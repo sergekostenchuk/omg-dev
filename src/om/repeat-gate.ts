@@ -92,6 +92,8 @@ export type RefusalStage = typeof REFUSAL_STAGES[number];
  * workspace or executor a feasibility check stood on. An unnamed role is not read as one of these.
  */
 export const ORIGIN_ROLES = Object.freeze(["proposal", "base", "derived", "environment"] as const);
+/** G6.2 (№3885 В2): the role naming the accepting attempt's series in a G5 finding of the candidate — no subject role. */
+export const ACCEPTING_ROLE = "accepting" as const;
 export type OriginRole = typeof ORIGIN_ROLES[number];
 
 type MapRole = "proposal" | "base" | "derived";
@@ -964,6 +966,17 @@ const derive = (store: Store, row: JournalRow, address: Address, ordinal: number
       return bad("call", "An E4 diagnostic belongs to a call admitted for this exact attempt");
     return reason === "refused" ? { class: "proposal", addressee: `node:${row.goal}`, basis: row.origin.sources }
       : { class: "conditions", addressee: `owner:${address.id}`, basis: row.origin.sources };
+  }
+  // G6.2 (№3869 п.5, №3881): a G5 finding of the group's candidate — the write order of shared files, or a subject no
+  // single proposal holds — names no proposal: it is the derivation's and goes to the attempt that assembled the group,
+  // never to the model and never to an analysis. A finding of a proposal's own content names that one proposal and is
+  // placed below by the one weighing like any other.
+  if (row.gate === "G5" && row.origin.stage === "atomicity" && !row.origin.sources.some(source => source.role === "proposal")) {
+    // The address is the accepting series its works step named, never the series of whoever closes now (№3885 В2).
+    const accepting = row.origin.sources.filter(source => source.role === ACCEPTING_ROLE);
+    if (accepting.length !== 1) return refused("origin_unreadable", "A G5 finding of the candidate names the one attempt that assembled it",
+      { unit: UNIT, target: address.id, field: `${path}.sources`, ref: row.source }, "producer");
+    return { class: "derivation", addressee: `accepting:${accepting[0]!.ref.id}`, basis: row.origin.sources };
   }
   const e5 = row.gate === "E5" || row.origin.stage === "fact-assessment"
     || row.source.id.startsWith(`om-unit-refusal:${address.project}:e5:`)
@@ -1920,7 +1933,7 @@ const refsSorted = (refs: readonly Ref[]): Ref[] => [...new Map(refs.map(ref => 
  * area: an LP4 cessation by that input (never the end of an application), the area-input check cessation, or the LP5
  * end of the remaining acceptance (never of a confirmation). One reading for the administrative rule and for A6.
  */
-function technicalEnds(store: Store, project: string, snapshot: CompletionSnapshot): { area: Ref; ends: (TechnicalEnd & { clean: boolean })[] } {
+function technicalEnds(store: Store, project: string, snapshot: CompletionSnapshot): { area: Ref; ends: (TechnicalEnd & { clean: boolean; group?: Ref })[] } {
   const area = managedTake(readCompletionAreaInput(store, project, reference(snapshot.binding)));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fields = (value: unknown): Record<string, any> | null => isPlainObject(value) ? value as Record<string, any> : null;
@@ -1942,7 +1955,15 @@ function technicalEnds(store: Store, project: string, snapshot: CompletionSnapsh
         clean: replacement !== null && value.remainder !== 'application' && (value.disposition !== 'check-ceased' || value.variant === AREA_INPUT_VARIANT) };
     }
     if (record.kind === COMPLETION_FINALIZATION_KIND) {
-      const value = record.value as unknown as CompletionFinalization, replacement = replaced(value.cause);
+      const value = record.value as unknown as CompletionFinalization, cause = fields(value.cause);
+      // G6.2 (return №3899): the end of a remaining acceptance by the saved G5 rejection of its group is clean, like the
+      // replaced B1 of its area: it names the rejection, and the end of a sound member is neutral.
+      if (cause && cause['kind'] === 'group-rejected' && isRef(cause['rejection'])) {
+        const rejection = exactOf(cause['rejection'] as Ref);
+        return { source: exactOf(row.source), kind: 'finalization', detail: `end of the remaining ${value.phase} by the group's G5 rejection (${rejection.id})`,
+          replacement: rejection, clean: value.phase === 'acceptance', group: rejection };
+      }
+      const replacement = replaced(value.cause);
       return { source: exactOf(row.source), kind: 'finalization', detail: `end of the remaining ${value.phase} by ${named(value.cause)}`,
         replacement, clean: replacement !== null && value.phase === 'acceptance' };
     }
@@ -1960,6 +1981,11 @@ function administrativeEnd(store: Store, project: string, snapshot: CompletionSn
   if (noop.length || snapshot.waiting.length || !snapshot.technical.length) return null;
   const { area, ends } = technicalEnds(store, project, snapshot);
   if (!ends.every(end => end.clean)) return null;
+  // G6.2 (return №3899): every end by one rejection of its group — the neutral end of a sound member; a mix with other
+  // ends has no one administrative reading.
+  const groups = [...new Map(ends.filter(end => end.group).map(end => [canonical(end.group as unknown as Json), end.group!])).values()];
+  if (groups.length) return groups.length === 1 && ends.every(end => end.group)
+    ? { kind: 'group-rejected', rejection: groups[0]!, sources: refsSorted(ends.map(end => end.source)) } : null;
   return { kind: 'area-input-replaced', input: area, replacements: refsSorted(ends.map(end => end.replacement!)),
     sources: refsSorted(ends.map(end => end.source)) };
 }

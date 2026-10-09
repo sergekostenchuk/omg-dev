@@ -31,10 +31,12 @@ import { NO_PRODUCER_EMISSIONS, prepareAnswersGate as prepareAnswersGateOf, prep
   writeAnswersCheckCessation as writeAnswersCheckCessationOf, writeAnswersEvaluation as writeAnswersEvaluationOf, writeAnswersRegistration as writeAnswersRegistrationOf, type AnswerRouteResult, type AnswersGateRequest, type RouteProducers,
   type UnservedQuestion } from "./answers-gate.js";
 import { gateCandidate as gateCandidateOf, prepareCandidate as prepareCandidateOf, writeCandidate as writeCandidateOf, type CandidateRequest } from "./frame-candidate.js";
-import { prepareSettleCandidate as prepareSettleCandidateOf, type SettleCandidateRequest } from "./frame-accept.js";
+import { prepareSettleCandidate as prepareSettleCandidateOf, readWorkRejection as readWorkRejectionOf, type SettleCandidateRequest } from "./frame-accept.js";
+import { readJournalAt as readJournalAtOf } from "./refusal-journal.js";
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, type FrameAttemptBinding } from "./layer-basis.js";
 import type { AcceptedFrameRequest } from "./frame-accept.js";
 import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf, producerProposal as producerProposalOf,
+  readAtomicGate as readAtomicGateOf, readWorksAcceptance as readWorksAcceptanceOf,
   type WorkProposalSource, type WorksAcceptanceRequest } from "./atomic-gate.js";
 import { runWakeChoice as runWakeChoiceOf, wakeStanding as wakeStandingOf, type WakeChoiceRequest } from "./wake-choice.js";
 import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines as writeGapLinesOf, type GapLinesRecord } from "./gap-lines.js";
@@ -85,7 +87,7 @@ export type RunErrorCode = typeof RUN_ERROR_CODES[number];
 export type RunSource = "refs" | "routes" | "queue" | "horizon" | "run-bases" | "input" | "accepted-answer" | "addressing" | "series"
   | "repeat-gate" | "stop-analysis" | "model-call" | "question-packet" | "assessment" | "answers-gate" | "frame-candidate"
   | "frame-accept" | "layer-basis" | "atomic-gate" | "gap-lines" | "obligations" | "feasibility" | "handoff" | "gaps"
-  | "stage-checks" | "run-control" | "frame-proposals" | "wake-choice";
+  | "stage-checks" | "run-control" | "frame-proposals" | "wake-choice" | "refusal-journal";
 export type RunResultCode = RunLocalCode | SourceCodes<RunSource>;
 export type RunResult<T> = OmResult<T, RunResultCode>;
 
@@ -150,6 +152,10 @@ const gateCandidate = transferring("frame-candidate", gateCandidateOf);
 const prepareCandidate = transferring("frame-candidate", prepareCandidateOf);
 const writeCandidate = transferring("frame-candidate", writeCandidateOf);
 const prepareSettleCandidate = transferring("frame-accept", prepareSettleCandidateOf);
+const readWorkRejection = transferring("frame-accept", readWorkRejectionOf);
+const readJournalAt = transferring("refusal-journal", readJournalAtOf);
+const readAtomicGate = transferring("atomic-gate", readAtomicGateOf);
+const readWorksAcceptance = transferring("atomic-gate", readWorksAcceptanceOf);
 const readAcceptedFrameLayer = transferring("layer-basis", readAcceptedFrameLayerOf);
 const prepareWorksAcceptance = transferring("atomic-gate", prepareWorksAcceptanceOf);
 const prepareWorksSources = transferring("atomic-gate", prepareWorksSourcesOf);
@@ -1291,6 +1297,16 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       if (ceased.value.cause) return step("cease-check", { project, binding: reference(binding) }, series.id, ordinal);
     } else if (level && !negative && !made) return finalizeStep(store, project, binding, "acceptance", series.id, ordinal);
   }
+  // G6.2 (№3888, №3891): a saved G5 rejection of this D1 group that rejected proposals ends the whole original group — the
+  // members closed since included. Every member, the accepting one included, ends its remaining acceptance by that
+  // rejection and keeps its paid assemblies for reuse; a member whose own result it rejected also closes on its own rows
+  // (below), so only the rejected root is new work.
+  if (!ended && !replaced && level === 3 && !made && !negative && work.answers?.complete) {
+    // The producer of the end decides who belongs to the group it rejected; a later attempt on the same D1 goes on.
+    const rejection = groupRejectionOf(store, project, members);
+    const request = rejection ? { project, binding: reference(binding), phase: "acceptance" as const, rejection } : null;
+    if (request && prepareCompletionFinalization(store, request).ok) return step("finalize", request, series.id, ordinal);
+  }
   if (!ended && level === 2 && !made && !negative) {
     const operations = scope.sources.operations as unknown as { frame: CandidateRequest["frame"]; proposals: Ref[] };
     const proposals = uniqueRefs([...operations.proposals, ...group.flatMap(row => row.assemblies.filter(item => item.level === 2).map(item => item.proposal))]);
@@ -1338,7 +1354,11 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   // E5 assesses a fact once and no neighbour's work changes that terminal. The attempt closes through the common G7 like a
   // negative one, its outcome derived by the close, and the next attempt asks the fact again.
   const technical = !ended && !!level && !negative && !made && technicalAssessmentFailure(store, project, work);
-  if (!ended && level && !negative && !technical) {
+  // G6.2 (№3869 п.1, п.5): an own assembly whose proposal a saved G5 rejection of the group rejected — a defect of its own
+  // content — closes this attempt through the common G7 with exactly the rows that name it; the next attempt of the block
+  // makes a new assembly, and the other members keep theirs.
+  const rejected = level === 3 && !negative && !made && !technical ? ownRejectedRows(store, project, work) : [];
+  if (!ended && level && !negative && !technical && !rejected.length) {
     // D2 lines are named by the D1 gap ids of the attempt's own node obligations at this level.
     const goalLines = [...new Set(batches.filter(row => row.task === "node-expansion" && row.level === level)
       .flatMap(row => row.items.map(item => item.gap)))].sort();
@@ -1361,9 +1381,13 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       // G6 (В2, №3869): an accepted answer of a question that blocks this group's own works and that B1 still holds keeps
       // their D1 open, so no G5 can pass on the old B1: neither the works step nor a wake choice for an assembly the
       // transition replaces is paid. The machine choice applies the answer once only this group is open; LP5 then ends it.
+      const results = group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: item.kind, record: item.record })));
+      // G6.2 (№3869 п.5): the saved outcome of this attempt's own works step comes first — a refused candidate is never
+      // assembled again from the same results.
+      const refused = refusedWorks(store, project, history, bound, results, series.id);
+      if (refused) return refused;
       const transition = groupTransition(store, project, (checked.request as { routes: Ref }).routes, group);
       if (transition) return transition;
-      const results = group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: item.kind, record: item.record })));
       const sources = prepareWorksSources(store, { project, results });
       if (!sources.ok) {
         // G5.1 (№3847): a sleeping flow whose producer work, answered before the wake-test era, has several covering tests
@@ -1407,9 +1431,64 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     }
     accepting.push(confirmed);
   }
-  const claim = prepareManagedClaim(store, { ...address, outcome: { reason: "result", accepting, cancelling: [], refusals: [] } } as never);
+  const claim = prepareManagedClaim(store, { ...address, outcome: { reason: "result", accepting, cancelling: [], refusals: rejected } } as never);
   if (!claim.ok) return { wait: waitOf(claim.refusal, project) };
   return step("close", { ...address, outcome: claim.value.outcome }, series.id, ordinal);
+}
+/**
+ * G6.2 (№3891): the saved G5 rejection of this D1 group that rejected proposals — read from the rejected proposals of its
+ * members, open or closed, by the rejection's own reader. The group never shrinks to whoever is open now.
+ */
+function groupRejectionOf(store: Store, project: string, members: readonly Member[]): Ref | null {
+  const found = new Map<string, Ref>();
+  for (const member of members) for (const assembly of member.assemblies.filter(item => item.level === 3)) {
+    const head = store.get<{ status?: string; verdict?: { contract?: string; candidate?: Ref; gate?: Ref } }>(assembly.proposal.id);
+    const verdict = head?.value.verdict;
+    if (!head || head.value.status !== "rejected" || verdict?.contract !== "om-work-rejection/v1" || !verdict.candidate || !verdict.gate) continue;
+    const rejection = take(readWorkRejection(store, { project, candidate: verdict.candidate, gate: verdict.gate }));
+    if (rejection.proposals.length) found.set(rejection.record.id, rejection.record);
+  }
+  return [...found.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)[0] ?? null;
+}
+/**
+ * G6.2 (№3869 п.1, п.5): the rows of the saved G5 rejection that name this attempt's own assemblies — each its proposal,
+ * rejected for a defect of its own content. They are read through the rejection's own reader, never guessed from heads.
+ */
+function ownRejectedRows(store: Store, project: string, work: CompletionSnapshot): { row: string; name: string; goal: string }[] {
+  const rows = new Map<string, { row: string; name: string; goal: string }>();
+  for (const assembly of assembliesOf(store, project, work).filter(item => item.level === 3)) {
+    const head = store.get<{ status?: string; verdict?: { contract?: string; candidate?: Ref; gate?: Ref } }>(assembly.proposal.id);
+    const verdict = head?.value.verdict;
+    if (!head || head.revision === assembly.proposal.revision || head.value.status !== "rejected" || verdict?.contract !== "om-work-rejection/v1"
+      || !verdict.candidate || !verdict.gate) continue;
+    const rejection = take(readWorkRejection(store, { project, candidate: verdict.candidate, gate: verdict.gate }));
+    if (!rejection.proposals.some(ref => same(ref, reference(head)))) continue;
+    for (const row of take(readJournalAt(store, project, rejection.journal)).value.rows)
+      if (same(row.source, rejection.diagnostic) && row.origin.sources.some(source => source.role === "proposal" && same(source.ref, assembly.proposal)))
+        rows.set(row.id, { row: row.id, name: row.code, goal: row.goal });
+  }
+  return [...rows.values()].sort((a, b) => a.row < b.row ? -1 : a.row > b.row ? 1 : 0);
+}
+/**
+ * G6.2 (№3869 п.5, №3891): the saved refusal of this accepting attempt's own works step that rejected no proposal — its
+ * findings are the candidate's own (the write order of shared files is G6.1's step). While the group's results are those
+ * of the refused candidate, the acceptance waits at that address; new results make a new candidate. A refusal that
+ * rejected proposals ends the whole group instead (groupRejectionOf).
+ */
+function refusedWorks(store: Store, project: string, history: RunHistory, bound: FrameAttemptBinding, results: readonly WorkProposalSource[],
+  series: string): Held | null {
+  const saved = history.saved("works", request => same((request.works as { binding?: unknown } | undefined)?.binding ?? null, bound));
+  const products = saved ? history.performed("works", saved as Record<string, unknown>) : null;
+  if (!products?.length) return null;
+  const acceptance = take(readWorksAcceptance(store, { project, record: products[0]! }));
+  const gate = take(readAtomicGate(store, { project, record: acceptance.value.gate })).value.result;
+  if (gate.passed) return null;
+  const set = (rows: readonly unknown[]) => rows.map(row => canonical(row as Json)).sort();
+  // Each finding keeps its own code and subject: the write order of shared files is G6.1's, any other is the candidate's own.
+  if (same(set(acceptance.value.request.results), set(results))) return wait("works_rejected", series, "works",
+    `The group's works candidate was refused for findings of the candidate itself, its results unchanged: ${gate.findings
+      .map(finding => `${finding.code} ${finding.target}`).join("; ")}`, [products[0]!], "dependent");
+  return null;
 }
 /**
  * G6 (В2, №3869): the wait of a group whose works acceptance stands on accepted answers of its own blocking questions not

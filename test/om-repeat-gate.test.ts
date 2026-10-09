@@ -4601,7 +4601,7 @@ test("LP6 rows 12, 14, 16, 17, 18: a close ended only by the replaced B1 of its 
   assert.ok(ended.length >= 1 && ended.every(row => row.value.cause.kind === "required-record-replaced"));
   const neutral = deliveredOf(f.close(2));
   assert.equal(neutral.verdict, "neutral");
-  const end = administrative(2)!;
+  const end = administrative(2)! as { kind: string; input: Ref; replacements: readonly Ref[]; sources: readonly Ref[] };
   assert.deepEqual([end.kind, end.input.revision, end.replacements.map(ref => ref.revision)], ["area-input-replaced", replaced.revision - 1, [replaced.revision]]);
   assert.deepEqual(end.sources.map(ref => ref.id).sort(), ended.map(row => row.id).sort());
   assert.equal(f.saved(2).outcome.reason, "interrupted", "The reason stays interrupted; only its progress marks it");
@@ -4744,4 +4744,25 @@ test("LP7 row 25 (model-call): one wrong row among the right ones of a joined an
     assert.deepEqual(round.refusals, ["not applied"], `${label}: the paid answer is refused whole`);
     assert.deepEqual([f.store.get("om-input:garden")!.revision, f.sent().length], [before, 1], `${label}: no field applied, B1 stays`);
   }
+});
+
+// G6.2 (№3869 п.5, №3885 В2): a G5 finding of the group's candidate — no proposal holds its subject — is placed by code:
+// derivation, never to the model and never to an analysis, addressed to the accepting attempt its works step named; a
+// row that does not name that one attempt is a typed refusal, never a hold.
+test("G6.2 a G5 finding of the candidate is the derivation's, addressed to the accepting attempt its works step named; without that attempt it is refused, never held", t => {
+  const { store } = fixture(t);
+  opened(store, "c1");
+  const accepting = reference(store.get(at("c1"))!);
+  const row = journalled(store, "c1", { name: "ownership_transfer_missing", stage: "atomicity", subject: "src/shared.ts",
+    sources: [source("accepting", accepting)] }, { gate: "G5", code: "ownership_transfer_missing", goal: "src/shared.ts" });
+  const result = closed(store, "c1", goal(), refusedBy(row));
+  const route = routeOf(result, row.row);
+  assert.deepEqual([route.class, route.addressee, route.toModel], ["derivation", `accepting:${accepting.id}`, false]);
+  assert.equal(store.list(ORIGIN_HOLD_KIND).length, 0, "No hold, no origin analysis");
+  opened(store, "c2");
+  const orphan = journalled(store, "c2", { name: "write_ownership_overlap", stage: "atomicity", subject: "src/shared.ts", sources: [] },
+    { gate: "G5", code: "write_ownership_overlap", goal: "src/shared.ts" });
+  deliveredOf(openAttempt(store, { ...address("c2"), attempt: 1, goal: goal() }));
+  addressed(refusalOf(closeAttempt(store, { ...address("c2"), attempt: 1, outcome: refusedBy(orphan) })), "origin_unreadable", at("c2"));
+  assert.equal(store.list(ORIGIN_HOLD_KIND).length, 0);
 });

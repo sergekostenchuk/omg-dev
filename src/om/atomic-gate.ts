@@ -525,7 +525,7 @@ export function readWorksAcceptance(store: Store, request: { project: string; re
     } else {
       if (value.acceptance !== null) fail('atomic_gate_record_forged', saved.id, 'acceptance', 'A refused gate cannot claim an accepted graph');
       take(readRejectedCandidate(store, { project: request.project, level: 3, candidate: gate.value.result.candidate,
-        outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: value.gate } }));
+        outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: value.gate }, binding: (value.request.binding ?? null) as FrameAttemptBinding | null }));
     }
     return saved;
   });

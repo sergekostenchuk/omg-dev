@@ -697,7 +697,14 @@ test('F5 G5 capacity measures the complete V2 value at the exact boundary and re
   const rejected = ok(writeWorksAcceptance(f.store, request));
   assert.equal(rejected.state, 'rejected', JSON.stringify({ seed: f.seedRoot, findings: gateWrite(rejected).value.result.findings })); assert.equal(rejected.acceptance, null);
   for (const item of acceptedBases) assert.deepEqual(f.store.get(item.id), item.value, item.id);
-  assert.ok(f.proposals.every(ref => f.store.get<LayerProposal>(ref.id)!.value.status === 'rejected'));
+  // G6.2 (№3869 п.1, №3885): only the proposals that define a work over capacity are rejected — every other stays proposed,
+  // and each diagnostic row names exactly its one holder.
+  const over = new Set(outcome.findings.filter(finding => finding.code === 'work_packet_over_capacity').map(finding => finding.target));
+  const holds = (ref: Ref) => f.store.get<LayerProposal>(ref.id, ref.revision)!.value.nodes.some(node => over.has(node.id));
+  assert.ok(f.proposals.some(holds), 'A proposal defines a work over capacity');
+  for (const ref of f.proposals) assert.equal(f.store.get<LayerProposal>(ref.id)!.value.status, holds(ref) ? 'rejected' : 'proposed', ref.id);
+  const diagnostic = f.store.list<{ gate: string; refusals: { origin: { sources: { role: string }[] } }[] }>('om-unit-refusal').find(row => row.value.gate === 'G5')!;
+  assert.ok(diagnostic.value.refusals.every(row => row.origin.sources.filter(source => source.role === 'proposal').length === 1));
   const stored = ok(readWorksAcceptance(f.store, { project: f.project, record: reference(rejected.record) }));
   const snapshot = heads(f.store); f.restart();
   assert.deepEqual(ok(readWorksAcceptance(f.store, { project: f.project, record: reference(rejected.record) })), stored);

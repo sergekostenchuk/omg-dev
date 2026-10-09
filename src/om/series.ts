@@ -211,12 +211,17 @@ export const ATTEMPT_PROGRESS_CONTRACT = "om-attempt-progress/v1" as const;
 export const SERIES_PROGRESS_CONTRACT = "om-series-progress/v1" as const;
 /** The key family of a decided block input field; such keys reach a series only from their confirming provider. */
 export const INPUT_FIELD_KEY_PREFIX = "om-result:input-field:";
-export interface AdministrativeEnd {
+export type AdministrativeEnd = {
   readonly kind: "area-input-replaced";
   readonly input: Ref;
   readonly replacements: readonly Ref[];
   readonly sources: readonly Ref[];
-}
+} | {
+  /** G6.2 (return №3899): a sound member of a group ended by the saved G5 rejection of others' defective work — neutral. */
+  readonly kind: "group-rejected";
+  readonly rejection: Ref;
+  readonly sources: readonly Ref[];
+};
 export interface AttemptProgress { readonly contract: typeof ATTEMPT_PROGRESS_CONTRACT; readonly administrative: AdministrativeEnd | null }
 /** The boundary from which a block series is walked by LP6: the exact revision before it, and the first attempt it covers. */
 export interface ProgressPolicy { readonly contract: typeof SERIES_PROGRESS_CONTRACT; readonly previous: Ref | null; readonly from: number }
@@ -1853,8 +1858,10 @@ const outcomeOf = (outcome: AttemptOutcome | ClaimedOutcome, order: AchievedOrde
 });
 const refsInOrder = (refs: readonly Ref[]): Ref[] => ordered(refs.map(exactRef), item => canonical(item));
 const progressOf = (progress: AttemptProgress): AttemptProgress => ({ contract: progress.contract,
-  administrative: progress.administrative === null ? null : { kind: progress.administrative.kind, input: exactRef(progress.administrative.input),
-    replacements: refsInOrder(progress.administrative.replacements), sources: refsInOrder(progress.administrative.sources) } });
+  administrative: progress.administrative === null ? null : progress.administrative.kind === "group-rejected"
+    ? { kind: "group-rejected", rejection: exactRef(progress.administrative.rejection), sources: refsInOrder(progress.administrative.sources) }
+    : { kind: progress.administrative.kind, input: exactRef(progress.administrative.input),
+      replacements: refsInOrder(progress.administrative.replacements), sources: refsInOrder(progress.administrative.sources) } });
 const policyOf = (policy: ProgressPolicy): ProgressPolicy =>
   ({ contract: policy.contract, previous: policy.previous === null ? null : exactRef(policy.previous), from: policy.from });
 const reconciliationOf = (item: Reconciliation): Reconciliation => ({ after: item.after, transition: exactRef(item.transition),
@@ -1935,10 +1942,12 @@ function progressProblem(value: unknown): string | null {
     return "progress";
   const end = (value as Record<string, unknown>)['administrative'];
   if (end === null) return null;
-  if (!isPlainObject(end) || !exactKeys(end, ["kind", "input", "replacements", "sources"])
-    || (end as Record<string, unknown>)['kind'] !== "area-input-replaced" || !isRef((end as Record<string, unknown>)['input']))
+  const group = isPlainObject(end) && (end as Record<string, unknown>)['kind'] === "group-rejected";
+  if (group ? !exactKeys(end as object, ["kind", "rejection", "sources"]) || !isRef((end as Record<string, unknown>)['rejection'])
+    : !isPlainObject(end) || !exactKeys(end, ["kind", "input", "replacements", "sources"])
+      || (end as Record<string, unknown>)['kind'] !== "area-input-replaced" || !isRef((end as Record<string, unknown>)['input']))
     return "progress.administrative";
-  for (const field of ["replacements", "sources"]) {
+  for (const field of group ? ["sources"] : ["replacements", "sources"]) {
     const list = (end as Record<string, unknown>)[field];
     if (!Array.isArray(list) || list.length === 0 || !list.every(isRef) || new Set(list.map(item => canonical(item))).size !== list.length)
       return `progress.administrative.${field}`;

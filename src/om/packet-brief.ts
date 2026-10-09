@@ -676,24 +676,41 @@ function briefExamples(payload: Record<string, any>, labels: BriefLabel[], basis
     let id = 'example-refinement'; while (reserved.has(id)) id += '-next';
     const assigned = payload.expansion.obligations.filter((row: { id: string }) => payload.expansion.assigned.includes(row.id));
     const ends = assigned.filter((row: { kind: string }) => row.kind === 'connection-end');
-    const code = { path: 'src/example-unit.ts', access: 'write', status: 'planned', symbol: 'exampleResult' };
     const ports = ends.map((row: { artifact: string; role: string }, i: number) => ({ id: `example-port-${i + 1}`,
       direction: row.role === 'producer' ? 'out' : 'in', contract: basis.graph.artifacts.find(artifact => artifact.id === row.artifact)!.contract }));
-    const testId = `${id}-proof`, covers = [...new Set<string>(ends.map((row: { connector: string }) => row.connector))];
+    // G6.2 (№3883, №3884): a works example of the transition era passes its own acceptance — one artifact per work. The
+    // upper outcome, the consumer ends and the producer ends of that artifact stay with the first work; every other
+    // produced artifact gets a work of its own, with its own write path and test. Elsewhere the example keeps its bytes.
+    const others: string[] = payload.works && basis.transitionEra ? [...new Set<string>(ends.filter((row: { role: string; artifact: string }) =>
+      row.role === 'producer' && row.artifact !== upper.outcome).map((row: { artifact: string }) => row.artifact))] : [];
+    const workIds = [id, ...others.map((_, index) => { let next = `${id}-${index + 2}`; while (reserved.has(next)) next += '-next'; return next; })];
+    const holder = (row: { kind: string; role?: string; artifact?: string }) => row.kind === 'connection-end' && row.role === 'producer'
+      && others.includes(row.artifact!) ? others.indexOf(row.artifact!) + 1 : 0;
     const command = { executable: 'node', args: ['--test', 'test/example-unit.test.mjs'] };
-    const node = { ...upper, id, parent: upper.id, kind: payload.works ? 'work' : 'operation', title: 'Example refinement structure',
-      ports, code: payload.works ? [code] : [], tests: payload.works ? [testId] : [] };
-    const tests = payload.works ? [{ id: testId, node: id, command, covers,
-      obligations: requiredTests(upper).filter(row => row.status === 'required').map(row => row.name), contract: {
-        given: ['The assigned input contracts hold'], when: 'Invoke the planned product entrypoint', then: ['Observe the declared useful result'],
-        forbiddenEffects: ['No changes outside the declared write scope'], entrypoint: { kind: 'api', path: code.path, symbol: code.symbol, status: code.status },
-        counterfactuals: covers.map(connector => ({ connector, mutation: 'remove', expectedFailure: 'missing_input', command })),
-        resourceClass: 'own_dirs', resources: [],
-      } }] : [];
-    const proposal = { nodes: [node], fills: assigned.map((row: { id: string; kind: string; role?: string }) => ({ obligation: label('slot', row.id), node: id,
-      ...(row.kind === 'connection-end' ? { port: ports[ends.indexOf(row)].id, ...(payload.works ? { codeRef: code } : {}),
-        ...(wakes(payload, basis, row) ? { [WAKE_TEST.field]: testId } : {}) } : {}) })),
-      tests, localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
+    const units = workIds.map((workId, index) => {
+      const code = { path: index ? `src/example-unit-${index + 1}.ts` : 'src/example-unit.ts', access: 'write', status: 'planned', symbol: 'exampleResult' };
+      const own = ends.filter((row: { kind: string; role?: string; artifact?: string }) => holder(row) === index);
+      const testId = `${workId}-proof`, covers = [...new Set<string>(own.map((row: { connector: string }) => row.connector))];
+      const node = { ...upper, id: workId, parent: upper.id, kind: payload.works ? 'work' : 'operation', title: 'Example refinement structure',
+        ...(index ? { outcome: others[index - 1] } : {}), ports: own.map((row: unknown) => ports[ends.indexOf(row)]),
+        code: payload.works ? [code] : [], tests: payload.works ? [testId] : [] };
+      const tests = payload.works ? [{ id: testId, node: workId, command, covers,
+        obligations: requiredTests(upper).filter(row => row.status === 'required').map(row => row.name), contract: {
+          given: ['The assigned input contracts hold'], when: 'Invoke the planned product entrypoint', then: ['Observe the declared useful result'],
+          forbiddenEffects: ['No changes outside the declared write scope'], entrypoint: { kind: 'api', path: code.path, symbol: code.symbol, status: code.status },
+          counterfactuals: covers.map(connector => ({ connector, mutation: 'remove', expectedFailure: 'missing_input', command })),
+          resourceClass: 'own_dirs', resources: [],
+        } }] : [];
+      return { code, testId, node, tests };
+    });
+    const testId = units[0]!.testId;
+    const proposal = { nodes: units.map(unit => unit.node), fills: assigned.map((row: { id: string; kind: string; role?: string; artifact?: string }) => {
+      const unit = units[holder(row)]!;
+      return { obligation: label('slot', row.id), node: unit.node.id,
+        ...(row.kind === 'connection-end' ? { port: ports[ends.indexOf(row)].id, ...(payload.works ? { codeRef: unit.code } : {}),
+          ...(wakes(payload, basis, row) ? { [WAKE_TEST.field]: unit.testId } : {}) } : {}) };
+    }),
+      tests: units.flatMap(unit => unit.tests), localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
     const bindings = payload.works?.obligations.filter((row: Parameters<typeof taskBindingId>[0]) => payload.works.assigned.includes(taskBindingId(row)))
       .map((row: Parameters<typeof taskBindingId>[0]) => ({ id: taskBindingId(row), scope: row.scope, obligation: row.obligation, consumers: [{ node: id, tests: [testId] }] }));
     examples.unshift(json({ ...envelope, action: 'answer', proposal, ...(bindings ? { bindings } : {}) }));

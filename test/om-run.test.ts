@@ -1273,12 +1273,14 @@ test("25 C61 7 R8 №1749 №1860-12 H1.1 two blocks of one N2 frame: G4b waits 
  * the 'cross' graph, the owner's works horizon over that layer, D1 with the works frame, M6 and M3. The pass then pays one
  * MC2 works cycle per block and does everything else.
  */
-function worksFixture(t: test.TestContext, late = false, fact: boolean | number = false) {
+function worksFixture(t: test.TestContext, late = false, fact: boolean | number = false, shape?: (graph: Graph) => void) {
   const facts = fact === true ? ["works-fact"] : Array.from({ length: Number(fact) }, (_, index) => index ? `works-fact-${index + 1}` : "works-fact");
   const root = mkdtempSync(join(tmpdir(), "omg-h1-works-")), database = join(root, "state.sqlite");
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const desired = gardenGraph("cross"), { level: _level, ...l1 } = projectGraph(desired, 1);
+  const desired = gardenGraph("cross");
+  shape?.(desired);
+  const { level: _level, ...l1 } = projectGraph(desired, 1);
   // A late question of the environment (checked when a task starts): D1 keeps it as a late gap and D7 needs its assignment.
   // FA1: a repository fact of the consuming block, asked by MC1 and assessed by E5 in the same attempt as its works.
   preparedFeatures(engine, project, l1 as Graph, late || fact ? field => {
@@ -3188,6 +3190,149 @@ function mp2WorkAnswer(f: ReturnType<typeof worksFixture>, saved: Ref) {
       .map(item => ({ obligation: item.id, node: work.id, ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
     localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
     removes: [], replaces: [], redefines: [] } } };
+}
+
+// G6.2 (№3883, №3884): the producing operation also produces a second artifact through its other output (like o-state on
+// the live pass). The example answer of its new works packet gives each artifact a work of its own, so the example passes
+// the packet's own acceptance (E3, one artifact per work); every new works packet of the pass is checked the same way.
+function twoArtifacts(graph: Graph) {
+  graph.artifacts.push({ ...structuredClone(graph.artifacts.find(row => row.id === "garden-data")!), id: "garden-alt", terminal: false });
+  const flow = graph.connectors.find(row => row.id === "garden-flow")!;
+  const moved = flow.bindings.filter(binding => binding.producer.port === "out-alt");
+  flow.bindings = flow.bindings.filter(binding => binding.producer.port !== "out-alt");
+  graph.connectors.push({ ...structuredClone(flow), id: "garden-alt-flow", artifact: "garden-alt", wakeTest: null, bindings: moved });
+  for (const test of graph.tests.filter(row => row.covers.includes("garden-flow") && row.node.startsWith("garden-produce"))) {
+    test.covers.push("garden-alt-flow");
+    const pair = test.contract?.counterfactuals.find(row => row.connector === "garden-flow");
+    if (pair) test.contract!.counterfactuals.push({ ...structuredClone(pair), connector: "garden-alt-flow" });
+  }
+}
+test("G6.2 the example answer of every new works packet passes the packet's own acceptance, a node producing two artifacts included", async t => {
+  const f = worksFixture(t, false, false, twoArtifacts);
+  ok(startRun(f.store, { project }));
+  const checked = new Map<string, boolean>();
+  for (let index = 0; index < 120 && checked.size < 2; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string; message: string }; step?: { action: string; request: { packet?: Ref } } };
+    if (state.phase === "waiting" || state.phase === "unable" || state.phase === "complete") assert.fail(`The pass reaches the works packets: ${JSON.stringify(state).slice(0, 600)}`);
+    if (state.phase !== "step" || state.step!.action !== "cycle" || !state.step!.request.packet || checked.has(state.step!.request.packet.id)) continue;
+    const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    const payload = packet.value.packet as unknown as { brief: { examples: { action: string; proposal?: { nodes: Node[] } }[] } };
+    const example = payload.brief.examples.find(row => row.action === "answer")!;
+    const result = checkAnswerForm(f.store, { project, packet: saved, raw: canonical(example) });
+    assert.ok(result.ok, `The example passes its own acceptance: ${JSON.stringify(result).slice(0, 800)}`);
+    checked.set(saved.id, example.proposal!.nodes.length > 1);
+    f.answer(saved);
+  }
+  assert.ok([...checked.values()].includes(true), `The producing packet's example holds a work per artifact: ${JSON.stringify([...checked])}`);
+});
+
+// G6.2 (№3869 п.1, п.5, №3885): a G5 finding of one work's own content rejects only the proposal that defines it. The base
+// before G6 (a62940ec) issues the producing root and admits its one work for two artifacts (its E3 knows no such rule); G5
+// refuses it today. Only that proposal is rejected, its attempt closes through G7 on its own rows — placed as the
+// proposal's, no hold, no analysis — and the next attempt of its block answers anew; the consuming block's paid work is
+// kept and nothing stands on input_stale.
+const G62_BASE = "a62940ecc6ee43d2b44ef315abf1067b060d4db0";
+test("G6.2 a G5 finding of one work's own content rejects only its proposal: its attempt closes on its own rows with no hold, the next attempt answers anew, the other member's paid work is kept — never input_stale; a rejected assembly is never reused, through a chain of reuses either", async t => {
+  for (const chain of [false, true]) await t.test(chain ? "the rejected assembly came by a reuse" : "the rejected assembly is the attempt's own", async t => g62Rejection(t, chain));
+  // Return №3899: the sound member's end by the group's rejection is neutral — two earlier attempts without a result
+  // before it do not make a third that stops the line and pays A6; it reuses its assembly and the group is accepted.
+  await t.test("a sound member with two earlier attempts without a result ends neutrally: no stop, no A6", async t => g62Rejection(t, false, true));
+});
+async function g62Rejection(t: test.TestContext, chain: boolean, prior = false) {
+  const f = worksFixture(t, false, false, twoArtifacts), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+  const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
+  const paid = new Map<string, number>(), count = (node: string) => paid.set(node, (paid.get(node) ?? 0) + 1);
+  const consumeAddress = { project, block: "garden-consume-block", line: 1 };
+  if (prior) {
+    ok(openSeries(f.store, { ...consumeAddress, slice: "g62-prior", predecessor: null, basis: null } as Parameters<typeof openSeries>[1]));
+    const goal = { key: "g62-prior", questions: ["Address one contract"], result: "A supported contract" };
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      ok(beginAttempt(f.store, { ...consumeAddress, attempt, goal } as Parameters<typeof beginAttempt>[1]));
+      ok(closeAttempt(f.store, { ...consumeAddress, attempt, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as Parameters<typeof closeAttempt>[1]));
+    }
+  }
+  ok(startRun(f.store, { project }));
+  for (let round = 0; round < 4; round++) {
+    const issued = atCommit(f, G62_BASE, `g62-issue-${round}`, `const { advanceRun } = await import(src('om/run.js'));
+for (let index = 0; index < 40; index++) {
+  const state = take(await advanceRun(store, args.request)).record.value.state;
+  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
+  if (state.phase === 'waiting') { out(null); break; }
+}`, { request: f.request }) as Ref | null;
+    assert.ok(issued, "The base issues a works packet");
+    const answer = mp2WorkAnswer(f, issued), node = answer.research.proposal.nodes[0]!.parent!;
+    count(node); push(answer.research);
+    assert.equal(atCommit(f, G62_BASE, `g62-cycle-${round}`, `const { advanceRun } = await import(src('om/run.js'));
+out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request }), "cycle");
+    if (node === "garden-produce-operation") break;
+  }
+  f.restart();
+  // The chain: G1 replaces the B1 under the group before its acceptance, LP5 ends it and every root is answered again by
+  // a reuse of its paid assembly — the defective one included, so G5 rejects the reuse's origin.
+  if (chain) lp5ReplaceB1(f);
+  const answered = new Set<string>();
+  let probed: string[] = [];
+  for (let index = 0; index < 300 && !worksAcceptance(f.store).frame; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string }; step?: { action: string; request: { packet?: Ref } } };
+    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+    if (state.phase === "waiting" || state.phase === "unable") break;
+    // The one producer of the new end admits it only for the group on the rejection's own D1: the consuming block's next
+    // attempt, on the next D1, is never ended by the old group's rejection.
+    const consume = blockSeries(f as unknown as Fixture, "garden-consume-block")?.value;
+    const later = prior ? 3 : 1;
+    if (!probed.length && consume?.attempts[later] && consume.attempts[later]!.outcome === null) {
+      const next = ok(readCompletionBinding(f.store, project, reference(f.store.get(`repair-series:${project}:1:garden-consume-block`)!), later + 1))!;
+      const denied = refusal(prepareCompletionFinalization(f.store, { project, binding: reference(next), phase: "acceptance",
+        rejection: reference(f.store.list("om-work-rejection")[0]!) }) as never);
+      probed = [denied.code, denied.at.field ?? ""];
+    }
+    if (state.phase !== "step" || state.step!.action !== "cycle" || !state.step!.request.packet || answered.has(state.step!.request.packet.id)) continue;
+    const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    answered.add(saved.id);
+    const answer = mp2WorkAnswer(f, saved), node = answer.research.proposal.nodes[0]!.parent!;
+    count(node);
+    if (node === "garden-produce-operation") {
+      const example = (packet.value.packet as unknown as { brief: { examples: { action: string; proposal: unknown }[] } }).brief.examples.find(row => row.action === "answer")!;
+      push({ ...answer.research, proposal: example.proposal });
+    } else push(answer.research);
+  }
+  const text = trail.join(",");
+  assert.ok(!text.includes("input_stale"), `Never input_stale: ${text}`);
+  const rejections = f.store.list<{ proposals: Ref[] }>("om-work-rejection");
+  assert.equal(rejections.length, 1, text);
+  assert.equal(rejections[0]!.value.proposals.length, 1, "Only the proposal defining the defective work is rejected");
+  const rejected = f.store.get<LayerProposal>(rejections[0]!.value.proposals[0]!.id)!;
+  assert.ok(rejected.value.status === "rejected" && rejected.value.nodes.some(node => node.parent === "garden-produce-operation"), "The producing work's proposal");
+  assert.equal(f.store.list("om-origin-hold").length, 0, "No hold, no origin analysis");
+  const journal = f.store.get<{ rows: { id: string; gate: string }[]; classifications: { row: string; class: string; addressee: string }[] }>(`om-refusal-journal:${project}`)!.value;
+  const g5 = new Set(journal.rows.filter(row => row.gate === "G5").map(row => row.id));
+  const placed = journal.classifications.filter(row => g5.has(row.row));
+  assert.ok(placed.length > 0 && placed.every(row => row.class === "proposal"), `The rows are placed as the proposal's: ${JSON.stringify(placed)}`);
+  const guilty = chain ? 1 : 0;
+  assert.equal(blockSeries(f as unknown as Fixture, "garden-produce-block").value.attempts[guilty]!.outcome?.reason, "refused", text);
+  assert.ok((paid.get("garden-produce-operation") ?? 0) >= 2, `The producing root is answered anew: ${text.slice(-900)}`);
+  for (const [node, times] of paid) if (node !== "garden-produce-operation") assert.equal(times, 1, `${node} is paid once`);
+  // The whole group ended by the rejection: the sound member by its finalization (interrupted), the defective one on its
+  // rows; their next attempts reuse every sound assembly, and the new candidate is accepted.
+  const ends = f.store.list<{ cause: { kind: string } }>("om-completion-finalization").map(row => row.value.cause.kind);
+  assert.ok(ends.length >= 2 && ends.every(kind => kind === "group-rejected"), `Every member ends by the group's rejection: ${JSON.stringify(ends)}`);
+  // The consuming block's first attempt of the pass is a sound member of the rejected group: it ends by the rejection,
+  // neutrally — its progress names the rejection, the line is not stopped and no A6 is planned.
+  const member = blockSeries(f as unknown as Fixture, "garden-consume-block").value.attempts[prior ? 2 : 0]!;
+  assert.equal(member.outcome?.reason, "interrupted");
+  assert.equal((member.outcome as unknown as { progress?: { administrative: { kind: string } | null } }).progress?.administrative?.kind, "group-rejected",
+    JSON.stringify(member.outcome));
+  assert.ok(!text.includes("analyze"), `No A6 is planned: ${text.slice(-500)}`);
+  const acceptance = worksAcceptance(f.store);
+  assert.deepEqual([acceptance.passed, acceptance.frame], [true, true], `The new candidate is accepted: ${text.slice(-600)}`);
+  assert.deepEqual(probed, ["completion_cause_unproved", "group"], "An attempt of the next D1 is never ended by the old group's rejection");
+  const reuses = f.store.list<CompletionReuse>(COMPLETION_REUSE_KIND);
+  if (chain) assert.ok(reuses.some(row => row.value.origin.proposal.id === rejected.id), "The rejected assembly had come by a reuse");
+  const after = reuses.filter(row => f.store.get<{ status: string }>(row.value.origin.proposal.id)!.value.status === "rejected"
+    && f.store.get<{ attempt: number }>(row.value.binding.id, row.value.binding.revision)!.value.attempt > (chain ? 2 : 1));
+  assert.deepEqual(after.map(row => row.id), [], "No attempt after the rejection reuses the rejected assembly");
 }
 
 test("MP2 (№2968 rows 8, 18) through the pass a refused works answer is corrected once; G7 closes the block attempt with its result, every physical call sent once, the first refusal kept in its history", async t => {

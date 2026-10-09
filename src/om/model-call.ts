@@ -32,6 +32,7 @@ import { readFrameProposals as readFrameProposalsOf, prepareFrameProposals as pr
 import { readGaps as readGapsOf } from './gaps.js';
 import { prepareOmObligations as prepareOmObligationsOf, readOmObligations as readOmObligationsOf, type OmObligations } from './obligations.js';
 import { taskBindingId, taskObligations } from '../graph/task-obligations.js';
+import { readWorkRejectionAt as readWorkRejectionAtOf } from './frame-accept.js';
 import type { Graph } from '../graph/model.js';
 import { RefinementRelations } from '../graph/relations.js';
 import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
@@ -77,7 +78,7 @@ export type TransportErrorCode = typeof TRANSPORT_ERROR_CODES[number];
  */
 export type ModelCallSource = 'refs' | 'input' | 'addressing' | 'accepted-answer' | 'answer-form' | 'answers-gate' | 'assessment'
   | 'call-record' | 'frame-obligations' | 'frame-proposals' | 'gaps' | 'layer-basis' | 'obligations' | 'question-packet' | 'refusal-journal'
-  | 'repeat-gate' | 'routes' | 'series' | 'run-control' | 'transport';
+  | 'repeat-gate' | 'routes' | 'series' | 'run-control' | 'transport' | 'frame-accept';
 export type ModelCallCode = ModelCallLocalCode | SourceCodes<ModelCallSource>;
 export type ModelCallResult<T> = OmResult<T, ModelCallCode>;
 
@@ -115,6 +116,8 @@ const readCall = transferring('call-record', readCallOf);
 const readCallLedger = transferring('call-record', readCallLedgerOf);
 const readCallLedgerAt = transferring('call-record', readCallLedgerAtOf);
 const readCompletionBinding = transferring('series', readCompletionBindingOf);
+// G6.2: frame-accept reaches this module through a cycle of imports — its reader is bound at the call, not at load.
+const readWorkRejectionAt = (store: Store, request: { project: string; record: Ref }) => transfer('frame-accept', readWorkRejectionAtOf(store, request));
 const readCompletionCloseAt = transferring('repeat-gate', readCompletionCloseAtOf);
 const readCompletionOriginalAdmission = transferring('series', readCompletionOriginalAdmissionOf);
 const readCompletionOwnerAt = transferring('series', readCompletionOwnerAtOf);
@@ -3283,6 +3286,8 @@ export type CompletionCause = { kind: 'file-observation'; source: Ref; observati
   | { kind: 'series-admission-change'; condition: 'same-line' | 'active-participation'; change: SeriesAdmissionChange }
   // LP4 (№2887): a proved cessation of a step of this cycle in the exact predecessor work forbids its remaining work.
   | { kind: 'cycle-step-ceased'; cessation: Ref; work: Ref };
+/** G6.2 (№3891): an end of a remaining acceptance — by its area's replaced B1, or by the saved G5 rejection of its group. */
+export type FinalizationCause = CompletionCause | { kind: 'group-rejected'; rejection: Ref };
 export interface CompletionDispositionContext {
   binding: Revision<CompletionOwner>; assignment: Revision<CompletionAssignment>; snapshot: CompletionSnapshot;
 }
@@ -3488,6 +3493,27 @@ function areaReplacement(store: Store, binding: Revision<CompletionOwner>): { ca
   const cause: CompletionCause = { kind: 'required-record-replaced', prerequisite, replacement: reference(head), proof: null };
   readReplacement(store, binding.value.project, prerequisite, cause.replacement, null);
   return { cause, guards: [reference(head)] };
+}
+/**
+ * G6.2 (№3888, №3891): the one admission of the end by a group's G5 rejection. The exact saved rejection, which rejected
+ * proposals to replace, of the works candidate of this attempt's own group — the attempt its works step named, or one
+ * whose own result the refused G5 checked. Every member ends so, the defective one too (it closes on its own rows
+ * besides), so its sound roots stay reusable; the group stays the one it was, however many of its members closed since.
+ */
+function groupRejection(store: Store, binding: Revision<CompletionOwner>, ref: Ref): { cause: FinalizationCause; guards: Ref[] } {
+  const project = binding.value.project;
+  const rejection = take(readWorkRejectionAt(store, { project, record: ref }));
+  if (!rejection.proposals.length) fail('completion_cause_unproved', ref.id, 'proposals', 'A rejection of the candidate alone replaces no member: no administrative end');
+  if (!rejection.binding) fail('completion_cause_unproved', ref.id, 'binding', 'The rejection names the attempt whose works step assembled the candidate');
+  // The original group is who the rejection checked: the accepting attempt and every attempt whose own result the refused
+  // G5 took — never a later attempt on the same D1, which would end by it again and again.
+  const accepting = binding.value.series.id === rejection.binding.series.id && binding.value.attempt === rejection.binding.ordinal;
+  const head = store.get<CompletionWork>(completionWorkId(project, binding.id));
+  if (!head) fail('completion_invalid', binding.id, 'work', 'A managed binding keeps its work registry');
+  const products = take(readCompletionWorkAt(store, project, reference(head))).products;
+  if (!accepting && !products.some(product => rejection.results.some(result => same(result.record, product))))
+    fail('completion_cause_unproved', binding.id, 'group', 'Only an attempt of the group the rejection checked ends by it');
+  return { cause: { kind: 'group-rejected', rejection: ref }, guards: [ref] };
 }
 /** LP6 (№3325 §3): the exact B1 prerequisite of an attempt's own area — what an administrative end must have replaced. */
 export function readCompletionAreaInput(store: Store, project: string, bindingRef: Ref): ModelCallResult<Sealed<{
@@ -3850,7 +3876,7 @@ export type FinalizationPhase = 'acceptance' | 'confirmation';
  */
 export interface CompletionFinalization {
   contract: 'om-completion-finalization/v1'; project: string; binding: Ref; work: Ref; phase: FinalizationPhase;
-  outcome: 'ceased'; cause: CompletionCause; level: 2 | 3; evaluation: Ref; accepted: Ref | null; basis: ConfirmationGround | null;
+  outcome: 'ceased'; cause: FinalizationCause; level: 2 | 3; evaluation: Ref; accepted: Ref | null; basis: ConfirmationGround | null;
 }
 export const completionFinalizationId = (project: string, binding: string, phase: FinalizationPhase): string =>
   `${COMPLETION_FINALIZATION_KIND}:${project}:${hashJson({ binding, phase })}`;
@@ -3955,7 +3981,7 @@ function readAreaCause(store: Store, binding: Revision<CompletionOwner>, cause: 
 }
 /** The one derivation of the end of a remaining acceptance or confirmation, for its producer and for every reader. */
 function finalizationValue(store: Store, project: string, request: {
-  binding: Ref; work: Ref; phase: FinalizationPhase; cause: CompletionCause; accepted: Ref | null; basis: ConfirmationGround | null;
+  binding: Ref; work: Ref; phase: FinalizationPhase; cause: FinalizationCause; accepted: Ref | null; basis: ConfirmationGround | null;
 }): CompletionFinalization {
   const binding = take(readCompletionOwnerAt(store, project, request.binding)) as Revision<CompletionOwner>;
   if (!same(reference(binding), request.binding) || binding.value.owner.kind !== 'block')
@@ -3971,7 +3997,11 @@ function finalizationValue(store: Store, project: string, request: {
     fail('completion_invalid', request.work.id, 'answers', 'The remaining acceptance follows a complete, evaluated check');
   const level = acceptanceLevel(store, binding);
   if (!level) fail('completion_invalid', binding.id, 'level', 'Only an attempt with a common acceptance has its remainder');
-  readAreaCause(store, binding, request.cause);
+  if (object(request.cause) && request.cause.kind === 'group-rejected') {
+    if (!exactKeys(request.cause, ['kind', 'rejection']) || request.phase !== 'acceptance') fail('completion_cause_invalid', binding.id, 'cause',
+      'The end by a group rejection names its exact event and ends a remaining acceptance');
+    groupRejection(store, binding, request.cause.rejection);
+  } else readAreaCause(store, binding, request.cause as CompletionCause);
   if (request.phase === 'confirmation') {
     const accepted = completionAcceptance(store, project, level, completionAcceptanceResults(store, project, before, level));
     if (!accepted || !request.accepted || !same(accepted.frame, request.accepted))
@@ -3999,7 +4029,7 @@ export function readCompletionFinalizationAt(store: Store, project: string, ref:
  * proved impossible — the accepted frame or graph superseded, both heads guarded — and only while no D2 confirmed this
  * attempt (the D2 history guarded). The record and its registration are one transaction.
  */
-export function prepareCompletionFinalization(store: Store, request: { project: string; binding: Ref; phase: FinalizationPhase }): ModelCallResult<Sealed<{
+export function prepareCompletionFinalization(store: Store, request: { project: string; binding: Ref; phase: FinalizationPhase; rejection?: Ref }): ModelCallResult<Sealed<{
   record: Revision<CompletionFinalization>; writes: Write[]; guards: TransactionGuard[];
 }>> {
   return result(() => {
@@ -4011,7 +4041,9 @@ export function prepareCompletionFinalization(store: Store, request: { project: 
     const head = store.get<CompletionWork>(completionWorkId(project, binding.id));
     if (!head) fail('completion_invalid', binding.id, 'work', 'A managed binding keeps its work registry');
     if (head.value.closed) fail('completion_closed', head.id, 'work', 'Closed work accepts only exact historical repeats');
-    const replaced = areaReplacement(store, binding);
+    if (request.rejection !== undefined && (!isRef(request.rejection) || phase !== 'acceptance'))
+      fail('completion_invalid', binding.id, 'rejection', 'Only a remaining acceptance ends by its group\'s rejection, named by its exact event');
+    const replaced = request.rejection ? groupRejection(store, binding, request.rejection) : areaReplacement(store, binding);
     if (!replaced) fail('completion_cause_unproved', binding.id, 'cause', 'The remaining acceptance keeps its area: only a replaced B1 ends it');
     const snapshot = take(readCompletionWorkAt(store, project, reference(head)));
     const level = acceptanceLevel(store, binding);
@@ -4044,7 +4076,7 @@ export function prepareCompletionFinalization(store: Store, request: { project: 
       || !writes.some(row => same(writeRef(row), guard)))) };
   });
 }
-export function writeCompletionFinalization(store: Store, request: { project: string; binding: Ref; phase: FinalizationPhase }): ModelCallResult<Sealed<Revision<CompletionFinalization>>> {
+export function writeCompletionFinalization(store: Store, request: { project: string; binding: Ref; phase: FinalizationPhase; rejection?: Ref }): ModelCallResult<Sealed<Revision<CompletionFinalization>>> {
   return result(() => {
     const prepared = take(prepareCompletionFinalization(store, request));
     if (prepared.writes.length) take(writeGuarded(store, { unit: 'G7', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
@@ -4155,6 +4187,17 @@ function rootStarted(store: Store, binding: Revision<CompletionOwner>, before: S
   return false;
 }
 /** Whether a closed attempt was ended by the replaced B1 of its area (LP5): only such an attempt hands its results on. */
+/** G6.2 (№3891): a work ended by the saved G5 rejection of its group — its sound results stay reusable whatever its close. */
+function endedByGroupRejection(store: Store, snapshot: Sealed<CompletionSnapshot>): boolean {
+  return snapshot.products.some(ref => {
+    const record = store.get<CompletionFinalization>(ref.id, ref.revision);
+    return record?.kind === COMPLETION_FINALIZATION_KIND && object(record.value.cause) && record.value.cause.kind === 'group-rejected';
+  });
+}
+/** The one rule of a source attempt whose results hand on: ended by its area's B1 and interrupted, or by its group's rejection. */
+function handsOn(store: Store, reason: string, snapshot: Sealed<CompletionSnapshot>): boolean {
+  return reason === 'interrupted' && endedByArea(store, snapshot) || endedByGroupRejection(store, snapshot);
+}
 function endedByArea(store: Store, snapshot: Sealed<CompletionSnapshot>): boolean {
   if (snapshot.products.some(ref => store.get(ref.id, ref.revision)?.kind === COMPLETION_FINALIZATION_KIND)) return true;
   return snapshot.products.some(ref => {
@@ -4219,12 +4262,11 @@ function reuseValue(store: Store, project: string, request: { binding: Ref; root
     || !lineContinues(store, project, binding, owner))
     fail('completion_foreign', source.binding.id, 'source', 'A reuse comes from an earlier attempt of the same block line');
   const close = take(readCompletionCloseAt(store, project, source.close));
-  if (source.close.id !== completionCloseId(project, owner.id) || !same(close.binding, reference(owner)) || !same(close.work, source.work)
-    || close.claim.reason !== 'interrupted')
-    fail('completion_foreign', source.close.id, 'close', 'The source attempt is closed on its exact work and interrupted');
+  if (source.close.id !== completionCloseId(project, owner.id) || !same(close.binding, reference(owner)) || !same(close.work, source.work))
+    fail('completion_foreign', source.close.id, 'close', 'The source attempt is closed on its exact work');
   const earlier = take(readCompletionWorkAt(store, project, source.work));
-  if (!endedByArea(store, earlier))
-    fail('completion_foreign', source.work.id, 'work', 'Only an attempt ended by the replaced B1 of its area hands its results on');
+  if (!handsOn(store, close.claim.reason, earlier))
+    fail('completion_foreign', source.work.id, 'work', 'Only an attempt ended by the replaced B1 of its area or by its group\'s rejection hands its results on');
   if (!earlier.products.some(ref => same(ref, source.result)) || !earlier.resolved.some(ref => same(ref, source.root)))
     fail('completion_foreign', source.result.id, 'result', 'The result and its resolved root belong to the exact source work');
   const answered = resultRoot(store, project, owner, source.result);
@@ -4238,6 +4280,9 @@ function reuseValue(store: Store, project: string, request: { binding: Ref; root
   // is compared with today's: a question it held that today's input holds as an applied fact of this area makes the old
   // result unfit, and the root is new work whose packet carries the answer. An intermediate
   // reuse changes nothing; a saved reuse is never recomputed.
+  // G6.2 (№3891): a proposal G5 rejected for a defect of its own content is never reused — through any chain of reuses,
+  // whose origin is this one assembly. Only today's admission asks: a saved reuse is never recomputed.
+  if (current && store.get<{ status?: string }>(answered.origin.proposal.id)?.value.status === 'rejected') return null;
   const originWorks = (origin.record.value as unknown as { works?: WorksPartBindings }).works;
   if (!originWorks) fail('completion_foreign', answered.origin.assembly.id, 'works', 'A reused origin keeps the handoff it was asked on');
   if (learnedSince(store, project, worksBasisAt(store, project, originWorks), basis, area.node)) return null;
@@ -4304,9 +4349,8 @@ function reuseCandidates(store: Store, project: string, binding: Revision<Comple
       const closeHead = owner ? store.get(completionCloseId(project, owner.id)) : null;
       if (!owner || !closeHead) continue;
       const close = take(readCompletionCloseAt(store, project, reference(closeHead)));
-      if (close.claim.reason !== 'interrupted') continue;
       const earlier = take(readCompletionWorkAt(store, project, close.work));
-      if (!endedByArea(store, earlier)) continue;
+      if (!handsOn(store, close.claim.reason, earlier)) continue;
       const rows: CompletionReuseSource[] = [];
       for (const ref of earlier.products) {
         const kind = store.get(ref.id, ref.revision)?.kind;

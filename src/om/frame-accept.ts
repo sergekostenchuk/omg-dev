@@ -14,6 +14,7 @@ import { prepareAtomicGate, readAtomicGate, type AtomicGateRequest, type AtomicG
 import { journalId, prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, REFUSAL_JOURNAL_KIND,
   type RefusalJournal, type UnitRefusalRecord, type OriginSource } from './refusal-journal.js';
 import { readRecord, writeGuarded } from './refs.js';
+import { ACCEPTING_ROLE } from './repeat-gate.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { prepareRebaseBasis, buildRebasedLayer, type OmRebasedFrame } from './layer-basis.js';
 
@@ -33,6 +34,8 @@ export interface AcceptedFrameRequest { project: string; level: 2 | 3; graph: Re
 interface WorkRejectionRecord {
   contract: 'om-work-rejection/v1'; project: string; candidate: Ref; gate: Ref;
   diagnostic: Ref; previousJournal: Ref | null; journal: Ref; proposals: Ref[];
+  /** G6.2 (№3891): the attempt whose works step assembled the refused candidate — its group's transition is decided by it. */
+  binding: FrameAttemptBinding | null;
 }
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
@@ -120,30 +123,51 @@ function normalizeOutcome(request: SettleCandidateRequest): SettleCandidateReque
 function workRejectionId(request: SettleCandidateRequest): string {
   return `om-work-rejection:${request.project}:${hashJson([request.candidate, request.outcome.basis])}`;
 }
+/**
+ * G6.2 (№3869 п.1): a finding of the shared write order (ownership) concerns the group's candidate, never a writer's own
+ * content — its writers keep their proposals and the accepting attempt is its address.
+ */
+export const CANDIDATE_FINDING_CODES = Object.freeze(['ownership_transfer_missing', 'write_ownership_overlap'] as const);
+const OWN_PARTS = ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers', 'anchors'] as const;
+/** G6.2: the proposals whose own content defines the subject of a finding — the only ones that finding rejects. */
+function holdersOf(proposals: readonly Revision<LayerProposal>[], finding: { code: string; target: string }): Revision<LayerProposal>[] {
+  if ((CANDIDATE_FINDING_CODES as readonly string[]).includes(finding.code)) return [];
+  return proposals.filter(proposal => OWN_PARTS.some(part => ((proposal.value as unknown as Record<string, unknown>)[part] as { id?: unknown }[] | undefined ?? [])
+    .some(item => object(item) && item.id === finding.target)));
+}
+/**
+ * The one derivation of a work rejection (its producer and its reader): each finding names as its origin the candidate,
+ * the base, the environment and only the proposals that hold its subject; exactly those proposals are rejected (G6.2,
+ * №3869 п.1). A finding no proposal holds stays the candidate's: no proposal changes for it.
+ */
 function workRejectionSources(store: Store, request: SettleCandidateRequest,
   candidate: Revision<FrameCandidateRecord>, gate: Revision<AtomicGateRecord>) {
   if (candidate.value.level !== 3 || candidate.value.works?.contract !== WORKS_FRAME_CONTRACT
     || gate.value.result.passed || !gate.value.result.codes.length || !gate.value.result.findings.length)
     fail('gate_outcome_mismatch', candidate.id, 'passed', 'Work rejection requires the complete failed G5 result');
   const proposalRequest = { frame: candidate.value.request.frame, proposals: candidate.value.request.proposals };
-  const origins: OriginSource[] = [{ role: 'derived', ref: reference(candidate) },
+  const proposals = candidate.value.proposals.map(ref => exact<LayerProposal>(store, ref, ref.id, 'layer-proposal'));
+  const shared: OriginSource[] = [{ role: 'derived', ref: reference(candidate) },
     { role: 'base', ref: candidate.value.base.graph, context: { kind: 'frame', request: sealed(candidate.value.request.frame) } },
-    { role: 'environment', ref: gate.value.request.environment },
-    ...candidate.value.proposals.map(ref => ({ role: 'proposal', ref,
-      context: { kind: 'proposal' as const, request: sealed(proposalRequest) } }))];
-  const diagnosticValue: UnitRefusalRecord = { gate: 'G5', refusals: sorted(gate.value.result.findings).map(finding => ({
-    code: finding.code, goal: finding.target, remedy: finding.message,
-    origin: { name: finding.code, stage: 'atomicity', subject: finding.target, sources: sorted(origins) },
-  })) };
+    { role: 'environment', ref: gate.value.request.environment }];
+  // One row per finding and holder: a row names exactly one proposal, so G7 places it with that proposal's own block.
+  const rejected = new Map<string, Revision<LayerProposal>>();
+  const diagnosticValue: UnitRefusalRecord = { gate: 'G5', refusals: sorted(gate.value.result.findings).flatMap(finding => {
+    const holders = holdersOf(proposals, finding);
+    for (const holder of holders) rejected.set(holder.id, holder);
+    const row = (sources: OriginSource[]) => ({ code: finding.code, goal: finding.target, remedy: finding.message,
+      origin: { name: finding.code, stage: 'atomicity', subject: finding.target, sources: sorted(sources) } });
+    // A finding of the candidate goes back to the attempt whose works step assembled it (№3885 В2): its binding's series.
+    return holders.length ? holders.map(holder => row([...shared, { role: 'proposal', ref: reference(holder),
+      context: { kind: 'proposal' as const, request: sealed(proposalRequest) } } as OriginSource]))
+      : [row([...shared, ...(request.binding ? [{ role: ACCEPTING_ROLE, ref: request.binding.series } as OriginSource] : [])])];
+  }) };
   const diagnosticWrite: Write = { id: `${unitRefusalNamespace(request.project)}g5:${hashJson(reference(gate))}`,
     kind: UNIT_REFUSAL_KIND, expected: 0, value: diagnosticValue };
   const verdict = { contract: 'om-work-rejection/v1' as const, candidateHash: candidate.value.graphHash,
     candidate: request.candidate, gate: reference(gate), codes: sorted(gate.value.result.codes) };
-  const proposalWrites = candidate.value.proposals.map(ref => {
-    const original = exact<LayerProposal>(store, ref, ref.id, 'layer-proposal');
-    return { id: ref.id, kind: 'layer-proposal', expected: ref.revision,
-      value: { ...original.value, status: 'rejected' as const, verdict } };
-  });
+  const proposalWrites = sorted([...rejected.values()].map(reference)).map(ref => ({ id: ref.id, kind: 'layer-proposal', expected: ref.revision,
+    value: { ...rejected.get(ref.id)!.value, status: 'rejected' as const, verdict } }));
   return { diagnosticWrite, diagnostic: proposedRevision<UnitRefusalRecord>(diagnosticWrite), proposalWrites };
 }
 function withRecords(store: Store, rows: readonly Revision<unknown>[], absentHead?: string): Store {
@@ -158,7 +182,7 @@ function withRecords(store: Store, rows: readonly Revision<unknown>[], absentHea
 }
 function rejectionBody(request: SettleCandidateRequest, diagnostic: Ref, previousJournal: Ref | null, journal: Ref, proposals: Ref[]): WorkRejectionRecord {
   return { contract: 'om-work-rejection/v1', project: request.project, candidate: request.candidate,
-    gate: request.outcome.basis!, diagnostic, previousJournal, journal, proposals };
+    gate: request.outcome.basis!, diagnostic, previousJournal, journal, proposals, binding: request.binding ?? null };
 }
 /** Exact failed G5 settlement, including its journal snapshot; subsequent heads do not rewrite the event. */
 export function readRejectedCandidate(store: Store, request: SettleCandidateRequest): OmResult<Sealed<Settlement>> {
@@ -189,11 +213,47 @@ export function readRejectedCandidate(store: Store, request: SettleCandidateRequ
       { project: request.project, source: reference(diagnostic) }));
     const journalWrite = verified.writes.find(write => write.id === journal.id);
     const expectedJournal = journalWrite ? proposedRevision<RefusalJournal>(journalWrite) : previous;
-    if (!same(journal, expectedJournal) || !same(row.value, rejectionBody(request, reference(diagnostic),
+    // The accepting binding is an input of the settlement: a reader that names one must meet it; one that does not reads
+    // the saved one, which the rest of the event still has to reproduce.
+    const binding = request.binding === undefined ? (row.value.binding ?? null) : request.binding ?? null;
+    if (!same(journal, expectedJournal) || !same(row.value, rejectionBody({ ...request, binding }, reference(diagnostic),
       previous ? reference(previous) : null, reference(journal), proposals.map(reference))))
       fail('frame_acceptance_invalid', row.id, 'journal', 'The rejection must retain its complete journalled finding set and proposal transitions');
     return { state: 'rejected', graph: null, layer: null, frame: null, proposals };
   });
+}
+/**
+ * G6.2: the saved work rejection a rejected proposal names in its verdict, read by the same derivation as its producer —
+ * the rejection event, its diagnostic and the proposals it rejected.
+ */
+export interface WorkRejection { record: Ref; diagnostic: Ref; journal: Ref; proposals: Ref[]; binding: FrameAttemptBinding | null;
+  /** The exact results of the members the refused G5 checked — who the group was at the rejection. */
+  results: { kind: string; record: Ref }[] }
+export function readWorkRejection(store: Store, request: { project: string; candidate: Ref; gate: Ref }): OmResult<Sealed<WorkRejection>> {
+  return run(() => {
+    if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.candidate) || !isRef(request.gate)) invalid('rejection');
+    return rejectionOf(store, request.project, request.candidate, request.gate);
+  });
+}
+/** G6.2: the same reader, by the exact rejection event a transition names. */
+export function readWorkRejectionAt(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<WorkRejection>> {
+  return run(() => {
+    if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.record)) invalid('rejection');
+    const saved = exact<WorkRejectionRecord>(store, request.record, request.record.id, 'om-work-rejection');
+    if (!object(saved.value) || !isRef(saved.value.candidate) || !isRef(saved.value.gate))
+      fail('frame_acceptance_invalid', saved.id, 'rejection', 'A work rejection names its exact candidate and G5 gate');
+    const read = rejectionOf(store, request.project, saved.value.candidate, saved.value.gate);
+    if (!same(read.record, request.record)) fail('frame_acceptance_invalid', saved.id, 'rejection', 'The rejection is the one of its candidate and gate');
+    return read;
+  });
+}
+function rejectionOf(store: Store, project: string, candidate: Ref, gateRef: Ref): WorkRejection {
+  const gate = take(readAtomicGate(store, { project, record: gateRef })) as Revision<AtomicGateRecord>;
+  const settle: SettleCandidateRequest = { project, level: 3, candidate, outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: gateRef } };
+  const rejected = take(readRejectedCandidate(store, settle));
+  const row = store.get<WorkRejectionRecord>(workRejectionId(normalizeOutcome(settle)), 1)!;
+  return { record: reference(row), diagnostic: row.value.diagnostic, journal: row.value.journal, proposals: rejected.proposals.map(reference),
+    binding: row.value.binding ?? null, results: (gate.value.request as unknown as { results: { kind: string; record: Ref }[] }).results };
 }
 function requireAtomicOutcome(request: SettleCandidateRequest, candidate: Revision<FrameCandidateRecord>, atomic: Revision<AtomicGateRecord>): void {
   if (candidate.value.works?.contract !== WORKS_FRAME_CONTRACT || candidate.value.level !== 3
