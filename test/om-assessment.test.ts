@@ -36,7 +36,7 @@ import { readAcceptedAnswer, readAnswerSearch, applicableAnswer, prepareE5Accept
   confirmAnswerGapClosure, answerIndexId, type Mc1QuestionRecord } from '../src/om/accepted-answer.js';
 import { prepareAssessmentIntent, writeAssessmentIntent, readAssessmentIntentAt, readAssessmentResultAt, assessmentResultId,
   assessmentRefusalId, finishAssessmentAttempt, readAssessmentTerminalAt, applyAssessmentResult,
-  assessFact, prepareAssessmentFileTerminationCause, readAssessmentFileTerminationCause, ASSESSMENT_INTENT_KIND,
+  assessFact, prepareAssessmentFileTerminationCause, readAssessmentFileTerminationCause, ASSESSMENT_INTENT_KIND, ASSESSMENT_VERDICT_FORM,
   ASSESSMENT_RESULT_KIND,
   type AssessmentIntentRequest, type AssessmentResultRecord } from '../src/om/assessment.js';
 import { writeGuarded } from '../src/om/refs.js';
@@ -495,6 +495,29 @@ test('E5 preserves conflicting and off-form outcomes as their own terminal state
     f.restart();
     assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(terminal))), terminal);
     assert.equal(f.sent().length, 2);
+  });
+});
+
+// FA1 (№3816, №3817): the assessor is told the one form E5 reads a verdict by. A guessed form — the live omg-live assessors
+// answered {"assessment": {...}} with no form in their prompt — stays off-form; a lawful negative verdict in the form stays
+// negative; a blank reason is no reason, exactly as before.
+test('FA1 the E5 prompt carries the one verdict form verdictOf reads: the form is accepted, a guessed form is off-form, a negative verdict in the form stays negative', async t => {
+  const replies = {
+    form: [{ verdict: 'supported', reasons: [] }, 'supported'],
+    guessed: [{ assessment: { verdict: 'supported', findings: [], reason: 'The sources confirm the answer' } }, 'off-form'],
+    insufficient: [{ verdict: 'insufficient', reasons: ['The grounds do not show the constant value'] }, 'insufficient'],
+    unreasoned: [{ verdict: 'conflicting', reasons: [] }, 'off-form'],
+    blank: [{ verdict: 'insufficient', reasons: [' '] }, 'off-form'],
+  } as const;
+  for (const [variant, [reply, verdict]] of Object.entries(replies)) await t.test(variant, async child => {
+    const f = fixture(child), request = await f.original();
+    writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, { research: reply, usage }] }));
+    const terminal = ok(await assessFact(f.store, request));
+    assert.equal(terminal.value.verdict, verdict);
+    const intent = ok(readAssessmentIntentAt(f.store, f.project, terminal.value.intent));
+    assert.deepEqual((intent.packet as { responseForm?: unknown }).responseForm, ASSESSMENT_VERDICT_FORM);
+    const sent = f.sent().at(-1)!;
+    assert.ok(sent.includes('responseForm') && sent.includes('at least one unless the verdict is'), "The assessor's own request names the form");
   });
 });
 

@@ -2306,15 +2306,20 @@ const added = (before: Revision<CompletionWork>, after: Revision<CompletionWork>
   after.value.products.filter(ref => !before.value.products.some(old => same(old, ref)));
 /** A managed MC1 answer and its E5 terminal of the given verdict, paid through the real producers of this attempt. */
 async function managedFact(f: ReturnType<typeof fixture>, m: ReturnType<typeof managedAttempt>,
-  verdict: 'supported' | 'insufficient' | 'conflicting' | 'off-form') {
+  verdict: 'supported' | 'insufficient' | 'conflicting' | 'off-form', intentCommit?: string) {
   const assessor = verdict === 'off-form' ? { research: { answer: 'untyped reviewer reply' }, usage: traceUsage }
     : { research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage: traceUsage };
   writeFileSync(m.scenario, JSON.stringify({ database: f.path, steps: [m.answer, assessor] }));
   const original = ok(await runModelCall(f.store, { project: f.project, packet: reference(m.packet),
     dispatch: m.dispatch, role: 'implementer' }));
   assert.equal(original.outcome?.kind, 'fact-candidates');
-  const terminal = ok(await assessFact(f.store, { project: f.project, modelCall: reference(original.record),
-    questionId: m.batch.items[0]!.gap, dispatch: m.dispatch }));
+  const request = { project: f.project, modelCall: reference(original.record), questionId: m.batch.items[0]!.gap, dispatch: m.dispatch };
+  // FA1 (№3817): an era comparison starts with the E5 intent the compared producer issued — the base writes no verdict
+  // form into its prompt and cannot read an intent that carries one; today's E5 goes on with the base's intent as saved.
+  if (intentCommit) atCommit(f, intentCommit, `${m.packet.id.slice(-8)}-era-intent`,
+    `const { writeAssessmentIntent } = await import(src('om/assessment.js'));
+out(take(writeAssessmentIntent(store, args)));`, request);
+  const terminal = ok(await assessFact(f.store, request));
   assert.equal(terminal.value.verdict, verdict);
   return { original, terminal };
 }
@@ -3279,7 +3284,7 @@ const canonicalRefs = (values: readonly Ref[]) => [...values].sort((a, b) => can
 /** Own E5 N of a registered, not yet evaluated check: the evaluation that resolves it and the close of the attempt. */
 async function linkedN(f: ReturnType<typeof fixture>, slice: string, packetCommit?: string) {
   const m = registered(f, slice, false, packetCommit), fact = factGap(f);
-  const { terminal } = await managedFact(f, m, 'insufficient');
+  const { terminal } = await managedFact(f, m, 'insufficient', packetCommit);
   const work = m.work();
   const close = closeRequest(f, 'refused', work.refusals);
   const request = { project: f.project, binding: reference(m.binding),
@@ -4227,6 +4232,16 @@ const { canonical } = await import(src('canonical.js'));
 const prepared = gate[${JSON.stringify(entry)}](store, args);
 out(prepared.ok ? canonical(prepared.value) : canonical({ refusal: prepared.refusal }));`, request) as string;
 const preparedHere = (result: OmResult<unknown>) => result.ok ? canonical(result.value as Json) : canonical({ refusal: result.refusal } as unknown as Json);
+
+// FA1 (№3817): an E5 intent written before the verdict form keeps its era — today's E5 admits, dispatches and applies it
+// as saved (no form in its prompt), never as stale; a new intent carries the form (om-assessment FA1).
+test('FA1 an E5 intent of the era before the verdict form is admitted and its supported verdict applied by today\'s E5 as saved, never assessment_source_stale', async t => {
+  const f = fixture(t, 'repository-fact'), m = registered(f, 'fa1-era', false, PF1_BASE);
+  const { terminal } = await managedFact(f, m, 'supported', PF1_BASE);
+  assert.notEqual(terminal.value.accepted, null, 'The supported verdict is applied as an accepted fact');
+  const intent = f.store.get<{ packet: Record<string, unknown> }>(terminal.value.intent.id, terminal.value.intent.revision)!;
+  assert.equal(Object.hasOwn(intent.value.packet, 'responseForm'), false, 'The intent of the earlier era is kept as written');
+});
 
 test('PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prepares byte for byte what the base d519a60 prepares in its own process — two new sources in one batch, a late delivery mixing a stored source with a new one, and the evaluation linked with the close — result, writes, guards and their order; the written evaluation and delivery repeat without a write', async t => {
   const f = fixture(t, 'repository-fact'), batch = nodeBatch(f, 'garden-consume-block');

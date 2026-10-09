@@ -1,3 +1,4 @@
+import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { isStdioProtocol } from '../adapters/stdio-providers.js';
@@ -90,6 +91,21 @@ export const ASSESSMENT_INTENT_KIND = 'om-assessment-intent';
 export const ASSESSMENT_RESULT_KIND = 'om-assessment-result';
 const INTENT_CONTRACT = 'om-assessment-intent/v1';
 const RESULT_CONTRACT = 'om-assessment-result/v1';
+/**
+ * FA1 (№3816, №3817): the one form of an independent verdict — the E5 prompt names it and verdictOf checks it. An intent
+ * written before FA1 asked without it: the assessor guessed a form, and every live assessment of omg-live came off-form.
+ */
+export const ASSESSMENT_VERDICT_FORM = sealed({
+  schema: { type: 'object', additionalProperties: false, required: ['verdict', 'reasons'], properties: {
+    verdict: { type: 'string', enum: ['supported', 'insufficient', 'conflicting'] },
+    reasons: { type: 'array', items: { type: 'string', pattern: '\\S' } } },
+    if: { type: 'object', properties: { verdict: { const: 'supported' } } },
+    else: { type: 'object', properties: { reasons: { type: 'array', minItems: 1 } } } },
+  rule: 'Return exactly one JSON object of this schema and nothing else. verdict: "supported" when the cited grounds establish '
+    + 'the whole answer, "insufficient" when they do not establish it, "conflicting" when the sources contradict it. reasons: '
+    + 'concrete reasons, at least one unless the verdict is "supported".',
+});
+const verdictForm = new Ajv({ strict: true, allowUnionTypes: true }).compile(structuredClone(ASSESSMENT_VERDICT_FORM.schema) as object);
 const TERMINATION_CONTRACT = 'om-assessment-application-termination/v1';
 const CALL_PREFIX = 'e5-assessor/v1:';
 
@@ -235,7 +251,7 @@ function sourceBasis(store: Store, project: string, modelCall: Ref, questionId: 
     response: outcome.response, question: facts[0]!.question, questionId };
 }
 function sourceBody(store: Store, project: string, source: SourceBasis, dispatch: DispatchContract,
-  series: Ref, current: boolean): { value: AssessmentIntentRecord; guards: Ref[]; requiredGuards: Ref[] } {
+  series: Ref, current: boolean, formed = true): { value: AssessmentIntentRecord; guards: Ref[]; requiredGuards: Ref[] } {
   const origin = take(readFactAssessmentOrigin(store, project, source, source.modelCall.id));
   if ('owner' in origin.call.value) fail('assessment_source_invalid', source.call.id, 'owner', 'MC1 fact assessment belongs to a block attempt');
   const state = take(readModelCallState(store, { project, record: source.modelCall }));
@@ -285,7 +301,7 @@ function sourceBody(store: Store, project: string, source: SourceBasis, dispatch
   const prompt = sealed({ protocol: 'omg-fact-assessment/v1', questionId: source.questionId,
     question: { target: question.gap.target, field: question.gap.field,
       contract, fingerprint: question.record.value.fingerprint },
-    answer: { value: fact.value, grounds: fact.grounds },
+    answer: { value: fact.value, grounds: fact.grounds }, ...(formed ? { responseForm: ASSESSMENT_VERDICT_FORM } : {}),
   }) as unknown as Json;
   const guards = current ? refs([source.modelCall, source.packet, source.response, series,
     dispatch.adapter, dispatch.config, ...(liveQuestion?.guards ?? []), ...(liveCitations?.guards ?? []),
@@ -454,11 +470,13 @@ function originalGuardHeads(store: Store, intent: Sealed<CheckedAssessmentIntent
   }
   return [...original];
 }
+/** FA1: an intent keeps the era it was written in — one before the verdict form is admitted and applied without it. */
+const formedIntent = (intent: Sealed<CheckedAssessmentIntent>): boolean => isPlainObject(intent.packet) && Object.hasOwn(intent.packet as object, 'responseForm');
 export function prepareAssessmentAdmission(store: Store, project: string, ref: Ref): AssessmentResult<Sealed<AssessmentAdmission>> {
   requireIntentRef(store, project, ref);
   return checked(() => {
     const intent = take(readAssessmentIntentAt(store, project, ref));
-    const current = sourceBody(store, project, intent.record.value.source, intent.dispatch, intent.series, true);
+    const current = sourceBody(store, project, intent.record.value.source, intent.dispatch, intent.series, true, formedIntent(intent));
     if (!same({ ...intent.record.value, originalGuards: [] }, { ...current.value, originalGuards: [] }))
       fail('assessment_source_stale', ref.id, 'source', 'The current admission differs from the saved intent', ref);
     const head = store.get(ref.id);
@@ -470,7 +488,7 @@ export function prepareAssessmentAdmission(store: Store, project: string, ref: R
 function applicationGuards(store: Store, intent: Sealed<CheckedAssessmentIntent>): TransactionGuard[] {
   const source = intent.record.value, currentLine = store.get(source.series.id);
   if (!currentLine) fail('assessment_source_stale', source.series.id, 'series', 'The original attempt has no active line', source.series);
-  const current = sourceBody(store, source.project, source.source, source.dispatch, reference(currentLine), true);
+  const current = sourceBody(store, source.project, source.source, source.dispatch, reference(currentLine), true, formedIntent(intent));
   const comparable = (value: Sealed<AssessmentIntentRecord>) => ({ ...value, series: null, originalGuards: [] });
   if (!same(comparable(source), comparable(current.value)))
     fail('assessment_source_stale', intent.intent.id, 'source', 'The assessment no longer has its original fact and running attempt', intent.intent);
@@ -483,11 +501,9 @@ function applicationGuards(store: Store, intent: Sealed<CheckedAssessmentIntent>
 function verdictOf(raw: string): { verdict: 'supported' | 'insufficient' | 'conflicting'; reasons: string[] } | null {
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return null; }
-  if (!object(parsed) || !['supported', 'insufficient', 'conflicting'].includes(String(parsed.verdict))
-    || !Array.isArray(parsed.reasons) || !parsed.reasons.every(text)
-    || (parsed.verdict !== 'supported' && parsed.reasons.length === 0)
-    || !same(Object.keys(parsed).sort(), ['reasons', 'verdict'])) return null;
-  return { verdict: parsed.verdict as 'supported' | 'insufficient' | 'conflicting', reasons: parsed.reasons as string[] };
+  if (!verdictForm(parsed)) return null;
+  const verdict = parsed as { verdict: 'supported' | 'insufficient' | 'conflicting'; reasons: string[] };
+  return { verdict: verdict.verdict, reasons: verdict.reasons };
 }
 export function readAssessmentResultAt(store: Store, project: string, intentRef: Ref, assessorRef: Ref): AssessmentResult<Sealed<{
   intent: CheckedAssessmentIntent; assessor: Revision<TransportModelCall>; call: Ref;

@@ -1321,7 +1321,11 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
     return step("evaluate", evaluation, series.id, ordinal);
   }
   const accepting: Ref[] = [];
-  if (!ended && level && !negative) {
+  // FA1 (№3816, №3817): a complete check that failed on a technical E5 terminal of this attempt's own fact can never pass —
+  // E5 assesses a fact once and no neighbour's work changes that terminal. The attempt closes through the common G7 like a
+  // negative one, its outcome derived by the close, and the next attempt asks the fact again.
+  const technical = !ended && !!level && !negative && !made && technicalAssessmentFailure(store, project, work);
+  if (!ended && level && !negative && !technical) {
     // D2 lines are named by the D1 gap ids of the attempt's own node obligations at this level.
     const goalLines = [...new Set(batches.filter(row => row.task === "node-expansion" && row.level === level)
       .flatMap(row => row.items.map(item => item.gap)))].sort();
@@ -1567,6 +1571,23 @@ function assembliesOf(store: Store, project: string, work: CompletionSnapshot): 
   return rows;
 }
 /** The gate of the latest evaluation of this check and its exact request: whether G4b passed there. */
+/**
+ * FA1: the full G4b of this attempt's complete check names one of its own E5 terminals that is technical — the assessor's
+ * answer off-form or its call interrupted — and the attempt has no cause of its own besides: no semantic E5 verdict
+ * (insufficient, conflicting) and no counted refusal. Such a cause is a lawful negative result, never a technical failure;
+ * an attempt holding one keeps every earlier rule, and a mixed one is not paid again (return №3833).
+ */
+function technicalAssessmentFailure(store: Store, project: string, work: CompletionSnapshot): boolean {
+  if (!work.answers?.complete || !work.answers.evaluation || work.negative.length || work.refusals.length) return false;
+  const checked = passedGate(store, project, work.answers.evaluation);
+  if (checked.passed) return false;
+  const own = work.technical.map(row => row.source).filter(ref => {
+    const terminal = store.get<AssessmentResultRecord>(ref.id, ref.revision);
+    return terminal?.kind === ASSESSMENT_RESULT_KIND && (terminal.value.verdict === "off-form" || terminal.value.verdict === "interrupted");
+  });
+  return own.length > 0 && take(readAnswersGate(store, { project, record: checked.gate })).value.result.findings
+    .some(finding => !!finding.at?.ref && own.some(ref => same(finding.at.ref, ref)));
+}
 function passedGate(store: Store, project: string, evaluation: Ref): { passed: boolean; request: AnswersGateRequest; gate: Ref } {
   const read = take(readAnswersEvaluationAt(store, project, evaluation));
   const ref = (read.record.value as unknown as { gate: Ref }).gate;

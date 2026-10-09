@@ -1272,16 +1272,21 @@ test("25 C61 7 R8 №1749 №1860-12 H1.1 two blocks of one N2 frame: G4b waits 
  * the 'cross' graph, the owner's works horizon over that layer, D1 with the works frame, M6 and M3. The pass then pays one
  * MC2 works cycle per block and does everything else.
  */
-function worksFixture(t: test.TestContext, late = false) {
+function worksFixture(t: test.TestContext, late = false, fact: boolean | number = false) {
+  const facts = fact === true ? ["works-fact"] : Array.from({ length: Number(fact) }, (_, index) => index ? `works-fact-${index + 1}` : "works-fact");
   const root = mkdtempSync(join(tmpdir(), "omg-h1-works-")), database = join(root, "state.sqlite");
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const desired = gardenGraph("cross"), { level: _level, ...l1 } = projectGraph(desired, 1);
   // A late question of the environment (checked when a task starts): D1 keeps it as a late gap and D7 needs its assignment.
-  preparedFeatures(engine, project, l1 as Graph, late ? field => {
+  // FA1: a repository fact of the consuming block, asked by MC1 and assessed by E5 in the same attempt as its works.
+  preparedFeatures(engine, project, l1 as Graph, late || fact ? field => {
     const value = preparedField(project, field);
-    if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "later-env", question: "Which runtime does the task start on?",
-      consumer: "garden-consume-block", moment: "task-start", blocksCurrentStage: false, resolution: "Confirm it when the task starts" }];
+    if (field === "preparation") (value as Record<string, Json>).unknowns = [
+      ...(late ? [{ id: "later-env", question: "Which runtime does the task start on?",
+        consumer: "garden-consume-block", moment: "task-start", blocksCurrentStage: false, resolution: "Confirm it when the task starts" }] : []),
+      ...facts.map(id => ({ id, question: `Which ${id === "works-fact" ? "encoding" : id} is supported?`,
+        consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false, resolution: "Address this question during OM" }))];
     return value;
   } : undefined);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
@@ -1296,6 +1301,8 @@ function worksFixture(t: test.TestContext, late = false) {
   });
   if (late) decisions.push({ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: first, layers: [],
     decision: { target: "discovery:later-env", field: "address", value: { consumer: "garden-consume-block", kind: "environment-confirmation" } } })) as Write });
+  for (const id of facts) decisions.push({ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: first, layers: [],
+    decision: { target: `discovery:${id}`, field: "address", value: { consumer: "garden-consume-block", kind: "repository-fact" } } })) as Write });
   const input = decisions.length ? ok(writeAddressing(store, { project, input: reference(base), graph: first, decisions })) : base;
   const upper = ok(writeHorizon(store, { project, input: reference(input), graph: first, refinement: null, available: {},
     choice: { choiceVersion: "h1-upper", features: [{ outcome: "garden-result" }], excluded: [] } }));
@@ -1330,6 +1337,8 @@ function worksFixture(t: test.TestContext, late = false) {
   const steps: unknown[] = [];
   return { root, database, desired, routes, request,
     get store() { return store; }, get engine() { return engine; },
+    /** One more scripted reply of the model, after those already sent. */
+    push(step: Record<string, unknown>) { steps.push(step); writeFileSync(scenario, JSON.stringify({ database, steps })); },
     restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); },
     sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; },
     /** The MC2 works answer for the exact saved packet: the desired work of its operation, as in the F5 seed. */
@@ -1466,6 +1475,72 @@ test("OWN1.2 a D7 request the older rule performed (the environment question car
   assert.ok(ledgers.some(row => row.id === older!.ledger.id), "The older ledger stays as written");
   assert.ok(ledgers.some(row => row.id !== older!.ledger.id && !row.value.assignments.length), `The newer one is added beside it: ${JSON.stringify(ledgers.map(row => [row.id, row.value.assignments.length]))}`);
   assert.ok(performed.includes("works"), `The works answer that binds nothing is accepted: ${performed.join(",")} ${JSON.stringify(state)}`);
+});
+
+
+// FA1 (№3816, №3817): the consuming block's attempt asks its fact (MC1), E5 assesses it, and its works are answered. A
+// technical E5 terminal of its own fact (off-form, interrupted) fails the complete check for good — E5 assesses a fact
+// once — so the attempt closes through the common G7 with the reason the close derives, and the next attempt asks the
+// fact again (OMG-LIVE 0537: n-state 10 stood on frame_gate forever). A lawful negative verdict is no technical failure.
+async function factWorksPass(t: test.TestContext, verdicts: Verdict[], facts = 1) {
+  const f = worksFixture(t, false, facts);
+  ok(startRun(f.store, { project }));
+  const performed: string[] = [], answered = new Set<string>(), assessed: string[] = [];
+  let state: { phase: string; step?: { action: string; request: { packet: Ref } }; wait?: unknown } = { phase: "" };
+  for (let index = 0; index < 300 && !performed.includes("works"); index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    if (advanced.performed) performed.push(advanced.performed.action);
+    state = advanced.record.value.state as unknown as typeof state;
+    const key = state.phase === "step" ? JSON.stringify(state.step!.request) : "";
+    if (state.phase === "step" && state.step!.action === "cycle" && !answered.has(key)) {
+      answered.add(key);
+      const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+      const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+      if (batch.model !== "MC1") f.answer(saved);
+      else {
+        const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
+        f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+          results: batch.items.map(item => ({ questionId: item.gap, value: { answer: "UTF-8" }, citations: [{ source: reference(source),
+            selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage });
+      }
+    }
+    if (state.phase === "step" && state.step!.action === "assess" && !answered.has(key)) {
+      answered.add(key); const verdict = verdicts[Math.min(assessed.length, verdicts.length - 1)]!;
+      assessed.push(verdict); f.push(assessor(verdict));
+    }
+    if (state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
+  }
+  return { f, performed, state, assessed, consume: blockSeries(f as unknown as Fixture) };
+}
+test("FA1 a technical E5 terminal of the attempt's own fact closes the attempt through G7 with its derived reason; the next attempt asks the fact again and the works are accepted", async t => {
+  for (const technical of ["off-form", "interrupted"] as const) await t.test(technical, async child => {
+    const { performed, state, assessed, consume } = await factWorksPass(child, [technical, "supported"]);
+    assert.deepEqual(assessed, [technical, "supported"], `The fact is assessed once per attempt: ${performed.join(",")} ${JSON.stringify(state)}`);
+    assert.equal(consume.value.attempts[0]!.outcome?.reason, technical, "The common close derives the technical reason");
+    assert.deepEqual(consume.value.attempts[0]!.outcome?.achieved, []);
+    assert.ok(consume.value.attempts.length >= 2, "The next attempt opens after the close");
+    assert.ok(performed.includes("works"), `The works are accepted after the fact is supported: ${performed.join(",")} ${JSON.stringify(state)}`);
+  });
+});
+// FA1 return №3833: a technical terminal beside a lawful negative verdict of another own fact is no technical failure —
+// the negative verdict is the attempt's own cause, so nothing is paid again and the earlier wait stands.
+test("FA1 №3833 an own off-form E5 terminal beside an own insufficient or conflicting verdict keeps the earlier frame_gate wait: no close, no fact asked or assessed again", async t => {
+  for (const negative of ["insufficient", "conflicting"] as const) await t.test(negative, async child => {
+    const { performed, state, assessed, consume } = await factWorksPass(child, ["off-form", negative], 2);
+    assert.deepEqual(assessed, ["off-form", negative], `Each fact is assessed once: ${performed.join(",")} ${JSON.stringify(state)}`);
+    assert.equal(consume.value.attempts.length, 1, "No next attempt is opened");
+    assert.equal(consume.value.attempts[0]!.outcome, null, "The attempt is not closed through the technical branch");
+    assert.equal(performed.includes("works"), false);
+    assert.deepEqual([state.phase, (state.wait as { code?: string } | undefined)?.code], ["waiting", "frame_gate"]);
+  });
+});
+test("FA1 a lawful negative E5 verdict of the attempt's own fact is no technical failure: the attempt is never closed as off-form or interrupted and the fact is not asked again", async t => {
+  const { performed, state, assessed, consume } = await factWorksPass(t, ["insufficient"]);
+  assert.deepEqual(assessed, ["insufficient"], `${performed.join(",")} ${JSON.stringify(state)}`);
+  assert.ok(!["off-form", "interrupted"].includes(consume.value.attempts[0]!.outcome?.reason ?? ""),
+    `The negative verdict keeps its earlier rules: ${JSON.stringify(consume.value.attempts[0]!.outcome)} ${JSON.stringify(state)}`);
+  assert.equal(performed.includes("works"), false);
 });
 
 
