@@ -1756,8 +1756,8 @@
 - Отдаёт: —
 - Читает записи: отказ групповой приёмки; сборка-производитель
 - Пишет записи: дополнение выбора теста пробуждения
-- Разрешённые пути: `src/om/run.ts`, `test/om-run.test.ts`, `src/om/model-call.ts`, `test/om-model-call.test.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`, `src/om/atomic-gate.ts`, `src/om/frame-candidate.ts`
-- Из движка как есть: №3826; №3829; №3833; механика доставки MP2
+- Разрешённые пути: `src/om/run.ts`, `test/om-run.test.ts`, `src/om/model-call.ts`, `test/om-model-call.test.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`, `src/om/atomic-gate.ts`, `src/om/frame-candidate.ts`, `src/om/call-record.ts`, `test/om-call-record.test.ts`, `src/om/wake-choice.ts`, `test/om-wake-choice.test.ts`
+- Из движка как есть: №3826; №3829; №3833; опись №3846: механика вызова E5 (намерение → запись вызова → транспорт → применение), не исправление MP2; вызов в счёт принимающей попытки
 - После: G5
 - Тесты сверх обязательных:
   - прогон истории на снимке 0537 поверх FA1+G5: n-state получает один небольшой вызов выбора, приёмка n-results проходит; повтора MC2 и E5 нет
