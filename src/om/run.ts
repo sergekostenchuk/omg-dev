@@ -12,7 +12,7 @@ import { prepareRunBases as prepareRunBasesOf, readRunStandingGuards as readRunS
 import { readOmInput as readOmInputOf, type OmInputRecord } from "./input.js";
 import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js";
 import { writeApplyAnswer as writeApplyAnswerOf, writeOwnerDecision as writeOwnerDecisionOf } from "./addressing.js";
-import { ownerAnswersOf } from "./owner-result.js";
+import { ownerAnswersHeld, type OwnerAnswer } from "./owner-result.js";
 import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionRootAssignments, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
   resumeSeries as resumeSeriesOf, reconcileSeries as reconcileSeriesOf, prepareReconcileSeries as prepareReconcileSeriesOf, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionOwner, type CompletionWork, type SeriesOwner } from "./series.js";
@@ -535,7 +535,7 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
           built => [built.input, built.bases.horizon, built.bases.routes, built.bases.queue]);
       }
       // OWN1 (№3719 P2-1): an owner's proved answer of a question the bypass routes to the model is applied as its decision.
-      case "apply": return mapped(Object.hasOwn(body as object, "owner") ? writeOwnerDecision(store, body as never)
+      case "apply": return mapped(Object.hasOwn(body as object, "owners") ? writeOwnerDecision(store, body as never)
         : writeApplyAnswer(store, body as never), record => [refOf(record)]);
       case "close": {
         const closed = closeAttempt(store, body as never);
@@ -687,7 +687,7 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
   // answer is applied as the decision as soon as no attempt works on the current B1 (applyStep).
   const served = (batch: RouteBatch): boolean => !(unserved ??= new Set(take(readRouteProducers(store, { project, routes: bases.refs.routes }))
     .batches.filter(row => row.unserved.length).map(row => row.batch))).has(batch.id)
-    && !batch.items.every(item => (owned ??= new Set(ownerAnswersBypassed(store, project, bases).map(owner => owner.line))).has(item.gap));
+    && !batch.items.every(item => (owned ??= ownerAnswersBypassed(store, project, bases).answered).has(item.target));
   for (const block of bases.order) {
     const batches = bases.routes.value.batches.filter(batch => !isM5Batch(batch) && batch.items.every(item => item.consumers.includes(block))
       && !(batch.task === "node-expansion" && batch.level === 2 && batch.node !== block)).filter(served)
@@ -768,22 +768,23 @@ function applyStep(store: Store, project: string, bases: Bases): Choice | null {
     if (!answer.ok) return { wait: waitOf(answer.refusal, project) };
     return step("apply", { project, input: reference(input), answer: route.answer, question: reference(answer.value.question) });
   }
-  // OWN1 (№3719 P2-1): the owner's answer is above the model's — a question the bypass routes to the model that the owner
-  // has answered by H2 is decided by that answer, before any new work could send it to the model.
-  for (const owner of ownerAnswersBypassed(store, project, bases)) if (held.has(owner.target))
-    return step("apply", { project, input: reference(input), graph: bases.routes.value.request.gaps.sources.graph,
-      target: owner.target, owner: owner.result, value: owner.value });
+  // OWN1 (№3719 P2-1, OWN1.1 №3722): the owner's answer is above the model's — every question the bypass routes to the
+  // model that the owner has answered by H2 is decided by that answer, all of them in one B1 transition, before any new
+  // work could send one to the model; an answer given on earlier bases still holds while its very question is open.
+  const owners = ownerAnswersBypassed(store, project, bases).applicable;
+  if (owners.length) return step("apply", { project, input: reference(input), graph: bases.routes.value.request.gaps.sources.graph,
+    owners: owners.map(owner => ({ target: owner.target, owner: owner.result, value: owner.value })) });
   return null;
 }
 const OWNER_READERS = { routes: readRoutesOf, input: readOmInputOf };
-/** The owner's proved H2 answers of the questions the current M6 routes to the model in the bypass (design, owner-decision). */
-function ownerAnswersBypassed(store: Store, project: string, bases: Bases) {
-  const bypassed = bases.routes.value.routes.filter(route => route.route === "design" && route.kind === "owner-decision" && route.field === "answer");
-  return ownerAnswersOf(store, project, bases.refs.routes, bases.routes.value.request.gaps.sources.input, OWNER_READERS)
-    .flatMap(owner => {
-      const route = owner.field === "answer" ? bypassed.find(row => same(row.record, owner.gap)) : undefined;
-      return route ? [{ ...owner, line: route.gap }] : [];
-    });
+/** The owner's proved H2 answers of the open questions the current M6 routes to the model in the bypass (design, owner-decision). */
+function ownerAnswersBypassed(store: Store, project: string, bases: Bases): { applicable: OwnerAnswer[]; answered: Set<string> } {
+  const bypassed = new Set(bases.routes.value.routes.filter(route => route.route === "design" && route.kind === "owner-decision"
+    && route.field === "answer").map(route => route.target));
+  const input = store.get<OmInputRecord>(`om-input:${project}`)!.value.input;
+  const found = ownerAnswersHeld(store, project, input.questions as never, OWNER_READERS);
+  return { applicable: found.applicable.filter(owner => bypassed.has(owner.target)),
+    answered: new Set([...found.answered].filter(target => bypassed.has(target))) };
 }
 
 /** Every current line of the project (or every line), blocks and the mechanism; each series is read through its common reader. */

@@ -325,6 +325,8 @@ export function listOwnerQuestions(store: Store, project: string,
  * model, and its value is what the consumers get.
  */
 export interface OwnerAnswer { gap: Ref; target: string; field: string; result: Ref; value: Json }
+/** A B1 question row as far as the owner's question names it (OWN1.1). */
+export interface HeldQuestion { id: string; question: string; consumer: string; kind: unknown }
 export function ownerAnswersOf(store: Store, project: string, routes: Ref, input: Ref, readers: OwnerReaders): OwnerAnswer[] {
   const answers: OwnerAnswer[] = [];
   for (const head of store.list<OwnerResult>(OWNER_RESULT_KIND)) {
@@ -337,4 +339,34 @@ export function ownerAnswersOf(store: Store, project: string, routes: Ref, input
       result: exactRef(head), value: proved.value.record.value.value as unknown as Json });
   }
   return answers;
+}
+
+/**
+ * OWN1.1 (№3722): the owner's proved answers that still answer a question of the current B1. A result is proved by its
+ * own era (the exact B1/D1/M6 it was given on); it still applies after the bases moved for other reasons when the very
+ * question it answers — the same id, wording, consumer and kind — is still held open. One owner answer of a question
+ * applies; two different answers of one question apply none of them (the owner decides between them, never the engine).
+ */
+export function ownerAnswersHeld(store: Store, project: string, held: readonly HeldQuestion[], readers: OwnerReaders): {
+  applicable: OwnerAnswer[]; answered: Set<string>;
+} {
+  const byQuestion = new Map<string, OwnerAnswer[]>();
+  for (const head of store.list<OwnerResult>(OWNER_RESULT_KIND)) {
+    if (!head.id.startsWith(ownerResultNamespace(project))) continue;
+    const proved = readOwnerResult(store, { project, record: exactRef(head) }, readers);
+    if (!proved.ok) continue;
+    const question = proved.value.question, detail = question.question;
+    const row = held.find(item => item.id === detail.id);
+    if (!row || row.question !== detail.text || row.consumer !== detail.consumer || row.kind !== detail.kind
+      || question.route.target !== detail.id || question.route.field !== 'answer') continue;
+    const answers = byQuestion.get(detail.id) ?? [];
+    answers.push({ gap: exactRef(question.gap), target: detail.id, field: 'answer', result: exactRef(head),
+      value: proved.value.record.value.value as unknown as Json });
+    byQuestion.set(detail.id, answers);
+  }
+  const applicable: OwnerAnswer[] = [];
+  for (const answers of byQuestion.values())
+    if (answers.every(answer => same(answer.value, answers[0]!.value)))
+      applicable.push([...answers].sort((a, b) => a.result.id < b.result.id ? -1 : a.result.id > b.result.id ? 1 : 0)[0]!);
+  return { applicable: applicable.sort((a, b) => a.target < b.target ? -1 : a.target > b.target ? 1 : 0), answered: new Set(byQuestion.keys()) };
 }

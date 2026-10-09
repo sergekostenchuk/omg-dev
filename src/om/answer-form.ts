@@ -12,7 +12,7 @@ import { readRecord } from './refs.js';
 import { readRoutes, prepareRoutes, prepareManagedRouteBatch, type RoutesRequest } from './routes.js';
 import { readGaps, type GapReadRequest } from './gaps.js';
 import { decidedAnswer, inputDecisionWrite, deriveInputDecisions, prepareAddressing, type InputFieldDecision } from './addressing.js';
-import { ownerAnswersOf } from './owner-result.js';
+import { ownerAnswersHeld } from './owner-result.js';
 import { readOmInput, withHistoricalReads, type OmInputRecord } from './input.js';
 import { readPacketAnswer, packetReadPath, derivePartProposal, prepareQuestionPacket, type PartProposalBody, type PacketAnswerRequest,
   type PacketRead, type QuestionPacketRecord, type QuestionPacketRequest, type WorksPartBindings } from './question-packet.js';
@@ -193,9 +193,8 @@ function fieldForm(store: Store, request: InputFieldAnswerRequest, current: bool
   if (current) {
     // OWN1 (№3719 P2-1): the owner's answer is above the model's — a question the owner has answered by H2 meanwhile
     // takes no model decision; the owner's answer is applied by the pass itself.
-    const owned = new Set(ownerAnswersOf(store, request.project, request.routes, source.input, { routes: readRoutes, input: readOmInput })
-      .map(owner => canonical([owner.target, owner.field])));
-    if (parsed.results.some((row: { target: string; field: string }) => owned.has(canonical([row.target, row.field]))))
+    const owned = ownerAnswersHeld(store, request.project, base.value.input.questions as never, { routes: readRoutes, input: readOmInput }).answered;
+    if (parsed.results.some((row: { target: string; field: string }) => row.field === 'answer' && owned.has(row.target)))
       fail('answer_form_task_invalid', request.routes, 'results', 'The owner has answered this question by H2; the model decision is not applied');
     // OWN1: an accepted answer of another batch of the same managed attempt (its fact) moves the route's searches, never
     // this batch: the attempt still answers its own planned batch by the admission E2 issued it with, stale only when an

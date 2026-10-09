@@ -354,14 +354,18 @@ export function writeAddressing(store: Store, request: AddressingRequest): OmRes
   });
 }
 
-/** OWN1 (№3719 P2-1): the D3 request that decides one question by the owner's exact proved H2 answer. */
-export interface OwnerDecisionRequest { project: string; input: Ref; graph: Ref; target: string; owner: Ref; value: Json }
+/**
+ * OWN1 (№3719 P2-1, OWN1.1 №3722): the D3 request that decides questions by the owner's exact proved H2 answers — all
+ * of them in one B1 transition, so applying one never takes another out of its bases.
+ */
+export interface OwnerDecisionRequest { project: string; input: Ref; graph: Ref; owners: { target: string; owner: Ref; value: Json }[] }
 export function writeOwnerDecision(store: Store, request: OwnerDecisionRequest): OmResult<Sealed<Revision<OmInputRecord>>> {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.input) || !isRef(request.graph)
-    || !text(request.target) || !isRef(request.owner) || !Object.hasOwn(request, 'value')) invalid('owner');
-  return writeAddressing(store, { project: request.project, input: request.input, graph: request.graph, decisions: [{
+    || !Array.isArray(request.owners) || !request.owners.length
+    || request.owners.some(row => !object(row) || !text(row.target) || !isRef(row.owner) || !Object.hasOwn(row, 'value'))) invalid('owner');
+  return writeAddressing(store, { project: request.project, input: request.input, graph: request.graph, decisions: request.owners.map(row => ({
     pending: inputDecisionWrite({ project: request.project, input: request.input, graph: request.graph, layers: [],
-      decision: { target: request.target, field: 'answer', value: { owner: request.owner, value: request.value } as unknown as Json } }) as Write }] });
+      decision: { target: row.target, field: 'answer', value: { owner: row.owner, value: row.value } as unknown as Json } }) as Write })) });
 }
 /** The fact supplier proves acceptance and applicability; B1 owns the resulting input derivation. */
 export function prepareApplyAnswer(store: Store, request: ApplyAnswerRequest): OmResult<Sealed<PreparedAddressing>> {

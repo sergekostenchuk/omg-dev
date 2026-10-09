@@ -2212,6 +2212,7 @@ async function sameEnd(f: Fixture, request: RunRequest, sends: number) {
 // OWN1 (№3719, return of Codex-omg): the owner's answer is above the model's, and a decision packet asks no owner.
 import { issueOwnerInvitation, OwnerSessions } from "../src/product/owner-authority.js";
 import { writeOwnerResult } from "../src/om/owner-result.js";
+import { writeOwnerDecision } from "../src/om/addressing.js";
 import { checkAnswerForm } from "../src/om/answer-form.js";
 test("OWN1 №3719 P2-1 an owner's H2 answer of a question the bypass gives the model is its decision: the model is never asked, B1 holds the owner's value, om-decisions names the owner", async t => {
   const f = runFixture(t, ["spare"]);
@@ -2236,6 +2237,41 @@ test("OWN1 №3719 P2-1 an owner's H2 answer of a question the bypass gives the 
   assert.deepEqual(listed.decisions.map(row => [row.id, row.by, row.decision, row.owner, row.alternatives.length]),
     [["discovery:spare", "owner", "Retain every record permanently", reference(owner.result), 0]]);
 });
+// OWN1.1 (№3722): every owner answer holds — those given together are applied together, and one given on earlier bases
+// still applies while its very question is open.
+async function ownerAnswers(f: Fixture, ids: readonly string[]) {
+  const bases = f.bases(), routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!;
+  const sessions = new OwnerSessions(f.store), { invitation } = ok(issueOwnerInvitation(f.store, { project }));
+  const authority = sessions.authority(ok(sessions.exchange({ project, invitation })).bearer)!;
+  return ids.map(id => {
+    const routed = routes.value.routes.find(row => row.target === `discovery:${id}`)! as unknown as { record: Ref };
+    return ok(writeOwnerResult(f.store, authority, { project, routes: reference(routes), gap: routed.record,
+      value: `Explicit owner choice for ${id}`, basis: "Explicit choice for this question" }, { routes: readRoutes, input: readOmInput }));
+  });
+}
+// Top-level registrations only: S1.1 (om-operation-cost) loads this file as a fixture with its test() calls removed.
+test("OWN1.1 №3722 two owner answers of questions the bypass gives the model are both decisions: the model is never asked, B1 holds both owner values",
+  async t => twoOwnerAnswers(t, false));
+test("OWN1.1 №3722 two owner answers stay decisions when the second was given before B1 moved by the first: the model is never asked, B1 holds both owner values",
+  async t => twoOwnerAnswers(t, true));
+async function twoOwnerAnswers(t: test.TestContext, moved: boolean) {
+  const f = runFixture(t, ["encoding", "spare"]);
+  addressQuestions(f, [["encoding", "owner-decision"], ["spare", "owner-decision"]]);
+  const request = f.request(), [encoding, spare] = await ownerAnswers(f, ["encoding", "spare"]);
+  if (moved) {
+    // The first answer is applied by itself: B1, D1 and M6 move, and the second answer was given on the earlier bases.
+    const input = f.store.get<OmInputRecord>(`om-input:${project}`)!;
+    ok(writeOwnerDecision(f.store, { project, input: reference(input), graph: f.graph,
+      owners: [{ target: "discovery:encoding", owner: reference(encoding!.result), value: "Explicit owner choice for encoding" }] }));
+  }
+  ok(startRun(f.store, { project }));
+  const state = await restWithDecisions(f, request);
+  assert.equal(decisionCalls(f), 0, `The model is never asked a question the owner answered: ${JSON.stringify(state)}`);
+  const input = f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input;
+  assert.deepEqual(input.decided?.map(row => [row.question.id, row.value]), [
+    ["discovery:encoding", { owner: reference(encoding!.result), value: "Explicit owner choice for encoding" }],
+    ["discovery:spare", { owner: reference(spare!.result), value: "Explicit owner choice for spare" }]]);
+}
 test("OWN1 №3719 P2-2 a decision packet asks no owner: no need_owner in its form or examples, every example passes its own check, and a need_owner reply is a correctable refusal", async t => {
   const f = runFixture(t, ["spare"]);
   addressQuestions(f, [["spare", "design-decision"]]);
