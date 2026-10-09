@@ -25,8 +25,8 @@ import { delivered, refused, sealed, isPlainObject, localErrors, localRefusals, 
 import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
 import { readAnswerCitations as readAnswerCitationsOf, prepareAnswerCitations as prepareAnswerCitationsOf, readAcceptedAnswer as readAcceptedAnswerOf, readMc1Question as readMc1QuestionOf } from './accepted-answer.js';
 import { checkAnswerForm as checkAnswerFormOf, prepareAnswerForm as prepareAnswerFormOf, readSelectorProblem, readTextResult, readPointerResult,
-  pointerSegments, jsonShape, READ_RESULT_CONTRACT, type ReadResult } from './answer-form.js';
-import { readPacketResponse as readPacketResponseOf, readPartResult as readPartResultOf, readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf, normalizePartAnswer as normalizePartAnswerOf, type PacketRead, type QuestionPacketRecord, type PartProposalBody, type WorksPartBindings } from './question-packet.js';
+  pointerSegments, jsonShape, READ_RESULT_CONTRACT, type ReadResult, type ReadTooLarge } from './answer-form.js';
+import { readPacketResponse as readPacketResponseOf, readPartResult as readPartResultOf, readQuestionPacket as readQuestionPacketOf, writeQuestionPacket as writeQuestionPacketOf, normalizePartAnswer as normalizePartAnswerOf, shownNoProgress as shownNoProgressOf, type PacketRead, type QuestionPacketRecord, type PartProposalBody, type WorksPartBindings } from './question-packet.js';
 import { readRoutes as readRoutesOf } from './routes.js';
 import { readFrameProposals as readFrameProposalsOf, prepareFrameProposals as prepareFrameProposalsOf, type FrameProposals, type LayerProposal } from './frame-proposals.js';
 import { readGaps as readGapsOf } from './gaps.js';
@@ -139,6 +139,7 @@ const readUnacceptedLayer = transferring('layer-basis', readUnacceptedLayerOf);
 const recordCall = transferring('call-record', recordCallOf);
 const settleCall = transferring('call-record', settleCallOf);
 const writeQuestionPacket = transferring('question-packet', writeQuestionPacketOf);
+const shownNoProgress = transferring('question-packet', shownNoProgressOf);
 const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
 const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
 
@@ -816,6 +817,14 @@ function servedFacts(store: Store, row: DeliveredRow): Fact[] {
     const record = knownRecord(store, read.action === 'read_source' ? read.source : read.record), address = knowledgeAddress(record);
     if (!object(row.data) || row.data.contract !== READ_RESULT_CONTRACT) invalid('knowledge.data');
     const data = row.data as unknown as ReadResult;
+    // OBL1 (№3768, №3773, №3780): a read shown as too large is known by its length, a value by its shape at its pointer,
+    // and the refusal itself: the first one is news to its reader, the same one again is not.
+    if (data.outcome === 'too-large') {
+      const { contract: _contract, outcome: _outcome, requested, length, limit: _limit, matches: _matches, ...shape } = data;
+      return [...('pointer' in requested ? [{ kind: 'shape' as const, address, path: pointerSegments(requested.pointer)!.decoded,
+        content: read.action === 'read_source' ? record.value.content : null, shape: shape as unknown as Json }]
+        : [{ kind: 'length' as const, address, length }]), tooLargeFact(address, data)];
+    }
     if ('length' in data) return [{ kind: 'length', address, length: data.length },
       ...(data.served ? [{ kind: 'text' as const, address, start: data.served.start, end: data.served.end, text: data.text! }] : [])];
     const content = read.action === 'read_source' ? record.value.content : null;
@@ -825,6 +834,8 @@ function servedFacts(store: Store, row: DeliveredRow): Fact[] {
   }
   if (read.action === 'read') {
     const record = knownRecord(store, row.sources[0]), address = knowledgeAddress(record);
+    if (object(row.data) && row.data.outcome === 'too-large')
+      return [{ kind: 'length', address, length: record.value.content.length }, tooLargeFact(address, row.data as unknown as ReadTooLarge)];
     return [{ kind: 'length', address, length: record.value.content.length },
       { kind: 'text', address, start: 0, end: record.value.content.length, text: record.value.content }];
   }
@@ -836,6 +847,12 @@ function servedFacts(store: Store, row: DeliveredRow): Fact[] {
  */
 function searchFacts(store: Store, row: DeliveredRow & { read: Extract<PacketRead, { action: 'search' }> }): Fact[] {
   const read = row.read;
+  // OBL1 (№3773): a search too large to carry is known by its match count over its exact scope.
+  if (object(row.data) && row.data.outcome === 'too-large') {
+    const address = canonical({ search: read.query.toLowerCase(), within: read.within, scope: row.sources } as unknown as Json);
+    return [{ kind: 'shape', address, path: [], shape: { type: 'array', keys: [], length: row.data.matches as number } as unknown as Json, content: null },
+      tooLargeFact(address, row.data as unknown as ReadTooLarge)];
+  }
   if (!Array.isArray(row.data)) invalid('search.data');
   // A search over a workspace path keeps its path: an existing empty directory has no source to cover (Codex-omg №3171).
   const within = typeof read.within === 'string' ? posix.normalize(read.within).replace(/\/+$/, '') : null;
@@ -900,7 +917,18 @@ function addsAddressedKnowledge(store: Store, payload: Record<string, any>, read
   const known = visibleFacts(store, payload, readings);
   return data.some(row => servedFacts(store, row as unknown as DeliveredRow).some(fact => !knownFact(known, fact)));
 }
-function addsKnowledge(store: Store, packet: QuestionPacketRecord, data: readonly Json[]): boolean {
+/** OBL1 (№3780): that this exact read was refused as too large to show — news once, a repeat after. */
+const tooLargeFact = (address: string, data: ReadTooLarge): Fact => ({ kind: 'shape', address,
+  path: ['#too-large', canonical(data.requested as unknown as Json)], shape: { limit: data.limit } as unknown as Json, content: null });
+/** OBL1 (№3780): the continuation the cycle wrote for this source request showed nothing new — its own no-progress end. */
+function shownRepeat(store: Store, project: string, set: ContinuationEvidenceRequest): boolean {
+  const prior = take(readQuestionPacket(store, { project, record: set.packet })).value;
+  const { continuation: _continuation, correction: _correction, ...base } = prior.request;
+  return take(shownNoProgress(store, { ...base, previous: [...base.previous],
+    continuation: { packet: set.packet, call: set.call, response: set.response, deliveries: [...set.deliveries] } }));
+}
+/** Whether delivered rows add what the reader of `packet` did not see yet (OBL1: also for the rows a continuation shows). */
+export function addsKnowledge(store: Store, packet: QuestionPacketRecord, data: readonly Json[]): boolean {
   const readings = briefReadings(packet.packet);
   if (readings) return addsAddressedKnowledge(store, packet.packet as Record<string, any>, readings, data);
   const payload = packet.packet as Record<string, Json>;
@@ -1001,7 +1029,7 @@ function cycleSources(store: Store, project: string, value: ModelCycleRecord): M
     const set = store.get<ContinuationEvidenceRequest>(deliverySetId(request));
     if (!set || set.kind !== DELIVERY_SET_KIND) fail('model_delivery_invalid', project, 'deliveries', 'No progress needs the saved read results');
     const evidence = take(readContinuationEvidence(store, set.value));
-    if (evidence.novel)
+    if (evidence.novel && !shownRepeat(store, project, set.value))
       fail('model_delivery_invalid', project, 'terminal', 'New delivered information cannot be declared a repeated read');
     completion = { code: 'research_no_progress', message: 'The addressed reads add no information to this attempt', evidence: set.value.deliveries };
   } else if (value.terminal !== 'outcome' || last.outcome?.kind === 'need-source' || last.part !== null) {
@@ -3207,7 +3235,8 @@ function validateManagedFinish(store: Store, request: FinishModelAttemptRequest,
     const checked = known ? known.checked : form?.ok ? form.value : null;
     if (checked?.kind === 'need-source') {
       const reads = readContinuationEvidence(store, { project, packet: request.packet, call: request.call, response: request.response, deliveries: evidence });
-      if (reads.ok && !reads.value.novel && request.code === 'research_no_progress'
+      if (reads.ok && (!reads.value.novel || shownRepeat(store, project, { project, packet: request.packet, call: request.call, response: request.response,
+        deliveries: evidence })) && request.code === 'research_no_progress'
         && request.message === 'The addressed reads add no information to this attempt') return;
       // Row 2 (LP3): the read the engine cannot perform, derived again from the same exact response.
       const issue = readsIssue(store, { project, packet: request.packet, call: request.call, response: request.response });

@@ -249,7 +249,11 @@ export type ReadResult =
   | { contract: typeof READ_RESULT_CONTRACT; outcome: 'complete' | 'clipped'; requested: ReadRange; length: number; unit: 'utf16'; served: ReadRange; text: string }
   | { contract: typeof READ_RESULT_CONTRACT; outcome: 'outside'; requested: ReadRange; length: number; unit: 'utf16'; served: null; text: null }
   | { contract: typeof READ_RESULT_CONTRACT; outcome: 'complete'; requested: { pointer: string }; value: Json }
-  | { contract: typeof READ_RESULT_CONTRACT; outcome: 'missing'; requested: { pointer: string }; missing: string; parent: { pointer: string } & JsonShape };
+  | { contract: typeof READ_RESULT_CONTRACT; outcome: 'missing'; requested: { pointer: string }; missing: string; parent: { pointer: string } & JsonShape }
+  /** OBL1 (№3768, №3773): a read too large for what the next request can still carry — its length (and a value's shape). */
+  | ReadTooLarge;
+export type ReadTooLarge = { contract: typeof READ_RESULT_CONTRACT; outcome: 'too-large';
+  requested: { pointer: string } | ReadRange | { path: string } | { query: string }; length: number; limit: number; matches?: number } & Partial<JsonShape>;
 /** The one pointer syntax of Evidence and saved context: '' or '/'-prefixed, ~ escaped only as ~0 and ~1. */
 export function pointerSegments(pointer: unknown): { encoded: string[]; decoded: string[] } | null {
   if (typeof pointer !== 'string' || pointer !== '' && !pointer.startsWith('/')) return null;
@@ -284,6 +288,24 @@ export function readPointerResult(value: unknown, pointer: string): ReadResult |
     current = (current as Record<string, unknown>)[key];
   }
   return { contract: READ_RESULT_CONTRACT, outcome: 'complete', requested: { pointer }, value: JSON.parse(canonical(current)) as Json };
+}
+/**
+ * OBL1 (№3768, №3773): a delivered read as a continuation shows it when it would not fit — its length, a value's shape at
+ * its pointer, a search's match count — so the reader narrows it. The delivery itself keeps the whole data.
+ */
+export function tooLargeRead(data: unknown, read: { action: string; path?: string; query?: string }, limit: number): Json {
+  const length = canonical(data as Json).length;
+  const tooLarge = (requested: ReadTooLarge['requested'], size: number, more: Partial<ReadTooLarge> = {}) =>
+    ({ contract: READ_RESULT_CONTRACT, outcome: 'too-large', requested, length: size, limit, ...more }) as unknown as Json;
+  if (object(data) && data.contract === READ_RESULT_CONTRACT) {
+    const result = data as unknown as ReadResult;
+    if (result.outcome === 'complete' && 'value' in result) return tooLarge(result.requested, canonical(result.value).length, jsonShape(result.value));
+    if ('text' in result && typeof result.text === 'string') return tooLarge(result.requested, result.length);
+    return data as Json;
+  }
+  if (read.action === 'read' && typeof data === 'string') return tooLarge({ path: read.path! }, data.length);
+  if (read.action === 'search' && Array.isArray(data)) return tooLarge({ query: read.query! }, length, { matches: data.length });
+  return data as Json;
 }
 /** The form E3 admits for an addressed read in the MP3 era; existence and length are results of the read itself. */
 export function readSelectorProblem(selector: unknown, media: unknown): string | null {

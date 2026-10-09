@@ -2439,8 +2439,10 @@ function lp3Hiding(store: Store, id: string): Store {
   } });
 }
 
+// OBL1 (№3773): a brief continuation fits what its reads brought; the continuation the capacity cannot hold stays the end of
+// the packet era before the brief — the old packet producer issues these roots.
 test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold ends its cycle blocked and is never sent: the pass closes each attempt through G7, goes up the ladder and ends by A6 — never waiting on the blocked packet; the start of the root's cycle is chosen by its links in both positions of root and continuation", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
   const b = f.bases("lp3-52"), request = f.request(b);
   writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
   const need = lp3Need(f, b.routes, [{ action: "read", path: "big.txt", media: "text/plain" }]);
@@ -2617,8 +2619,8 @@ test("LP3 (№2876) a cycle start is refused only with the codes of H1 and of E2
 
 test("LP3 (№2817 п.4, п.7) the base d519a60 in its own process leaves the pass waiting on №52 and №53; the new code reopens it and finishes the saved work by an ordinary transition without paying the saved call again, the old revisions and records untouched", async t => {
   for (const kase of ["52", "53"] as const) await t.test(kase, async t => {
-    const f = runFixture(t, ["encoding"]);
-    if (kase === "53") lp3NativePackets(t, f);
+    // OBL1 (№3773): the next attempts keep the packet era of the base too — a brief continuation would fit what №52 read.
+    const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
     const b = f.bases(`lp3-era-${kase}`), request = f.request(b);
     writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
     const need = lp3Need(f, b.routes, kase === "52" ? [{ action: "read", path: "big.txt", media: "text/plain" }]

@@ -4447,6 +4447,71 @@ test('MP3 main scenario, rows 1, 2, 3, 5: one need_source of several reads deliv
   assert.equal(f.store.list('call-record').length, 2);
 });
 
+// OBL1 (№3768): a whole record read by a pointer can exceed what a continuation may carry; it is delivered as its shape.
+test('OBL1 №3768 №3773 a continuation fits what its reads brought: a result that would not fit is shown as its shape and length, the delivery keeps it whole, and the answer follows; a small read is shown whole', async t => {
+  const capacity = 22_000, m = mp3Cycle(t, 'fact', capacity), { f } = m, limit = capacity;
+  const whole = { action: 'read_context', record: reference(f.graph), pointer: '' }, small = { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' };
+  const graph = f.store.get(f.graph.id, f.graph.revision)!.value as Record<string, unknown>;
+  assert.ok(canonical(graph as Json).length + packetPrompt(f.packet.value.packet).length > capacity, 'Whole, the graph would not fit beside the packet');
+  f.steps([{ research: m.need([whole, small]), usage }, { research: e4Fact(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.record.value.terminal, 'outcome', 'The continuation is built and answered, never blocked');
+  const sent = f.sent(); assert.equal(sent.length, 2);
+  const next = m.payload(sent[1].requestId);
+  const data = new Map((next.sourceDeliveries[0].data as { read: Record<string, any>; data: unknown }[]).map(row => [canonical(row.read), row.data]));
+  assert.deepEqual(data.get(canonical(whole)), { contract: 'om-read-result/v1', outcome: 'too-large', requested: { pointer: '' },
+    length: canonical(graph as Json).length, limit, type: 'object', keys: Object.keys(graph).sort() });
+  assert.equal((data.get(canonical(small)) as { outcome: string }).outcome, 'complete');
+  assert.ok(sent[1].prompt.length <= capacity, 'The continuation fits its capacity');
+  const delivery = f.store.list<{ read: unknown; data: { outcome: string } }>('om-read-delivery').find(row => canonical(row.value.read as Json) === canonical(whole as unknown as Json))!;
+  assert.equal(delivery.value.data.outcome, 'complete', 'The delivery itself keeps the whole value');
+});
+
+test('OBL1 №3773 five reads that each fit alone but not together: the continuation shows the largest past what fits as their length and shape, keeps the rest whole, and the answer follows', async t => {
+  const capacity = 30_000, size = 4_000;
+  const f = e4Fixture(t, 'fact', capacity, 0, 5000, false, true, false, undefined, (store, project) => {
+    new Evidence(store).document(project, 'large-json', JSON.stringify(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`field${i}`, String(i).repeat(size)]))), 'application/json', 0);
+  });
+  const source = f.store.get<Source>(`source:${f.project}:large-json`)!;
+  const reads = Array.from({ length: 5 }, (_, i) => ({ action: 'read_source', source: reference(source), selector: { kind: 'json-pointer', pointer: `/field${i}` } }));
+  f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4Fact(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.record.value.terminal, 'outcome', 'Never blocked by what the reads brought');
+  const sent = f.sent(); assert.equal(sent.length, 2);
+  assert.ok(sent[1].prompt.length <= capacity);
+  const next = (f.store.list<QuestionPacketRecord>('question-packet').find(row => (row.value.packet as { requestId?: string } | null)?.requestId === sent[1].requestId)!
+    .value.packet as { sourceDeliveries: { data: { data: { outcome: string } }[] }[] });
+  const outcomes = next.sourceDeliveries.at(-1)!.data.map(row => row.data.outcome);
+  assert.ok(outcomes.includes('complete') && outcomes.includes('too-large'), outcomes.join(','));
+});
+
+test('OBL1 №3780 what is new is judged by what the reader is shown: the same too-large shape asked again is research-no-progress without another send; a narrower read is progress', async t => {
+  const capacity = 22_000, m = mp3Cycle(t, 'fact', capacity), { f } = m;
+  const whole = { action: 'read_context', record: reference(f.graph), pointer: '' };
+  f.steps([{ research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: e4Fact(f), usage }]);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.record.value.terminal, 'research-no-progress');
+  assert.equal(f.sent().length, 2, 'The same shown shape is not paid for a third time');
+  // №3784: the same in a managed attempt, as the pass runs it — the finish sees the continuation it is written with.
+  await t.test('managed: the same shape again ends research-no-progress with its finish, after two sends', async child => {
+    const n = mp3Cycle(child, 'fact', capacity, true), g = n.f;
+    const again = { action: 'read_context', record: reference(g.graph), pointer: '' };
+    g.steps([{ research: n.need([again]), usage }, { research: n.need([again]), usage }, { research: n.need([again]), usage }, { research: e4Fact(g), usage }]);
+    const managed = valueOf(await runModelCycle(g.store, g.request));
+    assert.equal(managed.record.value.terminal, 'research-no-progress');
+    assert.equal(g.sent().length, 2);
+  });
+  await t.test('a narrower read after the shape is progress', async child => {
+    const n = mp3Cycle(child, 'fact', capacity), g = n.f;
+    const narrow = { action: 'read_context', record: reference(g.graph), pointer: '/id' };
+    g.steps([{ research: n.need([{ action: 'read_context', record: reference(g.graph), pointer: '' }]), usage }, { research: n.need([narrow]), usage },
+      { research: e4Fact(g), usage }]);
+    const narrowed = valueOf(await runModelCycle(g.store, g.request));
+    assert.equal(narrowed.record.value.terminal, 'outcome');
+    assert.equal(g.sent().length, 3);
+  });
+});
+
 test('MP3 rows 3, 20, 24: known metadata gives no progress even at the first request; another end past EOF or another missing name is no new fact; a new served slice or omitted catalogue text is progress', async t => {
   await t.test('row 24: a length the catalogue shows ends the attempt at the first request', async child => {
     const m = mp3Cycle(child), { f, length } = m;

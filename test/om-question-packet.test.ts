@@ -2670,6 +2670,7 @@ for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation pres
   rejected(prepareQuestionPacket(f.store, wrong), 'packet_chain_invalid');
 });
 
+// OBL1 (№3773) replaces the blocked overflow: the continuation fits what the read brought by showing it as its length.
 test('E2 continuation saves overflow without truncating or reissuing native questions', t => {
   const p = packetFixture(t, 50_000), { f } = p;
   // A complete addressed read can exceed capacity even though the original assignment fits.
@@ -2679,10 +2680,12 @@ test('E2 continuation saves overflow without truncating or reissuing native ques
   const nativeCount = f.store.list('question').length;
   const request = { ...p.request, continuation: delivery.continuation };
   const prepared = ok(writeQuestionPacket(f.store, request));
-  assert.equal(prepared.record.value.state, 'blocked');
-  assert.equal(prepared.record.value.refusal?.code, 'packet_too_large');
-  assert.ok(prepared.record.value.fullChars! > 50_000);
-  assert.equal(prepared.record.value.packet, null); assert.equal(prepared.record.value.fingerprint, null);
+  assert.equal(prepared.record.value.state, 'ready');
+  assert.equal(prepared.record.value.refusal, null);
+  assert.ok(prepared.record.value.fingerprint!.chars <= 50_000);
+  assert.equal(prepared.record.value.readsFit, true);
+  const shown = (prepared.record.value.packet as { sourceDeliveries: { data: { data: Record<string, unknown> }[] }[] }).sourceDeliveries.at(-1)!.data[0]!.data;
+  assert.deepEqual([shown.outcome, shown.length, shown.requested], ['too-large', source.value.content.length, { start: 0, end: source.value.content.length }]);
   assert.deepEqual(prepared.record.value.native, first.value.native);
   assert.equal(f.store.list('question').length, nativeCount);
   const before = snapshot(f.store);
@@ -3176,6 +3179,24 @@ test('MP1 L3 examples use actual slots, declared CodeRefs and concrete D7 bindin
       assert.ok(ok(derivePartProposal(f.store, request)).works);
     }
   }
+  assert.deepEqual(snapshot(f.store), before);
+});
+
+// OBL1 (№3765, №3768): what a works answer binds is in the packet's own context, exactly — not only in its example.
+test('OBL1 a works packet gives the exact binding id, obligation and D7 scope Ref of every assigned obligation; an answer bound by them alone passes E3', async t => {
+  const f = await worksPacketFixture(t, 'multiple'), packet = ok(writeQuestionPacket(f.store, f.request())).record;
+  const payload = packet.value.packet as Record<string, any>;
+  const scope = JSON.parse(payload.brief.text.split('# Scope and exact context\n')[1].split('\n')[0]);
+  const example = payload.brief.examples.find((row: { action: string }) => row.action === 'answer');
+  assert.ok(example.bindings?.length, 'The fixture assigns D7 obligations');
+  assert.deepEqual(scope.works.bindings, example.bindings.map(({ consumers: _consumers, ...row }: Record<string, unknown>) => row));
+  for (const row of scope.works.bindings) assert.deepEqual(Object.keys(row.scope).sort(), ['hash', 'id', 'revision']);
+  assert.ok(!JSON.stringify(scope.works.bindings).includes('savedRecord'));
+  assert.ok(typeof scope.works.bindingRule === 'string');
+  const before = snapshot(f.store);
+  const answer = { ...example, bindings: scope.works.bindings.map((row: { id: string }) => ({ ...row,
+    consumers: example.bindings.find((binding: { id: string }) => binding.id === row.id).consumers })) };
+  assert.equal(ok(checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: canonical(answer) })).kind, 'node-proposal');
   assert.deepEqual(snapshot(f.store), before);
 });
 

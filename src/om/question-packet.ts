@@ -1,13 +1,13 @@
 import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, resolveBriefAnswer, type BriefBasis, type BriefLabel,
   briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot } from './packet-brief.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
-import { ANSWER_FORM_CODES, readTextResult, readPointerResult, type ReadResult } from './answer-form.js';
+import { ANSWER_FORM_CODES, readTextResult, readPointerResult, tooLargeRead, type ReadResult } from './answer-form.js';
 import { Ajv } from 'ajv';
 import { sourceIsCurrent, type Selector, type Source } from '../evidence/evidence.js';
 import { graphV2Schema } from '../graph/schema.js';
 import { readCall, type AnyCallRecord } from './call-record.js';
 import { readContinuationEvidence, currentSearchScope, prepareModelAttemptFinish, prepareCompletionPacket, prepareManagedEnvironment, pendingCallStore, readManagedModelDiagnostic, readCorrectionGround, readNeighbourResults, type NeighbourSource,
-  readModelCallState, readCompletionWorkAt, readDeliverySet, deliverySetAddress } from './model-call.js';
+  readModelCallState, readCompletionWorkAt, readDeliverySet, deliverySetAddress, addsKnowledge } from './model-call.js';
 import { readAssessmentRefusalAt } from './assessment.js';
 import { readDefinitions } from './repeat-gate.js';
 import { canonical, hashJson, type Json } from '../canonical.js';
@@ -163,6 +163,17 @@ export interface QuestionPacketRecord {
   briefContract?: typeof BRIEF_CONTENT_CONTRACT;
   /** MP2 (№2968 §2, row 19): the neighbour set a brief root issued after MP2 saved; absent in a packet MP1 issued. */
   briefNeighbors?: { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] };
+  /**
+   * OBL1 (№3768, №3773): a works brief step issued since OBL1 shows the exact binding data of its D7 obligations; absent in
+   * one issued before, which keeps its bytes. Every new step — a root, a part, a continuation or a correction of an older
+   * chain — is issued in the new era.
+   */
+  worksBindings?: true;
+  /**
+   * OBL1 (№3773): a brief continuation issued since OBL1 fits what its reads brought into its capacity — the largest
+   * delivered results it shows as their length and shape until it fits; absent in one issued before, which keeps its bytes.
+   */
+  readsFit?: true;
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -857,10 +868,6 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
   }
   const requestId = packetKey(request, protocol, contract);
   const payload = prior.value.packet;
-  let packet = json({ ...payload, requestId,
-    responseForm: { ...(payload.responseForm as Record<string, Json>), requestId },
-    sourceDeliveries: [...(Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries : []),
-      { ...continuation, data: evidence.data }] });
   let basis = priorDerived.briefBasis;
   if (briefContract(contract)) {
     if (!basis) fail('packet_record_invalid', prior.id, 'brief', 'A continuation needs the rederived prior assignment');
@@ -869,23 +876,47 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
     const deliveredSources = evidence.data.flatMap(row => object(row) && Array.isArray(row.sources) ? row.sources.filter(ref => isRef(ref) && ref.id.startsWith(`source:${request.project}:`)) as Ref[] : []);
     const material = briefMaterial(store, request.project, environment.value.workspace, current,
       unique([...basis.material.references, ...deliveredSources]));
-    basis = { ...basis, material, priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels };
-    const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
-    packet = json(boundedBrief({ ...packet as object, responseForm: { protocol, requestId,
-      schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } }, basis, capacity.maxRequestChars));
+    basis = { ...basis, material, worksBindings: stepShowsBindings(prior.value as QuestionPacketRecord, contract, saved), priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels };
     guards.push(...material.guards);
   }
+  const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
+  const build = (rows: readonly Json[]) => {
+    const whole = json({ ...payload, requestId,
+      responseForm: { ...(payload.responseForm as Record<string, Json>), requestId },
+      sourceDeliveries: [...(Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries : []),
+        { ...continuation, data: rows as Json[] }] });
+    return briefContract(contract) ? json(boundedBrief({ ...whole as object, responseForm: { protocol, requestId,
+      schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } }, basis!, capacity.maxRequestChars)) : whole;
+  };
+  let packet = build(evidence.data as unknown as Json[]);
   let fingerprint = bounded(packet, capacity.maxRequestChars);
+  // OBL1 (№3773): what the reads brought never blocks the continuation that carries them — the largest delivered results
+  // are shown as their length and shape until it fits; the deliveries keep their whole data. A continuation of before
+  // keeps its own era, and so does a chain of the packet contracts before the brief.
+  const readsFit = briefContract(contract) && (saved ? saved.readsFit === true : true);
+  let novel = evidence.novel;
+  if (!fingerprint && readsFit && novel) {
+    const rows = [...evidence.data] as unknown as Record<string, Json>[];
+    const order = rows.map((row, index) => [index, canonical(row.data ?? null).length] as const).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+    for (const [index] of order) {
+      rows[index] = { ...rows[index]!, data: tooLargeRead(rows[index]!.data, rows[index]!.read as { action: string }, capacity.maxRequestChars) };
+      packet = build(rows); fingerprint = bounded(packet, capacity.maxRequestChars);
+      if (fingerprint) break;
+    }
+    // №3780: what is new is judged by what the reader is shown — the same shape again is no progress, a narrower read is.
+    if (fingerprint) novel = addsKnowledge(store, prior.value as QuestionPacketRecord, rows as unknown as Json[]);
+  }
   const fullChars = packetPrompt(packet).length;
-  if (basis && evidence.novel && fingerprint && briefReadings(payload) !== null) {
+  if (basis && novel && fingerprint && briefReadings(payload) !== null) {
     const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars);
     packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars); guards.push(...step.guards);
   }
-  const value: QuestionPacketRecord = { ...copy(prior.value) as QuestionPacketRecord, request, packetContract: contract,
+  const { readsFit: _priorFit, ...priorValue } = stepEra(copy(prior.value) as QuestionPacketRecord, contract, saved);
+  const value: QuestionPacketRecord = { ...priorValue, ...(readsFit ? { readsFit: true as const } : {}), request, packetContract: contract,
     ...(basis ? { briefCatalogue: basis.material.references } : {}),
-    state: evidence.novel && fingerprint ? 'ready' : 'blocked', packet: evidence.novel && fingerprint ? packet : null,
-    fingerprint: evidence.novel ? fingerprint : null, fullChars,
-    refusal: !evidence.novel ? { code: 'research_no_progress', message: 'The addressed reads add no information to this attempt',
+    state: novel && fingerprint ? 'ready' : 'blocked', packet: novel && fingerprint ? packet : null,
+    fingerprint: novel ? fingerprint : null, fullChars,
+    refusal: !novel ? { code: 'research_no_progress', message: 'The addressed reads add no information to this attempt',
       at: { unit: 'E2', target: request.batch!, field: 'continuation', ref: continuation.response }, route: 'producer' }
       : fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
   return { value, guards: unique(guards), references: unique([...priorDerived.references, continuation.packet,
@@ -927,14 +958,14 @@ function deriveCorrection(store: Store, request: QuestionPacketRequest, current:
     correction: { refusals: [{ code: refusal.code, field: refusal.at.field ?? null, message: refusal.message, rule: briefRepairRule(refusal.code) }],
       answer: ground.raw },
     responseForm: { protocol, requestId, schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } },
-  { ...basis, priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels }, capacity.maxRequestChars));
+  { ...basis, worksBindings: stepShowsBindings(prior.value as QuestionPacketRecord, contract, saved), priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels }, capacity.maxRequestChars));
   let fingerprint = bounded(packet, capacity.maxRequestChars);
   const fullChars = packetPrompt(packet).length;
   if (fingerprint && briefReadings(payload) !== null) {
     const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars);
     packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars); guards.push(...step.guards);
   }
-  const value: QuestionPacketRecord = { ...copy(prior.value) as QuestionPacketRecord, request, packetContract: contract,
+  const value: QuestionPacketRecord = { ...stepEra(copy(prior.value) as QuestionPacketRecord, contract, saved), request, packetContract: contract,
     briefCatalogue: basis.material.references, state: fingerprint ? 'ready' : 'blocked', packet: fingerprint ? packet : null,
     fingerprint, fullChars,
     refusal: fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
@@ -972,6 +1003,25 @@ function contentContract(store: Store, request: QuestionPacketRequest, contract:
     fail('packet_record_invalid', target, 'briefContract', 'The saved marker and inner brief content version must agree');
   return chosen;
 }
+/** OBL1: a continuation or correction takes its predecessor's record, but the bindings era of its own step. */
+function stepEra(prior: QuestionPacketRecord, contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): QuestionPacketRecord {
+  const { worksBindings: _prior, ...rest } = prior;
+  return stepShowsBindings(prior, contract, saved) ? { ...rest, worksBindings: true } : rest;
+}
+/** OBL1: a step of the bindings era shows bindings where its works assign D7 obligations. */
+function stepShowsBindings(prior: QuestionPacketRecord, contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean {
+  return worksBindingsEra(contract, saved) && showsBindings(object(prior.packet) ? (prior.packet as Record<string, unknown>).works : null);
+}
+function showsBindings(works: unknown): boolean {
+  return object(works) && Array.isArray(works.obligations) && Array.isArray(works.assigned)
+    && (works.obligations as Parameters<typeof taskBindingId>[0][]).some(row => (works.assigned as string[]).includes(taskBindingId(row)));
+}
+/** OBL1: the saved step keeps its own era; a step issued now is of the bindings era (works brief packets only). */
+function worksBindingsEra(contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean {
+  if (saved && Object.hasOwn(saved, 'worksBindings') && (saved.worksBindings !== true || contract !== WORKS_BRIEF_PACKET_CONTRACT))
+    fail('packet_record_invalid', saved.request.routes.id, 'worksBindings', 'Only a works brief packet declares the bindings era');
+  return contract === WORKS_BRIEF_PACKET_CONTRACT && (saved ? saved.worksBindings === true : true);
+}
 function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean,
   protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): {
   value: QuestionPacketRecord; guards: TransactionGuard[]; references: Ref[]; writes: Write[]; briefBasis?: BriefBasis;
@@ -1008,8 +1058,10 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     fail('packet_record_invalid', request.routes.id, 'packetContract', 'The work answer era belongs only to an L3 node assignment');
   if (!worksPacketContract(contract) && Object.hasOwn(request, 'works'))
     fail('packet_task_set_invalid', request.routes.id, 'works', 'A D7 handoff is accepted only by the declared work-packet era');
+  const bindingsEra = worksBindingsEra(contract, saved);
   const base: QuestionPacketRecord = { project: request.project, request, ...(protocol ? { answerProtocol: protocol } : {}),
-    ...(contract ? { packetContract: contract } : {}), ...(briefVersion ? { briefContract: briefVersion } : {}), state: 'empty', packet: null, fingerprint: null,
+    ...(contract ? { packetContract: contract } : {}), ...(briefVersion ? { briefContract: briefVersion } : {}),
+    ...(bindingsEra ? { worksBindings: true as const } : {}), state: 'empty', packet: null, fingerprint: null,
     native: [], plan: null, fullChars: null, refusal: null, journal: null };
   if (!batch) {
     if (request.previous.length) fail('packet_chain_invalid', request.routes.id, 'previous', 'An empty route has no preceding parts');
@@ -1065,7 +1117,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     const input = take(readOmInput(store, request.project, gaps.sources.input));
     const graph = take(readRecord<Graph>(store, gaps.sources.graph,
       { unit: 'E2', target: requestId, id: `graph:${request.project}`, kind: 'graph' }));
-    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
+    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), worksBindings: bindingsEra, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
       gaps: batch.items.map(item => ({ question: item.gap, target: item.target, field: item.field, ref: item.record,
         evidence: json(gaps.records.find(row => same(reference(row), item.record))!.value.gap.evidence) })),
       contexts: unique([gaps.sources.input, gaps.sources.graph, ...input.value.input.sources.map(({ id, revision, hash }) => ({ id, revision, hash }))]),
@@ -1121,6 +1173,10 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       routes.record.value.request.gaps, current) : null;
     if (worksBasis) { guards.push(...worksBasis.guards); references.push(reference(worksBasis.producer), reference(worksBasis.record), ...worksBasis.inputs); }
     const works = worksBasis ? workAssignments(frame, batch.node, worksBasis) : null;
+    // OBL1: the bindings era is marked only where it shows bindings; every other works packet keeps the bytes of before.
+    const shows = bindingsEra && showsBindings(works);
+    if (!shows) delete (base as { worksBindings?: true }).worksBindings;
+    if (briefBasis) briefBasis.worksBindings = shows;
     if (!open.length) return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
     const allIds = open.map(item => item.id).sort(order);
     const whole = { ...context, assigned: allIds, connections: connectionContext(frame.frame.upper, open) };
@@ -1202,6 +1258,17 @@ function continuationFinish(store: Store, record: QuestionPacketRecord) {
     call: continuation.call, response: continuation.response, reason: 'refused', code: record.refusal.code,
     message: record.refusal.message, evidence: continuation.deliveries }));
 }
+/**
+ * OBL1 (№3780): whether the saved continuation of this exact source request ended as no progress by what it shows — a
+ * continuation of the fitting era judges novelty by the results it shows, not by the whole deliveries behind them.
+ */
+export function shownNoProgress(store: Store, request: QuestionPacketRequest): OmResult<boolean> {
+  requirePacket(store, request); request = copy(request);
+  return result(() => {
+    const saved = packetEra(store, request).checked;
+    return !!saved && saved.value.readsFit === true && saved.value.refusal?.code === 'research_no_progress';
+  }) as OmResult<boolean>;
+}
 export function prepareQuestionPacket(store: Store, request: QuestionPacketRequest): OmResult<Sealed<PreparedQuestionPacket>> {
   requirePacket(store, request); request = copy(request);
   return result(() => {
@@ -1229,7 +1296,10 @@ export function prepareQuestionPacket(store: Store, request: QuestionPacketReque
       fail('packet_record_invalid', checked.id, 'value', 'An existing packet cannot change without a new source request');
     const record: Revision<QuestionPacketRecord> = checked ?? { id: packetId(request, protocol, contract), kind: QUESTION_PACKET_KIND,
       revision: 1, hash: hashJson(derived.value), value: derived.value };
-    const finished = continuationFinish(store, record.value);
+    // OBL1 (№3784): the finish of a no-progress continuation judges what that continuation shows, so it sees the prepared
+    // packet; both are written in the one transaction below.
+    const finished = continuationFinish(checked ? store
+      : pendingCallStore(store, [{ id: record.id, kind: record.kind, expected: 0, value: record.value }]), record.value);
     const writes: Write[] = [...derived.writes, ...(finished?.writes ?? []),
       ...(checked ? [] : [{ id: record.id, kind: record.kind, expected: 0, value: record.value }])];
     const completion = checked ? { writes: [], guards: [] } : take(prepareCompletionPacket(pendingCallStore(admittedStore, writes), reference(record)));

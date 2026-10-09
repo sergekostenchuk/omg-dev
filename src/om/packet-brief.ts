@@ -124,6 +124,8 @@ function neighbourSection(basis: BriefBasis): string[] {
 }
 export interface BriefBasis {
   briefContract?: typeof BRIEF_CONTENT_CONTRACT;
+  /** OBL1 (№3773): the bindings era of the step — its works section shows the exact binding data of its D7 obligations. */
+  worksBindings?: boolean;
   project: string; graph: Graph; node: string | null; gaps: { question: string; target: string; field: string; ref: Ref; evidence: Json }[];
   /** MP2 (№2968 §2): the proved finished work of neighbouring roots — only in the form a packet issued after MP2 saves. */
   neighbors?: { contract: typeof NEIGHBOR_CONTRACT; works: Json[] };
@@ -729,13 +731,21 @@ function briefView(payload: Record<string, any>, basis: BriefBasis, labels: Brie
   } : null;
   const works = payload.works ? { contract: payload.works.contract, assigned: payload.works.assigned,
     obligations: payload.works.obligations, nodeAssignments: payload.works.nodeAssignments } : null;
+  // OBL1 (№3765, №3768): what a works answer binds is engine data, given here exactly — the binding id, the obligation and
+  // its D7 scope Ref — never the saved-record placeholder of the view below; the answer's bindings repeat it.
+  const bindings = payload.works && basis.worksBindings === true ? (payload.works.obligations as Parameters<typeof taskBindingId>[0][])
+    .filter(row => payload.works.assigned.includes(taskBindingId(row)))
+    .map(row => ({ id: taskBindingId(row), obligation: row.obligation, scope: { id: row.scope.id, revision: row.scope.revision, hash: row.scope.hash } })) : [];
   const meanings = labels.map(row => ({ label: row.label, domain: row.domain, meaning: row.domain === 'source'
     ? basis.material.sources.find(source => same(source.reference, row.value))?.path ?? 'Previously delivered source'
     : row.domain === 'question' ? questions.filter((question: Record<string, any>) => question.label === row.label).map(({ target, field }: Record<string, any>) => ({ target, field }))
     : row.domain === 'gap' ? basis.gaps.filter(gap => same(gap.ref, row.value)).map(gap => ({ target: view(gap.target, 'target'), field: gap.field }))
     : row.domain === 'slot' ? expansion?.obligations.find((slot: Record<string, any>) => slot.label === row.label) ?? 'Slot of an earlier part'
     : basis.accepted.find(source => same(source.ref, row.value))?.stage ?? (object(row.value) ? row.value.id.split(':')[0] : 'Saved context') }));
-  return { view, questions, meanings, expansion: view(expansion), works: view(works) };
+  return { view, questions, meanings, expansion: view(expansion),
+    works: works && bindings.length ? { ...view(works), bindings,
+      bindingRule: 'Bind each assigned obligation in bindings with exactly this id, obligation and scope; they are the engine\'s own D7 data.' }
+      : view(works) };
 }
 
 /** Share repeated schema nodes only; never rewrite const/enum/default values or change reference scopes. */
