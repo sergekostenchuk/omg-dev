@@ -18,7 +18,16 @@ export const PROPOSAL_REFUSAL_CODES = Object.freeze([
   "proposal_request_invalid", "proposal_invalid", "proposal_not_proposed", "proposal_base_stale",
   "slot_fill_foreign", "slot_fill_conflict", "proposal_node_reserved", "input_stale",
 ] as const);
-export interface ProposalFill { obligation: string; node: string; port?: string; codeRef?: CodeRef }
+export interface ProposalFill { obligation: string; node: string; port?: string; codeRef?: CodeRef; wakeTest?: string }
+/**
+ * G5 (№3820, №3822): the wake test of a producer end — the one test of its own work that covers the connection and wakes the
+ * consumers when they sleep. The answer form names it and E2 checks it by this one rule; the engine never picks one.
+ */
+export const WAKE_TEST = Object.freeze({ field: 'wakeTest' as const,
+  rule: 'When more than one test of its own work covers a connection, the producer end of that connection names in '
+    + 'wakeTest exactly one of them: the test that wakes the consumers of the connection when they sleep. Name it even when '
+    + 'no consumer sleeps now. A named test must be a test of this same work whose covers include this connection. The engine '
+    + 'never chooses one of several for you.' });
 export interface ProposalReplacement {
   obligation: string; base: { node: string; graph: Ref };
   with: { node: string; port: string | null }; basis: string;
@@ -36,7 +45,7 @@ export interface LayerProposal {
 }
 export interface ProposalObservation { reference: Ref; value: LayerProposal }
 export interface ProposalResult extends Omit<FilledFrame, 'fills'> {
-  fills: (Omit<FrameFill, 'source'> & { source: "accepted" | "identity" | "proposed" })[];
+  fills: (Omit<FrameFill, 'source'> & { source: "accepted" | "identity" | "proposed"; wakeTest?: string })[];
   proposals: ProposalObservation[];
 }
 export interface FrameGap {
@@ -144,7 +153,8 @@ function checkProposal(observation: ProposalObservation, frame: FrameRead): void
   const fillShape = (row: unknown) => object(row) && text(row['obligation']) && text(row['node'])
     && (row['port'] === undefined || text(row['port']))
     && (!Object.hasOwn(row, 'codeRef') || proposal.worksContract === WORKS_FRAME_CONTRACT && codeShape(row['codeRef']))
-    && Object.keys(row).every(key => ['obligation', 'node', 'port', ...(proposal.worksContract === WORKS_FRAME_CONTRACT ? ['codeRef'] : [])].includes(key));
+    && (!Object.hasOwn(row, WAKE_TEST.field) || proposal.worksContract === WORKS_FRAME_CONTRACT && text(row[WAKE_TEST.field]))
+    && Object.keys(row).every(key => ['obligation', 'node', 'port', ...(proposal.worksContract === WORKS_FRAME_CONTRACT ? ['codeRef', WAKE_TEST.field] : [])].includes(key));
   if (!Array.isArray(proposal.fills) || !proposal.fills.every(fillShape)) reject('proposal_invalid', ref.id, 'fills', 'Fills must be explicit complete endpoints');
   for (const field of ['removes', 'redefines'] as const)
     if (!Array.isArray(proposal[field]) || !proposal[field].every(text) || new Set(proposal[field]).size !== proposal[field].length)
@@ -217,6 +227,13 @@ function derive(frame: FrameRead, observations: ProposalObservation[], base: Fil
         ? !Object.hasOwn(row, 'codeRef') || !node!.code.some(code => same(code, row.codeRef))
         : Object.hasOwn(row, 'codeRef')))
         reject('slot_fill_foreign', row.obligation, 'codeRef', 'A real connection end needs one exact declared code reference; outcome fills carry none');
+      // G5: the wake test chosen by the work is checked when the work itself is accepted, whatever its neighbour sleeps now.
+      if (Object.hasOwn(row, WAKE_TEST.field)) {
+        const test = [...accepted.tests, ...proposals.flatMap(item => item.value.tests)].find(item => item.id === row.wakeTest);
+        if (obligation.kind !== 'connection-end' || obligation.role !== 'producer' || !obligation.connector || !test
+          || test.node !== row.node || !node!.tests.includes(test.id) || !test.covers.includes(obligation.connector))
+          reject('slot_fill_foreign', row.obligation, WAKE_TEST.field, WAKE_TEST.rule);
+      }
       const values = additions.get(row.obligation) ?? [];
       if (values.some(item => endpointKey(item) === endpointKey(row)) || (obligation.role !== 'consumer' && values.length > 0))
         reject('slot_fill_conflict', row.obligation, 'fill', 'Different proposals cannot compete for a single endpoint or single-valued obligation');

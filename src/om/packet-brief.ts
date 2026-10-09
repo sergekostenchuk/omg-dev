@@ -15,6 +15,7 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import { isPlainObject, type Refusal } from './refusal.js';
 import { bindingFlowIdentity } from '../graph/flow-identity.js';
+import { WAKE_TEST } from './frame-proposals.js';
 
 export const BRIEF_PACKET_CONTRACT = 'om-packet/brief-v1' as const;
 export const WORKS_BRIEF_PACKET_CONTRACT = 'om-packet/works-brief-v1' as const;
@@ -126,6 +127,8 @@ export interface BriefBasis {
   briefContract?: typeof BRIEF_CONTENT_CONTRACT;
   /** OBL1 (№3773): the bindings era of the step — its works section shows the exact binding data of its D7 obligations. */
   worksBindings?: boolean;
+  /** G5 (№3820, №3822): the wake-test era of the step — a producer end of its works form names its wake test. */
+  wakeTests?: boolean;
   project: string; graph: Graph; node: string | null; gaps: { question: string; target: string; field: string; ref: Ref; evidence: Json }[];
   /** MP2 (№2968 §2): the proved finished work of neighbouring roots — only in the form a packet issued after MP2 saves. */
   neighbors?: { contract: typeof NEIGHBOR_CONTRACT; works: Json[] };
@@ -367,6 +370,10 @@ const DECISION_EXAMPLE = Object.freeze({ decision: 'Choose the option the requir
   rationale: 'Name the requirement or fact of this brief the choice follows from',
   alternatives: [{ option: 'A second concrete option', consequences: 'What would follow if it were chosen instead' },
     { option: 'A third concrete option', consequences: 'What would follow if that one were chosen' }] });
+/** G5: a producer end of the assignment of a works step of the wake-test era. */
+function wakes(payload: Record<string, any>, basis: BriefBasis, row: { kind: string; role?: string }): boolean {
+  return basis.wakeTests === true && !!payload.works && row.kind === 'connection-end' && row.role === 'producer';
+}
 function answerSchema(payload: Record<string, any>, labels: BriefLabel[], basis: BriefBasis) {
   const schema = JSON.parse(canonical(payload.responseForm.schema));
   if (decidesQuestions(payload, basis))
@@ -416,6 +423,8 @@ function answerSchema(payload: Record<string, any>, labels: BriefLabel[], basis:
         else {
           variant.required = [...new Set([...variant.required, 'port', ...(payload.works ? ['codeRef'] : [])])];
           if (!payload.works) delete variant.properties.codeRef;
+          // G5: the producer end of a works answer names its wake test, by the one rule E2 checks.
+          if (wakes(payload, basis, row)) variant.properties[WAKE_TEST.field] = { type: 'string', minLength: 1, description: WAKE_TEST.rule };
         }
         return variant;
       });
@@ -670,8 +679,9 @@ function briefExamples(payload: Record<string, any>, labels: BriefLabel[], basis
         counterfactuals: covers.map(connector => ({ connector, mutation: 'remove', expectedFailure: 'missing_input', command })),
         resourceClass: 'own_dirs', resources: [],
       } }] : [];
-    const proposal = { nodes: [node], fills: assigned.map((row: { id: string; kind: string }) => ({ obligation: label('slot', row.id), node: id,
-      ...(row.kind === 'connection-end' ? { port: ports[ends.indexOf(row)].id, ...(payload.works ? { codeRef: code } : {}) } : {}) })),
+    const proposal = { nodes: [node], fills: assigned.map((row: { id: string; kind: string; role?: string }) => ({ obligation: label('slot', row.id), node: id,
+      ...(row.kind === 'connection-end' ? { port: ports[ends.indexOf(row)].id, ...(payload.works ? { codeRef: code } : {}),
+        ...(wakes(payload, basis, row) ? { [WAKE_TEST.field]: testId } : {}) } : {}) })),
       tests, localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
     const bindings = payload.works?.obligations.filter((row: Parameters<typeof taskBindingId>[0]) => payload.works.assigned.includes(taskBindingId(row)))
       .map((row: Parameters<typeof taskBindingId>[0]) => ({ id: taskBindingId(row), scope: row.scope, obligation: row.obligation, consumers: [{ node: id, tests: [testId] }] }));

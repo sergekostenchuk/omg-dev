@@ -1,10 +1,12 @@
 import test, { after, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { types } from 'node:util';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, digest, hashJson, type Json } from '../src/canonical.js';
 import { preplanTaskContext } from '../src/compiler/context.js';
 import { resolveArtifact, resolveExternalSource } from '../src/compiler/inputs.js';
@@ -23,7 +25,7 @@ import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requiremen
 import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from '../src/om/addressing.js';
-import { checkAtomicWorks, prepareWorksAcceptance, writeWorksAcceptance, readAtomicGate, prepareAtomicGate, writeAtomicGate,
+import { checkAtomicWorks, prepareWorksAcceptance, prepareWorksSources, writeWorksAcceptance, readAtomicGate, prepareAtomicGate, writeAtomicGate,
   readWorksAcceptance, transactionForTests, type AtomicGateRecord, type AtomicGateRequest, type PreparedWorksAcceptance } from '../src/om/atomic-gate.js';
 import { readAcceptedFrame, settleCandidate } from '../src/om/frame-accept.js';
 import { writeCandidate, readCandidate, type FrameCandidateRecord } from '../src/om/frame-candidate.js';
@@ -109,7 +111,71 @@ function addressFixtureFields(store: Store, project: string, input: Ref, graph: 
 
 /** The product setup uses real C5, D3, D1/D2 and a declared H2 owner command.
  * Every returned works proposal below is produced by the local E4 adapter. */
-async function produceAtomicSeed() {
+/**
+ * G5 (№3820, №3822): the era seed adds a late question of the environment no H2 assigns, so the D7 rule before OWN1.2
+ * (73d95d93: carried to its consumer by default) and today's (not carried) derive two ledgers from one exact request. The
+ * prep assignment — of a block the environment question does not reach — is issued, answered and assembled by that older
+ * code on its own ledger, binding nothing (as n-research in omg-live); the rest by today's.
+ */
+/**
+ * Runs a producer script with every engine module loaded from one exact commit, in its own process (as in
+ * om-answers-gate): the loader serves engine modules from Git and refuses any outside that checkout.
+ */
+function atCommit(f: { root: string; path: string }, commit: string, name: string, body: string, input: unknown): unknown {
+  const repository = fileURLToPath(new URL('../../', import.meta.url));
+  const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
+  const argsFile = join(f.root, `${name}-input.json`), served = join(f.root, `${name}-served.log`);
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(served, '');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database, input] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const { reference } = await import(src('pipeline/contracts.js'));
+const args = JSON.parse(readFileSync(input, 'utf8')), store = new Store(database);
+const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const out = value => process.stdout.write(JSON.stringify(value));
+try {
+${body}
+} finally { store.close(); }`);
+  writeFileSync(argsFile, JSON.stringify(input));
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output: unknown = JSON.parse(execFileSync(process.execPath,
+    ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.path, argsFile],
+    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 10_000_000 }));
+  const loaded = readFileSync(served, 'utf8').split('\n').filter(Boolean);
+  assert.ok(loaded.includes('src/storage/store.ts') && loaded.includes('src/pipeline/contracts.ts'),
+    `The producer ran on the modules of ${commit}: ${loaded.join(', ')}`);
+  return output;
+}
+const ERA_D7_COMMIT = '73d95d936ba7e3135eb898d783ee3c3a99c67719';
+async function produceAtomicSeed(era = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-f5-atomic-seed-')), database = join(root, 'state.sqlite'), project = 'garden';
   const store = new Store(database), engine = new ProductEngine(store);
   seedResources.push({ root, store });
@@ -121,7 +187,9 @@ async function produceAtomicSeed() {
     const value = preparedField(project, field);
     if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'atomic-proof',
       question: 'Which result proof must both retained consumers receive?', consumer: 'garden-produce-operation',
-      moment: 'task-result', blocksCurrentStage: false, resolution: 'Carry the proof until execution of the concrete work' }];
+      moment: 'task-result', blocksCurrentStage: false, resolution: 'Carry the proof until execution of the concrete work' },
+    ...(era ? [{ id: 'atomic-env', question: 'Which runtime does the consuming work start on?', consumer: 'garden-consume-operation',
+      moment: 'task-start', blocksCurrentStage: false, resolution: 'Confirm it when the task starts' }] : [])];
     return value;
   });
   let input = ok(writeOmInput(store, { project, expected: 0,
@@ -148,7 +216,9 @@ async function produceAtomicSeed() {
     gate: 'G3', candidate: reference(candidate.record), graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
   const graph = reference(accepted.graph!), layer2 = reference(accepted.layer!), upperFrame = reference(accepted.frame!);
   input = addressFixtureFields(store, project, reference(input), graph, [layer2], [{ target: 'discovery:atomic-proof', field: 'address',
-    value: { consumer: 'garden-produce-operation', kind: 'post-implementation-proof' } }]);
+    value: { consumer: 'garden-produce-operation', kind: 'post-implementation-proof' } },
+    ...(era ? [{ target: 'discovery:atomic-env', field: 'address' as const,
+      value: { consumer: 'garden-consume-operation', kind: 'environment-confirmation' } }] : [])]);
   const horizon = ok(writeHorizon(store, { project, input: reference(input), graph, refinement: layer2, available: {},
     choice: { choiceVersion: 'atomic-works', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
@@ -165,6 +235,16 @@ async function produceAtomicSeed() {
   const ledger = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [{ pending: {
     id: `om-owner-gap-assignment:${project}:${hashJson(assignment)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value: assignment } }] }));
   assert.equal(ledger.handoff.obligations.length, 2);
+  // The ledger the older rule derives from this exact request: the environment question carried to its consumer.
+  const older = era ? atCommit({ root, path: database }, ERA_D7_COMMIT, 'era-d7', `const { writeOmObligations } = await import(src('om/obligations.js'));
+const written = take(writeOmObligations(store, args));
+out({ producer: reference(written.producer), ledger: reference(written.record) });`, ledger.record.value.request) as { producer: Ref; ledger: Ref } : null;
+  if (older) {
+    const read = ok(readOmObligations(store, { project, producer: older.producer }));
+    assert.equal(canonical(read.record.value.request as unknown as Json), canonical(ledger.record.value.request as unknown as Json), 'One exact request');
+    assert.notDeepEqual(older.ledger, reference(ledger.record), 'Two rules, two ledgers');
+    assert.equal(read.handoff.obligations.length, 3, 'The older rule carries the environment question too');
+  }
   const routes = ok(writeRoutes(store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
   const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
@@ -176,17 +256,16 @@ async function produceAtomicSeed() {
   const opened = new Map<string, number>(), steps: { research: unknown; usage: { inputTokens: number; outputTokens: number; cachedInputTokens: number; reasoningOutputTokens: number } }[] = [];
   const results: { kind: 'assembly'; record: Ref }[] = [], cycles: Ref[] = [], proposals: Ref[] = [], transfers: TaskObligationBinding[] = [];
   let openGoal: { block: string; ordinal: number; series: Ref; goal: AttemptGoal } | null = null;
-  for (const batch of routes.value.batches.filter(item => item.level === 3 && item.task === 'node-expansion')) {
-    const upper = accepted.graph!.value.nodes.find(node => node.id === batch.node)!;
-    const block = upper.parent!; assert.ok(batch.items.every(item => item.consumers.includes(block)));
-    const ordinal = (opened.get(block) ?? 0) + 1;
-    if (ordinal === 1) ok(openSeries(store, { project, block, line: 1, slice: `atomic:${block}`, predecessor: null, basis: null }));
-    const goal: AttemptGoal = { key: `atomic:${batch.node}`, questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
-      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  /** One work assignment issued, answered by the local E4 adapter and assembled — by today's code or by the older one. */
+  async function issue(batch: (typeof routes.value.batches)[number], block: string, ordinal: number, goal: AttemptGoal,
+    works: { producer: Ref; ledger: Ref }, handoff: OmObligationHandoff, eraBatch: boolean) {
     const series = ok(beginAttempt(store, { project, block, line: 1, attempt: ordinal, goal }));
     const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(environment),
-      attempt: { series: reference(series), ordinal }, previous: [], works: { producer: reference(ledger.producer), ledger: reference(ledger.record) } };
-    const packet = ok(writeQuestionPacket(store, packetRequest)).record;
+      attempt: { series: reference(series), ordinal }, previous: [], works };
+    const packet = eraBatch ? store.get<import('../src/om/question-packet.js').QuestionPacketRecord>((atCommit({ root, path: database }, ERA_D7_COMMIT,
+      `era-packet-${ordinal}`, `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(reference(take(writeQuestionPacket(store, args)).record));`, packetRequest) as Ref).id)!
+      : ok(writeQuestionPacket(store, packetRequest)).record;
     assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'whole');
     const payload = packet.value.packet as unknown as { expansion: { assigned: string[];
       obligations: { id: string; kind: string; upper: { port?: string } }[] }; works: { assigned: string[] } };
@@ -206,21 +285,43 @@ async function produceAtomicSeed() {
         ...(item.kind === 'connection-end' ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
       localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
       removes: [], replaces: [], redefines: [] };
-    const bindings: TaskObligationBinding[] = ledger.handoff.obligations.filter(item => payload.works.assigned.includes(taskBindingId(item as CarriedObligation)))
+    const bindings: TaskObligationBinding[] = handoff.obligations.filter(item => payload.works.assigned.includes(taskBindingId(item as CarriedObligation)))
       .map(item => ({ id: taskBindingId(item as CarriedObligation), scope: item.scope, obligation: item.obligation,
         consumers: [{ node: work.id, tests: [...work.tests] }] }));
     steps.push({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal: body, bindings },
       usage: { inputTokens: 12, outputTokens: 3, cachedInputTokens: 0, reasoningOutputTokens: 1 } });
     writeFileSync(scenario, JSON.stringify({ database: store.path, steps }));
     const call: ModelCallRequest = { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(environment) }, role: 'implementer' };
-    const cycle = ok(await runModelCycle(store, call));
-    assert.equal(cycle.record.value.terminal, 'assembled', batch.node ?? 'node'); assert.ok(cycle.assembly);
-    const assembly = ok(readPartAssembly(store, { project, record: cycle.assembly }));
+    const cycle = eraBatch ? (() => {
+      const ran = atCommit({ root, path: database }, ERA_D7_COMMIT, `era-cycle-${ordinal}`, `const { runModelCycle } = await import(src('om/model-call.js'));
+const cycle = take(await runModelCycle(store, args));
+out({ record: reference(cycle.record), assembly: cycle.assembly });`, call) as { record: Ref; assembly: Ref };
+      return { record: store.get<import('../src/om/model-call.js').ModelCycleRecord>(ran.record.id)!, assembly: ran.assembly };
+    })() : ok(await runModelCycle(store, call));
+    if (cycle.record.value.terminal !== 'assembled') {
+      const refusals = store.list('om-unit-refusal').map(row => JSON.stringify(row.value).slice(0, 1500));
+      assert.fail(`${batch.node}: ${JSON.stringify(cycle.record.value).slice(0, 1500)} ${refusals.join(' | ')}`);
+    }
+    assert.ok(cycle.assembly);
+    const assembly = ok(readPartAssembly(store, { project, record: cycle.assembly! }));
     assert.deepEqual(assembly.record.value.works!.bindings.map(canonical).sort(), bindings.map(canonical).sort());
     assert.equal(cycle.record.value.results.length, 1);
     const part = ok(readPartResult(store, { project, record: cycle.record.value.results[0]! }));
     assert.deepEqual(part.record.value.works, assembly.record.value.works);
-    results.push({ kind: 'assembly', record: cycle.assembly }); cycles.push(reference(cycle.record));
+    return { series, cycle, assembly, bindings };
+  }
+  for (const batch of routes.value.batches.filter(item => item.level === 3 && item.task === 'node-expansion')) {
+    const upper = accepted.graph!.value.nodes.find(node => node.id === batch.node)!;
+    const block = upper.parent!; assert.ok(batch.items.every(item => item.consumers.includes(block)));
+    const ordinal = (opened.get(block) ?? 0) + 1;
+    if (ordinal === 1) ok(openSeries(store, { project, block, line: 1, slice: `atomic:${block}`, predecessor: null, basis: null }));
+    const goal: AttemptGoal = { key: `atomic:${batch.node}`, questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+    const eraBatch = !!older && batch.node === 'garden-prep-operation';
+    const { series, cycle, assembly, bindings } = await issue(batch, block, ordinal, goal,
+      eraBatch ? older! : { producer: reference(ledger.producer), ledger: reference(ledger.record) },
+      eraBatch ? ok(readOmObligations(store, { project, producer: older!.producer })).handoff as OmObligationHandoff : ledger.handoff as OmObligationHandoff, eraBatch);
+    results.push({ kind: 'assembly', record: cycle.assembly! }); cycles.push(reference(cycle.record));
     proposals.push(reference(assembly.proposal)); transfers.push(...bindings);
     // Keep this declared assignment open through F5→D2→G7. Other deliveries permit the next distinct assignment of their block.
     if (batch.node === 'garden-consume-operation') {
@@ -229,17 +330,30 @@ async function produceAtomicSeed() {
       outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } }));
     opened.set(block, ordinal);
   }
+  // G5: a D7 of ANOTHER request — the same D1 and D2 without the owner's assignment — and the produce answer issued on it.
+  let foreign: { kind: 'assembly'; record: Ref } | null = null;
+  if (older) {
+    const alt = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
+    const batch = routes.value.batches.find(item => item.level === 3 && item.task === 'node-expansion' && item.node === 'garden-produce-operation')!;
+    const block = accepted.graph!.value.nodes.find(node => node.id === batch.node)!.parent!, ordinal = opened.get(block)! + 1;
+    const goal: AttemptGoal = { key: `atomic:${batch.node}:foreign`, questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+    const issued = await issue(batch, block, ordinal, goal, { producer: reference(alt.producer), ledger: reference(alt.record) },
+      alt.handoff as OmObligationHandoff, false);
+    ok(completeAttempt(store, { project, block, line: 1, attempt: ordinal, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } }));
+    opened.set(block, ordinal); foreign = { kind: 'assembly', record: issued.cycle.assembly! };
+  }
   assert.ok(openGoal); assert.ok(results.length > 1); assert.equal(transfers.length, 2); assert.equal(new Set(transfers.map(item => item.id)).size, 2);
   const request = { project, results, environment: reference(environment), sources: [] as Ref[] };
   store.close();
   return { root, database, trace, scenario, traceBytes: readFileSync(trace, 'utf8'), data: {
     project, desired, environment, adapter, graph, layer2, upperFrame, input, gaps, gapRead, lines, ledger,
-    routes, results, proposals, cycles, transfers, openGoal, request } };
+    routes, results, proposals, cycles, transfers, openGoal, request, older, foreign } };
 }
 
-let atomicSeed: ReturnType<typeof produceAtomicSeed> | undefined;
-async function atomicFixture(t: TestContext) {
-  const seed = await (atomicSeed ??= produceAtomicSeed());
+let atomicSeed: ReturnType<typeof produceAtomicSeed> | undefined, eraSeed: ReturnType<typeof produceAtomicSeed> | undefined;
+async function atomicFixture(t: TestContext, era = false) {
+  const seed = await (era ? eraSeed ??= produceAtomicSeed(true) : atomicSeed ??= produceAtomicSeed());
   const root = mkdtempSync(join(tmpdir(), 'omg-f5-atomic-')), database = join(root, 'state.sqlite');
   copyFileSync(seed.database, database);
   copyFileSync(seed.trace, join(root, 'trace.jsonl')); copyFileSync(seed.scenario, join(root, 'scenario.json'));
@@ -406,6 +520,40 @@ test('F5 accepts real E2.1 and E4 work results with two distinct consumers, reba
   for (const cycle of f.cycles) ok(readModelCycle(f.store, { project: f.project, record: cycle }));
   const repeat = ok(writeWorksAcceptance(f.store, f.request)); assert.equal(repeat.state, 'unchanged');
   assert.deepEqual(repeat.acceptance, accepted.acceptance); assert.deepEqual(heads(f.store), snapshot); assert.equal(f.sent().length, sent);
+});
+
+// G5 (№3820, №3822): the prep answer was issued and assembled on the ledger the older D7 rule derived (73d95d93), the
+// others on today's ledger of the same exact request: one original handoff. Each source's bindings are transferred from
+// its own ledger onto the final handoff, losslessly; nothing is paid again.
+test('G5 two D7 of one exact request (the older rule and today\'s) are one original handoff: each source\'s bindings are transferred from its own ledger and the works are accepted without a model call', async t => {
+  const f = await atomicFixture(t, true), sent = f.sent().length;
+  assert.ok(f.older);
+  const sources = f.request.results.map(result => ok(readPartAssembly(f.store, { project: f.project, record: result.record })).record.value.works!);
+  assert.deepEqual([...new Set(sources.map(works => works.ledger.id))].sort(), [f.older.ledger.id, f.ledger.record.id].sort(), 'Two ledgers among the sources');
+  const older = sources.find(works => works.ledger.id === f.older!.ledger.id)!;
+  assert.deepEqual(older.bindings, [], 'The older answer binds nothing, as n-research in omg-live');
+  const accepted = ok(writeWorksAcceptance(f.store, f.request));
+  assert.equal(accepted.state, 'accepted', JSON.stringify(gateWrite(accepted as never).value?.result?.findings ?? null));
+  const historical = ok(readAcceptedFrame(f.store, { ...accepted.acceptance!, level: 3 as const }));
+  const candidate = ok(readCandidate(f.store, { project: f.project, candidate: historical.frame!.value.acceptance.candidate }));
+  const handoff = ok(readOmObligations(f.store, { project: f.project, producer: candidate.value.works!.producer }));
+  assert.deepEqual(candidate.value.works!.bindings.map(binding => binding.consumers).map(canonical).sort(),
+    sources.flatMap(works => works.bindings).map(binding => binding.consumers).map(canonical).sort(), 'Every consumer of every source survives');
+  assert.ok(candidate.value.works!.bindings.every(binding => binding.scope.id === handoff.record.id), 'All on the final handoff');
+  assert.equal(f.sent().length, sent, 'No model call');
+});
+
+test('G5 a D7 of another request among the sources is refused: all final proposals belong to one original handoff', async t => {
+  const f = await atomicFixture(t, true), before = heads(f.store);
+  assert.ok(f.foreign && f.older);
+  const produce = f.request.results.find(result => ok(readPartAssembly(f.store, { project: f.project, record: result.record })).record.value.works!.ledger.id === f.older!.ledger.id)!;
+  const foreign = ok(readPartAssembly(f.store, { project: f.project, record: f.foreign.record })).record.value.works!;
+  const request = ok(readOmObligations(f.store, { project: f.project, producer: foreign.producer })).record.value.request;
+  assert.notEqual(canonical(request as unknown as Json), canonical(f.ledger.record.value.request as unknown as Json), 'Another request');
+  const mixed = { ...f.request, results: f.request.results.map(result => result === produce ? f.foreign! : result) };
+  denied(prepareWorksAcceptance(f.store, mixed), 'atomic_gate_bindings_unproven');
+  denied(prepareWorksSources(f.store, { project: f.project, results: mixed.results }), 'atomic_gate_bindings_unproven');
+  assert.deepEqual(heads(f.store), before, 'Nothing is written');
 });
 
 test('F5 declared work goal closes accepted L3 gaps and confirms progress through D2 and A3 after restart', async t => {

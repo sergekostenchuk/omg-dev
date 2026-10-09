@@ -26,7 +26,7 @@ import { prepareAnswerTask, readAnswerTaskBasis, mc1FieldSpec, prepareMc1Questio
   type AnswerTaskRequest, type CheckedAnswerTask } from './accepted-answer.js';
 import { readCapacity } from './capacity.js';
 import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
-import { PROPOSAL_REFUSAL_CODES, prepareFrameProposals, readFrameProposals, type LayerProposal, type FrameProposals } from './frame-proposals.js';
+import { PROPOSAL_REFUSAL_CODES, WAKE_TEST, prepareFrameProposals, readFrameProposals, type LayerProposal, type FrameProposals } from './frame-proposals.js';
 import { FRAME_REFUSAL_CODES, flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
 import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, completionWorkId, type Attempt, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, unitRefusalNamespace, type JournalRow, type RefusalJournal } from './refusal-journal.js';
@@ -174,6 +174,12 @@ export interface QuestionPacketRecord {
    * delivered results it shows as their length and shape until it fits; absent in one issued before, which keeps its bytes.
    */
   readsFit?: true;
+  /**
+   * G5 (№3820, №3822): a works brief step issued since G5 whose assignment holds a producer end asks its answer to name the
+   * wake test of that end; absent in one issued before, which keeps its bytes, and in a step without a producer end. A
+   * continuation or correction keeps the era of its chain.
+   */
+  wakeTests?: true;
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -1016,6 +1022,15 @@ function showsBindings(works: unknown): boolean {
   return object(works) && Array.isArray(works.obligations) && Array.isArray(works.assigned)
     && (works.obligations as Parameters<typeof taskBindingId>[0][]).some(row => (works.assigned as string[]).includes(taskBindingId(row)));
 }
+/** G5: the saved step keeps its own era; a root or part issued now is of the wake-test era (works brief packets only). */
+function wakeTestsEra(contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean {
+  if (saved && Object.hasOwn(saved, 'wakeTests') && (saved.wakeTests !== true || contract !== WORKS_BRIEF_PACKET_CONTRACT))
+    fail('packet_record_invalid', saved.request.routes.id, 'wakeTests', 'Only a works brief packet declares the wake-test era');
+  return contract === WORKS_BRIEF_PACKET_CONTRACT && (saved ? saved.wakeTests === true : true);
+}
+/** G5: the era is marked only where it changes the form — an assignment holding a producer end of a connection. */
+const holdsProducerEnd = (assigned: readonly FrameObligation[]): boolean =>
+  assigned.some(item => item.kind === 'connection-end' && item.role === 'producer');
 /** OBL1: the saved step keeps its own era; a step issued now is of the bindings era (works brief packets only). */
 function worksBindingsEra(contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): boolean {
   if (saved && Object.hasOwn(saved, 'worksBindings') && (saved.worksBindings !== true || contract !== WORKS_BRIEF_PACKET_CONTRACT))
@@ -1058,10 +1073,10 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     fail('packet_record_invalid', request.routes.id, 'packetContract', 'The work answer era belongs only to an L3 node assignment');
   if (!worksPacketContract(contract) && Object.hasOwn(request, 'works'))
     fail('packet_task_set_invalid', request.routes.id, 'works', 'A D7 handoff is accepted only by the declared work-packet era');
-  const bindingsEra = worksBindingsEra(contract, saved);
+  const bindingsEra = worksBindingsEra(contract, saved), wakeEra = wakeTestsEra(contract, saved);
   const base: QuestionPacketRecord = { project: request.project, request, ...(protocol ? { answerProtocol: protocol } : {}),
     ...(contract ? { packetContract: contract } : {}), ...(briefVersion ? { briefContract: briefVersion } : {}),
-    ...(bindingsEra ? { worksBindings: true as const } : {}), state: 'empty', packet: null, fingerprint: null,
+    ...(bindingsEra ? { worksBindings: true as const } : {}), ...(wakeEra ? { wakeTests: true as const } : {}), state: 'empty', packet: null, fingerprint: null,
     native: [], plan: null, fullChars: null, refusal: null, journal: null };
   if (!batch) {
     if (request.previous.length) fail('packet_chain_invalid', request.routes.id, 'previous', 'An empty route has no preceding parts');
@@ -1117,7 +1132,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     const input = take(readOmInput(store, request.project, gaps.sources.input));
     const graph = take(readRecord<Graph>(store, gaps.sources.graph,
       { unit: 'E2', target: requestId, id: `graph:${request.project}`, kind: 'graph' }));
-    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), worksBindings: bindingsEra, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
+    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), worksBindings: bindingsEra, wakeTests: wakeEra, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
       gaps: batch.items.map(item => ({ question: item.gap, target: item.target, field: item.field, ref: item.record,
         evidence: json(gaps.records.find(row => same(reference(row), item.record))!.value.gap.evidence) })),
       contexts: unique([gaps.sources.input, gaps.sources.graph, ...input.value.input.sources.map(({ id, revision, hash }) => ({ id, revision, hash }))]),
@@ -1177,6 +1192,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
     const shows = bindingsEra && showsBindings(works);
     if (!shows) delete (base as { worksBindings?: true }).worksBindings;
     if (briefBasis) briefBasis.worksBindings = shows;
+    if (!wakeEra || !holdsProducerEnd(open)) delete (base as { wakeTests?: true }).wakeTests;
     if (!open.length) return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
     const allIds = open.map(item => item.id).sort(order);
     const whole = { ...context, assigned: allIds, connections: connectionContext(frame.frame.upper, open) };
@@ -1197,6 +1213,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
         return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
       const assignment = assignments[request.previous.length]!;
       const assigned = open.filter(item => assignment.obligations.includes(item.id));
+      if (wakeEra && holdsProducerEnd(assigned)) base.wakeTests = true; else delete (base as { wakeTests?: true }).wakeTests;
       // E2.2 (№1801, row 4): a part carries the causes of the questions it actually sends, never of the whole node.
       const sent = questions.filter(item => assignment.obligations.includes(item.target));
       packet = encode({ ...common, questions: sent,
@@ -1371,8 +1388,15 @@ export const WORKS_PART_PROPOSAL_SCHEMA = sealed({ ...PART_PROPOSAL_SCHEMA, prop
   ...PART_PROPOSAL_SCHEMA.properties, fills: { type: 'array', items: { ...fillShape,
     properties: { ...fillShape.properties, codeRef: graphV2Schema.properties.nodes.items.properties.code.items } } },
 } });
+// G5 (№3820, №3822): the body check admits the wake test a works answer of the wake-test era names (its packet form asks
+// for it, E2 checks it); the form an older packet carries keeps its own schema and never acquires the field.
+// It is built on first use: frame-proposals, which owns the rule, is part of this module's import cycle.
+const worksFill = WORKS_PART_PROPOSAL_SCHEMA.properties.fills.items;
+const worksBodySchema = () => ({ ...WORKS_PART_PROPOSAL_SCHEMA, properties: { ...WORKS_PART_PROPOSAL_SCHEMA.properties, fills: { type: 'array',
+  items: { ...worksFill, properties: { ...worksFill.properties, [WAKE_TEST.field]: { type: 'string', minLength: 1 } } } } } });
+let worksBody: ReturnType<Ajv['compile']> | undefined;
+const validateWorksPartBody = (value: unknown) => (worksBody ??= new Ajv({ strict: true, allowUnionTypes: true }).compile(worksBodySchema()))(value);
 const validatePartBody = new Ajv({ strict: true, allowUnionTypes: true }).compile(PART_PROPOSAL_SCHEMA);
-const validateWorksPartBody = new Ajv({ strict: true, allowUnionTypes: true }).compile(WORKS_PART_PROPOSAL_SCHEMA);
 function requirePart(store: Store, value: unknown): asserts value is PartResultRequest {
   if (!(store instanceof Store) || !object(value) || !text(value.project)
     || ![value.packet, value.call, value.response].every(isRef)
@@ -1383,9 +1407,10 @@ export function normalizePartAnswer(value: unknown, worksContract?: typeof WORKS
   return result(() => {
     if (worksContract !== undefined && worksContract !== WORKS_FRAME_CONTRACT)
       fail('part_answer_invalid', 'part-answer', 'worksContract', 'The work answer must name its known proposal contract');
-    const validate = worksContract === WORKS_FRAME_CONTRACT ? validateWorksPartBody : validatePartBody;
-    if (!validate(value))
-      fail('part_answer_invalid', 'part-answer', validate.errors?.[0]?.instancePath || 'proposal',
+    const valid = worksContract === WORKS_FRAME_CONTRACT ? validateWorksPartBody(value) : validatePartBody(value);
+    const errors = worksContract === WORKS_FRAME_CONTRACT ? worksBody?.errors : validatePartBody.errors;
+    if (!valid)
+      fail('part_answer_invalid', 'part-answer', errors?.[0]?.instancePath || 'proposal',
         'A typed part answer must satisfy the exact content schema without service fields');
     const body = copy(value) as unknown as PartProposalBody;
     // Only schema-declared sets are reordered. Arrays within schemas, commands and paths retain their meaning.
@@ -1475,6 +1500,15 @@ const compileAnswers = (family: ReturnType<typeof answerSchemaFamily>) => ({
   node: answerSchemasAjv.compile(family.node), fact: answerSchemasAjv.compile(family.fact),
   field: answerSchemasAjv.compile(family.field), works: answerSchemasAjv.compile(family.works),
 });
+/** G5: the protocol check of a works packet of the wake-test era admits the wake test its form asks for. */
+const wakeWorksValidators: Partial<Record<AnswerProtocol, ReturnType<Ajv['compile']>>> = {};
+function wakeWorksValidator(protocol: AnswerProtocol): ReturnType<Ajv['compile']> {
+  return wakeWorksValidators[protocol] ??= (() => {
+    const works = JSON.parse(canonical(answerSchemas[protocol].works as unknown as Json));
+    works.oneOf[0].properties.proposal = worksBodySchema();
+    return answerSchemasAjv.compile(works);
+  })();
+}
 const answerValidators = { 'omg-answer/v2': compileAnswers(answerSchemas['omg-answer/v2']),
   'omg-answer/v3': compileAnswers(answerSchemas['omg-answer/v3']) };
 const readPathValidator = answerSchemasAjv.compile(readPathShape);
@@ -1518,7 +1552,8 @@ function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): Packe
   }
   if (!object(parsed)) fail('part_answer_invalid', packet.id, 'raw', 'An answer must remain a typed object');
   if (value.answerProtocol) {
-    const validate = answerValidators[value.answerProtocol][packetWorkContract(value) ? 'works' : kind];
+    const validate = packetWorkContract(value) && value.wakeTests === true ? wakeWorksValidator(value.answerProtocol)
+      : answerValidators[value.answerProtocol][packetWorkContract(value) ? 'works' : kind];
     if (!validate(parsed)) fail('part_answer_invalid', packet.id, validate.errors?.[0]?.instancePath || 'reply',
       'The reply must use exactly one branch of the declared answer form without service fields');
     if (parsed.requestId !== payload.requestId)
@@ -1620,6 +1655,20 @@ function partProposal(store: Store, project: string, packet: Revision<QuestionPa
         { frame: frameSource.frame,
         proposals: [...frameSource.proposals, reference(preview)] })),
       () => fail('packet_chain_invalid', packet.id, 'proposal', 'The work-part content has a cyclic source derivation'));
+    // G5 (№3820, №3822, №3841): a producer end whose work has more than one test covering its connection names its wake
+    // test, checked when this work is accepted, whatever its neighbour sleeps; a named test is checked by the common E2
+    // rule above. With one covering test there is nothing to choose; the engine never takes the first of several.
+    if (value.wakeTests === true) {
+      const tests = new Map([...graph.tests, ...frame.proposals.flatMap(item => item.value.tests), ...contextual.tests].map(test => [test.id, test]));
+      for (const fill of body.fills) {
+        const obligation = frame.result.obligations.find(item => item.id === fill.obligation);
+        const node = scopedGraph.nodes.find(item => item.id === fill.node);
+        if (!obligation || obligation.kind !== 'connection-end' || obligation.role !== 'producer' || !obligation.connector || !node
+          || Object.hasOwn(fill, WAKE_TEST.field)) continue;
+        if ([...tests.values()].filter(test => test.node === node.id && node.tests.includes(test.id) && test.covers.includes(obligation.connector!)).length > 1)
+          fail('part_result_invalid', fill.obligation, WAKE_TEST.field, WAKE_TEST.rule);
+      }
+    }
     const assignment = (packet.value.packet as Record<string, Json>).works as unknown as WorksPacketContext;
     if (!Array.isArray(bindings) || new Set(bindings.map(binding => binding.id)).size !== bindings.length
       || bindings.length !== assignment.assigned.length || bindings.some(binding => !assignment.assigned.includes(binding.id)))

@@ -225,10 +225,21 @@ function modelSources(store: Store, project: string, results: readonly WorkPropo
   }
   if (new Set(outputs.map(output => canonical(reference(output.proposal)))).size !== outputs.length)
     fail('atomic_gate_bindings_unproven', project, 'results', 'A proposal occurs once in the accepted result set');
-  const first = works[0];
-  if (first && works.some(work => !same(work.producer, first.producer) || !same(work.ledger, first.ledger)))
-    fail('atomic_gate_bindings_unproven', project, 'works', 'All final proposals belong to one original handoff');
-  return { outputs, works, references: unique(outputs.flatMap(output => output.references)) };
+  // G5 (№3820, №3822): one original handoff is one exact D7 request. D7 derived from it by a rule of another era (OWN1.2)
+  // is the same handoff; each source keeps its own ledger, and its bindings are transferred from that ledger.
+  const originals = new Map<string, Sealed<OmObligations>>();
+  for (const work of works) {
+    const key = canonical(work.producer as unknown as Json);
+    if (originals.has(key)) continue;
+    const original = take(readOmObligations(store, { project, producer: work.producer }));
+    if (!same(reference(original.record), work.ledger))
+      fail('atomic_gate_bindings_unproven', work.ledger.id, 'ledger', 'The source ledger must belong to the checked answer');
+    originals.set(key, original);
+  }
+  const requests = new Set([...originals.values()].map(original => canonical(original.record.value.request as unknown as Json)));
+  if (requests.size > 1) fail('atomic_gate_bindings_unproven', project, 'works', 'All final proposals belong to one original handoff');
+  const originalOf = (work: WorksPartBindings): Sealed<OmObligations> => originals.get(canonical(work.producer as unknown as Json))!;
+  return { outputs, works, originalOf, references: unique(outputs.flatMap(output => output.references)) };
 }
 
 /** Assignment identity is checked by D7; this key preserves every responsibility and policy field. */
@@ -236,8 +247,9 @@ function assignmentKey(value: CarriedObligation): string {
   const { scope: _scope, original: _original, ...policy } = value;
   return canonical(policy);
 }
-function remapBindings(old: Sealed<OmObligations>, current: Sealed<OmObligations>, bindings: readonly TaskObligationBinding[]): TaskObligationBinding[] {
-  const former = new Map(taskObligations(old.handoff as OmObligationHandoff).map(item => [taskBindingId(item), item]));
+/** Each source's bindings are transferred from its own original ledger; one destination merges their consumers. */
+function remapBindings(sources: readonly { old: Sealed<OmObligations>; bindings: readonly TaskObligationBinding[] }[],
+  current: Sealed<OmObligations>): TaskObligationBinding[] {
   const destinations = new Map<string, CarriedObligation>();
   for (const item of taskObligations(current.handoff as OmObligationHandoff)) {
     const key = assignmentKey(item);
@@ -245,21 +257,24 @@ function remapBindings(old: Sealed<OmObligations>, current: Sealed<OmObligations
     destinations.set(key, item);
   }
   const mapped = new Map<string, TaskObligationBinding>();
-  for (const binding of bindings) {
-    const source = former.get(binding.id);
-    if (!source || !same(binding.scope, source.scope) || binding.obligation !== source.obligation)
-      fail('atomic_gate_bindings_unproven', binding.id, 'scope', 'Every binding must refer to its checked original handoff');
-    const next = destinations.get(assignmentKey(source));
-    if (!next) fail('atomic_gate_bindings_unproven', binding.id, 'assignment', 'The full unchanged assignment must survive the transfer');
-    const id = taskBindingId(next), previous = mapped.get(id);
-    const consumers = new Map((previous?.consumers ?? []).map(consumer => [consumer.node, consumer]));
-    for (const consumer of binding.consumers) {
-      const existing = consumers.get(consumer.node);
-      if (existing && !same(sorted(existing.tests), sorted(consumer.tests)))
-        fail('atomic_gate_bindings_unproven', id, 'tests', 'Overlapping answers disagree about the tests of one concrete consumer');
-      consumers.set(consumer.node, copy(consumer));
+  for (const { old, bindings } of sources) {
+    const former = new Map(taskObligations(old.handoff as OmObligationHandoff).map(item => [taskBindingId(item), item]));
+    for (const binding of bindings) {
+      const source = former.get(binding.id);
+      if (!source || !same(binding.scope, source.scope) || binding.obligation !== source.obligation)
+        fail('atomic_gate_bindings_unproven', binding.id, 'scope', 'Every binding must refer to its checked original handoff');
+      const next = destinations.get(assignmentKey(source));
+      if (!next) fail('atomic_gate_bindings_unproven', binding.id, 'assignment', 'The full unchanged assignment must survive the transfer');
+      const id = taskBindingId(next), previous = mapped.get(id);
+      const consumers = new Map((previous?.consumers ?? []).map(consumer => [consumer.node, consumer]));
+      for (const consumer of binding.consumers) {
+        const existing = consumers.get(consumer.node);
+        if (existing && !same(sorted(existing.tests), sorted(consumer.tests)))
+          fail('atomic_gate_bindings_unproven', id, 'tests', 'Overlapping answers disagree about the tests of one concrete consumer');
+        consumers.set(consumer.node, copy(consumer));
+      }
+      mapped.set(id, { id, scope: next.scope, obligation: next.obligation, consumers: sorted([...consumers.values()]) });
     }
-    mapped.set(id, { id, scope: next.scope, obligation: next.obligation, consumers: sorted([...consumers.values()]) });
   }
   return sorted([...mapped.values()]);
 }
@@ -274,14 +289,12 @@ function proveBindingTransfer(store: Store, request: AtomicGateRequest, candidat
       fail('atomic_gate_bindings_unproven', candidate.works!.ledger.id, 'results', 'A nonempty handoff needs the checked model results carrying its bindings');
     return current.inputs as Ref[];
   }
-  const original = take(readOmObligations(store, { project: request.project, producer: sources.works[0]!.producer }));
-  if (!same(reference(original.record), sources.works[0]!.ledger))
-    fail('atomic_gate_bindings_unproven', original.record.id, 'ledger', 'The answers must name the exact original ledger');
+  const original = sources.originalOf(sources.works[0]!);
   const initial = original.record.value.request.gaps.sources.works;
   if ('state' in initial || !same(initial.frame, candidate.request.frame)
     || !same(unique([...initial.proposals, ...sources.outputs.map(output => reference(output.proposal))]), unique(candidate.proposals)))
     fail('atomic_gate_bindings_unproven', request.candidate.id, 'proposals', 'The candidate must contain the initial proposals and exactly the checked final answers');
-  const expected = remapBindings(original, current, sources.works.flatMap(work => work.bindings));
+  const expected = remapBindings(sources.works.map(work => ({ old: sources.originalOf(work), bindings: work.bindings })), current);
   if (!same(sorted(expected), sorted(candidate.works!.bindings)))
     fail('atomic_gate_bindings_unproven', request.candidate.id, 'bindings', 'Final bindings must be the complete, lossless transfer of the checked answers');
   for (const basis of current.record.value.request.assignments) {
@@ -291,7 +304,7 @@ function proveBindingTransfer(store: Store, request: AtomicGateRequest, candidat
       || !same(transfer.record.value.from.ledger, reference(original.record)))
       fail('atomic_gate_bindings_unproven', basis.record.id, 'from', 'The retained authority must come from this exact answer assignment');
   }
-  return unique([...sources.references, ...original.inputs, ...current.inputs]);
+  return unique([...sources.references, ...sources.works.flatMap(work => sources.originalOf(work).inputs), ...current.inputs]);
 }
 
 /** New G5 rules are layered on native graph checks; C4 remains the authority for assembly and binding. */
@@ -514,9 +527,7 @@ export function readWorksAcceptance(store: Store, request: { project: string; re
  * the next D2 snapshot, the D7 transfer, C4 and F3. G5 acceptance and the machine list of its external Sources share it.
  */
 function worksCandidate(store: Store, project: string, results: readonly WorkProposalSource[], target: string) {
-  const checked = modelSources(store, project, results), first = checked.works[0]!;
-  const old = take(readOmObligations(store, { project, producer: first.producer }));
-  if (!same(reference(old.record), first.ledger)) fail('atomic_gate_bindings_unproven', first.ledger.id, 'ledger', 'The source ledger must belong to the checked answer');
+  const checked = modelSources(store, project, results), old = checked.originalOf(checked.works[0]!);
   const oldRequest = old.record.value.request, initial = oldRequest.gaps.sources.works;
   if ('state' in initial) fail('atomic_gate_basis_unproven', target, 'works', 'The original assignment requires an accepted operation frame');
   const works: ProposalRequest = { frame: copy(initial.frame) as ProposalRequest['frame'],
@@ -548,7 +559,7 @@ function worksCandidate(store: Store, project: string, results: readonly WorkPro
     tx.add(transfer); assignments.push({ record: reference(transfer.record) });
   }
   const handoff = take(prepareOmObligations(tx.view, { project, ...context, assignments })); tx.add(handoff);
-  const bindings = remapBindings(old, handoff, checked.works.flatMap(work => work.bindings));
+  const bindings = remapBindings(checked.works.map(work => ({ old: checked.originalOf(work), bindings: work.bindings })), handoff);
   const candidateRequest: CandidateRequest = { ...works, works: { contract: WORKS_FRAME_CONTRACT,
     producer: reference(handoff.producer), ledger: reference(handoff.record), bindings } };
   const candidate = take(prepareWorksFrame(tx.view, candidateRequest));

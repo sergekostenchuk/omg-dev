@@ -12,7 +12,7 @@ import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { WORKS_FRAME_CONTRACT, representativeJoinId, workAnchorId, workFillCode, fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameFill, type FrameRead, type PreparedFrame } from './frame-obligations.js';
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals,
-  type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
+  WAKE_TEST, type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
 import { readOmObligations, prepareOmObligations, type ObligationRequest, type OmObligationHandoff } from './obligations.js';
 import { withHistoricalReads } from './input.js';
 import { readRecord, writeGuarded } from './refs.js';
@@ -319,7 +319,7 @@ function workCodeFills(frame: FrameRead, result: ProposalResult, graph: Graph): 
     return { ...fill, codeRef: copy(codeRef) };
   })) };
 }
-function workDeliveries(graph: Graph, connector: Graph['connectors'][number], binding: Binding, flow: string): Binding[] {
+function workDeliveries(graph: Graph, connector: Graph['connectors'][number], binding: Binding, flow: string, choice: string | null = null): Binding[] {
   const activeProducer = graph.horizon.includes(binding.producer.node);
   const awake = binding.consumers.filter(endpoint => !activeProducer || graph.horizon.includes(endpoint.node));
   const sleeping = binding.consumers.filter(endpoint => activeProducer && !graph.horizon.includes(endpoint.node));
@@ -329,9 +329,11 @@ function workDeliveries(graph: Graph, connector: Graph['connectors'][number], bi
     if (!producer || producer.kind !== 'work' || producer.outcome !== connector.artifact)
       reject('sleeping_anchor_underivable', connector.id, binding.producer.node, 'The sleeping flow needs its producer work to produce this exact artifact');
     const tests = graph.tests.filter(test => test.node === producer.id && producer.tests.includes(test.id) && test.covers.includes(connector.id));
-    if (tests.length !== 1) reject('sleeping_wake_test_missing', connector.id, producer.id,
-      'Exactly one producer-owned covering test must determine the sleeping flow; no first-match selection');
-    const test = tests[0]!;
+    // G5 (№3820, №3822): the producer's work names its wake test; an end answered before that choice keeps the rule of
+    // its era — exactly one covering test. The first of several is never taken.
+    const test = choice === null ? (tests.length === 1 ? tests[0] : undefined) : tests.find(item => item.id === choice);
+    if (!test) reject('sleeping_wake_test_missing', connector.id, producer.id, choice === null
+      ? 'Exactly one producer-owned covering test must determine the sleeping flow; no first-match selection' : WAKE_TEST.rule);
     const id = workAnchorId(connector.id, flow, binding.producer);
     const anchor = { id, owner: producer.id, outcome: connector.artifact, test: test.id };
     const existing = graph.anchors.find(item => item.id === id);
@@ -521,7 +523,13 @@ function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandida
     });
     if (new Set(lower.map(flowKey)).size !== lower.length)
       reject('slot_fill_conflict', connector.id, 'flow', 'Distinct upper flows cannot share one lower producer/port/anchor flow');
-    const deliveries = level === 3 ? lower.flatMap((binding, index) => workDeliveries(graph, connector, binding, flowKey(upper[index]!))) : lower;
+    // G5: the wake test the lower producer's own fill names for this flow, if its work was answered with that choice.
+    const choices = upper.map(binding => result.fills.find(fill => {
+      const obligation = obligations.get(fill.obligation)!;
+      return obligation.connector === connector.id && obligation.flow === flowKey(binding) && obligation.role === 'producer'
+        && obligation.upper.node === binding.producer.node && obligation.upper.port === binding.producer.port;
+    })?.wakeTest ?? null);
+    const deliveries = level === 3 ? lower.flatMap((binding, index) => workDeliveries(graph, connector, binding, flowKey(upper[index]!), choices[index] ?? null)) : lower;
     const previous = connector.bindings.filter(binding => binding.level === level);
     if (!same(bindingSet(previous), bindingSet(deliveries)))
       connector.bindings = [...connector.bindings.filter(binding => binding.level !== level), ...deliveries];

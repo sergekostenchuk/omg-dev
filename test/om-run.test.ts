@@ -3531,7 +3531,20 @@ test("LP5 (№3278 §4, rows 13, 21) era: febbee2c, run from Git in its own proc
   const f = worksFixture(t);
   const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
   ok(startRun(f.store, { project }));
-  await lp5Pass(f, (_state, performed) => performed === "cycle" ? "stop" : undefined);
+  // G5 (№3820): the open works attempt is the base's own — its packet issued and its paid root cycled by febbee2c — since
+  // the base reads no works packet of a later era (the wake-test form); today's code then reads them all as they are.
+  const issued = atCommit(f, LP5_BASE_COMMIT, "lp5-base-issue", `const { advanceRun } = await import(src('om/run.js'));
+for (let index = 0; index < 40; index++) {
+  const state = take(await advanceRun(store, args.request)).record.value.state;
+  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
+  if (state.phase === 'waiting') { out(null); break; }
+}`, { request: f.request }) as Ref | null;
+  assert.ok(issued, "The base issues the works packet of the open attempt");
+  writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps: [{ research: mp2WorkAnswer(f, issued).research, usage }] }));
+  const cycled = atCommit(f, LP5_BASE_COMMIT, "lp5-base-cycle", `const { advanceRun } = await import(src('om/run.js'));
+out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request });
+  assert.equal(cycled, "cycle", "The base pays the root's answer");
+  f.restart();
   lp5ReplaceB1(f);
   const stood = atCommit(f, LP5_BASE_COMMIT, "lp5-base", `const { advanceRun } = await import(src('om/run.js'));
 const trail = [];

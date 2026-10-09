@@ -280,6 +280,43 @@ test('F2 requires explicit D7 era, ledger, exact proposal context and bindings e
   }
 });
 
+// G5 (№3820, №3822, №3841): the sleeping flow takes the wake test the producer work named for its end among several
+// covering tests; without a choice it keeps the rule of its era — exactly one covering test — and never takes the first
+// of several; a named test that does not cover the flow, or another work's, is refused by the common E2 rule.
+test('G5 a sleeping flow takes the named wake test of its producer end among three covering tests; no choice among several keeps sleeping_wake_test_missing; a test not covering the flow or of another work is refused', t => {
+  const f = firstWorks(t);
+  const source = ok(prepareFrameProposals(f.store, { frame: f.request.frame, proposals: f.request.proposals }));
+  const producer = f.proposal.nodes.find(node => node.id === 'garden-produce-work')!;
+  const covering = f.proposal.tests.filter(test => test.node === producer.id && producer.tests.includes(test.id) && test.covers.includes('garden-flow'));
+  assert.equal(covering.length, 1, 'The fixture work has one covering test: its sleeping flow needs no choice (F2 above)');
+  const ends = source.result.obligations.filter(item => item.connector === 'garden-flow' && item.role === 'producer').map(item => item.id);
+  const several = clone(f.proposal), work = several.nodes.find(node => node.id === producer.id)!;
+  for (const suffix of ['second', 'third']) {
+    several.tests.push({ ...clone(covering[0]!), id: `${covering[0]!.id}-${suffix}` }); work.tests.push(`${covering[0]!.id}-${suffix}`);
+  }
+  const assemble = (proposal: LayerProposal) => assembleCandidate(clone(source.frame) as unknown as FrameRead,
+    [{ reference: { ...f.proposalRef, hash: hashJson(proposal) }, value: proposal }], f.request.works);
+  denied(assemble(several), 'sleeping_wake_test_missing');
+  const choose = (test: string) => {
+    const proposal = clone(several);
+    for (const fill of proposal.fills) if (ends.includes(fill.obligation) && fill.node === producer.id) fill.wakeTest = test;
+    return proposal;
+  };
+  const chosen = ok(assemble(choose(`${covering[0]!.id}-third`)));
+  assert.equal(chosen.state, 'candidate'); if (chosen.state !== 'candidate') return;
+  const graph = chosen.candidate.graph as Graph;
+  const sleeping = graph.connectors.find(item => item.id === 'garden-flow')!.bindings.filter(binding => binding.level === 3 && binding.anchor !== null);
+  assert.equal(sleeping.length, 1);
+  assert.equal(graph.anchors.find(item => item.id === sleeping[0]!.anchor)!.test, `${covering[0]!.id}-third`, 'The named test wakes the sleeping consumers');
+  assert.deepEqual(validateGraph(graph).findings, []);
+  const narrow = choose('g5-narrow');
+  narrow.tests.push({ ...clone(covering[0]!), id: 'g5-narrow', covers: [] }); narrow.nodes.find(node => node.id === producer.id)!.tests.push('g5-narrow');
+  denied(assemble(narrow), 'slot_fill_foreign');
+  const foreign = f.proposal.tests.find(test => test.node !== producer.id && test.covers.includes('garden-flow'))
+    ?? f.proposal.tests.find(test => test.node !== producer.id)!;
+  denied(assemble(choose(foreign.id)), 'slot_fill_foreign');
+});
+
 test('F2 preserves an accepted operation wake test while deriving a separate work-owned sleeping anchor', t => {
   const f = firstWorks(t, false, true), upper = projectGraph(f.read.upper, 2);
   const upperConnector = upper.connectors.find(item => item.id === 'garden-flow')!;

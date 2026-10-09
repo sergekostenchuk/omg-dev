@@ -3200,6 +3200,131 @@ test('OBL1 a works packet gives the exact binding id, obligation and D7 scope Re
   assert.deepEqual(snapshot(f.store), before);
 });
 
+/**
+ * Runs a producer script with every engine module loaded from one exact commit, in its own process (as in
+ * om-answers-gate): the loader serves engine modules from Git and refuses any outside that checkout.
+ */
+function atCommit(f: { root: string; path: string }, commit: string, name: string, body: string, input: unknown): unknown {
+  const repository = fileURLToPath(new URL('../../', import.meta.url));
+  const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
+  const argsFile = join(f.root, `${name}-input.json`), served = join(f.root, `${name}-served.log`);
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(served, '');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative],
+      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database, input] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const { reference } = await import(src('pipeline/contracts.js'));
+const args = JSON.parse(readFileSync(input, 'utf8')), store = new Store(database);
+const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
+const out = value => process.stdout.write(JSON.stringify(value));
+try {
+${body}
+} finally { store.close(); }`);
+  writeFileSync(argsFile, JSON.stringify(input));
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output: unknown = JSON.parse(execFileSync(process.execPath,
+    ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.path, argsFile],
+    { cwd: repository, encoding: 'utf8', timeout: 180_000, maxBuffer: 10_000_000 }));
+  const loaded = readFileSync(served, 'utf8').split('\n').filter(Boolean);
+  assert.ok(loaded.includes('src/storage/store.ts') && loaded.includes('src/pipeline/contracts.ts'),
+    `The producer ran on the modules of ${commit}: ${loaded.join(', ')}`);
+  return output;
+}
+// G5 era: a works packet the base (f69d4b39, before G5) issued keeps its bytes and its form — no wake-test era, so its
+// answer names no wake test and none is required of it, however many tests cover the connection.
+const G5_BASE = 'f69d4b39e226cdc8527c923a6cc940fb9f2a3654';
+test('G5 a works packet issued before the wake-test era is admitted with its own bytes; its answer names no wake test even with three covering tests, and naming one is refused by its own form', async t => {
+  const f = await worksPacketFixture(t), request = f.request();
+  const saved = atCommit({ root: f.root, path: f.database }, G5_BASE, 'g5-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
+  assert.equal(Object.hasOwn(saved.value, 'wakeTests'), false, 'The base issues no wake-test era');
+  const again = ok(prepareQuestionPacket(f.store, request));
+  assert.deepEqual(again.writes, []); assert.deepEqual(reference(again.record), reference(saved), 'Admitted with its own bytes');
+  const payload = saved.value.packet as Record<string, any>;
+  const example = structuredClone(payload.brief.examples.find((row: { action: string }) => row.action === 'answer'));
+  assert.ok(!example.proposal.fills.some((fill: Record<string, unknown>) => Object.hasOwn(fill, 'wakeTest')));
+  const proof = example.proposal.tests[0];
+  for (const suffix of ['second', 'third']) {
+    example.proposal.tests.push({ ...structuredClone(proof), id: `${proof.id}-${suffix}` }); example.proposal.nodes[0].tests.push(`${proof.id}-${suffix}`);
+  }
+  const check = (answer: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(saved), raw: canonical(answer) });
+  assert.ok(check(example).ok, 'No choice is asked of the earlier era');
+  const named = structuredClone(example), producer = named.proposal.fills.findIndex((fill: Record<string, unknown>) => Object.hasOwn(fill, 'port'));
+  named.proposal.fills[producer].wakeTest = proof.id;
+  assert.equal(check(named).ok, false, 'The earlier form has no wake test');
+});
+
+// G5 (№3820, №3822, №3841): a producer end whose work has several tests covering its connection names the wake test when
+// its own work is accepted (E3), whatever its neighbour sleeps; a named test must be this work's and cover the connection;
+// with one covering test there is nothing to choose; the engine never takes the first of several.
+test('G5 a works packet of the wake-test era: several covering tests and an explicit wake choice pass; no choice, a test not covering the connection, another work\'s test or a choice on a consumer end are refused at E3; one covering test needs no choice', async t => {
+  const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record;
+  assert.equal(packet.value.wakeTests, true, 'A works packet with a producer end is of the wake-test era');
+  const payload = packet.value.packet as Record<string, any>;
+  const example = structuredClone(payload.brief.examples.find((row: { action: string }) => row.action === 'answer'));
+  const node = example.proposal.nodes[0], proof = example.proposal.tests[0];
+  const producer = example.proposal.fills.findIndex((fill: Record<string, unknown>) => Object.hasOwn(fill, 'wakeTest'));
+  assert.ok(producer >= 0, 'The example names the wake test of its producer end');
+  assert.equal(example.proposal.fills[producer].wakeTest, proof.id);
+  const check = (answer: unknown) => checkAnswerForm(f.store, { project: f.project, packet: reference(packet), raw: canonical(answer) });
+  const before = snapshot(f.store);
+  assert.ok(check(example).ok, 'One covering test, named');
+  const unnamed = structuredClone(example); delete unnamed.proposal.fills[producer].wakeTest;
+  assert.ok(check(unnamed).ok, 'One covering test: nothing to choose');
+  // Three tests of the same work cover the connection: the choice is the model's.
+  const several = structuredClone(example);
+  for (const suffix of ['second', 'third']) {
+    several.proposal.tests.push({ ...structuredClone(proof), id: `${proof.id}-${suffix}` });
+    several.proposal.nodes[0].tests.push(`${proof.id}-${suffix}`);
+  }
+  several.proposal.fills[producer].wakeTest = `${proof.id}-third`;
+  assert.ok(check(several).ok, 'Three covering tests and an explicit choice');
+  const silent = structuredClone(several); delete silent.proposal.fills[producer].wakeTest;
+  const none = rejected(check(silent), 'part_result_invalid');
+  assert.equal(none.at.field, 'wakeTest', 'Several covering tests and no choice: refused, never the first of them');
+  const narrow = structuredClone(several);
+  narrow.proposal.tests.push({ ...structuredClone(proof), id: `${proof.id}-narrow`, covers: [] });
+  narrow.proposal.nodes[0].tests.push(`${proof.id}-narrow`); narrow.proposal.fills[producer].wakeTest = `${proof.id}-narrow`;
+  assert.equal(check(narrow).ok, false, 'A test of this work that does not cover the connection is refused');
+  const foreign = structuredClone(several);
+  const other = f.desired.tests.find(test => test.node !== node.id)!;
+  foreign.proposal.fills[producer].wakeTest = other.id;
+  assert.equal(check(foreign).ok, false, "Another work's test is refused");
+  const consumer = example.proposal.fills.findIndex((fill: Record<string, unknown>, index: number) => index !== producer && Object.hasOwn(fill, 'port'));
+  if (consumer >= 0) {
+    const misplaced = structuredClone(several); misplaced.proposal.fills[consumer].wakeTest = proof.id;
+    rejected(check(misplaced), 'part_answer_invalid');
+  }
+  assert.deepEqual(snapshot(f.store), before, 'E3 writes nothing');
+});
+
 test('MP1 №3052 real-work joins require designed condition and explicit required/optional; native assembly still owns actual inputs', async t => {
   const f = await worksPacketFixture(t), packet = ok(writeQuestionPacket(f.store, f.request())).record;
   const payload = packet.value.packet as Record<string, any>;
