@@ -1395,3 +1395,84 @@ export async function load(url, context, next) {
     assert.deepEqual(delivered(writeCandidate(plain, request)), { state: 'candidate', record: old });
   } finally { plain.close(); }
 });
+
+// G6.1 (№3857 п.4, №3891): the write order of a shared file at the assembly of a works candidate, on small graphs. This file
+// is also a fixture of an earlier base (FJ1), so the new export is imported inside the tests, never at its top.
+import type { Graph as OrderGraph } from "../src/graph/model.js";
+const orderModule = async () => (await import("../src/om/frame-candidate.js")) as unknown as { WRITE_ORDER_REFUSAL_CODES: readonly string[]; deriveWriteOrder: (graph: OrderGraph, proposals: readonly { id: string; revision: number; hash: string }[], orders: readonly { path: string; order: string[]; choice: { id: string; revision: number; hash: string } }[]) => void };
+function orderGraph(writes: Record<string, string[]>, links: [string, string][] = [], transfers: [string, string, string][] = []): OrderGraph {
+  const works = Object.keys(writes);
+  return { version: 2, id: "order", title: "order", horizon: [...works], contracts: [], artifacts: [], anchors: [], joins: [], tests: [],
+    nodes: works.map(id => ({ id, kind: "work", parent: null, title: id, outcome: `${id}-out`, boundary: {}, ports: [],
+      code: writes[id]!.map(path => ({ path, access: "write", status: "planned" })), tests: [] })),
+    connectors: links.map(([from, to], index) => ({ id: `c${index}`, artifact: `a${index}`, returnsTo: from, wakeTest: null,
+      bindings: [{ level: 3, producer: { node: from, port: "out" }, consumers: [{ node: to, port: "in" }], anchor: null }] })),
+    edges: [], journeys: [], packets: [], requirements: [], actors: [],
+    transfers: transfers.map(([path, from, to], index) => ({ id: `t${index}`, path, from, to, condition: "producer_committed" })) } as unknown as OrderGraph;
+}
+const sources = [{ id: "om-proposal:garden:a", revision: 1, hash: "a".repeat(64) }];
+const orderRefusal = (action: () => void): { code: string; findings?: { code: string; message: string }[] } => {
+  try { action(); } catch (error) { return (error as { refusal: { code: string; findings?: { code: string; message: string }[] } }).refusal; }
+  return assert.fail("Expected a refusal");
+};
+const pairs = (graph: OrderGraph, path: string) => (graph.transfers ?? []).filter(row => row.path === path).map(row => [row.from, row.to]);
+test("G6.1 one lawful write order is completed by code, given transfers stay, and a transfer of one file orders another", async () => {
+  const { deriveWriteOrder } = await orderModule();
+  const unique = orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [["a", "b"], ["b", "c"]]);
+  deriveWriteOrder(unique, sources, []);
+  assert.deepEqual(pairs(unique, "f"), [["a", "b"], ["b", "c"]]);
+  const given = orderGraph({ a: ["f"], b: ["f"] }, [["a", "b"]], [["f", "a", "b"]]);
+  deriveWriteOrder(given, sources, []);
+  assert.deepEqual(pairs(given, "f"), [["a", "b"]], "The model's transfer stays, nothing is duplicated");
+  // a and b are ordered by nothing but the transfer the model gave for g; that orders f too.
+  const fixpoint = orderGraph({ a: ["f", "g"], b: ["f", "g"] }, [], [["g", "a", "b"]]);
+  deriveWriteOrder(fixpoint, sources, []);
+  assert.deepEqual(pairs(fixpoint, "f"), [["a", "b"]]);
+});
+test("G6.1 several lawful orders ask the choice with every option; a saved choice decides; a choice against the dependencies and a cycle are refused", async () => {
+  const { deriveWriteOrder } = await orderModule();
+  const open = orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [["a", "c"], ["b", "c"]]);
+  const missing = orderRefusal(() => deriveWriteOrder(open, sources, []));
+  assert.equal(missing.code, "write_order_choice_missing");
+  assert.deepEqual(missing.findings!.filter(row => row.code === "write_order_option").map(row => JSON.parse(row.message)), [["a", "b", "c"], ["b", "a", "c"]]);
+  assert.equal(missing.findings!.find(row => row.code === "write_order_sources")!.message, canonical(sources));
+  const chosen = orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [["a", "c"], ["b", "c"]]);
+  deriveWriteOrder(chosen, sources, [{ path: "f", order: ["b", "a", "c"], choice: sources[0]! }]);
+  assert.deepEqual(pairs(chosen, "f"), [["b", "a"], ["a", "c"]]);
+  for (const order of [["a", "c", "b"], ["a", "b"], ["a", "b", "z"]])
+    assert.equal(orderRefusal(() => deriveWriteOrder(orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [["a", "c"], ["b", "c"]]), sources,
+      [{ path: "f", order, choice: sources[0]! }])).code, "write_order_choice_invalid", JSON.stringify(order));
+  assert.equal(orderRefusal(() => deriveWriteOrder(orderGraph({ a: ["f"], b: ["f"] }, [["a", "b"], ["b", "a"]]), sources, [])).code, "ownership_order_cycle");
+  const none = orderGraph({ a: ["f"], b: ["g"] });
+  deriveWriteOrder(none, sources, []);
+  assert.deepEqual(none.transfers, [], "A file one work writes asks nothing");
+  // The write-order refusals are answered by their own choice, never by a works answer: the catalogue a works packet
+  // shows keeps its bytes in every era.
+  const { WRITE_ORDER_REFUSAL_CODES } = await orderModule();
+  assert.ok(Object.isFrozen(WRITE_ORDER_REFUSAL_CODES));
+  assert.deepEqual(WRITE_ORDER_REFUSAL_CODES.filter(code => (CANDIDATE_REFUSAL_CODES as readonly string[]).includes(code)), []);
+  assert.deepEqual([...WRITE_ORDER_REFUSAL_CODES].sort(), ["ownership_order_cycle", "write_order_choice_invalid", "write_order_choice_missing"]);
+});
+// Return №3913: a transfer the model gave for a file is a link — its writers stand next to each other in the one chain.
+test("G6.1 return №3913 a given transfer is a link of the chain: no option breaks it, a choice that does is refused, one lawful place is completed by code", async () => {
+  const { deriveWriteOrder } = await orderModule();
+  const three = () => orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [], [["f", "a", "b"]]);
+  const missing = orderRefusal(() => deriveWriteOrder(three(), sources, []));
+  assert.equal(missing.code, "write_order_choice_missing");
+  assert.deepEqual(missing.findings!.filter(row => row.code === "write_order_option").map(row => JSON.parse(row.message)), [["a", "b", "c"], ["c", "a", "b"]]);
+  assert.equal(orderRefusal(() => deriveWriteOrder(three(), sources, [{ path: "f", order: ["a", "c", "b"], choice: sources[0]! }])).code, "write_order_choice_invalid");
+  const chosen = three();
+  deriveWriteOrder(chosen, sources, [{ path: "f", order: ["c", "a", "b"], choice: sources[0]! }]);
+  assert.deepEqual(pairs(chosen, "f"), [["a", "b"], ["c", "a"]]);
+  // b before c by a dependency: the link a→b, then c — the one lawful chain, no choice.
+  const unique = orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [["b", "c"]], [["f", "a", "b"]]);
+  deriveWriteOrder(unique, sources, []);
+  assert.deepEqual(pairs(unique, "f"), [["a", "b"], ["b", "c"]]);
+  // The dependencies put c between a and b, the given link holds them together: a cycle, refused with no call.
+  assert.equal(orderRefusal(() => deriveWriteOrder(orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [["a", "c"], ["c", "b"]], [["f", "a", "b"]]), sources, [])).code,
+    "ownership_order_cycle");
+  // Given transfers that cannot be links of one chain are the model's own: nothing is added or asked, the native validator refuses them.
+  const forked = orderGraph({ a: ["f"], b: ["f"], c: ["f"] }, [], [["f", "a", "b"], ["f", "a", "c"]]);
+  deriveWriteOrder(forked, sources, []);
+  assert.deepEqual(pairs(forked, "f"), [["a", "b"], ["a", "c"]]);
+});

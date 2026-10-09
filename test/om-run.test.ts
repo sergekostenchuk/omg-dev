@@ -3227,6 +3227,152 @@ test("G6.2 the example answer of every new works packet passes the packet's own 
   assert.ok([...checked.values()].includes(true), `The producing packet's example holds a work per artifact: ${JSON.stringify([...checked])}`);
 });
 
+// G6.1 (№3857 п.4, №3891): the write ownership of shared files is completed at the assembly of the group's candidate. The
+// producing root answers with its example (a work per artifact); its two works, ordered by no dependency, share one file,
+// and its first work shares another with the consuming work it feeds. The second file's one lawful order is completed by
+// code; the first asks one narrow choice of the model, paid by the accepting attempt; the group is then accepted.
+test("G6.1 a shared file with one lawful write order gets its producer_committed transfer from the code; one with several asks one narrow choice, then the group is accepted", async t => {
+  for (const variant of ["chosen", "refused, then chosen"] as const) await t.test(variant, async t => {
+    const f = worksFixture(t, false, false, twoArtifacts), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+    const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
+    ok(startRun(f.store, { project }));
+    const answered = new Set<string>();
+    let orders = 0, reentered = 0, works: string[] = [];
+    for (let index = 0; index < 300 && !worksAcceptance(f.store).frame; index++) {
+      const advanced = ok(await advanceRun(f.store, f.request));
+      const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string; message: string }; step?: { action: string; request: { packet?: Ref; wake?: { task?: string; path?: string }; ordinal?: number } } };
+      trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+      // A restart and a re-entry of the settled write-order step return its own saved result and send nothing again.
+      if (advanced.performed?.action === "wake") {
+        const done = advanced.performed.request as unknown as { wake: Parameters<typeof runWakeChoice>[1]; ordinal: number }, sent = f.sent().length;
+        f.restart();
+        const again = ok(await runWakeChoice(f.store, done.wake, done.ordinal));
+        assert.deepEqual([again.id, f.sent().length], [advanced.products[0]?.id, sent], "Re-entry and restart pay nothing again");
+        reentered++;
+      }
+      if (state.phase === "waiting" || state.phase === "unable") break;
+      if (state.phase !== "step") continue;
+      const current = state.step!;
+      if (current.action === "wake" && current.request.wake?.task === "write-order" && current.request.ordinal === orders + 1) {
+        const lawful = [[works[0]!, works[1]!], [works[1]!, works[0]!]];
+        push({ writeOrder: variant === "refused, then chosen" && orders === 0 ? ["not-a-writer", works[0]!] : lawful[1] });
+        orders++;
+        continue;
+      }
+      if (current.action !== "cycle" || !current.request.packet || answered.has(current.request.packet.id)) continue;
+      const saved = current.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+      answered.add(saved.id);
+      const answer = mp2WorkAnswer(f, saved), node = answer.research.proposal.nodes[0]!.parent!;
+      if (node === "garden-produce-operation") {
+        const example = structuredClone((packet.value.packet as unknown as { brief: { examples: { action: string; proposal: { nodes: Node[]; fills: { node: string; codeRef?: { path: string } }[]; tests: { node: string; contract: { entrypoint: { path: string } } }[] } }[] } }).brief.examples.find(row => row.action === "answer")!.proposal);
+        works = example.nodes.map(item => item.id);
+        assert.equal(works.length, 2, "The example gives a work per artifact");
+        const shared = example.nodes[0]!.code[0]!.path;
+        example.nodes[1]!.code = example.nodes[1]!.code.map(ref => ({ ...ref, path: shared }));
+        for (const fill of example.fills) if (fill.node === works[1] && fill.codeRef) fill.codeRef.path = shared;
+        for (const test of example.tests) if (test.node === works[1]) test.contract.entrypoint.path = shared;
+        example.nodes[0]!.code.push({ path: "src/garden-shared.ts", access: "write", status: "planned" });
+        push({ ...answer.research, proposal: example });
+      } else {
+        if (node === "garden-consume-operation") answer.research.proposal.nodes[0]!.code.push({ path: "src/garden-shared.ts", access: "write", status: "planned" });
+        push(answer.research);
+      }
+    }
+    const text = trail.join(",");
+    assert.deepEqual([worksAcceptance(f.store).passed, worksAcceptance(f.store).frame], [true, true], `The group is accepted: ${text.slice(-700)}`);
+    const graph = f.store.get<Graph>(`graph:${project}`)!.value;
+    const transfers = (graph.transfers ?? []).map(row => [row.path, row.from, row.to]);
+    assert.ok(transfers.some(([path, from, to]) => path === "src/garden-shared.ts" && from === works[0] && to?.startsWith("garden-consume")),
+      `The one lawful order is completed by code: ${JSON.stringify(transfers)}`);
+    assert.ok(transfers.some(([path, from, to]) => path !== "src/garden-shared.ts" && from === works[1] && to === works[0]),
+      `The chosen order of the ambiguous file: ${JSON.stringify(transfers)}`);
+    const choices = f.store.list<{ task?: string; verdict: string }>(WAKE_CHOICE_KIND).filter(row => row.value.task === "write-order").map(row => row.value.verdict);
+    assert.deepEqual(choices.sort(), variant === "chosen" ? ["chosen"] : ["chosen", "refused"], text);
+    assert.deepEqual([reentered, f.store.list(WAKE_INTENT_KIND).length], [choices.length, choices.length], "One intent per call; every step re-entered without a call");
+  });
+});
+
+// G6.1 return №3913 (Codex's probe): three works of the producing operation, one per artifact, all write one file, and the
+// model gave the transfer of the first two. That transfer is a link of the one chain: no option it is offered breaks it,
+// an answer that does is refused, and the next intent's lawful choice keeps the link and the group is accepted.
+function threeArtifacts(graph: Graph) {
+  twoArtifacts(graph);
+  graph.artifacts.push({ ...structuredClone(graph.artifacts.find(row => row.id === "garden-alt")!), id: "garden-third" });
+  const third = structuredClone(graph.connectors.find(row => row.id === "garden-alt-flow")!);
+  third.id = "garden-third-flow"; third.artifact = "garden-third";
+  for (const binding of third.bindings) {
+    const producer = graph.nodes.find(node => node.id === binding.producer.node)!;
+    producer.ports.push({ ...structuredClone(producer.ports.find(port => port.id === binding.producer.port)!), id: "out-third" });
+    binding.producer.port = "out-third";
+    for (const consumer of binding.consumers) {
+      const node = graph.nodes.find(item => item.id === consumer.node)!;
+      node.ports.push({ ...structuredClone(node.ports.find(port => port.id === consumer.port)!), id: "in-third" });
+      consumer.port = "in-third";
+    }
+  }
+  graph.connectors.push(third);
+  for (const test of graph.tests.filter(row => row.covers.includes("garden-alt-flow"))) {
+    test.covers.push(third.id);
+    const pair = test.contract?.counterfactuals.find(row => row.connector === "garden-alt-flow");
+    if (pair) test.contract!.counterfactuals.push({ ...structuredClone(pair), connector: third.id });
+  }
+  for (const kind of ["block", "operation", "work"]) graph.joins.push({ id: `three-input-${kind}`, consumer: `garden-consume-${kind}`,
+    connectors: ["garden-flow", "garden-alt-flow", "garden-third-flow"],
+    ...(kind === "work" ? { required: ["garden-flow", "garden-alt-flow", "garden-third-flow"], optional: [], condition: "all required" } : {}),
+    failures: { missing: "missing", extra: "extra", foreign: "foreign", stale: "stale", duplicate: "duplicate", returnsTo: "garden-consume-block" } } as unknown as Graph["joins"][number]);
+}
+test("G6.1 return №3913 a given transfer of a shared file is a link: no offered order breaks it, an answer that does is refused, the lawful choice keeps it and the group is accepted", async t => {
+  const f = worksFixture(t, false, false, threeArtifacts), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+  const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
+  ok(startRun(f.store, { project }));
+  const answered = new Set<string>(), offered: string[][][] = [];
+  let orders = 0, works: string[] = [];
+  for (let index = 0; index < 300 && !worksAcceptance(f.store).frame; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string }; step?: { action: string; request: { packet?: Ref; wake?: { task?: string }; ordinal?: number } } };
+    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+    if (state.phase === "waiting" || state.phase === "unable") break;
+    if (state.phase !== "step") continue;
+    const current = state.step!;
+    if (current.action === "wake" && current.request.wake?.task === "write-order" && current.request.ordinal === orders + 1) {
+      // The breaking order first (the probe's answer), then the lawful order that puts the third writer before the link.
+      push({ writeOrder: orders === 0 ? [works[0]!, works[2]!, works[1]!] : [works[2]!, works[0]!, works[1]!] });
+      orders++;
+      continue;
+    }
+    if (current.action !== "cycle" || !current.request.packet || answered.has(current.request.packet.id)) continue;
+    const saved = current.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    answered.add(saved.id);
+    const answer = mp2WorkAnswer(f, saved), node = answer.research.proposal.nodes[0]!.parent!;
+    if (node === "garden-produce-operation") {
+      const example = structuredClone((packet.value.packet as unknown as { brief: { examples: { action: string; proposal: { nodes: Node[]; fills: { codeRef?: { path: string } }[]; tests: { contract: { entrypoint: { path: string } } }[]; transfers: Graph["transfers"] } }[] } }).brief.examples.find(row => row.action === "answer")!.proposal);
+      works = example.nodes.map(item => item.id);
+      assert.equal(works.length, 3, "The example gives a work per artifact");
+      for (const item of example.nodes) item.code = item.code.map(ref => ({ ...ref, path: "src/shared.ts" }));
+      for (const fill of example.fills) if (fill.codeRef) fill.codeRef.path = "src/shared.ts";
+      for (const test of example.tests) test.contract.entrypoint.path = "src/shared.ts";
+      example.transfers = [...(example.transfers ?? []), { id: "given-producer-pair", path: "src/shared.ts", from: works[0]!, to: works[1]!, condition: "producer_committed" }];
+      push({ ...answer.research, proposal: example });
+    } else {
+      if (node === "garden-consume-operation") (answer.research.proposal.joins as unknown[]).push(structuredClone(f.desired.joins.find(row => row.consumer === "garden-consume-work")!));
+      push(answer.research);
+    }
+  }
+  const text = trail.join(",");
+  for (const intent of f.store.list<{ allowed: string[] }>(WAKE_INTENT_KIND)) offered.push(intent.value.allowed.map(row => JSON.parse(row) as string[]));
+  assert.ok(offered.length > 0, text);
+  for (const options of offered) {
+    assert.deepEqual(options.map(row => canonical(row)).sort(), [[works[0], works[1], works[2]], [works[2], works[0], works[1]]].map(row => canonical(row as Json)).sort(),
+      "Every offered order keeps the given link, and no other");
+  }
+  const choices = f.store.list<{ task?: string; verdict: string }>(WAKE_CHOICE_KIND).filter(row => row.value.task === "write-order").map(row => row.value.verdict);
+  assert.deepEqual(choices.sort(), ["chosen", "refused"], text);
+  assert.deepEqual([worksAcceptance(f.store).passed, worksAcceptance(f.store).frame], [true, true], `The group is accepted: ${text.slice(-700)}`);
+  const graph = f.store.get<Graph>(`graph:${project}`)!.value;
+  const shared = (graph.transfers ?? []).filter(row => row.path === "src/shared.ts").map(row => [row.from, row.to]).sort();
+  assert.deepEqual(shared, [[works[0], works[1]], [works[2], works[0]]].sort(), "The given link stays, the code adds the lawful rest");
+});
+
 // G6.2 (№3869 п.1, п.5, №3885): a G5 finding of one work's own content rejects only the proposal that defines it. The base
 // before G6 (a62940ec) issues the producing root and admits its one work for two artifacts (its E3 knows no such rule); G5
 // refuses it today. Only that proposal is rejected, its attempt closes through G7 on its own rows — placed as the

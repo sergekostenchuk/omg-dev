@@ -38,7 +38,7 @@ import type { AcceptedFrameRequest } from "./frame-accept.js";
 import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf, producerProposal as producerProposalOf,
   readAtomicGate as readAtomicGateOf, readWorksAcceptance as readWorksAcceptanceOf,
   type WorkProposalSource, type WorksAcceptanceRequest } from "./atomic-gate.js";
-import { runWakeChoice as runWakeChoiceOf, wakeStanding as wakeStandingOf, type WakeChoiceRequest } from "./wake-choice.js";
+import { runWakeChoice as runWakeChoiceOf, wakeStanding as wakeStandingOf, type WakeChoiceRequest, type WriteOrderRequest } from "./wake-choice.js";
 import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines as writeGapLinesOf, type GapLinesRecord } from "./gap-lines.js";
 import { prepareOmObligations as prepareOmObligationsOf, writeOmObligations as writeOmObligationsOf } from "./obligations.js";
 import { prepareFeasibility as prepareFeasibilityOf, readFeasibility as readFeasibilityOf, writeFeasibility as writeFeasibilityOf, type OmFeasibility } from "./feasibility.js";
@@ -1393,7 +1393,11 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
         // G5.1 (№3847): a sleeping flow whose producer work, answered before the wake-test era, has several covering tests
         // and named none asks that one choice, paid by this accepting attempt; the works step then takes it.
         const wake = sources.refusal.code === "sleeping_wake_test_missing"
-          ? wakeStep(store, project, results, sources.refusal, { series: reference(series), attempt: ordinal }, request.dispatch, series.id) : null;
+          ? wakeStep(store, project, results, sources.refusal, { series: reference(series), attempt: ordinal }, request.dispatch, series.id)
+          // G6.1 (№3857 п.4, №3891): a shared file several write orders of which are lawful asks that choice, paid by this
+          // accepting attempt, by the same mechanism; the works step then takes it.
+          : sources.refusal.code === "write_order_choice_missing"
+            ? orderStep(store, project, results, sources.refusal, { series: reference(series), attempt: ordinal }, request.dispatch, series.id) : null;
         return wake ?? { wait: waitOf(sources.refusal, project) };
       }
       return step("works", { gate: checked.request, works: { project, environment: request.dispatch.config, sources: [...sources.value.sources],
@@ -1524,6 +1528,19 @@ function wakeStep(store: Store, project: string, results: WorkProposalSource[], 
   const wake: WakeChoiceRequest = { project, proposal, work, connector, accepting, dispatch };
   const standing = take(wakeStanding(store, wake));
   return standing.next === null ? null : step("wake", { wake, ordinal: standing.next }, series, accepting.attempt);
+}
+/**
+ * G6.1: the write-order step of the refused shared file — the exact proposals of the group's candidate and the file its
+ * refusal names, while that choice is open and one more intent is lawful.
+ */
+function orderStep(store: Store, project: string, results: WorkProposalSource[], refusal: Refusal, accepting: { series: Ref; attempt: number },
+  dispatch: RunRequest["dispatch"], series: string): Choice | null {
+  const sources = ((refusal as Refusal & { findings?: { code: string; message: string }[] }).findings ?? []).find(row => row.code === "write_order_sources");
+  if (!sources) return null;
+  const order: WriteOrderRequest = { task: "write-order", project, proposals: JSON.parse(sources.message) as Ref[], path: refusal.at.target,
+    results, accepting, dispatch };
+  const standing = take(wakeStanding(store, order));
+  return standing.next === null ? null : step("wake", { wake: order, ordinal: standing.next }, series, accepting.attempt);
 }
 /** LP5: the end of a remaining acceptance or confirmation by its common producer; an addressed refusal stays the wait. */
 function finalizeStep(store: Store, project: string, binding: Sealed<Revision<CompletionOwner>>, phase: FinalizationPhase, series: string,

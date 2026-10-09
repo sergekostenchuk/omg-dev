@@ -14,7 +14,8 @@ import { WORKS_FRAME_CONTRACT, representativeJoinId, workAnchorId, workFillCode,
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals,
   WAKE_TEST, type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
 import { readOmObligations, prepareOmObligations, type ObligationRequest, type OmObligationHandoff } from './obligations.js';
-import { checkWakeInput, type WakeChoiceInput } from './wake-choice.js';
+import { checkWakeInput, chosenWriteOrders, type WakeChoiceInput, type WriteOrderInput } from './wake-choice.js';
+import { dependencyEdges } from '../graph/dependencies.js';
 import { withHistoricalReads } from './input.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
@@ -25,6 +26,11 @@ export const CANDIDATE_REFUSAL_CODES = Object.freeze([
   'sleeping_anchor_underivable', 'sleeping_wake_test_missing', 'works_upper_drift',
   'derived_field_conflict', 'slot_fill_conflict', 'replacement_leaves_dangling', 'operation_port_unbound', 'graph_invalid',
 ] as const);
+/**
+ * G6.1: the refusals of the write order of a shared file. They are answered by the narrow write-order choice, not by a
+ * works answer, so they stay out of the catalogue a works packet shows: its bytes keep every era (as the G5.1 wake choice).
+ */
+export const WRITE_ORDER_REFUSAL_CODES = Object.freeze(['write_order_choice_missing', 'write_order_choice_invalid', 'ownership_order_cycle'] as const);
 export type CandidateResult<T> = { readonly ok: true; readonly value: Sealed<T> }
   | { readonly ok: false; readonly refusal: Sealed<Refusal & { findings?: Finding[] }> };
 export const JOIN_ASSEMBLY = 'identity-joins/v1' as const;
@@ -461,8 +467,122 @@ function structuralIdentityJoins(frame: FrameRead, result: ProposalResult, graph
   }
   return context;
 }
+const compare = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+/** G6.1: the files two or more works of these proposals declare for writing — where a write order can be asked. */
+function sharedWritePaths(proposals: readonly ProposalObservation[]): string[] {
+  const writers = new Map<string, Set<string>>();
+  for (const proposal of proposals) for (const node of proposal.value.nodes ?? []) if (node.kind === 'work')
+    for (const ref of node.code ?? []) if (ref.access === 'write') writers.set(ref.path, (writers.get(ref.path) ?? new Set()).add(node.id));
+  return [...writers].filter(([, ids]) => ids.size > 1).map(([path]) => path).sort(compare);
+}
+/**
+ * The transfers the model gave for a file as fixed links of its one chain (№3913): runs of writers, each immediately
+ * after the one before, in the order of their first writers; null when they cannot be links of one chain — an end
+ * outside the writers, a writer with two successors or two predecessors, a loop. The native validator refuses those.
+ */
+function givenRuns(ids: readonly string[], given: readonly { from: string; to: string }[]): string[][] | null {
+  const after = new Map<string, string>(), before = new Map<string, string>();
+  for (const { from, to } of given) {
+    if (!ids.includes(from) || !ids.includes(to) || from === to) return null;
+    if (after.get(from) === to) continue;
+    if (after.has(from) || before.has(to)) return null;
+    after.set(from, to); before.set(to, from);
+  }
+  const runs: string[][] = [];
+  for (const id of [...ids].sort(compare)) if (!before.has(id)) {
+    const run = [id];
+    for (let at = after.get(id); at !== undefined; at = after.get(at)) run.push(at);
+    runs.push(run);
+  }
+  return runs.flat().length === ids.length ? runs : null;
+}
+/** The runs of a file in the one order every dependency of the group allows, the earliest first; null on a cycle. */
+function runOrder(runs: readonly string[][], precedes: (a: readonly string[], b: readonly string[]) => boolean): string[][] | null {
+  const rest = [...runs], order: string[][] = [];
+  while (rest.length) {
+    const next = rest.find(run => !rest.some(other => other !== run && precedes(other, run)));
+    if (next === undefined) return null;
+    order.push(next); rest.splice(rest.indexOf(next), 1);
+  }
+  return order;
+}
+/** Every chain of the runs no dependency of the group forbids and no given transfer breaks — the options of a choice. */
+function lawfulOrders(runs: readonly string[][], precedes: (a: readonly string[], b: readonly string[]) => boolean): string[][] {
+  const found: string[][] = [];
+  const walk = (placed: string[], rest: readonly string[][]) => {
+    if (found.length > WRITE_ORDER_OPTIONS) return;
+    if (!rest.length) { found.push(placed); return; }
+    for (const run of rest) if (!rest.some(other => other !== run && precedes(other, run))) walk([...placed, ...run], rest.filter(item => item !== run));
+  };
+  walk([], runs);
+  return found;
+}
+const WRITE_ORDER_OPTIONS = 24;
+/**
+ * G6.1 (№3857 п.4, №3869, №3891): the write ownership of a file several works of the group write. A chain of
+ * producer_committed transfers the model gave stays: its transfers are links whose writers stand next to each other in
+ * the one chain (№3913). Where every dependency of the group — connections, requires and the transfers of every file —
+ * allows exactly one order of those links (each consecutive pair already ordered: no permutation is enumerated), the code
+ * completes that chain; where several orders are lawful, the model's saved choice of exactly these proposals decides, and
+ * without one the candidate waits for it; where none is lawful, it is refused. A choice is offered and admitted only if
+ * it keeps every given link.
+ */
+export function deriveWriteOrder(graph: Graph, proposals: readonly Ref[], orders: readonly WriteOrderInput[]): void {
+  const writers = new Map<string, string[]>();
+  for (const node of graph.nodes) if (node.kind === 'work' && graph.horizon.includes(node.id))
+    for (const ref of node.code) if (ref.access === 'write' && !(writers.get(ref.path) ?? []).includes(node.id)) writers.set(ref.path, [...(writers.get(ref.path) ?? []), node.id]);
+  const shared = [...writers].filter(([, ids]) => ids.length > 1).sort(([a], [b]) => compare(a, b));
+  if (!shared.length) return;
+  graph.transfers = [...(graph.transfers ?? [])];
+  const settled = new Set<string>();
+  for (let changed = true; changed;) {
+    changed = false;
+    const edges = dependencyEdges(graph, 3), next = new Map<string, string[]>();
+    for (const [from, to] of edges) next.set(from, [...(next.get(from) ?? []), to]);
+    const reaches = (from: string, to: string): boolean => {
+      const queue = [...(next.get(from) ?? [])], seen = new Set<string>();
+      for (let at = queue.shift(); at !== undefined; at = queue.shift()) {
+        if (at === to) return true; if (seen.has(at)) continue; seen.add(at); queue.push(...(next.get(at) ?? []));
+      }
+      return false;
+    };
+    const precedes = (a: readonly string[], b: readonly string[]): boolean => a.some(from => b.some(to => reaches(from, to)));
+    for (const [path, ids] of shared) {
+      if (settled.has(path)) continue;
+      const runs = givenRuns(ids, graph.transfers.filter(row => row.path === path));
+      // Given transfers that cannot be links of one chain are the model's own defect: the native validator refuses them.
+      if (!runs) { settled.add(path); continue; }
+      const order = runOrder(runs, precedes);
+      if (!order || runs.some(run => run.some((id, index) => run.slice(index + 1).some(later => reaches(later, id)))))
+        reject('ownership_order_cycle', path, 'transfers', 'The dependencies and the given transfers of the group order the writers of this file in a cycle');
+      const unique = order.every((run, index) => index === 0 || precedes(order[index - 1]!, run));
+      const chosen = unique ? null : orders.find(row => row.path === path) ?? null;
+      if (chosen && (canonical([...chosen.order].sort(compare)) !== canonical([...ids].sort(compare))
+        || chosen.order.some((id, index) => chosen.order.slice(index + 1).some(later => reaches(later, id)))
+        || runs.some(run => { const at = chosen.order.indexOf(run[0]!); return run.some((id, index) => chosen.order[at + index] !== id); })))
+        reject('write_order_choice_invalid', path, 'writeOrder', 'The chosen order must be a lawful order of exactly these writers keeping every given transfer');
+      const chain = unique ? order.flat() : chosen?.order ?? null;
+      if (!chain) continue;
+      settled.add(path);
+      const pairs = chain.slice(1).map((to, index) => [chain[index]!, to] as const);
+      // A transfer the model gave that the chain does not hold is left to the native validator, which refuses it.
+      if (graph.transfers.some(row => row.path === path && !pairs.some(([from, to]) => row.from === from && row.to === to))) continue;
+      for (const [from, to] of pairs) if (!graph.transfers.some(row => row.path === path && row.from === from && row.to === to)) {
+        graph.transfers.push({ id: `tr-order-${hashJson([path, from, to]).slice(0, 16)}`, path, from, to, condition: 'producer_committed' });
+        changed = true;
+      }
+    }
+    if (!changed && shared.some(([path]) => !settled.has(path))) {
+      const [path, ids] = shared.find(([item]) => !settled.has(item))!;
+      const options = lawfulOrders(givenRuns(ids, graph.transfers.filter(row => row.path === path))!, precedes);
+      reject('write_order_choice_missing', path, 'writeOrder', 'Several write orders of this shared file are lawful; the model chooses one',
+        [{ code: 'write_order_sources', target: path, message: canonical([...proposals].sort((a, b) => compare(canonical(a), canonical(b)))) },
+          ...options.map(option => ({ code: 'write_order_option', target: path, message: canonical(option) }))]);
+    }
+  }
+}
 function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandidateInput, joinAssembly?: typeof JOIN_ASSEMBLY,
-  wakes: readonly WakeChoiceInput[] = []): CandidateAssembly {
+  wakes: readonly WakeChoiceInput[] = [], orders: readonly WriteOrderInput[] = []): CandidateAssembly {
   const level = frame.request.level;
   const gaps = take(openObligationsToGaps(frame, result)) as FrameGap[];
   if (gaps.length) return { state: 'gaps', gaps };
@@ -564,6 +684,7 @@ function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandida
       if (!(error instanceof EngineError)) throw error;
       reject(error.code, graph.id, 'layer', error.message, error.code === 'graph_invalid' ? error.details as Finding[] : undefined);
     }
+    if (works) deriveWriteOrder(graph, result.proposals.map(item => item.reference), orders);
   }
   const actuallyRemoved = new Set([...removed].filter(id => !graph.nodes.some(node => node.id === id)));
   const dangling = danglingReferences(graph, actuallyRemoved);
@@ -595,14 +716,14 @@ export function assembleCandidate(frame: FrameRead, proposals: ProposalObservati
   return deriveCandidate(frame, proposals, works, frame?.request?.level === 3 ? JOIN_ASSEMBLY : undefined);
 }
 function deriveCandidate(frame: FrameRead, proposals: ProposalObservation[], works: WorksCandidateInput | undefined,
-  joinAssembly: typeof JOIN_ASSEMBLY | undefined, wakes: readonly WakeChoiceInput[] = []): CandidateResult<CandidateAssembly> {
+  joinAssembly: typeof JOIN_ASSEMBLY | undefined, wakes: readonly WakeChoiceInput[] = [], orders: readonly WriteOrderInput[] = []): CandidateResult<CandidateAssembly> {
   return outcome(() => {
     requireLevel(frame, works);
     if (!Array.isArray(proposals)) invalid('proposals');
     const result = take(applyProposals(frame, proposals)) as ProposalResult;
     if (frame.request.level === 3 && proposals.some(item => item.value.worksContract !== WORKS_FRAME_CONTRACT))
       reject('works_contract_invalid', 'candidate:3', 'proposals', 'New works assembly needs proposals of its declared era');
-    return assemble(copy(frame), result, works && normalizedWorks(works), joinAssembly, wakes);
+    return assemble(copy(frame), result, works && normalizedWorks(works), joinAssembly, wakes, orders);
   });
 }
 export function readCandidate(store: Store, request: CandidateReadRequest): CandidateResult<Revision<FrameCandidateRecord>> {
@@ -673,8 +794,12 @@ export function prepareCandidate(store: Store, request: CandidateRequest): Candi
     }
     const sources = take(prepareFrameProposals(store, request));
     if (request.frame.level === 3) request = normalizeRequest({ ...request, frame: sources.frame.request as CandidateRequest['frame'] });
+    // G6.1: the saved write-order choices of exactly these proposals, at their deterministic addresses — no list, no history.
+    const orders = request.works ? take(chosenWriteOrders(store, request.frame.project, request.proposals,
+      sharedWritePaths(sources.proposals as ProposalObservation[]))) as WriteOrderInput[] : [];
     const basis = request.frame.level === 3 ? checkedWorksBasis(store, request, true) : null;
-    const common = { guards: unique([...sources.guards, ...(basis?.guards ?? []), ...(request.wakes ?? []).map(wake => wake.choice)]) as Ref[],
+    const common = { guards: unique([...sources.guards, ...(basis?.guards ?? []), ...(request.wakes ?? []).map(wake => wake.choice),
+      ...orders.map(order => order.choice)]) as Ref[],
       expected: sources.expected as PreparedFrame['expected'] };
     const existingResult = (existing: Revision<FrameCandidateRecord>, candidate: FrameCandidate): PreparedCandidate => {
       const { request: _request, ...content } = existing.value;
@@ -684,14 +809,14 @@ export function prepareCandidate(store: Store, request: CandidateRequest): Candi
     };
     // C5 repeats an unmarked saved request. Probe only its exact old address, after current admission.
     if (request.frame.level === 3 && !Object.hasOwn(request, 'joinAssembly')) {
-      const legacy = deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, undefined, request.wakes);
+      const legacy = deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, undefined, request.wakes, orders);
       if (legacy.ok && legacy.value.state === 'candidate') {
         const candidate = legacy.value.candidate as FrameCandidate, existing = store.get<FrameCandidateRecord>(idOf(candidate));
         if (existing) return existingResult(existing, candidate);
       }
     }
     if (request.frame.level === 3) request = normalizeRequest({ ...request, joinAssembly: JOIN_ASSEMBLY });
-    const built = take(deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, request.joinAssembly, request.wakes));
+    const built = take(deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, request.joinAssembly, request.wakes, orders));
     if (built.state === 'gaps') return { ...common, state: 'gaps', gaps: built.gaps as FrameGap[], writes: [], existing: null };
     const candidate: FrameCandidateRecord = { ...built.candidate as FrameCandidate, request }, id = idOf(candidate);
     const existing = store.get<FrameCandidateRecord>(id);
