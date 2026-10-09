@@ -1665,7 +1665,7 @@
 - Отдаёт: —
 - Читает записи: workAssignments; om-obligations
 - Пишет записи: —
-- Разрешённые пути: `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`, `src/om/answer-form.ts`, `src/om/model-call.ts`, `test/om-model-call.test.ts`
+- Разрешённые пути: `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`, `src/om/answer-form.ts`, `src/om/model-call.ts`, `test/om-model-call.test.ts`, `test/om-run.test.ts`
 - Из движка как есть: №3765
 - После: OWN1, OWN1.1
 - Тесты сверх обязательных:
