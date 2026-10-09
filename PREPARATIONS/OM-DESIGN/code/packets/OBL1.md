@@ -45,7 +45,7 @@
 - Читает записи: workAssignments; om-obligations
 - Пишет записи: —
 - Из движка как есть: №3765
-- Уже сделано до тебя: OWN1 «Режим «обхода»: на вопросы владельца и вопросы без производителя отвечает модель (партия MC2), позднее обязательство назначается блоку-потребителю по умолчанию — проход не встаёт в unable» (src/om/answers-gate.ts, src/om/routes.ts, src/om/addressing.ts, src/om/input.ts, src/om/obligations.ts, src/om/packet-brief.ts, src/om/gaps.ts, src/om/owner-result.ts, src/om/achievements.ts, src/om/run.ts, src/om/answer-form.ts, src/product/commands.ts, src/product/engine.ts)
+- Уже сделано до тебя: OWN1 «Режим «обхода»: на вопросы владельца и вопросы без производителя отвечает модель (партия MC2), позднее обязательство назначается блоку-потребителю по умолчанию — проход не встаёт в unable» (src/om/answers-gate.ts, src/om/routes.ts, src/om/addressing.ts, src/om/input.ts, src/om/obligations.ts, src/om/packet-brief.ts, src/om/gaps.ts, src/om/owner-result.ts, src/om/achievements.ts, src/om/run.ts, src/om/answer-form.ts, src/product/commands.ts, src/product/engine.ts); OWN1.1 «Все применимые ответы владельца H2 сохраняются при переходе B1 в режиме обхода (два и больше H2 до старта — ни одного вызова модели)» (src/om/run.ts, src/om/owner-result.ts, src/om/addressing.ts, src/om/answer-form.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 

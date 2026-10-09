@@ -1667,7 +1667,7 @@
 - Пишет записи: —
 - Разрешённые пути: `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`, `src/om/answer-form.ts`, `src/om/model-call.ts`, `test/om-model-call.test.ts`
 - Из движка как есть: №3765
-- После: OWN1
+- После: OWN1, OWN1.1
 - Тесты сверх обязательных:
   - прогон истории на снимке 0333-stop: node-expansion получает scope и отвечает по существу, без need_source за Ref
   - проверка принадлежности bindings сохранена
@@ -1684,7 +1684,7 @@
 - Отдаёт: —
 - Читает записи: om-owner-result; om-input
 - Пишет записи: om-input (decided)
-- Разрешённые пути: `src/om/run.ts`, `src/om/owner-result.ts`, `test/om-run.test.ts`
+- Разрешённые пути: `src/om/run.ts`, `src/om/owner-result.ts`, `test/om-run.test.ts`, `src/om/addressing.ts`, `src/om/answer-form.ts`
 - Из движка как есть: проба Codex ~/REPORTS/review/omg-own1_pre-review-3721_091026.md
 - После: OWN1
 - Тесты сверх обязательных:
