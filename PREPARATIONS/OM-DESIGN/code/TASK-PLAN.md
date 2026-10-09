@@ -1665,12 +1665,13 @@
 - Отдаёт: —
 - Читает записи: workAssignments; om-obligations
 - Пишет записи: —
-- Разрешённые пути: `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`
+- Разрешённые пути: `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`, `src/om/answer-form.ts`, `src/om/model-call.ts`, `test/om-model-call.test.ts`
 - Из движка как есть: №3765
 - После: OWN1
 - Тесты сверх обязательных:
   - прогон истории на снимке 0333-stop: node-expansion получает scope и отвечает по существу, без need_source за Ref
   - проверка принадлежности bindings сохранена
+  - вторая половина петли (№3769): чтение по указателю больше четверти вместимости доставляется как too-large {length, limit, type, keys}, модель сужает указатель; продолжение помещается во вместимость; записанные доставки сверяются по своей эре
   - один полный прогон и ревью
 
 ### OWN1.1 · Все применимые ответы владельца H2 сохраняются при переходе B1 в режиме обхода (два и больше H2 до старта — ни одного вызова модели)
