@@ -333,7 +333,7 @@ test("readCall preserves storage exceptions from either the requested revision o
 
 test("recordCall writes the call and the one project-ledger row before dispatch, as sealed copies", t => {
   const f = fixture(t, "record");
-  assert.deepEqual([...CALL_PURPOSES], ["model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment"]);
+  assert.deepEqual([...CALL_PURPOSES], ["model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment", "wake-choice"]);
   const packet = Object.create(null) as Record<string, Json>;
   Object.defineProperty(packet, "__proto__", { value: { literal: true }, enumerable: true });
   packet['question'] = "who produces the price?";

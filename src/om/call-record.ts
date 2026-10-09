@@ -13,6 +13,7 @@ import { withHistoricalReads } from "./input.js";
 import { readModelCallState } from "./model-call.js";
 import { assessmentCallName, isAssessmentCallName, prepareAssessmentAdmission, readAssessmentIntentAt } from "./assessment.js";
 import { readPacketResponse } from "./question-packet.js";
+import { readWakeIntentAt, wakeCallOf } from "./wake-choice.js";
 import {
   prepareSeriesLineAdmission, readAnySeriesAt, readMechanismAdmission, readMechanismAnalysisAdmission, seriesRequestOf,
   type AttemptGoal, type MechanismAdmission, type SeriesOwner,
@@ -27,7 +28,7 @@ export const CALL_SETTLEMENT_STATUSES = Object.freeze(["succeeded", "failed"] as
 export type CallSettlementStatus = typeof CALL_SETTLEMENT_STATUSES[number];
 export type CallStatus = "open" | CallSettlementStatus;
 export const CALL_PURPOSES = Object.freeze([
-  "model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment",
+  "model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment", "wake-choice",
 ] as const);
 export type CallPurpose = typeof CALL_PURPOSES[number];
 
@@ -91,7 +92,13 @@ export interface FactAssessmentBasis {
   readonly questionId: string;
 }
 
-export type CallBasis = SeriesStopBasis | OriginHoldBasis | FactAssessmentBasis;
+/** G5.1 (№3847): the wake choice of one producer end, paid by the running accepting attempt; its exact intent. */
+export interface WakeChoiceBasis {
+  readonly kind: "wake-choice";
+  readonly intent: Ref;
+}
+
+export type CallBasis = SeriesStopBasis | OriginHoldBasis | FactAssessmentBasis | WakeChoiceBasis;
 
 export interface RecordCallRequest {
   readonly call: string;
@@ -193,6 +200,7 @@ const STOP_BASIS_KEYS = Object.freeze(["attempt", "kind", "series"] as const);
 const HOLD_BASIS_KEYS = Object.freeze(["hold", "kind"] as const);
 const FACT_BASIS_KEYS = Object.freeze(["call", "kind", "modelCall", "packet", "question", "questionId", "response"] as const);
 const MANAGED_FACT_BASIS_KEYS = Object.freeze([...FACT_BASIS_KEYS, "assessment"] as const);
+const WAKE_BASIS_KEYS = Object.freeze(["intent", "kind"] as const);
 const CALL_KEYS = Object.freeze([
   "attempt", "basis", "block", "call", "dispatch", "gaps", "goal", "openedAt", "packet", "projectId",
   "purpose", "series", "settledAt", "status", "usage",
@@ -633,6 +641,12 @@ function checkBasis(value: unknown, purpose: CallPurpose, target: string): OmRes
       response: exactRef(basis['response'] as Ref), question: exactRef(basis['question'] as Ref),
       questionId: basis['questionId'] as string });
   }
+  if (basis['kind'] === "wake-choice" && exactKeys(basis, WAKE_BASIS_KEYS) && exactReference(basis['intent'])) {
+    if (purpose !== "wake-choice") {
+      return problem("call_basis_invalid", "Only a wake-choice call can name a wake intent", target, "basis", "gap");
+    }
+    return delivered({ kind: "wake-choice", intent: exactRef(basis['intent'] as Ref) });
+  }
   return problem("call_basis_invalid", "A call basis exactly names its saved stop, origin hold or MC1 fact", target, "basis", "gap");
 }
 
@@ -805,6 +819,14 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
     }
     return delivered(guards);
   }
+  if (request.purpose === "wake-choice") {
+    if (!attempt || attempt.outcome !== null) {
+      return problem("call_series_unresolved", "A wake choice is paid by the accepting attempt while it runs",
+        target, "attempt", "producer", request.series);
+    }
+    const proved = wakeCallProved(store, project, request);
+    return proved.ok ? delivered(uniqueRefs([...guards, ...proved.value])) : proved;
+  }
   if (!attempt || attempt.outcome === null) {
     return problem("call_basis_unresolved", "An analysis call belongs to a completed attempt at its saved ground",
       target, "attempt", "producer", request.series);
@@ -832,6 +854,25 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
       target, "basis", "producer", basis.hold);
   }
   return delivered(uniqueRefs([...guards, ...context.value.reads]));
+}
+
+/** G5.1: a wake-choice E1 is exactly the call its saved intent derives — name, basis, paying attempt, goal and packet. */
+function wakeCallProved(store: Store, project: string, request: Pick<AnyCallRecord, "call" | "purpose" | "basis" | "gaps" | "series" | "attempt" | "goal" | "dispatch"> & { block?: string; packet: unknown }): OmResult<Sealed<readonly Ref[]>> {
+  const basis = request.basis as WakeChoiceBasis | null;
+  const intent = basis?.kind === "wake-choice" ? readWakeIntentAt(store, project, basis.intent) : null;
+  if (!intent || !intent.ok) return problem("call_basis_unresolved", "A wake choice needs its exact saved intent", request.call, "basis", "producer");
+  const expected = wakeCallOf(intent.value);
+  const actual = { call: request.call, purpose: request.purpose, basis: request.basis, block: request.block, gaps: request.gaps,
+    series: request.series, attempt: request.attempt, goal: request.goal, dispatch: request.dispatch };
+  const derived = { call: expected.call, purpose: expected.purpose, basis: expected.basis, block: (expected as { block: string }).block,
+    gaps: expected.gaps, series: expected.series, attempt: expected.attempt, goal: expected.goal, dispatch: expected.dispatch };
+  const packet = isPlainObject(request.packet) && Object.hasOwn(request.packet as object, "hash") ? request.packet
+    : { hash: hashJson(request.packet as Json) };
+  if (hashJson(actual as unknown as Json) !== hashJson(derived as unknown as Json)
+    || (packet as { hash: string }).hash !== hashJson(expected.packet as Json)) {
+    return problem("call_basis_unresolved", "The wake-choice call must reproduce its saved intent exactly", request.call, "basis", "producer", basis!.intent);
+  }
+  return delivered([reference(intent.value)]);
 }
 
 /** The admission proof is common A3 work; E1 only binds its own dispatch address and purpose to it. */
@@ -1112,6 +1153,7 @@ const copyBasis = (basis: CallBasis | null): CallBasis | null => basis === null 
   : basis.kind === "series-stop"
     ? { kind: basis.kind, series: exactRef(basis.series), attempt: basis.attempt }
     : basis.kind === "origin-hold" ? { kind: basis.kind, hold: exactRef(basis.hold) }
+      : basis.kind === "wake-choice" ? { kind: basis.kind, intent: exactRef(basis.intent) }
       : { kind: basis.kind,
         ...(basis.assessment === undefined ? {} : { assessment: exactRef(basis.assessment) }),
         modelCall: exactRef(basis.modelCall), call: exactRef(basis.call),
@@ -1156,6 +1198,9 @@ function validBasis(value: unknown, purpose: CallPurpose): value is CallBasis | 
   }
   if (purpose === "origin-analysis") {
     return basis['kind'] === "origin-hold" && exactKeys(basis, HOLD_BASIS_KEYS) && exactReference(basis['hold']);
+  }
+  if (purpose === "wake-choice") {
+    return basis['kind'] === "wake-choice" && exactKeys(basis, WAKE_BASIS_KEYS) && exactReference(basis['intent']);
   }
   if (purpose === "fact-assessment") {
     return basis['kind'] === "fact-assessment"

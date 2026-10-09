@@ -14,6 +14,7 @@ import { WORKS_FRAME_CONTRACT, representativeJoinId, workAnchorId, workFillCode,
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals,
   WAKE_TEST, type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
 import { readOmObligations, prepareOmObligations, type ObligationRequest, type OmObligationHandoff } from './obligations.js';
+import { checkWakeInput, type WakeChoiceInput } from './wake-choice.js';
 import { withHistoricalReads } from './input.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
@@ -34,7 +35,8 @@ export interface FrameCandidate {
 }
 export type CandidateAssembly = { state: 'gaps'; gaps: FrameGap[] } | { state: 'candidate'; candidate: FrameCandidate };
 export interface WorksCandidateInput { contract: typeof WORKS_FRAME_CONTRACT; producer: Ref; ledger: Ref; bindings: TaskObligationBinding[] }
-export interface CandidateRequest extends ProposalRequest { works?: WorksCandidateInput; joinAssembly?: typeof JOIN_ASSEMBLY }
+/** G5.1 (№3847): the chosen wake tests of producer ends answered before the wake-test era — present only when used. */
+export interface CandidateRequest extends ProposalRequest { works?: WorksCandidateInput; joinAssembly?: typeof JOIN_ASSEMBLY; wakes?: WakeChoiceInput[] }
 export interface FrameCandidateRecord extends FrameCandidate { request: CandidateRequest }
 export type PreparedCandidate = { guards: Ref[]; expected: PreparedFrame['expected']; writes: Write[] } & (
   { state: 'gaps'; gaps: FrameGap[]; existing: null }
@@ -99,6 +101,9 @@ function requireRequest(value: unknown): asserts value is CandidateRequest {
     || (frame['upper']['frame'] !== null && !isRef(frame['upper']['frame']))) invalid('frame.upper');
   if (!Array.isArray(value['proposals']) || !value['proposals'].every(isRef)) invalid('proposals');
   if (Object.hasOwn(value, 'joinAssembly') && (frame['level'] !== 3 || value['joinAssembly'] !== JOIN_ASSEMBLY)) invalid('joinAssembly');
+  if (Object.hasOwn(value, 'wakes') && (frame['level'] !== 3 || !Array.isArray(value['wakes']) || !value['wakes'].length
+    || !value['wakes'].every(item => object(item) && isRef(item['proposal']) && isRef(item['choice']) && text(item['work'])
+      && text(item['connector']) && text(item['test']) && Object.keys(item).length === 5))) invalid('wakes');
 }
 function checkedEra(value: FrameCandidateRecord, target: string): typeof JOIN_ASSEMBLY | undefined {
   if (!object(value.request) || !object(value.request.frame))
@@ -127,7 +132,8 @@ function normalizedWorks(works: WorksCandidateInput): WorksCandidateInput {
 function normalizeRequest(request: CandidateRequest): CandidateRequest {
   return copy({ frame: request.frame, proposals: sorted(request.proposals),
     ...(Object.hasOwn(request, 'joinAssembly') ? { joinAssembly: request.joinAssembly! } : {}),
-    ...(Object.hasOwn(request, 'works') ? { works: normalizedWorks(request.works!) } : {}) });
+    ...(Object.hasOwn(request, 'works') ? { works: normalizedWorks(request.works!) } : {}),
+    ...(Object.hasOwn(request, 'wakes') ? { wakes: sorted(request.wakes!) } : {}) });
 }
 
 function requireRead(value: unknown): asserts value is CandidateReadRequest {
@@ -455,7 +461,8 @@ function structuralIdentityJoins(frame: FrameRead, result: ProposalResult, graph
   }
   return context;
 }
-function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandidateInput, joinAssembly?: typeof JOIN_ASSEMBLY): CandidateAssembly {
+function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandidateInput, joinAssembly?: typeof JOIN_ASSEMBLY,
+  wakes: readonly WakeChoiceInput[] = []): CandidateAssembly {
   const level = frame.request.level;
   const gaps = take(openObligationsToGaps(frame, result)) as FrameGap[];
   if (gaps.length) return { state: 'gaps', gaps };
@@ -523,12 +530,17 @@ function assemble(frame: FrameRead, result: ProposalResult, works?: WorksCandida
     });
     if (new Set(lower.map(flowKey)).size !== lower.length)
       reject('slot_fill_conflict', connector.id, 'flow', 'Distinct upper flows cannot share one lower producer/port/anchor flow');
-    // G5: the wake test the lower producer's own fill names for this flow, if its work was answered with that choice.
-    const choices = upper.map(binding => result.fills.find(fill => {
-      const obligation = obligations.get(fill.obligation)!;
-      return obligation.connector === connector.id && obligation.flow === flowKey(binding) && obligation.role === 'producer'
-        && obligation.upper.node === binding.producer.node && obligation.upper.port === binding.producer.port;
-    })?.wakeTest ?? null);
+    // G5: the wake test the lower producer's own fill names for this flow, if its work was answered with that choice;
+    // G5.1: else the chosen supplement of that exact proposal, work and connection.
+    const choices = upper.map(binding => {
+      const fill = result.fills.find(row => {
+        const obligation = obligations.get(row.obligation)!;
+        return obligation.connector === connector.id && obligation.flow === flowKey(binding) && obligation.role === 'producer'
+          && obligation.upper.node === binding.producer.node && obligation.upper.port === binding.producer.port;
+      });
+      return fill?.wakeTest ?? wakes.find(wake => fill && same(wake.proposal, fill.basis) && wake.work === fill.node
+        && wake.connector === connector.id)?.test ?? null;
+    });
     const deliveries = level === 3 ? lower.flatMap((binding, index) => workDeliveries(graph, connector, binding, flowKey(upper[index]!), choices[index] ?? null)) : lower;
     const previous = connector.bindings.filter(binding => binding.level === level);
     if (!same(bindingSet(previous), bindingSet(deliveries)))
@@ -583,14 +595,14 @@ export function assembleCandidate(frame: FrameRead, proposals: ProposalObservati
   return deriveCandidate(frame, proposals, works, frame?.request?.level === 3 ? JOIN_ASSEMBLY : undefined);
 }
 function deriveCandidate(frame: FrameRead, proposals: ProposalObservation[], works: WorksCandidateInput | undefined,
-  joinAssembly: typeof JOIN_ASSEMBLY | undefined): CandidateResult<CandidateAssembly> {
+  joinAssembly: typeof JOIN_ASSEMBLY | undefined, wakes: readonly WakeChoiceInput[] = []): CandidateResult<CandidateAssembly> {
   return outcome(() => {
     requireLevel(frame, works);
     if (!Array.isArray(proposals)) invalid('proposals');
     const result = take(applyProposals(frame, proposals)) as ProposalResult;
     if (frame.request.level === 3 && proposals.some(item => item.value.worksContract !== WORKS_FRAME_CONTRACT))
       reject('works_contract_invalid', 'candidate:3', 'proposals', 'New works assembly needs proposals of its declared era');
-    return assemble(copy(frame), result, works && normalizedWorks(works), joinAssembly);
+    return assemble(copy(frame), result, works && normalizedWorks(works), joinAssembly, wakes);
   });
 }
 export function readCandidate(store: Store, request: CandidateReadRequest): CandidateResult<Revision<FrameCandidateRecord>> {
@@ -652,10 +664,18 @@ export function prepareCandidate(store: Store, request: CandidateRequest): Candi
   return outcome(() => {
     request = normalizeRequest(request);
     requireLevel({ request: request.frame }, request.works);
+    // G5.1: every supplement is proved by its own saved chosen result and belongs to a proposal of this request — before
+    // anything current is read; a saved result never changes, so it is no head to guard.
+    for (const wake of request.wakes ?? []) {
+      if (!request.proposals.some(ref => same(ref, wake.proposal)))
+        reject('works_obligations_invalid', wake.choice.id, 'wakes', 'A wake supplement belongs to a proposal of this candidate');
+      take(checkWakeInput(store, request.frame.project, wake));
+    }
     const sources = take(prepareFrameProposals(store, request));
     if (request.frame.level === 3) request = normalizeRequest({ ...request, frame: sources.frame.request as CandidateRequest['frame'] });
     const basis = request.frame.level === 3 ? checkedWorksBasis(store, request, true) : null;
-    const common = { guards: unique([...sources.guards, ...(basis?.guards ?? [])]) as Ref[], expected: sources.expected as PreparedFrame['expected'] };
+    const common = { guards: unique([...sources.guards, ...(basis?.guards ?? []), ...(request.wakes ?? []).map(wake => wake.choice)]) as Ref[],
+      expected: sources.expected as PreparedFrame['expected'] };
     const existingResult = (existing: Revision<FrameCandidateRecord>, candidate: FrameCandidate): PreparedCandidate => {
       const { request: _request, ...content } = existing.value;
       if (!same(content, candidate)) reject('candidate_graph_mismatch', existing.id, 'candidate', 'An existing candidate with this identity has a different derived result');
@@ -664,14 +684,14 @@ export function prepareCandidate(store: Store, request: CandidateRequest): Candi
     };
     // C5 repeats an unmarked saved request. Probe only its exact old address, after current admission.
     if (request.frame.level === 3 && !Object.hasOwn(request, 'joinAssembly')) {
-      const legacy = deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, undefined);
+      const legacy = deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, undefined, request.wakes);
       if (legacy.ok && legacy.value.state === 'candidate') {
         const candidate = legacy.value.candidate as FrameCandidate, existing = store.get<FrameCandidateRecord>(idOf(candidate));
         if (existing) return existingResult(existing, candidate);
       }
     }
     if (request.frame.level === 3) request = normalizeRequest({ ...request, joinAssembly: JOIN_ASSEMBLY });
-    const built = take(deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, request.joinAssembly));
+    const built = take(deriveCandidate(sources.frame as FrameRead, sources.proposals as ProposalObservation[], request.works, request.joinAssembly, request.wakes));
     if (built.state === 'gaps') return { ...common, state: 'gaps', gaps: built.gaps as FrameGap[], writes: [], existing: null };
     const candidate: FrameCandidateRecord = { ...built.candidate as FrameCandidate, request }, id = idOf(candidate);
     const existing = store.get<FrameCandidateRecord>(id);

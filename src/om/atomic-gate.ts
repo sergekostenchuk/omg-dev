@@ -20,6 +20,7 @@ import { readCapacity as readCapacityOf } from './capacity.js';
 import { readDeliveries as readDeliveriesOf } from './deliveries.js';
 import { prepareSettleCandidate as prepareSettleCandidateOf, readAcceptedFrame as readAcceptedFrameOf, readRejectedCandidate as readRejectedCandidateOf, type AcceptedFrameRequest } from './frame-accept.js';
 import type { CandidateRequest, FrameCandidateRecord } from './frame-candidate.js';
+import { chosenWakes as chosenWakesOf } from './wake-choice.js';
 import { WORKS_FRAME_CONTRACT } from './frame-obligations.js';
 import { isFrameAttemptBinding, type FrameAttemptBinding } from './layer-basis.js';
 import type { ProposalRequest } from './frame-proposals.js';
@@ -47,7 +48,7 @@ export type AtomicGateErrorCode = typeof ATOMIC_GATE_ERROR_CODES[number];
 /** The units whose refusals G5 hands on: its readers, and the compiler's resolution of an external task source (its
  * exceptions, through the exact earlier filter SOURCE_UNFIT). */
 export type AtomicGateSource = 'refs' | 'capacity' | 'deliveries' | 'frame-accept' | 'gap-lines' | 'gaps' | 'model-call' | 'neighbors'
-  | 'obligations' | 'question-packet' | 'works-frame' | 'compiler-inputs';
+  | 'obligations' | 'question-packet' | 'works-frame' | 'compiler-inputs' | 'wake-choice';
 export type AtomicGateCode = AtomicGateLocalCode | SourceCodes<AtomicGateSource>;
 export type AtomicGateResult<T> = OmResult<T, AtomicGateCode>;
 
@@ -62,6 +63,7 @@ const prepareCurrentGaps = transferring('gaps', prepareCurrentGapsOf);
 const prepareGaps = transferring('gaps', prepareGapsOf);
 const readGaps = transferring('gaps', readGapsOf);
 const readPartAssembly = transferring('model-call', readPartAssemblyOf);
+const chosenWakes = transferring('wake-choice', chosenWakesOf);
 const readReuseResult = transferring('model-call', readReuseResultOf);
 const prepareNeighbors = transferring('neighbors', prepareNeighborsOf);
 const readNeighbors = transferring('neighbors', readNeighborsOf);
@@ -242,6 +244,13 @@ function modelSources(store: Store, project: string, results: readonly WorkPropo
   return { outputs, works, originalOf, references: unique(outputs.flatMap(output => output.references)) };
 }
 
+/** G5.1 (№3847): the exact proposal of the one source whose answer defines this producer work, if exactly one does. */
+export function producerProposal(store: Store, project: string, results: readonly WorkProposalSource[], work: string): AtomicGateResult<Sealed<Ref | null>> {
+  return run(() => {
+    const found = modelSources(store, project, results).outputs.filter(output => output.proposal.value.nodes.some(node => node.id === work));
+    return found.length === 1 ? reference(found[0]!.proposal) : null;
+  });
+}
 /** Assignment identity is checked by D7; this key preserves every responsibility and policy field. */
 function assignmentKey(value: CarriedObligation): string {
   const { scope: _scope, original: _original, ...policy } = value;
@@ -560,8 +569,10 @@ function worksCandidate(store: Store, project: string, results: readonly WorkPro
   }
   const handoff = take(prepareOmObligations(tx.view, { project, ...context, assignments })); tx.add(handoff);
   const bindings = remapBindings(checked.works.map(work => ({ old: checked.originalOf(work), bindings: work.bindings })), handoff);
+  // G5.1 (№3847): the chosen wake tests of these exact proposals' producer ends travel with the candidate request.
+  const wakes = checked.outputs.flatMap(output => take(chosenWakes(store, project, reference(output.proposal))));
   const candidateRequest: CandidateRequest = { ...works, works: { contract: WORKS_FRAME_CONTRACT,
-    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings } };
+    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings }, ...(wakes.length ? { wakes } : {}) };
   const candidate = take(prepareWorksFrame(tx.view, candidateRequest));
   if (candidate.state !== 'candidate') fail('work_blocking_gap_open', target, 'candidate', 'The final proposals must fill the complete work frame');
   tx.add(candidate);

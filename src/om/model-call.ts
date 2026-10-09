@@ -1899,7 +1899,9 @@ export interface TransportModelCall extends ModelCall {
   transport: { version: 'om-model-transport/v1' | 'om-model-transport/managed-v1'; completionOwner?: CompletionCallOwner; request: ModelTransportRequest; exchange: Ref | null };
 }
 export interface ModelTransportOutcome { record: Revision<TransportModelCall>; call: Ref; exchange: Ref | null; result: AdapterResult; repeated: boolean }
-const DIRECT_TRANSPORT_PURPOSES: readonly string[] = Object.freeze(['fact-assessment', 'stop-analysis', 'origin-analysis']);
+const DIRECT_TRANSPORT_PURPOSES: readonly string[] = Object.freeze(['fact-assessment', 'stop-analysis', 'origin-analysis', 'wake-choice']);
+/** Calls outside a managed attempt's registry: the analyses and (G5.1) the wake choice of a frame's producer end. */
+const unmanagedPurpose = (purpose: string): boolean => purpose === 'stop-analysis' || purpose === 'origin-analysis' || purpose === 'wake-choice';
 const directTransportPurpose = (purpose: string): boolean => DIRECT_TRANSPORT_PURPOSES.includes(purpose);
 function requireTransport(store: Store, request: unknown): asserts request is ModelTransportRequest {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.call)
@@ -2980,7 +2982,7 @@ export function checkCompletionLedger(store: Store, snapshot: Sealed<CompletionS
     const exact = take(readCallLedgerAt(store, project, ledger, histories));
     for (const row of exact.value.calls) {
       if (row.series.id !== owner.series.id || row.attempt !== owner.attempt) continue;
-      if (row.purpose === 'stop-analysis' || row.purpose === 'origin-analysis') continue;
+      if (unmanagedPurpose(row.purpose)) continue;
       const admitted = take(readCall(store, project, row.call));
       if (!same(admitted.value.goal, owner.goal)) fail('completion_foreign', row.call.id, 'goal', 'E1 cannot change the whole managed goal');
       if (row.purpose === 'fact-assessment') {
@@ -3071,7 +3073,7 @@ export function prepareManagedEnvironment(store: Store, project: string, target:
 export function prepareManagedCallEnvironment(store: Store, project: string, request: AnyRecordCallRequest | AnyCallRecord,
   role: 'implementer' | 'reviewer' | null = null): ModelCallResult<EnvironmentAdmission | null> {
   try {
-    if (request.purpose === 'stop-analysis' || request.purpose === 'origin-analysis'
+    if (unmanagedPurpose(request.purpose)
       || !take(readCompletionBinding(store, project, request.series, request.attempt))) return { ok: true, value: null };
     const configured = store.get(request.dispatch.config.id);
     if (configured && same(reference(configured), request.dispatch.config)) return { ok: true, value: null };
@@ -3094,7 +3096,7 @@ export function prepareCompletionCall(store: Store, project: string, request: An
   owner: Omit<CompletionCallOwner, 'call'> | null; writes: Write[]; guards: TransactionGuard[];
 }>> {
   return result(() => {
-    if (request.purpose === 'stop-analysis' || request.purpose === 'origin-analysis') return { owner: null, writes: [], guards: [] };
+    if (unmanagedPurpose(request.purpose)) return { owner: null, writes: [], guards: [] };
     const binding = take(readCompletionBinding(store, project, request.series, request.attempt)) as Revision<CompletionOwner> | null;
     if (!binding) return { owner: null, writes: [], guards: [] };
     if (!same(request.goal, binding.value.goal)) fail('completion_foreign', binding.id, 'goal', 'The call retains the original whole goal');
@@ -3143,7 +3145,7 @@ export function prepareCompletionCall(store: Store, project: string, request: An
 function checkedCompletionOwner(store: Store, project: string, call: Ref, packetBasis: Ref, marker: unknown, history?: CallHistory): CompletionCallOwner | null {
   const admitted = take(readCall(store, project, call, history));
   const purpose = admitted.value.purpose;
-  const binding = purpose === 'stop-analysis' || purpose === 'origin-analysis' ? null
+  const binding = unmanagedPurpose(purpose) ? null
     : take(readCompletionBinding(store, project, admitted.value.series, admitted.value.attempt));
   if (!binding) {
     if (marker !== undefined) fail('completion_invalid', call.id, 'completionOwner', 'Standalone history cannot acquire managed provenance');

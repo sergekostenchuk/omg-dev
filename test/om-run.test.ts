@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Store, type Revision, type Write } from "../src/storage/store.js";
+import { observeStore, Store, type Revision, type Write } from "../src/storage/store.js";
 import { historicalProofCounters } from "../src/history/proofs.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
@@ -3523,6 +3523,196 @@ test("LP5 (№3278 rows 8, 9, 10, 11, 15, 19, 22, 23, 24; §3; return №3294 п
     }
     for (const packet of f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.state === "ready"))
       assert.ok(lp4Sent(f, reference(packet)) <= 1, "A paid answer is never sent again");
+  });
+});
+
+// ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
+import { chosenWakes, readWakeChoiceAt, runWakeChoice, wakeCallOf, WAKE_CHOICE_KIND, WAKE_INTENT_KIND, type WakeChoiceRecord, type WakeChoiceRequest } from "../src/om/wake-choice.js";
+import { prepareCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
+import { recordCall } from "../src/om/call-record.js";
+const G51_BASE = "f69d4b39e226cdc8527c923a6cc940fb9f2a3654";
+/** The produce root answered by the base before G5: every test of its work that covers a connection has a twin, no choice. */
+function g51AmbiguousAnswer(f: WorksRun, saved: Ref) {
+  const answer = mp2WorkAnswer(f, saved), proposal = answer.research.proposal;
+  const twins = proposal.tests.filter(test => test.covers.length).map(test => ({ ...structuredClone(test), id: `${test.id}-twin` }));
+  proposal.tests.push(...twins); proposal.nodes[0]!.tests.push(...twins.map(test => test.id));
+  return answer;
+}
+/**
+ * The pass of worksFixture whose produce root the base issued and paid with an ambiguous work, then today's code: every
+ * wake step is answered by `choose` (from the allowed tests the intent shows), every works cycle by mp2WorkAnswer.
+ */
+async function g51Pass(t: test.TestContext, choose: (allowed: string[], index: number) => string | Record<string, unknown>, bound = 200,
+  onWake?: (f: WorksRun, request: { wake: WakeChoiceRequest; ordinal: number }) => Promise<void>) {
+  const f = worksFixture(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+  const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
+  ok(startRun(f.store, { project }));
+  for (let round = 0; round < 4; round++) {
+    const issued = atCommit(f, G51_BASE, `g51-issue-${round}`, `const { advanceRun } = await import(src('om/run.js'));
+for (let index = 0; index < 40; index++) {
+  const state = take(await advanceRun(store, args.request)).record.value.state;
+  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
+  if (state.phase === 'waiting') { out(null); break; }
+}`, { request: f.request }) as Ref | null;
+    assert.ok(issued, "The base issues a works packet");
+    const produce = f.store.get<QuestionPacketRecord>(issued.id)!.value.packet as unknown as { expansion: { upper: { id: string } } };
+    const ambiguous = produce.expansion.upper.id === "garden-produce-operation";
+    push((ambiguous ? g51AmbiguousAnswer(f, issued) : mp2WorkAnswer(f, issued)).research);
+    assert.equal(atCommit(f, G51_BASE, `g51-cycle-${round}`, `const { advanceRun } = await import(src('om/run.js'));
+out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request }), "cycle");
+    if (ambiguous) break;
+  }
+  f.restart();
+  const answered = new Set(f.store.list<{ om?: { request: { packet: Ref } } }>("model-call").map(row => row.value.om?.request.packet.id ?? ""));
+  let wakes = 0, state: Lp5State = { phase: "" } as Lp5State;
+  for (let index = 0; index < bound; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    state = advanced.record.value.state as unknown as Lp5State;
+    const performed = advanced.performed?.action ?? "";
+    const woke = performed === "wake" ? `#${(advanced.performed!.request as { ordinal: number }).ordinal}=${advanced.products[0]?.id.split(":").at(-1)}` : "";
+    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${performed}${woke}${state.phase === "step" ? `>${state.step!.action}` : ""}`);
+    if (performed === "works" || state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
+    if (state.phase !== "step") continue;
+    const current = state.step as unknown as { action: string; request: { packet?: Ref; wake?: WakeChoiceRequest; ordinal?: number } };
+    if (current.action === "cycle" && current.request.packet && !answered.has(current.request.packet.id)) {
+      answered.add(current.request.packet.id); push(mp2WorkAnswer(f, current.request.packet).research);
+    }
+    if (current.action === "wake" && current.request.ordinal === wakes + 1) {
+      const proposal = f.store.get<LayerProposal>(current.request.wake!.proposal.id)!.value, work = current.request.wake!.work;
+      const allowed = proposal.tests.filter(test => test.node === work && test.covers.includes(current.request.wake!.connector)).map(test => test.id).sort();
+      const reply = choose(allowed, wakes);
+      if (typeof reply === "object" && Object.hasOwn(reply, "rawStdout")) { steps.push(reply); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); }
+      else push(typeof reply === "string" ? { wakeTest: reply } : reply);
+      wakes++;
+      if (onWake) await onWake(f, current.request as { wake: WakeChoiceRequest; ordinal: number });
+    }
+  }
+  return { f, trail, state, results: () => f.store.list<WakeChoiceRecord>(WAKE_CHOICE_KIND) };
+}
+test("G5.1 rows 1, 6, 7 an ambiguous producer end the base answered before the wake-test era is asked its wake test once, by the accepting attempt; the works are accepted with that test waking the sleeping flow, and a restart or re-entry pays nothing again", async t => {
+  const { f, trail, results } = await g51Pass(t, allowed => allowed[1]!);
+  const saved = results();
+  assert.equal(saved.length, 1, trail.join(","));
+  assert.deepEqual([saved[0]!.value.verdict, typeof saved[0]!.value.choice], ["chosen", "string"]);
+  assert.ok(trail.some(row => row.includes("works")), `The works are accepted after the choice: ${trail.join(",")}`);
+  const graph = f.store.get<Graph>(`graph:${project}`)!.value;
+  assert.ok(graph.anchors.some(anchor => anchor.test === saved[0]!.value.choice), `The chosen test wakes the sleeping consumers: ${JSON.stringify(graph.anchors)}`);
+  // The candidate's supplement is proved by its own saved result: another test, or a proposal outside it, is refused.
+  const candidate = f.store.list<FrameCandidateRecord>("frame-candidate").find(row => row.value.request.wakes?.length)!;
+  assert.ok(candidate, "The accepted works candidate carries its supplement");
+  const wake = candidate.value.request.wakes![0]!;
+  assert.equal(refusal(prepareCandidate(f.store, { ...candidate.value.request, wakes: [{ ...wake, test: `${wake.test}-other` }] }) as never).code, "wake_result_invalid");
+  assert.equal(refusal(prepareCandidate(f.store, { ...candidate.value.request,
+    wakes: [{ ...wake, proposal: { ...wake.proposal, id: `${wake.proposal.id}-foreign` } }] }) as never).code, "works_obligations_invalid");
+  // An E1 that does not reproduce its saved intent is refused before any dispatch.
+  const intent = f.store.list<import("../src/om/wake-choice.js").WakeIntentRecord>(WAKE_INTENT_KIND)[0]!;
+  const call = wakeCallOf(intent);
+  assert.ok(recordCall(f.store, project, call as never).ok, "The admitted E1 repeats as it is");
+  assert.equal(refusal(recordCall(f.store, project, { ...call, call: `${call.call}-second`, goal: { ...call.goal, result: "Another result" } } as never) as never).code,
+    "call_basis_unresolved");
+  const sent = f.sent().length;
+  f.restart();
+  ok(readWakeChoiceAt(f.store, project, reference(saved[0]!)));
+  for (let index = 0; index < 3; index++) ok(await advanceRun(f.store, f.request));
+  assert.equal(f.sent().length, sent, "Re-entry and restart pay nothing again");
+  assert.equal(f.store.list(WAKE_INTENT_KIND).length, 1);
+});
+// G5.1 return №3867-1: the producer of a wake step wrote the failed result of its intent 1, and the process stopped before
+// the pass settled that step. The saved step is that exact intent: repeating it returns result 1 and sends nothing;
+// intent 2 is a step of its own, chosen by the next choice of the pass.
+test("G5.1 return №3867-1 a restart after the saved failed result of intent 1, before its step settled, sends nothing again: the step returns result 1, and intent 2 is a step of its own", async t => {
+  let sends = -1;
+  const { f, trail, results } = await g51Pass(t, (allowed, index) => index === 0 ? "not-a-covering-test" : allowed[0]!, 200, async (run, request) => {
+    if (request.ordinal !== 1) return;
+    const written = ok(await runWakeChoice(run.store, request.wake, 1));
+    assert.equal(written.value.verdict, "refused");
+    run.restart(); sends = run.sent().length;
+  });
+  assert.deepEqual(results().map(row => [row.id.split(":").at(-1), row.value.verdict]), [["1", "refused"], ["2", "chosen"]], trail.join(","));
+  const wakes = trail.filter(row => row.includes(":wake#"));
+  assert.ok(wakes[0]!.includes(":wake#1=1"), `The saved step returns its own result 1: ${trail.join(",")}`);
+  assert.ok(wakes[1]!.includes(":wake#2=2"), `Intent 2 is its own step: ${trail.join(",")}`);
+  assert.equal(f.sent().length, sends + 1, "The repeat of step 1 sends nothing; only intent 2 is sent");
+  assert.ok(trail.some(row => row.includes("works")), trail.join(","));
+  // A step names its exact intent: an ordinal past an unsaved earlier one, or past a made choice, is refused.
+  const wake = f.store.get<WakeChoiceRecord>(results()[1]!.id)!.value;
+  const request = f.store.get<{ request: WakeChoiceRequest }>(wake.intent.id)!.value.request;
+  const total = f.sent().length;
+  assert.equal(ok(await runWakeChoice(f.store, request, 2)).value.verdict, "chosen", "A saved ordinal returns its own result");
+  assert.equal(ok(await runWakeChoice(f.store, request, 1)).value.verdict, "refused");
+  assert.equal(f.sent().length, total, "Repeats of saved intents send nothing");
+  await assert.rejects(runWakeChoice(f.store, request, 3), /ordinal/);
+});
+
+// G5.1 return №3867-2 (№3606): the chosen supplements of one proposal are read at the addresses of its own producer ends —
+// other choices in the history change neither the result nor the number of records the lookup reads.
+test("G5.1 return №3867-2 the supplements of one proposal are found by their addresses: a growing history of other choices reads no more records", async t => {
+  const { f, results } = await g51Pass(t, allowed => allowed[1]!);
+  const proposal = results()[0]!.value.proposal;
+  const measured = () => {
+    let rows = 0, lists = 0;
+    const previous = observeStore({ begin: () => ({}), end: (_token, _store, method, _mode, _id, _revision, found) => {
+      rows += found.length; if (method === "list") lists++; }, write: () => undefined, untraced: () => undefined });
+    try { return { value: ok(chosenWakes(f.store, project, proposal)), rows, lists }; } finally { observeStore(previous); }
+  };
+  const before = measured();
+  assert.equal(before.value.length, 1);
+  assert.equal(before.lists, 0, "No list of a whole kind");
+  f.store.writeMany(Array.from({ length: 300 }, (_, index) => ({ id: `${WAKE_CHOICE_KIND}:${project}:other-${index}:1`, kind: WAKE_CHOICE_KIND,
+    expected: 0, value: { project, proposal: { ...proposal, id: `${proposal.id}-other-${index}` }, verdict: "chosen", choice: "t" } })));
+  const after = measured();
+  assert.deepEqual(after.value, before.value);
+  assert.equal(after.rows, before.rows, "300 other results read nothing more");
+});
+
+test("G5.1 row 9 a producer end answered in the wake-test era names its wake test itself: the group takes it and no supplement is asked or paid", async t => {
+  const f = worksFixture(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], answered = new Set<string>(), trail: string[] = [];
+  ok(startRun(f.store, { project }));
+  for (let index = 0; index < 200 && !trail.some(row => row.includes(":works")); index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as Lp5State;
+    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+    if (state.phase === "waiting" || state.phase === "unable") break;
+    if (state.phase !== "step" || state.step!.action !== "cycle" || !state.step!.request.packet || answered.has(state.step!.request.packet.id)) continue;
+    const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    answered.add(saved.id);
+    const answer = g51AmbiguousAnswer(f, saved), payload = packet.value.packet as unknown as { expansion: { obligations: { id: string; kind: string; role?: string; connector?: string }[] } };
+    for (const fill of answer.research.proposal.fills as { obligation: string; wakeTest?: string }[]) {
+      const obligation = payload.expansion.obligations.find(item => item.id === fill.obligation);
+      if (obligation?.kind !== "connection-end" || obligation.role !== "producer") continue;
+      const covering = answer.research.proposal.tests.filter(test => test.covers.includes(obligation.connector!)).map(test => test.id).sort();
+      if (covering.length > 1) fill.wakeTest = covering[covering.length - 1]!;
+    }
+    steps.push({ research: answer.research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+  }
+  assert.ok(trail.some(row => row.includes(":works")), `The works are accepted on the work's own choice: ${trail.join(",")}`);
+  assert.equal(f.store.list(WAKE_INTENT_KIND).length, 0, "No supplement is asked");
+  assert.ok(!trail.some(row => row.includes("wake")));
+});
+
+test("G5.1 rows 3, 5 a choice outside the allowed tests is refused, asked once more showing why, then chosen; twice refused, the wait stands with no third call", async t => {
+  await t.test("refused, then chosen", async child => {
+    const { trail, results } = await g51Pass(child, (allowed, index) => index === 0 ? "not-a-covering-test" : allowed[0]!);
+    assert.deepEqual(results().map(row => row.value.verdict).sort(), ["chosen", "refused"], trail.join(","));
+    assert.ok(trail.some(row => row.includes("works")), trail.join(","));
+  });
+  await t.test("off-form, then chosen", async child => {
+    const { trail, results } = await g51Pass(child, (allowed, index) => index === 0 ? { answer: "the exact read test" } : allowed[1]!);
+    assert.deepEqual(results().map(row => row.value.verdict).sort(), ["chosen", "off-form"], trail.join(","));
+    assert.ok(trail.some(row => row.includes("works")), trail.join(","));
+  });
+  await t.test("interrupted, then chosen", async child => {
+    const { trail, results } = await g51Pass(child, (allowed, index) => index === 0 ? { rawStdout: "{broken", exitCode: 7, stderr: "intentional failure" } : allowed[0]!);
+    assert.equal(results().length, 2, trail.join(","));
+    assert.ok(["interrupted", "off-form"].includes(results().find(row => row.value.verdict !== "chosen")!.value.verdict), "A technical outcome, never a choice");
+    assert.ok(trail.some(row => row.includes("works")), trail.join(","));
+  });
+  await t.test("refused twice", async child => {
+    const { f, trail, state, results } = await g51Pass(child, () => "not-a-covering-test");
+    assert.deepEqual(results().map(row => row.value.verdict), ["refused", "refused"], trail.join(","));
+    assert.equal(f.store.list(WAKE_INTENT_KIND).length, 2, "No third intent");
+    assert.equal(state.phase, "waiting");
+    assert.equal(trail.some(row => row.includes("works")), false);
   });
 });
 

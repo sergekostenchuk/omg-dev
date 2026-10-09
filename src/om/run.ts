@@ -34,7 +34,9 @@ import { gateCandidate as gateCandidateOf, prepareCandidate as prepareCandidateO
 import { prepareSettleCandidate as prepareSettleCandidateOf, type SettleCandidateRequest } from "./frame-accept.js";
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, type FrameAttemptBinding } from "./layer-basis.js";
 import type { AcceptedFrameRequest } from "./frame-accept.js";
-import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf, type WorksAcceptanceRequest } from "./atomic-gate.js";
+import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf, producerProposal as producerProposalOf,
+  type WorkProposalSource, type WorksAcceptanceRequest } from "./atomic-gate.js";
+import { runWakeChoice as runWakeChoiceOf, wakeStanding as wakeStandingOf, type WakeChoiceRequest } from "./wake-choice.js";
 import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines as writeGapLinesOf, type GapLinesRecord } from "./gap-lines.js";
 import { prepareOmObligations as prepareOmObligationsOf, writeOmObligations as writeOmObligationsOf } from "./obligations.js";
 import { prepareFeasibility as prepareFeasibilityOf, readFeasibility as readFeasibilityOf, writeFeasibility as writeFeasibilityOf, type OmFeasibility } from "./feasibility.js";
@@ -82,7 +84,7 @@ export type RunErrorCode = typeof RUN_ERROR_CODES[number];
 export type RunSource = "refs" | "routes" | "queue" | "horizon" | "run-bases" | "input" | "accepted-answer" | "addressing" | "series"
   | "repeat-gate" | "stop-analysis" | "model-call" | "question-packet" | "assessment" | "answers-gate" | "frame-candidate"
   | "frame-accept" | "layer-basis" | "atomic-gate" | "gap-lines" | "obligations" | "feasibility" | "handoff" | "gaps"
-  | "stage-checks" | "run-control" | "frame-proposals";
+  | "stage-checks" | "run-control" | "frame-proposals" | "wake-choice";
 export type RunResultCode = RunLocalCode | SourceCodes<RunSource>;
 export type RunResult<T> = OmResult<T, RunResultCode>;
 
@@ -150,6 +152,9 @@ const prepareSettleCandidate = transferring("frame-accept", prepareSettleCandida
 const readAcceptedFrameLayer = transferring("layer-basis", readAcceptedFrameLayerOf);
 const prepareWorksAcceptance = transferring("atomic-gate", prepareWorksAcceptanceOf);
 const prepareWorksSources = transferring("atomic-gate", prepareWorksSourcesOf);
+const producerProposal = transferring("atomic-gate", producerProposalOf);
+const wakeStanding = transferring("wake-choice", wakeStandingOf);
+const runWakeChoice = (...args: Parameters<typeof runWakeChoiceOf>) => runWakeChoiceOf(...args).then(value => transfer("wake-choice", value));
 const writeGapLines = transferring("gap-lines", writeGapLinesOf);
 const prepareOmObligations = transferring("obligations", prepareOmObligationsOf);
 const writeOmObligations = transferring("obligations", writeOmObligationsOf);
@@ -181,7 +186,7 @@ export interface RunIntent { readonly outcomes: readonly string[] }
 
 export const RUN_ACTIONS = Object.freeze(["open-series", "open", "register", "lines", "obligations", "packet", "cycle", "assess",
   "candidate", "routes", "evaluate", "accept", "works", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
-  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile", "recover-analysis"] as const);
+  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile", "recover-analysis", "wake"] as const);
 export type RunAction = typeof RUN_ACTIONS[number];
 /** A chosen action: the exact request of its producer and the attempt it serves, if any. */
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
@@ -521,6 +526,9 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       }
       case "evaluate": return mapped(writeAnswersEvaluation(store, body as never), written => [refOf(written.evaluation)]);
       case "analyze": return mapped(await recovering(raw, project, () => runStopAnalysis(raw, body as never, undefined, hold)), record => [refOf(record)]);
+      case "wake": return mapped(await recovering(raw, project, () => runWakeChoice(raw, (body as { wake: WakeChoiceRequest }).wake,
+        (body as { ordinal: number }).ordinal, undefined, hold)),
+        choice => [refOf(choice)]);
       // LP8 (№3622): the one acceptance of a saved reviewer answer the old adapter wrapper refused — no model is called.
       case "recover-analysis": return mapped(writeStopAnalysisRecovery(store, body as never), record => [refOf(record)]);
       case "cease": return mapped(writeCompletionCessation(store, body as never), record => [refOf(record)]);
@@ -1347,7 +1355,13 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
         outcome: { gate: "G3", candidate: candidate!.ref, graphHash: candidate!.graphHash, passed: true, codes: [] }, binding: bound } }, series.id, ordinal);
       const results = group.flatMap(row => row.assemblies.filter(item => item.level === 3).map(item => ({ kind: item.kind, record: item.record })));
       const sources = prepareWorksSources(store, { project, results });
-      if (!sources.ok) return { wait: waitOf(sources.refusal, project) };
+      if (!sources.ok) {
+        // G5.1 (№3847): a sleeping flow whose producer work, answered before the wake-test era, has several covering tests
+        // and named none asks that one choice, paid by this accepting attempt; the works step then takes it.
+        const wake = sources.refusal.code === "sleeping_wake_test_missing"
+          ? wakeStep(store, project, results, sources.refusal, { series: reference(series), attempt: ordinal }, request.dispatch, series.id) : null;
+        return wake ?? { wait: waitOf(sources.refusal, project) };
+      }
       return step("works", { gate: checked.request, works: { project, environment: request.dispatch.config, sources: [...sources.value.sources],
         results, binding: bound } }, series.id, ordinal);
     }
@@ -1386,6 +1400,20 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   const claim = prepareManagedClaim(store, { ...address, outcome: { reason: "result", accepting, cancelling: [], refusals: [] } } as never);
   if (!claim.ok) return { wait: waitOf(claim.refusal, project) };
   return step("close", { ...address, outcome: claim.value.outcome }, series.id, ordinal);
+}
+/**
+ * G5.1: the wake step of the refused producer end — its proposal among this group's sources, while its choice is still
+ * open and one more intent is lawful. The step names the ordinal it asks, so a failed first intent is a new request.
+ */
+function wakeStep(store: Store, project: string, results: WorkProposalSource[], refusal: Refusal, accepting: { series: Ref; attempt: number },
+  dispatch: RunRequest["dispatch"], series: string): Choice | null {
+  const work = refusal.at.field, connector = refusal.at.target;
+  if (!work) return null;
+  const proposal = take(producerProposal(store, project, results, work));
+  if (!proposal) return null;
+  const wake: WakeChoiceRequest = { project, proposal, work, connector, accepting, dispatch };
+  const standing = take(wakeStanding(store, wake));
+  return standing.next === null ? null : step("wake", { wake, ordinal: standing.next }, series, accepting.attempt);
 }
 /** LP5: the end of a remaining acceptance or confirmation by its common producer; an addressed refusal stays the wait. */
 function finalizeStep(store: Store, project: string, binding: Sealed<Revision<CompletionOwner>>, phase: FinalizationPhase, series: string,
