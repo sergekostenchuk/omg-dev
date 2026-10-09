@@ -1701,7 +1701,7 @@
 - Отдаёт: —
 - Читает записи: om-gap; om-obligations
 - Пишет записи: om-obligations (D7)
-- Разрешённые пути: `src/om/obligations.ts`, `test/om-obligations.test.ts`
+- Разрешённые пути: `src/om/obligations.ts`, `test/om-obligations.test.ts`, `src/graph/om-obligation-readers.ts`, `src/graph/task-obligations.ts`, `src/om/run.ts`, `test/om-run.test.ts`
 - Из движка как есть: №3806
 - После: OWN1, OBL1
 - Тесты сверх обязательных:
