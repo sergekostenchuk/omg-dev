@@ -1793,8 +1793,8 @@
 - Отдаёт: —
 - Читает записи: отказ групповой приёмки; строки G5 в заявке закрытия
 - Пишет записи: статусы предложений; размещение происхождения G5
-- Разрешённые пути: `src/om/frame-accept.ts`, `test/om-frame-accept.test.ts`, `src/om/repeat-gate.ts`, `test/om-repeat-gate.test.ts`, `src/om/atomic-gate.ts`, `test/om-atomic-gate.test.ts`, `src/om/run.ts`, `test/om-run.test.ts`
-- Из движка как есть: №3862; №3865; №3869
+- Разрешённые пути: `src/om/frame-accept.ts`, `test/om-frame-accept.test.ts`, `src/om/repeat-gate.ts`, `test/om-repeat-gate.test.ts`, `src/om/atomic-gate.ts`, `test/om-atomic-gate.test.ts`, `src/om/run.ts`, `test/om-run.test.ts`, `src/om/packet-brief.ts`, `test/om-packet-brief.test.ts`
+- Из движка как есть: №3862; №3865; №3869; опись №3879; ревью G6 №3883 (неблокирующее): пример answer нового пакета o-state даёт одну работу для разных артефактов и сам получает part_result_invalid по ONE_ARTIFACT — исправить генератор примера (packet-brief), это пакет живого прохода
 - После: G6
 - Тесты сверх обязательных:
   - прогон истории после G6: отказ приёмки не вешает проход; невиновные сборки переиспользуются без оплаты; находки владения — к принимающей, без origin-analysis
