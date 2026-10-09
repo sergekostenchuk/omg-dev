@@ -26,6 +26,16 @@ export interface ObligationAssignment {
   runtimeCheck?: RuntimeCheck;
 }
 export interface CarriedObligation extends ObligationAssignment { scope: Ref; wake: ObligationWake }
+/**
+ * OWN1.2 (№3806, №3809): the one admissible consumer proof of an obligation a work binds — its own contract tests for
+ * post-implementation knowledge at task result, or the owner's runtime check that certifies the whole return condition
+ * of an environment confirmation. Any other kind or deadline has none: no work can bind it.
+ */
+export function consumerProofOf(obligation: Pick<ObligationAssignment, 'kind' | 'moment' | 'returnCondition' | 'runtimeCheck'>): 'tests' | 'runtime' | null {
+  if (obligation.kind === 'post-implementation-proof' && obligation.moment === 'task-result') return 'tests';
+  if (obligation.kind === 'environment-confirmation' && obligation.runtimeCheck?.satisfies === obligation.returnCondition) return 'runtime';
+  return null;
+}
 
 export const OM_OBLIGATION_CONTRACT = 'om-obligations/v1';
 /** The immutable OM era handoff: producer and its complete ledger select it. */

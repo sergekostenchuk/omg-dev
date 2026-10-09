@@ -428,8 +428,10 @@ export async function advanceRun(store: Store, request: RunRequest, control?: Ru
     if ("complete" in next) return transition(guarded, head, { phase: "complete", proof: next.complete }, head.value.last, null, []);
     if ("unable" in next) return transition(guarded, head, { phase: "unable", reasons: next.unable }, head.value.last, null, [], next.guards);
     // A choice identical to a request already performed with a product would repeat it without effect: the pass stands
-    // on that product and waits for its producer or a changed basis instead of looping on it.
-    const done = "step" in next ? performed(next.step.action, next.step.request) : null;
+    // on that product and waits for its producer or a changed basis instead of looping on it. OWN1.2 (№3806): D7 is
+    // chosen only when its own preparation would write (worksLedger), so its product is not found again even when the same
+    // request was performed — a ledger derived by an older rule (a default it no longer carries) is that changed basis.
+    const done = "step" in next && next.step.action !== "obligations" ? performed(next.step.action, next.step.request) : null;
     if (done && "step" in next) next = wait("step_without_effect", next.step.series ?? runId(request.project), next.step.action,
       "This exact request was performed and its product is found again; its producer or a changed basis decides the next action", done);
     if ("step" in next) {

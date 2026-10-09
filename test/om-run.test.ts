@@ -1388,14 +1388,16 @@ test("25 7 C61 №1749 H1 works of several blocks: each pays once, the full G4b 
   void phase;
 });
 
-// OWN1 (№3711, №3716) replaces the end of R13/R13b: in the bypass a late question no H2 assigned no longer ends the pass —
-// the engine carries it to its own consumer with what the pass knows of its own database; the question stays open.
-test("OWN1 H1.2 R13 R13b a late question of the environment no H2 assigned is carried by the engine to its consumer with the facts of its own database; the works go on, the question stays open and no owner command is invented", async t => {
+// OWN1 (№3711, №3716) replaced the end of R13/R13b: in the bypass a late question no H2 assigned no longer ends the pass.
+// OWN1.2 (№3806, №3809) replaces its carrying: the engine carries by default only what a work proves itself. The late
+// question of the environment without H2 is not in D7 — it stays open in B1 for its task start and binds no work, so the
+// works answer is accepted (OMG-LIVE 05:37: carried, it refused every works answer, task_obligation_resolution_required).
+test("OWN1.2 OWN1 H1.2 R13 R13b a late question of the environment no H2 assigned binds no work: D7 does not carry it, the works answer without a binding is accepted, the question stays open and no owner command is invented", async t => {
   const f = worksFixture(t, true);
   ok(startRun(f.store, { project }));
   const performed: string[] = [], answered = new Set<string>();
   let state: { phase: string; step?: { action: string; request: { packet: Ref } }; wait?: unknown } = { phase: "" };
-  for (let index = 0; index < 200; index++) {
+  for (let index = 0; index < 200 && !performed.includes("works"); index++) {
     const advanced = ok(await advanceRun(f.store, f.request));
     if (advanced.performed) performed.push(advanced.performed.action);
     state = advanced.record.value.state as unknown as typeof state;
@@ -1404,21 +1406,66 @@ test("OWN1 H1.2 R13 R13b a late question of the environment no H2 assigned is ca
     }
     if (state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
   }
-  // The works are asked of the model on the D7 ledger; binding the carried obligation to a work is the model's (this
-  // fixture's answers bind none, so the works are not accepted here).
   assert.ok(performed.indexOf("obligations") >= 0 && performed.indexOf("cycle", performed.indexOf("obligations")) > 0,
     `D7 and the works go on: ${performed.join(",")} ${JSON.stringify(state)}`);
-  assert.ok(f.sent().length > 0, "The works are asked of the model");
-  const carried = f.store.list<{ assignments: { kind: string; responsibleNode: string; responsibleConsumer: string; reason: string; returnCondition: string | null }[] }>("om-obligations")
-    .flatMap(row => row.value.assignments).filter(row => row.kind === "environment-confirmation");
-  assert.ok(carried.length >= 1, "The late gap is in the ledger");
-  for (const row of carried) {
-    assert.deepEqual([row.responsibleNode, row.responsibleConsumer], ["garden-consume-block", "garden-consume-block"]);
-    assert.match(row.reason, /^Assigned by the engine in the bypass: the consumer answers it at task-start\. Own database facts at this pass: stages discovery stage:garden:discovery@\d+/);
-    assert.equal(row.returnCondition, "Which runtime does the task start on?");
-  }
+  const ledgers = f.store.list<{ assignments: { kind: string }[] }>("om-obligations");
+  assert.ok(ledgers.length >= 1, "D7 is derived");
+  assert.deepEqual(ledgers.flatMap(row => row.value.assignments).filter(row => row.kind === "environment-confirmation"), [],
+    "A late question of the environment without H2 is not carried");
+  assert.ok(performed.includes("works"), `The works answer that binds nothing is accepted: ${performed.join(",")} ${JSON.stringify(state)}`);
+  assert.equal(JSON.stringify(f.store.list("om-unit-refusal")).includes("task_obligation_resolution_required"), false,
+    "No works answer is refused for a binding no work can make");
   assert.equal(f.store.list("om-owner-gap-assignment").length, 0, "The pass invents no owner command");
   assert.ok(f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.some(row => row.id === "discovery:later-env"), "The question stays open");
+});
+
+
+// OWN1.2 (№3806): the live pass had derived D7 for this exact request by the older rule (73d95d93 carried the environment
+// question to its consumer); the newer rule derives another ledger for the same request. Its earlier performance with the
+// older product is no step without effect: the pass writes the new ledger and the works go on (OMG-LIVE 0537 snapshot).
+import { prepareOmObligations, type ObligationRequest } from "../src/om/obligations.js";
+import { readGaps } from "../src/om/gaps.js";
+test("OWN1.2 a D7 request the older rule performed (the environment question carried) is performed again by the newer one: the pass writes the new ledger and the works answer is accepted, never step_without_effect", async t => {
+  const f = worksFixture(t, true);
+  ok(startRun(f.store, { project }));
+  const performed: string[] = [], answered = new Set<string>();
+  let older: { producer: Ref; ledger: Ref } | null = null;
+  let state: { phase: string; step?: { action: string; request: { packet: Ref } }; wait?: unknown } = { phase: "" };
+  for (let index = 0; index < 200 && !performed.includes("works"); index++) {
+    const head = f.store.get<RunRecord>(runId(project))!;
+    const chosen = head.value.state as unknown as { phase: string; step?: RunStep };
+    if (!older && chosen.phase === "step" && chosen.step!.action === "obligations") {
+      // What the older rule wrote for this exact request: the same ledger with the environment question carried.
+      const request = chosen.step!.request as unknown as ObligationRequest;
+      const derived = ok(prepareOmObligations(f.store, request));
+      assert.deepEqual(derived.record.value.assignments, [], "The newer rule carries nothing here");
+      const gap = ok(readGaps(f.store, request.gaps)).records.find(row => row.value.gap.target === "discovery:later-env")!;
+      const value = { ...derived.record.value, assignments: [{ obligation: gap.value.gap.id, original: { record: reference(gap), pointer: "/gap" },
+        kind: "environment-confirmation", moment: "task-start", neededForR2: false, responsibleNode: "garden-consume-block",
+        responsibleConsumer: "garden-consume-block", wake: null, reason: "Assigned by the engine in the bypass: the consumer answers it at task-start.",
+        returnCondition: "Which runtime does the task start on?" }] };
+      const ledger = f.store.write({ id: `om-obligations:${project}:${hashJson(value as unknown as Json)}`, kind: "om-obligations", expected: 0, value: value as unknown as Json });
+      const basis = { ...derived.producer.value, ledger: reference(ledger) };
+      const producer = f.store.write({ id: `om-obligation-basis:${project}:${hashJson(basis as unknown as Json)}`, kind: "om-obligation-basis", expected: 0, value: basis as unknown as Json });
+      older = { producer: reference(producer), ledger: reference(ledger) };
+      f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: { ...head.value, state: { phase: "ready" },
+        last: { step: chosen.step!, products: [older.producer, older.ledger], refusal: null } } as unknown as Json });
+      continue;
+    }
+    const advanced = ok(await advanceRun(f.store, f.request));
+    if (advanced.performed) performed.push(advanced.performed.action);
+    state = advanced.record.value.state as unknown as typeof state;
+    if (state.phase === "step" && state.step!.action === "cycle" && !answered.has(state.step!.request.packet.id)) {
+      answered.add(state.step!.request.packet.id); f.answer(state.step!.request.packet);
+    }
+    if (state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
+  }
+  assert.ok(older, "The pass chose D7 of this exact request");
+  assert.ok(performed.includes("obligations"), `The newer rule's D7 is performed after the older one: ${performed.join(",")} ${JSON.stringify(state)}`);
+  const ledgers = f.store.list<{ assignments: { kind: string }[] }>("om-obligations");
+  assert.ok(ledgers.some(row => row.id === older!.ledger.id), "The older ledger stays as written");
+  assert.ok(ledgers.some(row => row.id !== older!.ledger.id && !row.value.assignments.length), `The newer one is added beside it: ${JSON.stringify(ledgers.map(row => [row.id, row.value.assignments.length]))}`);
+  assert.ok(performed.includes("works"), `The works answer that binds nothing is accepted: ${performed.join(",")} ${JSON.stringify(state)}`);
 });
 
 

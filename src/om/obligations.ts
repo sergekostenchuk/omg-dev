@@ -14,7 +14,7 @@ import { historicalRead, withHistoricalReads } from './input.js';
 import { readFrameBasis } from './frame-obligations.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
-import { OM_LEDGER_ID_PREFIX, OM_OBLIGATION_CONTRACT, OM_PRODUCER_ID_PREFIX, registerOmObligationReaders,
+import { OM_LEDGER_ID_PREFIX, OM_OBLIGATION_CONTRACT, OM_PRODUCER_ID_PREFIX, consumerProofOf, registerOmObligationReaders,
   type OmObligationHandoff } from '../graph/om-obligation-readers.js';
 
 // The contract constants and handoff type belong to the lower reader slot so
@@ -379,19 +379,23 @@ function assignments(store: Store, basis: Context): OmObligationRecord['assignme
  * OWN1 (№3711, №3716): the bypass — a late question no H2 assigned is carried to each of its own accepted consumers, who
  * answer it at its own moment; the question stays open. The engine assigns it, it answers nothing: what the pass knows
  * of its own database (the stages B1 stands on and the accepted layers) goes with it, never in place of an observation.
+ * OWN1.2 (№3806, №3809): carried so is only what a work proves itself (consumerProofOf without an owner's runtime check);
+ * any other late question — an environment one without H2 — stays open in B1 for its own moment and binds no work.
  */
 function bypassAssignments(store: Store, basis: Context, gap: Sealed<GapRecord['gap']>): ReturnType<typeof projectAssignment>['assignments'] {
+  const moment = gap.moment === 'feasibility' ? 'R3' as const : gap.moment as 'task-start' | 'task-result';
+  const question = gap.evidence.find(row => row.origin === 'question')?.value;
+  const returnCondition = object(question) && text(question.question) ? question.question : `${gap.target}/${gap.field}`;
+  if (!consumerProofOf({ kind: gap.kind, moment, returnCondition })) return [];
   const source = basis.gaps.records.find(row => row.value.gap.id === gap.id);
   const consumers = sorted(gap.consumers);
   if (!source || !consumers.length || consumers.some(node => !basis.acceptedNodes.has(node)))
     fail('obligation_assignment_unresolved', gap.target, gap.field,
       'A late gap is carried to its own accepted consumers; this one has none, and H2 must assign it', 'owner');
-  const question = gap.evidence.find(row => row.origin === 'question')?.value;
   return consumers.map(node => ({ obligation: gap.id, original: { record: reference(source), pointer: '/gap' }, kind: gap.kind,
-    moment: gap.moment === 'feasibility' ? 'R3' as const : gap.moment as 'task-start' | 'task-result', neededForR2: false,
-    responsibleNode: node, responsibleConsumer: node, wake: null,
+    moment, neededForR2: false, responsibleNode: node, responsibleConsumer: node, wake: null,
     reason: `Assigned by the engine in the bypass: the consumer answers it at ${gap.moment}. ${ownDatabaseFacts(store, basis)}`,
-    returnCondition: object(question) && text(question.question) ? question.question : `${gap.target}/${gap.field}` }));
+    returnCondition }));
 }
 /** What the pass itself knows of its own database: the exact stages its B1 stands on and the accepted layers of D1. */
 function ownDatabaseFacts(store: Store, basis: Context): string {

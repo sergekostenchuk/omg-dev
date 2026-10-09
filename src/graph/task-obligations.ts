@@ -10,6 +10,7 @@ import { graphSchema, graphV2Schema } from './schema.js';
 import { carriedObligations, type CarriedObligation } from './obligation-policy.js';
 import { RefinementRelations } from './relations.js';
 import { obligationHandoff, omObligationHandoff, type ObligationHandoff } from './obligation-handoff.js';
+import { consumerProofOf } from './om-obligation-readers.js';
 import { taskObligationBindingSchema, type BoundTaskObligation, type TaskObligationBinding } from './task-obligation-model.js';
 const shapes = new Ajv({ allErrors: true, allowUnionTypes: true });
 const validBindings = shapes.compile<TaskObligationBinding[]>({ type: 'array', items: taskObligationBindingSchema });
@@ -122,8 +123,7 @@ function checkBinding(context: ReturnType<typeof bindingContext>, binding: TaskO
       || consumer.tests.some(id => !node.tests.includes(id) || !graph.tests.some(test => test.id === id && test.node === node.id && test.contract))) {
       fail('task_obligation_test_foreign', binding.id, 'Every selected test must be a concrete contract of this same work node'); continue;
     }
-    const supported = obligation.kind === 'post-implementation-proof' && obligation.moment === 'task-result' && consumer.tests.length > 0
-      || obligation.kind === 'environment-confirmation' && obligation.runtimeCheck?.satisfies === obligation.returnCondition;
+    const proof = consumerProofOf(obligation), supported = proof === 'tests' && consumer.tests.length > 0 || proof === 'runtime';
     if (!supported) {
       fail('task_obligation_resolution_required', binding.id, 'This knowledge kind/deadline has no declared admissible consumer proof; do not infer success or change its kind'); continue;
     }
