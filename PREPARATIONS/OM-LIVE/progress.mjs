@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 
 const OMG = `${homedir()}/OMG/.omg`;
 const WATCH = `${OMG}/live-watch.jsonl`, GATE = `${OMG}/live-gate/gate-log.jsonl`;
-const LIMITS = { calls: 80, block: 24, input: 8_000_000, minutes: 1800 };
+const LIMITS = { calls: 80, block: 33, input: 8_000_000, minutes: 1800 };
 const ENDS = new Set(["ended", "stopped", "terminated", "not-started", "peer-lost-before-start", "refused-closed"]);
 
 const lines = file => existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean) : [];
