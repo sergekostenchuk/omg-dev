@@ -1737,8 +1737,8 @@
 - Отдаёт: —
 - Читает записи: om-obligations (D7); ответ работ
 - Пишет записи: групповая приёмка; выбор теста пробуждения в ответе работ
-- Разрешённые пути: `src/om/atomic-gate.ts`, `test/om-atomic-gate.test.ts`, `src/om/frame-candidate.ts`, `test/om-frame-candidate.test.ts`, `src/om/works-frame.ts`, `test/om-works-frame.test.ts`, `src/om/packet-brief.ts`, `test/om-packet-brief.test.ts`
-- Из движка как есть: №3818; №3820
+- Разрешённые пути: `src/om/atomic-gate.ts`, `test/om-atomic-gate.test.ts`, `src/om/frame-candidate.ts`, `test/om-frame-candidate.test.ts`, `src/om/works-frame.ts`, `test/om-works-frame.test.ts`, `src/om/packet-brief.ts`, `test/om-packet-brief.test.ts`, `src/om/question-packet.ts`, `test/om-question-packet.test.ts`, `src/om/frame-proposals.ts`, `test/om-frame-proposals.test.ts`
+- Из движка как есть: №3818; №3820; №3823 (приём своей работы — partProposal/frame-proposals)
 - После: FA1
 - Тесты сверх обязательных:
   - прогон истории на снимке 0537 поверх FA1: отказ handoff снят без новых оплат; D7 другого запроса — отказ
