@@ -44,7 +44,7 @@
 - Читает записи: plan, phase-policy, environment; отправки исполнения
 - Пишет записи: допуск исполнения; записи отправок исполнения; stage execution
 - Из движка как есть: №3941 ~/REPORTS/review/omg-exec-inventory_111026.md; №3942 ~/REPORTS/review/omg-exec_opinion-3940_111026.md; №3945
-- Уже сделано до тебя: G6.1 «Владение общими файлами в группе: однозначные передачи producer_committed достраивает код, неоднозначный порядок записи — узкий выбор модели по механике G5.1» (src/om/atomic-gate.ts, src/om/frame-candidate.ts, src/om/wake-choice.ts, src/om/run.ts)
+- Уже сделано до тебя: G6.1 «Владение общими файлами в группе: однозначные передачи producer_committed достраивает код, неоднозначный порядок записи — узкий выбор модели по механике G5.1» (src/om/atomic-gate.ts, src/om/frame-candidate.ts, src/om/wake-choice.ts, src/om/run.ts); D8.4.1 «Общий исторический читатель reader-result у прежних потребителей (урок 45)» (src/discovery/reader-reuse.ts, src/discovery/pilot-context.ts, src/discovery/research-continuation.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -60,6 +60,9 @@
 - `src/om/frame-candidate.ts`
 - `src/om/wake-choice.ts`
 - `src/om/run.ts`
+- `src/discovery/reader-reuse.ts`
+- `src/discovery/pilot-context.ts`
+- `src/discovery/research-continuation.ts`
 
 ### Границы незавершённой интеграции
 
