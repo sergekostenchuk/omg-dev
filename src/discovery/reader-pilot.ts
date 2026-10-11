@@ -25,10 +25,11 @@ export interface ReaderPilotSettings {
 }
 /**
  * EX1 (№3945, №3951): the owner's admission of one exact accepted plan beyond the compilation boundary, with its execution
- * budget. Each revision of the pilot is a decision of its own; an earlier one is never erased.
+ * budget. Each revision of the pilot is a decision of its own; an earlier one is never erased. EX3 (№4000): a task may be
+ * corrected up to three times in all — the limit counts the corrections already used, so no revision resets it.
  */
 export interface ExecutionAdmissionSettings {
-  plan: Ref; roleLaunches: number; softInput: number; roleReserve: { implement: number; review: number }; maxCorrections: 0 | 1;
+  plan: Ref; roleLaunches: number; softInput: number; roleReserve: { implement: number; review: number }; maxCorrections: 0 | 1 | 2 | 3;
 }
 /** The admission an execution runs under: the exact pilot revision and its settings, a copy. */
 export interface ExecutionAdmission { readonly pilot: Ref; readonly execution: ExecutionAdmissionSettings }
@@ -52,7 +53,8 @@ readerPilotSchema.properties['planning'] = object({ fields: { type: "array", min
   maxRequestChars: positive, maxRounds: positive });
 readerPilotSchema.properties['callTimeoutMs'] = { type: "integer", minimum: 1, maximum: 3_000_000 };
 const executionSchema = object({ plan: object({ id: text, revision: positive, hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }),
-  roleLaunches: positive, softInput: positive, roleReserve: object({ implement: positive, review: positive }), maxCorrections: { enum: [0, 1] } });
+  roleLaunches: positive, softInput: positive, roleReserve: object({ implement: positive, review: positive }),
+  maxCorrections: { type: "integer", minimum: 0, maximum: 3 } });
 readerPilotSchema.properties['execution'] = executionSchema;
 const valid = new Ajv({ allErrors: true }).compile<ReaderPilotSettings>(readerPilotSchema);
 const validExecution = new Ajv({ allErrors: true }).compile<ExecutionAdmissionSettings>(executionSchema);

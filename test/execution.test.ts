@@ -792,7 +792,8 @@ test("EX1 A the boundary admits execution only under the owner's admission of ex
     refuseDirect(rest); refuse(rest, "command_invalid");
   }
   refuseDirect({ ...f.execution(), roleReserve: { implement: 5000 } });
-  refuseDirect({ ...f.execution(), maxCorrections: 2 });
+  // EX3 (№4000): the limit is an integer 0..3; four, a fraction, a negative or a string is no limit.
+  for (const maxCorrections of [4, 1.5, -1, "1", null]) refuseDirect({ ...f.execution(), maxCorrections });
   assert.throws(() => configureReaderPilot(f.store, f.engine.environments, "p", { ...f.settings, execution: f.execution() }, pilot.revision),
     { code: "execution_admission_invalid" }, "An admission is written only with its plan's currency proof");
   // A forged plan: another hash, another project's namespace.
@@ -1153,4 +1154,110 @@ test("EX2 №3986-1 the outcome a correction answers survives a refused launch: 
   const sends = f.sends().filter(row => row.value.role === "implement" && row.value.task === f.plan.value.tasks[0]!.id).sort((a, b) => a.value.attempt - b.value.attempt);
   assert.deepEqual(sends.map(row => [row.value.attempt, row.value.status, row.value.feedback?.check ?? null]), [[1, "answered", null], [2, "refused", 0], [3, "answered", 0]]);
   assert.deepEqual(sends.at(-1)!.value.feedback!.basis, reference(needs), "the correction names the exact outcome it answers");
+});
+
+// ---- EX3 (№4000): a task's correction limit is an integer 0..3, the task's in all ----
+const EX3_BASE = "e3f2b98eb5d232caae3a0956bc8d17bbaa136f70";
+const taskOne = (f: ReturnType<typeof ex1Fixture>) => f.plan.value.tasks[0]!;
+const implementsOf = (f: ReturnType<typeof ex1Fixture>) => f.provider().filter(call => call.mode === "implement" && call.task === taskOne(f).id);
+
+test("EX3 the limit of an admission is an integer 0..3: two and three are admitted and bound the command; four, a fraction, a negative or a string is refused by the command's form and by its writer, and a stored one by its reader", async t => {
+  const f = ex1Fixture(t, { admit: false });
+  const pilot = () => f.store.get("reader-pilot:p")!;
+  for (const maxCorrections of [4, 1.5, -1, "1"]) {
+    const before = pilot().revision;
+    assert.throws(() => f.admit(f.execution({ maxCorrections } as never)), { code: "command_invalid" }, String(maxCorrections));
+    assert.throws(() => configureReaderPilot(f.store, f.engine.environments, "p", { ...f.settings, execution: f.execution({ maxCorrections } as never) }, before,
+      plan => planCurrentGuardsProbe(f, plan)), { code: "execution_admission_invalid" }, String(maxCorrections));
+    assert.equal(pilot().revision, before, "nothing is written");
+  }
+  f.admit(f.execution({ maxCorrections: 2 }));
+  await assert.rejects(f.run({ maxCorrections: 3 }), { code: "execution_corrections_exceeded" }, "the command asks no more than the admission");
+  f.admit(f.execution({ maxCorrections: 3 }));
+  assert.equal(f.store.get<ReaderPilotSettings>("reader-pilot:p")!.value.execution!.maxCorrections, 3);
+  await assert.rejects(f.run({ maxCorrections: 4 }), { code: "execution_corrections_exceeded" });
+  // A stored pilot whose limit no writer could have written is refused by the reader that shares the writer's form.
+  const stored = f.store.get<ReaderPilotSettings>("reader-pilot:p")!, second = new Store(f.database);
+  for (const [index, maxCorrections] of [4, 1.5].entries()) {
+    second.write({ id: stored.id, kind: "reader-pilot", expected: stored.revision + index,
+      value: { ...stored.value, execution: { ...stored.value.execution!, maxCorrections } } as never });
+    await assert.rejects(f.run({ maxCorrections: 3 }), { code: "reader_pilot_invalid" }, String(maxCorrections));
+  }
+  second.close();
+  assert.deepEqual([f.sends().length, f.store.list("task-run").length], [0, 0]);
+});
+
+test("EX3 a task's three corrections: a failed check, its correction, a negative review, the next correction shown its finding — committed with two corrections used", async t => {
+  const f = ex1Fixture(t, { tap: true, budget: { maxCorrections: 3 } });
+  f.behave({ "implement:1": "wrong", "review:1": "code" });
+  const runs = await f.run({ maxCorrections: 3 });
+  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 3], ["committed", 1]]);
+  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "implement", "review", "implement", "review", "implement", "review"]);
+  const [, sighted, reviewed] = implementsOf(f);
+  assert.match(sighted!.correction!.error!, /not ok 1 - produce returns its successor/, "the first correction is shown the failed check");
+  assert.deepEqual(reviewed!.correction!.review, { verdict: "request_changes", kind: "code", findings: ["The result is wrong"] }, "the next is shown the review's finding");
+  assert.equal(reviewed!.correction!.error, "The result is wrong");
+  const sends = f.sends().filter(row => row.value.role === "implement" && row.value.task === taskOne(f).id).sort((a, b) => a.value.attempt - b.value.attempt);
+  assert.deepEqual(sends.map(row => [row.value.attempt, row.value.correction, row.value.feedback?.check ?? null]), [[1, false, null], [2, true, 0], [3, true, null]]);
+  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 2);
+});
+
+test("EX3 the limit is the task's in all: a restart and a new admission continue the count — under three the fourth counted correction is never launched, and no later revision opens one", async t => {
+  const f = ex1Fixture(t, { tap: true });
+  f.behave({ implement: "wrong" });
+  const first = await f.run({ maxCorrections: 1 });
+  assert.deepEqual([first[0]!.value.state, implementsOf(f).length], ["needs_code", 2]);
+  await assert.rejects(f.run({ retry: true, maxCorrections: 1 }), { code: "execution_corrections_exhausted" });
+  f.reopen();
+  f.admit(f.execution({ maxCorrections: 3 }));
+  const second = await f.run({ retry: true, maxCorrections: 3 });
+  assert.deepEqual([second[0]!.value.state, second[0]!.value.attempt], ["needs_code", 4]);
+  assert.equal(implementsOf(f).length, 4, "two more, not three: the first counted correction is the task's");
+  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 3);
+  f.reopen();
+  f.admit(f.execution({ maxCorrections: 3, roleLaunches: 41 }));
+  await assert.rejects(f.run({ retry: true, maxCorrections: 3 }), { code: "execution_corrections_exhausted" });
+  assert.deepEqual([implementsOf(f).length, f.sends().length], [4, 4], "the fourth correction reaches no provider and is no launch");
+  assert.equal(f.store.get<TaskRun>(second[0]!.id)!.revision, second[0]!.revision, "the refusal writes nothing");
+});
+
+test("EX3 the shared limits stop an execution with corrections left: launches or input, refused before any launch; a new admission continues with the correction the saved check asks", async t => {
+  const f = ex1Fixture(t, { tap: true, budget: { maxCorrections: 3, roleLaunches: 3 } });
+  f.behave({ implement: "wrong" });
+  const runs = await f.run({ maxCorrections: 3 });
+  assert.equal(runs[0]!.value.state, "interrupted");
+  assert.match(runs[0]!.value.error!, /^execution_budget_exhausted/);
+  assert.deepEqual([implementsOf(f).length, f.sends().length, correctionsUsed(f.store, f.plan, taskOne(f))], [3, 3, 2], "one correction is left, yet nothing is launched");
+  f.behave({});
+  f.admit(f.execution({ maxCorrections: 3, roleLaunches: 7 }));
+  const resumed = await f.run({ retry: true, maxCorrections: 3 });
+  assert.deepEqual(resumed.map(run => run.value.state), ["committed", "committed"]);
+  assert.match(implementsOf(f).at(-1)!.correction!.error!, /not ok 1 - produce returns its successor/);
+  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 3);
+  const g = ex1Fixture(t, { tap: true, budget: { maxCorrections: 3, softInput: 2500, roleReserve: { implement: 1000, review: 1000 } } });
+  g.behave({ implement: "wrong" });
+  const stopped = await g.run({ maxCorrections: 3 });
+  assert.equal(stopped[0]!.value.state, "interrupted");
+  assert.match(stopped[0]!.value.error!, /^execution_budget_exhausted: The admitted input would be exceeded/);
+  assert.deepEqual([implementsOf(g).length, correctionsUsed(g.store, g.plan, taskOne(g))], [2, 1]);
+});
+
+test("EX3 era: the base stops a task at its negative review with its one correction spent; under a new admission of three the new code continues it — the saved review is shown to the correction, never bought again, and the count goes on from the base's", async t => {
+  const f = ex1Fixture(t, { tap: true });
+  f.behave({ "implement:1": "wrong", "review:1": "code" });
+  const command = JSON.stringify(f.command());
+  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX3_BASE, "ex3-era", `
+out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_code"]);
+  f.reopen();
+  const stopped = f.store.list<TaskRun>("task-run")[0]!;
+  assert.deepEqual([stopped.value.attempt, stopped.value.review?.verdict], [2, "request_changes"]);
+  await assert.rejects(f.run({ retry: true, maxCorrections: 1 }), { code: "execution_corrections_exhausted" }, "the base's admission reads as it wrote it");
+  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 1);
+  f.admit(f.execution({ maxCorrections: 3 }));
+  const runs = await f.run({ retry: true, maxCorrections: 3 });
+  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 3], ["committed", 1]]);
+  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "implement", "review", "implement", "review", "implement", "review"],
+    "the saved negative review is not bought again before its correction");
+  assert.deepEqual(implementsOf(f)[2]!.correction!.review, { verdict: "request_changes", kind: "code", findings: ["The result is wrong"] });
+  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 2);
 });
