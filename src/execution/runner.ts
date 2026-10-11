@@ -9,7 +9,9 @@ import { ensureWorktree, requireWorktree } from "./worktree.js";
 import { capture, requireWritePaths } from "./candidate.js";
 import { currentBasis } from "./basis.js";
 import { callAgent, implementation, review, ExecutionSendHandle, EXECUTION_SEND_KIND, UNSENT, executionSendPrefix, lostSendClosure,
-  type ExecutionSend } from "./protocol.js";
+  type ExecutionSend, type ExecutionSendFeedback } from "./protocol.js";
+import type { Command } from "../graph/model.js";
+import type { ProcessResult } from "../runtime/process.js";
 import { executeProcess, stopOrphan, type ProcessObserver } from "./process.js";
 import { isProcessStopRefusal, writeProcessStopWitness, evaluateProcessStopWitnesses } from "../runtime/process-identity.js";
 import { checkCommands, commitIntent, publishCommit, finishCommit, subjectHash } from "./commit.js";
@@ -67,18 +69,138 @@ export function requireExecutionBudget(store: Store, admission: ExecutionAdmissi
   if (committed + forecast > softInput) throw new EngineError("execution_budget_exhausted", "The admitted input would be exceeded by this launch",
     { target: plan.id, field: "softInput", committed, forecast, limit: softInput });
 }
-/** Correction attempts this task of this plan has already launched: durable, so a retry never opens another (№3947). */
+// ---- EX2 (№3980): a correction sees what failed; a slot spent blind by the earlier producer is restored, narrowly. ----
+
+const TAP_SUMMARY = /^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b/;
+const tail = (text: string, limit: number): string => text.length <= limit ? text : text.slice(text.length - limit);
+/** The failed check's excerpt fits the request it joins: at most 12 000 characters, at most an eighth of the allowance. */
+export const feedbackLimit = (maxRequestChars: number): number => Math.max(1000, Math.min(12_000, Math.floor(maxRequestChars / 8)));
+/**
+ * What a correction is told of a failed check (№3980): its command, exit code or signal, where its full result is saved, and a
+ * bounded excerpt of both streams — every TAP `not ok` with its diagnostic block (expected/actual) and the TAP summary, then the
+ * stderr tail; output that is not TAP gives the tails of both streams. A cut is marked; the full result stays in the checks.
+ */
+/** Every TAP `not ok` line of an output with its diagnostic block (the lines indented below it). */
+function notOkBlocks(stdout: string): string[] {
+  const lines = stdout.split("\n"), indent = (line: string) => line.length - line.trimStart().length, blocks: string[] = [];
+  for (let at = 0; at < lines.length; at++) {
+    const match = /^(\s*)not ok \d+/.exec(lines[at]!);
+    if (!match) continue;
+    let end = at + 1;
+    while (end < lines.length && (lines[end]!.trim() === "" || indent(lines[end]!) > match[1]!.length)) end++;
+    blocks.push(lines.slice(at, end).join("\n").trimEnd());
+  }
+  return blocks;
+}
+export function checkFeedback(command: Command, result: ProcessResult, index: number, limit: number): { text: string; truncated: boolean } {
+  const head = `failed check: ${[command.executable.split("/").at(-1), ...command.args].join(" ")} → `
+    + `${result.signal ? `signal ${result.signal}` : `exit ${result.exitCode}`} (its full stdout and stderr are saved in this attempt's checks[${index}])`;
+  const lines = result.stdout.split("\n"), blocks = notOkBlocks(result.stdout);
+  const parts = [head];
+  let cut = false;
+  if (blocks.length) {
+    let room = Math.floor(limit * 0.7), shown = 0;
+    for (const block of blocks) {
+      if (room <= 0) break;
+      const part = block.length > Math.min(3000, room) ? `${block.slice(0, Math.min(3000, room))}\n…` : block;
+      if (part !== block) cut = true;
+      parts.push(part); room -= part.length; shown++;
+    }
+    if (shown < blocks.length) { cut = true; parts.push(`… ${blocks.length - shown} more failing test(s) not shown`); }
+    const summary = lines.map(line => line.trim()).filter(line => TAP_SUMMARY.test(line));
+    if (summary.length) parts.push(summary.join("\n"));
+    if (result.stderr.trim()) { const stderr = tail(result.stderr.trim(), 1000); cut ||= stderr.length < result.stderr.trim().length; parts.push(`stderr (tail):\n${stderr}`); }
+  } else {
+    const stdout = tail(result.stdout.trim(), Math.floor(limit * 0.6)), stderr = tail(result.stderr.trim(), Math.floor(limit * 0.3));
+    cut = stdout.length < result.stdout.trim().length || stderr.length < result.stderr.trim().length;
+    if (stdout) parts.push(`stdout (tail):\n${stdout}`);
+    if (stderr) parts.push(`stderr (tail):\n${stderr}`);
+  }
+  let text = parts.join("\n");
+  if (cut) text += "\n[cut: the excerpt is shortened; the full output is in the saved check]";
+  if (text.length > limit) { text = `${text.slice(0, limit - 60)}\n[cut: the excerpt is shortened; see the saved check]`; cut = true; }
+  return { text, truncated: cut };
+}
+/** The failed check of an attempt's saved checks, if one failed: the excerpt a correction of it is shown. */
+function failedCheck(run: TaskRun, limit: number): (Omit<ExecutionSendFeedback, "basis"> & { text: string }) | null {
+  const index = run.checks.findIndex(check => check.result.exitCode !== 0 || check.result.signal !== null);
+  if (index < 0) return null;
+  const check = run.checks[index]!, excerpt = checkFeedback(check.command, check.result, index, limit);
+  return { check: index, chars: excerpt.text.length, truncated: excerpt.truncated, text: excerpt.text };
+}
+
+export const EXECUTION_RECOVERY_KIND = "execution-recovery";
+export const EXECUTION_RECOVERY_CONTRACT = "execution-recovery/v1";
+/** The technical restoration of one correction slot: exactly which launch went blind, and the failed check it was not shown. */
+export interface ExecutionRecovery {
+  contract: typeof EXECUTION_RECOVERY_CONTRACT; project: string; plan: Ref; task: string; send: Ref; basis: Ref; check: number;
+  reason: "correction-without-check-output";
+}
+const recoveryId = (sendId: string): string => sendId.replace(/^execution-send:/, `${EXECUTION_RECOVERY_KIND}:`);
+/**
+ * The one derivation of a blind correction (№3980), shared by its writer and every reader: a paid correction launch of the
+ * earlier producer (it names no `feedback`), answering the needs_code outcome of the attempt before it, whose failed check had
+ * output on stdout while the error the launch was given is exactly the earlier producer's stderr tail — the diagnostics never
+ * reached it. Anything else is no basis: an old correction is never restored by the absence of the new field alone.
+ */
+export function blindCorrection(store: Store, plan: Revision<MachinePlan>, task: CompiledTask, send: Revision<ExecutionSend>): ExecutionRecovery | null {
+  const value = send.value;
+  if (value.role !== "implement" || !value.correction || UNSENT.includes(value.status) || "feedback" in value || value.task !== task.id
+    || canonical(value.plan) !== canonical(reference(plan)) || send.id !== `${executionSendPrefix(plan.value.projectId, plan.value.hash)}${taskScope(task)}${value.attempt}:implement:${value.ordinal}`)
+    return null;
+  const history = store.history<TaskRun>(runId(plan.value.hash, task.id));
+  const first = history.findIndex(row => row.value.attempt === value.attempt);
+  const basis = first > 0 ? history.slice(0, first).reverse().find(row => row.value.attempt === value.attempt - 1 && row.value.state === "needs_code") : undefined;
+  if (!basis) return null;
+  const index = basis.value.checks.findIndex(check => check.result.exitCode !== 0 || check.result.signal !== null);
+  const failed = index < 0 ? null : basis.value.checks[index]!.result;
+  // Proved withheld: the launch was given exactly the earlier producer's stderr tail, and the saved stdout holds a failing
+  // test's diagnostics (a TAP `not ok` block) that this error does not contain. Progress output on stdout proves nothing (№3986-2).
+  if (!failed || basis.value.error !== (failed.stderr.slice(-2000) || "A required check failed")
+    || !notOkBlocks(failed.stdout).some(block => !basis.value.error!.includes(block.split("\n")[0]!.trim()))) return null;
+  return { contract: EXECUTION_RECOVERY_CONTRACT, project: value.project, plan: reference(plan), task: task.id, send: reference(send), basis: reference(basis),
+    check: index, reason: "correction-without-check-output" };
+}
+/**
+ * Reads a saved restoration as written: its basis was proved by its producer when it was created (NR, №3606) and is never
+ * derived again here. Only its form is checked — a record without its exact launch at its own address is refused (T4).
+ */
+function readRecovery(store: Store, id: string, revision: number): ExecutionRecovery {
+  const record = store.get<ExecutionRecovery>(id, revision);
+  const send = record?.value?.send;
+  if (!record || record.kind !== EXECUTION_RECOVERY_KIND || record.value.contract !== EXECUTION_RECOVERY_CONTRACT
+    || typeof send?.id !== "string" || !Number.isSafeInteger(send.revision) || typeof send.hash !== "string" || recoveryId(send.id) !== id)
+    throw new EngineError("execution_recovery_invalid", "A restored correction slot names its exact launch at its own address", { target: id, field: "send" });
+  return record.value;
+}
+/** Writes the restoration of each blind correction launch of the task once; a repeated entry finds it and restores nothing more. */
+function restoreBlindCorrections(store: Store, plan: Revision<MachinePlan>, task: CompiledTask): void {
+  for (const send of sendsOf(store, plan, taskScope(task))) {
+    if (store.get(recoveryId(send.id))) continue;
+    const value = blindCorrection(store, plan, task, send);
+    if (value) store.writeMany([{ id: recoveryId(send.id), kind: EXECUTION_RECOVERY_KIND, expected: 0, value: value as never }], [reference(send)]);
+  }
+}
+/** Correction attempts this task of this plan has already launched: durable, so a retry never opens another (№3947); a launch
+ * the earlier producer sent blind is not counted once its restoration is saved (№3980). */
 export function correctionsUsed(store: Store, plan: Revision<MachinePlan>, task: CompiledTask): number {
+  const restored = new Set(store.identities("prefix", `${EXECUTION_RECOVERY_KIND}:${plan.value.projectId}:${plan.value.hash}:${taskScope(task)}`)
+    .filter(row => row.kind === EXECUTION_RECOVERY_KIND).map(row => readRecovery(store, row.id, row.revision).send.id));
   return new Set(sendsOf(store, plan, taskScope(task)).filter(row => row.value.role === "implement" && row.value.correction
-    && !UNSENT.includes(row.value.status)).map(row => row.value.attempt)).size;
+    && !UNSENT.includes(row.value.status) && !restored.has(row.id)).map(row => row.value.attempt)).size;
 }
 /** A new attempt corrects code when the latest settled outcome of its task, past interruptions, asked for a code change. */
-function pendingCorrection(store: Store, id: string): boolean {
+/**
+ * The outcome a new attempt corrects: the latest settled outcome of its task, past interruptions and launches that never got an
+ * answer, when it asked for a code change — its failed check and findings are what the correction is shown, however many
+ * attempts were refused or interrupted on the way (№3986-1). Read once, when the new attempt is produced.
+ */
+function correctionBasis(store: Store, id: string): Revision<TaskRun> | null {
   for (const revision of store.history<TaskRun>(id).reverse()) {
     if (["interrupted", "implementing", "checking", "reviewing"].includes(revision.value.state)) continue;
-    return revision.value.state === "needs_code";
+    return revision.value.state === "needs_code" ? revision : null;
   }
-  return false;
+  return null;
 }
 /**
  * The stage an earlier attempt already paid for, resumed rather than bought again (№3953-3): its applied implementation,
@@ -215,13 +337,15 @@ export class Executor {
         const contextSources = loadTaskContextSources(this.store, plan);
         const previous = run?.value;
         const resume = run ? paidStage(root.value, parent, task, run.value) : null;
-        let correction = false;
+        let correction = false, basis: Revision<TaskRun> | null = null;
         if (resume) {
           // The paid implementation (and a passed review) are kept; only the free stages after them run again.
           run = this.save(run!, resume === "commit" ? { state: "reviewing", child: null, error: null }
             : { state: "checking", child: null, error: null, checks: [], review: null, reviewSubject: null });
         } else {
-          correction = run ? pendingCorrection(this.store, run.id) : false;
+          basis = run ? correctionBasis(this.store, run.id) : null;
+          correction = basis !== null;
+          if (correction && correctionsUsed(this.store, plan, task) >= maxCorrections) restoreBlindCorrections(this.store, plan, task);
           if (correction && correctionsUsed(this.store, plan, task) >= maxCorrections)
             throw new EngineError("execution_corrections_exhausted", "This task already used its correction; a retry opens no other",
               { target: task.id, field: "maxCorrections", limit: maxCorrections });
@@ -242,12 +366,16 @@ export class Executor {
             value: { ...candidate, ...(task.researchObligations !== undefined ? { obligationStartProofs: starts.proofs } : {}) } }],
           [reference(lock), reference(root), ...guards, ...capacityGuards, ...starts.guards])[0]!;
         }
+        // What the correction is shown of the attempt it corrects: the excerpt of its failed check, from the saved result (№3980).
+        const shown = basis ? failedCheck(basis.value, feedbackLimit(maxRequestChars)) : null;
         let launched: ExecutionSendHandle | null = null;
         const closure = (): Write[] => { const write = launched?.take() ?? null; launched = null; return write ? [write] : []; };
         const send = (role: "implement" | "review") => (request: { hash: string; chars: number }): ExecutionSendHandle => {
           const ordinal = sendsOf(this.store, plan, `${taskScope(task)}${run!.value.attempt}:${role}:`).length + 1;
           return launched = new ExecutionSendHandle(this.store, { project, plan: reference(plan), task: task.id, attempt: run!.value.attempt, role, ordinal,
-            correction: role === "implement" && correction, admission: admission?.pilot ?? null }, plan.value.hash, request);
+            correction: role === "implement" && correction, admission: admission?.pilot ?? null,
+            feedback: role === "implement" && shown && basis ? { check: shown.check, chars: shown.chars, truncated: shown.truncated, basis: reference(basis) } : null },
+            plan.value.hash, request);
         };
         const observe: ProcessObserver = child => { run = this.save(run!, { child }); };
         const measure = (value: AgentUsage) => {
@@ -264,7 +392,9 @@ export class Executor {
           if (!resume) {
             requireCurrentTaskStart(this.store, run.value, task);
             const response = await callAgent(actual.implementer, actual, "implement", "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.",
-              { context, parent, inputs: inputs.inputs, ownership: ownership.grants, correction: previous ? { error: previous.error, review: previous.review } : null },
+              { context, parent, inputs: inputs.inputs, ownership: ownership.grants,
+                correction: basis ? { error: shown ? shown.text : basis.value.error, review: basis.value.review }
+                  : previous ? { error: previous.error, review: previous.review } : null },
               maxRequestChars, measure, observe, signal, send("implement"));
             const output = implementation(response, task);
             const tree = capture(root.value, parent, task);
@@ -282,7 +412,8 @@ export class Executor {
               const result = await executeProcess(command, actual.workspace, "", actual.timeoutMs, observe, signal);
               done.set(hashJson(command), { command, result });
               run = this.save(run, { checks: commands.filter(item => done.has(hashJson(item))).map(item => done.get(hashJson(item))!) });
-              requireCondition(result.exitCode === 0 && result.signal === null, "full_check_failed", result.stderr.slice(-2000) || "A required check failed");
+              requireCondition(result.exitCode === 0 && result.signal === null, "full_check_failed",
+                checkFeedback(command, result, run.value.checks.findIndex(check => hashJson(check.command) === hashJson(command)), feedbackLimit(maxRequestChars)).text);
               requireCondition(capture(root.value, parent, task) === tree, "candidate_changed", "A check changed the candidate bytes");
             }
             const subject = subjectHash(reference(plan), task.id, parent, tree);

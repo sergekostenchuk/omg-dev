@@ -415,7 +415,7 @@ const seen = existsSync(journal) ? readFileSync(journal, 'utf8').split('\\n').fi
 const step = behavior[mode + ':' + (seen + 1)] ?? behavior[mode] ?? 'ok';
 const group = pid => Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
 appendFileSync(journal, JSON.stringify({ mode, step, task: subject.context.binding.task, pid: process.pid, adapter: process.ppid,
-  group: group(process.pid), adapterGroup: group(process.ppid) }) + '\\n');
+  group: group(process.pid), adapterGroup: group(process.ppid), correction: subject.correction ?? null }) + '\\n');
 const usage = { input_tokens: 1000, output_tokens: 10, cached_input_tokens: 0, reasoning_output_tokens: 0 };
 if (step === 'refuse') {
   // The gate's part: its own saved refusal of exactly the open send of its group, before any provider.
@@ -461,8 +461,19 @@ mkdirSync('build', { recursive: true }); writeFileSync('build/marker', 'built');
 const modes = ['produce', ...(existsSync('consume.mjs') ? ['consume'] : [])];
 for (const mode of modes) { const result = spawnSync(process.execPath, ['check.mjs', mode], { stdio: 'inherit' }); if (result.status !== 0) process.exit(1); }
 `;
+/** EX2: a full check run by node --test — its failure is TAP on stdout, while stderr carries a warning (as SQLite's on the live pass). */
+const EX2_TAP_FULL = (directory: string) => String.raw`
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+appendFileSync(${JSON.stringify(join(directory, "order.log"))}, 'full\n');
+mkdirSync('build', { recursive: true }); writeFileSync('build/marker', 'built');
+writeFileSync('build/tap.test.mjs', "import test from 'node:test'; import assert from 'node:assert/strict'; process.emitWarning('SQLite is an experimental feature', 'ExperimentalWarning');\n"
+  + "test('produce returns its successor', async () => { const { produce } = await import('../produce.mjs'); assert.deepEqual({ value: produce(1) }, { value: 2 }); });\n");
+const result = spawnSync(process.execPath, ['--test', 'build/tap.test.mjs'], { stdio: 'inherit' });
+process.exit(result.status ?? 1);
+`;
 const EX1_BUDGET: Omit<ExecutionAdmissionSettings, "plan"> = { roleLaunches: 40, softInput: 6_000_000, roleReserve: { implement: 5000, review: 2000 }, maxCorrections: 1 };
-function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreModules?: boolean; modules?: boolean; admit?: boolean;
+function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreModules?: boolean; modules?: boolean; admit?: boolean; tap?: boolean; progress?: boolean;
   budget?: Partial<Omit<ExecutionAdmissionSettings, "plan">>; implementer?: { executable: string; args: string[] } } = {}) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "omg-ex1-"))), workspace = join(directory, "repo"), bin = join(directory, "bin");
   mkdirSync(workspace); mkdirSync(bin);
@@ -485,7 +496,9 @@ function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreMo
     for (const mutation of proof.contract!.counterfactuals) mutation.command = { executable: process.execPath, args: ["check.mjs", "mutation"] };
   }
   preparedFeatures(engine, "p", graph);
-  writeFileSync(join(directory, "full.mjs"), EX1_FULL(directory));
+  // `progress`: the full check prints progress on stdout while its failure stays on stderr (№3986-2).
+  writeFileSync(join(directory, "full.mjs"), options.tap ? EX2_TAP_FULL(directory)
+    : options.progress ? EX1_FULL(directory).replace("\nappendFileSync(", "\nconsole.log('Building candidate...');\nappendFileSync(") : EX1_FULL(directory));
   const adapter = { executable: process.execPath, args: [fileURLToPath(new URL("../src/adapters/codex-stdio.js", import.meta.url))] };
   engine.environments.configure("p", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command: options.implementer ?? adapter },
     reviewer: { actor: "reviewer", model: "fixture", effort: "high", command: adapter },
@@ -511,7 +524,7 @@ function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreMo
     get store() { return store; }, get engine() { return engine; },
     run: async (extra: Partial<{ retry: boolean; maxCorrections: number }> = {}) => await engine.execute(command(extra)) as Revision<TaskRun>[],
     behave: (value: Record<string, string>) => writeFileSync(join(directory, "behavior.json"), JSON.stringify(value)),
-    provider: (): { mode: string; step: string; task: string; pid: number; adapter: number; group: number; adapterGroup: number }[] => {
+    provider: (): { mode: string; step: string; task: string; pid: number; adapter: number; group: number; adapterGroup: number; correction: { error: string | null; review: unknown } | null }[] => {
       try { return readFileSync(join(directory, "provider.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } },
     sends: () => store.list<ExecutionSend>(EXECUTION_SEND_KIND),
     order: () => { try { return readFileSync(join(directory, "order.log"), "utf8").split("\n").filter(Boolean); } catch { return []; } },
@@ -932,7 +945,7 @@ test("EX1 a launch record is closed once, from sent; a subject without its exact
   const store = new Store(join(directory, "state.sqlite"));
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
   const plan = { id: "plan:p:x", revision: 1, hash: "a".repeat(64) };
-  const subject = { project: "p", plan, task: "task:abc", attempt: 1, role: "implement" as const, ordinal: 1, correction: false, admission: null };
+  const subject = { project: "p", plan, task: "task:abc", attempt: 1, role: "implement" as const, ordinal: 1, correction: false, admission: null, feedback: null };
   for (const wrong of [{ attempt: 0 }, { ordinal: 0 }, { role: "chat" }, { task: "" }])
     assert.throws(() => new ExecutionSendHandle(store, { ...subject, ...wrong } as never, "x", { hash: "h", chars: 1 }), { code: "execution_send_invalid" });
   assert.throws(() => new ExecutionSendHandle(store, subject, "x", { hash: "h", chars: 0 }), { code: "execution_send_invalid" });
@@ -998,4 +1011,146 @@ test("EX1 №3961-3 the reads of a decision are addressed by its plan and task: 
       role: "implement", ordinal: 1, correction: true, admission: null, request: { hash: "h", chars: 1 }, group: null, status: "answered", usage: null, startedAt: index, finishedAt: index } as never });
   assert.equal(measure(), before, "300 launches of another plan are not read");
   assert.ok(before > 0);
+});
+
+
+// ---- EX2 (№3980): the correction sees what failed; a blind slot is restored narrowly ----
+import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, type ExecutionRecovery } from "../src/execution/runner.js";
+const EX2_BASE = "afb55c7ddd110c7cf27b1493a722209e68455f73";
+
+test("EX2 a correction sees what failed: a TAP failure on stdout under a warning on stderr reaches it — the not ok block with its expected and actual, the summary — and its launch names that feedback", async t => {
+  const f = ex1Fixture(t, { tap: true });
+  f.behave({ "implement:1": "wrong" });
+  const runs = await f.run();
+  assert.deepEqual(runs.map(run => run.value.state), ["committed", "committed"]);
+  const correction = f.provider().filter(call => call.mode === "implement")[1]!.correction!;
+  assert.match(correction.error!, /^failed check: .*full\.mjs → exit 1 \(its full stdout and stderr are saved in this attempt's checks\[0\]\)/);
+  assert.match(correction.error!, /not ok 1 - produce returns its successor/);
+  assert.match(correction.error!, /value: 3/, "actual");
+  assert.match(correction.error!, /value: 2/, "expected");
+  assert.match(correction.error!, /# fail 1/);
+  assert.match(correction.error!, /ExperimentalWarning/, "the stderr tail too");
+  const send = f.sends().find(row => row.value.role === "implement" && row.value.attempt === 2)!.value;
+  assert.deepEqual([send.correction, send.feedback?.check, send.feedback?.truncated, send.feedback?.chars === correction.error!.length], [true, 0, false, true]);
+  assert.equal(f.sends().find(row => row.value.attempt === 1 && row.value.role === "implement")!.value.feedback, null, "a first attempt is shown nothing");
+});
+
+test("EX2 a failure without TAP gives the tails of both streams; a long one is cut within its limit and the cut is marked", async t => {
+  const f = ex1Fixture(t);
+  f.behave({ "implement:1": "wrong" });
+  await f.run();
+  const correction = f.provider().filter(call => call.mode === "implement")[1]!.correction!;
+  assert.match(correction.error!, /^failed check: /);
+  assert.match(correction.error!, /AssertionError/);
+  const block = (n: number) => `not ok ${n} - case ${n}\n  ---\n  error: |-\n${"    + actual - expected\n".repeat(400)}  ...`;
+  const stdout = [...Array.from({ length: 10 }, (_, n) => block(n + 1)), "# tests 10", "# fail 10"].join("\n");
+  const long = checkFeedback({ executable: "node", args: ["--test"] }, { exitCode: 1, signal: null, stdout, stderr: "warning\n".repeat(500) }, 3, 4000);
+  assert.ok(long.text.length <= 4000, `${long.text.length}`);
+  assert.equal(long.truncated, true);
+  assert.match(long.text, /\[cut: /);
+  assert.match(long.text, /^failed check: node --test → exit 1 .*checks\[3\]/);
+  assert.match(long.text, /not ok 1 - case 1/);
+  const quiet = checkFeedback({ executable: "/x/tsc", args: ["-p", "."] }, { exitCode: 2, signal: null, stdout: "src/a.ts(1,1): error TS2304: Cannot find name 'x'.", stderr: "" }, 0, 4000);
+  assert.deepEqual([quiet.truncated, /error TS2304/.test(quiet.text), /^failed check: tsc -p \. → exit 2/.test(quiet.text)], [false, true, true]);
+});
+
+/** The live case: the base (EX1) executes with a correction that fails again — its errors are the stderr tail, its correction launch names no feedback. */
+async function blindByBase(t: test.TestContext, then: Record<string, string>, fixture: { tap?: boolean; progress?: boolean } = { tap: true }) {
+  const f = ex1Fixture(t, fixture);
+  f.behave({ "implement:1": "wrong", "implement:2": "wrong" });
+  const command = JSON.stringify(f.command());
+  assert.equal(ex1AtCommit(f.directory, f.database, EX2_BASE, "ex2-blind", `
+try { await engine.execute(${command}); out('ran'); } catch (error) { out(error.code); }`), "ran");
+  f.reopen();
+  const runs = f.store.list<TaskRun>("task-run");
+  assert.deepEqual([runs[0]!.value.state, runs[0]!.value.attempt], ["needs_code", 2], "the base spent its one correction");
+  const blind = f.sends().find(row => row.value.attempt === 2)!;
+  assert.equal("feedback" in blind.value, false, "the base's launch names no feedback");
+  if (fixture.tap) assert.match(f.provider().filter(call => call.mode === "implement")[1]!.correction!.error!, /^\(node:\d+\) Warning|ExperimentalWarning/, "the base showed only the stderr tail");
+  f.behave(then);
+  return { f, blind };
+}
+test("EX2 a correction slot the earlier producer spent blind is restored once, by its exact launch: a restart does not restore it again, and the restored correction is shown what failed", async t => {
+  const { f, blind } = await blindByBase(t, {});
+  const runs = await f.run({ retry: true });
+  assert.deepEqual(runs.map(run => run.value.state), ["committed", "committed"]);
+  const recoveries = f.store.list<ExecutionRecovery>(EXECUTION_RECOVERY_KIND);
+  assert.equal(recoveries.length, 1);
+  assert.deepEqual([recoveries[0]!.value.send.id, recoveries[0]!.value.check], [blind.id, 0]);
+  const sighted = f.provider().filter(call => call.mode === "implement")[2]!.correction!;
+  assert.match(sighted.error!, /not ok 1 - produce returns its successor/, "the restored correction sees the failure of the attempt it corrects");
+  assert.ok(f.sends().find(row => row.value.attempt === 3)!.value.feedback, "and its launch names it");
+  assert.equal(f.sends().filter(row => row.value.role === "implement" && row.value.task === f.plan.value.tasks[0]!.id).length, 3, "both earlier launches stay in the account");
+});
+test("EX2 the restored slot is one: a restored correction that fails again exhausts the limit, a restart creates no second slot; an ordinary failed correction of this era exhausts it as before", async t => {
+  const { f } = await blindByBase(t, { "implement:3": "wrong" });
+  const runs = await f.run({ retry: true });
+  assert.equal(runs[0]!.value.state, "needs_code");
+  f.reopen();
+  await assert.rejects(f.run({ retry: true }), { code: "execution_corrections_exhausted" });
+  assert.equal(f.store.list(EXECUTION_RECOVERY_KIND).length, 1, "no second restoration");
+  const g = ex1Fixture(t, { tap: true });
+  g.behave({ "implement:1": "wrong", "implement:2": "wrong" });
+  assert.equal((await g.run())[0]!.value.state, "needs_code");
+  await assert.rejects(g.run({ retry: true }), { code: "execution_corrections_exhausted" });
+  assert.equal(g.store.list(EXECUTION_RECOVERY_KIND).length, 0, "a correction shown its failure is no basis");
+});
+test("EX2 a restoration is proved when it is created and read as written: the reader takes no history and its cost does not grow with later revisions; a record without its launch is refused by its form", async t => {
+  const { f, blind } = await blindByBase(t, {});
+  const task = f.plan.value.tasks[0]!;
+  assert.ok(blindCorrection(f.store, f.plan, task, blind), "the base's blind launch is a basis when the restoration is created");
+  await f.run({ retry: true });
+  assert.equal(f.store.list(EXECUTION_RECOVERY_KIND).length, 1);
+  const measure = () => {
+    let histories = 0, rows = 0;
+    const history = f.store.history.bind(f.store), get = f.store.get.bind(f.store), identities = f.store.identities.bind(f.store);
+    f.store.history = ((...args: Parameters<Store["history"]>) => { histories++; const found = history(...args); rows += found.length; return found; }) as Store["history"];
+    f.store.get = ((...args: Parameters<Store["get"]>) => { const found = get(...args); if (found) rows++; return found; }) as Store["get"];
+    f.store.identities = ((...args: Parameters<Store["identities"]>) => { const found = identities(...args); rows += found.length; return found; }) as Store["identities"];
+    try { correctionsUsed(f.store, f.plan, task); } finally { f.store.history = history; f.store.get = get; f.store.identities = identities; }
+    return { histories, rows };
+  };
+  const before = measure();
+  assert.equal(before.histories, 0, "the saved restoration is not derived again");
+  const run = f.store.list<TaskRun>("task-run").find(row => row.value.taskId === task.id)!;
+  for (let index = 0; index < 300; index++) {
+    const head = f.store.get<TaskRun>(run.id)!;
+    f.store.write({ id: run.id, kind: "task-run", expected: head.revision, value: { ...head.value, updatedAt: head.value.updatedAt + 1 } as never });
+  }
+  assert.deepEqual(measure(), before, "300 later revisions of the task run add nothing to the read");
+  const id = blind.id.replace(/^execution-send:/, `${EXECUTION_RECOVERY_KIND}:`), saved = f.store.get<ExecutionRecovery>(id)!;
+  const { send: _send, ...withoutSend } = saved.value;
+  f.store.write({ id, kind: EXECUTION_RECOVERY_KIND, expected: saved.revision, value: withoutSend as never });
+  assert.throws(() => correctionsUsed(f.store, f.plan, task), { code: "execution_recovery_invalid" }, "T4: a restoration without its launch");
+});
+
+test("EX2 №3986-2 progress output on stdout proves no blindness: when the earlier correction was given the whole failure on stderr, no slot is restored", async t => {
+  const { f, blind } = await blindByBase(t, {}, { progress: true });
+  const given = f.provider().filter(call => call.mode === "implement")[1]!.correction!.error!;
+  assert.match(given, /AssertionError/, "the earlier producer passed the whole failure");
+  const basis = f.store.history<TaskRun>(f.store.list<TaskRun>("task-run")[0]!.id).find(row => row.value.state === "needs_code" && row.value.attempt === 1)!;
+  assert.match(basis.value.checks[0]!.result.stdout, /Building candidate/);
+  assert.equal(blindCorrection(f.store, f.plan, f.plan.value.tasks[0]!, blind), null);
+  await assert.rejects(f.run({ retry: true }), { code: "execution_corrections_exhausted" });
+  assert.equal(f.store.list(EXECUTION_RECOVERY_KIND).length, 0);
+  assert.equal(f.provider().length, 2, "no further paid launch");
+});
+
+test("EX2 №3986-1 the outcome a correction answers survives a refused launch: after the gate refused the correction, the next one is shown the original not ok, its expected and actual and the saved check", async t => {
+  const f = ex1Fixture(t, { tap: true });
+  f.behave({ "implement:1": "wrong", "implement:2": "refuse" });
+  const runs = await f.run();
+  assert.equal(runs[0]!.value.state, "interrupted");
+  f.behave({});
+  const resumed = await f.run({ retry: true });
+  assert.deepEqual(resumed.map(run => run.value.state), ["committed", "committed"]);
+  const attempts = f.provider().filter(call => call.mode === "implement" && call.task === f.plan.value.tasks[0]!.id);
+  const shown = attempts.at(-1)!.correction!.error!;
+  assert.match(shown, /not ok 1 - produce returns its successor/);
+  assert.match(shown, /value: 3/); assert.match(shown, /value: 2/);
+  assert.match(shown, /checks\[0\]/);
+  const needs = f.store.history<TaskRun>(resumed[0]!.id).find(row => row.value.state === "needs_code" && row.value.attempt === 1)!;
+  const sends = f.sends().filter(row => row.value.role === "implement" && row.value.task === f.plan.value.tasks[0]!.id).sort((a, b) => a.value.attempt - b.value.attempt);
+  assert.deepEqual(sends.map(row => [row.value.attempt, row.value.status, row.value.feedback?.check ?? null]), [[1, "answered", null], [2, "refused", 0], [3, "answered", 0]]);
+  assert.deepEqual(sends.at(-1)!.value.feedback!.basis, reference(needs), "the correction names the exact outcome it answers");
 });
