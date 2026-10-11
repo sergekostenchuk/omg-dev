@@ -1981,7 +1981,7 @@
 - Пишет записи: адресная находка плана; исход попытки needs_plan / needs_code
 - Разрешённые пути: `src/execution/runner.ts`, `src/execution/protocol.ts`, `src/execution/model.ts`, `src/adapters/codex-stdio.ts`, `test/execution.test.ts`, `test/adapter-lineage.test.ts`
 - Из движка как есть: №4119; №4125; №4086
-- После: AT1
+- После: EX6
 - Тесты сверх обязательных:
   - ошибка разрешённого кода с падением неизменного соседнего теста — needs_code
   - тест вне writePaths без адресной находки — needs_code
@@ -2004,7 +2004,7 @@
 - Пишет записи: запись дефекта плана; правка принятого L3; новый план
 - Разрешённые пути: `src/om/plan-defect.ts`, `src/om/gaps.ts`, `src/om/run.ts`, `src/om/question-packet.ts`, `src/om/packet-brief.ts`, `src/om/frame-accept.ts`, `src/om/feasibility.ts`, `src/compiler/compiler.ts`, `src/product/repairs.ts`, `test/om-run.test.ts`, `test/om-gaps.test.ts`, `test/om-question-packet.test.ts`, `test/om-packet-brief.test.ts`, `test/om-frame-accept.test.ts`, `test/om-feasibility.test.ts`, `test/compiler.test.ts`, `test/repair.test.ts`
 - Из движка как есть: №4119; №4125; №4084
-- После: AT3a
+- После: AT1, AT3a
 - Тесты сверх обязательных:
   - сквозная регрессия: отменённое ожидание → адресная находка → дефект → новая работа с update product.test.ts → G5 → M8 → новый план
   - повтор входа ремонта по тому же дефекту — та же запись, без второго прохода и второго расхода

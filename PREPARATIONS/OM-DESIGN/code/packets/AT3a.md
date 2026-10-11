@@ -45,7 +45,7 @@
 - Читает записи: находки ревью и результаты проверок; сохранённый кандидат попытки
 - Пишет записи: адресная находка плана; исход попытки needs_plan / needs_code
 - Из движка как есть: №4119; №4125; №4086
-- Уже сделано до тебя: AT1 «Договор готовности работы в L3/G5 и адресные разрывы (AT1+AT2): опись влияния по графу репозитория (входы, потребители, их тесты: keep/update), решения поведения у производителя общего контракта (появление durable-состояния, provider), интерфейсы предшественников; G5 не принимает работу без полной описи; незакрытое условие — адресный разрыв (исследовать / доопределить моделью / вопрос владельцу) со штатным выходом назад к работе» (src/om/impact.ts, src/om/atomic-gate.ts, src/om/packet-brief.ts, src/om/question-packet.ts, src/om/gaps.ts, src/om/gap-lines.ts, src/om/feasibility.ts, src/graph/model.ts, src/graph/schema.ts, src/graph/semantics.ts, src/graph/layer-design.ts, src/compiler/context.ts, src/graph/builder.ts, src/om/answers-gate.ts, src/om/input.ts, src/om/run-bases.ts, src/om/run.ts)
+- Уже сделано до тебя: EX6 «Уточнение владельца к точной задаче плана в допуске исполнения (taskClarifications): текст передаётся запросам реализации, исправления и ревью как часть контракта задачи; без перекомпиляции плана» (src/discovery/reader-pilot.ts, src/execution/runner.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -57,23 +57,8 @@
 
 ### Соседи в коде (файлы прямых предшественников; содержимое — `git show <база>:<путь>`)
 
-- `src/om/impact.ts`
-- `src/om/atomic-gate.ts`
-- `src/om/packet-brief.ts`
-- `src/om/question-packet.ts`
-- `src/om/gaps.ts`
-- `src/om/gap-lines.ts`
-- `src/om/feasibility.ts`
-- `src/graph/model.ts`
-- `src/graph/schema.ts`
-- `src/graph/semantics.ts`
-- `src/graph/layer-design.ts`
-- `src/compiler/context.ts`
-- `src/graph/builder.ts`
-- `src/om/answers-gate.ts`
-- `src/om/input.ts`
-- `src/om/run-bases.ts`
-- `src/om/run.ts`
+- `src/discovery/reader-pilot.ts`
+- `src/execution/runner.ts`
 
 ### Границы незавершённой интеграции
 

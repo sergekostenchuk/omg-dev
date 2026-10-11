@@ -45,7 +45,7 @@
 - Читает записи: адресная находка плана (AT3a); принятый L3; решения H2
 - Пишет записи: запись дефекта плана; правка принятого L3; новый план
 - Из движка как есть: №4119; №4125; №4084
-- Уже сделано до тебя: AT3a «Исполнение (исправленный AT0): адресная находка плана в ответе ревью и исход реализации contract_unexecutable с проверкой адреса движком; раннее падение полной проверки разбирает существующая роль reviewer, а не прекращает ход до ревью» (src/execution/runner.ts, src/execution/protocol.ts, src/execution/model.ts, src/adapters/codex-stdio.ts)
+- Уже сделано до тебя: AT1 «Договор готовности работы в L3/G5 и адресные разрывы (AT1+AT2): опись влияния по графу репозитория (входы, потребители, их тесты: keep/update), решения поведения у производителя общего контракта (появление durable-состояния, provider), интерфейсы предшественников; G5 не принимает работу без полной описи; незакрытое условие — адресный разрыв (исследовать / доопределить моделью / вопрос владельцу) со штатным выходом назад к работе» (src/om/impact.ts, src/om/atomic-gate.ts, src/om/packet-brief.ts, src/om/question-packet.ts, src/om/gaps.ts, src/om/gap-lines.ts, src/om/feasibility.ts, src/graph/model.ts, src/graph/schema.ts, src/graph/semantics.ts, src/graph/layer-design.ts, src/compiler/context.ts, src/graph/builder.ts, src/om/answers-gate.ts, src/om/input.ts, src/om/run-bases.ts, src/om/run.ts); AT3a «Исполнение (исправленный AT0): адресная находка плана в ответе ревью и исход реализации contract_unexecutable с проверкой адреса движком; раннее падение полной проверки разбирает существующая роль reviewer, а не прекращает ход до ревью» (src/execution/runner.ts, src/execution/protocol.ts, src/execution/model.ts, src/adapters/codex-stdio.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -57,6 +57,23 @@
 
 ### Соседи в коде (файлы прямых предшественников; содержимое — `git show <база>:<путь>`)
 
+- `src/om/impact.ts`
+- `src/om/atomic-gate.ts`
+- `src/om/packet-brief.ts`
+- `src/om/question-packet.ts`
+- `src/om/gaps.ts`
+- `src/om/gap-lines.ts`
+- `src/om/feasibility.ts`
+- `src/graph/model.ts`
+- `src/graph/schema.ts`
+- `src/graph/semantics.ts`
+- `src/graph/layer-design.ts`
+- `src/compiler/context.ts`
+- `src/graph/builder.ts`
+- `src/om/answers-gate.ts`
+- `src/om/input.ts`
+- `src/om/run-bases.ts`
+- `src/om/run.ts`
 - `src/execution/runner.ts`
 - `src/execution/protocol.ts`
 - `src/execution/model.ts`
