@@ -1960,8 +1960,8 @@
 - Отдаёт: —
 - Читает записи: точное дерево репозитория; контракты предшественников плана
 - Пишет записи: опись влияния работы; решения keep/update; адресные разрывы готовности
-- Разрешённые пути: `src/om/packet-brief.ts`, `src/om/atomic-gate.ts`, `src/om/gaps.ts`, `src/om/impact.ts`, `test/om-atomic-gate.test.ts`, `test/om-gaps.test.ts`, `test/om-impact.test.ts`
-- Из движка как есть: №4081 ~/REPORTS/review/omg-atomic-plan-inventory_111026.md; №4082; №4084
+- Разрешённые пути: `src/om/impact.ts`, `src/om/atomic-gate.ts`, `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `src/om/gaps.ts`, `src/om/gap-lines.ts`, `src/om/feasibility.ts`, `src/graph/model.ts`, `src/graph/schema.ts`, `src/graph/semantics.ts`, `src/graph/layer-design.ts`, `src/compiler/context.ts`, `src/om/answers-gate.ts`, `src/om/input.ts`, `test/om-impact.test.ts`, `test/om-impact-flow.test.ts`, `test/om-atomic-gate.test.ts`, `test/om-gaps.test.ts`, `test/om-gap-lines.test.ts`, `test/om-packet-brief.test.ts`, `test/om-question-packet.test.ts`, `test/om-feasibility.test.ts`, `test/graph.test.ts`, `test/layer-design.test.ts`, `test/context.test.ts`
+- Из движка как есть: №4081 ~/REPORTS/review/omg-atomic-plan-inventory_111026.md; №4082; №4084; предревью договора №4089 (7 P2), договор с поправками №4091 ~/REPORTS/review/omg-at1-contract_111026.md; answers-gate.ts и input.ts — условно, по сообщению исполнителя до правки; одна поставка по слову Codex, ширина >6 осознанно
 - После: EX6
 - Тесты сверх обязательных:
   - задача 1: отменённое ожидание product.test.ts без пути записи — отказ G5 с адресом; решение init у производителя — принято
