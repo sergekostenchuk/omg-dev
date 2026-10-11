@@ -1027,7 +1027,7 @@ test("EX1 №3961-3 the reads of a decision are addressed by its plan and task: 
 
 
 // ---- EX2 (№3980): the correction sees what failed; a blind slot is restored narrowly ----
-import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, FIVE_CLASSES, IMPLEMENT_CLASSES, CORRECTION_CLASSES, REVIEW_CLASSES, REVIEW_PASS, REVIEW_CHANGES, riskMap, type ExecutionRecovery } from "../src/execution/runner.js";
+import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, FIVE_CLASSES, IMPLEMENT_CLASSES, CORRECTION_CLASSES, REVIEW_CLASSES, REVIEW_PASS, REVIEW_CHANGES, riskMap, CLARIFICATION_HEAD, CLARIFICATION_REVIEW, type ExecutionRecovery } from "../src/execution/runner.js";
 const EX2_BASE = "afb55c7ddd110c7cf27b1493a722209e68455f73";
 
 test("EX2 a correction sees what failed: a TAP failure on stdout under a warning on stderr reaches it — the not ok block with its expected and actual, the summary — and its launch names that feedback", async t => {
@@ -1455,4 +1455,67 @@ test("EX5 №4045 a reviewer that answers exactly in the forms its brief states 
   h.behave({ "review:1": `literal-plan:${absence}` });
   const stopped = await h.run({ maxCorrections: 1 });
   assert.deepEqual(stopped.map(run => [run.value.state, run.value.review?.kind]), [["needs_plan", "plan"]]);
+});
+
+// ---- EX6 (№4068): the owner's clarification of an exact task's contract, in its admission, with no recompilation ----
+const EX6_BASE = "145d833e4937836033883bd2ef66846c4753ad39";
+const VARIANT_1 = "Решение владельца (вариант 1): новый канон создаётся только явной инициализацией (CLI init). Приём поручения и восстановление работают с существующим каноном; его отсутствие не доказывает отсутствие commit. serve и npm run dev без канона не создают пустую базу и отвечают требованием явного init — это поведение по контракту, а не регрессия NEIGHBOURS.";
+
+test("EX6 an owner's clarification of an exact task reaches that task's implementation, its correction and its review, and no other task's", async t => {
+  const f = ex1Fixture(t);
+  const one = taskOne(f).id;
+  f.admit(f.execution({ taskClarifications: [{ task: one, text: VARIANT_1 }] }));
+  f.behave({ "review:1": "code:NEIGHBOURS: serve without the store answers that init is required" });
+  const runs = await f.run({ maxCorrections: 1 });
+  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 2], ["committed", 1]]);
+  assert.deepEqual(f.provider().filter(call => call.task === one).map(call => call.mode), ["implement", "review", "implement", "review"]);
+  for (const [index, call] of f.provider().entries()) {
+    const own = call.task === one;
+    assert.equal(call.brief.includes(`${CLARIFICATION_HEAD}${call.mode === "review" ? ` ${CLARIFICATION_REVIEW}` : ""}\n${VARIANT_1}`), own, `${index} ${call.mode}`);
+    assert.equal(call.brief.includes(CLARIFICATION_REVIEW), own && call.mode === "review", `${index}: only the review is told how to judge by it`);
+  }
+  assert.ok(briefsOf(f, "implement")[1]!.brief.includes(CORRECTION_CLASSES), "the correction carries it with what a correction owes");
+});
+
+test("EX6 a clarification names one exact task of this plan, once, with its text: a foreign or forged task, a duplicate, an empty list or text, or another form is refused by its writer and its command; a stored one by the boundary that reads it", async t => {
+  const f = ex1Fixture(t, { admit: false });
+  const pilot = () => f.store.get("reader-pilot:p")!, one = taskOne(f).id;
+  const refuse = (taskClarifications: unknown, code: string, field?: string) => {
+    const before = pilot().revision;
+    assert.throws(() => f.admit(f.execution({ taskClarifications } as never)),
+      (error: EngineError) => error.code === code && (!field || (error.details as { field?: string }).field === field), JSON.stringify(taskClarifications));
+    assert.throws(() => configureReaderPilot(f.store, f.engine.environments, "p", { ...f.settings, execution: f.execution({ taskClarifications } as never) }, before,
+      plan => planCurrentGuardsProbe(f, plan)), { code: "execution_admission_invalid" }, JSON.stringify(taskClarifications));
+    assert.equal(pilot().revision, before, "nothing is written");
+  };
+  for (const value of [[], [{ task: one }], [{ text: VARIANT_1 }], [{ task: one, text: "" }], [{ task: "", text: VARIANT_1 }], [{ task: one, text: 5 }],
+    [{ task: one, text: VARIANT_1, extra: true }], { [one]: VARIANT_1 }]) refuse(value, "command_invalid");
+  refuse([{ task: `task:${hashJson(["q", "graph", "node"]).slice(0, 40)}`, text: VARIANT_1 }], "execution_admission_invalid", "execution.taskClarifications.0.task");
+  refuse([{ task: one, text: VARIANT_1 }, { task: one.replace(/.$/, last => last === "0" ? "1" : "0"), text: VARIANT_1 }], "execution_admission_invalid", "execution.taskClarifications.1.task");
+  refuse([{ task: one, text: VARIANT_1 }, { task: one, text: "another" }], "execution_admission_invalid", "execution.taskClarifications.1.task");
+  f.admit(f.execution({ taskClarifications: [{ task: one, text: VARIANT_1 }] }));
+  const stored = f.store.get<ReaderPilotSettings>("reader-pilot:p")!, second = new Store(f.database);
+  assert.deepEqual(stored.value.execution!.taskClarifications, [{ task: one, text: VARIANT_1 }]);
+  const forged = [[{ task: `task:${"0".repeat(40)}`, text: VARIANT_1 }], [{ task: one, text: VARIANT_1 }, { task: one, text: "another" }]];
+  for (const [index, taskClarifications] of forged.entries()) {
+    second.write({ id: stored.id, kind: "reader-pilot", expected: stored.revision + index, value: { ...stored.value, execution: { ...stored.value.execution!, taskClarifications } } as never });
+    await assert.rejects(f.run({ maxCorrections: 1 }), { code: "execution_admission_invalid" }, JSON.stringify(taskClarifications));
+  }
+  second.write({ id: stored.id, kind: "reader-pilot", expected: stored.revision + forged.length, value: stored.value as never });
+  second.close();
+  assert.deepEqual([f.sends().length, f.store.list("task-run").length], [0, 0]);
+  assert.deepEqual((await f.run({ maxCorrections: 1 })).map(run => run.value.state), ["committed", "committed"]);
+});
+
+test("EX6 era: without a clarification every request is byte for byte the base's, and the admission the base wrote reads as it wrote it", async t => {
+  const f = ex1Fixture(t);
+  const command = JSON.stringify(f.command({ maxCorrections: 1 }));
+  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX6_BASE, "ex6-era", `
+out((await engine.execute(${command})).map(run => run.value.state));`), ["committed", "committed"]);
+  const g = ex1Fixture(t);
+  assert.deepEqual((await g.run({ maxCorrections: 1 })).map(run => run.value.state), ["committed", "committed"]);
+  assert.deepEqual(g.provider().map(call => call.brief), f.provider().map(call => call.brief), "no clarification, the base's requests");
+  f.reopen();
+  assert.deepEqual((await f.run({ retry: true, maxCorrections: 1 })).map(run => run.value.state), ["committed", "committed"]);
+  assert.equal(f.provider().length, 4, "the base's results stand; nothing is bought again");
 });

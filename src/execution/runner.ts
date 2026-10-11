@@ -244,6 +244,17 @@ export function riskMap(task: CompiledTask): string {
     `NEIGHBOURS: do the callers of what changes and the existing tests (${listed((task.tests ?? []).map(test => test.id))}) keep their contracts?`].join("\n");
 }
 const selfReview = (task: CompiledTask): string => `${FIVE_CLASSES}\n${riskMap(task)}`;
+/**
+ * EX6 (№4068): the owner's clarification of this exact task, from its admission — part of the task's contract, given to the
+ * implementation, its correction and its review alike. Without one the requests stay exactly as they were.
+ */
+export const CLARIFICATION_HEAD = "Owner's clarification of this task's contract — part of the contract: it settles what the plan leaves ambiguous and never overrides an explicit requirement of the plan.";
+export const CLARIFICATION_REVIEW = "Judge the candidate against the plan with this clarification: behaviour it prescribes is the contract, not a defect of any class.";
+export function clarificationOf(admission: ExecutionAdmission | null, task: string): string | null {
+  return admission?.execution.taskClarifications?.find(entry => entry.task === task)?.text ?? null;
+}
+const clarified = (text: string | null, review: boolean): string => text === null ? ""
+  : `\n${CLARIFICATION_HEAD}${review ? ` ${CLARIFICATION_REVIEW}` : ""}\n${text}`;
 const IMPLEMENT = "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.";
 /** A new attempt corrects code when the latest settled outcome of its task, past interruptions, asked for a code change. */
 /**
@@ -310,7 +321,7 @@ export class Executor {
       const results: Revision<TaskRun>[] = []; let parent = plan.value.base.head;
       const corrections = new Map<string, number>();
       for (let taskIndex = 0; taskIndex < plan.value.tasks.length; taskIndex++) {
-        const task = plan.value.tasks[taskIndex]!, limit = correctionLimit(options, admission, task.id);
+        const task = plan.value.tasks[taskIndex]!, limit = correctionLimit(options, admission, task.id), clarification = clarificationOf(admission, task.id);
         let run = this.store.get<TaskRun>(runId(plan.value.hash, task.id));
         if (run?.value.state === "committed") {
           requireCondition(run.value.parent === parent && run.value.commit && run.value.tree
@@ -448,7 +459,7 @@ export class Executor {
           const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, maxRequestChars, contextSources).text);
           if (!resume) {
             requireCurrentTaskStart(this.store, run.value, task);
-            const response = await callAgent(actual.implementer, actual, "implement", `${IMPLEMENT} ${IMPLEMENT_CLASSES}${correction ? ` ${CORRECTION_CLASSES}` : ""}\n${selfReview(task)}`,
+            const response = await callAgent(actual.implementer, actual, "implement", `${IMPLEMENT} ${IMPLEMENT_CLASSES}${correction ? ` ${CORRECTION_CLASSES}` : ""}\n${selfReview(task)}${clarified(clarification, false)}`,
               { context, parent, inputs: inputs.inputs, ownership: ownership.grants,
                 correction: basis ? { error: shown ? shown.text : basis.value.error, review: basis.value.review }
                   : previous ? { error: previous.error, review: previous.review } : null },
@@ -476,7 +487,7 @@ export class Executor {
             const subject = subjectHash(reference(plan), task.id, parent, tree);
             run = this.save(run, { state: "reviewing", reviewSubject: subject });
             if (admission) requireExecutionBudget(this.store, admission, plan, "review");
-            const answered = await callAgent(actual.reviewer, actual, "review", `Independently review the exact supplied task and candidate tree. Read the actual diff and tests. Return a structured pass or request_changes verdict. ${REVIEW_CLASSES}\n${selfReview(task)}`,
+            const answered = await callAgent(actual.reviewer, actual, "review", `Independently review the exact supplied task and candidate tree. Read the actual diff and tests. Return a structured pass or request_changes verdict. ${REVIEW_CLASSES}\n${selfReview(task)}${clarified(clarification, true)}`,
               { binding: subject, context, parent, tree, artifacts: run.value.artifacts, checks: run.value.checks },
               maxRequestChars, measure, observe, signal, send("review"));
             const verdict = review(answered);

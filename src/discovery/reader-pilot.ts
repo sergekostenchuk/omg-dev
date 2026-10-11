@@ -28,13 +28,16 @@ export interface ReaderPilotSettings {
  * budget. Each revision of the pilot is a decision of its own; an earlier one is never erased. EX3 (№4000): a task may be
  * corrected up to three times in all — the limit counts the corrections already used, so no revision resets it. EX4 (№4016):
  * the owner may address one exact task of this plan its own limit in all, in place of the ordinary one — an absolute
- * value, so a later revision restates it rather than adds to it.
+ * value, so a later revision restates it rather than adds to it. EX6 (№4068): the owner may clarify the contract of one
+ * exact task of this plan — a decision the accepted plan leaves open — with no recompilation: the plan, its task ids and
+ * the spent budget stay as they are.
  */
 export interface ExecutionAdmissionSettings {
   plan: Ref; roleLaunches: number; softInput: number; roleReserve: { implement: number; review: number }; maxCorrections: 0 | 1 | 2 | 3;
-  taskCorrections?: TaskCorrectionLimit[];
+  taskCorrections?: TaskCorrectionLimit[]; taskClarifications?: TaskClarification[];
 }
 export interface TaskCorrectionLimit { task: string; maxCorrections: number }
+export interface TaskClarification { task: string; text: string }
 /** The admission an execution runs under: the exact pilot revision and its settings, a copy. */
 export interface ExecutionAdmission { readonly pilot: Ref; readonly execution: ExecutionAdmissionSettings }
 export interface ReaderPilot extends ReaderPilotSettings { projectId: string }
@@ -61,6 +64,7 @@ const executionSchema = object({ plan: object({ id: text, revision: positive, ha
   maxCorrections: { type: "integer", minimum: 0, maximum: 3 } });
 executionSchema.properties['taskCorrections'] = { type: "array", minItems: 1,
   items: object({ task: text, maxCorrections: { type: "integer", minimum: 0 } }) };
+executionSchema.properties['taskClarifications'] = { type: "array", minItems: 1, items: object({ task: text, text }) };
 readerPilotSchema.properties['execution'] = executionSchema;
 const valid = new Ajv({ allErrors: true }).compile<ReaderPilotSettings>(readerPilotSchema);
 const validExecution = new Ajv({ allErrors: true }).compile<ExecutionAdmissionSettings>(executionSchema);
@@ -68,22 +72,26 @@ const validExecution = new Ajv({ allErrors: true }).compile<ExecutionAdmissionSe
 /**
  * The one derivation of an execution admission's basis, shared by its writer and every reader: the phase policy stops
  * exactly at compilation and the accepted compilation stage holds exactly this plan, and every addressed correction limit
- * names a task of exactly this plan, once (EX4). The heads are captured before they are checked; they guard the admission's
+ * (EX4) and clarification (EX6) names a task of exactly this plan, once. The heads are captured before they are checked; they guard the admission's
  * write. The plan's own currency (the gate before an execution root exists, the execution's own progress after) is proved
  * by the caller's plan reader, never by the gate alone after a commit (№3953-1).
  */
-export function executionAdmissionBasis(store: Store, project: string, execution: Pick<ExecutionAdmissionSettings, "plan" | "taskCorrections">): TransactionGuard[] {
+export function executionAdmissionBasis(store: Store, project: string,
+  execution: Pick<ExecutionAdmissionSettings, "plan" | "taskCorrections" | "taskClarifications">): TransactionGuard[] {
   const { plan } = execution;
   const policy = store.get(`phase-policy:${project}`), stage = store.get<StageArtifact>(stageId(project, "compilation"));
   const record = isRef(plan) ? store.get<{ projectId?: unknown; tasks?: { id?: unknown }[] }>(plan.id, plan.revision) : null;
   if (!isRef(plan) || !record || record.kind !== "plan" || record.hash !== plan.hash || record.value?.projectId !== project)
     throw new EngineError("execution_admission_invalid", "An execution admission names an exact plan of its project", { target: project, field: "execution.plan" });
-  const tasks = new Set((record.value.tasks ?? []).map(task => task.id)), addressed = execution.taskCorrections ?? [];
-  addressed.forEach((entry, index) => {
-    if (!tasks.has(entry.task) || addressed.findIndex(other => other.task === entry.task) !== index)
-      throw new EngineError("execution_admission_invalid", "An addressed correction limit names a task of exactly this plan, once",
-        { target: project, field: `execution.taskCorrections.${index}.task`, task: entry.task });
-  });
+  const tasks = new Set((record.value.tasks ?? []).map(task => task.id));
+  for (const field of ["taskCorrections", "taskClarifications"] as const) {
+    const addressed: readonly { task: string }[] = execution[field] ?? [];
+    addressed.forEach((entry, index) => {
+      if (!tasks.has(entry.task) || addressed.findIndex(other => other.task === entry.task) !== index)
+        throw new EngineError("execution_admission_invalid", "An addressed setting names a task of exactly this plan, once",
+          { target: project, field: `execution.${field}.${index}.task`, task: entry.task });
+    });
+  }
   requireCondition(phasePolicy(store, project)?.value.stopAfter === "compilation", "execution_admission_stale",
     "Execution is admitted only beyond a phase policy that stops at compilation");
   requireCondition(stage?.kind === "stage" && stage.value.projectId === project && stage.value.stage === "compilation" && stage.value.status === "accepted"
