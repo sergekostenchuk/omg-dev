@@ -415,7 +415,7 @@ const seen = existsSync(journal) ? readFileSync(journal, 'utf8').split('\\n').fi
 const step = behavior[mode + ':' + (seen + 1)] ?? behavior[mode] ?? 'ok';
 const group = pid => Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], { encoding: 'utf8' }).trim());
 appendFileSync(journal, JSON.stringify({ mode, step, task: subject.context.binding.task, pid: process.pid, adapter: process.ppid,
-  group: group(process.pid), adapterGroup: group(process.ppid), correction: subject.correction ?? null }) + '\\n');
+  group: group(process.pid), adapterGroup: group(process.ppid), correction: subject.correction ?? null, brief: raw.slice(0, raw.indexOf('\\nSubject:\\n')) }) + '\\n');
 const usage = { input_tokens: 1000, output_tokens: 10, cached_input_tokens: 0, reasoning_output_tokens: 0 };
 if (step === 'refuse') {
   // The gate's part: its own saved refusal of exactly the open send of its group, before any provider.
@@ -437,6 +437,7 @@ if (mode === 'implement') {
     : 'import {produce} from "./produce.mjs"; export const consume=n=>produce(n)*' + (wrong ? 3 : 2) + ';\\n');
   writeFileSync(output, JSON.stringify({ text: 'Implemented the bounded module', artifacts: step === 'no-artifacts' ? [] : subject.context.produces.map(id => ({ id })) }));
 } else writeFileSync(output, JSON.stringify(step === 'code' ? { verdict: 'request_changes', kind: 'code', findings: ['The result is wrong'] }
+  : step.startsWith('code:') ? { verdict: 'request_changes', kind: 'code', findings: [step.slice(5)] }
   : step === 'plan' ? { verdict: 'request_changes', kind: 'plan', findings: ['The responsibility cannot deliver'] } : { verdict: 'pass', kind: 'none', findings: [] }));
 console.log(JSON.stringify({ type: 'turn.completed', usage }));
 `;
@@ -524,7 +525,7 @@ function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreMo
     get store() { return store; }, get engine() { return engine; },
     run: async (extra: Partial<{ retry: boolean; maxCorrections: number }> = {}) => await engine.execute(command(extra)) as Revision<TaskRun>[],
     behave: (value: Record<string, string>) => writeFileSync(join(directory, "behavior.json"), JSON.stringify(value)),
-    provider: (): { mode: string; step: string; task: string; pid: number; adapter: number; group: number; adapterGroup: number; correction: { error: string | null; review: unknown } | null }[] => {
+    provider: (): { mode: string; step: string; task: string; pid: number; adapter: number; group: number; adapterGroup: number; correction: { error: string | null; review: unknown } | null; brief: string }[] => {
       try { return readFileSync(join(directory, "provider.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } },
     sends: () => store.list<ExecutionSend>(EXECUTION_SEND_KIND),
     order: () => { try { return readFileSync(join(directory, "order.log"), "utf8").split("\n").filter(Boolean); } catch { return []; } },
@@ -1016,7 +1017,7 @@ test("EX1 №3961-3 the reads of a decision are addressed by its plan and task: 
 
 
 // ---- EX2 (№3980): the correction sees what failed; a blind slot is restored narrowly ----
-import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, type ExecutionRecovery } from "../src/execution/runner.js";
+import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, PATHS_RULE, CORRECTION_PATHS_RULE, type ExecutionRecovery } from "../src/execution/runner.js";
 const EX2_BASE = "afb55c7ddd110c7cf27b1493a722209e68455f73";
 
 test("EX2 a correction sees what failed: a TAP failure on stdout under a warning on stderr reaches it — the not ok block with its expected and actual, the summary — and its launch names that feedback", async t => {
@@ -1260,4 +1261,104 @@ out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_
     "the saved negative review is not bought again before its correction");
   assert.deepEqual(implementsOf(f)[2]!.correction!.review, { verdict: "request_changes", kind: "code", findings: ["The result is wrong"] });
   assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 2);
+});
+
+// ---- EX4 (№4016): the rule of paths; a task's addressed limit in all; one limit per task in every branch ----
+const EX4_BASE = "39c63aad5f14730a45430c2ca016c61d8dea6307";
+const addressedTo = (f: ReturnType<typeof ex1Fixture>, task: string, maxCorrections: number, general: Partial<Omit<ExecutionAdmissionSettings, "plan">> = {}) =>
+  f.admit(f.execution({ ...general, taskCorrections: [{ task, maxCorrections }] }));
+
+test("EX4 an addressed limit names one exact task of this plan, once: a task of another plan, a forged id, a duplicate, an empty list or a limit of the wrong form is refused by its writer and its command; a stored one is refused by the boundary that reads it; a command of five passes under it", async t => {
+  const f = ex1Fixture(t, { admit: false });
+  const pilot = () => f.store.get("reader-pilot:p")!, one = taskOne(f).id;
+  const refuse = (taskCorrections: unknown, code: string, field?: string) => {
+    const before = pilot().revision;
+    assert.throws(() => f.admit(f.execution({ taskCorrections } as never)),
+      (error: EngineError) => error.code === code && (!field || (error.details as { field?: string }).field === field), JSON.stringify(taskCorrections));
+    assert.throws(() => configureReaderPilot(f.store, f.engine.environments, "p", { ...f.settings, execution: f.execution({ taskCorrections } as never) }, before,
+      plan => planCurrentGuardsProbe(f, plan)), { code: "execution_admission_invalid" }, JSON.stringify(taskCorrections));
+    assert.equal(pilot().revision, before, "nothing is written");
+  };
+  // T4 and the form: an absent limit or task, an empty list, a limit that is no count, a map in place of the list.
+  for (const value of [[], [{ task: one }], [{ maxCorrections: 5 }], [{ task: one, maxCorrections: 1.5 }], [{ task: one, maxCorrections: -1 }],
+    [{ task: one, maxCorrections: "5" }], [{ task: "", maxCorrections: 5 }], [{ task: one, maxCorrections: 5, extra: true }], { [one]: 5 }]) refuse(value, "command_invalid");
+  // The producer: a task of another plan's namespace, a forged id, the same task twice — each addressed to its entry.
+  refuse([{ task: `task:${hashJson(["q", "graph", "node"]).slice(0, 40)}`, maxCorrections: 5 }], "execution_admission_invalid", "execution.taskCorrections.0.task");
+  refuse([{ task: one, maxCorrections: 5 }, { task: one.replace(/.$/, last => last === "0" ? "1" : "0"), maxCorrections: 5 }], "execution_admission_invalid", "execution.taskCorrections.1.task");
+  refuse([{ task: one, maxCorrections: 5 }, { task: one, maxCorrections: 4 }], "execution_admission_invalid", "execution.taskCorrections.1.task");
+  addressedTo(f, one, 5, { maxCorrections: 3 });
+  assert.deepEqual(f.store.get<ReaderPilotSettings>("reader-pilot:p")!.value.execution!.taskCorrections, [{ task: one, maxCorrections: 5 }]);
+  await assert.rejects(f.run({ maxCorrections: 6 }), { code: "execution_corrections_exceeded" }, "a command asks no more than the admission's greatest limit");
+  // The reader takes only what its writer could write: a stored foreign task or a duplicate is refused at the boundary.
+  const stored = f.store.get<ReaderPilotSettings>("reader-pilot:p")!, second = new Store(f.database);
+  const forged = [[{ task: `task:${"0".repeat(40)}`, maxCorrections: 5 }], [{ task: one, maxCorrections: 5 }, { task: one, maxCorrections: 9 }]];
+  for (const [index, taskCorrections] of forged.entries()) {
+    second.write({ id: stored.id, kind: "reader-pilot", expected: stored.revision + index, value: { ...stored.value, execution: { ...stored.value.execution!, taskCorrections } } as never });
+    await assert.rejects(f.run({ maxCorrections: 5 }), { code: "execution_admission_invalid" }, JSON.stringify(taskCorrections));
+  }
+  second.write({ id: stored.id, kind: "reader-pilot", expected: stored.revision + forged.length, value: stored.value as never });
+  second.close();
+  assert.deepEqual([f.sends().length, f.store.list("task-run").length], [0, 0]);
+  const runs = await f.run({ maxCorrections: 5 });
+  assert.deepEqual(runs.map(run => run.value.state), ["committed", "committed"], "a command of five is not refused under the addressed limit");
+});
+
+test("EX4 era: the three corrections the base used count — an addressed five gives exactly two more; a restart and a repeated admission give no sixth; the limit is absolute, and the neighbouring task keeps the ordinary three", async t => {
+  const f = ex1Fixture(t, { budget: { maxCorrections: 3 } });
+  f.behave({ implement: "wrong" });
+  const command = JSON.stringify(f.command({ maxCorrections: 3 }));
+  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX4_BASE, "ex4-era", `
+out((await engine.execute(${command})).map(run => [run.value.state, run.value.attempt]));`), [["needs_code", 4]]);
+  f.reopen();
+  await assert.rejects(f.run({ retry: true, maxCorrections: 3 }), { code: "execution_corrections_exhausted" }, "the base's records read as it wrote them");
+  await assert.rejects(f.run({ retry: true, maxCorrections: 5 }), { code: "execution_corrections_exceeded" }, "five is no limit without its address");
+  assert.equal(correctionsUsed(f.store, f.plan, taskOne(f)), 3);
+  const one = taskOne(f).id, two = f.plan.value.tasks[1]!;
+  addressedTo(f, one, 5);
+  const more = await f.run({ retry: true, maxCorrections: 5 });
+  assert.deepEqual([more[0]!.value.state, more[0]!.value.attempt, implementsOf(f).length, correctionsUsed(f.store, f.plan, taskOne(f))], ["needs_code", 6, 6, 5]);
+  await assert.rejects(f.run({ retry: true, maxCorrections: 5 }), { code: "execution_corrections_exhausted" });
+  f.reopen();
+  addressedTo(f, one, 5);
+  await assert.rejects(f.run({ retry: true, maxCorrections: 5 }), { code: "execution_corrections_exhausted" }, "a repeated admission restates five, it adds nothing");
+  assert.equal(implementsOf(f).length, 6, "no sixth correction reaches the provider");
+  // A new decision of six is six in all: exactly one more, which here succeeds; the next task is held to the ordinary three.
+  addressedTo(f, one, 6);
+  f.behave({ implement: "wrong", "implement:7": "ok" });
+  const last = await f.run({ retry: true, maxCorrections: 6 });
+  assert.deepEqual(last.map(run => [run.value.state, run.value.attempt]), [["committed", 7], ["needs_code", 4]]);
+  assert.deepEqual([correctionsUsed(f.store, f.plan, taskOne(f)), correctionsUsed(f.store, f.plan, two)], [6, 3]);
+  assert.equal(f.provider().filter(call => call.mode === "implement" && call.task === two.id).length, 4, "the neighbour's own count, never the addressed one");
+});
+
+test("EX4 one limit per task in every branch — after a failed check, after a negative review, on retry: the addressed task takes its two, its neighbour under an ordinary none takes none; the correction after a review is given that saved finding and the rule of paths", async t => {
+  const f = ex1Fixture(t, { budget: { maxCorrections: 0 } });
+  const one = taskOne(f).id, serve = "serve: POST /api/command answers persisted=false after the store moved";
+  addressedTo(f, one, 2, { maxCorrections: 0 });
+  f.behave({ "implement:1": "wrong", "review:1": `code:${serve}`, "review:3": "code:The neighbour is wrong" });
+  const runs = await f.run({ maxCorrections: 2 });
+  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 3], ["needs_code", 1]]);
+  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "implement", "review", "implement", "review", "implement", "review"]);
+  const [first, afterCheck, afterReview] = implementsOf(f);
+  assert.ok(first!.brief.includes(PATHS_RULE) && !first!.brief.includes(CORRECTION_PATHS_RULE), "every implementation is given the rule of paths");
+  assert.ok(afterCheck!.brief.includes(CORRECTION_PATHS_RULE) && afterReview!.brief.includes(CORRECTION_PATHS_RULE), "a correction is tied to what it answers");
+  assert.deepEqual(afterReview!.correction!.review, { verdict: "request_changes", kind: "code", findings: [serve] });
+  await assert.rejects(f.run({ retry: true, maxCorrections: 2 }), { code: "execution_corrections_exhausted" }, "the neighbour's retry");
+  assert.equal(f.provider().length, 7);
+  const g = ex1Fixture(t, { budget: { maxCorrections: 0 } });
+  addressedTo(g, taskOne(g).id, 2, { maxCorrections: 0 });
+  g.behave({ "implement:2": "wrong" });
+  const failed = await g.run({ maxCorrections: 2 });
+  assert.deepEqual(failed.map(run => [run.value.state, run.value.attempt]), [["committed", 1], ["needs_code", 1]], "the neighbour's failed check opens no correction");
+  assert.equal(g.provider().filter(call => call.mode === "implement").length, 2);
+});
+
+test("EX4 the shared limits stop a task earlier than its addressed limit: launches are refused before any launch with corrections left", async t => {
+  const f = ex1Fixture(t, { budget: { maxCorrections: 3, roleLaunches: 3 } });
+  addressedTo(f, taskOne(f).id, 5, { maxCorrections: 3, roleLaunches: 3 });
+  f.behave({ implement: "wrong" });
+  const runs = await f.run({ maxCorrections: 5 });
+  assert.equal(runs[0]!.value.state, "interrupted");
+  assert.match(runs[0]!.value.error!, /^execution_budget_exhausted/);
+  assert.deepEqual([implementsOf(f).length, f.sends().length, correctionsUsed(f.store, f.plan, taskOne(f))], [3, 3, 2]);
 });

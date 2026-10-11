@@ -189,6 +189,26 @@ export function correctionsUsed(store: Store, plan: Revision<MachinePlan>, task:
   return new Set(sendsOf(store, plan, taskScope(task)).filter(row => row.value.role === "implement" && row.value.correction
     && !UNSENT.includes(row.value.status) && !restored.has(row.id)).map(row => row.value.attempt)).size;
 }
+/**
+ * EX4 (№4016): the corrections one task may use in all — the command's limit, within the task's own limit the owner
+ * addressed or else the admission's ordinary one. Every branch that opens or refuses a correction reads this one value.
+ */
+export function correctionLimit(options: ExecutionOptions, admission: ExecutionAdmission | null, task: string): number {
+  if (!admission) return options.maxCorrections;
+  const addressed = admission.execution.taskCorrections?.find(entry => entry.task === task);
+  return Math.min(options.maxCorrections, addressed ? addressed.maxCorrections : admission.execution.maxCorrections);
+}
+/**
+ * EX4 (№4016): the rule of paths given to every implementation. A review is right each time, yet a correction of the cited
+ * place alone leaves the same class open on the task's other entries, and the next review finds the next one.
+ */
+export const PATHS_RULE = "Paths: state the invariant this work must hold; find every entry point and place of the same class within the task's scope "
+  + "(direct engine calls, CLI commands, server routes and their requests, retries and recovery, missing, moved or unreadable state) and make each one hold it; "
+  + "add regressions that exercise those real paths, not only the function you changed. End the returned text with a short list of the paths you checked and the tests that cover each.";
+export const CORRECTION_PATHS_RULE = "This is a correction: every finding in correction.review and the failed check in correction.error is one instance of a class. "
+  + "Name the invariant it violates, close that class on every path of the task, not only the place it cites, and add a regression per path; "
+  + "the returned list names each finding with the paths and tests that now close it.";
+const IMPLEMENT = "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.";
 /** A new attempt corrects code when the latest settled outcome of its task, past interruptions, asked for a code change. */
 /**
  * The outcome a new attempt corrects: the latest settled outcome of its task, past interruptions and launches that never got an
@@ -223,9 +243,11 @@ export class Executor {
       && Number.isSafeInteger(options.maxCorrections) && options.maxCorrections >= 0, "execution_options_invalid", "Execution needs explicit context and correction allowances");
     // Every path into execution passes the continuation boundary; beyond compilation only the owner's admission of this plan.
     const admission = assertPilotBoundary(this.store, project, "execution", planRef);
-    if (admission && options.maxCorrections > admission.execution.maxCorrections)
+    // The command asks no more than some limit of the admission: its ordinary one or a task's addressed one (EX4).
+    const admitted = admission ? Math.max(admission.execution.maxCorrections, ...(admission.execution.taskCorrections ?? []).map(entry => entry.maxCorrections)) : null;
+    if (admitted !== null && options.maxCorrections > admitted)
       throw new EngineError("execution_corrections_exceeded", "A command cannot raise the admitted correction limit",
-        { target: project, field: "maxCorrections", admitted: admission.execution.maxCorrections, requested: options.maxCorrections });
+        { target: project, field: "maxCorrections", admitted, requested: options.maxCorrections });
     const lock = acquire(this.store, project);
     const control = new AbortController(); this.active.set(project, control);
     signal = signal ? AbortSignal.any([signal, control.signal]) : control.signal;
@@ -251,9 +273,8 @@ export class Executor {
       const environment = this.store.get<Environment>(plan.value.environment.id, plan.value.environment.revision)!;
       const results: Revision<TaskRun>[] = []; let parent = plan.value.base.head;
       const corrections = new Map<string, number>();
-      const maxCorrections = options.maxCorrections;
       for (let taskIndex = 0; taskIndex < plan.value.tasks.length; taskIndex++) {
-        const task = plan.value.tasks[taskIndex]!;
+        const task = plan.value.tasks[taskIndex]!, limit = correctionLimit(options, admission, task.id);
         let run = this.store.get<TaskRun>(runId(plan.value.hash, task.id));
         if (run?.value.state === "committed") {
           requireCondition(run.value.parent === parent && run.value.commit && run.value.tree
@@ -345,10 +366,10 @@ export class Executor {
         } else {
           basis = run ? correctionBasis(this.store, run.id) : null;
           correction = basis !== null;
-          if (correction && correctionsUsed(this.store, plan, task) >= maxCorrections) restoreBlindCorrections(this.store, plan, task);
-          if (correction && correctionsUsed(this.store, plan, task) >= maxCorrections)
-            throw new EngineError("execution_corrections_exhausted", "This task already used its correction; a retry opens no other",
-              { target: task.id, field: "maxCorrections", limit: maxCorrections });
+          if (correction && correctionsUsed(this.store, plan, task) >= limit) restoreBlindCorrections(this.store, plan, task);
+          if (correction && correctionsUsed(this.store, plan, task) >= limit)
+            throw new EngineError("execution_corrections_exhausted", "This task already used its corrections; a retry opens no other",
+              { target: task.id, field: "maxCorrections", limit });
           if (admission) {
             // A refused budget spends no attempt: the task keeps its state and the command answers with the refusal.
             try { requireExecutionBudget(this.store, admission, plan, "implement"); }
@@ -391,7 +412,7 @@ export class Executor {
           const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, maxRequestChars, contextSources).text);
           if (!resume) {
             requireCurrentTaskStart(this.store, run.value, task);
-            const response = await callAgent(actual.implementer, actual, "implement", "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.",
+            const response = await callAgent(actual.implementer, actual, "implement", `${IMPLEMENT} ${PATHS_RULE}${correction ? ` ${CORRECTION_PATHS_RULE}` : ""}`,
               { context, parent, inputs: inputs.inputs, ownership: ownership.grants,
                 correction: basis ? { error: shown ? shown.text : basis.value.error, review: basis.value.review }
                   : previous ? { error: previous.error, review: previous.review } : null },
@@ -428,7 +449,7 @@ export class Executor {
               // The negative review, its launch and the state it decides are one transaction: a lost process after it buys no
               // second review of the same tree (№3961-1).
               run = this.save(run, negativeReview(verdict), closure());
-              if (run.value.state === "needs_code" && correctionsUsed(this.store, plan, task) < maxCorrections) {
+              if (run.value.state === "needs_code" && correctionsUsed(this.store, plan, task) < limit) {
                 corrections.set(task.id, (corrections.get(task.id) ?? 0) + 1); taskIndex--; continue;
               }
               results.push(run); return results;
@@ -462,7 +483,7 @@ export class Executor {
               ? `${code}: ${task.id}: ${error.message}; ${canonical(error.details)}`
               : obligationPause || code === "execution_budget_exhausted" ? `${code}: ${error instanceof Error ? error.message : 'Missing obligation evidence'}`
                 : error instanceof Error ? error.message : "Execution failed" }, closure());
-          if (run.value.state === "needs_code" && correctionsUsed(this.store, plan, task) < maxCorrections) {
+          if (run.value.state === "needs_code" && correctionsUsed(this.store, plan, task) < limit) {
             corrections.set(task.id, (corrections.get(task.id) ?? 0) + 1); taskIndex--; continue;
           }
           results.push(run); return results;
