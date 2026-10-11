@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, symlinkSync, unlinkSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Store, type Revision } from "../storage/store.js";
-import { git, Environments, type ExecutionRoot } from "../runtime/environment.js";
+import { git, gitBytes, Environments, type ExecutionRoot } from "../runtime/environment.js";
 import type { MachinePlan } from "../compiler/model.js";
-import { requireCondition } from "../errors.js";
+import { EngineError, requireCondition } from "../errors.js";
 import { reference } from "../pipeline/contracts.js";
 import { digest } from "../canonical.js";
 
@@ -23,6 +23,26 @@ export function materializeWorktree(root: ExecutionRoot): void {
   }
   requireWorktree(root, root.head);
 }
+/**
+ * EX1 C: the managed worktree reads the dependencies of its source workspace, as the workspace itself does. The link is
+ * made only where Git ignores it, so it never enters a candidate; an existing entry must already be that link. Nothing is
+ * installed and nothing is fetched.
+ */
+export function linkDependencies(root: ExecutionRoot): void {
+  const source = join(root.sourceRoot, "node_modules");
+  if (!existsSync(source)) return;
+  const target = join(root.path, "node_modules"), real = realpathSync(source), present = lstatSync(target, { throwIfNoEntry: false });
+  if (present) requireCondition(present.isSymbolicLink() && realpathSync(target) === real, "worktree_dependencies_invalid",
+    "The worktree's dependencies must be the source workspace's own");
+  else symlinkSync(real, target, "dir");
+  // Git shows an entry it does not ignore as untracked; such a link would enter a candidate, so it is taken back at once.
+  const untracked = gitBytes(root.path, ["status", "--porcelain", "-z", "--untracked-files=all"]).toString("utf8").split("\0")
+    .filter(Boolean).map(line => line.slice(3));
+  if (untracked.some(path => path === "node_modules" || path.startsWith("node_modules/"))) {
+    if (!present) unlinkSync(target);
+    throw new EngineError("worktree_dependencies_unsupported", "Dependencies are linked only where Git ignores them, so they never enter a candidate");
+  }
+}
 export function ensureWorktree(store: Store, environments: Environments, plan: MachinePlan): Revision<ExecutionRoot> {
   const environment = environments.get(plan.projectId);
   let record = store.get<ExecutionRoot>(`execution-root:${plan.projectId}`);
@@ -41,5 +61,6 @@ export function ensureWorktree(store: Store, environments: Environments, plan: M
     const root = record.value; materializeWorktree(root);
     record = store.write({ id: record.id, kind: record.kind, expected: record.revision, value: { ...root, state: "ready" } });
   }
+  linkDependencies(record.value);
   return record;
 }

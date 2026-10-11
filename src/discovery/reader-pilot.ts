@@ -1,10 +1,11 @@
 import { phasePolicy } from "./phase-policy.js";
 import { Ajv } from "ajv";
-import type { Store, Revision } from "../storage/store.js";
+import type { Store, Revision, TransactionGuard, Write } from "../storage/store.js";
 import { executablePath, type Environment, type RoleBinding, type Environments } from "../runtime/environment.js";
 import type { Command } from "../graph/model.js";
 import { requireCondition, EngineError } from "../errors.js";
-import { isRef, type Ref } from "../pipeline/contracts.js";
+import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import { canonical } from "../canonical.js";
 import type { ModelCall } from "../runtime/model-usage.js";
 
 export interface ReaderPilotSettings {
@@ -20,7 +21,17 @@ export interface ReaderPilotSettings {
   physicalLimits?: { maxRequestChars: number; maxReplyChars: number; basis: string };
   planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
   unknownReserves?: { call: Ref; tokens: number }[];
+  execution?: ExecutionAdmissionSettings;
 }
+/**
+ * EX1 (№3945, №3951): the owner's admission of one exact accepted plan beyond the compilation boundary, with its execution
+ * budget. Each revision of the pilot is a decision of its own; an earlier one is never erased.
+ */
+export interface ExecutionAdmissionSettings {
+  plan: Ref; roleLaunches: number; softInput: number; roleReserve: { implement: number; review: number }; maxCorrections: 0 | 1;
+}
+/** The admission an execution runs under: the exact pilot revision and its settings, a copy. */
+export interface ExecutionAdmission { readonly pilot: Ref; readonly execution: ExecutionAdmissionSettings }
 export interface ReaderPilot extends ReaderPilotSettings { projectId: string }
 const text = { type: "string", minLength: 1 };
 const positive = { type: "integer", minimum: 1 };
@@ -40,9 +51,38 @@ readerPilotSchema.properties['physicalLimits'] = object({ maxRequestChars: posit
 readerPilotSchema.properties['planning'] = object({ fields: { type: "array", minItems: 1, uniqueItems: true, items: text },
   maxRequestChars: positive, maxRounds: positive });
 readerPilotSchema.properties['callTimeoutMs'] = { type: "integer", minimum: 1, maximum: 3_000_000 };
+const executionSchema = object({ plan: object({ id: text, revision: positive, hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }),
+  roleLaunches: positive, softInput: positive, roleReserve: object({ implement: positive, review: positive }), maxCorrections: { enum: [0, 1] } });
+readerPilotSchema.properties['execution'] = executionSchema;
 const valid = new Ajv({ allErrors: true }).compile<ReaderPilotSettings>(readerPilotSchema);
+const validExecution = new Ajv({ allErrors: true }).compile<ExecutionAdmissionSettings>(executionSchema);
 
-export function configureReaderPilot(store: Store, environments: Environments, project: string, settings: unknown, expected: number): Revision<ReaderPilot> {
+/**
+ * The one derivation of an execution admission's basis, shared by its writer and every reader: the phase policy stops
+ * exactly at compilation and the accepted compilation stage holds exactly this plan. The heads are captured before they
+ * are checked; they guard the admission's write. The plan's own currency (the gate before an execution root exists, the
+ * execution's own progress after) is proved by the caller's plan reader, never by the gate alone after a commit (№3953-1).
+ */
+export function executionAdmissionBasis(store: Store, project: string, plan: Ref): TransactionGuard[] {
+  const policy = store.get(`phase-policy:${project}`), stage = store.get<StageArtifact>(stageId(project, "compilation"));
+  const record = isRef(plan) ? store.get<{ projectId?: unknown }>(plan.id, plan.revision) : null;
+  if (!isRef(plan) || !record || record.kind !== "plan" || record.hash !== plan.hash || record.value?.projectId !== project)
+    throw new EngineError("execution_admission_invalid", "An execution admission names an exact plan of its project", { target: project, field: "execution.plan" });
+  requireCondition(phasePolicy(store, project)?.value.stopAfter === "compilation", "execution_admission_stale",
+    "Execution is admitted only beyond a phase policy that stops at compilation");
+  requireCondition(stage?.kind === "stage" && stage.value.projectId === project && stage.value.stage === "compilation" && stage.value.status === "accepted"
+    && canonical((stage.value.content as unknown as { plan?: unknown } | null)?.plan ?? null) === canonical(plan),
+  "execution_admission_stale", "Execution is admitted only for the plan of the accepted compilation stage");
+  return [reference(policy!), reference(stage), plan];
+}
+
+/** Prepares a pilot revision without writing: the write and the guards of its one transaction. */
+export function prepareReaderPilot(store: Store, environments: Environments, project: string, settings: unknown, expected: number,
+  planCurrent?: (plan: Ref) => readonly TransactionGuard[]): { write: Write; guards: TransactionGuard[] } {
+  const execution = settings !== null && typeof settings === "object" && !Array.isArray(settings) ? (settings as { execution?: unknown }).execution : undefined;
+  if (execution !== undefined && !validExecution(execution))
+    throw new EngineError("execution_admission_invalid", "An execution admission needs its exact plan, budget, reserves and correction limit",
+      { target: project, field: "execution", errors: validExecution.errors });
   if (!valid(settings)) throw new EngineError("reader_pilot_invalid", "The experiment requires explicit roles, limits and its L2 stop boundary", valid.errors);
   const env = environments.get(project).value;
   requireCondition(settings.reader.actor !== env.implementer.actor && settings.reader.actor !== env.reviewer.actor,
@@ -56,7 +96,19 @@ export function configureReaderPilot(store: Store, environments: Environments, p
       && call.value.profile?.id === `reader-pilot:${project}` && call.revision === reserve.call.revision && call.hash === reserve.call.hash,
       "usage_reserve_invalid", "A reserve must address an exact completed unmeasured call of this experiment");
   }
-  return store.write<ReaderPilot>({ id: `reader-pilot:${project}`, kind: "reader-pilot", expected, value: { ...settings, projectId: project } });
+  let guards: TransactionGuard[] = [];
+  if (settings.execution) {
+    guards = executionAdmissionBasis(store, project, settings.execution.plan);
+    if (!planCurrent) throw new EngineError("execution_admission_invalid", "An execution admission is written only with its plan's currency proof",
+      { target: project, field: "execution.plan" });
+    guards.push(...planCurrent(settings.execution.plan));
+  }
+  return { write: { id: `reader-pilot:${project}`, kind: "reader-pilot", expected, value: { ...settings, projectId: project } as never }, guards };
+}
+export function configureReaderPilot(store: Store, environments: Environments, project: string, settings: unknown, expected: number,
+  planCurrent?: (plan: Ref) => readonly TransactionGuard[]): Revision<ReaderPilot> {
+  const prepared = prepareReaderPilot(store, environments, project, settings, expected, planCurrent);
+  return store.writeMany<ReaderPilot>([prepared.write], prepared.guards)[0]!;
 }
 
 export function readerPilot(store: Store, project: string): Revision<ReaderPilot> | null {
@@ -68,13 +120,24 @@ export function readerPilot(store: Store, project: string): Revision<ReaderPilot
   return record.value.active ? record : null;
 }
 
-export function assertPilotBoundary(store: Store, project: string, phase: string): void {
+/**
+ * The continuation boundary. Execution beyond a policy that stops at compilation passes only under the owner's admission
+ * of exactly this plan, read by the same basis its writer proved (EX1); the admission is returned, and without a policy or
+ * pilot there is none (the earlier era executes as before).
+ */
+export function assertPilotBoundary(store: Store, project: string, phase: string, plan?: Ref): ExecutionAdmission | null {
   const policy = phasePolicy(store, project);
   const pilot = readerPilot(store, project);
   const configured = store.get(`reader-pilot:${project}`);
   if (policy && policy.value.stopAfter !== "L2") requireCondition(pilot, "phase_protections_missing", "Continuation cannot disable its context and budget preset");
+  const admitted = pilot?.value.execution;
+  if (phase === "execution" && policy?.value.stopAfter === "compilation" && admitted && plan !== undefined && canonical(admitted.plan) === canonical(plan)) {
+    executionAdmissionBasis(store, project, plan);
+    return { pilot: reference(pilot!), execution: structuredClone(admitted) };
+  }
   requireCondition(!(policy || configured) || !(policy?.value.stopAfter === "compilation" ? ["execution"] : policy?.value.stopAfter === "L3" ? ["R3", "execution"] : ["R2", "L3", "R3", "execution"]).includes(phase),
     "pilot_boundary_reached", "This phase is beyond the explicitly permitted continuation boundary");
+  return null;
 }
 
 /** The source environment stays unchanged so accepted source/assessment history
