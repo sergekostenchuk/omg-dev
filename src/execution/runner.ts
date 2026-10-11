@@ -199,15 +199,51 @@ export function correctionLimit(options: ExecutionOptions, admission: ExecutionA
   return Math.min(options.maxCorrections, addressed ? addressed.maxCorrections : admission.execution.maxCorrections);
 }
 /**
- * EX4 (№4016): the rule of paths given to every implementation. A review is right each time, yet a correction of the cited
- * place alone leaves the same class open on the task's other entries, and the next review finds the next one.
+ * EX5 (№4035): the five classes of self-review — ПУТИ, ОТСУТСТВИЕ, МАСКАРАД, ОКНА, СОСЕДИ — in one place, given to both
+ * roles. By the review statistics they bring ~90% of first findings; a role not asked to sweep them stops at the defect it
+ * sees first, and every review buys the next one. They are questions about the behaviour the task promises, never new
+ * requirements of their own.
  */
-export const PATHS_RULE = "Paths: state the invariant this work must hold; find every entry point and place of the same class within the task's scope "
-  + "(direct engine calls, CLI commands, server routes and their requests, retries and recovery, missing, moved or unreadable state) and make each one hold it; "
-  + "add regressions that exercise those real paths, not only the function you changed. End the returned text with a short list of the paths you checked and the tests that cover each.";
-export const CORRECTION_PATHS_RULE = "This is a correction: every finding in correction.review and the failed check in correction.error is one instance of a class. "
-  + "Name the invariant it violates, close that class on every path of the task, not only the place it cites, and add a regression per path; "
-  + "the returned list names each finding with the paths and tests that now close it.";
+export const FIVE_CLASSES = "Five classes, applied to this task's own contract (its boundary, contracts, criteria and write paths in the context): "
+  + "PATHS: every entry point and place that reaches the promised behaviour (engine calls, CLI commands, server routes and their requests, retries and recovery); "
+  + "ABSENCE: a missing, empty or unreadable input, field, source or state gives a typed refusal or keeps its uncertainty, never a silent default or a skipped check; "
+  + "MASQUERADE: a forged or foreign input or state (renamed or substituted file, another namespace, substituted hash, imitated status, structure of another kind) is told apart; "
+  + "WINDOWS: the gap between a check or read and its write or commit, a lost response, a repeat, a concurrent writer; "
+  + "NEIGHBOURS: callers and modules next to the change keep their contracts and tests. "
+  + "These classes question the behaviour the task promises; they add no requirement of their own, such as recovering every kind of corruption.";
+export const IMPLEMENT_CLASSES = "Before answering make five substantive passes over your change, one per class, fix what they find and add regressions on the real paths. "
+  + "Targeted diagnostic checks of your change are allowed; the engine runs the full check once on the final bytes. "
+  + "End the returned text with a short self-check: per class, the paths and tests checked, or why the class does not apply.";
+export const CORRECTION_CLASSES = "This is a correction. correction.review holds every finding of the review and correction.error the failed check; "
+  + "each is one instance of a class: name the requirement it violates and close that class on every path of the task, not only the place it cites. "
+  + "Then pass the five classes again over your own correction: it must bring no new defect. The self-check names each finding with the paths and tests that now close it.";
+/** The exact forms of a review answer the protocol accepts (protocol.review): the brief shows these, never its own variant (№4045). */
+export const REVIEW_PASS = { verdict: "pass", kind: "none", findings: [] };
+export const REVIEW_CHANGES = { verdict: "request_changes", kind: "code", findings: ["<class: requirement, place, scenario and consequence>"] };
+export const REVIEW_CLASSES = "Review in one pass over all five classes and return every confirmed blocking defect as a finding; after the first one keep reviewing. "
+  + "Each finding is one string: its class, the requirement it violates, the place, and the scenario with its consequence. "
+  + "One root cause on several entries is one finding that lists them; independent roots are separate findings. A class may not apply; a hypothesis or a matter of style is no finding. "
+  + `With no confirmed blocking defect after the whole review the answer is exactly ${JSON.stringify(REVIEW_PASS)}: verdict pass, kind none, no findings at all. `
+  + `Otherwise it is ${JSON.stringify(REVIEW_CHANGES)} with one finding or more; `
+  + `kind is "plan" instead of "code" only when the plan itself is contradictory or cannot be executed, and then all findings, code ones too, go with it. `
+  + "The full check already ran on these bytes: read its results in checks; a targeted check of a suspected defect is allowed.";
+const listed = (items: readonly string[]): string => !items.length ? "none"
+  : items.slice(0, 8).join(", ") + (items.length > 8 ? ` and ${items.length - 8} more` : "");
+/** The five classes made concrete on one task's own contract: short questions from its boundary, contracts, criteria and paths. */
+export function riskMap(task: CompiledTask): string {
+  const entries = [...new Set((task.tests ?? []).flatMap(test => test.contract?.entrypoint ? [`${test.contract.entrypoint.kind} ${test.contract.entrypoint.path}`] : []))];
+  const inputs = [...new Set((task.inputs ?? []).map(input => input.artifact))], criteria = (task.requirements ?? []).map(requirement => requirement.id);
+  const { boundary } = task;
+  return [`Risk map of ${task.id} (${boundary.state} state owned by ${boundary.authority}, written by ${boundary.writer}${boundary.provider ? ", through an external provider" : ""}):`,
+    `PATHS: do all entries (${listed(entries)}) and write paths (${listed(task.writePaths ?? [])}) deliver ${listed(task.produces ?? [])} and the criteria (${listed(criteria)}) the same way?`,
+    `ABSENCE: what does each entry do when an input (${listed(inputs)}) or its state is missing, empty or unreadable?`,
+    `MASQUERADE: what when that input or state is foreign, renamed, substituted or of another structure?`,
+    boundary.state === "durable"
+      ? `WINDOWS: a lost response, a repeat, a concurrent writer, the window between read and commit: does ${boundary.authority} stay the one truth (rollback: ${boundary.rollback})?`
+      : `WINDOWS: a repeat or a concurrent call: the same result, nothing half-written?`,
+    `NEIGHBOURS: do the callers of what changes and the existing tests (${listed((task.tests ?? []).map(test => test.id))}) keep their contracts?`].join("\n");
+}
+const selfReview = (task: CompiledTask): string => `${FIVE_CLASSES}\n${riskMap(task)}`;
 const IMPLEMENT = "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.";
 /** A new attempt corrects code when the latest settled outcome of its task, past interruptions, asked for a code change. */
 /**
@@ -412,7 +448,7 @@ export class Executor {
           const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, maxRequestChars, contextSources).text);
           if (!resume) {
             requireCurrentTaskStart(this.store, run.value, task);
-            const response = await callAgent(actual.implementer, actual, "implement", `${IMPLEMENT} ${PATHS_RULE}${correction ? ` ${CORRECTION_PATHS_RULE}` : ""}`,
+            const response = await callAgent(actual.implementer, actual, "implement", `${IMPLEMENT} ${IMPLEMENT_CLASSES}${correction ? ` ${CORRECTION_CLASSES}` : ""}\n${selfReview(task)}`,
               { context, parent, inputs: inputs.inputs, ownership: ownership.grants,
                 correction: basis ? { error: shown ? shown.text : basis.value.error, review: basis.value.review }
                   : previous ? { error: previous.error, review: previous.review } : null },
@@ -440,7 +476,7 @@ export class Executor {
             const subject = subjectHash(reference(plan), task.id, parent, tree);
             run = this.save(run, { state: "reviewing", reviewSubject: subject });
             if (admission) requireExecutionBudget(this.store, admission, plan, "review");
-            const answered = await callAgent(actual.reviewer, actual, "review", "Independently review the exact supplied task and candidate tree. Read the actual diff and tests. Return a structured pass or request_changes verdict; use kind=plan only when the plan needs correction, kind=code for implementation defects.",
+            const answered = await callAgent(actual.reviewer, actual, "review", `Independently review the exact supplied task and candidate tree. Read the actual diff and tests. Return a structured pass or request_changes verdict. ${REVIEW_CLASSES}\n${selfReview(task)}`,
               { binding: subject, context, parent, tree, artifacts: run.value.artifacts, checks: run.value.checks },
               maxRequestChars, measure, observe, signal, send("review"));
             const verdict = review(answered);

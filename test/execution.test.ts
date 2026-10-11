@@ -12,6 +12,7 @@ import { receiptId, type ArtifactReceipt } from "../src/compiler/model.js";
 import { resultGate } from "../src/execution/result.js";
 import { resolveArtifact } from "../src/compiler/inputs.js";
 import type { TaskRun } from "../src/execution/model.js";
+import type { CompiledTask } from "../src/compiler/model.js";
 import { treeFile } from "../src/runtime/git-files.js";
 import { processStart } from "../src/runtime/process-identity.js";
 import { requireWritePaths } from "../src/execution/candidate.js";
@@ -417,6 +418,13 @@ const group = pid => Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)
 appendFileSync(journal, JSON.stringify({ mode, step, task: subject.context.binding.task, pid: process.pid, adapter: process.ppid,
   group: group(process.pid), adapterGroup: group(process.ppid), correction: subject.correction ?? null, brief: raw.slice(0, raw.indexOf('\\nSubject:\\n')) }) + '\\n');
 const usage = { input_tokens: 1000, output_tokens: 10, cached_input_tokens: 0, reasoning_output_tokens: 0 };
+// EX5 №4045: a reviewer that answers exactly in the form its brief states — 'literal' passes, 'literal-code:a | b' or 'literal-plan:…' asks changes.
+const form = pattern => JSON.parse(raw.slice(0, raw.indexOf('\\nSubject:\\n')).match(pattern)[1]);
+const literal = step => {
+  if (step === 'literal') return form(/the answer is exactly (\\{.*?\\}):/);
+  const answer = form(/Otherwise it is (\\{.*?\\}) with/), how = step.slice(8, step.indexOf(':'));
+  return { ...answer, kind: how === 'plan' ? 'plan' : answer.kind, findings: step.slice(step.indexOf(':') + 1).split(' | ') };
+};
 if (step === 'refuse') {
   // The gate's part: its own saved refusal of exactly the open send of its group, before any provider.
   const { DatabaseSync } = await import('node:sqlite');
@@ -436,8 +444,10 @@ if (mode === 'implement') {
     ? 'export const produce=n=>{if(!Number.isFinite(n))throw new Error("input_missing");return n+' + (wrong ? 2 : 1) + '};\\n'
     : 'import {produce} from "./produce.mjs"; export const consume=n=>produce(n)*' + (wrong ? 3 : 2) + ';\\n');
   writeFileSync(output, JSON.stringify({ text: 'Implemented the bounded module', artifacts: step === 'no-artifacts' ? [] : subject.context.produces.map(id => ({ id })) }));
-} else writeFileSync(output, JSON.stringify(step === 'code' ? { verdict: 'request_changes', kind: 'code', findings: ['The result is wrong'] }
-  : step.startsWith('code:') ? { verdict: 'request_changes', kind: 'code', findings: [step.slice(5)] }
+} else writeFileSync(output, JSON.stringify(step.startsWith('literal') ? literal(step)
+  : step === 'code' ? { verdict: 'request_changes', kind: 'code', findings: ['The result is wrong'] }
+  : step.startsWith('code:') ? { verdict: 'request_changes', kind: 'code', findings: step.slice(5).split(' | ') }
+  : step.startsWith('plan:') ? { verdict: 'request_changes', kind: 'plan', findings: step.slice(5).split(' | ') }
   : step === 'plan' ? { verdict: 'request_changes', kind: 'plan', findings: ['The responsibility cannot deliver'] } : { verdict: 'pass', kind: 'none', findings: [] }));
 console.log(JSON.stringify({ type: 'turn.completed', usage }));
 `;
@@ -1017,7 +1027,7 @@ test("EX1 №3961-3 the reads of a decision are addressed by its plan and task: 
 
 
 // ---- EX2 (№3980): the correction sees what failed; a blind slot is restored narrowly ----
-import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, PATHS_RULE, CORRECTION_PATHS_RULE, type ExecutionRecovery } from "../src/execution/runner.js";
+import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, FIVE_CLASSES, IMPLEMENT_CLASSES, CORRECTION_CLASSES, REVIEW_CLASSES, REVIEW_PASS, REVIEW_CHANGES, riskMap, type ExecutionRecovery } from "../src/execution/runner.js";
 const EX2_BASE = "afb55c7ddd110c7cf27b1493a722209e68455f73";
 
 test("EX2 a correction sees what failed: a TAP failure on stdout under a warning on stderr reaches it — the not ok block with its expected and actual, the summary — and its launch names that feedback", async t => {
@@ -1340,8 +1350,9 @@ test("EX4 one limit per task in every branch — after a failed check, after a n
   assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 3], ["needs_code", 1]]);
   assert.deepEqual(f.provider().map(call => call.mode), ["implement", "implement", "review", "implement", "review", "implement", "review"]);
   const [first, afterCheck, afterReview] = implementsOf(f);
-  assert.ok(first!.brief.includes(PATHS_RULE) && !first!.brief.includes(CORRECTION_PATHS_RULE), "every implementation is given the rule of paths");
-  assert.ok(afterCheck!.brief.includes(CORRECTION_PATHS_RULE) && afterReview!.brief.includes(CORRECTION_PATHS_RULE), "a correction is tied to what it answers");
+  // EX5: the rule of paths is the first of the five classes every implementation is given (the EX4 rule, folded in).
+  assert.ok(first!.brief.includes(FIVE_CLASSES) && first!.brief.includes(IMPLEMENT_CLASSES) && !first!.brief.includes(CORRECTION_CLASSES), "every implementation is given the rule of paths");
+  assert.ok(afterCheck!.brief.includes(CORRECTION_CLASSES) && afterReview!.brief.includes(CORRECTION_CLASSES), "a correction is tied to what it answers");
   assert.deepEqual(afterReview!.correction!.review, { verdict: "request_changes", kind: "code", findings: [serve] });
   await assert.rejects(f.run({ retry: true, maxCorrections: 2 }), { code: "execution_corrections_exhausted" }, "the neighbour's retry");
   assert.equal(f.provider().length, 7);
@@ -1361,4 +1372,87 @@ test("EX4 the shared limits stop a task earlier than its addressed limit: launch
   assert.equal(runs[0]!.value.state, "interrupted");
   assert.match(runs[0]!.value.error!, /^execution_budget_exhausted/);
   assert.deepEqual([implementsOf(f).length, f.sends().length, correctionsUsed(f.store, f.plan, taskOne(f))], [3, 3, 2]);
+});
+
+// ---- EX5 (№4035): the five classes of self-review in the requests of both roles; every confirmed finding in one pass ----
+const EX5_BASE = "abd9dd8943400f4ff978439f8feb9957a7c9d4af";
+const absence = "ABSENCE: the intake store is missing — CLI command opens it with create-if-missing — after a lost response it reports persisted=false";
+const masquerade = "MASQUERADE: an empty file without tables in place of the store — serve opens it as a new store — POST /api/command answers on a fresh canon";
+const briefsOf = (f: ReturnType<typeof ex1Fixture>, mode: string) => f.provider().filter(call => call.mode === mode);
+
+test("EX5 both roles are given the five classes from one place, made concrete on the task's own contract; two independent findings pass the adapter, the saved review and the correction whole; a pass with no finding commits", async t => {
+  const f = ex1Fixture(t);
+  f.behave({ "review:1": `code:${absence} | ${masquerade}` });
+  const runs = await f.run({ maxCorrections: 1 });
+  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 2], ["committed", 1]]);
+  const [one, two] = f.plan.value.tasks as [CompiledTask, CompiledTask];
+  const implement = briefsOf(f, "implement"), review = briefsOf(f, "review");
+  assert.deepEqual([implement.length, review.length], [3, 3]);
+  for (const call of [...implement, ...review]) {
+    const task = call.task === one.id ? one : two;
+    assert.ok(call.brief.includes(FIVE_CLASSES) && call.brief.includes(riskMap(task)), `${call.mode}: the five classes and the risk map of its own task`);
+  }
+  assert.ok(implement.every(call => call.brief.includes(IMPLEMENT_CLASSES) && !call.brief.includes(REVIEW_CLASSES)));
+  assert.ok(review.every(call => call.brief.includes(REVIEW_CLASSES) && !call.brief.includes(IMPLEMENT_CLASSES)));
+  assert.deepEqual(implement.map(call => call.brief.includes(CORRECTION_CLASSES)), [false, true, false], "only the correction is told what a correction owes");
+  // СОСЕДИ in the adapter's own words: a targeted check is allowed, the full check is the engine's, once.
+  assert.ok(implement.every(call => call.brief.includes("targeted diagnostic checks of your own change are allowed") && !call.brief.includes("The engine owns testing")));
+  // The map is the task's own: its write paths, what it produces, its kind of state.
+  const map = riskMap(one);
+  for (const part of [one.writePaths[0]!, one.produces[0]!, `${one.boundary.state} state`]) assert.ok(map.includes(part), part);
+  // Two independent findings: kept by the adapter and the saved review, and given whole to the correction.
+  const negative = f.store.history<TaskRun>(runs[0]!.id).find(row => row.value.state === "needs_code")!;
+  assert.deepEqual(negative.value.review, { verdict: "request_changes", kind: "code", findings: [absence, masquerade] });
+  assert.deepEqual(implement[1]!.correction!.review, negative.value.review);
+  assert.equal(implement[1]!.correction!.error, `${absence}\n${masquerade}`);
+  // A pass with an empty array is a pass: it commits.
+  assert.deepEqual(runs.map(run => run.value.review), [{ verdict: "pass", kind: "none", findings: [] }, { verdict: "pass", kind: "none", findings: [] }]);
+});
+
+test("EX5 a review that finds the plan unexecutable among code defects returns all its findings with kind=plan: the task stops for its plan with every finding kept, and no correction is bought", async t => {
+  const f = ex1Fixture(t);
+  const plan = "PLAN: the contract asks persisted=false where its own criterion forbids it after a lost response";
+  f.behave({ "review:1": `plan:${absence} | ${plan}` });
+  const runs = await f.run({ maxCorrections: 1 });
+  assert.deepEqual(runs.map(run => run.value.state), ["needs_plan"]);
+  assert.deepEqual(runs[0]!.value.review, { verdict: "request_changes", kind: "plan", findings: [absence, plan] });
+  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "review"]);
+  const again = await f.run({ retry: true, maxCorrections: 1 });
+  assert.equal(again[0]!.value.state, "needs_plan");
+  assert.equal(f.provider().length, 2, "a plan finding buys nothing on a retry");
+});
+
+test("EX5 era: a negative review the base saved is read as it wrote it — its correction under the new code is given that finding with the five classes, and the task commits", async t => {
+  const f = ex1Fixture(t);
+  f.behave({ "review:1": "code:The result is wrong" });
+  const command = JSON.stringify(f.command({ maxCorrections: 0 }));
+  assert.deepEqual(ex1AtCommit(f.directory, f.database, EX5_BASE, "ex5-era", `
+out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_code"]);
+  assert.ok(!f.provider()[0]!.brief.includes(FIVE_CLASSES), "the base asked by its own rule");
+  f.reopen();
+  const runs = await f.run({ retry: true, maxCorrections: 1 });
+  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt]), [["committed", 2], ["committed", 1]]);
+  const correction = briefsOf(f, "implement")[1]!;
+  assert.deepEqual(correction.correction!.review, { verdict: "request_changes", kind: "code", findings: ["The result is wrong"] });
+  assert.ok(correction.brief.includes(FIVE_CLASSES) && correction.brief.includes(CORRECTION_CLASSES));
+  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "review", "implement", "review", "implement", "review"], "the saved review is not bought again");
+});
+
+test("EX5 №4045 a reviewer that answers exactly in the forms its brief states is understood: a pass commits with no correction, changes go to a correction with every finding, a plan finding stops", async t => {
+  const f = ex1Fixture(t);
+  f.behave({ review: "literal" });
+  const runs = await f.run({ maxCorrections: 1 });
+  assert.deepEqual(runs.map(run => [run.value.state, run.value.attempt, run.value.review]),
+    [["committed", 1, REVIEW_PASS], ["committed", 1, REVIEW_PASS]], "the stated pass is the protocol's pass");
+  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "review", "implement", "review"], "no correction is bought for a green candidate");
+  assert.ok(f.provider().filter(call => call.mode === "review").every(call => call.brief.includes(JSON.stringify(REVIEW_PASS))));
+  const g = ex1Fixture(t);
+  g.behave({ "review:1": `literal-code:${absence} | ${masquerade}`, review: "literal" });
+  const corrected = await g.run({ maxCorrections: 1 });
+  assert.deepEqual(corrected.map(run => [run.value.state, run.value.attempt]), [["committed", 2], ["committed", 1]]);
+  assert.deepEqual(briefsOf(g, "implement")[1]!.correction!.review, { ...REVIEW_CHANGES, findings: [absence, masquerade] });
+  const h = ex1Fixture(t);
+  h.behave({ "review:1": `literal-plan:${absence}` });
+  const stopped = await h.run({ maxCorrections: 1 });
+  assert.deepEqual(stopped.map(run => [run.value.state, run.value.review?.kind]), [["needs_plan", "plan"]]);
 });
