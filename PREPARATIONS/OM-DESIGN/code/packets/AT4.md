@@ -44,7 +44,7 @@
 - Читает записи: старый план, попытки, отправки исполнения
 - Пишет записи: соответствие задач версий плана; перенесённый кандидат
 - Из движка как есть: №4082; №4084
-- Уже сделано до тебя: AT3 «Штатная правка принятого L3 по обнаруженному дефекту плана → M8 → перекомпиляция (эры сохраняются) вместе с маршрутом needs_plan из исполнения: адресная находка противоречия контракта или недостающей области, а не по расположению теста (AT0)» (src/execution/runner.ts, src/execution/protocol.ts, src/om/frame-accept.ts, src/om/feasibility.ts, src/compiler/compiler.ts)
+- Уже сделано до тебя: AT3b «Маршрут дефекта плана в OM: один публичный repair-plan с ветвью OM → запись дефекта → пробел D1 над принятым L3 → пакет исправления работы → redefine → G5 → settle → явное возобновление завершённого прохода → M8 → compile» (src/om/plan-defect.ts, src/om/gaps.ts, src/om/run.ts, src/om/question-packet.ts, src/om/packet-brief.ts, src/om/frame-accept.ts, src/om/feasibility.ts, src/compiler/compiler.ts, src/product/repairs.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -56,11 +56,15 @@
 
 ### Соседи в коде (файлы прямых предшественников; содержимое — `git show <база>:<путь>`)
 
-- `src/execution/runner.ts`
-- `src/execution/protocol.ts`
+- `src/om/plan-defect.ts`
+- `src/om/gaps.ts`
+- `src/om/run.ts`
+- `src/om/question-packet.ts`
+- `src/om/packet-brief.ts`
 - `src/om/frame-accept.ts`
 - `src/om/feasibility.ts`
 - `src/compiler/compiler.ts`
+- `src/product/repairs.ts`
 
 ### Границы незавершённой интеграции
 
