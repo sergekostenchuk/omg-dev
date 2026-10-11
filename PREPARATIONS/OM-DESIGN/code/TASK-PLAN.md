@@ -1922,8 +1922,8 @@
 - Отдаёт: —
 - Читает записи: задача плана: boundary, contracts, criteria, writePaths; сохранённое ревью
 - Пишет записи: запросы implement/correction/review
-- Разрешённые пути: `src/execution/runner.ts`, `src/adapters/codex-stdio.ts`, `test/execution.test.ts`
-- Из движка как есть: №4034; №4035; ~/CLAUDE.md пять проходов
+- Разрешённые пути: `src/execution/runner.ts`, `src/adapters/codex-stdio.ts`, `test/execution.test.ts`, `test/adapter-lineage.test.ts`
+- Из движка как есть: №4034; №4035; ~/CLAUDE.md пять проходов; test/adapter-lineage.test.ts:205 дословно закрепляет инструкцию адаптера — меняется по п.3 №4035 (СОСЕДИ)
 - После: EX4
 - Тесты сверх обязательных:
   - обе роли получают пять классов
