@@ -605,3 +605,44 @@ test('LP3 (№2817-5) the path rule no longer sends a search into a context reco
   assert.match(rule, /any other supplied record, such as an obligation basis, is read with read_context by its exact reference and a JSON pointer, never used as a search scope/);
   assert.match(rule, /never use "\." or the absolute working directory as a scope/);
 });
+
+// ---- AT3a (№4125): the addressed form an execution under admission asks for, and the forms that stay without it ----
+test('AT3a the adapter asks the addressed review form and admits the unexecutable implementation outcome only when the request names the form', async t => {
+  const address = { plan: { id: 'plan:p:x', revision: 1, hash: 'h' }, task: 'task:one', attempt: 1, tree: null };
+  const form = { answerForm: 'execution/v2', address };
+  await t.test('review, addressed: findings are {text, address}', async () => {
+    const f = codexFixture(t);
+    const finding = { text: 'PLAN: the contract cancels a kept expectation', address: { ...address, tree: 't', requirement: 'r', norm: 'n', path: null, check: null } };
+    f.control('answer', JSON.stringify({ verdict: 'request_changes', kind: 'plan', findings: [finding] }));
+    const result = await runAdapter(f, adapterRequest({ mode: 'review', subject: form }));
+    assert.equal(result.exitCode, 0, result.stderr);
+    const schema = f.records()[0]!.schema as { properties: { findings: { items: { required: string[]; properties: { address: { anyOf: { type: string; required?: string[] }[] } } } } } };
+    assert.deepEqual(schema.properties.findings.items.required, ['text', 'address']);
+    assert.deepEqual(schema.properties.findings.items.properties.address.anyOf.map(item => item.required ?? item.type),
+      ['null', ['plan', 'task', 'attempt', 'tree', 'requirement', 'norm', 'path', 'check']]);
+    assert.deepEqual(envelope(result.stdout)['review'], { verdict: 'request_changes', kind: 'plan', findings: [finding] });
+  });
+  await t.test('review without the form: findings stay strings', async () => {
+    const f = codexFixture(t);
+    f.control('answer', JSON.stringify({ verdict: 'pass', kind: 'none', findings: [] }));
+    assert.equal((await runAdapter(f, adapterRequest({ mode: 'review' }))).exitCode, 0);
+    assert.deepEqual((f.records()[0]!.schema as { properties: { findings: { items: unknown } } }).properties.findings.items, { type: 'string' });
+  });
+  const unexecutable = { outcome: 'contract_unexecutable', findings: [{ text: 'An expectation outside the write paths', address: { ...address, requirement: 'r', norm: 'n', path: null, check: null } }] };
+  await t.test('implement, addressed: the unexecutable outcome passes, and the instruction names it', async () => {
+    const f = codexFixture(t);
+    f.control('answer', JSON.stringify(unexecutable));
+    const result = await runAdapter(f, adapterRequest({ mode: 'implement', subject: form }));
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.ok(f.records()[0]!.stdin.includes('contract_unexecutable'));
+    assert.deepEqual([envelope(result.stdout)['outcome'], envelope(result.stdout)['findings']], [unexecutable.outcome, unexecutable.findings]);
+  });
+  await t.test('implement without the form: only text and artifacts', async () => {
+    const f = codexFixture(t);
+    f.control('answer', JSON.stringify(unexecutable));
+    const result = await runAdapter(f, adapterRequest({ mode: 'implement' }));
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stderr, /provider_result_invalid/);
+    assert.ok(!f.records()[0]!.stdin.includes('contract_unexecutable'), 'the instruction stays as it was');
+  });
+});

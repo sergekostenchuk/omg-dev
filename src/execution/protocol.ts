@@ -8,7 +8,10 @@ import type { Environment, RoleBinding } from "../runtime/environment.js";
 import { executeProcess, type ProcessObserver } from "./process.js";
 import type { CompiledTask } from "../compiler/model.js";
 import { requireCondition, EngineError } from "../errors.js";
-import type { ArtifactValue, ReviewResult } from "./model.js";
+import { EXECUTION_REVIEW_CONTRACT, PLAN_DEFECT_CONTRACT, type ArtifactValue, type CheckResult, type PlanDefect, type PlanFindingAddress,
+  type ReviewFinding, type ReviewResult } from "./model.js";
+import { canonical } from "../canonical.js";
+import { safeRelativePath } from "../graph/topology.js";
 import type { AgentUsage } from "./model.js";
 import { boundedContext } from "../compiler/context.js";
 
@@ -151,6 +154,74 @@ export async function callAgent(role: RoleBinding, environment: Environment, mod
     "executor_response_foreign", "Executor response does not belong to this invocation");
   return response;
 }
+/**
+ * AT3a (№4125): the answer form an execution under admission asks for — review findings with addresses, and the
+ * implementation's outcome that the contract cannot be executed. Without it the requests and answers stay as they were.
+ */
+export const ANSWER_FORM = "execution/v2" as const;
+const plainObject = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const nonEmpty = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
+function addressShape(value: unknown): value is PlanFindingAddress {
+  if (!plainObject(value)) return false;
+  const plan = value['plan'], check = value['check'];
+  return Object.keys(value).sort().join(",") === "attempt,check,norm,path,plan,requirement,task,tree"
+    && plainObject(plan) && nonEmpty(plan['id']) && Number.isSafeInteger(plan['revision']) && nonEmpty(plan['hash']) && Object.keys(plan).length === 3
+    && nonEmpty(value['task']) && Number.isSafeInteger(value['attempt']) && (value['tree'] === null || nonEmpty(value['tree'])) && nonEmpty(value['requirement'])
+    && (value['norm'] === null || nonEmpty(value['norm'])) && (value['path'] === null || nonEmpty(value['path'])) && (value['norm'] === null) !== (value['path'] === null)
+    && (check === null || plainObject(check) && Object.keys(check).sort().join(",") === "failure,index" && Number.isSafeInteger(check['index'])
+      && (check['index'] as number) >= 0 && nonEmpty(check['failure']));
+}
+function findingsShape(value: unknown): value is ReviewFinding[] {
+  return Array.isArray(value) && value.every(item => plainObject(item) && Object.keys(item).sort().join(",") === "address,text"
+    && nonEmpty(item['text']) && (item['address'] === null || addressShape(item['address'])));
+}
+/** What an address is checked against: the exact attempt the finding is about, as the engine holds it. */
+export interface AddressContext { plan: Ref; task: CompiledTask; attempt: number; tree: string | null; checks: CheckResult[]; source: PlanDefect["source"] }
+export type PlanDefectResult = { ok: true; defect: PlanDefect } | { ok: false; code: string; message: string };
+/**
+ * The one check of a plan finding's address (№4125), by its producer and on every repeat of a saved outcome: the exact plan,
+ * task, attempt and tree; a requirement or test of the task; a norm, or a path outside the task's write paths; a check only
+ * when one was run — the saved, failed one, quoting its failure. It proves the address, never the meaning of the complaint.
+ */
+export function planDefectOf(findings: readonly (string | ReviewFinding)[], context: AddressContext): PlanDefectResult {
+  const code = context.source === "review" ? "review_address_foreign" : "implementation_address_foreign";
+  const addressed = findings.filter((item): item is ReviewFinding & { address: PlanFindingAddress } => typeof item !== "string" && item.address !== null);
+  if (!addressed.length) return { ok: false, code: context.source === "review" ? "review_plan_unaddressed" : "implementation_unexecutable_unaddressed",
+    message: "A plan defect names its exact address: plan, task, attempt, requirement and the contradicting norm or the necessary path" };
+  const requirements = new Set([...(context.task.requirements ?? []).map(item => item.id), ...context.task.tests.map(item => item.id)]);
+  for (const { address, text } of addressed) {
+    const refuse = (field: string, message: string): PlanDefectResult => ({ ok: false, code, message: `${field}: ${message} (${text})` });
+    if (canonical(address.plan) !== canonical(context.plan)) return refuse("plan", "the finding belongs to another plan");
+    if (address.task !== context.task.id) return refuse("task", "the finding belongs to another task");
+    if (address.attempt !== context.attempt) return refuse("attempt", "the finding belongs to another attempt");
+    if (address.tree !== context.tree) return refuse("tree", "the finding belongs to another candidate tree");
+    if (!requirements.has(address.requirement)) return refuse("requirement", `${address.requirement} is no requirement or test of this task`);
+    if (address.path !== null && (!safeRelativePath(address.path) || context.task.writePaths.includes(address.path)))
+      return refuse("path", `${address.path} is not a necessary path outside the task's write paths`);
+    if (address.check !== null) {
+      const saved = context.checks[address.check.index];
+      if (context.source === "implementation" || !saved) return refuse("check", "the finding cites a check that was not run");
+      if (saved.result.exitCode === 0 && saved.result.signal === null) return refuse("check", "the cited check did not fail");
+      if (!saved.result.stdout.includes(address.check.failure) && !saved.result.stderr.includes(address.check.failure))
+        return refuse("check.failure", "the cited failure is not in the saved check output");
+    }
+  }
+  return { ok: true, defect: { contract: PLAN_DEFECT_CONTRACT, source: context.source, findings: findings.map(item => typeof item === "string"
+    ? { text: item, address: null } : { text: item.text, address: item.address === null ? null : { ...item.address,
+      plan: { ...item.address.plan }, check: item.address.check === null ? null : { ...item.address.check } } }) } };
+}
+/** AT3a: the implementation's outcome — its result, or that the contract cannot be executed as planned, with addressed findings. */
+export type ImplementationOutcome = { kind: "result"; text: string; artifacts: ArtifactValue[] } | { kind: "unexecutable"; findings: ReviewFinding[] };
+export function implementationOutcome(response: Record<string, unknown>, task: CompiledTask, form: typeof ANSWER_FORM | null): ImplementationOutcome {
+  if (form === ANSWER_FORM && response['outcome'] !== undefined) {
+    const findings = response['findings'];
+    requireCondition(response['outcome'] === "contract_unexecutable" && findingsShape(findings) && findings.length > 0
+      && Object.keys(response).every(key => ["protocol", "requestId", "usage", "confirmed", "outcome", "findings"].includes(key)),
+    "implementation_missing", "An unexecutable contract is answered as {outcome: contract_unexecutable, findings: [{text, address}]}");
+    return { kind: "unexecutable", findings };
+  }
+  return { kind: "result", ...implementation(response, task) };
+}
 export function implementation(response: Record<string, unknown>, task: CompiledTask): { text: string; artifacts: ArtifactValue[] } {
   const text = response['text']; const artifacts = response['artifacts'];
   requireCondition(typeof text === "string" && text.trim() && Array.isArray(artifacts), "implementation_missing", "Executor must return its result and output artifacts");
@@ -160,11 +231,11 @@ export function implementation(response: Record<string, unknown>, task: Compiled
   requireCondition(artifacts.every(item => Object.keys(item).join(",") === "id"), "implementation_value_unexpected", "The agent identifies implemented contracts; the engine records code evidence rather than business values");
   return { text, artifacts };
 }
-export function review(response: Record<string, unknown>): ReviewResult {
+export function review(response: Record<string, unknown>, form: typeof ANSWER_FORM | null = null): ReviewResult {
   const result = response['review'] as ReviewResult | undefined;
   requireCondition(result && ["pass", "request_changes"].includes(result.verdict) && ["none", "code", "plan"].includes(result.kind)
-    && Array.isArray(result.findings) && result.findings.every(item => typeof item === "string")
+    && (form === ANSWER_FORM ? findingsShape(result.findings) : Array.isArray(result.findings) && result.findings.every(item => typeof item === "string"))
     && (result.verdict === "pass" ? result.kind === "none" && result.findings.length === 0 : result.kind !== "none" && result.findings.length > 0),
     "review_invalid", "Independent review requires a consistent verdict, correction route and findings");
-  return result;
+  return form === ANSWER_FORM ? { verdict: result.verdict, kind: result.kind, findings: result.findings, contract: EXECUTION_REVIEW_CONTRACT } : result;
 }

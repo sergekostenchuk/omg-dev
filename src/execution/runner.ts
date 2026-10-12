@@ -8,14 +8,15 @@ import { acquire, release } from "./lock.js";
 import { ensureWorktree, requireWorktree } from "./worktree.js";
 import { capture, requireWritePaths } from "./candidate.js";
 import { currentBasis } from "./basis.js";
-import { callAgent, implementation, review, ExecutionSendHandle, EXECUTION_SEND_KIND, UNSENT, executionSendPrefix, lostSendClosure,
-  type ExecutionSend, type ExecutionSendFeedback } from "./protocol.js";
+import { callAgent, implementationOutcome, review, planDefectOf, ExecutionSendHandle, EXECUTION_SEND_KIND, UNSENT, executionSendPrefix, lostSendClosure,
+  ANSWER_FORM, type AddressContext, type ExecutionSend, type ExecutionSendFeedback } from "./protocol.js";
 import type { Command } from "../graph/model.js";
 import type { ProcessResult } from "../runtime/process.js";
 import { executeProcess, stopOrphan, type ProcessObserver } from "./process.js";
 import { isProcessStopRefusal, writeProcessStopWitness, evaluateProcessStopWitnesses } from "../runtime/process-identity.js";
 import { checkCommands, commitIntent, publishCommit, finishCommit, subjectHash } from "./commit.js";
-import { runId, type TaskRun, type ExecutionResult, type ExecutionOptions, type AgentUsage, type CheckResult, type ReviewResult } from "./model.js";
+import { runId, findingText, EXECUTION_REVIEW_CONTRACT, type TaskRun, type ExecutionResult, type ExecutionOptions, type AgentUsage, type CheckResult,
+  type ReviewResult } from "./model.js";
 import { executionInputs } from "./inputs.js";
 import { loadTaskContextSources, taskContext } from "../compiler/context.js";
 import { readCapacity } from "../om/capacity.js";
@@ -45,9 +46,27 @@ export function planCurrentGuards(store: Store, compiler: Compiler, planRef: Ref
 const sendsOf = (store: Store, plan: Revision<MachinePlan>, scope = ""): Revision<ExecutionSend>[] =>
   store.identities("prefix", `${executionSendPrefix(plan.value.projectId, plan.value.hash)}${scope}`)
     .filter(row => row.kind === EXECUTION_SEND_KIND).map(row => store.get<ExecutionSend>(row.id, row.revision)!);
-/** The outcome of a negative review: a plan finding stops, a code finding asks a correction. */
+/** The outcome of a negative review of the era before AT3a: a plan finding stops, a code finding asks a correction. */
 const negativeReview = (verdict: ReviewResult): Partial<TaskRun> =>
-  ({ review: verdict, state: verdict.kind === "plan" ? "needs_plan" : "needs_code", child: null, error: verdict.findings.join("\n") });
+  ({ review: verdict, state: verdict.kind === "plan" ? "needs_plan" : "needs_code", child: null, error: verdict.findings.map(findingText).join("\n") });
+const failing = (check: CheckResult): boolean => check.result.exitCode !== 0 || check.result.signal !== null;
+/**
+ * AT3a (№4125): the one outcome of a review verdict, by its producer and on every repeat of a saved one. A verdict of the
+ * earlier era goes its own way. In the addressed era: pass with a failed check is refused and the code goes on; a plan
+ * stops the attempt only when every addressed finding names this exact attempt (planDefectOf), else the code goes on with
+ * the refusal named; a code verdict asks its correction. The verdict itself is always kept.
+ */
+export function reviewOutcome(verdict: ReviewResult, context: AddressContext): Partial<TaskRun> | null {
+  if (verdict.contract !== EXECUTION_REVIEW_CONTRACT) return verdict.verdict === "request_changes" ? negativeReview(verdict) : null;
+  const failed = context.checks.findIndex(failing);
+  if (verdict.verdict === "pass") return failed < 0 ? null : { review: verdict, state: "needs_code", child: null,
+    error: `review_pass_on_failed_check: the review passed a candidate whose check ${failed} failed; the failed check stands` };
+  const texts = verdict.findings.map(findingText).join("\n");
+  if (verdict.kind !== "plan") return { review: verdict, state: "needs_code", child: null, error: texts };
+  const checked = planDefectOf(verdict.findings, context);
+  return checked.ok ? { review: verdict, state: "needs_plan", child: null, error: texts, planDefect: checked.defect }
+    : { review: verdict, state: "needs_code", child: null, error: `${checked.code}: ${checked.message}\n${texts}` };
+}
 const taskScope = (task: CompiledTask): string => `${task.id.replace(/^task:/, "")}:`;
 
 /**
@@ -190,6 +209,14 @@ export function correctionsUsed(store: Store, plan: Revision<MachinePlan>, task:
     && !UNSENT.includes(row.value.status) && !restored.has(row.id)).map(row => row.value.attempt)).size;
 }
 /**
+ * Whether one more correction may open: the one count of used corrections, with any slot the earlier producer spent blind
+ * restored first — on every branch that decides it, so a review of a saved failed check (AT3a) keeps that restoration.
+ */
+function correctionRoom(store: Store, plan: Revision<MachinePlan>, task: CompiledTask, limit: number): boolean {
+  if (correctionsUsed(store, plan, task) >= limit) restoreBlindCorrections(store, plan, task);
+  return correctionsUsed(store, plan, task) < limit;
+}
+/**
  * EX4 (№4016): the corrections one task may use in all — the command's limit, within the task's own limit the owner
  * addressed or else the admission's ordinary one. Every branch that opens or refuses a correction reads this one value.
  */
@@ -220,13 +247,24 @@ export const CORRECTION_CLASSES = "This is a correction. correction.review holds
 /** The exact forms of a review answer the protocol accepts (protocol.review): the brief shows these, never its own variant (№4045). */
 export const REVIEW_PASS = { verdict: "pass", kind: "none", findings: [] };
 export const REVIEW_CHANGES = { verdict: "request_changes", kind: "code", findings: ["<class: requirement, place, scenario and consequence>"] };
-export const REVIEW_CLASSES = "Review in one pass over all five classes and return every confirmed blocking defect as a finding; after the first one keep reviewing. "
-  + "Each finding is one string: its class, the requirement it violates, the place, and the scenario with its consequence. "
-  + "One root cause on several entries is one finding that lists them; independent roots are separate findings. A class may not apply; a hypothesis or a matter of style is no finding. "
-  + `With no confirmed blocking defect after the whole review the answer is exactly ${JSON.stringify(REVIEW_PASS)}: verdict pass, kind none, no findings at all. `
-  + `Otherwise it is ${JSON.stringify(REVIEW_CHANGES)} with one finding or more; `
-  + `kind is "plan" instead of "code" only when the plan itself is contradictory or cannot be executed, and then all findings, code ones too, go with it. `
-  + "The full check already ran on these bytes: read its results in checks; a targeted check of a suspected defect is allowed.";
+/**
+ * The review rules in the form the request asks for — one exact form of a finding and of each verdict, never two (№4045).
+ * AT3a (№4125): the addressed form gives every plan finding its address; a code finding has none.
+ */
+export function reviewClasses(form: typeof ANSWER_FORM | null): string {
+  return "Review in one pass over all five classes and return every confirmed blocking defect as a finding; after the first one keep reviewing. "
+    + (form ? "Each finding is {text, address}: text is its class, the requirement it violates, the place, and the scenario with its consequence; address is null for a code finding. "
+      : "Each finding is one string: its class, the requirement it violates, the place, and the scenario with its consequence. ")
+    + "One root cause on several entries is one finding that lists them; independent roots are separate findings. A class may not apply; a hypothesis or a matter of style is no finding. "
+    + `With no confirmed blocking defect after the whole review the answer is exactly ${JSON.stringify(REVIEW_PASS)}: verdict pass, kind none, no findings at all. `
+    + `Otherwise it is ${JSON.stringify(form ? REVIEW_CHANGES_ADDRESSED : REVIEW_CHANGES)} with one finding or more; `
+    + (form ? `kind is "plan" instead of "code" only when the plan itself is contradictory or cannot be executed: then every plan finding carries its address, `
+      + "which the engine checks against this exact attempt, and the code findings go with it. A test outside the write paths is no plan defect by itself: "
+      + `name the norm the contract contradicts or the path it needs. ${ADDRESS_FORM} `
+      : `kind is "plan" instead of "code" only when the plan itself is contradictory or cannot be executed, and then all findings, code ones too, go with it. `)
+    + "The full check already ran on these bytes: read its results in checks; a targeted check of a suspected defect is allowed.";
+}
+export const REVIEW_CLASSES = reviewClasses(null);
 const listed = (items: readonly string[]): string => !items.length ? "none"
   : items.slice(0, 8).join(", ") + (items.length > 8 ? ` and ${items.length - 8} more` : "");
 /** The five classes made concrete on one task's own contract: short questions from its boundary, contracts, criteria and paths. */
@@ -255,6 +293,21 @@ export function clarificationOf(admission: ExecutionAdmission | null, task: stri
 }
 const clarified = (text: string | null, review: boolean): string => text === null ? ""
   : `\n${CLARIFICATION_HEAD}${review ? ` ${CLARIFICATION_REVIEW}` : ""}\n${text}`;
+/**
+ * AT3a (№4125): what an execution under admission tells its roles of the addressed form. The address names this exact
+ * attempt; the template in the request carries its plan, task, attempt and tree, the role adds the rest.
+ */
+export const ADDRESS_FORM = "An address is {plan, task, attempt, tree, requirement, norm, path, check}: plan, task, attempt and tree exactly as in "
+  + "subject.address; requirement — a requirement or test id of this task; exactly one of norm (the existing expectation or rule the contract "
+  + "contradicts) and path (a file outside the task's write paths the result needs), the other null; check — {index, failure} quoting the "
+  + "failing line of that saved check when the finding rests on one, else null.";
+export const IMPLEMENT_UNEXECUTABLE = "If the contract cannot be executed as planned — an existing expectation it cancels lies outside your write paths, "
+  + "the result needs a file outside them, or the plan contradicts itself — do not work around it and do not change other files: answer instead "
+  + `exactly {"outcome":"contract_unexecutable","findings":[{"text":"<requirement, contradiction and consequence>","address":{...}}]} with tree null and check null. ${ADDRESS_FORM}`;
+export const REVIEW_CHANGES_ADDRESSED = { verdict: "request_changes", kind: "code", findings: [{ text: "<class: requirement, place, scenario and consequence>", address: null }] };
+export const REVIEW_FAILED_CHECK = "The full check FAILED on these bytes (see checks and the excerpt below). pass is not allowed. Answer code when the "
+  + "code must change; answer plan only with addressed findings when the failure shows the plan contradicts an existing expectation it cannot "
+  + "change or needs a path outside the write paths.";
 const IMPLEMENT = "Implement the supplied atomic result. Preserve unrelated files. Return text and artifacts as an array of {id} naming all implemented output contracts. The engine records code evidence; do not fabricate business artifact values. Do not commit.";
 /** A new attempt corrects code when the latest settled outcome of its task, past interruptions, asked for a code change. */
 /**
@@ -274,10 +327,18 @@ function correctionBasis(store: Store, id: string): Revision<TaskRun> | null {
  * when the managed candidate is still exactly its tree, resumes at the checks; a passed review of that tree resumes at the
  * commit. Anything else is a new attempt.
  */
-function paidStage(root: ExecutionRoot, parent: string, task: CompiledTask, run: TaskRun): "checks" | "commit" | null {
+function paidStage(root: ExecutionRoot, parent: string, task: CompiledTask, run: TaskRun, addressed: { reviewed: boolean } | null): "checks" | "commit" | "review" | null {
+  // AT3a return №4141 P2-1, P2-2: under admission a completed failed check of this candidate that no review has answered
+  // is reviewed as saved — never run again, never replaced, and no correction slot is opened for it — whatever state the
+  // attempt stopped in, an earlier era's needs_code included.
+  const failed = run.checks.some(failing);
+  if (addressed && failed && run.review === null && !addressed.reviewed && run.implementation !== null && run.tree !== null && run.parent === parent
+    && ["interrupted", "checking", "reviewing", "needs_code"].includes(run.state)) {
+    try { return capture(root, parent, task) === run.tree ? "review" : null; } catch { return null; }
+  }
   if (!["interrupted", "checking", "reviewing"].includes(run.state) || run.implementation === null || run.tree === null || run.parent !== parent) return null;
   try { if (capture(root, parent, task) !== run.tree) return null; } catch { return null; }
-  return run.review?.verdict === "pass" && run.reviewSubject === subjectHash(run.plan, task.id, parent, run.tree) ? "commit" : "checks";
+  return run.review?.verdict === "pass" && run.reviewSubject === subjectHash(run.plan, task.id, parent, run.tree) && !failed ? "commit" : "checks";
 }
 
 export class Executor {
@@ -366,7 +427,8 @@ export class Executor {
         // applied — a plan finding stops, a code finding asks its correction — never bought again (№3961-1).
         if (run && ["interrupted", "checking", "reviewing"].includes(run.value.state) && run.value.review?.verdict === "request_changes"
           && run.value.tree && run.value.reviewSubject === subjectHash(run.value.plan, task.id, run.value.parent, run.value.tree))
-          run = this.save(run, negativeReview(run.value.review));
+          run = this.save(run, reviewOutcome(run.value.review, { plan: run.value.plan, task, attempt: run.value.attempt, tree: run.value.tree,
+            checks: run.value.checks, source: "review" })!);
         if (run && (run.value.state === "needs_plan" || !options.retry && !corrections.has(task.id))) { results.push(run); return results; }
         const guards = currentBasis(this.store, plan, root.value);
         const actual = { ...environment.value, workspace: root.value.path };
@@ -404,11 +466,15 @@ export class Executor {
         }
         const contextSources = loadTaskContextSources(this.store, plan);
         const previous = run?.value;
-        const resume = run ? paidStage(root.value, parent, task, run.value) : null;
+        // A review this attempt already answered is never bought again for the same saved check (its outcome stands).
+        const addressed = admission && run ? { reviewed: sendsOf(this.store, plan, `${taskScope(task)}${run.value.attempt}:review:`)
+          .some(row => row.value.status === "answered") } : null;
+        const resume = run ? paidStage(root.value, parent, task, run.value, addressed) : null;
         let correction = false, basis: Revision<TaskRun> | null = null;
         if (resume) {
-          // The paid implementation (and a passed review) are kept; only the free stages after them run again.
-          run = this.save(run!, resume === "commit" ? { state: "reviewing", child: null, error: null }
+          // The paid implementation (and a passed review) are kept; only the free stages after them run again — but a
+          // completed failed check is the basis of its review and is kept as saved.
+          run = this.save(run!, resume === "commit" || resume === "review" ? { state: "reviewing", child: null, error: null }
             : { state: "checking", child: null, error: null, checks: [], review: null, reviewSubject: null });
         } else {
           basis = run ? correctionBasis(this.store, run.id) : null;
@@ -457,14 +523,36 @@ export class Executor {
           const ownership = executionOwnership(this.store, plan, task, root.value);
           if (!resume) run = this.save(run, { inputs: [...inputs.guards, ...ownership.guards] });
           const context = JSON.parse(taskContext(plan, actual.fullCheck, task.id, maxRequestChars, contextSources).text);
+          // AT3a: an execution under admission asks the addressed form of both roles; without one the requests stay as they were.
+          const form = admission ? ANSWER_FORM : null;
+          const address = (tree: string | null) => form ? { answerForm: form, address: { plan: reference(plan), task: task.id, attempt: run!.value.attempt, tree } } : {};
           if (!resume) {
             requireCurrentTaskStart(this.store, run.value, task);
-            const response = await callAgent(actual.implementer, actual, "implement", `${IMPLEMENT} ${IMPLEMENT_CLASSES}${correction ? ` ${CORRECTION_CLASSES}` : ""}\n${selfReview(task)}${clarified(clarification, false)}`,
+            const response = await callAgent(actual.implementer, actual, "implement", `${IMPLEMENT} ${IMPLEMENT_CLASSES}${correction ? ` ${CORRECTION_CLASSES}` : ""}${form ? ` ${IMPLEMENT_UNEXECUTABLE}` : ""}\n${selfReview(task)}${clarified(clarification, false)}`,
               { context, parent, inputs: inputs.inputs, ownership: ownership.grants,
                 correction: basis ? { error: shown ? shown.text : basis.value.error, review: basis.value.review }
-                  : previous ? { error: previous.error, review: previous.review } : null },
+                  : previous ? { error: previous.error, review: previous.review } : null, ...address(null) },
               maxRequestChars, measure, observe, signal, send("implement"));
-            const output = implementation(response, task);
+            const output = implementationOutcome(response, task, form);
+            if (output.kind === "unexecutable") {
+              // The contract cannot be executed: its address is proved here, before anything is checked or reviewed; no check is
+              // asked for or invented. What the working copy holds is established first (return №4141 P2-3): a change outside
+              // the task's write paths is refused as any candidate's; an existing candidate — this answer's or a paid earlier
+              // one still in place — is recorded by its exact tree in the attempt and in every address; none means none.
+              let candidate: string | null = null;
+              try { candidate = capture(root.value, parent, task); }
+              catch (error) { if (!(error instanceof EngineError && error.code === "candidate_empty")) throw error; }
+              const checked = planDefectOf(output.findings, { plan: reference(plan), task, attempt: run.value.attempt, tree: null, checks: [], source: "implementation" });
+              const defect = checked.ok ? { ...checked.defect, findings: checked.defect.findings.map(item => item.address === null ? item
+                : { ...item, address: { ...item.address, tree: candidate } }) } : null;
+              const texts = output.findings.map(item => item.text).join("\n");
+              run = this.save(run, defect ? { state: "needs_plan", child: null, error: texts, planDefect: defect, tree: candidate }
+                : { state: "needs_code", child: null, error: `${checked.ok ? "" : `${checked.code}: ${checked.message}`}\n${texts}`, tree: candidate }, closure());
+              if (run.value.state === "needs_code" && correctionRoom(this.store, plan, task, limit)) {
+                corrections.set(task.id, (corrections.get(task.id) ?? 0) + 1); taskIndex--; continue;
+              }
+              results.push(run); return results;
+            }
             const tree = capture(root.value, parent, task);
             // The answered launch and its application are one transaction.
             run = this.save(run, { state: "checking", implementation: output.text, artifacts: output.artifacts, tree }, closure());
@@ -476,27 +564,33 @@ export class Executor {
             const commands = checkCommands(task, actual), full = hashJson(actual.fullCheck);
             const order = [...commands.filter(command => hashJson(command) === full), ...commands.filter(command => hashJson(command) !== full)];
             const done = new Map<string, CheckResult>();
-            for (const command of order) {
+            // A completed failed check kept as saved is what its review reads (return №4141 P2-2); otherwise the checks run.
+            let failed: string | null = resume === "review" ? failedCheck(run.value, feedbackLimit(maxRequestChars))!.text : null;
+            for (const command of resume === "review" ? [] : order) {
               const result = await executeProcess(command, actual.workspace, "", actual.timeoutMs, observe, signal);
               done.set(hashJson(command), { command, result });
               run = this.save(run, { checks: commands.filter(item => done.has(hashJson(item))).map(item => done.get(hashJson(item))!) });
-              requireCondition(result.exitCode === 0 && result.signal === null, "full_check_failed",
-                checkFeedback(command, result, run.value.checks.findIndex(check => hashJson(check.command) === hashJson(command)), feedbackLimit(maxRequestChars)).text);
+              const feedback = () => checkFeedback(command, result, run!.value.checks.findIndex(check => hashJson(check.command) === hashJson(command)), feedbackLimit(maxRequestChars)).text;
+              // AT3a (№4125): under admission a failed check no longer ends the attempt before the review — the existing reviewer
+              // reads the saved candidate and checks and decides code or an addressed plan, before any correction is bought.
+              if (!form) requireCondition(result.exitCode === 0 && result.signal === null, "full_check_failed", feedback());
               requireCondition(capture(root.value, parent, task) === tree, "candidate_changed", "A check changed the candidate bytes");
+              if (result.exitCode !== 0 || result.signal !== null) { failed = feedback(); break; }
             }
             const subject = subjectHash(reference(plan), task.id, parent, tree);
             run = this.save(run, { state: "reviewing", reviewSubject: subject });
             if (admission) requireExecutionBudget(this.store, admission, plan, "review");
-            const answered = await callAgent(actual.reviewer, actual, "review", `Independently review the exact supplied task and candidate tree. Read the actual diff and tests. Return a structured pass or request_changes verdict. ${REVIEW_CLASSES}\n${selfReview(task)}${clarified(clarification, true)}`,
-              { binding: subject, context, parent, tree, artifacts: run.value.artifacts, checks: run.value.checks },
+            const answered = await callAgent(actual.reviewer, actual, "review", `Independently review the exact supplied task and candidate tree. Read the actual diff and tests. Return a structured pass or request_changes verdict. ${reviewClasses(form)}${failed !== null ? `\n${REVIEW_FAILED_CHECK}\n${failed}` : ""}\n${selfReview(task)}${clarified(clarification, true)}`,
+              { binding: subject, context, parent, tree, artifacts: run.value.artifacts, checks: run.value.checks, ...address(tree) },
               maxRequestChars, measure, observe, signal, send("review"));
-            const verdict = review(answered);
+            const verdict = review(answered, form);
             requireCondition(capture(root.value, parent, task) === tree, "candidate_changed", "The candidate changed during independent review");
-            if (verdict.verdict === "request_changes") {
+            const outcome = reviewOutcome(verdict, { plan: reference(plan), task, attempt: run.value.attempt, tree, checks: run.value.checks, source: "review" });
+            if (outcome) {
               // The negative review, its launch and the state it decides are one transaction: a lost process after it buys no
               // second review of the same tree (№3961-1).
-              run = this.save(run, negativeReview(verdict), closure());
-              if (run.value.state === "needs_code" && correctionsUsed(this.store, plan, task) < limit) {
+              run = this.save(run, outcome, closure());
+              if (run.value.state === "needs_code" && correctionRoom(this.store, plan, task, limit)) {
                 corrections.set(task.id, (corrections.get(task.id) ?? 0) + 1); taskIndex--; continue;
               }
               results.push(run); return results;
@@ -530,7 +624,7 @@ export class Executor {
               ? `${code}: ${task.id}: ${error.message}; ${canonical(error.details)}`
               : obligationPause || code === "execution_budget_exhausted" ? `${code}: ${error instanceof Error ? error.message : 'Missing obligation evidence'}`
                 : error instanceof Error ? error.message : "Execution failed" }, closure());
-          if (run.value.state === "needs_code" && correctionsUsed(this.store, plan, task) < limit) {
+          if (run.value.state === "needs_code" && correctionRoom(this.store, plan, task, limit)) {
             corrections.set(task.id, (corrections.get(task.id) ?? 0) + 1); taskIndex--; continue;
           }
           results.push(run); return results;
