@@ -1067,10 +1067,37 @@ function worksBindingsEra(contract: QuestionPacketRecord['packetContract'], save
     fail('packet_record_invalid', saved.request.routes.id, 'worksBindings', 'Only a works brief packet declares the bindings era');
   return contract === WORKS_BRIEF_PACKET_CONTRACT && (saved ? saved.worksBindings === true : true);
 }
+type DerivedPacket = { value: QuestionPacketRecord; guards: TransactionGuard[]; references: Ref[]; writes: Write[]; briefBasis?: BriefBasis };
+/**
+ * PF5 (№4235): a step of a continuation or correction chain derives the step it follows, and so does the E3 recheck of the
+ * need_source behind it (readContinuationEvidence → prepareAnswerForm → prepareQuestionPacket) — two paths to the same link,
+ * each again for its own predecessor: 2^depth. While the outermost derivation runs (a preparation is synchronous and writes
+ * nothing), a derivation of the same exact request, mode, saved record and chain-step state on the same Store view is the
+ * same result and is derived once; the memo ends with that outermost call and never crosses preparations. A refusal is not
+ * kept: it ends the preparation it is met in.
+ */
+let derivations = 0, memo: Map<string, DerivedPacket> | null = null, views = 0;
+const viewIds = new WeakMap<Store, number>();
+const viewId = (store: Store): number => viewIds.get(store) ?? (viewIds.set(store, ++views), views);
+/** PF5: how many packet derivations have run in this process — the measure of one preparation in the tests. */
+export function packetDerivations(): number { return derivations; }
 function derivePacket(store: Store, request: QuestionPacketRequest, current: boolean,
-  protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): {
-  value: QuestionPacketRecord; guards: TransactionGuard[]; references: Ref[]; writes: Write[]; briefBasis?: BriefBasis;
-} {
+  protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): DerivedPacket {
+  const outer = memo === null;
+  if (outer) memo = new Map();
+  try {
+    const key = canonical([viewId(store), request, current, protocol ?? null, contract ?? null, saved === undefined ? null : hashJson(saved as unknown as Json),
+      chainSteps > 0] as unknown as Json);
+    const known = memo!.get(key);
+    if (known) return known;
+    derivations++;
+    const derived = derivePacketOnce(store, request, current, protocol, contract, saved);
+    memo!.set(key, derived);
+    return derived;
+  } finally { if (outer) memo = null; }
+}
+function derivePacketOnce(store: Store, request: QuestionPacketRequest, current: boolean,
+  protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): DerivedPacket {
   const briefVersion = contentContract(store, request, contract, saved);
   if (request.continuation) {
     if (!currentContract(contract))

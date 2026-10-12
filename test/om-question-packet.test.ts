@@ -3705,3 +3705,130 @@ test('LP7 row 29: a joined input packet is whole — ready when the capacity hol
     assert.deepEqual(saved.value.batches.find(batch => batch.id === joined.id)!.items, joined.items, 'The joined batch keeps every item');
   }
 });
+
+// ---- PF5 (№4235): one preparation derives each link of a continuation chain once ----
+import { packetDerivations } from '../src/om/question-packet.js';
+const PF5_BASE = '2785fca243698b923b994af3cff79ede3dc24e92';
+/** What a preparation gives its consumer, comparable across processes: the record, its guards, references and writes, or the refusal. */
+type PreparedSummary = { record: Ref; existing: boolean; guards: Json; references: Json; writes: Json } | { refusal: string };
+function preparedSummary(result: OmResult<Sealed<{ record: Revision<QuestionPacketRecord>; existing: boolean; guards: readonly unknown[];
+  references: readonly Ref[]; writes: readonly Write[] }>>): PreparedSummary {
+  if (!result.ok) return { refusal: result.refusal.code };
+  const value = result.value;
+  return { record: reference(value.record), existing: value.existing, guards: value.guards as unknown as Json, references: value.references as unknown as Json,
+    writes: value.writes.map(write => ({ id: write.id, expected: write.expected, hash: hashJson(write.value) })) as unknown as Json };
+}
+/** The preparations of `requests` by the base commit's engine, every module loaded from Git, in its own process (as routeAtCommit). */
+function preparedAtCommit(path: string, requests: readonly QuestionPacketRequest[]): PreparedSummary[] {
+  const root = dirname(path), repository = fileURLToPath(new URL('../../', import.meta.url)), served = join(root, 'pf5-base-served.log');
+  const loader = join(root, 'pf5-base-loader.mjs'), producer = join(root, 'pf5-base-producer.mjs'), input = join(root, 'pf5-base-input.json');
+  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
+  writeFileSync(served, '');
+  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
+import { appendFileSync, realpathSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from ${JSON.stringify(typescript)};
+let root, log, prefixes;
+export function initialize(data) {
+  root = data.root; log = data.log;
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+}
+export async function load(url, context, next) {
+  const prefix = prefixes.find(item => url.startsWith(item));
+  if (prefix && /\\.js$/.test(url)) {
+    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    appendFileSync(log, relative + '\\n');
+    const source = execFileSync('git', ['show', ${JSON.stringify(PF5_BASE)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
+    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
+      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
+  }
+  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
+    throw new Error('An engine module outside the era checkout: ' + url);
+  return next(url, context);
+}`);
+  writeFileSync(producer, `import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+const [repository, database, input] = process.argv.slice(2);
+const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
+const { Store } = await import(src('storage/store.js'));
+const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
+const { hashJson } = await import(src('canonical.js'));
+const { reference } = await import(src('pipeline/contracts.js'));
+const store = new Store(database);
+try {
+  process.stdout.write(JSON.stringify(JSON.parse(readFileSync(input, 'utf8')).map(request => {
+    const result = prepareQuestionPacket(store, request);
+    if (!result.ok) return { refusal: result.refusal.code };
+    const value = result.value;
+    return { record: reference(value.record), existing: value.existing, guards: value.guards, references: value.references,
+      writes: value.writes.map(write => ({ id: write.id, expected: write.expected, hash: hashJson(write.value) })) };
+  })));
+} finally { store.close(); }`);
+  writeFileSync(input, JSON.stringify(requests));
+  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
+    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
+  const output = JSON.parse(execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, path, input],
+    { cwd: repository, encoding: 'utf8', timeout: 300_000, maxBuffer: 50_000_000 })) as PreparedSummary[];
+  assert.ok(readFileSync(served, 'utf8').split('\n').includes('src/om/question-packet.ts'), `The preparations ran on the modules of ${PF5_BASE}`);
+  return output;
+}
+
+test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — N+1 derivations at depth N, where each link was derived twice per step — with the exact record, guards, references and writes of the base code 2785fca, a 6th link unwritten included, and its refusal codes for a foreign response or delivery', t => {
+  const p = packetFixture(t), { f } = p;
+  // Five reads of five different values: each link adds knowledge, so each continuation is a ready packet.
+  const question = f.input.value.input.questions[0]! as unknown as Record<string, unknown>;
+  const pointers = Object.keys(question).filter(key => typeof question[key] === 'string' && (question[key] as string).length > 0).sort()
+    .map(key => `/input/questions/0/${key}`);
+  assert.ok(pointers.length >= 6, pointers.join(' '));
+  const link = (packet: Sealed<Revision<QuestionPacketRecord>>, pointer: string): QuestionPacketRequest =>
+    ({ ...p.request, continuation: sourceContinuation(p, packet, { action: 'read_context', record: reference(f.input), pointer }).continuation });
+  let packet = ok(writeQuestionPacket(f.store, p.request)).record;
+  const requests: QuestionPacketRequest[] = [], counts: number[] = [], ours: PreparedSummary[] = [];
+  for (const pointer of pointers.slice(0, 5)) {
+    const request = link(packet, pointer), before = packetDerivations();
+    ours.push(preparedSummary(prepareQuestionPacket(f.store, request)));
+    counts.push(packetDerivations() - before);
+    requests.push(request);
+    packet = ok(writeQuestionPacket(f.store, request)).record;
+    assert.equal(packet.value.state, 'ready', `link ${requests.length} is a ready continuation`);
+  }
+  // The sixth link is prepared, not written: its new record's bytes and hash are compared too.
+  const sixth = link(packet, pointers[5]!), before = packetDerivations();
+  const unwritten = preparedSummary(prepareQuestionPacket(f.store, sixth));
+  counts.push(packetDerivations() - before);
+  assert.deepEqual(counts, [2, 3, 4, 5, 6, 7], 'Each link of the chain, the prepared one included, is derived once in its preparation');
+  assert.ok('record' in unwritten && !unwritten.existing && Array.isArray(unwritten.writes) && unwritten.writes.length > 0);
+  // A foreign response or delivery under the third link is refused as before.
+  const third = requests[2]!.continuation!;
+  const response = f.store.get(third.response.id)!, delivery = f.store.get(third.deliveries[0]!.id)!;
+  const foreignResponse = f.store.write({ id: `${response.id}:pf5-foreign`, kind: response.kind, expected: 0, value: response.value });
+  const foreignDelivery = f.store.write({ id: `${delivery.id}:pf5-foreign`, kind: delivery.kind, expected: 0, value: delivery.value });
+  const refused = [{ ...requests[2]!, continuation: { ...third, response: reference(foreignResponse) } },
+    { ...requests[2]!, continuation: { ...third, deliveries: [reference(foreignDelivery)] } }];
+  const refusals = refused.map(request => preparedSummary(prepareQuestionPacket(f.store, request)));
+  assert.ok(refusals.every(row => 'refusal' in row), JSON.stringify(refusals));
+  // The written chain prepared again: an existing record, each link derived once as well.
+  const again = requests.map(request => {
+    const from = packetDerivations(), summary = preparedSummary(prepareQuestionPacket(f.store, request));
+    return { summary, count: packetDerivations() - from };
+  });
+  assert.deepEqual(again.map(row => row.count), [2, 3, 4, 5, 6]);
+  // The base code prepares the same requests on the same database, in its own process: the same existing records, guards,
+  // references and writes; the same new record of the sixth link; the same refusals.
+  const base = preparedAtCommit(f.store.path, [...requests, sixth, ...refused]);
+  assert.deepEqual(JSON.parse(JSON.stringify([...again.map(row => row.summary), unwritten, ...refusals])), base);
+  // Before its write, each link's new record was the one the base code finds written: the same id, revision and hash.
+  for (const [index, row] of ours.entries()) {
+    const written = base[index]!;
+    assert.ok('record' in row && 'record' in written && !row.existing && written.existing);
+    assert.deepEqual([row.record, row.writes], [written.record, [{ id: written.record.id, expected: 0, hash: written.record.hash }]], `link ${index + 1}`);
+  }
+  // №4244: two derivations of one link with a different `current` in one preparation never share a result. The engine's one
+  // path that derives a link both ways is its preparation after the environment moved: historically for the environment's
+  // proof, then currently on the admitted view — 7 + 7 here, neither served from the other; the outcome is the base code's.
+  p.environment(100_000);
+  const from = packetDerivations(), moved = preparedSummary(prepareQuestionPacket(f.store, sixth));
+  assert.equal(packetDerivations() - from, 14);
+  assert.deepEqual(JSON.parse(JSON.stringify([moved])), preparedAtCommit(f.store.path, [sixth]));
+});
