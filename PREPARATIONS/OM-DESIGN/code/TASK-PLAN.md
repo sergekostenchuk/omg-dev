@@ -2006,7 +2006,7 @@
 - Отдаёт: —
 - Читает записи: принятый L3; находки двери AT1 (G5 v2); завершённый проход
 - Пишет записи: запись переоткрытия L3; новая ревизия кадра L3; новый план
-- Разрешённые пути: `src/product/commands.ts`, `src/om/run.ts`, `src/om/gaps.ts`, `src/om/frame-proposals.ts`, `src/om/frame-accept.ts`, `test/om-run.test.ts`, `test/om-gaps.test.ts`, `test/om-commands.test.ts`
+- Разрешённые пути: `src/product/commands.ts`, `src/product/engine.ts`, `src/om/run.ts`, `src/om/gaps.ts`, `src/om/frame-proposals.ts`, `src/om/frame-accept.ts`, `test/om-run.test.ts`, `test/om-gaps.test.ts`, `test/om-commands.test.ts`
 - Из движка как есть: DRY-L3; №4119; LP8.1
 - После: AT1
 - Тесты сверх обязательных:
