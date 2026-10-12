@@ -15,7 +15,7 @@ import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requiremen
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store, type Write } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { withHistoricalReads, writeOmInput, type OmInput } from "../src/om/input.js";
+import { READINESS_CONTRACT, readinessQuestionId, withHistoricalReads, writeOmInput, type OmInput, type ReadinessCause } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { fillObligations, type FrameLevel, type FrameRead, type FrameScope } from "../src/om/frame-obligations.js";
@@ -1028,4 +1028,71 @@ out({ read, historical: take(readGaps(store, read)), current: take(prepareCurren
   const reopened = new Store(f.database);
   t.after(() => reopened.close());
   check(reopened, "reopened");
+});
+
+// ---- AT1 door (№4105 п.1, п.3): a readiness question names its saved G5 and is addressed to an accepted place ----
+function readiness(consumer = "garden-produce-operation"): SourceQuestion {
+  const cause: ReadinessCause = { contract: READINESS_CONTRACT, cause: "transition", snapshot: { commit: "a".repeat(40), tree: "b".repeat(40) },
+    file: "test/loader.test.ts", line: 2, kind: "dynamic-import", expression: "import(name)", site: { start: 40, end: 52, hash: "h".repeat(64) },
+    candidates: ["src/garden.ts"], works: ["garden-produce-work"], places: [consumer] };
+  return { id: readinessQuestionId(cause, consumer), question: "Which files of the snapshot can import(name) load?", consumer, kind: "repository-fact",
+    blocks: true, source: fakeRef("om-atomic-gate:garden:refused"), moment: "om-pass", readiness: cause };
+}
+test("AT1 door: a readiness question is a blocking repository fact of the block above its work, its source the saved G5 — never a stage; a forged one is refused", () => {
+  const source = sources();
+  source.inputResult.input!.questions.push(readiness()); stamp(source);
+  const collected = collectGaps(source);
+  assert.deepEqual(collected.refusals, []);
+  const gap = collected.gaps.find(row => row.target === readiness().id)!;
+  assert.deepEqual([gap.code, gap.field, gap.kind, gap.routes, gap.moment, gap.blocking, gap.consumers, gap.evidence[0]!.source],
+    ["predecessor_question", "answer", "repository-fact", ["code", "research"], "om-pass", true, ["garden-produce-block"], fakeRef("om-atomic-gate:garden:refused")]);
+  const forged: [string, (question: SourceQuestion) => void][] = [
+    ["another identity", question => { question.id = "readiness:transition:other"; }],
+    ["a stage source", question => { question.source = fakeRef("stage:garden:features"); }],
+    ["another kind", question => { question.kind = "design-decision"; }],
+    ["not blocking", question => { question.blocks = false; }],
+    ["a cause without works", question => { question.readiness!.works = []; }],
+  ];
+  // Return №4186 P1: a transition is one question of its snapshot — its identity holds no consumer, it is placed once for all works.
+  assert.equal(readinessQuestionId(readiness().readiness!, "garden-consume-operation"), readiness().id);
+  // Return №4197: the one question is a gap of the block of every place its works stand in; its consumer is one of them.
+  const shared = sources(), both = readiness();
+  (both.readiness as { places: string[] }).places = ["garden-later-operation", "garden-produce-operation"];
+  shared.inputResult.input!.questions.push(both); stamp(shared);
+  const sharedGap = collectGaps(shared).gaps.find(row => row.target === both.id)!;
+  assert.deepEqual([...sharedGap.consumers].sort(), ["garden-later-block", "garden-produce-block"]);
+  const outside = sources(), stray = readiness();
+  (stray.readiness as { places: string[] }).places = ["garden-later-operation"];
+  outside.inputResult.input!.questions.push(stray); stamp(outside);
+  assert.equal(hasCode(collectGaps(outside), "gap_source_missing").at.target, stray.id, "the consumer is one of its places");
+  for (const [label, change] of forged) {
+    const changed = sources(), asked = readiness(); change(asked);
+    changed.inputResult.input!.questions.push(asked); stamp(changed);
+    const result = collectGaps(changed);
+    assert.equal(hasCode(result, "gap_source_missing").at.target, asked.id, label);
+    assert.equal(result.gaps.some(row => row.target === asked.id), false, label);
+  }
+});
+test("AT1 policy (№4117): a policy question is an owner decision asked at its producer — blocking for the producer's block, its source the saved G5; another kind or a moved producer is refused", () => {
+  const cause: ReadinessCause = { contract: READINESS_CONTRACT, cause: "policy", policy: "appearance", producer: "garden-produce-block",
+    governs: { contract: "garden-contract", hash: "h".repeat(64) }, works: ["garden-produce-work"] };
+  const asked = (): SourceQuestion => ({ id: readinessQuestionId(cause, "garden-produce-block"), question: "How does the state appear?", consumer: "garden-produce-block",
+    kind: "owner-decision", blocks: true, source: fakeRef("om-atomic-gate:garden:refused"), moment: "om-pass", readiness: structuredClone(cause) });
+  const source = sources();
+  source.inputResult.input!.questions.push(asked()); stamp(source);
+  const collected = collectGaps(source);
+  assert.deepEqual(collected.refusals, []);
+  const gap = collected.gaps.find(row => row.target === asked().id)!;
+  assert.deepEqual([gap.code, gap.kind, gap.routes, gap.blocking, gap.consumers], ["predecessor_question", "owner-decision", ["owner"], true, ["garden-produce-block"]]);
+  for (const [label, change] of [
+    ["a fact kind", (question: SourceQuestion) => { question.kind = "repository-fact"; }],
+    ["another producer", (question: SourceQuestion) => { (question.readiness as { producer: string }).producer = "garden-consume-block"; }],
+    ["an unknown policy", (question: SourceQuestion) => { (question.readiness as { policy: string }).policy = "rollback"; }],
+    ["another contract", (question: SourceQuestion) => { (question.readiness as { governs: { contract: string } }).governs.contract = "other-contract"; }],
+    ["no contract", (question: SourceQuestion) => { delete (question.readiness as { governs?: unknown }).governs; }],
+  ] as const) {
+    const changed = sources(), question = asked(); change(question);
+    changed.inputResult.input!.questions.push(question); stamp(changed);
+    assert.equal(hasCode(collectGaps(changed), "gap_source_missing").at.target, question.id, label);
+  }
 });

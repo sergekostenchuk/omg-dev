@@ -10,7 +10,8 @@ import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
-import { historicalProof, readOmInput, withHistoricalReads, type InputBuildResult, type InputGap, type OmInput } from './input.js';
+import { READINESS_CONTRACT, historicalProof, readOmInput, readinessQuestionId, withHistoricalReads, type InputBuildResult, type InputGap, type OmInput,
+  type ReadinessCause } from './input.js';
 import { readHorizon } from './horizon.js';
 import { readUnacceptedLayer } from './layer-basis.js';
 import { prepareFrameProposals, readFrameProposals, type FrameGap, type ProposalRequest, type PreparedFrameProposals } from './frame-proposals.js';
@@ -187,6 +188,10 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
   const resolve = (consumer: unknown): { blocks: string[]; mechanism?: string; uses?: string[] } => {
     if (text(consumer)) return { blocks: unique(relations.ancestry(consumer).filter(node => node.kind === 'block').map(node => node.id)) };
     if (!object(consumer)) return { blocks: [] };
+    if (Array.isArray(consumer.places) && consumer.places.length && consumer.places.every(text)) {
+      const blocks = (consumer.places as string[]).map(place => relations.ancestry(place).filter(node => node.kind === 'block').map(node => node.id));
+      return { blocks: blocks.some(found => !found.length) ? [] : unique(blocks.flat()) };
+    }
     if (text(consumer.mechanism) && (consumer.uses === undefined || Array.isArray(consumer.uses) && consumer.uses.every(text)))
       return { blocks: [], mechanism: consumer.mechanism, ...(consumer.uses === undefined ? {} : { uses: unique(consumer.uses as string[]) }) };
     if (Array.isArray(consumer.features)) {
@@ -269,6 +274,15 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
       || typeof question.blocks !== 'boolean' || !isRef(question.source)) {
       fail('gap_source_missing', 'inputResult', 'questions', 'A predecessor question needs its complete producer metadata'); continue;
     }
+    // AT1 door (№4105 п.1): a readiness question names its own producer — the saved G5 whose cause it asks, proved by the
+    // B1 derivation that added it; it is never passed off as a question of a stage.
+    if (Object.hasOwn(question, 'readiness')) {
+      if (!readinessQuestion(question)) fail('gap_source_missing', question.id, 'source', 'A readiness question names its exact saved G5 cause');
+      // Return №4197: a transition is a gap of the block of every place its works stand in.
+      else push({ target: question.id, code: 'predecessor_question', field: 'answer', source: question.source, kind: question.kind, moment: question.moment,
+        consumer: question.readiness?.cause === 'transition' ? { places: question.readiness.places } : question.consumer }, 'question', question as unknown as Json);
+      continue;
+    }
     const producer = Array.isArray(input.sources) ? input.sources.filter(source => object(source)
       && source.id === question.source.id && source.revision === question.source.revision && source.hash === question.source.hash) : [];
     if (producer.length !== 1 || !['discovery', 'features'].includes(producer[0]!.stage)
@@ -302,6 +316,29 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
   return finish();
 }
 
+/**
+ * The whole form of a readiness question: its exact cause, identity, addressed consumer and fixed moment and blocking; a
+ * transition is a repository fact, a policy an owner decision (decided by the owner's H2, or by the model in the pass).
+ */
+function readinessQuestion(question: Record<string, any>): boolean {
+  const cause = question.readiness as ReadinessCause;
+  const texts = (value: unknown) => Array.isArray(value) && value.every(text) && new Set(value).size === value.length;
+  if (!object(cause) || cause.contract !== READINESS_CONTRACT || !texts(cause.works) || !cause.works.length || !isRef(question.source)
+    || !question.source.id.startsWith('om-atomic-gate:') || question.moment !== 'om-pass' || question.blocks !== true
+    || question.addressedBy !== undefined) return false;
+  // The whole form first; the identity is derived from it only once it is complete.
+  const formed = cause.cause === 'policy'
+    ? ['appearance', 'provider'].includes(cause.policy) && text(cause.producer) && object(cause.governs)
+      && text(cause.governs.contract) && text(cause.governs.hash) && Object.keys(cause.governs).length === 2
+      && Object.keys(cause).length === 6 && question.kind === 'owner-decision'
+    : cause.cause === 'transition' && object(cause.snapshot) && text(cause.snapshot.commit) && text(cause.snapshot.tree)
+      && Object.keys(cause.snapshot).length === 2 && text(cause.file) && Number.isSafeInteger(cause.line) && cause.line >= 0
+      && text(cause.kind) && text(cause.expression) && object(cause.site) && Number.isSafeInteger(cause.site.start) && Number.isSafeInteger(cause.site.end)
+      && cause.site.start >= 0 && cause.site.end >= cause.site.start && text(cause.site.hash) && Object.keys(cause.site).length === 3
+      && texts(cause.candidates) && texts(cause.places) && cause.places.includes(question.consumer) && Object.keys(cause).length === 11
+      && question.kind === 'repository-fact';
+  return formed && question.id === readinessQuestionId(cause, question.consumer);
+}
 /** The supplied set cannot choose its own classification, deadline, routing, scope, or completeness. */
 export function gateGaps(result: GapCollection, sources: GapSources): Sealed<GapGate> {
   if (!object(result) || !Array.isArray(result.gaps) || !Array.isArray(result.refusals) || result.gaps.some(gap => !object(gap)))

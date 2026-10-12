@@ -143,7 +143,7 @@ function acceptedOperationsFixture(t: TestContext, codeStatus: 'planned' | 'exis
 }
 
 /** Real C3/C4/C5, D1/D2/D7 and F2/F4/G5 sources; no model or adapter is called. */
-function acceptedWorksFixture(t: TestContext, codeStatus: 'planned' | 'existing' = 'planned') {
+function acceptedWorksFixture(t: TestContext, codeStatus: 'planned' | 'existing' = 'planned', snapshot?: 'head' | null) {
   const base = acceptedOperationsFixture(t, codeStatus);
   const { root, workspace, database, project, basis, frame2, graph, layer, upperFrame, input, horizon, proposal, store, engine } = base;
   const works: ProposalRequest = { frame: clone(basis.request) as FrameRequest, proposals: [proposal(clone(basis) as unknown as FrameRead)] };
@@ -167,7 +167,8 @@ function acceptedWorksFixture(t: TestContext, codeStatus: 'planned' | 'existing'
   git(workspace, ['add', 'input.txt']);
   git(workspace, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'capture input']);
   const request: AtomicGateRequest = { project, candidate: reference(candidate.record), neighbors: reference(neighbors),
-    environment: reference(environment), gaps: gapRead, results: [], sources: [reference(source)] };
+    environment: reference(environment), gaps: gapRead, results: [], sources: [reference(source)],
+    ...(snapshot === undefined ? {} : { snapshot: snapshot === 'head' ? resolveSnapshot(workspace) : null }) };
   assert.deepEqual(candidate.record.value.graph.horizon, ['garden-consume-work']);
   assert.equal(store.get('execution-root:garden'), null);
   const gate = ok(writeAtomicGate(store, request));
@@ -936,3 +937,25 @@ export async function load(url,context,next){
  return next(url,context);
 }
 `;
+
+// ---- AT1 (№4091 п.5, row 14): the plan is issued only on the tree the works were checked against ----
+import { resolveSnapshot } from '../src/om/impact.js';
+import { ATOMIC_GATE_IMPACT_CONTRACT } from '../src/om/atomic-gate.js';
+test('AT1 row 14 M8 issues a plan only on the tree its works were checked against: the same tree passes; a workspace moved after G5 is stale; a gate of the impact era without its snapshot is not ready', t => {
+  const f = acceptedWorksFixture(t, 'planned', 'head');
+  assert.equal(f.gate.value.contract, ATOMIC_GATE_IMPACT_CONTRACT);
+  assert.equal(f.gate.value.impact!.snapshot!.tree, git(f.workspace, ['rev-parse', 'HEAD^{tree}']));
+  assert.ok(prepareFeasibility(f.store, f.feasibility).ok, 'the same tree');
+  const g = acceptedWorksFixture(t, 'planned', 'head');
+  writeFileSync(join(g.workspace, 'later.txt'), 'A later change');
+  git(g.workspace, ['add', 'later.txt']); git(g.workspace, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'later']);
+  const before = heads(g.store);
+  denied(prepareFeasibility(g.store, g.feasibility), 'feasibility_stale');
+  assert.deepEqual(heads(g.store), before, 'nothing is written');
+  const h = acceptedWorksFixture(t, 'planned', null);
+  assert.deepEqual([h.gate.value.contract, h.gate.value.impact], [ATOMIC_GATE_IMPACT_CONTRACT, { snapshot: null, works: [] }]);
+  denied(prepareFeasibility(h.store, h.feasibility), 'feasibility_not_ready');
+  const old = acceptedWorksFixture(t, 'planned');
+  assert.equal(old.gate.value.contract, 'om-atomic-gate/v1', 'a request of the earlier era keeps its own record and rule');
+  assert.ok(prepareFeasibility(old.store, old.feasibility).ok);
+});

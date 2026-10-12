@@ -26,12 +26,14 @@ import { isFrameAttemptBinding, type FrameAttemptBinding } from './layer-basis.j
 import type { ProposalRequest } from './frame-proposals.js';
 import { prepareGapLines as prepareGapLinesOf, readGapLines as readGapLinesOf } from './gap-lines.js';
 import { prepareCurrentGaps as prepareCurrentGapsOf, prepareGaps as prepareGapsOf, readGaps as readGapsOf, type GapCollection, type GapReadRequest, type GapRequest } from './gaps.js';
-import { withHistoricalReads, historicalRead } from './input.js';
+import { withHistoricalReads, historicalRead, readOmInput as readOmInputOf, type OmInput } from './input.js';
 import { readPartAssembly as readPartAssemblyOf, readReuseResult as readReuseResultOf } from './model-call.js';
 import { prepareNeighbors as prepareNeighborsOf, readNeighbors as readNeighborsOf, type NeighborCollection } from './neighbors.js';
 import { prepareObligationTransfer as prepareObligationTransferOf, prepareOmObligations as prepareOmObligationsOf, readObligationTransfer as readObligationTransferOf, readOmObligations as readOmObligationsOf,
   type ObligationRequest, type OmObligationHandoff, type OmObligations } from './obligations.js';
-import { readPartResult as readPartResultOf, type WorksPartBindings } from './question-packet.js';
+import { readPartResult as readPartResultOf, readQuestionPacket as readQuestionPacketOf, type WorksPartBindings } from './question-packet.js';
+import { declarationUnknown, declares, deriveImpact, impactCoverage, readSnapshot, validSnapshot, type ImpactCoverage, type ImpactResolution, type ImpactUnknown,
+  type RepositorySnapshot, type SnapshotFiles, type WorkImpact } from './impact.js';
 import { readRecord as readRecordOf, writeGuarded as writeGuardedOf, type GuardedWrite, type RecordRequest } from './refs.js';
 import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, transferError, transferring, type OmResult, type Refusal,
   type Sealed, type SourceCodes } from './refusal.js';
@@ -48,7 +50,7 @@ export type AtomicGateErrorCode = typeof ATOMIC_GATE_ERROR_CODES[number];
 /** The units whose refusals G5 hands on: its readers, and the compiler's resolution of an external task source (its
  * exceptions, through the exact earlier filter SOURCE_UNFIT). */
 export type AtomicGateSource = 'refs' | 'capacity' | 'deliveries' | 'frame-accept' | 'gap-lines' | 'gaps' | 'model-call' | 'neighbors'
-  | 'obligations' | 'question-packet' | 'works-frame' | 'compiler-inputs' | 'wake-choice';
+  | 'obligations' | 'question-packet' | 'works-frame' | 'compiler-inputs' | 'wake-choice' | 'input';
 export type AtomicGateCode = AtomicGateLocalCode | SourceCodes<AtomicGateSource>;
 export type AtomicGateResult<T> = OmResult<T, AtomicGateCode>;
 
@@ -67,25 +69,44 @@ const chosenWakes = transferring('wake-choice', chosenWakesOf);
 const readReuseResult = transferring('model-call', readReuseResultOf);
 const prepareNeighbors = transferring('neighbors', prepareNeighborsOf);
 const readNeighbors = transferring('neighbors', readNeighborsOf);
+const readOmInput = transferring('input', readOmInputOf);
 const prepareObligationTransfer = transferring('obligations', prepareObligationTransferOf);
 const prepareOmObligations = transferring('obligations', prepareOmObligationsOf);
 const readObligationTransfer = transferring('obligations', readObligationTransferOf);
 const readOmObligations = transferring('obligations', readOmObligationsOf);
 const readPartResult = transferring('question-packet', readPartResultOf);
+const readQuestionPacket = transferring('question-packet', readQuestionPacketOf);
 const prepareWorksFrame = transferring('works-frame', prepareWorksFrameOf);
 const readWorksFrame = transferring('works-frame', readWorksFrameOf);
 const readRecord = <T = Json>(store: Store, reference: unknown, request: RecordRequest) => transfer('refs', readRecordOf<T>(store, reference, request));
 const writeGuarded = <T = Json>(store: Store, request: GuardedWrite) => transfer('refs', writeGuardedOf<T>(store, request));
 
 export const ATOMIC_GATE_CONTRACT = 'om-atomic-gate/v1' as const;
+/**
+ * AT1 (№4091 п.5, п.6): the gate of the impact era — its request names the one repository snapshot its works were answered
+ * against (null when their packets had none), and its record keeps the exact inventory and coverage its producer derived.
+ * A reader takes them as saved; M8 issues the plan only on that very tree.
+ */
+export const ATOMIC_GATE_IMPACT_CONTRACT = 'om-atomic-gate/v2' as const;
+export interface AtomicGateImpact { snapshot: RepositorySnapshot | null; works: (WorkImpact & { coverage: ImpactCoverage['covered'] })[];
+  /** Return №4147: the exact parser the inventory of the snapshot was read with — part of its basis (none without a snapshot). */
+  parser?: string;
+  /** №4170: what the inventory does not establish — a limit of its completeness, saved with it (none without a snapshot). */
+  boundary?: string[];
+  /** AT1 door (№4105): the accepted resolutions of this snapshot's transitions B1 held, each by its readiness question. */
+  resolutions?: (ImpactResolution & { question: string })[];
+  /** AT1 (№4117): the policies the horizon's works need, each with the readiness question whose decision B1 holds. */
+  policies?: PolicyRow[] }
 // LP5 (№3278 §3): a reuse — a paid complete L3 assembly admitted again into a later attempt, with today's D7 bindings.
 export interface WorkProposalSource { kind: 'part' | 'assembly' | 'reuse'; record: Ref }
 export interface AtomicGateRequest {
   project: string; candidate: Ref; neighbors: Ref; environment: Ref; gaps: GapReadRequest; results: WorkProposalSource[]; sources: Ref[];
+  snapshot?: RepositorySnapshot | null;
 }
 export interface AtomicGateRecord {
-  contract: typeof ATOMIC_GATE_CONTRACT; project: string; request: AtomicGateRequest;
+  contract: typeof ATOMIC_GATE_CONTRACT | typeof ATOMIC_GATE_IMPACT_CONTRACT; project: string; request: AtomicGateRequest;
   result: { gate: 'G5'; candidate: Ref; graphHash: string; passed: boolean; codes: string[]; findings: Finding[] };
+  impact?: AtomicGateImpact;
 }
 export interface PreparedAtomicGate { record: Revision<AtomicGateRecord>; writes: Write[]; guards: Ref[]; references: Ref[] }
 const object = isPlainObject;
@@ -127,7 +148,8 @@ function requireRequest(store: Store, request: AtomicGateRequest): void {
   if (!(store instanceof Store) || !object(request) || !text(request.project)
     || ![request.candidate, request.neighbors, request.environment].every(isRef) || !object(request.gaps)
     || !sourcesShape(request.results) || !sourcesRefs(request.sources)
-    || Object.keys(request).some(key => !['project', 'candidate', 'neighbors', 'environment', 'gaps', 'results', 'sources'].includes(key))) invalid('request');
+    || Object.hasOwn(request, 'snapshot') && request.snapshot !== null && !validSnapshot(request.snapshot)
+    || Object.keys(request).some(key => !['project', 'candidate', 'neighbors', 'environment', 'gaps', 'results', 'sources', 'snapshot'].includes(key))) invalid('request');
 }
 
 const normalizedGateRequest = (request: AtomicGateRequest): AtomicGateRequest =>
@@ -414,6 +436,160 @@ function packetCapacity(store: Store, request: AtomicGateRequest, candidate: Fra
   }
   return findings;
 }
+/**
+ * AT1: the impact of the candidate's works on the exact snapshot their packets were answered against, derived by the
+ * producer from Git objects of that tree, and the coverage of each work's inventory by its own decisions.
+ */
+function impactOf(store: Store, request: AtomicGateRequest, graph: Graph): { record: AtomicGateImpact; findings: Finding[] } {
+  const snapshot = request.snapshot ?? null;
+  const input = take(readOmInput(store, request.project, request.gaps.sources.input)).value.input as OmInput;
+  const policy = gatePolicies(graph, input), policies = policy.rows.length ? { policies: policy.rows } : {};
+  if (!snapshot) return { record: { snapshot: null, works: [], ...policies }, findings: [...policy.findings, ...gateIntegrations(graph, null).findings] };
+  const environment = take(readRecord<Environment>(store, request.environment, { unit: 'G5', target: request.environment.id,
+    id: `environment:${request.project}`, kind: 'environment' }));
+  let files: ReturnType<typeof readSnapshot>;
+  try { files = readSnapshot(environment.value.workspace, snapshot); }
+  catch (error) {
+    if (error instanceof EngineError && ['impact_repository_unavailable', 'impact_snapshot_invalid'].includes(error.code))
+      fail('atomic_gate_basis_unproven', snapshot.tree, 'snapshot', 'The works are checked against their exact readable repository snapshot');
+    throw error;
+  }
+  const impact = gateImpact(files, graph, snapshot, readinessResolutions(input, snapshot));
+  return { record: { ...impact.record, ...policies }, findings: [...impact.findings, ...policy.findings] };
+}
+/**
+ * AT1 door (№4105 п.2, п.4): the transitions B1 of this gate's own D1 holds resolved — applied facts of readiness questions
+ * asked on this very tree. An answer about another snapshot resolves nothing here: its question is asked again for this one.
+ */
+export function readinessResolutions(input: Pick<OmInput, 'facts'>, snapshot: RepositorySnapshot): (ImpactResolution & { question: string })[] {
+  const rows: (ImpactResolution & { question: string })[] = [];
+  for (const fact of input.facts ?? []) {
+    const cause = fact.question.readiness;
+    if (cause?.cause !== 'transition' || cause.snapshot.tree !== snapshot.tree) continue;
+    const value = fact.value as { resolves?: unknown };
+    if (!object(value) || !Array.isArray(value.resolves) || !value.resolves.every(item => text(item) && cause.candidates.includes(item)))
+      fail('atomic_gate_basis_unproven', fact.question.id, 'resolves', 'An applied resolution names files among the candidates of its transition');
+    rows.push({ question: fact.question.id, file: cause.file, line: cause.line, site: { ...cause.site }, resolves: [...value.resolves as string[]].sort() });
+  }
+  return rows.sort((a, b) => a.question < b.question ? -1 : a.question > b.question ? 1 : 0);
+}
+/**
+ * AT1 (return №4124 P2-2, №4143, №4147): a connection the work's own result needs from existing code is proved on the exact
+ * snapshot — its file is in the tree and the TypeScript parser finds the symbol it names declared there (a mention, a
+ * comment, a string, a regular expression or a call is no declaration). A file the parser proves nothing about — another
+ * language, a parse diagnostic, a file beyond the analyzed size — is an addressed unknown of the work, asked through the
+ * readiness door; the research fact on this very tree decides it. Either way only the point's existence is proved, never
+ * that its interface fits the contract. Without a repository nothing existing is proved.
+ */
+export function gateIntegrations(graph: Graph, files: (SnapshotFiles & { readonly unanalyzed?: ReadonlySet<string> }) | null,
+  resolutions: readonly ImpactResolution[] = []): { findings: Finding[]; unknowns: Map<string, ImpactUnknown[]> } {
+  const findings: Finding[] = [], unknowns = new Map<string, ImpactUnknown[]>(), present = new Set(files?.paths ?? []);
+  for (const work of graph.nodes.filter(node => node.kind === 'work' && graph.horizon.includes(node.id)))
+    for (const integration of work.integrations ?? []) {
+      if (!('existing' in integration.basis)) continue;
+      const unproven = (message: string) => findings.push({ code: 'work_integration_unproven', target: work.id, field: integration.entry, message });
+      // Return №4173 G12: every segment after the file names the point — `#Store#commit` and `#Store.commit` alike.
+      const [path, ...segments] = integration.entry.split('#') as [string, ...string[]];
+      const symbol = segments.length ? segments.join('.') : undefined;
+      if (!files) { unproven(`No repository snapshot proves the existing connection point ${integration.entry}`); continue; }
+      if (!present.has(path)) { unproven(`The existing connection point ${integration.entry} is not in the snapshot ${files.snapshot.tree}`); continue; }
+      if (!symbol) continue;
+      const found = declares(files, path, symbol);
+      if (found === 'declared') continue;
+      if (found === 'absent') { unproven(`${path} of the snapshot ${files.snapshot.tree} declares no ${symbol}: a mention is no connection point`); continue; }
+      const unknown = declarationUnknown(integration.entry, found.unknown);
+      const answer = resolutions.find(row => row.file === unknown.file && same(row.site, unknown.site));
+      if (!answer) { unknowns.set(work.id, [...unknowns.get(work.id) ?? [], unknown]); continue; }
+      if (!answer.resolves.includes(integration.entry))
+        unproven(`The research fact on the snapshot ${files.snapshot.tree} finds no declaration of ${symbol} in ${path}`);
+    }
+  return { findings, unknowns };
+}
+/** AT1 (№4117): a policy a work of the horizon needs, and the readiness question whose decision B1 holds for it (or none). */
+export interface PolicyRow { work: string; policy: 'appearance' | 'provider'; producer: string; contract: { id: string; hash: string }; question: string | null }
+/**
+ * AT1 (№4117, contract §1.3): a durable work needs the appearance policy of its state's producer, a provider work the
+ * policy of its provider's authority — each decided once at that producer, whether the owner answered it (H2), the model
+ * decided it in the pass (OWN1) or research established it, and referred to by every consumer. Without it G5 refuses the
+ * work at that producer's address.
+ */
+export function gatePolicies(graph: Graph, input: Pick<OmInput, 'facts' | 'decided'>): { rows: PolicyRow[]; findings: Finding[] } {
+  const decided = new Map<string, string>();
+  for (const row of [...input.facts ?? [], ...input.decided ?? []]) {
+    const cause = row.question.readiness;
+    // A decision is for one exact contract; one whose cause names none decides nothing here and the policy is asked again.
+    if (cause?.cause === 'policy' && cause.governs) decided.set(canonical([cause.policy, cause.producer, cause.governs.contract, cause.governs.hash]), row.question.id);
+  }
+  const nodes = new Map(graph.nodes.map(node => [node.id, node]));
+  // The contract a policy governs, at the exact schema this graph gives it.
+  const contractOf = (artifact: string) => {
+    const id = graph.artifacts.find(item => item.id === artifact)?.contract ?? artifact;
+    return { id, hash: hashJson((graph.contracts.find(item => item.id === id)?.schema ?? null) as Json) };
+  };
+  const rows: PolicyRow[] = [], findings: Finding[] = [];
+  for (const work of graph.nodes.filter(node => node.kind === 'work' && graph.horizon.includes(node.id)).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) {
+    const needs = new Map<string, [PolicyRow['policy'], string, PolicyRow['contract']]>();
+    const need = (policy: PolicyRow['policy'], producer: string, contract: PolicyRow['contract']) =>
+      needs.set(canonical([policy, producer, contract.id, contract.hash]), [policy, producer, contract]);
+    // Its own durable result or provider call: the policy of its own result contract at its producer.
+    if (work.boundary.state === 'durable') need('appearance', work.boundary.writer, contractOf(work.outcome));
+    if (work.boundary.provider) need('provider', work.boundary.authority, contractOf(work.outcome));
+    // Return №4135 P2-1: every durable contract it uses — an artifact a connection brings it from a producer whose state is
+    // durable (or an artifact declared durable) — refers to that producer's policy of that contract, wherever the producer
+    // stands; the consumer creates no state of its own.
+    for (const connector of graph.connectors) for (const binding of connector.bindings) {
+      if (!binding.consumers.some(end => end.node === work.id) || binding.producer.node === work.id) continue;
+      const producer = nodes.get(binding.producer.node), artifact = graph.artifacts.find(item => item.id === connector.artifact);
+      if (!producer || !artifact || producer.boundary.state !== 'durable' && !String(artifact.durability ?? '').startsWith('durable')) continue;
+      need('appearance', producer.boundary.writer, contractOf(artifact.id));
+    }
+    for (const [policy, producer, contract] of [...needs.values()].sort((a, b) => canonical(a) < canonical(b) ? -1 : 1)) {
+      const question = decided.get(canonical([policy, producer, contract.id, contract.hash])) ?? null;
+      rows.push({ work: work.id, policy, producer, contract, question });
+      if (!question) findings.push({ code: 'work_policy_open', target: work.id, field: `${policy}:${producer}:${contract.id}`,
+        message: `The ${policy} policy of the contract ${contract.id} at its producer ${producer} is not decided: it is asked once and every work of the contract refers to it` });
+    }
+  }
+  return { rows, findings };
+}
+/** The impact rule of G5 over files in hand: each current work's inventory on the snapshot and its coverage by its decisions. */
+export function gateImpact(files: SnapshotFiles, graph: Graph, snapshot: RepositorySnapshot,
+  resolutions: readonly (ImpactResolution & { question: string })[] = []): { record: AtomicGateImpact; findings: Finding[] } {
+  const works = graph.nodes.filter(node => node.kind === 'work' && graph.horizon.includes(node.id));
+  // Several applied answers about one transition (asked for different blocks) resolve it by the union of their files.
+  const merged = new Map<string, ImpactResolution>();
+  for (const row of resolutions) {
+    const key = JSON.stringify([row.file, row.site.start, row.site.end, row.site.hash]), prior = merged.get(key);
+    merged.set(key, { file: row.file, line: row.line, site: { ...row.site }, resolves: [...new Set([...(prior?.resolves ?? []), ...row.resolves])].sort() });
+  }
+  const inventory = deriveImpact(files, works.map(node => ({ work: node.id, writes: node.code.filter(ref => ref.access === 'write').map(ref => ref.path) })),
+    [...merged.values()]);
+  const integrations = gateIntegrations(graph, files, [...merged.values()]);
+  const findings: Finding[] = [...integrations.findings];
+  const rows = inventory.works.map(derived => {
+    // A connection point the parser proves nothing about is one more unknown of the work's own inventory.
+    const work = { ...derived, unknowns: [...derived.unknowns, ...integrations.unknowns.get(derived.work) ?? []] };
+    const coverage = impactCoverage(work, works.find(node => node.id === work.work)!.impact ?? []);
+    findings.push(...coverage.findings.map(item => ({ code: item.code, target: item.target, field: item.field, message: item.message })));
+    return { ...work, coverage: coverage.covered };
+  });
+  return { record: { snapshot, parser: inventory.parser, boundary: [...inventory.boundary], works: rows, ...(resolutions.length ? { resolutions: resolutions.map(row => ({ ...row, resolves: [...row.resolves] })) } : {}) }, findings };
+}
+/** AT1: the one snapshot of the packets the final proposals were answered in — parts, assemblies of parts, reused assemblies. */
+function resultsSnapshot(store: Store, project: string, results: readonly WorkProposalSource[]): RepositorySnapshot | null {
+  const packets = new Map<string, Ref>();
+  const part = (ref: Ref) => { const read = take(readPartResult(store, { project, record: ref })); packets.set(canonical(read.record.value.request.packet), read.record.value.request.packet); };
+  const assembly = (ref: Ref) => { for (const item of take(readPartAssembly(store, { project, record: ref })).record.value.results) part(item); };
+  for (const source of results) {
+    if (source.kind === 'part') part(source.record);
+    else if (source.kind === 'assembly') assembly(source.record);
+    else assembly(take(readReuseResult(store, { project, record: source.record })).record.value.origin.assembly);
+  }
+  const snapshots = [...packets.values()].map(ref => take(readQuestionPacket(store, { project, record: ref })).value.briefImpact?.snapshot ?? null);
+  if (new Set(snapshots.map(item => canonical(item))).size > 1)
+    fail('atomic_gate_basis_unproven', project, 'snapshot', 'One works chain is checked against one repository snapshot');
+  return snapshots[0] ?? null;
+}
 function deriveGate(store: Store, request: AtomicGateRequest, current: boolean): PreparedAtomicGate {
   requireRequest(store, request); request = normalizedGateRequest(request);
   const candidate = take(readWorksFrame(store, { project: request.project, candidate: request.candidate }));
@@ -425,11 +601,14 @@ function deriveGate(store: Store, request: AtomicGateRequest, current: boolean):
     fail('atomic_gate_basis_unproven', request.candidate.id, 'gaps', 'The complete D1 set must describe the final proposals');
   const references = proveBindingTransfer(store, request, candidate.value as FrameCandidateRecord);
   const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
+  const impact = Object.hasOwn(request, 'snapshot') ? impactOf(store, request, candidate.value.graph as Graph) : null;
   const findings = unique([...take(checkAtomicWorks(candidate.value.graph as Graph, gapSet.collection as GapCollection)),
-    ...packetCapacity(store, request, candidate.value as FrameCandidateRecord, neighbors as Revision<NeighborCollection>, capacity.maxRequestChars, current)]);
-  const value: AtomicGateRecord = { contract: ATOMIC_GATE_CONTRACT, project: request.project, request,
+    ...packetCapacity(store, request, candidate.value as FrameCandidateRecord, neighbors as Revision<NeighborCollection>, capacity.maxRequestChars, current),
+    ...(impact?.findings ?? [])]);
+  const value: AtomicGateRecord = { contract: impact ? ATOMIC_GATE_IMPACT_CONTRACT : ATOMIC_GATE_CONTRACT, project: request.project, request,
     result: { gate: 'G5', candidate: request.candidate, graphHash: candidate.value.graphHash,
-      passed: findings.length === 0, codes: unique(findings.map(finding => finding.code)), findings } };
+      passed: findings.length === 0, codes: unique(findings.map(finding => finding.code)), findings },
+    ...(impact ? { impact: impact.record } : {}) };
   const record: Revision<AtomicGateRecord> = { id: gateId(request),
     kind: 'om-atomic-gate', revision: 1, hash: hashJson(value), value };
   const guards: Ref[] = [], writes: Write[] = [];
@@ -595,7 +774,8 @@ export function prepareWorksAcceptance(store: Store, raw: WorksAcceptanceRequest
     }
     const { tx, gapRead, candidateRef, neighbors } = worksCandidate(store, request.project, request.results, id);
     const gate = take(prepareAtomicGate(tx.view, { project: request.project, candidate: candidateRef, neighbors: neighbors.reference,
-      environment: request.environment, gaps: gapRead, results: request.results, sources: request.sources })); tx.add(gate);
+      environment: request.environment, gaps: gapRead, results: request.results, sources: request.sources,
+      snapshot: resultsSnapshot(store, request.project, request.results) })); tx.add(gate);
     const settlement = take(prepareSettleCandidate(tx.view, { project: request.project, level: 3, candidate: candidateRef, binding: request.binding ?? null,
       outcome: { ...gate.record.value.result, codes: [...gate.record.value.result.codes], basis: reference(gate.record) } })); tx.add(settlement);
     const accepted = settlement.result;

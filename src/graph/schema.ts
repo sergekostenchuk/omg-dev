@@ -41,6 +41,15 @@ const addRequired = (schema: { properties: Record<string, unknown>; required: st
 };
 addRequired(properties['nodes'].items, { purpose: text, benefit: text, beneficiary: id, implements: ids });
 properties['nodes'].items.properties.code.items.properties.symbol = text;
+// AT1 (№4091 п.4, п.7): optional, so a graph of the earlier era stays valid as written.
+const caseAddress = { type: "array", minItems: 1, maxItems: 64, items: text };
+const impactDecision = object({ entry: { anyOf: [object({ file: text }), object({ file: text, case: caseAddress }), object({ file: text, rest: { const: true } }),
+  object({ files: { type: "array", minItems: 1, maxItems: 10000, uniqueItems: true, items: text } }), object({ transitive: { const: true } })] },
+  decision: { enum: ["keep", "update"] }, requirement: id });
+impactDecision.properties['expectation'] = id;
+properties['nodes'].items.properties.impact = array(impactDecision);
+properties['nodes'].items.properties.integrations = array(object({ entry: text, contract: id,
+  basis: { anyOf: [object({ existing: text }), object({ predecessor: id })] } }));
 const codeRefSchema = properties['nodes'].items.properties.code.items;
 properties['connectors'].items.properties.bindings.items.properties.producer.properties.codeRef = structuredClone(codeRefSchema);
 properties['connectors'].items.properties.bindings.items.properties.consumers.items.properties.codeRef = structuredClone(codeRefSchema);

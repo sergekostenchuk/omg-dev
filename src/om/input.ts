@@ -15,6 +15,8 @@ import { historicalProof, historicalTrace, pendingSnapshotView, withHistoricalRe
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, type OmResult, type Refusal, type Sealed, type SourceCodes } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
+import type { Graph } from "../graph/model.js";
+import { transitionField } from "./impact.js";
 import { deriveInputDecisions } from "./addressing.js";
 import { answerSourceGuards, checkAnswerInputBody, prepareAnswerInvalidation, readAnswerForInput,
   readAnswerInvalidation, type AnswerInvalidation, type AnswerRequirementChange } from "./accepted-answer.js";
@@ -63,7 +65,7 @@ export interface OmInput {
     success: string[]; failures: string[]; forbiddenEffects: string[]; state: Record<string, Json>; proof: string }[];
   features: { index: number; title: string; outcome: string; behaviorIndexes: number[]; requirementIds: string[]; contracts: string[] }[];
   questions: { id: string; question: string; consumer: string; kind: Json; blocks: boolean; source: Ref;
-    moment?: typeof QUESTION_MOMENTS[number]; addressedBy?: Ref; originalConsumer?: string }[];
+    moment?: typeof QUESTION_MOMENTS[number]; addressedBy?: Ref; originalConsumer?: string; readiness?: ReadinessCause }[];
   facts?: AppliedInputFact[];
   /** OWN1 (№3711): predecessor questions the model decided in the bypass, each with its F5.3 decision; no longer asked. */
   decided?: DecidedInputQuestion[];
@@ -71,6 +73,34 @@ export interface OmInput {
 }
 export interface DecidedInputQuestion { question: OmInput['questions'][number]; value: Json; decision: Ref }
 export interface AppliedInputFact { question: OmInput['questions'][number]; value: Json; answer: Ref; mc1Question: Ref }
+/**
+ * AT1 (№4105): the exact cause of a readiness question, from the saved G5 finding that named it. A transition is the
+ * expression at one address of one snapshot; its accepted answer resolves it as {answer, resolves}. The cause is the
+ * question's identity: the same cause asks once, and a changed snapshot or expression is a new question.
+ */
+export const READINESS_CONTRACT = 'om-readiness/v1' as const;
+export interface ReadinessTransition { contract: typeof READINESS_CONTRACT; cause: 'transition'; snapshot: { commit: string; tree: string };
+  file: string; line: number; kind: string; expression: string; site: { start: number; end: number; hash: string }; candidates: string[]; works: string[];
+  /** Return №4197: the accepted place of each block its works stand in — the one question is a gap of every one of them. */
+  places: string[] }
+/**
+ * AT1 (№4117, contract §1.3, return №4124 P2-1): the policy of a shared durable contract — how its state appears, or how
+ * its provider is called — decided once for that exact contract (`governs`: the result contract and the hash of its schema)
+ * at its producer (the node the works' boundary names), whom the consumer works of the same contract refer to. Another
+ * contract of the same producer is another policy. `producer` is that node, or the name the boundary gives when no
+ * accepted node bears it (the question is then asked above the works).
+ */
+export interface ReadinessPolicy { contract: typeof READINESS_CONTRACT; cause: 'policy'; policy: 'appearance' | 'provider'; producer: string;
+  governs: { contract: string; hash: string }; works: string[] }
+export type ReadinessCause = ReadinessTransition | ReadinessPolicy;
+/**
+ * The question's identity: the exact cause and the place it is asked for — for a transition its snapshot, address and
+ * expression; for a policy its kind and producer.
+ */
+// Return №4186 P1: a transition is one question of its snapshot — whichever works and blocks need it, one answer serves them all.
+export const readinessQuestionId = (cause: ReadinessCause, consumer: string): string => cause.cause === 'transition'
+  ? `readiness:transition:${hashJson([cause.snapshot.tree, cause.file, cause.site.start, cause.site.end, cause.site.hash])}`
+  : `readiness:policy:${hashJson([cause.policy, cause.producer, cause.governs.contract, cause.governs.hash, consumer])}`;
 export interface InputBuildResult { input: OmInput | null; hash: string | null; refusals: Refusal[]; gaps: InputGap[] }
 /**
  * What the builder itself returns: the same shape with its refusals REPLACED (not intersected, №2511-2) by the builder's own
@@ -82,11 +112,13 @@ export interface DecisionInputDerivation { previous: Ref; graph: Ref; decisions:
 export interface RefreshInputDerivation { kind: "refresh"; previous: Ref; stages: Record<UpstreamStage, Ref>; inventory: Ref | null }
 export interface FactInputDerivation { kind: "fact"; previous: Ref; answer: Ref; question: Ref }
 export interface ReopenFactDependency { record: Ref; question: Ref; removed: Ref[]; conditions: AnswerRequirementChange[] }
+/** AT1 door (№4105): the readiness questions of one saved G5 rejection of the impact era, asked on the B1 of its own chain. */
+export interface ReadinessInputDerivation { kind: "readiness"; previous: Ref; gate: Ref }
 export interface ReopenFactInputDerivation { kind: "reopen-facts"; previous: Ref; invalidations: AnswerInvalidation[];
   dependencies?: ReopenFactDependency[] }
-export type InputDerivation = DecisionInputDerivation | RefreshInputDerivation | FactInputDerivation | ReopenFactInputDerivation;
+export type InputDerivation = DecisionInputDerivation | RefreshInputDerivation | FactInputDerivation | ReopenFactInputDerivation | ReadinessInputDerivation;
 export interface OmInputRecord { projectId: string; input: OmInput; hash: string; gaps: InputGap[]; derivation?: InputDerivation }
-export type DerivedInputRequest = { project: string } & (DecisionInputDerivation | FactInputDerivation | ReopenFactInputDerivation);
+export type DerivedInputRequest = { project: string } & (DecisionInputDerivation | FactInputDerivation | ReopenFactInputDerivation | ReadinessInputDerivation);
 export interface PreparedOmInput<G extends TransactionGuard = Ref> { record: OmInputRecord; writes: Write[]; guards: G[]; existing: Revision<OmInputRecord> | null }
 export const INPUT_REFRESH_CONFLICT = "input_refresh_conflict";
 
@@ -717,6 +749,8 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): Input
     if (request.kind === "reopen-facts") {
       if (!normalizedInvalidations(request.invalidations)) invalid("invalidations");
       if (Object.hasOwn(request, "dependencies") && !normalizedDependencies(request.dependencies)) invalid("dependencies");
+    } else if (request.kind === "readiness") {
+      if (!isRef(request.gate) || Object.keys(request).some(key => !["project", "kind", "previous", "gate"].includes(key))) invalid("gate");
     } else {
       if (request.kind !== "fact") invalid("kind");
       if (!isRef(request.answer)) invalid("answer");
@@ -781,6 +815,16 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): Input
       ...(normalized.length ? { dependencies: normalized } : {}) };
     const contracts = checkFactContracts(store, result);
     return contracts.ok ? delivered(result) : contracts;
+  }
+  if ("kind" in request && request.kind === "readiness") {
+    const body = previous.value.value as OmInputRecord;
+    const asked = readinessQuestions(store, request.project, previous.value as Revision<OmInputRecord>, request.gate);
+    if (!asked.ok) return asked;
+    // Nothing new to ask — every cause is open, applied or decided already: the same B1, no new revision (a repeat).
+    if (!asked.value.length) return delivered(body);
+    const input: OmInput = { ...body.input as OmInput, questions: sorted([...body.input.questions, ...asked.value]) as OmInput['questions'] };
+    return delivered({ projectId: request.project, input, hash: hashJson(input), gaps: body.gaps as InputGap[],
+      derivation: { kind: "readiness", previous: request.previous, gate: request.gate } });
   }
   if ("kind" in request) {
     const checked = readAnswerForInput(store, { project: request.project, record: request.answer,
@@ -906,4 +950,186 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
   return delivered({ record: rebuilt.value, existing: null,
     writes: [...writes.values(), { id: request.input.id, kind: "om-input", expected: request.input.revision, value: rebuilt.value }],
     guards: sorted([...heads.values()]) });
+}
+
+/**
+ * AT1 door (№4105 п.1–3): the readiness questions one saved G5 of the impact era asks on `previous`. Each unresolved
+ * transition its findings name becomes a blocking repository fact, asked once for the works of one block: its consumer is
+ * the nearest common block or operation of those works the gate's D1 graph already holds — the works themselves may not
+ * be accepted yet; they are the subject of the question. The gate's D1 must stand on `previous` or on a B1 it derives
+ * from (B1 → D1/G5 → B1); a cause already open, applied or decided is never asked again.
+ */
+interface ReadinessGate {
+  contract: string; project: string; request: { candidate: Ref; gaps: { sources: { input: Ref; graph: Ref } } };
+  result: { findings: { code: string; target: string; field?: string }[] };
+  impact?: { snapshot: { commit: string; tree: string } | null;
+    works: { work: string; unknowns: { file: string; line: number; kind: string; text: string; site: { start: number; end: number; hash: string }; candidates: string[] }[] }[];
+    policies?: { work: string; policy: 'appearance' | 'provider'; producer: string; contract: { id: string; hash: string }; question: string | null }[] };
+}
+function readinessQuestions(store: Store, project: string, previous: Revision<OmInputRecord>, ref: Ref): InputResult<Sealed<OmInput['questions']>> {
+  const read = readRecord<ReadinessGate>(store, ref, { unit: "G1", target: ref.id, idPrefix: `om-atomic-gate:${project}:`, kind: "om-atomic-gate" });
+  if (!read.ok) return transfer("refs", read);
+  const gate = read.value.value as unknown as ReadinessGate, snapshot = gate.impact?.snapshot ?? null;
+  if (gate.project !== project || gate.contract !== "om-atomic-gate/v2" || !gate.impact)
+    return refuse("record_forged", "Readiness questions come from a saved G5 of the impact era", at(ref.id, "impact", ref), "producer");
+  for (let cursor: Revision<OmInputRecord> = previous; canonical(reference(cursor)) !== canonical(gate.request.gaps.sources.input);) {
+    if (!cursor.value.derivation) return refuse("record_forged", "The gate's D1 must stand on this B1 or one it derives from",
+      at(ref.id, "gaps.sources.input", gate.request.gaps.sources.input), "producer");
+    const next = readOmInput(store, project, cursor.value.derivation.previous);
+    if (!next.ok) return next;
+    cursor = next.value as Revision<OmInputRecord>;
+  }
+  const accepted = readRecord<Graph>(store, gate.request.gaps.sources.graph, { unit: "G1", target: ref.id, id: `graph:${project}`, kind: "graph" });
+  if (!accepted.ok) return transfer("refs", accepted);
+  const candidate = readRecord<{ graph: Graph }>(store, gate.request.candidate, { unit: "G1", target: ref.id, idPrefix: `om-candidate:${project}:`, kind: "frame-candidate" });
+  if (!candidate.ok) return transfer("refs", candidate);
+  type Place = { id: string; kind: string; parent: string | null };
+  const places = (nodes: unknown) => new Map((nodes as Place[]).map(node => [node.id, node]));
+  const known = places(accepted.value.value.nodes), all = places(candidate.value.value.graph.nodes);
+  const chain = (nodes: ReadonlyMap<string, Place>, id: string): string[] => {
+    const out: string[] = [];
+    for (let node = nodes.get(id); node && !out.includes(node.id); node = node.parent ? nodes.get(node.parent) : undefined) out.push(node.id);
+    return out;
+  };
+  const unresolved = new Set(gate.result.findings.filter(item => item.code === "work_impact_unresolved").map(item => canonical([item.target, item.field ?? ""])));
+  const causes = new Map<string, { unknown: NonNullable<ReadinessGate['impact']>['works'][number]['unknowns'][number]; works: string[] }>();
+  for (const work of gate.impact!.works) for (const unknown of work.unknowns) {
+    if (!unresolved.has(canonical([work.work, transitionField(unknown)]))) continue;
+    // The cause is the exact place of the transition in the snapshot's file; the excerpt only shows it.
+    const key = canonical([unknown.file, unknown.site.start, unknown.site.end, unknown.site.hash]);
+    const row = causes.get(key) ?? { unknown, works: [] }; row.works.push(work.work); causes.set(key, row);
+  }
+  const held = new Set([...previous.value.input.questions, ...(previous.value.input.facts ?? []).map(fact => fact.question),
+    ...(previous.value.input.decided ?? []).map(item => item.question)].map(question => question.id));
+  const asked: OmInput['questions'] = [];
+  // The works of one cause, grouped by their accepted block: each group is asked at the nearest common accepted block or
+  // operation above its works.
+  const placed = (works: readonly string[]): { consumer: string; works: string[] }[] | Refusal => {
+    const groups = new Map<string, { anchors: string[]; works: string[] }>();
+    for (const work of [...new Set(works)].sort(order)) {
+      const anchor = chain(all, work).slice(1).find(id => ["block", "operation"].includes(known.get(id)?.kind ?? ""));
+      const block = anchor ? chain(known, anchor).find(id => known.get(id)!.kind === "block") : undefined;
+      if (!anchor || !block) return { code: "question_consumer_missing", message: "A readiness question is asked for an accepted block or operation above its work",
+        at: at(work, "consumer", ref), route: "producer" };
+      const group = groups.get(block) ?? { anchors: [], works: [] }; group.anchors.push(anchor); group.works.push(work); groups.set(block, group);
+    }
+    return [...groups.values()].map(group => ({ works: group.works,
+      consumer: chain(known, group.anchors[0]!).find(id => group.anchors.every(anchor => chain(known, anchor).includes(id)))! }));
+  };
+  for (const { unknown, works } of [...causes.values()].sort((a, b) => order(canonical([a.unknown.file, a.unknown.site.start, a.unknown.site.hash]), canonical([b.unknown.file, b.unknown.site.start, b.unknown.site.hash])))) {
+    if (!snapshot) return refuse("record_forged", "A transition is asked on the snapshot its gate checked", at(ref.id, "impact.snapshot", ref), "producer");
+    const placements = placed(works);
+    if (!Array.isArray(placements)) return refuse("question_consumer_missing", placements.message, placements.at, "producer");
+    // Return №4186 P1, №4188, №4197: one question for all its works, between blocks too — asked at the first block's place and
+    // naming the place in every block its works stand in, so that D1 makes it a gap of each of them.
+    const places = [...new Set(placements.map(group => group.consumer))].sort(order);
+    const groups = [{ consumer: placements[0]!.consumer, works: placements.flatMap(group => group.works).sort(order), places }];
+    for (const group of groups) {
+      const consumer = group.consumer;
+      const cause: ReadinessCause = { contract: READINESS_CONTRACT, cause: "transition", snapshot: { commit: snapshot.commit, tree: snapshot.tree },
+        file: unknown.file, line: unknown.line, kind: unknown.kind, expression: unknown.text, site: { ...unknown.site }, candidates: [...unknown.candidates], works: group.works,
+        places: group.places };
+      const id = readinessQuestionId(cause, consumer);
+      if (held.has(id)) continue;
+      held.add(id);
+      asked.push({ id, consumer, kind: "repository-fact", blocks: true, source: ref, moment: "om-pass", readiness: cause,
+        question: unknown.kind === "declaration"
+          ? `Repository snapshot ${snapshot.commit} (tree ${snapshot.tree}), connection point ${unknown.file}: the parser proves nothing about it — `
+            + `${unknown.text}. Does the code of that snapshot declare it? Answer with "resolves": ["${unknown.file}"] when it is declared there, [] when it `
+            + `is not, and "answer": the evidence. A declaration proves the point exists, not that its interface fits the contract. Works that need it: `
+            + `${group.works.join(", ")}.`
+          : `Repository snapshot ${snapshot.commit} (tree ${snapshot.tree}), ${unknown.file}${unknown.line ? `:${unknown.line}` : ""}: `
+          + `the impact analysis cannot resolve this ${unknown.kind} — ${unknown.text}. Which files of that snapshot can it load when it runs? `
+          + `Answer with "resolves": every such file among the ${unknown.candidates.length} candidates the result form lists, [] only when it loads none `
+          + `of them, and "answer": the evidence. Works it may affect: ${group.works.join(", ")}.` });
+    }
+  }
+  // AT1 (№4117): a policy G5 found undecided is asked once at its producer — the accepted node the boundary names — for
+  // all its consumer works; with no such node, above the works. The owner decides it (H2), or in the pass the model (OWN1).
+  const open = new Set(gate.result.findings.filter(item => item.code === "work_policy_open").map(item => canonical([item.target, item.field ?? ""])));
+  const policies = new Map<string, { policy: 'appearance' | 'provider'; producer: string; governs: { contract: string; hash: string }; works: string[] }>();
+  for (const row of gate.impact!.policies ?? []) {
+    if (row.question !== null || !open.has(canonical([row.work, `${row.policy}:${row.producer}:${row.contract.id}`]))) continue;
+    const key = canonical([row.policy, row.producer, row.contract.id, row.contract.hash]);
+    const item = policies.get(key) ?? { policy: row.policy, producer: row.producer, governs: { contract: row.contract.id, hash: row.contract.hash }, works: [] };
+    item.works.push(row.work); policies.set(key, item);
+  }
+  const policyKey = (item: { policy: string; producer: string; governs: { contract: string; hash: string } }) =>
+    canonical([item.policy, item.producer, item.governs.contract, item.governs.hash]);
+  for (const item of [...policies.values()].sort((a, b) => order(policyKey(a), policyKey(b)))) {
+    const producer = known.get(item.producer);
+    const groups = producer ? [{ consumer: producer.id, works: [...new Set(item.works)].sort(order) }] : placed(item.works);
+    if (!Array.isArray(groups)) return refuse("question_consumer_missing", groups.message, groups.at, "producer");
+    for (const group of groups) {
+      const cause: ReadinessCause = { contract: READINESS_CONTRACT, cause: "policy", policy: item.policy, producer: item.producer,
+        governs: { ...item.governs }, works: group.works };
+      const id = readinessQuestionId(cause, group.consumer);
+      if (held.has(id)) continue;
+      held.add(id);
+      asked.push({ id, consumer: group.consumer, kind: "owner-decision", blocks: true, source: ref, moment: "om-pass", readiness: cause,
+        question: item.policy === "appearance"
+          ? `Durable state of the contract ${item.governs.contract}, written by ${item.producer}: how does it appear? Who creates it and by what; `
+            + `what does an entry do when the state is absent; is a first run distinguishable from a loss, and by which sign? Decided once for this `
+            + `contract at its producer, for every work of it: ${group.works.join(", ")}.`
+          : `Provider of the contract ${item.governs.contract}, called under the authority ${item.producer}: what authority does a call carry, `
+            + `how is it repeated, and what happens when its outcome is unknown? Decided once for this contract at its producer, for every work `
+            + `that calls it: ${group.works.join(", ")}.` });
+    }
+  }
+  return delivered(asked);
+}
+/**
+ * Whether a saved G5 still has a readiness question the current B1 neither holds nor has answered. A G5 of the era before
+ * the impact (om-atomic-gate/v1) has none: its group goes the way it always did (return №4124 P2-6).
+ */
+export function readinessPending(store: Store, project: string, gate: Ref): InputResult<Sealed<boolean>> {
+  return withHistoricalReads(() => {
+    const read = readRecord<{ contract?: unknown; project?: unknown }>(store, gate, { unit: "G1", target: gate.id, idPrefix: `om-atomic-gate:${project}:`, kind: "om-atomic-gate" });
+    if (!read.ok) return transfer("refs", read);
+    if (read.value.value.project === project && read.value.value.contract === "om-atomic-gate/v1") return delivered(false);
+    const current = store.get<OmInputRecord>(`om-input:${project}`);
+    if (!current) return refuse("input_stale", "Readiness questions are asked on an existing B1", at(`om-input:${project}`, "head"), "producer");
+    const asked = readinessQuestions(store, project, current, gate);
+    return asked.ok ? delivered(asked.value.length > 0) : asked;
+  });
+}
+export interface ReadinessInputRequest { project: string; input: Ref; gate: Ref }
+/** The B1 transition that asks a saved G5's readiness questions; a repeat of a written one is delivered as it is. */
+export function prepareReadinessInput(store: Store, request: ReadinessInputRequest): InputResult<Sealed<PreparedOmInput>> {
+  return withHistoricalReads(() => {
+    if (!object(request) || !text(request.project) || !isRef(request.input) || !isRef(request.gate)
+      || Object.keys(request).some(key => !["project", "input", "gate"].includes(key))) invalid("readiness");
+    request = copy(request);
+    const current = store.get<OmInputRecord>(`om-input:${request.project}`);
+    if (!current) return refuse("input_stale", "Readiness questions are asked on an existing B1", at(`om-input:${request.project}`, "head"), "producer");
+    const admitted = prepareExistingOmInput(store, request.project, reference(current));
+    if (!admitted.ok) return admitted;
+    const wanted: ReadinessInputDerivation = { kind: "readiness", previous: request.input, gate: request.gate };
+    for (let cursor = admitted.value.existing as Revision<OmInputRecord>; cursor.value.derivation;) {
+      if (canonical(cursor.value.derivation) === canonical(wanted))
+        return delivered({ record: cursor.value, writes: [], guards: admitted.value.guards as Ref[], existing: cursor });
+      const next = readOmInput(store, request.project, cursor.value.derivation.previous);
+      if (!next.ok) return next;
+      cursor = next.value as Revision<OmInputRecord>;
+    }
+    if (canonical(reference(current)) !== canonical(request.input))
+      return refuse("input_stale", "New readiness questions are asked on the current B1", at(request.input.id, "head", request.input), "producer");
+    const derived = deriveOmInput(store, { project: request.project, ...wanted });
+    if (!derived.ok) return derived;
+    const guards = [...admitted.value.guards as Ref[], request.gate];
+    if (canonical(derived.value) === canonical(current.value)) return delivered({ record: current.value, writes: [], guards, existing: current });
+    return delivered({ record: derived.value as OmInputRecord, existing: null, guards,
+      writes: [{ id: current.id, kind: current.kind, expected: current.revision, value: derived.value as OmInputRecord }] });
+  });
+}
+export function writeReadinessInput(store: Store, request: ReadinessInputRequest): InputResult<Sealed<Revision<OmInputRecord>>> {
+  return withHistoricalReads(() => {
+    const prepared = prepareReadinessInput(store, request);
+    if (!prepared.ok) return prepared;
+    if (!prepared.value.writes.length) return delivered(prepared.value.existing!);
+    const result = writeGuarded<OmInputRecord>(store, { unit: "G1", target: `om-input:${request.project}`,
+      writes: prepared.value.writes as Write[], guards: prepared.value.guards as TransactionGuard[] });
+    if (!result.ok) return transfer("refs", result);
+    return delivered(result.value[0]!);
+  });
 }

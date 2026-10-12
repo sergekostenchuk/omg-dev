@@ -3,6 +3,7 @@ import { deriveTasks } from '../compiler/derive.js';
 import { resolveArtifact } from '../compiler/inputs.js';
 import type { ArtifactReceipt, TaskInput } from '../compiler/model.js';
 import { EngineError } from '../errors.js';
+import { ATOMIC_GATE_IMPACT_CONTRACT, type AtomicGateRecord } from './atomic-gate.js';
 import type { Graph } from '../graph/model.js';
 import type { Feasibility } from '../graph/refinement.js';
 import { REFINEMENT_CONTRACT_VERSION } from '../graph/research-contracts.js';
@@ -105,6 +106,25 @@ function requireRequest(store: Store, request: unknown): asserts request is Feas
 }
 
 /** The same exact C5/F2/D7 readers establish the inputs for preview and provenance. */
+/**
+ * AT1 (№4091 п.5): a plan is issued on exactly the tree its works were checked against. A gate of the impact era names that
+ * snapshot (read as saved, never derived again); without one the impact was never checked, and no plan is issued. A gate
+ * of the earlier era is read by its own rule.
+ */
+function sameSnapshot(store: Store, project: string, frame: { value: { acceptance: unknown } } | null, tree: string | null): void {
+  const gate = (frame?.value.acceptance as { gate?: { basis?: unknown } } | undefined)?.gate?.basis;
+  if (!isRef(gate)) return;
+  const record = take(readRecord<AtomicGateRecord>(store, gate, { unit: 'M8', target: gate.id, idPrefix: `om-atomic-gate:${project}:`, kind: 'om-atomic-gate' }));
+  if (record.value.contract !== ATOMIC_GATE_IMPACT_CONTRACT) return;
+  const snapshot = record.value.impact?.snapshot ?? null;
+  // A workspace without a repository has no snapshot to check an impact against — its packets carry none; a repository does.
+  if (!snapshot) {
+    if (tree !== null) fail('feasibility_not_ready', gate.id, 'snapshot', 'The works were accepted without the repository snapshot their impact is checked against');
+    return;
+  }
+  if (tree !== snapshot.tree)
+    fail('feasibility_stale', gate.id, 'snapshot', `The plan is issued on the tree its works were checked against: ${snapshot.tree}, not ${tree ?? 'no repository'}`);
+}
 function sources(store: Store, request: Pick<FeasibilityRequest, 'project' | 'graph' | 'layer' | 'frame'>, current: boolean) {
   const accepted = take(readAcceptedFrame(store, { ...request, level: 3 }));
   if (!accepted.graph || !accepted.layer || !accepted.frame)
@@ -329,6 +349,7 @@ export function prepareFeasibility(store: Store, request: FeasibilityRequest): F
     const inspection: FeasibilityInspection = { graph: request.graph, layer: request.layer, environment: request.environment,
       root: effective.root, executionRoot, workspace: executionRoot && workspace ? reference(workspace) : null,
       result: inspectRepository({ ...effective.environment.value, workspace: effective.root }, basis.graph as Graph) };
+    sameSnapshot(traced, request.project, basis.accepted.frame, inspection.result.state?.tree ?? null);
     const d7 = { producer: reference(basis.obligations.producer), ledger: reference(basis.obligations.record) };
     const readiness = readinessObligations(traced, request.project, [d7.producer, d7.ledger]);
     const deliveries = deliveryInputs(traced, request.project, basis, inspection);

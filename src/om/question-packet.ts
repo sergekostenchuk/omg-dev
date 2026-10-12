@@ -1,5 +1,8 @@
 import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, resolveBriefAnswer, type BriefBasis, type BriefLabel,
-  briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot } from './packet-brief.js';
+  briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot,
+  IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact } from './packet-brief.js';
+import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, IMPACT_PARSER, deriveTestMap, isRepository, readSnapshot, resolveSnapshot } from './impact.js';
+import { IMPACT_SEMANTIC_CODES } from '../graph/semantics.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
 import { ANSWER_FORM_CODES, readTextResult, readPointerResult, tooLargeRead, type ReadResult } from './answer-form.js';
 import { Ajv } from 'ajv';
@@ -186,6 +189,11 @@ export interface QuestionPacketRecord {
    * one issued before, which keeps its bytes. A continuation or correction keeps the era of its chain.
    */
   transitionEra?: true;
+  /**
+   * AT1 (№4091 п.5): the one repository snapshot of a works chain and its test map — resolved once by a new works root,
+   * kept by its parts, continuations and corrections; absent in a packet issued before, which keeps its bytes.
+   */
+  briefImpact?: BriefImpact;
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -984,6 +992,16 @@ function deriveCorrection(store: Store, request: QuestionPacketRequest, current:
   return { value, guards: unique(guards), references: unique([...priorDerived.references, correction.packet, correction.call, correction.response,
     correction.diagnostic, ...capacity.references, ...ground.references]), writes: priorDerived.writes, briefBasis: basis };
 }
+/** AT1: the saved impact form — its contract, exact snapshot and test map; anything else refuses. */
+function impactOf(value: unknown, target: string): BriefImpact {
+  if (!briefImpactForm(value)) fail('packet_record_invalid', target, 'briefImpact', 'A works chain keeps its exact repository snapshot and test map');
+  return copy(value) as BriefImpact;
+}
+/** The one resolution of a new works root: HEAD once, the tree of that commit, the test map of that exact tree. */
+function issuedImpact(workspace: string): BriefImpact {
+  const snapshot = resolveSnapshot(workspace);
+  return { contract: IMPACT_BRIEF_CONTRACT, snapshot, parser: IMPACT_PARSER, boundary: [...IMPACT_BOUNDARY], ...deriveTestMap(readSnapshot(workspace, snapshot)) };
+}
 /** MP2 (№2968 §1): the explicit saved neighbour form — its known contract and exact finished sources; anything else refuses. */
 function neighbourForm(value: unknown, target: string): { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] } {
   if (!object(value) || value.contract !== NEIGHBOR_CONTRACT || !Array.isArray(value.sources)
@@ -1175,6 +1193,19 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
       // The text names the work, not its private references: those stay in the saved form.
       briefBasis.neighbors = { contract: NEIGHBOR_CONTRACT, works: json(read.works.map(work => ({ node: work.node, nodes: work.nodes, writes: work.writes }))) as Json[] };
       references.push(...read.references); guards.push(...read.guards);
+    }
+    // AT1 (№4091 п.5): the saved form decides, as for the neighbours — a new works root resolves HEAD once and saves the
+    // tree with its test map; a part keeps its root's; a replay reads what was saved, never the repository again.
+    if (contract === WORKS_BRIEF_PACKET_CONTRACT) {
+      const impact = saved ? (Object.hasOwn(saved, 'briefImpact') ? impactOf(saved.briefImpact, requestId) : undefined)
+        : priorBrief ? (Object.hasOwn(priorBrief.value, 'briefImpact') ? impactOf(priorBrief.value.briefImpact, requestId) : undefined)
+        : null;
+      // A workspace that is no repository gives no section: G5 then records no snapshot, and M8 refuses such an acceptance.
+      const value = impact === null ? (isRepository(environment.value.workspace) ? issuedImpact(environment.value.workspace) : undefined) : impact;
+      if (value !== undefined) {
+        base.briefImpact = value; briefBasis.impact = value;
+        briefBasis.codes = [...briefBasis.codes, ...[...IMPACT_SEMANTIC_CODES, ...IMPACT_GATE_CODES].map(code => ({ code, phase: 'assembly' as const }))];
+      }
     }
   }
   const encode = (value: unknown): Json => {
@@ -1391,10 +1422,15 @@ const replacementShape = { type: 'object', additionalProperties: false, required
   base: { type: 'object', additionalProperties: false, required: ['node', 'graph'], properties: { node: { type: 'string', minLength: 1 }, graph: refShape } },
   with: { type: 'object', additionalProperties: false, required: ['node', 'port'], properties: {
     node: { type: 'string', minLength: 1 }, port: { anyOf: [{ type: 'string', minLength: 1 }, { type: 'null' }] } } } } };
+// AT1 (№4091 п.4, п.7): the node of a part answer keeps its form of before; only a works packet of the impact era admits a
+// work's impact decisions and required connections — its brief shows them, its protocol check admits them.
+const IMPACT_NODE_FIELDS = ['impact', 'integrations'] as const;
+const stableNode = (() => { const node = structuredClone(graphV2Schema.properties.nodes.items);
+  for (const field of IMPACT_NODE_FIELDS) delete node.properties[field]; return node; })();
 export const PART_PROPOSAL_SCHEMA = sealed({ type: 'object', additionalProperties: false, required: [...bodySections],
   properties: Object.fromEntries(bodySections.map(section => {
     const field = section === 'localConnectors' ? 'connectors' : section;
-    const native = (graphV2Schema.properties as Record<string, { items?: object }>)[field]?.items;
+    const native = section === 'nodes' ? stableNode : (graphV2Schema.properties as Record<string, { items?: object }>)[field]?.items;
     return [section, { type: 'array', items: native ?? (section === 'fills' ? fillShape : section === 'replaces'
       ? replacementShape : { type: 'string', minLength: 1 }) }];
   })) });
@@ -1408,8 +1444,9 @@ export const WORKS_PART_PROPOSAL_SCHEMA = sealed({ ...PART_PROPOSAL_SCHEMA, prop
 // for it, E2 checks it); the form an older packet carries keeps its own schema and never acquires the field.
 // It is built on first use: frame-proposals, which owns the rule, is part of this module's import cycle.
 const worksFill = WORKS_PART_PROPOSAL_SCHEMA.properties.fills.items;
-const worksBodySchema = () => ({ ...WORKS_PART_PROPOSAL_SCHEMA, properties: { ...WORKS_PART_PROPOSAL_SCHEMA.properties, fills: { type: 'array',
-  items: { ...worksFill, properties: { ...worksFill.properties, [WAKE_TEST.field]: { type: 'string', minLength: 1 } } } } } });
+const worksBodySchema = (wake = true, impact = true) => ({ ...WORKS_PART_PROPOSAL_SCHEMA, properties: { ...WORKS_PART_PROPOSAL_SCHEMA.properties,
+  ...(wake ? { fills: { type: 'array', items: { ...worksFill, properties: { ...worksFill.properties, [WAKE_TEST.field]: { type: 'string', minLength: 1 } } } } } : {}),
+  ...(impact ? { nodes: { type: 'array', items: structuredClone(graphV2Schema.properties.nodes.items) } } : {}) } });
 let worksBody: ReturnType<Ajv['compile']> | undefined;
 const validateWorksPartBody = (value: unknown) => (worksBody ??= new Ajv({ strict: true, allowUnionTypes: true }).compile(worksBodySchema()))(value);
 const validatePartBody = new Ajv({ strict: true, allowUnionTypes: true }).compile(PART_PROPOSAL_SCHEMA);
@@ -1516,14 +1553,20 @@ const compileAnswers = (family: ReturnType<typeof answerSchemaFamily>) => ({
   node: answerSchemasAjv.compile(family.node), fact: answerSchemasAjv.compile(family.fact),
   field: answerSchemasAjv.compile(family.field), works: answerSchemasAjv.compile(family.works),
 });
-/** G5: the protocol check of a works packet of the wake-test era admits the wake test its form asks for. */
-const wakeWorksValidators: Partial<Record<AnswerProtocol, ReturnType<Ajv['compile']>>> = {};
-function wakeWorksValidator(protocol: AnswerProtocol): ReturnType<Ajv['compile']> {
-  return wakeWorksValidators[protocol] ??= (() => {
+/**
+ * G5: the protocol check of a works packet of the wake-test era admits the wake test its form asks for. AT1: one of the
+ * impact era admits the work's impact decisions and required connections. Each era admits only its own fields.
+ */
+const eraWorksValidators = new Map<string, ReturnType<Ajv['compile']>>();
+function eraWorksValidator(protocol: AnswerProtocol, wake: boolean, impact: boolean): ReturnType<Ajv['compile']> {
+  const key = `${protocol}:${wake}:${impact}`;
+  let validator = eraWorksValidators.get(key);
+  if (!validator) {
     const works = JSON.parse(canonical(answerSchemas[protocol].works as unknown as Json));
-    works.oneOf[0].properties.proposal = worksBodySchema();
-    return answerSchemasAjv.compile(works);
-  })();
+    works.oneOf[0].properties.proposal = worksBodySchema(wake, impact);
+    eraWorksValidators.set(key, validator = answerSchemasAjv.compile(works));
+  }
+  return validator;
 }
 const answerValidators = { 'omg-answer/v2': compileAnswers(answerSchemas['omg-answer/v2']),
   'omg-answer/v3': compileAnswers(answerSchemas['omg-answer/v3']) };
@@ -1568,7 +1611,8 @@ function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): Packe
   }
   if (!object(parsed)) fail('part_answer_invalid', packet.id, 'raw', 'An answer must remain a typed object');
   if (value.answerProtocol) {
-    const validate = packetWorkContract(value) && value.wakeTests === true ? wakeWorksValidator(value.answerProtocol)
+    const wake = value.wakeTests === true, impact = Object.hasOwn(value, 'briefImpact');
+    const validate = packetWorkContract(value) && (wake || impact) ? eraWorksValidator(value.answerProtocol, wake, impact)
       : answerValidators[value.answerProtocol][packetWorkContract(value) ? 'works' : kind];
     if (!validate(parsed)) fail('part_answer_invalid', packet.id, validate.errors?.[0]?.instancePath || 'reply',
       'The reply must use exactly one branch of the declared answer form without service fields');

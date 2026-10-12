@@ -10,12 +10,14 @@ import { requiredTests } from '../graph/obligations.js';
 import { safeRelativePath } from '../graph/topology.js';
 import { GRAPH_VALIDATION_CODES } from '../graph/validate.js';
 import { GRAPH_SEMANTIC_CODES } from '../graph/semantics.js';
+import { graphV2Schema } from '../graph/schema.js';
 import { LAYER_ASSEMBLY_CODES } from '../graph/layer-assembly.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import { isPlainObject, type Refusal } from './refusal.js';
 import { bindingFlowIdentity } from '../graph/flow-identity.js';
 import { ONE_ARTIFACT, WAKE_TEST } from './frame-proposals.js';
+import { validSnapshot, type RepositorySnapshot, type TestCasesRow, type TestMapRow } from './impact.js';
 
 export const BRIEF_PACKET_CONTRACT = 'om-packet/brief-v1' as const;
 export const WORKS_BRIEF_PACKET_CONTRACT = 'om-packet/works-brief-v1' as const;
@@ -123,8 +125,48 @@ function neighbourSection(basis: BriefBasis): string[] {
     'Proved finished expansions of other roots of this attempt. Their nodes, ports and the files they declare for writing are taken work: build on them, keep their write paths unless the ownership rules order the write, and never redefine them.',
     canonical(basis.neighbors)] : [];
 }
+/**
+ * AT1 (№4091 п.5): the one repository snapshot of a works chain and its test map, saved by the packet that resolved it — a
+ * new works root resolves HEAD once; its parts, continuations and corrections keep it; a packet issued before has none.
+ */
+export const IMPACT_BRIEF_CONTRACT = 'om-brief-impact/v1' as const;
+/** `parser`: the exact parser the test map was read with — part of the map's basis (return №4147). */
+export interface BriefImpact { contract: typeof IMPACT_BRIEF_CONTRACT; snapshot: RepositorySnapshot; parser: string; boundary: string[]; map: TestMapRow[]; tests: TestCasesRow[] }
+const plain = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
+export function briefImpactForm(value: unknown): value is BriefImpact {
+  const texts = (item: unknown) => Array.isArray(item) && item.every(part => typeof part === 'string');
+  return plain(value) && Object.keys(value).sort().join(',') === 'boundary,contract,map,parser,snapshot,tests' && value['contract'] === IMPACT_BRIEF_CONTRACT
+    && typeof value['parser'] === 'string' && value['parser'].length > 0 && texts(value['boundary'])
+    && Array.isArray(value['tests']) && (value['tests'] as unknown[]).every(row => plain(row) && Object.keys(row).sort().join(',') === 'addressable,cases,test'
+      && typeof row['test'] === 'string' && typeof row['addressable'] === 'boolean' && Array.isArray(row['cases']) && (row['cases'] as unknown[]).every(texts))
+    && validSnapshot(value['snapshot']) && Array.isArray(value['map']) && (value['map'] as unknown[]).every(row => plain(row)
+      && Object.keys(row).sort().join(',') === 'direct,file,transitive' && typeof row['file'] === 'string' && safeRelativePath(row['file'] as string)
+      && Array.isArray(row['direct']) && (row['direct'] as unknown[]).every(item => typeof item === 'string')
+      && Number.isSafeInteger(row['transitive']) && (row['transitive'] as number) >= 0);
+}
+const IMPACT_RULE = 'This works chain is checked against the one repository snapshot below. For every existing file your work writes, '
+  + 'each test listed as direct for it (it reaches the file through tests, helpers and fixtures only) needs your own decision in node.impact, and so does any test '
+  + 'you find contradicting the requirement you change: keep (it stays as it is and must pass; several whole files may share one {"files": [...]} keep) '
+  + 'or update (its file is an exact write path of yours; name the requirement or contract it pins and this work\'s test that states the new expectation; '
+  + 'to update one case address it by its full chain of groups as listed below and keep {"file": ..., "rest": true} explicitly). Tests that reach your files only through other code '
+  + 'may be kept together by one {"transitive": true} keep naming the requirement it preserves; it covers exactly the remainder of your inventory and gives no right to edit them. '
+  + 'The engine finds these tests through imports, process launches, package scripts and fixtures, through src as well, in the exact snapshot; '
+  + 'a transition it cannot resolve becomes a research question that no keep closes, never an absence. '
+  + 'A connection your own result needs from code you do not write goes in node.integrations with its contract and its basis: existing code, or a work that precedes yours — never a later work. '
+  + 'The boundary listed below is what this analysis does not establish — computed targets of processes and workers, computed file reads, the consumers of files that do not exist yet: '
+  + 'a limit of its completeness, never a proof that nothing is influenced. A transitive keep covers only the expectations listed here; for a new file your own tests, '
+  + 'its connection points and the interfaces of the works before you are required whatever this inventory shows.';
+/** The impact section: the whole saved inventory, direct tests marked, repeated fields shared — never cut silently (№4098 п.5). */
+function impactSection(basis: BriefBasis): string[] {
+  if (!basis.impact) return [];
+  return ['# Impact on the existing product', IMPACT_RULE,
+    canonical({ snapshot: basis.impact.snapshot, notEstablished: basis.impact.boundary, map: basis.impact.map.map(row => ({ file: row.file, direct: row.direct, transitiveTests: row.transitive })),
+      caseAddresses: basis.impact.tests.map(row => row.addressable ? { test: row.test, cases: row.cases } : { test: row.test, cases: 'no reliable case address: decide by file' }) })];
+}
 export interface BriefBasis {
   briefContract?: typeof BRIEF_CONTENT_CONTRACT;
+  /** AT1 (№4091 п.5): the saved snapshot and test map of a works chain of the impact era; absent before it. */
+  impact?: BriefImpact;
   /** OBL1 (№3773): the bindings era of the step — its works section shows the exact binding data of its D7 obligations. */
   worksBindings?: boolean;
   /** G5 (№3820, №3822): the wake-test era of the step — a producer end of its works form names its wake test. */
@@ -294,14 +336,16 @@ function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
   const consumers = new Set<string>([...(basis.node ? [basis.node] : []),
     ...(payload.questions as { consumers?: string[] }[]).flatMap(question => question.consumers ?? [])]);
   const node = basis.graph.nodes.find(row => row.id === basis.node);
-  const decided = (input.decided ?? []).filter((row: { question: { consumer: string } }) => consumers.has(row.question.consumer));
+  // AT1 (№4117): the policy of a shared durable contract is decided once at its producer — every works brief refers to it.
+  const policy = (row: { question: unknown }) => (row.question as { readiness?: { cause?: string } }).readiness?.cause === 'policy';
+  const decided = (input.decided ?? []).filter((row: { question: { consumer: string } }) => consumers.has(row.question.consumer) || policy(row));
   // G6 (№3857): a fact applied to B1 for these consumers or for a node above this one (its block) reaches their works —
   // the question and its accepted answer.
   const above = new Set<string>();
   for (let at = basis.graph.nodes.find(row => row.id === basis.node); at && !above.has(at.id); at = basis.graph.nodes.find(row => row.id === at!.parent))
     above.add(at.id);
   const facts = basis.transitionEra ? (input.facts ?? []).filter((row: { question: { consumer: string } }) => consumers.has(row.question.consumer)
-    || above.has(row.question.consumer)).map((row: { question: Json; value: Json }) => ({ question: row.question, value: row.value })) : [];
+    || above.has(row.question.consumer) || policy(row)).map((row: { question: Json; value: Json }) => ({ question: row.question, value: row.value })) : [];
   const requirementIds = new Set(node?.implements ?? []);
   const knownRequirements = new Set((input.requirements ?? []).map((row: { id: string }) => row.id));
   const selectRequirement = (selected: unknown): void => {
@@ -422,6 +466,8 @@ function answerSchema(payload: Record<string, any>, labels: BriefLabel[], basis:
       }
     }
     if (!p.proposal) continue;
+    // AT1 (№4091 п.4, п.7): a works brief of the impact era asks for the work's impact decisions and required connections.
+    if (basis.impact && p.proposal.properties.nodes) p.proposal.properties.nodes.items = structuredClone(graphV2Schema.properties.nodes.items);
     for (const key of ['fills', 'replaces']) {
       const fill = p.proposal.properties[key].items;
       const variants = (payload.expansion.obligations as { id: string; kind: string }[]).filter(row => payload.expansion.assigned.includes(row.id)).map(row => {
@@ -465,6 +511,23 @@ const GRAPH_RULES: Readonly<Record<string, string>> = Object.freeze({
   realization_requirement_missing: 'An implementation includes every requirement of the role it explicitly realizes.',
   test_entrypoint_unbound: 'The active test entrypoint matches its node code path, status and declared symbol.',
   work_packet_boundary: 'An internal work packet writes only paths declared writable by that work.',
+  // AT1 (№4091 п.4, п.7): the decisions a work states about its impact inventory and the connections its own result needs.
+  impact_entry_duplicate: 'A work decides once per expectation of its impact inventory: one test file, one addressed case, or the transitive set.',
+  impact_requirement_unknown: 'Each impact decision names the exact requirement or contract id the expectation pins.',
+  impact_keep_invalid: 'A kept expectation states no new expectation.',
+  impact_update_invalid: 'An update addresses one test file or one addressed case of it, never the transitive set.',
+  impact_update_unscoped: 'An updated test file is an exact write path (code ref with access write) of the same work.',
+  impact_rest_invalid: 'The rest of a test file is kept only after an addressed update of a case of the same file.',
+  impact_update_unexplained: "An update names this work's own test whose contract states the changed requirement and the new expectation.",
+  integration_contract_unknown: 'A required connection names the exact contract id of its entry.',
+  integration_basis_unknown: 'A required connection rests on an existing file path or on another work that precedes this one.',
+  work_impact_undecided: 'Every expectation of the impact inventory of your exact write scope is decided: a direct test or a known contradiction by file or addressed case, the rest of a file after addressed updates, the transitive remainder by one keep.',
+  work_impact_case_unknown: 'An addressed case is one listed for its test file in the impact section, by its full chain of groups; a file without a reliable case address is decided by file.',
+  work_impact_entry_foreign: "A decision names only expectations of this work's own impact inventory.",
+  work_impact_unresolved: 'An unresolved transition on your affected path is a research question; no decision closes it.',
+  work_policy_open: 'A durable or provider work refers to the policy decided once for its result contract at its producer (shown as decided); until it is decided, G5 refuses the work at that contract and producer.',
+  work_integration_unproven: 'A connection from existing code names its file as the basis (`path` or `path#symbol` as the entry); the file must be in the snapshot and declare the symbol — a mention, a comment, a string or a call is no declaration.',
+  work_integration_deferred: "A connection the work's own result needs is already in existing code or provided by a work that precedes it; one only a later work makes is no basis — leave that connection to the later work's own result.",
 
   "contract_missing": "Every artifact and port names an existing contract.",
   "outcome_missing": "Every node names an existing produced artifact.",
@@ -877,6 +940,7 @@ export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Re
     '# Quoted material', canonical(manifest.filter(item => item.completeness === 'whole').map(item => ({ label: item.label,
       content: basis.material.sources.find(source => same(source.reference, item.source))!.value.content }))),
     ...neighbourSection(basis),
+    ...impactSection(basis),
     '# Acceptance rules',
     'Preserve all upper contracts, beneficiaries, bindings and sleeping delivery conditions. Fill each assigned slot exactly once. An endpoint needs a port (and its exact declared CodeRef at L3); an outcome has neither. Replacements preserve their exact basis. Do not guess missing evidence. Connector references name actual connectors, including definitions in this answer; there is no privileged name prefix. Joins are checked only after full assembly. Contract schemas must compile in strict Ajv. No graph or source identifier confers authority.',
     ...(payload.works ? [GRAPH_RULES.layer_join_design_required!] : []),

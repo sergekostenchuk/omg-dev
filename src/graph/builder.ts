@@ -12,6 +12,8 @@ for (const field of ["version", "id", "title", "actors", "requirements", "resear
   delete mapDesignSchema.properties[field]; mapDesignSchema.required = mapDesignSchema.required.filter(item => item !== field);
 }
 mapDesignSchema.properties['horizon'] = { type: "array", maxItems: 0 };
+// AT1 (№4091 п.4, п.7): a work's impact decisions and required connections must not rewrite accepted L1–L3 authoring schemas.
+for (const field of ["impact", "integrations"]) delete mapDesignSchema.properties['nodes'].items.properties[field];
 
 export function designOf(graph: Graph): Record<string, unknown> {
   const projection = projectGraph(graph, 1);

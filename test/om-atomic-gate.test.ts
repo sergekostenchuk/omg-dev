@@ -1151,3 +1151,190 @@ test('F5 seals exact external sources without an execution root and guards curre
   assert.throws(() => prepareAtomicGate(f.store, f.request), engineFailure('external_input_missing'));
   assert.equal(f.store.get('execution-root:garden'), null);
 });
+
+// ---- AT1 (№4091 п.4–6): the impact rule of G5 and the record of the impact era ----
+import { gateImpact, ATOMIC_GATE_IMPACT_CONTRACT } from '../src/om/atomic-gate.js';
+import { snapshotFiles } from '../src/om/impact.js';
+test('AT1 row 4, task 1: a work that writes the CLI without deciding the test that launches it is refused by G5 at that test; deciding it passes; the record keeps the inventory and its coverage', () => {
+  const files = snapshotFiles({ commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, ['src/cli.ts', 'test/product.test.ts'], new Map([
+    ['src/cli.ts', 'export const main = () => 1;\n'],
+    ['test/product.test.ts', 'import test from "node:test";\nconst cli = new URL("../src/cli.js", import.meta.url);\ntest("CLI command interface persists commands", () => cli);\n']]));
+  const graph = enrichedGraph(exampleGraph('p'), 'p');
+  const work = graph.nodes.find(node => node.id === 'p-produce-work')!;
+  work.code.push({ path: 'src/cli.ts', access: 'write', status: 'existing' });
+  const refused = gateImpact(files, graph, files.snapshot);
+  assert.deepEqual(refused.findings.map(item => [item.code, item.target, item.field]), [['work_impact_undecided', 'p-produce-work', 'test/product.test.ts']]);
+  work.impact = [{ entry: { files: ['test/product.test.ts'] }, decision: 'keep', requirement: 'p-R1' }];
+  const passed = gateImpact(files, graph, files.snapshot);
+  assert.deepEqual(passed.findings, []);
+  assert.deepEqual(passed.record.works.find(row => row.work === 'p-produce-work')!.coverage, [{ test: 'test/product.test.ts', by: 'file' }]);
+});
+test('AT1 rows 12–13 a works acceptance whose packets carry no snapshot writes a gate of the impact era with a null snapshot (M8 refuses it); a repeat writes nothing new', async t => {
+  const f = await atomicFixture(t);
+  const prepared = ok(prepareWorksAcceptance(f.store, f.request));
+  const gate = gateWrite(prepared).value;
+  assert.deepEqual([gate.contract, gate.request.snapshot, gate.impact], [ATOMIC_GATE_IMPACT_CONTRACT, null, { snapshot: null, works: [] }]);
+});
+test('AT1 door (№4105 п.2): an applied resolution of this snapshot turns the unknown into an edge of the inventory — the test it reaches must then be decided; the record names the resolution by its question', () => {
+  const files = snapshotFiles({ commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, ['src/cli.ts', 'test/loader.test.ts'], new Map([
+    ['src/cli.ts', 'export const main = () => 1;\n'],
+    ['test/loader.test.ts', 'import test from "node:test";\ntest("loads", async () => { await import(process.env.M!); });\n']]));
+  const graph = enrichedGraph(exampleGraph('p'), 'p');
+  const work = graph.nodes.find(node => node.id === 'p-produce-work')!;
+  work.code.push({ path: 'src/cli.ts', access: 'write', status: 'existing' });
+  const open = gateImpact(files, graph, files.snapshot);
+  const at = files.text('test/loader.test.ts')!.indexOf('import(process.env.M!)');
+  assert.deepEqual(open.findings.map(item => [item.code, item.target, item.field]), [['work_impact_unresolved', 'p-produce-work', `test/loader.test.ts:2#${at}-${at + 'import(process.env.M!)'.length}`]]);
+  assert.deepEqual(open.record.works.find(row => row.work === 'p-produce-work')!.unknowns[0]!.candidates, ['src/cli.ts']);
+  const site = open.record.works.find(row => row.work === 'p-produce-work')!.unknowns[0]!.site;
+  const resolution = { question: 'readiness:transition:q', file: 'test/loader.test.ts', line: 2, site, resolves: ['src/cli.ts'] };
+  const reached = gateImpact(files, graph, files.snapshot, [resolution]);
+  assert.deepEqual(reached.findings.map(item => [item.code, item.field]), [['work_impact_undecided', 'test/loader.test.ts']],
+    'the unknown is gone; the test it loads is now an entry of the work to decide');
+  assert.deepEqual(reached.record.resolutions, [resolution]);
+  work.impact = [{ entry: { files: ['test/loader.test.ts'] }, decision: 'keep', requirement: 'p-R1' }];
+  assert.deepEqual(gateImpact(files, graph, files.snapshot, [resolution]).findings, []);
+  delete work.impact;
+  const none = gateImpact(files, graph, files.snapshot, [{ ...resolution, resolves: [] }]);
+  assert.deepEqual(none.findings, [], 'an accepted empty resolution closes the unknown and adds nothing');
+});
+import { gatePolicies, readinessResolutions } from '../src/om/atomic-gate.js';
+import { validateGraph } from '../src/graph/validate.js';
+test('AT1 policy (№4117, return №4124 P2-1): a policy is decided once per result contract at its producer — a work of the same contract refers to it, a work of another contract of the same producer does not; a provider needs its own; without it G5 refuses at the contract and producer', () => {
+  const graph = enrichedGraph(exampleGraph('p'), 'p');
+  for (const work of graph.nodes.filter(node => node.kind === 'work')) work.boundary = { ...work.boundary, state: 'durable', writer: 'shared-store' };
+  const hash = (id: string) => hashJson((graph.contracts.find(item => item.id === id)?.schema ?? null) as Json);
+  const decision = (contract: string, policy = 'appearance', producer = 'shared-store') => ({ question: { id: `readiness:policy:${policy}:${contract}`, question: 'q',
+    consumer: producer, kind: 'owner-decision', blocks: true, source: { id: 'om-atomic-gate:p:g', revision: 1, hash: 'h' }, moment: 'om-pass' as const,
+    readiness: { contract: 'om-readiness/v1' as const, cause: 'policy' as const, policy: policy as 'appearance', producer,
+      governs: { contract, hash: hash(contract) }, works: ['p-produce-work'] } }, value: 'created on first run', decision: { id: 'd', revision: 1, hash: 'h' } });
+  assert.deepEqual(gatePolicies(graph, {}).findings.map(item => [item.code, item.target, item.field]), [
+    ['work_policy_open', 'p-consume-work', 'appearance:shared-store:p-contract'], ['work_policy_open', 'p-produce-work', 'appearance:shared-store:p-contract']]);
+  const shared = gatePolicies(graph, { decided: [decision('p-contract')] });
+  assert.deepEqual(shared.findings, [], 'both works write the same contract: one decision, referred to by both');
+  assert.deepEqual(shared.rows.map(row => [row.work, row.contract.id, row.question]),
+    [['p-consume-work', 'p-contract', 'readiness:policy:appearance:p-contract'], ['p-produce-work', 'p-contract', 'readiness:policy:appearance:p-contract']]);
+  // The consuming work's result gets a contract of its own: the same producer's decision for the other contract closes nothing.
+  graph.contracts.push({ id: 'p-result-contract', schema: { type: 'object' } });
+  graph.artifacts.find(artifact => artifact.id === 'p-result')!.contract = 'p-result-contract';
+  assert.deepEqual(gatePolicies(graph, { decided: [decision('p-contract')] }).findings.map(item => [item.target, item.field]),
+    [['p-consume-work', 'appearance:shared-store:p-result-contract']]);
+  // A changed schema of the contract is another revision of it: the earlier decision does not carry over.
+  const earlier = decision('p-contract');
+  graph.contracts.find(item => item.id === 'p-contract')!.schema = { type: 'object', required: ['changed'] };
+  assert.ok(gatePolicies(graph, { decided: [earlier] }).findings.some(item => item.target === 'p-produce-work'));
+  const work = graph.nodes.find(node => node.id === 'p-produce-work')!;
+  work.boundary = { ...work.boundary, state: 'transient', provider: true, authority: 'owner' };
+  assert.deepEqual(gatePolicies(graph, { decided: [decision('p-contract', 'provider', 'owner')] }).findings.map(item => [item.target, item.field]),
+    [['p-consume-work', 'appearance:shared-store:p-result-contract']], 'a provider work refers to its provider policy of its own contract');
+});
+test('AT1 door (№4105 п.2): only a resolution asked on this very tree resolves a transition here; a resolution outside its candidates is no proof', () => {
+  const cause = { contract: 'om-readiness/v1' as const, cause: 'transition' as const, snapshot: { commit: 'a'.repeat(40), tree: 'b'.repeat(40) },
+    file: 'test/loader.test.ts', line: 2, kind: 'dynamic-import', expression: 'import(x)', site: { start: 40, end: 49, hash: 'h'.repeat(64) }, candidates: ['src/cli.ts'], works: ['w'], places: ['o'] };
+  const fact = (tree: string, resolves: unknown) => ({ question: { id: `readiness:transition:${tree}`, question: 'q', consumer: 'o', kind: 'repository-fact', blocks: true,
+    source: { id: 'om-atomic-gate:p:g', revision: 1, hash: 'h' }, moment: 'om-pass' as const, readiness: { ...cause, snapshot: { ...cause.snapshot, tree } } },
+    value: { answer: 'a', resolves } as Json, answer: { id: 'a', revision: 1, hash: 'h' }, mc1Question: { id: 'm', revision: 1, hash: 'h' } });
+  const snapshot = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+  assert.deepEqual(readinessResolutions({ facts: [fact('b'.repeat(40), ['src/cli.ts']), fact('c'.repeat(40), ['src/cli.ts'])] }, snapshot),
+    [{ question: `readiness:transition:${'b'.repeat(40)}`, file: 'test/loader.test.ts', line: 2, site: { start: 40, end: 49, hash: 'h'.repeat(64) }, resolves: ['src/cli.ts'] }]);
+  assert.throws(() => readinessResolutions({ facts: [fact('b'.repeat(40), ['src/elsewhere.ts'])] }, snapshot),
+    (error: unknown) => (error as { refusal?: { code: string } }).refusal?.code === 'atomic_gate_basis_unproven');
+});
+import { gateIntegrations } from '../src/om/atomic-gate.js';
+test('AT1 return №4124 P2-2: a connection from existing code is proved on the exact snapshot — its file in the tree and its symbol in the file; without a repository nothing existing is proved; a predecessor\'s connection is not the snapshot\'s', () => {
+  const files = snapshotFiles({ commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, ['src/cli.ts'], new Map([['src/cli.ts', 'export function main() { return commit(); }\n']]));
+  const graph = enrichedGraph(exampleGraph('p'), 'p');
+  const work = graph.nodes.find(node => node.id === 'p-consume-work')!;
+  const unproven = (entry: string, existing: string, from: typeof files | null = files) => {
+    work.integrations = [{ entry, contract: 'p-contract', basis: { existing } }];
+    return gateIntegrations(graph, from).findings.map(item => [item.code, item.target, item.field]);
+  };
+  assert.deepEqual(unproven('src/cli.ts#main', 'src/cli.ts'), []);
+  assert.deepEqual(unproven('src/cli.ts', 'src/cli.ts'), [], 'a whole file is its own connection point');
+  assert.deepEqual(unproven('src/not-here.ts#commit', 'src/not-here.ts'), [['work_integration_unproven', 'p-consume-work', 'src/not-here.ts#commit']]);
+  assert.deepEqual(unproven('src/cli.ts#register', 'src/cli.ts'), [['work_integration_unproven', 'p-consume-work', 'src/cli.ts#register']], 'the symbol must occur');
+  assert.deepEqual(unproven('src/cli.ts#mai', 'src/cli.ts'), [['work_integration_unproven', 'p-consume-work', 'src/cli.ts#mai']], 'a symbol, not a substring');
+  assert.deepEqual(unproven('src/cli.ts#main', 'src/cli.ts', null), [['work_integration_unproven', 'p-consume-work', 'src/cli.ts#main']]);
+  work.integrations = [{ entry: 'src/store.ts#commit', contract: 'p-contract', basis: { predecessor: 'p-produce-work' } }];
+  assert.deepEqual(gateIntegrations(graph, files).findings, [], 'a predecessor\'s connection point is proved by the graph, not the snapshot');
+});
+test('AT1 return №4135 P2-1: a transient work that uses a durable contract refers to its producer\'s policy of that contract — the producer may stand outside the horizon; without the decision G5 refuses, a decision of another contract decides nothing, the producer\'s own decision is linked', () => {
+  const base = exampleGraph('p'), producer = base.nodes.find(node => node.id === 'p-produce-work')!;
+  producer.boundary = { ...producer.boundary, state: 'durable', writer: 'shared-store' };
+  const graph = enrichedGraph(base, 'p');
+  graph.contracts.push({ id: 'view-contract', schema: { type: 'string' } });
+  graph.artifacts.find(artifact => artifact.id === 'p-result')!.contract = 'view-contract';
+  graph.horizon = ['p-consume-work'];
+  assert.deepEqual(validateGraph(graph).findings, []);
+  const hash = (id: string) => hashJson((graph.contracts.find(item => item.id === id)?.schema ?? null) as Json);
+  const decision = (contract: string) => ({ question: { id: `policy-${contract}`, question: 'q', consumer: 'p-produce-block', kind: 'owner-decision', blocks: true,
+    source: { id: 'om-atomic-gate:p:g', revision: 1, hash: 'h' }, moment: 'om-pass' as const, readiness: { contract: 'om-readiness/v1' as const, cause: 'policy' as const,
+      policy: 'appearance' as const, producer: 'shared-store', governs: { contract, hash: hash(contract) }, works: ['p-produce-work'] } },
+  value: 'Explicit init; absence means recover-first', decision: { id: 'd', revision: 1, hash: 'h' } });
+  assert.deepEqual(gatePolicies(graph, {}).findings.map(item => [item.code, item.target, item.field]),
+    [['work_policy_open', 'p-consume-work', 'appearance:shared-store:p-contract']], 'the consumer of the durable input needs its policy');
+  assert.equal(gatePolicies(graph, { decided: [decision('view-contract')] }).findings.length, 1, 'a decision of another contract decides nothing');
+  const linked = gatePolicies(graph, { decided: [decision('p-contract')] });
+  assert.deepEqual([linked.findings, linked.rows.map(row => [row.work, row.policy, row.producer, row.contract.id, row.question])],
+    [[], [['p-consume-work', 'appearance', 'shared-store', 'p-contract', 'policy-p-contract']]], 'the producer\'s decision is referred to; the consumer creates no state');
+});
+test('AT1 return №4135 P2-2: a connection point is a declaration in the code of the snapshot — a comment, a string, a call or another declaration is none', () => {
+  const graph = enrichedGraph(exampleGraph('p'), 'p');
+  graph.nodes.find(node => node.id === 'p-produce-work')!.integrations = [{ entry: 'src/a.ts#commit', contract: 'p-contract', basis: { existing: 'src/a.ts' } }];
+  const view = (text: string | null) => snapshotFiles({ commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, text === null ? [] : ['src/a.ts'],
+    new Map(text === null ? [] : [['src/a.ts', text]]));
+  const proved = (text: string | null) => gateIntegrations(graph, view(text)).findings.length === 0;
+  for (const [label, text] of [['a function', 'export function commit() { return 1; }'], ['a const', 'export const commit = () => 1;'],
+    ['an export list', 'function save() {}\nexport { save as commit };'], ['a method', 'export class Store {\n  async commit(): Promise<void> { }\n}']] as const)
+    assert.ok(proved(text), label);
+  for (const [label, text] of [['no file', null], ['another declaration', 'export const unrelated = 1;'], ['a comment', '// commit is not implemented\nexport const unrelated = 1;'],
+    ['a string', 'export const description = "commit is not implemented";'], ['a call', 'import { commit } from "./b.js";\ncommit();'],
+    ['a template', 'export const note = `commit ${1}`;']] as const)
+    assert.ok(!proved(text), label);
+  const masked = gateImpact(view('// commit is not implemented\nexport const unrelated = 1;'), graph, { commit: 'a'.repeat(40), tree: 'b'.repeat(40) });
+  assert.deepEqual(masked.findings.map(item => [item.code, item.field]), [['work_integration_unproven', 'src/a.ts#commit']], 'G5 refuses the mention');
+});
+test('AT1 return №4143: G5 proves a connection point by the parser\'s declarations — a regular expression and a call before a block prove nothing, a declaration list and a binding pattern prove it', () => {
+  const graph = enrichedGraph(exampleGraph('p'), 'p'), snapshot = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+  graph.nodes.find(node => node.id === 'p-produce-work')!.integrations = [{ entry: 'src/a.ts#commit', contract: 'p-contract', basis: { existing: 'src/a.ts' } }];
+  const codes = (text: string) => gateImpact(snapshotFiles(snapshot, ['src/a.ts'], new Map([['src/a.ts', text]])), graph, snapshot).findings.map(item => [item.code, item.field]);
+  assert.deepEqual(codes('export const pattern = /function commit/;'), [['work_integration_unproven', 'src/a.ts#commit']], 'a regular expression');
+  assert.deepEqual(codes('commit()\n{ const x = 1; }'), [['work_integration_unproven', 'src/a.ts#commit']], 'a call and a separate block');
+  assert.deepEqual(codes('export const other = 1, commit = () => 1;'), [], 'a declaration list');
+  assert.deepEqual(codes('import { open } from "./store.js";\nexport const { commit } = open();'), [], 'a binding pattern');
+});
+test('AT1 return №4147: a connection point the parser proves nothing about — another language, a parse diagnostic — is an addressed unknown of the work through the readiness door, never proof and never a refusal for ever; the research fact on this tree decides it', () => {
+  const graph = enrichedGraph(exampleGraph('p'), 'p'), snapshot = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+  const work = graph.nodes.find(node => node.id === 'p-produce-work')!;
+  for (const [entry, path, text] of [['src/a.py#commit', 'src/a.py', null], ['src/a.ts#commit', 'src/a.ts', 'export function commit( {']] as const) {
+    work.integrations = [{ entry, contract: 'p-contract', basis: { existing: path } }];
+    const files = snapshotFiles(snapshot, [path], new Map(text === null ? [] : [[path, text]]));
+    const open = gateImpact(files, graph, snapshot);
+    assert.deepEqual(open.findings.map(item => [item.code, item.target, item.field]), [['work_impact_unresolved', 'p-produce-work', `${entry}:0#0-0`]], entry);
+    const [unknown] = open.record.works.find(row => row.work === 'p-produce-work')!.unknowns;
+    assert.deepEqual([unknown!.file, unknown!.kind, unknown!.candidates], [entry, 'declaration', [entry]]);
+    const answered = (resolves: string[]) => gateImpact(files, graph, snapshot, [{ question: 'readiness:transition:q', file: entry, line: 0, site: unknown!.site, resolves }]);
+    assert.deepEqual(answered([entry]).findings, [], 'the fact finds it declared');
+    assert.deepEqual(answered([]).findings.map(item => [item.code, item.field]), [['work_integration_unproven', entry]], 'the fact finds no declaration');
+  }
+  assert.equal(gateImpact(snapshotFiles(snapshot, ['src/a.ts'], new Map([['src/a.ts', 'export function commit() {}']])), graph, snapshot).record.parser, 'typescript@6.0.3');
+  assert.deepEqual(gateImpact(snapshotFiles(snapshot, ['src/a.ts'], new Map([['src/a.ts', 'export function commit() {}']])), graph, snapshot).record.boundary,
+    ['computed-process-targets', 'computed-file-reads', 'future-file-consumers'], 'the boundary is saved with the record');
+});
+test('AT1 return №4155 п.2, №4160 п.2: G5 accepts the five declared forms; a point in a form the analysis does not read is asked through the door — never a refusal without a way out — and the fact on this tree decides it', () => {
+  const graph = enrichedGraph(exampleGraph('p'), 'p'), snapshot = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+  graph.nodes.find(node => node.id === 'p-produce-work')!.integrations = [{ entry: 'src/a.ts#commit', contract: 'p-contract', basis: { existing: 'src/a.ts' } }];
+  const files = (text: string) => snapshotFiles(snapshot, ['src/a.ts'], new Map([['src/a.ts', text]]));
+  for (const text of ['interface Writer { commit(): number; } export const service = { commit() { return 1; } } satisfies Writer;',
+    'export const service = ({ commit() { return 1; } } as const);', 'export default { commit() { return 1; } };',
+    'export namespace A.B { export function commit() { return 1; } }', 'export const service = { ["commit"]() { return 1; } };'])
+    assert.deepEqual(gateImpact(files(text), graph, snapshot).findings, [], text);
+  for (const text of ['export function make() { return { commit() { return 1; } }; }', 'export * from "./b.js";']) {
+    const open = gateImpact(files(text), graph, snapshot);
+    assert.deepEqual(open.findings.map(item => [item.code, item.field]), [['work_impact_unresolved', 'src/a.ts#commit:0#0-0']], text);
+    const [unknown] = open.record.works.find(row => row.work === 'p-produce-work')!.unknowns;
+    const answered = (resolves: string[]) => gateImpact(files(text), graph, snapshot, [{ question: 'readiness:transition:q', file: 'src/a.ts#commit', line: 0, site: unknown!.site, resolves }]);
+    assert.deepEqual(answered(['src/a.ts#commit']).findings, [], `${text}: the fact proves the point`);
+    assert.deepEqual(answered([]).findings.map(item => item.code), ['work_integration_unproven'], `${text}: the fact refuses it`);
+  }
+});

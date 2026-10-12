@@ -204,7 +204,8 @@ test('MP1 per-question wire schema accepts source labels and rejects raw referen
 });
 
 test('MP1 catalogue covers actual graph emissions, including direct findings and EngineError; repair eligibility is closed', () => {
-  for (const [file, expected] of [['validate', GRAPH_VALIDATION_CODES], ['semantics', GRAPH_SEMANTIC_CODES], ['layer-assembly', LAYER_ASSEMBLY_CODES]] as const) {
+  // AT1: semantics emits the codes every brief shows and, apart, those a brief of the impact era shows (the brief of before keeps its bytes).
+  for (const [file, expected] of [['validate', GRAPH_VALIDATION_CODES], ['semantics', [...GRAPH_SEMANTIC_CODES, ...IMPACT_SEMANTIC_CODES]], ['layer-assembly', LAYER_ASSEMBLY_CODES]] as const) {
     const text = readFileSync(new URL(`../../src/graph/${file}.ts`, import.meta.url), 'utf8');
     const source = ts.createSourceFile(`${file}.ts`, text, ts.ScriptTarget.Latest, true);
     const codes = new Set<string>();
@@ -225,6 +226,11 @@ test('MP1 catalogue covers actual graph emissions, including direct findings and
   assert.equal(new Set(rules.map(rule => rule.code)).size, rules.length);
   for (const code of [...GRAPH_VALIDATION_CODES, ...GRAPH_SEMANTIC_CODES, ...LAYER_ASSEMBLY_CODES]) {
     const rule = rules.find(rule => rule.code === code)!; assert.ok(rule?.rule); assert.equal(rule.phase, 'assembly'); assert.equal(rule.repairable, false);
+  }
+  assert.ok(IMPACT_SEMANTIC_CODES.every(code => !rules.some(rule => rule.code === code)), 'A brief of before shows no impact rule');
+  const impactRules = briefRules([...IMPACT_SEMANTIC_CODES, ...IMPACT_GATE_CODES].map(code => ({ code, phase: 'assembly' as const })));
+  for (const code of [...IMPACT_SEMANTIC_CODES, ...IMPACT_GATE_CODES]) {
+    const rule = impactRules.find(rule => rule.code === code)!; assert.ok(rule?.rule && !rule.rule.startsWith('This C2/C3/C4 finding'), code);
   }
   assert.equal(briefAnswerRepairable('answer_label_unknown', 'reads/0/source'), true);
   assert.equal(briefAnswerRepairable('answer_label_unknown', 'requestId'), false);
@@ -631,4 +637,32 @@ test('OWN1 a decided question reaches the packets of its own consumer only; the 
     assert.equal(packet.brief.text.includes('ownDatabase'), late);
     if (late) assert.ok(packet.brief.text.includes('stage:garden:discovery'));
   }
+});
+import { IMPACT_SEMANTIC_CODES } from '../src/graph/semantics.js';
+import { IMPACT_GATE_CODES } from '../src/om/impact.js';
+test('AT1 policy (№4117): the policy decided once at its producer reaches the packets of every consumer — another block\'s ordinary decision still stays out', t => {
+  const f = sample(t), node = f.basis.node!;
+  const decision = (consumer: string, id: string, readiness?: Json) => ({ question: { id, question: `Which policy for ${id}?`, consumer, kind: 'owner-decision',
+    blocks: true, source: { id: 'om-atomic-gate:garden:refused', revision: 1, hash: '2'.repeat(64) }, ...(readiness ? { readiness } : {}) },
+  value: { decision: `Keep the ${id} rule`, rationale: 'r', alternatives: [] }, decision: { id: `om-input-decision:garden:${id}`, revision: 1, hash: '3'.repeat(64) } });
+  const input = { ...(f.basis.input as Record<string, Json>), decided: [
+    decision('garden-produce-block', 'state', { contract: 'om-readiness/v1', cause: 'policy', policy: 'appearance', producer: 'garden-produce-block', works: ['garden-produce-work'] }),
+    decision('garden-produce-block', 'elsewhere')] };
+  assert.notEqual(node, 'garden-produce-block');
+  const packet = deriveBrief(f.input, { ...f.basis, input: input as unknown as Json });
+  assert.ok(packet.brief.text.includes('Keep the state rule'), 'The producer\'s policy reaches a consumer elsewhere');
+  assert.ok(!packet.brief.text.includes('Keep the elsewhere rule'), 'An ordinary decision of another consumer stays out');
+});
+
+import { IMPACT_BOUNDARY, IMPACT_PARSER } from '../src/om/impact.js';
+import { IMPACT_BRIEF_CONTRACT, briefImpactForm } from '../src/om/packet-brief.js';
+test('AT1 №4170: the brief of an L3 works chain shows the declared boundary of its inventory as a limit of completeness, not a proof of no influence', t => {
+  const { basis, input } = sample(t);
+  const impact = { contract: IMPACT_BRIEF_CONTRACT, snapshot: { commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, parser: IMPACT_PARSER, boundary: [...IMPACT_BOUNDARY], map: [], tests: [] };
+  assert.ok(briefImpactForm(impact));
+  const { boundary: _boundary, ...without } = impact;
+  assert.equal(briefImpactForm(without), false, 'a brief impact keeps its boundary');
+  const prompt = packetPrompt(deriveBrief(input, { ...basis, impact }));
+  assert.ok(prompt.includes('"notEstablished":["computed-process-targets","computed-file-reads","future-file-consumers"]'), 'the boundary is shown');
+  assert.ok(prompt.includes('never a proof that nothing is influenced') && prompt.includes('A transitive keep covers only the expectations listed here'));
 });

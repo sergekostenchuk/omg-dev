@@ -4761,3 +4761,234 @@ test("LP8.1 a reopened record names the exact unable revision, its grounds and e
   assert.throws(() => lp81PrepareRunBases(f.store, { project }, { reweigh: "yes" } as never), (error: unknown) => error instanceof EngineError && error.code === "run_bases_request_invalid");
   assert.ok(ok(lp81PrepareRunBases(f.store, { project }, { reweigh: true })), "Weighing its grounds again, it reads them as a live pass");
 });
+
+// AT1 door (№4105): a works answer whose file a test may load through a transition nobody resolved is refused by G5; the
+// group's rejection first asks that transition in B1 (its source the saved gate), research answers it with the exact files
+// of the snapshot, the answer is applied, and the next works — now deciding the test the transition reaches — pass G5 on
+// the same snapshot. The question is asked once; a repeat of the B1 transition writes nothing.
+import { readinessPending, writeReadinessInput, type ReadinessTransition } from "../src/om/input.js";
+test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, researched, applied, and the next works decide what it reaches and pass G5 on the same snapshot", async t => {
+  const f = worksFixture(t), work = f.desired.nodes.find(node => node.id === "garden-produce-work")!;
+  const written = work.code.find(code => code.access === "write")!.path;
+  // The workspace is a repository whose test loads a file by a computed URL — the file the producing work writes.
+  mkdirSync(join(f.root, "test"), { recursive: true });
+  writeFileSync(join(f.root, written), "seed\n");
+  writeFileSync(join(f.root, "test", "loader.test.ts"), 'import test from "node:test";\nconst data = new URL(process.env.DATA!, import.meta.url);\ntest("loads its data", () => data);\n');
+  git(f.root, ["init", "-q", "-b", "main"]); git(f.root, ["add", written, "test/loader.test.ts"]);
+  git(f.root, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "base"]);
+  ok(startRun(f.store, { project }));
+  const performed: string[] = [], answered = new Set<string>(), forms: unknown[] = [];
+  let applied = false, restarted = false, last: unknown = null;
+  for (let index = 0; index < 500 && !worksAcceptance(f.store).frame; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const action = advanced.performed?.action ?? "";
+    if (action) performed.push(action);
+    // A crash right after the B1 transition: the pass goes on from the store, asking nothing twice.
+    if (action === "readiness" && !restarted) { restarted = true; f.restart(); }
+    if (action === "apply" && f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.facts?.some(fact => fact.question.readiness) && !applied) {
+      applied = true;
+      // What the works of the next attempt decide: the test the resolved transition reaches is kept for the data contract.
+      work.impact = [{ entry: { files: ["test/loader.test.ts"] }, decision: "keep", requirement: f.desired.contracts[0]!.id }];
+    }
+    const state = advanced.record.value.state as unknown as { phase: string; step?: { action: string; request: { packet: Ref } } };
+    last = state;
+    if (state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
+    if (state.phase !== "step") continue;
+    const key = JSON.stringify(state.step!.request);
+    if (state.step!.action === "cycle" && !answered.has(key)) {
+      answered.add(key);
+      const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+      const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+      if (batch.model !== "MC1") f.answer(saved);
+      else {
+        forms.push(packet.value.packet);
+        const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
+        f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+          results: batch.items.map(item => ({ questionId: item.gap, value: { answer: `The test loads ${written} by its DATA path`, resolves: [written] },
+            citations: [{ source: reference(source), selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage });
+      }
+    }
+    if (state.step!.action === "assess" && !answered.has(key)) { answered.add(key); f.push(assessor("supported")); }
+  }
+  const trail = `${performed.join(",")} ${JSON.stringify(last).slice(0, 1500)}`;
+  const gates = f.store.list<{ result: { passed: boolean; findings: { code: string; target: string; field?: string }[] };
+    impact?: { snapshot: { tree: string } | null; resolutions?: { question: string; resolves: string[] }[]; works: { work: string; coverage: { test: string; by: string }[] }[] } }>("om-atomic-gate");
+  const refused = gates.find(row => row.value.result.findings.some(item => item.code === "work_impact_unresolved"));
+  assert.ok(refused, `G5 refused the unresolved transition: ${trail}`);
+  assert.deepEqual(refused!.value.result.findings.filter(item => item.code === "work_impact_unresolved").map(item => [item.target, item.field]),
+    [["garden-produce-work", `test/loader.test.ts:2#${"import test from \"node:test\";\nconst data = ".length}-${"import test from \"node:test\";\nconst data = new URL(process.env.DATA!, import.meta.url)".length}`]]);
+  assert.deepEqual(performed.filter(row => row === "readiness"), ["readiness"], `The transition is asked once: ${trail}`);
+  assert.ok(performed.indexOf("readiness") < performed.lastIndexOf("apply") && performed.lastIndexOf("apply") < performed.lastIndexOf("works"), trail);
+  const input = f.store.get<OmInputRecord>(`om-input:${project}`)!;
+  const facts = (input.value.input.facts ?? []).filter(fact => fact.question.readiness);
+  assert.equal(facts.length, 1, "One readiness question, answered and applied");
+  const cause = facts[0]!.question.readiness as ReadinessTransition;
+  assert.deepEqual([facts[0]!.question.source.id, facts[0]!.question.consumer, cause.works, cause.snapshot.tree, facts[0]!.value],
+    [refused!.id, "garden-produce-operation", ["garden-produce-work"], refused!.value.impact!.snapshot!.tree,
+      { answer: `The test loads ${written} by its DATA path`, resolves: [written] }]);
+  assert.ok(forms.some(form => JSON.stringify(form).includes(`"resolves":{"items":{"enum":["${written}"`)), `The research packet names the snapshot's candidates: ${JSON.stringify(forms).slice(0, 3000)}`);
+  const passed = gates.find(row => row.value.result.passed)!;
+  assert.ok(passed, `G5 passed: ${JSON.stringify(worksAcceptance(f.store).findings)} ${trail}`);
+  assert.equal(passed.value.impact!.snapshot!.tree, refused!.value.impact!.snapshot!.tree, "The same snapshot");
+  assert.deepEqual(passed.value.impact!.resolutions!.map(row => [row.question, row.resolves]), [[facts[0]!.question.id, [written]]]);
+  assert.deepEqual(passed.value.impact!.works.find(row => row.work === "garden-produce-work")!.coverage, [{ test: "test/loader.test.ts", by: "file" }]);
+  assert.deepEqual(worksAcceptance(f.store).frame, true, "Layer 3 is written");
+  // The repeat: the gate's question is answered — nothing is pending and the same transition writes no new B1.
+  assert.equal(ok(readinessPending(f.store, project, reference(refused!))), false);
+  const derivation = f.store.history(input.id).map(row => (row.value as unknown as OmInputRecord).derivation).find(row => row && "kind" in row && row.kind === "readiness")!;
+  assert.deepEqual(ok(writeReadinessInput(f.store, { project, input: (derivation as { previous: Ref }).previous, gate: reference(refused!) })).value.derivation, derivation);
+  assert.equal(f.store.get(input.id)!.revision, input.revision);
+});
+
+// AT1 (№4117, contract §1.3): the appearance policy of a durable work's state is decided once at its producer. G5 refuses
+// the work at that producer; the group's rejection asks the policy in B1 at the producer, as an owner decision: in the pass
+// the model decides it (OWN1, the model's decision, never the owner's), or the owner's H2 answer decides it and the model
+// is never asked. Every works brief then carries the decision, and the next works pass G5 referring to it.
+async function policyDoor(t: test.TestContext, owner: boolean) {
+  const f = worksFixture(t, false, false, graph => {
+    // The producing chain keeps a durable state its block writes; each durable node proves a cold read and a cold restart.
+    for (const node of graph.nodes.filter(item => ["garden-produce-block", "garden-produce-operation", "garden-produce-work"].includes(item.id))) {
+      node.boundary = { ...node.boundary, state: "durable", writer: "garden-produce-block" };
+      for (const proof of graph.tests.filter(item => node.tests.includes(item.id)))
+        proof.obligations = [...new Set([...(proof.obligations ?? ["outcome"]), "durable_cold_read", "restart_cold"] as const)];
+    }
+  });
+  ok(startRun(f.store, { project }));
+  const performed: string[] = [], answered = new Set<string>();
+  let given: Ref | null = null, last: unknown = null, decisions = 0;
+  for (let index = 0; index < 500 && !worksAcceptance(f.store).frame; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    if (advanced.performed) performed.push(advanced.performed.action);
+    const asked = f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.find(row => row.readiness?.cause === "policy");
+    if (owner && asked && !given) {
+      const built = prepareRunBases(f.store, { project });
+      const bases = built.ok && built.value.state === "ready" ? built.value.built.bases : null;
+      const routes = bases ? f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)! : null;
+      const routed = routes?.value.routes.find(row => row.target === asked.id) as unknown as { record: Ref } | undefined;
+      if (routes && routed) {
+        const sessions = new OwnerSessions(f.store), { invitation } = ok(issueOwnerInvitation(f.store, { project }));
+        const authority = sessions.authority(ok(sessions.exchange({ project, invitation })).bearer)!;
+        given = reference(ok(writeOwnerResult(f.store, authority, { project, routes: reference(routes), gap: routed.record,
+          value: "The producing block creates the state on its first run; a missing state later is a loss", basis: "The owner's rule for this state" },
+          { routes: readRoutes, input: readOmInput })).result);
+      }
+    }
+    const state = advanced.record.value.state as unknown as { phase: string; step?: { action: string; request: { packet: Ref } } };
+    last = state;
+    if (state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
+    if (state.phase !== "step") continue;
+    const key = JSON.stringify(state.step!.request);
+    if (state.step!.action === "cycle" && !answered.has(key)) {
+      answered.add(key);
+      const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+      const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+      if (batch.model === "MC2" && batch.task === "input-field") {
+        decisions++;
+        f.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+          results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: OWN1_DECISION })) }, usage });
+      } else f.answer(saved);
+    }
+    if (state.step!.action === "assess" && !answered.has(key)) { answered.add(key); f.push(assessor("supported")); }
+  }
+  const trail = `${performed.join(",")} ${JSON.stringify(last).slice(0, 1500)}`;
+  const gates = f.store.list<{ result: { passed: boolean; findings: { code: string; target: string; field?: string }[] };
+    impact?: { policies?: { work: string; policy: string; producer: string; contract: { id: string; hash: string }; question: string | null }[] } }>("om-atomic-gate");
+  const refused = gates.find(row => row.value.result.findings.some(item => item.code === "work_policy_open"));
+  assert.ok(refused, `G5 refused the durable work without its producer's policy: ${trail}`);
+  const work = f.desired.nodes.find(node => node.id === "garden-produce-work")!;
+  const contract = f.desired.artifacts.find(artifact => artifact.id === work.outcome)!.contract;
+  // Return №4135 P2-1: the consuming work uses the durable garden data — it refers to the same producer's policy of the same contract.
+  assert.deepEqual(refused!.value.result.findings.filter(item => item.code === "work_policy_open").map(item => [item.target, item.field]),
+    [["garden-consume-work", `appearance:garden-produce-block:${contract}`], ["garden-produce-work", `appearance:garden-produce-block:${contract}`]],
+    "at the address of its contract and producer, for its producer and its consumer");
+  const governs = refused!.value.impact!.policies!.find(row => row.work === "garden-produce-work")!.contract;
+  assert.deepEqual(performed.filter(row => row === "readiness"), ["readiness"], `The policy is asked once: ${trail}`);
+  const input = f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input;
+  const decided = (input.decided ?? []).filter(row => row.question.readiness?.cause === "policy");
+  assert.equal(decided.length, 1, `One policy, decided once: ${trail}`);
+  const question = decided[0]!.question;
+  assert.deepEqual([question.consumer, question.kind, question.source.id, question.readiness],
+    ["garden-produce-block", "owner-decision", refused!.id, { contract: "om-readiness/v1", cause: "policy", policy: "appearance",
+      producer: "garden-produce-block", governs: { contract, hash: governs.hash }, works: ["garden-consume-work", "garden-produce-work"] }], "one question for both");
+  if (owner) {
+    assert.deepEqual(decided[0]!.value, { owner: given, value: "The producing block creates the state on its first run; a missing state later is a loss" });
+    assert.equal(decisions, 0, "The model is never asked the policy the owner answered");
+  } else {
+    assert.deepEqual(decided[0]!.value, OWN1_DECISION, "The model's decision in the bypass, not the owner's");
+    assert.equal(decisions, 1, "The model decides it once");
+    assert.equal(f.store.list().filter(row => row.id.startsWith("om-owner-result:")).length, 0, "No owner result is invented");
+  }
+  const passed = gates.find(row => row.value.result.passed);
+  assert.ok(passed, `G5 passed: ${JSON.stringify(worksAcceptance(f.store).findings)} ${trail}`);
+  assert.deepEqual(passed!.value.impact!.policies, ["garden-consume-work", "garden-produce-work"].map(work =>
+    ({ work, policy: "appearance", producer: "garden-produce-block", contract: governs, question: question.id })), "both refer to the one decision");
+  const decision = owner ? "The producing block creates the state on its first run" : OWN1_DECISION.decision;
+  const works = f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.packetContract === WORKS_BRIEF_PACKET_CONTRACT && row.value.packet
+    && JSON.stringify(row.value.packet).includes(decision));
+  assert.ok(works.length > 0, "The works brief after the decision carries it");
+}
+test("AT1 policy: a durable work's state policy is asked once at its producer and decided by the model in the bypass; the works refer to it and pass G5", async t => policyDoor(t, false));
+test("AT1 policy: the owner's H2 answer decides the producer's state policy; the model is never asked, and the works pass G5", async t => policyDoor(t, true));
+
+// AT1 return №4124 P2-6: a group the code before AT1 refused by its own G5 (the era before the impact) ends the way it
+// always did under the new code — its rejection asks no readiness question and never stands on a refusal of the era.
+const AT1_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
+test("AT1 return №4124 P2-6: a group refused by a G5 of the earlier era ends under the new code by its rejection as before — no readiness question, no refusal of the era, and the new candidate is accepted", async t => {
+  const f = worksFixture(t, false, false, twoArtifacts);
+  ok(startRun(f.store, { project }));
+  // As in G6.2: the code before G6 (a62940ec) answers the works, the producing one for two artifacts (its E3 admits it).
+  for (let round = 0; round < 4; round++) {
+    const issued = atCommit(f, G62_BASE, `p26-issue-${round}`, `const { advanceRun } = await import(src('om/run.js'));
+for (let index = 0; index < 40; index++) {
+  const state = take(await advanceRun(store, args.request)).record.value.state;
+  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
+  if (state.phase === 'waiting') { out(null); break; }
+}`, { request: f.request }) as Ref | null;
+    assert.ok(issued, "The earlier code issues a works packet");
+    const answer = mp2WorkAnswer(f, issued), node = answer.research.proposal.nodes[0]!.parent!;
+    f.push({ research: answer.research, usage });
+    assert.equal(atCommit(f, G62_BASE, `p26-cycle-${round}`, `const { advanceRun } = await import(src('om/run.js'));
+out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request }), "cycle");
+    if (node === "garden-produce-operation") break;
+  }
+  // The code before AT1 (e475bd59) goes on to its works step: its G5 of the earlier era refuses the group.
+  let works = false;
+  for (let round = 0; round < 16 && !works; round++) {
+    const result = atCommit(f, AT1_BASE, `p26-${round}`, `const { advanceRun } = await import(src('om/run.js'));
+let result = null;
+for (let index = 0; index < 80 && result === null; index++) {
+  const advanced = take(await advanceRun(store, args.request));
+  const state = advanced.record.value.state;
+  if (advanced.performed && advanced.performed.action === 'works') result = { works: true };
+  else if (state.phase === 'step' && state.step.action === 'cycle') result = { packet: state.step.request.packet };
+  else if (state.phase === 'waiting' || state.phase === 'unable' || state.phase === 'complete') result = { state };
+}
+out(result);`, { request: f.request }) as { works?: true; packet?: Ref; state?: unknown } | null;
+    assert.ok(result && !result.state, `The base reaches its works step: ${JSON.stringify(result).slice(0, 800)}`);
+    if (result.works) works = true; else f.answer(result.packet!);
+  }
+  assert.ok(works, "The base performed its works step");
+  f.restart();
+  const before = f.store.list<{ contract: string; result: { passed: boolean } }>("om-atomic-gate");
+  assert.ok(before.length > 0 && before.every(row => row.value.contract === "om-atomic-gate/v1" && !row.value.result.passed), "The base refused the group by its G5 of the earlier era");
+  const trail: string[] = [], answered = new Set<string>();
+  for (let index = 0; index < 300 && !worksAcceptance(f.store).frame; index++) {
+    const advanced = ok(await advanceRun(f.store, f.request));
+    const state = advanced.record.value.state as unknown as { phase: string; wait?: { code: string }; step?: { action: string; request: { packet?: Ref } } };
+    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
+    if (state.phase === "waiting" || state.phase === "unable") break;
+    if (state.phase !== "step" || state.step!.action !== "cycle" || !state.step!.request.packet || answered.has(state.step!.request.packet.id)) continue;
+    const saved = state.step!.request.packet, packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    answered.add(saved.id);
+    const answer = mp2WorkAnswer(f, saved), node = answer.research.proposal.nodes[0]!.parent!;
+    const example = (packet.value.packet as unknown as { brief: { examples: { action: string; proposal: unknown }[] } }).brief.examples.find(row => row.action === "answer")!;
+    f.push({ research: node === "garden-produce-operation" ? { ...answer.research, proposal: example.proposal } : answer.research, usage });
+  }
+  const text = trail.join(",");
+  assert.ok(!text.includes("waiting:") && !text.includes("readiness"), `No wait and no readiness question: ${text}`);
+  const ends = f.store.list<{ cause: { kind: string } }>("om-completion-finalization").map(row => row.value.cause.kind);
+  assert.ok(ends.length >= 1 && ends.every(kind => kind === "group-rejected"), `The group ends by its rejection as before: ${JSON.stringify(ends)} ${text}`);
+  assert.deepEqual([worksAcceptance(f.store).passed, worksAcceptance(f.store).frame], [true, true], `The new candidate is accepted: ${text.slice(-600)}`);
+});

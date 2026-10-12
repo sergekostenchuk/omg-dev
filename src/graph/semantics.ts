@@ -93,6 +93,60 @@ export function semanticFindings(graph: Graph): Finding[] {
     try { topologicalOrder([...owners], transfers.map(transfer => [transfer.from, transfer.to])); }
     catch { fail("ownership_transfer_cycle", path, "Write ownership transfers contain a cycle"); }
   }
+  // AT1 (№4091 п.4, п.7): what a work decides about its impact and the connections its own result needs, checked as a graph.
+  const pinned = new Set([...graph.requirements!.map(item => item.id), ...graph.contracts.map(item => item.id)]);
+  const order = dependencyEdges(graph, 3), precedes = (from: string, to: string) => {
+    const queue = [from], seen = new Set([from]);
+    while (queue.length) {
+      const current = queue.shift()!;
+      for (const [, target] of order.filter(edge => edge[0] === current)) {
+        if (target === to) return true;
+        if (!seen.has(target)) { seen.add(target); queue.push(target); }
+      }
+    }
+    return false;
+  };
+  for (const node of graph.nodes) {
+    // One decision per expectation, across the forms: a whole file once; an addressed case once; a file's rest once and
+    // only after an addressed update of that file; a whole-file decision excludes addressed ones of the same file.
+    const whole = new Set<string>(), cases = new Set<string>(), rests = new Set<string>(), addressed = new Set<string>();
+    let transitive = false;
+    for (const item of node.impact ?? []) {
+      const entry = item.entry, key = canonical(entry);
+      const files = "files" in entry ? entry.files : "file" in entry && !("case" in entry) && !("rest" in entry) ? [entry.file] : [];
+      for (const file of files) { if (whole.has(file)) fail("impact_entry_duplicate", node.id, `One decision per expectation: ${file}`); whole.add(file); }
+      if ("file" in entry && "case" in entry) { if (cases.has(key)) fail("impact_entry_duplicate", node.id, `One decision per expectation: ${key}`); cases.add(key); addressed.add(entry.file); }
+      if ("rest" in entry) { if (rests.has(entry.file)) fail("impact_entry_duplicate", node.id, `One decision per expectation: ${key}`); rests.add(entry.file); }
+      if ("transitive" in entry) { if (transitive) fail("impact_entry_duplicate", node.id, "One decision for the transitive remainder"); transitive = true; }
+      if (!pinned.has(item.requirement)) fail("impact_requirement_unknown", node.id, `A decision names the requirement or contract it pins: ${item.requirement}`);
+      if (item.decision === "keep" && item.expectation !== undefined) fail("impact_keep_invalid", node.id, `A kept expectation states no new one: ${key}`);
+      if (item.decision === "update") {
+        if (!("file" in entry) || "rest" in entry) { fail("impact_update_invalid", node.id, `An update addresses one test file or one case of it: ${key}`); continue; }
+        if (!node.code.some(ref => ref.path === entry.file && ref.access === "write"))
+          fail("impact_update_unscoped", node.id, `An updated test is an exact write path of this work: ${entry.file}`);
+        if (item.expectation === undefined || !node.tests.includes(item.expectation) || !graph.tests.some(test => test.id === item.expectation && test.node === node.id))
+          fail("impact_update_unexplained", node.id, `An update names this work's test of the new expectation: ${entry.file}`);
+      }
+    }
+    for (const file of whole) if (addressed.has(file) || rests.has(file)) fail("impact_entry_duplicate", node.id, `A whole-file decision excludes addressed ones: ${file}`);
+    for (const file of rests) if (!addressed.has(file)) fail("impact_rest_invalid", node.id, `The rest of a file is kept only after an addressed update of it: ${file}`);
+    for (const integration of node.integrations ?? []) {
+      if (!graph.contracts.some(contract => contract.id === integration.contract))
+        fail("integration_contract_unknown", node.id, `A required connection names its exact contract: ${integration.contract}`);
+      // The entry names the file of the connection point (`path` or `path#symbol`); its basis is that very file, or a
+      // preceding work that writes it (return №4124 P2-2: ordering alone proves no connection point).
+      const file = integration.entry.split("#")[0]!;
+      if ("existing" in integration.basis) {
+        if (!safeRelativePath(integration.basis.existing)) fail("integration_basis_unknown", node.id, `An existing basis is an exact relative path: ${integration.basis.existing}`);
+        else if (file !== integration.basis.existing) fail("integration_basis_unknown", node.id, `An existing basis is the file of its entry: ${integration.entry}`);
+      } else if (!nodes.has(integration.basis.predecessor) || integration.basis.predecessor === node.id)
+        fail("integration_basis_unknown", node.id, `A predecessor basis names another node: ${integration.basis.predecessor}`);
+      else if (!precedes(integration.basis.predecessor, node.id))
+        fail("work_integration_deferred", node.id, `The connection ${integration.entry} its own result needs is provided by ${integration.basis.predecessor}, which does not precede it`);
+      else if (!nodes.get(integration.basis.predecessor)!.code.some(ref => ref.access === "write" && ref.path === file))
+        fail("integration_basis_unknown", node.id, `The predecessor ${integration.basis.predecessor} writes the file of the entry: ${integration.entry}`);
+    }
+  }
   for (const packet of graph.packets!) {
     const unit = nodes.get(packet.unit);
     if (unit?.kind !== "work" || packet.writePaths.some(path => !unit.code.some(ref => ref.path === path && ref.access === "write"))) fail("work_packet_boundary", packet.id, "An internal packet must stay inside one atomic unit's declared writes");
@@ -155,4 +209,20 @@ export const GRAPH_SEMANTIC_CODES = Object.freeze([
   'test_entrypoint_unbound',
   'test_resource_missing',
   'work_packet_boundary',
+] as const);
+/**
+ * AT1 (№4091 п.4, п.7): the codes of a work's impact decisions and required connections. Kept apart from the list every
+ * brief shows, so a brief issued before the impact era keeps its bytes; a brief of the impact era shows them.
+ */
+export const IMPACT_SEMANTIC_CODES = Object.freeze([
+  'impact_entry_duplicate',
+  'impact_keep_invalid',
+  'impact_requirement_unknown',
+  'impact_rest_invalid',
+  'impact_update_invalid',
+  'impact_update_unexplained',
+  'impact_update_unscoped',
+  'integration_basis_unknown',
+  'integration_contract_unknown',
+  'work_integration_deferred',
 ] as const);

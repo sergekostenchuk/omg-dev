@@ -34,6 +34,16 @@ export const RUN_BASES_CODES = sealed(["run_bases_request_invalid", "run_bases_w
 export const FACT_RESULT_FORM = sealed({ type: "object", required: ["answer"], properties: { answer: { type: "string", minLength: 1 } },
   additionalProperties: false });
 
+/**
+ * AT1 door (№4105 п.4): the result form of a readiness transition — the evidence and the exact files of its snapshot the
+ * expression loads, each among the candidates the saved G5 named (none, when it can load nothing of the snapshot). An
+ * empty list is an answer like any other: E5 and the answer's sources decide whether it holds, never the form.
+ */
+export function readinessResultForm(candidates: readonly string[]): Json {
+  return { type: "object", required: ["answer", "resolves"], additionalProperties: false, properties: { answer: { type: "string", minLength: 1 },
+    resolves: { type: "array", uniqueItems: true, ...(candidates.length ? { items: { type: "string", enum: [...candidates] } } : { maxItems: 0 }) } } };
+}
+
 export interface RunBases { readonly horizon: Ref; readonly queue: Ref; readonly routes: Ref; readonly sources: readonly Ref[] }
 export interface RunBasesRequest { readonly project: string; readonly outcomes?: readonly string[] }
 /**
@@ -285,8 +295,11 @@ const routesRequestOf = (record: RoutesRecord, previous: Ref | null): RoutesRequ
 function routesStage(store: Store, project: string, input: Revision<OmInputRecord>, scope: GapReadRequest, mode: Mode): Ref {
   const records = scope.records.map(ref => store.get<{ gap: { kind: string; code: string; deferral?: unknown; target: string; consumers: string[] } }>(ref.id, ref.revision)!);
   const needed = records.filter(row => row.value.gap.kind === "repository-fact" && row.value.gap.code !== "inventory_missing" && !row.value.gap.deferral);
+  const transitions = new Map(input.value.input.questions.flatMap(question => question.readiness?.cause === "transition"
+    ? [[question.id, question.readiness.candidates] as const] : []));
   const questions = needed.map(row => ({ gap: reference(row), requirements: requirements(input.value, row.value.gap.target, row.value.gap.consumers),
-    resultForm: FACT_RESULT_FORM as unknown as Json }));
+    resultForm: transitions.has(row.value.gap.target) ? readinessResultForm(transitions.get(row.value.gap.target)!)
+      : FACT_RESULT_FORM as unknown as Json }));
   const tasks = questions.length ? take(prepareQuestionTasks(store, { project, gaps: scope, questions })).tasks : [];
   const base: RoutesRequest = { project, gaps: scope, catalog: { paths: [], records: [] }, previous: null,
     tasks: tasks.map(task => task.writes.length ? { pending: task.writes[0]! } : { record: reference(task.record) }) as RoutesRequest["tasks"] };

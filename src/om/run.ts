@@ -9,7 +9,7 @@ import { prepareRoutes as prepareRoutesOf, readRoutes as readRoutesOf, writeRout
 import { readQuestionQueue as readQuestionQueueOf } from "./queue.js";
 import { readHorizon as readHorizonOf } from "./horizon.js";
 import { prepareRunBases as prepareRunBasesOf, readRunStandingGuards as readRunStandingGuardsOf, writeRunBases as writeRunBasesOf, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
-import { readOmInput as readOmInputOf, type OmInputRecord } from "./input.js";
+import { readOmInput as readOmInputOf, readinessPending as readinessPendingOf, writeReadinessInput as writeReadinessInputOf, type OmInputRecord } from "./input.js";
 import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js";
 import { writeApplyAnswer as writeApplyAnswerOf, writeOwnerDecision as writeOwnerDecisionOf } from "./addressing.js";
 import { ownerAnswersHeld, type OwnerAnswer } from "./owner-result.js";
@@ -31,7 +31,8 @@ import { NO_PRODUCER_EMISSIONS, prepareAnswersGate as prepareAnswersGateOf, prep
   writeAnswersCheckCessation as writeAnswersCheckCessationOf, writeAnswersEvaluation as writeAnswersEvaluationOf, writeAnswersRegistration as writeAnswersRegistrationOf, type AnswerRouteResult, type AnswersGateRequest, type RouteProducers,
   type UnservedQuestion } from "./answers-gate.js";
 import { gateCandidate as gateCandidateOf, prepareCandidate as prepareCandidateOf, writeCandidate as writeCandidateOf, type CandidateRequest } from "./frame-candidate.js";
-import { prepareSettleCandidate as prepareSettleCandidateOf, readWorkRejection as readWorkRejectionOf, type SettleCandidateRequest } from "./frame-accept.js";
+import { prepareSettleCandidate as prepareSettleCandidateOf, readWorkRejection as readWorkRejectionOf, readWorkRejectionAt as readWorkRejectionAtOf,
+  type SettleCandidateRequest } from "./frame-accept.js";
 import { readJournalAt as readJournalAtOf } from "./refusal-journal.js";
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, type FrameAttemptBinding } from "./layer-basis.js";
 import type { AcceptedFrameRequest } from "./frame-accept.js";
@@ -103,6 +104,8 @@ const prepareRunBases = transferring("run-bases", (store: Store, request: { proj
 const readRunStandingGuards = transferring("run-bases", readRunStandingGuardsOf);
 const writeRunBases = transferring("run-bases", writeRunBasesOf);
 const readOmInput = transferring("input", readOmInputOf);
+const readinessPending = transferring("input", readinessPendingOf);
+const writeReadinessInput = transferring("input", writeReadinessInputOf);
 const readAcceptedAnswer = transferring("accepted-answer", readAcceptedAnswerOf);
 const writeApplyAnswer = transferring("addressing", writeApplyAnswerOf);
 const writeOwnerDecision = transferring("addressing", writeOwnerDecisionOf);
@@ -153,6 +156,7 @@ const prepareCandidate = transferring("frame-candidate", prepareCandidateOf);
 const writeCandidate = transferring("frame-candidate", writeCandidateOf);
 const prepareSettleCandidate = transferring("frame-accept", prepareSettleCandidateOf);
 const readWorkRejection = transferring("frame-accept", readWorkRejectionOf);
+const readWorkRejectionAt = transferring("frame-accept", readWorkRejectionAtOf);
 const readJournalAt = transferring("refusal-journal", readJournalAtOf);
 const readAtomicGate = transferring("atomic-gate", readAtomicGateOf);
 const readWorksAcceptance = transferring("atomic-gate", readWorksAcceptanceOf);
@@ -193,7 +197,7 @@ export interface RunIntent { readonly outcomes: readonly string[] }
 
 export const RUN_ACTIONS = Object.freeze(["open-series", "open", "register", "lines", "obligations", "packet", "cycle", "assess",
   "candidate", "routes", "evaluate", "accept", "works", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
-  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile", "recover-analysis", "wake"] as const);
+  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile", "recover-analysis", "wake", "readiness"] as const);
 export type RunAction = typeof RUN_ACTIONS[number];
 /** A chosen action: the exact request of its producer and the attempt it serves, if any. */
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
@@ -554,6 +558,8 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       // OWN1 (№3719 P2-1): an owner's proved answer of a question the bypass routes to the model is applied as its decision.
       case "apply": return mapped(Object.hasOwn(body as object, "owners") ? writeOwnerDecision(store, body as never)
         : writeApplyAnswer(store, body as never), record => [refOf(record)]);
+      // AT1 door (№4105 п.5): the readiness questions of a saved G5 rejection become questions of B1.
+      case "readiness": return mapped(writeReadinessInput(store, body as never), record => [refOf(record)]);
       case "close": {
         const closed = closeAttempt(store, body as never);
         if (!closed.ok) return closed;
@@ -1304,6 +1310,8 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   if (!ended && !replaced && level === 3 && !made && !negative && work.answers?.complete) {
     // The producer of the end decides who belongs to the group it rejected; a later attempt on the same D1 goes on.
     const rejection = groupRejectionOf(store, project, members);
+    const readiness = rejection ? groupReadiness(store, project, rejection, group, series.id, ordinal) : null;
+    if (readiness) return readiness;
     const request = rejection ? { project, binding: reference(binding), phase: "acceptance" as const, rejection } : null;
     if (request && prepareCompletionFinalization(store, request).ok) return step("finalize", request, series.id, ordinal);
   }
@@ -1453,6 +1461,23 @@ function groupRejectionOf(store: Store, project: string, members: readonly Membe
     if (rejection.proposals.length) found.set(rejection.record.id, rejection.record);
   }
   return [...found.values()].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)[0] ?? null;
+}
+/**
+ * AT1 door (№4105 п.5): a group whose saved G5 rejection names transitions B1 neither asks nor has answered asks them
+ * before it ends and before its blocks send any new work — under the rule of an answer's application (G6 В2): the B1
+ * transition is written once only this group's attempts are open, else the group waits for the others. LP5 then ends the
+ * group on the replaced B1; a repeat finds the questions asked and goes on.
+ */
+function groupReadiness(store: Store, project: string, rejection: Ref, group: readonly Member[], series: string, ordinal: number): Choice | null {
+  const read = take(readWorkRejectionAt(store, { project, record: rejection })).record;
+  const gate = store.get<{ gate: Ref }>(read.id, read.revision)!.value.gate;
+  if (!take(readinessPending(store, project, gate))) return null;
+  const others = projectSeries(store, project, true).filter(row => row.value.attempts.some(attempt => attempt.outcome === null)
+    && !group.some(member => member.series.id === row.id));
+  if (others.length) return wait("group_readiness", series, "readiness",
+    "The group's works were refused for transitions nobody has resolved; B1 asks them once the other open attempts finish",
+    uniqueRefs([gate, ...others.map(row => reference(row))]), "dependent");
+  return step("readiness", { project, input: reference(store.get<OmInputRecord>(`om-input:${project}`)!), gate }, series, ordinal);
 }
 /**
  * G6.2 (№3869 п.1, п.5): the rows of the saved G5 rejection that name this attempt's own assemblies — each its proposal,

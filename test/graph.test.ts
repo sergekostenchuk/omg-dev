@@ -141,3 +141,66 @@ test("S1.5 №2363 the verdict memory is bounded: past 512 distinct schemas the 
   assert.equal(compilations(() => invalidContracts(withContracts([many[2]!]))).compiled, 0, "A verdict used more recently is still kept");
   assert.equal(compilations(() => invalidContracts(withContracts([extra]))).compiled, 0);
 });
+
+// ---- AT1 (№4091 п.4, п.7): a work's impact decisions and the connections its own result needs, as graph form ----
+import { enrichedGraph } from "./enriched-graph-fixture.js";
+import type { Graph } from "../src/graph/model.js";
+const decided = (): Graph => {
+  const graph = enrichedGraph(exampleGraph("p"), "p");
+  const produce = graph.nodes.find(node => node.id === "p-produce-work")!, consume = graph.nodes.find(node => node.id === "p-consume-work")!;
+  produce.code.push({ path: "test/cli.test.ts", access: "write", status: "existing" });
+  produce.code.push({ path: "src/store.ts", access: "write", status: "planned" });
+  produce.impact = [
+    { entry: { file: "test/cli.test.ts", case: ["CLI", "persists commands"] }, decision: "update", requirement: "p-R1", expectation: "p-produce-work-test" },
+    { entry: { file: "test/cli.test.ts", rest: true }, decision: "keep", requirement: "p-R1" },
+    { entry: { files: ["test/server.test.ts", "test/ui.test.ts"] }, decision: "keep", requirement: "p-contract" },
+    { entry: { transitive: true }, decision: "keep", requirement: "p-R1" },
+  ];
+  consume.integrations = [{ entry: "src/store.ts#commit", contract: "p-contract", basis: { predecessor: "p-produce-work" } },
+    { entry: "src/cli.ts#main", contract: "p-contract", basis: { existing: "src/cli.ts" } }];
+  return graph;
+};
+const codes = (graph: Graph) => validateGraph(graph).findings.map(finding => finding.code);
+
+test("AT1 П4/П7 a graph of the earlier era is valid as written; decisions tied to a requirement and an update with its write path and test, and connections from existing code or a predecessor, are valid", () => {
+  assert.deepEqual(codes(enrichedGraph(exampleGraph("p"), "p")), []);
+  const graph = decided();
+  assert.deepEqual(codes(graph), []);
+  assert.ok(validateGraph(graph).graph, "the new fields are part of the graph handle");
+});
+
+test("AT1 П4 every decision is tied: a repeated entry, an unknown requirement, a kept expectation with a new one, an update of the transitive set, without its write path or without this work's test — each refused by its code", () => {
+  const cases: [string, (graph: Graph) => void][] = [
+    ["impact_entry_duplicate", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact!.push({ entry: { file: "test/server.test.ts" }, decision: "keep", requirement: "p-R1" }); }],
+    ["impact_entry_duplicate", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact!.push({ entry: { file: "test/cli.test.ts" }, decision: "keep", requirement: "p-R1" }); }],
+    ["impact_rest_invalid", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact!.push({ entry: { file: "test/other.test.ts", rest: true }, decision: "keep", requirement: "p-R1" }); }],
+    ["impact_update_invalid", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact![2] = { entry: { files: ["test/server.test.ts"] }, decision: "update", requirement: "p-R1", expectation: "p-produce-work-test" }; }],
+    ["impact_requirement_unknown", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact![2]!.requirement = "p-unknown"; }],
+    ["impact_keep_invalid", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact![2]!.expectation = "p-produce-work-test"; }],
+    ["impact_update_invalid", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact![3] = { entry: { transitive: true }, decision: "update", requirement: "p-R1", expectation: "p-produce-work-test" }; }],
+    ["impact_update_unscoped", graph => { const node = graph.nodes.find(item => item.id === "p-produce-work")!; node.code = node.code.filter(ref => ref.path !== "test/cli.test.ts"); }],
+    ["impact_update_unexplained", graph => { delete graph.nodes.find(node => node.id === "p-produce-work")!.impact![0]!.expectation; }],
+    ["impact_update_unexplained", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.impact![0]!.expectation = "p-consume-work-test"; }],
+  ];
+  for (const [code, mutate] of cases) { const graph = decided(); mutate(graph); assert.deepEqual(codes(graph), [code], code); }
+});
+
+test("AT1 П7 a connection the own result needs rests on existing code or a preceding work: one a later work makes is deferred; an unknown contract or basis is refused", () => {
+  const cases: [string, (graph: Graph) => void][] = [
+    ["work_integration_deferred", graph => { graph.nodes.find(node => node.id === "p-produce-work")!.integrations = [{ entry: "src/store.ts#commit", contract: "p-contract", basis: { predecessor: "p-consume-work" } }]; }],
+    ["integration_contract_unknown", graph => { graph.nodes.find(node => node.id === "p-consume-work")!.integrations![0]!.contract = "p-none"; }],
+    ["integration_basis_unknown", graph => { graph.nodes.find(node => node.id === "p-consume-work")!.integrations![0]!.basis = { predecessor: "p-consume-work" }; }],
+    ["integration_basis_unknown", graph => { graph.nodes.find(node => node.id === "p-consume-work")!.integrations![0]!.basis = { predecessor: "p-nowhere" }; }],
+    ["integration_basis_unknown", graph => { graph.nodes.find(node => node.id === "p-consume-work")!.integrations![1]!.basis = { existing: "../outside.ts" }; }],
+    ["integration_basis_unknown", graph => { graph.nodes.find(node => node.id === "p-consume-work")!.integrations![1]!.basis = { existing: "src/other.ts" }; }],
+    ["integration_basis_unknown", graph => { const node = graph.nodes.find(item => item.id === "p-produce-work")!; node.code = node.code.filter(ref => ref.path !== "src/store.ts"); }],
+  ];
+  for (const [code, mutate] of cases) { const graph = decided(); mutate(graph); assert.deepEqual(codes(graph), [code], code); }
+  const reading = decided();
+  reading.nodes.find(node => node.id === "p-produce-work")!.code.push({ path: "src/store.ts", access: "read", status: "existing" });
+  assert.deepEqual(codes(reading), [], "an ordinary read of a file a later work changes is no promised connection");
+  for (const shape of [{ entry: { file: "x", extra: 1 }, decision: "keep", requirement: "p-R1" }, { entry: { file: "x" }, decision: "drop", requirement: "p-R1" }]) {
+    const graph = decided(); graph.nodes.find(node => node.id === "p-produce-work")!.impact!.push(shape as never);
+    assert.equal(validateGraph(graph).graph, null, JSON.stringify(shape));
+  }
+});
