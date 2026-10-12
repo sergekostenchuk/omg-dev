@@ -1180,6 +1180,297 @@ test("H1.2 R12 R10a 27 25 7 C61 C28 H1 end to end: the pass works L3 through MC2
   assert.deepEqual(store.list().map(reference), before);
 });
 
+import { regateRun } from "../src/om/run.js";
+import { currentL3Reopen, l3ReopenId, readFrameProposals } from "../src/om/frame-proposals.js";
+import { resolveSnapshot } from "../src/om/impact.js";
+/**
+ * RL3 (№4205): the owner's om-regate over the accepted L3 of a completed pass — rows 1–9 of the outcome table of the
+ * inventory (~/REPORTS/review/omg-rl3-inventory_121026.md). The door is AT1's own: a test the snapshot gained reaches the
+ * file a work writes, and the work's impact decisions no longer cover it.
+ */
+/**
+ * RL3: the garden pass of H1.2 started over its accepted operations, with the answering adapter of its own scenario: `respond`
+ * answers a saved cycle with a work, `drive` advances to a chosen state and fails on any other stand.
+ */
+async function gardenPass(t: test.TestContext) {
+  const f = (await loadOperations()).acceptedOperationsFixture(t, "planned", 0);
+  const { store, workspace, desired } = f;
+  const built = ok(writeRunBases(store, { project, outcomes: ["garden-result"] }));
+  const scenario = join(f.root, "scenario.json"), trace = join(f.root, "trace.jsonl");
+  const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
+  const environment = f.engine.environments.configure(project, { workspace,
+    implementer: { actor: "rl3-works-producer", model: "fixture", effort: "high", command },
+    reviewer: { actor: "rl3-works-reviewer", model: "fixture", effort: "high", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: 200_000 }, 0);
+  const commit = (message: string, files: Record<string, string>) => {
+    for (const [path, text] of Object.entries(files)) writeFileSync(join(workspace, path), text);
+    git(workspace, ["add", ...Object.keys(files)]);
+    git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-qm", message]);
+  };
+  writeFileSync(join(workspace, "input.txt"), "A captured external input");
+  new Evidence(store).file(project, "garden-data", workspace, "input.txt", "text/plain", 0);
+  commit("capture input", { "input.txt": "A captured external input" });
+  const adapter = store.write({ id: `adapter:${project}:rl3`, kind: "dispatch-adapter", expected: 0, value: { projectId: project, protocol: "codex-stdio" } });
+  const g = { f, store, workspace, desired, built, adapter, commit, respond: null as unknown as typeof respond, drive: null as unknown as typeof drive,
+    cycle: null as unknown as typeof cycle, request: { project, dispatch: { adapter: reference(adapter), config: reference(environment) } } as RunRequest };
+  ok(startRun(store, { project }));
+  // The pass works L3 through one paid answer to its completion, as in H1.2.
+  const steps: Json[] = [];
+  const respond = (step: RunStep, work: Node, removes: string[]) => {
+    const packet = store.get<QuestionPacketRecord>((step.request as unknown as { packet: Ref }).packet.id)!;
+    const payload = packet.value.packet as unknown as { expansion: { assigned: string[]; obligations: { id: string; kind: string; upper: { port?: string } }[] } };
+    const body = { nodes: [work], tests: structuredClone(desired.tests.filter(proof => work.tests.includes(proof.id))),
+      fills: payload.expansion.obligations.filter(item => payload.expansion.assigned.includes(item.id)).map(item => ({ obligation: item.id, node: work.id,
+        ...(item.kind === "connection-end" ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
+      localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
+      removes, replaces: [], redefines: [] };
+    steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", proposal: body, bindings: [] }, usage } as unknown as Json);
+    writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+  };
+  const drive = async (stop: (state: RunRecord["state"]) => boolean, bound = 40): Promise<string[]> => {
+    const performed: string[] = [];
+    for (let index = 0; index < bound; index++) {
+      const advanced = ok(await advanceRun(store, g.request));
+      if (advanced.performed) performed.push(advanced.performed.action);
+      const state = advanced.record.value.state;
+      if (stop(state as RunRecord["state"])) return performed;
+      if (state.phase === "waiting" || state.phase === "unable" || state.phase === "complete")
+        assert.fail(`The pass stood (${state.phase}) after ${performed.join(",")}: ${JSON.stringify(state).slice(0, 800)}`);
+    }
+    return assert.fail(`The pass did not reach its next stop: ${performed.join(",")}`);
+  };
+  const cycle = (state: RunRecord["state"]) => state.phase === "step" && state.step.action === "cycle";
+  g.respond = respond; g.drive = drive; g.cycle = cycle;
+  return g;
+}
+test("RL3 rows 1–9: om-regate refuses an unfinished pass and writes nothing when the door passes; a work the door finds on the current snapshot is reopened in one guarded transaction — a repeat is that record, a head a second Store moved refuses it whole; the ordinary machine designs the work anew on the same line and goal to a new completion; the D1 of the earlier era reads as written and a forged reopening is refused", async t => {
+  const g = await gardenPass(t), { f, store, workspace, desired, built, adapter, commit, respond, drive, cycle } = g;
+  let environment = store.get(`environment:${project}`)!;
+  // Row 1: an unfinished pass is refused at its phase, and nothing is written.
+  let before = store.list().map(reference);
+  const early = refusal(regateRun(store, { project }));
+  assert.deepEqual([early.code, early.at.field], ["record_missing", "state.phase"]);
+  assert.match(early.message, /ready/);
+  assert.deepEqual(store.list().map(reference), before);
+  const first = structuredClone(desired.nodes.find(node => node.id === "garden-consume-work")!);
+  await drive(cycle);
+  respond((ok(readRun(store, { project }))!.value.state as { step: RunStep }).step, first, []);
+  await drive(state => state.phase === "complete");
+  const completed = ok(readRun(store, { project }))!, frame1 = reference(store.get(`om-frame:${project}:3`)!);
+  // The last D1 the pass saved, read before any reopening: the era row 9 holds it to.
+  const works1 = store.get<RoutesRecord>(built.bases.routes.id)!.value.request.gaps.sources.works as unknown as ProposalRequest;
+  const read1 = ok(readFrameProposals(store, works1));
+  const accepted = store.get<Graph>(`graph:${project}`)!.value.nodes.find(node => node.id === "garden-consume-work")!;
+  // Row 2: the door passes on the accepted L3 — the answer names the snapshot, and nothing is written.
+  before = store.list().map(reference);
+  const passing = ok(regateRun(store, { project }));
+  assert.deepEqual([passing.state, passing.findings, passing.reopen, passing.frame], ["passed", [], null, frame1]);
+  assert.deepEqual(passing.snapshot, resolveSnapshot(workspace));
+  assert.deepEqual(store.list().map(reference), before, "A door that passes writes nothing");
+  // The snapshot gains the work's file and a test that reaches it: the work's impact no longer covers that test.
+  commit("a test reaches the consumed result", { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" });
+  // Row 5: a head the door read moved by a second Store between the reading and the write refuses the transaction whole.
+  let raced = false;
+  class Moving extends Store {
+    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
+      if (!raced && writes.some(write => write.kind === "om-l3-reopen")) {
+        raced = true;
+        const other = new Store(f.database);
+        try { const head = other.get(`environment:${project}`)!; other.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value }); }
+        finally { other.close(); }
+      }
+      return super.writeMany<T>(writes, guards);
+    }
+  }
+  const moving = new Moving(f.database);
+  try {
+    const lost = refusal(regateRun(moving, { project }));
+    assert.ok(raced);
+    assert.deepEqual([lost.code, lost.at.target], ["input_stale", `environment:${project}`]);
+  } finally { moving.close(); }
+  assert.equal(store.get(l3ReopenId(project)), null, "Nothing of the lost transaction is written");
+  assert.deepEqual(ok(readRun(store, { project })), completed);
+  environment = store.get(`environment:${project}`)!;
+  g.request = { project, dispatch: { adapter: reference(adapter), config: reference(environment) } };
+  // Row 3: one guarded transaction — the record of the reopened work and the transition of the pass out of complete.
+  before = store.list().map(reference);
+  const reopened = ok(regateRun(store, { project })), reopen = reopened.reopen!;
+  assert.equal(reopened.state, "reopened");
+  assert.deepEqual(reopened.findings.map(row => [row.code, row.target, row.field]), [["work_impact_undecided", "garden-consume-work", "regate.test.mjs"]]);
+  assert.deepEqual(reopen.value.works, [{ work: "garden-consume-work", definition: hashJson(accepted as unknown as Json) }]);
+  assert.deepEqual([reopen.value.run, reopen.value.frame, reopen.value.snapshot, reopen.value.decision],
+    [reference(completed), frame1, resolveSnapshot(workspace), { actor: "owner", command: "om-regate" }]);
+  assert.deepEqual([reopen.value.input, reopen.value.environment], [reference(store.get(`om-input:${project}`)!), reference(environment)]);
+  assert.deepEqual(reopened.run.value.state, { phase: "regated", from: reference(completed), reopen: reference(reopen) });
+  const moved = store.list().map(reference).filter(ref => !before.some(old => canonical(old) === canonical(ref)));
+  assert.deepEqual(moved.map(ref => ref.id).sort(), [l3ReopenId(project), runId(project)].sort(), "Exactly the record and the pass are written");
+  // Row 4: a repeat is that record; nothing is written.
+  before = store.list().map(reference);
+  assert.deepEqual(reference(ok(regateRun(store, { project })).reopen!), reference(reopen));
+  assert.deepEqual(store.list().map(reference), before);
+  // Row 9: a D1 the pass saved before the reopening reads exactly as it did.
+  assert.deepEqual(ok(readFrameProposals(store, works1)), read1);
+  // Row 6: the regated pass goes on as from ready — new bases over the record, and new work of the same line and goal: the
+  // goal its first attempt achieved before the reopening is not achieved for the reopened work.
+  // The record is a root the machine derivation reads: the bases chosen after it name it, so they are a new step, never a
+  // repeat without effect.
+  const chosen = ok(await advanceRun(store, g.request)).record.value.state as { step: RunStep };
+  assert.equal(chosen.step.action, "bases");
+  assert.ok((chosen.step.request as unknown as { basis: Ref[] }).basis.some(ref => canonical(ref) === canonical(reference(reopen))));
+  const toCycle = await drive(cycle);
+  assert.deepEqual(toCycle, ["bases", "open", "register", "lines", "obligations", "packet"]);
+  const packet2 = ((ok(readRun(store, { project }))!.value.state as { step: RunStep }).step.request as unknown as { packet: Ref }).packet;
+  const routes2 = store.get<QuestionPacketRecord>(packet2.id, packet2.revision)!.value.request.routes;
+  const works2 = store.get<RoutesRecord>(routes2.id, routes2.revision)!.value.request.gaps.sources.works as unknown as ProposalRequest;
+  const named = (works2.frame as unknown as { reopen: { record: Ref; works: string[] } }).reopen;
+  assert.deepEqual([works2.frame.frame, named], [frame1, { record: reference(reopen), works: ["garden-consume-work"] }],
+    "The new D1 stands on the accepted frame and names the record");
+  const filledBy = (store.get(frame1.id, frame1.revision)!.value as { fills: { obligation: string; node: string; source: string }[] }).fills
+    .filter(row => row.node === "garden-consume-work" && row.source === "accepted").map(row => row.obligation).sort();
+  assert.ok(filledBy.length > 0);
+  assert.deepEqual(ok(readFrameProposals(store, works2)).result.open.map(item => item.id).sort(), filledBy, "Exactly the reopened work's fills open");
+  // The same frame named without the record derives as before it; today's preparation of it stands on the record and guards it.
+  const naming = (reopenValue: unknown): ProposalRequest => {
+    const { reopen: _named, ...frame } = works2.frame as unknown as Record<string, unknown>;
+    return { ...works2, frame: (reopenValue === undefined ? frame : { ...frame, reopen: reopenValue }) as unknown as ProposalRequest["frame"] };
+  };
+  assert.deepEqual(ok(readFrameProposals(store, naming(undefined))).result.open, []);
+  const current = ok(prepareFrameProposals(store, naming(undefined)));
+  assert.deepEqual((current.frame.request as unknown as { reopen: unknown }).reopen, named);
+  assert.ok(current.guards.some(ref => canonical(ref) === canonical(reference(reopen))));
+  assert.deepEqual(current.result.open.map(item => item.id).sort(), filledBy);
+  // A request naming other works, a forged record or one the frame does not stand on today is refused.
+  assert.equal(refusal(readFrameProposals(store, naming({ ...named, works: ["garden-produce-work"] }))).code, "proposal_invalid");
+  assert.equal(readFrameProposals(store, naming({ ...named, record: { ...named.record, hash: "0".repeat(64) } })).ok, false);
+  assert.equal(refusal(prepareFrameProposals(store, naming({ ...named, works: ["garden-produce-work"] }))).code, "input_stale");
+  const series = blockSeries(f as unknown as Fixture);
+  assert.equal(series.value.attempts.length, 2);
+  assert.deepEqual(series.value.attempts[1]!.goal, series.value.attempts[0]!.goal);
+  // Rows 7, 8: the work redesigned with its impact decided is accepted on a new frame; the record no longer speaks of it, and
+  // the pass completes through a new M8, M9 and the compiler.
+  const second = { ...structuredClone(accepted), impact: [{ entry: { file: "regate.test.mjs" }, decision: "keep" as const,
+    requirement: "garden-contract" }] };
+  respond((ok(readRun(store, { project }))!.value.state as { step: RunStep }).step, second, ["garden-consume-work"]);
+  const redesign = await drive(state => state.phase === "complete");
+  assert.deepEqual(redesign, ["cycle", "evaluate", "works", "bases", "confirm", "close", "feasibility", "handoff", "compile"]);
+  const frame2 = store.get(`om-frame:${project}:3`)!;
+  assert.equal(frame2.revision, frame1.revision + 1);
+  assert.equal(ok(currentL3Reopen(store, project, reference(frame2))), null);
+  assert.deepEqual(store.get<Graph>(`graph:${project}`)!.value.nodes.find(node => node.id === "garden-consume-work")!.impact, second.impact);
+  const plan = store.get<{ content: { plan: Ref } }>(`stage:${project}:compilation`)!.value.content.plan;
+  assert.deepEqual(store.get<{ feasibility: Ref }>(plan.id, plan.revision)!.value.feasibility, reference(store.get(`om-feasibility:${project}`)!));
+  // The door passes on the redesigned works: a new regate writes nothing.
+  before = store.list().map(reference);
+  assert.equal(ok(regateRun(store, { project })).state, "passed");
+  assert.deepEqual(store.list().map(reference), before);
+});
+
+import { releaseRegateWait } from "../src/om/run.js";
+import { gatePolicies } from "../src/om/atomic-gate.js";
+/**
+ * RL3 (№4217, №4218): the policies the owner's reopening asked. The garden graph's door needs no durable policy, so the record
+ * the regate wrote is given the one a durable producer of the reopened work's contract would need — in the form a G5 of the
+ * impact era names it (policyGate) — and the readiness step, the owner's wait and its three exits are read on a real pass.
+ */
+async function regatePolicy(t: test.TestContext, exit: "owner" | "release" | "foreign") {
+  const g = await gardenPass(t), { store, desired, commit, respond, drive, cycle } = g;
+  const stepOf = () => (ok(readRun(store, { project }))!.value.state as { step: RunStep }).step;
+  await drive(cycle);
+  respond(stepOf(), structuredClone(desired.nodes.find(node => node.id === "garden-consume-work")!), []);
+  await drive(state => state.phase === "complete");
+  commit("a test reaches the consumed result", { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" });
+  const regated = ok(regateRun(store, { project })).reopen!;
+  const graph = store.get<Graph>(`graph:${project}`)!.value, work = graph.nodes.find(node => node.id === "garden-consume-work")!;
+  const contract = graph.artifacts.find(artifact => artifact.id === work.outcome)?.contract ?? work.outcome;
+  const governs = { id: contract, hash: hashJson((graph.contracts.find(item => item.id === contract)?.schema ?? null) as Json) };
+  const findings = [...regated.value.findings, { code: "work_policy_open", target: work.id, field: `appearance:garden-consume-block:${contract}`, message: "An undecided policy" }]
+    .sort((a, b) => canonical(a as unknown as Json) < canonical(b as unknown as Json) ? -1 : 1);
+  const reopen = store.write({ id: regated.id, kind: regated.kind, expected: regated.revision, value: { ...regated.value, findings,
+    impact: { ...regated.value.impact, policies: [{ work: work.id, policy: "appearance", producer: "garden-consume-block", contract: governs, question: null }] } } as unknown as Json });
+  // A pass that does not wait on the reopening's policies is not released, and nothing is written.
+  const early = store.list().map(reference), unwaited = refusal(releaseRegateWait(store, { project }));
+  assert.deepEqual([unwaited.code, unwaited.at.field], ["record_missing", "state.wait"]);
+  assert.deepEqual(store.list().map(reference), early);
+  // The readiness step asks the policy in B1 from the record before any work; the bases route it; the pass waits for the owner.
+  assert.deepEqual(await drive(state => state.phase === "waiting"), ["readiness", "bases"]);
+  const input = store.get<OmInputRecord>(`om-input:${project}`)!;
+  const question = input.value.input.questions.find(row => row.readiness?.cause === "policy")!;
+  assert.deepEqual([question.consumer, question.kind, question.source, question.readiness], ["garden-consume-block", "owner-decision", reference(reopen),
+    { contract: "om-readiness/v1", cause: "policy", policy: "appearance", producer: "garden-consume-block", governs: { contract, hash: governs.hash }, works: [work.id] }]);
+  const waiting = (ok(readRun(store, { project }))!.value.state as { wait: RunWait }).wait;
+  assert.deepEqual([waiting.code, waiting.target, waiting.field, waiting.basis], ["regate_owner_policy", reopen.id, "policy", [reference(reopen), reference(input)]]);
+  assert.match(waiting.message, new RegExp(question.id));
+  // Exit 3: a repeat without the owner's answer or release writes nothing and spends nothing.
+  const quiet = store.list().map(reference);
+  assert.equal(ok(await advanceRun(store, g.request)).performed, null);
+  assert.deepEqual(store.list().map(reference), quiet);
+  if (exit === "foreign") {
+    // Another policy, asked from a saved G5 of the impact era (as policyGate), stands open beside the reopening's: the wait is
+    // the reopening's alone — the owner answers that one, and the pass goes on to its works with the other still open (OWN1).
+    const head = store.get<OmInputRecord>(`om-input:${project}`)!;
+    const candidate = store.write({ id: `om-candidate:${project}:rl3-foreign`, kind: "frame-candidate", expected: 0, value: { level: 3, graph: structuredClone(graph) } as unknown as Json });
+    const gate = store.write({ id: `om-atomic-gate:${project}:rl3-foreign`, kind: "om-atomic-gate", expected: 0, value: { contract: "om-atomic-gate/v2", project,
+      request: { project, candidate: reference(candidate), gaps: { sources: { project, input: reference(head), graph: reference(store.get(`graph:${project}`)!) }, records: [] } },
+      result: { gate: "G5", passed: false, codes: ["work_policy_open"], findings: [{ code: "work_policy_open", target: work.id, field: "appearance:garden-produce-block:other-contract", message: "An undecided policy" }] },
+      impact: { snapshot: null, works: [], policies: [{ work: work.id, policy: "appearance", producer: "garden-produce-block", contract: { id: "other-contract", hash: "other-contract-hash" }, question: null }] } } as unknown as Json });
+    ok(writeReadinessInput(store, { project, input: reference(head), gate: reference(gate) }));
+    assert.deepEqual(await drive(state => state.phase === "waiting"), ["bases"], "The new B1 gets its bases; the reopening's policy still waits");
+  }
+  const built = ok(prepareRunBases(store, { project }));
+  assert.equal(built.state, "ready");
+  const routes = store.get<RoutesRecord>((built as { built: { bases: RunBases } }).built.bases.routes.id)!;
+  const routed = routes.value.routes.find(row => row.target === question.id)! as unknown as { record: Ref; route: string };
+  assert.equal(routed.route, "design", "In the bypass the model would decide it");
+  const line = gapLineKey(project, question.id, "answer");
+  if (exit === "foreign") {
+    const sessions = new OwnerSessions(store), { invitation } = ok(issueOwnerInvitation(store, { project }));
+    const authority = sessions.authority(ok(sessions.exchange({ project, invitation })).bearer)!;
+    ok(writeOwnerResult(store, authority, { project, routes: reference(routes), gap: routed.record, value: "The owner's rule for the reopened state",
+      basis: "The owner's rule for this state" }, { routes: readRoutes, input: readOmInput }));
+    const performed = await drive(state => state.phase === "step" && state.step.action === "open");
+    assert.deepEqual(performed, ["apply", "bases"], "No wait on a policy the reopening did not ask");
+    const open = store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.filter(row => row.readiness?.cause === "policy");
+    assert.deepEqual(open.map(row => [row.source.id, row.readiness!.cause === "policy" && row.readiness!.governs.contract]), [[`om-atomic-gate:${project}:rl3-foreign`, "other-contract"]]);
+  } else if (exit === "owner") {
+    // Exit 1: the owner's H2 answer is applied first; the model is never asked; every works brief and the gate get it decided.
+    const sessions = new OwnerSessions(store), { invitation } = ok(issueOwnerInvitation(store, { project }));
+    const authority = sessions.authority(ok(sessions.exchange({ project, invitation })).bearer)!;
+    const value = "The consuming block creates the state on its first run; a missing state later is a loss";
+    const owner = ok(writeOwnerResult(store, authority, { project, routes: reference(routes), gap: routed.record, value, basis: "The owner's rule for this state" },
+      { routes: readRoutes, input: readOmInput }));
+    const performed = await drive(cycle);
+    assert.equal(performed[0], "apply", performed.join(","));
+    const decided = store.get<OmInputRecord>(`om-input:${project}`)!.value.input;
+    assert.deepEqual(decided.decided?.filter(row => row.question.id === question.id).map(row => row.value), [{ owner: reference(owner.result), value }]);
+    assert.ok(!decided.questions.some(row => row.id === question.id));
+    assert.ok(!blockSeries(g.f as unknown as Fixture).value.attempts.at(-1)!.goal.questions.includes(line), "No attempt asks the model the owner's policy");
+    const packet = stepOf().request as unknown as { packet: Ref };
+    assert.ok(JSON.stringify(store.get(packet.packet.id, packet.packet.revision)!.value).includes(value), "The works brief carries the decision");
+    // The decision closes the policy of the contract for every work of it: two durable works of the contract refer to it.
+    const durable = structuredClone(graph), second = { ...structuredClone(work), id: "garden-consume-work-2" };
+    durable.nodes.push(second);
+    durable.horizon = [...durable.horizon, second.id];
+    for (const node of durable.nodes.filter(row => [work.id, second.id].includes(row.id))) node.boundary = { ...node.boundary, state: "durable", writer: "garden-consume-block" };
+    assert.deepEqual(gatePolicies(durable, input.value.input).findings.map(row => [row.code, row.target]),
+      [["work_policy_open", work.id], ["work_policy_open", second.id]]);
+    const closed = gatePolicies(durable, decided);
+    assert.deepEqual([closed.findings, closed.rows.map(row => [row.work, row.question])], [[], [[work.id, question.id], [second.id, question.id]]]);
+  } else {
+    // Exit 2: the owner's explicit release — one record naming the reopening; a repeat is that record; the pass goes on by OWN1.
+    const released = ok(releaseRegateWait(store, { project }));
+    assert.deepEqual([released.value.reopen, released.value.run, released.value.decision],
+      [reference(reopen), reference(ok(readRun(store, { project }))!), { actor: "owner", command: "om-continue", release: "regate_owner_policy" }]);
+    assert.deepEqual(reference(ok(releaseRegateWait(store, { project }))), reference(released));
+    const performed = await drive(cycle);
+    assert.equal(performed[0], "open", performed.join(","));
+    assert.ok(blockSeries(g.f as unknown as Fixture).value.attempts.at(-1)!.goal.questions.includes(line), "The released policy goes to the model with the works");
+    assert.ok(!(store.get<OmInputRecord>(`om-input:${project}`)!.value.input.decided ?? []).some(row => row.question.id === question.id));
+  }
+}
+test("RL3 №4218 exits 1 and 3: the reopening's policy is asked in B1 before any work and the pass waits for the owner — a repeat writes nothing; the owner's H2 answer is applied first, never asked of the model, carried decided to the works brief, and closes the policy for every work of the contract", async t => regatePolicy(t, "owner"));
+test("RL3 №4218 condition 1: the wait is the reopening's alone — a policy asked from a saved G5 beside it stays open and the pass goes on to its works once the owner answered the reopening's", async t => regatePolicy(t, "foreign"));
+test("RL3 №4218 exits 2 and 3: the owner's explicit release of the wait is one record of that reopening — a repeat is that record — and the pass then gives the policy to the model by OWN1 with the reopened works", async t => regatePolicy(t, "release"));
+
 /**
  * The MC2 answer of a block for its exact saved packet: one operation filling exactly the obligations the packet
  * assigned, with a port per connection end (the shape of the real node-part protocol).

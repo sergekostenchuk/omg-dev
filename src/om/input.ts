@@ -966,26 +966,55 @@ interface ReadinessGate {
     works: { work: string; unknowns: { file: string; line: number; kind: string; text: string; site: { start: number; end: number; hash: string }; candidates: string[] }[] }[];
     policies?: { work: string; policy: 'appearance' | 'provider'; producer: string; contract: { id: string; hash: string }; question: string | null }[] };
 }
-function readinessQuestions(store: Store, project: string, previous: Revision<OmInputRecord>, ref: Ref): InputResult<Sealed<OmInput['questions']>> {
+/**
+ * RL3 (№4217): the owner's reopening of an accepted L3 (om-regate, the record of frame-proposals.ts, named here by its id and
+ * kind so the input stays off the frame modules) asks its door's questions as a saved G5 does: its own findings and impact
+ * on its snapshot, the B1 and the accepted graph the door read — the reopened works stand in that graph.
+ */
+interface ReadinessReopen { contract: string; project: string; input: Ref; graph: Ref; findings: ReadinessGate['result']['findings']; impact?: ReadinessGate['impact'] }
+interface ReadinessSource { findings: ReadinessGate['result']['findings']; impact: NonNullable<ReadinessGate['impact']>; input: Ref; graph: Ref; works: Ref | null }
+function readinessSource(store: Store, project: string, ref: Ref): InputResult<Sealed<ReadinessSource>> {
+  if (ref.id === `om-l3-reopen:${project}`) {
+    const read = readRecord<ReadinessReopen>(store, ref, { unit: "G1", target: ref.id, id: ref.id, kind: "om-l3-reopen" });
+    if (!read.ok) return transfer("refs", read);
+    const reopen = read.value.value as unknown as ReadinessReopen;
+    if (reopen.project !== project || reopen.contract !== "om-l3-reopen/v1" || !reopen.impact || !isRef(reopen.input) || !isRef(reopen.graph)
+      || !Array.isArray(reopen.findings))
+      return refuse("record_forged", "Readiness questions come from the owner's reopening with the door's impact", at(ref.id, "impact", ref), "producer");
+    return delivered({ findings: reopen.findings, impact: reopen.impact, input: reopen.input, graph: reopen.graph, works: null });
+  }
   const read = readRecord<ReadinessGate>(store, ref, { unit: "G1", target: ref.id, idPrefix: `om-atomic-gate:${project}:`, kind: "om-atomic-gate" });
   if (!read.ok) return transfer("refs", read);
-  const gate = read.value.value as unknown as ReadinessGate, snapshot = gate.impact?.snapshot ?? null;
+  const gate = read.value.value as unknown as ReadinessGate;
   if (gate.project !== project || gate.contract !== "om-atomic-gate/v2" || !gate.impact)
     return refuse("record_forged", "Readiness questions come from a saved G5 of the impact era", at(ref.id, "impact", ref), "producer");
-  for (let cursor: Revision<OmInputRecord> = previous; canonical(reference(cursor)) !== canonical(gate.request.gaps.sources.input);) {
+  return delivered({ findings: gate.result.findings, impact: gate.impact, input: gate.request.gaps.sources.input, graph: gate.request.gaps.sources.graph,
+    works: gate.request.candidate });
+}
+function readinessQuestions(store: Store, project: string, previous: Revision<OmInputRecord>, ref: Ref): InputResult<Sealed<OmInput['questions']>> {
+  const source = readinessSource(store, project, ref);
+  if (!source.ok) return source;
+  const gate = { result: { findings: source.value.findings }, impact: source.value.impact } as unknown as
+    { result: ReadinessGate['result']; impact: NonNullable<ReadinessGate['impact']> }, snapshot = gate.impact.snapshot ?? null;
+  for (let cursor: Revision<OmInputRecord> = previous; canonical(reference(cursor)) !== canonical(source.value.input);) {
     if (!cursor.value.derivation) return refuse("record_forged", "The gate's D1 must stand on this B1 or one it derives from",
-      at(ref.id, "gaps.sources.input", gate.request.gaps.sources.input), "producer");
+      at(ref.id, "gaps.sources.input", source.value.input), "producer");
     const next = readOmInput(store, project, cursor.value.derivation.previous);
     if (!next.ok) return next;
     cursor = next.value as Revision<OmInputRecord>;
   }
-  const accepted = readRecord<Graph>(store, gate.request.gaps.sources.graph, { unit: "G1", target: ref.id, id: `graph:${project}`, kind: "graph" });
+  const accepted = readRecord<Graph>(store, source.value.graph, { unit: "G1", target: ref.id, id: `graph:${project}`, kind: "graph" });
   if (!accepted.ok) return transfer("refs", accepted);
-  const candidate = readRecord<{ graph: Graph }>(store, gate.request.candidate, { unit: "G1", target: ref.id, idPrefix: `om-candidate:${project}:`, kind: "frame-candidate" });
-  if (!candidate.ok) return transfer("refs", candidate);
+  // The works the questions are about: the candidate's of a G5, the accepted graph's own of a reopening.
+  let works: Graph = accepted.value.value as Graph;
+  if (source.value.works) {
+    const candidate = readRecord<{ graph: Graph }>(store, source.value.works, { unit: "G1", target: ref.id, idPrefix: `om-candidate:${project}:`, kind: "frame-candidate" });
+    if (!candidate.ok) return transfer("refs", candidate);
+    works = (candidate.value.value as { graph: Graph }).graph;
+  }
   type Place = { id: string; kind: string; parent: string | null };
   const places = (nodes: unknown) => new Map((nodes as Place[]).map(node => [node.id, node]));
-  const known = places(accepted.value.value.nodes), all = places(candidate.value.value.graph.nodes);
+  const known = places(accepted.value.value.nodes), all = places(works.nodes);
   const chain = (nodes: ReadonlyMap<string, Place>, id: string): string[] => {
     const out: string[] = [];
     for (let node = nodes.get(id); node && !out.includes(node.id); node = node.parent ? nodes.get(node.parent) : undefined) out.push(node.id);
@@ -993,7 +1022,7 @@ function readinessQuestions(store: Store, project: string, previous: Revision<Om
   };
   const unresolved = new Set(gate.result.findings.filter(item => item.code === "work_impact_unresolved").map(item => canonical([item.target, item.field ?? ""])));
   const causes = new Map<string, { unknown: NonNullable<ReadinessGate['impact']>['works'][number]['unknowns'][number]; works: string[] }>();
-  for (const work of gate.impact!.works) for (const unknown of work.unknowns) {
+  for (const work of gate.impact.works) for (const unknown of work.unknowns) {
     if (!unresolved.has(canonical([work.work, transitionField(unknown)]))) continue;
     // The cause is the exact place of the transition in the snapshot's file; the excerpt only shows it.
     const key = canonical([unknown.file, unknown.site.start, unknown.site.end, unknown.site.hash]);
@@ -1048,7 +1077,7 @@ function readinessQuestions(store: Store, project: string, previous: Revision<Om
   // all its consumer works; with no such node, above the works. The owner decides it (H2), or in the pass the model (OWN1).
   const open = new Set(gate.result.findings.filter(item => item.code === "work_policy_open").map(item => canonical([item.target, item.field ?? ""])));
   const policies = new Map<string, { policy: 'appearance' | 'provider'; producer: string; governs: { contract: string; hash: string }; works: string[] }>();
-  for (const row of gate.impact!.policies ?? []) {
+  for (const row of gate.impact.policies ?? []) {
     if (row.question !== null || !open.has(canonical([row.work, `${row.policy}:${row.producer}:${row.contract.id}`]))) continue;
     const key = canonical([row.policy, row.producer, row.contract.id, row.contract.hash]);
     const item = policies.get(key) ?? { policy: row.policy, producer: row.producer, governs: { contract: row.contract.id, hash: row.contract.hash }, works: [] };
@@ -1084,9 +1113,12 @@ function readinessQuestions(store: Store, project: string, previous: Revision<Om
  */
 export function readinessPending(store: Store, project: string, gate: Ref): InputResult<Sealed<boolean>> {
   return withHistoricalReads(() => {
-    const read = readRecord<{ contract?: unknown; project?: unknown }>(store, gate, { unit: "G1", target: gate.id, idPrefix: `om-atomic-gate:${project}:`, kind: "om-atomic-gate" });
-    if (!read.ok) return transfer("refs", read);
-    if (read.value.value.project === project && read.value.value.contract === "om-atomic-gate/v1") return delivered(false);
+    // A G5 of the era before the impact asks nothing; RL3: the owner's reopening asks its door's questions like a G5 of the impact era.
+    if (gate.id !== `om-l3-reopen:${project}`) {
+      const read = readRecord<{ contract?: unknown; project?: unknown }>(store, gate, { unit: "G1", target: gate.id, idPrefix: `om-atomic-gate:${project}:`, kind: "om-atomic-gate" });
+      if (!read.ok) return transfer("refs", read);
+      if (read.value.value.project === project && read.value.value.contract === "om-atomic-gate/v1") return delivered(false);
+    }
     const current = store.get<OmInputRecord>(`om-input:${project}`);
     if (!current) return refuse("input_stale", "Readiness questions are asked on an existing B1", at(`om-input:${project}`, "head"), "producer");
     const asked = readinessQuestions(store, project, current, gate);

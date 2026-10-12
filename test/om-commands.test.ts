@@ -22,7 +22,7 @@ import type { RoutesRecord } from "../src/om/routes.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 import { runControlId, type RunControlRecord, type RunControlStatus } from "../src/om/run-control.js";
 import { readPass, startPass, type PassOutcome } from "../src/om/run-driver.js";
-import { advanceRun, runId, type RunRecord, type RunRequest } from "../src/om/run.js";
+import { advanceRun, regateRun, releaseRegateWait, runId, type RunRecord, type RunRequest } from "../src/om/run.js";
 import { spendReport, type SpendReport } from "../src/om/spend-report.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
@@ -416,4 +416,27 @@ test("H2 row 5 of №1821-2: a continue returns the driver's standing wait once;
     await elsewhere(f.database, engine => engine.execute({ type: "om-continue", project }))])
     assert.deepEqual([ok<PassOutcome>(again).end, ok<PassOutcome>(again).run], ["waiting", waiting.run], "The standing wait is returned without a revision");
   assert.equal(f.sent().length, 0, "The claimed call never reached the provider and is never resent");
+});
+
+test("RL3 (№4205, №4218): om-regate and the release of om-continue go through the one command API — a strict form, an unknown project and a project without a pass are refused before any write, and the answer is the pass's own", async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-rl3-command-")), database = join(root, "state.sqlite");
+  const store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  engine.execute({ type: "create-project", project, title: project });
+  const blank = snapshot(store);
+  // The owner names the project only: the works, the snapshot and the findings are the door's, never command input.
+  for (const command of [{ type: "om-regate" }, { type: "om-regate", project: "" }, { type: "om-regate", project: 7 },
+    { type: "om-regate", project, works: ["garden-consume-work"] }, { type: "om-regate", project, snapshot: "HEAD" }, { type: "om-regate", project, force: true }])
+    rejects(() => engine.execute(command), "command_invalid");
+  rejects(() => engine.execute({ type: "om-regate", project: "nowhere" }), "project_missing");
+  const missing = refusal(engine.execute({ type: "om-regate", project }));
+  assert.deepEqual([missing.code, missing.at.field], ["record_missing", "run"]);
+  assert.deepEqual(missing, refusal(regateRun(store, { project })), "The command answers with the pass's own regate");
+  // №4218: the owner's release of the wait on the reopening's policies is the exact word of om-continue, decided before the continue.
+  for (const release of [true, "", "release", "regate_owner_policy ", ["regate_owner_policy"]])
+    rejects(() => engine.execute({ type: "om-continue", project, release }), "command_invalid");
+  const unreleased = refusal(await engine.execute({ type: "om-continue", project, release: "regate_owner_policy" }));
+  assert.deepEqual([unreleased.code, unreleased.at.field], ["record_missing", "run"]);
+  assert.deepEqual(unreleased, refusal(releaseRegateWait(store, { project })), "The release answers with the pass's own refusal");
+  assert.deepEqual(snapshot(store), blank, "No refused regate or release wrote anything");
 });

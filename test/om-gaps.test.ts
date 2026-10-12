@@ -80,7 +80,7 @@ function inventoryGap(): SourceGap {
   return { code: "inventory_missing", target: "repo-inventory", field: "inventory", source: null,
     consumer: { mechanism: "M6", uses: ["code-answer", "project-question-package"] }, message: "Repository inventory is unavailable" };
 }
-function frameGaps(graph: Graph, level: FrameLevel): FrameGap[] {
+function frameOf(graph: Graph, level: FrameLevel): FrameRead {
   const { level: _level, ...projected } = projectGraph(graph, level === 2 ? 1 : 2);
   const upper = projected as Graph;
   const nodes = upper.nodes.filter(node => LEVEL[node.kind] === level - 1).map(node => node.id);
@@ -90,6 +90,10 @@ function frameGaps(graph: Graph, level: FrameLevel): FrameGap[] {
     layer: null, frame: null, upper: level === 2 ? null : { horizon: fakeRef("om-horizon:garden:choice"), frame: null } },
     upper, upperRef, scope, accepted: null, references: [upperRef],
     result: clone(delivered(fillObligations(upper, scope, null, upperRef, level))) as FrameRead["result"] };
+  return frame;
+}
+function frameGaps(graph: Graph, level: FrameLevel): FrameGap[] {
+  const frame = frameOf(graph, level);
   return clone(delivered(openObligationsToGaps(frame, delivered(applyProposals(frame, [])) as Parameters<typeof openObligationsToGaps>[1]))) as FrameGap[];
 }
 function nativeRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
@@ -1095,4 +1099,22 @@ test("AT1 policy (№4117): a policy question is an owner decision asked at its 
     changed.inputResult.input!.questions.push(question); stamp(changed);
     assert.equal(hasCode(collectGaps(changed), "gap_source_missing").at.target, question.id, label);
   }
+});
+
+test("RL3 (№4205): a works frame request carries a reopening only over an accepted L3 frame, as its exact record and its works sorted and distinct; any other form is an invalid request before any derivation", () => {
+  const graph = sources().graph, works = frameOf(graph, 3), operations = frameOf(graph, 2);
+  const record = fakeRef("om-l3-reopen:garden");
+  const naming = (read: FrameRead, reopen: unknown, frame = read.request.frame): FrameRead =>
+    ({ ...read, request: { ...read.request, frame, reopen } as FrameRead["request"] });
+  const invalid = (read: FrameRead) => assert.throws(() => applyProposals(read, []), (error: unknown) => error instanceof EngineError
+    && error.code === "proposal_request_invalid" && (error.details as { field: string }).field === "frame.reopen");
+  // On L2, or on L3 with no accepted frame, a reopening has nothing to stand on.
+  invalid(naming(operations, { record, works: ["garden-produce-work"] }));
+  invalid(naming(works, { record, works: ["garden-produce-work"] }));
+  // Over an accepted frame: the exact record and nonempty, sorted, distinct works — nothing else.
+  const frame = fakeRef("om-frame:garden:3");
+  for (const reopen of [null, {}, { record }, { record, works: [] }, { record, works: ["b", "a"] }, { record, works: ["a", "a"] }, { record, works: [" "] },
+    { record: { id: record.id }, works: ["a"] }, { record, works: ["a"], findings: [] }]) invalid(naming(works, reopen, frame));
+  // A well-formed one passes the form; the frame read must then agree with its accepted base, which this one does not hold.
+  assert.equal(refusedAs(applyProposals(naming(works, { record, works: ["garden-consume-work"] }, frame), []), "proposal_invalid").at.field, "frame.accepted");
 });

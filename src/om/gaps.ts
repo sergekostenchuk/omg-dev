@@ -274,8 +274,8 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
       || typeof question.blocks !== 'boolean' || !isRef(question.source)) {
       fail('gap_source_missing', 'inputResult', 'questions', 'A predecessor question needs its complete producer metadata'); continue;
     }
-    // AT1 door (№4105 п.1): a readiness question names its own producer — the saved G5 whose cause it asks, proved by the
-    // B1 derivation that added it; it is never passed off as a question of a stage.
+    // AT1 door (№4105 п.1): a readiness question names its own producer — the saved G5 whose cause it asks (RL3: or the owner's
+    // reopening of the accepted L3, whose door asked it), proved by the B1 derivation that added it; never a question of a stage.
     if (Object.hasOwn(question, 'readiness')) {
       if (!readinessQuestion(question)) fail('gap_source_missing', question.id, 'source', 'A readiness question names its exact saved G5 cause');
       // Return №4197: a transition is a gap of the block of every place its works stand in.
@@ -324,7 +324,7 @@ function readinessQuestion(question: Record<string, any>): boolean {
   const cause = question.readiness as ReadinessCause;
   const texts = (value: unknown) => Array.isArray(value) && value.every(text) && new Set(value).size === value.length;
   if (!object(cause) || cause.contract !== READINESS_CONTRACT || !texts(cause.works) || !cause.works.length || !isRef(question.source)
-    || !question.source.id.startsWith('om-atomic-gate:') || question.moment !== 'om-pass' || question.blocks !== true
+    || !['om-atomic-gate:', 'om-l3-reopen:'].some(prefix => question.source.id.startsWith(prefix)) || question.moment !== 'om-pass' || question.blocks !== true
     || question.addressedBy !== undefined) return false;
   // The whole form first; the identity is derived from it only once it is complete.
   const formed = cause.cause === 'policy'

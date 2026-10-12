@@ -60,6 +60,32 @@ export interface FrameGap {
     port: string | null; portContract: string | null; existing: string[]; allowNew: true };
 }
 export interface ProposalRequest { frame: FrameRequest; proposals: Ref[] }
+/**
+ * RL3 (№4205): the owner's reopening of an accepted works frame (om-regate). The AT1 door was run over the accepted L3
+ * on a snapshot and found these works not passing; their accepted fills on exactly this frame revision no longer count,
+ * so their obligations are open again and the ordinary machine designs them anew. A later accepted frame records its
+ * own fills, so the record speaks only of the frame it names. Written once per reopening, beside the pass's transition.
+ */
+export const L3_REOPEN_KIND = 'om-l3-reopen';
+export const L3_REOPEN_CONTRACT = 'om-l3-reopen/v1';
+export const l3ReopenId = (project: string): string => `om-l3-reopen:${project}`;
+export interface L3Reopen {
+  contract: typeof L3_REOPEN_CONTRACT; project: string;
+  /** The completed pass, its accepted works frame and graph, the B1 and environment the door read, and the snapshot. */
+  run: Ref; frame: Ref; graph: Ref; input: Ref; environment: Ref; snapshot: { commit: string; tree: string };
+  /** The door's findings in canonical order; every one names a reopened work, every reopened work has one. */
+  findings: { code: string; target: string; field: string; message: string }[];
+  /** The reopened works with the hash of their accepted definition, sorted by work. */
+  works: { work: string; definition: string }[];
+  /**
+   * The door's own record, in the form of a G5's: the impact inventory on the snapshot and the policy rows. Its readiness
+   * questions — the transitions it could not resolve, the policies B1 does not decide — are asked from it (№4217).
+   */
+  impact: { snapshot: { commit: string; tree: string }; works: unknown[]; policies?: unknown[] } & Record<string, unknown>;
+  decision: { actor: 'owner'; command: 'om-regate' };
+}
+/** The reopening a works frame request stands on: the exact record and its works, carried with the request it was derived for. */
+export interface FrameReopen { record: Ref; works: string[] }
 export interface FrameProposals {
   frame: FrameRead; proposals: ProposalObservation[]; result: ProposalResult; gaps: FrameGap[]; references: Ref[];
 }
@@ -110,6 +136,99 @@ function requireRequest(value: unknown): asserts value is FrameRequest {
   const upper = value['upper'];
   if (value['level'] === 2 ? upper !== null : !object(upper) || !isRef(upper['horizon'])
     || (upper['frame'] !== null && !isRef(upper['frame']))) invalid('frame.upper');
+  // RL3: a reopening is carried only by a works request over an accepted frame, as its exact record and sorted works.
+  if (Object.hasOwn(value, 'reopen')) {
+    const reopen = value['reopen'];
+    if (value['level'] !== 3 || value['frame'] === null || !object(reopen) || Object.keys(reopen).length !== 2 || !isRef(reopen['record'])
+      || !Array.isArray(reopen['works']) || !reopen['works'].length || !reopen['works'].every(text)
+      || !same(reopen['works'], [...new Set(reopen['works'] as string[])].sort(order))) invalid('frame.reopen');
+  }
+}
+const reopenOf = (request: FrameRequest): FrameReopen | null => (request as FrameRequest & { reopen?: FrameReopen }).reopen ?? null;
+/** The frame request as its C2 reader knows it: the reopening is this module's own and never part of the frame derivation. */
+function bare(request: FrameRequest): FrameRequest {
+  const { reopen: _reopen, ...rest } = request as FrameRequest & { reopen?: FrameReopen };
+  return rest as FrameRequest;
+}
+function withReopen<T extends FrameRead>(frame: T, reopen: FrameReopen | null): T {
+  return reopen ? { ...frame, request: { ...frame.request, reopen } } : frame;
+}
+const hex = (value: unknown, size: number): boolean => typeof value === 'string' && new RegExp(`^[a-f0-9]{${size}}$`).test(value);
+/** The saved reopening, checked as a whole; a missing or foreign field is a refusal, never guessed. */
+function checkReopen(record: Revision<L3Reopen>, project: string): L3Reopen {
+  const value = record.value as unknown;
+  const keys = ['contract', 'project', 'run', 'frame', 'graph', 'input', 'environment', 'snapshot', 'findings', 'works', 'impact', 'decision'];
+  const fail = (field: string): never => reject('proposal_invalid', record.id, field, 'The reopening of the works frame lost a required field or holds a foreign one');
+  if (!object(value) || Object.keys(value).length !== keys.length || !keys.every(key => Object.hasOwn(value, key))) fail('record');
+  const reopen = value as unknown as L3Reopen;
+  if (reopen.contract !== L3_REOPEN_CONTRACT || reopen.project !== project) fail('contract');
+  for (const key of ['run', 'frame', 'graph', 'input', 'environment'] as const) if (!isRef(reopen[key])) fail(key);
+  if (!object(reopen.snapshot) || Object.keys(reopen.snapshot).length !== 2 || !hex(reopen.snapshot.commit, 40) || !hex(reopen.snapshot.tree, 40)) fail('snapshot');
+  if (!Array.isArray(reopen.works) || !reopen.works.length || !reopen.works.every(row => object(row) && Object.keys(row).length === 2
+    && text(row.work) && hex(row.definition, 64)) || !same(reopen.works.map(row => row.work), [...new Set(reopen.works.map(row => row.work))].sort(order))) fail('works');
+  const works = new Set(reopen.works.map(row => row.work));
+  if (!Array.isArray(reopen.findings) || !reopen.findings.length || !reopen.findings.every(row => object(row) && Object.keys(row).length === 4
+    && ['code', 'target', 'field', 'message'].every(key => typeof row[key as keyof typeof row] === 'string') && works.has(row.target))
+    || !same(reopen.findings, sorted(reopen.findings)) || reopen.works.some(row => !reopen.findings.some(item => item.target === row.work))) fail('findings');
+  if (!object(reopen.impact) || !same(reopen.impact.snapshot, reopen.snapshot) || !Array.isArray(reopen.impact.works)
+    || Object.hasOwn(reopen.impact, 'policies') && !Array.isArray(reopen.impact.policies)) fail('impact');
+  if (!same(reopen.decision, { actor: 'owner', command: 'om-regate' })) fail('decision');
+  return reopen;
+}
+/** RL3: the exact saved reopening at its reference. */
+export function readL3Reopen(store: Store, project: string, ref: Ref): OmResult<Sealed<Revision<L3Reopen>>> {
+  if (!(store instanceof Store) || !text(project) || !isRef(ref)) invalid('reopen');
+  return outcome(() => {
+    const record = take(readRecord<L3Reopen>(store, ref, { unit: 'F4.3', target: ref.id, id: l3ReopenId(project), kind: L3_REOPEN_KIND })) as Revision<L3Reopen>;
+    checkReopen(record, project);
+    return record;
+  });
+}
+/** RL3: the reopening that stands today on this exact accepted works frame — the head record naming it — or none. */
+export function currentL3Reopen(store: Store, project: string, frame: Ref): OmResult<Sealed<Revision<L3Reopen>> | null> {
+  if (!(store instanceof Store) || !text(project) || !isRef(frame)) invalid('reopen');
+  const head = store.get(l3ReopenId(project));
+  if (!head) return delivered(null);
+  const read = readL3Reopen(store, project, reference(head));
+  if (!read.ok) return read;
+  return delivered(same(read.value.value.frame, frame) ? read.value : null);
+}
+/**
+ * The reopening a works frame is derived under. A saved request is read with exactly the record it names (none named: the
+ * derivation of its own era, untouched); a current one takes the record standing today on its frame and refuses a request
+ * that names another. Either way the record must then fit the frame read (requireReopenFits).
+ */
+function reopenFor(store: Store, request: FrameRequest, current: boolean): { reopen: FrameReopen | null; guard: Ref | null } {
+  const named = reopenOf(request);
+  if (request.level !== 3 || request.frame === null) return { reopen: null, guard: null };
+  let record: Revision<L3Reopen> | null;
+  if (current) {
+    record = take(currentL3Reopen(store, request.project, request.frame)) as Revision<L3Reopen> | null;
+    const found = record ? { record: reference(record), works: record.value.works.map(row => row.work) } : null;
+    if (named !== null && !same(named, found))
+      reject('input_stale', l3ReopenId(request.project), 'frame.reopen', 'The reopening of the works frame changed after its named revision');
+  } else {
+    if (!named) return { reopen: null, guard: null };
+    record = take(readL3Reopen(store, request.project, named.record)) as Revision<L3Reopen>;
+    if (!same(record.value.frame, request.frame) || !same(named.works, record.value.works.map(row => row.work)))
+      reject('proposal_invalid', named.record.id, 'frame.reopen', 'The named reopening belongs to this exact works frame and its works');
+  }
+  return record ? { reopen: { record: reference(record), works: record.value.works.map(row => row.work) }, guard: reference(record) } : { reopen: null, guard: null };
+}
+/**
+ * The record speaks of its frame: each reopened work is an accepted real work there, with a real fill of the horizon to
+ * open — a reopening that would open nothing is refused, never passed silently. The definition the door judged stays the
+ * record's evidence; a later revision of the graph under the same frame (a map status) does not undo the owner's decision.
+ */
+function requireReopenFits(frame: FrameRead, reopen: FrameReopen | null): void {
+  if (!reopen) return;
+  const zone = new Map(frame.result.obligations.map(item => [item.id, item.zone]));
+  for (const work of reopen.works) {
+    const node = frame.accepted?.graph.nodes.find(item => item.id === work);
+    if (!node || LEVEL[node.kind] !== 3
+      || !frame.result.fills.some(fill => fill.node === work && fill.source === 'accepted' && zone.get(fill.obligation) === 'horizon'))
+      reject('proposal_invalid', reopen.record.id, 'works', `The reopened work ${work} holds no accepted real fill of the horizon of this frame`);
+  }
 }
 function requireFrame(value: unknown): asserts value is FrameRead {
   if (!object(value)) invalid('frame');
@@ -196,7 +315,9 @@ function derive(frame: FrameRead, observations: ProposalObservation[], base: Fil
   const reserved = new Set(frame.upper.nodes.filter(node => LEVEL[node.kind] === frame.request.level - 1)
     .map(node => representativeId(node.id, frame.request.level)));
   for (const row of [...base.fills, ...(frame.accepted?.frame?.value.fills ?? [])]) if (row.source === 'identity') reserved.add(row.node);
-  const oldFills = base.fills.filter(row => row.source === 'accepted');
+  // RL3: a reopened work's real fills of the horizon do not count on the frame its reopening names — their obligations open.
+  const reopened = new Set(reopenOf(frame.request)?.works ?? []);
+  const oldFills = base.fills.filter(row => row.source === 'accepted' && !(reopened.has(row.node) && obligations.get(row.obligation)?.zone === 'horizon'));
   const additions = new Map<string, ProposalResult['fills']>();
   const replacements = new Map<string, string>();
   const removed = new Set(proposals.flatMap(item => item.value.removes));
@@ -371,7 +492,7 @@ export function observeProposal(store: Store, request: ObserveProposalRequest): 
       reject('proposal_invalid', request.proposal.id, 'request', 'The observed proposal must occur in its own project context');
     if (new Set(context.proposals.map(ref => ref.id)).size !== context.proposals.length)
       reject('proposal_invalid', request.proposal.id, 'request.proposals', 'A proposal context names each exact participant once');
-    const frame = take(readFrame(store, context.frame)), references = [...frame.references];
+    const frame = take(readFrame(store, bare(context.frame))), references = [...frame.references];
     let observed: ObservedProposal | null = null;
     for (const ref of context.proposals) {
       const record = take(readRecord<LayerProposal>(store, ref, { unit: 'F4.3', target: ref.id,
@@ -411,15 +532,23 @@ function bundle(frame: FrameRead, proposals: ProposalObservation[]): FramePropos
 }
 export function readFrameProposals(store: Store, request: ProposalRequest): OmResult<Sealed<FrameProposals>> {
   requireStored(store, request); request = copy(request);
-  return outcome(() => bundle(take(readFrame(store, request.frame)) as FrameRead, loadProposals(store, request)));
+  return outcome(() => {
+    const { reopen } = reopenFor(store, request.frame, false);
+    const frame = withReopen(take(readFrame(store, bare(request.frame))) as FrameRead, reopen);
+    requireReopenFits(frame, reopen);
+    return bundle(frame, loadProposals(store, request));
+  });
 }
 /** No writes or status changes: C4/C5 use this same checked set and these guards in their own transaction. */
 export function prepareFrameProposals(store: Store, request: ProposalRequest): OmResult<Sealed<PreparedFrameProposals>> {
   requireStored(store, request); request = copy(request);
   return outcome(() => {
-    const frame = take(prepareFrame(store, request.frame)) as PreparedFrame;
+    const { reopen, guard } = reopenFor(store, request.frame, true);
+    const frame = withReopen(take(prepareFrame(store, bare(request.frame))) as PreparedFrame, reopen);
+    requireReopenFits(frame, reopen);
     const result = bundle(frame, loadProposals(store, request));
     const guards = new Map(frame.guards.map(ref => [ref.id, ref]));
+    if (guard) guards.set(guard.id, guard);
     for (const proposal of result.proposals) {
       const head = store.get(proposal.reference.id);
       if (!head || !same(reference(head), proposal.reference))

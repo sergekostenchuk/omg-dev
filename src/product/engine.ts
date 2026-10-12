@@ -4,6 +4,7 @@ import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
 import { configureDispatch } from '../om/dispatch.js';
 import { continuePass, readPass, resumeStoppedPass, startPass, stopPass } from '../om/run-driver.js';
+import { regateRun, releaseRegateWait } from '../om/run.js';
 import { spendReport } from '../om/spend-report.js';
 import { writeGuarded } from '../om/refs.js';
 import { prepareFeasibility, readFeasibility, type OmFeasibility } from '../om/feasibility.js';
@@ -279,6 +280,11 @@ export class ProductEngine {
           const resumed = resumeStoppedPass(this.store, { project: command.project, stop: command.resumeStop });
           if (!resumed.ok) return Promise.resolve(resumed);
         }
+        // RL3 (№4218): the owner's release of the wait on their reopening's policies is decided first, like a named resume.
+        if (command.release !== undefined) {
+          const released = releaseRegateWait(this.store, { project: command.project });
+          if (!released.ok) return Promise.resolve(released);
+        }
         return continuePass(this.store, { project: command.project });
       }
       case "om-state": this.#project(command.project); return readPass(this.store, { project: command.project });
@@ -288,6 +294,7 @@ export class ProductEngine {
       case "om-fsck": this.#project(command.project); return runIntegrityCheck(this.store, { project: command.project });
       // OWN1 (№3714): read only — the questions the pass decided in the bypass, with the model's choice and its alternatives.
       case "om-decisions": this.#project(command.project); return listBypassDecisions(this.store, { project: command.project });
+      case "om-regate": this.#project(command.project); return regateRun(this.store, { project: command.project });
       case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
       case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
       case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);

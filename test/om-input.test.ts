@@ -3592,3 +3592,56 @@ test("PF3.3 (№3568 rows 15, 16): observers of the parent's trace — ordered a
   assert.equal(digest(canonical([flat, counts] as unknown as Json)), '15ddb3237bace74d7bf215529db8d31ba176d5f526c75580a05ffb68fc6e8c8f',
     'Every stream, value and derivation count is that of the accepted engine (computed on d3ab5fcd)');
 });
+
+import { prepareReadinessInput, readinessPending, writeReadinessInput } from "../src/om/input.js";
+import { transitionField } from "../src/om/impact.js";
+/**
+ * RL3 (№4217): the owner's reopening of the accepted L3 (om-regate) is a source of readiness questions as a saved G5 of the
+ * impact era is: its door's unresolved transitions and undecided policies are asked in B1 before any works packet.
+ */
+test("RL3 (№4217): the owner's reopening asks its door's unresolved transition and undecided policy in B1 as a saved G5 does — above the accepted work and at the accepted producer, its source the record; a repeat asks nothing; a reopening without the door's impact, on a B1 of another chain or under another project's address is refused", async t => {
+  const f = await createOmFixture(t), project = f.project;
+  const stages = Object.fromEntries(Object.entries(f.stages).map(([stage, row]) => [stage, reference(row)])) as Record<UpstreamStage, Ref>;
+  const root = writeOmInput(f.store, { project, stages, expected: 0 });
+  assert.ok(root.ok);
+  const accepted = f.graphRevision.value as Graph, work = accepted.nodes.find(node => node.kind === "work")!;
+  const block = accepted.nodes.find(node => node.kind === "block")!.id, snapshot = { commit: "c".repeat(40), tree: "b".repeat(40) };
+  const unknown = { file: "test/loader.test.ts", line: 2, kind: "dynamic-import", text: "import(process.env.M!)", site: { start: 60, end: 82, hash: "a".repeat(64) }, candidates: ["src/garden.ts"] };
+  const fake = (id: string): Ref => ({ id, revision: 1, hash: hashJson(id) });
+  const body = (input: Ref, impact: boolean) => ({ contract: "om-l3-reopen/v1", project, run: fake(`om-run:${project}`), frame: fake(`om-frame:${project}:3`),
+    graph: reference(f.graphRevision), input, environment: fake(`environment:${project}`), snapshot,
+    findings: [{ code: "work_impact_unresolved", target: work.id, field: transitionField(unknown), message: "An unresolved transition" },
+      { code: "work_policy_open", target: work.id, field: `appearance:${block}:state-contract`, message: "An undecided policy" }],
+    works: [{ work: work.id, definition: hashJson(work as unknown as Json) }],
+    ...(impact ? { impact: { snapshot, works: [{ work: work.id, affected: [], entries: [], consumers: [], unknowns: [unknown] }],
+      policies: [{ work: work.id, policy: "appearance", producer: block, contract: { id: "state-contract", hash: "state-contract-hash" }, question: null }] } } : {}),
+    decision: { actor: "owner", command: "om-regate" } });
+  const reopen = reference(f.store.write({ id: `om-l3-reopen:${project}`, kind: "om-l3-reopen", expected: 0, value: body(reference(root.value), true) as unknown as Json }));
+  const pending = readinessPending(f.store, project, reopen);
+  assert.ok(pending.ok && pending.value);
+  const asked = writeReadinessInput(f.store, { project, input: reference(root.value), gate: reopen });
+  assert.ok(asked.ok);
+  const added = asked.value.value.input.questions.filter(question => !root.value.value.input.questions.some(prior => prior.id === question.id))
+    .map(question => [question.readiness!.cause, question.consumer, question.kind, question.source, question.readiness!.works]).sort();
+  assert.deepEqual(added, [["policy", block, "owner-decision", reopen, [work.id]], ["transition", work.parent, "repository-fact", reopen, [work.id]]].sort());
+  assert.deepEqual(asked.value.value.derivation, { kind: "readiness", previous: reference(root.value), gate: reopen });
+  const read = readOmInput(f.store, project, reference(asked.value));
+  assert.ok(read.ok, "a trusted read of the derived B1");
+  // A repeat asks nothing: the same request delivers the written B1, and on it nothing is pending.
+  const again = prepareReadinessInput(f.store, { project, input: reference(asked.value), gate: reopen });
+  assert.ok(again.ok && again.value.writes.length === 0);
+  const after = readinessPending(f.store, project, reopen);
+  assert.ok(after.ok && !after.value);
+  // Without the door's impact, on a B1 of another chain, or under another project's address, nothing is asked.
+  const refusedWith = (gate: Ref, input: Ref, code: string) => {
+    const result = prepareReadinessInput(f.store, { project, input, gate });
+    assert.ok(!result.ok && result.refusal.code === code, JSON.stringify(result));
+  };
+  const bare = reference(f.store.write({ id: reopen.id, kind: "om-l3-reopen", expected: 1, value: body(reference(asked.value), false) as unknown as Json }));
+  refusedWith(bare, reference(asked.value), "record_forged");
+  const other = f.store.write({ id: `om-input-other:${project}`, kind: "om-input", expected: 0, value: root.value.value as unknown as Json });
+  const foreign = reference(f.store.write({ id: reopen.id, kind: "om-l3-reopen", expected: 2, value: body(reference(other), true) as unknown as Json }));
+  refusedWith(foreign, reference(asked.value), "record_forged");
+  const elsewhere = f.store.write({ id: `om-l3-reopen:${project}-other`, kind: "om-l3-reopen", expected: 0, value: body(reference(asked.value), true) as unknown as Json });
+  assert.equal(prepareReadinessInput(f.store, { project, input: reference(asked.value), gate: reference(elsewhere) }).ok, false);
+});

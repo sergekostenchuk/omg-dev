@@ -25,12 +25,13 @@ export type ProductCommand =
   | {type:"recover-model-call";project:string;call:Ref}
   | {type:"continue-preparation";project:string;maxCalls:number}
   | { type: "om-start"; project: string; outcomes?: string[] }
-  | { type: "om-continue"; project: string; resumeStop?: string }
+  | { type: "om-continue"; project: string; resumeStop?: string; release?: "regate_owner_policy" }
   | { type: "om-state"; project: string }
   | { type: "om-spend"; project: string }
   | { type: "om-stop"; project: string }
   | { type: "om-fsck"; project: string }
   | { type: "om-decisions"; project: string }
+  | { type: "om-regate"; project: string }
   | { type: "set-map-status"; project: string; expected: number; base: Ref; nodes: MapStatusDelta['nodes'] }
   | { type: "research-stage"; project: string; draftId: string; maxTurns: number }
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
@@ -94,9 +95,13 @@ const omStart = command("om-start", { project });
 omStart.properties['outcomes'] = { type: "array", minItems: 1, items: text };
 const omContinue = command("om-continue", { project });
 omContinue.properties['resumeStop'] = text;
+// RL3 (№4218): the owner's explicit release of the wait on the policies their reopening asked — the pass then decides them by OWN1.
+omContinue.properties['release'] = { const: "regate_owner_policy" };
 const schema = { oneOf: [
   omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("om-decisions", { project }),
+  // RL3 (№4205): the owner's explicit reopening of a completed pass's accepted L3 by the AT1 door.
+  command("om-regate", { project }),
   command("recover-legacy-operation",{project,operation:ref,token:string}),
   command('observe-runtime',{project,scope:ref,obligation:string,key:string}),
   command('recover-runtime-observation',{project,observation:ref}),

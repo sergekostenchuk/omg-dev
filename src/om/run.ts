@@ -9,7 +9,7 @@ import { prepareRoutes as prepareRoutesOf, readRoutes as readRoutesOf, writeRout
 import { readQuestionQueue as readQuestionQueueOf } from "./queue.js";
 import { readHorizon as readHorizonOf } from "./horizon.js";
 import { prepareRunBases as prepareRunBasesOf, readRunStandingGuards as readRunStandingGuardsOf, writeRunBases as writeRunBasesOf, RUN_BASES_HEAD_STAGES, type RunBases } from "./run-bases.js";
-import { readOmInput as readOmInputOf, readinessPending as readinessPendingOf, writeReadinessInput as writeReadinessInputOf, type OmInputRecord } from "./input.js";
+import { readOmInput as readOmInputOf, readinessPending as readinessPendingOf, writeReadinessInput as writeReadinessInputOf, type OmInput, type OmInputRecord } from "./input.js";
 import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js";
 import { writeApplyAnswer as writeApplyAnswerOf, writeOwnerDecision as writeOwnerDecisionOf } from "./addressing.js";
 import { ownerAnswersHeld, type OwnerAnswer } from "./owner-result.js";
@@ -37,7 +37,7 @@ import { readJournalAt as readJournalAtOf } from "./refusal-journal.js";
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, type FrameAttemptBinding } from "./layer-basis.js";
 import type { AcceptedFrameRequest } from "./frame-accept.js";
 import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf, producerProposal as producerProposalOf,
-  readAtomicGate as readAtomicGateOf, readWorksAcceptance as readWorksAcceptanceOf,
+  readAtomicGate as readAtomicGateOf, readWorksAcceptance as readWorksAcceptanceOf, gateImpact, gatePolicies, readinessResolutions,
   type WorkProposalSource, type WorksAcceptanceRequest } from "./atomic-gate.js";
 import { runWakeChoice as runWakeChoiceOf, wakeStanding as wakeStandingOf, type WakeChoiceRequest, type WriteOrderRequest } from "./wake-choice.js";
 import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines as writeGapLinesOf, type GapLinesRecord } from "./gap-lines.js";
@@ -46,9 +46,11 @@ import { prepareFeasibility as prepareFeasibilityOf, readFeasibility as readFeas
 import { writeHandoff as writeHandoffOf } from "./handoff.js";
 import { stageId } from "../pipeline/contracts.js";
 import { StageChecks } from "../product/stage-checks.js";
-import { uniqueTransactionGuards } from "../runtime/environment.js";
+import { uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
 import { readGaps as readGapsOf, type GapReadRequest } from "./gaps.js";
-import { readFrameProposals as readFrameProposalsOf } from "./frame-proposals.js";
+import { currentL3Reopen as currentL3ReopenOf, l3ReopenId, readFrameProposals as readFrameProposalsOf, L3_REOPEN_CONTRACT, L3_REOPEN_KIND,
+  type L3Reopen } from "./frame-proposals.js";
+import { readSnapshot, resolveSnapshot, type RepositorySnapshot } from "./impact.js";
 import type { Graph } from "../graph/model.js";
 import { RefinementRelations } from "../graph/relations.js";
 import type { DispatchContract } from "./call-record.js";
@@ -175,6 +177,7 @@ const writeFeasibility = transferring("feasibility", writeFeasibilityOf);
 const writeHandoff = transferring("handoff", writeHandoffOf);
 const readGaps = transferring("gaps", readGapsOf);
 const readFrameProposals = transferring("frame-proposals", readFrameProposalsOf);
+const currentL3Reopen = transferring("frame-proposals", currentL3ReopenOf);
 const runStopAnalysis = async (...args: Parameters<typeof runStopAnalysisOf>) => transfer("stop-analysis", await runStopAnalysisOf(...args));
 const runModelCycle = async (...args: Parameters<typeof runModelCycleOf>) => transfer("model-call", await runModelCycleOf(...args));
 const assessFact = async (...args: Parameters<typeof assessFactOf>) => transfer("assessment", await assessFactOf(...args));
@@ -226,7 +229,12 @@ export type RunState =
    * revision and its grounds, and the new ground found instead (the next step, a wait or the proved completion). The
    * pass goes on from here as from "ready".
    */
-  | { readonly phase: "reopened"; readonly from: Ref; readonly reasons: readonly RunReason[]; readonly ground: RunReopenGround };
+  | { readonly phase: "reopened"; readonly from: Ref; readonly reasons: readonly RunReason[]; readonly ground: RunReopenGround }
+  /**
+   * RL3 (№4205): a completed pass the owner reopened by om-regate — the exact complete revision and the record of the works
+   * its accepted L3 reopened. The pass goes on from here as from "ready"; without the command a complete pass stays complete.
+   */
+  | { readonly phase: "regated"; readonly from: Ref; readonly reopen: Ref };
 /** What the current rules found in place of the end: exactly one of a next step, an addressed wait or the completion proof. */
 export type RunReopenGround = { readonly step: RunStep } | { readonly wait: RunWait } | { readonly complete: readonly Ref[] };
 export interface RunRecord {
@@ -308,6 +316,7 @@ function checkRecord(value: unknown, project: string): value is RunRecord {
   else if (state.phase === "reopened") {
     if (Object.keys(state).length !== 4 || !isRef(state.from) || !checkReasons(state.reasons) || !checkReopenGround(state.ground)) return false;
   }
+  else if (state.phase === "regated") { if (Object.keys(state).length !== 3 || !isRef(state.from) || !isRef(state.reopen)) return false; }
   else return false;
   const last = value.last;
   return last === null || object(last) && Object.keys(last).length === 3 && checkStep(last.step) && Array.isArray(last.products)
@@ -482,6 +491,85 @@ export function unableReopens(store: Store, request: RunRequest): boolean {
     const saved = take(readRun(store, { project: request.project })) as Revision<RunRecord> | null;
     return saved !== null && saved.value.state.phase === "unable" && !("unable" in reweigh(store, request, saved));
   } catch (error) { if (error instanceof RunFailure) return false; throw error; }
+}
+/** RL3 (№4205): what the owner's regate found on the accepted L3 of a completed pass. */
+export interface RunRegate {
+  /** "passed": every work passes the door and nothing is written; "reopened": the saved record the pass now stands on. */
+  readonly state: "passed" | "reopened";
+  readonly run: Revision<RunRecord>; readonly frame: Ref; readonly snapshot: RepositorySnapshot;
+  readonly findings: L3Reopen["findings"]; readonly reopen: Revision<L3Reopen> | null;
+}
+/** The door's findings as the record keeps them: the four fields of each, one row per meaning, in canonical order. */
+function recordFindings(findings: readonly { code: string; target: string; field?: string; message: string }[]): L3Reopen["findings"] {
+  const rows = findings.map(item => ({ code: item.code, target: item.target, field: item.field ?? "", message: item.message }));
+  return [...new Map(rows.map(row => [canonical(row as unknown as Json), row])).entries()]
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, row]) => row);
+}
+/**
+ * RL3 (№4205): the owner's explicit command over a completed pass. The AT1 door — G5's own policy and impact rules — is
+ * run over the accepted L3 on the configured workspace's current snapshot, with the readiness answers B1 holds for that
+ * tree. Every work passes: nothing is written. Otherwise one guarded transaction writes the record of the reopened works
+ * (the complete revision, the accepted frame and graph, B1, the environment, the snapshot, the findings, each work with
+ * its judged definition, the owner's decision) and moves the pass out of complete; the ordinary machine then designs those
+ * works anew on that frame (frame-proposals), L1 and L2 untouched. A repeat while the record stands is that record; any
+ * other unfinished pass is refused. A workspace that cannot be read is the door's own exception.
+ */
+export function regateRun(store: Store, request: { project: string }): RunResult<Sealed<RunRegate>> {
+  check(store instanceof Store && object(request) && isText(request.project) && Object.keys(request).length === 1,
+    "run_request_invalid", "The owner's regate names its project");
+  const project = request.project;
+  try {
+    const head = take(readRun(store, { project })) as Revision<RunRecord> | null;
+    if (!head) fail("record_missing", runId(project), "run", "The owner's regate reopens a completed pass; this project has none");
+    const frameHead = store.get(`om-frame:${project}:3`);
+    const standing = (): Revision<L3Reopen> | null => standingReopen(store, project);
+    if (head.value.state.phase !== "complete") {
+      const saved = standing();
+      if (saved) return delivered({ state: "reopened" as const, run: head, frame: saved.value.frame, snapshot: saved.value.snapshot,
+        findings: saved.value.findings, reopen: saved });
+      fail("record_missing", head.id, "state.phase", `The owner's regate reopens a completed pass; this pass is ${head.value.state.phase}`, reference(head));
+    }
+    if (!frameHead) fail("record_missing", `om-frame:${project}:3`, "frame", "A completed pass stands on its accepted works frame");
+    const layer = take(readAcceptedFrameLayer(store, { project, level: 3, frame: reference(frameHead) }));
+    const inputHead = store.get(`om-input:${project}`), environmentHead = store.get(`environment:${project}`);
+    if (!inputHead) fail("record_missing", `om-input:${project}`, "input", "The door reads the policies and readiness answers of the current B1");
+    if (!environmentHead) fail("record_missing", `environment:${project}`, "environment", "The door reads the snapshot of the configured workspace");
+    const input = (take(readOmInput(store, project, reference(inputHead))) as Revision<OmInputRecord>).value.input as OmInput;
+    const environment = take(readRecord<Environment>(store, reference(environmentHead), { unit: UNIT, target: environmentHead.id,
+      id: `environment:${project}`, kind: "environment" })) as Revision<Environment>;
+    const workspace = environment.value.workspace, snapshot = resolveSnapshot(workspace), graph = layer.graph.value as Graph;
+    const policy = gatePolicies(graph, input);
+    const impact = gateImpact(readSnapshot(workspace, snapshot), graph, snapshot, readinessResolutions(input, snapshot));
+    const findings = recordFindings([...impact.findings, ...policy.findings]), frame = reference(frameHead);
+    if (!findings.length) return delivered({ state: "passed" as const, run: head, frame, snapshot, findings, reopen: null });
+    const works = [...new Set(findings.map(item => item.target))].sort().map(work => {
+      const node = graph.nodes.find(item => item.id === work);
+      if (!node) fail("record_missing", work, "works", "The door names only works of the accepted graph", reference(layer.graph));
+      return { work, definition: hashJson(node as unknown as Json) };
+    });
+    const value: L3Reopen = { contract: L3_REOPEN_CONTRACT, project, run: reference(head), frame, graph: reference(layer.graph),
+      input: reference(inputHead), environment: reference(environmentHead), snapshot: { commit: snapshot.commit, tree: snapshot.tree },
+      findings, works, impact: { ...impact.record, ...(policy.rows.length ? { policies: policy.rows } : {}) } as unknown as L3Reopen["impact"],
+      decision: { actor: "owner", command: "om-regate" } };
+    const expected = store.get(l3ReopenId(project))?.revision ?? 0;
+    const reopen: Ref = { id: l3ReopenId(project), revision: expected + 1, hash: hashJson(value as unknown as Json) };
+    const pass: RunRecord = { ...head.value, state: { phase: "regated", from: reference(head), reopen } };
+    // The heads the door read guard the one transaction: a frame, B1 or environment moved meanwhile refuses it whole.
+    const written = writeGuarded(store, { unit: UNIT, target: head.id, writes: [
+      { id: reopen.id, kind: L3_REOPEN_KIND, expected, value: value as unknown as Json },
+      { id: head.id, kind: RUN_KIND, expected: head.revision, value: pass as unknown as Json }],
+    guards: [frame, reference(inputHead), reference(environmentHead)] });
+    if (written.ok) return delivered({ state: "reopened" as const, run: written.value[1] as unknown as Revision<RunRecord>, frame, snapshot, findings,
+      reopen: written.value[0] as unknown as Revision<L3Reopen> });
+    // Two stores: the regate that won from this very completion is the answer; anything else is the refusal of this one.
+    const now = take(readRun(store, { project })) as Revision<RunRecord> | null, saved = standing();
+    if (now && now.value.state.phase !== "complete" && saved && same(saved.value.run, reference(head)))
+      return delivered({ state: "reopened" as const, run: now, frame, snapshot: saved.value.snapshot, findings: saved.value.findings, reopen: saved });
+    return { ok: false, refusal: written.refusal };
+  } catch (error) {
+    if (error instanceof RunFailure) return { ok: false, refusal: error.refusal };
+    throw error;
+  }
 }
 function settle(store: Store, head: Revision<RunRecord>, step: RunStep, outcome: Performed): RunAdvance {
   if ("wait" in outcome) return transition(store, head, { phase: "waiting", wait: outcome.wait }, { step, products: [], refusal: outcome.wait }, step, []);
@@ -684,6 +772,11 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
     if ("step" in next) return next;
     waits.push(next);
   }
+  // RL3 (№4217): the readiness questions of the owner's reopening are asked in B1 first, before the bases of its works.
+  if (!open.length) {
+    const asked = regateReadiness(store, project);
+    if (asked) return asked;
+  }
   const bases = machineBases(store, request, open);
   if ("step" in bases) return bases;
   if ("wait" in bases) {
@@ -703,6 +796,10 @@ function selectNext(store: Store, request: RunRequest, history: RunHistory): Nex
     const applied = applyStep(store, project, bases);
     if (applied) return applied;
   }
+  // RL3 (№4218): the policies the owner's reopening asked wait for the owner before any new work — their H2 answer is applied
+  // above; their explicit release gives them to the pass's ordinary OWN1. A repeat without either writes nothing.
+  const owner = regatePolicyWait(store, project);
+  if (owner) return owner;
   // 2. New work: the project mechanism M5:addressing first (№1737 п.2), then blocks strictly in M3 order.
   const m5 = bases.routes.value.batches.filter(isM5Batch).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const owners: [Owner, RouteBatch[]][] = m5.length ? [[{ owner: M5_OWNER }, [m5[0]!]]] : [];
@@ -772,8 +869,10 @@ function machineBases(store: Store, request: RunRequest, open: readonly Ref[]): 
  * inventory, the graph, the accepted frames and the research L2 — so a changed world is a new step, never a repeat
  * without effect; the heads of the attempts it was decided on guard its writes (№1860 п.5).
  */
+// RL3: the owner's reopening of the accepted works is one more root — D1 derives the reopened works' gaps from it.
 const rootIds = (project: string): string[] => [`om-input:${project}`, `graph:${project}`, `om-frame:${project}:2`, `om-frame:${project}:3`,
-  `phase:${project}:L2`, `repo-inventory:${project}`, ...["discovery", "concept", "operation-map", "specification", "features"].map(stage => `stage:${project}:${stage}`)];
+  `phase:${project}:L2`, `repo-inventory:${project}`, ...["discovery", "concept", "operation-map", "specification", "features"].map(stage => `stage:${project}:${stage}`),
+  l3ReopenId(project)];
 /** The roots the machine bases derive from, each at its head or — where the choice depends on its absence — as absent. */
 function rootGuards(store: Store, project: string): TransactionGuard[] {
   return rootIds(project).map(id => { const head = store.get(id); return head ? reference(head) : { id, absent: true as const }; });
@@ -877,7 +976,9 @@ function newWork(store: Store, request: RunRequest, bases: Bases, owner: Owner, 
   // A goal already achieved is done: on these exact routes nothing remains, and a new routes Ref alone never pays for
   // the same goal again (№1860 п.5, C52) — its results are delivered first; a gap it still does not close waits,
   // addressed to that result, instead of a new ordinal.
-  if (last && same(last.goal, goal) && last.outcome?.reason === "result") return samePlan(store, project, series, last.ordinal, bases) ? null
+  // RL3: a goal achieved before the owner reopened the works of these bases is no achievement of the reopened ones.
+  if (last && same(last.goal, goal) && last.outcome?.reason === "result" && !reopenedSince(store, project, series, last.ordinal, bases))
+    return samePlan(store, project, series, last.ordinal, bases) ? null
     : wait("goal_achieved", series.id, "goal", "This goal was achieved on earlier routes; its gaps remain open on the current ones without a proved new subject",
       [reference(series), bases.refs.routes], "neutral");
   const ordinal = (attempts.at(-1)?.ordinal ?? 0) + 1;
@@ -894,6 +995,95 @@ function samePlan(store: Store, project: string, series: Revision<AnyRepairSerie
   if (!series.value.attempts.some(attempt => attempt.ordinal === ordinal)) return true;
   const binding = take(readCompletionBinding(store, project, reference(series), ordinal));
   return binding === null || sameRef(binding.value.plan.routes, reference(bases.routes));
+}
+/** RL3: the reopening a works source of D1 stands on — the record its frame request names — or none. */
+function worksReopen(works: unknown): Ref | null {
+  const frame = object(works) && object(works.frame) ? works.frame : null;
+  return frame && object(frame.reopen) && isRef(frame.reopen.record) ? frame.reopen.record : null;
+}
+/**
+ * RL3: whether the owner reopened the works of these bases after this attempt was worked: its routes (read at the series
+ * that made it) stand on no reopening or on another one. An attempt without routes is of an earlier mode, before any.
+ */
+function reopenedSince(store: Store, project: string, series: Sealed<Revision<AnyRepairSeries>>, ordinal: number, bases: Bases): boolean {
+  const reopen = worksReopen(bases.routes.value.request.gaps.sources.works);
+  if (!reopen) return false;
+  const binding = take(readCompletionBinding(store, project, originOf(store, project, series, ordinal), ordinal));
+  if (!binding) return true;
+  const plan = take(readRoutes(store, { project, record: binding.value.plan.routes })).record as unknown as Revision<RoutesRecord>;
+  return !same(worksReopen(plan.value.request.gaps.sources.works), reopen);
+}
+/** RL3: the owner's reopening standing today on the accepted works frame, or none. */
+function standingReopen(store: Store, project: string): Revision<L3Reopen> | null {
+  const frame = store.get(`om-frame:${project}:3`);
+  return frame ? take(currentL3Reopen(store, project, reference(frame))) as Revision<L3Reopen> | null : null;
+}
+/** RL3 (№4217): the readiness step of the standing reopening — its door's transitions and policies not yet asked in B1. */
+function regateReadiness(store: Store, project: string): Choice | null {
+  const reopen = standingReopen(store, project);
+  if (!reopen) return null;
+  const pending = readinessPending(store, project, reference(reopen));
+  if (!pending.ok) return { wait: waitOf(pending.refusal, project) };
+  if (!pending.value) return null;
+  return step("readiness", { project, input: reference(store.get<OmInputRecord>(`om-input:${project}`)!), gate: reference(reopen) });
+}
+/**
+ * RL3 (№4218): the wait on the policies the standing reopening asked: each still open in B1 (an owner's H2 answer is applied
+ * before this is weighed), unless the owner released them to OWN1. Its state is the pass's own addressed wait.
+ */
+function regatePolicyWait(store: Store, project: string): Held | null {
+  const reopen = standingReopen(store, project);
+  if (!reopen) return null;
+  const input = store.get<OmInputRecord>(`om-input:${project}`)!;
+  const asked = input.value.input.questions.filter(question => question.readiness?.cause === "policy" && same(question.source, reference(reopen)));
+  if (!asked.length || regateRelease(store, project, reference(reopen))) return null;
+  return wait("regate_owner_policy", reopen.id, "policy", `The owner reopened the works of the accepted frame; the policies it asked wait for `
+    + `the owner's H2 answer or an explicit release to the pass: ${asked.map(question => question.id).join(", ")}`, [reference(reopen), reference(input)]);
+}
+/** RL3 (№4218): the owner's release of the policies a reopening asked, as om-continue writes it. */
+export interface RegateRelease {
+  readonly contract: "om-l3-release/v1"; readonly project: string; readonly reopen: Ref; readonly run: Ref;
+  readonly decision: { readonly actor: "owner"; readonly command: "om-continue"; readonly release: "regate_owner_policy" };
+}
+const releaseId = (project: string): string => `om-l3-release:${project}`;
+/** The saved release of exactly this reopening, read as a whole; another one's, or none, releases nothing here. */
+function regateRelease(store: Store, project: string, reopen: Ref): Revision<RegateRelease> | null {
+  const head = store.get(releaseId(project));
+  if (!head) return null;
+  const release = take(readRecord<RegateRelease>(store, reference(head), { unit: UNIT, target: head.id, id: releaseId(project), kind: "om-l3-release" })) as Revision<RegateRelease>;
+  const value = release.value as unknown;
+  if (!object(value) || Object.keys(value).length !== 5 || value.contract !== "om-l3-release/v1" || value.project !== project || !isRef(value.reopen)
+    || !isRef(value.run) || !same(value.decision, { actor: "owner", command: "om-continue", release: "regate_owner_policy" }))
+    fail("run_record_invalid", head.id, "release", "The owner's release lost a required field or holds a foreign one", reference(head));
+  return same(release.value.reopen, reopen) ? release : null;
+}
+/**
+ * RL3 (№4218): the owner's explicit release (om-continue) of the pass waiting on the policies their reopening asked: one record
+ * naming that reopening, written with the waiting pass as its guard; the pass then goes on by OWN1. A repeat is that record;
+ * a pass that does not wait on them is refused.
+ */
+export function releaseRegateWait(store: Store, request: { project: string }): RunResult<Sealed<Revision<RegateRelease>>> {
+  check(store instanceof Store && object(request) && isText(request.project) && Object.keys(request).length === 1,
+    "run_request_invalid", "A release names its project");
+  const project = request.project;
+  try {
+    const head = take(readRun(store, { project })) as Revision<RunRecord> | null;
+    if (!head) fail("record_missing", runId(project), "run", "A release lets a waiting pass go on; this project has none");
+    const reopen = standingReopen(store, project);
+    const saved = reopen ? regateRelease(store, project, reference(reopen)) : null;
+    if (saved) return delivered(saved);
+    const state = head.value.state;
+    if (!reopen || state.phase !== "waiting" || state.wait.code !== "regate_owner_policy")
+      fail("record_missing", head.id, "state.wait", "Only a pass waiting on the policies of the owner's reopening is released", reference(head));
+    const value: RegateRelease = { contract: "om-l3-release/v1", project, reopen: reference(reopen), run: reference(head),
+      decision: { actor: "owner", command: "om-continue", release: "regate_owner_policy" } };
+    const written = take(writeGuarded<RegateRelease>(store, { unit: UNIT, target: releaseId(project), writes: [{ id: releaseId(project),
+      kind: "om-l3-release", expected: store.get(releaseId(project))?.revision ?? 0, value: value as unknown as Json }], guards: [reference(head), reference(reopen)] }));
+    return delivered(written[0]! as unknown as Revision<RegateRelease>);
+  } catch (error) {
+    if (error instanceof RunFailure) return { ok: false, refusal: error.refusal };
+    throw error;
+  }
 }
 /** The series that made an attempt itself: this one, or the predecessor that carried it before the line moved on (№1995 п.5). */
 function originOf(store: Store, project: string, series: Sealed<Revision<AnyRepairSeries>>, ordinal: number): Ref {
@@ -1990,6 +2180,10 @@ function scopeAttempts(store: Store, project: string, scope: GapReadRequest): Me
 function completion(store: Store, request: RunRequest): Next | { complete: Ref[] } | null {
   const project = request.project, works = store.get(`om-frame:${project}:3`);
   if (!works) return null;
+  // RL3: a works frame the owner reopened never completes the pass; its reopened works are designed anew first.
+  const reopen = take(currentL3Reopen(store, project, reference(works))) as Revision<L3Reopen> | null;
+  if (reopen) return wait("frame_reopened", reopen.id, "works", `The owner reopened the works ${reopen.value.works.map(row => row.work).join(", ")}`
+    + " of this accepted frame; they are designed anew before the pass may complete", [reference(reopen)]);
   const layer = take(readAcceptedFrameLayer(store, { project, level: 3, frame: reference(works) }));
   const accepted = { graph: reference(layer.graph), layer: reference(layer.layer), frame: reference(layer.frame) };
   const saved = store.get<OmFeasibility>(`om-feasibility:${project}`);
