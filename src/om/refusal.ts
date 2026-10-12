@@ -61,9 +61,19 @@ export type Sealed<T> =
 export function sealed<T>(value: T): Sealed<T> {
   return seal(value, new Set<object>()) as Sealed<T>;
 }
-/** NR1 (№3600): the copies seal made — deeply frozen, checked once, never changing — handed on as they are when they are
- * delivered again, never checked and copied again. Only seal adds to it. */
-const sealedCopies = new WeakSet<object>();
+/**
+ * NR1 (№3600): a copy seal made — deeply frozen, checked once, never changing — is handed on as it is when it is delivered
+ * again, never checked and copied again. PF6 (№4262): it is known by a private brand stamped on it before it is frozen, not
+ * by a weak table of every copy: a WeakSet of each nested copy of each result took 6.1 million keys in one step of the live
+ * pass, and its ephemeron rehash held the main thread for minutes. A private field is no property — keys, JSON, hashes,
+ * spreads, clones and Reflect.ownKeys never see it — and only seal stamps it: another frozen object is no sealed copy.
+ */
+class SealedBase { constructor(copy: object) { return copy; } }
+class SealedCopy extends SealedBase {
+  #sealed = true;
+  static stamp<T extends object>(copy: T): T { return new SealedCopy(copy) as unknown as T; }
+  static has(value: object): boolean { return #sealed in value; }
+}
 
 // The accepted shapes are canonical()'s: a unit may only deliver finite, acyclic JSON.
 function seal(value: unknown, seen: Set<object>): unknown {
@@ -72,12 +82,12 @@ function seal(value: unknown, seen: Set<object>): unknown {
   if (typeof value !== "object" || seen.has(value)) {
     throw new EngineError("unsealable_value", "Only finite, acyclic JSON values can be delivered to a consumer");
   }
-  if (sealedCopies.has(value)) return value;
+  if (SealedCopy.has(value)) return value;
   seen.add(value);
   let copy: unknown;
   if (Array.isArray(value)) {
     if (Object.keys(value).length !== value.length) throw new EngineError("unsealable_value", "Sparse arrays cannot be delivered");
-    copy = Object.freeze(value.map(item => seal(item, seen)));
+    copy = Object.freeze(SealedCopy.stamp(value.map(item => seal(item, seen))));
   } else {
     if (![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
       throw new EngineError("unsealable_value", "Only plain objects can be delivered");
@@ -91,10 +101,9 @@ function seal(value: unknown, seen: Set<object>): unknown {
         enumerable: true, writable: true, configurable: true,
       });
     }
-    copy = Object.freeze(target);
+    copy = Object.freeze(SealedCopy.stamp(target));
   }
   seen.delete(value);
-  sealedCopies.add(copy as object);
   return copy;
 }
 
