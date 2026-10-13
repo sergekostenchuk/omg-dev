@@ -63,7 +63,7 @@ export function replaceFoundationCopies(value: unknown, body: Record<string, any
   for(const key of FOUNDATION_FIELDS) if(body[key] && typeof body[key]==='object' && JSON.stringify(body[key]).length>1024) known.set(hashJson(body[key]),`/body/${key}`);
   const visit=(v:any):any=>{
     if(v && typeof v==='object') {
-      if (store && isRef(v.source) && v.selector && Object.hasOwn(v,'value') && new Evidence(store).verify(v)) return v;
+      if (store && isRef(v.source) && v.selector && Object.hasOwn(v,'value') && new Evidence(store).verifyReading(v)) return v;
       if (store && isRef(v.ref) && v.ref.id.startsWith('source:') && typeof v.excerpt==='string') {
         const source=store.get<Source>(v.ref.id,v.ref.revision);
         if(source && source.hash===v.ref.hash && source.value.content.startsWith(v.excerpt))return v;

@@ -5,7 +5,6 @@ import { Evidence, sourceIsCurrent, type Source } from "../evidence/evidence.js"
 import { reference, type Ref } from "../pipeline/contracts.js";
 import { digest } from "../canonical.js";
 import { workspacePath, gitBytes } from "../runtime/environment.js";
-import { requireCondition } from "../errors.js";
 import type { ResearchTurn } from './research-model.js';
 import { projectResearchSearchObservation, projectSearchTurnCompletion, requireSearchQuery,
   type ResearchSearchProcess } from './research-consumer-transition.js';
@@ -36,8 +35,7 @@ export class ResearchSources {
     return new Evidence(this.store).file(this.project, key, this.root, path, media, old?.revision ?? 0);
   }
   excerpt(ref: Ref, start: number, end: number) {
-    requireCondition(end - start <= 50_000, "research_excerpt_limit", "Read a smaller source range");
-    return new Evidence(this.store).observe(this.project, ref, { kind: "text-range", start, end });
+    return new Evidence(this.store).readSource(this.project, ref, { start, end });
   }
   private searchFacts(query: string) {
     requireSearchQuery(query);

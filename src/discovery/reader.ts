@@ -3,12 +3,12 @@ import { realpathSync } from 'node:fs';
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import { Environments, uniqueTransactionGuards, workspacePath, type Environment } from "../runtime/environment.js";
 import { pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
-import { Evidence, sourceIsCurrent, type Source, type Observation } from "../evidence/evidence.js";
+import { Evidence, sourceIsCurrent, sourceReadRange, type SourceReadRange, type Source, type Observation } from "../evidence/evidence.js";
 import { ResearchSources } from "./research-sources.js";
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { prepareResearchConsumerIntent, prepareResearchConsumerApplication,
   findResearchConsumerIntent, listResearchConsumerIntentsByRoot, researchConsumerIntentId,
-  readResearchConsumerExecution, readResearchConsumerIntent, captureResearchConsumerRetryPermits,
+  readResearchConsumerExecution, readResearchConsumerIntent, readResearchConsumerTurn, captureResearchConsumerRetryPermits,
   resumeResearchConsumerExecution, refuseResearchConsumerIntent,
   type ResearchConsumerIntent, type ResearchConsumerIntentInput, type ResearchConsumerExecution } from "./response-recovery.js";
 import { canonical, digest, hashJson } from "../canonical.js";
@@ -22,14 +22,15 @@ import { projectPaidReaderResult, projectReaderSelection, readerDraftEquivalent 
 export type ReaderSelection = ({ source: Ref } | { sourceIndex: number }) & { firstLine: number; lastLine: number };
 export interface ReaderResult {
   /** New producer outputs name their derivation; absence is the historical reader era. */
-  contract?: 'reader-result/v2'; producer?: 'paid' | 'combined' | 'reused'; intent?: Ref;
+  contract?: 'reader-result/v2'; producer?: 'paid' | 'combined' | 'reused' | 'outside'; intent?: Ref;
   projectId: string; question: Ref; pilot: Ref; purpose: string; sources: Ref[];
   observations: Observation[]; unresolved: string[];
   coverage: Omit<ReaderSource, "lines">[];
   reusedFrom?: Ref[];
   parts?: Ref[];
+  request?: { inputs: BundleInput[]; rootSources: ReaderIntentCursor['sourceOrder']; child: number[]; consumer: ReaderConsumerBinding | null };
 }
-export interface ReaderSource { ref: Ref; totalChars: number; visibleRange: { start: number; end: number };
+export interface ReaderSource { reading?: SourceReadRange; ref: Ref; totalChars: number; visibleRange: { start: number; end: number };
   partial: boolean; lines: { line: number; start: number; end: number; text: string }[] }
 
 export function readerResultCurrent(store: Store, project: string, result: ReaderResult): boolean {
@@ -48,11 +49,11 @@ interface ReaderIntentCursor {
   rootKey: string;
   purpose: string;
   rootInputs: BundleInput[];
-  rootSourceOrder: { sourceIndex: number; source: Ref; window: { start: number; end: number } }[];
+  rootSourceOrder: { sourceIndex: number; source: Ref; window: { start: number; end: number }; reading?: SourceReadRange }[];
   inputs: BundleInput[];
   child: number[];
   consumer: ReaderConsumerBinding | null;
-  sourceOrder: { sourceIndex: number; source: Ref; window: { start: number; end: number } }[];
+  sourceOrder: { sourceIndex: number; source: Ref; window: { start: number; end: number }; reading?: SourceReadRange }[];
   reusedFrom: Ref[];
   covered: ReaderPrior['covered'];
   context: { role: "reader"; purpose: string; sources: (ReturnType<typeof readerSourcePacket> & { sourceIndex: number })[] };
@@ -100,6 +101,46 @@ export function numberedSource(source: Revision<Source>, range = { start: 0, end
     partial: range.start !== 0 || range.end !== source.value.content.length, lines };
 }
 
+/** New requests keep their requested range independently of the actual source window. */
+function requestedReaderSource(source: Revision<Source>, range = { start: 0, end: source.value.content.length }): ReaderSource {
+  const reading = sourceReadRange(source.value.content.length, range);
+  const supplied = numberedSource(source, reading.served ?? { start: reading.length, end: reading.length });
+  // Complete legacy windows already record both bounds and totalChars. Keep their reuse identity.
+  return reading.outcome === 'complete' ? supplied : { ...supplied, reading };
+}
+function restoreReaderSource(source: Revision<Source>, window: { start: number; end: number }, reading?: SourceReadRange): ReaderSource {
+  const supplied = numberedSource(source, window);
+  if (reading === undefined) return supplied;
+  requireCondition(reading && typeof reading === 'object' && !Array.isArray(reading),
+    'reader_intent_source_invalid', 'The saved read outcome must be an object');
+  const expected = sourceReadRange(source.value.content.length, reading.requested);
+  const served = expected.served ?? { start: expected.length, end: expected.length };
+  requireCondition(canonical(reading) === canonical(expected) && window.start >= served.start && window.end <= served.end,
+    'reader_intent_source_invalid', 'The actual window differs from its original read request');
+  return { ...supplied, reading: expected };
+}
+function outsideReaderNotices(sources: readonly ReaderSource[]): string[] {
+  return sources.filter(source => source.reading?.outcome === 'outside').map(source =>
+    `[${source.ref.id}@${source.ref.revision}] source_read_outside: requested ${source.reading!.requested.start}..${source.reading!.requested.end}; length ${source.totalChars} UTF-16`);
+}
+function requestedReaderOrder(store: Store, project: string, inputs: BundleInput[], root: ReaderSource[]) {
+  return inputs.map(input => {
+    const source = root.find(item => item.ref.id === savedReaderInputId(project, input));
+    const record = source && store.get<Source>(source.ref.id, source.ref.revision);
+    requireCondition(source && record?.kind === 'source' && ('source' in input
+      ? canonical(input.source) === canonical(source.ref)
+      : record.value.origin?.kind === 'file' && record.value.mediaType === input.media),
+      'reader_intent_source_invalid', 'The root source does not match its public request');
+    if (Object.hasOwn(input, 'range')) requireCondition(input.range && typeof input.range === 'object'
+      && Number.isSafeInteger(input.range.start) && Number.isSafeInteger(input.range.end)
+      && input.range.start >= 0 && input.range.end >= input.range.start,
+    'reader_intent_source_invalid', 'The saved requested range is incomplete');
+    const range = input.range ?? { start: 0, end: source.totalChars };
+    const expected = source.reading ? requestedReaderSource(record, range) : numberedSource(record, range);
+    return { source: source.ref, window: expected.visibleRange, ...(expected.reading ? { reading: expected.reading } : {}) };
+  });
+}
+
 /** Keep extraction offsets in the engine; the reader selects line numbers only.
  * Tuple columns are explicit, and every visible character remains in the packet. */
 export function readerSourcePacket(source: ReaderSource, covered:ReturnType<typeof reusableReaderRanges>['covered']=[]) {
@@ -134,7 +175,7 @@ function splitReaderSources(supplied: ReaderSource[], invalidCode: string): Read
 }
 
 function readerSourceOrder(supplied: ReaderSource[]): ReaderIntentCursor['sourceOrder'] {
-  return supplied.map((source, sourceIndex) => ({ sourceIndex, source: source.ref, window: source.visibleRange }));
+  return supplied.map((source, sourceIndex) => ({ sourceIndex, source: source.ref, window: source.visibleRange, ...(source.reading ? { reading: source.reading } : {}) }));
 }
 
 /** The model returns source coordinates only. The engine extracts original
@@ -196,9 +237,11 @@ function projectedReaderObservations(store: Store, project: string, supplied: Re
     }
   }
   const unique = [...new Map(observations.map(observation => [hashJson(observation), observation])).values()];
-  requireCondition(canonical({ observations: unique, unresolved: selected.response.unresolved }).length <= maxChars,
+  const outside = outsideReaderNotices(supplied);
+  const unresolved = outside.length ? [...new Set([...selected.response.unresolved, ...outside])] : selected.response.unresolved;
+  requireCondition(canonical({ observations: unique, unresolved }).length <= maxChars,
     "reader_output_limit", "Selected evidence exceeds the working-set allowance; use a narrower connected source bundle");
-  return { observations: unique, unresolved: selected.response.unresolved };
+  return { observations: unique, unresolved };
 }
 
 export function readerObservations(store: Store, project: string, supplied: ReaderSource[], response: unknown,
@@ -250,7 +293,7 @@ export function derivePaidReaderResult(store: Store, running: Revision<ResearchC
       && source.value.projectId === project && typeof source.value.content === 'string'
       && digest(source.value.content) === source.value.sha256,
     'reader_intent_output_invalid', 'The historical reader source bytes are missing');
-    return numberedSource(source, item.window);
+    return restoreReaderSource(source, item.window, item.reading);
   });
   const historicalPrior = savedReaderPrior(store, project, supplied, cursor, true);
   const projected = projectedReaderObservations(store, project, supplied, execution.payload,
@@ -302,8 +345,11 @@ export function readReaderResultAt(store: Store, project: string, ref: Ref): Rev
         || question.value.projectId !== project || pilot?.kind !== 'reader-pilot'
         || canonical(reference(pilot)) !== canonical(value.pilot) || pilot.value.projectId !== project)
         invalid('The exact question or pilot of the reader result is missing');
+      if (!value.sources.every(isRef) || !value.coverage.every(entry => entry && typeof entry === 'object'
+        && !Array.isArray(entry) && isRef(entry.ref) && entry.visibleRange && typeof entry.visibleRange === 'object'))
+        invalid('The source coverage has a missing reference or window');
       const sourceOrder = value.coverage.map((entry, sourceIndex) => ({
-        sourceIndex, source: entry.ref, window: entry.visibleRange
+        sourceIndex, source: entry.ref, window: entry.visibleRange, ...(entry.reading ? { reading: entry.reading } : {})
       }));
       const supplied = historicalReaderSources(store, project, sourceOrder);
       if (canonical(value.sources) !== canonical(supplied.map(source => source.ref))
@@ -359,6 +405,39 @@ export function readReaderResultAt(store: Store, project: string, ref: Ref): Rev
         return record; // The prior producer did not save an intent backlink.
       }
       if (value.contract !== 'reader-result/v2') invalid('The reader result has an unknown producer era');
+      if (value.producer === 'outside') {
+        const request = value.request;
+        if (Object.hasOwn(value, 'intent') || Object.hasOwn(value, 'parts') || Object.hasOwn(value, 'reusedFrom')
+          || !request || typeof request !== 'object' || Array.isArray(request)
+          || !Array.isArray(request.inputs) || !Array.isArray(request.rootSources) || !request.rootSources.length
+          || !Array.isArray(request.child)
+          || request.child.some(part => part !== 0 && part !== 1)
+          || !(request.consumer === null || request.consumer && isRef(request.consumer.run) && isRef(request.consumer.turn))
+          || !supplied.every(source => source.reading?.outcome === 'outside')
+          || value.observations.length !== 0
+          || canonical(value.unresolved) !== canonical(outsideReaderNotices(supplied)))
+          invalid('An outside result differs from its addressed source reads');
+        if (request.consumer) {
+          const run = store.get<{projectId: string; draftId: string}>(request.consumer.run.id, request.consumer.run.revision);
+          const turn = readResearchConsumerTurn(store, request.consumer.turn);
+          if (!run || run.kind !== 'research-run' || canonical(reference(run)) !== canonical(request.consumer.run)
+            || run.value.projectId !== project || turn.value.run !== run.id || turn.value.status !== 'pending'
+            || canonical(turn.value.question) !== canonical(value.question)
+            || turn.value.action?.action !== 'read_bundle' || turn.value.action.purpose !== value.purpose
+            || canonical(turn.value.action.inputs) !== canonical(request.inputs))
+            invalid('The outside result lost its exact consumer request');
+        }
+        const root = historicalReaderSources(store, project, request.rootSources);
+        const requested = requestedReaderOrder(store, project, request.inputs, root);
+        const unique = [...new Map(requested.map(item => [item.source.id, item])).values()];
+        if (!requested.every(item => canonical(unique.find(value => value.source.id === item.source.id)) === canonical(item))
+          || canonical(unique) !== canonical(request.rootSources.map(({ source, window, reading }) =>
+            ({ source, window, ...(reading ? { reading } : {}) })))
+          || canonical(supplied) !== canonical(expectedReaderChildSources(root, request.child)))
+          invalid('An outside result lost its original bundle request');
+        return record;
+      }
+      if (Object.hasOwn(value, 'request')) invalid('Only an outside result has an unpaid request proof');
       if (value.producer === 'paid') {
         if (!isRef(value.intent) || Object.hasOwn(value, 'parts')) invalid('A paid result lost its intent');
         const running = readResearchConsumerIntent(store, value.intent);
@@ -402,7 +481,7 @@ export function readReaderResultAt(store: Store, project: string, ref: Ref): Rev
         if (Object.hasOwn(value, 'parts') || !Array.isArray(value.reusedFrom)
           || value.reusedFrom.length === 0
           || new Set(value.reusedFrom.map(canonical)).size !== value.reusedFrom.length
-          || value.unresolved.length !== 0)
+          || canonical(value.unresolved) !== canonical(outsideReaderNotices(supplied)))
           invalid('A reused result needs exact distinct origins and no borrowed conclusion');
         const origins = value.reusedFrom.map(read);
         const overlaps = (observation: Observation) => supplied.some(source =>
@@ -450,6 +529,15 @@ export function readReaderResultAt(store: Store, project: string, ref: Ref): Rev
   return read(ref);
 }
 
+/** Scope uses only claimed project and question; all result fields need the
+ * exact producer proof before selection or current admission. */
+function readerResultsInScope(store: Store, project: string, question?: Ref): Revision<ReaderResult>[] {
+  return store.list<ReaderResult>('reader-result').filter(result => result.value
+    && typeof result.value === 'object' && !Array.isArray(result.value) && result.value.projectId === project
+    && (!question || !isRef(result.value.question) || result.value.question.id === question.id))
+    .map(result => readReaderResultAt(store, project, reference(result)));
+}
+
 function savedReaderInputId(project: string, input: BundleInput): string {
   requireCondition(input && typeof input === 'object',
     'reader_intent_source_invalid', 'The saved source input is missing');
@@ -479,7 +567,7 @@ function historicalReaderSources(store: Store, project: string,
       && item.window.start >= 0 && item.window.end >= item.window.start
       && item.window.end <= source.value.content.length,
     'reader_intent_source_invalid', 'The exact historical source bytes or window are missing');
-    return numberedSource(source, item.window);
+    return restoreReaderSource(source, item.window, item.reading);
   });
   requireCondition(new Set(supplied.map(source => source.ref.id)).size === supplied.length,
     'reader_intent_source_invalid', 'The saved source order contains ambiguous duplicate sources');
@@ -487,6 +575,9 @@ function historicalReaderSources(store: Store, project: string,
 }
 
 function expectedReaderChildSources(root: ReaderSource[], child: number[]): ReaderSource[] {
+  requireCondition(Array.isArray(root) && root.length > 0 && Array.isArray(child)
+    && child.every(part => part === 0 || part === 1),
+  'reader_intent_source_invalid', 'The reader child needs a source root and a binary position');
   let supplied = root;
   for (const part of child) supplied = splitReaderSources(supplied, 'reader_intent_source_invalid')[part]!;
   return supplied;
@@ -513,23 +604,10 @@ function readerCursor(store: Store, intent: Revision<ResearchConsumerIntent>, ro
     && canonical(intent.value.owner) === canonical(cursor.consumer?.turn ?? question),
     'reader_intent_cursor_invalid', 'The reader intent key does not bind its child position');
   const root = historicalReaderSources(store, intent.value.projectId, cursor.rootSourceOrder);
-  const byId = new Map(root.map(source => [source.ref.id, source]));
-  const requested = cursor.rootInputs.map(input => {
-    const source = byId.get(savedReaderInputId(intent.value.projectId, input));
-    const record = source && store.get<Source>(source.ref.id, source.ref.revision);
-    requireCondition(source && record?.kind === 'source' && ('source' in input
-      ? canonical(input.source) === canonical(source.ref)
-      : record.value.origin?.kind === 'file' && record.value.mediaType === input.media),
-    'reader_intent_source_invalid', 'The root source does not match its public request');
-    const range = input.range ?? { start: 0, end: source.totalChars };
-    requireCondition(Number.isSafeInteger(range.start) && Number.isSafeInteger(range.end)
-      && range.start >= 0 && range.end >= range.start && range.end <= source.totalChars,
-    'reader_intent_source_invalid', 'The original requested range is invalid');
-    return { source: source.ref, window: range };
-  });
+  const requested = requestedReaderOrder(store, intent.value.projectId, cursor.rootInputs, root);
   const unique = [...new Map(requested.map(item => [item.source.id, item])).values()];
   requireCondition(requested.every(item => canonical(unique.find(value => value.source.id === item.source.id)) === canonical(item))
-    && canonical(unique) === canonical(cursor.rootSourceOrder.map(({ source, window }) => ({ source, window })))
+    && canonical(unique) === canonical(cursor.rootSourceOrder.map(({ source, window, reading }) => ({ source, window, ...(reading ? { reading } : {}) })))
     && root.every(source => intent.value.basis.some(ref => canonical(ref) === canonical(source.ref))),
   'reader_intent_source_invalid', 'The root source order differs from its public request and saved basis');
   const expected = expectedReaderChildSources(root, cursor.child);
@@ -599,6 +677,19 @@ export function readerResumeStep(store: Store, project: string, question: Ref, p
   });
   const children = history.map(entry => entry.current);
   const base = { rootKey, key, lineage, history, children };
+  // Candidate selection may read the claimed scope only. Prove every candidate
+  // before inspecting its request, windows or child role; a damaged neighbour
+  // must refuse with its address rather than hide a saved result or send again.
+  const results = readerResultsInScope(store, project, question);
+  if (!children.length && child.length === 0) {
+    const outside = results.filter(result => result.value.producer === 'outside'
+      && canonical(result.value.question) === canonical(question) && result.value.purpose === purpose
+      && result.value.request!.child.length === 0
+      && canonical(result.value.request!.inputs) === canonical(rootInputs)
+      && canonical(result.value.request!.consumer) === canonical(consumer));
+    if (outside.length > 1) invalidReaderResult(reference(outside[1]!), 'One outside request has incompatible results');
+    if (outside[0]) return { ...base, kind: 'completed' as const, result: outside[0] };
+  }
   if (!children.length) return { ...base, kind: 'none' as const };
   const originalQuestion = children[0]!.value.question;
   requireCondition(canonical(originalQuestion) === canonical(question),
@@ -621,7 +712,6 @@ export function readerResumeStep(store: Store, project: string, question: Ref, p
       && canonical(result.value.sources) === canonical(sources.map(source => source.ref))
       && canonical(result.value.coverage) === canonical(sources.map(({ lines: _lines, ...entry }) => entry));
   };
-  const results = store.list<ReaderResult>('reader-result');
   const checked = (result: Revision<ReaderResult>) => readReaderResultAt(store, project, reference(result));
   const ownResult = (intent: Revision<ResearchConsumerIntent>) =>
     appliedReaderResult(store, project, originalQuestion, purpose, intent, rootKey, rootInputs);
@@ -751,7 +841,7 @@ function savedReaderSources(store: Store, project: string, cursor: ReaderIntentC
       && source.value.projectId === project && head && canonical(reference(head)) === canonical(item.source)
       && sourceIsCurrent(source.value),
     'reader_intent_source_stale', 'The paid reader source changed before its selection was applied');
-    return numberedSource(source, item.window);
+    return restoreReaderSource(source, item.window, item.reading);
   });
   requireCondition(new Set(supplied.map(source => source.ref.id)).size === supplied.length,
     'reader_intent_source_invalid', 'The saved source order contains ambiguous duplicate sources');
@@ -1000,26 +1090,30 @@ async function readBundlePart(store: Store, environment: Environment, pilot: Rev
     requireCondition(source, "source_stale", "The requested source version is unavailable or changed");
     return source;
   });
-  const windows = captured.map((source, index) => numberedSource(source, inputs[index]!.range));
+  const expectedSources = rootSources ? expectedReaderChildSources(rootSources, child) : null;
+  const windows = captured.map((source, index) => expectedSources
+    ? restoreReaderSource(source, inputs[index]!.range!, expectedSources[index]!.reading)
+    : requestedReaderSource(source, inputs[index]!.range));
   for (const window of windows) requireCondition(windows.every(other => other.ref.id !== window.ref.id
-    || canonical(other.visibleRange) === canonical(window.visibleRange)), "reader_range_ambiguous", "Use one unambiguous window per source in a bundle");
+    || canonical([other.visibleRange, other.reading ?? null]) === canonical([window.visibleRange, window.reading ?? null])),
+    "reader_range_ambiguous", "Use one unambiguous requested window per source in a bundle");
   const unique = [...new Map(captured.map(source => [source.id, source])).values()];
   const supplied = [...new Map(windows.map(source => [source.ref.id, source])).values()];
   const rootSupplied = rootSources ?? supplied;
   if (rootSources) requireCondition(
     canonical(readerSourceOrder(supplied)) === canonical(readerSourceOrder(expectedReaderChildSources(rootSources, child))),
     'reader_intent_source_invalid', 'The child source changed since its root bundle was captured');
-  const checkedResults = store.list<ReaderResult>('reader-result')
-    .filter(result => result.value.projectId === environment.projectId)
-    .map(result => readReaderResultAt(store, environment.projectId, reference(result)));
+  const checkedResults = readerResultsInScope(store, environment.projectId);
   const reused = checkedResults.find(result => canonical(result.value.question) === canonical(question)
     && result.value.purpose === purpose && readerResultCurrent(store, environment.projectId, result.value)
     && canonical(result.value.coverage) === canonical(supplied.map(({lines:_lines,...coverage})=>coverage)));
   if (reused && !previous) return reused;
   const save=(extracted:{observations:Observation[];unresolved:string[]},metadata:{reusedFrom?:Ref[];parts?:Ref[]}={})=>{
     const value:ReaderResult={projectId:environment.projectId,question,pilot:reference(pilot),purpose,sources:unique.map(reference),
-      contract:'reader-result/v2',producer:metadata.parts?'combined':'reused',
-      coverage:supplied.map(({lines:_lines,...coverage})=>coverage),...extracted,...metadata};
+      contract:'reader-result/v2',producer:metadata.parts?'combined':supplied.every(source => source.reading?.outcome === 'outside')?'outside':'reused',
+      coverage:supplied.map(({lines:_lines,...coverage})=>coverage),...extracted,...metadata,
+      ...(supplied.every(source => source.reading?.outcome === 'outside') ? {
+        request: { inputs: rootInputs, rootSources: readerSourceOrder(rootSupplied), child, consumer } } : {}) };
     const id=`reader-result:v2:${hashJson(value)}`;
     const record = store.get<ReaderResult>(id)??store.writeMany<ReaderResult>([{id,kind:'reader-result',expected:0,value}],
       [question,reference(draft),reference(pilot),...(consumer?[consumer.turn]:[]),
@@ -1027,6 +1121,8 @@ async function readBundlePart(store: Store, environment: Environment, pilot: Rev
         {id:researchConsumerIntentId(environment.projectId,'reader',key),absent:true}])[0]!;
     return readReaderResultAt(store,environment.projectId,reference(record));
   };
+  if (supplied.every(source => source.reading?.outcome === 'outside'))
+    return save({ observations: [], unresolved: outsideReaderNotices(supplied) });
   const prior=reusableReaderRanges(store,environment.projectId,supplied);
   const savedDescendant = lineage.some(path => path.length > child.length &&
     child.every((part, index) => path[index] === part));

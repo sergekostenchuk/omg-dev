@@ -10,7 +10,7 @@ import { Discovery, type Decision, type DiscoveryDraft, type Question } from "./
 import type { ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
-  projectResearchTurnRevision, projectPaidLocalRefusal, projectRepeatedContextRead,
+  projectResearchTurnRevision, projectSourceReadingTurn, projectPaidLocalRefusal, projectRepeatedContextRead,
   projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES,
   projectSynthesisHandoffTurn, acceptanceEraOf, acceptanceBindingId,
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
@@ -25,7 +25,7 @@ import { captureResearchConsumerRetryPermits, findResearchConsumerIntent, listRe
   type ManagedProposalRefusal,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { ResearchSources } from "./research-sources.js";
-import type { Source } from "../evidence/evidence.js";
+import { SOURCE_READ_CONTRACT, type Source } from "../evidence/evidence.js";
 import { assessAnswer, readResearchAssessmentAt } from "./research-assessment.js";
 import { readAssessmentPaidOrigin, paidAssessmentTerminal } from "./assessment-session.js";
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
@@ -842,7 +842,7 @@ export class Researcher {
             const source = this.store.get<Source>(action.source.id, action.source.revision);
             requireCondition(source && canonical(reference(source)) === canonical(action.source),
               'research_consumer_intent_invalid', 'The paid excerpt lost its exact source');
-            turnProof = { kind: 'source-excerpt', projectId: project,
+            turnProof = { kind: 'source-excerpt', readContract: SOURCE_READ_CONTRACT, projectId: project,
               source: { ref: reference(source), value: source.value } };
           }
           else if (action.action === "pause") stop = { status: "paused", error: action.reason };
@@ -990,6 +990,7 @@ export class Researcher {
         }
         const completedTurn = { id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,
           value: capturedSearch ? capturedSearch.turn
+            : turnProof?.kind === 'source-excerpt' ? projectSourceReadingTurn(pendingTurn.value, project, turnProof.source)
             : turnProof && (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
             ? projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, turnProof)
             : { ...pendingTurn.value, status: "completed" as const, assessment, observation, error } };
@@ -1013,6 +1014,8 @@ export class Researcher {
         } else if (turnProof?.kind === 'accepted-answer' && turnProof.binding) {
           this.completeAcceptedTurn(pendingTurn, completedTurn.value as ManagedResearchTurn,
             [turnProof.binding.ref], owner);
+        } else if (turnProof?.kind === 'source-excerpt') {
+          this.store.writeMany([completedTurn], [reference(pendingTurn), turnProof.source.ref]);
         } else this.store.write<ResearchTurn>(completedTurn);
         // C32: the derived reading is retained only after its completed turn
         // is durable; a crash between the two is repaired from the turn on

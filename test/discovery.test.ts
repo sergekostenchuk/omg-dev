@@ -1,3 +1,4 @@
+import { replaceFoundationCopies } from '../src/discovery/continuation-packet.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -600,3 +601,41 @@ test("D8.4.2-2 P2-3 (â„–2276-3): a rebound proves its source chain to the end â€
   assert.equal(proven.assessment?.id, lawfulAssessment.id);
 });
 
+
+
+test('RS1 source reads clip requests and report addressed outside, while citations remain strict', t => {
+  const { discovery } = fixture(t), evidence = discovery.evidence;
+  const source = evidence.document('p', 'hx1', 'x'.repeat(137), 'text/plain', 0), ref = reference(source);
+  for (const [start, end, outcome, served] of [
+    [0, 200, 'clipped', { start: 0, end: 137 }], [2, 10, 'complete', { start: 2, end: 10 }],
+    [137, 200, 'outside', null], [200, 300, 'outside', null],
+  ] as const) {
+    const result = evidence.readSource('p', ref, { start, end });
+    assert.deepEqual([result.outcome, result.served, result.length, result.requested], [outcome, served, 137, { start, end }]);
+    assert.equal(evidence.verifyReading(result), true);
+    assert.equal(evidence.verifyReading({ ...result, length: 200 }), false);
+    assert.equal(evidence.verifyReading({ ...result, value: 'invented' }), false);
+    assert.equal(evidence.verifyReading({ ...result, contract: 'unknown' }), false);
+    assert.equal(evidence.verifyReading({ ...result, served: undefined }), false);
+    if (served) assert.equal(evidence.verify({ projectId: 'p', source: ref, selector: { kind: 'text-range', ...served }, value: result.value }), true);
+  }
+  assert.throws(() => evidence.observe('p', ref, { kind: 'text-range', start: 0, end: 200 }), code('selector_invalid'));
+  for (const requested of [undefined as never, { start: -1, end: 10 }, { start: 2, end: 1 }, { start: 0, end: 0 }, { start: 0.5, end: 1 }])
+    assert.throws(() => evidence.readSource('p', ref, requested), code('selector_invalid'));
+  const empty = evidence.document('p', 'empty', '', 'text/plain', 0);
+  assert.equal(evidence.readSource('p', reference(empty), { start: 0, end: 10 }).outcome, 'outside');
+  assert.throws(() => evidence.readSource('foreign', ref, { start: 0, end: 1 }), code('source_missing'));
+  evidence.document('p', 'hx1', 'changed', 'text/plain', 1);
+  assert.throws(() => evidence.readSource('p', ref, { start: 0, end: 200 }), code('source_stale'));
+});
+
+
+test('RS1 continuation preserves both legacy observations and new read bytes equal to serialized foundation', t => {
+  const { store, discovery } = fixture(t);
+  const foundation = { long: 'foundation-data'.repeat(200) }, text = JSON.stringify(foundation);
+  const source = discovery.evidence.document('p', 'foundation', text, 'text/plain', 0), ref = reference(source);
+  const old = discovery.evidence.observe('p', ref, { kind: 'text-range', start: 0, end: text.length });
+  const current = discovery.evidence.readSource('p', ref, { start: 0, end: text.length + 100 });
+  for (const reading of [old, current]) assert.deepEqual(
+    replaceFoundationCopies({ reading }, { core: foundation }, ref, store), { reading });
+});

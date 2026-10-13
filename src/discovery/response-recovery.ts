@@ -26,7 +26,7 @@ import { contextWorkspace } from './context-workspace.js';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { reference, isRef, uniqueRefs, type Ref, type Finding } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
-import { Evidence, type Source, type Observation, type Selector } from '../evidence/evidence.js';
+import { Evidence, SOURCE_READ_CONTRACT, type Source, type Observation, type Selector } from '../evidence/evidence.js';
 import { processStart } from '../runtime/process-identity.js';
 import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executionOf } from './model-call-recovery.js';
 import { isResearchPreview } from './research-preview.js';
@@ -35,7 +35,7 @@ import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalR
   projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
   projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
-  projectAddressedWorkspace, projectResearchTurnRevision, isCorrectableLayerDesignFailure,
+  projectAddressedWorkspace, projectResearchTurnRevision, projectSourceReadingTurn, isCorrectableLayerDesignFailure,
   managedTurnId, matchAcceptedPaidAnswer, ACTION_RESPONSE_REFUSAL_CODES,
   acceptanceBindingId, acceptanceEraOf, projectAcceptanceBinding,
   ACCEPTANCE_BINDING_CONTRACT, ACCEPTANCE_BINDING_FIELDS,
@@ -879,6 +879,8 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
       || typeof source.value.content !== 'string' || digest(source.value.content) !== source.value.sha256)
       consumerInvalid(before.id, 'The paid source action lost its exact source bytes');
     return { kind: action.action === 'read' ? 'source-read' : 'source-excerpt',
+      ...(action.action === 'read_source' && Object.hasOwn(after.value.observation ?? {}, 'contract')
+        ? { readContract: after.value.observation.contract } : {}),
       projectId: producer.value.projectId, source: { ref: reference(source), value: source.value } };
   }
   if (action.action === 'read_plan' && after.value.status === 'completed' && after.value.error === null) {
@@ -1050,6 +1052,27 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
       || Object.hasOwn(saved.value, 'consumerIntent') || Object.hasOwn(saved.value, 'acceptanceContract')
       || Object.hasOwn(saved.value, 'acceptanceBinding'))
       consumerInvalid(saved.id, 'A legacy turn address cannot claim a new consumer producer');
+    if (saved.value.action?.action === 'read_source' && object(saved.value.observation)
+      && Object.hasOwn(saved.value.observation, 'contract')) {
+      const before = store.get<Record<string, any>>(saved.id, saved.revision - 1);
+      const sourceRef = saved.value.action.source;
+      const source = isRef(sourceRef) ? store.get<Source>(sourceRef.id, sourceRef.revision) : null;
+      const run = before && typeof before.value.run === 'string' ? store.get<{projectId: string}>(before.value.run, 1) : null;
+      if (saved.value.observation.contract !== SOURCE_READ_CONTRACT || !before
+        || before.kind !== 'research-turn' || hashJson(before.value) !== before.hash
+        || !run || run.kind !== 'research-run' || hashJson(run.value) !== run.hash
+        || !source || source.kind !== 'source' || canonical(reference(source)) !== canonical(sourceRef))
+        consumerInvalid(saved.id, 'The queued source read lost its exact pending action and source');
+      const parent = managedSearchParent(store, before);
+      if (isRef(before.value.plannedBy) && !parent)
+        consumerInvalid(saved.id, 'The source read lost its exact parent queue');
+      if (parent) readResearchConsumerTurn(store, reference(parent.queued));
+      try {
+        const expected = projectSourceReadingTurn(before.value as ResearchTurn, run.value.projectId,
+          { ref: reference(source), value: source.value });
+        if (canonical(expected) !== canonical(saved.value)) consumerInvalid(saved.id, 'The queued read differs from its exact source result');
+      } catch { consumerInvalid(saved.id, 'The queued source read cannot be derived from its original bytes'); }
+    }
     if (saved.revision > 1 && saved.value.status === 'completed') {
       const first = store.get<Record<string, any>>(saved.id, 1);
       if (first && researchAction(first.value.action).action === 'search') {

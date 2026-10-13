@@ -149,7 +149,7 @@ export function pilotContext(store: Store, draft: Revision<DiscoveryDraft>, ques
     .filter(record => record.value.projectId === project && record.value.question === question.id);
   const currentRead = (record: typeof directReadings[number]) => {
     const { action, observation } = record.value;
-    if (action.action === "read_source") return evidence.verify(observation as Observation);
+    if (action.action === "read_source") return evidence.verifyReading(observation);
     if (action.action === "read") return sourceCurrent(observation.ref);
     if (action.action === "read_context") {
       if(isRef(observation.record)&&isReaderResultRef(observation.record)){

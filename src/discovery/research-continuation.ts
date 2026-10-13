@@ -73,7 +73,7 @@ export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], quest
     }
     const evidence = new Evidence(store);
     if (action === "read_bundle" && !observation.observations.every((o: any) => evidence.verify(o))) return null;
-    if (action === "read_source" && !evidence.verify(observation)) return null;
+    if (action === "read_source" && !evidence.verifyReading(observation)) return null;
     if (action === "read" && (!reader || canonical(reference(reader)) !== canonical(observation.ref) || !sourceIsCurrent(reader.value))) return null;
     if (action === "read_context") {
       if (isRef(observation.record) && isReaderResultRef(observation.record)) {
