@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 162. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → AT3b → AT4 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 163. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → AT3b → AT4 → RS1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 80.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 81.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2093,6 +2093,26 @@
   - реализация Devin с признаком: contract_unexecutable с адресом принимается
   - один полный прогон и ревью
 
+### RS1 · Запрос чтения за концом источника усекается по концу с указанием длины, а не отвергает весь ответ модели (наблюдение №57); проверка цитат-доказательств не ослабляется
+
+**Цель.** Класс «законный по схеме запрос модели отвергается целиком»: read_source с end больше длины источника (HX1 13.10: Devin 0–200 при 137 знаках; omg-live 03.10: 0–30000 при 5504) даёт selector_invalid «Text evidence needs a valid nonempty range» (evidence.ts:68–70, research-consumer-transition.ts:291) и останавливает стадию. Ремонт: во ВСЕХ местах, где исполняется запрос чтения модели (research-continuation, pilot-context, OM-доставки чтений и др. — опись мест до кода), диапазон запроса усекается до длины источника, длина источника сообщается в выдаче; start за концом — типизированный адресный отказ этого чтения, а не всего ответа. Цитаты-доказательства в ответах (evidence.verify для answer/citation) — прежняя строгая проверка. Сохранённый ответ, остановленный этим отказом, после ремонта применяется штатным восстановлением без нового платного вызова.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: запрос чтения модели; сохранённый источник
+- Пишет записи: выдача чтения (усечённый диапазон и длина)
+- Разрешённые пути: `src/evidence/evidence.ts`, `src/discovery/research-continuation.ts`, `src/discovery/pilot-context.ts`, `src/discovery/research-consumer-transition.ts`, `test/research.test.ts`, `test/discovery.test.ts`
+- Из движка как есть: №57; LP1; LP3
+- После: RL3
+- Тесты сверх обязательных:
+  - read_source с end за концом — выдача усечённого диапазона и длины источника, стадия продолжается
+  - start за концом — адресный отказ одного чтения, остальные чтения ответа выдаются
+  - цитата-доказательство за концом в ответе — прежний selector_invalid / answer_unconfirmed
+  - сохранённый ответ HX1 (model-response:f6e1bc7f…) на копии применяется после ремонта без нового вызова
+  - один полный прогон и ревью
+
 ### AT3b · Маршрут дефекта плана в OM: один публичный repair-plan с ветвью OM → запись дефекта → пробел D1 над принятым L3 → пакет исправления работы → redefine → G5 → settle → явное возобновление завершённого прохода → M8 → compile
 
 **Цель.** Вход ремонта — идемпотентная запись точного дефекта и основания ремонта, без переписывания старого task-run; ветвь OM передаёт работу штатному проходу с его управлением, бюджетом и остановкой; maxTurns не превращается молча в бесплатные шаги. D1: класс пробела «дефект плана» над принятым кадром → модель, находка в брифе; настоящее решение H2 имеет приоритет и входит в новый контракт со своей точной ссылкой; EX6 не копируется как самостоятельная истина. Неизменённые принятые работы сохраняются. Противоречие явному требованию верхнего слоя — адрес к владельцу этого требования, не правка нижнего. Ошибочная жалоба — исход с объяснением и возвратом к исправлению кода, без бесконечного переоткрытия того же пробела. G5 проверяет новый контракт, а не превращает жалобу в факт. Явный переход возобновления по точному дефекту и прежнему complete (сейчас run.ts:422 и startRun возвращают завершённый проход); обычное продолжение завершённого прохода — прежнее поведение. Эра: различимая форма источника дефекта и перехода ремонта; для кадра — ссылки на дефект через основание, если контракт C5 не меняется; от старых кадров не требовать, их принятие не пересчитывать. Кандидат и расход — AT4.
@@ -2148,7 +2168,7 @@
 - Пишет записи: пакет ядра
 - Разрешённые пути: `package.json`, `tsconfig.json`, `scripts/check-backend.mjs`, `test/fixtures/core1-records.ts`, `test/assessment-session-resume.test.ts`, `test/discovery.test.ts`, `test/execution-external-input.test.ts`, `test/om-accepted-answer.test.ts`, `test/om-achievements.test.ts`, `test/om-addressing.test.ts`, `test/om-answers-gate.test.ts`, `test/om-call-record.test.ts`, `test/om-compiler-readers.test.ts`, `test/om-composite-keys.test.ts`, `test/om-feasibility-boundary.test.ts`, `test/om-feasibility-projection.test.ts`, `test/om-feasibility.test.ts`, `test/om-frame-accept.test.ts`, `test/om-frame-candidate.test.ts`, `test/om-gap-lines.test.ts`, `test/om-gaps.test.ts`, `test/om-legacy-operation-lock.test.ts`, `test/om-legacy-route-closure.test.ts`, `test/om-model-call.test.ts`, `test/om-operation-cost.test.ts`, `test/om-probe.test.ts`, `test/om-question-packet.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-repeat-gate.test.ts`, `test/om-result-identity.test.ts`, `test/om-routes.test.ts`, `test/om-run.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/om-series-current.test.ts`, `test/om-series.test.ts`, `test/om-task-context.test.ts`, `test/om-task-neighbors.test.ts`, `test/om-work-zone.test.ts`, `test/preparation.test.ts`, `test/reader-pilot.test.ts`, `test/research-call-resume.test.ts`, `test/runtime-absence-r3.test.ts`, `test/runtime-absence-research.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1
+- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1
 - Тесты сверх обязательных:
   - ЧАСТЬ А (слово пользователя ~22:10 «тест смотрит только актуальную версию»; вопрос Opus-1 №3686, разрешение оркестратора): 41 файл тестов, запускающих старый движок из git, и один модуль образцов test/fixtures/core1-records.ts — формат не в живой базе → сценарий удалить; формат в живой базе → образец из снимка 1554, читает нынешний код; проверки нового не трогать
   - ДО КОДА части Б — опись легаси и список удаляемого показать пользователю; удалять после его «да»
