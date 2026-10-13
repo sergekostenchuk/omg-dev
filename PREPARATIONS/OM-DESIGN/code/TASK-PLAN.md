@@ -2168,8 +2168,8 @@
 - Отдаёт: —
 - Читает записи: сохранённое основание и текущая запись контекста; FieldSpec выбранного вопроса; действующая инструкция роли
 - Пишет записи: транспортная проекция брифа initial и continuation
-- Разрешённые пути: `src/discovery/continuation-packet.ts`, `src/discovery/working-context.ts`, `src/discovery/research-protocol.ts`, `src/discovery/planning-context.ts`, `test/continuation-packet.test.ts`, `test/research-preview.test.ts`, `test/early-stage-briefs.test.ts`
-- Из движка как есть: №4417; №4425; RB1; MP1
+- Разрешённые пути: `src/discovery/continuation-packet.ts`, `src/discovery/working-context.ts`, `src/discovery/research-protocol.ts`, `src/discovery/planning-context.ts`, `test/continuation-packet.test.ts`, `test/research-preview.test.ts`, `test/early-stage-briefs.test.ts`, `test/conclusion-consolidation.test.ts`
+- Из движка как есть: №4417; №4425; №4436; RB1; MP1
 - После: RS2
 - Тесты сверх обязательных:
   - настоящие initial и continuation пяти ранних стадий (15 FieldSpec), question и questions, через штатных производителей (analyst, assessor, reading-planner, escalation-assessor, reader, synthesis) с бесплатным адаптером, а не прямой вызов helper; R0 без pilot (research-runner.ts:192)
