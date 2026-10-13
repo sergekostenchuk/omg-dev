@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 168. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → AT3b → AT4 → RS1 → RS2 → RS3 → RS4 → RS5 → DS1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 168. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → AT3b → AT4 → RS5 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -2210,8 +2210,8 @@
 - Отдаёт: —
 - Читает записи: исходное поручение; принятые ответы Discovery этой версии; импортированные документы исследования
 - Пишет записи: план исследования; отчёт исследования; вердикт Discovery; исход Discovery для перехода к концепции
-- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/requirements.ts`, `src/discovery/discovery-outcome.ts`, `src/discovery/research-runner.ts`, `src/product/stage-research.ts`, `src/product/stage-checks.ts`, `src/discovery/working-context.ts`, `src/discovery/research-assessment.ts`, `src/om/input.ts`, `test/research.test.ts`, `test/early-stage-briefs.test.ts`, `test/stage-research.test.ts`, `test/stage-checks.test.ts`, `test/om-input.test.ts`, `test/preparation-fixture.ts`, `test/product-fixture.ts`, `test/product.test.ts`, `test/preparation.test.ts`, `src/discovery/research-reuse.ts`
-- Из движка как есть: №4458; №4460; №4463; №4480; №4489; №4491; discovery-as-need-router
+- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/requirements.ts`, `src/discovery/discovery-outcome.ts`, `src/discovery/research-runner.ts`, `src/product/stage-research.ts`, `src/product/stage-checks.ts`, `src/discovery/working-context.ts`, `src/discovery/research-assessment.ts`, `src/om/input.ts`, `test/research.test.ts`, `test/early-stage-briefs.test.ts`, `test/stage-research.test.ts`, `test/stage-checks.test.ts`, `test/om-input.test.ts`, `test/preparation-fixture.ts`, `test/product-fixture.ts`, `test/product.test.ts`, `test/preparation.test.ts`, `src/discovery/research-reuse.ts`, `src/om/gaps.ts`
+- Из движка как есть: №4458; №4460; №4463; №4480; №4489; №4491; №4498; discovery-as-need-router
 - После: RS4, RS3
 - Тесты сверх обязательных:
   - три предметных примера владельца (харнесс, шина светильников, левитирующая тумбочка): разные планы проходят до отчёта и оценщика; план без источников — отказ формы; роль не захардкожена
@@ -2234,7 +2234,7 @@
 - Пишет записи: запись дефекта плана; правка принятого L3; новый план
 - Разрешённые пути: `src/om/plan-defect.ts`, `src/om/gaps.ts`, `src/om/run.ts`, `src/om/question-packet.ts`, `src/om/packet-brief.ts`, `src/om/frame-accept.ts`, `src/om/feasibility.ts`, `src/compiler/compiler.ts`, `src/product/repairs.ts`, `test/om-run.test.ts`, `test/om-gaps.test.ts`, `test/om-question-packet.test.ts`, `test/om-packet-brief.test.ts`, `test/om-frame-accept.test.ts`, `test/om-feasibility.test.ts`, `test/compiler.test.ts`, `test/repair.test.ts`
 - Из движка как есть: №4119; №4125; №4084
-- После: AT1, AT3a, RL3, PF5, RB1
+- После: AT1, AT3a, RL3, PF5, RB1, DS1
 - Тесты сверх обязательных:
   - сквозная регрессия: отменённое ожидание → адресная находка → дефект → новая работа с update product.test.ts → G5 → M8 → новый план
   - повтор входа ремонта по тому же дефекту — та же запись, без второго прохода и второго расхода
