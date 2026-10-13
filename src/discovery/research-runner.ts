@@ -15,7 +15,7 @@ import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectSynthesisHandoffTurn, acceptanceEraOf, acceptanceBindingId,
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
   type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
-import { captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents,
+import { captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
   prepareResearchConsumerIntent, readResearchConsumerIntent,
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
@@ -207,13 +207,16 @@ export class Researcher {
       && intent.value.cursor.delivery.run === id && Number.isSafeInteger(intent.value.cursor.delivery.turn)
       && intent.value.cursor.delivery.turn > 0
       && !this.store.get(paidTurnId(id, intent.value.cursor.delivery.turn)));
-    const refusedSynthesis = intents.filter(intent => intent.value.state === "refused"
+    const settledSynthesis = intents.filter(intent => intent.value.state === "refused"
       && (intent.value.kind === "synthesis" || intent.value.kind === "consolidation")
       && intent.value.cursor.delivery && typeof intent.value.cursor.delivery === "object"
       && intent.value.cursor.delivery.run === id && Number.isSafeInteger(intent.value.cursor.delivery.turn)
       && intent.value.cursor.delivery.turn > 0
       && !this.store.get(paidTurnId(id, intent.value.cursor.delivery.turn))
       && findResearchConsumerIntent(this.store, project, intent.value.kind, intent.value.key)?.id === intent.id);
+    // RS3 (№4414): only a provider failure without a response is answered by another generation; any other saved refusal
+    // of the step is its outcome, restored below — never prepared again under a new run revision.
+    const refusedSynthesis = settledSynthesis.filter(intent => retryableResearchConsumerRefusal(this.store, intent));
     requireCondition(refusedSynthesis.every(intent => retryPermits.some(permit => canonical(permit) === canonical(reference(intent)))),
       "research_consumer_retry_permit_missing", "A failed synthesis cannot be retried inside the invocation that proved its failure");
     const unhandedReader = intents.filter(intent => intent.value.state === "applied" && intent.value.kind === "reader"
@@ -248,10 +251,12 @@ export class Researcher {
     let run = this.store.get<ResearchRun>(id);
     requireCondition(run?.value.status !== "running" || processStart(run.value.owner.pid) !== run.value.owner.started,
       "research_busy", "This draft already has an active researcher");
-    const refusedAction = intents.filter(intent => intent.value.state === "refused"
-      && intent.value.refusal?.kind === "consumer-invalid"
+    const refusedAction = [...intents.filter(intent => intent.value.state === "refused"
       && ["analyst", "reading-planner", "escalation-assessor"].includes(intent.value.kind)
-      && intent.value.cursor.run === id);
+      && intent.value.cursor.run === id
+      && findResearchConsumerIntent(this.store, project, intent.value.kind, intent.value.key)?.id === intent.id
+      && !retryableResearchConsumerRefusal(this.store, intent)),
+      ...settledSynthesis.filter(intent => !retryableResearchConsumerRefusal(this.store, intent))];
     requireCondition(refusedAction.length <= 1, "research_consumer_intent_invalid",
       "Several paid operations claim a terminal refusal for this run");
     if (refusedAction.length === 1) {

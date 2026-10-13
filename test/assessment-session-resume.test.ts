@@ -1637,14 +1637,17 @@ test('an empty-provider failure missing its mandatory raw response record is not
   assert.equal(usage.measuredCalls, 0); assert.equal(usage.unmeasuredCalls, 1); assert.equal(usage.reportedTokens, null);
 });
 
-for (const defect of ['foreign-request', 'missing-research'] as const) {
+// RS3 (№4426): a bare envelope of its own request is a failure without a response only under the adapter's structured
+// provider_failed / provider_empty line (below); without that line, or under adapter_failed, the model may have answered.
+for (const defect of ['foreign-request', 'missing-research', 'missing-research-adapter-failed'] as const) {
   test(`a real failed provider with ${defect} envelope cannot disguise its output as an empty retryable failure`, async t => {
     const f = resumeFixture(t);
     writeFileSync(f.environment.value.reviewer.command.args[0]!, `import{readFileSync,appendFileSync}from'node:fs';
 const request=JSON.parse(readFileSync(0,'utf8'));
 appendFileSync(${JSON.stringify(join(f.root, 'wire.ndjson'))},JSON.stringify(request)+'\\n');
 const envelope={protocol:request.protocol,requestId:${JSON.stringify(defect)}==='foreign-request'?'another-request':request.requestId,
-...(${JSON.stringify(defect)}==='missing-research'?{}:{research:{verdict:'supported',reasons:[]}})};
+...(${JSON.stringify(defect)}==='foreign-request'?{research:{verdict:'supported',reasons:[]}}:{})};
+if(${JSON.stringify(defect)}==='missing-research-adapter-failed')process.stderr.write(JSON.stringify({error:'adapter_failed',message:'Unexpected token'})+'\\n');
 process.stdout.write(JSON.stringify(envelope),()=>process.exit(1));`);
     await assert.rejects(f.invoke(), d83NoResponseRetry);
     const call = f.store.list<ModelCall>('model-call')[0]!;
@@ -1659,6 +1662,38 @@ process.stdout.write(JSON.stringify(envelope),()=>process.exit(1));`);
     const heads = f.store.list(); await assert.rejects(f.invoke(f.fresh()), d83NoResponseRetry);
     assert.deepEqual(f.store.list(), heads); assert.deepEqual(f.store.get(raw.id), raw); assert.deepEqual(f.store.get(call.id), call);
     assert.equal(f.sent().length, 1); assert.equal(f.store.list('model-call').length, 1); assert.equal(f.store.list('model-response').length, 1);
+  });
+}
+
+// RS3 (№4414, №4426): the bare envelope codex-stdio and devin-stdio print when their CLI failed (provider_failed) or gave no
+// final answer (provider_empty) is a provider failure without a response: the assessment is retryable and the next entry
+// pays one new generation, the failed attempt kept as it was.
+for (const code of ['provider_failed', 'provider_empty'] as const) {
+  test(`RS3 a real adapter's bare envelope under ${code} is a retryable assessment failure; the next entry renews it once`, async t => {
+    const f = resumeFixture(t), marker = join(f.root, 'rs3-failed');
+    writeFileSync(f.environment.value.reviewer.command.args[0]!, `import{readFileSync,appendFileSync,existsSync,writeFileSync}from'node:fs';
+const request=JSON.parse(readFileSync(0,'utf8'));
+appendFileSync(${JSON.stringify(join(f.root, 'wire.ndjson'))},JSON.stringify(request)+'\\n');
+if(!existsSync(${JSON.stringify(marker)})){writeFileSync(${JSON.stringify(marker)},'failed');
+process.stderr.write(JSON.stringify({error:${JSON.stringify(code)},message:'426 Upgrade Required'})+'\\n');
+process.stdout.write(JSON.stringify({protocol:request.protocol,requestId:request.requestId,usage:null})+'\\n',()=>process.exit(1));}
+else console.log(JSON.stringify({protocol:request.protocol,requestId:request.requestId,research:{verdict:'supported',reasons:[]},
+usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+    await assert.rejects(f.invoke(), { code: 'research_provider_failed' });
+    assert.equal(f.sent().length, 1);
+    const call = f.store.list<ModelCall>('model-call')[0]!;
+    assert.deepEqual([call.value.status, call.value.error], ['failed', 'research_provider_failed']);
+    const received = call.value.response?.record; assert.ok(received);
+    const raw = f.store.get<any>(received.id, received.revision)!;
+    assert.deepEqual(Object.keys(JSON.parse(raw.value.text)), ['protocol', 'requestId', 'usage']);
+    const application = f.store.list<any>('assessment-application').find(app => app.value.call?.id === call.id)!;
+    assert.equal(application.value.state, 'retryable');
+    const before = { application: structuredClone(application), session: structuredClone(f.store.get<any>(application.value.session.id, application.value.session.revision)!) };
+    const db = f.fresh();
+    assert.deepEqual(await f.invoke(db), verdict);
+    assert.equal(f.sent().length, 2);
+    assert.deepEqual(db.get(call.id), call); assert.deepEqual(db.get(raw.id), raw);
+    d83RenewalLink(db, before);
   });
 }
 
@@ -1858,3 +1893,39 @@ test('another response barrier blocks prepared-limit renewal without discarding 
   assert.deepEqual(f.store.get(before.raw.id), before.raw); assert.deepEqual(f.store.get(barrier.id), barrier);
   callsOnce(f, 2); assert.deepEqual(f.store.get(f.question.id), f.question);
 });
+
+import { DatabaseSync as Rs3Database } from 'node:sqlite';
+import { canonical as rs3Canonical } from '../src/canonical.js';
+import type { Ref as Rs3Ref } from '../src/pipeline/contracts.js';
+// RS3 (№4433): an assessment call's own envelope is read only through the receipt its era proves (assessmentExecution); an
+// unproved sibling consumerExecution saying provider_failed under recomputed hashes changes no outcome.
+for (const [code, retryable] of [['adapter_failed', false], ['provider_failed', true]] as const)
+  test(`RS3 №4433: an assessment call's own envelope under ${code} is ${retryable ? '' : 'not '}a provider failure, and a forged sibling consumerExecution with provider_failed changes nothing`, async t => {
+    const f = resumeFixture(t);
+    writeFileSync(f.environment.value.reviewer.command.args[0]!, `import{readFileSync}from'node:fs';
+const request=JSON.parse(readFileSync(0,'utf8'));
+process.stderr.write(JSON.stringify({error:${JSON.stringify(code)},message:'x'})+'\\n');
+process.stdout.write(JSON.stringify({protocol:request.protocol,requestId:request.requestId,usage:null})+'\\n',()=>process.exit(1));`);
+    await assert.rejects(f.invoke(), retryable ? { code: 'research_provider_failed' } : d83NoResponseRetry);
+    const call = f.store.list<ModelCall>('model-call')[0]!, received = call.value.response?.record; assert.ok(received);
+    const raw = f.store.get<any>(received.id, received.revision)!;
+    assert.ok(raw.value.assessmentExecution, 'The application era proves the assessment receipt');
+    const application = f.store.list<any>('assessment-application').find(app => app.value.call?.id === call.id)!;
+    const session = f.store.get<any>(application.value.session.id, application.value.session.revision)!;
+    const read = (store: Store, ref: Rs3Ref) => { try { return readResearchExecution(store, 'p', ref, session, f.draft, f.question, application.value.role, application.value.profile).kind; }
+      catch (error) { return (error as EngineError).code; } };
+    const expected = retryable ? 'provider-failed' : 'response_recovery_wire_foreign';
+    assert.equal(read(f.store, reference(call)), expected);
+    const value = { ...structuredClone(raw.value), consumerExecution: { process: { exitCode: 1, signal: null,
+      stderr: JSON.stringify({ error: 'provider_failed', message: 'counterfeit sibling' }) + '\n' } } };
+    const callValue = structuredClone(call.value) as any; callValue.response.record = { id: raw.id, revision: raw.revision, hash: hashJson(value) };
+    const db = new Rs3Database(f.database);
+    const trigger = (db.prepare("SELECT sql FROM sqlite_master WHERE name='revisions_no_update'").get() as { sql: string }).sql;
+    db.exec('DROP TRIGGER revisions_no_update');
+    for (const [id, revision, body] of [[raw.id, raw.revision, value], [call.id, call.revision, callValue]] as const)
+      db.prepare('UPDATE revisions SET body=?,sha256=? WHERE entity_id=? AND revision=?').run(rs3Canonical(body), hashJson(body as never), id, revision);
+    db.exec(trigger); db.close();
+    const reopened = f.fresh(), forged = reopened.get<ModelCall>(call.id, call.revision)!;
+    assert.ok(reopened.get<any>(raw.id, raw.revision)!.value.consumerExecution, 'The forged sibling is in the store');
+    assert.equal(read(reopened, reference(forged)), expected, 'The sibling receipt is never read');
+  });

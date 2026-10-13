@@ -5479,3 +5479,86 @@ test('D8.4e-3 W6 (№2259): the successful attempt writes the four records once;
   assert.deepEqual(f.attempt(), accepted, 'the repeated attempt is the saved result (W2)');
 });
 
+
+/**
+ * RS3 (№4414): a synthesis step on a repeat research-stage. Its saved refusal is either a provider failure without a
+ * response — the adapter's own envelope, as codex-stdio and devin-stdio print it — answered by one new generation at the
+ * next explicit entry, or any other refusal, restored as the run's typed pause: never a missing permit or a different
+ * saved admission.
+ */
+for (const [name, line, retryable] of [
+  ['its own envelope (codex-stdio / devin-stdio)', `console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,usage:null}));console.error(JSON.stringify({error:'provider_failed',message:'426 Upgrade Required'}));process.exit(1);`, true],
+  ['a foreign request envelope', `console.log(JSON.stringify({protocol:r.protocol,requestId:'another-request',usage:null}));process.exit(1);`, false],
+] as const)
+  test(`RS3 №4414: a synthesis step failing with ${name} — ${retryable ? 'the next entry pays one new generation' : 'every repeat entry restores the saved refusal as a typed pause'}`, async t => {
+    const f = await synthesisV2Fixture(t, `
+if(c.dispatchMode==='planning')research={action:'synthesize',question:c.question.id};
+else{${line}}`);
+    const { projectId: _p, ...settings } = f.pilot.value;
+    configureReaderPilot(f.store, f.engine.environments, 'p', { ...settings,
+      planning: { fields: [f.question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, f.pilot.revision);
+    const first = await f.engine.researcher.run('p', f.draft.id, 4);
+    assert.equal(first.value.status, 'paused');
+    const synthesis = () => f.store.list<any>('research-consumer-intent').filter(intent => intent.value.kind === 'synthesis')
+      .sort((a, b) => a.value.generation - b.value.generation);
+    const [refused] = synthesis();
+    assert.deepEqual([refused!.value.state, refused!.value.refusal?.kind], ['refused', retryable ? 'provider-failed' : 'terminal']);
+    const calls = () => f.store.list('model-call').length, before = calls();
+    if (retryable) {
+      const failed = f.store.list<ModelCall>('model-call').find(call => call.value.status === 'failed' && call.value.usage === null)!;
+      const head = f.store.get<any>(f.pilot.id)!, { projectId: _q, ...rest } = head.value;
+      configureReaderPilot(f.store, f.engine.environments, 'p', { ...rest, unknownReserves: [{ call: reference(failed), tokens: 100 }] }, head.revision);
+      const second = await f.engine.researcher.run('p', f.draft.id, 4);
+      assert.equal(second.value.status, 'paused');
+      assert.equal(calls(), before + 1, 'One new generation of the same step');
+      assert.deepEqual(synthesis().map(intent => [intent.value.generation, intent.value.refusal?.kind ?? null]), [[0, 'provider-failed'], [1, 'provider-failed']]);
+      assert.deepEqual(synthesis()[1]!.value.previous, reference(refused!));
+    } else {
+      for (const attempt of [1, 2]) {
+        const again = await f.engine.researcher.run('p', f.draft.id, 4);
+        assert.deepEqual([again.value.status, again.value.pauseCode], ['paused', refused!.value.refusal!.code], `attempt ${attempt}: ${again.value.error}`);
+        assert.doesNotMatch(again.value.error ?? '', /different saved admission|cannot be retried inside/);
+      }
+      assert.equal(calls(), before, 'The saved outcome is restored; nothing is sent again');
+      assert.equal(synthesis().length, 1);
+    }
+  });
+
+import { readResearchExecution as rs3ReadExecution } from '../src/discovery/response-recovery.js';
+/** RS3 (№4433): rewrite exact saved revisions of a disposable store — a forged sibling receipt under recomputed hashes. */
+function rs3Forge(database: string, records: { id: string; revision: number; value: unknown }[]) {
+  const db = new DatabaseSync(database);
+  const trigger = (db.prepare("SELECT sql FROM sqlite_master WHERE name='revisions_no_update'").get() as { sql: string }).sql;
+  db.exec('DROP TRIGGER revisions_no_update');
+  for (const record of records) db.prepare('UPDATE revisions SET body=?,sha256=? WHERE entity_id=? AND revision=?')
+    .run(canonical(record.value), hashJson(record.value as never), record.id, record.revision);
+  db.exec(trigger); db.close();
+}
+for (const [name, code, retryable] of [['adapter_failed (the model may have answered)', 'adapter_failed', false], ['provider_failed (no response)', 'provider_failed', true]] as const)
+  test(`RS3 №4433: a failed consumer call's own envelope under ${name} — both readers of the one physical result agree (${retryable ? 'retryable' : 'never retryable'}), and an unproved sibling assessmentExecution with provider_failed changes neither`, async t => {
+    const f = await synthesisV2Fixture(t, `console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,usage:null}));console.error(JSON.stringify({error:${JSON.stringify(code)},message:'x'}));process.exit(1);`);
+    await assert.rejects(f.invoke(), { code: 'research_provider_failed' });
+    const intent = f.store.list<any>('research-consumer-intent').find(row => row.value.kind === 'synthesis')!;
+    const call = f.store.get<any>(intent.value.refusal.call.id, intent.value.refusal.call.revision)!;
+    const raw = f.store.get<any>(call.value.response.record.id, call.value.response.record.revision)!;
+    const session = f.store.get<any>(intent.value.owner.id, intent.value.owner.revision)!;
+    const outcome = (read: () => { kind: string }) => { try { return read().kind; } catch (error) { return (error as EngineError).code; } };
+    const readers = (store: Store, intentRef: Ref, callRef: Ref) => [
+      outcome(() => readResearchConsumerExecution(store, 'p', intentRef)),
+      outcome(() => rs3ReadExecution(store, 'p', callRef, session, f.draft, f.question, f.dispatch.implementer, reference(f.pilot)))];
+    const expected = retryable ? ['provider-failed', 'provider-failed'] : ['terminal', 'response_recovery_wire_foreign'];
+    assert.deepEqual(readers(f.store, reference(intent), reference(call)), expected);
+    assert.equal(intent.value.refusal.kind, retryable ? 'provider-failed' : 'terminal');
+    // A sibling receipt of the other era, with no contract, call, dispatch, exit or signal, saying provider_failed.
+    const value = { ...structuredClone(raw.value), assessmentExecution: { process: { stderr: JSON.stringify({ error: 'provider_failed', message: 'counterfeit sibling' }) + '\n' } } };
+    const raw2 = { id: raw.id, revision: raw.revision, value };
+    const callValue = structuredClone(call.value); callValue.response.record = { id: raw.id, revision: raw.revision, hash: hashJson(value) };
+    const intentValue = structuredClone(intent.value);
+    intentValue.refusal.call = { id: call.id, revision: call.revision, hash: hashJson(callValue) }; intentValue.refusal.response = callValue.response.record;
+    rs3Forge(f.database, [raw2, { id: call.id, revision: call.revision, value: callValue }, { id: intent.id, revision: intent.revision, value: intentValue }]);
+    const reopened = f.open();
+    const intent2 = reopened.get<any>(intent.id, intent.revision)!, call2 = reopened.get<any>(call.id, call.revision)!;
+    assert.ok(reopened.get<any>(raw.id, raw.revision)!.value.assessmentExecution, 'The forged sibling is in the store');
+    assert.deepEqual(readers(reopened, reference(intent2), reference(call2)), expected, 'The sibling receipt is never read');
+    assert.equal(captureResearchConsumerRetryPermits(reopened, 'p').some(permit => permit.id === intent.id), retryable);
+  });

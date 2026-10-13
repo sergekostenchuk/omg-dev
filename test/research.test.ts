@@ -724,3 +724,200 @@ for(const mode of ['paid','refused']){
   for(const turn of expected.turns)assert.deepEqual(store.get(turn.id,turn.revision),turn);
  }
 });
+
+import { spawnSync as rs3Spawn } from "node:child_process";
+import { fileURLToPath as rs3Path } from "node:url";
+import { readResearchConsumerIntent as rs3ReadIntent } from "../src/discovery/response-recovery.js";
+import type { ResearchConsumerIntent as Rs3Intent } from "../src/discovery/response-recovery.js";
+/**
+ * RS3 (№4414, №4426): what a real adapter prints when its vendor CLI fails — captured by running codex-stdio or devin-stdio
+ * itself over a CLI stub: `fail` exits 1 (HX2: no usage), `fail-usage` after a measured turn, `empty` completes without a
+ * final answer, `garbage` answers what the adapter cannot read. Every one prints the same bare envelope; only the adapter's
+ * structured error line differs.
+ */
+function rs3RealFailure(t: test.TestContext, adapter: "codex" | "devin", cli: "fail" | "fail-usage" | "empty" | "garbage" = "fail") {
+  const root = mkdtempSync(join(tmpdir(), "omg-rs3-adapter-")), bin = join(root, "bin"), home = join(root, "home");
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(bin, { recursive: true }); mkdirSync(join(home, ".config", "devin"), { recursive: true });
+  writeFileSync(join(home, ".config", "devin", "config.json"), JSON.stringify({ devin: { org_id: "rs3-org" } }));
+  const usage = `console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:7,cached_input_tokens:0,output_tokens:1,reasoning_output_tokens:0}}));`;
+  const answer = (text: string) => adapter === "codex"
+    ? `const args=process.argv.slice(2);writeFileSync(args[args.indexOf('-o')+1],${JSON.stringify(text)});${usage}`
+    : `process.stdout.write(${JSON.stringify(text)});`;
+  writeFileSync(join(bin, adapter), `#!${process.execPath}\nimport{writeFileSync}from'node:fs';\n` + (cli === "fail" || cli === "fail-usage"
+    ? `${cli === "fail-usage" ? usage : ""}console.error('ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 426 Upgrade Required');process.exit(1);\n`
+    : `${answer(cli === "empty" ? "" : "not json")}\n`), { mode: 0o700 });
+  const script = rs3Path(new URL(`../src/adapters/${adapter}-stdio.js`, import.meta.url));
+  const request = { protocol: "omg-agent/v1", requestId: "RS3-REQUEST", mode: "research", model: adapter === "codex" ? "fixture-model" : "swe-2-high",
+    effort: "high", prompt: "Return the declared research action", subject: { role: "analyst", questions: [] } };
+  const result = rs3Spawn(process.execPath, [script, ...(adapter === "codex" ? ["--compact-research"] : [])], { cwd: root, input: JSON.stringify(request),
+    encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env["PATH"] ?? ""}`, HOME: home } });
+  assert.equal(result.status, 1, result.stderr);
+  const lines = result.stdout.trim().split("\n");
+  assert.equal(lines.length, 1, result.stdout);
+  const envelope = JSON.parse(lines[0]!) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(envelope), ["protocol", "requestId", "usage"], "Only the envelope of its own request");
+  assert.deepEqual([envelope["protocol"], envelope["requestId"]], ["omg-agent/v1", "RS3-REQUEST"]);
+  const code = (JSON.parse(result.stderr.trim().split("\n").at(-1)!) as { error: string }).error;
+  return { stdout: result.stdout.replace("RS3-REQUEST", "$REQUEST"), stderr: result.stderr, exit: 1, code };
+}
+type Rs3Step = { stdout: string; stderr: string; exit: number; signal?: boolean; role?: string; code?: string };
+/** The research fixture's adapter that first replays the planned failures of analyst turns (rs3.json beside calls.txt). */
+const RS3_ADAPTER = ADAPTER.replace("if(scenario==='failure')",
+  `const rs3=process.argv[3].replace(/calls\\.txt$/,'rs3.json');
+if(existsSync(rs3)){const plan=JSON.parse(readFileSync(rs3,'utf8')),role=['assess-answer','assess-escalation'].includes(c.role)?c.role:'analyst',at=plan.findIndex(s=>(s.role??'analyst')===role);
+ const step=at>=0?plan.splice(at,1)[0]:null;writeFileSync(rs3,JSON.stringify(plan));
+ if(step){process.stdout.write(step.stdout.replaceAll('$REQUEST',req.requestId));process.stderr.write(step.stderr);
+  if(step.signal){await new Promise(r=>setTimeout(r,50));process.kill(process.pid,'SIGTERM');}else process.exit(step.exit);}}
+if(scenario==='failure')`);
+/** The research fixture whose analyst turns first replay the given failures, in order; later calls answer as usual. */
+function rs3Fixture(t: test.TestContext, steps: Rs3Step[]) {
+  const f = fixture(t); f.configure("p");
+  writeFileSync(join(f.root, "adapter.mjs"), RS3_ADAPTER);
+  writeFileSync(join(f.root, "rs3.json"), JSON.stringify(steps));
+  f.engine.discovery.evidence.document("p", "brief", researchInput("p", "Input", "Owner outcome"), "application/json", 0);
+  const draft = f.engine.prepare("p", "discovery");
+  const intents = () => f.store.list<Rs3Intent>("research-consumer-intent").filter(row => row.value.kind === "analyst")
+    .sort((a, b) => a.value.generation - b.value.generation || (a.id < b.id ? -1 : 1));
+  const calls = () => readFileSync(join(f.root, "calls.txt"), "utf8").trim().split("\n").filter(role => role !== "assess-answer" && role !== "assess-escalation").length;
+  return { ...f, draft, intents, calls };
+}
+
+for (const [name, adapter, cli, expected] of [["codex-stdio, its CLI failed (HX2)", "codex", "fail", "provider_failed"], ["codex-stdio, its CLI failed after a measured turn", "codex", "fail-usage", "provider_failed"],
+  ["codex-stdio, no final answer", "codex", "empty", "provider_empty"], ["devin-stdio, its CLI failed", "devin", "fail", "provider_failed"], ["devin-stdio, no final answer", "devin", "empty", "provider_empty"]] as const)
+  test(`RS3 №4414: a ${name} failure of a paid analyst turn is provider-failed — the next research-stage entry is a new generation of the same step, and the saved attempt stays byte for byte`, async t => {
+    const failure = rs3RealFailure(t, adapter, cli);
+    assert.equal(failure.code, expected, "The adapter's structured error line");
+    const f = rs3Fixture(t, [failure]);
+    const first = await f.engine.researcher.run("p", f.draft.id, 1);
+    assert.deepEqual([first.value.status, first.value.pauseCode], ["paused", "research_provider_failed"]);
+    const [refused] = f.intents();
+    assert.deepEqual([refused!.value.generation, refused!.value.state, refused!.value.refusal?.kind, refused!.value.refusal?.code],
+      [0, "refused", "provider-failed", "provider_failed_without_response"]);
+    const saved = f.store.list().filter(row => ["model-call", "model-response", "model-request", "research-context", "research-consumer-intent"].includes(row.kind))
+      .map(row => f.store.history(row.id).map(revision => [revision.id, revision.revision, revision.hash]));
+    const second = await f.engine.execute({ type: "research-stage", project: "p", draftId: f.draft.id, maxTurns: 1 }) as { status: string };
+    assert.notEqual(second.status, "failed");
+    const generations = f.intents();
+    assert.deepEqual(generations.map(row => [row.value.generation, row.value.state]), [[0, "refused"], [1, "applied"]], "One new generation of the same step");
+    assert.deepEqual(generations[1]!.value.previous, reference(refused!));
+    assert.equal(f.calls(), 2, "One new physical call");
+    for (const history of saved) for (const [id, revision, hash] of history) assert.equal(f.store.get(id as string, revision as number)!.hash, hash, `${id}@${revision} is unchanged`);
+    assert.deepEqual(rs3ReadIntent(new Store(join(f.root, "state.sqlite")), reference(refused!)).value.refusal?.kind, "provider-failed", "A reopened store reads the same outcome");
+  });
+
+const RS3_PRIOR: [string, Rs3Step, string][] = [
+  ["an envelope with research", { stdout: '{"protocol":"omg-agent/v1","requestId":"$REQUEST","research":{"action":"pause","reason":"x"},"usage":null}\n', stderr: "", exit: 1 }, "research_provider_failed"],
+  ["a foreign request's envelope", { stdout: '{"protocol":"omg-agent/v1","requestId":"another-request","usage":null}\n', stderr: '{"error":"provider_failed","message":"x"}\n', exit: 1 }, "research_provider_failed"],
+  ["an envelope with another field", { stdout: '{"protocol":"omg-agent/v1","requestId":"$REQUEST","usage":null,"error":"provider_failed"}\n', stderr: '{"error":"provider_failed","message":"x"}\n', exit: 1 }, "research_provider_failed"],
+  ["a signal after the envelope", { stdout: '{"protocol":"omg-agent/v1","requestId":"$REQUEST","usage":null}\n', stderr: '{"error":"provider_failed","message":"x"}\n', exit: 0, signal: true }, "research_provider_failed"],
+  ["a bare envelope without the adapter's structured error line", { stdout: '{"protocol":"omg-agent/v1","requestId":"$REQUEST","usage":null}\n', stderr: "provider unavailable", exit: 1 }, "research_provider_failed"],
+  ["a bare envelope under another structured error", { stdout: '{"protocol":"omg-agent/v1","requestId":"$REQUEST","usage":null}\n', stderr: '{"error":"adapter_failed","message":"Unexpected token"}\n', exit: 1 }, "research_provider_failed"],
+];
+for (const [name, adapter, cli, expected] of [["codex-stdio, an answer it cannot read", "codex", "garbage", "adapter_failed"], ["devin-stdio, an answer it cannot read", "devin", "garbage", "provider_result_invalid"]] as const)
+  test(`RS3 №4426: the bare envelope of ${name} (${expected}) — the model may have answered: the prior terminal, restored as the run's typed pause on a repeat`, async t => {
+    const failure = rs3RealFailure(t, adapter, cli);
+    assert.equal(failure.code, expected);
+    const f = rs3Fixture(t, [failure]);
+    await f.engine.researcher.run("p", f.draft.id, 1);
+    const [refused] = f.intents();
+    assert.deepEqual([refused!.value.state, refused!.value.refusal?.kind, refused!.value.refusal?.code], ["refused", "terminal", "research_provider_failed"]);
+    const again = await f.engine.researcher.run("p", f.draft.id, 1);
+    assert.deepEqual([again.value.status, again.value.pauseCode], ["paused", "research_provider_failed"]);
+    assert.equal(f.calls(), 1); assert.equal(f.intents().length, 1);
+  });
+for (const [name, step, code] of RS3_PRIOR)
+  test(`RS3 №4414: ${name} keeps its prior terminal outcome — and a repeat research-stage restores it as the run's typed pause, never a different saved admission`, async t => {
+    const f = rs3Fixture(t, [step]);
+    const first = await f.engine.researcher.run("p", f.draft.id, 1);
+    assert.equal(first.value.status, "paused");
+    const [refused] = f.intents();
+    assert.deepEqual([refused!.value.state, refused!.value.refusal?.kind], ["refused", "terminal"], `not provider-failed: ${JSON.stringify(refused!.value.refusal)}`);
+    assert.equal(refused!.value.refusal?.code, step.signal ? refused!.value.refusal?.code : code);
+    const before = f.store.list().map(row => [row.id, row.revision]);
+    for (const attempt of [1, 2]) {
+      const again = await f.engine.researcher.run("p", f.draft.id, 1);
+      assert.deepEqual([again.value.status, again.value.pauseCode], ["paused", refused!.value.refusal?.code], `attempt ${attempt}: ${again.value.error}`);
+      assert.doesNotMatch(again.value.error ?? "", /different saved admission/);
+    }
+    assert.equal(f.calls(), 1, "The saved outcome is restored; nothing is sent again");
+    assert.deepEqual(f.intents().length, 1);
+    const run = f.store.list<ResearchRun>("research-run")[0]!;
+    assert.deepEqual(f.store.list().filter(row => row.id !== run.id).map(row => [row.id, row.revision]), before.filter(([id]) => id !== run.id));
+  });
+
+test("RS3 №4414 window: a guarded head moved by a second Store between the new generation's preparation and its write refuses it whole — no generation 1, the refused attempt unchanged", async t => {
+  const f = rs3Fixture(t, [rs3RealFailure(t, "codex")]);
+  await f.engine.researcher.run("p", f.draft.id, 1);
+  const [refused] = f.intents();
+  assert.equal(refused!.value.refusal?.kind, "provider-failed");
+  const original = f.store.writeMany.bind(f.store); let raced = false;
+  f.store.writeMany = ((writes: Write[], guards?: Parameters<Store["writeMany"]>[1]) => {
+    if (!raced && writes.some(write => write.kind === "research-consumer-intent" && write.expected === 0 && (write.value as { generation?: number }).generation === 1)) {
+      raced = true;
+      const other = new Store(join(f.root, "state.sqlite"));
+      try { const head = other.get("environment:p")!; other.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value }); }
+      finally { other.close(); }
+    }
+    return original(writes, guards);
+  }) as typeof f.store.writeMany;
+  const result = await f.engine.researcher.run("p", f.draft.id, 1);
+  f.store.writeMany = original;
+  assert.ok(raced);
+  assert.equal(result.value.status, "paused");
+  assert.deepEqual(f.intents().map(row => row.value.generation), [0], "Nothing of the lost transaction is written");
+  assert.deepEqual(f.store.get(refused!.id)!.hash, refused!.hash);
+  assert.equal(f.calls(), 1);
+});
+
+test("RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and the next research-stage pays one new generation of the same step", async t => {
+  const failure = rs3RealFailure(t, "codex");
+  const root = mkdtempSync(join(tmpdir(), "omg-rs3-era-")), era = join(root, "era"), data = join(root, "data");
+  mkdirSync(era); mkdirSync(data); t.after(() => rmSync(root, { recursive: true, force: true }));
+  execFileSync("tar", ["-xf", "-", "-C", era], { input: execFileSync("git", ["archive", "8b665772db79"], { maxBuffer: 80 << 20 }) });
+  symlinkSync(resolve("node_modules"), join(era, "node_modules"));
+  execFileSync(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "-p", join(era, "tsconfig.json")], { cwd: era });
+  writeFileSync(join(data, "adapter.mjs"), RS3_ADAPTER);
+  writeFileSync(join(data, "rs3.json"), JSON.stringify([failure]));
+  const producer = join(era, "rs3-old-producer.mjs");
+  writeFileSync(producer, `import{writeFileSync}from'node:fs';
+import{Store}from'./dist/src/storage/store.js';import{ProductEngine}from'./dist/src/product/engine.js';import{researchInput}from'./dist/test/preparation-fixture.js';
+const root=${JSON.stringify(data)},store=new Store(root+'/state.sqlite'),engine=new ProductEngine(store);
+engine.execute({type:'create-project',project:'p',title:'Old producer'});
+const command={executable:process.execPath,args:[root+'/adapter.mjs','normal',root+'/calls.txt']};
+engine.environments.configure('p',{workspace:root,implementer:{actor:'researcher',model:'protocol-fixture',effort:'high',command},reviewer:{actor:'assessor',model:'protocol-fixture',effort:'high',command},fullCheck:{executable:process.execPath,args:['--version']},timeoutMs:2000},0);
+engine.discovery.evidence.document('p','brief',researchInput('p','Input','Owner outcome'),'application/json',0);
+const draft=engine.prepare('p','discovery');const run=await engine.researcher.run('p',draft.id,1);
+writeFileSync(root+'/expected.json',JSON.stringify({draft:draft.id,run,records:store.list().map(row=>store.history(row.id)).flat()}));store.close();`);
+  execFileSync(process.execPath, [producer], { cwd: era, maxBuffer: 4 << 20 });
+  const expected = JSON.parse(readFileSync(join(data, "expected.json"), "utf8")) as { draft: string; run: { value: ResearchRun }; records: { id: string; revision: number; hash: string }[] };
+  assert.deepEqual([expected.run.value.status, expected.run.value.pauseCode], ["paused", "research_provider_failed"]);
+  const store = new Store(join(data, "state.sqlite")); t.after(() => store.close());
+  const intents = () => store.list<Rs3Intent>("research-consumer-intent").filter(row => row.value.kind === "analyst").sort((a, b) => a.value.generation - b.value.generation);
+  const [old] = intents();
+  assert.deepEqual([old!.value.generation, old!.value.state, old!.value.refusal?.kind, old!.value.refusal?.code], [0, "refused", "terminal", "research_provider_failed"],
+    "The base classified the envelope failure as its terminal");
+  assert.deepEqual(rs3ReadIntent(store, reference(old!)), old, "The new reader proves it in its era");
+  const result = await new ProductEngine(store).execute({ type: "research-stage", project: "p", draftId: expected.draft, maxTurns: 1 }) as { status: string };
+  assert.notEqual(result.status, "failed");
+  assert.deepEqual(intents().map(row => [row.value.generation, row.value.state]), [[0, "refused"], [1, "applied"]]);
+  assert.deepEqual(intents()[1]!.value.previous, reference(old!));
+  assert.equal(readFileSync(join(data, "calls.txt"), "utf8").trim().split("\n").filter(role => !role.startsWith("assess")).length, 2);
+  for (const record of expected.records) assert.equal(store.get(record.id, record.revision)!.hash, record.hash, `${record.id}@${record.revision} is unchanged`);
+  const reopened = new Store(join(data, "state.sqlite")); t.after(() => reopened.close());
+  assert.deepEqual(rs3ReadIntent(reopened, reference(old!)), old);
+});
+
+test("RS3 №4414: an assessor failing with the codex-stdio envelope is a provider failure of the assessment — the proposed answer survives and the next entry assesses it again without calling its researcher", async t => {
+  const f = rs3Fixture(t, [{ ...rs3RealFailure(t, "codex"), role: "assess-answer" }]);
+  const first = await f.engine.researcher.run("p", f.draft.id, 4);
+  assert.equal(first.value.status, "paused", JSON.stringify(first.value));
+  const candidate = f.store.list<ResearchTurn>("research-turn").find(turn => turn.value.status === "pending")!;
+  assert.ok(candidate, "The proposed answer waits for its assessment");
+  const second = await f.engine.researcher.run("p", f.draft.id, 4);
+  assert.equal(second.value.status, "completed", JSON.stringify(second.value));
+  const roles = readFileSync(join(f.root, "calls.txt"), "utf8").trim().split("\n");
+  assert.equal(roles.filter(role => role === "research").length, f.draft.value.questions.length + 1, "The researcher is not called again for the assessed answer");
+  assert.ok(roles.filter(role => role === "assess-answer").length >= 2, "The assessment is asked again");
+  assert.equal(f.store.get<ResearchTurn>(candidate.id)!.value.status, "completed");
+});

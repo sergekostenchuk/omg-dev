@@ -274,8 +274,7 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
         origin.value.rootKey, origin.value.generation - 1))
       consumerInvalid(saved.id, 'The next generation lost its exact predecessor address');
     const predecessor = readResearchConsumerIntent(store, prior);
-    if (predecessor.value.state !== 'refused'
-      || predecessor.value.refusal?.kind !== 'provider-failed'
+    if (!retryableResearchConsumerRefusal(store, predecessor)
       || !sameLogicalConsumerStep(predecessor.value, origin.value))
       consumerInvalid(saved.id, 'A new generation needs the proved refused logical step');
   }
@@ -366,11 +365,14 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
     const paid = readResearchConsumerExecutionFromIntent(store, saved.value.projectId, saved);
     const refusal = saved.value.refusal!;
     const synthesisFamily = saved.value.kind === 'synthesis' || saved.value.kind === 'consolidation';
-    const expectedKind = paid.kind === 'provider-failed' ? 'provider-failed'
+    // RS3: before RS3 a failure that left only its own envelope was saved as its terminal research_provider_failed.
+    const legacy = paid.kind === 'provider-failed' && paid.envelope === true && refusal.kind === 'terminal'
+      && refusal.code === paid.call.value.error;
+    const expectedKind = legacy ? 'terminal' : paid.kind === 'provider-failed' ? 'provider-failed'
       : paid.kind === 'terminal' ? 'terminal'
       : saved.value.kind === 'reader' ? 'reader-invalid' : 'consumer-invalid';
     if (refusal.kind !== expectedKind
-      || refusal.code !== (paid.kind === 'response' ? refusal.code : paid.code)
+      || refusal.code !== (paid.kind === 'response' ? refusal.code : legacy ? paid.call.value.error : paid.code)
       || canonical([refusal.call, refusal.request, refusal.response, refusal.archive]) !== canonical([
         reference(paid.call), paid.request, paid.response, paid.archive]))
       consumerInvalid(saved.id, 'The terminal refusal lacks its exact no-response physical proof');
@@ -1202,8 +1204,7 @@ export function captureResearchConsumerRetryPermits(store: Store, projectId: str
   checkConsumerClaimOrigins(store);
   return store.list<ResearchConsumerIntent>('research-consumer-intent')
     .map(record => readResearchConsumerIntent(store, reference(record)))
-    .filter(record => record.value.projectId === projectId && record.value.state === 'refused'
-      && record.value.refusal?.kind === 'provider-failed')
+    .filter(record => record.value.projectId === projectId && retryableResearchConsumerRefusal(store, record))
     .map(reference);
 }
 export function listPendingResearchConsumerIntents(store: Store, projectId: string, draftId: string): Revision<ResearchConsumerIntent>[] {
@@ -1256,7 +1257,7 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   if (!Array.isArray(permits) || !permits.every(isRef))
     consumerInvalid('research-consumer-intent', 'Retry permits must be exact saved terminal references');
   const previous = findResearchConsumerIntent(store, input.projectId, input.kind, input.key);
-  const replacing = previous?.value.state === 'refused' && previous.value.refusal?.kind === 'provider-failed'
+  const replacing = !!previous && retryableResearchConsumerRefusal(store, previous)
     && permits.some(permit => canonical(permit) === canonical(reference(previous)));
   let currentRefusedCall: Ref | null = null;
   if (replacing) {
@@ -1606,8 +1607,45 @@ export type ResearchConsumerExecution = {
   intent: Revision<ResearchConsumerIntent>; call: Revision<ModelCall>; request: Ref; archive: Ref;
   subject: Record<string, any>; prompt: string; guards: TransactionGuard[];
 } & ({ kind: 'response'; payload: unknown; response: Ref }
-  | { kind: 'provider-failed'; code: 'provider_failed_without_response'; response: Ref }
+  | { kind: 'provider-failed'; code: 'provider_failed_without_response'; response: Ref; envelope?: true }
   | { kind: 'terminal'; code: string; response: Ref | null });
+/**
+ * RS3 (№4414, №4426): a provider failure leaves no model response — the adapter wrote nothing, or only the envelope of its
+ * own request. codex-stdio and devin-stdio print that envelope on EVERY failure, also after the model answered and the
+ * answer could not be read; only the adapter's structured error line (the last line of its stderr) tells them apart. So
+ * the envelope is a failure without a response only under provider_failed or provider_empty; under any other code, or
+ * without the line, the model may have answered — the prior terminal. A response with research, a foreign request or
+ * another field is an answer of its own kind.
+ */
+const NO_RESPONSE_ERRORS: readonly string[] = ['provider_failed', 'provider_empty'];
+function adapterErrorCode(stderr: unknown): string | null {
+  const last = typeof stderr === 'string' ? stderr.split('\n').map(line => line.trim()).filter(Boolean).at(-1) : undefined;
+  if (!last) return null;
+  try { const parsed: unknown = JSON.parse(last); return object(parsed) && typeof parsed.error === 'string' ? parsed.error : null; }
+  catch { return null; }
+}
+function noModelResponse(text: string, protocol: unknown, requestId: unknown, stderr: unknown): 'empty' | 'envelope' | null {
+  if (text === '') return 'empty';
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return null; }
+  return object(parsed) && Object.keys(parsed).every(key => ['protocol', 'requestId', 'usage'].includes(key))
+    && parsed.protocol === protocol && parsed.requestId === requestId
+    && (!Object.hasOwn(parsed, 'usage') || parsed.usage === null || object(parsed.usage))
+    && NO_RESPONSE_ERRORS.includes(adapterErrorCode(stderr) ?? '') ? 'envelope' : null;
+}
+/**
+ * RS3: a refused paid step another generation may answer — a provider failure without a model response. Before RS3 a
+ * failure that left only its own envelope was saved as the terminal research_provider_failed; it reads in its era and is
+ * the same physical failure, so it is retried the same way.
+ */
+export function retryableResearchConsumerRefusal(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
+  const refusal = intent.value.state === 'refused' ? intent.value.refusal : null;
+  if (!refusal) return false;
+  if (refusal.kind === 'provider-failed') return true;
+  if (refusal.kind !== 'terminal' || refusal.code !== 'research_provider_failed') return false;
+  const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  return paid.kind === 'provider-failed' && paid.envelope === true;
+}
 
 /** The same exact physical proof is used for recovery and ordinary retry.
  * A terminal label alone never authorizes interpretation of paid bytes. */
@@ -1830,10 +1868,10 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     subject: envelope.subject, prompt: envelope.prompt, guards };
   if (call.value.status === 'failed') {
     const process = response.value.consumerExecution?.process;
-    const emptyNormalFailure = response.value.text === '' && call.value.error === 'research_provider_failed'
-      && call.value.response!.chars === 0 && call.value.response!.bytes === 0
+    const normalFailure = call.value.error === 'research_provider_failed'
       && process?.signal === null && Number.isSafeInteger(process?.exitCode) && process.exitCode > 0;
-    if (emptyNormalFailure) return { kind: 'provider-failed', code: 'provider_failed_without_response', ...base };
+    const absent = normalFailure ? noModelResponse(response.value.text, envelope.protocol, envelope.requestId, process.stderr) : null;
+    if (absent) return { kind: 'provider-failed', code: 'provider_failed_without_response', ...(absent === 'envelope' ? { envelope: true as const } : {}), ...base };
     if (typeof call.value.error !== 'string' || !call.value.error)
       consumerInvalid(intent.id, 'A failed call needs its saved original error');
     return { kind: 'terminal', code: call.value.error, ...base };
@@ -2487,10 +2525,17 @@ function researchExecution(store: Store, project: string, callRef: Ref,
   }
   const linked = object(response) && response.protocol === request.protocol && response.requestId === request.requestId
     && Object.hasOwn(response, 'research');
-  requireCondition(!object(response) || !['protocol', 'requestId', 'research'].some(key => Object.hasOwn(response, key)) || linked,
+  // RS3 (№4433): the one receipt this call's era proves carries every mark read from the process — the physical proof
+  // below, its exit and signal, and the no-response mark of a failed call's own envelope. A sibling receipt is not read.
+  const receiptName = applicationEra ? 'assessmentExecution' as const : consumerEra ? 'consumerExecution' as const : null;
+  const executionReceipt = receiptName ? responseValue[receiptName] : null;
+  const absent = call.value.status === 'failed' ? noModelResponse(responseText, request.protocol, request.requestId,
+    object(executionReceipt) && object(executionReceipt.process) ? executionReceipt.process.stderr : undefined) : null;
+  requireCondition(!object(response) || !['protocol', 'requestId', 'research'].some(key => Object.hasOwn(response, key)) || linked
+    || absent === 'envelope',
     'response_recovery_wire_foreign', 'A foreign or incomplete research envelope is not evidence of an absent response');
-  const physicalProof = applicationEra ? assessmentExecution(store, call, responseValue)
-    : consumerEra ? physicalExecution(store, call, responseValue, 'consumerExecution', 'consumerIntent', 'research-consumer-execution/v1') : [];
+  const physicalProof = receiptName === 'assessmentExecution' ? assessmentExecution(store, call, responseValue)
+    : receiptName === 'consumerExecution' ? physicalExecution(store, call, responseValue, receiptName, 'consumerIntent', 'research-consumer-execution/v1') : [];
   const result: ResearchExecutionContext = { call, request: requestRef, response: responseRef, archive: archiveRef, body,
     subject: request.subject as Record<string, any>, prompt: request.prompt as string,
     // Claim and authorization are immutable ancestors of the guarded terminal
@@ -2505,13 +2550,11 @@ function researchExecution(store: Store, project: string, callRef: Ref,
   }
   if (call.value.status === 'succeeded') throw new EngineError(object(response) ? 'response_recovery_wire_foreign' : 'response_recovery_wire_invalid',
     'The succeeded physical call must retain its own research response');
-  const executionReceipt = applicationEra ? responseValue.assessmentExecution
-    : consumerEra ? responseValue.consumerExecution : null;
   requireCondition(call.value.status === 'failed' && call.value.error === 'research_provider_failed' && physicalProof.length > 0
     && object(executionReceipt) && object(executionReceipt.process)
     && Number.isSafeInteger(executionReceipt.process.exitCode) && executionReceipt.process.exitCode > 0
     && executionReceipt.process.signal === null
-    && (!consumerEra || responseText === '' && call.value.response?.chars === 0 && call.value.response.bytes === 0),
+    && (!consumerEra || absent === 'envelope' || responseText === '' && call.value.response?.chars === 0 && call.value.response.bytes === 0),
   'response_recovery_execution_invalid', 'Only a proven completed provider failure without a linked research response permits retry');
   return { kind: 'provider-failed', ...result };
 }
