@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 164. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → AT3b → AT4 → RS1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → RS2 → INT1 → SEC1.
+Задач: 165. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → AT3b → AT4 → RS1 → RS2 → RS3 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 82.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 83.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2135,6 +2135,29 @@
   - соседи: research-call-resume, assessment-session-resume, synthesis-finalization, context-recovery — без изменений ожиданий
   - один полный прогон и ревью
 
+### RS3 · Отказ провайдера без ответа модели распознаётся по тому, что настоящие адаптеры пишут при сбое (конверт omg-agent/v1 с usage:null без research), и даёт повторяемый исход provider-failed с новой генерацией того же шага; повторный вход после любого сохранённого отказа — восстановление исхода с рабочим выходом, а не конфликт допуска
+
+**Цель.** Блокер HX2 №4405/№4411 (13.10): первый ход Sol упал на транспорте (CLI exit 1, ответ адаптера — конверт {protocol, requestId, usage:null} без research). response-recovery.ts:1831–1840 признаёт provider-failed (provider_failed_without_response) ТОЛЬКО при пустом тексте ответа; codex-stdio и devin-stdio (devin-stdio.ts:329) при сбое пишут непустой конверт — значит ЛЮБОЙ сбой транспорта на настоящем адаптере становится terminal research_provider_failed. Тесты (research-call-resume, assessment-session-resume) подают пустой ответ — заглушка не совпадала с настоящими адаптерами. Затем штатный повтор research-stage создаёт новый run и готовит тот же ключ шага (research-runner.ts:694–703); раннее восстановление сохранённого отказа (research-runner.ts:251–255) охватывает только consumer-invalid; общий подготовитель отказывает «The operation key names a different saved admission» (response-recovery.ts:1286–1287) — отказ без рабочего выхода (критерий №4158). Ремонт класса: (1) отказ провайдера без ответа модели — exit≠0 или сигнал И текст ответа пуст ЛИБО является только конвертом протокола своего запроса (protocol и requestId совпадают, research отсутствует) — даёт provider-failed, повторяемый новой генерацией того же логического шага (replacing, response-recovery.ts:1259); конверт с research или чужой requestId — прежние исходы; (2) опись ВСЕХ terminal-исходов платного шага (provider-failed, terminal, reader-invalid, consumer-invalid) на повторном входе research-stage / reader / assessment / synthesis: каждый либо восстанавливается как сохранённый исход с типизированным выходом, либо разрешает новую генерацию — никогда не конфликт допуска; (3) тесты — на настоящих формах адаптеров (codex-stdio и devin-stdio при сбое), не на пустой строке. Сохранённый отказ HX2 (model-call:consumer:v1:e4be336f…, конверт usage:null, exit 1) после ремонта допускает новую генерацию штатным research-stage. Диагностику CLI (первая строка ERROR вместо финальной) не чинить — отдельное наблюдение.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: сохранённый ответ адаптера при сбое; сохранённое намерение платного шага
+- Пишет записи: исход отказа провайдера (provider-failed); новая генерация того же шага
+- Разрешённые пути: `src/discovery/response-recovery.ts`, `src/discovery/research-runner.ts`, `test/research-call-resume.test.ts`, `test/research.test.ts`
+- Из движка как есть: №4405; №4411; C13/C62
+- После: RS2
+- Тесты сверх обязательных:
+  - конверт protocol+requestId+usage:null без research при exit 1 (форма codex-stdio) — provider-failed, новая генерация того же шага, сохранённые записи побайтно прежние
+  - то же для формы devin-stdio при сбое
+  - конверт с research, чужой requestId, сигнал, exit 0 — прежние исходы (не ослаблять)
+  - повторный вход research-stage после каждого вида сохранённого отказа: восстановление исхода с типизированным выходом или новая генерация — никогда «different saved admission»
+  - сохранённый отказ HX2 на копии ~/omg-wt/hx2-admission-stale-20261013-095611.sqlite — штатный research-stage допускает новую генерацию (новый вызов — заглушка, платных 0)
+  - настоящий прежний производитель из Git (om/module 8b665772): прежние исходы читаются своей эрой
+  - окна: смена охраняемой головы между подготовкой и записью — отказ без частичной записи
+  - один полный прогон и ревью
+
 ### AT3b · Маршрут дефекта плана в OM: один публичный repair-plan с ветвью OM → запись дефекта → пробел D1 над принятым L3 → пакет исправления работы → redefine → G5 → settle → явное возобновление завершённого прохода → M8 → compile
 
 **Цель.** Вход ремонта — идемпотентная запись точного дефекта и основания ремонта, без переписывания старого task-run; ветвь OM передаёт работу штатному проходу с его управлением, бюджетом и остановкой; maxTurns не превращается молча в бесплатные шаги. D1: класс пробела «дефект плана» над принятым кадром → модель, находка в брифе; настоящее решение H2 имеет приоритет и входит в новый контракт со своей точной ссылкой; EX6 не копируется как самостоятельная истина. Неизменённые принятые работы сохраняются. Противоречие явному требованию верхнего слоя — адрес к владельцу этого требования, не правка нижнего. Ошибочная жалоба — исход с объяснением и возвратом к исправлению кода, без бесконечного переоткрытия того же пробела. G5 проверяет новый контракт, а не превращает жалобу в факт. Явный переход возобновления по точному дефекту и прежнему complete (сейчас run.ts:422 и startRun возвращают завершённый проход); обычное продолжение завершённого прохода — прежнее поведение. Эра: различимая форма источника дефекта и перехода ремонта; для кадра — ссылки на дефект через основание, если контракт C5 не меняется; от старых кадров не требовать, их принятие не пересчитывать. Кандидат и расход — AT4.
@@ -2190,7 +2213,7 @@
 - Пишет записи: пакет ядра
 - Разрешённые пути: `package.json`, `tsconfig.json`, `scripts/check-backend.mjs`, `test/fixtures/core1-records.ts`, `test/assessment-session-resume.test.ts`, `test/discovery.test.ts`, `test/execution-external-input.test.ts`, `test/om-accepted-answer.test.ts`, `test/om-achievements.test.ts`, `test/om-addressing.test.ts`, `test/om-answers-gate.test.ts`, `test/om-call-record.test.ts`, `test/om-compiler-readers.test.ts`, `test/om-composite-keys.test.ts`, `test/om-feasibility-boundary.test.ts`, `test/om-feasibility-projection.test.ts`, `test/om-feasibility.test.ts`, `test/om-frame-accept.test.ts`, `test/om-frame-candidate.test.ts`, `test/om-gap-lines.test.ts`, `test/om-gaps.test.ts`, `test/om-legacy-operation-lock.test.ts`, `test/om-legacy-route-closure.test.ts`, `test/om-model-call.test.ts`, `test/om-operation-cost.test.ts`, `test/om-probe.test.ts`, `test/om-question-packet.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-repeat-gate.test.ts`, `test/om-result-identity.test.ts`, `test/om-routes.test.ts`, `test/om-run.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/om-series-current.test.ts`, `test/om-series.test.ts`, `test/om-task-context.test.ts`, `test/om-task-neighbors.test.ts`, `test/om-work-zone.test.ts`, `test/preparation.test.ts`, `test/reader-pilot.test.ts`, `test/research-call-resume.test.ts`, `test/runtime-absence-r3.test.ts`, `test/runtime-absence-research.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1
+- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3
 - Тесты сверх обязательных:
   - ЧАСТЬ А (слово пользователя ~22:10 «тест смотрит только актуальную версию»; вопрос Opus-1 №3686, разрешение оркестратора): 41 файл тестов, запускающих старый движок из git, и один модуль образцов test/fixtures/core1-records.ts — формат не в живой базе → сценарий удалить; формат в живой базе → образец из снимка 1554, читает нынешний код; проверки нового не трогать
   - ДО КОДА части Б — опись легаси и список удаляемого показать пользователю; удалять после его «да»
