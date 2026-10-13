@@ -14,7 +14,7 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { checkpoint } from "./research-continuation.js";
-import { Evidence, sourceIsCurrent } from "../evidence/evidence.js";
+import { Evidence, sourceIsCurrent, SOURCE_READ_CONTRACT } from "../evidence/evidence.js";
 import { readReaderResultAt, readerResultCurrent } from "./reader.js";
 import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWrites, markRecoveredSessionWritten,
   isResponseRecovery, prepareResearchConsumerIntent, readResearchConsumerIntent, findResearchConsumerIntent,
@@ -76,6 +76,21 @@ export function pendingSynthesis(store: Store, draft: Revision<DiscoveryDraft>, 
 const instruction = "\nmaterialPage may carry a finite JSON fragment of one large saved material; its cursor must advance before the next source. Synthesis uses finite pages of the materials already requested. synthesisPage gives the range actually supplied; omitted pages are not missing research. If synthesisPage.complete is false, return checkpoint with findings from this page, exact citations and remaining uncertainties; do not ask the reading planner to retrieve later pages. The engine saves your checkpoint and supplies the next page. An early answer is only an unassessed checkpoint. synthesisNotes contains earlier proposed answers and source citations, not authoritative facts; reconcile exceptions and contradictions across them. After the last page, compose the complete answer using these notes and supplied evidence. Only then request new research if essential information is still absent. All original materials remain at working.archive /body/synthesisMaterials. Never infer absence from an unshown page.";
 const checkpointInstruction = " A context-only page without primary Source evidence may use citations:[] only to record substantive missing-primary-text questions in unresolved, not to establish findings. Do not invent or borrow an irrelevant citation. Keep progress counts out of unresolved; the engine records them. Final answers still require sufficient primary citations and evidence.";
 
+/** Reading results retain their request/window metadata; answer observations
+ * still take verifyReading's strict Observation branch. Outside results have
+ * no selector, but must prove the same source and request as delivered reads.
+ * Both name their exact source; a reader window's bare range does not. A
+ * delivered value is verified source content, so the walk does not look inside
+ * it for engine material. Returns the children still to walk. */
+function verifyMaterialReading(store: Store, draft: Revision<DiscoveryDraft>, value: Record<string, any>): unknown[] {
+  if (!isRef(value.source)
+    || !(value.contract === SOURCE_READ_CONTRACT || (value.selector && Object.hasOwn(value, 'value'))))
+    return Object.values(value);
+  requireCondition(value.projectId === draft.value.projectId && new Evidence(store).verifyReading(value),
+    'synthesis_evidence_stale', 'A material source changed; do not reuse stale synthesis notes');
+  return Object.entries(value).flatMap(([key, child]) => key === 'value' ? [] : [child]);
+}
+
 /** Current admission for a new send or application: today's heads plus the
  * currency of every saved material. History itself never re-checks these. */
 function verifySynthesisMaterials(store: Store, draft: Revision<DiscoveryDraft>, materials: unknown): void {
@@ -83,9 +98,7 @@ function verifySynthesisMaterials(store: Store, draft: Revision<DiscoveryDraft>,
     if (!value || typeof value !== "object") return;
     if (isRef(value.record) && typeof value.pointer === 'string' && Object.hasOwn(value, 'value'))
       requireCurrentPriorContext(store, draft, value);
-    if (isRef(value.source) && value.selector && Object.hasOwn(value, "value")) {
-      requireCondition(new Evidence(store).verify(value), "synthesis_evidence_stale", "A material source changed; do not reuse stale synthesis notes");
-    }
+    const children = verifyMaterialReading(store, draft, value);
     if (isRef(value.ref)) {
       const reader = store.get<any>(value.ref.id, value.ref.revision);
       if (reader?.kind === "reader-result") {
@@ -99,7 +112,7 @@ function verifySynthesisMaterials(store: Store, draft: Revision<DiscoveryDraft>,
           && sourceIsCurrent(current.value), "synthesis_evidence_stale", "A directly read source changed before synthesis continued");
       }
     }
-    for (const child of Object.values(value)) verify(child);
+    for (const child of children) verify(child);
   };
   verify(materials);
 }
@@ -807,9 +820,7 @@ async function legacySynthesisSession(store: Store, draft: Revision<DiscoveryDra
       if (!value || typeof value !== "object") return;
       if(isRef(value.record)&&typeof value.pointer==='string'&&Object.hasOwn(value,'value'))
         requireCurrentPriorContext(store,draft,value);
-      if (isRef(value.source) && value.selector && Object.hasOwn(value, "value")) {
-        requireCondition(new Evidence(store).verify(value), "synthesis_evidence_stale", "A material source changed; do not reuse stale synthesis notes");
-      }
+      const children = verifyMaterialReading(store, draft, value);
       if (isRef(value.ref)) {
         const reader = store.get<any>(value.ref.id, value.ref.revision);
         if (reader?.kind === "reader-result") requireCondition(reader.hash === value.ref.hash
@@ -820,7 +831,7 @@ async function legacySynthesisSession(store: Store, draft: Revision<DiscoveryDra
             && sourceIsCurrent(current.value), "synthesis_evidence_stale", "A directly read source changed before synthesis continued");
         }
       }
-      for (const child of Object.values(value)) verify(child);
+      for (const child of children) verify(child);
     };
     verify(materials);
     if (session!.value.result) return session!.value.result!;

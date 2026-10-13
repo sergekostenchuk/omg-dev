@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { Store } from '../src/storage/store.js';
+import { ProductEngine } from '../src/product/engine.js';
+import { preparedFeatures } from './product-fixture.js';
+import type { Question } from '../src/discovery/discovery.js';
+import { pilotContext } from '../src/discovery/pilot-context.js';
 import { join } from 'node:path';
 import { fixture } from './synthesis-session-fixture.js';
 import { reference } from '../src/pipeline/contracts.js';
@@ -10,11 +16,11 @@ import { compactConclusions } from '../src/discovery/continuation-packet.js';
 import { synthesisControls } from '../src/discovery/synthesis-controls.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { configureReaderPilot, pilotEnvironment } from '../src/discovery/reader-pilot.js';
-import { synthesisSession } from '../src/discovery/synthesis-session.js';
+import { synthesisSession, readSynthesisSession } from '../src/discovery/synthesis-session.js';
 import { activeSynthesisNotes } from '../src/discovery/conclusion-consolidation.js';
 import { previewResearch } from '../src/discovery/research-preview.js';
 import { checkpoint } from '../src/discovery/research-continuation.js';
-import { hashJson } from '../src/canonical.js';
+import { hashJson, digest } from '../src/canonical.js';
 
 type F = Awaited<ReturnType<typeof fixture>>;
 
@@ -263,4 +269,192 @@ test('a paid tightening recovers through the ordinary consumer once, preserving 
   const active=activeSynthesisNotes(f.store.get<any>(f.before.id)!.value.notes);
   assert.deepEqual(active[0]!.consolidated!.tightenedFrom,session.value.notes.at(-1).checkpoint);
   await assert.rejects(f.invoke(),{code:'consolidation_capacity_exhausted'});assert.equal(f.store.list('model-call').length,f.setupCalls+2);
+});
+
+function rs5Fixture(t: test.TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-rs5-'));
+  const store = new Store(join(root, 'state.sqlite')), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  preparedFeatures(engine, 'p');
+  const path = join(root, 'adapter.mjs'), wire = join(root, 'wire.ndjson');
+  const command = { executable: process.execPath, args: [path] };
+  const environment = engine.environments.configure('p', { workspace: root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 10000 }, 0);
+  const r0 = engine.refinement.begin('p', 'R0');
+  engine.refinement.finishResearch('p', 'R0', reference(r0), 0); engine.refinement.sealLayer('p', 1, 0);
+  const draft = engine.refinement.begin('p', 'R1'), question = store.get<Question>(draft.value.questions[0]!)!;
+  const pilot = configureReaderPilot(store, engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command }, agentCommand: command,
+    maxRequestChars: 100000, maxContinuationChars: 100000, maxReadChars: 60000, maxReplyChars: 20000,
+    maxCalls: 30, maxReportedTokens: 100000,
+    planning: { fields: [question.value.spec.field], maxRequestChars: 100000, maxRounds: 5 } }, 0);
+  const source = engine.discovery.evidence.document('p', 'rs5', 'The output has one writer and rejects invalid input.', 'text/plain', 0);
+  const context = (reading: unknown) => ({ ...pilotContext(store, draft, question), workingSelections: [{ kind: 'context', value: reading }] });
+  const dispatch = pilotEnvironment(environment.value, pilot.value);
+  const invoke = (reading: unknown, view = store, options?: Parameters<typeof synthesisSession>[9]) =>
+    synthesisSession(view, draft, question, environment, dispatch, pilot, context(reading), 'Return the declared research action', undefined, options);
+  const adapter = (code: string) => writeFileSync(path, `import{readFileSync,appendFileSync,existsSync,writeFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;appendFileSync(${JSON.stringify(wire)},JSON.stringify(r)+'\\n');let research;${code}
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:1,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  adapter("research={action:'pause',reason:'RS5 local terminator'};");
+  return { root, store, engine, draft, question, environment, pilot, source, dispatch, context, invoke, adapter,
+    wires: () => existsSync(wire) ? readFileSync(wire, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [] };
+}
+
+for (const outcome of ['complete', 'clipped'] as const) test(`RS5-01 native reading-planner → read_source ${outcome} → synthesis survives restart`, async t => {
+  const f = rs5Fixture(t), length = f.source.value.content.length;
+  const requested = { start: 0, end: length + (outcome === 'clipped' ? 100 : 0) };
+  f.adapter(`if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'read_source',source:${JSON.stringify(reference(f.source))},...${JSON.stringify(requested)}}]};
+else research={action:'pause',reason:'RS5 material reached synthesis'};`);
+  const run = await f.engine.researcher.run('p', f.draft.id, 5);
+  assert.equal(run.value.status, 'paused');
+  assert.equal(f.wires().filter(w => w.subject.dispatchMode === 'planning').length, 1);
+  const synthesis = f.wires().filter(w => w.subject.dispatchMode === 'synthesis');
+  assert.equal(synthesis.length, 1, JSON.stringify(run.value));
+  const session = f.store.list<any>('synthesis-session')[0]!;
+  const readings: any[] = [];
+  const visit = (v: any) => { if (!v || typeof v !== 'object') return; if (v.contract === 'source-read/v1') readings.push(v); else Object.values(v).forEach(visit); };
+  visit(session.value.basis.materials);
+  assert.equal(readings.length, 1); assert.equal(readings[0].outcome, outcome);
+  assert.deepEqual(readings[0].requested, requested); assert.deepEqual(readings[0].served, { start: 0, end: length });
+  assert.equal(readings[0].value, f.source.value.content);
+  assert.ok(f.store.list<any>('research-turn').some(turn => turn.value.action?.action === 'read_source' && turn.value.observation?.outcome === outcome));
+  const second = new Store(join(f.root, 'state.sqlite')); t.after(() => second.close());
+  assert.deepEqual(readSynthesisSession(second, reference(session)), session);
+  const archive = f.store.get<any>(synthesis[0].subject.working.archive.id)!.value.body;
+  const beforeCalls = f.store.list('model-call').map(reference);
+  const result = await synthesisSession(second, f.draft, f.question, f.environment, f.dispatch, f.pilot, archive, 'Return the declared research action');
+  assert.equal(result.action, 'pause');
+  assert.equal(second.list('model-call').length, beforeCalls.length + 1);
+  assert.deepEqual(beforeCalls, second.list('model-call').filter(c => beforeCalls.some(ref => ref.id === c.id)).map(reference));
+});
+
+for (const outcome of ['complete', 'clipped', 'outside'] as const) test(`RS5-02 ${outcome} material is verified before initial send and resumed send`, async t => {
+  const f = rs5Fixture(t), length = f.source.value.content.length;
+  const reading = f.engine.discovery.evidence.readSource('p', reference(f.source),
+    { start: outcome === 'outside' ? length : 0, end: length + (outcome === 'complete' ? 0 : 100) });
+  assert.equal((await f.invoke(reading)).action, 'pause');
+  const session = f.store.list<any>('synthesis-session')[0]!;
+  const second = new Store(join(f.root, 'state.sqlite')); t.after(() => second.close());
+  assert.deepEqual(readSynthesisSession(second, reference(session)), session);
+  second.write({ id: f.source.id, kind: 'source', expected: f.source.revision,
+    value: { ...f.source.value, content: 'Changed source', sha256: digest('Changed source') } });
+  const calls = second.list('model-call');
+  await assert.rejects(f.invoke(reading, second), { code: 'synthesis_evidence_stale' });
+  assert.deepEqual(second.list('model-call'), calls);
+  assert.deepEqual(readSynthesisSession(second, reference(session)), session, 'historical result does not use current source heads');
+});
+
+for (const outcome of ['clipped', 'outside'] as const) test(`RS5-03 ${outcome}: a genuine reading of another project never becomes this project's synthesis material`, async t => {
+  const f = rs5Fixture(t), evidence = f.engine.discovery.evidence;
+  const source = evidence.document('other', 'rs5', f.source.value.content, 'text/plain', 0), length = source.value.content.length;
+  const foreign = evidence.readSource('other', reference(source), outcome === 'clipped' ? { start: 0, end: 200 } : { start: length, end: length + 10 });
+  assert.equal(foreign.outcome, outcome); assert.equal(evidence.verifyReading(foreign), true);
+  await assert.rejects(f.invoke(foreign), { code: 'synthesis_evidence_stale' });
+  assert.equal(f.store.list('model-call').length, 0);
+  assert.equal(f.store.list('research-checkpoint').length, 0);
+});
+
+test('RS5-04 clipped reading does not permit an out-of-range checkpoint citation', async t => {
+  const f = rs5Fixture(t), reading = f.engine.discovery.evidence.readSource('p', reference(f.source), { start: 0, end: 200 });
+  f.adapter(`research={action:'checkpoint',question:c.question.id,value:{finding:'A supported condition'},citations:[{source:${JSON.stringify(reference(f.source))},selector:{kind:'text-range',start:0,end:200}}],unresolved:[]};`);
+  await assert.rejects(f.invoke(reading), { code: 'selector_invalid' });
+  assert.equal(f.store.list('research-checkpoint').length, 0);
+  assert.equal(f.store.list('model-call').length, 1);
+  await assert.rejects(f.invoke(reading), { code: 'selector_invalid' });
+  assert.equal(f.store.list('model-call').length, 1, 'a paid invalid citation is not sent again');
+});
+
+for (const point of ['intent', 'application'] as const) test(`RS5-07 source replacement at ${point} transaction refuses without a partial checkpoint`, async t => {
+  const f = rs5Fixture(t), second = new Store(join(f.root, 'state.sqlite')); t.after(() => second.close());
+  const reading = f.engine.discovery.evidence.readSource('p', reference(f.source), { start: 0, end: 200 });
+  f.adapter(`research={action:'checkpoint',question:c.question.id,value:{finding:'The output has one writer'},citations:[{source:${JSON.stringify(reference(f.source))},selector:${JSON.stringify(reading.selector)}}],unresolved:[]};`);
+  const write = f.store.writeMany.bind(f.store); let changed = false;
+  f.store.writeMany = ((writes: any[], guards: any[] = []) => {
+    const target = point === 'intent' ? writes.some(w => w.kind === 'research-consumer-intent' && w.value.state === 'prepared')
+      : writes.some(w => w.kind === 'research-checkpoint');
+    if (!changed && target) {
+      assert.ok(guards.some(g => g.id === f.source.id && g.hash === f.source.hash), 'source guard predates the write');
+      changed = true;
+      second.write({ id: f.source.id, kind: 'source', expected: f.source.revision,
+        value: { ...f.source.value, content: 'Changed in another Store', sha256: digest('Changed in another Store') } });
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  await assert.rejects(f.invoke(reading), { code: point === 'intent' ? 'synthesis_intent_claim_conflict' : 'synthesis_evidence_stale' });
+  assert.equal(changed, true);
+  assert.equal(f.store.list('research-checkpoint').length, 0);
+  assert.equal(f.store.list('model-call').length, point === 'intent' ? 0 : 1);
+});
+
+test('RS5-08 a paid synthesis checkpoint over clipped reading recovers after restart without another call', async t => {
+  const f = rs5Fixture(t), reading = f.engine.discovery.evidence.readSource('p', reference(f.source), { start: 0, end: 200 });
+  f.adapter(`research={action:'checkpoint',question:c.question.id,value:{finding:'The output has one writer'},citations:[{source:${JSON.stringify(reference(f.source))},selector:${JSON.stringify(reading.selector)}}],unresolved:[]};`);
+  const write = f.store.writeMany.bind(f.store); let interrupted = false;
+  f.store.writeMany = ((writes: any[], guards: any[] = []) => {
+    if (!interrupted && writes.some(w => w.kind === 'research-checkpoint')) {
+      interrupted = true; throw Error('RS5 interrupted before checkpoint application');
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  await assert.rejects(f.invoke(reading), /RS5 interrupted before checkpoint application/);
+  f.store.writeMany = write;
+  assert.equal(interrupted, true); assert.equal(f.store.list('research-checkpoint').length, 0);
+  const session = f.store.list<any>('synthesis-session')[0]!, call = f.store.list<any>('model-call')[0]!;
+  assert.equal(call.value.status, 'succeeded');
+  const old = f.store.list().filter(r => ['model-call', 'model-request', 'model-response', 'research-context'].includes(r.kind));
+  const second = new Store(join(f.root, 'state.sqlite')); t.after(() => second.close());
+  const receipt = await new ProductEngine(second).execute({ type: 'recover-research-response', project: 'p', call: reference(call), session: reference(session) }) as any;
+  assert.equal(receipt.value.state, 'applied'); assert.equal(second.list('model-call').length, 1);
+  const note = second.list<any>('research-checkpoint')[0]!;
+  assert.equal(note.value.observations.length, 1);
+  assert.equal(note.value.observations[0].value, reading.value);
+  assert.equal(Object.hasOwn(note.value.observations[0], 'contract'), false, 'checkpoint records a strict quote of served bytes');
+  for (const record of old) assert.deepEqual(second.get(record.id, record.revision), record);
+  assert.equal(readSynthesisSession(second, reference(second.get(session.id)!)).value.notes.length, 1);
+});
+
+for (const outcome of ['clipped', 'outside'] as const) test(`RS5-09 native read_bundle ${outcome} window reaches synthesis; its bare range is not a delivered read`, async t => {
+  const f = rs5Fixture(t), length = f.source.value.content.length;
+  const range = outcome === 'clipped' ? { start: 0, end: length + 100 } : { start: length, end: length + 10 };
+  f.adapter(`if(c.role==='reader')research={selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]};
+else if(c.dispatchMode==='planning')research={action:'read_plan',question:c.question.id,reads:[{action:'read_bundle',purpose:'RS5 window',inputs:[{source:${JSON.stringify(reference(f.source))},range:${JSON.stringify(range)}}]}]};
+else research={action:'pause',reason:'RS5 reader material reached synthesis'};`);
+  const run = await f.engine.researcher.run('p', f.draft.id, 5);
+  assert.equal(run.value.status, 'paused', JSON.stringify(run.value));
+  const reader = f.store.list<any>('reader-result')[0]!;
+  assert.equal(reader.value.coverage[0].reading.outcome, outcome);
+  assert.equal(f.wires().filter(w => w.subject.dispatchMode === 'synthesis').length, 1, JSON.stringify(run.value));
+  const session = f.store.list<any>('synthesis-session')[0]!;
+  const windows: any[] = [];
+  const visit = (v: any) => { if (!v || typeof v !== 'object') return; if (v.reading?.outcome) windows.push(v); Object.values(v).forEach(visit); };
+  visit(session.value.basis.materials);
+  assert.equal(windows.length, 1); assert.deepEqual(windows[0].reading, reader.value.coverage[0].reading);
+});
+
+for (const [label, payload] of [
+  ['reading-like fields', { outcome: 'complete', requested: { format: 'json' } }],
+  ['nested reading-like fields', { job: { outcome: 'outside', requested: 'garden' } }],
+  ['an engine-shaped read as content', { contract: 'source-read/v1', projectId: 'p', source: { id: 'source:p:absent', revision: 1, hash: '0'.repeat(64) },
+    selector: { kind: 'text-range', start: 0, end: 1 }, value: 'x', record: { id: 'reader-result:p:absent', revision: 1, hash: '0'.repeat(64) }, pointer: '/x' }],
+] as [string, unknown][]) test(`RS5-11 a lawful JSON source with ${label} reaches synthesis; its content is not engine material`, async t => {
+  const f = rs5Fixture(t), evidence = f.engine.discovery.evidence;
+  const source = evidence.document('p', 'domain-json', JSON.stringify({ payload }), 'application/json', 0);
+  const observation = evidence.observe('p', reference(source), { kind: 'json-pointer', pointer: '/payload' });
+  assert.equal(evidence.verifyReading(observation), true);
+  assert.equal((await f.invoke(observation)).action, 'pause');
+  assert.equal(f.store.list('model-call').length, 1);
+  const second = new Store(join(f.root, 'state.sqlite')); t.after(() => second.close());
+  assert.equal((await f.invoke(observation, second)).action, 'pause', 'a new Store admits the same material');
+});
+
+test('RS5-11 a changed JSON source is refused before the send', async t => {
+  const f = rs5Fixture(t), evidence = f.engine.discovery.evidence;
+  const source = evidence.document('p', 'domain-json', JSON.stringify({ payload: { outcome: 'complete' } }), 'application/json', 0);
+  const observation = evidence.observe('p', reference(source), { kind: 'json-pointer', pointer: '/payload' });
+  evidence.document('p', 'domain-json', JSON.stringify({ payload: { outcome: 'changed' } }), 'application/json', source.revision);
+  await assert.rejects(f.invoke(observation), { code: 'synthesis_evidence_stale' });
+  assert.equal(f.store.list('model-call').length, 0);
 });
