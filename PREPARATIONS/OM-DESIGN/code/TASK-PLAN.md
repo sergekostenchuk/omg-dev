@@ -2210,8 +2210,8 @@
 - Отдаёт: —
 - Читает записи: исходное поручение; принятые ответы Discovery этой версии; импортированные документы исследования
 - Пишет записи: план исследования; отчёт исследования; вердикт Discovery; исход Discovery для перехода к концепции
-- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/requirements.ts`, `src/discovery/discovery-outcome.ts`, `src/discovery/research-runner.ts`, `src/product/stage-research.ts`, `src/product/stage-checks.ts`, `src/discovery/working-context.ts`, `src/discovery/research-assessment.ts`, `src/om/input.ts`, `test/research.test.ts`, `test/early-stage-briefs.test.ts`, `test/stage-research.test.ts`, `test/stage-checks.test.ts`, `test/om-input.test.ts`, `test/preparation-fixture.ts`, `test/product-fixture.ts`, `test/product.test.ts`, `test/preparation.test.ts`, `src/discovery/research-reuse.ts`, `src/om/gaps.ts`
-- Из движка как есть: №4458; №4460; №4463; №4480; №4489; №4491; №4498; discovery-as-need-router
+- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/requirements.ts`, `src/discovery/discovery-outcome.ts`, `src/discovery/research-runner.ts`, `src/product/stage-research.ts`, `src/product/stage-checks.ts`, `src/discovery/working-context.ts`, `src/discovery/research-assessment.ts`, `src/om/input.ts`, `test/research.test.ts`, `test/early-stage-briefs.test.ts`, `test/stage-research.test.ts`, `test/stage-checks.test.ts`, `test/om-input.test.ts`, `test/preparation-fixture.ts`, `test/product-fixture.ts`, `test/product.test.ts`, `test/preparation.test.ts`, `src/discovery/research-reuse.ts`, `src/om/gaps.ts`, `test/om-runtime-confirmation.test.ts`
+- Из движка как есть: №4458; №4460; №4463; №4480; №4489; №4491; №4498; №4501; discovery-as-need-router
 - После: RS4, RS3
 - Тесты сверх обязательных:
   - три предметных примера владельца (харнесс, шина светильников, левитирующая тумбочка): разные планы проходят до отчёта и оценщика; план без источников — отказ формы; роль не захардкожена
