@@ -11,7 +11,7 @@ import { archivedContext, contextValue } from "./working-context.js";
 import { readerResultCurrent, readReaderResultAt } from "./reader.js";
 import { isReaderResultRef } from "./pilot-context.js";
 import { EngineError } from "../errors.js";
-import { contextLookupKey, contextProgress, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
+import { foldContextEvent, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
 import { projectCheckpointValue, researchAction, matchAcceptedPaidAnswer,
   type AcceptedPaidAnswerInputs } from './research-consumer-transition.js';
@@ -132,12 +132,10 @@ export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],qu
   for(const turn of turns){
     if(turn.value.question?.id!==question.id||turn.value.status!=='completed'||turn.value.error)continue;
     const action=(turn.value.action as ResearchAction).action;
-    if(['checkpoint','answer','answer_delta','read_bundle','read_source'].includes(action))workspace=contextProgress(workspace);
-    if(action!=='read_context')continue;
+    if(action!=='read_context') { workspace=foldContextEvent(workspace,action); continue; }
     const result=latestFocus(store,[turn],question) as ContextLookup|null;
     if(!result)continue;
-    const key=contextLookupKey(result);
-    workspace={entries:[...workspace.entries.filter(e=>e.key!==key),{key,result}],sinceProgress:workspace.sinceProgress+1};
+    workspace=foldContextEvent(workspace,action,result);
   }
   return workspace;
 }

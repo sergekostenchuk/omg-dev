@@ -38,6 +38,18 @@ export function addContextLookup(state: ContextWorkspace, result: ContextLookup,
 }
 export function contextProgress(state: ContextWorkspace): ContextWorkspace {return {...state,sinceProgress:0,checkpointedKeys:state.entries.map(entry=>entry.key)};}
 
+/** Fold an admitted historical event, not a new lookup request: replay may
+ * move an existing original, while addContextLookup still rejects redelivery. */
+export function foldContextEvent(state: ContextWorkspace, action: string, result?: ContextLookup): ContextWorkspace {
+  if (['checkpoint', 'answer', 'answer_delta', 'read_bundle', 'read_source'].includes(action))
+    return contextProgress(state);
+  if (action !== 'read_context') return state;
+  requireCondition(result, 'research_context_invalid', 'A context history event needs its proved lookup');
+  const key = contextLookupKey(result);
+  return { ...state, entries: [...state.entries.filter(entry => entry.key !== key), { key, result }],
+    sinceProgress: state.sinceProgress + 1 };
+}
+
 /** The newest requested original must cross the actual dispatch boundary.
  * Older originals may be replaced by explicit addresses, never by empty data. */
 export function requireContextDelivery(expected: ContextLookup[], packet: Record<string, any>): void {

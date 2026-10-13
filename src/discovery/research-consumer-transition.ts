@@ -13,7 +13,7 @@ import type { DiscoveryDraft, Question } from './discovery.js';
 import type { Revision, Store } from '../storage/store.js';
 import { activeSynthesisNotes, consolidationNotice, consolidatedProposal,
   type ConsolidationNotice, type SynthesisNote } from './conclusion-consolidation.js';
-import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace,
+import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace, foldContextEvent,
   type ContextLookup, type ContextWorkspace } from './context-workspace.js';
 import { archivedContext, contextPage, contextValue, type ContextPage } from './working-context.js';
 import type { Graph } from '../graph/model.js';
@@ -825,9 +825,8 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
     const prior = turn.value;
     if (prior.question?.id !== question.id || prior.status !== 'completed' || prior.error) continue;
     const kind = (prior.action as { action?: unknown } | null)?.action;
-    if (['checkpoint', 'answer', 'answer_delta', 'read_bundle', 'read_source'].includes(String(kind)))
-      workspace = contextProgress(workspace);
-    if (kind !== 'read_context' || canonical(prior.question) !== canonical(question)) continue;
+    if (kind !== 'read_context') { workspace = foldContextEvent(workspace, String(kind)); continue; }
+    if (canonical(prior.question) !== canonical(question)) continue;
     requireCondition(entry.context,
       'research_consumer_intent_invalid',
       'An earlier addressed read lost its exact checked original');
@@ -836,10 +835,7 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
       'research_consumer_intent_invalid', 'The original addressed action is invalid');
     const result = prior.observation as ProjectedContextRead;
     contextReadIdentity({ ...entry.context, action, observation: result, question });
-    const key = contextLookupKey(result);
-    workspace = { ...workspace,
-      entries: [...workspace.entries.filter(item => item.key !== key), { key, result }],
-      sinceProgress: workspace.sinceProgress + 1 };
+    workspace = foldContextEvent(workspace, kind, result);
   }
   return workspace;
 }

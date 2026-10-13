@@ -507,3 +507,220 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{
   assert.equal(store.list<ResearchTurn>('research-turn')[0]!.value.status, 'pending');
   assert.equal(store.list('model-call').length, 1); assert.equal(store.list('model-response').length, 1);
 });
+
+import { addressedWorkspace } from '../src/discovery/research-continuation.js';
+import { readContextTurnHistoryAt } from '../src/discovery/response-recovery.js';
+import { projectAddressedWorkspace, type ManagedResearchTurn } from '../src/discovery/research-consumer-transition.js';
+import type { DiscoveryDraft } from '../src/discovery/discovery.js';
+import { canonical } from '../src/canonical.js';
+
+const RS2_ADAPTER = `import{readFileSync,writeFileSync,appendFileSync,existsSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject,root=process.argv[2];
+appendFileSync(root+'/wire.jsonl',JSON.stringify(r)+'\\n');
+let research;
+if(c.role==='assess-answer') research={verdict:'supported',reasons:[]};
+else {
+ const n=existsSync(root+'/position')?Number(readFileSync(root+'/position','utf8')):0;
+ const a=JSON.parse(readFileSync(root+'/actions.json','utf8'))[n];
+ if(!a)throw Error('Unexpected fixture dispatch '+n);
+ writeFileSync(root+'/position',String(n+1));
+ const catalog=c.inventory?.sources??c.originals?.sources??[];
+ const sources=Array.isArray(catalog)?catalog:catalog.rows.map(row=>Object.fromEntries(catalog.columns.map((key,i)=>[key,row[i]])));
+ const source=sources.find(s=>s.location==='rs2-source'),q=c.question??c.questions[0];
+ const citations=[{source:source.ref,selector:{kind:'text-range',start:0,end:137}}];
+ if(a==='source')research={action:'read_source',source:source.ref,start:0,end:200};
+ else if(a==='checkpoint')research={action:'checkpoint',question:q.id,value:{note:'Retain the source and exact context'},citations,unresolved:['Need fields']};
+ else if(a==='answer')research={action:'answer',question:q.id,value:{ok:true},citations};
+ else if(a==='repeat')research={action:'read_context',record:c.contextWorkspace.at(-1).record,pointer:c.contextWorkspace.at(-1).pointer};
+ else research={action:'read_context',record:c.working.archive,pointer:'/body/'+a};
+}
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`;
+
+function rs2Fixture(t:test.TestContext,actions:string[]) {
+ const f=fixture(t);f.configure('p');
+ const source=f.engine.discovery.evidence.document('p','rs2-source','x'.repeat(137),'text/plain',0);
+ const draft=f.engine.discovery.create('p','discovery','R0','concept',[
+  {field:'result',kind:'design',prompt:'Design a result from the source',risk:'Incomplete context',schema:{type:'object'}}]);
+ writeFileSync(join(f.root,'adapter.mjs'),RS2_ADAPTER);
+ // The existing environment dispatches [adapter, scenario, calls]; use scenario as the root.
+ const env=f.engine.environments.get('p');
+ const command={executable:process.execPath,args:[join(f.root,'adapter.mjs'),f.root]};
+ f.engine.environments.configure('p',{...env.value,implementer:{...env.value.implementer,command},
+  reviewer:{...env.value.reviewer,command}},env.revision);
+ writeFileSync(join(f.root,'actions.json'),JSON.stringify(actions));
+ return {...f,draft,source};
+}
+
+function rs2Prove(store:Store,draftId:string,number?:number) {
+ const turns=store.list<ResearchTurn>('research-turn').sort((a,b)=>a.value.number-b.value.number);
+ const last=number?turns.find(t=>t.value.number===number)!:turns.at(-1)!;
+ const before=store.get<ManagedResearchTurn>(last.id,1)!;
+ const draft=store.get<DiscoveryDraft>(draftId)!;
+ const question=store.get<Question>(before.value.question!.id,before.value.question!.revision)!;
+ const previous=turns.filter(t=>t.value.number<before.value.number);
+ const exact=projectAddressedWorkspace(before.value,
+  readContextTurnHistoryAt(store,'p',draft,reference(question),previous,before.value.number),reference(question));
+ const current=addressedWorkspace(store,previous,question);
+ assert.deepEqual(current,exact);
+ return exact;
+}
+
+for(const progress of ['source','checkpoint'])test(`RS2 ${progress} then two addressed reads survive paid interruption and restart without new calls`,async t=>{
+ const actions=progress==='source'?['source','sourceCatalogue','fields']:['sourceCatalogue','checkpoint','fields'];
+ const f=rs2Fixture(t,actions);
+ for(let n=0;n<2;n++)await f.engine.researcher.run('p',f.draft.id,1);
+ const original=f.store.writeMany.bind(f.store);let interrupted=false;
+ f.store.writeMany=((writes:Write[],guards=[])=>{
+  if(!interrupted&&writes.some(w=>w.kind==='research-turn'&&(w.value as ResearchTurn).status==='completed'
+    &&(w.value as any).action?.pointer==='/body/fields')) {
+   interrupted=true;throw new EngineError('fixture_rs2_interrupted','Paid addressed read awaits completion');
+  }
+  return original(writes,guards);
+ }) as typeof f.store.writeMany;
+ const stopped=await f.engine.researcher.run('p',f.draft.id,1);f.store.writeMany=original;
+ assert.ok(interrupted,JSON.stringify(stopped.value));
+ const calls=f.store.list('model-call'),responses=f.store.list('model-response');
+ const restarted=new Store(join(f.root,'state.sqlite'));t.after(()=>restarted.close());
+ await new ProductEngine(restarted).researcher.run('p',f.draft.id,1);
+ const turn=restarted.list<ResearchTurn>('research-turn').find(r=>r.value.number===3)!;
+ assert.equal(turn.value.status,'completed');assert.equal(turn.value.error,null);
+ assert.deepEqual(readResearchConsumerTurn(restarted,reference(turn)),turn);
+ assert.deepEqual(restarted.list('model-call'),calls);assert.deepEqual(restarted.list('model-response'),responses);
+ const workspace=rs2Prove(restarted,f.draft.id);
+ assert.equal(workspace.checkpointedKeys!.length,progress==='source'?0:1);
+ const packet=JSON.parse(readFileSync(join(f.root,'wire.jsonl'),'utf8').trim().split('\n').at(-1)!).subject;
+ assert.equal(canonical(packet.contextWorkspace),canonical(workspace.entries.map(e=>e.result)));
+});
+
+test('RS2 repeated delivered lookup retains the exact refusal through the historical reader',async t=>{
+ const f=rs2Fixture(t,['sourceCatalogue','repeat']);
+ await f.engine.researcher.run('p',f.draft.id,1);
+ const result=await f.engine.researcher.run('p',f.draft.id,1);
+ assert.equal(result.value.pauseCode,'research_no_progress');
+ const turn=f.store.list<ResearchTurn>('research-turn').find(r=>r.value.number===2)!;
+ assert.equal((turn.value.observation as any).code,'research_no_progress');
+ const restart=new Store(join(f.root,'state.sqlite'));t.after(()=>restart.close());
+ assert.deepEqual(readResearchConsumerTurn(restart,reference(turn)),turn);
+ rs2Prove(restart,f.draft.id);
+});
+
+import { layerDesignOf } from '../src/graph/layer-design.js';
+import { layerDeltaView } from '../src/discovery/layer-delta.js';
+import { enrichedGraph } from './enriched-graph-fixture.js';
+import { exampleGraph } from './graph-fixture.js';
+import { answerTechnicalFixture } from './technical-research-fixture.js';
+
+for(const delta of [false,true])test(`RS2 accepted ${delta?'answer_delta':'answer'} and lawful question reopening keep subsequent reads consistent`,async t=>{
+ let f:ReturnType<typeof rs2Fixture>;
+ if(!delta)f=rs2Fixture(t,['sourceCatalogue','answer','fields','sourceCatalogue']);
+ else {
+  const base=fixture(t),full=enrichedGraph(exampleGraph('p'),'p');
+  preparedFeatures(base.engine,'p',full);base.configure('p');
+  writeFileSync(join(base.root,'README.md'),'A local stateless transformation fixture.');
+  const source=base.engine.discovery.evidence.document('p','rs2-source','x'.repeat(137),'text/plain',0);
+  const r0=base.engine.refinement.begin('p','R0');
+  base.engine.refinement.finishResearch('p','R0',reference(r0),0);base.engine.refinement.sealLayer('p',1,0);
+  const r1=base.engine.refinement.begin('p','R1');answerTechnicalFixture(base.engine,'p',r1);
+  base.engine.refinement.finishResearch('p','R1',reference(base.store.get(r1.id)!),0);
+  const draft=base.engine.refinement.prepareLayer('p',2);
+  const question=base.store.get<Question>(draft.value.questions[0]!)!;
+  const view=layerDeltaView(base.store,'p',layerDesignOf(full,2,question.value.spec.layerAssembly),2,question.value.spec.layerAssembly);
+  const adapter=RS2_ADAPTER.replace("const citations=[{source:source.ref,selector:{kind:'text-range',start:0,end:137}}];",
+   `const citations=${JSON.stringify([{source:reference(source),selector:{kind:'text-range',start:0,end:137}}])};`)
+   .replace("else if(a==='answer')research={action:'answer',question:q.id,value:{ok:true},citations};",
+   "else if(a==='answer')research={action:'answer_delta',question:q.id,...JSON.parse(readFileSync(root+'/delta.json','utf8')),citations};");
+  writeFileSync(join(base.root,'delta.json'),JSON.stringify({base:view.base,upserts:view.upserts,removes:view.removes}));
+  writeFileSync(join(base.root,'adapter.mjs'),adapter);
+  writeFileSync(join(base.root,'actions.json'),JSON.stringify(['sourceCatalogue','answer','question','sourceCatalogue']));
+  const env=base.engine.environments.get('p'),command={executable:process.execPath,args:[join(base.root,'adapter.mjs'),base.root]};
+  base.engine.environments.configure('p',{...env.value,implementer:{...env.value.implementer,command},reviewer:{...env.value.reviewer,command}},env.revision);
+  configureReaderPilot(base.store,base.engine.environments,'p',{experimental:true,active:true,stopAfter:'L2',
+   reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command},agentCommand:command,
+   maxCalls:40,maxReportedTokens:50000000,maxRequestChars:100000,maxReadChars:60000,maxReplyChars:100000},0);
+  f={...base,draft,source};
+ }
+ for(let n=0;n<2;n++)await f.engine.researcher.run('p',f.draft.id,1);
+ const answer=f.store.list<ResearchTurn>('research-turn').find(turn=>(turn.value.action as any).action===(delta?'answer_delta':'answer'))!;
+ assert.ok(answer,JSON.stringify({responses:f.store.list('model-response'),runs:f.store.list<ResearchRun>('research-run').map(r=>({status:r.value.status,error:r.value.error})),turns:f.store.list<ResearchTurn>('research-turn').map(t=>({status:t.value.status,action:(t.value.action as any).action,error:t.value.error}))}));assert.equal(answer.value.error,null,JSON.stringify(answer.value));
+ assert.equal(f.store.get<Question>(f.draft.value.questions[0]!)!.value.status,'answered',JSON.stringify({runs:f.store.list('research-run'),turn:{status:answer.value.status,assessment:answer.value.assessment,error:answer.value.error}}));
+ const q=f.store.get<Question>(f.draft.value.questions[0]!)!;f.engine.discovery.reopen(q.id,q.revision);
+ const restarted=new Store(join(f.root,'state.sqlite'));t.after(()=>restarted.close());
+ for(let n=0;n<2;n++)await new ProductEngine(restarted).researcher.run('p',f.draft.id,1);
+ const turns=restarted.list<ResearchTurn>('research-turn').sort((a,b)=>a.value.number-b.value.number);
+ assert.equal(turns.length,4);assert.equal(turns.at(-1)!.value.error,null);
+ assert.equal(turns.at(-1)!.value.status,'completed');
+ assert.deepEqual(readResearchConsumerTurn(restarted,reference(answer)),answer);
+ assert.deepEqual(rs2Prove(restarted,f.draft.id).checkpointedKeys,[],'older-revision lookups are not silently made current');
+});
+
+test('RS2 current lookup head and exact historical lookup have distinct admission, without accepting a partial history',async t=>{
+ const f=rs2Fixture(t,['sourceCatalogue','fields']);
+ await f.engine.researcher.run('p',f.draft.id,1);
+ const first=f.store.list<ResearchTurn>('research-turn')[0]!;
+ const record=(first.value.observation as any).record;
+ const original=f.store.get<any>(record.id)!;
+ const another=new Store(join(f.root,'state.sqlite'));t.after(()=>another.close());
+ another.write({...original,expected:original.revision,value:{...original.value,body:{...original.value.body,changed:true}}});
+ assert.deepEqual(readResearchConsumerTurn(another,reference(first)),first,'today’s head does not rewrite a completed exact reading');
+ const question=f.store.get<Question>(f.draft.value.questions[0]!)!;
+ assert.deepEqual(addressedWorkspace(f.store,[first],question).entries,[],'the changed head is not current material');
+ const run=await f.engine.researcher.run('p',f.draft.id,1);
+ assert.equal(run.value.pauseCode,'research_consumer_context_stale');
+ const pending=f.store.list<ResearchTurn>('research-turn').find(turn=>turn.value.number===2)!;
+ assert.equal(pending.value.status,'pending');
+ const currentDraft=f.store.get<DiscoveryDraft>(f.draft.id)!;
+ assert.throws(()=>readContextTurnHistoryAt(f.store,'p',currentDraft,reference(question),[],2),{code:'research_consumer_intent_invalid'});
+ const forged=f.store.write<ResearchTurn>({id:'research-turn:v1:rs2-forged',kind:'research-turn',expected:0,
+   value:{...first.value,observation:{...(first.value.observation as any),value:'forged'}}});
+ assert.throws(()=>readContextTurnHistoryAt(f.store,'p',currentDraft,reference(question),[forged],2),{code:'research_consumer_intent_invalid'});
+ assert.deepEqual(readResearchConsumerTurn(another,reference(first)),first);
+});
+
+test('RS2 exact Git ecd00625 producer keeps history and packet bytes and recovers its paid pending read',async t=>{
+ const root=mkdtempSync(join(tmpdir(),'omg-rs2-era-')),era=join(root,'era');mkdirSync(era);
+ t.after(()=>rmSync(root,{recursive:true,force:true}));
+ execFileSync('tar',['-xf','-','-C',era],{input:execFileSync('git',['archive','ecd006252f7102d5377d61e8c9911685c1aa4aeb'],{maxBuffer:80<<20})});
+ symlinkSync(resolve('node_modules'),join(era,'node_modules'));
+ execFileSync(process.execPath,[resolve('node_modules/typescript/bin/tsc'),'-p',join(era,'tsconfig.json')],{cwd:era});
+ const producer=join(era,'rs2-old-producer.mjs');
+ writeFileSync(producer,`import{mkdirSync,writeFileSync}from'node:fs';
+import{Store}from'./dist/src/storage/store.js';import{ProductEngine}from'./dist/src/product/engine.js';
+import{reference}from'./dist/src/pipeline/contracts.js';
+import{projectAddressedWorkspace}from'./dist/src/discovery/research-consumer-transition.js';
+import{readContextTurnHistoryAt}from'./dist/src/discovery/response-recovery.js';
+for(const mode of ['paid','refused']){
+ const root=${JSON.stringify(root)}+'/'+mode;mkdirSync(root);const store=new Store(root+'/state.sqlite'),engine=new ProductEngine(store);
+ engine.execute({type:'create-project',project:'p',title:'Old producer'});
+ const adapter=root+'/adapter.mjs';writeFileSync(adapter,${JSON.stringify(RS2_ADAPTER)});
+ const command={executable:process.execPath,args:[adapter,root]};
+ engine.environments.configure('p',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'assessor',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:5000},0);
+ engine.discovery.evidence.document('p','rs2-source','x'.repeat(137),'text/plain',0);
+ const draft=engine.prepare('p','discovery');
+ const actions=mode==='paid'?['source','sourceCatalogue','fields']:['sourceCatalogue','repeat'];
+ writeFileSync(root+'/actions.json',JSON.stringify(actions));
+ let run;for(const action of actions)run=await engine.researcher.run('p',draft.id,1);
+ const turns=store.list('research-turn').sort((a,b)=>a.value.number-b.value.number),last=turns.at(-1),question=store.get(last.value.question.id);
+ const workspace=projectAddressedWorkspace(store.get(last.id,1).value,readContextTurnHistoryAt(store,'p',store.get(draft.id),reference(question),turns,last.value.number),reference(question));
+ writeFileSync(root+'/expected.json',JSON.stringify({draft,turns,workspace,run,records:store.list().filter(r=>['model-call','model-response','research-context'].includes(r.kind))}));store.close();
+}`);
+ execFileSync(process.execPath,[producer],{cwd:era,maxBuffer:4<<20});
+ for(const mode of ['paid','refused']){
+  const dir=join(root,mode),expected=JSON.parse(readFileSync(join(dir,'expected.json'),'utf8'));
+  const store=new Store(join(dir,'state.sqlite'));t.after(()=>store.close());
+  for(const turn of expected.turns)assert.deepEqual(readResearchConsumerTurn(store,reference(turn)),turn);
+  assert.deepEqual(rs2Prove(store,expected.draft.id),expected.workspace,'the historical fold is byte-for-byte the old formula');
+  const packet=JSON.parse(readFileSync(join(dir,'wire.jsonl'),'utf8').trim().split('\n').at(-1)!).subject;
+  assert.equal(canonical(packet.contextWorkspace),canonical(expected.workspace.entries.map((e:any)=>e.result)));
+  if(mode==='paid'){
+   assert.equal(expected.run.value.pauseCode,'research_consumer_context_stale','the actual old producer reproduces HX1');
+   const result=await new ProductEngine(store).execute({type:'research-stage',project:'p',draftId:expected.draft.id,maxTurns:1}) as any;
+   assert.equal(result.status,'paused');
+   const completed=store.get<ResearchTurn>(expected.turns.at(-1).id)!;
+   assert.equal(completed.value.status,'completed');assert.equal(completed.value.error,null);
+   const restarted=new Store(join(dir,'state.sqlite'));t.after(()=>restarted.close());
+   assert.deepEqual(readResearchConsumerTurn(restarted,reference(completed)),completed);
+  }else assert.equal(expected.run.value.pauseCode,'research_no_progress');
+  assert.deepEqual(store.list().filter(r=>['model-call','model-response','research-context'].includes(r.kind)),expected.records);
+  for(const turn of expected.turns)assert.deepEqual(store.get(turn.id,turn.revision),turn);
+ }
+});
