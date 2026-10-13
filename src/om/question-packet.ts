@@ -1,7 +1,7 @@
-import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, resolveBriefAnswer, type BriefBasis, type BriefLabel,
+import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, graphIndex, reopenedMaterial, resolveBriefAnswer, type BriefBasis, type BriefLabel,
   briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot,
   IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact } from './packet-brief.js';
-import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, IMPACT_PARSER, deriveTestMap, isRepository, readSnapshot, resolveSnapshot } from './impact.js';
+import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, IMPACT_PARSER, deriveTestMap, isRepository, readSnapshot, resolveSnapshot, transitionField } from './impact.js';
 import { IMPACT_SEMANTIC_CODES } from '../graph/semantics.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
 import { ANSWER_FORM_CODES, readTextResult, readPointerResult, tooLargeRead, type ReadResult } from './answer-form.js';
@@ -29,7 +29,8 @@ import { prepareAnswerTask, readAnswerTaskBasis, mc1FieldSpec, prepareMc1Questio
   type AnswerTaskRequest, type CheckedAnswerTask } from './accepted-answer.js';
 import { readCapacity } from './capacity.js';
 import { prepareRoutes, prepareManagedRouteBatch, readRoutes, type RoutedBatch, type RoutesRecord } from './routes.js';
-import { ONE_ARTIFACT, PROPOSAL_REFUSAL_CODES, WAKE_TEST, prepareFrameProposals, readFrameProposals, type LayerProposal, type FrameProposals } from './frame-proposals.js';
+import { ONE_ARTIFACT, PROPOSAL_REFUSAL_CODES, WAKE_TEST, prepareFrameProposals, readFrameProposals, readL3Reopen, type LayerProposal, type FrameProposals,
+  type FrameReopen } from './frame-proposals.js';
 import { FRAME_REFUSAL_CODES, flowKey, WORKS_FRAME_CONTRACT, type FrameObligation } from './frame-obligations.js';
 import { readCompletionBinding, readAnySeriesAt, readMechanismAdmission, prepareSeriesLineAdmission, completionWorkId, type Attempt, type RepairSeries, type AnyRepairSeries } from './series.js';
 import { readJournal, readJournalAt, journalId, registerJournalProofExecutor, unitRefusalNamespace, type JournalRow, type RefusalJournal } from './refusal-journal.js';
@@ -163,7 +164,7 @@ export interface QuestionPacketRecord {
   packetContract?: 'om-packet/v3' | 'om-packet/works-v1' | typeof BRIEF_PACKET_CONTRACT | typeof WORKS_BRIEF_PACKET_CONTRACT;
   briefCatalogue?: Ref[];
   /** Absent on historical v1 records, including empty/blocked; descendants retain their proved root's version. */
-  briefContract?: typeof BRIEF_CONTENT_CONTRACT;
+  briefContract?: typeof BRIEF_CONTENT_CONTRACT | typeof BRIEF_REOPEN_CONTRACT;
   /** MP2 (№2968 §2, row 19): the neighbour set a brief root issued after MP2 saved; absent in a packet MP1 issued. */
   briefNeighbors?: { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] };
   /**
@@ -599,6 +600,73 @@ function expansionContext(frame: FrameProposals, node: string) {
     }),
     reserved: frame.result.representatives.map(item => item.id).sort(order), previous: [] as Json[] };
 }
+/** RB1: whether a request expands an L3 node over a works frame the owner reopened (RL3) — the root then shows those works whole. */
+function reopenedRoot(store: Store, request: QuestionPacketRequest): boolean {
+  if (request.batch === null) return false;
+  const routes = take(readRoutes(store, { project: request.project, record: request.routes })) as unknown as { record: Revision<RoutesRecord> };
+  const batch = routes.record.value.batches.find(item => item.id === request.batch);
+  const works = routes.record.value.request.gaps.sources.works as unknown as { frame?: { reopen?: FrameReopen } };
+  return batch?.task === 'node-expansion' && batch.level === 3 && object(works.frame) && object(works.frame.reopen);
+}
+/**
+ * RB1 (№4285, №4291; class of 03.10: every duty with its material in the first request): each work the owner reopened under
+ * the expanded node, whole as the accepted graph holds it — the node, its tests, its L3 bindings, the joins it consumes, its
+ * edges, and the works before it (by order, by the bindings it consumes, by its integrations) with their ports and code
+ * references — with what the AT1 door found in it and the tests its change reaches. A policy finding carries the decision
+ * B1 now holds for its exact policy, producer and contract (or null), so that the model designs by it and never decides it
+ * again. The model redefines the work under the same id (removes) instead of asking for what it must keep or change.
+ */
+type PolicyRow = { question: { id: string; readiness?: { cause: string; policy?: string; producer?: string; governs?: { contract: string; hash: string };
+  snapshot?: { commit: string; tree: string }; file?: string; line?: number; site?: { start: number; end: number; hash: string }; works?: string[] } }; value: Json };
+function reopenedContext(store: Store, frame: FrameProposals, node: string, references: Ref[], input: Json): Json[] {
+  const reopen = (frame.frame.request as { reopen?: FrameReopen }).reopen, graph = frame.frame.accepted?.graph;
+  if (!reopen || !graph) return [];
+  const record = take(readL3Reopen(store, frame.frame.request.project, reopen.record)) as unknown as Revision<{ snapshot: { commit: string; tree: string };
+    findings: { code: string; target: string; field: string; message: string }[];
+    impact: { works: { work: string; entries: { test: string; direct: boolean; cases?: unknown; addressable?: boolean }[] }[] } }>;
+  references.push(reopen.record);
+  const held = input as { facts?: PolicyRow[]; decided?: PolicyRow[] }, applied = [...held.facts ?? [], ...held.decided ?? []];
+  const policies = applied.filter(row => row.question.readiness?.cause === 'policy');
+  const decision = (field: string) => {
+    const row = policies.find(item => { const cause = item.question.readiness!; return `${cause.policy}:${cause.producer}:${cause.governs?.contract}` === field; });
+    return row ? { question: row.question.id, governs: row.question.readiness!.governs!, value: row.value } : null;
+  };
+  // №4343: a transition the door found is closed by the answer B1 applied for that exact site of the reopening's snapshot
+  // and this work — whichever block its question was asked at (its consumer); its works and places name this one.
+  const transitions = applied.filter(row => row.question.readiness?.cause === 'transition');
+  const answered = (work: string, field: string) => {
+    const row = transitions.find(item => { const cause = item.question.readiness!;
+      return cause.snapshot?.tree === record.value.snapshot.tree && (cause.works ?? []).includes(work)
+        && transitionField({ file: cause.file!, line: cause.line!, site: cause.site! }) === field; });
+    return row ? { question: row.question.id, snapshot: row.question.readiness!.snapshot!, value: row.value } : null;
+  };
+  const relations = new RefinementRelations(graph);
+  return reopen.works.filter(work => relations.refines(work, node)).sort(order).map(work => json({ ...reopenedDefinition(graph, work),
+    findings: record.value.findings.filter(finding => finding.target === work)
+      .map(finding => finding.code === 'work_policy_open' ? { ...finding, decision: decision(finding.field) }
+        : finding.code === 'work_impact_unresolved' ? { ...finding, decision: answered(work, finding.field) } : finding),
+    affected: (record.value.impact.works.find(row => row.work === work)?.entries ?? [])
+      .map(entry => ({ test: entry.test, direct: entry.direct, ...(entry.addressable ? { cases: entry.cases } : {}) })) }));
+}
+/**
+ * RB1: a reopened work as the accepted graph defines it — the node, its tests, its L3 bindings with the wake test of their
+ * connector (№4337), the sleeping anchors it owns (the wake test its producer end chose), the joins it consumes, its edges,
+ * and the works before it. Its accepted fills do not keep the wake choice: the redefinition names it again.
+ */
+export function reopenedDefinition(graph: Graph, work: string) {
+  const definition = graph.nodes.find(item => item.id === work)!;
+  const bindings = graph.connectors.flatMap(connector => connector.bindings.filter(binding => binding.level === 3
+    && (binding.producer.node === work || binding.consumers.some(end => end.node === work)))
+    .map(binding => ({ connector: connector.id, artifact: connector.artifact, wakeTest: connector.wakeTest, binding })));
+  const edges = (graph.edges ?? []).filter(edge => edge.source === work || edge.target === work);
+  const before = new Set([...edges.filter(edge => edge.target === work).map(edge => edge.source),
+    ...bindings.filter(row => row.binding.producer.node !== work).map(row => row.binding.producer.node),
+    ...(definition.integrations ?? []).flatMap(item => 'predecessor' in item.basis ? [item.basis.predecessor] : [])]);
+  return { work, node: definition, tests: graph.tests.filter(test => test.node === work), bindings,
+    anchors: graph.anchors.filter(anchor => anchor.owner === work),
+    joins: graph.joins.filter(join => join.consumer === work), edges,
+    predecessors: graph.nodes.filter(item => before.has(item.id) && item.id !== work).sort((a, b) => order(a.id, b.id)) };
+}
 function worksTaskBasis(store: Store, request: QuestionPacketRequest, gaps: Sealed<GapReadRequest>, current: boolean) {
   if (!request.works) fail('packet_task_set_invalid', request.batch!, 'works', 'A work assignment needs its exact D7 producer and complete ledger, including an empty ledger');
   const basis = request.works;
@@ -1016,7 +1084,7 @@ function neighbourForm(value: unknown, target: string): { contract: typeof NEIGH
 function contentContract(store: Store, request: QuestionPacketRequest, contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord) {
   const target = packetId(request, saved ? saved.answerProtocol : PACKET_ANSWER_PROTOCOL, contract);
   const declared = saved && Object.hasOwn(saved, 'briefContract');
-  if (declared && (saved.briefContract !== BRIEF_CONTENT_CONTRACT || !briefContract(contract)))
+  if (declared && (![BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT].includes(saved.briefContract!) || !briefContract(contract)))
     fail('packet_record_invalid', target, 'briefContract', 'Only a brief packet can declare the supported content version');
   if (!briefContract(contract)) return undefined;
   const predecessors = [...(request.continuation ? [request.continuation.packet] : []),
@@ -1025,9 +1093,15 @@ function contentContract(store: Store, request: QuestionPacketRequest, contract:
   const inherited = predecessors[0]?.value.briefContract;
   if (predecessors.some(prior => prior.value.briefContract !== inherited))
     fail('packet_chain_invalid', target, 'briefContract', 'All preceding steps preserve the brief content version of their root');
-  const chosen = saved ? saved.briefContract : predecessors.length ? inherited : BRIEF_CONTENT_CONTRACT;
+  // RB1 (№4285): a new works root over a reopened frame shows the reopened works whole (om-brief/v3); every other new root,
+  // and every saved packet and chain step, keeps the version it was issued with.
+  const chosen = saved ? saved.briefContract : predecessors.length ? inherited
+    : contract === WORKS_BRIEF_PACKET_CONTRACT && reopenedRoot(store, request) ? BRIEF_REOPEN_CONTRACT : BRIEF_CONTENT_CONTRACT;
   if (saved && predecessors.length && chosen !== inherited)
     fail('packet_chain_invalid', target, 'briefContract', 'A saved descendant preserves its proved root content version');
+  // RB1: om-brief/v3 is issued only to a works root over a reopened frame; a saved root claiming it elsewhere is no record of it.
+  if (saved && !predecessors.length && chosen === BRIEF_REOPEN_CONTRACT && !(contract === WORKS_BRIEF_PACKET_CONTRACT && reopenedRoot(store, request)))
+    fail('packet_record_invalid', target, 'briefContract', 'Only a works root over a reopened frame declares om-brief/v3');
   if (saved?.packet !== undefined && saved.packet !== null && (!object(saved.packet) || !object(saved.packet.brief)
     || saved.packet.brief.contract !== (chosen ?? 'om-brief/v1')))
     fail('packet_record_invalid', target, 'briefContract', 'The saved marker and inner brief content version must agree');
@@ -1178,11 +1252,12 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     refusals: retry.refusals, rules: batch.model === 'MC1'
       ? ['answer_route_foreign', 'answer_question_invalid', 'answer_inapplicable', 'evidence_missing']
       : ['slot_fill_foreign', 'slot_fill_conflict', 'proposal_node_reserved', 'frame_upper_drift'] };
-  let briefBasis: BriefBasis | null = null;
+  let briefBasis: BriefBasis | null = null, briefWorkspace: string | undefined;
   if (briefContract(contract)) {
     if (saved && !Array.isArray(saved.briefCatalogue)) fail('packet_record_invalid', requestId, 'briefCatalogue', 'The text era retains its observed catalogue even when blocked');
     const environment = take(readRecord<{ workspace: string }>(store, request.environment,
       { unit: 'E2', target: requestId, id: `environment:${request.project}`, kind: 'environment' }));
+    briefWorkspace = environment.value.workspace;
     const priorBrief = request.previous.length ? loadPacket(store, request.project, request.previous.at(-1)!.packet) : null;
     const material = briefMaterial(store, request.project, environment.value.workspace, current, saved?.briefCatalogue ?? priorBrief?.value.briefCatalogue);
     base.briefCatalogue = material.references;
@@ -1198,7 +1273,8 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
         const row = take(readRecord<{ content: { fields: Record<string, Json> } }>(store, source,
           { unit: 'E2', target: requestId, id: source.id, kind: 'stage' }));
         return { stage: source.stage, ref: { id: source.id, revision: source.revision, hash: source.hash }, fields: json(row.value.content.fields) as Record<string, Json> };
-      }), material, materialBudget: Math.min(45000, Math.floor(capacity.maxRequestChars / 4)),
+      // RB1 (№4293 п.3): a brief over reopened works may fill the whole request; the selection rules, not a budget, bound it.
+      }), material, materialBudget: briefVersion === BRIEF_REOPEN_CONTRACT ? capacity.maxRequestChars : Math.min(45000, Math.floor(capacity.maxRequestChars / 4)),
       codes: [...[...QUESTION_PACKET_CODES, ...ANSWER_FORM_CODES].map(code => ({ code, phase: 'answer' as const })),
         ...[...FRAME_REFUSAL_CODES, ...PROPOSAL_REFUSAL_CODES, ...CANDIDATE_REFUSAL_CODES].map(code => ({ code, phase: 'assembly' as const }))] };
     references.push(...briefBasis.contexts);
@@ -1255,6 +1331,18 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     }
     if (current) guards.push(...take(prepareFrameProposals(store, source)).guards);
     const context = expansionContext(frame, batch.node), open = frame.result.open.filter(item => item.upper.node === batch.node);
+    const reopened = briefVersion === BRIEF_REOPEN_CONTRACT ? reopenedContext(store, frame, batch.node, references, briefBasis!.input) : [];
+    if (reopened.length) {
+      // RB1 (№4291 п.1): their material is read from the exact snapshot of this chain — the one G5 judges the answer by.
+      if (!briefBasis!.impact || briefWorkspace === undefined)
+        fail('packet_brief_invalid', batch.node, 'reopened', 'A reopened work is shown with the files of the exact repository snapshot of its chain');
+      // №4293 п.3: and anything else of the accepted graph is reachable by its index, under a label of this packet.
+      const accepted = frame.frame.accepted!;
+      briefBasis!.contexts = unique([...briefBasis!.contexts, accepted.reference]); references.push(accepted.reference);
+      if (current) { head(store, accepted.reference); guards.push(accepted.reference); }
+      Object.assign(context, { reopened, reopenedFiles: reopenedMaterial(readSnapshot(briefWorkspace, briefBasis!.impact.snapshot), reopened),
+        graphIndex: graphIndex(accepted.graph, accepted.reference) });
+    }
     const worksBasis = worksPacketContract(contract) ? worksTaskBasis(store, request,
       routes.record.value.request.gaps, current) : null;
     if (worksBasis) { guards.push(...worksBasis.guards); references.push(reference(worksBasis.producer), reference(worksBasis.record), ...worksBasis.inputs); }
@@ -1306,6 +1394,13 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
   let fingerprint = bounded(packet, capacity.maxRequestChars);
   if (!fingerprint) {
     base.state = 'blocked'; base.refusal = blocked(batch.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', batch.node ?? batch.id);
+    // RB1 (№4291 п.1): reopened works come with all their material or not at all — when it does not fit, the refusal names
+    // the works to split by their results, never a brief with part of it.
+    const reopenedWorks = object(packet) && object(packet.expansion) && Array.isArray(packet.expansion.reopened)
+      ? (packet.expansion.reopened as { work: string }[]).map(row => row.work) : [];
+    if (reopenedWorks.length) base.refusal = { ...base.refusal, at: { unit: 'E2', target: reopenedWorks.length === 1 ? reopenedWorks[0]! : batch.node!, field: 'reopened' },
+      message: `Reopened ${reopenedWorks.join(', ')} with the whole material of their duties (${packetPrompt(packet).length} chars) exceed the capacity of one request (${capacity.maxRequestChars}): split the work by its results`,
+      };
     return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
   }
   // MP3: optional carried reads in the capacity left by the fitting packet; they never block or split it.

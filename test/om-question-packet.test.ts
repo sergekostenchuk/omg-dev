@@ -3832,3 +3832,319 @@ test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — 
   assert.equal(packetDerivations() - from, 14);
   assert.deepEqual(JSON.parse(JSON.stringify([moved])), preparedAtCommit(f.store.path, [sixth]));
 });
+
+import { mkdirSync as rb1Mkdir, renameSync as rb1Rename } from 'node:fs';
+import { BRIEF_CONTENT_CONTRACT as RB1_V2, BRIEF_REOPEN_CONTRACT as RB1_V3 } from '../src/om/packet-brief.js';
+import { advanceRun as rb1Advance, readRun as rb1ReadRun, regateRun as rb1Regate, startRun as rb1Start,
+  type RunRecord as Rb1RunRecord, type RunRequest as Rb1RunRequest, type RunStep as Rb1RunStep } from '../src/om/run.js';
+import { writeRunBases as rb1Bases } from '../src/om/run-bases.js';
+import { git as rb1Git } from '../src/runtime/environment.js';
+import { resolveSnapshot as rb1Snapshot } from '../src/om/impact.js';
+/** RB1: the engine of om/module before RB1 — the brief the live pass issued to its reopened attempts 13 and 14. */
+const RB1_BASE = 'b8c99b1b';
+let rb1Operations: Promise<{ acceptedOperationsFixture(t: TestContext, status: 'planned', count: number): {
+  root: string; workspace: string; database: string; project: string; desired: Graph; readonly store: Store; readonly engine: ProductEngine } }> | undefined;
+/** The accepted-operations fixture of om-feasibility, loaded without registering its tests (as om-run does). */
+function rb1LoadOperations() {
+  rb1Operations ??= (async () => {
+    const url = new URL('./om-feasibility.test.js', import.meta.url), source = readFileSync(url, 'utf8');
+    const end = source.indexOf('const heads =');
+    assert.ok(end > 0);
+    const prefix = source.slice(0, end).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g,
+      (_match, _quote: string, path: string) => `from ${JSON.stringify(new URL(path, url).href)}`);
+    assert.ok(!/\btest\(/.test(prefix), 'Fixture loading does not register a neighboring test suite');
+    return import(`data:text/javascript;base64,${Buffer.from(`${prefix}\nexport { acceptedOperationsFixture };`).toString('base64')}`);
+  })();
+  return rb1Operations;
+}
+/**
+ * RB1: the garden pass of RL3 completed, then reopened by the owner's om-regate on a snapshot where a test reaches the
+ * consumed work's file through two fixtures — driven to the packet step of the reopened attempt, its packet not yet written.
+ * `respond` answers the saved cycle with a work, `drive` advances to a chosen state and fails on any other stand.
+ */
+async function rb1Reopened(t: TestContext, extra: Record<string, string> = {}) {
+  const f = (await rb1LoadOperations()).acceptedOperationsFixture(t, 'planned', 0);
+  const { store, workspace, desired, project } = f;
+  ok(rb1Bases(store, { project, outcomes: ['garden-result'] }));
+  const scenario = join(f.root, 'scenario.json'), trace = join(f.root, 'trace.jsonl');
+  const command = { executable: process.execPath, args: [fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url)), '--scenario', scenario, '--trace', trace] };
+  const environment = f.engine.environments.configure(project, { workspace,
+    implementer: { actor: 'rb1-works-producer', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'rb1-works-reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 10_000, requestCapacityChars: 200_000 }, 0);
+  const commit = (message: string, files: Record<string, string>) => {
+    for (const [path, text] of Object.entries(files)) { rb1Mkdir(dirname(join(workspace, path)), { recursive: true }); writeFileSync(join(workspace, path), text); }
+    rb1Git(workspace, ['add', ...Object.keys(files)]);
+    rb1Git(workspace, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', message]);
+  };
+  writeFileSync(join(workspace, 'input.txt'), 'A captured external input');
+  new Evidence(store).file(project, 'garden-data', workspace, 'input.txt', 'text/plain', 0);
+  commit('capture input', { 'input.txt': 'A captured external input' });
+  const adapter = store.write({ id: `adapter:${project}:rb1`, kind: 'dispatch-adapter', expected: 0, value: { projectId: project, protocol: 'codex-stdio' } });
+  const request: Rb1RunRequest = { project, dispatch: { adapter: reference(adapter), config: reference(environment) } };
+  ok(rb1Start(store, { project }));
+  const steps: Json[] = [];
+  const step = () => (ok(rb1ReadRun(store, { project }))!.value.state as { step: Rb1RunStep }).step;
+  const respond = (work: Node, removes: string[]) => {
+    const saved = (step().request as unknown as { packet: Ref }).packet;
+    const payload = store.get<QuestionPacketRecord>(saved.id, saved.revision)!.value.packet as unknown as {
+      expansion: { assigned: string[]; obligations: { id: string; kind: string; upper: { port?: string } }[] } };
+    const body = { nodes: [work], tests: clone(desired.tests.filter(proof => work.tests.includes(proof.id))),
+      fills: payload.expansion.obligations.filter(item => payload.expansion.assigned.includes(item.id)).map(item => ({ obligation: item.id, node: work.id,
+        ...(item.kind === 'connection-end' ? { port: item.upper.port!, codeRef: work.code[0]! } : {}) })),
+      localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
+      removes, replaces: [], redefines: [] };
+    push({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', proposal: body, bindings: [] },
+      usage: { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 } } as unknown as Json);
+  };
+  const push = (entry: Json) => { steps.push(entry); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
+  const drive = async (stop: (state: Rb1RunRecord['state']) => boolean, bound = 40): Promise<string[]> => {
+    const performed: string[] = [];
+    for (let index = 0; index < bound; index++) {
+      const advanced = ok(await rb1Advance(store, request));
+      if (advanced.performed) performed.push(advanced.performed.action);
+      const state = advanced.record.value.state;
+      if (stop(state as Rb1RunRecord['state'])) return performed;
+      if (state.phase === 'waiting' || state.phase === 'unable' || state.phase === 'complete')
+        assert.fail(`The pass stood (${state.phase}) after ${performed.join(',')}: ${JSON.stringify(state).slice(0, 800)}`);
+    }
+    return assert.fail(`The pass did not reach its next stop: ${performed.join(',')}`);
+  };
+  const at = (action: string) => (state: Rb1RunRecord['state']) => state.phase === 'step' && state.step.action === action;
+  await drive(at('cycle'));
+  respond(clone(desired.nodes.find(node => node.id === 'garden-consume-work')!), []);
+  await drive(state => state.phase === 'complete');
+  commit('a test reaches the consumed result through its fixtures', { 'consume.txt': 'consumed\n',
+    'package.json': JSON.stringify({ name: 'garden', private: true, type: 'module', scripts: { test: 'node --test test/regate.test.mjs' } }),
+    'test/regate.test.mjs': "import '../consume.txt';\nimport { fixture } from './regate-fixture.mjs';\nconsole.log(fixture);\n",
+    'test/regate-fixture.mjs': "export { deep as fixture } from './deep-fixture.mjs';\n",
+    'test/deep-fixture.mjs': "export const deep = 'RB1 deep fixture text';\n", ...extra });
+  const reopen = ok(rb1Regate(store, { project })).reopen!;
+  await drive(at('packet'));
+  return { f, store, workspace, desired, project, reopen, request, step, respond, push, drive, at, work: 'garden-consume-work' };
+}
+
+test('RB1 (№4285, №4291, №4293): the root over a reopened frame is om-brief/v3 — it orders the redefinition with an example of it, gives each reopened work whole with its findings, the decisions behind them, its predecessors, every direct test and fixture from the snapshot and the index of the accepted graph; the redefinition it asks is accepted to a new completion', async t => {
+  const g = await rb1Reopened(t), { store, workspace, project, work } = g;
+  await g.drive(g.at('cycle'));
+  const saved = (g.step().request as unknown as { packet: Ref }).packet, record = store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+  assert.deepEqual([record.value.briefContract, record.value.state], [RB1_V3, 'ready']);
+  const payload = record.value.packet as unknown as Record<string, any>, text = packetPrompt(payload);
+  // The work whole, as the accepted graph holds it, with the reasons it was reopened.
+  const index = payload.expansion.graphIndex as { record: Ref; layers: Record<string, Record<string, Record<string, string>>> };
+  const graph = store.get<Graph>(index.record.id, index.record.revision)!.value, node = graph.nodes.find(row => row.id === work)!;
+  assert.equal(payload.expansion.reopened.length, 1);
+  const [entry] = payload.expansion.reopened;
+  assert.deepEqual([entry.work, entry.node], [work, node]);
+  assert.deepEqual(entry.tests, graph.tests.filter(row => row.node === work));
+  assert.deepEqual(entry.joins, graph.joins.filter(row => row.consumer === work));
+  assert.deepEqual(entry.edges, (graph.edges ?? []).filter(row => row.source === work || row.target === work));
+  const bindings = graph.connectors.flatMap(connector => connector.bindings.filter(binding => binding.level === 3
+    && (binding.producer.node === work || binding.consumers.some(end => end.node === work))).map(binding => ({ connector: connector.id, artifact: connector.artifact,
+    wakeTest: connector.wakeTest, binding })));
+  assert.ok(bindings.length > 0);
+  assert.deepEqual(entry.bindings, bindings);
+  assert.deepEqual(entry.anchors, graph.anchors.filter(row => row.owner === work));
+  const before = new Set([...(graph.edges ?? []).filter(row => row.target === work).map(row => row.source),
+    ...bindings.filter(row => row.binding.producer.node !== work).map(row => row.binding.producer.node)]);
+  assert.ok(before.size > 0);
+  assert.deepEqual(entry.predecessors, graph.nodes.filter(row => before.has(row.id)).sort((a, b) => a.id < b.id ? -1 : 1), 'The works before it, whole: ports and code references');
+  assert.deepEqual(entry.findings, g.reopen.value.findings.filter(row => row.target === work));
+  assert.deepEqual(entry.findings.map((row: { code: string; field: string }) => [row.code, row.field]), [['work_impact_undecided', 'test/regate.test.mjs']]);
+  assert.deepEqual(entry.affected.filter((row: { direct: boolean }) => row.direct).map((row: { test: string }) => row.test), ['test/regate.test.mjs']);
+  // Every file of its duty whole, from the snapshot the chain is judged by.
+  const files = payload.expansion.reopenedFiles as { snapshot: { commit: string }; files: { path: string; for: string[]; content?: string }[] };
+  assert.deepEqual(files.snapshot, record.value.briefImpact!.snapshot);
+  assert.deepEqual(files.snapshot, rb1Snapshot(workspace));
+  const roles = Object.fromEntries(files.files.map(file => [file.path, file.for]));
+  assert.deepEqual([roles['test/regate.test.mjs'], roles['test/regate-fixture.mjs'], roles['test/deep-fixture.mjs']],
+    [[`${work}: direct test`], [`${work}: fixture of a direct test`], [`${work}: fixture of a direct test`]]);
+  for (const code of node.code) assert.ok(roles[code.path]?.includes(`${work}: code`), code.path);
+  for (const file of files.files) if (file.content !== undefined)
+    assert.equal(file.content, execFileSync('git', ['-C', workspace, 'show', `${files.snapshot.commit}:${file.path}`], { encoding: 'utf8' }), `${file.path} is the snapshot's text, whole`);
+  // The index: every pointer reads its object of the exact record, under a label this packet issued.
+  for (const kinds of Object.values(index.layers)) for (const ids of Object.values(kinds)) for (const [id, pointer] of Object.entries(ids))
+    assert.equal((pointer.split('/').slice(1).reduce((value: any, key) => value[key], graph as unknown) as { id: string }).id, id);
+  const label = (payload.brief.labels as { label: string; domain: string; value: unknown }[]).find(row => row.domain === 'context' && same(row.value, index.record))!.label;
+  assert.ok(text.includes(`"record":"${label}"`));
+  // The brief orders the redefinition, quotes each file once and shows an example of it.
+  for (const part of ['# Reopened works — redefine each one in place', 'Redefine each reopened work in this answer', 'list that id in removes',
+    'names its wake test again in wakeTest of its fill',
+    'never decide it again', 'never by the number of its files or tests', '# Files of the reopened works', '# Index of the accepted graph'])
+    assert.ok(text.includes(part), part);
+  assert.equal(text.split('RB1 deep fixture text').length, 2, 'A file of the duty is quoted once');
+  const example = (payload.brief.examples as Record<string, any>[])[0]!;
+  assert.deepEqual([example.action, example.proposal.removes, example.proposal.nodes.map((row: Node) => row.id)], ['answer', [work], [work]]);
+  assert.ok(example.proposal.fills.length > 0 && example.proposal.fills.every((fill: { node: string }) => fill.node === work), 'The example fills the slots with the redefined work');
+  assert.deepEqual(example.proposal.nodes[0].impact[0].entry, { file: 'test/regate.test.mjs' });
+  // The redefinition the brief asks is the answer the engine accepts, to a new completion.
+  const second = { ...clone(node), impact: [{ entry: { file: 'test/regate.test.mjs' }, decision: 'keep' as const, requirement: 'garden-contract' }] };
+  g.respond(second, [work]);
+  assert.deepEqual(await g.drive(state => state.phase === 'complete'), ['cycle', 'evaluate', 'works', 'bases', 'confirm', 'close', 'feasibility', 'handoff', 'compile']);
+  assert.deepEqual(store.get<Graph>(`graph:${project}`)!.value.nodes.find(row => row.id === work)!.impact, second.impact);
+});
+
+test('RB1 (№4285 п.4) era: a root the engine before RB1 wrote over a reopened frame — the v2 brief of attempts 13 and 14 — is read and continued as written; a root that claims om-brief/v3 where nothing is reopened is refused', async t => {
+  const g = await rb1Reopened(t), { f, store, project } = g;
+  const request = g.step().request as unknown as QuestionPacketRequest;
+  const base = atCommit({ root: f.root, path: f.database }, RB1_BASE, 'rb1-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
+  assert.deepEqual([base.value.briefContract, base.value.state], [RB1_V2, 'ready']);
+  assert.equal(Object.hasOwn((base.value.packet as unknown as { expansion: object }).expansion, 'reopened'), false);
+  const again = ok(prepareQuestionPacket(store, request));
+  assert.deepEqual([again.writes, reference(again.record)], [[], reference(base)], 'Admitted with its own bytes');
+  assert.deepEqual(ok(readQuestionPacket(store, { project, record: reference(base) })), base);
+  await g.drive(g.at('cycle'));
+  assert.deepEqual((g.step().request as unknown as { packet: Ref }).packet, reference(base), 'The pass goes on with the packet it has');
+  // Masquerade: the first attempt's root (no reopened frame) rewritten to claim the reopen era.
+  const first = store.list<QuestionPacketRecord>('question-packet').filter(row => row.value.briefContract === RB1_V2 && row.id !== base.id
+    && row.value.packetContract === WORKS_BRIEF_PACKET_CONTRACT && !row.value.request.continuation && !row.value.request.correction && !row.value.request.previous.length)[0]!;
+  const forged = clone(first.value) as QuestionPacketRecord & { packet: { brief: { contract: string } } };
+  forged.briefContract = RB1_V3; forged.packet.brief.contract = RB1_V3;
+  store.write({ id: first.id, kind: first.kind, expected: first.revision, value: forged as unknown as Json });
+  const refused = prepareQuestionPacket(store, first.value.request);
+  assert.equal(refused.ok, false);
+  assert.deepEqual(!refused.ok && [refused.refusal.code, refused.refusal.at.field], ['packet_record_invalid', 'briefContract']);
+});
+
+test('RB1 (№4291 п.1) absence and overflow: reopened works come with all their material or the packet is refused at them — no repository snapshot is packet_brief_invalid, a duty that does not fit is node_unexpandable addressed to the work, never a brief with part of it', async t => {
+  const big = `export const filler = ${JSON.stringify('x'.repeat(240_000))};\n`;
+  const g = await rb1Reopened(t, { 'test/big-fixture.mjs': big,
+    'test/regate.test.mjs': "import '../consume.txt';\nimport { fixture } from './regate-fixture.mjs';\nimport { filler } from './big-fixture.mjs';\nconsole.log(fixture, filler.length);\n" });
+  const { store, workspace, work } = g, request = g.step().request as unknown as QuestionPacketRequest;
+  const before = snapshot(store);
+  // Absence: the workspace is no repository — no snapshot to read the duty from.
+  rb1Rename(join(workspace, '.git'), join(workspace, '.git-away'));
+  try {
+    const absent = prepareQuestionPacket(store, request);
+    assert.equal(absent.ok, false);
+    assert.deepEqual(!absent.ok && [absent.refusal.code, absent.refusal.at.target, absent.refusal.at.field], ['packet_brief_invalid', 'garden-consume-operation', 'reopened']);
+  } finally { rb1Rename(join(workspace, '.git-away'), join(workspace, '.git')); }
+  // Overflow: the direct test's fixture alone exceeds the request; the packet is refused at the work, nothing is cut.
+  const blocked = ok(prepareQuestionPacket(store, request)).record.value;
+  assert.deepEqual([blocked.state, blocked.packet, blocked.refusal?.code, blocked.refusal?.at.target, blocked.refusal?.at.field, blocked.refusal?.route],
+    ['blocked', null, 'node_unexpandable', work, 'reopened', 'owner']);
+  assert.match(blocked.refusal!.message, /split the work by its results/);
+  assert.ok(blocked.fullChars! > 200_000);
+  assert.deepEqual(snapshot(store), before, 'A preparation writes nothing');
+});
+
+import { reopenedDefinition as rb1Definition } from '../src/om/question-packet.js';
+import { acceptedWakeTest as rb1AcceptedWake } from '../src/om/packet-brief.js';
+import { assembleCandidate as rb1Assemble } from '../src/om/frame-candidate.js';
+import type { FrameRead as Rb1FrameRead } from '../src/om/frame-obligations.js';
+let rb1Works: Promise<{ firstWorks(t: TestContext): { store: Store; proposal: LayerProposal; proposalRef: Ref;
+  request: { frame: FrameRequest; proposals: Ref[]; works: never } } }> | undefined;
+/** The first L3 works of om-works-frame (a producer work with a sleeping flow), loaded without registering its tests. */
+function rb1LoadWorks() {
+  rb1Works ??= (async () => {
+    const url = new URL('./om-works-frame.test.js', import.meta.url), source = readFileSync(url, 'utf8');
+    const end = source.indexOf("test('F2 stores");
+    assert.ok(end > 0);
+    const prefix = source.slice(0, end).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g,
+      (_match, _quote: string, path: string) => `from ${JSON.stringify(new URL(path, url).href)}`);
+    assert.ok(!/\btest\(/.test(prefix), 'Fixture loading does not register a neighboring test suite');
+    return import(`data:text/javascript;base64,${Buffer.from(`${prefix}\nexport { firstWorks };`).toString('base64')}`);
+  })();
+  return rb1Works;
+}
+
+test('RB1 №4337 wakeTest: a reopened producer work is shown with its connector\'s wake test and the anchor its accepted choice made; the brief names that test for its producer end — a redefinition without the choice meets sleeping_wake_test_missing, with it the flow wakes by the same test', async t => {
+  const f = (await rb1LoadWorks()).firstWorks(t);
+  const source = ok(prepareFrameProposals(f.store, { frame: f.request.frame, proposals: f.request.proposals }));
+  const producer = f.proposal.nodes.find(node => node.id === 'garden-produce-work')!;
+  const covering = f.proposal.tests.filter(row => row.node === producer.id && producer.tests.includes(row.id) && row.covers.includes('garden-flow'));
+  assert.equal(covering.length, 1);
+  const ends = source.result.obligations.filter(item => item.connector === 'garden-flow' && item.role === 'producer').map(item => item.id);
+  const several = clone(f.proposal), work = several.nodes.find(node => node.id === producer.id)!;
+  for (const suffix of ['second', 'third']) {
+    several.tests.push({ ...clone(covering[0]!), id: `${covering[0]!.id}-${suffix}` }); work.tests.push(`${covering[0]!.id}-${suffix}`);
+  }
+  const assemble = (proposal: LayerProposal) => rb1Assemble(clone(source.frame) as unknown as Rb1FrameRead,
+    [{ reference: { ...f.proposalRef, hash: hashJson(proposal as unknown as Json) }, value: proposal }], f.request.works);
+  const choose = (choice: string | null) => {
+    const proposal = clone(several);
+    for (const fill of proposal.fills) if (ends.includes(fill.obligation) && fill.node === producer.id) {
+      if (choice === null) delete (fill as { wakeTest?: string }).wakeTest; else (fill as { wakeTest?: string }).wakeTest = choice;
+    }
+    return proposal;
+  };
+  // The accepted graph of the work: its producer end chose the third of three covering tests.
+  const accepted = ok(assemble(choose(`${covering[0]!.id}-third`)));
+  assert.equal(accepted.state, 'candidate'); if (accepted.state !== 'candidate') return;
+  const graph = accepted.candidate.graph as Graph, connector = graph.connectors.find(row => row.id === 'garden-flow')!;
+  // The brief's definition of that work, reopened: every binding with its connector's wake test, and the anchor it owns.
+  const definition = rb1Definition(graph, producer.id);
+  const flows = definition.bindings.filter(row => row.connector === 'garden-flow');
+  assert.ok(flows.some(row => row.binding.anchor !== null) && flows.every(row => row.wakeTest === connector.wakeTest));
+  assert.deepEqual(definition.anchors, graph.anchors.filter(anchor => anchor.owner === producer.id));
+  assert.deepEqual(definition.anchors.map(anchor => anchor.test), [`${covering[0]!.id}-third`]);
+  const shown = rb1AcceptedWake(definition as unknown as Json, 'garden-flow');
+  assert.equal(shown, `${covering[0]!.id}-third`, 'The brief names the accepted choice — the test of its anchor');
+  assert.equal(rb1AcceptedWake({ ...definition, anchors: [] } as unknown as Json, 'garden-flow'), null, 'No anchor, no choice is invented');
+  assert.equal(rb1AcceptedWake(definition as unknown as Json, 'garden-other-flow'), null);
+  // The redefinition assembled anew: without the choice the same refusal, with the shown one the flow wakes by it.
+  const silent = assemble(choose(null));
+  assert.equal(!silent.ok && silent.refusal.code, 'sleeping_wake_test_missing');
+  const again = ok(assemble(choose(shown!)));
+  assert.equal(again.state, 'candidate'); if (again.state !== 'candidate') return;
+  const sleeping = (again.candidate.graph as Graph).connectors.find(row => row.id === 'garden-flow')!.bindings.filter(binding => binding.level === 3 && binding.anchor !== null);
+  assert.equal(sleeping.length, 1);
+  assert.equal((again.candidate.graph as Graph).anchors.find(anchor => anchor.id === sleeping[0]!.anchor)!.test, shown);
+});
+
+test('RB1 №4343: an answer B1 applied to a transition the reopening found reaches the new works brief by the works and places it names, not only by the block it was asked at — the finding shows it closed and the brief carries the fact', async t => {
+  const g = await rb1Reopened(t, { 'produce.txt': 'seed\n',
+    'test/loader.test.mjs': 'const data = new URL(process.env.DATA, import.meta.url);\nconsole.log(data.href);\n',
+    'package.json': JSON.stringify({ name: 'garden', private: true, type: 'module', scripts: { test: 'node --test test/regate.test.mjs test/loader.test.mjs' } }) });
+  const { store, project } = g;
+  const unresolved = g.reopen.value.findings.filter(row => row.code === 'work_impact_unresolved');
+  assert.ok(unresolved.length > 0, JSON.stringify(g.reopen.value.findings));
+  const source = store.list<{ content: string }>('source').find(row => row.id.startsWith(`source:${project}:`))!;
+  const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
+  // Research answers the transition (it loads none of the candidates). The first works answer leaves the test undecided, so
+  // G5 refuses it; the attempt closes, the fact is applied, and the next attempt asks the works anew — as attempt 14 after B1 r13.
+  let works: Ref | null = null, first: Ref | null = null;
+  const answered = new Set<string>();
+  for (let index = 0; index < 200 && !works; index++) {
+    const state = ok(rb1ReadRun(store, { project }))!.value.state as Rb1RunRecord['state'];
+    if (state.phase === 'waiting' || state.phase === 'unable' || state.phase === 'complete') assert.fail(`The pass stood: ${JSON.stringify(state).slice(0, 600)}`);
+    if (state.phase === 'step' && state.step.action === 'cycle') {
+      const saved = (state.step.request as unknown as { packet: Ref }).packet, packet = store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+      const routed = store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+      if (!answered.has(saved.id)) {
+        answered.add(saved.id);
+        if (batch.model === 'MC1') g.push({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer', results: batch.items.map(item => ({ questionId: item.gap,
+          value: { answer: 'DATA names no file of this snapshot', resolves: [] },
+          citations: [{ source: reference(source), selector: { kind: 'text-range', start: 0, end: source.value.content.length } }] })) }, usage } as unknown as Json);
+        else if (!first) { first = saved; g.respond(clone(g.desired.nodes.find(row => row.id === g.work)!), [g.work]); }
+        else { works = saved; break; }
+      }
+    }
+    if (state.phase === 'step' && state.step.action === 'assess' && !answered.has(JSON.stringify(state.step.request))) {
+      answered.add(JSON.stringify(state.step.request));
+      g.push({ research: { verdict: 'supported', reasons: [] }, usage } as unknown as Json);
+    }
+    await g.drive(() => true);
+  }
+  assert.ok(works, 'The pass asked the works anew after the answer was applied');
+  const facts = (store.get<{ input: { facts?: { question: { id: string; consumer: string; readiness?: { cause: string; works: string[]; places: string[] } }; value: Json }[] } }>(`om-input:${project}`)!
+    .value.input.facts ?? []).filter(row => row.question.readiness?.cause === 'transition');
+  assert.ok(facts.length > 0);
+  const record = store.get<QuestionPacketRecord>(works!.id, works!.revision)!, payload = record.value.packet as unknown as Record<string, any>;
+  assert.equal(record.value.briefContract, RB1_V3);
+  const text = packetPrompt(payload), node = (store.get<RoutesRecord>(record.value.request.routes.id, record.value.request.routes.revision)!.value.batches
+    .find(row => row.id === record.value.request.batch)!).node!;
+  for (const entry of payload.expansion.reopened as { work: string; findings: { code: string; field: string; decision?: { question: string; value: { resolves: string[] } } | null }[] }[])
+    for (const finding of entry.findings.filter(row => row.code === 'work_impact_unresolved')) {
+      const fact = facts.find(row => row.question.readiness!.works.includes(entry.work))!;
+      assert.ok(fact, `${entry.work}: its transition was answered`);
+      assert.deepEqual([finding.decision?.question, finding.decision?.value.resolves], [fact.question.id, []], `${entry.work} ${finding.field} is closed by its answer`);
+      assert.ok(text.includes(fact.question.id));
+    }
+  // The fact is in the brief's scope even where it was asked at another block — by its works and places.
+  const scope = JSON.parse(text.split('\n# Scope and exact context\n')[1]!.split('\n')[0]!) as { input: { facts?: { question: { id: string } }[] } };
+  for (const fact of facts) assert.ok((scope.input.facts ?? []).some(row => row.question.id === fact.question.id), `${fact.question.id} (asked at ${fact.question.consumer}) reaches the brief of ${node}`);
+  assert.ok(text.includes('A transition finding without a decision is a research question'));
+});

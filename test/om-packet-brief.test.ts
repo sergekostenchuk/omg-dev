@@ -666,3 +666,88 @@ test('AT1 №4170: the brief of an L3 works chain shows the declared boundary of
   assert.ok(prompt.includes('"notEstablished":["computed-process-targets","computed-file-reads","future-file-consumers"]'), 'the boundary is shown');
   assert.ok(prompt.includes('never a proof that nothing is influenced') && prompt.includes('A transitive keep covers only the expectations listed here'));
 });
+
+import { BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT, graphIndex, reopenedMaterial } from '../src/om/packet-brief.js';
+import { snapshotFiles } from '../src/om/impact.js';
+import { LEVEL } from '../src/graph/model.js';
+
+test("RB1 (№4291 п.1–2): a reopened work's material is its files, test entrypoints and connection points, every direct test whole and the fixtures those tests import, closed — from the snapshot; nothing else, and nothing of it dropped or silently absent", () => {
+  const snapshot = { commit: 'a'.repeat(40), tree: 'b'.repeat(40) };
+  const texts = new Map(Object.entries({
+    'src/work.ts': 'export const work = 1;\n',
+    'src/conn.ts': 'export function point() {}\n',
+    'src/other.ts': 'export const other = 2;\n',
+    'test/direct.test.ts': "import { work } from '../src/work.js';\nimport { other } from '../src/other.js';\nimport { help } from './helper-fixture.js';\n",
+    'test/helper-fixture.ts': "export { deep as help } from './deep-fixture.js';\n",
+    // A fixture reaching back to a test: the test is no fixture, and the closure ends.
+    'test/deep-fixture.ts': "import './direct.test.js';\nexport const deep = 3;\n",
+    'test/indirect.test.ts': "import { help } from './helper-fixture.js';\n",
+  }));
+  const files = snapshotFiles(snapshot, [...texts.keys(), 'assets/logo.png'], texts);
+  const reopened = [{ work: 'w-a', node: { code: [{ path: 'src/work.ts', access: 'write' }, { path: 'src/planned.ts', access: 'write' }, { path: 'assets/logo.png', access: 'read' }],
+    integrations: [{ entry: 'src/conn.ts#point', contract: 'c', basis: { existing: 'src/conn.ts' } }], ports: [], tests: ['t-a'] },
+    tests: [{ id: 't-a', contract: { entrypoint: { path: 'src/work.ts' } } }],
+    affected: [{ test: 'test/direct.test.ts', direct: true }, { test: 'test/indirect.test.ts', direct: false }] }] as unknown as Json[];
+  const material = reopenedMaterial(files, reopened) as unknown as { snapshot: unknown; files: { path: string; for: string[]; content?: string; absent?: string; unread?: string }[] };
+  assert.deepEqual(material.snapshot, snapshot);
+  assert.deepEqual(material.files.map(file => [file.path, file.for]), [
+    ['assets/logo.png', ['w-a: code']], ['src/conn.ts', ['w-a: connection point']], ['src/planned.ts', ['w-a: code']],
+    ['src/work.ts', ['w-a: code', 'w-a: test entrypoint']], ['test/deep-fixture.ts', ['w-a: fixture of a direct test']],
+    ['test/direct.test.ts', ['w-a: direct test']], ['test/helper-fixture.ts', ['w-a: fixture of a direct test']]],
+    'Code under test the work does not write (src/other.ts) and a test reached only through others are no material of its duty');
+  for (const file of material.files) if (texts.has(file.path)) assert.equal(file.content, texts.get(file.path), `${file.path} is whole`);
+  assert.deepEqual([material.files.find(file => file.path === 'src/planned.ts')!.absent, material.files.find(file => file.path === 'assets/logo.png')!.unread],
+    ['not in the snapshot', 'in the snapshot; the analysis reads no file of this kind or size'], 'A file it cannot quote is named as such');
+  assert.deepEqual(reopenedMaterial(files, []), { snapshot, files: [] });
+});
+
+test('RB1 (№4293 п.3): the index of the accepted graph names every object by layer and kind, and its pointer reads exactly that object of the record', () => {
+  const graph = gardenGraph(), record = { id: 'graph:garden', revision: 3, hash: 'c'.repeat(64) };
+  const index = graphIndex(graph, record) as unknown as { record: Ref; layers: Record<string, Record<string, Record<string, string>>> };
+  assert.deepEqual(index.record, record);
+  const at = (pointer: string) => pointer.split('/').slice(1).reduce((value: any, key) => value[key], graph as unknown);
+  let count = 0;
+  for (const [layer, kinds] of Object.entries(index.layers)) for (const [kind, ids] of Object.entries(kinds)) for (const [id, pointer] of Object.entries(ids)) {
+    count++;
+    assert.equal(at(pointer).id, id, `${kind} ${id} at ${pointer}`);
+    if (kind === 'node') assert.equal(layer, `L${LEVEL[at(pointer).kind as keyof typeof LEVEL]}`);
+    else if (kind === 'test') assert.equal(layer, `L${LEVEL[graph.nodes.find(node => node.id === at(pointer).node)!.kind]}`);
+    else if (kind === 'connector') assert.ok(at(pointer).bindings.some((binding: { level: number }) => `L${binding.level}` === layer));
+    else if (['artifact', 'contract'].includes(kind)) assert.equal(layer, 'shared');
+  }
+  assert.equal(count, graph.nodes.length + graph.tests.length + graph.joins.length + (graph.edges ?? []).length + graph.artifacts.length + graph.contracts.length
+    + graph.connectors.reduce((sum, connector) => sum + new Set(connector.bindings.map(binding => binding.level)).size, 0), 'Every object, a connector once per level of its bindings');
+});
+
+test('RB1 (№4285 п.4): om-brief/v3 holds what v2 holds — a brief with no reopened works is v2 text under its own marker, and an unknown marker is refused', t => {
+  const { basis, input } = sample(t);
+  const v2 = deriveBrief(input, { ...basis, briefContract: BRIEF_CONTENT_CONTRACT }), v3 = deriveBrief(input, { ...basis, briefContract: BRIEF_REOPEN_CONTRACT });
+  assert.deepEqual([v2.brief.contract, v3.brief.contract], [BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT]);
+  assert.equal(v3.brief.text, v2.brief.text);
+  assert.deepEqual({ ...v3.brief, contract: BRIEF_CONTENT_CONTRACT }, v2.brief);
+  assert.equal(packetPrompt(v3), v3.brief.text);
+  assert.throws(() => deriveBrief(input, { ...basis, briefContract: 'om-brief/v4' as typeof BRIEF_REOPEN_CONTRACT }),
+    (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid');
+  assert.throws(() => packetPrompt({ ...v3, brief: { ...v3.brief, contract: 'om-brief/v4' } }), (error: unknown) => error instanceof EngineError);
+});
+
+test('RB1 (№4343): a decision B1 applied reaches a v3 brief by the works and places it names, even when it was asked at another block; v2 keeps its consumer rule, and an unrelated decision reaches neither', t => {
+  const { basis, input } = sample(t);
+  const cause = (works: string[], places: string[]) => ({ contract: 'om-readiness/v1', cause: 'transition', snapshot: { commit: 'a'.repeat(40), tree: 'b'.repeat(40) },
+    file: 'src/server.ts', line: 31, kind: 'dynamic-url', expression: 'new URL(x)', site: { start: 1, end: 2, hash: 'c'.repeat(64) }, candidates: [], works, places });
+  const row = (id: string, readiness: unknown) => ({ question: { id, question: 'Which files?', consumer: 'garden-produce-block', kind: 'repository-fact', blocks: true,
+    source: { id: 'om-atomic-gate:garden:x', revision: 1, hash: 'd'.repeat(64) }, readiness }, value: { answer: 'none', resolves: [] } });
+  const facts = [row('readiness:transition:by-place', cause(['w-other'], ['garden-consume-block'])), row('readiness:transition:by-work', cause(['garden-consume-work'], ['garden-produce-block'])),
+    row('readiness:transition:foreign', cause(['w-other'], ['garden-produce-block']))];
+  const decided = [{ ...row('readiness:transition:decided', cause(['w-other'], ['garden-consume-block'])), decision: { id: 'om-decision:garden:x', revision: 1, hash: 'e'.repeat(64) } }];
+  const payload = { ...input, expansion: undefined } as Record<string, any>;
+  const scoped = (contract: typeof BRIEF_CONTENT_CONTRACT | typeof BRIEF_REOPEN_CONTRACT) => {
+    const text = deriveBrief(payload, { ...basis, briefContract: contract, transitionEra: true, input: { ...(basis.input as object), facts, decided } as unknown as Json }).brief.text as string;
+    const scope = JSON.parse(text.split('\n# Scope and exact context\n')[1]!.split('\n')[0]!) as { input: { facts?: { question: { id: string } }[]; decided?: { question: { id: string } }[] } };
+    return [(scope.input.facts ?? []).map(item => item.question.id), (scope.input.decided ?? []).map(item => item.question.id)];
+  };
+  // The brief's node is garden-consume-block; every question was asked at garden-produce-block.
+  assert.deepEqual(scoped(BRIEF_CONTENT_CONTRACT), [[], []], 'v2: by consumer only, as issued');
+  assert.deepEqual(scoped(BRIEF_REOPEN_CONTRACT), [['readiness:transition:by-place'], ['readiness:transition:decided']],
+    'v3: a place of this node; a work of it counts only where the brief expands the node (its accepted or reopened works)');
+});
