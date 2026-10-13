@@ -2103,7 +2103,7 @@
 - Отдаёт: —
 - Читает записи: запрос чтения модели; сохранённый источник
 - Пишет записи: выдача чтения (усечённый диапазон и длина)
-- Разрешённые пути: `src/evidence/evidence.ts`, `src/discovery/research-continuation.ts`, `src/discovery/pilot-context.ts`, `src/discovery/research-consumer-transition.ts`, `test/research.test.ts`, `test/discovery.test.ts`
+- Разрешённые пути: `src/evidence/evidence.ts`, `src/discovery/research-continuation.ts`, `src/discovery/pilot-context.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/research-sources.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `src/discovery/reader.ts`, `test/research.test.ts`, `test/discovery.test.ts`
 - Из движка как есть: №57; LP1; LP3
 - После: RL3
 - Тесты сверх обязательных:
