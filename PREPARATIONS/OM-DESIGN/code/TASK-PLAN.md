@@ -2145,9 +2145,9 @@
 - Отдаёт: —
 - Читает записи: сохранённый ответ адаптера при сбое; сохранённое намерение платного шага
 - Пишет записи: исход отказа провайдера (provider-failed); новая генерация того же шага
-- Разрешённые пути: `src/discovery/response-recovery.ts`, `src/discovery/research-runner.ts`, `test/research-call-resume.test.ts`, `test/research.test.ts`
-- Из движка как есть: №4405; №4411; C13/C62
-- После: RS2
+- Разрешённые пути: `src/discovery/response-recovery.ts`, `src/discovery/research-runner.ts`, `test/research-call-resume.test.ts`, `test/research.test.ts`, `test/assessment-session-resume.test.ts`
+- Из движка как есть: №4405; №4411; №4424; C13/C62
+- После: RS2, D8.3.1
 - Тесты сверх обязательных:
   - конверт protocol+requestId+usage:null без research при exit 1 (форма codex-stdio) — provider-failed, новая генерация того же шага, сохранённые записи побайтно прежние
   - то же для формы devin-stdio при сбое

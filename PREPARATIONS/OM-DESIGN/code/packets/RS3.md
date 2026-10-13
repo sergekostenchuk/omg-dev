@@ -46,7 +46,7 @@
 - Читает записи: сохранённый ответ адаптера при сбое; сохранённое намерение платного шага
 - Пишет записи: исход отказа провайдера (provider-failed); новая генерация того же шага
 - Из движка как есть: №4405; №4411; №4424; C13/C62
-- Уже сделано до тебя: RS2 «Рабочая область контекста вопроса выводится одним общим правилом: текущая и историческая свёртка адресных чтений не расходятся; после read_source / read_bundle / checkpoint / answer / answer_delta следующий read_context не теряет checkpointedKeys; сравнение в research-runner остаётся строгим» (src/discovery/context-workspace.ts, src/discovery/research-continuation.ts, src/discovery/research-consumer-transition.ts)
+- Уже сделано до тебя: RS2 «Рабочая область контекста вопроса выводится одним общим правилом: текущая и историческая свёртка адресных чтений не расходятся; после read_source / read_bundle / checkpoint / answer / answer_delta следующий read_context не теряет checkpointedKeys; сравнение в research-runner остаётся строгим» (src/discovery/context-workspace.ts, src/discovery/research-continuation.ts, src/discovery/research-consumer-transition.ts); D8.3.1 «Поздняя квитанция новой эры оценки: регрессия и шов (дополнение №868-4)» ()
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
