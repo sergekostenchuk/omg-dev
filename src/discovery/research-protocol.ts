@@ -214,15 +214,15 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const requestLimit = audit?.pilot?.value.maxRequestChars ?? 300000;
   const overhead = Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
     controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
-    requestLimit - overhead, { common: true, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}),
+    requestLimit - overhead, { common: true, purpose: audit!.purpose, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}),
       ...(audit!.pilot?{contextChars:audit!.pilot.value.maxRequestChars}:{}),
       ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxRequestChars}:{}) }) : context;
-  if (packetState) (subject as any).continuation = continuationMetadata(packetState, (subject as any).working.archive);
+  if (packetState) (subject as any).continuation = continuationMetadata(packetState, (subject as any).working.archive, audit!.store);
   if (!consolidating && context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
     requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);
   audit?.onContext?.(subject as Record<string, any>);

@@ -1,3 +1,4 @@
+import { contextValue } from '../src/discovery/working-context.js';
 import { Evidence } from "../src/evidence/evidence.js";
 import { layerDesignSpec } from "../src/graph/layer-design.js";
 import test from 'node:test';
@@ -57,7 +58,8 @@ test('actual dry envelopes carry foundation once per question/role in R0/R1/R2/L
  for(const wire of sent){const key=wire.subject.continuation.question+':'+wire.subject.continuation.role;groups.set(key,[...(groups.get(key)??[]),wire]);}
  for(const wires of groups.values()){
   assert.equal(wires.filter(w=>JSON.stringify(w).includes('FOUNDATION_SENTINEL')).length,1);
-  assert.equal(wires.filter(w=>w.prompt.includes('PROMPT_SENTINEL')).length,1);
+  assert.equal(wires.filter(w=>w.prompt.includes('PROMPT_SENTINEL')).length,wires[0].subject.continuation.role==='reader'?1:2);
+  if(wires[0].subject.continuation.role!=='reader')assert.ok(wires[1].prompt.includes(wires[0].prompt),'RS4 preserves the actual role instruction');
   const next=wires[1];assert.equal(next.subject.continuation.kind,'continuation');
   assert.ok(JSON.stringify(next).length<=100000);
   assert.ok(!Object.hasOwn(next.subject,'core'));assert.ok(!Object.hasOwn(next.subject,'map'));
@@ -160,4 +162,19 @@ test('a failed continuation cannot replace the last delivered candidate used for
  await assert.rejects(researchCall(f.role,f.env,'fixture',{...context,value:{changed:'not delivered'}},undefined,audit),{code:'research_provider_failed'});
  const after=continuationState(f.store,'p',draft.id,q.id,'assessor',f.role.actor);
  assert.deepEqual(after.latest,initial.latest);assert.equal(after.priorCalls,1);assert.equal(after.initial,false);
+});
+
+
+test('RS4 planning addresses refer to the raw archive, not the added selected question projection',async t=>{
+ const f=fixture(t),{draft,q}=question(f.store,'discovery','R0','planner-plural');
+ const source:any=body(q,f.root,'reading-planner');source.questions=[{id:'another',field:'another'},{id:q.id,...q.value.spec}];delete source.question;
+ await researchCall(f.role,f.env,'Plan exact reads',source,undefined,{store:f.store,draftId:draft.id,questionId:q.id,purpose:'reading-planner'});
+ const wire=JSON.parse(readFileSync(f.log,'utf8').trim()),packet=wire.subject;
+ const archive=f.store.get<any>(packet.working.archive.id,packet.working.archive.revision)!;
+ for(const section of packet.working.sections)assert.doesNotThrow(()=>contextValue(archive.value,section.pointer));
+ assert.ok(!packet.working.sections.some((s:any)=>s.pointer==='/body/question'));
+ assert.ok(packet.working.sections.some((s:any)=>s.pointer==='/body/questions'));
+ assert.equal(packet.question.id,q.id);assert.deepEqual(packet.question.schema,q.value.spec.schema);
+ assert.equal(packet.question.schemaAddress.pointer,'/body/questions/1/schema');
+ assert.deepEqual(contextValue(archive.value,packet.question.schemaAddress.pointer),q.value.spec.schema);
 });

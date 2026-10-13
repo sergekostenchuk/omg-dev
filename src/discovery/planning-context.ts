@@ -1,3 +1,4 @@
+import { contextSections } from './continuation-packet.js';
 import { relative, isAbsolute } from "node:path";
 import { requireCondition, EngineError } from "../errors.js";
 import type { Ref } from "../pipeline/contracts.js";
@@ -6,11 +7,10 @@ import { packPriorEvidence, priorEvidenceSources } from './prior-evidence-summar
 import { packContextWorkspace } from './context-workspace.js';
 
 const rows = (v: any): any[] => Array.isArray(v) ? v : v?.rows?.map((r: unknown[]) => Object.fromEntries(v.columns.map((k: string, i: number) => [k, r[i]]))) ?? [];
-const pointer = (s: string) => s.replaceAll("~", "~0").replaceAll("/", "~1");
 
 /** Exact statements, structural identifiers and addresses; never a generated
  * summary of code or evidence. Synthesis still receives the full working view. */
-export function planningContext(body: Record<string, any>, archive: Ref, maxChars: number, contextChars?:number) {
+export function planningContext(body: Record<string, any>, archive: Ref, maxChars: number, contextChars?:number, archivedBody = body) {
   const root = body.repositoryRoot as string;
   requireCondition(typeof root === "string" && isAbsolute(root), "planning_context_invalid", "Planning requires its bound repository root");
   const sourceLocations = new Map((body.inventory?.sources ?? []).map((s: any) => [s.ref.id, s.location]));
@@ -31,10 +31,7 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
       instruction: "Complete original gap questions and deferral reasons remain at ref /obligations/index; this is an address index, not evidence of irrelevance."
         + (body.researchScope.policy ? " The approved kind, owner and resolution moment are fixed at assignmentPointer. Deferred proof remains owed at R3 or the named task boundary; entering the scope does not move that deadline to R2." : '') } : null,
     role: body.role, dispatchMode: "planning", stage: body.stage, level: body.level, consumer: body.consumer,
-    draft: body.draft, question: { id: body.question.id, field: body.question.field, kind: body.question.kind,
-      ...(body.question.basisContract ? {basisContract:body.question.basisContract} : {}),
-      ...(body.question.obligationContract ? {obligationContract:body.question.obligationContract} : {}),
-      prompt: body.question.prompt, risk: body.question.risk },
+    draft: body.draft, question: body.question,
     objective: body.core.objective, problem: body.core.problem, actors: body.core.actors,
     constraints: body.core.constraints, specificationConstraints: body.core.specificationConstraints,
     concept: body.core.concept,
@@ -59,7 +56,7 @@ export function planningContext(body: Record<string, any>, archive: Ref, maxChar
     }] : []),
     openGaps: body.openGaps, failures: body.failures, unresolvedEvidence: body.unresolvedEvidence,
     working: { archive, instruction: "This is a navigation index, not evidence or an answer context. Every requirement/node is indexed. Full criteria, schemas, evidence, checkpoints and histories remain in the archived body. Use its record and /body/... pointers. Original source refs are returned with reads; file paths are relative to the research workspace when possible. No new fact is inferred by this index.",
-      sections: ["core", "map", "readings", "directReadings", "checkpoints", "question", "inventory"].map(k => ({ pointer: `/body/${pointer(k)}` })) },
+      sections: contextSections(archivedBody, ["core", "map", "readings", "directReadings", "checkpoints", "question", "questions", "inventory"]) },
   };
   // Encode navigation records using the same lossless transport as the rich
   // context. Do not trim requirements, unknowns or source addresses to fit.

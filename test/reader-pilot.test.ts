@@ -692,7 +692,9 @@ test("planning indexes all sources, requirements and nodes without carrying obse
   const packet = workingContext(store, "p", draft.id, question.id, body, 50000);
   assert.ok(JSON.stringify(packet).length < 50000);
   assert.ok(!JSON.stringify(packet).includes("LARGE_OBSERVATION_NOT_FOR_PLANNING"));
-  assert.equal(packet.question.schema, undefined);
+  assert.deepEqual(packet.question.schema, question.value.spec.schema);
+  assert.deepEqual(readPilotContext(store, draft, packet.question.schemaAddress.record,
+    packet.question.schemaAddress.pointer, 50000).value, question.value.spec.schema);
   assert.deepEqual(records<any>(packet.sources).map((s: any)=>inventory.sources[s.index]!.ref.id), inventory.sources.map(s=>s.ref.id));
   assert.deepEqual(records<any>(packet.requirements).map((r: any)=>r.id), base.core.requirements.flatMap((s: any)=>records<any>(s.requirements).map(r=>r.id)));
   assert.deepEqual(records<any>(packet.nodes).map((n: any)=>n.id), records<any>(base.map.nodes).map(n=>n.id));

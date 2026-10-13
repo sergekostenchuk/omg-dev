@@ -4,8 +4,8 @@ import type { Store, Revision, Write, ReadGuard } from '../storage/store.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
-import { hashJson } from '../canonical.js';
-import { requireCondition } from '../errors.js';
+import { canonical, hashJson } from '../canonical.js';
+import { EngineError, requireCondition } from '../errors.js';
 
 /** Project-wide foundation, not the current question's small response contract.
  * These fields never travel again as an implicit part of a continuation. */
@@ -42,8 +42,8 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   const archives=delivered.flatMap(c=>c.value.packet?[c.value.packet.archive]:[]);
   for(const ref of archives){
     const original=isRef(ref)?store.get<any>(ref.id,ref.revision):null;
-    requireCondition(original?.kind==='research-context'&&original.hash===ref.hash&&original.value.projectId===projectId
-      &&original.value.question.id===questionId,'continuation_foreign','Delivered foundation belongs to another question');
+    requireCondition(original?.kind==='research-context'&&original.hash===ref.hash&&original.value?.projectId===projectId
+      &&isRef(original.value.question)&&original.value.question.id===questionId,'continuation_foreign','Delivered foundation belongs to another question');
   }
   return {initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
     basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor};
@@ -80,13 +80,59 @@ export function replaceFoundationCopies(value: unknown, body: Record<string, any
   };
   return visit(value);
 }
-export function continuationMetadata(state: ContinuationPacketState, archive: Ref) {
-  return {kind:state.initial?'initial':'continuation',role:state.purpose,question:state.question.id,
-    foundation:state.basis??archive,current:archive,previousCalls:state.priorCalls,
-    foundationPointers:FOUNDATION_FIELDS.map(key=>`/body/${key}`)};
+export function contextSections(body: Record<string, unknown>, keys = Object.keys(body)) {
+  return keys.filter(key => Object.hasOwn(body, key)).map(key => ({
+    pointer: `/body/${key.replaceAll('~', '~0').replaceAll('/', '~1')}`,
+  }));
 }
 
-export function continuationPrompt(purpose: string): string {
+/** Bind the selected contract once; transport shapes must not define a second FieldSpec. */
+export function selectedQuestion(question: Revision<Question>, body: Record<string, any>) {
+  const fail = (message: string) => new EngineError('context_question_invalid', `[${question.id}] ${message}`);
+  const spec = question.value.spec;
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec) || !Object.hasOwn(spec, 'schema')
+    || !['field', 'prompt', 'risk'].every(key => Object.hasOwn(spec, key) && typeof (spec as any)[key] === 'string' && (spec as any)[key].trim())
+    || !['fact', 'decision', 'design'].includes(spec.kind)) throw fail('The bound FieldSpec is incomplete');
+  const validate = (q: Record<string, any>) => {
+    for (const [key, value] of Object.entries(spec))
+      if (Object.hasOwn(q, key) && canonical(q[key]) !== canonical(value))
+        throw fail(`The supplied question changed ${key}`);
+  };
+  let pointer: string | null = null;
+  if (Object.hasOwn(body, 'question')) {
+    const q = body['question'];
+    if (!q || typeof q !== 'object' || Array.isArray(q) || (Object.hasOwn(q, 'id') && q.id !== question.id))
+      throw fail('The supplied question is not the bound question');
+    validate(q);
+    if (Object.hasOwn(q, 'schema') && canonical(q.schema) === canonical(spec.schema)) pointer = '/body/question/schema';
+  }
+  if (Object.hasOwn(body, 'questions')) {
+    const list = body['questions'];
+    if (!Array.isArray(list)) throw fail('The question collection is not an array');
+    const matches = list.flatMap((q: any, i: number) => q && typeof q === 'object' && q.id === question.id ? [i] : []);
+    if (matches.length !== 1) throw fail('The collection must identify exactly one selected question');
+    const index = matches[0]!, q = list[index];
+    validate(q);
+    if (!pointer && Object.hasOwn(q, 'schema') && canonical(q.schema) === canonical(spec.schema)) pointer = `/body/questions/${index}/schema`;
+  }
+  return { question: { id: question.id, ...structuredClone(spec) }, schemaPointer: pointer };
+}
+
+export function continuationMetadata(state: ContinuationPacketState, archive: Ref, store: Store) {
+  const foundation = state.basis ?? archive;
+  const original = store.get<{ projectId: string; draft: Ref; question: Ref; body: Record<string, unknown> }>(foundation.id, foundation.revision);
+  requireCondition(original?.kind === 'research-context' && original.hash === foundation.hash
+    && original.value?.projectId === state.projectId && isRef(original.value.draft) && original.value.draft.id === state.draft.id
+    && isRef(original.value.question) && original.value.question.id === state.question.id && original.value.body && typeof original.value.body === 'object' && !Array.isArray(original.value.body),
+  'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
+  return {kind:state.initial?'initial':'continuation',role:state.purpose,question:state.question.id,
+    foundation,current:archive,previousCalls:state.priorCalls,
+    foundationPointers:contextSections(original.value.body, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
+}
+
+export function continuationPrompt(purpose: string, currentPrompt?: string): string {
+  // Reader results re-derive this exact legacy prompt during historical replay.
+  if (purpose !== 'reader' && currentPrompt !== undefined) return currentPrompt + '\n' + CONTINUATION_INSTRUCTION;
   const protocol = purpose === 'escalation-assessor' ? 'Return {necessary:boolean,reason:string}; a user question is necessary only for unavailable owner-only information, never for technical failures.' : purpose === 'reader'
     ? 'Select exact supplied original line coordinates. Return {selections:[{sourceIndex,firstLine,lastLine}],unresolved:[string]}. Include exceptions and conditions. Do not summarize source text.'
     : purpose === 'reading-planner'

@@ -67,13 +67,19 @@ test('an unfit next fragment triggers consolidation even below the configurable 
   const f = await fixture(t, 1500, 30000, 0.95);
   assert.equal(consolidationNeeded(f.notes, f.pilot.value), false);
   let found = false;
-  for (let chars = 12000; chars < 15000; chars += 100) {
+  // The full role prompt and FieldSpec are mandatory; find the actual packet
+  // boundary instead of coupling this scenario to their former byte count.
+  let low = 0, high = f.pilot.value.maxRequestChars;
+  while (low <= high) {
+    const chars = Math.floor((low + high) / 2);
     f.context.request = { immutableCondition: 'x'.repeat(chars) };
     try {
       const packet = JSON.parse((await previewResearch(f.invoke)).input).subject;
       if (packet.dispatchMode === 'consolidation') { found = true; break; }
+      low = chars + 1;
     } catch (error) {
       if (!(error instanceof EngineError && ['pilot_core_limit','research_context_capacity'].includes(error.code))) throw error;
+      high = chars - 1;
     }
   }
   assert.ok(found, 'The actual packer must reach the fragment-not-fit path');
