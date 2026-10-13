@@ -47,7 +47,7 @@
 - Читает записи: действие модели web_search/web_fetch; ответ шлюза поиска
 - Пишет записи: запись результата веб-поиска; Source происхождения web (снимок страницы); завершение хода исследования
 - Из движка как есть: №4552; №4458; SRCH0
-- Уже сделано до тебя: DS1 «Discovery v5 по назначению стадии: шаг 0 — план исследования от лица роли-эксперта (домен, роли, стартовые вопросы, источники, вопросы реализуемости, результат), затем отчёт исследования с источниками и вердикт go / conditional / no_go / insufficient_evidence; preparation только после принятого go; отрицательный исход — сохранённый результат и остановка до концепции, не цикл исправлений» (src/discovery/preparation-contracts.ts, src/discovery/requirements.ts, src/discovery/discovery-outcome.ts, src/discovery/research-runner.ts, src/product/stage-research.ts, src/product/stage-checks.ts, src/discovery/working-context.ts, src/discovery/research-assessment.ts, src/om/input.ts, src/discovery/research-reuse.ts, src/om/gaps.ts); RS5 «Хвост RS1: каждый читатель материала, в который может прийти выдача read_source (source-read/v1), проверяет его общим verifyReading; цитаты-доказательства остаются под строгим Evidence.verify» (src/discovery/synthesis-session.ts, src/discovery/saved-synthesis.ts)
+- Уже сделано до тебя: DS1 «Discovery v5 по назначению стадии: шаг 0 — план исследования от лица роли-эксперта (домен, роли, стартовые вопросы, источники, вопросы реализуемости, результат), затем отчёт исследования с источниками и вердикт go / conditional / no_go / insufficient_evidence; preparation только после принятого go; отрицательный исход — сохранённый результат и остановка до концепции, не цикл исправлений» (src/discovery/preparation-contracts.ts, src/discovery/requirements.ts, src/discovery/discovery-outcome.ts, src/discovery/research-runner.ts, src/product/stage-research.ts, src/product/stage-checks.ts, src/discovery/working-context.ts, src/discovery/research-assessment.ts, src/om/input.ts, src/discovery/research-reuse.ts, src/om/gaps.ts); RS5 «Хвост RS1: каждый читатель материала, в который может прийти выдача read_source (source-read/v1), проверяет его общим verifyReading; цитаты-доказательства остаются под строгим Evidence.verify» (src/discovery/synthesis-session.ts, src/discovery/saved-synthesis.ts); DRY5FIX «Ошибка модели на ранней стадии (форма, недоступное действие, значение ответа аналитика; ошибка формы оценщика и оценщика эскалации) завершает её попытку адресным отказом, следующий обычный research-stage получает исправленный ответ без застревания; reopen пишет только то, что читает свой читатель; чужой испорченный ход не блокирует новое исследование» (src/discovery/early-research-outcome.ts, src/discovery/research-consumer-transition.ts, src/discovery/response-recovery.ts, src/discovery/research-runner.ts, src/discovery/assessment-session.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -72,6 +72,10 @@
 - `src/om/gaps.ts`
 - `src/discovery/synthesis-session.ts`
 - `src/discovery/saved-synthesis.ts`
+- `src/discovery/early-research-outcome.ts`
+- `src/discovery/research-consumer-transition.ts`
+- `src/discovery/response-recovery.ts`
+- `src/discovery/assessment-session.ts`
 
 ### Границы незавершённой интеграции
 
