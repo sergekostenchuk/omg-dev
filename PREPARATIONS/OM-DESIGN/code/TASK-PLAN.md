@@ -2232,7 +2232,7 @@
 - Отдаёт: —
 - Читает записи: действие модели web_search/web_fetch; ответ шлюза поиска
 - Пишет записи: запись результата веб-поиска; Source происхождения web (снимок страницы); завершение хода исследования
-- Разрешённые пути: `src/discovery/web-research.ts`, `src/evidence/evidence.ts`, `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-model.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-sources.ts`, `src/discovery/research-continuation.ts`, `src/discovery/pilot-context.ts`, `src/discovery/reading-plan.ts`, `src/discovery/planning-context.ts`, `src/discovery/working-context.ts`, `src/discovery/continuation-packet.ts`, `test/web-research.test.ts`, `test/research.test.ts`, `test/early-stage-briefs.test.ts`, `test/research-call-resume.test.ts`
+- Разрешённые пути: `src/discovery/web-research.ts`, `src/evidence/evidence.ts`, `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-model.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-sources.ts`, `src/discovery/research-continuation.ts`, `src/discovery/pilot-context.ts`, `src/discovery/reading-plan.ts`, `src/discovery/planning-context.ts`, `src/discovery/working-context.ts`, `src/discovery/continuation-packet.ts`, `src/graph/research-basis.ts`, `test/web-research.test.ts`, `test/research.test.ts`, `test/early-stage-briefs.test.ts`, `test/research-call-resume.test.ts`
 - Из движка как есть: №4552; №4458; SRCH0
 - После: DS1, RS5
 - Тесты сверх обязательных:
