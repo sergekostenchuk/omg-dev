@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля; окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 165. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → AT3b → AT4 → RS1 → RS2 → RS3 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 166. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → AT3b → AT4 → RS1 → RS2 → RS3 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → RS4 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 83.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 84.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2156,6 +2156,27 @@
   - сохранённый отказ HX2 на копии ~/omg-wt/hx2-admission-stale-20261013-095611.sqlite — штатный research-stage допускает новую генерацию (новый вызов — заглушка, платных 0)
   - настоящий прежний производитель из Git (om/module 8b665772): прежние исходы читаются своей эрой
   - окна: смена охраняемой головы между подготовкой и записью — отказ без частичной записи
+  - один полный прогон и ревью
+
+### RS4 · Бриф ранних стадий: каждый объявленный адрес существует в своей точной записи, выбранный вопрос приходит с полным контрактом (schema, risk, proof, obligations, contracts, targets, layerAssembly) в initial и continuation, инструкция роли и фазы не подменяется generic-продолжением
+
+**Цель.** Блокер HX3 №4417 (13.10): после трёх успешных вызовов Sol модель дважды читала адреса из брифа без нового материала (/body/fields/preparation → null; /body/core → context_missing). Разбор Codex-omg №4425 (пробы на 8b665772 и копии HX3): (1) continuation-packet.ts:83–86 continuationMetadata объявляет все 25 FOUNDATION_FIELDS в initial и continuation, существуют 5; статический перечень и в planning-context.ts:62; schemaAddress жёстко /body/question/schema (working-context.ts:104); working.sections строится после преобразования body (:159–162). (2) Выбранный вопрос урезается: singular теряет risk/proof, plural (body.questions, ранний research) ещё и schema и obligations; targets/layerAssembly отбрасываются выборочной сборкой; в продолжении нет subject.question, хотя инструкция требует subject.question.id. Полная схема preparation в первом запросе 21 547 знаков, следующий пакет 8 758 — потеря не от вместимости. (3) research-protocol.ts:217 заменяет исходную инструкцию роли generic-продолжением — теряются формы действий и правила доказательств (analyst — форма citations; assessor — proofLimit/documentaryAllowance). Ремонт (№4425, 9/10 каждый пункт): (а) адреса — только существующие: foundationPointers — относительно точного continuation.foundation, текущие — относительно current/working.archive, наличие по own-property/JSON pointer (null, false, 0, [] существуют); изменяемые fields, предпосылки, кандидат — адрес current; (б) ОДИН построитель полного выбранного вопроса для question и questions — id и полный FieldSpec (schema, risk, proof, obligations, contracts, targets, layerAssembly если есть), однозначно под именем из инструкции; schemaAddress из настоящего archive (/body/question/schema либо /body/questions/<индекс выбранного id>/schema, индекс не предполагать 0); для analyst схема и правила ответа — в самом пакете; (в) действующая инструкция роли и фазы (analyst, assessor, reading-planner, escalation-assessor) сохраняется плюс пояснение о stateless-продолжении; synthesis/finalization/consolidation — свои режимы. Удаление копий foundation допустимо, если обязательные условия решения доставлены, а опущенное имеет действительные адреса — проверять ПОСЛЕ replaceFoundationCopies и ограничения вместимости; нехватка вместимости — до отправки. Эра: архив и cursor.context/prompt не менять, меняется только будущая транспортная проекция; оплаченный managed-вызов восстанавливается из сохранённого subject (research-protocol.ts:167–172); метки версии не нужно. ЛОВУШКА: reader.ts:81–85,285 заново вычисляет continuationPrompt('reader') и сравнивает с сохранённым — reader-prompt оставить побайтно прежним (reader.ts не трогать). Старые пакеты новым правилом полноты не проверять.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: сохранённое основание и текущая запись контекста; FieldSpec выбранного вопроса; действующая инструкция роли
+- Пишет записи: транспортная проекция брифа initial и continuation
+- Разрешённые пути: `src/discovery/continuation-packet.ts`, `src/discovery/working-context.ts`, `src/discovery/research-protocol.ts`, `src/discovery/planning-context.ts`, `test/continuation-packet.test.ts`, `test/research-preview.test.ts`, `test/early-stage-briefs.test.ts`
+- Из движка как есть: №4417; №4425; RB1; MP1
+- После: RS2
+- Тесты сверх обязательных:
+  - настоящие initial и continuation пяти ранних стадий (15 FieldSpec), question и questions, через штатных производителей (analyst, assessor, reading-planner, escalation-assessor, reader, synthesis) с бесплатным адаптером, а не прямой вызов helper; R0 без pilot (research-runner.ts:192)
+  - каждый объявленный адрес разрешается в своей точной записи и возвращает заявленный материал; foundation ≠ current; выбранный вопрос не первый в массиве; null против отсутствия; экранирование JSON pointer
+  - полный контракт выбранного вопроса и формы разрешённых действий сохранены после упаковки и ограничения вместимости; reader — исходные координаты и prompt побайтно прежний; assessor — кандидат и ограничения доказательств; нехватка вместимости — до отправки
+  - настоящий прежний производитель из Git (om/module 8b665772): completed, оплаченный pending, reader-result после перезапуска; прежние request/response/archive неизменны; оплаченный ответ без новой отправки; подмена основания/вопроса отвергается
+  - свежая копия остановленного HX3 (~/omg-wt/hx3-continuation-contract-20261013-101221.sqlite): штатный preview следующего пакета, затем бесплатный сценарный ответ через настоящую приёмку — схема доставлена, объявленные адреса без context_missing
   - один полный прогон и ревью
 
 ### AT3b · Маршрут дефекта плана в OM: один публичный repair-plan с ветвью OM → запись дефекта → пробел D1 над принятым L3 → пакет исправления работы → redefine → G5 → settle → явное возобновление завершённого прохода → M8 → compile
