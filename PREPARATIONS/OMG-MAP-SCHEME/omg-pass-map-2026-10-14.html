@@ -230,7 +230,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <span>Спецификация</span><a href="#s-what">Что это</a><a href="#s-input">Вход</a><a href="#s-process">Обработка</a><a href="#s-output">Выход</a><a href="#s-records">Записи</a><a href="#s-doors">Двери</a><a href="#s-gaps">Пробелы</a><a href="#s-missed">Упускали</a>
     <span>Фичи</span><a href="#f-what">Что это</a><a href="#f-input">Вход</a><a href="#f-process">Обработка</a><a href="#f-output">Выход</a><a href="#f-questions">Вопросы</a><a href="#f-records">Записи</a><a href="#f-gaps">Пробелы</a>
     <span>OM</span><a href="#o-what">Что это</a><a href="#o-routes">Два маршрута</a><a href="#o-actions">Действия</a><a href="#o-records">Записи</a><a href="#o-missed">Поправки</a><a href="#o-min">Минимум</a>
-    <span>Исполнение</span><a href="#x-what">Что это</a><a href="#x-in">Вход модели</a><a href="#x-out">Ответ модели</a><a href="#x-cards">Пять задач</a><a href="#x-records">Записи</a><a href="#x-gaps">Пробелы</a>
+    <span>Исполнение</span><a href="#x-what">Что это</a><a href="#x-in">Вход модели</a><a href="#x-out">Ответ модели</a><a href="#x-cards">Пять задач</a><a href="#x-phase">Фаза задачи</a><a href="#x-records">Записи</a><a href="#x-gaps">Пробелы</a>
     <span>Итог</span><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
   </nav>
 
@@ -1005,6 +1005,28 @@ ul.plain b{color:var(--ink);font-weight:500}
         </table></div>
         <p style="margin-top:10px">Тест-контракт каждой задачи: given / when / then, forbiddenEffects, entrypoint, counterfactuals, resourceClass. На карте: развернуть «Исполнение плана» → «Пять задач плана — пример»; клик по карточке — полный договор.</p>
       </section>
+      <section class="sec wide" id="x-phase">
+        <h3>Фаза исполнения задачи — на примере T4 <small>пример · на карте: «Исполнение плана» → «Фаза исполнения задачи · T4»</small></h3>
+        <div class="tw"><table>
+          <thead><tr><th>Шаг</th><th>Кто</th><th>Что происходит с T4</th><th>Состояние</th></tr></thead>
+          <tbody>
+            <tr><td>Выбор задачи</td><td>код</td><td>T4 — следующая в массиве; parent — коммит T3</td><td>—</td></tr>
+            <tr><td>Входы</td><td>код</td><td>Квитанции a-protocol (T1), a-session-binding (T2), a-api-binding (T3); права на 2 файла</td><td>—</td></tr>
+            <tr><td>task-start</td><td>код · runtimeCheck</td><td>Стенд транспорта доступен и запрещает внешние обращения; нет — отказ до отправки</td><td>—</td></tr>
+            <tr><td>Попытка</td><td>запись</td><td>run попытки 1 с parent и основаниями</td><td>implementing</td></tr>
+            <tr><td>Контекст и отправка</td><td>код · запись</td><td>task-context (scope, req-vendor-call, criteria, obligations); execution-send до запуска</td><td>sent</td></tr>
+            <tr><td>Кодирование</td><td>модель</td><td>Пишет src/vendor-adapter.mjs и тест; возвращает text + artifacts: [a-vendor-adapter]</td><td>answered</td></tr>
+            <tr><td>Кандидат</td><td>код</td><td>diff ⊆ writePaths, дерево = байты</td><td>checking</td></tr>
+            <tr><td>Проверки</td><td>код</td><td>fullCheck → test-vendor-adapter → counterfactual → provider_outcome_unknown</td><td>checking</td></tr>
+            <tr><td>Ревью</td><td>ревьюер</td><td>diff, тесты, договор: pass / code / plan</td><td>reviewing</td></tr>
+            <tr><td>task-result</td><td>код</td><td>Тест доказывает: неоднозначный исход не повторяется скрыто</td><td>—</td></tr>
+            <tr><td>Коммит</td><td>код · запись</td><td>gates → commit_pending → CAS update-ref</td><td>commit_pending → committed</td></tr>
+            <tr><td>Квитанция</td><td>запись</td><td>artifact a-vendor-adapter: commit, tree, files; writer-index</td><td>committed</td></tr>
+            <tr><td>Дальше</td><td>код</td><td>T5 получает квитанцию как вход; parent — коммит T4</td><td>—</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px"><b>Боковые исходы:</b> ревью code → needs_code → попытка 2 с findings в том же scope; нет task-result → awaiting_obligation, кандидат сохранён, коммит после подтверждения без нового кода; plan-находка или contract_unexecutable → needs_plan — для нового OM ремонт не подключён (PR1).</p>
+      </section>
       <section class="sec" id="x-records">
         <h3>Записи</h3>
         <div class="tw"><table>
@@ -1499,6 +1521,37 @@ ul.plain b{color:var(--ink);font-weight:500}
        ],
        edges:[{f:"t1",t:"t2",l:"a-protocol"},{f:"t1",t:"t3",l:"a-protocol"},{f:"t1",t:"t4",l:"a-protocol"},{f:"t2",t:"t4",l:"a-session-binding"},{f:"t3",t:"t4",l:"a-api-binding"},{f:"t4",t:"t5",l:"a-vendor-adapter"}]},
 
+      {id:"phase",n:"Фаза",st:"ex",g:0,t:"Фаза исполнения задачи · T4",io:["CompiledTask T4","committed + квитанция"],
+       sum:"Жизнь одной задачи от допуска до коммита на примере T4 «vendor adapter»: входы, task-start, контекст, модель, кандидат, проверки, ревью, task-result, коммит, квитанция.",
+       d:[["Что показывает","Один проход цикла T → K → R → C для конкретной задачи-примера со всеми состояниями попытки: implementing → checking → reviewing → commit_pending → committed; и боковые исходы needs_code, awaiting_obligation, needs_plan."],["Почему T4","У неё больше всего механики: три входа-квитанции, task-start с runtimeCheck, провайдерская граница (provider_safety), task-result proof, контрпроверка."],["Граница","Пример: id, хэши, коммиты и квитанции символические; формы и порядок — по коду (runner.ts, commit.ts, protocol.ts, task-obligations.ts)."]],
+       nodes:[
+        {id:"pick",x:0,y:0,role:"код",st:"ex",g:0,t:"Выбор задачи",io:["plan.tasks","T4 · parent = коммит T3"],bh:"Следующий элемент топологического массива; parent — последний принятый коммит (T3), не только узел данных.",d:[["Действие","F1/T1: run задачи; committed T1–T3 — звенья точной цепи плана (runner.ts:386)."]]},
+        {id:"inputs",x:240,y:0,role:"код",st:"ex",g:0,t:"Входы-квитанции",io:["T1 · T2 · T3","subject.inputs"],bh:"a-protocol ← T1 · a-session-binding ← T2 · a-api-binding ← T3 — настоящие квитанции того же плана.",d:[["Действие","T5 (inputs.ts:11): producerTask каждого входа — committed run этого плана; чужая квитанция не подходит. Права записи: два новых файла T4 (ownership.ts:9)."]]},
+        {id:"tstart",x:480,y:0,role:"код · runtimeCheck",st:"ex",g:0,t:"task-start: стенд",io:["binding-adapter-start","подтверждение"],bh:"Локальный стенд транспорта доступен и запрещает обращения к внешнему вендору.",d:[["Действие","T4 (task-obligations.ts:44): runtimeCheck по объявленному скрипту, subjects local-adapter-fixture, timeout 10 c."],["Нет подтверждения","Остановка до отправки модели — типизированный отказ, а не попытка «на авось»."]]},
+        {id:"run",x:720,y:0,role:"запись",st:"ex",g:0,t:"run · попытка 1",io:["основания","implementing"],bh:"run:<planHash>:<T4>: attempt 1, parent, inputs, основания.",d:[["Действие","Создан run попытки; предел исправлений считается по истории, перезапуск его не обнуляет."]]},
+        {id:"ctx",x:960,y:0,role:"код",st:"ex",g:0,t:"task-context",io:["граф + T4","запрос omg-agent/v1"],bh:"action · scope (writePaths 2, readPaths 3) · req-vendor-call · criteria · connections.",d:[["Что внутри","action: «Единый vendor adapter для двух режимов», outcome a-vendor-adapter, польза; scope: boundary provider true, writePaths src/vendor-adapter.mjs и тест, readPaths protocol, session, api-connection; requirements: req-vendor-call; criteria: test-vendor-adapter, counterfactual «ambiguous response», fullCheck, obligations outcome и provider_safety, оба researchObligations."],["Вместимость","Проверяется на весь запрос; нехватка — отказ до оплаты."]]},
+        {id:"send",x:1200,y:0,role:"запись",st:"ex",g:0,t:"execution-send",io:["запрос","sent"],bh:"Сохранено до запуска адаптера: requestId, размер, группа процессов.",d:[["Действие","T7–T8: запись отправки, затем supervisor и адаптер в execution-root."]]},
+        {id:"model",x:1200,y:250,role:"модель",st:"ex",g:0,t:"Модель кодирует",io:["запрос","файлы + ответ"],bh:"Пишет src/vendor-adapter.mjs и test/vendor-adapter.test.mjs; возвращает text + artifacts: [a-vendor-adapter].",d:[["Возвращает","{protocol, requestId, text, artifacts: [{id: a-vendor-adapter}]} — без commit, tree, хэшей, квитанции."],["Альтернатива","outcome: contract_unexecutable с адресом нормы или пути вне writePaths — ветка needs_plan."]]},
+        {id:"cand",x:960,y:250,role:"код",st:"ex",g:0,t:"Кандидат",io:["answered","checking"],bh:"diff и untracked ⊆ writePaths; дерево = байты; непустое изменение.",d:[["Действие","K1–K5 (candidate.ts:25): ровно id a-vendor-adapter; два файла; tree сохранён одной транзакцией с ответом."]]},
+        {id:"checks",x:720,y:250,role:"код · запись",st:"ex",g:0,t:"Проверки на байтах",io:["tree","stdout · exit"],bh:"fullCheck → test-vendor-adapter → counterfactual «ambiguous response» ожидает provider_outcome_unknown.",d:[["Действие","K6–K8 (commit.ts:15, runner.ts:560): fullCheck первым; принимается exit 0 и без сигнала; после — дерево не изменилось."],["Смысл","Семантику доказывает договор теста (локальный транспорт считает отправки), не имя команды."]]},
+        {id:"review",x:480,y:250,role:"оценщик · ревьюер",st:"ex",g:0,t:"Ревью",io:["diff + checks","reviewing → pass"],bh:"Независимый ревьюер: diff, тесты, договор T4; pass / code / plan.",d:[["Действие","R1–R6: subjectHash, контекст, parent и tree, artifacts, checks; pass — kind none, findings []."]]},
+        {id:"tresult",x:240,y:250,role:"код",st:"ex",g:0,t:"task-result proof",io:["test-vendor-adapter","доказано"],bh:"binding-adapter-result: неоднозначный исход не вызывает скрытую повторную отправку.",d:[["Действие","C1: post-implementation-proof — выполненный контрактный тест на точном дереве."],["Предел","Доказывает локальный договор, не работу реального вендора."]]},
+        {id:"commit",x:0,y:250,role:"код · запись",st:"ex",g:0,t:"Коммит",io:["gates","commit_pending → committed"],bh:"requireGates → commit-object → commit_pending → update-ref CAS → committed.",d:[["Действие","C2–C6 (commit.ts:18–61): все выходы, команды, pass, обязательства на точном дереве; окно Git ↔ БД закрыто intent и recoverCommits."]]},
+        {id:"receipt",x:0,y:500,role:"запись",st:"ex",g:0,t:"Квитанция a-vendor-adapter",io:["коммит","artifact:<hash>"],bh:"artifact, node, signature, contractHash, commit, tree, value.files, plan, run; writer-index.",d:[["Действие","C7. Модель эти значения не сочиняет."]]},
+        {id:"next",x:240,y:500,role:"код",st:"ex",g:0,t:"→ T5",io:["квитанция T4","вход T5 · parent"],bh:"T5 получает a-vendor-adapter как вход; parent — коммит T4.",d:[["Действие","C8 / F1: следующая задача."]]},
+        {id:"await",x:480,y:500,role:"запись",st:"ex",g:0,t:"awaiting_obligation",io:["нет task-result","кандидат сохранён"],bh:"Кандидат и оплаченные gates ждут подтверждения; потом коммит без нового кода и ревью.",d:[["Действие","S6."]]},
+        {id:"plan",x:720,y:500,role:"запись",st:"ex",g:1,t:"needs_plan",io:["plan-находка / unexecutable","остановка"],bh:"Адресный дефект договора; для нового OM ремонт не подключён.",d:[["Действие","R8 / S7: остановка задачи; парковка кандидата."],["Пробел","Ремонт плана для нового OM — legacy_route_closed.",GAP],["Задача","PR1",TASK]]},
+        {id:"fix",x:960,y:500,role:"код · модель",st:"ex",g:0,t:"needs_code → попытка 2",io:["findings + ошибка","новая попытка"],bh:"Исправление в том же scope, в пределе исправлений.",d:[["Действие","R7: correction {error, review} в subject; находки адресны."]]}
+       ],
+       edges:[
+        {f:"pick",t:"inputs"},{f:"inputs",t:"tstart"},{f:"tstart",t:"run",l:"подтверждено"},{f:"run",t:"ctx"},{f:"ctx",t:"send"},
+        {f:"send",t:"model"},{f:"model",t:"cand"},{f:"cand",t:"checks"},{f:"checks",t:"review"},{f:"review",t:"tresult",l:"pass"},{f:"tresult",t:"commit"},
+        {f:"commit",t:"receipt"},{f:"receipt",t:"next"},
+        {f:"review",t:"fix",l:"code",k:"alt"},{f:"fix",t:"model",l:"попытка 2",k:"alt"},
+        {f:"review",t:"plan",l:"plan",k:"alt"},{f:"model",t:"plan",l:"unexecutable",k:"alt"},
+        {f:"tresult",t:"await",l:"нет подтверждения",k:"alt"},{f:"await",t:"commit",l:"получено",k:"alt"}
+       ].map(lbl)},
+
       {id:"t",n:"T",st:"yes",g:1,t:"Задача и отправка",io:["CompiledTask + parent","изменённые файлы"],
        sum:"Допустить задачу, разрешить входы и права, собрать task-context и запрос omg-agent/v1, отправить исполнителю.",
        d:[["Запрос исполнителю","omg-agent/v1, mode implement, prompt, subject: context (TaskContext), parent, inputs [{connector, artifact, ref, kind, value}], ownership, correction, answerForm execution/v2, address."],["TaskContext","binding; action (title, outcome, purpose, benefit, beneficiary); scope (boundary, code refs, ports, packets, read/writePaths); requirements, actor; inputs, produces; artifacts и contracts — графовые схемы, не behaviorContracts; criteria — tests, wake-tests, fullCheck, obligations, joins, researchObligations; connections, controls; neighbors; details — адрес task-detail."],["Предел","scope.code — адреса, не тексты; модель читает файлы в execution-root. Вместимость проверяется на весь запрос, нехватка — отказ, не обрезка."],["Пробел","Не доставляются отдельно: entry, inputs, compatibility договоров; success, failures, interactions фич; impact и integrations узла (их проверяет G5). task-detail есть, но у адаптера нет цикла его вызова.",GAP],["Задача","SP1",TASK]],
@@ -1594,6 +1647,9 @@ ul.plain b{color:var(--ink);font-weight:500}
      links:[
       {f:"a.ready",t:"t.run",l:"root ready",lc:"A → T"},
       {f:"tasks",t:"t.run",l:"CompiledTask → допуск задачи",lc:"план → T"},
+      {f:"tasks.t4",t:"phase.pick",l:"T4 в работу",lc:"задача → фаза"},
+      {f:"phase.next",t:"tasks.t5",l:"T5 — следующая",k:"alt",route:"below",depth:40},
+      {f:"phase",t:"t.run",l:"та же фаза — общий цикл T → K → R → C",k:"tie",lc:"фаза ⊂ цикл"},
       {f:"t.model",t:"k.form",l:"файлы + text + artifacts",lc:"T → K"},
       {f:"k.same",t:"r.subject",l:"кандидат + checks",lc:"K → R"},
       {f:"r.next",t:"c.proof",l:"pass",lc:"R → C"},
