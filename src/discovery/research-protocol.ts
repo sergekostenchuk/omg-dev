@@ -1,7 +1,7 @@
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, executionOf } from './model-call-recovery.js';
-import { invocationProgress, consumeInvocationAllowance } from "./invocation-progress.js";
+import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
@@ -34,6 +34,8 @@ import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEr
   type ResearchConsumerIntent } from './response-recovery.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply } from './research-consumer-transition.js';
+import { earlyResearchStage } from './early-research-outcome.js';
+import { RunControlGate, RunControlLost } from '../om/run-control.js';
 
 export { researchAction } from './research-consumer-transition.js';
 
@@ -250,6 +252,13 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const replay = !consumerIntent && audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
     audit.questionId, audit.purpose, input) : null;
   if (replay) return replay.research;
+  const control = audit && draft && earlyResearchStage(draft.value.stage)
+    ? new RunControlGate(audit.store, environment.projectId) : null;
+  try { control?.admit(); }
+  catch (error) {
+    if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
+    throw error;
+  }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
   const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>):null;
   const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
@@ -290,7 +299,6 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
   }
   const ownership = audit ? physicalClaim() : null;
-  consumeInvocationAllowance();
   const callWrite: Write = { id: callId, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit?.draftId ?? "", purpose: audit?.purpose ?? "", requestId,
       ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
@@ -311,9 +319,17 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   preparedAssessmentCall(assessment, callWrite, originalCall, application);
   const consumerReservation = consumerIntent ? prepareResearchConsumerReservation(audit!.store, reference(consumerIntent), callWrite,
     (callWrite.value as ModelCall).request.record!, (callWrite.value as ModelCall).packet!.archive) : null;
-  let call: Revision<ModelCall> | null = audit ? audit.store.writeMany<ModelCall>([callWrite, ...reservation.writes,
-    ...(application?.writes ?? []), ...(consumerReservation?.writes ?? [])],
-    [...reservation.guards, ...(application?.guards ?? []), ...(consumerReservation?.guards ?? [])])[0]! : null;
+  requireInvocationAllowance();
+  let call: Revision<ModelCall> | null;
+  try {
+    const writer = audit ? control?.view() ?? audit.store : null;
+    call = writer ? writer.writeMany<ModelCall>([callWrite, ...reservation.writes,
+      ...(application?.writes ?? []), ...(consumerReservation?.writes ?? [])],
+      [...reservation.guards, ...(application?.guards ?? []), ...(consumerReservation?.guards ?? [])])[0]! : null;
+  } catch (error) {
+    if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
+    throw error;
+  }
   const claimed = call ? reference(call) : null;
   let patch: Partial<ModelCall> = {};
   let rawResponse: string | null = null;
@@ -321,10 +337,26 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   let stopRefusal: EngineError | null = null;
   let heldSpawn: EngineError | null = null;
   let spawnedPid: number | null = null;
+  const controlAbort = control ? new AbortController() : null;
+  const forwardAbort = () => controlAbort?.abort();
+  if (controlAbort && signal) {
+    if (signal.aborted) controlAbort.abort();
+    else signal.addEventListener('abort', forwardAbort, { once: true });
+  }
+  const stopWatching = controlAbort ? control!.watch(controlAbort) : null;
+  const dispatchSignal = controlAbort?.signal ?? signal;
   try {
-    const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, signal, true, pid=>{
+    control?.assertCurrent();
+    const result = await runProcess(role.command, environment.workspace, input, environment.timeoutMs, dispatchSignal, true, pid=>{
       spawnedPid = pid;
-      if(call&&audit) call = authorizeModelDispatch(audit.store, reference(call), pid);
+      try {
+        if(call&&audit) call = authorizeModelDispatch(control?.view() ?? audit.store, reference(call), pid);
+        consumeInvocationAllowance();
+      } catch (error) {
+        if (error instanceof RunControlLost)
+          throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
+        throw error;
+      }
     });
     physicalResult = result;
     rawResponse = result.stdout;
@@ -336,21 +368,25 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     if (outcome.error) throw new EngineError(outcome.error, outcome.message ?? 'Research call failed');
     return outcome.payload;
   } catch (error) {
+    const failure = error instanceof RunControlLost
+      ? new EngineError(error.refusal.code, error.refusal.message, error.refusal.at) : error;
     // An unproven stop is not a terminal model failure: the running claim, the
     // reserved call and the physical witness survive; only the witness is
     // appended — no failed/finishedAt, no intent refusal, no finalization.
-    if (isProcessStopRefusal(error)) { stopRefusal = error as EngineError; throw error; }
-    // A spawned provider whose authorization or identity capture was refused
-    // before the dispatch commit leaves no providerProcess and no readable
-    // no-response terminal. The running claim stays open — the witness holds
-    // the spawned pid so recovery can prove its end instead.
-    if (call && audit && spawnedPid !== null && executionOf(call.value)?.phase === 'claimed') {
-      heldSpawn = error instanceof EngineError ? error
-        : new EngineError('process_record_failed', error instanceof Error ? error.message : 'The spawned provider was not durably recorded');
-      throw error;
+    if (isProcessStopRefusal(failure)) { stopRefusal = failure as EngineError; throw failure; }
+    const dispatchRefused = failure instanceof EngineError
+      && ['run_stopped', 'run_control_changed'].includes(failure.code);
+    // A control refusal before authorization proves that no request crossed
+    // stdin; other ownership failures still need the spawned-process witness.
+    if (call && audit && spawnedPid !== null && executionOf(call.value)?.phase === 'claimed' && !dispatchRefused) {
+      heldSpawn = failure instanceof EngineError ? failure
+        : new EngineError('process_record_failed', failure instanceof Error ? failure.message : 'The spawned provider was not durably recorded');
+      throw failure;
     }
-    patch.status = "failed"; patch.error = error instanceof EngineError ? error.code : "research_call_failed"; throw error;
+    patch.status = "failed"; patch.error = failure instanceof EngineError ? failure.code : "research_call_failed"; throw failure;
   } finally {
+    stopWatching?.();
+    if (controlAbort && signal) signal.removeEventListener('abort', forwardAbort);
     if (call && audit && (stopRefusal || heldSpawn))
       writeProcessStopWitness(audit.store, reference(call),
         { owner: call.value.ownerProcess ?? null, child: call.value.providerProcess ?? null, pid: spawnedPid }, stopRefusal ?? heldSpawn);

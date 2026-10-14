@@ -34,6 +34,7 @@ export type ProductCommand =
   | { type: "om-regate"; project: string }
   | { type: "set-map-status"; project: string; expected: number; base: Ref; nodes: MapStatusDelta['nodes'] }
   | { type: "research-stage"; project: string; draftId: string; maxTurns: number }
+  | { type: "early-stage-run"; project: string; maxTurns: number; maxCalls: number; draftId?: string; outcomes?: string[] }
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
   | { type: "model-usage"; project: string; since: number }
   | { type: "configure-reader-pilot"; project: string; expected: number; settings: ReaderPilotSettings }
@@ -103,6 +104,10 @@ const omContinue = command("om-continue", { project });
 omContinue.properties['resumeStop'] = text;
 // RL3 (№4218): the owner's explicit release of the wait on the policies their reopening asked — the pass then decides them by OWN1.
 omContinue.properties['release'] = { const: "regate_owner_policy" };
+const earlyStageRun = command("early-stage-run", { project,
+  maxTurns: { type: "integer", minimum: 1, maximum: 100 }, maxCalls: { type: "integer", minimum: 1, maximum: 100 } });
+earlyStageRun.properties['draftId'] = string;
+earlyStageRun.properties['outcomes'] = { type: "array", minItems: 1, items: text };
 const schema = { oneOf: [
   omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("om-decisions", { project }),
@@ -125,6 +130,7 @@ const schema = { oneOf: [
     code: { type: "array", items: object({ path: string, access: { enum: ["read", "write"] }, status: { const: "existing" } }) },
   }) } }),
   command("research-stage", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
+  earlyStageRun,
   command("research-phase", { project, phase: { enum: ["R1", "R2", "L2", "L3"] }, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("model-usage", { project, since: expected }),
   command("configure-reader-pilot", { project, expected, settings: readerPilotSchema }),

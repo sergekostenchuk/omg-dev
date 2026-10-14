@@ -10,6 +10,7 @@ import { reference, type Finding, type Ref } from "../pipeline/contracts.js";
 export interface ConsumerResult {
   status: "accepted" | "paused" | "needs_owner" | "blocked";
   artifact: Ref | null; research: Ref | null; feedback: Ref | null; findings: Finding[];
+  turnsUsed?: number;
 }
 export interface ConsumerOutcome { artifact: Ref | null; findings: Finding[]; guards: Ref[] }
 
@@ -20,27 +21,28 @@ export async function researchForConsumer(store: Store, researcher: Researcher, 
   artifact: Ref | null = null): Promise<ConsumerResult> {
   requireCondition(Number.isInteger(maxTurns) && maxTurns >= 1 && maxTurns <= 100,
     "research_budget_invalid", "Consumer research needs a bounded turn allowance");
-  let remaining = maxTurns;
-  let result: ConsumerResult = { status: "paused", artifact, research: null, feedback: null, findings: [] };
+  let remaining = maxTurns, turnsUsed = 0;
+  let result: ConsumerResult = { status: "paused", artifact, research: null, feedback: null, findings: [], turnsUsed };
   const runId = `research-run:${hashJson([project, draftId])}`;
   while (remaining > 0) {
     const consume = capture();
     const previousTurns = store.get<ResearchRun>(runId)?.value.turns ?? 0;
     const run = await researcher.run(project, draftId, remaining);
-    remaining -= Math.max(1, run.value.turns - previousTurns);
-    result.research = reference(run);
-    if (run.value.status !== "completed") return { ...result, status: run.value.status === "needs_owner" ? "needs_owner" : "paused" };
+    const spent = Math.max(0, run.value.turns - previousTurns);
+    turnsUsed += spent; remaining -= spent;
+    result.research = reference(run); result.turnsUsed = turnsUsed;
+    if (run.value.status !== "completed") return { ...result, status: run.value.status === "needs_owner" ? "needs_owner" : "paused", turnsUsed };
     const draft = store.get<DiscoveryDraft>(draftId)!;
     const consumed = consume(draft);
     result = { ...result, artifact: consumed.artifact, findings: consumed.findings };
     if (!consumed.findings.length) {
       requireCondition(consumed.artifact, "consumer_result_missing", "Acceptance requires a saved consumer result");
-      return { ...result, status: "accepted" };
+      return { ...result, status: "accepted", turnsUsed };
     }
-    if (consumed.findings.some(finding => !finding.field)) return { ...result, status: "blocked" };
+    if (consumed.findings.some(finding => !finding.field)) return { ...result, status: "blocked", turnsUsed };
     result.feedback = reference(rejectResearch(store, draft, consumed.findings, consumed.guards));
   }
-  return result;
+  return { ...result, turnsUsed };
 }
 
 export function designFindings(error: unknown, field: string, target: string, codes: ReadonlySet<string>): Finding[] {

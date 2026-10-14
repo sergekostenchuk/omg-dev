@@ -592,6 +592,8 @@ function requireRetryable(store: Store, app: Application) {
   if (!app.received) applicationInvalid(app.session.id, 'A failed attempt needs its exact physical outcome');
   const outcome = executionOutcome(store, app, app.received);
   if (outcome.kind === 'provider-failed') return outcome;
+  if (outcome.kind === 'terminal'
+    && ['run_stopped', 'run_control_changed'].includes(outcome.code)) return outcome;
   if (outcome.kind === 'response' && ['model-refused', 'renewed'].includes(app.state)
     && app.replyOutcomeContract === EARLY_RESEARCH_OUTCOME && app.resolution) {
     const before = exact<ApplicationSession>(store, app.session, 'assessment-session'), binding = before.value.binding!;
@@ -819,13 +821,16 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
         if (['process_timeout', 'process_cancelled'].includes(call.value.error ?? '') && !call.value.response)
           refuseApplication(store, application, { kind: 'call', call: reference(call), code: call.value.error! }, [reference(call)]);
         const outcome = executionOutcome(store, app, reference(call));
-        if (outcome.kind === 'provider-failed') {
+        if (outcome.kind === 'provider-failed' || outcome.kind === 'terminal') {
           store.writeMany([{ id: application.id, kind: application.kind, expected: application.revision,
             value: { ...app, state: 'retryable', received: reference(call) } }],
           // Recording the exact physical failure is independent of today's
           // admission. Renewal checks the fresh context before the next call.
           uniqueTransactionGuards([reference(application), reference(session), reference(outcome.call)]));
-          throw new EngineError('research_provider_failed', `[${call.id}] Provider failed without a research response; the exact attempt is preserved`);
+          throw new EngineError(outcome.kind === 'terminal' ? outcome.code : 'research_provider_failed',
+            outcome.kind === 'terminal'
+              ? `[${call.id}] Control refused the request before dispatch; the exact unsubmitted attempt is preserved`
+              : `[${call.id}] Provider failed without a research response; the exact attempt is preserved`);
         }
         applicationInvalid(call.id, 'A failed label contradicts the saved response');
       }

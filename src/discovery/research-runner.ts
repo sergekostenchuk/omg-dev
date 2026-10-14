@@ -97,9 +97,12 @@ export class Researcher {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
+    const early = earlyResearchStage(draft.value.stage);
     const restoreOnly = options.restoreOnly === true || draft.value.contractVersion === 4 && UPSTREAM_STAGES.includes(draft.value.stage as UpstreamStage);
-    requireCondition(!restoreOnly || draft.value.contractVersion === 4 && UPSTREAM_STAGES.includes(draft.value.stage as UpstreamStage),
-      'research_contract_upgrade_required', 'Restore-only applies to the previous Discovery era');
+    requireCondition(!restoreOnly || early, 'research_restore_invalid', 'Restore-only applies only to early-stage paid work');
+    const restoreComplete = draft.value.contractVersion === 4
+      ? { code: 'research_contract_upgrade_required', message: `[${draftId}] Previous paid work is settled; prepare Discovery v5 before new work` }
+      : { code: 'research_restore_complete', message: `[${draftId}] Saved paid work is settled; restoration cannot begin a new action` };
     const id = `research-run:${hashJson([project, draftId])}`;
     // №2000-8: the prologue's first duty is restoring a PROVEN paid terminal —
     // a pending paid turn whose session already reached its terminal
@@ -111,7 +114,6 @@ export class Researcher {
     // pilot is a lawful reason to refuse NEW work, never to lose a result the
     // project already paid for. assessAnswer on a priorOrigin reads only the
     // saved materials (environment, dispatch, context, prompt, runtime proofs).
-    const early = earlyResearchStage(draft.value.stage);
     const recordedTurns = this.store.list<ResearchTurn>("research-turn")
       .filter(turn => !early || turn.value.run === id)
       .map(turn => readResearchConsumerTurn(this.store, reference(turn)) as Revision<ResearchTurn>)
@@ -166,7 +168,13 @@ export class Researcher {
     }
     if (forcedPendingTurn) {
       const savedOrigin = readAssessmentPaidOrigin(this.store, project, reference(forcedPendingTurn));
-      if (savedOrigin && paidAssessmentTerminal(this.store, project, reference(forcedPendingTurn))) {
+      const savedApplication = savedOrigin
+        ? this.store.get<{ state: string; call: Ref | null }>(savedOrigin.value.application) : null;
+      const savedCall = savedApplication?.kind === 'assessment-application' && savedApplication.value.state === 'running'
+        && isRef(savedApplication.value.call) ? this.store.get<{ status: string; response?: { record?: Ref } | null }>(savedApplication.value.call.id) : null;
+      const paidResponseReady = savedCall?.kind === 'model-call' && savedCall.value.status !== 'running'
+        && isRef(savedCall.value.response?.record);
+      if (savedOrigin && (paidAssessmentTerminal(this.store, project, reference(forcedPendingTurn)) || paidResponseReady)) {
         const paid = admittedResearchAction(forcedPendingTurn.value.action);
         requireCondition(paid.action === 'answer' || paid.action === 'answer_delta',
           'research_assessment_binding_invalid', 'A paid origin must belong to an answer turn');
@@ -336,7 +344,7 @@ export class Researcher {
     if (run?.value.status === "completed" && checked?.findings.length === 0
       && discoveryOutcome(this.store,draft).findings.length===0) return run;
     if (restoreOnly && !outstanding && !forcedPendingTurn)
-      throw new EngineError('research_contract_upgrade_required', `[${draftId}] Previous paid work is settled; prepare Discovery v5 before new work`);
+      throw new EngineError(restoreComplete.code, restoreComplete.message);
     requireCondition(!checked?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed; prepare a current draft");
     if (outstanding || forcedPendingTurn) requireCondition(run?.kind === "research-run" && run.value.projectId === project && run.value.draftId === draftId,
       "research_consumer_intent_invalid", "The original research run is missing");
@@ -371,7 +379,7 @@ export class Researcher {
           ? readAssessmentPaidOrigin(this.store, project, reference(forcedPendingTurn)) : null;
         if (savedOrigin) {
           requireCondition(!restoreOnly || paidAssessmentTerminal(this.store,project,reference(forcedPendingTurn)),
-            'research_contract_upgrade_required', `[${draftId}] Restore preserves the paid answer without starting a new assessment`);
+            restoreComplete.code, `[${draftId}] Restore preserves the paid answer without starting a new assessment`);
           const paid = admittedResearchAction(forcedPendingTurn.value.action);
           requireCondition(paid.action === 'answer' || paid.action === 'answer_delta',
             'research_assessment_binding_invalid', 'A paid origin must belong to an answer turn');
@@ -390,11 +398,11 @@ export class Researcher {
       let resumedSent: Record<string, any> | undefined;
       for (let turn = 0; turn < limit; turn++) {
         if (restoreOnly) {
-          requireCondition(outstanding || forcedPendingTurn, 'research_contract_upgrade_required',
+          requireCondition(outstanding || forcedPendingTurn, restoreComplete.code,
             `[${draftId}] Restore cannot prepare a new research question`);
           if (outstanding) requireCondition(outstanding.value.call
             && readResearchConsumerExecution(this.store,project,reference(outstanding)).kind==='response',
-            'research_contract_upgrade_required', `[${draftId}] Restore cannot send an unpaid request`);
+            restoreComplete.code, `[${draftId}] Restore cannot send an unpaid request`);
         }
         if (outstanding && (outstanding.value.kind === "synthesis" || outstanding.value.kind === "consolidation")) {
           requireCondition(pilot, "reader_pilot_required", "The saved synthesis requires its original reader profile");
@@ -942,7 +950,7 @@ export class Researcher {
             webOutcome = await executeWebTurn({ store: this.store, projectId: project, stage: draft.value.stage,
               environment: this.store.get<Environment>(`environment:${project}`)!, turn: pendingTurn });
           }
-          else if (action.action === "pause") stop = { status: "paused", error: action.reason };
+          else if (action.action === "pause") stop = { status: "paused", error: action.reason, pauseCode: "research_model_paused" };
           else {
             const question = pending.find(item => item.id === action.question);
             requireCondition(question, "research_question_foreign", "Only a pending question from this draft can be answered");
@@ -1112,7 +1120,8 @@ export class Researcher {
           const saved = this.store.writeMany<ResearchTurn | ResearchRun>([
             projected ? { ...completedTurn, value: projected.turn } : completedTurn,
             { id: run.id, kind: run.kind, expected: run.revision,
-              value: projected?.run ?? { ...run.value, ...stop } }], stopGuards);
+              value: projected ? early ? { ...projected.run, pauseCode: "research_model_paused" } : projected.run
+                : { ...run.value, ...stop } }], stopGuards);
           return saved[1]! as Revision<ResearchRun>;
         }
         if (capturedSearch) {
@@ -1135,12 +1144,15 @@ export class Researcher {
           retainPilotRead(this.store, project, pending[0]!.id, action, observation);
         forcedPendingTurn = null;
       }
+      if (restoreOnly) return this.save(run, { status: "paused", ownerQuestion: null,
+        error: restoreComplete.message, pauseCode: restoreComplete.code });
       draft = this.store.get<DiscoveryDraft>(draftId)!;
       const outcome = discoveryOutcome(this.store, draft);
       if (outcome.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
         error: outcome.reason, pauseCode: outcome.findings[0]!.code }, outcome.guards);
       return this.save(run, this.discovery.gate(project, reference(draft)).findings.length === 0 ? { status: "completed" }
-        : { status: "paused", error: "Research turn allowance reached; evidence and answers are preserved for continuation" });
+        : { status: "paused", ...(early ? { pauseCode: "research_turns_exhausted" } : {}),
+          error: "Research turn allowance reached; evidence and answers are preserved for continuation" });
     } catch (error) {
       const current = this.store.get<ResearchRun>(run.id) ?? run; // the synthesis reservation may have moved the shared record
       requireCondition(current?.kind === "research-run" && current.value.projectId === project

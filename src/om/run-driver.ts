@@ -3,6 +3,7 @@ import { reference, type Ref } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
 import { readDispatch } from "./dispatch.js";
 import { recoverOmModelCall } from "./model-call.js";
+import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { delivered, isPlainObject, isText, refused, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import { acquireRunExecution, readRunControl, releaseRunExecution, resumeStoppedRun, runOwnerState, stopRun, unfinishedRunCalls,
   RunControlGate, RunControlLost, type RunControlRecord, type RunControlStatus, type RunExecution } from "./run-control.js";
@@ -173,7 +174,7 @@ function recoverLost(store: Store, project: string): Refusal | null {
   for (const call of unfinishedRunCalls(store, project)) {
     const owner = call.value["ownerProcess"] as { pid: number; started: string } | undefined;
     if (!owner || runOwnerState(owner) !== "gone") continue;
-    try { recoverOmModelCall(store, project, reference(call)); }
+    try { recoverPhysicalCall(store, project, call); }
     catch (error) {
       if (!(error instanceof EngineError)) throw error;
       const failed = refused("run_stop_unfinished", `The end of a claimed physical call is not proved: ${error.code}`,
@@ -182,6 +183,12 @@ function recoverLost(store: Store, project: string): Refusal | null {
     }
   }
   return null;
+}
+/** Recover through the producer that owns the saved call era; an early call is never parsed as an OM call. */
+function recoverPhysicalCall(store: Store, project: string, call: Revision<Record<string, unknown>>): unknown {
+  return 'om' in call.value || 'transport' in call.value
+    ? recoverOmModelCall(store, project, reference(call))
+    : recoverModelCall(store, project, reference(call));
 }
 /**
  * Lifts the named stop once the old execution is proved to be over. A proved-dead executor's claimed calls are first
@@ -198,7 +205,7 @@ export function resumeStoppedPass(store: Store, request: { project: string; stop
     for (const call of unfinishedRunCalls(store, project)) {
       const owner = call.value["ownerProcess"] as { pid: number; started: string } | undefined;
       if (owner && runOwnerState(owner) === "gone") continue;
-      try { recoverOmModelCall(store, project, reference(call)); }
+      try { recoverPhysicalCall(store, project, call); }
       catch (error) {
         if (!(error instanceof EngineError)) throw error;
         return refused("run_stop_unfinished", `The end of a claimed physical call is not proved: ${error.code}`,

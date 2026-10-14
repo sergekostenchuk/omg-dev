@@ -1564,11 +1564,13 @@ export function assessmentReadView(store: Store, savedProof?: AssessmentReadProo
 }
 
 interface ResearchExecutionContext {
-  call: Revision<ModelCall>; request: Ref; response: Ref; archive: Ref;
+  call: Revision<ModelCall>; request: Ref; archive: Ref;
   body: Record<string, any>; subject: Record<string, any>; prompt: string; guards: Ref[];
 }
 export type ResearchExecution = ResearchExecutionContext & (
-  { kind: 'response'; payload: unknown } | { kind: 'provider-failed' });
+  { kind: 'response'; payload: unknown; response: Ref }
+  | { kind: 'provider-failed'; response: Ref }
+  | { kind: 'terminal'; code: 'run_stopped' | 'run_control_changed'; response: null });
 
 /** The receipt records runProcess's close result, not an interpretation of its
  * status label. Both producers share the same physical proof. */
@@ -1633,6 +1635,26 @@ function assessmentExecution(store: Store, call: Revision<ModelCall>, value: Rec
   return physicalExecution(store, call, value, 'assessmentExecution', 'assessmentApplication', 'assessment-execution/v1');
 }
 
+function assessmentControlTerminal(store: Store, call: Revision<ModelCall>): 'run_stopped' | 'run_control_changed' | null {
+  const code = call.value.error;
+  if (call.value.status !== 'failed' || call.value.response !== null
+    || !['run_stopped', 'run_control_changed'].includes(code ?? '')) return null;
+  const before = store.get<ModelCall>(call.id, call.revision - 1), claim = store.get<ModelCall>(call.id, 1);
+  const execution = executionOf(call.value);
+  const excluding = (value: ModelCall) => Object.fromEntries(Object.entries(value)
+    .filter(([field]) => !['status', 'finishedAt', 'error', 'runtime'].includes(field)));
+  requireCondition(before?.kind === 'model-call' && claim?.kind === 'model-call'
+    && before.value.status === 'running' && before.value.response === null && before.value.error === null
+    && claim.value.status === 'running' && claim.value.response === null && claim.value.error === null
+    && execution?.phase === 'claimed' && executionOf(before.value)?.phase === 'claimed'
+    && executionOf(claim.value)?.phase === 'claimed'
+    && canonical(excluding(before.value)) === canonical(excluding(call.value))
+    && canonical(reference(claim)) === canonical(reference(before))
+    && Number.isSafeInteger(call.value.finishedAt) && Number(call.value.finishedAt) >= call.value.startedAt,
+  'response_recovery_execution_invalid', 'The control refusal must immediately follow its exact unsubmitted physical claim');
+  return code as 'run_stopped' | 'run_control_changed';
+}
+
 export type ResearchConsumerExecution = {
   intent: Revision<ResearchConsumerIntent>; call: Revision<ModelCall>; request: Ref; archive: Ref;
   subject: Record<string, any>; prompt: string; guards: TransactionGuard[];
@@ -1687,6 +1709,11 @@ export function retryableResearchConsumerRefusal(store: Store, intent: Revision<
   if (!refusal) return false;
   if (refusal.kind === 'provider-failed') return true;
   if (refusal.kind === 'consumer-invalid' && earlyResearchConsumerFailure(store, intent)) return true;
+  if (refusal.kind === 'terminal' && ['run_stopped', 'run_control_changed'].includes(refusal.code)) {
+    const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+    return paid.kind === 'terminal' && paid.response === null && paid.code === refusal.code
+      && executionOf(paid.call.value)?.phase === 'claimed';
+  }
   if (refusal.kind !== 'terminal' || refusal.code !== 'research_provider_failed') return false;
   const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
   return paid.kind === 'provider-failed' && paid.envelope === true;
@@ -1839,9 +1866,12 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
       'process_output_limit', 'process_record_failed', 'research_call_failed'];
     const before = store.get<ModelCall>(call.id, call.revision - 1);
     const claim = store.get<ModelCall>(call.id, 1);
+    const controlRefusedBeforeDispatch = !!before
+      && ['run_stopped', 'run_control_changed'].includes(String(call.value.error))
+      && executionOf(call.value)?.phase === 'claimed' && executionOf(before.value)?.phase === 'claimed';
     const excluding = (value: ModelCall) => Object.fromEntries(Object.entries(value).filter(([key]) =>
       !['status', 'finishedAt', 'error', 'runtime'].includes(key)));
-    if (!allowed.includes(String(call.value.error)) || !before || !claim
+    if (!(allowed.includes(String(call.value.error)) || controlRefusedBeforeDispatch) || !before || !claim
       || before.value.status !== 'running' || before.value.response !== null
       || canonical(excluding(before.value)) !== canonical(excluding(call.value))
       || claim.value.status !== 'running' || claim.value.response !== null
@@ -2443,10 +2473,15 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && call.value.purpose === purpose && object(call.value.requested) && canonical(call.value.requested) === canonical(role)
     && canonical(call.value.profile ?? null) === canonical(profile),
   'response_recovery_call_foreign', 'The succeeded call must belong to this exact consumer, profile and role');
-  requireCondition(object(call.value.request) && object(call.value.response) && object(call.value.packet),
+  const controlTerminal = !onlyResponse && !synthesis ? assessmentControlTerminal(store, call) : null;
+  requireCondition(object(call.value.request) && (controlTerminal ? call.value.response === null : object(call.value.response))
+    && object(call.value.packet),
     'response_recovery_wire_missing', 'The complete paid request, response and context archive must exist');
-  const requestRef = call.value.request.record, responseRef = call.value.response.record, archiveRef = call.value.packet.archive;
-  requireCondition(isRef(requestRef) && isRef(responseRef) && isRef(archiveRef), 'response_recovery_wire_missing', 'The complete paid request, response and context archive must exist');
+  const requestRef = call.value.request.record,
+    responseRef = controlTerminal ? null : call.value.response!.record,
+    archiveRef = call.value.packet.archive;
+  requireCondition(isRef(requestRef) && (controlTerminal || isRef(responseRef)) && isRef(archiveRef),
+    'response_recovery_wire_missing', 'The complete paid request, response and context archive must exist');
   const read = (ref: Ref, kind: string) => {
     const record = store.get<Record<string, any>>(ref.id, ref.revision);
     requireCondition(record?.kind === kind && canonical(reference(record)) === canonical(ref) && object(record.value)
@@ -2454,15 +2489,19 @@ function researchExecution(store: Store, project: string, callRef: Ref,
       && record.value.draftId === draft.id && typeof record.value.text === 'string', 'response_recovery_wire_invalid', 'A saved wire identity is missing or foreign');
     return record.value;
   };
-  const requestValue = read(requestRef, 'model-request'), responseValue = read(responseRef, 'model-response');
-  const requestText = requestValue.text as string, responseText = responseValue.text as string;
+  const requestValue = read(requestRef, 'model-request'),
+    responseValue = controlTerminal ? null : read(responseRef!, 'model-response');
+  const requestText = requestValue.text as string,
+    responseText = responseValue ? responseValue.text as string : null;
   requireCondition(digest(requestText) === call.value.request.hash && requestText.length === call.value.request.chars
-    && Buffer.byteLength(requestText) === call.value.request.bytes && responseText.length === call.value.response!.chars
-    && Buffer.byteLength(responseText) === call.value.response!.bytes, 'response_recovery_wire_invalid', 'Recovery cannot truncate or repair paid wire bytes');
+    && Buffer.byteLength(requestText) === call.value.request.bytes
+    && (controlTerminal || responseText !== null && responseText.length === call.value.response!.chars
+      && Buffer.byteLength(responseText) === call.value.response!.bytes),
+  'response_recovery_wire_invalid', 'Recovery cannot truncate or repair paid wire bytes');
   let request: Record<string, any>, response: unknown;
   try { request = JSON.parse(requestText); }
   catch { throw new EngineError('response_recovery_wire_invalid', 'Both saved envelopes must be complete JSON'); }
-  try { response = JSON.parse(responseText); }
+  try { response = responseText === null ? null : JSON.parse(responseText); }
   catch { if (onlyResponse) throw new EngineError('response_recovery_wire_invalid', 'Both saved envelopes must be complete JSON'); }
   requireCondition(object(request) && object(request.subject) && typeof request.prompt === 'string'
     && request.protocol === 'omg-agent/v1' && request.mode === 'research' && request.requestId === call.value.requestId
@@ -2572,30 +2611,32 @@ function researchExecution(store: Store, project: string, callRef: Ref,
         : canonical(request.subject.value) === canonical(body.value)),
     'response_recovery_page_foreign', 'Ambiguous serialized page order cannot be silently reconstructed');
   }
+  const result: ResearchExecutionContext = { call, request: requestRef, archive: archiveRef, body,
+    subject: request.subject as Record<string, any>, prompt: request.prompt as string,
+    // Claim and authorization are immutable ancestors of the guarded terminal
+    // call, not simultaneous current heads to put into writeMany's guards.
+    guards: uniqueRefs([reference(session), callRef, requestRef, archiveRef, ...inputs, ...(profile ? [profile] : [])]) };
+  if (controlTerminal) return { kind: 'terminal', code: controlTerminal, response: null, ...result };
   const linked = object(response) && response.protocol === request.protocol && response.requestId === request.requestId
     && Object.hasOwn(response, 'research');
   // RS3 (№4433): the one receipt this call's era proves carries every mark read from the process — the physical proof
   // below, its exit and signal, and the no-response mark of a failed call's own envelope. A sibling receipt is not read.
   const receiptName = applicationEra ? 'assessmentExecution' as const : consumerEra ? 'consumerExecution' as const : null;
-  const executionReceipt = receiptName ? responseValue[receiptName] : null;
-  const absent = call.value.status === 'failed' ? noModelResponse(responseText, request.protocol, request.requestId,
+  const executionReceipt = receiptName ? responseValue![receiptName] : null;
+  const absent = call.value.status === 'failed' ? noModelResponse(responseText!, request.protocol, request.requestId,
     object(executionReceipt) && object(executionReceipt.process) ? executionReceipt.process.stderr : undefined) : null;
   requireCondition(!object(response) || !['protocol', 'requestId', 'research'].some(key => Object.hasOwn(response, key)) || linked
     || absent === 'envelope',
     'response_recovery_wire_foreign', 'A foreign or incomplete research envelope is not evidence of an absent response');
-  const physicalProof = receiptName === 'assessmentExecution' ? assessmentExecution(store, call, responseValue)
-    : receiptName === 'consumerExecution' ? physicalExecution(store, call, responseValue, receiptName, 'consumerIntent', 'research-consumer-execution/v1') : [];
-  const result: ResearchExecutionContext = { call, request: requestRef, response: responseRef, archive: archiveRef, body,
-    subject: request.subject as Record<string, any>, prompt: request.prompt as string,
-    // Claim and authorization are immutable ancestors of the guarded terminal
-    // call, not simultaneous current heads to put into writeMany's guards.
-    guards: uniqueRefs([reference(session), callRef, requestRef, responseRef, archiveRef, ...inputs, ...(profile ? [profile] : [])]) };
+  const physicalProof = receiptName === 'assessmentExecution' ? assessmentExecution(store, call, responseValue!)
+    : receiptName === 'consumerExecution' ? physicalExecution(store, call, responseValue!, receiptName, 'consumerIntent', 'research-consumer-execution/v1') : [];
+  result.guards = uniqueRefs([...result.guards, responseRef!]);
   if (linked) {
     // Presence, not payload validity, distinguishes a received answer. Even a
     // null or malformed research value belongs to the application transition.
     requireCondition(call.value.status === 'succeeded' && call.value.error === null,
       'response_recovery_execution_invalid', 'A linked research response contradicts the saved failed or running outcome');
-    return { kind: 'response', ...result, payload: (response as Record<string, unknown>)['research'] };
+    return { kind: 'response', response: responseRef!, ...result, payload: (response as Record<string, unknown>)['research'] };
   }
   if (call.value.status === 'succeeded') throw new EngineError(object(response) ? 'response_recovery_wire_foreign' : 'response_recovery_wire_invalid',
     'The succeeded physical call must retain its own research response');
@@ -2605,7 +2646,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && executionReceipt.process.signal === null
     && (!consumerEra || absent === 'envelope' || responseText === '' && call.value.response?.chars === 0 && call.value.response.bytes === 0),
   'response_recovery_execution_invalid', 'Only a proven completed provider failure without a linked research response permits retry');
-  return { kind: 'provider-failed', ...result };
+  return { kind: 'provider-failed', response: responseRef!, ...result };
 }
 
 export function readResearchExecution(store: Store, project: string, callRef: Ref,

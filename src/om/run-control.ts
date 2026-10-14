@@ -144,6 +144,12 @@ export class RunControlGate {
     requireProject(store, project);
   }
   admit(): RunControlAdmission { return this.#admission ??= admitRunControl(this.store, this.project, this.hold); }
+  /** Rechecks the saved admission immediately before a physical side effect that has no store transaction of its own. */
+  assertCurrent(): RunControlAdmission {
+    const admission = this.admit();
+    if (moved(this.store, admission)) loss(currentControl(this.store, this.project), this.project);
+    return admission;
+  }
   /** The hold to hand on to a nested producer: the one taken here, or the caller's. */
   get held(): RunControlHold | undefined { return this.#admission?.hold ?? this.hold; }
   /** A write-only view whose every transaction carries the admitted control. */

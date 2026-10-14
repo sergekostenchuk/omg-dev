@@ -30,10 +30,33 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
   return {key,guards:calls.map(reference)};
 }
 
-const allowance=new AsyncLocalStorage<{remaining:number}>();
-export function withInvocationAllowance<T>(limit:number,work:()=>Promise<T>):Promise<T>{return allowance.run({remaining:limit},work);}
+interface InvocationAllowanceState { limit:number; remaining:number; used:number }
+export interface InvocationAllowanceReport<T> { value:T; limit:number; remaining:number; used:number }
+
+const allowance=new AsyncLocalStorage<InvocationAllowanceState>();
+
+function state(limit:number):InvocationAllowanceState {
+ requireCondition(Number.isInteger(limit)&&limit>0,'research_call_allowance','The research call allowance must be a positive integer');
+ return {limit,remaining:limit,used:0};
+}
+
+export function withInvocationAllowance<T>(limit:number,work:()=>Promise<T>):Promise<T>{
+ return allowance.run(state(limit),work);
+}
+
+export async function withInvocationAllowanceReport<T>(limit:number,work:()=>Promise<T>):Promise<InvocationAllowanceReport<T>>{
+ const current=state(limit);
+ const value=await allowance.run(current,work);
+ return {value,limit:current.limit,remaining:current.remaining,used:current.used};
+}
+
+/** Check before preparing a physical dispatch; consume only after its durable claim is written. */
+export function requireInvocationAllowance(){
+ const current=allowance.getStore();if(!current)return;
+ requireCondition(current.remaining>0,'research_call_allowance','The research call allowance is exhausted; all inner-role invocations count');
+}
+
 export function consumeInvocationAllowance(){
  const current=allowance.getStore();if(!current)return;
- requireCondition(current.remaining>0,'research_call_allowance','The preparation call allowance is exhausted; all inner-role invocations count');
- current.remaining--;
+ requireInvocationAllowance();current.remaining--;current.used++;
 }

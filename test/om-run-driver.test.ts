@@ -32,6 +32,7 @@ import { preparedField } from "./preparation-fixture.js";
 const project = "garden";
 const adapterFixture = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 const driverModule = new URL("../src/om/run-driver.js", import.meta.url).href;
+const productModule = new URL("../src/product/engine.js", import.meta.url).href;
 const storeModule = new URL("../src/storage/store.js", import.meta.url).href;
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 function ok<T>(result: OmResult<T>): T {
@@ -289,6 +290,46 @@ await driver.startPass(store, { project: ${JSON.stringify(project)} });`;
   assert.ok(recovered.value.recovery, "The common recovery proved the owner and the provider gone");
   const sent = f.sent().map(row => row.requestId);
   assert.deepEqual([sent.length, new Set(sent).size], [2, 2], "The lost request was never sent again");
+});
+
+test("DRV1 common stop recovers a lost early model-call through its research producer, never the OM reader", async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-drv1-early-recovery-")), database = join(root, "state.sqlite"),
+    workspace = join(root, "repo"), adapter = join(root, "adapter.mjs"), pause = join(root, "provider.pause.json");
+  mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "early recovery\n");
+  git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
+  writeFileSync(adapter, `import{readFileSync,writeFileSync}from'node:fs';JSON.parse(readFileSync(0,'utf8'));
+writeFileSync(${JSON.stringify(pause)},JSON.stringify({pid:process.pid}));process.kill(process.pid,'SIGSTOP');`);
+  const store = new Store(database), engine = new ProductEngine(store), earlyProject = "early-recovery";
+  engine.execute({ type: "create-project", project: earlyProject, title: "Early recovery" });
+  engine.discovery.evidence.document(earlyProject, "brief", "A local early-stage recovery fixture", "text/plain", 0);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure(earlyProject, { workspace,
+    implementer: { actor: "early-author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "early-reviewer", model: "fixture", effort: "high", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 30_000 }, 0);
+  const draft = engine.prepare(earlyProject, "discovery");
+  const script = `const [{Store},{ProductEngine}]=await Promise.all([import(${JSON.stringify(storeModule)}),import(${JSON.stringify(productModule)})]);
+const store=new Store(${JSON.stringify(database)});await new ProductEngine(store).stageResearch.run(${JSON.stringify(earlyProject)},${JSON.stringify(draft.id)},10);`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: "ignore" });
+  const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await exited;
+    store.close(); rmSync(root, { recursive: true, force: true }); });
+  const provider = await checkpoint(pause);
+  child.kill("SIGKILL"); await exited;
+  process.kill(provider.pid, "SIGKILL");
+  for (let tries = 0; probeProcessIdentity(provider.pid).state === "present" && tries < 200; tries++)
+    await new Promise(resolve => setTimeout(resolve, 20));
+  const lost = store.list<Record<string, unknown>>("model-call")[0]!;
+  assert.equal(lost.value["status"], "running");
+  assert.equal(Object.hasOwn(lost.value, "om") || Object.hasOwn(lost.value, "transport"), false);
+  const stopped = ok(stopPass(store, { project: earlyProject }));
+  const recovered = store.get<any>(lost.id)!;
+  assert.deepEqual([recovered.value.status, recovered.value.error], ["failed", "process_lost"]);
+  assert.ok(recovered.value.recovery, "the common stop used the early recovery producer");
+  assert.equal(stopped.finished, true);
+  const resumed = resumeStoppedPass(store, { project: earlyProject, stop: stopped.control!.value.stop!.token });
+  assert.equal(resumed.ok, true);
+  assert.equal(store.list("model-call").length, 1, "recovery never sends the lost request again");
 });
 
 async function until(f: Fixture, request: RunRequest, action: string, bound = 30) {

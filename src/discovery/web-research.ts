@@ -6,6 +6,7 @@ import { reference, type Ref } from "../pipeline/contracts.js";
 import { projectWebSource, type Source } from "../evidence/evidence.js";
 import { requireWebResearchSettings, type Environment, type WebResearchSettings } from "../runtime/environment.js";
 import type { ResearchRun, ResearchTurn } from "./research-model.js";
+import { RunControlGate, RunControlLost } from "../om/run-control.js";
 
 /** Model actions of web research (№4552). Search results are navigation; only a fetched snapshot is evidence. */
 export type WebAction = { action: "web_search"; query: string; purpose: string } | { action: "web_fetch"; url: string; purpose: string };
@@ -294,12 +295,20 @@ export async function executeWebTurn(input: WebResearchInput): Promise<WebResear
   if (exhausted) throw new EngineError("web_research_budget_exhausted",
     "The stage's web research allowance is spent; raise it in the environment to continue the same action",
     { target: budgetId, limit: exhausted, budget: view, turn: reference(turn) });
-  const reserved = store.writeMany<WebBudget>([{ id: budgetId, kind: "web-budget", expected: before?.revision ?? 0,
-    value: { ...used, attempts: used.attempts + 1 } }], [reference(turn), { id: captureId, absent: true }])[0]!;
+  let reserved: Revision<WebBudget>;
+  const control = new RunControlGate(store, projectId);
+  try {
+    reserved = control.view().writeMany<WebBudget>([{ id: budgetId, kind: "web-budget", expected: before?.revision ?? 0,
+      value: { ...used, attempts: used.attempts + 1 } }], [reference(turn), { id: captureId, absent: true }])[0]!;
+  } catch (error) {
+    if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
+    throw error;
+  }
   const transport = input.transport ?? httpTransport;
   const gateway = settings.gatewayUrl.replace(/\/+$/, "");
   let response: WebCaptureResponse;
   try {
+    control.assertCurrent();
     const reply = action.action === "web_search"
       ? await transport(`${gateway}/search?${new URLSearchParams({ q: action.query, n: String(MAX_RESULTS) })}`,
         { method: "GET", timeoutMs: settings.timeoutMs, maxBytes: settings.limits.responseBytes })
@@ -314,6 +323,8 @@ export async function executeWebTurn(input: WebResearchInput): Promise<WebResear
     else throw new EngineError("web_gateway_unavailable", "The web gateway did not complete the request; continue the same action after it recovers",
       { gateway, status: reply.status, turn: reference(turn), action });
   } catch (error) {
+    if (error instanceof RunControlLost)
+      throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
     if (error instanceof WebTransportFailure && error.reason === "too_large" && action.action === "web_fetch")
       response = { kind: "fetch", reply: { requestedUrl: action.url, finalUrl: null, fetchedAt: now(), status: null, success: false,
         failure: `The page answer exceeded ${settings.limits.responseBytes} bytes`, text: "", truncated: false, extraction: "none" } };

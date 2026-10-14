@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { reference } from '../src/pipeline/contracts.js';
 import { buildOmInput, type InputStages, writeOmInput } from '../src/om/input.js';
+import { resumeStoppedPass, stopPass } from '../src/om/run-driver.js';
 import { discoveryOutcome } from '../src/discovery/discovery-outcome.js';
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -15,6 +16,9 @@ import { exampleGraph } from "./graph-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { buildL1, designOf } from "../src/graph/builder.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
+import type { ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
+import { executeWebTurn } from "../src/discovery/web-research.js";
+import type { Environment } from "../src/runtime/environment.js";
 import type { StageResearchResult } from "../src/product/stage-research.js";
 import { consumerFeedback, rejectResearch, type ConsumerFeedback } from "../src/discovery/consumer-feedback.js";
 import { researchGraphContext, researchPrerequisites } from "../src/discovery/research-context.js";
@@ -97,6 +101,7 @@ test("stage command automatically repairs consumer rejections and accepts all up
       const again = await engine.stageResearch.run(project, draft.id, 8);
       assert.equal(again.status, "accepted"); assert.equal(store.list("research-turn").length, count);
       assert.equal(again.stage!.revision, result.stage!.revision, "Accepted stage is not republished");
+      assert.deepEqual([again.turnsUsed, again.reason], [0, null], "Current accepted replay reports zero new work");
     }
     const feedback = store.list<ConsumerFeedback>("research-feedback").filter(item => item.value.projectId === project);
     assert.equal(feedback.length, 2);
@@ -617,6 +622,103 @@ function dry5Stop(store: Store, match: (write: Write) => boolean, after = false)
   }) as typeof store.writeMany;
   return () => { store.writeMany = original; assert.ok(hit, 'The real persistence boundary was reached'); };
 }
+test('DRV1 stop restores a received early answer without sending its next assessor until exact resume', async t => {
+  const f = dry5StageFixture(t, 'missing'), draft = f.engine.prepare('p', 'discovery');
+  const firstQuestion = f.store.get<Question>(draft.value.questions[0]!)!;
+  const restore = dry5Stop(f.store, write => write.kind === 'model-response'
+    && String((write.value as {text?: string}).text).includes('"action":"answer"')
+    && String((write.value as {text?: string}).text).includes(firstQuestion.id), true);
+  await f.engine.stageResearch.run('p', draft.id, 20); restore();
+  const calls = f.calls().length;
+  const stopped = stopPass(f.store, { project: 'p' });
+  if (!stopped.ok) assert.fail(stopped.refusal.message);
+  const reopened = f.open();
+  const result = await reopened.stageResearch.run('p', draft.id, 20);
+  assert.deepEqual([result.status, result.reason?.code, f.calls().length], ['stopped', 'run_stopped', calls]);
+  assert.ok(reopened.store.list<any>('research-consumer-intent').some(intent => intent.value.state === 'applied'),
+    'the saved physical answer was applied');
+  assert.ok(reopened.store.list<any>('research-turn').some(turn => turn.value.status === 'pending'),
+    'the paid A reached its durable turn before stop blocked the unpaid B');
+  const resumed = resumeStoppedPass(reopened.store, { project: 'p', stop: stopped.value.control!.value.stop!.token });
+  if (!resumed.ok) assert.fail(resumed.refusal.message);
+  const continued = await f.open().stageResearch.run('p', draft.id, 20);
+  assert.equal(continued.status, 'paused', 'the separately injected DRY5 error still ends this external entry');
+  assert.ok(f.calls().length > calls, 'new work begins only after the exact stop is resumed');
+  const completed = await f.open().stageResearch.run('p', draft.id, 20);
+  assert.equal(completed.status, 'accepted', JSON.stringify(completed));
+});
+test('DRV1 stop before a new web action blocks HTTP and its budget; exact resume admits one transport', async t => {
+  const f = fixture(t); f.setup('p');
+  const base = f.store.get<Environment>('environment:p')!;
+  const command = { executable: process.execPath, args: ['--version'] };
+  const environment = f.engine.environments.configure('p', { workspace: f.root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'assessor', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 4000, webResearch: { enabled: true, gatewayUrl: 'http://127.0.0.1:18890',
+      timeoutMs: 4000, limits: { httpAttempts: 8, pages: 2, receivedChars: 10000, responseBytes: 10000 } } }, base.revision);
+  const draft = f.engine.prepare('p', 'discovery'), question = f.store.get<Question>(draft.value.questions[0]!)!;
+  const run = f.store.write<ResearchRun>({ id: `research-run:web-stop`, kind: 'research-run', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, environment: reference(environment), status: 'running', turns: 1,
+      limit: 10, inputs: draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null,
+      owner: { pid: process.pid, started: 'fixture' }, requestChars: 0 } });
+  const action = { action: 'web_search' as const, query: 'subscription harness vendor', purpose: 'find vendor material' };
+  const turn = f.store.write<ResearchTurn>({ id: 'research-turn:web-stop:1', kind: 'research-turn', expected: 0,
+    value: { run: run.id, number: 1, action, assessment: null, observation: null, error: null,
+      status: 'pending', question: reference(question) } });
+  const stopped = stopPass(f.store, { project: 'p' }); if (!stopped.ok) assert.fail(stopped.refusal.message);
+  let transports = 0;
+  const transport = async () => { transports++; return { status: 200, body: { query: action.query, results: [],
+    engines_queried: ['fixture'], unresponsive_engines: [] } }; };
+  await assert.rejects(executeWebTurn({ store: f.store, projectId: 'p', stage: 'discovery', environment, turn, transport }),
+    (error: unknown) => error instanceof Error && 'code' in error && error.code === 'run_stopped');
+  assert.deepEqual([transports, f.store.list('web-budget').length, f.store.list('web-capture').length], [0, 0, 0]);
+  const resumed = resumeStoppedPass(f.store, { project: 'p', stop: stopped.value.control!.value.stop!.token });
+  if (!resumed.ok) assert.fail(resumed.refusal.message);
+  const completed = await executeWebTurn({ store: f.store, projectId: 'p', stage: 'discovery', environment, turn, transport });
+  assert.deepEqual([completed.turn.value.status, transports], ['completed', 1]);
+  const second = f.store.write<ResearchTurn>({ id: 'research-turn:web-stop:2', kind: 'research-turn', expected: 0,
+    value: { ...turn.value, number: 2, status: 'pending', observation: null, error: null } });
+  const original = f.store.writeMany.bind(f.store); let reservedStop: string | null = null;
+  f.store.writeMany = ((writes: Write[], guards = []) => {
+    const rows = original(writes, guards);
+    if (!reservedStop && writes.some(write => write.kind === 'web-budget')) {
+      const other = new Store(f.path);
+      try {
+        const result = stopPass(other, { project: 'p' }); if (!result.ok) assert.fail(result.refusal.message);
+        reservedStop = result.value.control!.value.stop!.token;
+      } finally { other.close(); }
+    }
+    return rows;
+  }) as typeof f.store.writeMany;
+  try {
+    await assert.rejects(executeWebTurn({ store: f.store, projectId: 'p', stage: 'discovery', environment, turn: second,
+      transport }), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'run_stopped');
+  } finally { f.store.writeMany = original; }
+  assert.deepEqual([transports, f.store.list('web-capture').length, f.store.get<ResearchTurn>(second.id)!.value.status],
+    [1, 1, 'pending'], 'a stop after reservation prevents the still-unstarted HTTP request');
+  assert.ok(reservedStop); const resumedReserved = resumeStoppedPass(f.store, { project: 'p', stop: reservedStop });
+  if (!resumedReserved.ok) assert.fail(resumedReserved.refusal.message);
+  const retried = await executeWebTurn({ store: f.store, projectId: 'p', stage: 'discovery', environment, turn: second, transport });
+  assert.deepEqual([retried.turn.value.status, transports, f.store.list('web-capture').length], ['completed', 2, 2]);
+  const third = f.store.write<ResearchTurn>({ id: 'research-turn:web-stop:3', kind: 'research-turn', expected: 0,
+    value: { ...turn.value, number: 3, status: 'pending', observation: null, error: null } });
+  let entered!: () => void, release!: (reply: { status: number; body: unknown }) => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const heldTransport = async () => { transports++; entered(); return new Promise<{ status: number; body: unknown }>(resolve => { release = resolve; }); };
+  const inFlight = executeWebTurn({ store: f.store, projectId: 'p', stage: 'discovery', environment, turn: third,
+    transport: heldTransport });
+  await started;
+  const stoppedDuring = stopPass(f.store, { project: 'p' }); if (!stoppedDuring.ok) assert.fail(stoppedDuring.refusal.message);
+  release({ status: 200, body: { query: action.query, results: [], engines_queried: ['fixture'], unresponsive_engines: [] } });
+  const saved = await inFlight;
+  assert.deepEqual([saved.turn.value.status, transports, f.store.list('web-capture').length], ['completed', 3, 3],
+    'an admitted HTTP answer is saved after stop');
+  const fourth = f.store.write<ResearchTurn>({ id: 'research-turn:web-stop:4', kind: 'research-turn', expected: 0,
+    value: { ...turn.value, number: 4, status: 'pending', observation: null, error: null } });
+  await assert.rejects(executeWebTurn({ store: f.store, projectId: 'p', stage: 'discovery', environment, turn: fourth,
+    transport }), (error: unknown) => error instanceof Error && 'code' in error && error.code === 'run_stopped');
+  assert.equal(transports, 3, 'the next HTTP is blocked by the saved stop');
+});
 for (const mode of ['bundle', 'assessor-fields']) test(`DRY5FIX O: two native reopens after ${mode} remain readable`, async t => {
   const f = dry5StageFixture(t, mode), draft = f.engine.prepare('p', 'discovery');
   const restore = mode === 'bundle' ? dry5Stop(f.store, write => write.kind === 'research-turn'

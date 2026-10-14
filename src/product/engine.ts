@@ -50,6 +50,7 @@ import { Researcher } from "../discovery/research-runner.js";
 import type { ResearchRun } from "../discovery/research-model.js";
 import { PlanRepairs } from "./repairs.js";
 import { StageResearch } from "./stage-research.js";
+import { EarlyStageDriver } from "./early-stage-driver.js";
 import { RefinementResearch } from "./refinement-research.js";
 import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
@@ -58,6 +59,7 @@ import { OwnerSessions, issueOwnerInvitation, type OwnerAuthority } from "./owne
 import { listOwnerQuestions, writeOwnerResult, type OwnerReaders } from "../om/owner-result.js";
 import { readOmInput } from "../om/input.js";
 import { readRoutes } from "../om/routes.js";
+import { RunControlGate, type RunControlHold } from "../om/run-control.js";
 
 export type { Project, StageContent } from "./stage-checks.js";
 /** H2.0: the om readers the owner producer shares with the G4b gate — handed in so om/owner-result stays off the ring. */
@@ -74,6 +76,7 @@ export class ProductEngine {
   readonly researcher: Researcher;
   readonly repairs: PlanRepairs;
   readonly stageResearch: StageResearch;
+  readonly earlyStages: EarlyStageDriver;
   readonly refinementResearch: RefinementResearch;
   /** The lower kit of stage checks, era and compile (R2, №2419): the fields above are its very instances. */
   readonly checks: StageChecks;
@@ -88,6 +91,7 @@ export class ProductEngine {
     this.researcher = new Researcher(store, this.discovery, this.environments);
     this.repairs = new PlanRepairs(this);
     this.stageResearch = new StageResearch(this);
+    this.earlyStages = new EarlyStageDriver(this);
     this.refinementResearch = new RefinementResearch(this, actor);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult { return this.checks.validateStage(stage, context); }
@@ -98,6 +102,10 @@ export class ProductEngine {
     if (prior) { const status = this.pipeline.inspect(project, prior); requireCondition(status.state === "accepted", "predecessor_not_ready", `${prior} must be accepted`); inputs.push(...status.guards); }
     const consumer = STAGES[STAGES.indexOf(stage) + 1]!;
     return this.discovery.forStage(project, stage, consumer, inputs);
+  }
+  /** DRV1: prepare's one transaction carries the early executor's exact durable control. */
+  prepareEarlyStage(project: string, stage: UpstreamStage, hold: RunControlHold): Revision<DiscoveryDraft> {
+    return new ProductEngine(new RunControlGate(this.store, project, hold).view(), this.actor).prepare(project, stage);
   }
   draft(project: string, stage: UpstreamStage, draftId: string, expected: number): Revision<StageArtifact> {
     this.#project(project);
@@ -245,6 +253,7 @@ export class ProductEngine {
       case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,
         { projectId: command.project, base: command.base, nodes: command.nodes, actor: this.actor }, command.expected, this.environments.effective(command.project).root);
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
+      case "early-stage-run": this.#project(command.project); return this.earlyStages.run(command);
       case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
       case "model-usage": this.#project(command.project); return modelUsage(this.store, command.project, command.since);
       case "configure-reader-pilot": this.#project(command.project); return configureReaderPilot(this.store, this.environments, command.project, command.settings, command.expected,

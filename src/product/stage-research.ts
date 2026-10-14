@@ -7,19 +7,27 @@ import { UPSTREAM_STAGES, type UpstreamStage, RESEARCH_CONTRACT_VERSION } from "
 import { researchForConsumer, designFindings } from "../discovery/consumer-research.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { reference, stageId, type Finding, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import { readRunControl, runControlId } from "../om/run-control.js";
+import type { Revision } from "../storage/store.js";
 
 export interface StageResearchResult {
-  status: "accepted" | "paused" | "needs_owner" | "blocked";
+  status: "accepted" | "paused" | "needs_owner" | "blocked" | "stopped";
   discovery?: Omit<DiscoveryOutcome, "guards" | "findings">;
   stage: Ref | null; research: Ref | null; feedback: Ref | null; findings: Finding[];
+  // Accepted stages from contracts before v5 replay the public result shape of
+  // their producer. Current runs always report both fields.
+  turnsUsed?: number; reason?: Finding | null;
 }
+
+export interface StageResearchOptions { restoreOnly?: boolean }
 
 const DESIGN_ERRORS = new Set(["graph_invalid", "map_design_missing", "derived_field_conflict", "l1_detail_leak",
   "outcome_uncovered", "journey_uncovered", "graph_semantic_drift"]);
 
 export class StageResearch {
   constructor(private readonly engine: ProductEngine) {}
-  async run(project: string, draftId: string, maxTurns: number): Promise<StageResearchResult> {
+  async run(project: string, draftId: string, maxTurns: number,
+    options: StageResearchOptions = {}): Promise<StageResearchResult> {
     requireCondition(Number.isInteger(maxTurns) && maxTurns >= 1 && maxTurns <= 100, "research_budget_invalid", "Stage research needs a bounded turn allowance");
     const { store, pipeline, researcher } = this.engine;
     const draft = store.get<DiscoveryDraft>(draftId);
@@ -34,21 +42,50 @@ export class StageResearch {
       const outcome = checked.state === 'accepted' ? discoveryOutcome(store, draft) : null;
       const discovery = outcome && outcome.state !== 'legacy'
         ? { state: outcome.state, verdict: outcome.verdict, report: outcome.report, conditions: outcome.conditions, ownerChoices: outcome.ownerChoices, reason: outcome.reason } : undefined;
-      return { status: checked.state === "accepted" ? "accepted" : "blocked", stage: reference(artifact), research: null, feedback: null,
-        findings: checked.findings, ...(discovery ? { discovery } : {}) };
+      const replay = { status: checked.state === "accepted" ? "accepted" as const : "blocked" as const,
+        stage: reference(artifact), research: null, feedback: null, findings: checked.findings,
+        ...(discovery ? { discovery } : {}) };
+      return (draft.value.contractVersion ?? 1) < RESEARCH_CONTRACT_VERSION ? replay
+        : { ...replay, turnsUsed: 0, reason: checked.findings[0] ?? null };
     }
+    const stoppedFinding = { code: 'run_stopped', target: runControlId(project),
+      message: 'The project is stopped; resume the exact stop before new research' };
+    const restorePaid = async (): Promise<Revision<ResearchRun> | null> => {
+      const runId = `research-run:${hashJson([project,draftId])}`;
+      let restored = store.get<ResearchRun>(runId);
+      if (draft.value.contractVersion === 4 || restored) {
+        try { restored = await researcher.run(project,draftId,1,undefined,{restoreOnly:true}); }
+        catch(error) { if(!(error instanceof EngineError)) throw error; restored = store.get<ResearchRun>(runId); }
+      }
+      return restored;
+    };
+    if (options.restoreOnly) {
+      const restored = await restorePaid();
+      return { status: 'stopped', stage: artifact ? reference(artifact) : null,
+        research: restored ? reference(restored) : null, feedback: null,
+        findings: [stoppedFinding], turnsUsed: 0, reason: stoppedFinding };
+    }
+    const control = readRunControl(store, { project });
+    if (!control.ok) throw new EngineError(control.refusal.code, control.refusal.message, control.refusal.at);
     if (draft.value.contractVersion===4) {
-      let restored: Awaited<ReturnType<typeof researcher.run>> | null = null;
-      try { restored = await researcher.run(project,draftId,1,undefined,{restoreOnly:true}); }
-      catch(error) { if(!(error instanceof EngineError && error.code==='research_contract_upgrade_required')) throw error; }
-      const run=store.get<ResearchRun>(`research-run:${hashJson([project,draftId])}`);
+      const restored = await restorePaid(), run=store.get<ResearchRun>(`research-run:${hashJson([project,draftId])}`);
+      if (control.value.stopped) return {status:'stopped',stage:artifact?reference(artifact):null,
+        research:restored?reference(restored):run?reference(run):null,feedback:null,findings:[stoppedFinding],turnsUsed:0,reason:stoppedFinding};
       if (restored?.value.pauseCode && restored.value.pauseCode !== 'research_contract_upgrade_required')
         return {status:'paused',stage:artifact?reference(artifact):null,research:reference(restored),feedback:null,
-          findings:[{code:restored.value.pauseCode,target:draftId,message:restored.value.error ?? 'The saved paid turn could not be restored'}]};
+          findings:[{code:restored.value.pauseCode,target:draftId,message:restored.value.error ?? 'The saved paid turn could not be restored'}],
+          turnsUsed:0,reason:{code:restored.value.pauseCode,target:draftId,message:restored.value.error ?? 'The saved paid turn could not be restored'}};
       return {status:'paused',stage:artifact?reference(artifact):null,research:run?reference(run):null,feedback:null,
-        findings:[{code:'research_contract_upgrade_required',target:draftId,message:'Paid v4 work is retained; prepare Discovery v5 before new research or acceptance'}]};
+        findings:[{code:'research_contract_upgrade_required',target:draftId,message:'Paid v4 work is retained; prepare Discovery v5 before new research or acceptance'}],
+        turnsUsed:0,reason:{code:'research_contract_upgrade_required',target:draftId,message:'Paid v4 work is retained; prepare Discovery v5 before new research or acceptance'}};
     }
     requireCondition(draft.value.contractVersion === RESEARCH_CONTRACT_VERSION, "research_contract_upgrade_required", "New stage research requires the current contract");
+    if (control.value.stopped) {
+      const restored = await restorePaid();
+      return { status: 'stopped', stage: artifact ? reference(artifact) : null,
+        research: restored ? reference(restored) : null, feedback: null,
+        findings: [stoppedFinding], turnsUsed: 0, reason: stoppedFinding };
+    }
     let graphExpected = store.get(`graph:${project}`)?.revision ?? 0;
     const result = await researchForConsumer(store, researcher, project, draftId, maxTurns, () => {
       // Capture before the model call; a competing stage edit must never be overwritten.
@@ -80,10 +117,25 @@ export class StageResearch {
       };
     }, artifact ? reference(artifact) : null);
     const { artifact: accepted, ...rest } = result;
+    const research = rest.research ? store.get<ResearchRun>(rest.research.id, rest.research.revision) : null;
+    const findings = rest.findings.length || !research?.value.pauseCode ? rest.findings
+      : [{ code: research.value.pauseCode, target: draftId, message: research.value.error ?? 'Research paused' }];
+    const currentControl = readRunControl(store, { project });
+    if (!currentControl.ok) throw new EngineError(currentControl.refusal.code, currentControl.refusal.message, currentControl.refusal.at);
+    const status = rest.status !== 'accepted' && currentControl.value.stopped ? 'stopped' as const : rest.status;
     const outcome = discoveryOutcome(store, store.get<DiscoveryDraft>(draftId)!);
-    if (outcome.state === 'legacy') return { ...rest, stage: accepted };
-    const { guards: _guards, findings, ...discovery } = outcome;
-    return { ...rest, stage: accepted, discovery,
-      ...(findings.length ? { status: outcome.ownerChoices.length ? 'needs_owner' as const : 'paused' as const, findings } : {}) };
+    if (outcome.state === 'legacy') {
+      const reported = status === 'stopped' ? [stoppedFinding, ...findings] : findings;
+      return { ...rest, status, findings: reported, turnsUsed: rest.turnsUsed ?? 0,
+        stage: accepted, reason: reported[0] ?? null };
+    }
+    const { guards: _guards, findings: outcomeFindings, ...discovery } = outcome;
+    const finalFindings = outcomeFindings.length ? outcomeFindings : findings;
+    const outcomeStatus = outcomeFindings.length
+      ? outcome.ownerChoices.length ? 'needs_owner' as const : 'paused' as const : status;
+    const finalStatus = outcomeStatus === 'accepted' || !currentControl.value.stopped ? outcomeStatus : 'stopped';
+    const reported = finalStatus === 'stopped' ? [stoppedFinding, ...finalFindings] : finalFindings;
+    return { ...rest, status: finalStatus, findings: reported, turnsUsed: rest.turnsUsed ?? 0,
+      stage: accepted, discovery, reason: reported[0] ?? null };
   }
 }
