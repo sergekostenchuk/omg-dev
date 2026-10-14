@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); недоверенный вход: ответ модели не по форме или с чужими ссылками, подлинный результат другой попытки/владельца → отказ с адресом (подделку собственной базы не тестировать — решение владельца 28.09, 13.10); окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 191. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → L1A → DRV1 → ASM1 → ASM1.1 → UNK1 → DS1.2a → DS1.2m → DRY6-03 → AT3b → IN1 → CFG1 → AT4 → DS1.2e → DS1.2c → DS1.2s → DRY6-01 → DRY6-02 → DS1.2lh → DS1.2v → ENV1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 193. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → L1A → DRV1 → ASM1 → ASM1.1 → UNK1 → DS1.2a → DS1.2m → DRY6-03 → AT3b → IN1 → CFG1 → AT4 → DS1.2e → DS1.2c → DS1.2s → DRY6-01 → DS1.3a → DS1.3b → DRY6-02 → DS1.2lh → DS1.2v → ENV1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 109.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 111.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2331,6 +2331,48 @@
   - подлинная старая незавершённая оплата и историческое завершённое принятие читаются по своей эре; managed B/C сохраняют прежние binding и восстановление
   - штатный reuse нового прямого результата не теряет proof; несовместимое основание ведёт к обычной оценке, не к обходу или застреванию; результат другого вопроса/проекта не принимается
 
+### DS1.3a · Читаемый итог Discovery из ПРИНЯТОЙ записи: один чистый читатель stage-summary (поручение с доказанным IN1-происхождением; результаты отчёта с точными citations; вариант и причина вердикта; ограничения и неизвестное с их адресами; web — сохранённые URL/время/цитата и предел доказательства), принятое отдельно от исхода текущего исследования; read-only команда stage-summary через /api/command и читаемый export-stage с исходным JSON в конце; без окна
+
+**Цель.** ~/REPORTS/review/omg-ds13-contract-4986_151026.md §2–§3, §8 п.1–5. projection, публичные формы записей и протоколы исследования не менять (эра-тесты сравнивают projection побайтно, engine.ts:155–158). Не-go (conditional/no_go/insufficient_evidence) — исход конкретного исследования без фиктивной приёмки; до вердикта — «исследование не завершено». Citations — через сохранённый research-answer/assessment и его observations, не через сегодняшний каталог Source. Последний по времени черновик без доказанной связи не выбирать. Фальшивые accepted-артефакты ради теста не создавать.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: принятая стадия Discovery, её research-answer/assessment/observations, привязка IN1
+- Пишет записи: read-only структурированный итог и читаемый export-stage
+- Разрешённые пути: `src/product/stage-summary.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/stage-summary.test.ts`
+- Из движка как есть: №4986; №4990
+- После: IN1, CFG1, UNK1, DS1.2e
+- Тесты сверх обязательных:
+  - принять Discovery, затем штатно подготовить новый draft/reopen — принятые значения и авторство за прежними Ref, кандидат отделён
+  - законные conditional/no_go/insufficient_evidence и отсутствие вердикта — корректные непринятые исходы без фиктивной preparation/приёмки
+  - остановка и недостающее исследование — указан связанный draft/question, чужой последний run не подставлен
+  - изменение Source/вопроса после принятия и перезапуск Store — прежний итог и цитаты, без новых вызовов/HTTP/записей
+  - точная привязка IN1 даёт дословное поручение; actor driver:verbatim без неё — нет
+  - второй Store меняет основание между чтениями — согласованный старый снимок либо адресный stale
+  - подлинные v3/v4/v5 читаются по своей схеме; отсутствие поля старой схемы обозначено как отсутствие в той версии
+
+### DS1.3b · Тот же читаемый итог для концепции, L1, спецификации и фич: разделы и требования; точная принятая проекция content.graph L1 (layer Ref, без сегодняшнего graph-binding); полный behaviorContract без обрезки до B1; фичи с пользой, исходами, взаимодействиями и вопросами; принятое отдельно от кандидата
+
+**Цель.** ~/REPORTS/review/omg-ds13-contract-4986_151026.md §4. Второй reader не нужен — расширение stage-summary из DS1.3a. L1: участник → существующие узлы/переходы → результат по journeys/edges; legacy journey не подменяет journeys графа; полный graph Ref — только из точной сохранённой связи; разница полного графа при той же L1 не называется изменением принятого пути. Старые индексы behavior не переименовывать в id требований. Для v6 — реальные applications/каталог с адресами; сквозной v6 — после DS1.2v.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: принятые стадии concept/operation-map/specification/features и их точные источники
+- Пишет записи: читаемый итог четырёх стадий в общем читателе
+- Разрешённые пути: `src/product/stage-summary.ts`, `test/stage-summary.test.ts`, `src/product/engine.ts`
+- Из движка как есть: №4986; №4990
+- После: DS1.3a
+- Тесты сверх обязательных:
+  - принятые четыре стадии против новых кандидатов
+  - старая спецификация/фичи с отсутствующими полями своей эры
+  - полный договор не обрезан до B1; обе нити требований сохранены
+  - после save-graph/следующего слоя принятый путь L1 прежний; изменение лишь L2 не объявлено изменением L1
+  - отсутствующий обязательный layer Ref — адресная ошибка
+
 ### DRY6-03 · Ссылки движка отдельно от произвольного JSON: om-fsck и обход ссылок считают ссылкой только поля, объявленные ссылкой договором записи, а не любой объект вида {id, revision, hash} в теле (выдержка JSON-источника, ответ модели, observations); старые om-integrity.findings[].ref с ложной ссылкой не блокируют новый scan
 
 **Цель.** ~/REPORTS/review/omg-dry6-contracts-4950_151026.md §DRY6-03: src/storage/fsck.ts:26–28, 77–90 распознаёт ссылки по форме → законный JSON Source с отсутствующим {id,revision,hash} даёт store_damaged и OM не стартует, двери нет (тот же класс — наблюдение №79). Различать ссылки и произвольный JSON по договору записи (одна чистая таблица семантики в reference-sites.ts при необходимости); не исключать целиком context и не узнавать ссылки по форме/id; не менять старые тела, hash, ревизии и отчёты; проверки hash/ledger/heads прежние; массово писателей записей не менять, второй валидатор продукта не строить.
@@ -2379,7 +2421,7 @@
 - Пишет записи: одно разрешённое новое поколение отменённой попытки по явному resume; адресная дверь повтора конкретного call для старых терминалов
 - Разрешённые пути: `src/om/run-control.ts`, `src/discovery/research-protocol.ts`, `src/discovery/model-call-recovery.ts`, `src/discovery/response-recovery.ts`, `src/discovery/assessment-session.ts`, `src/runtime/model-usage.ts`, `src/om/run-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `src/discovery/research-runner.ts`, `test/early-stage-driver.test.ts`, `test/research-call-resume.test.ts`, `test/assessment-session-resume.test.ts`, `test/om-run-control.test.ts`
 - Из движка как есть: №4951; №4961
-- После: UNK1, DRY6-01, CFG1, DRV1
+- После: UNK1, DRY6-01, CFG1, DRV1, DS1.3b
 - Тесты сверх обязательных:
   - A/B/C: адаптер уже получил stdin, второй Store делает stop, затем новый Store и явный resume — ровно одно новое поколение, тот же draft и правильный кандидат/turn
   - повтор под stop, двойной resume, конкурентные продолжения и повтор после рестарта — лишних отправок нет
@@ -2495,7 +2537,7 @@
 - Пишет записи: переключение производителей новой работы на v6
 - Разрешённые пути: `src/discovery/requirements.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/research-runner.ts`, `test/discovery-v6-era.test.ts`, `test/ds12-v6-release.test.ts`
 - Из движка как есть: №4870; №4877
-- После: DS1.2lh, DS1.2m, DS1.2s, DS1.2c, DS1.2e, DRY6-02
+- После: DS1.2lh, DS1.2m, DS1.2s, DS1.2c, DS1.2e, DRY6-02, DS1.3b
 - Тесты сверх обязательных:
   - СКВОЗНАЯ v6 до OM (перенесено из DS1.2m по №4900/№4901): после включения производителей v6 — настоящий OM-root selected/v2 → parts/correction и новый G5/task-v3 на законном v6 B1 (Discovery + concept + specification v6); смешанный префикс — прежний договор
   - ВКЛЮЧЕНИЕ v6 (перенесено из DS1.2e по №4925/№4926): после переключения производителей — четыре исхода Discovery v6 и owner_choice, mapDesign drift v6, оплаченные v5 A/B/C и web capture → 0 повторов/HTTP и адресная дверь новой работы, точная форма legacy replay выпущенных эр — на настоящем производителе, без подмены модулей в тесте
@@ -2684,7 +2726,7 @@
 - Пишет записи: проекция условий среды с requiredBy; охраны условий в записи startRun/writeRunBases нового OM
 - Разрешённые пути: `src/om/environment-readiness.ts`, `src/runtime/environment.ts`, `src/om/run-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/environment-readiness.test.ts`, `test/om-run-driver.test.ts`, `test/early-stage-driver.test.ts`
 - Из движка как есть: №4856; №4864; CFG1; DRV1
-- После: DRV1, IN1, CFG1, DS1.2e, DS1.2lh, DRY6-02, DS1.2v
+- После: DRV1, IN1, CFG1, DS1.2e, DS1.2lh, DRY6-02, DS1.2v, DS1.3b
 - Тесты сверх обязательных:
   - не-Git, Git без HEAD, вложенный вместо корня: Discovery с рабочим runner доступен, status называет недостающее, новый OM не пишет B1/run и не вызывает модель; после исправления среды повтор проходит
   - capacity/dispatch: status до OM показывает адреса; DRV1 и прямой om-start отказывают одинаково до записи/оплаты; после configure повтор без дублей
@@ -2748,7 +2790,7 @@
 - Пишет записи: пакет ядра
 - Разрешённые пути: `package.json`, `tsconfig.json`, `scripts/check-backend.mjs`, `test/fixtures/core1-records.ts`, `test/assessment-session-resume.test.ts`, `test/discovery.test.ts`, `test/execution-external-input.test.ts`, `test/om-accepted-answer.test.ts`, `test/om-achievements.test.ts`, `test/om-addressing.test.ts`, `test/om-answers-gate.test.ts`, `test/om-call-record.test.ts`, `test/om-compiler-readers.test.ts`, `test/om-composite-keys.test.ts`, `test/om-feasibility-boundary.test.ts`, `test/om-feasibility-projection.test.ts`, `test/om-feasibility.test.ts`, `test/om-frame-accept.test.ts`, `test/om-frame-candidate.test.ts`, `test/om-gap-lines.test.ts`, `test/om-gaps.test.ts`, `test/om-legacy-operation-lock.test.ts`, `test/om-legacy-route-closure.test.ts`, `test/om-model-call.test.ts`, `test/om-operation-cost.test.ts`, `test/om-probe.test.ts`, `test/om-question-packet.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-repeat-gate.test.ts`, `test/om-result-identity.test.ts`, `test/om-routes.test.ts`, `test/om-run.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/om-series-current.test.ts`, `test/om-series.test.ts`, `test/om-task-context.test.ts`, `test/om-task-neighbors.test.ts`, `test/om-work-zone.test.ts`, `test/preparation.test.ts`, `test/reader-pilot.test.ts`, `test/research-call-resume.test.ts`, `test/runtime-absence-r3.test.ts`, `test/runtime-absence-research.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1, SP1a, SP1b, ASM1.1, CFG1, ENV1, DS1.2a, DS1.2e, DS1.2c, DS1.2s, DS1.2lh, DS1.2m, DRY6-01, DRY6-02, DRY6-03, DS1.2v
+- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1, SP1a, SP1b, ASM1.1, CFG1, ENV1, DS1.2a, DS1.2e, DS1.2c, DS1.2s, DS1.2lh, DS1.2m, DRY6-01, DRY6-02, DRY6-03, DS1.2v, DS1.3a, DS1.3b
 - Тесты сверх обязательных:
   - ЧАСТЬ А (слово пользователя ~22:10 «тест смотрит только актуальную версию»; вопрос Opus-1 №3686, разрешение оркестратора): 41 файл тестов, запускающих старый движок из git, и один модуль образцов test/fixtures/core1-records.ts — формат не в живой базе → сценарий удалить; формат в живой базе → образец из снимка 1554, читает нынешний код; проверки нового не трогать
   - ДО КОДА части Б — опись легаси и список удаляемого показать пользователю; удалять после его «да»
@@ -2767,7 +2809,7 @@
 - Пишет записи: интерфейс сервиса движка и подключения
 - Разрешённые пути: `src/product/commands.ts`, `src/cli.ts`, `src/service/server.ts`, `test/service.test.ts`
 - Из движка как есть: продуктовые команды om-start/om-continue/om-state/om-stop/om-spend/om-fsck; проект SEC1
-- После: NR, OWN1, RL3, WB1, DRV1, IN1, CFG1, ENV1, DRY6-02
+- После: NR, OWN1, RL3, WB1, DRV1, IN1, CFG1, ENV1, DRY6-02, DS1.3b
 - Тесты сверх обязательных:
   - ДО КОДА — проект Codex-omg вместе с SEC1: исследование, как подключают такие движки в харнесы (MCP, плагины Claude Code/Codex/Cursor), и как продукты выдают и сохраняют ключ владельца (ключ восстановления, связка ключей ОС, экспорт); пути уточняются проектом
   - один и тот же сценарий проекта через MCP и через CLI даёт одинаковые записи
