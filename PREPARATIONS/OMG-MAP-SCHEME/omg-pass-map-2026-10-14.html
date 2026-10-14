@@ -1,3 +1,4 @@
+<meta charset="utf-8">
 <title>Проход продукта OMG</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1264,13 +1265,7 @@ research-stage(project, draftId, maxTurns)
         <h3>Сделано по датам <small>на карте — зелёная отметка «✓ дата» рядом с «!»; кнопка «Сделано» и выбор даты в панели; сплошная рамка — влито, пунктир — принято ревью и ждёт вливания</small></h3>
         <div class="tw"><table>
           <thead><tr><th>Дата</th><th>Задача</th><th>Состояние</th><th>Что закрыто</th><th>Где</th></tr></thead>
-          <tbody>
-            <tr><td>14.10.2026</td><td>DRY5FIX</td><td>влито</td><td>Ошибка модели на ранних стадиях завершает попытку адресным отказом; следующий запуск получает исправленный ответ без застревания</td><td>om/module 3cef0e61</td></tr>
-            <tr><td>14.10.2026</td><td>DS1 (+ DS1.1)</td><td>принято</td><td>Discovery v5: план → отчёт → вердикт; анкета только после go; выбор условия владельцем; перенос ограничений отчёта в анкету; ошибка нового предложения — адресный отказ</td><td>ревью №4715, вливание цепочкой</td></tr>
-            <tr><td>14.10.2026</td><td>WB1</td><td>принято</td><td>Модель сама ищет и читает страницы; шлюз закрыт от редиректов во внутреннюю сеть, общий срок загрузки</td><td>ревью №4708, вливание за DS1</td></tr>
-            <tr><td>14.10.2026</td><td>WB1b</td><td>принято</td><td>Web-источник принимается на стадиях после Discovery с пределом reported-not-runtime-proof</td><td>ревью №4682, вливание за WB1</td></tr>
-            <tr><td>14.10.2026</td><td>L1A · DRV1 · SP1 · UNK1 · IN1 · ASM1</td><td>в работе / договор</td><td>Этап 2: договоры Codex №4684–4687, №4714; L1A — адресная часть готова; DRV1 — у исполнителя</td><td>план be2809e, d661400, ae7b84f</td></tr>
-          </tbody>
+          <tbody id="doneRows"></tbody>
         </table></div>
       </section>
       <section class="sec wide" id="tasks">
@@ -1278,17 +1273,17 @@ research-stage(project, draftId, maxTurns)
         <div class="tw"><table>
           <thead><tr><th>#</th><th>Задача</th><th>Результат</th><th>Стадии</th><th>Состояние</th></tr></thead>
           <tbody>
-            <tr><td>1</td><td>DS1 — ядро v5</td><td>План → отчёт → вердикт → preparation при go</td><td>Discovery</td><td><span class="pill acc">написана</span></td></tr>
-            <tr><td>2</td><td>DRY5FIX</td><td>Ошибка модели → отказ попытки и обычный повтор</td><td>все ранние</td><td><span class="pill acc">готова</span></td></tr>
-            <tr><td>3</td><td>WB1 + WB1b</td><td>Модель ищет и читает интернет через движок</td><td>Discovery</td><td><span class="pill warn">части готовы</span></td></tr>
-            <tr><td>4</td><td>IN1 — вход и понимание</td><td>brief автоматически; objective = слова владельца; понимание модели с авторством</td><td>Вход</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>5</td><td>DS1.1 — двери не-go</td><td>Выбор через полномочие владельца; продолжение по недостающему</td><td>Discovery</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>1</td><td>DS1 — ядро v5</td><td>План → отчёт → вердикт → preparation при go</td><td>Discovery</td><td><span class="pill acc">влито 14.10</span></td></tr>
+            <tr><td>2</td><td>DRY5FIX</td><td>Ошибка модели → отказ попытки и обычный повтор</td><td>все ранние</td><td><span class="pill acc">влито 14.10</span></td></tr>
+            <tr><td>3</td><td>WB1 + WB1b</td><td>Модель ищет и читает интернет через движок</td><td>Discovery</td><td><span class="pill acc">влито 14.10</span></td></tr>
+            <tr><td>4</td><td>IN1 — вход и понимание</td><td>brief автоматически; objective = слова владельца; понимание модели с авторством</td><td>Вход</td><td><span class="pill warn">в работе</span></td></tr>
+            <tr><td>5</td><td>DS1.1 — двери не-go</td><td>Выбор через полномочие владельца; продолжение по недостающему</td><td>Discovery</td><td><span class="pill acc">влито 14.10 (в DS1)</span></td></tr>
             <tr><td>6</td><td>DS1.2 — перенос обязательств</td><td>Отчёт → preparation → conceptSections → implements, пути → договоры поведения: Ref Discovery + constraint id → requirement ids; код — охват, оценщик — применение</td><td>Discovery → концепция → карта → спецификация</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>7</td><td>L1A — материал автора карты</td><td>Доставить externalSystems и основания; реестр обязательных outcome-id и правило «id результата = id артефакта»</td><td>Карта L1</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>8</td><td>ASM1 — контекст оценщика</td><td>Оценщик видит принятые соседние поля своей стадии и критерий их согласия: 4 поля концепции; operationRequirements ↔ mapDesign; behavior / constraints / договоры; список фич ↔ подготовка</td><td>концепция, карта, спецификация, фичи</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>9</td><td>SP1 — полный материал у потребителей</td><td>Выбранный договор целиком (entry, inputs, compatibility) и подготовка фичи целиком (benefit, success, failures, interactions) рядом с нормализованными связями — вопросам OM, задачам фактов, детализации; автору и оценщику фич — каталог артефактов L1; исполнителю — impact и integrations узла или рабочий вызов task-detail</td><td>спецификация, фичи → OM → исполнение</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>7</td><td>L1A — материал автора карты</td><td>Доставить externalSystems и основания; реестр обязательных outcome-id и правило «id результата = id артефакта»</td><td>Карта L1</td><td><span class="pill acc">влито 14.10</span></td></tr>
+            <tr><td>8</td><td>ASM1 — контекст оценщика</td><td>Оценщик видит принятые соседние поля своей стадии и критерий их согласия: 4 поля концепции; operationRequirements ↔ mapDesign; behavior / constraints / договоры; список фич ↔ подготовка</td><td>концепция, карта, спецификация, фичи</td><td><span class="pill warn">принято, ждёт вливания; ASM1.1 в работе</span></td></tr>
+            <tr><td>9</td><td>SP1 — полный материал у потребителей</td><td>Выбранный договор целиком (entry, inputs, compatibility) и подготовка фичи целиком (benefit, success, failures, interactions) рядом с нормализованными связями — вопросам OM, задачам фактов, детализации; автору и оценщику фич — каталог артефактов L1; исполнителю — impact и integrations узла или рабочий вызов task-detail</td><td>спецификация, фичи → OM → исполнение</td><td><span class="pill warn">SP1a влито; SP1b в работе</span></td></tr>
             <tr><td>10</td><td>UNK1 — неизвестное и его исполнимая передача</td><td>Ранняя дверь: материал / возврат к основанию / выбор. Поздний вопрос: видимые потребитель, срок, допустимое доказательство и рабочая дверь — либо честное ожидание</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>11</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию и в конце om-start (coldStart уже строит вход OM), на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>11</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию и в конце om-start (coldStart уже строит вход OM), на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill warn">принято, перенос и прогон</span></td></tr>
             <tr><td>12</td><td>DS1.3 — итог владельцу</td><td>Читаемый вид стадий из принятых записей; верное авторство; в GraphPanel — путь, условия, статус; сводка договоров поведения</td><td>все ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>13</td><td>PR1 — ремонт плана по needs_plan</td><td>Адресная находка contract_unexecutable / plan-ревью → исправление принятого L3 → новый план; оплаченный кандидат сохраняется. Нужна, только если HX4 доходит до кодирования</td><td>исполнение → OM</td><td><span class="pill bad">условная</span></td></tr>
             <tr><td>14</td><td>CFG1 — режим роли по фазе</td><td>Профили или режимы адаптера для research, implement, review, chat без тихой замены запечатанной среды; отказ до отправки неподдержанного режима</td><td>вход → исполнение</td><td><span class="pill bad">новая</span></td></tr>
@@ -1328,7 +1323,10 @@ research-stage(project, draftId, maxTurns)
     {id:"DS1.1",date:"14.10.2026",st:"merged",ref:"в составе DS1, om/module 7e162aeb",what:"Дверь выбора условия владельцем (owner_choice): предответы, отдельная запись решения, новый вердикт по выбору; выбор только для conditional"},
     {id:"WB1",date:"14.10.2026",st:"merged",ref:"om/module 66f0534a (ревью Codex №4708, шлюз — круг 3)",what:"Модель прохода сама ищет и читает страницы: web_search / web_fetch, снимок страницы — Source вида web; шлюз NL99 закрыт от редиректов во внутреннюю сеть, общий срок загрузки"},
     {id:"WB1b",date:"14.10.2026",st:"merged",ref:"om/module 5dc62ffc (ревью Codex №4682)",what:"Источник web принимается на стадиях после Discovery как документальное свидетельство с пределом reported-not-runtime-proof"},
-    {id:"L1A",date:"14.10.2026",st:"merged",ref:"om/module 6f449f68 (ревью Codex №4729, прогон 4590/4272/0)",what:"Материал карты L1 приходит к модели через researchPrerequisites без смены FieldSpec; продолжение A/B получает новый материал, оплаченные ответы прежнего производителя восстанавливаются без повторного вызова."}
+    {id:"L1A",date:"14.10.2026",st:"merged",ref:"om/module 6f449f68 (ревью Codex №4729, прогон 4590/4272/0)",what:"Материал карты L1 приходит к модели через researchPrerequisites без смены FieldSpec; продолжение A/B получает новый материал, оплаченные ответы прежнего производителя восстанавливаются без повторного вызова."},
+    {id:"SP1a",of:"SP1",date:"14.10.2026",st:"merged",ref:"om/module f08507f2 (ревью Codex №4781 с первого раза, прогон 4608/4290/0)",what:"Модель OM видит выбранную спецификацию целиком: полные договоры поведения, подготовку фич и все ограничения с точными ссылками — обязательной частью вопроса; старые пакеты не меняются."},
+    {id:"DRV1",date:"14.10.2026",st:"accepted",ref:"ревью Codex №4788 (круг 3); перенос поверх SP1a и прогон",what:"Драйвер ранних стадий: stop / maxTurns / maxCalls; остановка до отправки не тратит вызов, оплаченные ответы восстанавливаются, конкурентное возобновление не выходит за бюджет."},
+    {id:"ASM1",date:"14.10.2026",st:"accepted",ref:"ревью Codex №4790 (круг 3); перенос после DRV1",what:"Оценщик ранних стадий получает точный принятый префикс соседних полей; при смене соседа завершённая оценка пересматривается, незавершённая старая — восстанавливается без нового вызова."}
   ];
   var DST={merged:"влито",accepted:"принято"};
   /* two-row snake layout for sub-block schemes; empty labels stay hidden */
@@ -2742,13 +2740,19 @@ research-stage(project, draftId, maxTurns)
   function ownDone(k){
     var it=IT[k],ids={};
     (it.d||[]).forEach(function(r){if(r[2]===TASK)String(r[1]).split(/[\s·,+;()]+/).forEach(function(w){ids[w]=1;});});
-    return DONE.filter(function(x){return ids[x.id]&&(!doneDate||x.date===doneDate);});
+    return DONE.filter(function(x){return (ids[x.id]||(x.of&&ids[x.of]))&&(!doneDate||x.date===doneDate);});
   }
   function doneOf(k){
     if(IT[k].kind==="node")return ownDone(k);
     var seen={},out=[];
     ORDER.forEach(function(c){if(c===k||c.indexOf(k+".")===0)ownDone(c).forEach(function(x){if(!seen[x.id]){seen[x.id]=1;out.push(x);}});});
     return out;
+  }
+  function renderDoneTable(){
+    var tb=document.getElementById("doneRows");if(!tb)return;tb.innerHTML="";
+    DONE.forEach(function(x){var tr=document.createElement("tr");
+      [x.date,x.id+(x.of?" (часть "+x.of+")":""),DST[x.st],x.what,x.ref].forEach(function(v){var td=document.createElement("td");td.textContent=v;tr.appendChild(td);});
+      tb.appendChild(tr);});
   }
   function renderDone(){
     ORDER.forEach(function(k){
@@ -2900,6 +2904,7 @@ research-stage(project, draftId, maxTurns)
   });
   document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&sel)closeDetail();});
 
+  renderDoneTable();
   renderDone();
   layout();fit();
   if(document.fonts&&document.fonts.ready)document.fonts.ready.then(function(){layout();fit();});
