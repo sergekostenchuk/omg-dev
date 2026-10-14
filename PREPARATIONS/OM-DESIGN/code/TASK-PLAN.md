@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); недоверенный вход: ответ модели не по форме или с чужими ссылками, подлинный результат другой попытки/владельца → отказ с адресом (подделку собственной базы не тестировать — решение владельца 28.09, 13.10); окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 175. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → AT3b → AT4 → L1A → DRV1 → UNK1 → IN1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 176. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → AT3b → AT4 → L1A → DRV1 → ASM1 → UNK1 → IN1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 93.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 94.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2289,6 +2289,27 @@
   - documentaryAllowance — только явно разрешённые точные Source Ref, прежний claimLimit; веб-цитата не подтверждает среду автоматически
   - один полный прогон и ревью
 
+### ASM1 · Оценщик ранних стадий (assess-answer B и escalation C) получает точный принятый префикс соседних полей своего черновика — только answered с точными question/answer Ref по порядку FieldSpec, открытый сосед останавливает префикс (pending), отклонённое значение переоткрытого поля не выдаётся за принятое; эра — по сохранённому договору производителя оценки
+
+**Цель.** Опись claude-worker ~/REPORTS/review/omg-asm1_inventory_141026.md: оценщик concept / operation-map / specification / features не получает принятых соседей (research-assessment.ts:193–195 — только prerequisites и карта); Discovery закрыта discoveryContext DS1. Договор Codex-omg №4684 (§1 ~/REPORTS/review/omg-hx4-contracts-4661-4677_141026.md): общий принятый префикс до выбранного вопроса; нового безусловного отказа из-за неотвеченного соседа не вводить; полный обязательный материал сохраняется в initial/continuation, нехватка вместимости — до отправки; эру фиксирует сохранённый договор производителя оценки, не наличие поля; нужны текущая доставка и guards, упаковка, priorOrigin и исторический читатель; старый оплаченный ответ не получает сегодняшних соседей; escalation-assessor — в ту же доставку; аналитик с отклонённым предложением — вне ASM1; requirements.ts, DS1-схемы и приёмку стадий не менять.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: принятые ответы соседних полей черновика
+- Пишет записи: материал оценки B/C с принятым префиксом и точными Ref
+- Разрешённые пути: `src/discovery/stage-neighbors.ts`, `src/discovery/research-assessment.ts`, `src/discovery/assessment-session.ts`, `src/discovery/working-context.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `test/stage-neighbors.test.ts`, `test/assessment-session-resume.test.ts`, `test/research-call-resume.test.ts`
+- Из движка как есть: №4660; №4684; DS1
+- После: DS1, DRY5FIX, WB1, L1A, DRV1
+- Тесты сверх обязательных:
+  - четыре стадии, последний вопрос: оценщик получает точный принятый префикс; пустой префикс первого вопроса законен
+  - штатное reopen среднего поля: старое значение и более поздние поля не в префиксе, pending указывает реальный открытый вопрос
+  - чужие question/answer другого draft/project не подставляются; смена соседа вторым Store между чтением и публикацией — оценка не принимается на смешанном основании
+  - initial и continuation B/C сохраняют материал и инструкции; вместимость — до вызова
+  - сбой после оплаченного B/C, новый Store: восстановление с исходными соседями, ноль новых вызовов
+  - подлинные старые paid B/C восстанавливаются прежним читателем (сохранённый образец старого производителя)
+
 ### L1A · Материал карты L1: вопросы operation-map получают у автора и оценщика точные preparation.externalSystems принятой Discovery, каталог outcome-id / actor-id / пар requirement→outcome принятой концепции и явно названные правила движка buildL1 (результат Discovery сохраняет свой id как результатный артефакт и в success journey; промежуточные артефакты допустимы; служба ≠ runtime-вход ≠ документальный Source) — через общий researchPrerequisites, без смены FieldSpec v5
 
 **Цель.** Опись claude-worker ~/REPORTS/review/omg-l1a_inventory_141026.md: researchPrerequisites (research-context.ts:14–33) даёт карте из Discovery только actors/outcomes/constraints/journeys — externalSystems до operationRequirements и mapDesign не доходит; правило outcome-id = id артефакта есть только как поздняя проверка buildL1 (builder.ts:38–44, semantics.ts:32/56/63) — модель узнаёт его из оплаченного отказа. Договор Codex-omg №4685 (§2 ~/REPORTS/review/omg-hx4-contracts-4661-4677_141026.md): доставка правил материалом годится — правило явно названо правилом движка, не цитатой Discovery и не новой инструкцией фазы; FieldSpec v5 и prompt не менять (stage-checks сравнивает эталон); каталог выводит код из точных draft.inputs, модель его не создаёт; только для operation-map; не требовать механически «каждая externalSystem = отдельный block или external artifact»; порядок operationRequirements → mapDesign сохранить; pilot-context.ts не трогать (ранняя карта не использует reader-pilot, research-runner.ts:201). Эра: сохранённые analyst intents и paid assessor origins не пересобирать сегодняшней функцией; новая генерация получает новый материал; в продолжении адрес архива действительно разрешается; при сжатии не выдавать несуществующий указатель и не объявлять скрытый каталог прочитанным. working-context.ts — только если реальная упаковка теряет обязательный материал.
@@ -2346,7 +2367,7 @@
 - Пишет записи: observation.unknown хода и пауза research_material_missing
 - Разрешённые пути: `src/discovery/research-model.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-context.ts`, `test/early-unknown.test.ts`, `test/research-call-resume.test.ts`
 - Из движка как есть: №4672; №4686
-- После: DS1, DRY5FIX, WB1, L1A, DRV1
+- После: DS1, DRY5FIX, WB1, L1A, DRV1, ASM1
 - Тесты сверх обязательных:
   - корректный need_research на текущий вопрос завершает ход, не pending, не зовёт владельца; новый материал → следующий вход отвечает без нового draft
   - неизменённый повтор — ноль вызовов
@@ -2432,7 +2453,7 @@
 - Пишет записи: пакет ядра
 - Разрешённые пути: `package.json`, `tsconfig.json`, `scripts/check-backend.mjs`, `test/fixtures/core1-records.ts`, `test/assessment-session-resume.test.ts`, `test/discovery.test.ts`, `test/execution-external-input.test.ts`, `test/om-accepted-answer.test.ts`, `test/om-achievements.test.ts`, `test/om-addressing.test.ts`, `test/om-answers-gate.test.ts`, `test/om-call-record.test.ts`, `test/om-compiler-readers.test.ts`, `test/om-composite-keys.test.ts`, `test/om-feasibility-boundary.test.ts`, `test/om-feasibility-projection.test.ts`, `test/om-feasibility.test.ts`, `test/om-frame-accept.test.ts`, `test/om-frame-candidate.test.ts`, `test/om-gap-lines.test.ts`, `test/om-gaps.test.ts`, `test/om-legacy-operation-lock.test.ts`, `test/om-legacy-route-closure.test.ts`, `test/om-model-call.test.ts`, `test/om-operation-cost.test.ts`, `test/om-probe.test.ts`, `test/om-question-packet.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-repeat-gate.test.ts`, `test/om-result-identity.test.ts`, `test/om-routes.test.ts`, `test/om-run.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/om-series-current.test.ts`, `test/om-series.test.ts`, `test/om-task-context.test.ts`, `test/om-task-neighbors.test.ts`, `test/om-work-zone.test.ts`, `test/preparation.test.ts`, `test/reader-pilot.test.ts`, `test/research-call-resume.test.ts`, `test/runtime-absence-r3.test.ts`, `test/runtime-absence-research.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1
+- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1
 - Тесты сверх обязательных:
   - ЧАСТЬ А (слово пользователя ~22:10 «тест смотрит только актуальную версию»; вопрос Opus-1 №3686, разрешение оркестратора): 41 файл тестов, запускающих старый движок из git, и один модуль образцов test/fixtures/core1-records.ts — формат не в живой базе → сценарий удалить; формат в живой базе → образец из снимка 1554, читает нынешний код; проверки нового не трогать
   - ДО КОДА части Б — опись легаси и список удаляемого показать пользователю; удалять после его «да»
