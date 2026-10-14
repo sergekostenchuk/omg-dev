@@ -1,3 +1,4 @@
+import type { Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import type { CodeRef, Graph } from "../graph/model.js";
 import type { Ref } from "../pipeline/contracts.js";
@@ -75,7 +76,7 @@ export interface OmFeasibilityView {
   readonly ready: boolean; readonly graph: Ref; readonly environment: Ref; readonly inputs: readonly Ref[];
   readonly obligations: { readonly handoff: Frozen<ObligationHandoffForm> };
   readonly producer: {
-    readonly candidate: Ref; readonly layer: Ref; readonly frame: Ref;
+    readonly candidate: Ref; readonly layer: Ref; readonly frame: Ref; readonly horizon: Ref;
     readonly deliveries: {
       readonly ownership: { readonly root: Ref | null; readonly indexes: { readonly [path: string]: Ref } } | null;
       readonly resolved: readonly { readonly producer: string; readonly artifact: string; readonly source: Ref | null; readonly receipt: Ref | null }[];
@@ -87,7 +88,28 @@ export interface AcceptedFrameView {
   readonly frame: OmRecord<{ readonly acceptance: { readonly candidate: Ref;
     readonly gate: { readonly name: "G3"; readonly basis?: never } | { readonly name: "G5"; readonly basis: Ref } } }> | null;
 }
-export interface AtomicGateView { readonly request: { readonly candidate: Ref; readonly neighbors: Ref } }
+export interface AtomicGateView { readonly request: { readonly candidate: Ref; readonly neighbors: Ref;
+  readonly taskContextContract?: "omg-task-context/v2" } }
+export type TaskContextBasis = { contract: "omg-task-context/v1"; gate: Ref }
+  | { contract: "omg-task-context/v2"; gate: Ref; horizon: Ref; input: Ref };
+export interface TaskSpecification {
+  contract: "selected-specification/v1";
+  contracts: { source: Ref; index: number; pointer: string; value: Json;
+    effective: { source: Ref; pointer: string; value: Json } }[];
+  preparations: { source: Ref; index: number; pointer: string; featureIndex: number; value: Json }[];
+  constraints: { source: Ref; pointer: string; value: Json };
+}
+export interface TaskSpecificationRequest { project: string; input: Ref; requirements: string[]; nodes: string[] }
+/** Narrow selection input shared with the pure task selector in OM. */
+export interface TaskSpecificationSelection {
+  project: string; inputRef: Ref;
+  input: { sources: (Ref & { stage: string })[];
+    contracts: { id: string; nodes: string[] | null; requirements: string[] }[];
+    features: { index: number; title: string; outcome: string; requirementIds: string[]; contracts: string[] }[] };
+  accepted: { stage: string; ref: Ref; fields: Record<string, Json> }[];
+  requirements: string[]; nodes: string[];
+}
+export type TaskSpecificationSelector = (request: TaskSpecificationSelection) => TaskSpecification;
 export interface NeighborNode { id: string; title: string; outcome: string; represented?: true }
 export interface NeighborChain { work: NeighborNode; operation: NeighborNode; block: NeighborNode }
 export interface DataNeighbor {
@@ -128,6 +150,8 @@ export interface DeliveryView {
 
 /** The kit, as function-valued properties so tsc checks each real reader strictly when it is installed. */
 export interface CompilerOmReaders {
+  readonly readTaskContextBasis: (store: Store, request: RecordReadRequest) => OmReaderResult<Frozen<TaskContextBasis>>;
+  readonly readTaskSpecification: (store: Store, request: TaskSpecificationRequest) => OmReaderResult<Frozen<TaskSpecification>>;
   readonly readFeasibility: (store: Store, request: RecordReadRequest) => OmReaderResult<OmRecord<OmFeasibilityView>>;
   readonly gateFeasibility: (store: Store, request: RecordReadRequest) => OmReaderResult<FeasibilityAdmission>;
   readonly neighborsOf: (graph: Graph, work: string, sources: NeighborSources) => OmReaderResult<Frozen<NeighborPacket>>;
@@ -139,7 +163,7 @@ export interface CompilerOmReaders {
   readonly readWorksFrame: (store: Store, request: CandidateReadRequest) => OmReaderResult<OmRecord<WorksFrameView>>;
 }
 const READERS = Object.freeze(["readFeasibility", "gateFeasibility", "neighborsOf", "readNeighbors", "readAtomicGate",
-  "readAcceptedFrame", "readFrame", "readDeliveries", "readWorksFrame"] as const);
+  "readAcceptedFrame", "readFrame", "readDeliveries", "readWorksFrame", "readTaskContextBasis", "readTaskSpecification"] as const);
 
 let installed: CompilerOmReaders | null = null;
 /**
@@ -156,7 +180,7 @@ export function registerCompilerOmReaders(readers: CompilerOmReaders): void {
   const kit: CompilerOmReaders = Object.freeze({ readFeasibility: readers.readFeasibility, gateFeasibility: readers.gateFeasibility,
     neighborsOf: readers.neighborsOf, readNeighbors: readers.readNeighbors, readAtomicGate: readers.readAtomicGate,
     readAcceptedFrame: readers.readAcceptedFrame, readFrame: readers.readFrame, readDeliveries: readers.readDeliveries,
-    readWorksFrame: readers.readWorksFrame });
+    readWorksFrame: readers.readWorksFrame, readTaskContextBasis: readers.readTaskContextBasis, readTaskSpecification: readers.readTaskSpecification });
   const missing = READERS.find(name => typeof kit[name] !== "function");
   if (missing) throw invalid(missing);
   if (installed) {
@@ -192,3 +216,8 @@ export const readDeliveries: CompilerOmReaders["readDeliveries"] = (store, reque
   reader("readDeliveries", request, ["project", "candidate"])(store, request);
 export const readWorksFrame: CompilerOmReaders["readWorksFrame"] = (store, request) =>
   reader("readWorksFrame", request, ["project", "candidate"])(store, request);
+
+export const readTaskContextBasis: CompilerOmReaders["readTaskContextBasis"] = (store, request) =>
+  reader("readTaskContextBasis", request, ["project", "record"])(store, request);
+export const readTaskSpecification: CompilerOmReaders["readTaskSpecification"] = (store, request) =>
+  reader("readTaskSpecification", request, ["project", "input"])(store, request);

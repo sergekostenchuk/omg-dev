@@ -1,15 +1,19 @@
 import test, { type TestContext } from 'node:test';
+import '../src/om/compiler-readers.js';
+import { selectTaskSpecification } from '../src/om/selected-specification.js';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, digest, hashJson } from '../src/canonical.js';
-import { preplanTaskContext, taskContext, taskContextContent, type ContextText } from '../src/compiler/context.js';
+import { preplanTaskContext, taskContext, taskContextContent, type ContextText, type PlanTaskContextSources } from '../src/compiler/context.js';
 import { deriveTasks } from '../src/compiler/derive.js';
-import type { CompiledTask, MachinePlan } from '../src/compiler/model.js';
+import { TASK_CONTEXT_CONTRACT, type CompiledTask, type MachinePlan } from '../src/compiler/model.js';
+import type { TaskSpecification, TaskSpecificationSelection, OmReaderResult } from '../src/compiler/om-readers.js';
+import type { AtomicGateRequest } from '../src/om/atomic-gate.js';
 import { EngineError } from '../src/errors.js';
 import { LEVEL, type Command, type Graph, type Node } from '../src/graph/model.js';
 import { RefinementRelations } from '../src/graph/relations.js';
@@ -18,7 +22,7 @@ import { frameObligations, type FrameObligation } from '../src/om/frame-obligati
 import { buildPackets, NEIGHBOR_CONTRACT, type NeighborCollection, type NeighborSources } from '../src/om/neighbors.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { writerIndexId } from '../src/ownership/writer-index.js';
-import { reference, type Ref } from '../src/pipeline/contracts.js';
+import { reference, type Ref, type StageArtifact } from '../src/pipeline/contracts.js';
 import type { Revision } from '../src/storage/store.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
@@ -29,7 +33,7 @@ const ref = (id: string): Ref => ({ id, revision: 1, hash: hashJson(id) });
 const clone = structuredClone;
 const node = (graph: Graph, id: string): Node => graph.nodes.find(item => item.id === id)!;
 type PreplanRequest = Parameters<typeof preplanTaskContext>[0];
-function ok<T>(value: OmResult<T>): T {
+function ok<T>(value: OmResult<T> | OmReaderResult<T>): T {
   if (!value.ok) assert.fail(`${value.refusal.code}: ${value.refusal.message}`);
   return value.value;
 }
@@ -357,4 +361,329 @@ test('V2 unchanged legacy bytes and hashes match the complete aa8eb1d source gra
   for (const [index, entry] of entries.entries())
     assert.deepEqual(taskContext(entry.plan, entry.fullCheck, entry.task, 1_000_000), historical[index], `legacy case ${index}`);
   assert.notEqual(historical[0]!.text, historical[2]!.text, 'Missing and explicit empty D7 remain different legacy payloads');
+});
+
+function sp1ContextFixture() {
+  const f = fixture(), saved = plan(f.graph, f.tasks);
+  saved.value.feasibility = ref(`om-feasibility:${project}`);
+  saved.value.taskContextContract = TASK_CONTEXT_CONTRACT;
+  saved.hash = hashJson(saved.value);
+  const input = ref(`om-input:${project}`), specificationRef = ref(`stage:${project}:specification`), features = ref(`stage:${project}:features`);
+  const specification: TaskSpecification = { contract: 'selected-specification/v1',
+    contracts: [{ source: specificationRef, index: 3, pointer: '/content/fields/behaviorContracts/3',
+      value: { id: 'B1', entry: 'Begin the bounded operation', inputs: ['external input'], compatibility: ['retain v1 clients'],
+        state: { writer: 'the responsible component' }, mentionedFile: 'do-not-authorize.txt' },
+      effective: { source: input, pointer: '/contracts/3', value: { id: 'B1', nodes: [f.task.node], state: { writer: f.task.node } } } }],
+    preparations: [{ source: features, index: 2, featureIndex: 1, pointer: '/content/fields/featurePreparation/2',
+      value: { featureTitle: 'Bounded behavior', outcome: f.task.outcome, beneficiary: 'operator', benefit: 'stable result',
+        success: ['consumer sees result'], failures: ['missing input refused'], interactions: ['another contract B2 is context only'] } }],
+    constraints: { source: specificationRef, pointer: '/content/fields/constraints', value: ['No silent loss of material'] } };
+  const sources: PlanTaskContextSources = { plan: reference(saved), graph: saved.value.graph, candidate: f.request.basis.candidate,
+    references: [saved.value.graph, saved.value.environment, saved.value.feasibility, f.request.basis.candidate],
+    neighbors: neighborSources(f.graph), deliveryOwnership: f.request.neighbors.value.source.ownership,
+    specification: { basis: { contract: TASK_CONTEXT_CONTRACT, gate: ref(`om-atomic-gate:${project}:gate`),
+      horizon: ref(`om-horizon:${project}:horizon`), input }, tasks: { [f.task.id]: specification } } };
+  return { ...f, saved, sources, specification, request: { ...f.request, taskContextContract: TASK_CONTEXT_CONTRACT, specification } };
+}
+
+test('SP1b the preliminary and saved-plan contexts retain the same complete original and effective specification without granting extra paths', () => {
+  const f = sp1ContextFixture(), before = clone(f.task);
+  const pre = JSON.parse(preplanTaskContext(f.request, 1_000_000).text);
+  const actual = JSON.parse(taskContext(f.saved, FULL_CHECK, f.task.id, 1_000_000, f.sources).text);
+  assert.equal(pre.version, 'omg-task-context/preplan-v2'); assert.equal(actual.version, TASK_CONTEXT_CONTRACT);
+  assert.deepEqual(pre.selectedSpecification, f.specification); assert.deepEqual(actual.selectedSpecification, f.specification);
+  assert.equal(actual.selectedSpecification.contracts[0].pointer, '/content/fields/behaviorContracts/3');
+  assert.equal(actual.selectedSpecification.contracts[0].effective.pointer, '/contracts/3');
+  assert.notEqual(actual.selectedSpecification.contracts[0].value.state.writer, actual.selectedSpecification.contracts[0].effective.value.state.writer);
+  for (const context of [pre, actual]) {
+    assert.deepEqual(context.scope.writePaths, f.task.writePaths);
+    assert.equal(context.scope.writePaths.includes('do-not-authorize.txt'), false);
+    assert.deepEqual(context.contracts, taskContextContent({ graph: f.graph, task: f.task, fullCheck: FULL_CHECK }).contracts,
+      'Graph schemas retain their distinct meaning');
+  }
+  assert.deepEqual(f.task, before);
+});
+
+test('SP1b mandatory specification is measured whole at the exact limit and an overflow names the task and source before sending', () => {
+  const f = sp1ContextFixture(), legacy = fixture();
+  const prior = preplanTaskContext(legacy.request, 1_000_000), full = preplanTaskContext(f.request, 1_000_000);
+  assert.ok(full.chars > prior.chars); assert.deepEqual(preplanTaskContext(f.request, full.chars), full);
+  for (const capacity of [prior.chars, full.chars - 1]) assert.throws(() => preplanTaskContext(f.request, capacity), (error: unknown) => {
+    assert.ok(error instanceof EngineError); assert.equal(error.code, 'context_budget_exceeded');
+    const details = error.details as { requiredChars: number; maxChars: number; target: string; field: string; sources: Ref[] };
+    assert.equal(details.requiredChars, full.chars); assert.equal(details.maxChars, capacity); assert.equal(details.target, f.task.id);
+    assert.equal(details.field, 'selectedSpecification');
+    for (const source of [f.specification.constraints.source, f.specification.contracts[0]!.effective.source, f.specification.preparations[0]!.source])
+      assert.ok(details.sources.some(ref => canonical(ref) === canonical(source)));
+    return true;
+  });
+  const actual = taskContext(f.saved, FULL_CHECK, f.task.id, 1_000_000, f.sources);
+  assert.deepEqual(taskContext(f.saved, FULL_CHECK, f.task.id, actual.chars, f.sources), actual);
+  assert.throws(() => taskContext(f.saved, FULL_CHECK, f.task.id, actual.chars - 1, f.sources),
+    (error: unknown) => error instanceof EngineError && error.code === 'context_budget_exceeded');
+});
+
+test('SP1b declared context with missing material refuses at the pure boundary while an unmarked legacy route stays byte exact', () => {
+  const f = sp1ContextFixture(), { specification: _specification, ...missing } = f.request;
+  sourceError(() => preplanTaskContext(missing, 1_000_000));
+  const { specification: _sources, ...sources } = f.sources;
+  sourceError(() => taskContext(f.saved, FULL_CHECK, f.task.id, 1_000_000, sources));
+  const legacy = fixture(), saved = plan(legacy.graph, legacy.tasks), before = taskContext(saved, FULL_CHECK, legacy.task.id, 1_000_000);
+  const payload = JSON.parse(before.text);
+  assert.equal(payload.version, 'omg-task-context/v1'); assert.equal(Object.hasOwn(payload, 'selectedSpecification'), false);
+  assert.deepEqual(taskContext(saved, FULL_CHECK, legacy.task.id, before.chars), before);
+  const unmarked = { ...legacy.request, specification: f.specification };
+  sourceError(() => preplanTaskContext(unmarked, 1_000_000));
+});
+
+// A real live snapshot is supplied by the operator; the test never manufactures an old-era database.
+test('SP1b actual saved v1 plan and G5 keep their exact era after a native stage change and restart; the lower selector reads original stage refs',
+  { skip: !process.env['OMG_SP1_HISTORY_SNAPSHOT'], timeout: 300_000 }, async t => {
+  const { DatabaseSync, backup } = await import('node:sqlite');
+  const { Store } = await import('../src/storage/store.js');
+  const { loadTaskContextSources } = await import('../src/compiler/context.js');
+  const { readAtomicGate, writeAtomicGate } = await import('../src/om/atomic-gate.js');
+  const { readTaskContextBasis } = await import('../src/compiler/om-readers.js');
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { taskSpecificationReader } = await import('../src/om/compiler-readers.js');
+  const root = mkdtempSync(join(tmpdir(), 'omg-sp1-history-')), path = join(root, 'history.sqlite');
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const original = new DatabaseSync(process.env['OMG_SP1_HISTORY_SNAPSHOT']!, { readOnly: true });
+  try { await backup(original, path); } finally { original.close(); }
+  let store = new Store(path);
+  t.after(() => store.close());
+  const saved = store.list<MachinePlan>('plan').find(row => row.value.feasibility.id.startsWith('om-feasibility:')
+    && !Object.hasOwn(row.value, 'taskContextContract'))!;
+  assert.ok(saved, 'The supplied live snapshot contains an authentic old plan');
+  const engine = new ProductEngine(store);
+  assert.deepEqual(engine.compiler.read(saved.id), saved);
+  const basis = readTaskContextBasis(store, { project: saved.value.projectId, record: saved.value.feasibility });
+  assert.equal(basis.ok, true); if (!basis.ok) return;
+  assert.equal(basis.value.contract, 'omg-task-context/v1');
+  const gate = ok(readAtomicGate(store, { project: saved.value.projectId, record: basis.value.gate }));
+  assert.equal(Object.hasOwn(gate.value.request, 'taskContextContract'), false);
+  assert.deepEqual(ok(writeAtomicGate(store, clone(gate.value.request) as AtomicGateRequest)), gate, 'A late exact repeat never upgrades the saved gate');
+  const environment = store.get<{ fullCheck: Command }>(saved.value.environment.id, saved.value.environment.revision)!;
+  const contexts = () => {
+    const sources = loadTaskContextSources(store, saved);
+    assert.equal(sources?.specification, undefined);
+    return saved.value.tasks.map(task => taskContext(saved, environment.value.fullCheck, task.id, 1_000_000, sources));
+  };
+  const before = contexts();
+  assert.ok(before.length > 0);
+  const inputRef = gate.value.request.gaps.sources.input;
+  let selected: TaskSpecificationSelection | undefined;
+  const reader = taskSpecificationReader(selection => {
+    selected = selection;
+    const specification = selection.accepted.find(stage => stage.stage === 'specification')!;
+    assert.ok(specification); assert.ok(Array.isArray(specification.fields['constraints']));
+    return { contract: 'selected-specification/v1', contracts: [], preparations: [], constraints: {
+      source: specification.ref, pointer: '/content/fields/constraints', value: specification.fields['constraints']! } };
+  });
+  const request = { project: saved.value.projectId, input: inputRef, requirements: ['fixture-requirement'], nodes: ['fixture-work', 'fixture-operation'] };
+  const originalSelection = ok(reader(store, request));
+  assert.ok(selected); assert.deepEqual(selected.inputRef, inputRef);
+  assert.deepEqual(selected.requirements, request.requirements); assert.deepEqual(selected.nodes, request.nodes);
+  for (const source of selected.input.sources) {
+    const delivered: TaskSpecificationSelection['accepted'][number] = selected.accepted.find(stage => stage.stage === source.stage)!;
+    const exact = store.get<StageArtifact>(source.id, source.revision)!;
+    assert.deepEqual(delivered.ref, reference(exact));
+    assert.deepEqual(delivered.fields, (exact.value.content as { fields: unknown }).fields, 'Full original fields reach the shared selector');
+  }
+  const oldSpecification = store.get<StageArtifact>(originalSelection.constraints.source.id)!;
+  const content = clone(oldSpecification.value.content) as { fields: Record<string, import('../src/canonical.js').Json> };
+  content.fields['constraints'] = ['A later draft must not replace material bound by the old plan'];
+  const changed = engine.pipeline.draft(saved.value.projectId, 'specification', content, oldSpecification.revision);
+  assert.ok(changed.revision > oldSpecification.revision);
+  assert.deepEqual(ok(reader(store, request)), originalSelection);
+  assert.deepEqual(contexts(), before);
+
+  for (const result of before) {
+    const body = JSON.parse(result.text);
+    assert.equal(body.version, 'omg-task-context/v1'); assert.equal(Object.hasOwn(body, 'selectedSpecification'), false);
+  }
+  store.close(); store = new Store(path);
+  assert.deepEqual(contexts(), before);
+  assert.deepEqual(ok(reader(store, request)), originalSelection);
+  assert.deepEqual(new ProductEngine(store).compiler.read(saved.id), saved);
+});
+
+
+function sp1Selection(): TaskSpecificationSelection {
+  const specification = ref(`stage:${project}:specification`), features = ref(`stage:${project}:features`);
+  const originals = ['unrelated', 'required', 'node', 'ancestor'].map(id => ({ id,
+    entry: `entry ${id}`, inputs: [`input ${id}`], compatibility: `compatibility ${id}`,
+    state: { writer: `original writer ${id}` } }));
+  return { project, inputRef: ref(`om-input:${project}`), requirements: [], nodes: [],
+    input: { sources: [{ ...specification, stage: 'specification' }, { ...features, stage: 'features' }],
+      contracts: [
+        { ...originals[0]!, id: 'unrelated', nodes: ['elsewhere'], requirements: ['elsewhere'] },
+        { ...originals[3]!, id: 'ancestor', nodes: ['parent'], requirements: [] },
+        { ...originals[1]!, id: 'required', nodes: null, requirements: ['R'] },
+        { ...originals[2]!, id: 'node', nodes: ['work'], requirements: [], state: { writer: 'resolved-work' } },
+      ], features: [
+        { index: 0, title: 'same title', outcome: 'other outcome', requirementIds: [], contracts: ['unrelated'] },
+        { index: 1, title: 'same title', outcome: 'chosen outcome', requirementIds: [], contracts: ['required', 'unrelated'] },
+        { index: 2, title: 'by requirement', outcome: 'requirement outcome', requirementIds: ['F'], contracts: ['unrelated'] },
+      ] }, accepted: [
+      { stage: 'specification', ref: specification, fields: { behaviorContracts: originals, constraints: ['global constraint'] } },
+      { stage: 'features', ref: features, fields: { featurePreparation: [
+        { featureTitle: 'by requirement', outcome: 'requirement outcome', beneficiary: 'F user', interactions: ['extra action is context'] },
+        { featureTitle: 'same title', outcome: 'other outcome', beneficiary: 'unrelated user' },
+        { featureTitle: 'same title', outcome: 'chosen outcome', beneficiary: 'chosen user', benefit: 'useful result',
+          success: ['success'], failures: ['failure'], interactions: ['do not grant extra.txt'], contracts: ['required', 'unrelated'] },
+      ] } },
+    ] };
+}
+for (const mode of ['requirement', 'node', 'ancestor'] as const)
+test(`SP1b task selection by ${mode} keeps exact original indices and resolved B1 values`, () => {
+  const request = sp1Selection();
+  if (mode === 'requirement') request.requirements = ['R']; else request.nodes = mode === 'node' ? ['work'] : ['child', 'parent'];
+  const before = canonical(request), selected = selectTaskSpecification(request);
+  assert.equal(selected.contracts.length, 1);
+  const row = selected.contracts[0]!;
+  const id = mode === 'requirement' ? 'required' : mode;
+  assert.equal((row.value as any).id, id);
+  const originalIndex = ['unrelated', 'required', 'node', 'ancestor'].indexOf(id);
+  const effectiveIndex = request.input.contracts.findIndex(value => value.id === id);
+  assert.equal(row.pointer, `/content/fields/behaviorContracts/${originalIndex}`);
+  assert.deepEqual(row.effective, { source: request.inputRef, pointer: `/contracts/${effectiveIndex}`, value: request.input.contracts[effectiveIndex] });
+  assert.deepEqual(row.source, request.accepted[0]!.ref);
+  assert.deepEqual(selected.constraints.value, ['global constraint']);
+  assert.equal(canonical(request), before);
+  if (mode === 'node') assert.notDeepEqual((row.value as any).state, (row.effective.value as any).state);
+});
+
+test('SP1b features use requirement or exact selected contract without title matching or recursive contract expansion', () => {
+  const request = sp1Selection(); request.requirements = ['R', 'F'];
+  const selected = selectTaskSpecification(request);
+  assert.deepEqual(selected.contracts.map(row => (row.value as any).id), ['required']);
+  assert.deepEqual(selected.preparations.map(row => row.featureIndex), [2, 1]);
+  assert.deepEqual(selected.preparations.map(row => row.pointer), ['/content/fields/featurePreparation/0', '/content/fields/featurePreparation/2']);
+  assert.equal((selected.preparations[1]!.value as any).beneficiary, 'chosen user');
+  (selected.preparations[1]!.value as any).beneficiary = 'caller edit';
+  assert.equal((selectTaskSpecification(request).preparations[1]!.value as any).beneficiary, 'chosen user');
+});
+
+test('SP1b pure selection refuses a foreign basis and missing or ambiguous selected preparation with addresses', () => {
+  const request = sp1Selection(); request.requirements = ['R'];
+  for (const kind of ['input', 'stage', 'missing', 'ambiguous'] as const) {
+    const changed = clone(request);
+    if (kind === 'input') changed.inputRef = ref('om-input:other');
+    if (kind === 'stage') changed.accepted[0]!.ref = ref('stage:other:specification');
+    if (kind === 'missing') changed.accepted[1]!.fields['featurePreparation'] = [];
+    if (kind === 'ambiguous') (changed.accepted[1]!.fields['featurePreparation'] as any[]).push(clone((changed.accepted[1]!.fields['featurePreparation'] as any[])[2]));
+    assert.throws(() => selectTaskSpecification(changed), (error: unknown) => error instanceof EngineError
+      && error.code === (kind === 'input' || kind === 'stage' ? 'selected_specification_basis_invalid' : 'selected_specification_unresolved')
+      && !!(error.details as any).target && !!(error.details as any).field, kind);
+  }
+});
+
+/** Reuse the current legal C3/C4/C5→G5 fixture, without importing its test registrations or a historical producer. */
+async function sp1CurrentWorks(t: TestContext) {
+  const url = new URL('./om-feasibility.test.js', import.meta.url);
+  const compiled = readFileSync(url, 'utf8'), end = compiled.indexOf('const heads =');
+  assert.ok(end > 0);
+  const source = compiled.slice(0, end).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g,
+    (_match, _quote, path) => 'from ' + JSON.stringify(new URL(path, url).href));
+  assert.equal(/\btest\(/.test(source), false);
+  const fixture = await import('data:text/javascript;base64,' + Buffer.from(source + '\nexport { acceptedWorksFixture };').toString('base64'));
+  return fixture.acceptedWorksFixture(t);
+}
+
+test('SP1b current G5 and compiled v2 plan deliver the same full material and later stages cannot replace its exact sources', async t => {
+  const f = await sp1CurrentWorks(t);
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { writeFeasibility } = await import('../src/om/feasibility.js');
+  const { writeHandoff } = await import('../src/om/handoff.js');
+  const { readNeighbors } = await import('../src/om/neighbors.js');
+  const { loadTaskContextSources } = await import('../src/compiler/context.js');
+  const engine = new ProductEngine(f.store), m8 = ok(writeFeasibility(f.store, f.feasibility));
+  ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
+  const plan = engine.compiler.compile(f.project);
+  assert.equal(plan.value.taskContextContract, TASK_CONTEXT_CONTRACT);
+  assert.equal(plan.value.derivation, 'external-inputs/v1');
+  assert.equal(f.gate.value.request.taskContextContract, TASK_CONTEXT_CONTRACT);
+  assert.deepEqual(engine.compiler.compile(f.project), plan);
+  const sources = loadTaskContextSources(f.store, plan)!;
+  const task = plan.value.tasks[0]!, neighbors = ok(readNeighbors(f.store, { project: f.project, neighbors: f.gate.value.request.neighbors }));
+  const actual = engine.compiler.context(f.project, reference(plan), task.id, 1_000_000);
+  const selected = JSON.parse(actual.text).selectedSpecification;
+  assert.ok(selected.contracts.length > 0); assert.ok(selected.preparations.length > 0);
+  const preplan = preplanTaskContext({ project: f.project, graph: plan.value.graphSnapshot, task,
+    fullCheck: f.environment.value.fullCheck, basis: { candidate: f.gate.value.request.candidate, environment: plan.value.environment },
+    neighbors: neighbors as Revision<NeighborCollection>, taskContextContract: TASK_CONTEXT_CONTRACT, specification: selected }, 1_000_000);
+  assert.deepEqual(JSON.parse(preplan.text).selectedSpecification, selected);
+  assert.deepEqual(sources.specification!.tasks[task.id], selected);
+  const raw = f.store.get(selected.contracts[0].source.id, selected.contracts[0].source.revision)!;
+  assert.deepEqual(selected.contracts[0].value, raw.value.content.fields.behaviorContracts[selected.contracts[0].index]);
+  assert.ok(sources.references.some(item => canonical(item) === canonical(selected.contracts[0].source)));
+  assert.ok(sources.references.some(item => canonical(item) === canonical(selected.contracts[0].effective.source)));
+  assert.equal(selected.contracts[0].effective.source.id, `om-input:${f.project}`);
+  const beforeTask = canonical(task), oldStage = f.store.get(selected.constraints.source.id)!;
+  const changed = clone(oldStage.value.content); changed.fields.constraints = ['A later stage is not this plan material'];
+  engine.pipeline.draft(f.project, 'specification', changed, oldStage.revision);
+  f.restart(); const restarted = new ProductEngine(f.store);
+  assert.deepEqual(taskContext(plan, f.environment.value.fullCheck, task.id, 1_000_000,
+    loadTaskContextSources(f.store, plan)), actual);
+  assert.throws(() => restarted.compiler.context(f.project, reference(plan), task.id, 1_000_000), { code: 'plan_stale' });
+  assert.deepEqual(restarted.compiler.read(plan.id), plan);
+  assert.equal(canonical(restarted.compiler.read(plan.id).value.tasks[0]), beforeTask);
+  assert.throws(() => restarted.compiler.compile(f.project), EngineError);
+});
+
+
+for (const changedBasis of ['specification', 'environment'] as const)
+test(`SP1b compile guards ${changedBasis} changed by another Store before publishing the v2 plan`, async t => {
+  const f = await sp1CurrentWorks(t);
+  const { Store } = await import('../src/storage/store.js');
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { writeFeasibility } = await import('../src/om/feasibility.js');
+  const { writeHandoff } = await import('../src/om/handoff.js');
+  const engine = new ProductEngine(f.store), m8 = ok(writeFeasibility(f.store, f.feasibility));
+  ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
+  const otherStore = new Store(f.database), other = new ProductEngine(otherStore); t.after(() => otherStore.close());
+  const write = f.store.writeMany.bind(f.store); let shifted = false;
+  f.store.writeMany = ((writes: import('../src/storage/store.js').Write[], guards = []) => {
+    if (!shifted && writes.some(row => row.kind === 'plan')) {
+      shifted = true;
+      if (changedBasis === 'specification') {
+        const stage = otherStore.get<StageArtifact>(`stage:${f.project}:specification`)!;
+        other.pipeline.draft(f.project, 'specification', stage.value.content, stage.revision);
+      } else {
+        const environment = other.environments.get(f.project), { projectId: _project, ...value } = environment.value;
+        other.environments.configure(f.project, { ...value, requestCapacityChars: 250_000 }, environment.revision);
+      }
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  assert.throws(() => engine.compiler.compile(f.project), { code: 'input_stale' });
+  f.store.writeMany = write;
+  assert.ok(shifted); assert.equal(f.store.list('plan').length, 0); assert.equal(f.store.get(`current-plan:${f.project}`), null);
+});
+
+
+test('SP1b exact plan repeat guards the current stage before returning an existing plan', async t => {
+  const f = await sp1CurrentWorks(t);
+  const { Store } = await import('../src/storage/store.js');
+  const { ProductEngine } = await import('../src/product/engine.js');
+  const { writeFeasibility } = await import('../src/om/feasibility.js');
+  const { writeHandoff } = await import('../src/om/handoff.js');
+  const engine = new ProductEngine(f.store), m8 = ok(writeFeasibility(f.store, f.feasibility));
+  ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
+  const plan = engine.compiler.compile(f.project);
+  const otherStore = new Store(f.database), other = new ProductEngine(otherStore); t.after(() => otherStore.close());
+  const get = f.store.get.bind(f.store); let shifted = false;
+  f.store.get = ((id: string, revision?: number) => {
+    const result = get(id, revision);
+    if (!shifted && id === plan.id && revision === undefined) {
+      shifted = true;
+      const stage = otherStore.get<StageArtifact>(`stage:${f.project}:features`)!;
+      other.pipeline.draft(f.project, 'features', stage.value.content, stage.revision);
+    }
+    return result;
+  }) as typeof f.store.get;
+  assert.throws(() => engine.compiler.compile(f.project), { code: 'plan_stale' });
+  f.store.get = get;
+  assert.ok(shifted); assert.equal(f.store.list('plan').length, 1); assert.deepEqual(f.store.get(plan.id), plan);
 });

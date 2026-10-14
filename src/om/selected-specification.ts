@@ -1,5 +1,6 @@
 import { canonical, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
+import type { TaskSpecification, TaskSpecificationSelection } from '../compiler/om-readers.js';
 import { isRef, stageId, type Ref } from '../pipeline/contracts.js';
 
 /**
@@ -79,4 +80,28 @@ export function selectSpecification(request: SelectedSpecificationRequest): Sele
   }).sort((a, b) => a.index - b.index);
   return { contract: SELECTED_SPECIFICATION_CONTRACT, contracts, preparations: prepared,
     constraints: { source: exact(specification.ref), pointer: `${FIELDS}/constraints`, value: constraints as Json } };
+}
+
+
+/** Task scope uses resolved B1 bindings; selecting a feature never recursively expands its contracts. */
+export function selectTaskSpecification(request: TaskSpecificationSelection): TaskSpecification {
+  const { project, inputRef, input, accepted, requirements, nodes } = request;
+  if (!isRef(inputRef) || inputRef.id !== `om-input:${project}`)
+    failure('selected_specification_basis_invalid', `om-input:${project}`, 'input', 'Task material needs the exact input of its project');
+  const required = new Set(requirements), ancestry = new Set(nodes);
+  const contracts = input.contracts.flatMap((value, index) => value.requirements.some(id => required.has(id))
+    || value.nodes?.some(id => ancestry.has(id)) ? [{ index, value }] : []);
+  const ids = new Set(contracts.map(row => row.value.id));
+  const features = input.features.filter(feature => feature.requirementIds.some(id => required.has(id))
+    || feature.contracts.some(id => ids.has(id)));
+  const selected = selectSpecification({ project, sources: input.sources, accepted,
+    contracts: [...ids], features });
+  return structuredClone({ ...selected, contracts: selected.contracts.map(row => {
+    const id = (row.value as Row).id;
+    const effective = contracts.filter(item => item.value.id === id);
+    if (effective.length !== 1) failure('selected_specification_unresolved', String(id), '/contracts',
+      'A selected original has one effective B1 contract', inputRef);
+    const resolved = effective[0]!;
+    return { ...row, effective: { source: exact(inputRef), pointer: `/contracts/${resolved.index}`, value: resolved.value as unknown as Json } };
+  }) });
 }

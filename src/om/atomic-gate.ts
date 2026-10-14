@@ -1,9 +1,9 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import { preplanTaskContext } from '../compiler/context.js';
+import { loadTaskSpecification, preplanTaskContext } from '../compiler/context.js';
 import { deriveTasks } from '../compiler/derive.js';
 import { resolveExternalSource } from '../compiler/inputs.js';
-import type { TaskInput } from '../compiler/model.js';
+import { TASK_CONTEXT_CONTRACT, type TaskInput } from '../compiler/model.js';
 import { readWriter, type WriterProof } from '../ownership/owners.js';
 import type { Environment, ExecutionRoot } from '../runtime/environment.js';
 import type { Graph } from '../graph/model.js';
@@ -17,6 +17,7 @@ import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.
 import { noteUntracedRead, Store, type Revision, type Write } from '../storage/store.js';
 import { provenReads, registerSourceOverlay } from '../storage/store-view.js';
 import { readCapacity as readCapacityOf } from './capacity.js';
+import { taskSpecificationReader } from './task-specification.js';
 import { readDeliveries as readDeliveriesOf } from './deliveries.js';
 import { prepareSettleCandidate as prepareSettleCandidateOf, readAcceptedFrame as readAcceptedFrameOf, readRejectedCandidate as readRejectedCandidateOf, type AcceptedFrameRequest } from './frame-accept.js';
 import type { CandidateRequest, FrameCandidateRecord } from './frame-candidate.js';
@@ -54,6 +55,7 @@ export type AtomicGateSource = 'refs' | 'capacity' | 'deliveries' | 'frame-accep
 export type AtomicGateCode = AtomicGateLocalCode | SourceCodes<AtomicGateSource>;
 export type AtomicGateResult<T> = OmResult<T, AtomicGateCode>;
 
+const readTaskSpecification = taskSpecificationReader();
 const readCapacity = transferring('capacity', readCapacityOf);
 const readDeliveries = transferring('deliveries', readDeliveriesOf);
 const prepareSettleCandidate = transferring('frame-accept', prepareSettleCandidateOf);
@@ -102,6 +104,7 @@ export interface WorkProposalSource { kind: 'part' | 'assembly' | 'reuse'; recor
 export interface AtomicGateRequest {
   project: string; candidate: Ref; neighbors: Ref; environment: Ref; gaps: GapReadRequest; results: WorkProposalSource[]; sources: Ref[];
   snapshot?: RepositorySnapshot | null;
+  taskContextContract?: typeof TASK_CONTEXT_CONTRACT;
 }
 export interface AtomicGateRecord {
   contract: typeof ATOMIC_GATE_CONTRACT | typeof ATOMIC_GATE_IMPACT_CONTRACT; project: string; request: AtomicGateRequest;
@@ -149,12 +152,19 @@ function requireRequest(store: Store, request: AtomicGateRequest): void {
     || ![request.candidate, request.neighbors, request.environment].every(isRef) || !object(request.gaps)
     || !sourcesShape(request.results) || !sourcesRefs(request.sources)
     || Object.hasOwn(request, 'snapshot') && request.snapshot !== null && !validSnapshot(request.snapshot)
-    || Object.keys(request).some(key => !['project', 'candidate', 'neighbors', 'environment', 'gaps', 'results', 'sources', 'snapshot'].includes(key))) invalid('request');
+    || Object.hasOwn(request, 'taskContextContract') && request.taskContextContract !== TASK_CONTEXT_CONTRACT
+    || Object.keys(request).some(key => !['project', 'candidate', 'neighbors', 'environment', 'gaps', 'results', 'sources', 'snapshot', 'taskContextContract'].includes(key))) invalid('request');
 }
 
 const normalizedGateRequest = (request: AtomicGateRequest): AtomicGateRequest =>
   ({ ...copy(request), sources: sorted(request.sources), results: sorted(request.results) });
 const gateId = (request: AtomicGateRequest) => `om-atomic-gate:${request.project}:${hashJson(request)}`;
+function issuedRequest(store: Store, request: AtomicGateRequest): AtomicGateRequest {
+  request = normalizedGateRequest(request);
+  // A saved G5 keeps its own era, including current re-admission through C5. A new identity measures v2.
+  if (request.taskContextContract || store.get(gateId(request))) return request;
+  return { ...request, taskContextContract: TASK_CONTEXT_CONTRACT };
+}
 
 /** A preview has the same exact revisions as the one final transaction; it never writes to the store. */
 class Transaction {
@@ -425,8 +435,10 @@ function packetCapacity(store: Store, request: AtomicGateRequest, candidate: Fra
   if (used.size !== external.size) fail('atomic_gate_basis_unproven', request.candidate.id, 'sources', 'A context names exactly its necessary external sources');
   const findings: Finding[] = [...derived.obligations.findings];
   for (const task of derived.tasks) {
+    const selected = request.taskContextContract ? { taskContextContract: request.taskContextContract,
+      specification: loadTaskSpecification(store, request.project, request.gaps.sources.input, graph, task, readTaskSpecification) } : {};
     try { preplanTaskContext({ project: request.project, graph, task, fullCheck: fullCheck!,
-      basis: { candidate: request.candidate, environment: request.environment }, neighbors }, limit); }
+      basis: { candidate: request.candidate, environment: request.environment }, neighbors, ...selected }, limit); }
     catch (error) {
       if (!(error instanceof EngineError) || error.code !== 'context_budget_exceeded') throw error;
       const size = error.details as { requiredChars: number; maxChars: number };
@@ -599,6 +611,13 @@ function deriveGate(store: Store, request: AtomicGateRequest, current: boolean):
   if (request.gaps.sources.project !== request.project || !same(request.gaps.sources.works, {
     frame: candidate.value.request.frame, proposals: candidate.value.request.proposals }))
     fail('atomic_gate_basis_unproven', request.candidate.id, 'gaps', 'The complete D1 set must describe the final proposals');
+  const guards: Ref[] = [], writes: Write[] = [];
+  if (current) {
+    const gaps = take(prepareCurrentGaps(store, request.gaps)); guards.push(...gaps.guards);
+    const prepared = take(prepareNeighbors(store, { project: request.project, candidate: request.candidate }));
+    if (!same(prepared.reference, request.neighbors)) fail('input_stale', request.neighbors.id, 'source', 'The neighbors must match the complete current delivery derivation');
+    guards.push(...prepared.guards, ...request.sources, request.candidate, request.neighbors); writes.push(...prepared.writes);
+  }
   const references = proveBindingTransfer(store, request, candidate.value as FrameCandidateRecord);
   const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
   const impact = Object.hasOwn(request, 'snapshot') ? impactOf(store, request, candidate.value.graph as Graph) : null;
@@ -611,13 +630,7 @@ function deriveGate(store: Store, request: AtomicGateRequest, current: boolean):
     ...(impact ? { impact: impact.record } : {}) };
   const record: Revision<AtomicGateRecord> = { id: gateId(request),
     kind: 'om-atomic-gate', revision: 1, hash: hashJson(value), value };
-  const guards: Ref[] = [], writes: Write[] = [];
-  if (current) {
-    const gaps = take(prepareCurrentGaps(store, request.gaps)); guards.push(...gaps.guards);
-    const prepared = take(prepareNeighbors(store, { project: request.project, candidate: request.candidate }));
-    if (!same(prepared.reference, request.neighbors)) fail('input_stale', request.neighbors.id, 'source', 'The neighbors must match the complete current delivery derivation');
-    guards.push(...prepared.guards, ...capacity.guards, ...request.sources, request.candidate, request.neighbors); writes.push(...prepared.writes);
-  }
+  if (current) guards.push(...capacity.guards);
   return { record, writes, guards: unique(guards), references: unique([...references, request.candidate, request.neighbors,
     request.environment, ...request.sources, ...request.gaps.records]) };
 }
@@ -633,7 +646,8 @@ export function readAtomicGate(store: Store, request: { project: string; record:
 }
 export function prepareAtomicGate(store: Store, request: AtomicGateRequest): AtomicGateResult<Sealed<PreparedAtomicGate>> {
   return run(() => {
-    const prepared = deriveGate(store, request, true), existing = store.get(prepared.record.id);
+    requireRequest(store, request);
+    const prepared = deriveGate(store, issuedRequest(store, request), true), existing = store.get(prepared.record.id);
     if (existing) {
       const saved = take(readAtomicGate(store, { project: request.project, record: reference(existing) }));
       if (!same(saved, prepared.record)) fail('atomic_gate_record_forged', existing.id, 'request', 'An outcome identity cannot be reused');
@@ -644,7 +658,7 @@ export function prepareAtomicGate(store: Store, request: AtomicGateRequest): Ato
 }
 export function writeAtomicGate(store: Store, request: AtomicGateRequest): AtomicGateResult<Sealed<Revision<AtomicGateRecord>>> {
   return run(() => {
-    requireRequest(store, request); request = normalizedGateRequest(request);
+    requireRequest(store, request); request = issuedRequest(store, request);
     const existing = store.get(gateId(request));
     // Returning an immutable prior outcome is not a new admission; C5 always uses prepareAtomicGate for current guards.
     if (existing) return take(readAtomicGate(store, { project: request.project, record: reference(existing) })) as Revision<AtomicGateRecord>;

@@ -8,7 +8,7 @@ import { types } from 'node:util';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, digest, hashJson, type Json } from '../src/canonical.js';
-import { preplanTaskContext } from '../src/compiler/context.js';
+import { loadTaskSpecification, preplanTaskContext } from '../src/compiler/context.js';
 import { resolveArtifact, resolveExternalSource } from '../src/compiler/inputs.js';
 import { Evidence, type Source } from '../src/evidence/evidence.js';
 import { git, type RepositoryState } from '../src/runtime/environment.js';
@@ -96,7 +96,9 @@ function measuredContexts(store: Store, gate: AtomicGateRecord) {
     { version: 2, owner: () => null, researchObligations: bindings.byNode }).tasks;
   return tasks.map(task => ({ task, context: preplanTaskContext({ project: request.project, graph, task,
     fullCheck: environment.value.fullCheck, basis: { candidate: request.candidate, environment: request.environment },
-    neighbors: neighbors as Revision<NeighborCollection> }, 1_000_000) }));
+    neighbors: neighbors as Revision<NeighborCollection>, ...(request.taskContextContract ? {
+      taskContextContract: request.taskContextContract, specification: loadTaskSpecification(store, request.project,
+        request.gaps.sources.input, graph, task) } : {}) }, 1_000_000) }));
 }
 
 function addressFixtureFields(store: Store, project: string, input: Ref, graph: Ref, layers: Ref[], extra: InputDecisionProposal['decision'][] = []) {
@@ -504,7 +506,8 @@ test('F5 accepts real E2.1 and E4 work results with two distinct consumers, reba
   assert.ok(contexts.some(item => item.task.researchObligations!.length === 2));
   for (const item of contexts) {
     const payload = JSON.parse(item.context.text);
-    assert.equal(payload.version, 'omg-task-context/preplan-v1');
+    assert.equal(payload.version, 'omg-task-context/preplan-v2');
+    assert.equal(payload.selectedSpecification.contract, 'selected-specification/v1');
     assert.deepEqual(payload.criteria.researchObligations, item.task.researchObligations);
     assert.ok(payload.binding.candidate); assert.ok(payload.binding.environment); assert.ok(payload.binding.neighbors);
   }
@@ -1337,4 +1340,71 @@ test('AT1 return №4155 п.2, №4160 п.2: G5 accepts the five declared forms;
     assert.deepEqual(answered(['src/a.ts#commit']).findings, [], `${text}: the fact proves the point`);
     assert.deepEqual(answered([]).findings.map(item => item.code), ['work_integration_unproven'], `${text}: the fact refuses it`);
   }
+});
+
+
+for (const stageName of ['specification', 'features'] as const)
+test(`SP1b G5 v2 refuses a native ${stageName} head change in its publication window without partial acceptance`, async t => {
+  const f = await atomicFixture(t), prepared = ok(prepareWorksAcceptance(f.store, f.request));
+  assert.equal(prepared.state, 'accepted');
+  assert.equal(gateWrite(prepared).value.request.taskContextContract, 'omg-task-context/v2');
+  const other = new Store(f.database); t.after(() => other.close());
+  const stage = other.get<import('../src/pipeline/contracts.js').StageArtifact>(`stage:${f.project}:${stageName}`)!;
+  new ProductEngine(other).pipeline.draft(f.project, stageName, stage.value.content, stage.revision);
+  const after = heads(f.store), sent = f.sent().length;
+  denied(writeGuarded(f.store, { unit: 'G5', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+  assert.deepEqual(heads(f.store), after); assert.equal(f.store.get(prepared.record.id), null);
+  assert.equal(f.store.get(gateWrite(prepared).id), null); assert.equal(f.sent().length, sent);
+});
+
+test('SP1b G5 rejects the full specification where the old preplan fits, including a cold direct entry without ProductEngine', async t => {
+  const f = await atomicFixture(t), prepared = ok(prepareWorksAcceptance(f.store, f.request));
+  assert.equal(prepared.state, 'accepted');
+  const gate = gateWrite(prepared).value;
+  const coldGate = (request: typeof f.request) => JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    import { readFileSync } from 'node:fs';
+    import { Store } from ${JSON.stringify(new URL('../src/storage/store.js', import.meta.url).href)};
+    import { prepareWorksAcceptance } from ${JSON.stringify(new URL('../src/om/atomic-gate.js', import.meta.url).href)};
+    import { readTaskSpecification } from ${JSON.stringify(new URL('../src/compiler/om-readers.js', import.meta.url).href)};
+    const { database, request, input } = JSON.parse(readFileSync(0, 'utf8')), store = new Store(database);
+    const emptySlot = () => assert.throws(() => readTaskSpecification(store,
+      { project: request.project, input, requirements: [], nodes: [] }), { code: 'om_compiler_reader_unavailable' });
+    try {
+      emptySlot();
+      const result = prepareWorksAcceptance(store, request);
+      assert.equal(result.ok, true, JSON.stringify(result));
+      const prepared = result.value, gate = prepared.writes.find(write => write.id === prepared.record.value.gate.id).value;
+      assert.equal(gate.request.taskContextContract, 'omg-task-context/v2');
+      emptySlot();
+      console.log(JSON.stringify({ state: prepared.state, gate }));
+    } finally { store.close(); }
+  `], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
+    input: JSON.stringify({ database: f.database, request, input: gate.request.gaps.sources.input }) }));
+  assert.deepEqual(coldGate(f.request), { state: prepared.state, gate });
+  const path = join(f.root, 'sp1b-capacity.sqlite'); copyFileSync(f.database, path);
+  const inspection = new Store(path); let oldSize: number, newSize: number;
+  try {
+    inspection.writeMany(sourceWrites(prepared), [...prepared.guards]);
+    const { taskContextContract: _version, ...oldRequest } = clone(gate.request);
+    oldSize = Math.max(...measuredContexts(inspection, { ...clone(gate), request: oldRequest }).map(item => item.context.chars));
+    const contexts = measuredContexts(inspection, gate);
+    newSize = Math.max(...contexts.map(item => item.context.chars));
+    const owners = new Map<string, number>();
+    for (const { context, task } of contexts) {
+      const body = JSON.parse(context.text);
+      assert.deepEqual(body.scope.writePaths, task.writePaths);
+      for (const contract of body.selectedSpecification.contracts) owners.set(contract.value.id, (owners.get(contract.value.id) ?? 0) + 1);
+    }
+    assert.ok([...owners.values()].some(count => count > 1), 'A shared contract reaches each matching task without expanding writePaths');
+    assert.ok(newSize > oldSize);
+  } finally { inspection.close(); }
+  const { projectId: _project, ...configuration } = f.environment.value;
+  const limited = f.engine.environments.configure(f.project, { ...configuration, requestCapacityChars: oldSize }, f.environment.revision);
+  const request = { ...f.request, environment: reference(limited) }, before = heads(f.store), sent = f.sent().length;
+  const refusal = ok(prepareWorksAcceptance(f.store, request));
+  assert.equal(refusal.state, 'rejected'); assert.equal(refusal.acceptance, null);
+  assert.ok(gateWrite(refusal).value.result.codes.includes('work_packet_over_capacity'));
+  assert.deepEqual(coldGate(request), { state: refusal.state, gate: gateWrite(refusal).value });
+  assert.deepEqual(heads(f.store), before); assert.equal(f.sent().length, sent);
 });

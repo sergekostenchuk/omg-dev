@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { gateFeasibility, neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFeasibility, readFrame, readNeighbors,
-  readWorksFrame, registerCompilerOmReaders, type CompilerOmReaders, type ObligationHandoffForm } from '../src/compiler/om-readers.js';
+  readWorksFrame, readTaskContextBasis, readTaskSpecification, registerCompilerOmReaders, type CompilerOmReaders, type ObligationHandoffForm } from '../src/compiler/om-readers.js';
 import type { ObligationHandoff } from '../src/graph/obligation-handoff.js';
 import type { readFeasibility as omReadFeasibility } from '../src/om/feasibility.js';
 import type { Ref } from '../src/pipeline/contracts.js';
@@ -24,10 +24,10 @@ const SRC = pathToFileURL(join(ROOT, 'dist/src/')).href, TST = pathToFileURL(joi
 /** The base implementation the slot replaces: om/module before R3+R4 (R6 merged). */
 const BASE = 'ee2bf80bf3bf291cfb65f6c50d9707e913b4c4b0';
 const NAMES = ['readFeasibility', 'gateFeasibility', 'neighborsOf', 'readNeighbors', 'readAtomicGate', 'readAcceptedFrame',
-  'readFrame', 'readDeliveries', 'readWorksFrame'] as const;
+  'readFrame', 'readDeliveries', 'readWorksFrame', 'readTaskContextBasis', 'readTaskSpecification'] as const;
 type Name = typeof NAMES[number];
 const wrappers = { readFeasibility, gateFeasibility, neighborsOf, readNeighbors, readAtomicGate, readAcceptedFrame, readFrame,
-  readDeliveries, readWorksFrame } as unknown as Record<Name, (...args: unknown[]) => unknown>;
+  readDeliveries, readWorksFrame, readTaskContextBasis, readTaskSpecification } as unknown as Record<Name, (...args: unknown[]) => unknown>;
 
 const ref = (id: string): Ref => ({ id, revision: 1, hash: 'a'.repeat(64) });
 let touched = 0;
@@ -50,6 +50,9 @@ function calls(): [Name, unknown[], Record<string, unknown>][] {
     ['readFrame', [store, frameRequest], { project, level: 3, frame }],
     ['readDeliveries', [store, { project, candidate, ownership }], { project, candidate }],
     ['readWorksFrame', [store, { project, candidate }], { project, candidate }],
+    ['readTaskContextBasis', [store, { project, record }], { project, record }],
+    ['readTaskSpecification', [store, { project, input: ref('om-input:garden'), requirements: ['R1'], nodes: ['garden-work', 'garden-block'] }],
+      { project, input: ref('om-input:garden') }],
   ];
 }
 function refusal(run: () => unknown): EngineError {
@@ -556,7 +559,7 @@ test('R3+R4 the registrant is the only installer and the slot never loads it: it
   const slot = readFileSync(join(ROOT, 'src/compiler/om-readers.ts'), 'utf8');
   assert.equal(/\bimport\s*\(/.test(slot), false);
   assert.deepEqual([...slot.matchAll(/from\s+["']([^"']+)["']/g)].map(match => match[1]).sort(),
-    ['../errors.js', '../graph/model.js', '../pipeline/contracts.js', '../storage/store.js']);
+    ['../canonical.js', '../errors.js', '../graph/model.js', '../pipeline/contracts.js', '../storage/store.js']);
   const registrant = readFileSync(join(ROOT, 'src/om/compiler-readers.ts'), 'utf8');
   assert.equal((registrant.match(/registerCompilerOmReaders\(/g) ?? []).length, 1, 'One installation');
   for (const name of NAMES) assert.ok(registrant.includes(name), name);

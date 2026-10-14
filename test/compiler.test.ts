@@ -64,3 +64,17 @@ test("machine tasks, dependencies and required durable checks are derived withou
   store.write({ id: plan.id, kind: "plan", expected: 3, value: foreignBase });
   assert.throws(() => engine.compiler.read(plan.id), /sealed R3 basis/);
 });
+
+
+test('SP1b compilation without an M8 chain retains v1 context and repeats the exact saved plan', async t => {
+  const { executionFixture } = await import('./execution-fixture.js');
+  const f = executionFixture(t);
+  assert.equal(f.plan.value.feasibility.id.startsWith('om-feasibility:'), false);
+  assert.equal(Object.hasOwn(f.plan.value, 'taskContextContract'), false);
+  assert.deepEqual(f.engine.compiler.compile('p'), f.plan);
+  const value = f.engine.compiler.context('p', reference(f.plan), f.plan.value.tasks[0]!.id, 1_000_000);
+  assert.equal(JSON.parse(value.text).version, 'omg-task-context/v1');
+  assert.equal(Object.hasOwn(JSON.parse(value.text), 'selectedSpecification'), false);
+  f.reopen(); assert.deepEqual(f.engine.compiler.read(f.plan.id), f.plan);
+  assert.deepEqual(f.engine.compiler.compile('p'), f.plan);
+});

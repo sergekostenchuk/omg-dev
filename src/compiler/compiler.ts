@@ -8,7 +8,7 @@ import { hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
-import { checkedPlanDerivation, planDerivation, EXTERNAL_INPUT_DERIVATION, type MachinePlan } from "./model.js";
+import { checkedPlanDerivation, planDerivation, EXTERNAL_INPUT_DERIVATION, TASK_CONTEXT_CONTRACT, type MachinePlan } from "./model.js";
 import { deriveTasks } from "./derive.js";
 import { resolveArtifact, resolvePlanExternalSource } from "./inputs.js";
 import { requireBasis } from "./basis.js";
@@ -16,7 +16,7 @@ import { REFINEMENT_CONTRACT_VERSION } from "../graph/research-contracts.js";
 import { taskContext, loadTaskContextSources, boundedContext, selectDetail, type DetailSelector, type EvidenceDetail } from "./context.js";
 import { Owners, selectWriter } from "../ownership/owners.js";
 import { readWriterIndex } from "../ownership/writer-index.js";
-import { readFeasibility, type ObligationHandoffForm } from "./om-readers.js";
+import { readFeasibility, readTaskContextBasis, type ObligationHandoffForm } from "./om-readers.js";
 import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
 import { readinessObligations } from '../graph/obligation-readiness.js';
 import { taskObligationHandoff, requireTaskObligations } from '../graph/task-obligations.js';
@@ -33,6 +33,9 @@ export class Compiler {
     const feasibility = this.store.get<Feasibility>(feasibilityRef.id, om ? feasibilityRef.revision : undefined)!;
     const checked = this.refinement.feasibilityGate(project, feasibilityRef);
     requireCondition(checked.findings.length === 0 && feasibility.value.repository, "feasibility_not_ready", "Current R3 proof is required");
+    const contextBasis = om ? readTaskContextBasis(this.store, { project, record: feasibilityRef }) : null;
+    if (contextBasis && !contextBasis.ok) throw new EngineError(contextBasis.refusal.code, contextBasis.refusal.message, contextBasis.refusal.at);
+    const taskContextContract = contextBasis?.ok && contextBasis.value.contract === TASK_CONTEXT_CONTRACT ? TASK_CONTEXT_CONTRACT : undefined;
     const record = this.store.get<Graph>(`graph:${project}`)!; const graph = requireGraph(record.value);
     const environment = this.environments.get(project);
     const owners = new Owners(this.store, project, feasibility.value.repository!);
@@ -46,7 +49,7 @@ export class Compiler {
     // M8's historical closure is proved by its reader, not pinned as a collection of current heads.
     const guards = om ? uniqueRefs([...inputs, reference(stage.artifact), feasibilityRef, reference(record), reference(environment)])
       : [...new Map(inputs.map(ref => [`${ref.id}:${ref.revision}`, ref])).values()];
-    const body = { version: 2 as const, derivation: EXTERNAL_INPUT_DERIVATION, projectId: project, graph: reference(record), environment: reference(environment),
+    const body = { ...(taskContextContract ? { taskContextContract } : {}), version: 2 as const, derivation: EXTERNAL_INPUT_DERIVATION, projectId: project, graph: reference(record), environment: reference(environment),
       stage: reference(stage.artifact), feasibility: feasibilityRef, base: feasibility.value.repository,
       guards, tasks: derived.tasks, graphSnapshot: graph };
     const value: MachinePlan = { ...body, hash: hashJson(body) }; const id = `plan:${project}:external-inputs-v1:${value.hash}`;
@@ -87,6 +90,14 @@ export class Compiler {
     requireCondition(plan && plan.kind === "plan", "plan_missing", "Machine plan is missing");
     const derivation = planDerivation(plan.id);
     const om = requireBasis(this.store, plan.value);
+    if (Object.hasOwn(plan.value, 'taskContextContract')) {
+      if (plan.value.taskContextContract !== TASK_CONTEXT_CONTRACT || !om) throw new EngineError('context_source_invalid',
+        'A declared task context needs its M8 producer and known contract', { unit: 'V2', target: plan.id, field: 'taskContextContract' });
+      const basis = readTaskContextBasis(this.store, { project: plan.value.projectId, record: plan.value.feasibility });
+      if (!basis.ok) throw new EngineError(basis.refusal.code, basis.refusal.message, basis.refusal.at);
+      if (basis.value.contract !== plan.value.taskContextContract) throw new EngineError('context_source_invalid',
+        'The plan context version is the version measured by its accepted G5', { unit: 'V2', target: plan.id, field: 'taskContextContract' });
+    }
     const { hash, ...body } = plan.value;
     requireCondition(hashJson(body) === hash, "plan_corrupt", "Machine plan checksum mismatch");
     const graph = this.store.get<Graph>(plan.value.graph.id, plan.value.graph.revision);

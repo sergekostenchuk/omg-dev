@@ -23,7 +23,9 @@ export interface CompiledTask {
   purpose?: string; benefit?: string; beneficiary?: string; requirements?: Requirement[]; packets?: WorkPacket[];
   ownership?: WriteGrant[];
 }
+export const TASK_CONTEXT_CONTRACT = 'omg-task-context/v2' as const;
 export interface MachinePlan {
+  taskContextContract?: typeof TASK_CONTEXT_CONTRACT;
   derivation?: 'external-inputs/v1';
   version: 1 | 2; projectId: string; graph: Ref; environment: Ref; stage: Ref; feasibility: Ref;
   base: NonNullable<Feasibility['repository']>; guards: Ref[]; tasks: CompiledTask[];
@@ -48,6 +50,7 @@ export function checkedPlanDerivation(plan: Revision<MachinePlan>, project?: str
     || !value || typeof value !== 'object' || Array.isArray(value)) invalid('plan');
   if (value.derivation !== EXTERNAL_INPUT_DERIVATION) invalid('derivation');
   if (value.version !== 2) invalid('version');
+  if (Object.hasOwn(value, 'taskContextContract') && value.taskContextContract !== TASK_CONTEXT_CONTRACT) invalid('taskContextContract');
   if (typeof value.projectId !== 'string' || !value.projectId.length
     || (project !== undefined && project !== value.projectId)) invalid('projectId');
   const { hash, ...body } = value;

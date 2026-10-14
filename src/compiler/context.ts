@@ -10,10 +10,10 @@ import { controlPredecessors } from "../graph/dependencies.js";
 import { sealed, type Sealed } from "../om/refusal.js";
 import { neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFeasibility, readFrame, readNeighbors, readWorksFrame,
   type DeliveryOwnershipBasis, type FrameRequest, type NeighborCollection, type NeighborPacket, type NeighborSources,
-  type OmReaderResult } from "./om-readers.js";
+  readTaskContextBasis, readTaskSpecification, type TaskSpecification, type TaskContextBasis, type OmReaderResult } from "./om-readers.js";
 import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
 import { readRecord } from "../om/refs.js";
-import type { CompiledTask, MachinePlan } from "./model.js";
+import { TASK_CONTEXT_CONTRACT, type CompiledTask, type MachinePlan } from "./model.js";
 
 export interface ContextText { text: string; chars: number; utf8Bytes: number; hash: string }
 export function boundedContext(value: unknown, maxChars: number): ContextText {
@@ -26,12 +26,15 @@ export function boundedContext(value: unknown, maxChars: number): ContextText {
 
 export interface TaskContextSource { graph: Graph; task: CompiledTask; fullCheck: Command }
 export interface PreplanContextSource extends TaskContextSource {
+  taskContextContract?: typeof TASK_CONTEXT_CONTRACT;
+  specification?: TaskSpecification;
   project: string;
   basis: { candidate: Ref; environment: Ref };
   /** Already checked by F4's readNeighbors/prepareNeighbors; a DTO is not proof of acceptance. */
   neighbors: Revision<NeighborCollection>;
 }
 export interface PlanTaskContextSources {
+  specification?: { basis: Extract<TaskContextBasis, { contract: typeof TASK_CONTEXT_CONTRACT }>; tasks: Record<string, TaskSpecification> };
   plan: Ref; graph: Ref; candidate: Ref; references: Ref[];
   neighbors: NeighborSources; deliveryOwnership: DeliveryOwnershipBasis;
 }
@@ -97,6 +100,8 @@ function take<T>(result: OmReaderResult<T>): T {
 function requirePlan(plan: Revision<MachinePlan>): void {
   if (!object(plan) || !isRef(plan) || plan.kind !== "plan" || !object(plan.value)) invalid("plan");
   const value = plan.value;
+  if (Object.hasOwn(value, 'taskContextContract') && value.taskContextContract !== TASK_CONTEXT_CONTRACT) invalid('plan.taskContextContract', plan.id);
+  if (value.taskContextContract && !value.feasibility?.id.startsWith('om-feasibility:')) invalid('plan.feasibility', plan.id);
   if (!text(value.projectId) || ![value.graph, value.environment, value.feasibility].every(isRef)
     || !Array.isArray(value.guards) || !value.guards.every(isRef)
     || !Array.isArray(value.tasks) || !value.tasks.every(object)
@@ -164,7 +169,13 @@ export function loadTaskContextSources(store: Store, plan: Revision<MachinePlan>
     const fills = operations.accepted?.frame?.value.fills ?? null;
     references.push(plan.value.graph, plan.value.environment, plan.value.feasibility, candidateRef, layer, frame,
       ...works.references, ...operations.references, ...delivery.references);
-    return sealed({ plan: reference(plan), graph: plan.value.graph, candidate: candidateRef, references: uniqueRefs(references),
+    const specification = plan.value.taskContextContract ? (() => {
+      const basis = take(readTaskContextBasis(source, { project, record: plan.value.feasibility }));
+      if (basis.contract !== plan.value.taskContextContract) invalid('plan.taskContextContract', plan.id);
+      return { basis, tasks: Object.fromEntries(plan.value.tasks.map(task => [task.id,
+        loadTaskSpecification(source, project, basis.input, plan.value.graphSnapshot, task)])) };
+    })() : undefined;
+    return sealed({ ...(specification ? { specification } : {}), plan: reference(plan), graph: plan.value.graph, candidate: candidateRef, references: uniqueRefs(references),
       neighbors: { identity: [...new Set([...candidate.value.fills, ...(fills ?? [])]
         .filter(fill => fill.source === "identity").map(fill => fill.node))].sort(), receipts: delivery.receipts,
       frames: { operations: { obligations: operations.result.obligations, fills },
@@ -297,17 +308,51 @@ function planNeighbors(plan: Revision<MachinePlan>, task: CompiledTask, sources:
   return take(neighborsOf(plan.value.graphSnapshot, task.node, sources.neighbors as unknown as NeighborSources));
 }
 
+// The compiler uses its installed slot; direct G5 supplies the same OM reader without requiring product assembly.
+export function loadTaskSpecification(store: Store, project: string, input: Ref, graph: Graph, task: CompiledTask,
+  reader: typeof readTaskSpecification = readTaskSpecification): TaskSpecification {
+  return copy(take(reader(store, { project, input, requirements: (task.requirements ?? []).map(row => row.id),
+    nodes: new RefinementRelations(graph).ancestry(task.node).map(node => node.id) }))) as TaskSpecification;
+}
+
+function requireSpecification(value: unknown, target: string): asserts value is TaskSpecification {
+  if (!object(value) || value['contract'] !== 'selected-specification/v1' || !Array.isArray(value['contracts'])
+    || !Array.isArray(value['preparations']) || !object(value['constraints']) || !isRef(value['constraints']['source'])
+    || value['constraints']['pointer'] !== '/content/fields/constraints' || !Array.isArray(value['constraints']['value'])) invalid('selectedSpecification', target);
+  const row = (value: unknown): value is Record<string, unknown> => object(value) && isRef(value['source'])
+    && Number.isSafeInteger(value['index']) && (value['index'] as number) >= 0 && Object.hasOwn(value, 'value');
+  for (const entry of value['contracts']) if (!row(entry) || entry['pointer'] !== `/content/fields/behaviorContracts/${entry['index']}`
+    || !object(entry['effective']) || !isRef(entry['effective']['source']) || !/^\/contracts\/(0|[1-9][0-9]*)$/.test(String(entry['effective']['pointer']))
+    || !Object.hasOwn(entry['effective'], 'value')) invalid('selectedSpecification.contracts', target);
+  for (const entry of value['preparations']) if (!row(entry) || entry['pointer'] !== `/content/fields/featurePreparation/${entry['index']}`
+    || !Number.isSafeInteger(entry['featureIndex']) || (entry['featureIndex'] as number) < 0) invalid('selectedSpecification.preparations', target);
+}
+function contextWithSpecification(value: unknown, maxChars: number, specification: Sealed<TaskSpecification> | undefined, target: string): ContextText {
+  try { return boundedContext(value, maxChars); }
+  catch (error) {
+    if (specification && error instanceof EngineError && error.code === 'context_budget_exceeded')
+      throw new EngineError(error.code, error.message, { ...(error.details as object), unit: 'V2', target, field: 'selectedSpecification',
+        sources: uniqueRefs([specification.constraints.source, ...specification.contracts.flatMap(row => [row.source, row.effective.source]),
+          ...specification.preparations.map(row => row.source)]) });
+    throw error;
+  }
+}
+
 /** Pre-plan era. The caller verifies candidate/environment, D7 and F4 with their common readers and
  * supplies the allowance from V1. This pure serialization neither admits work nor permits a model send. */
 export function preplanTaskContext(source: PreplanContextSource, maxChars: number): ContextText {
   source = copy(source); requireContentSource(source);
   const packet = requireNeighbors(source), { task, project, basis, neighbors } = source;
-  return boundedContext({ version: "omg-task-context/preplan-v1",
+  if (Object.hasOwn(source, 'taskContextContract') && source.taskContextContract !== TASK_CONTEXT_CONTRACT) invalid('taskContextContract', task.id);
+  const specification = source.taskContextContract ? source.specification : undefined;
+  if (source.taskContextContract) requireSpecification(specification, task.id);
+  else if (Object.hasOwn(source, 'specification')) invalid('taskContextContract', task.id);
+  return contextWithSpecification({ version: source.taskContextContract ? 'omg-task-context/preplan-v2' : "omg-task-context/preplan-v1",
     binding: { candidate: basis.candidate, environment: basis.environment, neighbors: reference(neighbors), task: task.id },
-    ...omContent(source, packet, neighbors.value.source.ownership),
+    ...omContent(source, packet, neighbors.value.source.ownership), ...(specification ? { selectedSpecification: specification } : {}),
     details: { source: "works-candidate", project, candidate: basis.candidate, task: task.id,
       selectors: ["graph entity ID", "evidence-index", "bound evidence reference ID and JSON pointer or text range"] },
-  }, maxChars);
+  }, maxChars, specification, task.id);
 }
 
 /** This is an implementation brief, not the scheduler's complete machine plan. */
@@ -324,12 +369,17 @@ export function taskContext(plan: Revision<MachinePlan>, fullCheck: Command, tas
   if ((om && !sources) || (!om && sources !== undefined && sources !== null)) invalid("sources", plan.id);
   const checked = sources ? copy(sources) : null;
   const body = checked ? omContent(source, planNeighbors(plan, task, checked), checked.deliveryOwnership) : content(source);
-  return boundedContext({ version: "omg-task-context/v1", binding: { plan: reference(plan), graph: plan.value.graph, task: task.id,
+  const specification = plan.value.taskContextContract ? checked?.specification?.tasks[task.id] : undefined;
+  if (plan.value.taskContextContract) {
+    if (checked?.specification?.basis.contract !== plan.value.taskContextContract) invalid('sources.taskContextContract', plan.id);
+    requireSpecification(specification, task.id);
+  } else if (checked?.specification) invalid('sources.taskContextContract', plan.id);
+  return contextWithSpecification({ version: plan.value.taskContextContract ?? "omg-task-context/v1", binding: { plan: reference(plan), graph: plan.value.graph, task: task.id,
     base: { commit: plan.value.base.head, tree: plan.value.base.tree } },
-    ...body,
+    ...body, ...(specification ? { selectedSpecification: specification } : {}),
     details: { command: "task-detail", project: plan.value.projectId, plan: reference(plan), task: task.id,
       selectors: ["graph entity ID", "evidence-index", "bound evidence reference ID and JSON pointer or text range"] },
-  }, maxChars);
+  }, maxChars, specification, task.id);
 }
 
 export interface DetailSelector { id: string; pointer: string; start: number | null; end: number | null }
