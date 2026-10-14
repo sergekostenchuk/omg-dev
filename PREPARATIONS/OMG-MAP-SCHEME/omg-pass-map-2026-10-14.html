@@ -185,7 +185,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 <div class="page">
   <header class="head">
     <div class="l">
-      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · Исполнение — №4597 · Вход — №4600 · + оркестратор</div>
+      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · Исполнение — №4597 · Вход — №4600 · Discovery D1–D7 — №4602 · + оркестратор</div>
       <h1>Проход продукта: <b>от идеи до задачи</b></h1>
       <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки.</p>
     </div>
@@ -225,7 +225,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 
   <nav class="nav" aria-label="Разделы">
     <span>Вход</span><a href="#i-what">Что это</a><a href="#i-when">Когда что</a><a href="#i-secrets">Секреты</a><a href="#i-owner">Владелец</a><a href="#i-gaps">Пробелы</a>
-    <span>Discovery</span><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
+    <span>Discovery</span><a href="#d-subs">Подблоки</a><a href="#d-actions">Действия модели</a><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
     <span>Концепция</span><a href="#c-what">Что это</a><a href="#c-input">Вход</a><a href="#c-process">Обработка</a><a href="#c-output">Выход</a><a href="#c-records">Записи</a><a href="#c-doors">Двери</a><a href="#c-gaps">Пробелы</a><a href="#c-missed">Упускали</a>
     <span>Карта L1</span><a href="#m-what">Что это</a><a href="#m-input">Вход</a><a href="#m-process">Обработка</a><a href="#m-output">Выход</a><a href="#m-records">Записи</a><a href="#m-doors">Двери</a><a href="#m-gaps">Пробелы</a><a href="#m-missed">Упускали</a>
     <span>Спецификация</span><a href="#s-what">Что это</a><a href="#s-input">Вход</a><a href="#s-process">Обработка</a><a href="#s-output">Выход</a><a href="#s-records">Записи</a><a href="#s-doors">Двери</a><a href="#s-gaps">Пробелы</a><a href="#s-missed">Упускали</a>
@@ -344,6 +344,42 @@ research-stage(project, draftId, maxTurns)
             <tr><td>Компилятор, исполнитель</td><td>Что реализовать; точные ограничения; документация; как проверить</td><td>Требования, контракты, researchObligations, evidence-index</td><td>Прослеживаемости вывода Discovery до задачи</td></tr>
           </tbody>
         </table></div>
+      </section>
+      <section class="sec wide" id="d-subs">
+        <h3>Подблоки Discovery <small>на карте: развернуть Discovery → D1–D7 и S · сведено с Codex-omg №4602</small></h3>
+        <div class="tw"><table>
+          <thead><tr><th>Подблок</th><th>Назначение</th><th>База c4a88faf</th><th>Невлитые копии</th><th>Не готово / класс</th></tr></thead>
+          <tbody>
+            <tr><td>D1 · понимание и план</td><td>Что поняли и как проверять реализуемость</td><td>brief, objective, общий research</td><td>DS1 researchPlan, принятый префикс</td><td>Понимание с авторством — IN1</td></tr>
+            <tr><td>D2 · исследование наружу</td><td>Повторяемая способность: поиск, снимки, чтение</td><td>Проектные Sources, read, search</td><td>WB1: Source web, исполнитель, captures, бюджет</td><td>Подключение к runner и восстановлению — WB1; потребители — WB1b</td></tr>
+            <tr><td>D3 · отчёт</td><td>Адресуемые выводы с цитатами, вариант, ограничения</td><td>Общие answer, citations, оценка</td><td>DS1 отчёт, id, привязка к плану</td><td>Реальные основания WB1; перенос DS1.2; покрытие решающих вопросов</td></tr>
+            <tr><td>D4 · вердикт</td><td>go / conditional / no_go / insufficient</td><td>Нет</td><td>DS1 verdict, outcome, пауза</td><td>Двери DS1.1; итог DS1.3</td></tr>
+            <tr><td>D5 · двери не-go</td><td>Боковые двери вердикта</td><td>reopen, общий need_owner</td><td>DS1 точные зависимости</td><td>Варианты, полномочие, возобновление — DS1.1, UNK1</td></tr>
+            <tr><td>D6 · анкета</td><td>Вариант в форме для концепции, L1, OM</td><td>preparation, схема, ссылки</td><td>DS1 доставляет план, отчёт, вердикт и оценщику</td><td>Сохранение смысла — DS1.2; поздние вопросы — UNK1</td></tr>
+            <tr><td>D7 · приёмка и итог</td><td>go → accepted; no_go → отрицательный итог</td><td>draft, inspect, accept, feedback</td><td>DS1 v5 gate, история, outcome</td><td>Читаемый итог — DS1.3; запуск концепции — DRV1</td></tr>
+            <tr><td>S · цикл хода</td><td>Пакет → вызов → действие → проверка → оценка → применение или повтор</td><td>RS1–RS5, контекст, оценки, сохранённые вызовы; ранние тупики</td><td>DRY5FIX: отказ хода, повтор, reopen</td><td>Совместное применение; web-действия в классификаторе; ASM1</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec wide" id="d-actions">
+        <h3>Действия модели: место и доступность</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Действие</th><th>Смысл · подблок</th><th>Ранний analyst на базе</th></tr></thead>
+          <tbody>
+            <tr><td><code>answer</code></td><td>Значение plan / report / verdict / preparation · D1, D3, D4, D6</td><td>Да; схема, строгие цитаты, затем оценщик</td></tr>
+            <tr><td><code>read_source</code></td><td>Точный фрагмент Source · D1–D6</td><td>Да; выдача clipped / outside</td></tr>
+            <tr><td><code>read_context</code></td><td>Адресная часть сохранённого контекста · S</td><td>Да; без выдуманных адресов</td></tr>
+            <tr><td><code>read</code></td><td>Документ из файла workspace · D2</td><td>Да; создаёт Source, не исполняет файл</td></tr>
+            <tr><td><code>search</code></td><td>Поиск по источникам проекта · D2</td><td>Да; <b>не интернет</b></td></tr>
+            <tr><td><code>checkpoint</code></td><td>Промежуточное предложение · S, D2, D3</td><td>Да; не supported answer</td></tr>
+            <tr><td><code>need_owner</code></td><td>Неизбежный выбор после исследования</td><td>Да, с escalation-assessor; ещё не дверь DS1.1</td></tr>
+            <tr><td><code>pause</code></td><td>Техническая пауза</td><td>Да; не no_go</td></tr>
+            <tr><td><code>read_bundle</code>, <code>read_plan</code>, <code>synthesize</code>, <code>need_research</code></td><td>Reader и planning</td><td>Только в pilot / planning — ранний runner их не включает</td></tr>
+            <tr><td><code>answer_delta</code></td><td>Дельта layerDesign</td><td>Для OM / pilot, не для отчёта и анкеты</td></tr>
+            <tr><td><code>web_search</code>, <code>web_fetch</code></td><td>Внешний поиск и снимок · D2</td><td>Нет на базе; WB1 должна подключить к раннему analyst</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px">Команды prepare-stage, research-stage, reopen-question, configure, решение владельца — <b>не</b> действия модели; их вызывает драйвер или оператор.</p>
       </section>
       <section class="sec" id="d-chain">
         <h3>Что нужно OMG: цепочка без угадывания</h3>
@@ -1307,36 +1343,145 @@ research-stage(project, draftId, maxTurns)
       {f:"d.d8",t:"e.e3",l:"первый вопрос",lc:"D → E"},
       {f:"c.c6",t:"f.f4",l:"перед OM / M8",k:"alt",route:"below",depth:40}
      ]},
-    {id:"disc",n:"Стадия 1",st:"ds1",g:1,t:"Discovery",io:["идея","stage:discovery"],
-     sum:"Понимание и план → поиск в интернете → отчёт с цитатами → вердикт → анкета для цепочки. Или обоснованный отказ.",
-     d:[["Что делает","Превращает поручение в обоснованное решение: что нужно, кому и зачем, какой вариант, в каких рамках, что неизвестно — или обоснованный останов. Закрывает внешние вопросы, от которых зависит допустимость продукта."],["Отдаёт","stage:<p>:discovery: концепции — все поля (автору и оценщику); карте L1 — actors, outcomes, journeys; OM — actors, unknowns, externalSystems, каталог Source."],["Пробелы","Нет поиска в интернете (WB1), дверей после не-go, переноса отчёта в анкету, итога владельцу.",GAP],["Задачи","DS1 · WB1 + WB1b · IN1 · DS1.1 · DS1.2 · DS1.3",TASK]],
-     nodes:[
-      {id:"plan",x:0,y:170,role:"модель",st:"part",g:1,t:"1 · Понимание и план",io:["brief · objective","researchPlan"],bh:"Потребность, результат, границы, «зачем». Домен → роли → вопросы, реализуемость, источники.",
-       d:[["Что делает","Понимание поручения как предложение модели и план: домен, роли-перспективы, стартовые вопросы, вопросы реализуемости, источники, результат."],["Как сейчас","DS1: researchPlan есть; отдельного понимания с авторством нет."],["Проверка","Код — форма, id, непустые источники. Оценщик — штатная оценка."],["Пробел","Понимание не выделено и не отличено от слов владельца.",GAP],["Задача","DS1 + IN1",TASK]]},
-      {id:"web",x:220,y:170,role:"модель → движок",st:"no",g:1,t:"2 · Исследование",io:["вопросы плана","Source web"],bh:"web_search → web_fetch → снимок (адрес, время, sha256) → read_source → цитаты.",
-       d:[["Что делает","Модель просит поиск и загрузку; движок сохраняет снимок как Source вида web; дальше чтение и строгие цитаты."],["Как сейчас","В om/module нет; WB1/WB1b остановлены, части готовы."],["Правила","Поиск — навигация, текст страницы — материал. Сбой поиска ≠ «аналогов нет». Web — «сообщено в документе»."],["Риск","С NL99 надёжно отвечает один поисковик.",GAP],["Задача","WB1 + WB1b",TASK]]},
-      {id:"report",x:440,y:170,role:"модель · оценщик",st:"ds1",g:0,t:"3 · Отчёт",io:["Source · цитаты","researchReport"],bh:"Выводы по вопросам плана с цитатами. Варианты, ограничения, экономика, открытые вопросы.",
-       d:[["Что делает","results с выводом, цитатами и пределами; openQuestions; вариант; ограничения; «взять / адаптировать / построить»."],["Проверка","Код — ссылки на план, цитаты существуют. Оценщик — цитата подтверждает вывод."],["Задача","DS1",TASK]]},
-      {id:"verdict",x:660,y:170,role:"модель · оценщик",st:"ds1",g:1,dec:1,t:"4 · Вердикт",io:["отчёт Ref","исход"],bh:"",
-       d:[["Что делает","Исход по текущему отчёту: outcome, причина, вариант, основания, условия evidence или owner_choice."],["Как сейчас","DS1: одна функция исхода; go — к анкете; остальные — пауза с кодом."],["Пробел","После паузы нет рабочих дверей.",GAP],["Задача","DS1 + DS1.1",TASK]]},
-      {id:"prep",x:880,y:170,role:"модель · оценщик",st:"part",g:1,t:"5 · Preparation",io:["go + отчёт","анкета"],bh:"actors · outcomes · 17 сценариев · constraints · externalSystems · risks · unknowns.",
-       d:[["Что делает","Разворачивает вариант в анкету для всей цепочки."],["Как сейчас","Поле v4 со старым промптом; на вердикт и отчёт опираться не обязано."],["Как должно","Каждое ограничение отчёта — строка constraints со ссылкой на отчёт; externalSystems — со ссылками; открытые вопросы — закрыты или unknown с consumer и moment."],["Пробел","Анкета не привязана к исследованию.",GAP],["Задача","DS1.2",TASK]]},
-      {id:"stage",x:1100,y:170,role:"запись",st:"yes",g:0,mono:1,t:"stage:<p>:discovery",io:["приёмка","вход концепции"],bh:"research-stage принимает сам. no_go стадию не принимает.",
-       d:[["Что это","Принятая Discovery: content = draft, fields, graph."],["Правило","Принятие ответа и допуск следующей стадии — разные вещи."],["Кому","Концепции — все поля; карте L1 — actors, outcomes, journeys; OM — actors, unknowns, externalSystems."]]},
-      {id:"summary",x:880,y:0,role:"для владельца",st:"no",g:1,t:"Итог владельцу",io:["принятые записи","читаемый вид"],bh:"Поняли · нашли · вариант · ограничения · неизвестно · вердикт · что выбрать.",
-       d:[["Что делает","Один читаемый итог из тех же принятых записей."],["Как сейчас","Общий UI/JSON/экспорт; связного итога нет."],["Пробел","Владелец не видит результата исследования в понятном виде.",GAP],["Задача","DS1.3",TASK]]},
-      {id:"choice",x:440,y:400,role:"владелец",st:"no",g:1,t:"Выбор по условию",io:["условие","решение"],bh:"Модель даёт варианты с последствиями; выбор — через полномочие владельца.",
-       d:[["Что делает","Варианты с id и последствиями, включая отказ; решение с точной привязкой к вердикту и условию."],["Дальше","Вердикт переоткрывается → новый вердикт с учётом решения."],["Как сейчас","Нет: answer-decision не знает условия; actor ≠ удостоверение владельца.",GAP],["Задача","DS1.1",TASK]]},
-      {id:"nogo",x:660,y:400,role:"итог",st:"ds1",g:0,t:"no_go · отказ",io:["вердикт","итог"],bh:"Невозможно в исследованных условиях. Концепция не открывается.",
-       d:[["Что делает","Отрицательный итог с причинами — полезный результат."],["Как продолжить","Только новые условия или основания."]]}
-     ],
-     edges:[
-      {f:"plan",t:"web",l:"вопросы плана"},{f:"web",t:"report",l:"Source web"},{f:"report",t:"verdict",l:"отчёт Ref"},
-      {f:"verdict",t:"prep",l:"go"},{f:"prep",t:"stage",l:"приёмка"},{f:"verdict",t:"summary",l:"вид"},
-      {f:"verdict",t:"choice",l:"conditional",k:"alt"},{f:"choice",t:"verdict",l:"решение",k:"alt",fs:"t",ff:.8,ts:"b",tf:.25},
-      {f:"verdict",t:"nogo",l:"no_go",k:"alt"},{f:"verdict",t:"web",l:"нужен факт · insufficient",k:"alt",loop:"above",depth:95,ff:.3,tf:.7}
-     ]},
+    {id:"disc",n:"Стадия 1",st:"ds1",g:1,t:"Discovery",io:["идея","stage:discovery"],top:30,
+     sum:"Понимание и план → исследование наружу → отчёт с цитатами → вердикт → двери не-go → анкета → приёмка и итог. S — общий цикл хода.",
+     d:[["Что делает","Превращает поручение в обоснованное решение: что нужно, кому и зачем, какой вариант, в каких рамках, что неизвестно — или обоснованный останов. Закрывает внешние вопросы, от которых зависит допустимость продукта."],["Два выхода","go + принятая preparation → stage:discovery accepted, вход концепции. Поддержанный no_go → полезный отрицательный итог, без accepted stage, разрешающего концепцию; окончательность — для текущего поручения, варианта и оснований."],["Три уровня","assessment supported — ответ обоснован; verdict.outcome — продуктовый вывод; research-run status — техника. Не сводить к одной отметке «принято»."],["Пробелы","Нет поиска моделью на базе (WB1); двери не-go (DS1.1); перенос в анкету (DS1.2); итог владельцу (DS1.3); понимание с авторством (IN1).",GAP],["Задачи","DS1 · WB1 + WB1b · IN1 · DS1.1 · DS1.2 · DS1.3 · DRY5FIX · UNK1",TASK]],
+     subs:[
+      {id:"d1",n:"D1",st:"ds1",g:1,t:"Понимание и план",io:["brief · objective","researchPlan"],
+       sum:"Показать, какую потребность модель поняла, и определить, как проверять её реализуемость. Роли — перспективы одной модели.",
+       d:[["Форма DS1","domain, roles[{role, side, why}], startingQuestions, sources[{id, kind, what, why}], feasibilityQuestions, deliverable. URL заранее не обязателен — выдумывать ссылки нельзя."],["Пробел","Отдельного понимания и допущений с авторством в схеме нет.",GAP],["Задача","DS1 + IN1",TASK]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"ds1",g:0,t:"Принятый префикс",io:["brief · objective","answer Ref"],bh:"Точные answer и question Ref.",d:[["Действие","D1.1 (discovery-outcome.ts:29)."]]},
+        {id:"n2",role:"код",st:"ds1",g:0,t:"Вопрос researchPlan",io:["схема","пакет"],bh:"Схема, материал поручения, инструкция роли.",d:[["Действие","D1.2."]]},
+        {id:"n3",role:"модель",st:"part",g:1,t:"Понимание",io:["поручение","интерпретация"],bh:"Потребность, результат, границы, допущения; «зачем» — известно или гипотеза.",d:[["Действие","D1.3."],["Задача","IN1",TASK]]},
+        {id:"n4",role:"модель",st:"ds1",g:0,t:"Домен и роли",io:["понимание","перспективы"],bh:"Какие стороны задачи исследуют роли.",d:[["Действие","D1.4."]]},
+        {id:"n5",role:"модель",st:"ds1",g:0,t:"Вопросы и источники",io:["роли","answer"],bh:"Стартовые вопросы, источники, реализуемость, deliverable.",d:[["Действие","D1.5."]]},
+        {id:"n6",role:"код",st:"ds1",g:0,t:"Форма и id",io:["answer","проверка"],bh:"Уникальность id; точные цитаты поручения.",d:[["Действие","D1.6 (discovery-outcome.ts:102)."]]},
+        {id:"n7",role:"оценщик",st:"ds1",g:0,t:"Оценка плана",io:["план","supported?"],bh:"Соответствие задаче, польза, нет предположений под видом фактов.",d:[["Действие","D1.7."]]},
+        {id:"n8",role:"запись",st:"ds1",g:0,t:"fields.researchPlan",io:["supported","принятый план"],bh:"research-answer + assessment.",d:[["Действие","D1.8. План — предложение о работе, не доказательство материала."]]}
+       ],4),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6"},{f:"n6",t:"n7"},{f:"n7",t:"n8"}].map(lbl)},
 
+      {id:"d2",n:"D2",st:"no",g:1,t:"Исследование наружу",io:["вопрос плана","Source web · чтения"],
+       sum:"Повторяемая способность: модель ищет и загружает страницы через движок, движок сохраняет снимки как Source web; дальше — чтение и цитаты.",
+       d:[["Записи WB1","web-budget:<p>:<stage> (attempts, pages, receivedChars); web-capture:<hash(turn)> — фактический ответ шлюза; source:<p>:web:<hash> — content, sha256, origin web, requested/finalUrl, fetchedAt, status, completeness unknown."],["Не смешивать","title, snippet, score выдачи — навигация, не цитаты. Хэш не доказывает истинность и полноту. Web Source — reported-not-runtime-proof."],["Состояние","На базе нет. В WB1 есть исполнитель, настройки и Source web; подключение к раннему runner и восстановлению не найдено.",GAP],["Задача","WB1 + WB1b; DRY5FIX должен признавать web-действия",TASK]],
+       nodes:snake([
+        {id:"n1",role:"модель",st:"no",g:0,t:"web_search / web_fetch",io:["вопрос","query · url · purpose"],bh:"Какой вопрос прояснить; поиск или известный адрес.",d:[["Действие","D2.1."]]},
+        {id:"n2",role:"код",st:"no",g:0,t:"Допуск запроса",io:["действие","pending turn"],bh:"Настройка, URL, остаток лимитов.",d:[["Действие","D2.2."]]},
+        {id:"n3",role:"запись",st:"no",g:0,t:"Учёт попытки",io:["запрос","web-budget"],bh:"До HTTP учитывает попытку.",d:[["Действие","D2.3."]]},
+        {id:"n4",role:"код · шлюз",st:"no",g:0,t:"Шлюз",io:["запрос","выдача / текст"],bh:"Search — кандидаты и состояние поисковиков; fetch — текст и исход.",d:[["Действие","D2.4."]]},
+        {id:"n5",role:"запись",st:"no",g:0,t:"WebCapture",io:["ответ","до применения"],bh:"Фактический ответ — до применения к ходу.",d:[["Действие","D2.5 (web-research.ts:178)."]]},
+        {id:"n6",role:"код · запись",st:"no",g:1,t:"Source web",io:["capture","Source Ref"],bh:"Снимок с полнотой; вместе с завершением хода.",d:[["Действие","D2.6 (evidence.ts:9 в WB1)."],["Задача","WB1",TASK]]},
+        {id:"n7",role:"модель",st:"yes",g:0,t:"read_source",io:["Source","фрагменты"],bh:"Выбрать страницу; читать существенное.",d:[["Действие","D2.7. Выдача clipped / outside — RS1."]]},
+        {id:"n8",role:"модель",st:"yes",g:0,t:"Сопоставление · checkpoint",io:["чтения","промежуточное"],bh:"Исключения, условия, противоречия.",d:[["Действие","D2.8."]]},
+        {id:"n9",role:"код · запись",st:"yes",g:0,t:"Чтения следующему ходу",io:["сохранённое","цитаты Source/selector"],bh:"Цитаты отчёта адресуют эти Source.",d:[["Действие","D2.9."],["Двери","Часть поисковиков молчит — видимый предел; все молчат или шлюз недоступен — техника, продолжить после восстановления; лимит — пауза, не «достаточно»; capture сохранён — применить без HTTP."]]}
+       ],5),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6",l:"fetch"},{f:"n6",t:"n7"},{f:"n7",t:"n8"},{f:"n8",t:"n9"},{f:"n5",t:"n1",l:"search → выбрать страницу",k:"alt",loop:"above",depth:30}].map(lbl)},
+
+      {id:"d3",n:"D3",st:"ds1",g:0,t:"Отчёт",io:["план + чтения","researchReport"],
+       sum:"Превратить прочитанное в адресуемые выводы по вопросам плана; отделить установленные пределы от неизвестного.",
+       d:[["Форма DS1","researchPlan Ref, results[{id, question, conclusion, citations: индексы, limits}], openQuestions[{id, question, reason}], variant, constraints."],["Код проверяет","Ссылки результатов на вопросы плана, индексы цитат, точный план. Не проверяет покрытие всех решающих вопросов — это оценщик."],["Классы","DS1; WB1/WB1b — основания; DS1.2 — перенос; UNK1 — открытые вопросы. Нет чисел в источниках — ограничение знания, не повод выдумывать стоимость."]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"ds1",g:0,t:"Принятый план",io:["план Ref","question id"],bh:"План с вопросами и answer Ref.",d:[["Действие","D3.1."]]},
+        {id:"n2",role:"модель",st:"ds1",g:0,t:"Вопросы → выводы",io:["план + чтения","сопоставление"],bh:"Выводы и открытые вопросы.",d:[["Действие","D3.2."]]},
+        {id:"n3",role:"модель",st:"ds1",g:0,t:"results",io:["выводы","id · conclusion · citations · limits"],bh:"Каждый вывод — с цитатами и пределами.",d:[["Действие","D3.3."]]},
+        {id:"n4",role:"модель",st:"ds1",g:0,t:"variant · constraints · openQuestions",io:["выводы","вариант"],bh:"Нехватка материала → назад в D2.",d:[["Действие","D3.4."]]},
+        {id:"n5",role:"код",st:"ds1",g:0,t:"Схема и связи",io:["отчёт","проверка"],bh:"Локальные id, вопросы плана, точный план, индексы цитат.",d:[["Действие","D3.5 (discovery-outcome.ts:106)."]]},
+        {id:"n6",role:"код",st:"yes",g:0,t:"Цитаты → Observation",io:["citation","строгая проверка"],bh:"Настоящий Source / selector.",d:[["Действие","D3.6: Evidence.observe / verify."]]},
+        {id:"n7",role:"оценщик",st:"ds1",g:0,t:"Оценка отчёта",io:["отчёт","supported?"],bh:"Поддержка выводов, сравнение вариантов, нет необоснованной уверенности.",d:[["Действие","D3.7 (research-assessment.ts:176)."]]},
+        {id:"n8",role:"запись",st:"ds1",g:0,t:"fields.researchReport",io:["supported","отчёт"],bh:"Адрес — report Ref + локальный id.",d:[["Действие","D3.8."]]}
+       ],4),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6"},{f:"n6",t:"n7"},{f:"n7",t:"n8"}].map(lbl)},
+
+      {id:"d4",n:"D4",st:"ds1",g:1,t:"Вердикт",io:["отчёт Ref","outcome"],
+       sum:"Обоснованный вывод о продолжении выбранного варианта: go / conditional / no_go / insufficient_evidence.",
+       d:[["Форма DS1","researchReport, outcome, reason, variant, bases[{result, reason}], conditions[{id, kind: evidence | owner_choice, condition, criterion}]; у go условия пусты, у conditional — непусты."],["Важно","Оценщик вернул insufficient — исправляется кандидат. Оценщик поддержал outcome=insufficient_evidence — это законный продуктовый результат. Не-go не идёт в rejectResearch."],["Пробел","Двери после паузы и понятный итог.",GAP],["Задача","DS1.1 · DS1.3",TASK]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"ds1",g:0,t:"Принятый префикс",io:["план + отчёт","контекст"],bh:"Включая точный отчёт.",d:[["Действие","D4.1."]]},
+        {id:"n2",role:"модель",st:"ds1",g:0,t:"Исход",io:["отчёт","go / conditional / no_go / insufficient"],bh:"Вариант и причина.",d:[["Действие","D4.2."]]},
+        {id:"n3",role:"модель",st:"ds1",g:0,t:"bases · conditions",io:["исход","основания"],bh:"bases → result / openQuestion; условия с criterion.",d:[["Действие","D4.3."]]},
+        {id:"n4",role:"код",st:"ds1",g:0,t:"Форма вердикта",io:["вердикт","проверка"],bh:"Точный отчёт, bases, уникальные условия; go — без условий.",d:[["Действие","D4.4."]]},
+        {id:"n5",role:"оценщик",st:"ds1",g:0,t:"Оценка вывода",io:["вердикт","supported?"],bh:"Обоснованность именно этого вывода.",d:[["Действие","D4.5."]]},
+        {id:"n6",role:"запись",st:"ds1",g:0,t:"Вердикт принят",io:["supported","research-answer"],bh:"Отрицательный вывод — не ошибка ответа.",d:[["Действие","D4.6."]]},
+        {id:"n7",role:"код",st:"ds1",g:0,t:"discoveryOutcome",io:["принятые записи","исход + guards"],bh:"Одна функция исхода.",d:[["Действие","D4.7 (discovery-outcome.ts:153)."]]},
+        {id:"n8",role:"код · запись",st:"ds1",g:1,t:"Маршрут исхода",io:["outcome","D6 / пауза"],bh:"go → D6; иначе пауза с кодом → D5 или итог.",d:[["Действие","D4.8 (research-runner.ts:480)."],["Задача","DS1.1",TASK]]}
+       ],4),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6"},{f:"n6",t:"n7"},{f:"n7",t:"n8"}].map(lbl)},
+
+      {id:"d5",n:"D5",st:"no",g:1,t:"Двери не-go",io:["verdict Ref · condition","продолжение / итог"],
+       sum:"Боковые двери вердикта: evidence → получить факт; owner_choice → выбор владельца; insufficient → продолжить по недостающему; no_go → итог.",
+       d:[["Что есть","Общий reopen-question; в DS1 принятый префикс обрывается на переоткрытом вопросе; report и verdict проверяют точные Ref оснований."],["Чего нет","condition → варианты → защищённый выбор → новый verdict. В conditions нет options; need_owner — {question, reason, searched}; answer-decision не привязан к условию и не использует H2.",GAP],["Задача","DS1.1 · UNK1",TASK]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"ds1",g:0,t:"Продукт или техника",io:["пауза","основание остановки"],bh:"conditional / insufficient / no_go ≠ технический сбой.",d:[["Действие","D5.1."]]},
+        {id:"n2",role:"код · модель",st:"no",g:0,t:"Недостающее или варианты",io:["condition","факт / варианты"],bh:"evidence — какой факт; owner_choice — варианты с последствиями.",d:[["Действие","D5.2."]]},
+        {id:"n3",role:"модель через код",st:"part",g:0,t:"Получить материал",io:["бюджет","D2"],bh:"Или честное техническое ожидание.",d:[["Действие","D5.3."]]},
+        {id:"n4",role:"владелец",st:"no",g:1,t:"Выбор по условию",io:["варианты","выбор / отказ"],bh:"Через настоящее полномочие; не правит verdict в go.",d:[["Действие","D5.4."],["Задача","DS1.1",TASK]]},
+        {id:"n5",role:"запись",st:"no",g:1,t:"verdictRef + conditionId + optionId",io:["выбор","решение"],bh:"Требуемая дверь.",d:[["Действие","D5.5."]]},
+        {id:"n6",role:"код",st:"ds1",g:0,t:"Переоткрыть зависимые",io:["решение / факт","reopen"],bh:"Прежние ответы — история.",d:[["Действие","D5.6."]]},
+        {id:"n7",role:"модель · оценщик",st:"ds1",g:0,t:"Новый вердикт",io:["отчёт / выбор","verdict"],bh:"Обновить отчёт, если изменились факты или вариант.",d:[["Действие","D5.7."]]},
+        {id:"n8",role:"код",st:"ds1",g:0,t:"Новый исход",io:["verdict","go / ожидание / no_go"],bh:"go → D6; no_go → итог без цикла исправлений.",d:[["Действие","D5.8."]]},
+        {id:"n9",role:"владелец · запись",st:"ds1",g:0,t:"Отрицательный итог",io:["no_go","основания"],bh:"Новый проход — только при содержательном изменении.",d:[["Действие","D5.9."]]}
+       ],5),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3",l:"evidence"},{f:"n2",t:"n4",l:"owner_choice",k:"alt",loop:"below",depth:40},{f:"n3",t:"n6",k:"alt",loop:"above",depth:30},{f:"n4",t:"n5"},{f:"n5",t:"n6"},{f:"n6",t:"n7"},{f:"n7",t:"n8"},{f:"n1",t:"n9",l:"no_go",k:"alt"}].map(lbl)},
+
+      {id:"d6",n:"D6",st:"part",g:1,t:"Анкета · preparation",io:["go + исследование","preparation"],
+       sum:"Изложить исследованный вариант в форме для концепции, L1 и OM; перенести ограничения, внешние системы и неизвестные с основаниями.",
+       d:[["Форма","problem, existingSituation; actors, outcomes с id; journeys по 17 вариантам; constraints {id, rule, basis}; externalSystems; risks; unknowns {id, question, consumer, blocksCurrentStage, resolution, moment}."],["Проверяется","Уникальность actors/outcomes; beneficiary ∈ actors; сценарии ссылаются на известные; у каждого actor сценарий; risk → outcome; blocksCurrentStage=true — preparation_unresolved."],["Не проверяется","Сохранение ограничений отчёта; basis — свободный текст; externalSystems не привязаны к result; openQuestions не обязаны стать unknowns.",GAP],["Задача","DS1.2 · UNK1 (ASM1 не дублировать — DS1 уже доставляет контекст оценщику)",TASK]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"ds1",g:0,t:"go · префикс",io:["outcome go","план + отчёт + вердикт"],bh:"Весь принятый исследовательский префикс.",d:[["Действие","D6.1."]]},
+        {id:"n2",role:"модель",st:"yes",g:0,t:"Проблема · участники · результаты",io:["вариант","actors · outcomes"],bh:"Без неподтверждённых внешних фактов.",d:[["Действие","D6.2."]]},
+        {id:"n3",role:"модель",st:"yes",g:0,t:"journeys",io:["17 вариантов","применимые · причины"],bh:"Не 17 модулей; неприменимость — с основанием.",d:[["Действие","D6.3."]]},
+        {id:"n4",role:"модель",st:"part",g:1,t:"Ограничения · внешние системы",io:["отчёт","constraints · externalSystems"],bh:"С адресными основаниями — DS1.2.",d:[["Действие","D6.4."],["Задача","DS1.2",TASK]]},
+        {id:"n5",role:"модель",st:"part",g:1,t:"Риски · неизвестные",io:["openQuestions","unknowns · moment"],bh:"consumer, moment, путь разрешения.",d:[["Действие","D6.5."],["Задача","UNK1",TASK]]},
+        {id:"n6",role:"код",st:"yes",g:0,t:"Схема и ссылки",io:["анкета","проверка"],bh:"id, участники, сценарии, блокеры.",d:[["Действие","D6.6 (preparation-validation.ts:16)."]]},
+        {id:"n7",role:"оценщик",st:"part",g:1,t:"Согласие с исследованием",io:["анкета + отчёт","supported?"],bh:"Вариант не подменён, условия не потеряны.",d:[["Действие","D6.7 (research-assessment.ts:188 в DS1)."],["Задача","DS1.2",TASK]]},
+        {id:"n8",role:"запись",st:"yes",g:0,t:"fields.preparation",io:["supported","полный draft"],bh:"→ D7.",d:[["Действие","D6.8."]]}
+       ],4),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6"},{f:"n6",t:"n7"},{f:"n7",t:"n8"}].map(lbl)},
+
+      {id:"d7",n:"D7",st:"part",g:1,t:"Приёмка и итог",io:["draft · outcome","stage:discovery / итог"],
+       sum:"go → stage:discovery accepted, вход концепции; поддержанный no_go → понятный отрицательный итог. Читаемый итог владельцу из тех же записей.",
+       d:[["Запись","StageArtifact {draft Ref, fields, graph: null}; stage id стабилен, ревизии сохраняются. accept-stage после research-stage не обязателен."],["Итог владельцу","«Не делать при этих условиях, потому что…» — завершённый результат; «не вызвался шлюз» — техника; «не хватает оснований» — недостаток знания. Не прятать всё под «исследование идёт»."],["Пробел","Читаемого итога нет; запуск концепции — DRV1.",GAP],["Задача","DS1.3 · DRV1",TASK]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"ds1",g:0,t:"Исход ещё раз",io:["принятые основания","outcome"],bh:"По точным принятым основаниям.",d:[["Действие","D7.1."]]},
+        {id:"n2",role:"код",st:"yes",g:0,t:"draft StageArtifact",io:["go + вопросы","fields"],bh:"Только для go.",d:[["Действие","D7.2."]]},
+        {id:"n3",role:"код",st:"ds1",g:0,t:"StageChecks",io:["artifact","находки"],bh:"Проект, draft, версия, эталон, поля, оценки, preparationFindings, outcome.",d:[["Действие","D7.3 (stage-checks.ts:247 в DS1)."]]},
+        {id:"n4",role:"код · запись",st:"yes",g:0,mono:1,t:"stage:<p>:discovery",io:["нет находок","accepted"],bh:"Вход концепции.",d:[["Действие","D7.4: pipeline.accept."]]},
+        {id:"n5",role:"код",st:"yes",g:0,t:"Feedback полю",io:["находка","S"],bh:"При не-go этот цикл не запускается.",d:[["Действие","D7.5 (consumer-research.ts:26)."]]},
+        {id:"n6",role:"представление · запись",st:"no",g:1,t:"Читаемый итог",io:["принятые ответы","поняли · нашли · исход"],bh:"Поняли, нашли, вариант, основания, пределы, неизвестное, исход, дальше.",d:[["Действие","D7.6."],["Задача","DS1.3",TASK]]},
+        {id:"n7",role:"владелец",st:"yes",g:0,t:"Владелец видит",io:["итог","результат / условие"],bh:"Не утверждает каждый обычный supported answer.",d:[["Действие","D7.7."]]},
+        {id:"n8",role:"вызывающий код",st:"part",g:1,t:"→ концепция",io:["accepted","prepare-stage concept"],bh:"При не-go — остаётся в своей двери.",d:[["Действие","D7.8."],["Задача","DRV1",TASK]]}
+       ],4),
+       edges:[{f:"n1",t:"n2",l:"go"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n6",loop:"below",depth:40},{f:"n3",t:"n5",l:"находка",k:"alt"},{f:"n6",t:"n7"},{f:"n7",t:"n8"},{f:"n1",t:"n6",l:"не-go",k:"alt",loop:"above",depth:30}].map(lbl)},
+
+      {id:"s",n:"S",st:"part",g:1,t:"Цикл исследовательского хода",io:["draft · вопрос · среда","применение / повтор / пауза"],
+       sum:"Общий механизм ранних стадий: пакет → вызов → действие → проверка → оценка → применение или рабочий повтор. Обслуживает D1–D6.",
+       d:[["Роли","Analyst — действия исследования; assessor — supported / insufficient / conflicting, свои read_context и assessment_checkpoint; escalation-assessor — necessary / reason; reader — selections / unresolved (только где подключён)."],["Действия analyst на базе","answer, read_source, read_context, read, search (по проекту, не интернет), checkpoint, need_owner, pause. read_bundle, read_plan, synthesize, need_research — только в pilot / planning; answer_delta — для OM. web_search / web_fetch — WB1."],["Три отказа","Оценщик законно сказал insufficient — исправить кандидата. Модель нарушила форму — DRY5FIX: адресный отказ хода и обычный повтор. Сеть, поиск, исполнитель — техника, не no_go."],["Пробел","Совместное применение DS1 + WB1 + DRY5FIX; классификатор DRY5FIX должен признавать web-действия.",GAP],["Задача","DRY5FIX · ASM1 · WB1",TASK]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"yes",g:0,t:"Оплаченное или первый вопрос",io:["run","вопрос"],bh:"Сначала незавершённая оплаченная операция.",d:[["Действие","S1 (research-runner.ts:92)."]]},
+        {id:"n2",role:"код",st:"yes",g:0,t:"Пакет initial / continuation",io:["вопрос","полный контракт"],bh:"RS4: полный контракт, только существующие адреса; RS2 — свёртка.",d:[["Действие","S2 (continuation-packet.ts:99). Нехватка вместимости — отказ до отправки."]]},
+        {id:"n3",role:"запись",st:"yes",g:0,t:"intent · запрос · model-call",io:["пакет","до отправки"],bh:"Сохранено до отправки.",d:[["Действие","S3."]]},
+        {id:"n4",role:"модель",st:"yes",g:0,t:"Одно действие",io:["запрос","action"],bh:"Своей роли и фазы.",d:[["Действие","S4."]]},
+        {id:"n5",role:"код · запись",st:"part",g:1,t:"Ответ: форма · допустимость",io:["ответ","чтение / кандидат"],bh:"Сохранить, проверить; исполнить чтение или готовить кандидата.",d:[["Действие","S5."],["Пробел","Ошибка формы — тупик на базе; DRY5FIX.",GAP],["Задача","DRY5FIX",TASK]]},
+        {id:"n6",role:"код",st:"yes",g:0,t:"Цитаты и схема",io:["кандидат","Observation"],bh:"Evidence.observe / verify; verifyReading (RS1, RS5).",d:[["Действие","S6."]]},
+        {id:"n7",role:"оценщик",st:"part",g:0,t:"Оценка",io:["кандидат","supported / нет"],bh:"Для answer — поддержка; для need_owner — необходимость.",d:[["Действие","S7 (research-assessment.ts:104)."]]},
+        {id:"n8",role:"код · запись",st:"yes",g:0,t:"Применить или сохранить",io:["исход","answer / отказ / пауза"],bh:"Атомарно, к точному оплаченному ходу.",d:[["Действие","S8."]]},
+        {id:"n9",role:"код · вызывающий",st:"yes",g:0,t:"Следующий ход",io:["исход","ход / повтор / останов"],bh:"Следующий вопрос, исправление, восстановление, адресный останов.",d:[["Действие","S9. Повтор не значит «без расходов»: потерянный неприменённый ответ — новый вызов."]]}
+       ],5),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6",l:"answer"},{f:"n6",t:"n7"},{f:"n7",t:"n8"},{f:"n8",t:"n9"},{f:"n5",t:"n8",l:"чтение",k:"alt",loop:"below",depth:40},{f:"n9",t:"n1",l:"следующий ход",k:"alt"}].map(lbl)}
+     ],
+     links:[
+      {f:"d1.n8",t:"d2.n1",l:"принятый план",lc:"D1 → D2"},
+      {f:"d2.n9",t:"d3.n1",l:"Source · чтения",lc:"D2 → D3"},
+      {f:"d3.n8",t:"d4.n1",l:"отчёт Ref",lc:"D3 → D4"},
+      {f:"d4.n8",t:"d6.n1",l:"go",lc:"go"},
+      {f:"d4.n8",t:"d5.n1",l:"conditional · insufficient · no_go",k:"alt",lc:"не-go"},
+      {f:"d6.n8",t:"d7.n1",l:"полный draft",lc:"D6 → D7"},
+      {f:"d5.n3",t:"d2.n1",l:"новые факты",k:"alt",route:"above",depth:46},
+      {f:"d5.n8",t:"d6.n1",l:"новый go",k:"alt",route:"above",depth:92},
+      {f:"d5.n9",t:"d7.n6",l:"отрицательный итог",k:"alt",route:"below",depth:46},
+      {f:"s",t:"d1",l:"S обслуживает каждый ход D1–D6",k:"tie",route:"below",depth:92}
+     ]},
     {id:"con",n:"Стадия 2",st:"part",g:1,t:"Концепция",io:["stage:discovery","conceptSections"],top:70,
      sum:"Превращает исследованную потребность и границы в адресуемые требования: кому, какой результат, какое поведение, как принять.",
      d:[["Что делает","Из принятой Discovery строит разделы и требования: id, утверждение, польза, получатель (actor id), результат (outcome id), критерии приёмки. С неё начинается нить требований до задачи."],["Берёт","stage:<p>:discovery целиком — и автор, и оценщик (после DS1 — ещё план, отчёт, вердикт с вариантом)."],["Отдаёт","stage:<p>:concept: карте L1 — требования и покрытие; спецификации — что покрыть контрактами; фичам — требования контрактов; OM — требования и критерии."],["Пробелы","Применение ограничений и варианта не обязательно; нет двери для существенного неизвестного; нет драйвера запуска; UI путает авторство.",GAP],["Задачи","DS1.2 · UNK1 · DRV1 · DS1.3",TASK]],
@@ -1845,11 +1990,11 @@ research-stage(project, draftId, maxTurns)
 
   /* ---------- links between stages; they land on inner nodes when a stage is expanded ---------- */
   var CROSS=[
-    {f:"in.e.e9",t:"disc.plan",l:"первый research action",lc:"идея → первый вызов Discovery"},
-    {f:"disc.summary",t:"in.b.b1",l:"итог владельцу",route:"above",depth:40},
-    {f:"disc.stage",t:"con.trigger",l:"accepted · guards",lc:"stage:discovery — все поля"},
-    {f:"disc.stage",t:"con.packet",l:"prerequisites: Discovery целиком",route:"above",depth:40,ff:.8,tf:.5},
-    {f:"con.door",t:"disc.plan",l:"адресный возврат к исследованию",k:"alt",route:"below",depth:44,ff:.5,tf:.5},
+    {f:"in.e.e9",t:"disc.d1.n1",l:"первый research action",lc:"идея → первый вызов Discovery"},
+    {f:"disc.d7.n6",t:"in.b.b1",l:"итог владельцу",route:"above",depth:40},
+    {f:"disc.d7.n4",t:"con.trigger",l:"accepted · guards",lc:"stage:discovery — все поля"},
+    {f:"disc.d7.n4",t:"con.packet",l:"prerequisites: Discovery целиком",route:"above",depth:40,ff:.8,tf:.5},
+    {f:"con.door",t:"disc.d2.n1",l:"адресный возврат к исследованию",k:"alt",route:"below",depth:44,ff:.5,tf:.5},
     {f:"con.stage",t:"map.trigger",l:"accepted · guards",lc:"stage:concept — conceptSections"},
     {f:"con.stage",t:"map.packet",l:"prerequisites: концепция целиком",route:"above",depth:40,ff:.35},
     {f:"con.stage",t:"map.build",l:"conceptSections → requirements",route:"above",depth:84,ff:.65},
@@ -1857,7 +2002,7 @@ research-stage(project, draftId, maxTurns)
     {f:"map.stage",t:"spec.packet",l:"prerequisites: карта целиком",route:"above",depth:40,ff:.4},
     {f:"spec.stage",t:"om.b1.read",l:"нормализованные договоры (без entry · inputs · compatibility)",route:"above",depth:40,ff:.8},
     {f:"spec.omgap",t:"om.b1.gaps",l:"nodes · state → решение OM",k:"alt",route:"below",depth:44,ff:.5},
-    {f:"disc.stage",t:"spec.packet",l:"actors · outcomes · constraints",route:"below",depth:198,ff:.14},
+    {f:"disc.d7.n4",t:"spec.packet",l:"actors · outcomes · constraints",route:"below",depth:198,ff:.14},
     {f:"map.stage",t:"om.l1.om",l:"graph-layer:1 · journeys → очередь OM",route:"below",depth:44,ff:.7},
     {f:"map.graph",t:"feat.checks",l:"артефакты L1 → проверка outcome · interactions",route:"below",depth:88,ff:.5},
     {f:"spec",t:"feat",l:"контракты"},
@@ -1870,12 +2015,12 @@ research-stage(project, draftId, maxTurns)
     {f:"om.c.plan",t:"run.tasks",l:"MachinePlan.tasks[] (пример)",route:"below",depth:60},
     {f:"con.stage",t:"spec.packet",l:"conceptSections → покрыть договорами",route:"above",depth:128,ff:.5},
     {f:"con.stage",t:"om.b1.read",l:"требования + критерии {id}#n",route:"below",depth:88,ff:.65},
-    {f:"disc.stage",t:"map.packet",l:"actors · outcomes · constraints · journeys",lc:"actors · outcomes · constraints · journeys",route:"below",depth:132,ff:.3},
-    {f:"disc.stage",t:"map.build",l:"preparation → actors · outcomes · journeys",route:"below",depth:154,ff:.22},
-    {f:"disc.stage",t:"om.b1.read",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
-    {f:"disc.web",t:"om.r1.packet",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6}
+    {f:"disc.d7.n4",t:"map.packet",l:"actors · outcomes · constraints · journeys",lc:"actors · outcomes · constraints · journeys",route:"below",depth:132,ff:.3},
+    {f:"disc.d7.n4",t:"map.build",l:"preparation → actors · outcomes · journeys",route:"below",depth:154,ff:.22},
+    {f:"disc.d7.n4",t:"om.b1.read",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
+    {f:"disc.d2.n6",t:"om.r1.packet",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6}
   ];
-  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec.packet","spec.model","spec.assess","spec.contracts","spec.checks","spec.stage","feat.packet","feat.model","feat.prep","feat.checks","feat.stage","feat.norm","om.b1.input","om.r1.packet","om.r2.mat","om.l3.model","om.c.compiler","run.t.ctx","run.t.model","run.k.exec","run.r.review","run.c.receipt"];
+  var CHAIN=["disc.d2.n6","disc.d3.n3","disc.d4.n2","disc.d6.n4","disc.d7.n4","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec.packet","spec.model","spec.assess","spec.contracts","spec.checks","spec.stage","feat.packet","feat.model","feat.prep","feat.checks","feat.stage","feat.norm","om.b1.input","om.r1.packet","om.r2.mat","om.l3.model","om.c.compiler","run.t.ctx","run.t.model","run.k.exec","run.r.review","run.c.receipt"];
 
   function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 
