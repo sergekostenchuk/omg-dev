@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); недоверенный вход: ответ модели не по форме или с чужими ссылками, подлинный результат другой попытки/владельца → отказ с адресом (подделку собственной базы не тестировать — решение владельца 28.09, 13.10); окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 179. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → AT3b → AT4 → L1A → DRV1 → ASM1 → ASM1.1 → UNK1 → IN1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 181. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → AT3b → L1A → DRV1 → IN1 → CFG1 → AT4 → ASM1 → ASM1.1 → UNK1 → ENV1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 97.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 99.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2461,6 +2461,48 @@
   - design в окне не отправляет answer-fact и не получает недоказанную подпись оценки
   - исторические записи не переавторизуются
 
+### CFG1 · Режим роли по фазе: команды роли выбираются по mode (research analyst/assessor, OM research, implement, review, chat) одним resolver для вызова и для проверки M8; compact только у выбранного research; отсутствующая клетка — адресный отказ без заимствования чужой; model/effort/speed пока общие для роли
+
+**Цель.** Опись codex-worker2 ~/REPORTS/review/omg-cfg1-env1_inventory_141026.md: единый RoleBinding.command для всех фаз, воспроизведено --compact-research → adapter_mode_invalid для implement/review/chat. Договор Codex-omg №4864 (~/REPORTS/review/omg-cfg1-env1-contract-4855_141026.md §3, 9/10, узкая граница): один resolver вызова и проверки implement/review в M8; старые корректные универсальные команды не запрещаются, у новой формы нет fallback отсутствующей клетки; оплаченный вызов восстанавливается по сохранённому основанию без повторной отправки; явный research override reader-pilot сохраняется; форматы сохранённых ответов и ядро физического recovery не меняются. Полные профили моделей по фазам, UI-редактор матрицы — вне задачи. Не обязателен для первого HX4 до OM (нужен до coding/review/chat с compact-конфигурацией).
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: RoleBinding роли и mode вызова
+- Пишет записи: выбор команды роли по mode одним resolver; адресный отказ отсутствующей клетки
+- Разрешённые пути: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`, `test/role-mode.test.ts`
+- Из движка как есть: №4856; №4864
+- После: DRV1, IN1, AT3a
+- Тесты сверх обязательных:
+  - одна настройка проходит analyst/assessor research, OM research, implement, review, chat через разные локальные argv-маркеры; compact только у выбранного research; wire metadata совпадает с эффективным binding
+  - каждый реально запрашиваемый mode без команды — адресный отказ, 0 model-call/send/spawn; после configure тот же путь запускается; неиспользуемый chat не блокирует research
+  - подлинный reader preset и analyst/assessor pilot используют прежние явные команды/actor и точный сохранённый pilot Ref
+  - research доступен, implement/review отсутствует: Discovery работает, новый M8 не даёт положительную готовность; после настройки клетки новый M8 её использует
+  - реальные paid A/B/C, OM и implement/review/correction старого producer: новый Store, 0 повторных вызовов, прежние request hashes; несовместимая команда — stale без утраты ответа
+  - второй Store делает configure до CAS/отправки: старая неавторизованная отправка не проходит; сохранённый response не становится lost и не отправляется повторно
+
+### ENV1 · Условия среды до нового OM: один reader условий {condition, state, requiredBy, at, basis, action}; проверка в startPass при создании нового om-run (включая ветвь с готовым om-input) — Git root/HEAD, capacity, dispatch, research runner; отказ до B1/om-run/вызова; будущие checks не блокируют; история читается по своей эре
+
+**Цель.** Опись codex-worker2 №4856; договор Codex-omg №4864 (~/REPORTS/review/omg-cfg1-env1-contract-4855_141026.md §4, 9/10 с разделением сроков): research runner нужен до своего вызова; Git/dispatch/capacity — к новому OM; будущие checks не блокируют создание продукта; общая проверка startPass охватывает и существующий om-input без om-run. Отказ до нового B1/om-run/model-call; исправление — configure/configure-om-dispatch или подготовка workspace оператором, затем тот же startPass; ENV1 не создаёт коммитов и не меняет repository/credentials. Environment/dispatch/capacity Ref и absence guards доходят до той же записи startRun/writeRunBases (без второго producer оснований). Без baseline-прогона, обязательного provider --version, нового глобального fingerprint-gate и повторной проверки завершённой истории. Механизм не обязателен для первого HX4, если условия уже настроены; UI готовности и gateway probe — вне задачи.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: Environment, OM dispatch, requestCapacityChars, Git root/HEAD, research binding
+- Пишет записи: проекция условий среды с requiredBy; охраны условий в записи startRun/writeRunBases нового OM
+- Разрешённые пути: `src/om/environment-readiness.ts`, `src/runtime/environment.ts`, `src/om/run-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/environment-readiness.test.ts`, `test/om-run-driver.test.ts`, `test/early-stage-driver.test.ts`
+- Из движка как есть: №4856; №4864; CFG1; DRV1
+- После: DRV1, IN1, CFG1
+- Тесты сверх обязательных:
+  - не-Git, Git без HEAD, вложенный вместо корня: Discovery с рабочим runner доступен, status называет недостающее, новый OM не пишет B1/run и не вызывает модель; после исправления среды повтор проходит
+  - capacity/dispatch: status до OM показывает адреса; DRV1 и прямой om-start отказывают одинаково до записи/оплаты; после configure повтор без дублей
+  - заранее созданный om-input без om-run: та же защита startRun
+  - второй Store меняет Environment/dispatch между чтением и записью: stale/CAS, нет частичного нового прохода
+  - check-скрипт ещё будет написан: строка с будущим сроком, не ложное ready и не запрет OM; baseline не запускается
+  - подлинный legacy producer при исчезнувшем сегодняшнем runner/изменившемся HEAD: историческое чтение и сохранённый ответ без нового probe и вызова
+
 ### AT3b · Маршрут дефекта плана в OM: один публичный repair-plan с ветвью OM → запись дефекта → пробел D1 над принятым L3 → пакет исправления работы → redefine → G5 → settle → явное возобновление завершённого прохода → M8 → compile
 
 **Цель.** Вход ремонта — идемпотентная запись точного дефекта и основания ремонта, без переписывания старого task-run; ветвь OM передаёт работу штатному проходу с его управлением, бюджетом и остановкой; maxTurns не превращается молча в бесплатные шаги. D1: класс пробела «дефект плана» над принятым кадром → модель, находка в брифе; настоящее решение H2 имеет приоритет и входит в новый контракт со своей точной ссылкой; EX6 не копируется как самостоятельная истина. Неизменённые принятые работы сохраняются. Противоречие явному требованию верхнего слоя — адрес к владельцу этого требования, не правка нижнего. Ошибочная жалоба — исход с объяснением и возвратом к исправлению кода, без бесконечного переоткрытия того же пробела. G5 проверяет новый контракт, а не превращает жалобу в факт. Явный переход возобновления по точному дефекту и прежнему complete (сейчас run.ts:422 и startRun возвращают завершённый проход); обычное продолжение завершённого прохода — прежнее поведение. Эра: различимая форма источника дефекта и перехода ремонта; для кадра — ссылки на дефект через основание, если контракт C5 не меняется; от старых кадров не требовать, их принятие не пересчитывать. Кандидат и расход — AT4.
@@ -2498,7 +2540,7 @@
 - Пишет записи: соответствие задач версий плана; перенесённый кандидат
 - Разрешённые пути: `src/execution/runner.ts`, `src/execution/basis.ts`, `src/discovery/reader-pilot.ts`, `test/execution.test.ts`
 - Из движка как есть: №4082; №4084
-- После: AT3b
+- После: AT3b, CFG1
 - Тесты сверх обязательных:
   - перекомпиляция сохраняет кандидат задачи 1 как непринятый материал и расход 16 / 11 394 846
   - разделённая задача — каждый файл с новым владельцем, бюджет не удваивается
@@ -2516,7 +2558,7 @@
 - Пишет записи: пакет ядра
 - Разрешённые пути: `package.json`, `tsconfig.json`, `scripts/check-backend.mjs`, `test/fixtures/core1-records.ts`, `test/assessment-session-resume.test.ts`, `test/discovery.test.ts`, `test/execution-external-input.test.ts`, `test/om-accepted-answer.test.ts`, `test/om-achievements.test.ts`, `test/om-addressing.test.ts`, `test/om-answers-gate.test.ts`, `test/om-call-record.test.ts`, `test/om-compiler-readers.test.ts`, `test/om-composite-keys.test.ts`, `test/om-feasibility-boundary.test.ts`, `test/om-feasibility-projection.test.ts`, `test/om-feasibility.test.ts`, `test/om-frame-accept.test.ts`, `test/om-frame-candidate.test.ts`, `test/om-gap-lines.test.ts`, `test/om-gaps.test.ts`, `test/om-legacy-operation-lock.test.ts`, `test/om-legacy-route-closure.test.ts`, `test/om-model-call.test.ts`, `test/om-operation-cost.test.ts`, `test/om-probe.test.ts`, `test/om-question-packet.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-repeat-gate.test.ts`, `test/om-result-identity.test.ts`, `test/om-routes.test.ts`, `test/om-run.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/om-series-current.test.ts`, `test/om-series.test.ts`, `test/om-task-context.test.ts`, `test/om-task-neighbors.test.ts`, `test/om-work-zone.test.ts`, `test/preparation.test.ts`, `test/reader-pilot.test.ts`, `test/research-call-resume.test.ts`, `test/runtime-absence-r3.test.ts`, `test/runtime-absence-research.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1, SP1a, SP1b, ASM1.1
+- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1, SP1a, SP1b, ASM1.1, CFG1, ENV1
 - Тесты сверх обязательных:
   - ЧАСТЬ А (слово пользователя ~22:10 «тест смотрит только актуальную версию»; вопрос Opus-1 №3686, разрешение оркестратора): 41 файл тестов, запускающих старый движок из git, и один модуль образцов test/fixtures/core1-records.ts — формат не в живой базе → сценарий удалить; формат в живой базе → образец из снимка 1554, читает нынешний код; проверки нового не трогать
   - ДО КОДА части Б — опись легаси и список удаляемого показать пользователю; удалять после его «да»
@@ -2535,7 +2577,7 @@
 - Пишет записи: интерфейс сервиса движка и подключения
 - Разрешённые пути: `src/product/commands.ts`, `src/cli.ts`, `src/service/server.ts`, `test/service.test.ts`
 - Из движка как есть: продуктовые команды om-start/om-continue/om-state/om-stop/om-spend/om-fsck; проект SEC1
-- После: NR, OWN1, RL3, WB1, DRV1, IN1
+- После: NR, OWN1, RL3, WB1, DRV1, IN1, CFG1, ENV1
 - Тесты сверх обязательных:
   - ДО КОДА — проект Codex-omg вместе с SEC1: исследование, как подключают такие движки в харнесы (MCP, плагины Claude Code/Codex/Cursor), и как продукты выдают и сохраняют ключ владельца (ключ восстановления, связка ключей ОС, экспорт); пути уточняются проектом
   - один и тот же сценарий проекта через MCP и через CLI даёт одинаковые записи
