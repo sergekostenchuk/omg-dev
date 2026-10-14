@@ -81,6 +81,10 @@ h1 b{color:var(--accent);font-weight:600}
 .scard .soon{font:10px var(--mono);color:var(--ink3)}
 .scard .ft2 .ib{margin-left:auto}
 .scard .mark,.node .mark{position:absolute;right:-7px;top:-7px;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font:600 10px var(--mono);border:1.5px solid var(--warn);background:var(--raised);color:var(--warn)}
+.scard .done,.node .done{position:absolute;right:16px;top:-9px;height:18px;padding:0 6px;border-radius:9px;display:flex;align-items:center;font:600 9.5px var(--mono);border:1.5px solid var(--ok);background:var(--raised);color:var(--ok);white-space:nowrap;letter-spacing:.02em}
+.done.acc2{border-style:dashed}
+.detail dd.done{color:var(--ok)}
+select.chip{appearance:none;-webkit-appearance:none;padding-right:22px;background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),linear-gradient(135deg,currentColor 50%,transparent 50%);background-position:calc(100% - 12px) 55%,calc(100% - 8px) 55%;background-size:4px 4px;background-repeat:no-repeat}
 
 .node{position:absolute;width:176px;border:1px solid var(--line2);border-radius:12px;background:var(--raised);padding:7px 10px 8px;box-shadow:0 10px 30px var(--shadow);cursor:pointer;transition:border-color .15s,opacity .2s,box-shadow .15s;z-index:3}
 .node:hover{border-color:#4a4a52}
@@ -199,6 +203,8 @@ ul.plain b{color:var(--ink);font-weight:500}
     <button class="chip" data-mode="" aria-pressed="true">Весь поток</button>
     <button class="chip" data-mode="chain" aria-pressed="false">Цепочка фактов</button>
     <button class="chip" data-mode="gaps" aria-pressed="false">Пробелы</button>
+    <button class="chip" data-mode="done" aria-pressed="false">Сделано</button>
+    <select class="chip" id="doneDate" aria-label="Сделано за дату"><option value="">все даты</option></select>
     <span class="sep" aria-hidden="true"></span>
     <button class="chip" id="expAll">Развернуть всё</button>
     <button class="chip" id="colAll">Свернуть всё</button>
@@ -232,7 +238,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <span>Фичи</span><a href="#f-subs">Подблоки</a><a href="#f-what">Что это</a><a href="#f-input">Вход</a><a href="#f-process">Обработка</a><a href="#f-output">Выход</a><a href="#f-questions">Вопросы</a><a href="#f-records">Записи</a><a href="#f-gaps">Пробелы</a>
     <span>OM</span><a href="#o-what">Что это</a><a href="#o-routes">Два маршрута</a><a href="#o-actions">Действия</a><a href="#o-records">Записи</a><a href="#o-missed">Поправки</a><a href="#o-min">Минимум</a>
     <span>Исполнение</span><a href="#x-what">Что это</a><a href="#x-in">Вход модели</a><a href="#x-out">Ответ модели</a><a href="#x-cards">Пять задач</a><a href="#x-phase">Фаза задачи</a><a href="#x-records">Записи</a><a href="#x-gaps">Пробелы</a>
-    <span>Итог</span><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
+    <span>Итог</span><a href="#done">Сделано</a><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
   </nav>
 
   <!-- ===================== INPUT ===================== -->
@@ -1254,6 +1260,19 @@ research-stage(project, draftId, maxTurns)
   <div class="block">
     <div class="bh2"><h2>Итог</h2><small>предложение оркестратора · классы — по Codex №4585 и №4587 · не выдано</small></div>
     <div class="grid">
+      <section class="sec wide" id="done">
+        <h3>Сделано по датам <small>на карте — зелёная отметка «✓ дата» рядом с «!»; кнопка «Сделано» и выбор даты в панели; сплошная рамка — влито, пунктир — принято ревью и ждёт вливания</small></h3>
+        <div class="tw"><table>
+          <thead><tr><th>Дата</th><th>Задача</th><th>Состояние</th><th>Что закрыто</th><th>Где</th></tr></thead>
+          <tbody>
+            <tr><td>14.10.2026</td><td>DRY5FIX</td><td>влито</td><td>Ошибка модели на ранних стадиях завершает попытку адресным отказом; следующий запуск получает исправленный ответ без застревания</td><td>om/module 3cef0e61</td></tr>
+            <tr><td>14.10.2026</td><td>DS1 (+ DS1.1)</td><td>принято</td><td>Discovery v5: план → отчёт → вердикт; анкета только после go; выбор условия владельцем; перенос ограничений отчёта в анкету; ошибка нового предложения — адресный отказ</td><td>ревью №4715, вливание цепочкой</td></tr>
+            <tr><td>14.10.2026</td><td>WB1</td><td>принято</td><td>Модель сама ищет и читает страницы; шлюз закрыт от редиректов во внутреннюю сеть, общий срок загрузки</td><td>ревью №4708, вливание за DS1</td></tr>
+            <tr><td>14.10.2026</td><td>WB1b</td><td>принято</td><td>Web-источник принимается на стадиях после Discovery с пределом reported-not-runtime-proof</td><td>ревью №4682, вливание за WB1</td></tr>
+            <tr><td>14.10.2026</td><td>L1A · DRV1 · SP1 · UNK1 · IN1 · ASM1</td><td>в работе / договор</td><td>Этап 2: договоры Codex №4684–4687, №4714; L1A — адресная часть готова; DRV1 — у исполнителя</td><td>план be2809e, d661400, ae7b84f</td></tr>
+          </tbody>
+        </table></div>
+      </section>
       <section class="sec wide" id="tasks">
         <h3>Минимум до живого HX4 <small>одна задача — один класс</small></h3>
         <div class="tw"><table>
@@ -1302,6 +1321,15 @@ research-stage(project, draftId, maxTurns)
   "use strict";
   var ST={yes:["ok","есть"],ds1:["acc","в DS1"],part:["warn","частично"],no:["bad","нет"],ex:["","пример"]};
   var GAP=1,TASK=2;
+  /* done work by date: merged = in om/module; accepted = independent review passed, merge pending */
+  var DONE=[
+    {id:"DRY5FIX",date:"14.10.2026",st:"merged",ref:"om/module 3cef0e61",what:"Ошибка модели на ранних стадиях (форма, недоступное действие, значение; ошибка оценщика) завершает попытку адресным отказом; следующий обычный запуск получает исправленный ответ без застревания"},
+    {id:"DS1",date:"14.10.2026",st:"accepted",ref:"ревью Codex №4715 (круг 2), вливание цепочкой",what:"Discovery v5: план исследования → отчёт с источниками → вердикт go / conditional / no_go / insufficient_evidence; анкета только после go; ошибка нового предложения модели — адресный отказ попытки"},
+    {id:"DS1.1",date:"14.10.2026",st:"accepted",ref:"в составе DS1",what:"Дверь выбора условия владельцем (owner_choice): предответы, отдельная запись решения, новый вердикт по выбору; выбор только для conditional"},
+    {id:"WB1",date:"14.10.2026",st:"accepted",ref:"ревью Codex №4708 (шлюз, круг 3), вливание за DS1",what:"Модель прохода сама ищет и читает страницы: web_search / web_fetch, снимок страницы — Source вида web; шлюз NL99 закрыт от редиректов во внутреннюю сеть, общий срок загрузки"},
+    {id:"WB1b",date:"14.10.2026",st:"accepted",ref:"ревью Codex №4682, вливание за WB1",what:"Источник web принимается на стадиях после Discovery как документальное свидетельство с пределом reported-not-runtime-proof"}
+  ];
+  var DST={merged:"влито",accepted:"принято"};
   /* two-row snake layout for sub-block schemes; empty labels stay hidden */
   function snake(list,k){list.forEach(function(n,i){if(i<k){n.x=i*220;n.y=0;}else{n.x=(k-1-(i-k))*220;n.y=200;}});return list;}
   function lbl(e){if(e.l==null)e.l="";return e;}
@@ -2708,6 +2736,36 @@ research-stage(project, draftId, maxTurns)
     });
   }
 
+  /* ---------- done marks: task classes named in a node's «Задача» rows that are merged or accepted ---------- */
+  var doneDate="";
+  function ownDone(k){
+    var it=IT[k],ids={};
+    (it.d||[]).forEach(function(r){if(r[2]===TASK)String(r[1]).split(/[\s·,+;()]+/).forEach(function(w){ids[w]=1;});});
+    return DONE.filter(function(x){return ids[x.id]&&(!doneDate||x.date===doneDate);});
+  }
+  function doneOf(k){
+    if(IT[k].kind==="node")return ownDone(k);
+    var seen={},out=[];
+    ORDER.forEach(function(c){if(c===k||c.indexOf(k+".")===0)ownDone(c).forEach(function(x){if(!seen[x.id]){seen[x.id]=1;out.push(x);}});});
+    return out;
+  }
+  function renderDone(){
+    ORDER.forEach(function(k){
+      var el=IT[k].kind==="node"?nodeEl[k]:cardEl[k];if(!el)return;
+      var old=el.querySelector(":scope > .done");if(old)old.remove();
+      var list=doneOf(k);if(!list.length)return;
+      var allMerged=list.every(function(x){return x.st==="merged";});
+      var s=document.createElement("span");s.className="done"+(allMerged?"":" acc2");
+      s.title=list.map(function(x){return x.id+" — "+DST[x.st]+" "+x.date;}).join("\n");
+      var dates=list.map(function(x){return x.date.slice(0,5);}).filter(function(v,i,a){return a.indexOf(v)===i;});
+      s.textContent=(IT[k].kind==="node"?"✓ ":"✓ "+list.length+" · ")+dates.join(", ");
+      el.appendChild(s);
+    });
+  }
+  (function(){var sel=document.getElementById("doneDate");if(!sel)return;
+    DONE.map(function(x){return x.date;}).filter(function(v,i,a){return a.indexOf(v)===i;}).forEach(function(d){var o=document.createElement("option");o.value=d;o.textContent=d;sel.appendChild(o);});
+    sel.addEventListener("change",function(){doneDate=sel.value;renderDone();apply();});})();
+
   /* ---------- highlight ---------- */
   var sel=null,mode="";
   function visibleKeys(){return ORDER.filter(function(k){return shown(k)&&(IT[k].kind==="node"||!opened(k));});}
@@ -2716,6 +2774,7 @@ research-stage(project, draftId, maxTurns)
   function apply(){
     var ns=null,es=null,vis=visibleKeys();
     if(sel){ns={};ns[sel]=1;es={};drawn.forEach(function(d,i){if(d.a===sel||d.b===sel){es[i]=1;ns[d.a]=1;ns[d.b]=1;}});}
+    else if(mode==="done"){ns={};es={};vis.forEach(function(k){if(doneOf(k).length)ns[k]=1;});}
     else if(mode==="gaps"){ns={};es={};vis.forEach(function(k){if(IT[k].kind==="node"?IT[k].g:anyGap(k))ns[k]=1;});}
     else if(mode==="chain"){ns={};es={};
       vis.forEach(function(k){if(CHAIN.some(function(c){return under(c,k);}))ns[k]=1;});
@@ -2734,6 +2793,7 @@ research-stage(project, draftId, maxTurns)
       (it.g?'<span class="mk" title="пробел">!</span>':'')+'<button type="button" class="x" data-act="close" aria-label="Закрыть">×</button></div>'+
       '<h2>'+esc(it.t)+'</h2><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div><dl>';
     (it.d||[]).forEach(function(r){h+='<div><dt>'+esc(r[0])+'</dt><dd'+(r[2]===GAP?' class="gap"':r[2]===TASK?' class="task"':'')+'>'+esc(r[1])+'</dd></div>';});
+    doneOf(key).forEach(function(x){h+='<div><dt>Сделано · '+esc(x.date)+'</dt><dd class="done">'+esc(x.id)+' — '+esc(DST[x.st])+' ('+esc(x.ref)+'): '+esc(x.what)+'</dd></div>';});
     h+='</dl>';
     var inc=drawn.filter(function(d){return d.b===key;}),out=drawn.filter(function(d){return d.a===key;});
     if(inc.length||out.length){h+='<div class="links">';
@@ -2839,6 +2899,7 @@ research-stage(project, draftId, maxTurns)
   });
   document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&sel)closeDetail();});
 
+  renderDone();
   layout();fit();
   if(document.fonts&&document.fonts.ready)document.fonts.ready.then(function(){layout();fit();});
 })();
