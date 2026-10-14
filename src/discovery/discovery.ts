@@ -14,7 +14,7 @@ import type { TechnicalReport } from '../graph/research-contracts.js';
 import { Environments, uniqueTransactionGuards } from '../runtime/environment.js';
 import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
 import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/runtime-evidence.js';
-import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
+import { readResearchAssessmentAt, assessmentBindingId, directAssessmentBasis } from './research-assessment.js';
 import { readResearchConsumerTurn, readResearchAcceptanceBinding, pinnedLayerDeltaStore } from './response-recovery.js';
 import { researchAction, projectAcceptanceBinding, acceptanceBindingId, managedAnswerId, managedAnswerTurn,
   type ManagedResearchTurn, type AcceptedPaidAnswerInputs, type ResearchAcceptanceBinding } from './research-consumer-transition.js';
@@ -221,9 +221,19 @@ export class Discovery {
       const obligations = obligationEvidenceFindings(question.value.spec,assessment.value.value as unknown as TechnicalReport,assessment.value.observations,runtime.proofs);
       if (obligations.length) throw new EngineError('research_obligation_evidence_invalid','An assessed value still must satisfy its assigned knowledge kind',obligations);
     }
+    // ASM1.1 (№4791): a direct assessment judged on an accepted prefix is accepted on that same prefix only. Its exact
+    // neighbors and grounds come from its own saved material through the common reader, must still stand, and guard the
+    // acceptance write itself — a reopen between this check and the write refuses the whole transaction.
+    const prefix = managedPending === undefined ? directAssessmentBasis(this.store, assessment) ?? [] : [];
+    for (const ref of prefix) {
+      const head = this.store.get(ref.id);
+      if (!head || canonical(reference(head)) !== canonical(ref))
+        throw new EngineError('research_assessment_basis_stale', `[${ref.id}] The accepted prefix this assessment was judged on changed; assess the answer again on the current prefix`,
+          { unit: 'research-acceptance', target: question.id, field: 'origin', ref });
+    }
     const answer: ResearchAnswer = { projectId: question.value.projectId, question: id, assessment: assessmentRef, value: assessment.value.value };
     const guards: TransactionGuard[] = [assessmentRef, assessment.value.environment,
-      ...assessment.value.observations.map(item => item.source), ...runtimeGuards];
+      ...assessment.value.observations.map(item => item.source), ...runtimeGuards, ...prefix];
     if (managedPending === undefined) return this.#answer(question, answer.value, answer, "research-answer", guards);
     const managed = this.#managedAcceptance(question, assessment, managedPending);
     return this.#answer(question, answer.value, answer, "research-answer", guards, managed);

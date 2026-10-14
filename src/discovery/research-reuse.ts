@@ -17,6 +17,9 @@ export function reuseResearch(store: Store, discovery: Discovery, draft: Revisio
       const report = value.value;
       if (draft.value.stage === "om-g2" && report && typeof report === "object" && !Array.isArray(report)
         && Array.isArray(report['gaps']) && report['gaps'].length > 0) continue;
+      // ASM1.1 (№4791 §6): a direct assessment bound to its own prefixed material proves nothing for another question's
+      // prefix — not a reuse candidate; the ordinary current assessment of this question stays available.
+      if (value.origin !== undefined) continue;
       if (value.projectId !== draft.value.projectId || value.verdict !== "supported" || value.researcher === value.assessor
         || canonical(value.environment) !== canonical(environment) || value.observations.length === 0
         || !value.observations.every(item => discovery.evidence.verify(item))) continue;

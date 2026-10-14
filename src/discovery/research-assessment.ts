@@ -3,13 +3,13 @@ import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.
 import { Ajv } from "ajv";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { Evidence } from "../evidence/evidence.js";
-import { reference, isRef, type Ref, type Finding } from "../pipeline/contracts.js";
+import { reference, isRef, uniqueRefs, type Ref, type Finding } from "../pipeline/contracts.js";
 import { uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
 import { canonical, hashJson } from "../canonical.js";
 import { realpathSync } from 'node:fs';
 import { requireCondition, EngineError } from "../errors.js";
 import type { Question, DiscoveryDraft } from "./discovery.js";
-import type { ResearchAction, ResearchAssessment } from "./research-model.js";
+import { DIRECT_ASSESSMENT_ORIGIN, type ResearchAction, type ResearchAssessment } from "./research-model.js";
 import { researchPrerequisites, researchGraphContext } from "./research-context.js";
 import { consumerFeedback } from "./consumer-feedback.js";
 import { pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
@@ -18,7 +18,7 @@ import { layerDeltaView, expandLayerDelta } from "./layer-delta.js";
 import { technicalProposalFindings, type LegacyPathResolution } from "../graph/research-evidence.js";
 import type { TechnicalReport } from "../graph/research-contracts.js";
 import type { Graph } from "../graph/model.js";
-import { assessmentSession, assessmentSessionWithProof, readAssessmentSessionOutcomeAt,
+import { assessmentSessionWithProof, readAssessmentSessionOutcomeAt,
   readAssessmentPaidOrigin, readDirectAssessmentMaterials, type AssessmentPaidOriginInput } from "./assessment-session.js";
 import { assessmentReadView, readResearchConsumerIntent, readResearchConsumerTurn,
   prepareManagedProposalRefusal, type AssessmentReadProof } from './response-recovery.js';
@@ -78,7 +78,8 @@ function managedTurn(store: Store, pendingRef: Ref, draft: Revision<DiscoveryDra
 }
 function assessmentValue(question: Revision<Question>, action: Extract<ResearchAction, { action: 'answer' }>,
   environment: Revision<Environment>, observations: ResearchAssessment['observations'],
-  bases: ResearchAssessment['bases'], runtimeProofs: ResearchAssessment['runtimeProofs'], response: { verdict: unknown; reasons: unknown }): ResearchAssessment {
+  bases: ResearchAssessment['bases'], runtimeProofs: ResearchAssessment['runtimeProofs'], response: { verdict: unknown; reasons: unknown },
+  origin?: ResearchAssessment['origin']): ResearchAssessment {
   requireCondition(['supported', 'insufficient', 'conflicting'].includes(String(response.verdict))
     && Array.isArray(response.reasons) && response.reasons.every(item => typeof item === 'string')
     && (response.verdict === 'supported' || response.reasons.length > 0),
@@ -87,7 +88,75 @@ function assessmentValue(question: Revision<Question>, action: Extract<ResearchA
     ...(bases ? { bases } : {}), ...(runtimeProofs?.length ? { runtimeProofs } : {}), observations,
     verdict: response.verdict as ResearchAssessment['verdict'], reasons: response.reasons as string[],
     researcher: environment.value.implementer.actor, assessor: environment.value.reviewer.actor,
-    environment: reference(environment) };
+    environment: reference(environment), ...(origin ? { origin } : {}) };
+}
+
+type AssessmentProof = ReturnType<typeof readAssessmentSessionOutcomeAt>;
+const object = (value: unknown): value is Record<string, any> => typeof value === 'object' && value !== null && !Array.isArray(value);
+function originInvalid(id: string, message: string): never {
+  throw new EngineError('research_assessment_origin_invalid', `[${id}] ${message}`);
+}
+/** ASM1.1 (№4791): the accepted prefix a saved assessor material was judged on — each neighbor's exact question and answer,
+ * the pending neighbor, and the Discovery grounds with their owner decisions. Null when the material carries no prefix. */
+function materialPrefix(context: Record<string, any>, id: string): Ref[] | null {
+  const neighbors = context.assessmentContextContract === STAGE_NEIGHBOR_CONTEXT ? context.stageNeighbors : undefined;
+  const discovery = object(context.discoveryContext) ? context.discoveryContext : undefined;
+  if (neighbors === undefined && discovery === undefined) return null;
+  const refs: Ref[] = [];
+  if (neighbors !== undefined) {
+    if (!object(neighbors) || neighbors.contract !== 'stage-neighbors/v1' || !Array.isArray(neighbors.fields)
+      || !neighbors.fields.every((row: unknown) => object(row) && isRef(row.question) && isRef(row.answer))
+      || !(neighbors.pending === null || object(neighbors.pending) && isRef(neighbors.pending.question)))
+      originInvalid(id, 'The saved assessor material lost its exact neighbors');
+    for (const row of neighbors.fields) refs.push(row.question, row.answer);
+    if (neighbors.pending) refs.push(neighbors.pending.question);
+  }
+  if (discovery !== undefined) {
+    const fields: unknown[] = object(discovery.fields) ? Object.values(discovery.fields) : [];
+    if (!object(discovery.fields) || !fields.every(row => object(row) && isRef(row.question) && isRef(row.answer))
+      || !Array.isArray(discovery.ownerDecisions) || !discovery.ownerDecisions.every((round: unknown) => object(round)
+        && Array.isArray(round.decisions) && round.decisions.every((decision: unknown) => object(decision) && isRef(decision.ref))))
+      originInvalid(id, 'The saved assessor material lost its exact Discovery grounds');
+    for (const row of fields as { question: Ref; answer: Ref }[]) refs.push(row.question, row.answer);
+    for (const round of discovery.ownerDecisions) for (const decision of round.decisions) refs.push(decision.ref);
+  }
+  return uniqueRefs(refs);
+}
+/** ASM1.1: the one derivation of a direct assessment from its exact completed assessor material — the producer builds the
+ * record with it and acceptance proves the record with it. Observations, bases and runtime proofs are those the material
+ * showed the assessor; the verdict is the material's terminal result. */
+function directAssessment(store: Store, projectId: string, proof: AssessmentProof, observations: ResearchAssessment['observations'],
+  bases: ResearchAssessment['bases'], runtimeProofs: ResearchAssessment['runtimeProofs']): ResearchAssessment {
+  const question = exact<Question>(store, proof.question, 'question');
+  const environment = exact<Environment>(store, proof.environment, 'environment');
+  const shown = proof.context;
+  if (question.value.projectId !== projectId || !Array.isArray(shown.observations)
+    || !same(shown.observations.slice(0, observations.length), observations)
+    || !same(shown.bases ?? null, bases ? bases.map(({ quote: _quote, ...binding }) => binding) : null)
+    || !same(shown.runtimeProofs ?? [], runtimeProofs ?? []))
+    originInvalid(proof.application.id, 'The assessment differs from the material its assessor saw');
+  return assessmentValue(question, { action: 'answer', question: question.id, value: shown.value, citations: [] }, environment,
+    observations, bases, runtimeProofs, proof.result as { verdict: unknown; reasons: unknown },
+    { contract: DIRECT_ASSESSMENT_ORIGIN, session: proof.session, application: proof.application });
+}
+/**
+ * ASM1.1 (№4791): the exact prefix a direct assessment was judged on, re-read from its own completed session and application
+ * by the common terminal reader — never from today's neighbors — once the assessment is re-derived from that material.
+ * Null for an assessment made before its producer bound the material: it keeps the reading of its era.
+ */
+export function directAssessmentBasis(store: Store, assessment: Revision<ResearchAssessment>): Ref[] | null {
+  const origin = assessment.value.origin;
+  if (origin === undefined) return null;
+  if (!object(origin) || origin.contract !== DIRECT_ASSESSMENT_ORIGIN || !isRef(origin.session) || !isRef(origin.application)
+    || assessment.value.reusedFrom !== undefined)
+    originInvalid(assessment.id, 'A direct assessment names its exact completed assessor session and application');
+  const proof = readAssessmentSessionOutcomeAt(store, assessment.value.projectId, origin.session, origin.application);
+  const prefix = materialPrefix(proof.context, assessment.id);
+  if (prefix === null) originInvalid(assessment.id, 'A bound direct assessment stands on a material with an accepted prefix');
+  if (!same(directAssessment(store, assessment.value.projectId, proof, assessment.value.observations,
+    assessment.value.bases, assessment.value.runtimeProofs), assessment.value))
+    originInvalid(assessment.id, 'The assessment is not what its exact assessor material produced');
+  return prefix;
 }
 
 export async function assessAnswer(store: Store, question: Revision<Question>, action: Extract<ResearchAction, { action: "answer" }>,
@@ -214,14 +283,20 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const paidOrigin: AssessmentPaidOriginInput | undefined = managedPending && assessmentReads
     ? { ...(withNeighbors ? { materialContract: STAGE_NEIGHBOR_CONTEXT } : {}), pending: managedPending, root: canonicalRoot, graph: proposalGraph, legacyPaths, reads: assessmentReads, runtime, runtimeAdmission: selection.admission }
     : undefined;
-  const delivered = managedPending
-    ? await assessmentSessionWithProof(store, draft, question, environment, dispatch, pilot, context, prompt, signal,
-      uniqueTransactionGuards([...runtimeGuards, ...related.guards, ...neighbors.guards, ...(readView?.guards ?? [])]), paidOrigin)
-    : { result: await assessmentSession(store, draft, question, environment, dispatch, pilot, context, prompt, signal,uniqueTransactionGuards([...runtimeGuards, ...related.guards, ...neighbors.guards])), proof: null };
+  // A direct call has no paid origin; its completed session still yields the exact proof of what its assessor saw.
+  const delivered = await assessmentSessionWithProof(store, draft, question, environment, dispatch, pilot, context, prompt, signal,
+    uniqueTransactionGuards([...runtimeGuards, ...related.guards, ...neighbors.guards, ...(readView?.guards ?? [])]), paidOrigin);
   const response = delivered.result as { verdict?: unknown; reasons?: unknown } | null;
   requireCondition(response !== null && response !== undefined, 'assessment_invalid', 'Assessment returned no verdict');
-  const value = assessmentValue(question, action, environment, observations, bases, runtime.proofs,
-    response as { verdict: unknown; reasons: unknown });
+  // ASM1.1 (№4791): a direct assessment on a prefixed material is bound to that exact material: its identity differs per
+  // prefix and its acceptance guards the prefix the assessor saw. The material was saved before the call; a historical
+  // standalone session without a terminal proof keeps its prior contract.
+  const bound = !managedPending && delivered.proof && materialPrefix(delivered.proof.context, question.id) !== null ? delivered.proof : null;
+  if (bound) requireCondition(same(bound.question, reference(question)) && same(bound.environment, reference(environment))
+    && same(bound.context.value, action.value), 'research_assessment_binding_invalid',
+    `[${question.id}] The direct assessor session judged another question, environment or candidate`);
+  const value = bound ? directAssessment(store, question.value.projectId, bound, observations, bases, runtime.proofs)
+    : assessmentValue(question, action, environment, observations, bases, runtime.proofs, response as { verdict: unknown; reasons: unknown });
   const id = `research-assessment:${hashJson(value)}`;
   const existing = store.get<ResearchAssessment>(id);
   if (!managedPending) {

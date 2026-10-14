@@ -6,7 +6,12 @@ import type { BundleInput } from "./reader.js";
 import type { ContextPage } from "./working-context.js";
 import type { WebAction } from "./web-research.js";
 
+/** ASM1.1 (№4791): the producer contract binding a direct assessment to the exact material its assessor saw. */
+export const DIRECT_ASSESSMENT_ORIGIN = 'direct-assessment-origin/v1' as const;
 export interface ResearchAssessment {
+  /** ASM1.1: a direct assessment judged on an accepted prefix names its completed assessor session and application; their
+   * saved material is the basis its acceptance guards. Part of the identity. Absent in an assessment made before. */
+  origin?: { contract: typeof DIRECT_ASSESSMENT_ORIGIN; session: Ref; application: Ref };
   runtimeProofs?: import('../graph/runtime-evidence.js').RuntimeEvidence[];
   bases?: import('../graph/research-basis.js').ResolvedResearchBasis[];
   projectId: string; question: Ref; value: Json; observations: Observation[];

@@ -11,6 +11,7 @@ import { assessmentSession, assessmentPacket } from '../src/discovery/assessment
 import { readResearchExecution, readResearchResponse } from '../src/discovery/response-recovery.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
+import { DIRECT_ASSESSMENT_ORIGIN } from '../src/discovery/research-model.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import { modelUsage, type ModelCall, type ProcessIdentity } from '../src/runtime/model-usage.js';
@@ -2290,7 +2291,14 @@ test(`ASM1 return direct B ${era}: a paid receipt keeps its original application
   const applied = restarted.get<any>(application.id)!;
   assert.equal(applied.value.state, 'applied'); assert.deepEqual(applied.value.context, application.value.context);
   assert.equal(applied.value.prompt, application.value.prompt);
-  assert.deepEqual(await f.direct(f.fresh()), result);
+  const later = await f.direct(f.fresh());
+  if (era === 'unmarked') {
+    // ASM1.1 (№4791 §3 п.2, п.5): the recovered unmarked attempt keeps its earlier contract — no origin. The later current
+    // call is a new material on today's prefix, so it is a different, bound assessment, never the recovered one.
+    assert.equal(result.value.origin, undefined, 'The recovered attempt is not marked with a material it never saw');
+    assert.equal(later.value.origin?.contract, DIRECT_ASSESSMENT_ORIGIN);
+    assert.notEqual(later.id, result.id);
+  } else assert.deepEqual(later, result);
   // Recovery above paid nothing. A later current call from an unmarked completed
   // producer is a new material era; a completed v2 call is an exact repeat.
   callsOnce(f, era === 'unmarked' ? 2 : 1);
