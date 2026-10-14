@@ -2376,7 +2376,7 @@
 - Отдаёт: —
 - Читает записи: каталог оснований DS1.2a; ответ модели conceptSections
 - Пишет записи: applications у requirements концепции v6; исправимый исход ошибок применения и доставка каталога в A/B/C
-- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/preparation-validation.ts`, `src/discovery/research-assessment.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/working-context.ts`, `test/preparation.test.ts`, `test/early-research-outcome.test.ts`, `test/concept-basis-application.test.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`
+- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/preparation-validation.ts`, `src/discovery/research-assessment.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/working-context.ts`, `test/preparation.test.ts`, `test/early-research-outcome.test.ts`, `test/concept-basis-application.test.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `src/product/stage-checks.ts`, `src/om/input.ts`
 - Из движка как есть: №4862; №4870
 - После: DS1.2e, ASM1.1, UNK1
 - Тесты сверх обязательных:
@@ -2385,6 +2385,10 @@
   - неверный link → новый Store → один исправляющий ответ A на неизменном основании; прежний ответ не оплачивается повторно
   - штатный revise/reopen вторым Store между supported и researched/accept (в том числе внутри writeMany) — stale без частичной приёмки, оплаченный ответ сохранён
   - initial и continuation с большим каталогом: полное основание у A/B/C или адресный отказ до отправки
+  - ручной design через штатную команду → ворота стадии проверяют applications v6 (№4947)
+  - законный принятый producer → B1 проверяет applications по разрешённым sources
+  - отсутствие applications, чужой подлинный Ref и корректный вариант; смена Discovery в окне записи — отказ без частичной записи
+  - прежний v5 — без новых требований
 
 ### DS1.2s · DS1.2 ТЗ S: applications у behaviorContracts v6; обязательные основания договора выводятся из его requirements, каждое применено в поведении/границе этого договора (entry/inputs, success/failures/forbiddenEffects, state, compatibility/proof); текст constraints ТЗ остаётся отдельным массивом строк; B сверяет согласованность с Discovery
 
