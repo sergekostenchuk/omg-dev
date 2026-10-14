@@ -1,3 +1,4 @@
+import { answerDiscoveryCondition } from '../discovery/discovery-decision.js';
 import { runIntegrityCheck } from "../om/integrity.js";
 import { listBypassDecisions } from "../om/addressing.js";
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
@@ -322,7 +323,9 @@ export class ProductEngine {
         workspacePath(effective.root, command.path);
         return this.discovery.evidence.file(command.project, command.id, effective.root, command.path, command.media, command.expected);
       }
-      case "answer-decision": return this.discovery.decision(command.question, command.expected, this.actor, command.value);
+      case "answer-decision":
+        if ('mode' in command) { this.#project(command.project); return answerDiscoveryCondition(this.store, command, this.actor); }
+        return this.discovery.decision(command.question, command.expected, this.actor, command.value);
       case "answer-fact": return this.discovery.fact(command.question, command.expected, command.source, command.selector);
       case "reopen-question": return this.discovery.reopen(command.question, command.expected);
       case "save-graph": this.#project(command.project); return this.graphs.save(command.project, command.graph, command.expected, this.actor);

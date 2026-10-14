@@ -1,6 +1,7 @@
 import { Ajv } from 'ajv';
 import { EngineError, requireCondition } from '../errors.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
+import { requireDiscoveryProposal, type DiscoveryContext } from './discovery-outcome.js';
 import { researchAction } from './research-consumer-transition.js';
 
 export const EARLY_RESEARCH_OUTCOME = 'early-research-outcome/v1' as const;
@@ -29,7 +30,8 @@ export function requireEscalationReply(response: any): void {
 /** Physical ownership and packet/cursor admission must be proved by the caller.
  * This rule classifies only reply errors; it never grants a physical dispatch. */
 export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
-  role: 'analyst' | 'assessor' | 'escalation-assessor', payload: unknown): EngineError | null {
+  role: 'analyst' | 'assessor' | 'escalation-assessor', payload: unknown,
+  discovery: DiscoveryContext | null = null): EngineError | null {
   requireCondition(draft && typeof draft.stage === 'string' && draft.stage && question && question.draftId && question.projectId === draft.projectId
     && Array.isArray(draft.questions) && question.spec?.schema !== undefined
     && ['analyst', 'assessor', 'escalation-assessor'].includes(role),
@@ -46,14 +48,21 @@ export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
       if (action.action === 'read_plan') throw new EngineError('reading_plan_disabled', 'Grouped reading requires the planning preset');
       if (action.action === 'synthesize' || action.action === 'need_research')
         throw new EngineError('research_question_foreign', 'Mode transition must target the current question');
-      if (action.action === 'answer') requireCondition(new Ajv({ strict: true, allowUnionTypes: true })
-        .compile(question.spec.schema as object)(action.value), 'answer_invalid',
-      'Proposed research result does not satisfy its consumer contract');
+      if (action.action === 'answer') {
+        requireCondition(new Ajv({ strict: true, allowUnionTypes: true })
+          .compile(question.spec.schema as object)(action.value), 'answer_invalid',
+        'Proposed research result does not satisfy its consumer contract');
+        // Only the original delivered grounds prove a reply defect. Current
+        // admission still rejects a valid paid answer whose grounds have moved.
+        requireDiscoveryProposal(draft, { id: action.question, value: question },
+          action.value, discovery, action.citations.length);
+      }
     }
   } catch (error) {
     if (error instanceof EngineError && ['research_response_invalid', 'reader_pilot_required',
       'reading_plan_disabled', 'research_question_foreign', 'answer_invalid',
-      'assessment_invalid', 'escalation_assessment_invalid'].includes(error.code)) return error;
+      'assessment_invalid', 'escalation_assessment_invalid', 'discovery_basis_stale',
+      'discovery_constraint_missing', 'discovery_constraint_stale', 'discovery_research_invalid'].includes(error.code)) return error;
     throw error;
   }
   return null;

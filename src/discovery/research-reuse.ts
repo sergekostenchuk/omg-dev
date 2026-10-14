@@ -1,3 +1,5 @@
+import { discoveryReuseAdmission, isDiscoveryV5, type DiscoveryContext } from './discovery-outcome.js';
+import { readAssessmentPaidOrigin } from './assessment-session.js';
 import { Store, type Revision } from "../storage/store.js";
 import { canonical, hashJson } from "../canonical.js";
 import { requireCondition } from "../errors.js";
@@ -36,10 +38,15 @@ export function reuseResearch(store: Store, discovery: Discovery, draft: Revisio
       const proven = readAcceptedResearchAnswer(store, draft.value.projectId, reference(activeAnswer));
       requireCondition(proven.assessment !== null && canonical(reference(proven.assessment)) === canonical(reference(prior)),
         'research_reuse_source_invalid', `[${prior.id}] The reuse source is not the assessment of its accepted answer`);
+      const origin = isDiscoveryV5(draft.value) && proven.binding
+        ? readAssessmentPaidOrigin(store, draft.value.projectId, proven.binding.value.pending) : null;
+      const admission = discoveryReuseAdmission(store, store.get<DiscoveryDraft>(draft.id)!, question, value.value,
+        origin?.value.context['discoveryContext'] as DiscoveryContext | undefined ?? null);
+      if (!admission.allowed) continue;
       const rebound: ResearchAssessment = { ...value, question: reference(question), reusedFrom: reference(prior) };
       const id = `research-assessment:${hashJson(rebound)}`;
       const assessment = store.get<ResearchAssessment>(id) ?? store.writeMany<ResearchAssessment>([{ id, kind: "research-assessment", expected: 0, value: rebound }],
-        [reference(question), reference(prior), reference(current), reference(activeAnswer), ...draft.value.inputs, ...value.observations.map(item => item.source)])[0]!;
+        [reference(question), reference(prior), reference(current), reference(activeAnswer), ...draft.value.inputs, ...value.observations.map(item => item.source), ...admission.guards])[0]!;
       discovery.researched(question.id, question.revision, reference(assessment)); reused++; break;
     }
   }

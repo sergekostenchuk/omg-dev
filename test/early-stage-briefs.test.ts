@@ -1,5 +1,8 @@
+import { discoveryContext } from '../src/discovery/discovery-outcome.js';
+import type { DiscoveryDraft } from '../src/discovery/discovery.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {Ajv} from 'ajv';
 import {mkdtempSync,writeFileSync,readFileSync,rmSync,existsSync,mkdirSync,symlinkSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
@@ -9,7 +12,7 @@ import {ProductEngine} from '../src/product/engine.js';
 import {reference, type Ref} from '../src/pipeline/contracts.js';
 import {canonical, type Json} from '../src/canonical.js';
 import type {Question} from '../src/discovery/discovery.js';
-import {REQUIREMENTS,UPSTREAM_STAGES} from '../src/discovery/requirements.js';
+import {REQUIREMENTS,UPSTREAM_STAGES,VERSION4_REQUIREMENTS,RESEARCH_CONTRACT_VERSION} from '../src/discovery/requirements.js';
 import {contextValue,workingContext} from '../src/discovery/working-context.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {previewResearch} from '../src/discovery/research-preview.js';
@@ -32,7 +35,8 @@ function fixture(t:test.TestContext) {
  values['mapDesign']=designOf(enrichedGraph(exampleGraph('p'),'p',values['preparation'],values['conceptSections'])) as unknown as Json;
  const source=engine.discovery.evidence.document('p','fixture',JSON.stringify(values),'application/json',0);
  writeFileSync(join(root,'values.json'),JSON.stringify(values));
- writeFileSync(path,`import{readFileSync,appendFileSync,existsSync,writeFileSync}from'node:fs';
+ writeFileSync(path,`import{boundDiscoveryValue}from ${JSON.stringify(new URL('./preparation-fixture.js',import.meta.url).href)};
+ import{readFileSync,appendFileSync,existsSync,writeFileSync}from'node:fs';
  const root=${JSON.stringify(root)},r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,q=s.question??s.questions?.[0],role=s.continuation.role;
  appendFileSync(${JSON.stringify(log)},JSON.stringify(r)+'\\n');
  const file=root+'/counts.json',counts=existsSync(file)?JSON.parse(readFileSync(file,'utf8')):{},key=s.continuation.question+':'+role;
@@ -44,7 +48,7 @@ function fixture(t:test.TestContext) {
  else if(role==='escalation-assessor')research={necessary:false,reason:'Fixture goal already supplies the choice'};
  else if(n===1)research={action:'read_source',source,start:0,end:${source.value.content.length}};
  else if(mode==='escalation')research={action:'need_owner',question:q.id,reason:'Fixture escalation only',searched:[source]};
- else research={action:'answer',question:q.id,value:JSON.parse(readFileSync(root+'/values.json','utf8'))[q.field],citations:[{source,selector:{kind:'json-pointer',pointer:'/'+q.field}}]};
+ else research={action:'answer',question:q.id,value:boundDiscoveryValue(q.field,JSON.parse(readFileSync(root+'/values.json','utf8'))[q.field],s.discoveryContext),citations:[{source,selector:{kind:'json-pointer',pointer:'/'+q.field}}]};
  console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:0,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const command={executable:process.execPath,args:[path]};
  const environment=engine.environments.configure('p',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'medium',command},reviewer:{actor:'assessor',model:'fixture',effort:'medium',command},fullCheck:{executable:process.execPath,args:['--version']},timeoutMs:10000},0);
@@ -85,7 +89,7 @@ test('RS4 real early-stage analyst and assessor producers retain their complete 
   const key=wire.subject.continuation.question+':'+wire.subject.continuation.role;
   groups.set(key,[...(groups.get(key)??[]),wire]);
  }
- assert.equal(groups.size,26);
+ assert.equal(groups.size,32);
  for(const pair of groups.values()) {
   assert.equal(pair[0].subject.continuation.kind,'initial');assert.equal(pair[1].subject.continuation.kind,'continuation');
   assert.ok(pair[1].prompt.includes(pair[0].prompt),'role and evidence instructions survive');
@@ -94,7 +98,7 @@ test('RS4 real early-stage analyst and assessor producers retain their complete 
  }
 });
 
-test('RS4 all 15 real early FieldSpecs survive both producer question shapes, including a selected non-first question',async t=>{
+test('RS4 all 18 real early FieldSpecs survive both producer question shapes, including a selected non-first question',async t=>{
  const f=fixture(t);writeFileSync(join(f.root,'mode'),'pause');let count=0;
  for(const stage of UPSTREAM_STAGES) {
   const draft=f.engine.discovery.forStage('p',stage,'compilation');
@@ -110,7 +114,7 @@ test('RS4 all 15 real early FieldSpecs survive both producer question shapes, in
    count++;
   }
  }
- assert.equal(count,30);
+ assert.equal(count,36);
 });
 
 test('RS4 native escalation and public reader preserve their own material and address only their actual foundation',async t=>{
@@ -314,4 +318,58 @@ test('RS4 exact archive indexes retain sizes and counts, and empty protocol arra
  const section=packet.working.sections.find((s:any)=>s.pointer==='/body/readings');
  assert.equal(section.count,3);assert.equal(section.chars,JSON.stringify(readings).length);
  assert.deepEqual(resolveAddress(f.store,packet.working.archive,section.pointer),readings);
+});
+
+
+test('DS1-01 Discovery v5 plans have domain-specific perspectives and sources; v4 and moment stay unchanged', t => {
+ const f=fixture(t),draft=f.engine.prepare('p','discovery');
+ assert.equal(draft.value.contractVersion,5);assert.equal(RESEARCH_CONTRACT_VERSION,5);
+ assert.deepEqual(draft.value.questions.map(id=>f.store.get<Question>(id)!.value.spec.field),
+  ['brief','objective','researchPlan','researchReport','verdict','preparation']);
+ assert.deepEqual(VERSION4_REQUIREMENTS.discovery.map(q=>q.field),['brief','objective','preparation']);
+ const currentPreparation=REQUIREMENTS.discovery.at(-1)!,priorPreparation=VERSION4_REQUIREMENTS.discovery.at(-1)!;
+ assert.deepEqual({...currentPreparation,prompt:priorPreparation.prompt},priorPreparation);
+ assert.ok(currentPreparation.prompt.startsWith(priorPreparation.prompt));
+ assert.match(currentPreparation.prompt,/discoveryContext.reportConstraints/);
+ for(const stage of UPSTREAM_STAGES.filter(stage=>stage!=='discovery'))assert.deepEqual(REQUIREMENTS[stage],VERSION4_REQUIREMENTS[stage]);
+ const spec=REQUIREMENTS.discovery.find(q=>q.field==='researchPlan')!,validate=new Ajv({strict:true}).compile(spec.schema as object);
+ assert.equal(spec.kind,'design');assert.equal(spec.proof,'assessment');
+ const plans=[
+  ['Subscription and API harness','Integration architect','Provider authentication documentation','Which supported interfaces separate subscription access from API credentials?'],
+  ['Lighting fixture bus','Electrical systems engineer','Electrical standards and bus specifications','Which supply and control constraints determine safe interoperability?'],
+  ['Levitating nightstand','Control and mechanical engineer','Actuation and stability experiments','Can the object remain stable within the stated energy, load and safety constraints?'],
+ ].map(([domain,role,source,question])=>({domain,roles:[{role,side:domain,why:'This perspective addresses the feasibility risk'}],
+  startingQuestions:[{id:'start',question,why:'Choose an evidence-backed direction'}],sources:[{id:'primary',kind:'documentation or experiment',what:source,why:'Resolve the material uncertainty'}],
+  feasibilityQuestions:[{id:'feasible',question,why:'Do not promise an unsupported result'}],deliverable:'A sourced report and a justified feasibility verdict'}));
+ for(const plan of plans){assert.equal(validate(plan),true,JSON.stringify(validate.errors));assert.equal(validate({...plan,sources:[]}),false);}
+ assert.equal(new Set(plans.map(plan=>plan.roles[0]!.role)).size,3);
+ const verdict=REQUIREMENTS.discovery.find(q=>q.field==='verdict')!;
+ const check=new Ajv({strict:true}).compile(verdict.schema as object);
+ assert.equal(check({researchReport:{id:'answer',revision:1,hash:'a'.repeat(64)},outcome:'conditional',reason:'Evidence is missing',variant:'Bounded experiment',
+  bases:[{result:'missing',reason:'No measurement'}],conditions:[{id:'measure',kind:'evidence',condition:'Demonstrate stability',criterion:'Observed stability within the agreed envelope',fulfilled:true}]}),false);
+});
+
+test('DS1-08 packed initial and continuation deliver exact accepted grounds to analyst and assessor; overflow sends nothing',async t=>{
+ const f=fixture(t);preparedFeatures(f.engine,'complete');
+ const stage=f.store.get<any>('stage:complete:discovery')!,draft=f.store.get<DiscoveryDraft>(stage.value.content.draft.id)!;
+ writeFileSync(join(f.root,'mode'),'pause');
+ const command={executable:process.execPath,args:[f.path]},settings={workspace:f.root,implementer:{actor:'author',model:'fixture',effort:'medium' as const,command},reviewer:{actor:'assessor',model:'fixture',effort:'medium' as const,command},fullCheck:command,timeoutMs:10000};
+ const env=f.engine.environments.configure('complete',settings,0);
+ for(const field of ['researchReport','verdict','preparation'])for(const purpose of ['analyst','assessor']) {
+  const q=f.store.get<Question>(draft.value.questions.find(id=>f.store.get<Question>(id)!.value.spec.field===field)!)!;
+  const context=discoveryContext(f.store,draft,q).context!;
+  const body={role:purpose==='analyst'?'research':'assess-answer',question:{id:q.id,...q.value.spec},discoveryContext:context,
+    core:context.fields.researchPlan?.value,observations:[],value:draft.value.fields[field]};
+  const audit={store:f.store,draftId:draft.id,questionId:q.id,purpose},role=purpose==='analyst'?env.value.implementer:env.value.reviewer;
+  const before=f.store.list('model-call').length;
+  const initial=JSON.parse((await previewResearch(()=>researchCall(role,env.value,'Preserve this role and its material',body,undefined,audit))).input);
+  assert.deepEqual(initial.subject.discoveryContext,context);assert.equal(initial.subject.continuation.kind,'initial');
+  await researchCall(role,env.value,'Preserve this role and its material',body,undefined,audit);
+  const next=JSON.parse((await previewResearch(()=>researchCall(role,env.value,'Preserve this role and its material',body,undefined,audit))).input);
+  assert.deepEqual(next.subject.discoveryContext,context);assert.equal(next.subject.continuation.kind,'continuation');
+  assert.ok(next.prompt.includes('Preserve this role and its material'));
+  const oversized=structuredClone(body);(oversized.discoveryContext.fields.researchPlan!.value as any).deliverable='x'.repeat(350000);
+  await assert.rejects(researchCall(role,env.value,'Preserve this role and its material',oversized,undefined,audit),{code:'pilot_core_limit'});
+  assert.equal(f.store.list('model-call').length,before+1);
+ }
 });

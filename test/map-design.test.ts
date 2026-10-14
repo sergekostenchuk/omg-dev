@@ -1,3 +1,4 @@
+import { answerDiscoveryFixture } from './product-fixture.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -27,7 +28,13 @@ function mapInput(engine: ProductEngine, project: string, graph: Graph) {
     for (const id of current.value.questions) {
       const question = engine.store.get<Question>(id)!;
       if (question.value.spec.kind === "fact") engine.discovery.fact(id, 1, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
-      else engine.discovery.decision(id, 1, "owner", question.value.spec.field === "mapDesign" ? designOf(graph) as unknown as Json : preparedField(project, question.value.spec.field));
+      else {
+        const field = question.value.spec.field;
+        const value = field === "mapDesign" ? designOf(graph) as unknown as Json : preparedField(project, field);
+        if (stage === 'discovery' && current.value.contractVersion === 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
+          answerDiscoveryFixture(engine, project, engine.store.get<DiscoveryDraft>(current.id)!, question, value, source);
+        else engine.discovery.decision(id, question.revision, "owner", value);
+      }
     }
     if (stage !== "operation-map") {
       const artifact = engine.draft(project, stage, current.id, 0); engine.pipeline.accept(project, stage, artifact.revision);

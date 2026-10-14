@@ -1,3 +1,4 @@
+import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.js';
 import { Ajv } from "ajv";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { Evidence } from "../evidence/evidence.js";
@@ -36,8 +37,8 @@ interface ResearchAssessmentBinding {
   session: Ref; application: Ref; reads: AssessmentReadProof;
 }
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
-function assessmentPrompt(bases: ResearchAssessment['bases'] | undefined, obligationContract: unknown): string {
-  return "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions." + (bases ? " bases[].proofLimit limits the claim: quoted-intent-requires-attribution requires establishing explicit attributable owner intent, not trusting the document ingestion label; reported-not-runtime-proof is a documentary report and does not establish current environment behavior or completed implementation. Preserve documentary support with its stated limits instead of promoting it to a repository fact or discarding it." : "") + (obligationContract ? " Assess each coverage member against its fixed assignment.kind and consumer. A documentaryAllowance only admits the named source: the actual claim must stay within assignment.documentaryAllowance.claimLimit and the quoted evidence. Reject broader claims; admission of a document does not certify runtime behavior or implementation." : "");
+function assessmentPrompt(bases: ResearchAssessment['bases'] | undefined, obligationContract: unknown, discoveryPreparation = false): string {
+  return "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions." + (bases ? " bases[].proofLimit limits the claim: quoted-intent-requires-attribution requires establishing explicit attributable owner intent, not trusting the document ingestion label; reported-not-runtime-proof is a documentary report and does not establish current environment behavior or completed implementation. Preserve documentary support with its stated limits instead of promoting it to a repository fact or discarding it." : "") + (obligationContract ? " Assess each coverage member against its fixed assignment.kind and consumer. A documentaryAllowance only admits the named source: the actual claim must stay within assignment.documentaryAllowance.claimLimit and the quoted evidence. Reject broader claims; admission of a document does not certify runtime behavior or implementation." : "") + (discoveryPreparation ? ' For Discovery preparation, compare every rule with its addressed report constraint: a correct basis with opposite meaning is not supported. The outcomes, scenarios and external systems must develop verdict.variant without replacing it; preserve its risks and unresolved questions with their moments. Exact owner choices select conditions, not facts of feasibility.' : '');
 }
 export const assessmentBindingId = (projectId: string, turnId: string) =>
   `research-assessment-binding:v1:${hashJson({ projectId, turnId })}`;
@@ -174,6 +175,10 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
       canonicalRoot, question.value.spec.field, priorOrigin ? 'historical' : 'current').bases : undefined;
   const sourceLocations = (priorOrigin ? originalPilot : pilot) ? observations.map(o => ({ source: o.source,
     location: inputStore.get<any>(o.source.id)!.value.origin.location })) : undefined;
+  const related = discoveryContext(inputStore, draft, question);
+  if (priorOrigin) requireCondition(same(related.context, priorOrigin.value.context['discoveryContext'] ?? null),
+    'research_assessment_binding_invalid', 'The saved assessor context lost its accepted Discovery grounds');
+  requireDiscoveryProposal(draft.value, question, action.value, related.context, observations.length);
   const assessmentReads = readView?.finish();
   // Exact quotes are already in the paged candidate and observations. Keep only
   // machine bindings mandatory instead of duplicating every quote on every page.
@@ -188,15 +193,17 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
     : { role: "assess-answer", ...(basisBindings ? { bases: basisBindings } : {}), ...(runtime.proofs.length?{runtimeProofs:runtime.proofs}:{}), question: question.value.spec, value: action.value, observations:assessmentObservations,
       prerequisites: researchPrerequisites(store, draft.value), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
+  if (computedContext && related.context) Object.assign(computedContext, { discoveryContext: related.context });
   const context = priorOrigin?.value.context ?? computedContext!;
-  const prompt = priorOrigin?.value.prompt ?? assessmentPrompt(bases, question.value.spec.obligationContract);
+  const prompt = priorOrigin?.value.prompt ?? assessmentPrompt(bases, question.value.spec.obligationContract,
+    related.context !== null && question.value.spec.field === 'preparation');
   const paidOrigin: AssessmentPaidOriginInput | undefined = managedPending && assessmentReads
     ? { pending: managedPending, root: canonicalRoot, graph: proposalGraph, legacyPaths, reads: assessmentReads, runtime, runtimeAdmission: selection.admission }
     : undefined;
   const delivered = managedPending
     ? await assessmentSessionWithProof(store, draft, question, environment, dispatch, pilot, context, prompt, signal,
-      uniqueTransactionGuards([...runtimeGuards, ...(readView?.guards ?? [])]), paidOrigin)
-    : { result: await assessmentSession(store, draft, question, environment, dispatch, pilot, context, prompt, signal,runtimeGuards), proof: null };
+      uniqueTransactionGuards([...runtimeGuards, ...related.guards, ...(readView?.guards ?? [])]), paidOrigin)
+    : { result: await assessmentSession(store, draft, question, environment, dispatch, pilot, context, prompt, signal,uniqueTransactionGuards([...runtimeGuards, ...related.guards])), proof: null };
   const response = delivered.result as { verdict?: unknown; reasons?: unknown } | null;
   requireCondition(response !== null && response !== undefined, 'assessment_invalid', 'Assessment returned no verdict');
   const value = assessmentValue(question, action, environment, observations, bases, runtime.proofs,
@@ -205,7 +212,7 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const existing = store.get<ResearchAssessment>(id);
   if (!managedPending) return existing ?? store.writeMany<ResearchAssessment>([{ id, kind: "research-assessment", expected: 0, value }],
     uniqueTransactionGuards([reference(question), reference(environment), ...draft.value.inputs, ...observations.map(item => item.source),
-      ...runtimeGuards]))[0]!;
+      ...runtimeGuards, ...related.guards]))[0]!;
   requireCondition(delivered.proof && turn && assessmentReads, 'research_assessment_binding_invalid',
     'A managed paid answer needs its exact terminal assessor and read proof');
   const assessmentRef: Ref = existing ? reference(existing) : { id, revision: 1, hash: hashJson(value) };
@@ -332,6 +339,10 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
   const bases = resolved?.bases;
   const sourceLocations = origin.value.profile ? observations.map(o => ({ source: o.source,
     location: view.store.get<any>(o.source.id)!.value.origin.location })) : undefined;
+  const related = discoveryContext(view.store, capturedDraft, question);
+  requireDiscoveryProposal(capturedDraft.value, question, action.value, related.context, observations.length);
+  requireCondition(same(related.context, outcome.context.discoveryContext ?? null),
+    'research_assessment_binding_invalid', `[${turnId}] The assessor did not receive its exact Discovery grounds`);
   view.finish();
   requireCondition(!origin.value.profile || question.value.spec.field !== 'layerDesign' || paid.action === 'answer_delta',
     'research_assessment_binding_invalid', 'A piloted layer design must retain its exact original delta');
@@ -349,7 +360,8 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
         ? 'changes_against_exact_base_after_machine_L2_validation' : 'complete_field'
       : null)
     && (!origin.value.profile || same(outcome.context.sourceLocations, sourceLocations))
-    && outcome.prompt === assessmentPrompt(bases, question.value.spec.obligationContract),
+    && outcome.prompt === assessmentPrompt(bases, question.value.spec.obligationContract,
+      related.context !== null && question.value.spec.field === 'preparation'),
     'research_assessment_binding_invalid', `[${turnId}] The assessor context does not derive from the paid proposal and exact sources`);
   const projected = assessmentValue(question, action, environment, observations, bases, runtime.proofs,
     outcome.result as { verdict: unknown; reasons: unknown });

@@ -1,4 +1,6 @@
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
+import { UPSTREAM_STAGES, type UpstreamStage } from './requirements.js';
+import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
@@ -90,10 +92,13 @@ function dispatchModeAfterRecovery(turns: Revision<ResearchTurn>[], question: Re
 
 export class Researcher {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly environments: Environments) {}
-  async run(project: string, draftId: string, limit: number, signal?: AbortSignal): Promise<Revision<ResearchRun>> {
+  async run(project: string, draftId: string, limit: number, signal?: AbortSignal, options: { restoreOnly?: boolean } = {}): Promise<Revision<ResearchRun>> {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
+    const restoreOnly = options.restoreOnly === true || draft.value.contractVersion === 4 && UPSTREAM_STAGES.includes(draft.value.stage as UpstreamStage);
+    requireCondition(!restoreOnly || draft.value.contractVersion === 4 && UPSTREAM_STAGES.includes(draft.value.stage as UpstreamStage),
+      'research_contract_upgrade_required', 'Restore-only applies to the previous Discovery era');
     const id = `research-run:${hashJson([project, draftId])}`;
     // №2000-8: the prologue's first duty is restoring a PROVEN paid terminal —
     // a pending paid turn whose session already reached its terminal
@@ -317,8 +322,20 @@ export class Researcher {
         "research_owner_question_invalid", "The saved owner decision has no question in this draft");
       if (question.value.status !== "answered") return run;
     }
-    const checked = outstanding || forcedPendingTurn ? null : this.discovery.gate(project, reference(draft));
-    if (run?.value.status === "completed" && checked?.findings.length === 0) return run;
+    let admitted: ReturnType<typeof discoveryOutcome> | null = null;
+    if (!outstanding && !forcedPendingTurn && !restoreOnly) {
+      try { admitted = discoveryOutcome(this.store, draft); }
+      catch (error) {
+        // Source movement follows the existing refresh path. Broken accepted
+        // pairs must refuse before that path can reopen them and pay again.
+        if (!(error instanceof EngineError && ['research_evidence_stale', 'evidence_stale'].includes(error.code))) throw error;
+      }
+    }
+    const checked = outstanding || forcedPendingTurn || restoreOnly && run?.value.status !== "completed" ? null : this.discovery.gate(project, reference(draft));
+    if (run?.value.status === "completed" && checked?.findings.length === 0
+      && discoveryOutcome(this.store,draft).findings.length===0) return run;
+    if (restoreOnly && !outstanding && !forcedPendingTurn)
+      throw new EngineError('research_contract_upgrade_required', `[${draftId}] Previous paid work is settled; prepare Discovery v5 before new work`);
     requireCondition(!checked?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed; prepare a current draft");
     if (outstanding || forcedPendingTurn) requireCondition(run?.kind === "research-run" && run.value.projectId === project && run.value.draftId === draftId,
       "research_consumer_intent_invalid", "The original research run is missing");
@@ -328,6 +345,8 @@ export class Researcher {
         requestChars: run?.value.requestChars ?? 0 } }], [reference(draft), reference(environment), ...draft.value.inputs])[0]!;
     requireCondition(run, "research_consumer_intent_invalid", "The research run was not claimed");
     try {
+      if (admitted?.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
+        error: admitted.reason, pauseCode: admitted.findings[0]!.code }, admitted.guards);
       const staleCodes = new Set(["research_evidence_stale", "evidence_stale", "answer_target_mismatch"]);
       for (const finding of (checked?.findings ?? []).filter(item => staleCodes.has(item.code))) {
         const question = this.store.get<Question>(finding.target);
@@ -350,6 +369,8 @@ export class Researcher {
         const savedOrigin = pendingQuestionLive
           ? readAssessmentPaidOrigin(this.store, project, reference(forcedPendingTurn)) : null;
         if (savedOrigin) {
+          requireCondition(!restoreOnly || paidAssessmentTerminal(this.store,project,reference(forcedPendingTurn)),
+            'research_contract_upgrade_required', `[${draftId}] Restore preserves the paid answer without starting a new assessment`);
           const paid = researchAction(forcedPendingTurn.value.action);
           requireCondition(paid.action === 'answer' || paid.action === 'answer_delta',
             'research_assessment_binding_invalid', 'A paid origin must belong to an answer turn');
@@ -364,9 +385,16 @@ export class Researcher {
             pilot ?? undefined, reference(forcedPendingTurn));
         }
       }
-      if (!outstanding && !forcedPendingTurn) reuseResearch(this.store, this.discovery, this.store.get<DiscoveryDraft>(draftId)!, reference(environment));
+      if (!restoreOnly && !outstanding && !forcedPendingTurn) reuseResearch(this.store, this.discovery, this.store.get<DiscoveryDraft>(draftId)!, reference(environment));
       let resumedSent: Record<string, any> | undefined;
       for (let turn = 0; turn < limit; turn++) {
+        if (restoreOnly) {
+          requireCondition(outstanding || forcedPendingTurn, 'research_contract_upgrade_required',
+            `[${draftId}] Restore cannot prepare a new research question`);
+          if (outstanding) requireCondition(outstanding.value.call
+            && readResearchConsumerExecution(this.store,project,reference(outstanding)).kind==='response',
+            'research_contract_upgrade_required', `[${draftId}] Restore cannot send an unpaid request`);
+        }
         if (outstanding && (outstanding.value.kind === "synthesis" || outstanding.value.kind === "consolidation")) {
           requireCondition(pilot, "reader_pilot_required", "The saved synthesis requires its original reader profile");
           const original = outstanding;
@@ -453,6 +481,9 @@ export class Researcher {
           continue;
         }
         draft = this.store.get<DiscoveryDraft>(draftId)!;
+        const outcome = forcedPendingTurn ? null : discoveryOutcome(this.store, draft);
+        if (outcome?.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
+          error: outcome.reason, pauseCode: outcome.findings[0]!.code }, outcome.guards);
         const gate = forcedPendingTurn ? null : this.discovery.gate(project, reference(draft));
         if (gate?.findings.length === 0) return this.save(run, { status: "completed" });
         requireCondition(!gate?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed during the run");
@@ -557,6 +588,8 @@ export class Researcher {
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
           && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
         const workspace=addressedWorkspace(this.store,turns,pending[0]!);
+        const related = forcedPendingTurn ? { context: null, guards: [] }
+          : discoveryContext(this.store, draft, pending[0]!);
         const context = pilot ? { ...pilotContext(this.store, draft, pending[0]!),
           ...(mode ? { dispatchMode: mode, repositoryRoot: effective.root } : {}),
           researchMissing: ([...turns].reverse().find(t => t.value.question?.id === pending[0]!.id
@@ -587,11 +620,17 @@ export class Researcher {
             && retryPermits.some(ref => ref.id === item.id) && earlyResearchConsumerFailure(this.store, item));
           const failedTurn = [...turns].reverse().find(item => item.value.question?.id === pending[0]!.id
             && (item.value.observation as { contract?: string } | null)?.contract === EARLY_RESEARCH_OUTCOME);
+          const failedProducer = failedTurn ? readResearchConsumerIntent(this.store,
+            (failedTurn.value as ManagedResearchTurn).consumerIntent) : null;
           const failure = failedIntent ? earlyResearchConsumerFailure(this.store, failedIntent)
-            : failedTurn ? earlyResearchFailure(draft.value, pending[0]!.value, 'analyst', failedTurn.value.action) : null;
+            : failedProducer ? earlyResearchFailure(
+              this.store.get<DiscoveryDraft>(failedProducer.value.draft.id, failedProducer.value.draft.revision)!.value,
+              this.store.get<Question>(failedProducer.value.question.id, failedProducer.value.question.revision)!.value,
+              'analyst', failedTurn!.value.action, failedProducer.value.cursor.context?.discoveryContext ?? null) : null;
           if (failure) Object.assign(context, { failures: [earlyResearchCorrection('analyst', failure,
             reference(failedIntent ?? failedTurn!), pending[0]!.value)] });
         }
+        if (related.context) Object.assign(context, { discoveryContext: related.context });
         if (savedMaterials) Object.assign(context, {savedMaterials, savedOnly: true, workingSelections: [], readings: [], focus: null, previousProposal: null, previousProposalRef: null, history: []});
         if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
           && pendingSynthesis(this.store, draft, pending[0]!, environment, context)) mode = "synthesis";
@@ -710,7 +749,7 @@ export class Researcher {
               pendingTurn = replayed[1]! as Revision<ResearchTurn>;
               action = researchAction(pendingTurn.value.action);
             } else {
-            const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...turns.map(reference),
+            const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...(outcome?.guards ?? []), ...related.guards, ...turns.map(reference),
               ...sources.list().map(reference)]);
             const layerGraph = draft.value.stage === 'om-g2' && pending[0]!.value.spec.field === 'layerDesign'
               ? this.store.get<Graph>(`graph:${project}`) : null;
@@ -748,10 +787,11 @@ export class Researcher {
             const producer = readResearchConsumerIntent(this.store, (pendingTurn.value as ManagedResearchTurn).consumerIntent);
             const originalDraft = this.store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
             const originalQuestion = this.store.get<Question>(pendingTurn.value.question.id, pendingTurn.value.question.revision)!;
-            const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action);
+            const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action,
+              producer.value.cursor.context?.discoveryContext ?? null);
             if (failure) {
               const value = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn,
-                { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion });
+                { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer });
               const saved = this.store.writeMany<ResearchTurn | ResearchRun>([
                 { id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision, value },
                 { id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, status: 'paused',
@@ -905,6 +945,8 @@ export class Researcher {
               // throws PreparedManagedProposalRefusal; the refusal and its
               // completed turn are written atomically below.
               {
+                requireCondition(!restoreOnly || managedPending && paidAssessmentTerminal(this.store,project,managedPending),
+                  'research_contract_upgrade_required', `[${draftId}] The paid answer is preserved; a new assessment needs Discovery v5`);
                 const result = await assessAnswer(this.store, question, proposal, environment, effective.root, signal,
                   pilot ?? undefined, managedPending);
                 assessment = reference(result); observation = { verdict: result.value.verdict, reasons: result.value.reasons };
@@ -932,6 +974,7 @@ export class Researcher {
                 }
               }
             } else {
+              requireCondition(!restoreOnly,'research_contract_upgrade_required', `[${draftId}] A new owner assessment needs Discovery v5`);
               const consulted = sources.list().map(reference);
               ownerConsulted = consulted;
               ownerHadPriorRead = history.some(item => ["search", "read", "read_source", "read_bundle", "read_context"].includes(String((item.action as { action?: string })?.action)));
@@ -1077,6 +1120,9 @@ export class Researcher {
         forcedPendingTurn = null;
       }
       draft = this.store.get<DiscoveryDraft>(draftId)!;
+      const outcome = discoveryOutcome(this.store, draft);
+      if (outcome.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
+        error: outcome.reason, pauseCode: outcome.findings[0]!.code }, outcome.guards);
       return this.save(run, this.discovery.gate(project, reference(draft)).findings.length === 0 ? { status: "completed" }
         : { status: "paused", error: "Research turn allowance reached; evidence and answers are preserved for continuation" });
     } catch (error) {

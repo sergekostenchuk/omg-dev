@@ -45,7 +45,7 @@ import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.
 import { writeGuarded } from '../src/om/refs.js';
 import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
-import { preparedFeatures, refinedLayers } from './product-fixture.js';
+import { preparedFeatures, refinedLayers, withHistoricalUpstream } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
 const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => any } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
@@ -75,7 +75,7 @@ function frozen(value: unknown): boolean {
   return value === null || typeof value !== 'object' || Object.isFrozen(value) && Object.values(value).every(frozen);
 }
 
-function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false) {
+function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false, historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), 'omg-question-packet-')), database = join(root, 'state.sqlite');
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -94,7 +94,7 @@ function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOw
       moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the addressed question during OM',
     }));
     return value;
-  });
+  }, historicalCommit);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
@@ -372,7 +372,7 @@ try {
 }
 function packetFixture(t: TestContext, capacity: number | null = 100_000, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false,
   resultForm: Json = { type: 'string' }, routeCommit?: string) {
-  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer);
+  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer, routeCommit);
   for (const question of f.request.questions) question.resultForm = resultForm;
   const tasks = ok(prepareQuestionTasks(f.store, f.request));
   const routesRequest = { project: f.project, gaps: f.request.gaps,
@@ -1502,12 +1502,12 @@ test('NR1 (№3591) a journal is read as written: the sources its rows name are 
   });
 });
 
-function emptyPacketFixture(t: TestContext) {
+function emptyPacketFixture(t: TestContext, historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), 'omg-packet-accepted-')), database = join(root, 'state.sqlite');
   const store = new Store(database), engine = new ProductEngine(store), project = 'garden';
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   writeFileSync(join(root, 'README.md'), 'Native accepted garden layers for empty-packet testing.\n');
-  preparedFeatures(engine, project, gardenGraph());
+  preparedFeatures(engine, project, gardenGraph(), undefined, historicalCommit);
   const command = { executable: process.execPath, args: ['--version'] };
   const environment = engine.environments.configure(project, { workspace: root,
     implementer: { actor: 'accepted-layer-worker', model: 'fixture', effort: 'high', command },
@@ -1748,7 +1748,7 @@ test('E2 admits an MC2 missing input field with a proven block consumer under th
 });
 
 // Dynamic imports let the same fixture run under the immutable historical producer's complete module graph.
-async function workExpansionFixture(database: string, root: string, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false) {
+async function workExpansionFixture(database: string, root: string, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false, historicalCommit?: string) {
   const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default;
   const { writeFileSync } = await import('node:fs'), { join } = await import('node:path');
   const { canonical } = await import('../src/canonical.js');
@@ -1791,7 +1791,7 @@ async function workExpansionFixture(database: string, root: string, late?: 'mult
         question: 'Which result proof do these work consumers retain?', consumer: responsible,
         moment: 'task-result', blocksCurrentStage: false, resolution: 'Carry this result proof until work execution' }];
       return value;
-    });
+    }, historicalCommit);
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
     let input = ok(writeOmInput(store, { project, expected: 0, stages }));
     const command = { executable: process.execPath, args: ['--version'] };
@@ -1878,9 +1878,9 @@ test('E2 work expansion belongs to its proven consumer block rather than the upp
   assert.equal(ok(readQuestionPacket(store, { project, record: acceptedPacket })).value.state, 'ready');
 });
 
-async function worksPacketFixture(t: TestContext, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false) {
+async function worksPacketFixture(t: TestContext, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false, historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), 'omg-e21-works-')), database = join(root, 'state.sqlite');
-  const base = await workExpansionFixture(database, root, late, initialWorks);
+  const base = await workExpansionFixture(database, root, late, initialWorks, historicalCommit);
   let store = base.store;
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const gaps = { sources: clone(base.gaps.sources) as GapRequest, records: base.gaps.records.map(reference) };
@@ -3261,7 +3261,7 @@ ${body}
 // answer names no wake test and none is required of it, however many tests cover the connection.
 const G5_BASE = 'f69d4b39e226cdc8527c923a6cc940fb9f2a3654';
 test('G5 a works packet issued before the wake-test era is admitted with its own bytes; its answer names no wake test even with three covering tests, and naming one is refused by its own form', async t => {
-  const f = await worksPacketFixture(t), request = f.request();
+  const f = await worksPacketFixture(t, undefined, undefined, G5_BASE), request = f.request();
   const saved = atCommit({ root: f.root, path: f.database }, G5_BASE, 'g5-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
 out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
   assert.equal(Object.hasOwn(saved.value, 'wakeTests'), false, 'The base issues no wake-test era');
@@ -3352,7 +3352,7 @@ test('G6 a works packet of the transition era states the one-artifact rule; a ne
 // and E3 does not refuse a second artifact (the G5 gate keeps its invariant at the common acceptance, as before).
 const G6_BASE = 'bfd28369d5a93b67bcee96e1de971c05378e9114';
 test('G6 a works packet issued before the transition era is admitted with its own bytes: no rule in its brief, and its E3 does not refuse a second artifact', async t => {
-  const f = await worksPacketFixture(t), request = f.request();
+  const f = await worksPacketFixture(t, undefined, undefined, G6_BASE), request = f.request();
   const saved = atCommit({ root: f.root, path: f.database }, G6_BASE, 'g6-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
 out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;
   assert.equal(Object.hasOwn(saved.value, 'transitionEra'), false, 'The base issues no transition era');
@@ -3621,7 +3621,7 @@ test('MP1.1 rows 5–8,20: actual managed correction → continuation → next p
 test('MP1.1 rows 2,4: true legacy empty/no-batch and independent new empty preserve their chosen version and repeat after reopen', async t => {
   const { h15AtCommit } = await mp11CycleFixtures(t);
   for (const historical of [false, true]) {
-    const f = emptyPacketFixture(t);
+    const f = emptyPacketFixture(t, historical ? MP11_BASE : undefined);
     const packet = historical ? h15AtCommit(f, MP11_BASE, 'mp11-empty', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
       out(take(writeQuestionPacket(store, args)).record);`, f.request) : ok(writeQuestionPacket(f.store, f.request)).record;
     assert.equal(packet.value.state, 'empty'); assert.equal(packet.value.packet, null);
@@ -3775,7 +3775,7 @@ try {
 }
 
 test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — N+1 derivations at depth N, where each link was derived twice per step — with the exact record, guards, references and writes of the base code 2785fca, a 6th link unwritten included, and its refusal codes for a foreign response or delivery', t => {
-  const p = packetFixture(t), { f } = p;
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, PF5_BASE), { f } = p;
   // Five reads of five different values: each link adds knowledge, so each continuation is a ready packet.
   const question = f.input.value.input.questions[0]! as unknown as Record<string, unknown>;
   const pointers = Object.keys(question).filter(key => typeof question[key] === 'string' && (question[key] as string).length > 0).sort()
@@ -3862,8 +3862,10 @@ function rb1LoadOperations() {
  * consumed work's file through two fixtures — driven to the packet step of the reopened attempt, its packet not yet written.
  * `respond` answers the saved cycle with a work, `drive` advances to a chosen state and fails on any other stand.
  */
-async function rb1Reopened(t: TestContext, extra: Record<string, string> = {}) {
-  const f = (await rb1LoadOperations()).acceptedOperationsFixture(t, 'planned', 0);
+async function rb1Reopened(t: TestContext, extra: Record<string, string> = {}, historicalCommit?: string) {
+  const fixtures = await rb1LoadOperations();
+  const f = historicalCommit ? withHistoricalUpstream(historicalCommit, () => fixtures.acceptedOperationsFixture(t, 'planned', 0))
+    : fixtures.acceptedOperationsFixture(t, 'planned', 0);
   const { store, workspace, desired, project } = f;
   ok(rb1Bases(store, { project, outcomes: ['garden-result'] }));
   const scenario = join(f.root, 'scenario.json'), trace = join(f.root, 'trace.jsonl');
@@ -3985,7 +3987,7 @@ test('RB1 (№4285, №4291, №4293): the root over a reopened frame is om-brie
 });
 
 test('RB1 (№4285 п.4) era: a root the engine before RB1 wrote over a reopened frame — the v2 brief of attempts 13 and 14 — is read and continued as written; a root that claims om-brief/v3 where nothing is reopened is refused', async t => {
-  const g = await rb1Reopened(t), { f, store, project } = g;
+  const g = await rb1Reopened(t, {}, RB1_BASE), { f, store, project } = g;
   const request = g.step().request as unknown as QuestionPacketRequest;
   const base = atCommit({ root: f.root, path: f.database }, RB1_BASE, 'rb1-base-packet', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
 out(take(writeQuestionPacket(store, args)).record);`, request) as Revision<QuestionPacketRecord>;

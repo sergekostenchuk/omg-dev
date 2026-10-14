@@ -4397,7 +4397,7 @@ try {
 function lp6Gate(t: test.TestContext) {
   const seeded = seedCopy("lp6:gate-fields", store => {
     const engine = new ProductEngine(store), project = "garden", { level: _level, ...l1 } = projectGraph(gardenGraph("cross"), 1);
-    preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field));
+    preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field), LP7_BASE);
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
     deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
     return null;

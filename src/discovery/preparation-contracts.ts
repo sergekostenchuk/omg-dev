@@ -79,3 +79,45 @@ export const UPSTREAM_MOMENT_DETAILS = { ...UPSTREAM_DETAILS,
   discovery: { ...UPSTREAM_DETAILS.discovery, schema: preparationMomentSchema, prompt: UPSTREAM_DETAILS.discovery.prompt + momentInstruction },
   features: { ...UPSTREAM_DETAILS.features, schema: featurePreparationMomentSchema, prompt: UPSTREAM_DETAILS.features.prompt + momentInstruction },
 } satisfies Record<string, FieldSpec>;
+
+// A plan proposes research; its sources name work to do, not acquired evidence.
+const researchRef = object({ id: text, revision: { type: "integer", minimum: 1 },
+  hash: { type: "string", pattern: "^[a-f0-9]{64}$" } });
+const researchQuestion = object({ id: text, question: text, why: text });
+export const discoveryResearchPlanSchema = object({
+  domain: text, roles: list(object({ role: text, side: text, why: text }), 1),
+  startingQuestions: list(researchQuestion, 1),
+  sources: list(object({ id: text, kind: text, what: text, why: text }), 1),
+  feasibilityQuestions: list(researchQuestion, 1), deliverable: text,
+});
+export const discoveryResearchReportSchema = object({
+  researchPlan: researchRef,
+  results: list(object({ id: text, question: text, conclusion: text,
+    citations: list({ type: "integer", minimum: 0 }, 1), limits: texts() })),
+  openQuestions: list(object({ id: text, question: text, reason: text })),
+  variant: text, constraints: texts(),
+});
+export const discoveryVerdictSchema = object({
+  researchReport: researchRef,
+  outcome: { enum: ["go", "conditional", "no_go", "insufficient_evidence"] },
+  reason: text, variant: text,
+  bases: list(object({ result: text, reason: text }), 1),
+  conditions: list({ oneOf: [
+    object({ id: text, kind: { const: "evidence" }, condition: text, criterion: text }),
+    object({ id: text, kind: { const: "owner_choice" }, condition: text, criterion: text,
+      options: list(object({ optionId: text, label: text, consequences: texts(1), choice: { enum: ["accept", "decline"] } }), 2) }),
+  ] }),
+});
+export const DISCOVERY_RESEARCH_FIELDS = [
+  preparationField("researchPlan", "Определи домен поручения и профессиональные роли людей, которые исследовали бы его разные стороны. От этих позиций предложи, с чего начать, что изучить, какие источники искать, какие вопросы решают реализуемость и что будет конкретным результатом исследования. У startingQuestions и feasibilityQuestions должны быть разные устойчивые id. sources — непустой план поиска материалов, а не доказательство их получения; URL заранее выдумывать не нужно. Цитаты на этом шаге подтверждают исходное поручение и ограничения. Не выдавай план, предположения о спросе или экономике за исследованные факты. Исследование должно зависеть от домена задачи, без заранее назначенной роли. Исходное поручение и цель находятся в discoveryContext.",
+    "Исследование не определяет предмет, профессиональные перспективы, необходимые источники и результат", discoveryResearchPlanSchema),
+  preparationField("researchReport", "Исследуй вопросы принятого researchPlan из discoveryContext. В researchPlan скопируй точный answer Ref плана. Каждый results[].question и openQuestions[].question ссылается на id его startingQuestions или feasibilityQuestions. results[].citations — индексы точных citations этого ответа; свяжи каждый существенный вывод с прочитанными источниками и обозначь пределы доказательства. Объясни варианты, доступные интеграции и ограничения, сравнение использовать/адаптировать/построить и экономику, где они существенны для задачи. Не выдумывай применимость, спрос, стоимость или отсутствие решений: при нехватке данных сохрани конкретные openQuestions. Дай исследованный вариант и ограничения, включая невозможность исходного варианта при имеющихся условиях. План и поручение сами по себе не доказывают внешних фактов.",
+    "Выводы о вариантах и реализуемости не связаны с вопросами исследования и источниками", discoveryResearchReportSchema),
+  preparationField("verdict", "По принятым researchPlan и researchReport из discoveryContext вынеси обоснованный вердикт; в researchReport скопируй точный answer Ref отчёта. bases[].result ссылается на id результата или открытого вопроса отчёта. go допускает обычную подготовку; conditional сохраняет существенные условия; no_go означает невозможность в исследованных условиях, а не ошибку ответа; insufficient_evidence сохраняет недостаточность основания, а не выдуманное отсутствие решений. У go условия пусты. Для каждого owner_choice дай options с устойчивыми optionId, label, consequences и choice: accept или decline; обязательно предложи отказ и принятие. Решения из discoveryContext.ownerDecisions относятся только к указанному прежнему conditional: не переноси их на новое условие по совпадению id и не выдавай за проверку внешнего факта. После выбора выпусти новый обоснованный вердикт. У conditional условия непусты: evidence требует проверяемого материала, owner_choice требует выбора условий владельцем. criterion говорит, что именно подтвердит условие; одного модельного fulfilled:true недостаточно. Утвердительный вердикт должен относиться к текущему исследованному варианту, ограничения сохраняются. supported у оценщика означает обоснованность любого из четырёх выводов, а не автоматическое разрешение проекта.",
+    "Discovery идёт в концепцию без обоснованного разрешения или гоняет отрицательный вывод по кругу", discoveryVerdictSchema),
+] satisfies FieldSpec[];
+
+// V5 is first released with the research-to-preparation handoff; v4 stays literal.
+export const DISCOVERY_PREPARATION = { ...UPSTREAM_MOMENT_DETAILS.discovery,
+  prompt: UPSTREAM_MOMENT_DETAILS.discovery.prompt + " Разверни выбранный verdict.variant из discoveryContext в результаты, сценарии и внешние системы. Каждое ограничение принятого researchReport перенеси в preparation.constraints: rule сохраняет его смысл, basis точно копирует готовый адрес из discoveryContext.reportConstraints. Ограничение нельзя отбросить молча: для ошибочного или чужого варианту ограничения сначала переоткрывается отчёт. Дополнительные ограничения поручения сохраняй со своим основанием. Сохрани риски и оставшиеся неизвестные исследованного варианта с их moment. Учитывай точные решения владельца из discoveryContext.ownerDecisions, но выбор владельца не доказывает реализуемость.",
+} satisfies FieldSpec;

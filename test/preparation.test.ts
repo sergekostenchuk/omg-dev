@@ -1,3 +1,4 @@
+import { discoveryContext } from '../src/discovery/discovery-outcome.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -6,7 +7,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store } from "../src/storage/store.js";
+import { Store, type Revision } from "../src/storage/store.js";
 import { ProductEngine, type StageContent } from "../src/product/engine.js";
 import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, VERSION3_REQUIREMENTS, type UpstreamStage } from "../src/discovery/requirements.js";
 import { JOURNEY_VARIANTS, QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION, preparationSchema, featurePreparationSchema, UPSTREAM_DETAILS } from "../src/discovery/preparation-contracts.js";
@@ -14,8 +15,14 @@ import { reference, stageId, type StageArtifact } from "../src/pipeline/contract
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { canonical, type Json } from "../src/canonical.js";
 import type { Graph } from "../src/graph/model.js";
-import { preparedField, preparationValue } from "./preparation-fixture.js";
-import { preparedFeatures } from "./product-fixture.js";
+import { preparedField, preparationValue as basePreparationValue, boundDiscoveryValue } from "./preparation-fixture.js";
+import { preparedFeatures, answerDiscoveryFixture } from "./product-fixture.js";
+
+function preparationValue(engine: ProductEngine, draft: Revision<DiscoveryDraft>): Json {
+  const current = engine.store.get<DiscoveryDraft>(draft.id)!;
+  const question = current.value.questions.map(id => engine.store.get<Question>(id)!).find(q => q.value.spec.field === 'preparation')!;
+  return boundDiscoveryValue('preparation', basePreparationValue('p'), discoveryContext(engine.store, current, question).context);
+}
 
 function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-preparation-")); const store = new Store(join(root, "state.sqlite"));
@@ -26,37 +33,43 @@ function fixture(t: test.TestContext) {
   const draft = engine.prepare("p", "discovery");
   engine.discovery.fact(draft.value.questions[0]!, 1, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
   engine.discovery.decision(draft.value.questions[1]!, 1, "owner", "Return a validated local result");
-  return { engine, store, draft, source, root };
+  for (const id of draft.value.questions) {
+    const question=store.get<Question>(id)!;
+    if (['researchPlan','researchReport','verdict'].includes(question.value.spec.field))
+      answerDiscoveryFixture(engine,'p',store.get<DiscoveryDraft>(draft.id)!,question,preparedField('p',question.value.spec.field),source);
+  }
+  const preparation=draft.value.questions.find(id=>store.get<Question>(id)!.value.spec.field==='preparation')!;
+  return { engine, store, draft, source, root, preparation };
 }
 
 test("new initial research requires every scenario category and refuses unresolved essential inputs", t => {
-  const { engine, draft, store } = fixture(t);
+  const { engine, draft, store, preparation } = fixture(t);
   assert.equal(draft.value.contractVersion, RESEARCH_CONTRACT_VERSION);
   const stage = engine.draft("p", "discovery", draft.id, 0);
   assert.throws(() => engine.pipeline.accept("p", "discovery", stage.revision), /validation refused/);
-  const value = preparationValue("p") as Record<string, Json>;
+  const value = preparationValue(engine, draft) as Record<string, Json>;
   const journeys = value['journeys'] as Record<string, Json>;
   assert.equal(Object.keys(journeys).length, JOURNEY_VARIANTS.length);
   delete journeys['crash_recovery'];
-  assert.throws(() => engine.discovery.decision(draft.value.questions[2]!, 1, "owner", value), /field contract/);
-  const blocked = preparationValue("p") as Record<string, Json>;
+  assert.throws(() => engine.discovery.decision(preparation, 1, "owner", value), /field contract/);
+  const blocked = preparationValue(engine, draft) as Record<string, Json>;
   blocked['unknowns'] = [{ id: "essential", question: "Which input must be transformed?", consumer: "concept", blocksCurrentStage: true, resolution: "Unavailable", moment: "om-pass" }];
-  engine.discovery.decision(draft.value.questions[2]!, 1, "owner", blocked);
+  engine.discovery.decision(preparation, 1, "owner", blocked);
   const next = engine.draft("p", "discovery", draft.id, stage.revision);
   assert.ok(engine.pipeline.inspect("p", "discovery").findings.some(item => item.code === "preparation_unresolved"));
   assert.throws(() => engine.pipeline.accept("p", "discovery", next.revision), /validation refused/);
-  const question = engine.discovery.reopen(draft.value.questions[2]!, store.get(draft.value.questions[2]!)!.revision);
-  engine.discovery.decision(question.id, question.revision, "owner", preparationValue("p"));
+  const question = engine.discovery.reopen(preparation, store.get(preparation)!.revision);
+  engine.discovery.decision(question.id, question.revision, "owner", preparationValue(engine, draft));
   const fixed = engine.draft("p", "discovery", draft.id, next.revision);
   engine.pipeline.accept("p", "discovery", fixed.revision);
   assert.equal(engine.pipeline.inspect("p", "discovery").state, "accepted");
 });
 
 test("a complete-looking preparation cannot bind a scenario to a foreign beneficiary", t => {
-  const { engine, draft } = fixture(t);
-  const value = preparationValue("p") as any;
+  const { engine, draft, preparation } = fixture(t);
+  const value = preparationValue(engine, draft) as any;
   value.outcomes[0].beneficiary = "unknown-person";
-  engine.discovery.decision(draft.value.questions[2]!, 1, "owner", value);
+  engine.discovery.decision(preparation, 1, "owner", value);
   const stage = engine.draft("p", "discovery", draft.id, 0);
   assert.ok(engine.pipeline.inspect("p", "discovery").findings.some(item => item.code === "beneficiary_missing"));
   assert.throws(() => engine.pipeline.accept("p", "discovery", stage.revision), /validation refused/);
@@ -130,7 +143,8 @@ for (const stage of ["discovery", "features"] as const) test(`B1.1 v4 ${stage} q
   preparedFeatures(engine, project);
   const savedStage = store.get<StageArtifact>(stageId(project, stage))!;
   const draft = store.get<DiscoveryDraft>((savedStage.value.content as unknown as StageContent).draft.id)!;
-  assert.equal(draft.value.contractVersion, QUESTION_MOMENT_CONTRACT_VERSION);
+  assert.equal(draft.value.contractVersion, RESEARCH_CONTRACT_VERSION);
+  assert.equal(QUESTION_MOMENT_CONTRACT_VERSION,4, "Question moment semantics retain their version");
   const field = stage === "discovery" ? "preparation" : "featurePreparation";
   const id = draft.value.questions.find(id => store.get<Question>(id)!.value.spec.field === field)!;
   let question = engine.discovery.reopen(id, store.get(id)!.revision);
@@ -138,7 +152,7 @@ for (const stage of ["discovery", "features"] as const) test(`B1.1 v4 ${stage} q
     const question = { ...(stage === "discovery" ? { id: "retained", resolution: "Resolve at the declared moment" } : {}),
       question: "Which environment condition must hold?", consumer: "p-produce-block", blocksCurrentStage: false,
       ...(present ? { moment } : {}) };
-    const value = preparedField(project, field) as any;
+    const value = (stage === "discovery" ? preparationValue(engine, draft) : preparedField(project, field)) as any;
     if (stage === "discovery") value.unknowns = [question];
     else value[0].remainingQuestions = [question];
     return value as Json;
@@ -160,16 +174,16 @@ for (const stage of ["discovery", "features"] as const) test(`B1.1 v4 ${stage} q
 });
 
 test("B1.1 v4 stage research uses the declared question schema and the ordinary consumer gate", async t => {
-  const { engine, store, draft, root } = fixture(t);
+  const { engine, store, draft, root, preparation } = fixture(t);
   const command = { executable: process.execPath, args: ["--version"] };
   engine.environments.configure("p", { workspace: root,
     implementer: { actor: "author", model: "fixture", effort: "high", command },
     reviewer: { actor: "assessor", model: "fixture", effort: "high", command },
     fullCheck: command, timeoutMs: 4000 }, 0);
-  const value = preparationValue("p") as Record<string, Json>;
+  const value = preparationValue(engine, draft) as Record<string, Json>;
   value.unknowns = [{ id: "retained", question: "Which environment condition must hold?", consumer: "concept",
     blocksCurrentStage: false, resolution: "Confirm before feasibility", moment: "feasibility" }];
-  engine.discovery.decision(draft.value.questions[2]!, 1, "owner", value);
+  engine.discovery.decision(preparation, 1, "owner", value);
   // All research answers are already present; the real research-stage path still applies its consumer gate.
   const result = await engine.stageResearch.run("p", draft.id, 1);
   assert.equal(result.status, "accepted", JSON.stringify(result));
@@ -230,9 +244,9 @@ import {fileURLToPath} from 'node:url';
 let root,ts;
 export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
 export async function load(url,context,next){
- const prefix=new URL('dist/src/',root).href;
+ const prefix=new URL('dist/',root).href;
  if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative='src/'+url.slice(prefix.length).replace(/\.js$/,'.ts');
+  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
   const source=execFileSync('git',['show','1189043f4bc7:'+relative],{cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
  }

@@ -20,6 +20,17 @@ export function preparationValue(project: string): Json {
 
 export function preparedField(project: string, field: string): Json {
   const actor = `${project}-user`, outcome = `${project}-result`, requirement = `${project}-R1`, contract = `${project}-B1`;
+  if (field === "researchPlan") return {
+    domain: "Local stateless transformation", roles: [{role:"CLI product engineer",side:"Transformation and validation",why:"Bound the requested observable result"}],
+    startingQuestions:[{id:"scope",question:"Which local result is needed?",why:"Define the promised behavior"}],
+    sources:[{id:"request",kind:"provided document",what:"The explicit fixture request",why:"Establish the chosen scope"}],
+    feasibilityQuestions:[{id:"feasibility",question:"Can the local transformation be bounded and validated?",why:"Check the proposed delivery constraints"}],
+    deliverable:"A supported local CLI design and its constraints",
+  };
+  if (field === "researchReport") return {researchPlan:{id:"fixture-plan",revision:1,hash:"0".repeat(64)},
+    results:[{id:"bounded",question:"feasibility",conclusion:"The fixture explicitly proposes a bounded local transformation",citations:[0],limits:["Controlled fixture data; no live research claimed"]}],
+    openQuestions:[],variant:"Local stateless transformation",constraints:["Local inputs and outputs only"]};
+  if (field === "verdict") return {researchReport:{id:"fixture-report",revision:1,hash:"0".repeat(64)},outcome:"go",reason:"The fixture scope has a bounded implementation",variant:"Local stateless transformation",bases:[{result:"bounded",reason:"The supplied fixture supports its proposed scope"}],conditions:[]};
   if (field === "preparation") return preparationValue(project);
   if (field === "conceptSections") return [{ id: `${project}-concept`, title: "Local transformation", requirements: [{ id: requirement,
     statement: "Transform valid input and reject invalid input", benefit: "Reliable local result", beneficiary: actor, outcome, acceptance: ["Invalid input produces no result"] }] }];
@@ -38,4 +49,19 @@ export function preparedField(project: string, field: string): Json {
 }
 
 export const researchInput = (project: string, brief = `Existing request for ${project}`, objective = `Deliver ${project} outcome`) =>
-  JSON.stringify({ brief, objective, preparation: preparationValue(project) });
+  JSON.stringify({ brief, objective, researchPlan:preparedField(project,"researchPlan"), researchReport:preparedField(project,"researchReport"), verdict:preparedField(project,"verdict"), preparation: preparationValue(project) });
+
+/** Bind fixture proposals to the actually delivered accepted answers. */
+export function boundDiscoveryValue(field: string, value: Json, context: any): Json {
+  if (field === "researchReport" && context?.fields?.researchPlan)
+    return {...value as object,researchPlan:context.fields.researchPlan.answer} as Json;
+  if (field === "verdict" && context?.fields?.researchReport)
+    return {...value as object,researchReport:context.fields.researchReport.answer} as Json;
+  if (field === "preparation" && context?.reportConstraints) {
+    const proposed = structuredClone(value) as any;
+    proposed.constraints = [...proposed.constraints, ...context.reportConstraints.map((row: any, index: number) =>
+      ({id:`research-constraint-${index}`,rule:row.rule,basis:row.basis}))];
+    return proposed;
+  }
+  return value;
+}

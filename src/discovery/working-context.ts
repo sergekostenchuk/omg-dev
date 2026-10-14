@@ -69,6 +69,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   const archivedBody = body;
+  const relatedResearch = body['discoveryContext'];
   const hasQuestion = Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader';
   const selected = hasQuestion ? selectedQuestion(question, archivedBody) : null;
   const contract = selected ? { id: question.id, ...question.value.spec } : null;
@@ -78,6 +79,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (projectedQuestion) body = { ...body, question: projectedQuestion,
     ...(Object.hasOwn(body, 'questions') ? { questions: [projectedQuestion] } : {}) };
   const finish = (packet: Record<string, any>) => {
+    if (relatedResearch !== undefined) requireCondition(packet.discoveryContext
+      && canonical(packet.discoveryContext) === canonical(relatedResearch),
+    'context_discovery_incomplete', `[${question.id}] The packed question lost its accepted research grounds`);
     if (contract) {
       for (const [field, expected] of Object.entries(contract))
         requireCondition(packet.question && Object.hasOwn(packet.question, field)
@@ -93,6 +97,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       && Number.isSafeInteger(body['consolidation'].targetChars) && body['consolidation'].targetChars > 0,
     'consolidation_context_invalid', 'Consolidation needs its saved notes and bounded output target');
     const packet = { dispatchMode: 'consolidation', question: projectedQuestion,
+      ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
       synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
       consolidation: {...consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars, body['consolidation'].format === 2 ? 2 : 1),
         ...(body['consolidation'].tightening ? {tightening:body['consolidation'].tightening} : {})},
@@ -138,6 +143,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     body = replaceFoundationCopies(dynamic, body, reference(archive), store);
     if (projectedQuestion) { body['question'] = projectedQuestion; if (Object.hasOwn(original, 'questions')) body['questions'] = [projectedQuestion]; }
     if(original['assessmentState'])body['value']=assessmentValue;
+    if(relatedResearch !== undefined)body['discoveryContext']=relatedResearch;
     if(candidate) body['candidate']=replaceFoundationCopies(candidate,{...original,value:undefined},reference(archive),store);
     if(proposalChanges) body['proposalChanges']=replaceFoundationCopies(proposalChanges,{...original,previousProposal:undefined},reference(archive),store);
   }
@@ -158,9 +164,12 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     delete body['synthesisNotes']; delete body['assessmentNotes']; delete body['checkpoints'];
   }
   if (body['dispatchMode'] === "planning" && !options.continuation) {
-    return finish(planningContext(body,reference(archive),maxChars,options.contextChars,archivedBody));
+    const reserved = relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length;
+    const packet = planningContext(body,reference(archive),maxChars-reserved,options.contextChars,archivedBody);
+    if(relatedResearch !== undefined)packet.discoveryContext=relatedResearch;
+    return finish(packet);
   }
-  const mandatory = ["answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["discoveryContext", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation

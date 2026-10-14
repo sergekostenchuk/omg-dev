@@ -129,7 +129,7 @@ function gatePrefix(store: Store, kind: QuestionKind, addressQuestion: boolean, 
         moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the named decision before assembling work' }] : []),
     ];
     return value;
-  });
+  }, kind === 'owner-decision' && addressQuestion ? undefined : LP7_BASE);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
     reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const first = ok(writeOmInput(store, { project, expected: 0, stages }));

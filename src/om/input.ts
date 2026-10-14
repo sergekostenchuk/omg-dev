@@ -1,7 +1,7 @@
 import { Ajv, type AnySchema } from "ajv";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
-import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
+import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
 import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../discovery/preparation-contracts.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
 import { readAcceptedResearchAnswer } from "../discovery/discovery.js";
@@ -332,7 +332,7 @@ export function gateInput(result: InputBuildResult): Sealed<{ passed: boolean; c
   return sealed({ passed, codes: [...new Set(result.refusals.map(item => item.code))].sort(order) });
 }
 
-const contractsByVersion = sealed({ 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS, [RESEARCH_CONTRACT_VERSION]: REQUIREMENTS });
+const contractsByVersion = sealed({ 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS, 4: VERSION4_REQUIREMENTS, [RESEARCH_CONTRACT_VERSION]: REQUIREMENTS });
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 
 function requireInputRequest(store: Store, request: InputRequest): void {

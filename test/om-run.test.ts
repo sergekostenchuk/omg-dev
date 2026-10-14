@@ -65,7 +65,7 @@ function refusal<T>(result: OmResult<T>): Refusal { if (result.ok) assert.fail("
  * accepted horizon, D1, M6 and the owner's M3 queue.
  */
 function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refine = true, addressed: boolean | string[] = false, later = false, cold = false,
-  unknowns: Readonly<Record<string, { consumer?: string; moment?: string }>> = {}) {
+  unknowns: Readonly<Record<string, { consumer?: string; moment?: string }>> = {}, historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), "omg-h1-run-")), database = join(root, "state.sqlite"), workspace = join(root, "repo");
   mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "H1 pass repository\n");
   writeFileSync(join(workspace, "h1-source.txt"), "UTF-8 is the supported encoding.\n");
@@ -108,7 +108,7 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
         ...(field === "featurePreparation" ? { requirements: ["garden-R2"], behaviorContracts: ["garden-B2"] } : {}) });
     }
     return value;
-  });
+  }, historicalCommit);
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
   const environment = (amount = 100_000) => engine.environments.configure(project, { workspace,
@@ -1564,7 +1564,7 @@ test("25 C61 7 R8 №1749 №1860-12 H1.1 two blocks of one N2 frame: G4b waits 
  * the 'cross' graph, the owner's works horizon over that layer, D1 with the works frame, M6 and M3. The pass then pays one
  * MC2 works cycle per block and does everything else.
  */
-function worksFixture(t: test.TestContext, late = false, fact: boolean | number = false, shape?: (graph: Graph) => void) {
+function worksFixture(t: test.TestContext, late = false, fact: boolean | number = false, shape?: (graph: Graph) => void, historicalCommit?: string) {
   const facts = fact === true ? ["works-fact"] : Array.from({ length: Number(fact) }, (_, index) => index ? `works-fact-${index + 1}` : "works-fact");
   const root = mkdtempSync(join(tmpdir(), "omg-h1-works-")), database = join(root, "state.sqlite");
   let store = new Store(database), engine = new ProductEngine(store);
@@ -1582,7 +1582,7 @@ function worksFixture(t: test.TestContext, late = false, fact: boolean | number 
       ...facts.map(id => ({ id, question: `Which ${id === "works-fact" ? "encoding" : id} is supported?`,
         consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false, resolution: "Address this question during OM" }))];
     return value;
-  } : undefined);
+  } : undefined, historicalCommit);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages }));
   const first = reference(store.get(`graph:${project}`)!);
@@ -2937,7 +2937,7 @@ function lp3Hiding(store: Store, id: string): Store {
 // OBL1 (№3773): a brief continuation fits what its reads brought; the continuation the capacity cannot hold stays the end of
 // the packet era before the brief — the old packet producer issues these roots.
 test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold ends its cycle blocked and is never sent: the pass closes each attempt through G7, goes up the ladder and ends by A6 — never waiting on the blocked packet; the start of the root's cycle is chosen by its links in both positions of root and continuation", async t => {
-  const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
+  const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
   const b = f.bases("lp3-52"), request = f.request(b);
   writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
   const need = lp3Need(f, b.routes, [{ action: "read", path: "big.txt", media: "text/plain" }]);
@@ -2973,7 +2973,7 @@ test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold end
 const lp3Context = (f: Fixture): Ref => reference(f.store.get(`om-input:${project}`)!);
 
 test("LP3 (№2817 row 2, №53) a need_source whose search names a context record as its scope ends the cycle as reads-invalid with its record_foreign: the pass closes the attempt, goes on to the next and never waits on the refusal; a source scope and read_context of the same record still deliver", async t => {
-  const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
+  const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
   const b = f.bases("lp3-53"), request = f.request(b);
   const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
   f.steps([need, need, need, stopAnswer(f, false)]);
@@ -3020,7 +3020,7 @@ test("MP1 LP3 №53 in the brief era: a search scope naming a context Ref is ref
 });
 
 test("LP3 (№2870, №2817 row 9) a packet whose record cannot be read is never taken for a continuation: a saved cycle of it is performed as saved and its producer's record_missing stands as the pass's wait — no ready, no new packet, nothing sent; once the record is read again the same saved cycle goes on", { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
-  const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
+  const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
   const b = f.bases("lp3-2870"), request = f.request(b);
   f.steps([lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }])]);
   ok(startRun(f.store, { project }));
@@ -3051,7 +3051,7 @@ test("LP3 (№2870, №2817 row 9) a packet whose record cannot be read is never
 const isRefOf = (request: unknown, packet: Ref): boolean => canonical((request as { packet?: Ref }).packet ?? null) === canonical(packet);
 
 test("LP3 (№2870, works-v1) an H1 works root whose three lawful read_context reads leave a continuation the capacity cannot hold ends each cycle blocked, never sends the blocked packet and reaches the attempt's close through G7 — also after a restart between steps", async t => {
-  const f = lp3NativePackets(t, worksFixture(t)), capture = new ResearchSources(f.store, project, f.root), reads: unknown[] = [];
+  const f = lp3NativePackets(t, worksFixture(t, undefined, undefined, undefined, LP3_PACKET_COMMIT)), capture = new ResearchSources(f.store, project, f.root), reads: unknown[] = [];
   for (let index = 0; index < 3; index++) {
     writeFileSync(join(f.root, `context-${index}.txt`), `context ${index} ${"x".repeat(90_000)}`);
     reads.push({ action: "read_context", record: reference(capture.read(`context-${index}.txt`, "text/plain")), pointer: "/content" });
@@ -3115,7 +3115,7 @@ test("LP3 (№2876) a cycle start is refused only with the codes of H1 and of E2
 test("LP3 (№2817 п.4, п.7) the base d519a60 in its own process leaves the pass waiting on №52 and №53; the new code reopens it and finishes the saved work by an ordinary transition without paying the saved call again, the old revisions and records untouched", async t => {
   for (const kase of ["52", "53"] as const) await t.test(kase, async t => {
     // OBL1 (№3773): the next attempts keep the packet era of the base too — a brief continuation would fit what №52 read.
-    const f = lp3NativePackets(t, runFixture(t, ["encoding"]));
+    const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
     const b = f.bases(`lp3-era-${kase}`), request = f.request(b);
     writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
     const need = lp3Need(f, b.routes, kase === "52" ? [{ action: "read", path: "big.txt", media: "text/plain" }]
@@ -3226,7 +3226,7 @@ test("LP4 (№2887 rows 1, 4, 9, §6.3, §6.4, §6.6) an addressed file the firs
 
 test("LP4 (№2887 row 10, §6.2, §6.6) the producers 3cba953 and 202c470, each from its whole Git code in its own process, leave the pass on completion_ceased after the roles move — saved as a wait or as the step about to be performed; the new code on a new Store ends the remaining work by cease and G7 without sending the paid need_source again, every saved revision as the old code wrote it", async t => {
   for (const [name, commit] of Object.entries(LP4_COMMITS)) for (const stop of ["waiting", "step"] as const) await t.test(`${name} ${stop}`, async t => {
-    const f = worksFixture(t), moved = join(f.root, "adapter-next.mjs");
+    const f = worksFixture(t, undefined, undefined, undefined, commit), moved = join(f.root, "adapter-next.mjs");
     writeFileSync(moved, readFileSync(adapterFixture));
     const reads = name === "3cba953" ? [{ action: "search", within: reference(f.store.get(`om-input:${project}`)!), query: "question" }]
       : [{ action: "read", path: "lp4-later.txt", media: "text/plain" }];
@@ -3284,7 +3284,7 @@ out({ seen, request });`,
 
 test("LP4 (№2902, rows 3/4) a saved cycle whose step ceased, while its root also has a direct cause of higher priority (a lawfully replaced B1), is not performed: saved as the step or — by the code 202c470 in its own process — as the wait on completion_ceased, the new code goes back to the choice, which ceases the root by its direct cause, without a stop on completion_ceased and without another send", async t => {
   for (const saved of ["step", "waiting"] as const) await t.test(saved, async t => {
-    const f = worksFixture(t);
+    const f = worksFixture(t, undefined, undefined, undefined, LP4_COMMITS['202c470']);
     let step: RunStep | null = null;
     if (saved === "waiting") {
       // LP1 transfer: 202c470 can only write its old waiting state over a packet of its own era.
@@ -3677,7 +3677,7 @@ test("G6.2 a G5 finding of one work's own content rejects only its proposal: its
   await t.test("a sound member with two earlier attempts without a result ends neutrally: no stop, no A6", async t => g62Rejection(t, false, true));
 });
 async function g62Rejection(t: test.TestContext, chain: boolean, prior = false) {
-  const f = worksFixture(t, false, false, twoArtifacts), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+  const f = worksFixture(t, false, false, twoArtifacts, G62_BASE), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
   const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
   const paid = new Map<string, number>(), count = (node: string) => paid.set(node, (paid.get(node) ?? 0) + 1);
   const consumeAddress = { project, block: "garden-consume-block", line: 1 };
@@ -4206,7 +4206,7 @@ function g51AmbiguousAnswer(f: WorksRun, saved: Ref) {
  */
 async function g51Pass(t: test.TestContext, choose: (allowed: string[], index: number) => string | Record<string, unknown>, bound = 200,
   onWake?: (f: WorksRun, request: { wake: WakeChoiceRequest; ordinal: number }) => Promise<void>) {
-  const f = worksFixture(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+  const f = worksFixture(t, undefined, undefined, undefined, G51_BASE), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
   const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
   ok(startRun(f.store, { project }));
   for (let round = 0; round < 4; round++) {
@@ -4380,7 +4380,7 @@ test("G5.1 rows 3, 5 a choice outside the allowed tests is refused, asked once m
 
 const LP5_BASE_COMMIT = "febbee2cf8187e1c230eec325e183fc8203e06ae";
 test("LP5 (№3278 §4, rows 13, 21) era: febbee2c, run from Git in its own process on the B1 replaced under its open works attempt, ends the unsent root by LP4 and stands on input_stale; the new code reads its records as they are and continues that very open work — the check ceased, the attempt closed, the new bases built, the paid root answered by its reuse", async t => {
-  const f = worksFixture(t);
+  const f = worksFixture(t, undefined, undefined, undefined, LP5_BASE_COMMIT);
   const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
   ok(startRun(f.store, { project }));
   // G5 (№3820): the open works attempt is the base's own — its packet issued and its paid root cycled by febbee2c — since
@@ -4508,12 +4508,12 @@ for (const item of args.ops) {
 out({ verdicts: done, analysis: analysis && reference(analysis), steps });
 `;
 /** The garden block garden-consume-block on a B1 that leaves its contract's nodes and state and its criterion's checkKind open. */
-function lp6Line(t: test.TestContext) {
+function lp6Line(t: test.TestContext, historicalCommit = LP6_BASE) {
   const root = mkdtempSync(join(tmpdir(), "omg-lp6-era-")), database = join(root, "state.sqlite");
   let store = new Store(database);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const engine = new ProductEngine(store), { level: _level, ...l1 } = projectGraph(gardenGraph("cross"), 1);
-  preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field));
+  preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field), historicalCommit);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   ok(writeOmInput(store, { project, expected: 0, stages }));
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl"), block = "garden-consume-block";
@@ -4856,7 +4856,7 @@ test("LP7 row 26: one question of a joined batch waiting for the owner holds tha
 
 const LP7_BASE = "7c7d3cccb88d0a6c17b21051069f0244d98248f9";
 test("LP7 row 21 (run): a field packet the base code 7c7d3ccc issued on its split route before the release is answered by today's code — the exact route stays current and the paid answer applies once", async t => {
-  const f = lp6Line(t);
+  const f = lp6Line(t, LP7_BASE);
   f.old("lp7-issued", [{ op: "round", ordinal: 1, answers: [{ field: "nodes", unsent: true }] }], LP7_BASE);
   const packet = f.store.list<QuestionPacketRecord>("question-packet")[0]!;
   const routes = ok(readRoutes(f.store, { project, record: packet.value.request.routes })).record as unknown as Revision<RoutesRecord>;
@@ -4902,7 +4902,7 @@ test("LP7 rows 14, 24 (run): an answer of some joined fields — part of state i
 });
 
 test("LP7 row 22 (run): the routes, packets, paid applied answer and close the base code 7c7d3ccc wrote are read by today's code after a reopen exactly as written — nothing is executed again to read them", async t => {
-  const f = lp6Line(t);
+  const f = lp6Line(t, LP7_BASE);
   f.old("lp7-history", [{ op: "round", ordinal: 1, answers: [{ field: "nodes", value: LP7_VALUES.nodes! }, { field: "checkKind", unsent: true }] },
     { op: "cease", ordinal: 1 }, { op: "close", ordinal: 1 }], LP7_BASE);
   f.restart();
@@ -4926,7 +4926,7 @@ type Reopened = { phase: "reopened"; from: Ref; reasons: RunReason[]; ground: { 
 const passRows = (store: Store) => store.history(runId(project)).map(row => (row.value as unknown as RunRecord).state.phase);
 /** The R5 scenario whose review the old adapter wrapper refused (`confirmed` missing): ea207137, run from Git, ends the pass on it. */
 async function wrapperUnable(t: test.TestContext) {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP81_BASE_COMMIT);
   const b = f.bases("lp81-wrapper"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, { ...stopAnswer(f, true), confirmed: null }, addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -5227,7 +5227,7 @@ test("AT1 policy: the owner's H2 answer decides the producer's state policy; the
 // always did under the new code — its rejection asks no readiness question and never stands on a refusal of the era.
 const AT1_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
 test("AT1 return №4124 P2-6: a group refused by a G5 of the earlier era ends under the new code by its rejection as before — no readiness question, no refusal of the era, and the new candidate is accepted", async t => {
-  const f = worksFixture(t, false, false, twoArtifacts);
+  const f = worksFixture(t, false, false, twoArtifacts, G62_BASE);
   ok(startRun(f.store, { project }));
   // As in G6.2: the code before G6 (a62940ec) answers the works, the producing one for two artifacts (its E3 admits it).
   for (let round = 0; round < 4; round++) {

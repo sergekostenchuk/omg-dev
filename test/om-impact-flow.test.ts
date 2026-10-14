@@ -24,12 +24,12 @@ import ts from ${JSON.stringify(typescript)};
 let prefixes, root, log;
 export function initialize(data) {
   root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
+  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/', base).href);
 }
 export async function load(url, context, next) {
   const prefix = prefixes.find(item => url.startsWith(item));
   if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
+    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
     appendFileSync(log, relative + '\\n');
     const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
     return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,

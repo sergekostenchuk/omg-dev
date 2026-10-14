@@ -61,6 +61,7 @@ export type ProductCommand =
   | { type: "source-document"; project: string; id: string; text: string; media: "text/plain" | "application/json"; expected: number }
   | { type: "source-file"; project: string; id: string; path: string; media: "text/plain" | "application/json"; expected: number }
   | { type: "answer-decision"; question: string; expected: number; value: Json }
+  | { type: "answer-decision"; mode: "discovery-condition"; project: string; draft: string; verdictRef: Ref; conditionId: string; optionId: string }
   | { type: "answer-fact"; question: string; expected: number; source: Ref; selector: Selector }
   | { type: "reopen-question"; question: string; expected: number }
   | { type: "save-graph"; project: string; expected: number; graph: unknown }
@@ -145,6 +146,7 @@ const schema = { oneOf: [
   command("source-document", { project, id: project, text: { type: "string", maxLength: 5_000_000 }, media: { enum: ["text/plain", "application/json"] }, expected }),
   command("source-file", { project, id: project, path: string, media: { enum: ["text/plain", "application/json"] }, expected }),
   command("answer-decision", { question: string, expected, value: {} }),
+  command("answer-decision", { mode: { const: "discovery-condition" }, project, draft: string, verdictRef: ref, conditionId: string, optionId: string }),
   command("answer-fact", { question: string, expected, source: ref, selector: { oneOf: [
     object({ kind: { const: "json-pointer" }, pointer: { type: "string" } }),
     object({ kind: { const: "text-range" }, start: expected, end: { type: "integer", minimum: 1 } }),

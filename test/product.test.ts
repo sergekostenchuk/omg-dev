@@ -1,3 +1,5 @@
+import { answerDiscoveryFixture, preparedFeatures, withHistoricalUpstream } from './product-fixture.js';
+import type { Json } from '../src/canonical.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -7,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { Store, type Revision } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { UPSTREAM_STAGES } from "../src/discovery/requirements.js";
-import type { DiscoveryDraft } from "../src/discovery/discovery.js";
+import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
@@ -32,7 +34,9 @@ test("the real product command path carries two independent products from brief 
         else {
           const field = question.value.spec.field;
           const value = field === "mapDesign" ? designOf(graph) : preparedField(project, field);
-          engine.execute({ type: "answer-decision", question: id, expected: 1, value });
+          if (stage === 'discovery' && ['researchPlan','researchReport','verdict','preparation'].includes(field))
+            answerDiscoveryFixture(engine,project,store.get<DiscoveryDraft>(draft.id)!,store.get<Question>(id)!,value as Json,source as Revision<{content:string}>);
+          else engine.execute({ type: "answer-decision", question: id, expected: 1, value });
         }
       }
       const artifact = engine.execute({ type: "draft-stage", project, stage, draftId: draft.id, expected: 0 }) as Revision;
@@ -72,7 +76,10 @@ test("unrelated research cannot approve a stage and research retains the input v
   const initial = engine.prepare("demo", "discovery");
   engine.discovery.fact(initial.value.questions[0]!, 1, reference(source), { kind: "text-range", start: 0, end: 5 });
   engine.discovery.decision(initial.value.questions[1]!, 1, "owner", "Outcome");
-  engine.discovery.decision(initial.value.questions[2]!, 1, "owner", preparedField("demo", "preparation"));
+  for (const id of initial.value.questions.slice(2)) {
+    const question=store.get<Question>(id)!;
+    answerDiscoveryFixture(engine,'demo',store.get<DiscoveryDraft>(initial.id)!,question,preparedField('demo',question.value.spec.field),source as Revision<{content:string}>);
+  }
   const artifact = engine.draft("demo", "discovery", initial.id, 0);
   engine.pipeline.accept("demo", "discovery", artifact.revision);
   assert.throws(() => engine.draft("demo", "concept", initial.id, 0), /Research must belong/);
@@ -112,4 +119,23 @@ test("S1.5 №2363 the projection follows the files behind its sources at an unc
   try { assert.equal(engine.projection("p").executionRunning, true); } finally { executor.isRunning = original; }
   assert.equal(engine.projection("p").executionRunning, false);
   assert.equal(store.changeStamp(), stamp);
+});
+
+
+test('DS1 explicit historical upstream uses its Git producer and leaves current fixtures on v5', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-ds1-fixture-era-'));
+  const store = new Store(join(root, 'state.sqlite')), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const commit = 'e9c1ca5c41fb80508559aeab41da8f3da7422953';
+  const version = (project: string) => {
+    const stage = store.get<{content: {draft: {id:string;revision:number}}}>(`stage:${project}:discovery`)!;
+    const draft = stage.value.content.draft;
+    return store.get<DiscoveryDraft>(draft.id, draft.revision)!.value.contractVersion;
+  };
+  withHistoricalUpstream(commit, () => preparedFeatures(engine, 'era'));
+  assert.equal(version('era'), 4);
+  preparedFeatures(engine, 'current');
+  assert.equal(version('current'), 5);
+  for (const project of ['era', 'current']) for (const stage of UPSTREAM_STAGES)
+    assert.equal(engine.pipeline.inspect(project, stage).state, 'accepted');
 });

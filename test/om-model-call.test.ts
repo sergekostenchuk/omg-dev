@@ -289,7 +289,7 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
         // OWN1 (№3711): a design question of the pass is the model's; the one no producer of the pass serves is a later one.
         moment: kind === 'design' ? 'task-start' : 'om-pass', blocksCurrentStage: false, resolution: 'Address during OM' }] : [])];
     return value;
-  });
+  }, LP7_BASE);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = valueOf(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   // 'design' also addresses the spare question as a design decision of task start: no producer of the pass answers it (H1.5, OWN1).

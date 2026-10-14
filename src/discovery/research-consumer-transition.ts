@@ -18,6 +18,7 @@ import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace, 
   type ContextLookup, type ContextWorkspace } from './context-workspace.js';
 import { archivedContext, contextPage, contextValue, type ContextPage } from './working-context.js';
 import type { Graph } from '../graph/model.js';
+import type { ResearchConsumerIntent } from './response-recovery.js';
 import type { Json } from '../canonical.js';
 
 /* This module is the dependency leaf for paid consumer transitions. Its inputs
@@ -1239,7 +1240,7 @@ export type TurnTransitionProof =
   | { kind: 'accepted-answer'; inputs: AcceptedPaidAnswerInputs;
       /** D8.4e: the proven K; mandatory for a turn of the binding era. */
       binding?: { ref: Ref; value: ResearchAcceptanceBinding } }
-  | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question> }
+  | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question>; producer: Revision<ResearchConsumerIntent> }
   | { kind: 'question-reopened'; original: Revision<Question>;
       reopened: Revision<Question>; draft: Revision<DiscoveryDraft> }
   | { kind: 'repeat-context'; current: ContextReadIdentityInput;
@@ -1525,14 +1526,19 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       ...(bindingRef ? { acceptanceBinding: bindingRef } : {}) };
   }
   if (proof.kind === 'early-model-refusal') {
-    const { draft, question } = proof;
-    requireCondition(draft.kind === 'discovery-draft' && question.kind === 'question'
+    const { draft, question, producer } = proof;
+    requireCondition(producer.kind === 'research-consumer-intent' && hashJson(producer.value) === producer.hash
+      && canonical(exactRef(producer)) === canonical(before.consumerIntent)
+      && canonical(producer.value.draft) === canonical(exactRef(draft))
+      && canonical(producer.value.question) === canonical(exactRef(question))
+      && draft.kind === 'discovery-draft' && question.kind === 'question'
       && hashJson(draft.value) === draft.hash && hashJson(question.value) === question.hash
       && canonical(before.question) === canonical(exactRef(question))
       && question.value.draftId === draft.id && draft.value.questions.includes(question.id)
       && (!('question' in action) || action.question === question.id),
     'research_consumer_intent_invalid', 'The early refusal lost its exact draft and selected question');
-    const failure = earlyResearchFailure(draft.value, question.value, 'analyst', action);
+    const failure = earlyResearchFailure(draft.value, question.value, 'analyst', action,
+      producer.value.cursor.context?.discoveryContext ?? null);
     requireCondition(failure, 'research_consumer_intent_invalid', 'A valid early reply cannot become a model refusal');
     return { ...before, status: 'completed', assessment: null,
       observation: { contract: EARLY_RESEARCH_OUTCOME, code: failure.code, details: failure.details ?? null,

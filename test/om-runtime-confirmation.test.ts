@@ -189,7 +189,7 @@ function b11ExactMomentChain(f: ReturnType<typeof fixture>, origin: 'unknowns' |
   assert.deepEqual(original, f.unaddressed); assert.deepEqual(addressed, f.input);
   assert.deepEqual(gaps, f.gaps); assert.deepEqual(ledger.handoff, f.ledger.handoff);
   const stage = origin === 'unknowns' ? 'discovery' : 'features';
-  assert.equal(original.value.input.sources.find(source => source.stage === stage)!.contractVersion, 4);
+  assert.equal(original.value.input.sources.find(source => source.stage === stage)!.contractVersion, 5);
   assert.equal(original.value.input.questions.length, moments.length);
   for (const [index, moment] of moments.entries()) {
     const question = original.value.input.questions.find(item => item.question === `Observe local runtime condition ${index}`)!;
@@ -946,9 +946,9 @@ import {fileURLToPath} from 'node:url';
 let root,ts;
 export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
 export async function load(url,context,next){
- const prefix=new URL('dist/src/',root).href;
+ const prefix=new URL('dist/',root).href;
  if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative='src/'+url.slice(prefix.length).replace(/\.js$/,'.ts');
+  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
   const source=execFileSync('git',['show','ee3fd4cb0941cc47e1b783e06015bd3a8d59fd8b:'+relative],
    {cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};

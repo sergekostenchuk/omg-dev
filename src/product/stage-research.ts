@@ -1,12 +1,16 @@
+import { hashJson } from '../canonical.js';
+import type { ResearchRun } from '../discovery/research-model.js';
+import { discoveryOutcome, type DiscoveryOutcome } from '../discovery/discovery-outcome.js';
 import type { ProductEngine, StageContent } from "./engine.js";
 import type { DiscoveryDraft } from "../discovery/discovery.js";
 import { UPSTREAM_STAGES, type UpstreamStage, RESEARCH_CONTRACT_VERSION } from "../discovery/requirements.js";
 import { researchForConsumer, designFindings } from "../discovery/consumer-research.js";
-import { requireCondition } from "../errors.js";
+import { requireCondition, EngineError } from "../errors.js";
 import { reference, stageId, type Finding, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 
 export interface StageResearchResult {
   status: "accepted" | "paused" | "needs_owner" | "blocked";
+  discovery?: Omit<DiscoveryOutcome, "guards" | "findings">;
   stage: Ref | null; research: Ref | null; feedback: Ref | null; findings: Finding[];
 }
 
@@ -27,7 +31,22 @@ export class StageResearch {
       requireCondition((artifact.value.content as unknown as StageContent).draft?.id === draftId,
         "stage_already_accepted", "Accepted research must be explicitly revised before replacing it");
       const checked = pipeline.inspect(project, stage);
-      return { status: checked.state === "accepted" ? "accepted" : "blocked", stage: reference(artifact), research: null, feedback: null, findings: checked.findings };
+      const outcome = checked.state === 'accepted' ? discoveryOutcome(store, draft) : null;
+      const discovery = outcome && outcome.state !== 'legacy'
+        ? { state: outcome.state, verdict: outcome.verdict, report: outcome.report, conditions: outcome.conditions, ownerChoices: outcome.ownerChoices, reason: outcome.reason } : undefined;
+      return { status: checked.state === "accepted" ? "accepted" : "blocked", stage: reference(artifact), research: null, feedback: null,
+        findings: checked.findings, ...(discovery ? { discovery } : {}) };
+    }
+    if (draft.value.contractVersion===4) {
+      let restored: Awaited<ReturnType<typeof researcher.run>> | null = null;
+      try { restored = await researcher.run(project,draftId,1,undefined,{restoreOnly:true}); }
+      catch(error) { if(!(error instanceof EngineError && error.code==='research_contract_upgrade_required')) throw error; }
+      const run=store.get<ResearchRun>(`research-run:${hashJson([project,draftId])}`);
+      if (restored?.value.pauseCode && restored.value.pauseCode !== 'research_contract_upgrade_required')
+        return {status:'paused',stage:artifact?reference(artifact):null,research:reference(restored),feedback:null,
+          findings:[{code:restored.value.pauseCode,target:draftId,message:restored.value.error ?? 'The saved paid turn could not be restored'}]};
+      return {status:'paused',stage:artifact?reference(artifact):null,research:run?reference(run):null,feedback:null,
+        findings:[{code:'research_contract_upgrade_required',target:draftId,message:'Paid v4 work is retained; prepare Discovery v5 before new research or acceptance'}]};
     }
     requireCondition(draft.value.contractVersion === RESEARCH_CONTRACT_VERSION, "research_contract_upgrade_required", "New stage research requires the current contract");
     let graphExpected = store.get(`graph:${project}`)?.revision ?? 0;
@@ -61,6 +80,10 @@ export class StageResearch {
       };
     }, artifact ? reference(artifact) : null);
     const { artifact: accepted, ...rest } = result;
-    return { ...rest, stage: accepted };
+    const outcome = discoveryOutcome(store, store.get<DiscoveryDraft>(draftId)!);
+    if (outcome.state === 'legacy') return { ...rest, stage: accepted };
+    const { guards: _guards, findings, ...discovery } = outcome;
+    return { ...rest, stage: accepted, discovery,
+      ...(findings.length ? { status: outcome.ownerChoices.length ? 'needs_owner' as const : 'paused' as const, findings } : {}) };
   }
 }

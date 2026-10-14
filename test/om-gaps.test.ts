@@ -1015,7 +1015,7 @@ ${body}
 }
 
 test("PF3.1 rows 35, 39: a D1 set the base code 259d7a8c wrote, read and prepared reads and prepares the same with the new code — cold, warm and after reopen", async t => {
-  const f = await createOmFixture(t), request = nativeRequest(f);
+  const f = await createOmFixture(t, undefined, undefined, PF31_BASE), request = nativeRequest(f);
   const root = mkdtempSync(join(tmpdir(), "omg-pf31-era-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const old = atBase(root, f.database, `const { writeGaps, readGaps, prepareCurrentGaps } = await import(src('om/gaps.js'));

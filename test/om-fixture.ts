@@ -204,7 +204,7 @@ export function gardenGraph(variant: GardenVariant = "standard", project = "gard
   return full;
 }
 
-export async function createOmFixture(t: TestContext, variant: GardenVariant = "standard", project = "garden"): Promise<OmFixture> {
+export async function createOmFixture(t: TestContext, variant: GardenVariant = "standard", project = "garden", historicalCommit?: string): Promise<OmFixture> {
   validateTestContext(t);
   validateGardenArguments(variant, project);
   const root = mkdtempSync(join(tmpdir(), "omg-om-fixture-"));
@@ -222,7 +222,7 @@ export async function createOmFixture(t: TestContext, variant: GardenVariant = "
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
 
   const graph = gardenGraph(variant, project);
-  preparedFeatures(engine, project, graph);
+  preparedFeatures(engine, project, graph, undefined, historicalCommit);
   const command = { executable: process.execPath, args: [agent] };
   engine.environments.configure(project, {
     workspace,

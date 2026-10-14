@@ -797,7 +797,8 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
     if (!draft || !question || canonical(reference(draft)) !== canonical(draftRef)
       || canonical(reference(question)) !== canonical(questionRef))
       consumerInvalid(before.id, 'The early model refusal lost its exact original contract');
-    return { kind: 'early-model-refusal', draft, question };
+    return { kind: 'early-model-refusal', draft, question,
+      producer: readResearchConsumerIntent(store, before.value.consumerIntent) };
   }
   const localRefusal = projectPaidLocalRefusal(before.value as ManagedResearchTurn);
   if (localRefusal) return localRefusal.proof;
@@ -1669,7 +1670,8 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
   if (paid.kind !== 'response') return null;
   return earlyResearchFailure(draft.value, question.value,
-    intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload);
+    intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
+    intent.value.cursor.context?.discoveryContext ?? null);
 }
 export function retryableResearchConsumerRefusal(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
   const refusal = intent.value.state === 'refused' ? intent.value.refusal : null;

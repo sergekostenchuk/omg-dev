@@ -1,3 +1,6 @@
+import { discoveryOutcome } from '../src/discovery/discovery-outcome.js';
+import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
+import { preparedField } from './preparation-fixture.js';
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -17,7 +20,7 @@ import { processStart } from "../src/runtime/process-identity.js";
 import { Store, observeStore, type Revision, type StoreObserver, type TransactionGuard, type Write } from "../src/storage/store.js";
 import { captureView, storeView } from "../src/storage/store-view.js";
 import { writeFeasibility, type FeasibilityRequest } from "../src/om/feasibility.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { preparedFeatures, refinedLayers, answerDiscoveryFixture } from "./product-fixture.js";
 
 const git = (cwd: string, args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 const project = "p";
@@ -334,3 +337,90 @@ test("Q4 №2563-3: on a proven Store omProject picks era candidates by indexed 
     assert.equal(new StageChecks(store).omProject("era45"), false, "And a second unmarked project still answers cleanly");
   } finally { observeStore(previous); }
 });
+
+function discoveryV5Base(t:TestContext) {
+ const root=mkdtempSync(join(tmpdir(),'omg-ds1-gate-')),store=new Store(join(root,'state.sqlite')),engine=new ProductEngine(store);
+ t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
+ engine.execute({type:'create-project',project:'p',title:'Controlled Discovery'});
+ const source=engine.discovery.evidence.document('p','request','Controlled local transformation scope','text/plain',0);
+ const command={executable:process.execPath,args:['--version']};
+ engine.environments.configure('p',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'medium',command},reviewer:{actor:'assessor',model:'fixture',effort:'medium',command},fullCheck:command,timeoutMs:1000},0);
+ const draft=engine.prepare('p','discovery');
+ for(const id of draft.value.questions) {
+  const q=store.get<Question>(id)!,field=q.value.spec.field;
+  if(field==='brief')engine.discovery.fact(id,q.revision,reference(source),{kind:'text-range',start:0,end:source.value.content.length});
+  else if(['researchPlan','researchReport','verdict','preparation'].includes(field))answerDiscoveryFixture(engine,'p',store.get<DiscoveryDraft>(draft.id)!,q,preparedField('p',field),source);
+  else engine.discovery.decision(id,q.revision,'owner',preparedField('p',field));
+ }
+ return {root,store,engine,draft,source,question:(field:string)=>store.get<Question>(draft.value.questions.find(id=>store.get<Question>(id)!.value.spec.field===field)!)!};
+}
+
+for(const change of ['plan','report','foreign-draft','bare-go'] as const) test(`DS1-06 ${change} cannot masquerade as current accepted research before dispatch or stage acceptance`,async t=>{
+ const f=discoveryV5Base(t);
+ if(change==='bare-go') {
+  const q=f.question('verdict'),value=f.store.get<DiscoveryDraft>(f.draft.id)!.value.fields.verdict!;
+  f.engine.discovery.reopen(q.id,q.revision);f.engine.discovery.decision(q.id,q.revision+1,'owner',value);
+ }else if(change==='foreign-draft'){
+  const q=f.question('researchPlan');f.store.write({id:q.id,kind:q.kind,expected:q.revision,value:{...q.value,draftId:'discovery:foreign'}});
+ }else{
+  const field=change==='plan'?'researchPlan':'researchReport',q=f.question(field),a=f.store.get<any>(q.value.answer!.id)!;
+  const value={...a.value.value,...(change==='plan'?{domain:'Substituted domain'}:{variant:'Substituted result'})};
+  const replacement=f.store.write({id:a.id+':replacement',kind:a.kind,expected:0,value:{...a.value,value}});
+  f.store.write({id:q.id,kind:q.kind,expected:q.revision,value:{...q.value,answer:reference(replacement)}});
+  const draft=f.store.get<DiscoveryDraft>(f.draft.id)!;
+  f.store.write({id:draft.id,kind:draft.kind,expected:draft.revision,value:{...draft.value,fields:{...draft.value.fields,[field]:value}}});
+ }
+ assert.throws(()=>discoveryOutcome(f.store,f.store.get<DiscoveryDraft>(f.draft.id)!),(e:any)=>e instanceof EngineError&&/question:|discovery:/.test(e.message));
+ const artifact=f.engine.draft('p','discovery',f.draft.id,0);
+ assert.throws(()=>f.engine.pipeline.accept('p','discovery',artifact.revision));
+ await f.engine.researcher.run('p',f.draft.id,1).catch(error=>assert.ok(error instanceof EngineError));
+ assert.equal(f.store.list('model-call').length,0);
+ assert.throws(()=>f.engine.prepare('p','concept'),{code:'predecessor_not_ready'});
+});
+
+for(const field of ['researchPlan','researchReport','verdict']) test(`DS1-07 reopening ${field} invalidates its old value and a second Store wins the pre-dispatch window`,async t=>{
+ const f=discoveryV5Base(t),prep=f.question('preparation');f.engine.discovery.reopen(prep.id,prep.revision);
+ const before=f.question(field),other=new Store(f.store.path);t.after(()=>other.close());
+ const write=f.store.writeMany.bind(f.store);let raced=false;
+ f.store.writeMany=((writes:Write[],guards:TransactionGuard[]=[])=>{
+  if(!raced&&writes.some(w=>w.kind==='research-consumer-intent'&&w.expected===0)){
+   raced=true;new ProductEngine(other).discovery.reopen(before.id,before.revision);
+  }
+  return write(writes,guards);
+ }) as typeof f.store.writeMany;
+ const run=await f.engine.researcher.run('p',f.draft.id,1);f.store.writeMany=write;
+ assert.ok(raced);assert.equal(run.value.pauseCode,'input_stale');assert.equal(f.store.list('model-call').length,0);
+ assert.equal(f.store.list('research-consumer-intent').length,0,'the failed preparation is atomic');
+ assert.equal(discoveryOutcome(f.store,f.store.get<DiscoveryDraft>(f.draft.id)!).state,'researching');
+ const artifact=f.engine.draft('p','discovery',f.draft.id,0);assert.throws(()=>f.engine.pipeline.accept('p','discovery',artifact.revision));
+});
+
+for (const missing of ['answer', 'answer-null', 'value', 'assessment', 'assessment-null', 'questions', 'fields', 'question-status']) {
+ test(`DS1-10 absent ${missing} is an addressed refusal at the outcome and stage gate, not an exception or a new call`, async t => {
+  const f = discoveryV5Base(t), q = f.question('researchPlan');
+  const artifact = f.engine.draft('p', 'discovery', f.draft.id, 0);
+  if (missing === 'questions' || missing === 'fields') {
+   const draft = f.store.get<any>(f.draft.id)!, value = { ...draft.value }; delete value[missing];
+   f.store.write({ id: draft.id, kind: draft.kind, expected: draft.revision, value });
+  } else if (missing.startsWith('answer') || missing === 'question-status') {
+   const value: any = { ...q.value };
+   if (missing === 'answer-null') value.answer = null;
+   else delete value[missing === 'question-status' ? 'status' : 'answer'];
+   f.store.write({ id: q.id, kind: q.kind, expected: q.revision, value });
+  } else {
+   const a = f.store.get<any>(q.value.answer!.id)!, value = { ...a.value };
+   if (missing === 'assessment-null') value.assessment = null; else delete value[missing];
+   const damaged = f.store.write({ id: a.id + ':damaged', kind: a.kind, expected: 0, value });
+   f.store.write({ id: q.id, kind: q.kind, expected: q.revision, value: { ...q.value, answer: reference(damaged) } });
+  }
+  const before = f.store.list().map(reference);
+  const refused = (error: any) => error instanceof EngineError && error.code.startsWith('discovery_') && /question:|discovery:/.test(error.message);
+  assert.throws(() => discoveryOutcome(f.store, f.store.get<DiscoveryDraft>(f.draft.id)!), refused);
+  const reopened = new Store(f.store.path);
+  try { assert.throws(() => discoveryOutcome(reopened, reopened.get<DiscoveryDraft>(f.draft.id)!), refused); }
+  finally { reopened.close(); }
+  assert.throws(() => f.engine.pipeline.accept('p', 'discovery', artifact.revision), (e: any) => e instanceof EngineError);
+  await assert.rejects(f.engine.researcher.run('p', f.draft.id, 1), refused);
+  assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.store.list('model-call').length, 0);
+ });
+}

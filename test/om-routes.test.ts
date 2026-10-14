@@ -104,7 +104,7 @@ function frozen(value: unknown): boolean {
   return value === null || typeof value !== "object" || Object.isFrozen(value) && Object.values(value).every(frozen);
 }
 
-function routesFixture(t: TestContext, withEncoding = false) {
+function routesFixture(t: TestContext, withEncoding = false, historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), "omg-routes-")), path = join(root, "state.sqlite");
   let store = new Store(path), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -118,7 +118,7 @@ function routesFixture(t: TestContext, withEncoding = false) {
         question: "Which encoding does the repository support?", consumer: "garden-consume-block",
         moment: "om-pass", blocksCurrentStage: false, resolution: "Read repository facts during OM" }] : [])];
     return value;
-  });
+  }, historicalCommit);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [{ pending:
@@ -983,7 +983,7 @@ test('LP7 rows 1, 2, 3, 6, 7, 8, 9: the block input fields of one complete consu
 });
 
 test('LP7 rows 4, 5: a new record whose D1 joins nothing keeps consumer-set-v1 and the very bytes the base code 7c7d3ccc prepares in its own process; no batch at all is an explicit empty', t => {
-  const f = routesFixture(t, true);
+  const f = routesFixture(t, true, LP7_BASE);
   decide(f, 'garden-B1', 'nodes', NODES);
   // Row 4: checkKind alone is left for its consumer set, so joining changes no batch.
   const rest = decide(f, 'garden-B1', 'state', STATE), request = requestFor(f, rest), prepared = ok(prepareRoutes(f.store, request));
@@ -998,7 +998,7 @@ test('LP7 rows 4, 5: a new record whose D1 joins nothing keeps consumer-set-v1 a
 });
 
 test('LP7 rows 12–15, 20: a consumer-set-v1 route the base code saved with split fields stays current by its own algorithm and is never reclassified; a changed search needs the explicit successor, born joined; a new D1 joins the rest', async t => {
-  const f = routesFixture(t, true), request = requestFor(f);
+  const f = routesFixture(t, true, LP7_BASE), request = requestFor(f);
   const saved = f.aside(() => atCommit(f, LP7_BASE, 'lp7-saved', BASE_WRITE, request)) as Revision<RoutesRecord>;
   // Row 12: the base code split the three input fields of garden-consume-block; this code keeps that exact record current.
   assert.deepEqual([saved.value.grouping, fieldsOf(saved.value)], ['consumer-set-v1', ['checkKind', 'nodes', 'state']]);
@@ -1031,7 +1031,7 @@ test('LP7 rows 12–15, 20: a consumer-set-v1 route the base code saved with spl
 
 test('LP7 rows 18, 19: the era chosen at preparation is guarded — the base code taking the address after it, or a moved source, refuses the write with no partial one', t => {
   // Row 18: preparation chose a joined new record; the base code then wrote its own split record at that very address.
-  const f = routesFixture(t, true), request = requestFor(f), prepared = ok(prepareRoutes(f.store, request));
+  const f = routesFixture(t, true, LP7_BASE), request = requestFor(f), prepared = ok(prepareRoutes(f.store, request));
   assert.deepEqual([prepared.existing, prepared.record.value.grouping], [false, 'block-input-v1']);
   const theirs = f.aside(() => atCommit(f, LP7_BASE, 'lp7-race', BASE_WRITE, request)) as Revision<RoutesRecord>;
   assert.deepEqual([theirs.id, theirs.value.grouping], [prepared.record.id, 'consumer-set-v1']);
@@ -1040,7 +1040,7 @@ test('LP7 rows 18, 19: the era chosen at preparation is guarded — the base cod
   assert.deepEqual(snapshot(f.store), after); assert.deepEqual(f.store.get(theirs.id), theirs, 'The record that won is not overwritten');
   assert.deepEqual(ok(prepareRoutes(f.store, request)).record, theirs, 'and it stays current by its own algorithm');
   // Row 19: a guarded source moved after preparation.
-  const g = routesFixture(t, true), other = ok(prepareRoutes(g.store, requestFor(g)));
+  const g = routesFixture(t, true, LP7_BASE), other = ok(prepareRoutes(g.store, requestFor(g)));
   g.refreshInventory();
   const moved = snapshot(g.store);
   rejected(writeGuarded(g.store, { unit: 'M6', target: other.record.id, writes: other.writes, guards: other.guards }), 'input_stale');

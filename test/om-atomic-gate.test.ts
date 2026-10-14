@@ -191,7 +191,7 @@ async function produceAtomicSeed(era = false) {
     ...(era ? [{ id: 'atomic-env', question: 'Which runtime does the consuming work start on?', consumer: 'garden-consume-operation',
       moment: 'task-start', blocksCurrentStage: false, resolution: 'Confirm it when the task starts' }] : [])];
     return value;
-  });
+  }, era ? ERA_D7_COMMIT : undefined);
   let input = ok(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   const initial = ok(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),

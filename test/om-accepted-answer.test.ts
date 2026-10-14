@@ -134,7 +134,7 @@ function rejected(result: OmResult<unknown>, code: string | readonly string[]): 
   return refusal;
 }
 
-function factFixture(t: TestContext) {
+function factFixture(t: TestContext, historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), 'omg-accepted-fact-')), path = join(root, 'state.sqlite');
   let store = new Store(path), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -146,7 +146,7 @@ function factFixture(t: TestContext) {
       question: 'Which output format does the repository support?', consumer: block,
       moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
     return value;
-  });
+  }, historicalCommit);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [{ pending:
@@ -1353,7 +1353,7 @@ ${body}
 }
 
 test('PF3 row 24: accepted answers and the index the base code 5929ea25 wrote prepare and read the same with the new code, warm and after reopen', async t => {
-  const f = factFixture(t), a = await f.answer(), b = await f.answer();
+  const f = factFixture(t, PF3_BASE), a = await f.answer(), b = await f.answer();
   const args = JSON.stringify({ requests: [a.request, b.request], project: f.project, target: f.target });
   const old = atBase(f.root, join(f.root, 'state.sqlite'), `const { writeAcceptedAnswer, prepareAnswerSearch, readAnswerSearch } = await import(src('om/accepted-answer.js'));
 const args = ${args};

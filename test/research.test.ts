@@ -23,7 +23,8 @@ import { researchInput } from "./preparation-fixture.js";
 
 // Protocol fixture, not a claim of live-model research quality. The assessor's
 // controlled responses let the test isolate whether the engine enforces them.
-const ADAPTER = `import {readFileSync,appendFileSync,existsSync,writeFileSync} from 'node:fs';
+const ADAPTER = `import {boundDiscoveryValue} from ${JSON.stringify(new URL('./preparation-fixture.js',import.meta.url).href)};
+import {readFileSync,appendFileSync,existsSync,writeFileSync} from 'node:fs';
 import {isDeepStrictEqual} from 'node:util';
 const req=JSON.parse(readFileSync(0,'utf8')), c=req.subject, scenario=process.argv[2];
 if(!c.inventory)c.inventory={sources:c.originals?.sources??[]};
@@ -33,7 +34,7 @@ if(scenario==='failure') {process.stderr.write('provider unavailable');process.e
 const reply=research=>console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research}));
 if(c.role==='assess-answer') {
  if(scenario==='assessor-retry'&&!existsSync(process.argv[3]+'.retry')) {writeFileSync(process.argv[3]+'.retry','started');process.stderr.write('assessor unavailable');process.exit(1)}
- const same=c.observations.some(o=>isDeepStrictEqual(o.value,c.value??c.focus?.value??c.observations[0]?.value));
+ const same=c.observations.some(o=>isDeepStrictEqual(boundDiscoveryValue(c.question.field,o.value,c.discoveryContext),c.value??c.focus?.value??c.observations[0]?.value));
  reply({verdict:scenario==='irrelevant'||!same?'insufficient':'supported',reasons:scenario==='irrelevant'||!same?['The source does not support this requested property']:[]});
 } else if(c.role==='assess-escalation') {
  if(scenario==='race') {writeFileSync(process.argv[3]+'.awaiting','started');await new Promise(resolve=>setTimeout(resolve,300));}
@@ -49,7 +50,7 @@ if(c.role==='assess-answer') {
   const full=c.history.find(t=>t.action.action==='read_source'&&t.action.source.hash===source.ref.hash&&t.action.start===0&&t.action.end===source.length);
   if(source.truncated&&!full) {reply({action:'read_source',source:source.ref,start:0,end:source.length});process.exit(0)}
   const values=JSON.parse(full?full.observation.value:source.excerpt);
-  reply({action:'answer',question:q.id,value:values[q.field],citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+q.field}}]});
+  reply({action:'answer',question:q.id,value:boundDiscoveryValue(q.field,values[q.field],c.discoveryContext),citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+q.field}}]});
  }
 }`;
 
@@ -75,21 +76,26 @@ test("research command connects a process provider, evidence assessment and down
     configure(project);
     engine.discovery.evidence.document(project, "brief", researchInput(project), "application/json", 0);
     const draft = engine.prepare(project, "discovery");
-    const run = await engine.execute({ type: "research-draft", project, draftId: draft.id, maxTurns: 4 }) as { value: ResearchRun };
+    const run = await engine.execute({ type: "research-draft", project, draftId: draft.id, maxTurns: 8 }) as { value: ResearchRun };
     assert.equal(run.value.status, "completed", JSON.stringify({run:run.value,turns:store.list<ResearchTurn>("research-turn").map(t=>({action:(t.value.action as {action:string}).action,error:t.value.error}))})); assert.equal(run.value.ownerQuestion, null);
     const content = engine.draft(project, "discovery", draft.id, 0);
     engine.pipeline.accept(project, "discovery", content.revision);
     assert.equal(engine.pipeline.inspect(project, "discovery").state, "accepted");
     const count = store.list("research-turn").length;
-    await engine.researcher.run(project, draft.id, 4);
+    await engine.researcher.run(project, draft.id, 8);
     assert.equal(store.list("research-turn").length, count, "A completed unchanged draft must not call the model again");
     const next = engine.prepare(project, "discovery");
-    const reused = await engine.researcher.run(project, next.id, 4);
-    assert.equal(reused.value.status, "completed"); assert.equal(reused.value.turns, 0);
-    assert.equal(store.list("research-turn").length, count, "The same stage questions and input versions reuse assessed evidence");
+    const reused = await engine.researcher.run(project, next.id, 8);
+    assert.equal(reused.value.status, "completed",JSON.stringify(reused.value));
+    const newlyAnswered=store.list<ResearchTurn>("research-turn").filter(t=>t.value.run===reused.id&&(t.value.action as any).action==='answer');
+    assert.deepEqual(newlyAnswered.sort((a,b)=>a.value.number-b.value.number).map(t=>store.get<Question>((t.value.action as any).question)!.value.spec.field),
+      ['researchReport','verdict','preparation'], "The plan is reused; changed exact parent refs require new downstream answers");
+    const reusedCount=store.list("research-turn").length;
+    await engine.researcher.run(project,next.id,8);
+    assert.equal(store.list("research-turn").length,reusedCount,"The exact same v5 draft remains free to repeat");
     engine.discovery.evidence.document(project, "brief", researchInput(project, "Changed source", "Changed owner intent"), "application/json", 1);
     assert.equal(engine.pipeline.inspect(project, "discovery").state, "stale");
-    const refreshed = await engine.researcher.run(project, draft.id, 4);
+    const refreshed = await engine.researcher.run(project, draft.id, 8);
     assert.equal(refreshed.value.status, "completed", JSON.stringify({message:"Only changed evidence is refreshed",run:refreshed.value,turns:store.list<ResearchTurn>("research-turn").slice(-8).map(t=>({action:(t.value.action as {action:string}).action,error:t.value.error}))}));
   }
 });
@@ -103,7 +109,7 @@ test("bounded research resumes without erasing answers or escalating an exhauste
   const second = await engine.researcher.run("p", draft.id, 1);
   assert.equal(second.value.status, "paused");
   const answered = engine.store.get(draft.value.questions[0]!)!;
-  const third = await engine.researcher.run("p", draft.id, 2);
+  const third = await engine.researcher.run("p", draft.id, 5);
   assert.equal(third.value.status, "completed");
   assert.equal(engine.store.get(answered.id)!.revision, answered.revision);
 });
@@ -143,12 +149,12 @@ test("provider failure preserves unresolved work and is not an owner question", 
 test("a proposed answer survives assessor outage and resumes assessment without calling its researcher again", async t => {
   const { engine, configure, store, root } = fixture(t, "assessor-retry"); configure("p");
   engine.discovery.evidence.document("p", "brief", researchInput("p", "Input", "Owner outcome"), "application/json", 0);
-  const draft = engine.prepare("p", "discovery"); const first = await engine.researcher.run("p", draft.id, 4);
+  const draft = engine.prepare("p", "discovery"); const first = await engine.researcher.run("p", draft.id, 8);
   assert.equal(first.value.status, "paused");
   const candidate = store.list<ResearchTurn>("research-turn").find(turn => turn.value.status === "pending")!;
   assert.equal(candidate.value.status, "pending");
   assert.equal((candidate.value.action as { value: string }).value, "Input");
-  const second = await engine.researcher.run("p", draft.id, 4);
+  const second = await engine.researcher.run("p", draft.id, 8);
   assert.equal(second.value.status, "completed");
   assert.equal(readFileSync(join(root, "calls.txt"), "utf8").split("\n").filter(role => role === "research").length, draft.value.questions.length + 1);
   assert.equal(store.get<ResearchTurn>(candidate.id)!.value.status, "completed");
@@ -159,7 +165,7 @@ test("owner answer arriving during escalation assessment prevents publication of
   engine.discovery.evidence.document("p", "brief", "Destination has not yet been selected.", "text/plain", 0);
   const draft = engine.discovery.create("p", "discovery", "R0", "concept", [{ field: "destination", kind: "decision",
     prompt: "Which destination did the owner choose?", risk: "No target", schema: { type: "string" } }]);
-  const pending = engine.researcher.run("p", draft.id, 4);
+  const pending = engine.researcher.run("p", draft.id, 8);
   for (let attempts = 0; !existsSync(join(root, "calls.txt.awaiting")); attempts++) {
     assert.ok(attempts < 200, "Assessor did not reach the controlled await window");
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -167,7 +173,7 @@ test("owner answer arriving during escalation assessment prevents publication of
   engine.discovery.decision(draft.value.questions[0]!, 1, "owner", "Local export");
   const result = await pending;
   assert.notEqual(result.value.status, "needs_owner"); assert.equal(result.value.ownerQuestion, null);
-  assert.equal((await engine.researcher.run("p", draft.id, 4)).value.status, "completed");
+  assert.equal((await engine.researcher.run("p", draft.id, 8)).value.status, "completed");
 });
 
 for (const start of [0, 137]) test(`RS1 saved paid read ${start}..200 resumes once after restart and remains historically readable`, async t => {
@@ -870,7 +876,7 @@ test("RS3 №4414 window: a guarded head moved by a second Store between the new
   assert.equal(f.calls(), 1);
 });
 
-test("RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and the next research-stage pays one new generation of the same step", async t => {
+test("RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and DS1 requires upgrade before a new paid generation", async t => {
   const failure = rs3RealFailure(t, "codex");
   const root = mkdtempSync(join(tmpdir(), "omg-rs3-era-")), era = join(root, "era"), data = join(root, "data");
   mkdirSync(era); mkdirSync(data); t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -899,10 +905,9 @@ writeFileSync(root+'/expected.json',JSON.stringify({draft:draft.id,run,records:s
     "The base classified the envelope failure as its terminal");
   assert.deepEqual(rs3ReadIntent(store, reference(old!)), old, "The new reader proves it in its era");
   const result = await new ProductEngine(store).execute({ type: "research-stage", project: "p", draftId: expected.draft, maxTurns: 1 }) as { status: string };
-  assert.notEqual(result.status, "failed");
-  assert.deepEqual(intents().map(row => [row.value.generation, row.value.state]), [[0, "refused"], [1, "applied"]]);
-  assert.deepEqual(intents()[1]!.value.previous, reference(old!));
-  assert.equal(readFileSync(join(data, "calls.txt"), "utf8").trim().split("\n").filter(role => !role.startsWith("assess")).length, 2);
+  assert.equal(result.status, "paused");
+  assert.deepEqual(intents().map(row => [row.value.generation, row.value.state]), [[0, "refused"]]);
+  assert.equal(readFileSync(join(data, "calls.txt"), "utf8").trim().split("\n").filter(role => !role.startsWith("assess")).length, 1);
   for (const record of expected.records) assert.equal(store.get(record.id, record.revision)!.hash, record.hash, `${record.id}@${record.revision} is unchanged`);
   const reopened = new Store(join(data, "state.sqlite")); t.after(() => reopened.close());
   assert.deepEqual(rs3ReadIntent(reopened, reference(old!)), old);
@@ -910,11 +915,11 @@ writeFileSync(root+'/expected.json',JSON.stringify({draft:draft.id,run,records:s
 
 test("RS3 №4414: an assessor failing with the codex-stdio envelope is a provider failure of the assessment — the proposed answer survives and the next entry assesses it again without calling its researcher", async t => {
   const f = rs3Fixture(t, [{ ...rs3RealFailure(t, "codex"), role: "assess-answer" }]);
-  const first = await f.engine.researcher.run("p", f.draft.id, 4);
+  const first = await f.engine.researcher.run("p", f.draft.id, 8);
   assert.equal(first.value.status, "paused", JSON.stringify(first.value));
   const candidate = f.store.list<ResearchTurn>("research-turn").find(turn => turn.value.status === "pending")!;
   assert.ok(candidate, "The proposed answer waits for its assessment");
-  const second = await f.engine.researcher.run("p", f.draft.id, 4);
+  const second = await f.engine.researcher.run("p", f.draft.id, 8);
   assert.equal(second.value.status, "completed", JSON.stringify(second.value));
   const roles = readFileSync(join(f.root, "calls.txt"), "utf8").trim().split("\n");
   assert.equal(roles.filter(role => role === "research").length, f.draft.value.questions.length + 1, "The researcher is not called again for the assessed answer");

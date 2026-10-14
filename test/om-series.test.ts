@@ -1,3 +1,4 @@
+import { answerDiscoveryFixture } from './product-fixture.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -2833,7 +2834,9 @@ function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = 
             if (field === 'preparation') (value as Record<string, Json>).unknowns = ids.map(id => ({ id,
               question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', moment: 'om-pass', blocksCurrentStage: false,
               resolution: 'Resolve the question during OM' }));
-            engine.discovery.decision(id, question.revision, 'owner', value);
+            if (stage === 'discovery' && draft.value.contractVersion === 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
+              answerDiscoveryFixture(engine, project, engine.store.get<import('../src/discovery/discovery.js').DiscoveryDraft>(draft.id)!, question, value, source);
+            else engine.discovery.decision(id, question.revision, 'owner', value);
           }
         }
         const old = store.get(`stage:${project}:${stage}`)!;
