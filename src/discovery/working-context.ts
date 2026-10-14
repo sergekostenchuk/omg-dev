@@ -118,6 +118,13 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   }
   if (options.continuation) {
     const previousBody=options.previous?store.get<Archive>(options.previous.id,options.previous.revision)?.value.body:undefined;
+    const mapMaterial = (value: Record<string, any> | undefined) => Array.isArray(value?.['prerequisites'])
+      ? value['prerequisites'].find((item: any) => item.stage === 'concept')?.operationMapMaterial : undefined;
+    const currentMapMaterial = mapMaterial(body);
+    // A previously delivered request may predate L1A. Its archive is not evidence
+    // that this catalogue (or the external systems accompanying it) was sent.
+    const newMapPrerequisites = currentMapMaterial
+      && canonical(currentMapMaterial) !== canonical(mapMaterial(previousBody) ?? null) ? body['prerequisites'] : undefined;
     const originals=originalIndex(body,previousBody);
     const dynamic: Record<string, any> = Object.fromEntries(Object.entries(body).filter(([key]) => !FOUNDATION_FIELDS.includes(key as typeof FOUNDATION_FIELDS[number])));
     if (body['previousProposal']) {
@@ -141,6 +148,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     const candidate=dynamic['candidate'],proposalChanges=dynamic['proposalChanges'],assessmentValue=dynamic['value'];
     const original=body;
     body = replaceFoundationCopies(dynamic, body, reference(archive), store);
+    if (newMapPrerequisites) body['prerequisites'] = newMapPrerequisites;
     if (projectedQuestion) { body['question'] = projectedQuestion; if (Object.hasOwn(original, 'questions')) body['questions'] = [projectedQuestion]; }
     if(original['assessmentState'])body['value']=assessmentValue;
     if(relatedResearch !== undefined)body['discoveryContext']=relatedResearch;

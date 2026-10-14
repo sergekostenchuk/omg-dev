@@ -1,6 +1,8 @@
 import type { Store } from "../storage/store.js";
-import { STAGES, reference, type StageArtifact } from "../pipeline/contracts.js";
+import { STAGES, reference, stageId, type StageArtifact } from "../pipeline/contracts.js";
 import type { DiscoveryDraft } from "./discovery.js";
+import { canonical } from "../canonical.js";
+import { EngineError } from "../errors.js";
 import type { Graph } from "../graph/model.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { REFINEMENT_CONTRACT_VERSION, type TechnicalReport } from "../graph/research-contracts.js";
@@ -8,6 +10,65 @@ import { researchGapDeferred } from '../graph/research-scope.js';
 import type { PlanDefect } from "../graph/plan-defects.js";
 import { projectGraph } from "../graph/project.js";
 import { layerRelationContext } from '../graph/layer-assembly.js';
+
+const MAP_RULES = [
+  "Engine rule (buildL1): every Discovery preparation.outcomes[].id remains the id of a result artifact and the outcome of a success journey. Do not rename these results; additional intermediate artifacts are allowed.",
+  "Engine rule: operationRequirements.outcomes[].outcome and conceptCoverage use the exact outcome and requirement identities in this catalogue. Actor references use the accepted actor ids. The engine supplies graph actors and requirements from these accepted stages.",
+  "External entities have different meanings: preparation.externalSystems names a service or vendor; artifact.external=true describes a concrete runtime input with a producer outside the product; a documentary Source, including a web snapshot, is evidence for a claim. None proves either of the other two.",
+  "A service dependency may affect a product block's responsibility, contract and failure path. Merely listing a service does not require one separate block or external artifact per service; documentation does not prove an available session, API response or runtime execution.",
+] as const;
+
+function operationMapMaterial(store: Store, draft: DiscoveryDraft) {
+  const fail = (target: string, field: string, message: string): never => {
+    throw new EngineError("operation_map_material_invalid", `[${target}] ${message}`, { target, field });
+  };
+  const accepted = (stage: "discovery" | "concept") => {
+    const id = stageId(draft.projectId, stage), refs = draft.inputs.filter(ref => ref.id === id);
+    if (refs.length !== 1) return fail(id, "inputs", "Map material needs exactly one accepted stage reference in its draft inputs");
+    const ref = refs[0]!, record = store.get<StageArtifact>(ref.id, ref.revision);
+    if (!record || record.kind !== "stage" || record.hash !== ref.hash || record.value.projectId !== draft.projectId
+      || record.value.stage !== stage || record.value.status !== "accepted")
+      return fail(id, "inputs", "Map material needs the exact accepted stage of this project");
+    return record;
+  };
+  const discovery = accepted("discovery"), concept = accepted("concept");
+  if (!concept.value.inputs.some(ref => canonical(ref) === canonical(reference(discovery))))
+    return fail(concept.id, "inputs", "The concept and Discovery must belong to the same accepted stage chain");
+  const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+  const fields = (record: typeof discovery) => {
+    const content = record.value.content;
+    if (!object(content) || !object(content['fields'])) return fail(record.id, "content.fields", "Map material needs the accepted stage fields");
+    return content['fields'];
+  };
+  const preparation = fields(discovery)['preparation'];
+  if (!object(preparation)) return fail(discovery.id, "preparation", "Map material needs Discovery preparation");
+  const list = (value: unknown, target: string, field: string): Record<string, unknown>[] => {
+    if (!Array.isArray(value) || !value.every(object)) return fail(target, field, "Map material needs its explicit accepted list");
+    return value;
+  };
+  const text = (value: unknown, target: string, field: string): string => {
+    if (typeof value !== "string" || !value.trim()) return fail(target, field, "Map identities must be nonempty accepted strings");
+    return value;
+  };
+  const address = (record: typeof discovery, pointer: string) => ({ record: reference(record), pointer });
+  const outcomes = list(preparation['outcomes'], discovery.id, "preparation.outcomes").map((value, index) => ({
+    id: text(value['id'], discovery.id, `preparation.outcomes.${index}.id`),
+    source: address(discovery, `/content/fields/preparation/outcomes/${index}`),
+  }));
+  const actors = list(preparation['actors'], discovery.id, "preparation.actors").map((value, index) => ({
+    id: text(value['id'], discovery.id, `preparation.actors.${index}.id`),
+    source: address(discovery, `/content/fields/preparation/actors/${index}`),
+  }));
+  const requirements = list(fields(concept)['conceptSections'], concept.id, "conceptSections").flatMap((section, sectionIndex) =>
+    list(section['requirements'], concept.id, `conceptSections.${sectionIndex}.requirements`).map((value, index) => ({
+      id: text(value['id'], concept.id, `conceptSections.${sectionIndex}.requirements.${index}.id`),
+      outcome: text(value['outcome'], concept.id, `conceptSections.${sectionIndex}.requirements.${index}.outcome`),
+      source: address(concept, `/content/fields/conceptSections/${sectionIndex}/requirements/${index}`),
+    })));
+  list(preparation['externalSystems'], discovery.id, "preparation.externalSystems");
+  return { contract: "operation-map-material/v1", sources: { discovery: reference(discovery), concept: reference(concept) },
+    catalogue: { outcomes, actors, requirements }, engineRules: { origin: "engine-rule", rules: [...MAP_RULES] } };
+}
 
 /** The immediate accepted prerequisite carries the detailed handoff; older stages
  * supply identities needed for traceability, without duplicating every report. */
@@ -17,6 +78,7 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft) {
     return record?.kind === "stage" && record.hash === ref.hash ? [record] : [];
   }).sort((left, right) => STAGES.indexOf(right.value.stage) - STAGES.indexOf(left.value.stage));
   const latest = stages[0];
+  const mapMaterial = draft.stage === "operation-map" ? operationMapMaterial(store, draft) : null;
   return stages.map(record => {
     const content = record.value.content as { fields?: Record<string, unknown> };
     const fields = content?.fields ?? {};
@@ -25,10 +87,11 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft) {
       if (name === "preparation" && value && typeof value === "object") {
         const preparation = value as Record<string, unknown>;
         identities[name] = { actors: preparation['actors'], outcomes: preparation['outcomes'], constraints: preparation['constraints'],
-          ...(draft.stage === "operation-map" ? { journeys: preparation['journeys'] } : {}) };
+          ...(draft.stage === "operation-map" ? { journeys: preparation['journeys'], externalSystems: preparation['externalSystems'] } : {}) };
       } else if (name === "conceptSections" && Array.isArray(value)) identities[name] = value;
     }
-    return { ref: reference(record), stage: record.value.stage, fields: record === latest ? fields : identities };
+    return { ref: reference(record), stage: record.value.stage, fields: record === latest ? fields : identities,
+      ...(mapMaterial && record.value.stage === "concept" ? { operationMapMaterial: mapMaterial } : {}) };
   });
 }
 
