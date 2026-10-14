@@ -5330,3 +5330,21 @@ test('NR1 №3674 п.2: a packet of the previous attempt is not registered in th
     assert.equal(correct.value.request.attempt!.ordinal, 2);
   } finally { for (const fn of cleanups.reverse()) fn(); }
 });
+
+// ---- SP1a (№4714 §2.1): a correction of a selection-era root keeps its declaration and its selected material ----
+import { BRIEF_SELECTION_CONTRACT } from '../src/om/packet-brief.js';
+
+test('SP1a №4714 §2.1: the legal correction of a new managed root — a paid repairable E3 refusal with its diagnostic — keeps briefSelection and the same selected section', async t => {
+  const f = mp2Managed(t);
+  assert.equal(f.packet.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'A new root declares the selection era');
+  f.steps([{ research: mp2Refused(f) }, { research: e4Node(f) }]);
+  const cycle = valueOf(await mp2Cycle(f.store, f.request));
+  const [first, second] = cycle.record.value.steps;
+  const rejected = mp2Step(f, first!), corrected = f.store.get<QuestionPacketRecord>(second!.packet.id)!;
+  assert.deepEqual(corrected.value.request.correction, { packet: first!.packet, call: rejected.call, response: rejected.response, diagnostic: rejected.diagnostic });
+  assert.equal(corrected.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'The correction keeps its root era');
+  const scope = (packet: Json) => JSON.parse(packetPrompt(packet).split('# Scope and exact context\n')[1]!.split('\n')[0]!).input;
+  const selected = scope(f.packet.value.packet as Json).selected;
+  assert.ok(selected && selected.contract === 'selected-specification/v1', 'The root shows the selected specification');
+  assert.deepEqual(scope(corrected.value.packet as Json).selected, selected, 'The correction shows the same selected material');
+});

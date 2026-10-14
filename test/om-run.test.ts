@@ -4929,19 +4929,22 @@ async function wrapperUnable(t: test.TestContext) {
   const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP81_BASE_COMMIT);
   const b = f.bases("lp81-wrapper"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, { ...stopAnswer(f, true), confirmed: null }, addressAll(f, b.routes)]);
-  ok(startRun(f.store, { project }));
-  await driveTo(f, request, "analyze", 40);
-  const failure = f.store.list().find(row => row.kind === "om-stop-analysis-failure")!;
-  assert.ok(failure, "The review was refused for the wrapper and saved as a failure");
-  const ended = atCommit(f, LP81_BASE_COMMIT, "lp81-base", `const { advanceRun } = await import(src('om/run.js'));
+  // SP1a (№4714 §2.1): a packet today's code issues declares the selection era, which ea207137 cannot re-derive. So the base
+  // code runs the whole pass it ends — its start, the review the old wrapper refused and the end — and today's code reopens it.
+  const ended = atCommit(f, LP81_BASE_COMMIT, "lp81-base", `const { startRun, advanceRun } = await import(src('om/run.js'));
+take(startRun(store, { project: args.project }));
 let state = null;
-for (let index = 0; index < 10; index++) {
+for (let index = 0; index < 60; index++) {
   state = take(await advanceRun(store, args.request)).record.value.state;
   if (state.phase === 'unable' || state.phase === 'waiting') break;
 }
-out(state);`, { request }) as { phase: string };
+out(state);`, { request, project }) as { phase: string };
   assert.equal(ended.phase, "unable", `The base ends the pass on the failed review: ${JSON.stringify(ended)}`);
   f.restart();
+  const failure = f.store.list().find(row => row.kind === "om-stop-analysis-failure")!;
+  assert.ok(failure, "The review was refused for the wrapper and saved as a failure");
+  assert.ok(f.store.list<{ briefSelection?: string }>("question-packet").every(row => !Object.hasOwn(row.value, "briefSelection")),
+    "Every packet of the base pass is of the era before the selection");
   const unable = ok(readRun(f.store, { project }))!;
   assert.deepEqual(reasonsOf(unable.value.state).map(row => [row.kind, row.code]), [["stop-analysis-failed", "analysis_failed"]]);
   return { f, request, failure: reference(failure), unable };

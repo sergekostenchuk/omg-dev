@@ -15,6 +15,7 @@ import { historicalProof, historicalTrace, pendingSnapshotView, withHistoricalRe
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, type OmResult, type Refusal, type Sealed, type SourceCodes } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
+import { preparationMatches } from "./selected-specification.js";
 import type { Graph } from "../graph/model.js";
 import { transitionField } from "./impact.js";
 import { deriveInputDecisions } from "./addressing.js";
@@ -251,7 +252,8 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
     }
   }
   const requirementIds = new Set(requirements.map(req => req.id));
-  const prepOf = (feature: Row) => preps.filter(prep => prep.featureTitle === feature.title && prep.outcome === feature.outcome);
+  // SP1 (№4714 §3): the one matching rule the delivery of the full preparation shares; B1 keeps its own gap/refusal handling.
+  const prepOf = (feature: Row): Row[] => preparationMatches(preps, feature).map(match => match.value as Row);
   const usedBy = (id: string): Json => ({ features: rawFeatures.flatMap((feature, index) => {
     const mine = prepOf(feature);
     return mine.length === 1 && Array.isArray(mine[0]!.behaviorContracts) && mine[0]!.behaviorContracts.includes(id)

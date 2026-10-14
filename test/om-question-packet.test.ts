@@ -75,7 +75,8 @@ function frozen(value: unknown): boolean {
   return value === null || typeof value !== 'object' || Object.isFrozen(value) && Object.values(value).every(frozen);
 }
 
-function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false, historicalCommit?: string) {
+function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false, historicalCommit?: string,
+  decideContract = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-question-packet-')), database = join(root, 'state.sqlite');
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -98,8 +99,12 @@ function questionFixture(t: TestContext, desiredGraph = gardenGraph(), addressOw
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
-    decisions: descriptors.filter(item => addressOwner || item.kind !== 'owner-decision').map(item => ({ pending: clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
-      decision: { target: `discovery:${item.id}`, field: 'address', value: { consumer: item.consumer, kind: item.kind } } })) as Write })) }));
+    decisions: [...descriptors.filter(item => addressOwner || item.kind !== 'owner-decision').map(item => ({ pending: clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: `discovery:${item.id}`, field: 'address', value: { consumer: item.consumer, kind: item.kind } } })) as Write })),
+      // SP1a: B1 itself decides the contract binding and its prose boundary — the normalized row then differs from the original.
+      ...(decideContract ? [{ field: 'nodes', value: ['garden-produce-block'] }, { field: 'state', value: { writer: 'garden-produce-block',
+        authority: 'garden-user', rollback: 'garden-produce-block' } }].map(decision => ({ pending: clone(inputDecisionWrite({ project,
+        input: reference(base), graph: reference(graph), layers: [], decision: { target: 'garden-B1', ...decision } as never })) as Write })) : [])] }));
   const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
     choice: { choiceVersion: 'question-packet-fixture', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
@@ -371,8 +376,8 @@ try {
   return output;
 }
 function packetFixture(t: TestContext, capacity: number | null = 100_000, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false,
-  resultForm: Json = { type: 'string' }, routeCommit?: string) {
-  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer, routeCommit);
+  resultForm: Json = { type: 'string' }, routeCommit?: string, decideContract = false) {
+  const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer, routeCommit, decideContract);
   for (const question of f.request.questions) question.resultForm = resultForm;
   const tasks = ok(prepareQuestionTasks(f.store, f.request));
   const routesRequest = { project: f.project, gaps: f.request.gaps,
@@ -3783,7 +3788,11 @@ test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — 
   assert.ok(pointers.length >= 6, pointers.join(' '));
   const link = (packet: Sealed<Revision<QuestionPacketRecord>>, pointer: string): QuestionPacketRequest =>
     ({ ...p.request, continuation: sourceContinuation(p, packet, { action: 'read_context', record: reference(f.input), pointer }).continuation });
-  let packet = ok(writeQuestionPacket(f.store, p.request)).record;
+  // SP1a (№4714 §2.1): a root today's code issues declares the selection era, which the base code cannot reproduce. The base
+  // code writes the root instead: a chain of the era before the selection, which the links today's code adds must keep.
+  let packet = atCommit({ root: f.root, path: f.database }, PF5_BASE, 'pf5-base-root', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
+out(take(writeQuestionPacket(store, args)).record);`, p.request) as Sealed<Revision<QuestionPacketRecord>>;
+  assert.equal(Object.hasOwn(packet.value, 'briefSelection'), false, 'The base root declares no selection era');
   const requests: QuestionPacketRequest[] = [], counts: number[] = [], ours: PreparedSummary[] = [];
   for (const pointer of pointers.slice(0, 5)) {
     const request = link(packet, pointer), before = packetDerivations();
@@ -3792,6 +3801,7 @@ test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — 
     requests.push(request);
     packet = ok(writeQuestionPacket(f.store, request)).record;
     assert.equal(packet.value.state, 'ready', `link ${requests.length} is a ready continuation`);
+    assert.equal(Object.hasOwn(packet.value, 'briefSelection'), false, `link ${requests.length} keeps the era of its root`);
   }
   // The sixth link is prepared, not written: its new record's bytes and hash are compared too.
   const sixth = link(packet, pointers[5]!), before = packetDerivations();
@@ -4149,4 +4159,163 @@ test('RB1 №4343: an answer B1 applied to a transition the reopening found reac
   const scope = JSON.parse(text.split('\n# Scope and exact context\n')[1]!.split('\n')[0]!) as { input: { facts?: { question: { id: string } }[] } };
   for (const fact of facts) assert.ok((scope.input.facts ?? []).some(row => row.question.id === fact.question.id), `${fact.question.id} (asked at ${fact.question.consumer}) reaches the brief of ${node}`);
   assert.ok(text.includes('A transition finding without a decision is a research question'));
+});
+
+// ---- SP1a (№4714): the accepted specification whole in the questions of OM — the saved selection era of a packet root ----
+import { BRIEF_SELECTION_CONTRACT, type BriefLabel } from '../src/om/packet-brief.js';
+
+/** The scope section of a saved brief packet and its context labels, read as the model reads them. */
+function sp1Scope(record: Sealed<Revision<QuestionPacketRecord>>) {
+  const payload = record.value.packet as Record<string, any>, text = packetPrompt(payload);
+  const scope = JSON.parse(text.split('# Scope and exact context\n')[1]!.split('\n')[0]!) as { input: Record<string, any> };
+  const label = (name: unknown) => (payload.brief.labels as BriefLabel[]).find(row => row.label === name)?.value;
+  return { text, input: scope.input, label };
+}
+/** Every selected element is the exact accepted original at its own stage Ref and pointer, bounded by the scoped rows. */
+function sp1Delivered(store: Store, input: Ref, record: Sealed<Revision<QuestionPacketRecord>>) {
+  const { input: scope, label } = sp1Scope(record), selected = scope.selected;
+  assert.equal(record.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'A new root declares the selection era');
+  assert.ok(selected, 'The brief shows the selected specification');
+  assert.equal(selected.contract, 'selected-specification/v1');
+  const sources = store.get<{ input: { sources: (Ref & { stage: string })[] } }>(input.id, input.revision)!.value.input.sources;
+  const exact = (stage: string) => { const { id, revision, hash } = sources.find(row => row.stage === stage)!; return { id, revision, hash }; };
+  const fields = (stage: string) => store.get<{ content: { fields: Record<string, Json[]> } }>(exact(stage).id, exact(stage).revision)!.value.content.fields;
+  assert.ok(selected.contracts.length > 0, 'The scope selects a contract');
+  assert.deepEqual(selected.contracts.map((row: any) => row.value.id).sort(), scope.contracts.map((row: { id: string }) => row.id).sort(),
+    'Exactly the scoped contracts — nothing outside the scope');
+  for (const row of selected.contracts) {
+    assert.deepEqual(label(row.source), exact('specification'));
+    assert.equal(row.pointer, `/content/fields/behaviorContracts/${row.index}`);
+    assert.deepEqual(row.value, fields('specification').behaviorContracts![row.index]);
+    for (const field of ['entry', 'inputs', 'compatibility']) assert.ok(Object.hasOwn(row.value, field), `The original ${field} reaches the model`);
+  }
+  for (const row of scope.contracts) assert.equal(Object.hasOwn(row, 'entry'), false, 'The normalized B1 row stays beside it');
+  assert.deepEqual(selected.preparations.map((row: any) => row.featureIndex).sort(), scope.features.map((row: { index: number }) => row.index).sort());
+  for (const row of selected.preparations) {
+    assert.deepEqual(label(row.source), exact('features'));
+    assert.equal(row.pointer, `/content/fields/featurePreparation/${row.index}`);
+    assert.deepEqual(row.value, fields('features').featurePreparation![row.index]);
+    for (const field of ['beneficiary', 'benefit', 'success', 'failures', 'interactions']) assert.ok(Object.hasOwn(row.value, field), `The original ${field} reaches the model`);
+  }
+  assert.deepEqual(label(selected.constraints.source), exact('specification'));
+  assert.equal(selected.constraints.pointer, '/content/fields/constraints');
+  assert.deepEqual(selected.constraints.value, fields('specification').constraints);
+  assert.ok(selected.rule.includes('the B1 row is the binding decision'));
+  return selected;
+}
+
+test('SP1a №4714 §5 «доставка» MC1: a new root declares the selection and carries the full selected contract, preparation and every constraint at exact Refs; the saved root re-derives the same bytes after a restart', t => {
+  const p = packetFixture(t), { f } = p;
+  const record = ok(writeQuestionPacket(f.store, p.request)).record;
+  assert.equal((record.value.packet as Record<string, any>).model, 'MC1');
+  sp1Delivered(f.store, reference(f.input), record);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(record) })), record);
+  const again = ok(prepareQuestionPacket(f.store, p.request));
+  assert.equal(again.existing, true); assert.deepEqual(again.record, record);
+});
+
+test('SP1a №4714 §5 «доставка» node and parts: an expansion root and each of its parts carry the same declaration and the same selected originals', t => {
+  const p = expansionFixture(t), { f } = p;
+  const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
+  const environment = p.environment(whole.fingerprint!.chars - 1);
+  const request = { ...p.request, environment: reference(environment) };
+  const first = ok(writeQuestionPacket(f.store, request)).record;
+  assert.equal(first.value.plan!.mode, 'parts');
+  assert.equal((first.value.packet as Record<string, any>).task, 'node-expansion');
+  const selected = sp1Delivered(f.store, reference(f.input), first);
+  const firstResult = partResult(p, { record: first } as never), firstProposal = firstResult.proposal;
+  ok(prepareFrameProposals(f.store, { ...f.request.gaps.sources.operations, proposals: [reference(firstProposal)] }));
+  const second = ok(writeQuestionPacket(f.store, { ...request,
+    previous: [{ packet: reference(first), proposal: reference(firstProposal), result: reference(firstResult.record) }] })).record;
+  assert.equal(second.value.plan!.position, 1);
+  assert.deepEqual(sp1Delivered(f.store, reference(f.input), second), selected, 'A part keeps its root era and material');
+});
+
+test('SP1a №4714 §5 «доставка» works: a works root carries the selected specification of its scope', async t => {
+  const f = await worksPacketFixture(t), record = ok(writeQuestionPacket(f.store, f.request())).record;
+  assert.equal(record.value.packetContract, WORKS_BRIEF_PACKET_CONTRACT);
+  sp1Delivered(f.store, f.gaps.sources.input, record);
+});
+
+/** An input-field request of the contract, attempted on its block like the native MC2 field test above. */
+function sp1FieldRequest(p: ReturnType<typeof packetFixture>, slice: string): QuestionPacketRequest {
+  const { f } = p;
+  const batch = p.routes.value.batches.find(batch => batch.task === 'input-field' && batch.items.some(item => item.target === 'garden-B1'))!;
+  assert.ok(batch, 'B1 asks a field of the contract');
+  const block = batch.items[0]!.consumers[0] ?? p.block;
+  let ordinal = 1;
+  if (block === p.block) {
+    ok(completeAttempt(f.store, { project: f.project, block, line: 1, attempt: 1,
+      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
+    ordinal = 2;
+  } else ok(openSeries(f.store, { project: f.project, block, line: 1, slice, predecessor: null, basis: null }));
+  const goal: AttemptGoal = { key: slice, questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
+    result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
+  const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: ordinal, goal }));
+  return { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal } };
+}
+
+test('SP1a №4714 §5 «доставка» input field: an ordinary field brief carries the selected originals of its contract', t => {
+  const p = packetFixture(t), { f } = p;
+  const record = ok(writeQuestionPacket(f.store, sp1FieldRequest(p, 'sp1a-field'))).record;
+  assert.equal((record.value.packet as Record<string, any>).task, 'input-field');
+  sp1Delivered(f.store, reference(f.input), record);
+});
+
+test('SP1a №4714 §2.1: a continuation keeps the declaration and the selected material of its root', t => {
+  const p = packetFixture(t), { f } = p;
+  const first = ok(writeQuestionPacket(f.store, p.request)).record;
+  const delivery = sourceContinuation(p, first);
+  const second = ok(writeQuestionPacket(f.store, { ...p.request, continuation: delivery.continuation })).record;
+  assert.equal(second.value.state, 'ready'); assert.ok(second.value.request.continuation);
+  assert.deepEqual(sp1Delivered(f.store, reference(f.input), second), sp1Delivered(f.store, reference(f.input), first));
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(second) })), second);
+});
+
+test('SP1a №4714 §5 «расхождение представлений»: B1 decided nodes/state — the normalized row shows the decision, the original contract stays as accepted', t => {
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, true), { f } = p;
+  const effective = f.input.value.input.contracts.find(row => row.id === 'garden-B1')!;
+  assert.deepEqual(effective.nodes, ['garden-produce-block']);
+  assert.equal(effective.state.writer, 'garden-produce-block');
+  const record = ok(writeQuestionPacket(f.store, p.request)).record;
+  const selected = sp1Delivered(f.store, reference(f.input), record), { input: scope } = sp1Scope(record);
+  const original = selected.contracts.find((row: any) => row.value.id === 'garden-B1').value;
+  assert.equal(Object.hasOwn(original, 'nodes'), false, 'The original never acquires the B1 binding');
+  assert.equal(original.state.writer, 'transformation service', 'The original prose stays as accepted');
+  const row = scope.contracts.find((row: { id: string }) => row.id === 'garden-B1');
+  assert.deepEqual([row.nodes, row.state.writer, row.state.authority], [['garden-produce-block'], 'garden-produce-block', 'garden-user']);
+});
+
+test('SP1a №4714 §5 «бюджет»: the selected section is mandatory — where the brief fits without it but not with it, the packet is blocked before any call, nothing is cut', t => {
+  const p = packetFixture(t), { f } = p;
+  const request = sp1FieldRequest(p, 'sp1a-budget');
+  const ready = ok(prepareQuestionPacket(f.store, request)).record;
+  const { text } = sp1Scope(ready), section = `,"selected":${canonical(sp1Scope(ready).input.selected)}`;
+  assert.ok(text.includes(section), 'The section is one part of the scope');
+  const without = text.length - section.length;
+  assert.ok(without < ready.value.fullChars!);
+  const environment = p.environment(without);
+  const blocked = ok(writeQuestionPacket(f.store, { ...request, environment: reference(environment) })).record;
+  assert.equal(blocked.value.state, 'blocked'); assert.equal(blocked.value.refusal?.code, 'packet_too_large');
+  assert.equal(blocked.value.packet, null);
+  assert.equal(blocked.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'The blocked root keeps its era');
+  assert.deepEqual(f.store.list('model-call'), [], 'No model call is made');
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(blocked) })), blocked);
+});
+
+test('SP1a №4714 §5 «принадлежность источника»: a later revision of the specification never replaces the exact version a saved packet selected from; the current admission refuses it as stale', t => {
+  const p = packetFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
+  const spec = f.store.get(`stage:${f.project}:specification`)!, selectedFrom = reference(spec);
+  assert.deepEqual(sp1Scope(packet).label(sp1Scope(packet).input.selected.constraints.source), selectedFrom);
+  f.store.write({ id: spec.id, kind: spec.kind, expected: spec.revision, value: spec.value });
+  const before = snapshot(f.store);
+  rejected(prepareQuestionPacket(f.store, p.request), 'input_stale');
+  const read = ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) }));
+  assert.deepEqual(read, packet);
+  for (const row of [...sp1Scope(read).input.selected.contracts, sp1Scope(read).input.selected.constraints])
+    assert.deepEqual(sp1Scope(read).label(row.source), selectedFrom, 'The saved selection keeps its exact stage revision');
+  assert.deepEqual(snapshot(f.store), before);
 });

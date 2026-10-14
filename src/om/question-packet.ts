@@ -1,6 +1,7 @@
 import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, graphIndex, reopenedMaterial, resolveBriefAnswer, type BriefBasis, type BriefLabel,
   briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot,
-  IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact } from './packet-brief.js';
+  IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact, BRIEF_SELECTION_CONTRACT } from './packet-brief.js';
+import { SELECTED_SPECIFICATION_CODES } from './selected-specification.js';
 import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, IMPACT_PARSER, deriveTestMap, isRepository, readSnapshot, resolveSnapshot, transitionField } from './impact.js';
 import { IMPACT_SEMANTIC_CODES } from '../graph/semantics.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
@@ -86,7 +87,7 @@ function result<T>(action: () => T): OmResult<Sealed<T>> {
     try { return delivered(action()); }
     catch (error) {
       if (error instanceof PacketFailure) return { ok: false, refusal: error.refusal };
-      if (error instanceof EngineError && ['packet_brief_invalid', 'input_stale'].includes(error.code))
+      if (error instanceof EngineError && ['packet_brief_invalid', 'input_stale', ...SELECTED_SPECIFICATION_CODES].includes(error.code))
         return refused(error.code, error.message, (error.details ?? { unit: 'E2', target: 'packet-brief' }) as Refusal['at'], 'producer');
       throw error;
     }
@@ -165,6 +166,9 @@ export interface QuestionPacketRecord {
   briefCatalogue?: Ref[];
   /** Absent on historical v1 records, including empty/blocked; descendants retain their proved root's version. */
   briefContract?: typeof BRIEF_CONTENT_CONTRACT | typeof BRIEF_REOPEN_CONTRACT;
+  /** SP1 (№4714 §2.1): a brief root issued after SP1 declares that its brief carries the selected specification whole;
+   * its parts, continuations and corrections keep it; absent in a root saved before. */
+  briefSelection?: typeof BRIEF_SELECTION_CONTRACT;
   /** MP2 (№2968 §2, row 19): the neighbour set a brief root issued after MP2 saved; absent in a packet MP1 issued. */
   briefNeighbors?: { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] };
   /**
@@ -1107,6 +1111,26 @@ function contentContract(store: Store, request: QuestionPacketRequest, contract:
     fail('packet_record_invalid', target, 'briefContract', 'The saved marker and inner brief content version must agree');
   return chosen;
 }
+/**
+ * SP1 (№4714 §2.1): the selection era is the saved declaration of the chain root — never the content of a stage, today's
+ * configuration or what an assembled text shows. A new brief root declares it; every preceding step of a chain agrees.
+ */
+function selectionContract(store: Store, request: QuestionPacketRequest, contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord) {
+  const target = packetId(request, saved ? saved.answerProtocol : PACKET_ANSWER_PROTOCOL, contract);
+  if (saved && Object.hasOwn(saved, 'briefSelection') && (saved.briefSelection !== BRIEF_SELECTION_CONTRACT || !briefContract(contract)))
+    fail('packet_record_invalid', target, 'briefSelection', 'Only a brief packet can declare the supported selection version');
+  if (!briefContract(contract)) return undefined;
+  const predecessors = [...(request.continuation ? [request.continuation.packet] : []),
+    ...(request.correction ? [request.correction.packet] : []), ...request.previous.map(part => part.packet)]
+    .map(ref => loadPacket(store, request.project, ref));
+  const inherited = predecessors[0]?.value.briefSelection;
+  if (predecessors.some(prior => prior.value.briefSelection !== inherited))
+    fail('packet_chain_invalid', target, 'briefSelection', 'All preceding steps preserve the selection version of their root');
+  const chosen = saved ? saved.briefSelection : predecessors.length ? inherited : BRIEF_SELECTION_CONTRACT;
+  if (saved && predecessors.length && chosen !== inherited)
+    fail('packet_chain_invalid', target, 'briefSelection', 'A saved descendant preserves its proved root selection version');
+  return chosen;
+}
 /** OBL1: a continuation or correction takes its predecessor's record, but the bindings era of its own step. */
 function stepEra(prior: QuestionPacketRecord, contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): QuestionPacketRecord {
   const { worksBindings: _prior, ...rest } = prior;
@@ -1173,6 +1197,7 @@ function derivePacket(store: Store, request: QuestionPacketRequest, current: boo
 function derivePacketOnce(store: Store, request: QuestionPacketRequest, current: boolean,
   protocol: QuestionPacketRecord['answerProtocol'], contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord): DerivedPacket {
   const briefVersion = contentContract(store, request, contract, saved);
+  const selection = selectionContract(store, request, contract, saved);
   if (request.continuation) {
     if (!currentContract(contract))
       fail('packet_record_invalid', request.continuation.packet.id, 'packetContract', 'A historical packet cannot acquire continuation semantics');
@@ -1207,6 +1232,7 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
   const bindingsEra = worksBindingsEra(contract, saved), wakeEra = wakeTestsEra(contract, saved), transitionStep = transitionEraOf(contract, saved);
   const base: QuestionPacketRecord = { project: request.project, request, ...(protocol ? { answerProtocol: protocol } : {}),
     ...(contract ? { packetContract: contract } : {}), ...(briefVersion ? { briefContract: briefVersion } : {}),
+    ...(selection ? { briefSelection: selection } : {}),
     ...(bindingsEra ? { worksBindings: true as const } : {}), ...(wakeEra ? { wakeTests: true as const } : {}),
     ...(transitionStep ? { transitionEra: true as const } : {}), state: 'empty', packet: null, fingerprint: null,
     native: [], plan: null, fullChars: null, refusal: null, journal: null };
@@ -1265,7 +1291,7 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     const input = take(readOmInput(store, request.project, gaps.sources.input));
     const graph = take(readRecord<Graph>(store, gaps.sources.graph,
       { unit: 'E2', target: requestId, id: `graph:${request.project}`, kind: 'graph' }));
-    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), worksBindings: bindingsEra, wakeTests: wakeEra, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
+    briefBasis = { ...(briefVersion ? { briefContract: briefVersion } : {}), ...(selection ? { selection } : {}), worksBindings: bindingsEra, wakeTests: wakeEra, project: request.project, node: batch.node ?? null, graph: graph.value as Graph,
       gaps: batch.items.map(item => ({ question: item.gap, target: item.target, field: item.field, ref: item.record,
         evidence: json(gaps.records.find(row => same(reference(row), item.record))!.value.gap.evidence) })),
       contexts: unique([gaps.sources.input, gaps.sources.graph, ...input.value.input.sources.map(({ id, revision, hash }) => ({ id, revision, hash }))]),

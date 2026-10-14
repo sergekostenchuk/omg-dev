@@ -18,6 +18,7 @@ import { isPlainObject, type Refusal } from './refusal.js';
 import { bindingFlowIdentity } from '../graph/flow-identity.js';
 import { ONE_ARTIFACT, WAKE_TEST } from './frame-proposals.js';
 import { isTestFile, isTestSupport, validSnapshot, type RepositorySnapshot, type SnapshotFiles, type TestCasesRow, type TestMapRow } from './impact.js';
+import { selectSpecification } from './selected-specification.js';
 
 export const BRIEF_PACKET_CONTRACT = 'om-packet/brief-v1' as const;
 export const WORKS_BRIEF_PACKET_CONTRACT = 'om-packet/works-brief-v1' as const;
@@ -26,6 +27,12 @@ export const WORKS_BRIEF_VERSION = 'om-question-packet/works-brief-v1' as const;
 export const BRIEF_CONTENT_CONTRACT = 'om-brief/v2' as const;
 /** RB1 (№4285): v2 and, for a works root over a reopened frame, the reopened works whole with their material first. */
 export const BRIEF_REOPEN_CONTRACT = 'om-brief/v3' as const;
+/**
+ * SP1 (№4714 §2.1): the saved declaration of a packet root that its brief carries the selected specification whole. A new
+ * root declares it; parts, continuations and corrections keep their root's; a root saved without it keeps its own bytes.
+ */
+export const BRIEF_SELECTION_CONTRACT = 'om-brief-selection/v1' as const;
+const SELECTED_RULE = 'selected is the accepted original specification behind this scope: the full behavior contracts and feature preparations it selects and every specification constraint, each at its exact stage reference (a context label) and JSON pointer. contracts above are their effective B1 rows: where nodes or state differ, the B1 row is the binding decision and the original text stays as accepted. This material does not widen the assignment, its writable paths, ownership or permitted actions.';
 /** What v2 brought holds in v3 too. */
 const contentEra = (value: unknown): boolean => value === BRIEF_CONTENT_CONTRACT || value === BRIEF_REOPEN_CONTRACT;
 export const BRIEF_CODES = Object.freeze(['answer_label_unknown', 'packet_brief_invalid'] as const);
@@ -277,6 +284,8 @@ function impactSection(basis: BriefBasis): string[] {
 }
 export interface BriefBasis {
   briefContract?: typeof BRIEF_CONTENT_CONTRACT | typeof BRIEF_REOPEN_CONTRACT;
+  /** SP1: the selection era of the packet root; absent in a root saved before it. */
+  selection?: typeof BRIEF_SELECTION_CONTRACT;
   /** AT1 (№4091 п.5): the saved snapshot and test map of a works chain of the impact era; absent before it. */
   impact?: BriefImpact;
   /** OBL1 (№3773): the bindings era of the step — its works section shows the exact binding data of its D7 obligations. */
@@ -489,7 +498,12 @@ function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
   const features = (input.features ?? []).filter((row: Record<string, any>) => row.requirementIds.some((id: string) => requirementIds.has(id)));
   const specification = basis.accepted.find(row => row.stage === 'specification');
   const behavior = (specification?.fields.behavior ?? []) as Json[];
-  return { requirementText, features, behavior: [...new Set<number>(features.flatMap((row: Record<string, any>) => row.behaviorIndexes))]
+  // SP1 (№4714 §2.5): the same scope, whole — the originals of the contracts and features selected above, never wider.
+  const selected = basis.selection ? { ...selectSpecification({ project: basis.project, sources: input.sources ?? [], accepted: basis.accepted,
+    contracts: contracts.map((row: { id: string }) => row.id),
+    features: features.map((row: { index: number; title: string; outcome: string }) => ({ index: row.index, title: row.title, outcome: row.outcome })) }),
+  rule: SELECTED_RULE } : null;
+  return { ...(selected ? { selected } : {}), requirementText, features, behavior: [...new Set<number>(features.flatMap((row: Record<string, any>) => row.behaviorIndexes))]
     .sort((a, b) => a - b).map(index => ({ source: specification!.ref, index, text: behavior[index] })),
     requirements: (input.requirements ?? []).filter((row: { id: string }) => requirementIds.has(row.id)),
     criteria: (input.criteria ?? []).filter((row: { id: string; requirement: string }) => targets.has(row.id) || requirementIds.has(row.requirement)),
@@ -1032,6 +1046,8 @@ function compactSchema(schema: any): any {
 export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Record<string, any> {
   if (Object.hasOwn(basis, 'briefContract') && !contentEra(basis.briefContract))
     invalid('briefContract', 'The selected brief content contract must be supported');
+  if (Object.hasOwn(basis, 'selection') && basis.selection !== BRIEF_SELECTION_CONTRACT)
+    invalid('selection', 'The declared specification selection version must be supported');
   basis = { ...basis, material: { ...basis.material, sources: [...basis.material.sources].sort((a, b) => compare(a.path, b.path) || compare(canonical(a.reference), canonical(b.reference))) } };
   const labels = labelMap(payload, basis);
   const picks = selectMaterial(basis, payload);

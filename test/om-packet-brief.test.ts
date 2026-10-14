@@ -751,3 +751,55 @@ test('RB1 (№4343): a decision B1 applied reaches a v3 brief by the works and p
   assert.deepEqual(scoped(BRIEF_REOPEN_CONTRACT), [['readiness:transition:by-place'], ['readiness:transition:decided']],
     'v3: a place of this node; a work of it counts only where the brief expands the node (its accepted or reopened works)');
 });
+
+// ---- SP1a (№4714): the selected specification is a mandatory part of the brief scope, only in the selection era ----
+import { boundedBrief, BRIEF_SELECTION_CONTRACT } from '../src/om/packet-brief.js';
+import { preparedField } from './preparation-fixture.js';
+
+function selectionBasis(t: test.TestContext) {
+  const f = sample(t);
+  const specification = { id: 'stage:garden:specification', revision: 3, hash: '3'.repeat(64) };
+  const features = { id: 'stage:garden:features', revision: 2, hash: '2'.repeat(64) };
+  const contract = (preparedField('garden', 'behaviorContracts') as Json[])[0] as Record<string, Json>;
+  const preparation = (preparedField('garden', 'featurePreparation') as Json[])[0] as Record<string, Json>;
+  const basis: BriefBasis = { ...f.basis,
+    contexts: [...f.basis.contexts, specification, features],
+    accepted: [{ stage: 'specification', ref: specification, fields: { behavior: ['Transform valid input'], constraints: ['Local inputs and outputs only'],
+      behaviorContracts: [contract] } }, { stage: 'features', ref: features, fields: { features: [{ title: 'Deliver result', outcome: 'garden-result', requirements: [0] }],
+      featurePreparation: [preparation] } }],
+    input: { requirements: [], criteria: [], questions: [],
+      sources: [{ ...specification, stage: 'specification', contractVersion: 5 }, { ...features, stage: 'features', contractVersion: 5 }],
+      contracts: [{ id: 'garden-B1', nodes: ['garden-consume-block'], requirements: ['garden-R1'], outcome: 'garden-result', actor: 'garden-user',
+        success: contract.success!, failures: contract.failures!, forbiddenEffects: contract.forbiddenEffects!, state: contract.state!, proof: contract.proof! }],
+      features: [{ index: 0, title: 'Deliver result', outcome: 'garden-result', behaviorIndexes: [0], requirementIds: ['garden-R1'], contracts: ['garden-B1'] }] } as Json };
+  const scope = (payload: Record<string, any>) => JSON.parse(packetPrompt(payload).split('# Scope and exact context\n')[1]!.split('\n')[0]!).input;
+  return { ...f, basis, contract, preparation, scope };
+}
+
+test('SP1a №4714 §2.1: a basis without the selection declaration shows no section — the brief differs from the selection era by exactly that section', t => {
+  const f = selectionBasis(t);
+  const before = deriveBrief(f.input, f.basis), selected = deriveBrief(f.input, { ...f.basis, selection: BRIEF_SELECTION_CONTRACT });
+  assert.equal(Object.hasOwn(f.scope(before), 'selected'), false);
+  const section = f.scope(selected).selected;
+  assert.deepEqual(section.contracts.map((row: any) => [row.index, row.pointer, row.value]), [[0, '/content/fields/behaviorContracts/0', f.contract]]);
+  assert.deepEqual(section.preparations.map((row: any) => [row.featureIndex, row.pointer, row.value]), [[0, '/content/fields/featurePreparation/0', f.preparation]]);
+  assert.deepEqual(section.constraints.value, ['Local inputs and outputs only']);
+  assert.equal(packetPrompt(selected).replace(`,"selected":${canonical(section)}`, ''), packetPrompt(before),
+    'Everything else of the brief is byte-identical; the era alone decides the section');
+});
+
+test('SP1a №4714 §3: the section is mandatory — boundedBrief never trims it to fit, the caller sees the true size', t => {
+  const f = selectionBasis(t), basis = { ...f.basis, selection: BRIEF_SELECTION_CONTRACT };
+  const whole = deriveBrief(f.input, basis), bounded = boundedBrief(f.input, basis, 100);
+  assert.ok(packetPrompt(bounded).length > 100, 'Nothing is cut to fit the limit');
+  assert.deepEqual(f.scope(bounded).selected, f.scope(whole).selected);
+});
+
+test('SP1a №4714 §2.1: an unsupported declaration and a basis without the exact selected stages are addressed refusals of the brief', t => {
+  const f = selectionBasis(t);
+  assert.throws(() => deriveBrief(f.input, { ...f.basis, selection: 'om-brief-selection/v2' as typeof BRIEF_SELECTION_CONTRACT }),
+    (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid' && (error.details as { field: string }).field === 'selection');
+  assert.throws(() => deriveBrief(f.input, { ...f.basis, selection: BRIEF_SELECTION_CONTRACT, accepted: f.basis.accepted.filter(row => row.stage !== 'features') }),
+    (error: unknown) => error instanceof EngineError && error.code === 'selected_specification_basis_invalid'
+      && (error.details as { target: string }).target === 'stage:garden:features');
+});
