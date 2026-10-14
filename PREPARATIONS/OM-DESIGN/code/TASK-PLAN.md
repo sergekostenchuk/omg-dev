@@ -2513,7 +2513,7 @@
 - Отдаёт: —
 - Читает записи: точные stage sources плана и каталог оснований
 - Пишет записи: selected-specification/v2 с основаниями; omg-task-context/v3 и новый briefSelection
-- Разрешённые пути: `src/om/selected-specification.ts`, `src/om/task-specification.ts`, `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `src/compiler/om-readers.ts`, `src/compiler/context.ts`, `src/compiler/model.ts`, `src/compiler/compiler.ts`, `src/om/atomic-gate.ts`, `test/om-question-packet.test.ts`, `test/om-atomic-gate.test.ts`, `test/om-task-context.test.ts`, `src/om/compiler-readers.ts`
+- Разрешённые пути: `src/om/selected-specification.ts`, `src/om/task-specification.ts`, `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `src/compiler/om-readers.ts`, `src/compiler/context.ts`, `src/compiler/model.ts`, `src/compiler/compiler.ts`, `src/om/atomic-gate.ts`, `test/om-question-packet.test.ts`, `test/om-atomic-gate.test.ts`, `test/om-task-context.test.ts`, `src/om/compiler-readers.ts`, `test/om-packet-brief.test.ts`
 - Из движка как есть: №4862; №4870
 - После: DS1.2a, SP1b
 - Тесты сверх обязательных:
