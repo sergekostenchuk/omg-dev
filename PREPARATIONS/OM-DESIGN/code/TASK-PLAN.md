@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); недоверенный вход: ответ модели не по форме или с чужими ссылками, подлинный результат другой попытки/владельца → отказ с адресом (подделку собственной базы не тестировать — решение владельца 28.09, 13.10); окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 176. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → AT3b → AT4 → L1A → DRV1 → ASM1 → UNK1 → IN1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 178. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → AT3b → AT4 → L1A → DRV1 → ASM1 → UNK1 → IN1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 94.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 96.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2310,6 +2310,48 @@
   - сбой после оплаченного B/C, новый Store: восстановление с исходными соседями, ноль новых вызовов
   - подлинные старые paid B/C восстанавливаются прежним читателем (сохранённый образец старого производителя)
 
+### SP1a · Выбранная спецификация целиком в вопросах OM (обычный бриф, works и MC1): полные принятые behaviorContracts, featurePreparation и constraints с точными Ref и адресами — обязательной частью брифа; эра — сохранённая декларация корня пакета briefSelection
+
+**Цель.** Опись claude-worker ~/REPORTS/review/omg-sp1_inventory_141026.md, договор Codex-omg №4714 (~/REPORTS/review/omg-sp1-contract-4710_141026.md §2.1, §2.2, §2.5, §3, §4 SP1a, §5): модель OM видит только нормализованные строки B1 (src/om/input.ts:260–311 — без entry/inputs/compatibility и без пользы/исходов/взаимодействий фич). Одна чистая функция отбора src/om/selected-specification.ts (принятые поля с точными Ref и выбранные идентичности → полные элементы; без поиска голов, HTTP, модели); общий поиск подготовки вместо локального prepOf в input.ts без изменения байтов и исходов B1. Раздел selected — обязательная часть boundedBrief (materialBudget 0), не readings; нехватка вместимости — штатный адресный исход до вызова, без усечения. Исходный договор и действующие привязки B1 nodes/state различаются явно. Новый корень пакета объявляет briefSelection (om-brief-selection/v1); parts/continuation/correction и остановленный по вместимости пакет наследуют эру исходной цепочки; исторический корень без декларации — прежний алгоритм и прежние байты. constraints — весь список с Ref и адресом поля. Отбор пакета OM — в пределах существующего scopedInput. Материал не расширяет writePaths, полномочия и внешние действия.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: принятые стадии specification и features с точными Ref; нормализованный вход B1
+- Пишет записи: обязательный раздел выбранной спецификации в пакете вопроса OM; декларация briefSelection корня пакета
+- Разрешённые пути: `src/om/selected-specification.ts`, `src/om/input.ts`, `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/selected-specification.test.ts`, `test/om-packet-brief.test.ts`, `test/om-question-packet.test.ts`, `test/om-input.test.ts`
+- Из движка как есть: №4710; №4714; WB1b
+- После: DS1, WB1, WB1b
+- Тесты сверх обязательных:
+  - пакет обычного узла, works и MC1 содержит полный выбранный договор (entry/inputs/compatibility), подготовку (beneficiary/benefit/success/failures/interactions) и constraints с точными адресами; несвязанный договор не добавлен
+  - законное applyInputDecisions разрешило nodes/state: решение B1 видно, полный исходный договор сохранён; после выноса prepOf прежние результаты B1 не меняются
+  - подлинный старый корень и его parts/continuation/correction, включая остановленный пакет, сохраняют прежние байты и исходы (существующий снимок исторических пакетов); новый корень и потомки несут декларацию
+  - выбранный материал превышает вместимость: адресный исход до вызова модели, элементы не усечены; граница «без нового материала помещался, с ним — нет»
+  - Ref другого проекта или другого основания не принимается; реальное обновление стадии не подменяет точную историческую версию
+  - неоднозначное или отсутствующее сопоставление подготовки — адресный исход новой доставки на реальном входе общего сопоставителя, не молчаливый пропуск
+
+### SP1b · Та же выбранная спецификация в контексте задачи исполнителя и в предварительном измерении G5: версия контекста плана taskContextContract v2 в хэше плана, чтение точной цепочки M8/horizon/input/stages через нижний интерфейс читателей, полный материал в packetCapacity; старый план и старый допуск — v1 без изменений
+
+**Цель.** Договор Codex-omg №4714 (~/REPORTS/review/omg-sp1-contract-4710_141026.md §2.3, §2.5 п.2–4, §3, §4 SP1b, §5): исполнитель не получает договоров спецификации (compiler/context.ts:45–75 — contracts там означают схемы графовых артефактов). Отбор задачи — пересечение requirements с требованиями задачи или effective contract.nodes с узлом задачи/его предками (решённые связи B1, не проза); фичи — по пересечению требований или явной ссылке на выбранный договор; без рекурсивного расширения. Та же функция src/om/selected-specification.ts из SP1a, второй реализации нет. Новый план объявляет taskContextContract (omg-task-context/v2) в хэше тела; derivation external-inputs/v1 не подменять. preplan и реальный task context получают одинаковый выбранный материал из одного точного основания (input принятого horizon, gaps.ts:410–413); G5 packetCapacity измеряет полный новый материал, версия материала — в основании нового допуска и передаётся в план; старые G5/M8/планы читаются своим способом (readAtomicGate против prepareAtomicGate). Чтение цепочки — через src/compiler/om-readers.ts + src/om/compiler-readers.ts, без прямого импорта тяжёлых читателей OM в компилятор. Старый план: v1 для implement/review/correction и восстановления; новая голова стадии не обновляет материал старого плана. Маршруты без цепочки om-feasibility → horizon → input не ломаются.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: точная цепочка плана M8 → horizon → input → принятые стадии; общий отбор SP1a
+- Пишет записи: раздел выбранной спецификации в task context v2 и preplan; версия контекста плана в хэше и в основании нового допуска G5
+- Разрешённые пути: `src/om/selected-specification.ts`, `src/compiler/context.ts`, `src/compiler/model.ts`, `src/compiler/compiler.ts`, `src/compiler/om-readers.ts`, `src/om/compiler-readers.ts`, `src/om/atomic-gate.ts`, `test/om-task-context.test.ts`, `test/om-atomic-gate.test.ts`, `test/compiler.test.ts`, `test/om-compiler-readers.test.ts`, `test/execution.test.ts`
+- Из движка как есть: №4714; SP1a
+- После: SP1a, AT3a
+- Тесты сверх обязательных:
+  - требование задачи, явная привязка B1 к узлу и привязка к его предку отдельно приводят к доставке; несвязанный договор исключён; один договор нескольких задач доставляется каждой без расширения writePaths
+  - новый preplan содержит тот же выбранный материал, что реальный task context; переполнение из-за спецификации ловится G5 до принятия работ; старый G5 сохраняет старый исход
+  - настоящий старый план даёт прежний context v1 для implement/review/correction; восстановление после оплаченного implement не повторяет implement, после полученного подходящего review не повторяет review
+  - новый план получает материал по точным Ref своей цепочки; повторное чтение и восстановление — из сохранённых документов без поиска, HTTP и нового исследования
+  - в полном документе упомянуты дополнительные действия/файлы: разрешённая область CompiledTask и обработка plan/code findings прежние
+  - маршрут компилятора без цепочки om-feasibility → horizon → input работает как прежде
+
 ### L1A · Материал карты L1: вопросы operation-map получают у автора и оценщика точные preparation.externalSystems принятой Discovery, каталог outcome-id / actor-id / пар requirement→outcome принятой концепции и явно названные правила движка buildL1 (результат Discovery сохраняет свой id как результатный артефакт и в success journey; промежуточные артефакты допустимы; служба ≠ runtime-вход ≠ документальный Source) — через общий researchPrerequisites, без смены FieldSpec v5
 
 **Цель.** Опись claude-worker ~/REPORTS/review/omg-l1a_inventory_141026.md: researchPrerequisites (research-context.ts:14–33) даёт карте из Discovery только actors/outcomes/constraints/journeys — externalSystems до operationRequirements и mapDesign не доходит; правило outcome-id = id артефакта есть только как поздняя проверка buildL1 (builder.ts:38–44, semantics.ts:32/56/63) — модель узнаёт его из оплаченного отказа. Договор Codex-omg №4685 (§2 ~/REPORTS/review/omg-hx4-contracts-4661-4677_141026.md): доставка правил материалом годится — правило явно названо правилом движка, не цитатой Discovery и не новой инструкцией фазы; FieldSpec v5 и prompt не менять (stage-checks сравнивает эталон); каталог выводит код из точных draft.inputs, модель его не создаёт; только для operation-map; не требовать механически «каждая externalSystem = отдельный block или external artifact»; порядок operationRequirements → mapDesign сохранить; pilot-context.ts не трогать (ранняя карта не использует reader-pilot, research-runner.ts:201). Эра: сохранённые analyst intents и paid assessor origins не пересобирать сегодняшней функцией; новая генерация получает новый материал; в продолжении адрес архива действительно разрешается; при сжатии не выдавать несуществующий указатель и не объявлять скрытый каталог прочитанным. working-context.ts — только если реальная упаковка теряет обязательный материал.
@@ -2410,7 +2452,7 @@
 - Пишет записи: запись дефекта плана; правка принятого L3; новый план
 - Разрешённые пути: `src/om/plan-defect.ts`, `src/om/gaps.ts`, `src/om/run.ts`, `src/om/question-packet.ts`, `src/om/packet-brief.ts`, `src/om/frame-accept.ts`, `src/om/feasibility.ts`, `src/compiler/compiler.ts`, `src/product/repairs.ts`, `test/om-run.test.ts`, `test/om-gaps.test.ts`, `test/om-question-packet.test.ts`, `test/om-packet-brief.test.ts`, `test/om-frame-accept.test.ts`, `test/om-feasibility.test.ts`, `test/compiler.test.ts`, `test/repair.test.ts`
 - Из движка как есть: №4119; №4125; №4084
-- После: AT1, AT3a, RL3, PF5, RB1, DS1, WB1b
+- После: AT1, AT3a, RL3, PF5, RB1, DS1, WB1b, SP1a, SP1b
 - Тесты сверх обязательных:
   - сквозная регрессия: отменённое ожидание → адресная находка → дефект → новая работа с update product.test.ts → G5 → M8 → новый план
   - повтор входа ремонта по тому же дефекту — та же запись, без второго прохода и второго расхода
@@ -2453,7 +2495,7 @@
 - Пишет записи: пакет ядра
 - Разрешённые пути: `package.json`, `tsconfig.json`, `scripts/check-backend.mjs`, `test/fixtures/core1-records.ts`, `test/assessment-session-resume.test.ts`, `test/discovery.test.ts`, `test/execution-external-input.test.ts`, `test/om-accepted-answer.test.ts`, `test/om-achievements.test.ts`, `test/om-addressing.test.ts`, `test/om-answers-gate.test.ts`, `test/om-call-record.test.ts`, `test/om-compiler-readers.test.ts`, `test/om-composite-keys.test.ts`, `test/om-feasibility-boundary.test.ts`, `test/om-feasibility-projection.test.ts`, `test/om-feasibility.test.ts`, `test/om-frame-accept.test.ts`, `test/om-frame-candidate.test.ts`, `test/om-gap-lines.test.ts`, `test/om-gaps.test.ts`, `test/om-legacy-operation-lock.test.ts`, `test/om-legacy-route-closure.test.ts`, `test/om-model-call.test.ts`, `test/om-operation-cost.test.ts`, `test/om-probe.test.ts`, `test/om-question-packet.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-repeat-gate.test.ts`, `test/om-result-identity.test.ts`, `test/om-routes.test.ts`, `test/om-run.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/om-series-current.test.ts`, `test/om-series.test.ts`, `test/om-task-context.test.ts`, `test/om-task-neighbors.test.ts`, `test/om-work-zone.test.ts`, `test/preparation.test.ts`, `test/reader-pilot.test.ts`, `test/research-call-resume.test.ts`, `test/runtime-absence-r3.test.ts`, `test/runtime-absence-research.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1
+- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1, SP1a, SP1b
 - Тесты сверх обязательных:
   - ЧАСТЬ А (слово пользователя ~22:10 «тест смотрит только актуальную версию»; вопрос Opus-1 №3686, разрешение оркестратора): 41 файл тестов, запускающих старый движок из git, и один модуль образцов test/fixtures/core1-records.ts — формат не в живой базе → сценарий удалить; формат в живой базе → образец из снимка 1554, читает нынешний код; проверки нового не трогать
   - ДО КОДА части Б — опись легаси и список удаляемого показать пользователю; удалять после его «да»
