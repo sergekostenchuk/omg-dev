@@ -104,6 +104,13 @@ h1 b{color:var(--accent);font-weight:600}
 .frame.subf .fh{border-bottom-color:rgba(154,154,162,.2)}
 .frame.subf .fh .ft{color:var(--ink)}
 .scard.sub{width:212px}
+.node.taskc{width:300px;border-left:3px solid var(--accent);padding:8px 11px 9px}
+.node.taskc .tid{font:500 10px var(--mono);color:var(--accent);margin-bottom:2px}
+.node.taskc .t{font-size:13px}
+.node.taskc .kv{display:grid;grid-template-columns:62px 1fr;gap:3px 8px;margin-top:6px;padding-top:6px;border-top:1px dashed var(--line2);font-size:10.5px;line-height:1.4}
+.node.taskc .kv span{font:9px var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--ink3);padding-top:1px}
+.node.taskc .kv b{font:400 10px var(--mono);color:var(--ink2);word-break:break-word}
+.node.taskc .kv b.w{color:var(--ink)}
 .dragging{cursor:grabbing!important;box-shadow:0 18px 44px rgba(0,0,0,.55)!important}
 
 .zoom{position:absolute;right:12px;bottom:12px;display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--line2);border-radius:10px;background:var(--raised);z-index:6}
@@ -178,7 +185,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 <div class="page">
   <header class="head">
     <div class="l">
-      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · + оркестратор</div>
+      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · Исполнение — №4597 · + оркестратор</div>
       <h1>Проход продукта: <b>от идеи до задачи</b></h1>
       <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки.</p>
     </div>
@@ -223,6 +230,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <span>Спецификация</span><a href="#s-what">Что это</a><a href="#s-input">Вход</a><a href="#s-process">Обработка</a><a href="#s-output">Выход</a><a href="#s-records">Записи</a><a href="#s-doors">Двери</a><a href="#s-gaps">Пробелы</a><a href="#s-missed">Упускали</a>
     <span>Фичи</span><a href="#f-what">Что это</a><a href="#f-input">Вход</a><a href="#f-process">Обработка</a><a href="#f-output">Выход</a><a href="#f-questions">Вопросы</a><a href="#f-records">Записи</a><a href="#f-gaps">Пробелы</a>
     <span>OM</span><a href="#o-what">Что это</a><a href="#o-routes">Два маршрута</a><a href="#o-actions">Действия</a><a href="#o-records">Записи</a><a href="#o-missed">Поправки</a><a href="#o-min">Минимум</a>
+    <span>Исполнение</span><a href="#x-what">Что это</a><a href="#x-in">Вход модели</a><a href="#x-out">Ответ модели</a><a href="#x-cards">Пять задач</a><a href="#x-records">Записи</a><a href="#x-gaps">Пробелы</a>
     <span>Итог</span><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
   </nav>
 
@@ -919,6 +927,115 @@ ul.plain b{color:var(--ink);font-weight:500}
     </div>
   </div>
 
+  <!-- ===================== EXECUTION ===================== -->
+  <div class="block" id="b-run">
+    <div class="bh2"><h2>Исполнение плана · <b>модель кодирует по задачам</b></h2><small>execute-plan → коммиты и квитанции · сведено с Codex-omg №4597</small></div>
+    <div class="grid">
+      <section class="sec wide" id="x-what">
+        <h3>Что такое исполнение</h3>
+        <p>Исполнение превращает <b>точный принятый машинный план</b> в последовательность проверенных изменений Git и квитанций реализованных выходов. <b>Модель меняет файлы</b> в границах задачи; <b>движок</b> решает допустимость кандидата, запускает проверки, вызывает независимого ревьюера, публикует точный коммит и сохраняет квитанцию. Сочинять новое содержание продукта или расширять границы плана исполнитель не должен.</p>
+        <div class="tw"><table>
+          <thead><tr><th>Граница</th><th>Смысл</th></tr></thead>
+          <tbody>
+            <tr><td>Компиляция</td><td>Уже определила задачи, зависимости, входы, область записи, тестовые договоры</td></tr>
+            <tr><td><b>Исполнение</b></td><td><b>Изменения в этих границах; исправить код или адресно сообщить, что договор неисполним</b></td></tr>
+            <tr><td>Ревью задачи</td><td>Конкретный кандидат против договора; положительный ответ модели не заменяет выполненные проверки</td></tr>
+            <tr><td>Принятие execution</td><td>Все задачи committed, проверки, ревью и обязательства на тех же деревьях, коммиты — цепь</td></tr>
+            <tr><td>Решение владельца о поставке</td><td>Merge, публикация, бизнес-приёмка — отдельно, не из accepted execution</td></tr>
+          </tbody>
+        </table></div>
+        <ol class="chain" style="margin-top:12px">
+          <li><span><b>Допуск и execution-root</b> → задача: точный parent, реальные входы, права, task-start</span></li>
+          <li><span><b>Контекст и отправка</b> → изменённые файлы + text + id выходов</span></li>
+          <li><span><b>Кандидат</b> строго в writePaths → все команды на этих байтах</span></li>
+          <li><span><b>Независимое ревью</b>: pass / code / адресный plan</span></li>
+          <li><span><b>task-result proof</b> → commit_pending → Git CAS → committed + квитанция</span></li>
+          <li><span><b>Следующая задача</b> → execution-result → accepted execution → отдельное решение о поставке</span></li>
+        </ol>
+      </section>
+      <section class="sec" id="x-in">
+        <h3>Что получает модель-исполнитель</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Часть</th><th>Содержимое</th></tr></thead>
+          <tbody>
+            <tr><td>Запрос</td><td><code>omg-agent/v1</code>, mode implement, prompt, subject</td></tr>
+            <tr><td>subject</td><td>context, parent, inputs [{connector, artifact, ref, kind, value}], ownership, correction, answerForm execution/v2, address</td></tr>
+            <tr><td>action</td><td>title, outcome, purpose, benefit, beneficiary</td></tr>
+            <tr><td>scope</td><td>boundary, code refs, ports, packets, ownership, readPaths / writePaths</td></tr>
+            <tr><td>requirements, actor</td><td>Требования графа, которые реализует работа</td></tr>
+            <tr><td>artifacts, contracts</td><td>Графовые схемы данных — не behaviorContracts спецификации</td></tr>
+            <tr><td>criteria</td><td>tests, wake-tests, fullCheck, obligations, joins, researchObligations</td></tr>
+            <tr><td>connections, neighbors</td><td>Связи, управляющие переходы, соседи, поставки</td></tr>
+            <tr><td>details</td><td>Адрес task-detail — у адаптера нет встроенного цикла его вызова</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px">scope.code — адреса, не тексты: модель читает файлы в execution-root. Вместимость проверяется на весь запрос; нехватка — отказ, не обрезка.</p>
+      </section>
+      <section class="sec" id="x-out">
+        <h3>Что модель возвращает</h3>
+        <p>Меняет файлы, <b>не делает commit</b>, возвращает один JSON:</p>
+        <ul class="plain">
+          <li><code>{protocol, requestId, text, artifacts: [{id}]}</code> — все и только id из produces.</li>
+          <li><b>Не возвращает</b> бизнес-значение артефакта, commit, tree, хэши, квитанцию — их производит движок.</li>
+          <li><b>Адресный режим:</b> <code>outcome: contract_unexecutable</code> с findings {text, address{plan, task, attempt, requirement, norm | path}} — требование противоречит норме или нужен путь вне writePaths.</li>
+          <li><b>Ревьюер</b> возвращает review {verdict, kind, findings}; pass — строго kind none и пустые findings.</li>
+        </ul>
+        <div class="tw" style="margin-top:10px"><table>
+          <thead><tr><th>Поведение</th><th>Без допуска</th><th>execution/v2</th></tr></thead>
+          <tbody>
+            <tr><td>Findings ревью</td><td>Строки</td><td>{text, address}</td></tr>
+            <tr><td>Неисполнимость</td><td>Нет формы</td><td>contract_unexecutable</td></tr>
+            <tr><td>Упала проверка</td><td>Обрыв до ревью, needs_code</td><td>Ревьюер выбирает code / plan</td></tr>
+            <tr><td>Plan-находка</td><td>needs_plan</td><td>Нужен доказанный адрес, иначе code</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec wide" id="x-cards">
+        <h3>Пять задач плана — пример <small>иллюстрация, не живой HX4</small></h3>
+        <p>Условная архитектура: формат запроса → разрешённая подписочная сессия / API credential reference → один vendor adapter → CLI. Поля совпадают с <code>CompiledTask</code>; T1…T5 — подписи, настоящие id, signature, parent, tree и квитанции выводит движок. Для будущих producerTask стоят <code>receipt: null</code> — перед зависимой задачей движок подставит настоящую квитанцию.</p>
+        <div class="tw"><table>
+          <thead><tr><th>Задача</th><th>Результат</th><th>Пишет</th><th>Зависит</th><th>Граница</th><th>Проверка</th></tr></thead>
+          <tbody>
+            <tr><td>T1 · формат</td><td>a-protocol</td><td><code>src/protocol.mjs</code> + тест</td><td>—</td><td>transient · provider false</td><td>normalizeRequest; невалидный запрос → request_invalid</td></tr>
+            <tr><td>T2 · сессия</td><td>a-session-binding</td><td><code>src/subscription-session.mjs</code> + тест</td><td>T1</td><td>transient · provider false</td><td>отозванный handle → session_unavailable; нет перехода на API</td></tr>
+            <tr><td>T3 · API</td><td>a-api-binding</td><td><code>src/api-connection.mjs</code> + тест</td><td>T1</td><td>transient · provider false</td><td>чужая ссылка отвергнута; секрет не в диагностике</td></tr>
+            <tr><td>T4 · адаптер</td><td>a-vendor-adapter</td><td><code>src/vendor-adapter.mjs</code> + тест</td><td>T1, T2, T3</td><td>transient · <b>provider true</b></td><td>исходы типизированы; неоднозначный не повторяется; task-start — стенд, task-result — нет скрытого повтора</td></tr>
+            <tr><td>T5 · CLI</td><td>a-cli</td><td><code>src/cli.mjs</code> + тест</td><td>T4</td><td>transient · provider false</td><td>отдельный процесс CLI; отказ без секретов; нет второго транспорта</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px">Тест-контракт каждой задачи: given / when / then, forbiddenEffects, entrypoint, counterfactuals, resourceClass. На карте: развернуть «Исполнение плана» → «Пять задач плана — пример»; клик по карточке — полный договор.</p>
+      </section>
+      <section class="sec" id="x-records">
+        <h3>Записи</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Запись</th><th>Что связывает</th></tr></thead>
+          <tbody>
+            <tr><td><code>execution-root:&lt;p&gt;</code></td><td>worktree, ветка, base / head</td></tr>
+            <tr><td><code>execution-lock:&lt;p&gt;</code></td><td>Владение процессом</td></tr>
+            <tr><td><code>run:&lt;planHash&gt;:&lt;task&gt;</code></td><td>Попытки задачи: parent, tree, commit, checks, review, proofs</td></tr>
+            <tr><td><code>execution-send:…</code></td><td>Один запуск роли, размер запроса, статус, usage</td></tr>
+            <tr><td><code>artifact:&lt;hash&gt;</code></td><td>Квитанция реализации</td></tr>
+            <tr><td><code>parked:&lt;hash&gt;</code></td><td>Непринятый кандидат на ремонте</td></tr>
+            <tr><td><code>execution-result:&lt;p&gt;:&lt;planHash&gt;</code></td><td>План, runs, финальный head</td></tr>
+            <tr><td><code>stage:&lt;p&gt;:execution</code></td><td>Accepted {result}</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px">Статусы отправки (sent, answered, lost…) и попытки (implementing, checking, reviewing, commit_pending, committed, needs_code, needs_plan, awaiting_obligation) — разные; answered ≠ прошёл проверки.</p>
+      </section>
+      <section class="sec" id="x-gaps">
+        <h3>Пробелы <small>вердикт Codex</small></h3>
+        <ul class="plain">
+          <li><b>SP1 виден у исполнителя</b>: entry, inputs, compatibility договоров, success, failures, interactions фич и impact, integrations узла (их проверяет G5) не приходят отдельными полями.</li>
+          <li><b>DS1.2 виден у исполнителя</b>: условие исследования, не ставшее требованием или тестом, исполнитель и ревьюер не восстановят — gates проверяют скомпилированный договор, не researchReport.</li>
+          <li><b>Новое: дверь needs_plan нового OM не подключена</b> — legacy_route_closed; нет потребителя planDefect для исправления L3 (PR1). Для цели «идея → план» не участвует; для реального кодирования — нужна.</li>
+          <li><b>task-detail</b> — команда есть, у адаптера нет цикла её вызова.</li>
+          <li><b>Не изоляция</b>: writePaths — проверка кандидата; readPaths и provider не ограничивают процесс, сеть и расходы — это настройка среды.</li>
+          <li><b>Нет «повтора без расходов»</b>: потерянный неприменённый результат — lost с неизвестной ценой.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+
   <!-- ===================== SUMMARY ===================== -->
   <div class="block">
     <div class="bh2"><h2>Итог</h2><small>предложение оркестратора · классы — по Codex №4585 и №4587 · не выдано</small></div>
@@ -936,15 +1053,16 @@ ul.plain b{color:var(--ink);font-weight:500}
             <tr><td>6</td><td>DS1.2 — перенос обязательств</td><td>Отчёт → preparation → conceptSections → implements, пути → договоры поведения: Ref Discovery + constraint id → requirement ids; код — охват, оценщик — применение</td><td>Discovery → концепция → карта → спецификация</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>7</td><td>L1A — материал автора карты</td><td>Доставить externalSystems и основания; реестр обязательных outcome-id и правило «id результата = id артефакта»</td><td>Карта L1</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>8</td><td>ASM1 — контекст оценщика</td><td>Оценщик видит принятые соседние поля своей стадии и критерий их согласия: 4 поля концепции; operationRequirements ↔ mapDesign; behavior / constraints / договоры; список фич ↔ подготовка</td><td>концепция, карта, спецификация, фичи</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>9</td><td>SP1 — полный материал у потребителей</td><td>Выбранный договор целиком (entry, inputs, compatibility) и подготовка фичи целиком (benefit, success, failures, interactions) рядом с нормализованными связями — вопросам OM, задачам фактов, детализации; автору и оценщику фич — каталог артефактов L1</td><td>спецификация, фичи → OM</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>9</td><td>SP1 — полный материал у потребителей</td><td>Выбранный договор целиком (entry, inputs, compatibility) и подготовка фичи целиком (benefit, success, failures, interactions) рядом с нормализованными связями — вопросам OM, задачам фактов, детализации; автору и оценщику фич — каталог артефактов L1; исполнителю — impact и integrations узла или рабочий вызов task-detail</td><td>спецификация, фичи → OM → исполнение</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>10</td><td>UNK1 — неизвестное и его исполнимая передача</td><td>Ранняя дверь: материал / возврат к основанию / выбор. Поздний вопрос: видимые потребитель, срок, допустимое доказательство и рабочая дверь — либо честное ожидание</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>11</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию и в конце om-start (coldStart уже строит вход OM), на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>12</td><td>DS1.3 — итог владельцу</td><td>Читаемый вид стадий из принятых записей; верное авторство; в GraphPanel — путь, условия, статус; сводка договоров поведения</td><td>все ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>13</td><td>PR1 — ремонт плана по needs_plan</td><td>Адресная находка contract_unexecutable / plan-ревью → исправление принятого L3 → новый план; оплаченный кандидат сохраняется. Нужна, только если HX4 доходит до кодирования</td><td>исполнение → OM</td><td><span class="pill bad">условная</span></td></tr>
           </tbody>
         </table></div>
         <p style="margin-top:12px"><b>Не добавлять до HX4</b> (Codex №4587): включение порога ради checkKind; удаление audience/outcome/acceptance; утверждение владельцем каждой концепции и требования; новую модель-оркестратор; перенос текстов источников во все требования; перепроверку принятой истории.</p>
         <ul class="plain">
-          <li><b>Риск:</b> 12 задач вместо «почти готово» — живой HX4 сдвигается; оценку в часах честно дать нельзя до описей.</li>
+          <li><b>Риск:</b> 12 задач (+ PR1, если HX4 доходит до кодирования) вместо «почти готово» — живой HX4 сдвигается; оценку в часах честно дать нельзя до описей.</li>
           <li><b>Риск:</b> задачи 4–8 трогают одни файлы ранних стадий — последовательно, не параллельно; SP1 — в файлах OM, может идти параллельно.</li>
           <li><b>Риск:</b> HX4 может честно закончиться insufficient_evidence — поиск с NL99 бедный.</li>
         </ul>
@@ -966,7 +1084,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 <script>
 (function(){
   "use strict";
-  var ST={yes:["ok","есть"],ds1:["acc","в DS1"],part:["warn","частично"],no:["bad","нет"]};
+  var ST={yes:["ok","есть"],ds1:["acc","в DS1"],part:["warn","частично"],no:["bad","нет"],ex:["","пример"]};
   var GAP=1,TASK=2;
   /* two-row snake layout for sub-block schemes; empty labels stay hidden */
   function snake(list,k){list.forEach(function(n,i){if(i<k){n.x=i*220;n.y=0;}else{n.x=(k-1-(i-k))*220;n.y=200;}});return list;}
@@ -1340,10 +1458,151 @@ ul.plain b{color:var(--ink);font-weight:500}
       {f:"m8.next",t:"b1.gaps",l:"не готов → исправить основание",k:"alt",route:"above",depth:90},
       {f:"r1.store",t:"s.saved",l:"попытки · остановки · восстановление",k:"alt",route:"below",depth:46}
      ]},
-    {id:"run",n:"Финал",st:"part",g:1,mock:1,t:"Исполнение плана",io:["MachinePlan","изменения · проверки · квитанции"],
-     soon:"подробная карта — следующий шаг",
-     sum:"Отдельный запуск execute-plan: исполнитель вносит изменения по точному плану, запускает проверки, сохраняет квитанции.",
-     d:[["Что делает","Выполнить изменения, запустить проверки, принять результат, сохранить квитанции. Компиляция уже сделана внутри om-run."],["Берёт","Точный план, task context, scope, материалы, команды проверок, зависимые результаты, правила task-start и task-result."],["Пробел","Прослеживаемость существенного вывода Discovery до пакета задачи не установлена.",GAP],["Подробная карта","Следующим шагом.",TASK]]}
+    {id:"run",n:"Финал",st:"part",g:1,t:"Исполнение плана",io:["MachinePlan","коммиты · квитанции · execution"],top:30,
+     sum:"execute-plan: модель меняет файлы в границах задачи; движок проверяет кандидата, зовёт ревьюера, публикует коммит и квитанцию.",
+     d:[["Что делает","Превращает точный принятый план в последовательность проверенных изменений Git и квитанций реализованных выходов. Модель меняет файлы; движок решает допустимость кандидата, запускает проверки, вызывает независимого ревьюера, публикует точный коммит. Новое содержание продукта и расширение границ — не право исполнителя."],["Граница","Не финальный merge, не deployment, не бизнес-приёмка; работает в execution-root на ветке omg/<key>. Задачи — последовательно в порядке plan.tasks (DAG есть, параллели нет)."],["Пробелы","SP1 и DS1.2 видны прямо в пакете исполнителя; дверь needs_plan нового OM не подключена; доступ к task-detail зависит от адаптера.",GAP],["Задачи","SP1 · DS1.2 · PR1 (если HX4 доходит до кодирования)",TASK]],
+     subs:[
+      {id:"a",n:"A",st:"yes",g:0,t:"Допуск и рабочая копия",io:["execute-plan","execution-root ready"],
+       sum:"Захватить исполнение, довести старые commit_pending, проверить план и подготовить управляемую рабочую копию.",
+       d:[["Вход","project, точный plan Ref, {retry, maxContextChars, maxCorrections}; accepted compilation; environment."],["Проверки","Исходная копия чистая и на принятой базе; неподтверждённая смена ветки отвергается. linkDependencies ничего не ставит и не качает."],["Двери","Актуализировать план или среду; закончить прежний процесс; recover-execution. retry:true не даёт права на другой план или шире scope."]],
+       nodes:snake([
+        {id:"start",role:"владелец · код",st:"yes",g:0,t:"execute-plan",io:["точный план","пределы"],bh:"Передать план и разрешённые пределы.",d:[["Действие","A1 (runner.ts:349)."]]},
+        {id:"params",role:"код",st:"yes",g:0,t:"Параметры и граница",io:["пределы","допуск"],bh:"Фазовая граница, предел исправлений.",d:[["Действие","A2."]]},
+        {id:"lock",role:"код · запись",st:"yes",g:0,t:"execution-lock",io:["процесс","владение"],bh:"При особом допуске — и общий run-control.",d:[["Действие","A3 (lock.ts:9)."]]},
+        {id:"pending",role:"код",st:"yes",g:0,t:"Довести commit_pending",io:["intent","коммит"],bh:"Без повторного вызова модели.",d:[["Действие","A4."]]},
+        {id:"plan",role:"код",st:"yes",g:0,t:"Принадлежность плана",io:["plan Ref","актуальность"],bh:"Принятая compilation, актуальность оснований.",d:[["Действие","A5."]]},
+        {id:"root",role:"запись",st:"yes",g:0,t:"execution-root",io:["план","creating"],bh:"Создать при необходимости.",d:[["Действие","A6."]]},
+        {id:"wt",role:"код",st:"yes",g:0,t:"Git worktree",io:["plan.base.head","рабочая копия"],bh:"Материализовать, проверить репозиторий, ветку, head.",d:[["Действие","A7 (worktree.ts:49)."]]},
+        {id:"ready",role:"код · запись",st:"yes",g:0,t:"root ready",io:["worktree","готово"],bh:"Подключить зависимости ссылкой.",d:[["Действие","A8."]]}
+       ],4),
+       edges:[{f:"start",t:"params"},{f:"params",t:"lock"},{f:"lock",t:"pending"},{f:"pending",t:"plan"},{f:"plan",t:"root"},{f:"root",t:"wt"},{f:"wt",t:"ready"}].map(lbl)},
+
+      {id:"tasks",n:"План",st:"ex",g:0,t:"Пять задач плана — пример",io:["MachinePlan.tasks[]","вход цикла задачи"],
+       sum:"Иллюстрация формы CompiledTask для HX: формат → сессия / API → адаптер → CLI. Не живой HX4, не выбранная архитектура.",
+       d:[["Что это","Пять условных карточек в точной форме CompiledTask (compiler/model.ts:17). Реальные id, signature, parent, tree, plan Ref, D7 и Source выводят производители — здесь символические T1…T5."],["Предположения примера","Node.js и fullCheck = node --test test; все работы добавляют новые файлы; проверки на локальном стенде без платных запросов к вендору. Пути и команды — иллюстрации."],["Граница","Способ подписочного доступа, полномочия и ограничения вендора устанавливает Discovery. Обходы авторизации и чужие сессии не предполагаются."],["Порядок","Зависимости — DAG, но runner выполнит 2 и 3 последовательно; Git parent каждой задачи — последний принятый коммит."]],
+       nodes:[
+        {id:"t1",x:0,y:150,task:[["пишет","src/protocol.mjs · test/protocol.test.mjs",1],["читает","package.json"],["проверка","node --test test/protocol.test.mjs"],["граница","transient · provider false"],["обязат.","outcome"],["зависит","—"],["вернёт","text + artifacts: [a-protocol]"]],
+         role:"задача · пример",st:"ex",g:0,tid:"T1 · w-protocol → a-protocol",t:"Формат запроса и типизированного результата",io:["—","a-protocol"],
+         d:[["Требование","req-protocol: запрос задаёт модель, режим подключения и текст; результат различает ответ и типизированный отказ."],["Польза","Единый договор между CLI, подключением и адаптером; ошибки входа отделены от отказа провайдера. Получатель — actor-operator."],["Тест","given — запрос с моделью, режимом и текстом; when — normalizeRequest; then — валидный нормализован, без модели или с неизвестным режимом — типизированный отказ; запрещено — сеть и запись секретов. Counterfactual: подмена связи → request_invalid."],["Видит исполнитель","action, scope, req-protocol, графовую схему a-protocol, тесты и fullCheck, три исходящие связи и соседей."],["Возвращает","Изменения двух разрешённых файлов, непустой text и artifacts: [{id: a-protocol}]. Коммит и квитанцию делает движок."]]},
+        {id:"t2",x:380,y:0,task:[["пишет","src/subscription-session.mjs · test/…",1],["читает","src/protocol.mjs"],["вход","a-protocol ← T1 (квитанция)"],["проверка","node --test test/subscription-session.test.mjs"],["граница","transient · provider false"],["зависит","T1"],["вернёт","artifacts: [a-session-binding]"]],
+         role:"задача · пример",st:"ex",g:0,tid:"T2 · w-session → a-session-binding",t:"Разрешённая subscription session",io:["a-protocol","a-session-binding"],
+         d:[["Требование","req-session: подписочный режим принимает непрозрачный разрешённый session handle и не переходит на API автоматически."],["Тест","given — локальный интерфейс даёт активный или отозванный handle; then — активный возвращён, отсутствующий или отозванный → session_unavailable; запрещено — скрытое получение сессии, хранение секрета, переключение на API."],["Вход","Настоящая квитанция a-protocol из T1; код T1 уже в parent."],["Граница","Что вендор даёт подходящий интерфейс сессии, карточка не устанавливает — это исследование до выбора плана."]]},
+        {id:"t3",x:380,y:310,task:[["пишет","src/api-connection.mjs · test/…",1],["читает","src/protocol.mjs"],["вход","a-protocol ← T1 (квитанция)"],["проверка","node --test test/api-connection.test.mjs"],["граница","transient · provider false"],["зависит","T1"],["вернёт","artifacts: [a-api-binding]"]],
+         role:"задача · пример",st:"ex",g:0,tid:"T3 · w-api-binding → a-api-binding",t:"API credential reference",io:["a-protocol","a-api-binding"],
+         d:[["Требование","req-api-binding: API-режим получает секрет через разрешённый resolver по ссылке и не использует подписочную сессию вместо него."],["Тест","given — resolver доступен; then — корректная ссылка разрешена, отсутствующая или чужая отвергнута; запрещено — секрет в диагностике, автоматический subscription fallback."],["Граница","Реального ключа в CompiledTask нет. Secure storage не придуман: если resolver нет, план требует отдельного обоснованного решения."]]},
+        {id:"t4",x:760,y:150,task:[["пишет","src/vendor-adapter.mjs · test/…",1],["читает","protocol · session · api-connection"],["вход","T1, T2, T3 (квитанции)"],["проверка","node --test test/vendor-adapter.test.mjs"],["граница","transient · provider TRUE",1],["обязат.","outcome · provider_safety"],["research","task-start: стенд · task-result: нет скрытого повтора",1],["вернёт","artifacts: [a-vendor-adapter]"]],
+         role:"задача · пример",st:"ex",g:0,tid:"T4 · w-vendor-adapter → a-vendor-adapter",t:"Единый vendor adapter для двух режимов",io:["a-protocol · a-session · a-api","a-vendor-adapter"],
+         d:[["Требование","req-vendor-call: явно выбранные режим и модель; различать отказ, отмену и неопределённый результат без скрытого повтора."],["Тест","given — локальный транспорт считает отправки и даёт ответ, отказ, отмену, неопределённость; then — режим и модель сохранены, исходы типизированы, неоднозначный не повторяется; запрещено — утечка credential/session, скрытое переключение, повторная отправка. Counterfactual → provider_outcome_unknown."],["researchObligations","task-start, environment-confirmation: локальный стенд доступен и запрещает обращения к внешнему вендору (runtimeCheck). task-result, post-implementation-proof: неоднозначный исход не вызывает скрытую повторную отправку — доказывает test-vendor-adapter."],["Предел","Proof подтверждает локальный договор, не работоспособность реального вендора."]]},
+        {id:"t5",x:1140,y:150,task:[["пишет","src/cli.mjs · test/cli.test.mjs",1],["читает","все src/*.mjs"],["вход","a-vendor-adapter ← T4"],["проверка","node --test test/cli.test.mjs (отдельный процесс CLI)"],["граница","transient · provider false"],["зависит","T4"],["вернёт","artifacts: [a-cli]"]],
+         role:"задача · пример",st:"ex",g:0,tid:"T5 · w-cli → a-cli",t:"CLI, выбор модели и результат",io:["a-vendor-adapter","a-cli"],
+         d:[["Требование","req-cli: CLI принимает модель, режим и текст; вызывает adapter и выводит ответ или типизированную диагностику без секретов."],["Тест","Отдельный процесс CLI: успех — ответ; неизвестная модель и недоступное подключение — понятный отказ; отмена без повторной отправки; запрещено — секреты в выводе, второй транспорт в обход adapter. Counterfactual: нет адаптера → adapter_unavailable."],["Предел","Живой платный вызов частью примера не заявлен."]]}
+       ],
+       edges:[{f:"t1",t:"t2",l:"a-protocol"},{f:"t1",t:"t3",l:"a-protocol"},{f:"t1",t:"t4",l:"a-protocol"},{f:"t2",t:"t4",l:"a-session-binding"},{f:"t3",t:"t4",l:"a-api-binding"},{f:"t4",t:"t5",l:"a-vendor-adapter"}]},
+
+      {id:"t",n:"T",st:"yes",g:1,t:"Задача и отправка",io:["CompiledTask + parent","изменённые файлы"],
+       sum:"Допустить задачу, разрешить входы и права, собрать task-context и запрос omg-agent/v1, отправить исполнителю.",
+       d:[["Запрос исполнителю","omg-agent/v1, mode implement, prompt, subject: context (TaskContext), parent, inputs [{connector, artifact, ref, kind, value}], ownership, correction, answerForm execution/v2, address."],["TaskContext","binding; action (title, outcome, purpose, benefit, beneficiary); scope (boundary, code refs, ports, packets, read/writePaths); requirements, actor; inputs, produces; artifacts и contracts — графовые схемы, не behaviorContracts; criteria — tests, wake-tests, fullCheck, obligations, joins, researchObligations; connections, controls; neighbors; details — адрес task-detail."],["Предел","scope.code — адреса, не тексты; модель читает файлы в execution-root. Вместимость проверяется на весь запрос, нехватка — отказ, не обрезка."],["Пробел","Не доставляются отдельно: entry, inputs, compatibility договоров; success, failures, interactions фич; impact и integrations узла (их проверяет G5). task-detail есть, но у адаптера нет цикла его вызова.",GAP],["Задача","SP1",TASK]],
+       nodes:snake([
+        {id:"run",role:"код",st:"yes",g:0,t:"Run задачи",io:["план","задача"],bh:"committed пропускается только как звено цепи.",d:[["Действие","T1 (runner.ts:386)."]]},
+        {id:"group",role:"код",st:"yes",g:0,t:"Прежний процесс",io:["child / group","закрыт"],bh:"Потерянная отправка закрывается своим исходом.",d:[["Действие","T2."]]},
+        {id:"stage",role:"код",st:"yes",g:0,t:"Оплаченная стадия · лимит",io:["история","новая попытка / продолжение"],bh:"Продолжить оплаченное или новая попытка, исправление.",d:[["Действие","T3."]]},
+        {id:"tstart",role:"код",st:"yes",g:0,t:"task-start",io:["обязательства","run"],bh:"Подтверждения до отправки; иначе остановка.",d:[["Действие","T4 (task-obligations.ts:44)."]]},
+        {id:"inputs",role:"код",st:"yes",g:0,t:"Входы и права",io:["квитанции","inputs · grants"],bh:"Квитанции предшественников того же плана.",d:[["Действие","T5 (inputs.ts:11, ownership.ts:9). Чужая квитанция не заменяет producerTask."]]},
+        {id:"ctx",role:"код",st:"part",g:1,t:"task-context",io:["граф + задача","запрос"],bh:"Контекст, исправление, адресная форма; вместимость всего запроса.",d:[["Действие","T6 (compiler/context.ts:45, 314)."],["Пробел","Часть ранних положений не доставляется.",GAP],["Задача","SP1",TASK]]},
+        {id:"send",role:"запись",st:"yes",g:0,t:"execution-send",io:["запрос","запись до запуска"],bh:"Сохранить до запуска адаптера.",d:[["Действие","T7: статусы sent / answered / failed / interrupted / lost / refused / not-started."]]},
+        {id:"adapter",role:"код",st:"yes",g:0,t:"supervisor · адаптер",io:["omg-agent/v1","процесс"],bh:"В execution-root, группа процессов.",d:[["Действие","T8 (protocol.ts:124)."]]},
+        {id:"model",role:"модель",st:"yes",g:0,t:"Исполнитель кодирует",io:["запрос","файлы + ответ"],bh:"Меняет файлы; возвращает text и artifacts — или contract_unexecutable.",d:[["Возвращает","{protocol, requestId, text, artifacts: [{id}]} — все и только id из produces. Не commit, не tree, не хэши, не квитанцию."],["Адресный режим","outcome: contract_unexecutable с findings {text, address{plan, task, attempt, requirement, norm | path}}."]]}
+       ],5),
+       edges:[{f:"run",t:"group"},{f:"group",t:"stage"},{f:"stage",t:"tstart"},{f:"tstart",t:"inputs"},{f:"inputs",t:"ctx"},{f:"ctx",t:"send"},{f:"send",t:"adapter"},{f:"adapter",t:"model"}].map(lbl)},
+
+      {id:"k",n:"K",st:"yes",g:0,t:"Кандидат и проверки",io:["файлы + ответ","tree + checks"],
+       sum:"Зафиксировать кандидата строго в writePaths и прогнать все команды на его байтах.",
+       d:[["Проверки","Форма ответа и точный набор id; реальные пути без ссылок и выхода из workspace; diff и untracked против writePaths; дерево = физические байты; непустое изменение. Команды: fullCheck первым, затем тесты и counterfactuals; принимается exit 0 и без сигнала."],["Границы","writePaths проверяется по кандидату — не OS-песочница; readPaths — список материала, не ACL; provider не блокирует сеть и расходы."]],
+       nodes:snake([
+        {id:"form",role:"код",st:"yes",g:0,t:"Форма ответа",io:["ответ","id выходов"],bh:"protocol, requestId, точное множество id.",d:[["Действие","K1."]]},
+        {id:"paths",role:"код",st:"yes",g:0,t:"Пути записи",io:["файлы","проверка"],bh:"Обычные файлы, без выхода из workspace.",d:[["Действие","K2."]]},
+        {id:"diff",role:"код",st:"yes",g:0,t:"diff ⊆ writePaths",io:["изменения","Git tree"],bh:"diff и untracked против точных writePaths.",d:[["Действие","K3 (candidate.ts:25)."]]},
+        {id:"bytes",role:"код",st:"yes",g:0,t:"Дерево = байты",io:["tree","непустое"],bh:"Сверка с физическими байтами.",d:[["Действие","K4 (candidate-bytes.ts:8)."]]},
+        {id:"save",role:"запись",st:"yes",g:0,t:"answered + результат",io:["ответ","implementation · tree"],bh:"Одной транзакцией.",d:[["Действие","K5."]]},
+        {id:"cmds",role:"код",st:"yes",g:0,t:"Набор команд",io:["tests + fullCheck","команды"],bh:"tests, counterfactuals, environment.fullCheck.",d:[["Действие","K6 (commit.ts:15)."]]},
+        {id:"exec",role:"код · запись",st:"yes",g:0,t:"Прогон проверок",io:["команды","stdout · exit"],bh:"fullCheck первым; сохранить фактический вывод.",d:[["Действие","K7 (runner.ts:560)."]]},
+        {id:"same",role:"код",st:"yes",g:0,t:"Дерево не изменилось",io:["checks","ревьюеру"],bh:"Передать результат по правилам режима.",d:[["Действие","K8."]]}
+       ],4),
+       edges:[{f:"form",t:"paths"},{f:"paths",t:"diff"},{f:"diff",t:"bytes"},{f:"bytes",t:"save"},{f:"save",t:"cmds"},{f:"cmds",t:"exec"},{f:"exec",t:"same"}].map(lbl)},
+
+      {id:"r",n:"R",st:"yes",g:0,t:"Ревью и исправление",io:["кандидат + checks","pass / code / plan"],
+       sum:"Независимый ревьюер читает diff и тесты; code — исправление в scope, plan — остановка задачи с адресом.",
+       d:[["Ревьюер получает","binding, context, parent, tree, artifacts, checks, address."],["Ответ","review {verdict, kind, findings}. pass — строго verdict pass, kind none, findings []."],["Два режима","Без особого допуска: findings — строки; упавшая проверка обрывает попытку до ревью. execution/v2: findings {text, address}; ревьюер читает сохранённую проверку и выбирает code или plan; plan-находка требует доказанного адреса, иначе считается code."],["Предел","Адрес подтверждает предмет претензии, не её истинность."]],
+       nodes:snake([
+        {id:"subject",role:"код",st:"yes",g:0,t:"subjectHash",io:["plan · task · parent · tree","reviewing"],bh:"Сохранить состояние reviewing.",d:[["Действие","R1."]]},
+        {id:"give",role:"код",st:"yes",g:0,t:"Передать ревьюеру",io:["контекст + checks","запрос"],bh:"Контекст, parent/tree, artifacts, реальные checks.",d:[["Действие","R2 (runner.ts:583)."]]},
+        {id:"review",role:"оценщик · ревьюер",st:"yes",g:0,t:"Независимое ревью",io:["diff + тесты","pass / code / plan"],bh:"Фактический diff и тесты против договора задачи.",d:[["Действие","R3."]]},
+        {id:"check",role:"код",st:"yes",g:0,t:"Форма · дерево",io:["ответ","проверен"],bh:"Дерево не изменилось после ревью.",d:[["Действие","R4."]]},
+        {id:"v2",role:"код",st:"yes",g:0,t:"Адрес plan-находки",io:["findings","допуск"],bh:"execution/v2: нет pass поверх упавшей проверки.",d:[["Действие","R5 (protocol.ts:186 planDefectOf)."]]},
+        {id:"save",role:"запись",st:"yes",g:0,t:"verdict",io:["ревью","состояние"],bh:"С закрытием send в одной транзакции.",d:[["Действие","R6. Повторный вход применяет сохранённый исход, не покупает ревью заново."]]},
+        {id:"code",role:"код · модель",st:"yes",g:0,t:"needs_code → исправление",io:["findings","новая попытка"],bh:"Ошибка и все findings в исправляющую попытку, в пределе.",d:[["Действие","R7."]]},
+        {id:"next",role:"код",st:"yes",g:0,t:"pass → коммит · plan → стоп",io:["verdict","C или S"],bh:"needs_plan — остановка задачи.",d:[["Действие","R8."]]}
+       ],4),
+       edges:[{f:"subject",t:"give"},{f:"give",t:"review"},{f:"review",t:"check"},{f:"check",t:"v2"},{f:"v2",t:"save"},{f:"save",t:"code",l:"code"},{f:"save",t:"next",l:"pass / plan",loop:"below",depth:40}].map(lbl)},
+
+      {id:"c",n:"C",st:"yes",g:0,t:"Коммит и квитанции",io:["pass","committed + receipt"],
+       sum:"task-result proof → gates → commit-object → commit_pending → Git CAS → committed, квитанция артефакта, writer-index.",
+       d:[["ArtifactReceipt","projectId, artifact, node, signature, contractHash, commit, tree, value {files [{path, hash}]}, plan, run. Модель эти значения не сочиняет."],["Окно Git ↔ БД","Закрыто сохранённым intent и recoverCommits."],["Предел","Квитанция доказывает принятую реализацию договора в коде, не бизнес-ответ внешнего API."]],
+       nodes:snake([
+        {id:"proof",role:"код",st:"yes",g:0,t:"task-result proof",io:["тесты / runtime","доказательство"],bh:"Выполненные контрактные тесты или настоящее runtime-подтверждение.",d:[["Действие","C1. Нет подтверждения → awaiting_obligation, кандидат сохранён."]]},
+        {id:"gates",role:"код",st:"yes",g:0,t:"requireGates",io:["run","допуск"],bh:"Все выходы, команды, pass на точном дереве, обязательства.",d:[["Действие","C2 (commit.ts:18)."]]},
+        {id:"obj",role:"код",st:"yes",g:0,t:"commit-object",io:["tree + parent","commit"],bh:"Без перемещения ветки.",d:[["Действие","C3."]]},
+        {id:"pending",role:"запись",st:"yes",g:0,t:"commit_pending",io:["commit","intent"],bh:"CAS с проверенными основаниями.",d:[["Действие","C4 (commit.ts:29)."]]},
+        {id:"publish",role:"код",st:"yes",g:0,t:"update-ref (CAS)",io:["intent","ветка"],bh:"Проверить parent/tree и поздние подтверждения.",d:[["Действие","C5 (commit.ts:50)."]]},
+        {id:"done",role:"код · запись",st:"yes",g:0,t:"committed",io:["ref","execution-root.head"],bh:"Сдвинуть head корня.",d:[["Действие","C6 (commit.ts:61)."]]},
+        {id:"receipt",role:"запись",st:"yes",g:0,t:"ArtifactReceipt · writer-index",io:["коммит","квитанция"],bh:"artifact:<hash>; кто последним законно писал путь.",d:[["Действие","C7."]]},
+        {id:"parent",role:"код",st:"yes",g:0,t:"Родитель следующей",io:["commit","следующая задача"],bh:"Принятый коммит — parent следующей задачи.",d:[["Действие","C8."]]}
+       ],4),
+       edges:[{f:"proof",t:"gates"},{f:"gates",t:"obj"},{f:"obj",t:"pending"},{f:"pending",t:"publish"},{f:"publish",t:"done"},{f:"done",t:"receipt"},{f:"receipt",t:"parent"}].map(lbl)},
+
+      {id:"f",n:"F",st:"yes",g:0,t:"Следующая задача и итог",io:["committed","stage:execution"],
+       sum:"Цикл по плану; после всех задач — execution-result и accepted execution; поставка — отдельное решение владельца.",
+       d:[["Итог","execution-result: plan Ref, committed run Refs, финальный head; stage:execution content {result}. resultGate — полнота плана, gates, цепь коммитов."],["Предел","«Все карточки committed» не доказывает невыраженный пользовательский сценарий — только то, что в тестах."]],
+       nodes:snake([
+        {id:"next",role:"код",st:"yes",g:0,t:"Следующий элемент",io:["plan.tasks","задача"],bh:"Топологически упорядоченный массив.",d:[["Действие","F1."]]},
+        {id:"check",role:"код",st:"yes",g:0,t:"parent · квитанции",io:["root","проверка"],bh:"Реальные квитанции producerTask того же плана.",d:[["Действие","F2 (inputs.ts:11)."]]},
+        {id:"grant",role:"код",st:"yes",g:0,t:"Передача права записи",io:["writer-index","grant"],bh:"При передаче файла от прежнего владельца.",d:[["Действие","F3."]]},
+        {id:"cycle",role:"код",st:"yes",g:0,t:"Цикл T → K → R → C",io:["задача","committed"],bh:"Обычный цикл задачи.",d:[["Действие","F4."]]},
+        {id:"result",role:"запись",st:"yes",g:0,t:"execution-result",io:["все runs","результат"],bh:"plan, runs, final head.",d:[["Действие","F5 (runner.ts:635)."]]},
+        {id:"stage",role:"запись",st:"yes",g:0,t:"stage:execution",io:["результат","accepted"],bh:"Со ссылкой на результат и доказательствами.",d:[["Действие","F6."]]},
+        {id:"gate",role:"код",st:"yes",g:0,t:"resultGate",io:["результат","проверка"],bh:"Полнота плана, gates, цепь коммитов.",d:[["Действие","F7 (result.ts:10)."]]},
+        {id:"owner",role:"владелец",st:"yes",g:0,t:"Поставка · слияние",io:["результат","решение"],bh:"Отдельно: merge, публикация, бизнес-приёмка.",d:[["Действие","F8 — не следует автоматически из accepted execution."]]}
+       ],4),
+       edges:[{f:"next",t:"check"},{f:"check",t:"grant"},{f:"grant",t:"cycle"},{f:"cycle",t:"result",l:"все завершены"},{f:"result",t:"stage"},{f:"stage",t:"gate"},{f:"gate",t:"owner"},
+        {f:"cycle",t:"next",l:"есть следующая",k:"alt",loop:"above",depth:40}].map(lbl)},
+
+      {id:"s",n:"S",st:"part",g:1,t:"Остановка · восстановление · парковка",io:["сбой / stop / needs_plan","продолжение"],
+       sum:"Боковой контур: доказать конец процесса, продолжить оплаченную стадию, довести commit_pending; ремонт плана для нового OM не подключён.",
+       d:[["Не переобещать","stop-execution — AbortController этого экземпляра; межпроцессный контроль — только при особом допуске. recover-execution доводит commit intents, не чинит план и не повторяет модель. retry:true не освобождает needs_plan; предел исправлений по истории. Потерянный неприменённый результат — lost с неизвестным расходом, не ноль."],["Пробел","needs_plan нового OM: ремонт отказывает legacy_route_closed; нет потребителя TaskRun.planDefect для исправления L3. parkCandidate и om-regate по отдельности не составляют маршрут «needs_plan → новый план → продолжить».",GAP],["Задача","PR1 — адресный ремонт плана (если HX4 доходит до кодирования)",TASK]],
+       nodes:snake([
+        {id:"stop",role:"владелец · код",st:"yes",g:0,t:"Остановка · сбой",io:["stop / потеря","событие"],bh:"Остановить исполнение или получить потерю процесса.",d:[["Действие","S1 (runner.ts:653)."]]},
+        {id:"end",role:"код",st:"yes",g:0,t:"Конец процесса",io:["child / group","доказан"],bh:"Неопределённость не выдаётся за освобождение.",d:[["Действие","S2."]]},
+        {id:"state",role:"запись",st:"yes",g:0,t:"Состояние попытки",io:["исход","interrupted / needs_* / awaiting"],bh:"И исход отправки.",d:[["Действие","S3."]]},
+        {id:"paid",role:"код",st:"yes",g:0,t:"paidStage",io:["повтор","проверки / ревью / коммит"],bh:"Продолжить с оплаченной стадии.",d:[["Действие","S4 (runner.ts:330)."]]},
+        {id:"recover",role:"код",st:"yes",g:0,t:"recover-execution",io:["commit_pending","коммит"],bh:"Без моделей и прогонов.",d:[["Действие","S5 (recovery.ts:12)."]]},
+        {id:"await",role:"код",st:"yes",g:0,t:"awaiting_obligation",io:["кандидат","ждёт подтверждения"],bh:"Кандидат и gates сохранены до подтверждения.",d:[["Действие","S6 → коммит без повторного кода и ревью."]]},
+        {id:"park",role:"код · запись",st:"part",g:1,t:"Парковка кандидата",io:["needs_plan","parked"],bh:"archiveRef, старая копия сохранена, новый root.",d:[["Действие","S7 (park.ts:19)."],["Пробел","Связанный ремонт нового OM не подключён.",GAP]]},
+        {id:"repair",role:"владелец · ремонт",st:"no",g:1,t:"Ремонт договора",io:["needs_plan","новый план"],bh:"Законный маршрут, не расширяя scope старой попытки.",d:[["Как сейчас","Для нового OM: legacy_route_closed (repairs.ts:66).",GAP],["Задача","PR1",TASK]]}
+       ],4),
+       edges:[{f:"stop",t:"end"},{f:"end",t:"state"},{f:"state",t:"paid",l:"повтор"},{f:"state",t:"recover",l:"commit_pending"},{f:"state",t:"await",l:"позднее доказательство"},{f:"state",t:"park",l:"needs_plan",k:"alt"},{f:"park",t:"repair",k:"alt"}].map(lbl)}
+     ],
+     links:[
+      {f:"a.ready",t:"t.run",l:"root ready",lc:"A → T"},
+      {f:"tasks",t:"t.run",l:"CompiledTask → допуск задачи",lc:"план → T"},
+      {f:"t.model",t:"k.form",l:"файлы + text + artifacts",lc:"T → K"},
+      {f:"k.same",t:"r.subject",l:"кандидат + checks",lc:"K → R"},
+      {f:"r.next",t:"c.proof",l:"pass",lc:"R → C"},
+      {f:"c.parent",t:"f.next",l:"принятый commit",lc:"C → F"},
+      {f:"r.code",t:"t.stage",l:"needs_code → исправление",k:"alt",route:"above",depth:46},
+      {f:"f.cycle",t:"t.run",l:"следующая задача",k:"alt",route:"above",depth:92},
+      {f:"r.next",t:"s.state",l:"needs_plan",k:"alt",route:"below",depth:46},
+      {f:"c.proof",t:"s.await",l:"нет подтверждения",k:"alt",route:"below",depth:90}
+     ]}
   ];
 
   /* ---------- links between stages; they land on inner nodes when a stage is expanded ---------- */
@@ -1369,7 +1628,8 @@ ul.plain b{color:var(--ink);font-weight:500}
     {f:"feat.stage",t:"om.b1.start",l:"om-start → coldStart",lc:"stage:features → om-start",route:"above",depth:60,ff:.5},
     {f:"feat.norm",t:"om.b1.input",l:"нормализованные фичи (без benefit · success · failures · interactions)",route:"below",depth:44,ff:.5},
     {f:"feat.questions",t:"om.b1.gaps",l:"оставшиеся вопросы → адресация OM",k:"alt",route:"below",depth:88,ff:.5},
-    {f:"om.c.exec",t:"run",l:"execute-plan — отдельный запуск",lc:"MachinePlan → execute-plan"},
+    {f:"om.c.exec",t:"run.a.start",l:"execute-plan — отдельный запуск",lc:"MachinePlan → execute-plan"},
+    {f:"om.c.plan",t:"run.tasks",l:"MachinePlan.tasks[] (пример)",route:"below",depth:60},
     {f:"con.stage",t:"spec.packet",l:"conceptSections → покрыть договорами",route:"above",depth:128,ff:.5},
     {f:"con.stage",t:"om.b1.read",l:"требования + критерии {id}#n",route:"below",depth:88,ff:.65},
     {f:"disc.stage",t:"map.packet",l:"actors · outcomes · constraints · journeys",lc:"actors · outcomes · constraints · journeys",route:"below",depth:132,ff:.3},
@@ -1377,7 +1637,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     {f:"disc.stage",t:"om.b1.read",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
     {f:"disc.web",t:"om.r1.packet",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6}
   ];
-  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec.packet","spec.model","spec.assess","spec.contracts","spec.checks","spec.stage","feat.packet","feat.model","feat.prep","feat.checks","feat.stage","feat.norm","om.b1.input","om.r1.packet","om.r2.mat","om.l3.model","om.c.compiler","run"];
+  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec.packet","spec.model","spec.assess","spec.contracts","spec.checks","spec.stage","feat.packet","feat.model","feat.prep","feat.checks","feat.stage","feat.norm","om.b1.input","om.r1.packet","om.r2.mat","om.l3.model","om.c.compiler","run.t.ctx","run.t.model","run.k.exec","run.r.review","run.c.receipt"];
 
   function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 
@@ -1412,7 +1672,14 @@ ul.plain b{color:var(--ink);font-weight:500}
       d.className="node"+(it.dec?" dec":"");d.dataset.key=k;d.tabIndex=0;d.setAttribute("role","button");d.setAttribute("aria-label",it.t);
       var h='<div class="meta"><span class="pill">'+esc(it.role)+'</span>'+stHtml(it.st)+'</div>'+
         '<div class="t'+(it.mono?" mono":"")+'">'+esc(it.t)+'</div><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div>';
-      if(it.dec)h+='<div class="outs"><span class="pill ok">go</span><span class="pill warn">conditional</span><span class="pill warn">insufficient</span><span class="pill bad">no_go</span></div>';
+      if(it.task){
+        d.className="node taskc";
+        h='<div class="meta"><span class="pill">'+esc(it.role)+'</span>'+stHtml(it.st)+'</div><div class="tid">'+esc(it.tid)+'</div>'+
+          '<div class="t">'+esc(it.t)+'</div><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div><div class="kv">';
+        it.task.forEach(function(r){h+='<span>'+esc(r[0])+'</span><b'+(r[2]?' class="w"':'')+'>'+esc(r[1])+'</b>';});
+        h+='</div>';
+      }
+      else if(it.dec)h+='<div class="outs"><span class="pill ok">go</span><span class="pill warn">conditional</span><span class="pill warn">insufficient</span><span class="pill bad">no_go</span></div>';
       else h+='<div class="bh">'+esc(it.bh)+'</div>';
       if(it.g)h+='<span class="mark" title="пробел">!</span>';
       d.innerHTML=h;view.appendChild(d);nodeEl[k]=d;return;
