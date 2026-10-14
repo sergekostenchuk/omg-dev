@@ -2450,7 +2450,7 @@
 - Отдаёт: —
 - Читает записи: дословное поручение владельца
 - Пишет записи: Source поручения, brief, objective с различимым авторством; метки окна по kind
-- Разрешённые пути: `src/product/early-stage-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/early-stage-driver.test.ts`, `ui/app.tsx`, `test/ui.test.ts`, `test/discovery-decision.test.ts`
+- Разрешённые пути: `src/product/early-stage-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/early-stage-driver.test.ts`, `ui/app.tsx`, `test/ui.test.ts`, `test/discovery-decision.test.ts`, `test/layer-design.test.ts`
 - Из движка как есть: №4674; №4686; DRV1
 - После: DRV1
 - Тесты сверх обязательных:
