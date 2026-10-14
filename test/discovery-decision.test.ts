@@ -47,7 +47,7 @@ test('DS1.1 partial choices survive restart; last choice and normal reopen are a
   const f = fixture(t, [ownerCondition('scope'), ownerCondition('cost'), {id:'proof',kind:'evidence',condition:'Measure throughput',criterion:'Measured bound'}]);
   const original = f.store.get(f.verdict.id, f.verdict.revision), before = f.question('verdict');
   const first = f.engine.execute(f.command()) as Revision<DiscoveryConditionDecision>;
-  assert.equal(first.value.actor, 'local-owner'); assert.equal(first.value.optionId, 'accept');
+  assert.equal(first.value.actor, 'local-caller'); assert.equal(first.value.optionId, 'accept');
   assert.throws(() => f.engine.execute(f.command('scope', 'decline')), {code: 'discovery_choice_conflict'});
   assert.throws(() => new ProductEngine(f.store, 'another-owner').execute(f.command()), {code: 'discovery_choice_conflict'});
   assert.deepEqual(f.state().ownerChoices.map(c => c.conditionId), ['cost']);

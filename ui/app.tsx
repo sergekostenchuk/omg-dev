@@ -114,8 +114,18 @@ function QuestionPanel({ question, view, cmd, run, busy }: { question: View['que
   const values = view.drafts.find(d => d.id === q.draftId)?.value.fields;
   const parseValue = () => schema.type === "array" && schema.items?.type === "string" ? answer.split("\n").map(line => line.trim()).filter(Boolean)
     : schema.type === "array" || schema.type === "object" ? JSON.parse(answer) : answer;
-  return <article className="question"><div className="question-top"><span className="eyebrow">{q.level} · {q.spec.kind === "fact" ? "ПОДТВЕРЖДАЕМЫЙ ФАКТ" : "РЕШЕНИЕ ВЛАДЕЛЬЦА"}</span><Badge state={question.assessment.state}/></div><h3>{q.spec.prompt}</h3><p className="muted">{question.assessment.state === "stale" ? "Основание или контекст ответа изменились — требуется пересмотр." : q.status === "answered" ? q.spec.kind === "fact" ? "Ответ проверен по привязанной версии источника." : "Зафиксировано решение владельца." : `Риск: ${q.spec.risk}`}</p>
+  const assessed = q.answer?.id.startsWith("research-answer:") === true;
+  const label = q.spec.kind === "fact" ? "ПОДТВЕРЖДАЕМЫЙ ФАКТ"
+    : q.spec.kind === "decision" ? "РЕШЕНИЕ ВЛАДЕЛЬЦА"
+    : q.status === "answered" && !assessed ? "ПРОЕКТНОЕ ПРЕДЛОЖЕНИЕ" : "ПРЕДЛОЖЕНИЕ МОДЕЛИ";
+  const note = question.assessment.state === "stale" ? "Основание или контекст ответа изменились — требуется пересмотр."
+    : q.status === "answered" ? q.spec.kind === "fact" ? "Ответ проверен по привязанной версии источника."
+      : q.spec.kind === "decision" ? "Зафиксировано решение владельца."
+      : assessed ? "Принято по независимой оценке исследования." : "Зафиксировано проектное предложение."
+    : q.spec.kind === "design" ? "Ответ даёт исследование стадии." : `Риск: ${q.spec.risk}`;
+  return <article className="question"><div className="question-top"><span className="eyebrow">{q.level} · {label}</span><Badge state={question.assessment.state}/></div><h3>{q.spec.prompt}</h3><p className="muted">{note}</p>
     {q.status === "answered" ? <><div className="answer-value">{typeof values?.[q.spec.field] === "string" ? String(values[q.spec.field]) : JSON.stringify(values?.[q.spec.field], null, 2)}</div><button className="text-button" disabled={busy} onClick={() => run(() => cmd({ type: "reopen-question", question: question.id, expected: question.revision }), "Вопрос открыт для пересмотра")}>Пересмотреть ответ</button></>
+      : q.spec.kind === "design" ? null
       : <form onSubmit={event => { event.preventDefault(); void run(() => q.spec.kind === "decision"
         ? cmd({ type: "answer-decision", question: question.id, expected: question.revision, value: parseValue() })
         : cmd({ type: "answer-fact", question: question.id, expected: question.revision, source: ref(source!), selector: source!.value.mediaType === "application/json" ? { kind: "json-pointer", pointer } : { kind: "text-range", start: 0, end: source!.value.content.length } }), "Ответ сохранён с основанием"); }}>

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonical } from "../src/canonical.js";
+import { canonical, digest } from "../src/canonical.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { REQUIREMENTS, UPSTREAM_STAGES } from "../src/discovery/requirements.js";
 import { executeWebTurn } from "../src/discovery/web-research.js";
@@ -14,9 +14,10 @@ import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { gardenGraph } from "./om-fixture.js";
 import { resumeStoppedPass, stopPass } from "../src/om/run-driver.js";
-import { reference } from "../src/pipeline/contracts.js";
+import { reference, uniqueRefs } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
-import type { EarlyStageOutcome } from "../src/product/early-stage-driver.js";
+import { parseCommand } from "../src/product/commands.js";
+import type { EarlyStageInstruction, EarlyStageOutcome } from "../src/product/early-stage-driver.js";
 import { preparedField } from "./preparation-fixture.js";
 import { answerDiscoveryFixture, preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../src/storage/store.js";
@@ -119,18 +120,434 @@ function acceptDiscovery(engine: ProductEngine, project: string, expected: numbe
   return engine.store.get<DiscoveryDraft>(draft.id)!;
 }
 
+function instruction(project: string, text = `Build the exact ${project} product described here.`): EarlyStageInstruction {
+  return { title: project, id: "instruction", text, media: "text/plain",
+    brief: { kind: "text-range", start: 0, end: text.length } };
+}
+
+test("IN1 creates the Project first and resumes after that committed boundary", async t => {
+  const f = fixture(t), input = instruction("p");
+  const original = f.store.writeMany.bind(f.store); let crashed = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    const saved = original<T>(writes, guards);
+    if (!crashed && writes.some(write => write.kind === "project" && write.id === "project:p")) {
+      crashed = true; throw new Error("crash after project");
+    }
+    return saved;
+  };
+  try {
+    await assert.rejects(async () => f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+      maxCalls: 1, instruction: input }), /crash after project/);
+  } finally { f.store.writeMany = original; }
+  const { trace } = f.configure("p"), reopened = new Store(f.database); t.after(() => reopened.close());
+  const result = await new ProductEngine(reopened).execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 1, instruction: input }) as EarlyStageOutcome;
+  assert.deepEqual([result.end, result.reason?.code, result.budget.callsMade],
+    ["stage_paused", "research_call_allowance", 1]);
+  assert.deepEqual([reopened.history("project:p").length, reopened.history("source:p:instruction").length,
+    reopened.history("early-stage-input:p").length, f.calls(trace).length], [1, 1, 1, 1]);
+});
+
+test("IN1 initializes verbatim Source, brief and fallback objective before the first researchPlan call", async t => {
+  const f = fixture(t), { trace } = f.setup("p"), input = instruction("p", "Build a planting planner from this exact request.");
+  const result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 1, instruction: input }) as EarlyStageOutcome;
+  assert.deepEqual([result.end, result.stage, result.reason?.code, result.budget.callsMade],
+    ["stage_paused", "discovery", "research_call_allowance", 1]);
+  const source = f.store.get<any>("source:p:instruction")!, binding = f.store.get<any>("early-stage-input:p")!;
+  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
+  const questions = draft.value.questions.map(id => f.store.get<Question>(id)!);
+  const brief = questions.find(row => row.value.spec.field === "brief")!, objective = questions.find(row => row.value.spec.field === "objective")!;
+  const briefAnswer = f.store.get<any>(brief.value.answer!.id)!, objectiveAnswer = f.store.get<any>(objective.value.answer!.id)!;
+  assert.deepEqual([source.value.content, source.value.sha256, source.value.origin.kind,
+    draft.value.fields.brief, draft.value.fields.objective, objectiveAnswer.value.actor],
+  [input.text, digest(input.text), "owner-document", input.text, input.text, "driver:verbatim"]);
+  assert.deepEqual(draft.value.inputs, uniqueRefs([reference(f.store.get("project:p")!), reference(source), reference(binding)]));
+  assert.deepEqual(briefAnswer.value.observation.selector, input.brief);
+  assert.deepEqual(f.calls(trace), [{ role: "research", field: "researchPlan" }],
+    "the first physical call occurs only after verbatim input initialization");
+});
+
+test("IN1 explicit objective is selected from the same exact Source; arbitrary model prose is not an input field", async t => {
+  const f = fixture(t), { trace } = f.setup("p");
+  const text = "Build a planting planner.\nReduce missed watering.";
+  const input: EarlyStageInstruction = { title: "p", id: "instruction", text, media: "text/plain",
+    brief: { kind: "text-range", start: 0, end: 25 },
+    objective: { kind: "text-range", start: 26, end: text.length } };
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 1, instruction: input });
+  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
+  assert.deepEqual([draft.value.fields.brief, draft.value.fields.objective],
+    ["Build a planting planner.", "Reduce missed watering."]);
+  assert.equal(f.calls(trace)[0]?.field, "researchPlan");
+  assert.throws(() => parseCommand({ type: "early-stage-run", project: "x", maxTurns: 1, maxCalls: 1,
+    instruction: { ...instruction("x"), value: "A model paraphrase" } }), { code: "command_invalid" });
+  assert.throws(() => parseCommand({ type: "revise-early-stage-input", project: "x", expected: 0 }),
+    { code: "command_invalid" });
+});
+
+test("IN1 derives brief and explicit objective through exact JSON pointers", async t => {
+  const f = fixture(t), { trace } = f.setup("p");
+  const text = JSON.stringify({ assignment: "Build a planting planner.", goal: "Reduce missed watering." });
+  const input: EarlyStageInstruction = { title: "p", id: "instruction", text, media: "application/json",
+    brief: { kind: "json-pointer", pointer: "/assignment" },
+    objective: { kind: "json-pointer", pointer: "/goal" } };
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30, maxCalls: 1, instruction: input });
+  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
+  assert.deepEqual([f.store.get<any>("source:p:instruction")!.value.content,
+    draft.value.fields.brief, draft.value.fields.objective, f.calls(trace)[0]?.field],
+  [text, "Build a planting planner.", "Reduce missed watering.", "researchPlan"]);
+});
+
+test("IN1 refuses missing instruction and an invalid selector before project, draft or run control", async t => {
+  const f = fixture(t);
+  const missing = await f.engine.execute({ type: "early-stage-run", project: "missing", maxTurns: 1,
+    maxCalls: 1 }) as EarlyStageOutcome;
+  assert.deepEqual([missing.end, missing.reason?.code, missing.budget.callsMade], ["blocked", "instruction_missing", 0]);
+  const invalid = await f.engine.execute({ type: "early-stage-run", project: "invalid", maxTurns: 1, maxCalls: 1,
+    instruction: { ...instruction("invalid", "short"), brief: { kind: "text-range", start: 0, end: 99 } } }) as EarlyStageOutcome;
+  const noBrief = { title: "missing-selector", id: "instruction", text: "Exact request", media: "text/plain" } as unknown as EarlyStageInstruction;
+  const missingSelector = await f.engine.earlyStages.run({ project: "missing-selector", maxTurns: 1, maxCalls: 1,
+    instruction: noBrief });
+  assert.deepEqual([invalid.end, invalid.reason?.code, invalid.budget.callsMade], ["blocked", "selector_invalid", 0]);
+  assert.deepEqual([missingSelector.end, missingSelector.reason?.code, missingSelector.budget.callsMade],
+    ["blocked", "selector_invalid", 0]);
+  for (const project of ["missing", "invalid", "missing-selector"]) {
+    assert.equal(f.store.get(`project:${project}`), null);
+    assert.equal(f.store.get(`om-run-control:${project}`), null);
+    assert.equal(f.store.get(`early-stage-input:${project}`), null);
+    assert.equal(f.store.list<DiscoveryDraft>("discovery-draft").some(row => row.value.projectId === project), false);
+  }
+});
+
+test("IN1 automatic objective names the copier while ordinary answer-decision names only the local caller", async t => {
+  const f = fixture(t); f.setup("p");
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 1, maxCalls: 1,
+    instruction: instruction("p") });
+  const draft = f.engine.discovery.create("p", "discovery", "R0", "concept", [{ field: "choice", kind: "decision",
+    prompt: "Choose", risk: "Missing choice", schema: { type: "string", minLength: 1 } }]);
+  const question = f.store.get<Question>(draft.value.questions[0]!)!;
+  f.engine.execute({ type: "answer-decision", question: question.id, expected: question.revision, value: "chosen" });
+  const answer = f.store.get<any>(f.store.get<Question>(question.id)!.value.answer!.id)!;
+  assert.equal(answer.value.actor, "local-caller");
+  assert.notEqual(answer.value.actor, "local-owner", "an unauthenticated command caller is not labelled as the owner");
+});
+
+test("IN1 leaves a previous-era decision and draft without present-day input authorship", async t => {
+  const f = fixture(t); f.setup("p");
+  const draft = f.engine.prepare("p", "discovery");
+  const objective = draft.value.questions.map(id => f.store.get<Question>(id)!)
+    .find(question => question.value.spec.field === "objective")!;
+  f.engine.discovery.decision(objective.id, objective.revision, "legacy-owner", "Keep the historical objective");
+  const before = f.store.get<Question>(objective.id)!.value.answer!;
+  await f.engine.execute({ type: "early-stage-run", project: "p", draftId: draft.id, maxTurns: 1, maxCalls: 1 });
+  const after = f.store.get<Question>(objective.id)!.value.answer!;
+  assert.deepEqual(after, before);
+  assert.equal(f.store.get<any>(after.id, after.revision)!.value.actor, "legacy-owner");
+  assert.equal(f.store.get("early-stage-input:p"), null);
+});
+
+for (const boundary of ["source", "early-stage-input", "discovery-draft", "fact"] as const)
+test(`IN1 restart after committed ${boundary} resumes one input and one draft without duplicate calls`, async t => {
+  const f = fixture(t), { trace } = f.setup("p"), input = instruction("p");
+  const original = f.store.writeMany.bind(f.store); let crashed = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    const saved = original<T>(writes, guards);
+    if (!crashed && writes.some(write => write.kind === boundary
+      && (boundary !== "source" || write.id === "source:p:instruction"))) {
+      crashed = true; throw new Error(`crash after ${boundary}`);
+    }
+    return saved;
+  };
+  try {
+    await assert.rejects(async () => f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+      maxCalls: 1, instruction: input }), new RegExp(`crash after ${boundary}`));
+  } finally { f.store.writeMany = original; }
+  const reopened = new Store(f.database); t.after(() => reopened.close());
+  const result = await new ProductEngine(reopened).execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 1, instruction: input }) as EarlyStageOutcome;
+  assert.deepEqual([result.end, result.reason?.code, result.budget.callsMade],
+    ["stage_paused", "research_call_allowance", 1]);
+  assert.deepEqual([reopened.history("source:p:instruction").length, reopened.history("early-stage-input:p").length,
+    reopened.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.projectId === "p" && row.value.stage === "discovery").length,
+    reopened.list("fact").length, reopened.list("decision").filter(row => (row.value as any).actor === "driver:verbatim").length,
+    f.calls(trace).length], [1, 1, 1, 1, 1, 1]);
+});
+
+test("IN1 refuses a competing Source at its address before the first Source commit", async t => {
+  const f = fixture(t), { trace } = f.setup("p"), input = instruction("p");
+  const original = f.store.writeMany.bind(f.store); let moved = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    if (!moved && writes.some(write => write.kind === "source" && write.id === "source:p:instruction")) {
+      moved = true; const other = new Store(f.database);
+      try { new ProductEngine(other).execute({ type: "source-document", project: "p", id: "instruction",
+        text: "A competing assignment requiring explicit review.", media: "text/plain", expected: 0 }); }
+      finally { other.close(); }
+    }
+    return original<T>(writes, guards);
+  };
+  let result: EarlyStageOutcome;
+  try { result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 1, instruction: input }) as EarlyStageOutcome; }
+  finally { f.store.writeMany = original; }
+  assert.deepEqual([result.end, result.reason?.code, result.budget.callsMade, f.calls(trace).length],
+    ["blocked", "instruction_stale", 0, 0]);
+  assert.deepEqual([f.store.get("early-stage-input:p"), f.store.list<DiscoveryDraft>("discovery-draft")
+    .some(row => row.value.projectId === "p"), f.store.list("fact").length, f.store.list("decision").length],
+  [null, false, 0, 0]);
+});
+
+for (const boundary of ["early-stage-input", "discovery-draft", "fact", "decision"] as const)
+test(`IN1 Source move before ${boundary} commit refuses the window without that partial answer`, async t => {
+  const f = fixture(t), { trace } = f.setup("p"), input = instruction("p");
+  const original = f.store.writeMany.bind(f.store); let moved = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    if (!moved && writes.some(write => write.kind === boundary)) {
+      moved = true; const other = new Store(f.database);
+      try { new ProductEngine(other).execute({ type: "source-document", project: "p", id: "instruction",
+        text: "A changed assignment requiring explicit review.", media: "text/plain", expected: 1 }); }
+      finally { other.close(); }
+    }
+    return original<T>(writes, guards);
+  };
+  let result: EarlyStageOutcome;
+  try { result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 1, instruction: input }) as EarlyStageOutcome; }
+  finally { f.store.writeMany = original; }
+  assert.deepEqual([result.end, result.reason?.code, result.budget.callsMade, f.calls(trace).length],
+    ["blocked", "input_stale", 0, 0]);
+  const driverDecisions = f.store.list("decision").filter(row => (row.value as any).actor === "driver:verbatim").length;
+  const expected = boundary === "early-stage-input" ? [0, 0, 0, 0]
+    : boundary === "discovery-draft" ? [1, 0, 0, 0]
+    : boundary === "fact" ? [1, 1, 0, 0] : [1, 1, 1, 0];
+  assert.deepEqual([f.store.list("early-stage-input").length,
+    f.store.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.projectId === "p").length,
+    f.store.list("fact").length, driverDecisions], expected,
+  "only complete earlier boundaries may survive; the raced write is atomic");
+});
+
+test("IN1 changed Source makes the accepted researchPlan addressed stale without another model call", async t => {
+  const f = fixture(t), { trace } = f.setup("p"), input = instruction("p");
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 2, instruction: input });
+  const draft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
+  const plan = draft.value.questions.map(id => f.store.get<Question>(id)!)
+    .find(question => question.value.spec.field === "researchPlan")!;
+  assert.equal(f.store.get<Question>(plan.id)!.value.status, "answered");
+  const calls = f.calls(trace).length;
+  f.engine.execute({ type: "source-document", project: "p", id: "instruction",
+    text: "A changed assignment requiring explicit review.", media: "text/plain", expected: 1 });
+  const repeated = await new ProductEngine(f.store).execute({ type: "early-stage-run", project: "p",
+    maxTurns: 30, maxCalls: 2 }) as EarlyStageOutcome;
+  assert.deepEqual([repeated.end, repeated.reason?.code, repeated.budget.callsMade, f.calls(trace).length],
+    ["blocked", "instruction_stale", 0, calls]);
+});
+
+test("IN1 explicitly revises an unfinished input without rewriting its paid draft", async t => {
+  const f = fixture(t), { trace } = f.setup("p"), first = instruction("p");
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30, maxCalls: 2, instruction: first });
+  assert.equal(f.engine.pipeline.inspect("p", "discovery").state, "missing");
+  const oldDraft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
+  const oldQuestions = oldDraft.value.questions.map(id => reference(f.store.get<Question>(id)!));
+  const calls = f.calls(trace).length, revised = instruction("p", "Build the revised unfinished assignment.");
+  f.engine.execute({ type: "source-document", project: "p", id: revised.id, text: revised.text,
+    media: revised.media, expected: 1 });
+  const result = f.engine.execute({ type: "revise-early-stage-input", project: "p", expected: 1,
+    instruction: revised }) as { binding: ReturnType<typeof reference>; discovery: null };
+  assert.equal(result.discovery, null);
+  assert.deepEqual(oldDraft.value.questions.map(id => reference(f.store.get<Question>(id)!)), oldQuestions);
+  assert.equal(f.calls(trace).length, calls);
+  const reopened = new Store(f.database); t.after(() => reopened.close());
+  const continued = await new ProductEngine(reopened).execute({ type: "early-stage-run", project: "p",
+    maxTurns: 30, maxCalls: 1, instruction: revised }) as EarlyStageOutcome;
+  assert.deepEqual([continued.end, continued.reason?.code, continued.budget.callsMade],
+    ["stage_paused", "research_call_allowance", 1]);
+  assert.equal(reopened.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.stage === "discovery").length, 2);
+  assert.equal(f.calls(trace).length, calls + 1);
+});
+
+test("IN1 explicitly revises a changed input, marks dependent research stale and resumes from a new exact draft", async t => {
+  const f = fixture(t), { trace } = f.setup("p"), originalInput = instruction("p");
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 10,
+    maxCalls: 100, instruction: originalInput });
+  assert.equal(f.engine.pipeline.inspect("p", "discovery").state, "accepted");
+  const oldStage = f.store.get<any>("stage:p:discovery")!;
+  const oldDraft = f.store.get<DiscoveryDraft>(oldStage.value.content.draft.id)!;
+  const oldQuestions = oldDraft.value.questions.map(id => reference(f.store.get<Question>(id)!));
+  const paid = f.store.list("model-call").map(reference), paidCount = f.calls(trace).length;
+
+  const changed = instruction("p", "Build the first corrected product requested by the owner.");
+  f.engine.execute({ type: "source-document", project: "p", id: changed.id, text: changed.text,
+    media: changed.media, expected: 1 });
+  const staleStore = new Store(f.database); t.after(() => staleStore.close());
+  const stale = await new ProductEngine(staleStore).execute({ type: "early-stage-run", project: "p",
+    maxTurns: 1, maxCalls: 1, instruction: changed }) as EarlyStageOutcome;
+  assert.deepEqual([stale.end, stale.reason?.code, stale.budget.callsMade, f.calls(trace).length],
+    ["blocked", "instruction_stale", 0, paidCount]);
+
+  const finalInput = instruction("p", "Build the final corrected product requested by the owner.");
+  const originalWrite = f.store.writeMany.bind(f.store); let raced = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    if (!raced && writes.some(write => write.id === "early-stage-input:p")) {
+      raced = true; const competing = new Store(f.database);
+      try { new ProductEngine(competing).execute({ type: "source-document", project: "p", id: finalInput.id,
+        text: finalInput.text, media: finalInput.media, expected: 2 }); }
+      finally { competing.close(); }
+    }
+    return originalWrite<T>(writes, guards);
+  };
+  try {
+    assert.throws(() => f.engine.execute({ type: "revise-early-stage-input", project: "p", expected: 1,
+      instruction: changed }), (error: unknown) => error instanceof EngineError && error.code === "input_stale");
+  } finally { f.store.writeMany = originalWrite; }
+  assert.deepEqual([f.store.get("early-stage-input:p")!.revision, reference(f.store.get("stage:p:discovery")!),
+    f.calls(trace).length], [1, reference(oldStage), paidCount], "the losing revision writes no partial binding or stage");
+
+  const revisedStore = new Store(f.database); t.after(() => revisedStore.close());
+  const revisedEngine = new ProductEngine(revisedStore);
+  const revised = revisedEngine.execute({ type: "revise-early-stage-input", project: "p", expected: 1,
+    instruction: finalInput }) as { binding: ReturnType<typeof reference>; discovery: ReturnType<typeof reference> };
+  const binding = revisedStore.get<any>("early-stage-input:p")!, discovery = revisedStore.get<any>("stage:p:discovery")!;
+  assert.deepEqual([revised.binding, binding.revision, binding.value.source.revision,
+    revised.discovery, discovery.revision, discovery.value.status],
+  [reference(binding), 2, 3, reference(discovery), oldStage.revision + 1, "draft"]);
+  assert.deepEqual(oldDraft.value.questions.map(id => reference(revisedStore.get<Question>(id)!)), oldQuestions,
+    "explicit revision marks prior answers for review without reopening or rewriting them");
+  assert.deepEqual(revisedStore.list("model-call").map(reference), paid, "paid work remains exact history");
+  const assessments = revisedEngine.projection("p").questions
+    .filter(row => oldDraft.value.questions.includes(row.id)).map(row => row.assessment.state);
+  assert.ok(assessments.length > 0 && assessments.every(state => state === "stale"));
+
+  const repeated = revisedEngine.execute({ type: "revise-early-stage-input", project: "p", expected: 1,
+    instruction: finalInput }) as { binding: ReturnType<typeof reference>; discovery: ReturnType<typeof reference> };
+  assert.deepEqual([repeated, revisedStore.history("early-stage-input:p").length,
+    revisedStore.history("stage:p:discovery").length],
+  [revised, 2, oldStage.revision + 1], "a lost response repeats without another revision");
+
+  const continuedStore = new Store(f.database); t.after(() => continuedStore.close());
+  const continued = await new ProductEngine(continuedStore).execute({ type: "early-stage-run", project: "p",
+    maxTurns: 10, maxCalls: 1, instruction: finalInput }) as EarlyStageOutcome;
+  assert.deepEqual([continued.end, continued.stage, continued.reason?.code, continued.budget.callsMade],
+    ["stage_paused", "discovery", "research_call_allowance", 1]);
+  const drafts = continuedStore.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.stage === "discovery");
+  const fresh = drafts.find(row => row.id !== oldDraft.id)!;
+  assert.equal(drafts.length, 2);
+  assert.deepEqual(fresh.value.inputs, uniqueRefs([binding.value.project, binding.value.source, reference(binding)]));
+  assert.deepEqual(oldDraft.value.questions.map(id => reference(continuedStore.get<Question>(id)!)), oldQuestions);
+  assert.equal(f.calls(trace).length, paidCount + 1, "only the new assignment starts one new physical call");
+
+  const exactStore = new Store(f.database); t.after(() => exactStore.close());
+  const exact = await new ProductEngine(exactStore).execute({ type: "early-stage-run", project: "p",
+    draftId: fresh.id, maxTurns: 10, maxCalls: 1 }) as EarlyStageOutcome;
+  assert.deepEqual([exact.end, exact.stage, exact.draft?.id, exact.reason?.code, exact.budget.callsMade],
+    ["stage_paused", "discovery", fresh.id, "research_call_allowance", 1],
+    "the returned revised draft remains the exact restart door instead of conflicting with the historical stage binding");
+  assert.equal(f.calls(trace).length, paidCount + 2);
+});
+
+test("IN1 revision between revised-draft selection and write refuses the old basis and restarts on the winner", async t => {
+  const f = fixture(t), { trace } = f.setup("p"), first = instruction("p");
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30, maxCalls: 1, instruction: first });
+  const oldDraft = f.store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.stage === "discovery")!;
+  const second = instruction("p", "Build the second exact assignment.");
+  f.engine.execute({ type: "source-document", project: "p", id: second.id, text: second.text,
+    media: second.media, expected: 1 });
+  f.engine.execute({ type: "revise-early-stage-input", project: "p", expected: 1, instruction: second });
+  const third = instruction("p", "Build the third exact assignment that wins the write window.");
+  const original = f.store.writeMany.bind(f.store); let revised = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    if (!revised && writes.some(write => write.kind === "discovery-draft")) {
+      revised = true; const other = new Store(f.database);
+      try {
+        const engine = new ProductEngine(other);
+        engine.execute({ type: "source-document", project: "p", id: third.id, text: third.text,
+          media: third.media, expected: 2 });
+        engine.execute({ type: "revise-early-stage-input", project: "p", expected: 2, instruction: third });
+      } finally { other.close(); }
+    }
+    return original<T>(writes, guards);
+  };
+  let raced: EarlyStageOutcome;
+  try { raced = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
+    maxCalls: 1, instruction: second }) as EarlyStageOutcome; }
+  finally { f.store.writeMany = original; }
+  assert.deepEqual([revised, raced.end, raced.reason?.code, raced.budget.callsMade,
+    f.store.list<DiscoveryDraft>("discovery-draft").length, f.calls(trace).length],
+  [true, "blocked", "input_stale", 0, 1, 1], "the losing selector writes no draft or paid call");
+  assert.equal(f.store.get<DiscoveryDraft>(oldDraft.id)!.id, oldDraft.id);
+
+  const reopened = new Store(f.database); t.after(() => reopened.close());
+  const resumed = await new ProductEngine(reopened).execute({ type: "early-stage-run", project: "p",
+    maxTurns: 30, maxCalls: 1, instruction: third }) as EarlyStageOutcome;
+  const fresh = reopened.list<DiscoveryDraft>("discovery-draft").find(row => row.id !== oldDraft.id)!;
+  assert.deepEqual([resumed.end, resumed.stage, resumed.draft?.id, resumed.reason?.code,
+    resumed.budget.callsMade, reopened.list("discovery-draft").length, f.calls(trace).length],
+  ["stage_paused", "discovery", fresh.id, "research_call_allowance", 1, 2, 2]);
+});
+
+for (const paid of [
+  { name: "analyst A", marker: '"action":"answer"', needOwner: false },
+  { name: "answer assessor B", marker: '"verdict":"supported"', needOwner: false },
+  { name: "escalation assessor C", marker: '"necessary":true', needOwner: true },
+] as const) test(`IN1 revised draft restores paid ${paid.name} through explicit and automatic stopped selection`, async t => {
+  const f = fixture(t), { values, trace } = f.setup("p"), originalInput = instruction("p");
+  await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 4,
+    maxCalls: 100, instruction: originalInput });
+  assert.equal(f.engine.pipeline.inspect("p", "discovery").state, "accepted");
+  const oldDraft = f.store.get<any>("stage:p:discovery")!.value.content.draft.id;
+  const revisedInput = instruction("p", "Revised instruction with its own saved research generation.");
+  f.engine.execute({ type: "source-document", project: "p", id: revisedInput.id, text: revisedInput.text,
+    media: revisedInput.media, expected: 1 });
+  f.engine.execute({ type: "revise-early-stage-input", project: "p", expected: 1, instruction: revisedInput });
+  if (paid.needOwner) {
+    const fields = JSON.parse(readFileSync(values, "utf8")); fields.needOwner = true;
+    writeFileSync(values, JSON.stringify(fields));
+  }
+  const original = f.store.writeMany.bind(f.store); let stopped = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    const saved = original<T>(writes, guards);
+    if (!stopped && writes.some(write => write.kind === "model-response"
+      && String((write.value as { text?: string }).text).includes(paid.marker))) {
+      stopped = true; stopFrom(f.database, "p");
+      throw new EngineError("probe_paid_stop", "Stop after a revised paid response and before its application");
+    }
+    return saved;
+  };
+  let first: EarlyStageOutcome;
+  try { first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
+    maxCalls: 100, instruction: revisedInput }) as EarlyStageOutcome; }
+  finally { f.store.writeMany = original; }
+  assert.deepEqual([stopped, first.end, first.reason?.code], [true, "stopped", "run_stopped"]);
+  const fresh = f.store.list<DiscoveryDraft>("discovery-draft")
+    .find(row => row.value.stage === "discovery" && row.id !== oldDraft)!;
+  const pending = ["research-consumer-intent", "assessment-application"].flatMap(kind =>
+    f.store.list<any>(kind).filter(row => row.value.state === "running").map(row => row.id));
+  assert.ok(pending.length > 0);
+  const calls = f.calls(trace).length, reopened = new Store(f.database); t.after(() => reopened.close());
+  const engine = new ProductEngine(reopened);
+  const explicit = await engine.execute({ type: "early-stage-run", project: "p", draftId: fresh.id,
+    maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  const automatic = await engine.execute({ type: "early-stage-run", project: "p",
+    maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.deepEqual([explicit.end, explicit.draft?.id, explicit.stageResult?.status,
+    automatic.end, automatic.draft?.id, automatic.stageResult?.status,
+    f.calls(trace).length],
+  ["stopped", fresh.id, "stopped", "stopped", fresh.id, "stopped", calls]);
+  assert.ok(pending.some(id => reopened.get<any>(id)?.value.state === "applied"));
+});
+
 test("DRV1 one entry uses StageResearch for five stages, builds the real L1 and stops at the shared early-call boundary", async t => {
   const f = fixture(t), { trace } = f.setup("p");
   const result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-    maxCalls: 40 }) as EarlyStageOutcome;
+    maxCalls: 36, instruction: instruction("p") }) as EarlyStageOutcome;
   assert.equal(result.end, "om_ready", JSON.stringify(result));
   assert.ok(UPSTREAM_STAGES.every(stage => f.engine.pipeline.inspect("p", stage).state === "accepted"));
   assert.ok(f.store.get("graph:p"), "operation-map used the existing build-map producer");
   assert.equal(result.budget.callsMade, f.store.list<any>("model-call").filter(row => row.value.draftId).length,
     "only new early physical dispatches consume maxCalls");
-  assert.deepEqual([result.budget.callsMade, result.budget.callsRemaining], [40, 0]);
+  assert.deepEqual([result.budget.callsMade, result.budget.callsRemaining], [36, 0]);
   assert.ok(result.budget.turnsUsed > 0 && result.budget.turnsUsed <= result.budget.maxTurns);
-  assert.equal(f.calls(trace).length, 40);
+  assert.equal(f.calls(trace).length, 36);
   assert.equal(f.store.get("om-input:p"), null, "OM keeps its own budget and is not entered after the early allowance is spent");
 });
 
@@ -206,7 +623,7 @@ test("DRV1 stop immediately after its guarded prepare resumes the same saved dra
   let first: EarlyStageOutcome;
   try {
     first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-      maxCalls: 10 }) as EarlyStageOutcome;
+      maxCalls: 10, instruction: instruction("p") }) as EarlyStageOutcome;
   } finally { f.store.writeMany = original; }
   const prepared = f.store.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.stage === "discovery");
   assert.deepEqual([first.end, first.reason?.code, first.budget.callsMade, prepared.length, f.calls(trace).length],
@@ -234,7 +651,7 @@ test(`DRV1 returns supported ${state} as its subject outcome and repeat neither 
   writeFileSync(values, JSON.stringify(fields));
   const expected = state === "conditional" ? "needs_owner" : state;
   const first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-    maxCalls: 100 }) as EarlyStageOutcome;
+    maxCalls: 100, instruction: instruction("p") }) as EarlyStageOutcome;
   assert.deepEqual([first.end, first.stage, first.stageResult?.discovery?.state], [expected, "discovery", state]);
   const calls = f.calls(trace).length, drafts = f.store.list<DiscoveryDraft>("discovery-draft").length;
   const repeated = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
@@ -248,7 +665,7 @@ test("DRV1 one live early executor makes a concurrent start busy; stop inside A 
   const f = fixture(t), { trace, earlyHold, earlyPause } = f.setup("p");
   writeFileSync(earlyHold, "research");
   const driving = f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-    maxCalls: 100 }) as Promise<EarlyStageOutcome>;
+    maxCalls: 100, instruction: instruction("p") }) as Promise<EarlyStageOutcome>;
   await pauseCount(earlyPause, 1);
   const competingStore = new Store(f.database); t.after(() => competingStore.close());
   const competing = await new ProductEngine(competingStore).execute({ type: "early-stage-run", project: "p",
@@ -270,7 +687,7 @@ test(`DRV1 stop inside ${role} blocks every later physical role`, async t => {
   }
   writeFileSync(earlyHold, role);
   const driving = f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-    maxCalls: 100 }) as Promise<EarlyStageOutcome>;
+    maxCalls: 100, instruction: instruction("p") }) as Promise<EarlyStageOutcome>;
   await pauseCount(earlyPause, 1);
   stopFrom(f.database, "p");
   const result = await driving;
@@ -292,7 +709,7 @@ test("DRV1 stop written after one accepted stage blocks the next stage before pr
   let result: EarlyStageOutcome;
   try {
     result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-      maxCalls: 100 }) as EarlyStageOutcome;
+      maxCalls: 100, instruction: instruction("p") }) as EarlyStageOutcome;
   } finally { f.store.writeMany = original; }
   assert.deepEqual([result.end, result.reason?.code], ["stopped", "run_stopped"]);
   assert.equal(f.engine.pipeline.inspect("p", "discovery").state, "accepted");
@@ -330,7 +747,7 @@ test("DRV1 maxCalls counts a durable physical send once and reports its machine 
 test("DRV1 maxTurns is one shared early-stage allowance rather than a fresh allowance per stage", async t => {
   const f = fixture(t); f.setup("p");
   const result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 10,
-    maxCalls: 100 }) as EarlyStageOutcome;
+    maxCalls: 100, instruction: instruction("p") }) as EarlyStageOutcome;
   assert.deepEqual([result.end, result.reason?.code, result.budget.turnsUsed, result.budget.turnsRemaining],
     ["stage_paused", "research_turns_exhausted", 10, 0]);
   assert.equal(f.engine.pipeline.inspect("p", "discovery").state, "accepted",
@@ -343,7 +760,7 @@ test("DRV1 model pause has a machine reason and does not loop inside the same ex
   const fields = JSON.parse(readFileSync(values, "utf8")); fields.modelPause = true;
   writeFileSync(values, JSON.stringify(fields));
   const result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-    maxCalls: 100 }) as EarlyStageOutcome;
+    maxCalls: 100, instruction: instruction("p") }) as EarlyStageOutcome;
   assert.deepEqual([result.end, result.reason?.code, result.budget.callsMade, f.calls(trace).length],
     ["stage_paused", "research_model_paused", 1, 1], JSON.stringify(result));
 });
@@ -352,7 +769,8 @@ test("DRV1 common stop blocks both the driver before prepare and direct research
   const f = fixture(t); f.setup("p");
   const stopped = stopPass(f.store, { project: "p" }); assert.equal(stopped.ok, true);
   const before = f.store.list("discovery-draft").length;
-  const result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 10, maxCalls: 10 }) as EarlyStageOutcome;
+  const result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 10, maxCalls: 10,
+    instruction: instruction("p") }) as EarlyStageOutcome;
   assert.deepEqual([result.end, result.reason?.code, result.budget.callsMade], ["stopped", "run_stopped", 0]);
   assert.equal(f.store.list("discovery-draft").length, before);
 
@@ -375,7 +793,7 @@ test("DRV1 stop after the model claim but before dispatch sends nothing and exac
   let first: EarlyStageOutcome;
   try {
     first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
-      maxCalls: 60 }) as EarlyStageOutcome;
+      maxCalls: 60, instruction: instruction("p") }) as EarlyStageOutcome;
   } finally { f.store.writeMany = original; }
   const refused = f.store.list<any>("model-call");
   assert.deepEqual([first.end, first.reason?.code, first.budget.callsMade, f.calls(trace).length],
@@ -401,7 +819,7 @@ test("DRV1 stop at stdin authorization keeps its typed no-response outcome and e
   let first: EarlyStageOutcome;
   try {
     first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
-      maxCalls: 60 }) as EarlyStageOutcome;
+      maxCalls: 60, instruction: instruction("p") }) as EarlyStageOutcome;
   } finally { f.store.writeMany = original; }
   const call = f.store.list<any>("model-call")[0]!;
   assert.deepEqual([first.end, first.reason?.code, first.budget.callsMade, f.calls(trace).length,
@@ -427,7 +845,7 @@ test("DRV1 stop before B dispatch renews the same candidate only after exact res
   let first: EarlyStageOutcome;
   try {
     first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
-      maxCalls: 60 }) as EarlyStageOutcome;
+      maxCalls: 60, instruction: instruction("p") }) as EarlyStageOutcome;
   } finally { f.store.writeMany = original; }
   const stoppedCall = f.store.list<any>("model-call").find(call => call.value.purpose === "assessor")!;
   const before = f.store.list<any>("assessment-application").find(app => app.value.state === "retryable")!;
@@ -463,7 +881,7 @@ test("DRV1 stop before C dispatch retries the same escalation only after exact r
   let first: EarlyStageOutcome;
   try {
     first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 30,
-      maxCalls: 60 }) as EarlyStageOutcome;
+      maxCalls: 60, instruction: instruction("p") }) as EarlyStageOutcome;
   } finally { f.store.writeMany = original; }
   const before = f.store.list<any>("research-consumer-intent")
     .find(intent => intent.value.kind === "escalation-assessor" && intent.value.state === "refused")!;
@@ -497,7 +915,8 @@ test("DRV1 stopped restoration stays restore-only when another Store resumes at 
     }
     return saved;
   };
-  try { await f.engine.earlyStages.run({ project: "p", maxTurns: 30, maxCalls: 60 }); }
+  try { await f.engine.earlyStages.run({ project: "p", maxTurns: 30, maxCalls: 60,
+    instruction: instruction("p") }); }
   finally { f.store.writeMany = original; }
   assert.ok(stop); const paidCalls = f.calls(trace).length;
   const draft = f.store.list<DiscoveryDraft>("discovery-draft")[0]!;
@@ -545,7 +964,7 @@ for (const paid of [
   let first: EarlyStageOutcome;
   try {
     first = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100,
-      maxCalls: 100 }) as EarlyStageOutcome;
+      maxCalls: 100, instruction: instruction("p") }) as EarlyStageOutcome;
   } finally { f.store.writeMany = original; }
   assert.deepEqual([first.end, first.reason?.code], ["stopped", "run_stopped"]);
   const draft = f.store.list<DiscoveryDraft>("discovery-draft")[0]!;
@@ -581,7 +1000,8 @@ test("DRV1 public stopped entry applies a saved web capture without HTTP or anot
     }
     return saved;
   };
-  try { await f.engine.earlyStages.run({ project: "p", maxTurns: 4, maxCalls: 4 }); }
+  try { await f.engine.earlyStages.run({ project: "p", maxTurns: 4, maxCalls: 4,
+    instruction: instruction("p") }); }
   finally { f.store.writeMany = original; }
   assert.ok(pendingSaved);
   const draft = f.store.list<DiscoveryDraft>("discovery-draft")[0]!;

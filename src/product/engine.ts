@@ -82,7 +82,7 @@ export class ProductEngine {
   readonly checks: StageChecks;
   /** H2.0: the in-memory owner-session registry — its bearer map dies with this engine (and its server). */
   readonly owners: OwnerSessions;
-  constructor(readonly store: Store, private readonly actor = "local-owner") {
+  constructor(readonly store: Store, private readonly actor = "local-caller") {
     this.owners = new OwnerSessions(store);
     this.checks = new StageChecks(store);
     this.discovery = this.checks.discovery; this.graphs = this.checks.graphs; this.pipeline = this.checks.pipeline;
@@ -96,16 +96,20 @@ export class ProductEngine {
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult { return this.checks.validateStage(stage, context); }
   #project(id: string): Revision<Project> { return this.checks.project(id); }
-  prepare(project: string, stage: UpstreamStage): Revision<DiscoveryDraft> {
+  #prepare(project: string, stage: UpstreamStage, entryInputs: Ref[]): Revision<DiscoveryDraft> {
     this.#project(project);
     const prior = predecessor(stage); const inputs: Ref[] = [];
     if (prior) { const status = this.pipeline.inspect(project, prior); requireCondition(status.state === "accepted", "predecessor_not_ready", `${prior} must be accepted`); inputs.push(...status.guards); }
+    requireCondition(stage === "discovery" || entryInputs.length === 0, "research_context_invalid",
+      "Only Discovery accepts the exact early-stage input basis");
+    inputs.push(...entryInputs);
     const consumer = STAGES[STAGES.indexOf(stage) + 1]!;
     return this.discovery.forStage(project, stage, consumer, inputs);
   }
+  prepare(project: string, stage: UpstreamStage): Revision<DiscoveryDraft> { return this.#prepare(project, stage, []); }
   /** DRV1: prepare's one transaction carries the early executor's exact durable control. */
-  prepareEarlyStage(project: string, stage: UpstreamStage, hold: RunControlHold): Revision<DiscoveryDraft> {
-    return new ProductEngine(new RunControlGate(this.store, project, hold).view(), this.actor).prepare(project, stage);
+  prepareEarlyStage(project: string, stage: UpstreamStage, hold: RunControlHold, entryInputs: Ref[] = []): Revision<DiscoveryDraft> {
+    return new ProductEngine(new RunControlGate(this.store, project, hold).view(), this.actor).#prepare(project, stage, entryInputs);
   }
   draft(project: string, stage: UpstreamStage, draftId: string, expected: number): Revision<StageArtifact> {
     this.#project(project);
@@ -253,7 +257,8 @@ export class ProductEngine {
       case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,
         { projectId: command.project, base: command.base, nodes: command.nodes, actor: this.actor }, command.expected, this.environments.effective(command.project).root);
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
-      case "early-stage-run": this.#project(command.project); return this.earlyStages.run(command);
+      case "early-stage-run": return this.earlyStages.run(command);
+      case "revise-early-stage-input": return this.earlyStages.reviseInput(command.project, command.expected, command.instruction);
       case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
       case "model-usage": this.#project(command.project); return modelUsage(this.store, command.project, command.since);
       case "configure-reader-pilot": this.#project(command.project); return configureReaderPilot(this.store, this.environments, command.project, command.settings, command.expected,

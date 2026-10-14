@@ -1,15 +1,17 @@
-import { canonical } from "../canonical.js";
-import type { DiscoveryDraft, Question } from "../discovery/discovery.js";
+import { canonical, digest, type Json } from "../canonical.js";
+import { Discovery, type Decision, type DiscoveryDraft, type Fact, type Question } from "../discovery/discovery.js";
 import { withInvocationAllowanceReport } from "../discovery/invocation-progress.js";
 import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, VERSION4_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
-import { EngineError } from "../errors.js";
-import { isRef, predecessor, reference, STAGES, type Ref, type StageArtifact } from "../pipeline/contracts.js";
-import type { Revision } from "../storage/store.js";
+import { EngineError, requireCondition } from "../errors.js";
+import type { Selector, Source } from "../evidence/evidence.js";
+import { isRef, predecessor, reference, stageId, STAGES, uniqueRefs, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import type { Revision, TransactionGuard, Write } from "../storage/store.js";
+import { storeView } from "../storage/store-view.js";
 import { continuePass, startPass, type PassOutcome } from "../om/run-driver.js";
 import { readRun } from "../om/run.js";
-import { acquireRunExecution, admitRunControl, releaseRunExecution, RunControlLost, type RunExecution } from "../om/run-control.js";
+import { acquireRunExecution, admitRunControl, releaseRunExecution, RunControlGate, RunControlLost, type RunExecution } from "../om/run-control.js";
 import type { Refusal } from "../om/refusal.js";
-import type { StageContent, ProductEngine } from "./engine.js";
+import type { Project, StageContent, ProductEngine } from "./engine.js";
 import type { StageResearchResult } from "./stage-research.js";
 
 export type EarlyStageEnd = "stage_paused" | "needs_owner" | "conditional" | "no_go" | "insufficient_evidence"
@@ -23,15 +25,36 @@ export interface EarlyStageBudget {
 }
 export interface EarlyStageRequest {
   project: string; maxTurns: number; maxCalls: number; draftId?: string; outcomes?: string[];
+  instruction?: EarlyStageInstruction;
+}
+export interface EarlyStageInstruction {
+  title: string; id: string; text: string; media: "text/plain" | "application/json";
+  brief: Selector; objective?: Selector;
 }
 export interface EarlyStageOutcome {
   end: EarlyStageEnd; project: string; stage: UpstreamStage | null; draft: Ref | null; candidates: Ref[];
   stageResult: StageResearchResult | null; reason: EarlyStageReason | null; budget: EarlyStageBudget;
   om: PassOutcome | null;
 }
+export interface EarlyStageInputRevision { binding: Ref; discovery: Ref | null }
 
 interface EarlyResult extends Omit<EarlyStageOutcome, "budget"> { turnsUsed: number; handoff: boolean }
 type Selection = { draft: Revision<DiscoveryDraft> } | { outcome: EarlyResult };
+
+const EARLY_INPUT_CONTRACT = "early-stage-input/v1" as const;
+const EARLY_INPUT_KIND = "early-stage-input";
+const DRIVER_ACTOR = "driver:verbatim" as const;
+interface EarlyStageInput {
+  contract: typeof EARLY_INPUT_CONTRACT; projectId: string; project: Ref; source: Ref; brief: Selector;
+  objective: { kind: "brief" } | { kind: "source"; selector: Selector }; actor: typeof DRIVER_ACTOR;
+}
+interface ResolvedInput {
+  binding: Revision<EarlyStageInput>; project: Revision<Project>; source: Revision<Source>;
+  brief: string; objective: string; refs: Ref[];
+}
+interface PreparedInstruction { instruction: EarlyStageInstruction; brief: string; objective: string }
+
+const inputId = (project: string): string => `early-stage-input:${project}`;
 
 const reason = (code: string, target: string, message: string, field?: string): EarlyStageReason =>
   ({ code, target, message, ...(field ? { field } : {}) });
@@ -41,8 +64,57 @@ const refusalReason = (value: Refusal): EarlyStageReason =>
 export class EarlyStageDriver {
   constructor(private readonly engine: ProductEngine) {}
 
+  reviseInput(project: string, expected: number, instruction: EarlyStageInstruction): EarlyStageInputRevision {
+    this.#prepareInstruction(project, instruction);
+    const store = this.engine.store;
+    const binding = this.#savedBinding(project);
+    requireCondition(binding, "instruction_missing", "The project has no saved early-stage input to revise");
+    const projectRecord = store.get<Project>(binding.value.project.id, binding.value.project.revision);
+    const currentProject = store.get<Project>(binding.value.project.id);
+    requireCondition(projectRecord?.kind === "project" && currentProject
+      && canonical(reference(projectRecord)) === canonical(binding.value.project)
+      && canonical(reference(currentProject)) === canonical(binding.value.project)
+      && projectRecord.value.id === project && projectRecord.value.title === instruction.title,
+    "instruction_stale", "The saved project identity changed and needs its own explicit review");
+    const sourceValue: Source = { projectId: project,
+      origin: { kind: "owner-document", location: instruction.id }, content: instruction.text,
+      mediaType: instruction.media, sha256: digest(instruction.text) };
+    const source = store.get<Source>(`source:${project}:${instruction.id}`);
+    requireCondition(source?.kind === "source" && canonical(source.value) === canonical(sourceValue),
+      "instruction_stale", "The revised input must name the exact current owner Source bytes");
+    const objective = instruction.objective !== undefined
+      ? { kind: "source" as const, selector: instruction.objective } : { kind: "brief" as const };
+    const value: EarlyStageInput = { contract: EARLY_INPUT_CONTRACT, projectId: project,
+      project: reference(currentProject), source: reference(source), brief: instruction.brief, objective, actor: DRIVER_ACTOR };
+    const discoveryId = stageId(project, "discovery"), discovery = store.get<StageArtifact>(discoveryId);
+    if (discovery) requireCondition(discovery.kind === "stage" && discovery.value.projectId === project
+      && discovery.value.stage === "discovery", "artifact_invalid", "The saved Discovery stage is foreign or malformed");
+    if (canonical(binding.value) === canonical(value))
+      return { binding: reference(binding), discovery: discovery ? reference(discovery) : null };
+    requireCondition(binding.revision === expected, "revision_conflict", "Reload the early-stage input before revising it");
+    const writes: Write[] = [{ id: binding.id, kind: EARLY_INPUT_KIND, expected: binding.revision, value }];
+    if (discovery?.value.status === "accepted") writes.push({ id: discovery.id, kind: "stage", expected: discovery.revision,
+      value: { ...discovery.value, status: "draft", proofs: [] } });
+    const guards: TransactionGuard[] = [reference(binding), reference(currentProject), reference(source),
+      discovery ? reference(discovery) : { id: discoveryId, absent: true }];
+    const saved = store.writeMany(writes, guards);
+    const revised = saved.find(row => row.id === binding.id)!;
+    const reopened = saved.find(row => row.id === discoveryId) ?? discovery;
+    return { binding: reference(revised), discovery: reopened ? reference(reopened) : null };
+  }
+
   async run(request: EarlyStageRequest): Promise<EarlyStageOutcome> {
     const { project, maxTurns, maxCalls } = request;
+    let inspected: ResolvedInput | PreparedInstruction | null;
+    try {
+      inspected = this.#inspectInput(request);
+      if (inspected && !("binding" in inspected)) this.#ensureProject(project, inspected);
+    }
+    catch (error) {
+      const early = this.#entryFailure(project, error, 0);
+      return this.#result(project, early.end, early.stage, early.draft, early.candidates, early.stageResult,
+        early.reason, 0, maxTurns, maxCalls, 0, null);
+    }
     const execution = acquireRunExecution(this.engine.store, { project });
     if (!execution.ok) {
       if (execution.refusal.code === "run_stopped") return this.#restoreStopped(request, execution.refusal);
@@ -53,9 +125,12 @@ export class EarlyStageDriver {
     let early: EarlyResult;
     let callsMade = 0, callsRemaining = maxCalls;
     try {
+      const input = this.#initializeInput(request, execution.value as RunExecution, inspected);
       const measured = await withInvocationAllowanceReport(maxCalls,
-        () => this.#driveEarly(request, execution.value as RunExecution));
+        () => this.#driveEarly(request, execution.value as RunExecution, input));
       early = measured.value; callsMade = measured.used; callsRemaining = measured.remaining;
+    } catch (error) {
+      early = this.#entryFailure(project, error, 0);
     } finally {
       releaseRunExecution(this.engine.store, execution.value as RunExecution);
     }
@@ -85,7 +160,8 @@ export class EarlyStageDriver {
     if (!current || current.blocked)
       return this.#result(request.project, "stopped", current?.stage ?? null, current?.draft ?? null, [], null,
         stopped, 0, request.maxTurns, request.maxCalls, 0, null);
-    const selected = this.#savedDraft(request.project, current.stage, current.artifact, request.draftId);
+    const selected = this.#savedDraft(request.project, current.stage, current.artifact, request.draftId,
+      this.#inputRefs(request.project));
     if (!selected.draft)
       return this.#result(request.project, "stopped", current.stage, null, selected.candidates, null,
         stopped, 0, request.maxTurns, request.maxCalls, 0, null);
@@ -95,25 +171,231 @@ export class EarlyStageDriver {
       stopped, 0, request.maxTurns, request.maxCalls, 0, null);
   }
 
+  #selection(text: string, media: Source["mediaType"], selector: unknown): Json {
+    requireCondition(selector !== null && typeof selector === "object" && !Array.isArray(selector),
+      "selector_invalid", "The instruction needs an exact brief or objective selector");
+    const shape = selector as Record<string, unknown>;
+    if (shape['kind'] === "text-range") {
+      const start = shape['start'], end = shape['end'];
+      requireCondition(media === "text/plain" && Number.isSafeInteger(start) && Number.isSafeInteger(end)
+        && (start as number) >= 0 && (end as number) > (start as number) && (end as number) <= text.length,
+      "selector_invalid", "The instruction selector must name a nonempty exact text range");
+      return text.slice(start as number, end as number);
+    }
+    requireCondition(shape['kind'] === "json-pointer" && media === "application/json" && typeof shape['pointer'] === "string"
+      && (shape['pointer'] === "" || shape['pointer'].startsWith("/")),
+    "selector_invalid", "The instruction selector must be a valid JSON pointer for a JSON source");
+    const pointer = shape['pointer'] as string;
+    let value: unknown;
+    try { value = JSON.parse(text); canonical(value); }
+    catch { throw new EngineError("source_invalid", "The instruction JSON source is invalid", { target: "instruction", field: "text" }); }
+    if (pointer) for (const encoded of pointer.slice(1).split("/")) {
+      requireCondition(!/~(?![01])/.test(encoded), "selector_invalid", "The instruction JSON pointer has an invalid escape");
+      const key = encoded.replaceAll("~1", "/").replaceAll("~0", "~");
+      requireCondition(value !== null && typeof value === "object" && Object.hasOwn(value, key),
+        "selector_invalid", "The instruction selector does not identify a source value");
+      value = (value as Record<string, unknown>)[key];
+    }
+    return JSON.parse(canonical(value)) as Json;
+  }
+
+  #prepareInstruction(project: string, instruction: EarlyStageInstruction): PreparedInstruction {
+    requireCondition(instruction && typeof instruction === "object" && typeof instruction.title === "string"
+      && instruction.title.trim().length > 0 && typeof instruction.id === "string"
+      && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(instruction.id) && typeof instruction.text === "string"
+      && instruction.text.trim().length > 0 && Buffer.byteLength(instruction.text) <= 5_000_000
+      && ["text/plain", "application/json"].includes(instruction.media),
+    "instruction_missing", "The early-stage driver needs a verbatim bounded instruction and its source identity");
+    if (instruction.media === "application/json") {
+      try { canonical(JSON.parse(instruction.text)); }
+      catch { throw new EngineError("source_invalid", "The instruction JSON source is invalid", { target: project, field: "instruction.text" }); }
+    }
+    const brief = this.#selection(instruction.text, instruction.media, instruction.brief);
+    const objective = instruction.objective !== undefined
+      ? this.#selection(instruction.text, instruction.media, instruction.objective) : brief;
+    requireCondition(typeof brief === "string" && brief.length > 0 && typeof objective === "string" && objective.length > 0,
+      "selector_invalid", "The brief and objective selectors must each identify verbatim nonempty text");
+    return { instruction, brief, objective };
+  }
+
+  #legacyDiscovery(project: string): boolean {
+    return this.engine.store.get(`stage:${project}:discovery`) !== null
+      || this.engine.store.list<DiscoveryDraft>("discovery-draft")
+        .some(draft => draft.value.projectId === project && draft.value.stage === "discovery");
+  }
+
+  #inputRefs(project: string): Ref[] {
+    const binding = this.engine.store.get<EarlyStageInput>(inputId(project));
+    if (binding?.kind !== EARLY_INPUT_KIND || binding.value?.contract !== EARLY_INPUT_CONTRACT
+      || binding.value.projectId !== project || !isRef(binding.value.project) || !isRef(binding.value.source)) return [];
+    return uniqueRefs([binding.value.project, binding.value.source, reference(binding)]);
+  }
+
+  #savedBinding(project: string): Revision<EarlyStageInput> | null {
+    const binding = this.engine.store.get<EarlyStageInput>(inputId(project));
+    if (!binding) return null;
+    requireCondition(binding.kind === EARLY_INPUT_KIND && binding.value?.contract === EARLY_INPUT_CONTRACT
+      && binding.value.projectId === project && binding.value.actor === DRIVER_ACTOR
+      && isRef(binding.value.project) && isRef(binding.value.source)
+      && binding.value.objective && ["brief", "source"].includes(binding.value.objective.kind),
+    "instruction_binding_invalid", "The saved early-stage input binding is incomplete or foreign");
+    return binding;
+  }
+
+  #readInput(project: string): ResolvedInput | null {
+    const store = this.engine.store, binding = this.#savedBinding(project);
+    if (!binding) return null;
+    const projectRecord = store.get<Project>(binding.value.project.id, binding.value.project.revision);
+    const currentProject = store.get<Project>(binding.value.project.id);
+    requireCondition(projectRecord?.kind === "project" && canonical(reference(projectRecord)) === canonical(binding.value.project)
+      && currentProject && canonical(reference(currentProject)) === canonical(binding.value.project)
+      && projectRecord.value.id === project,
+    "instruction_stale", "The project named by the saved instruction changed and needs explicit review");
+    const source = store.get<Source>(binding.value.source.id, binding.value.source.revision);
+    const currentSource = store.get<Source>(binding.value.source.id);
+    requireCondition(source?.kind === "source" && canonical(reference(source)) === canonical(binding.value.source)
+      && currentSource && canonical(reference(currentSource)) === canonical(binding.value.source)
+      && source.value.projectId === project && source.value.origin.kind === "owner-document",
+    "instruction_stale", "The instruction Source changed and needs explicit review before research continues");
+    let brief: Json, objective: Json;
+    try {
+      const evidence = new Discovery(store).evidence;
+      brief = evidence.observe(project, binding.value.source, binding.value.brief).value;
+      objective = binding.value.objective.kind === "brief" ? brief
+        : evidence.observe(project, binding.value.source, binding.value.objective.selector).value;
+    } catch (error) {
+      if (error instanceof EngineError && ["source_missing", "source_stale"].includes(error.code))
+        throw new EngineError("instruction_stale", "The saved instruction basis changed and needs explicit review",
+          { target: binding.value.source.id, field: "source" });
+      throw new EngineError("instruction_binding_invalid", "The saved instruction selectors cannot be reproduced",
+        { target: binding.id, field: "selector" });
+    }
+    requireCondition(typeof brief === "string" && brief.length > 0 && typeof objective === "string" && objective.length > 0,
+      "instruction_binding_invalid", "The saved instruction no longer derives textual brief and objective values");
+    return { binding, project: projectRecord, source, brief, objective,
+      refs: uniqueRefs([binding.value.project, binding.value.source, reference(binding)]) };
+  }
+
+  #sameInstruction(project: string, prepared: PreparedInstruction, saved: ResolvedInput): void {
+    const source: Source = { projectId: project,
+      origin: { kind: "owner-document", location: prepared.instruction.id }, content: prepared.instruction.text,
+      mediaType: prepared.instruction.media, sha256: digest(prepared.instruction.text) };
+    const objective = prepared.instruction.objective !== undefined
+      ? { kind: "source" as const, selector: prepared.instruction.objective } : { kind: "brief" as const };
+    requireCondition(saved.project.value.title === prepared.instruction.title
+      && canonical(saved.source.value) === canonical(source)
+      && canonical(saved.binding.value.brief) === canonical(prepared.instruction.brief)
+      && canonical(saved.binding.value.objective) === canonical(objective),
+    "instruction_stale", "This run names another instruction; revise the saved input and dependent research explicitly");
+  }
+
+  #inspectInput(request: EarlyStageRequest): ResolvedInput | PreparedInstruction | null {
+    const saved = this.#readInput(request.project);
+    if (saved) {
+      if (request.instruction) this.#sameInstruction(request.project,
+        this.#prepareInstruction(request.project, request.instruction), saved);
+      return saved;
+    }
+    const project = this.engine.store.get<Project>(`project:${request.project}`);
+    // Previous-era drafts and accepted stages keep their producer's rules. IN1
+    // never attaches present-day authorship to an already started history.
+    if (project && this.#legacyDiscovery(request.project)) return null;
+    requireCondition(request.instruction, "instruction_missing",
+      "A verbatim instruction is required before the driver creates its first Discovery draft");
+    const prepared = this.#prepareInstruction(request.project, request.instruction);
+    if (project) requireCondition(project.kind === "project" && project.value.id === request.project
+      && project.value.title === prepared.instruction.title,
+    "instruction_stale", "The existing project title differs from this instruction and needs explicit review");
+    return prepared;
+  }
+
+  #ensureProject(projectId: string, prepared: PreparedInstruction): Revision<Project> {
+    let project = this.engine.store.get<Project>(`project:${projectId}`);
+    if (!project) {
+      try { project = this.engine.store.write<Project>({ id: `project:${projectId}`, kind: "project", expected: 0,
+        value: { id: projectId, title: prepared.instruction.title } }); }
+      catch (error) {
+        if (!(error instanceof EngineError && error.code === "revision_conflict")) throw error;
+        project = this.engine.store.get<Project>(`project:${projectId}`);
+      }
+    }
+    requireCondition(project?.kind === "project" && project.value.id === projectId
+      && project.value.title === prepared.instruction.title,
+    "instruction_stale", "The project address already names another assignment title");
+    return project;
+  }
+
+  #initializeInput(request: EarlyStageRequest, execution: RunExecution,
+    inspected: ResolvedInput | PreparedInstruction | null): ResolvedInput | null {
+    if (!inspected) return null;
+    if ("binding" in inspected) {
+      const refreshed = this.#inspectInput(request);
+      requireCondition(refreshed && "binding" in refreshed, "instruction_stale",
+        "The saved instruction changed before the driver acquired execution");
+      return refreshed;
+    }
+    const { instruction } = inspected, gate = new RunControlGate(this.engine.store, request.project, execution.hold);
+    const controlled = gate.view();
+    let project = this.engine.store.get<Project>(`project:${request.project}`);
+    requireCondition(project?.kind === "project" && project.value.id === request.project
+      && project.value.title === instruction.title,
+    "instruction_stale", "The project changed before its instruction could be saved");
+    const sourceValue: Source = { projectId: request.project,
+      origin: { kind: "owner-document", location: instruction.id }, content: instruction.text,
+      mediaType: instruction.media, sha256: digest(instruction.text) };
+    const sourceId = `source:${request.project}:${instruction.id}`;
+    let source = this.engine.store.get<Source>(sourceId);
+    if (!source) {
+      const sourceStore = storeView(controlled, { write: (writes, guards) =>
+        controlled.writeMany(writes, [...guards, reference(project!)]) });
+      try { source = new Discovery(sourceStore).evidence.document(request.project, instruction.id,
+        instruction.text, instruction.media, 0); }
+      catch (error) {
+        if (!(error instanceof EngineError && error.code === "revision_conflict")) throw error;
+        source = this.engine.store.get<Source>(sourceId);
+      }
+    }
+    requireCondition(source?.kind === "source" && canonical(source.value) === canonical(sourceValue),
+      "instruction_stale", "The instruction Source address already names different bytes");
+    const objective = instruction.objective !== undefined
+      ? { kind: "source" as const, selector: instruction.objective } : { kind: "brief" as const };
+    const value: EarlyStageInput = { contract: EARLY_INPUT_CONTRACT, projectId: request.project,
+      project: reference(project), source: reference(source), brief: instruction.brief, objective, actor: DRIVER_ACTOR };
+    let binding = this.engine.store.get<EarlyStageInput>(inputId(request.project));
+    if (!binding) {
+      try { binding = controlled.writeMany<EarlyStageInput>([{ id: inputId(request.project), kind: EARLY_INPUT_KIND,
+        expected: 0, value }], [reference(project), reference(source)])[0]!; }
+      catch (error) {
+        if (!(error instanceof EngineError && error.code === "revision_conflict")) throw error;
+        binding = this.engine.store.get<EarlyStageInput>(inputId(request.project));
+      }
+    }
+    requireCondition(binding?.kind === EARLY_INPUT_KIND && canonical(binding.value) === canonical(value),
+      "instruction_stale", "Another instruction won before this input could be saved");
+    const resolved = this.#readInput(request.project);
+    requireCondition(resolved, "instruction_binding_invalid", "The saved instruction cannot be read back");
+    this.#sameInstruction(request.project, inspected, resolved);
+    return resolved;
+  }
+
   #savedDraft(project: string, stage: UpstreamStage, artifact: Revision<StageArtifact> | null,
-    explicit: string | undefined): { draft: Revision<DiscoveryDraft> | null; candidates: Ref[] } {
-    const bound = artifact?.value.content as unknown as Partial<StageContent> | undefined;
-    const boundDraft = isRef(bound?.draft) ? bound.draft : null;
+    explicit: string | undefined, entryRefs: Ref[]): { draft: Revision<DiscoveryDraft> | null; candidates: Ref[] } {
+    const boundDraft = this.#activeStageDraft(project, stage, artifact, entryRefs);
     if (explicit && boundDraft && explicit !== boundDraft.id) return { draft: null, candidates: [] };
     const named = explicit ?? boundDraft?.id;
     if (named) {
       const draft = this.engine.store.get<DiscoveryDraft>(named);
-      return !this.#draftRefusal(project, stage, draft) ? { draft: draft!, candidates: [] }
+      return !this.#draftRefusal(project, stage, draft, entryRefs) ? { draft: draft!, candidates: [] }
         : { draft: null, candidates: [] };
     }
     const valid = this.engine.store.list<DiscoveryDraft>("discovery-draft")
       .filter(draft => draft.value.projectId === project && draft.value.stage === stage && draft.value.level === "R0"
-        && !this.#draftRefusal(project, stage, draft));
+        && !this.#draftRefusal(project, stage, draft, entryRefs));
     return valid.length === 1 ? { draft: valid[0]!, candidates: [] }
       : { draft: null, candidates: valid.map(reference) };
   }
 
-  async #driveEarly(request: EarlyStageRequest, execution: RunExecution): Promise<EarlyResult> {
+  async #driveEarly(request: EarlyStageRequest, execution: RunExecution, input: ResolvedInput | null): Promise<EarlyResult> {
     let turnsUsed = 0, explicit = request.draftId;
     for (;;) {
       try { admitRunControl(this.engine.store, request.project, execution.hold); }
@@ -127,10 +409,14 @@ export class EarlyStageDriver {
         [], null, reason("research_turns_exhausted", current.stage, "The shared early research turn allowance is exhausted")),
         turnsUsed, handoff: false };
 
-      const selected = this.#selectDraft(request.project, current.stage, current.artifact, explicit, execution);
+      const selected = this.#selectDraft(request.project, current.stage, current.artifact, explicit, execution, input);
       explicit = undefined;
       if ("outcome" in selected) return { ...selected.outcome, turnsUsed, handoff: false };
       const draft = selected.draft;
+      if (current.stage === "discovery" && input) {
+        try { this.#ensureInputAnswers(draft, input, execution); }
+        catch (error) { return this.#entryFailure(request.project, error, turnsUsed); }
+      }
       let stageResult: StageResearchResult;
       try {
         stageResult = await this.engine.stageResearch.run(request.project, draft.id, request.maxTurns - turnsUsed);
@@ -148,6 +434,60 @@ export class EarlyStageDriver {
           "The shared early research turn allowance is exhausted; consumer feedback is preserved");
       return { ...outcome, turnsUsed, handoff: false };
     }
+  }
+
+  #ensureInputAnswers(selected: Revision<DiscoveryDraft>, input: ResolvedInput, execution: RunExecution): void {
+    const store = this.engine.store, gate = new RunControlGate(store, selected.value.projectId, execution.hold);
+    const discovery = new Discovery(gate.view());
+    const answer = (field: "brief" | "objective"): void => {
+      const draft = store.get<DiscoveryDraft>(selected.id);
+      requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === input.binding.value.projectId
+        && canonical(draft.value.inputs) === canonical(input.refs),
+      "instruction_stale", "The Discovery draft moved away from its exact instruction basis");
+      const matches = draft.value.questions.map(id => store.get<Question>(id))
+        .filter(question => question?.kind === "question" && question.value.spec.field === field);
+      requireCondition(matches.length === 1, "instruction_binding_invalid",
+        `The Discovery input needs exactly one ${field} question`);
+      const question = matches[0]!;
+      if (question.value.status === "open") {
+        if (field === "brief") discovery.fact(question.id, question.revision, reference(input.source), input.binding.value.brief);
+        else discovery.decision(question.id, question.revision, DRIVER_ACTOR, input.objective);
+      } else requireCondition(question.value.status === "answered", "instruction_answer_stale",
+        `The ${field} question is not open or answered`);
+      const currentDraft = store.get<DiscoveryDraft>(draft.id)!, currentQuestion = store.get<Question>(question.id)!;
+      requireCondition(currentQuestion.value.status === "answered" && isRef(currentQuestion.value.answer),
+        "instruction_answer_stale", `The ${field} answer was not saved`);
+      const saved = store.get<Decision | Fact>(currentQuestion.value.answer.id, currentQuestion.value.answer.revision);
+      requireCondition(saved && canonical(reference(saved)) === canonical(currentQuestion.value.answer)
+        && saved.value.projectId === input.binding.value.projectId && saved.value.question === currentQuestion.id,
+      "instruction_answer_stale", `The ${field} answer belongs to another input`);
+      if (field === "brief") {
+        const expected = new Discovery(store).evidence.observe(input.binding.value.projectId,
+          reference(input.source), input.binding.value.brief);
+        requireCondition(saved.kind === "fact" && canonical((saved.value as Fact).observation) === canonical(expected),
+          "instruction_answer_stale", "The brief is not the exact selected instruction text");
+      } else requireCondition(saved.kind === "decision" && (saved.value as Decision).actor === DRIVER_ACTOR
+        && canonical((saved.value as Decision).value) === canonical(input.objective),
+      "instruction_answer_stale", "The objective was not copied verbatim by the driver");
+      requireCondition(canonical(currentDraft.value.fields[field]) === canonical(field === "brief" ? input.brief : input.objective),
+        "instruction_answer_stale", `The ${field} answer differs from its draft field`);
+    };
+    answer("brief");
+    answer("objective");
+  }
+
+  #entryFailure(project: string, error: unknown, turnsUsed: number): EarlyResult {
+    if (error instanceof RunControlLost || error instanceof EngineError
+      && ["run_stopped", "run_control_changed", "run_busy"].includes(error.code))
+      return this.#controlOutcome(project, error, turnsUsed);
+    if (error instanceof EngineError) {
+      const details = error.details && typeof error.details === "object" ? error.details as Record<string, unknown> : null;
+      const target = typeof details?.['target'] === "string" ? details['target'] : project;
+      const field = typeof details?.['field'] === "string" ? details['field'] : undefined;
+      return { ...this.#base(project, "blocked", null, null, [], null,
+        reason(error.code, target, error.message, field)), turnsUsed, handoff: false };
+    }
+    throw error;
   }
 
   #currentStage(project: string): { stage: UpstreamStage; artifact: Revision<StageArtifact> | null; draft: Ref | null;
@@ -169,17 +509,16 @@ export class EarlyStageDriver {
   }
 
   #selectDraft(project: string, stage: UpstreamStage, artifact: Revision<StageArtifact> | null,
-    explicit: string | undefined, execution: RunExecution): Selection {
-    const bound = artifact?.value.content as unknown as Partial<StageContent> | undefined;
-    const boundDraft = isRef(bound?.draft) ? bound.draft : null;
-    const boundId = boundDraft?.id ?? null;
-    if (explicit && boundId && explicit !== boundId)
+    explicit: string | undefined, execution: RunExecution, input: ResolvedInput | null): Selection {
+    const entryRefs = input?.refs ?? [];
+    const boundDraft = this.#activeStageDraft(project, stage, artifact, entryRefs);
+    if (explicit && boundDraft && explicit !== boundDraft.id)
       return { outcome: { ...this.#base(project, "blocked", stage, boundDraft, [], null,
         reason("early_draft_conflict", explicit, "The stage already names another saved draft", "draftId")), turnsUsed: 0, handoff: false } };
-    const named = explicit ?? boundId;
+    const named = explicit ?? boundDraft?.id;
     if (named) {
       const draft = this.engine.store.get<DiscoveryDraft>(named);
-      const invalid = this.#draftRefusal(project, stage, draft);
+      const invalid = this.#draftRefusal(project, stage, draft, entryRefs);
       return invalid
         ? { outcome: { ...this.#base(project, "blocked", stage, draft ? reference(draft) : null, [], null, invalid), turnsUsed: 0, handoff: false } }
         : { draft: draft! };
@@ -189,14 +528,17 @@ export class EarlyStageDriver {
       .filter(row => row.value.projectId === project && row.value.stage === stage && row.value.level === "R0");
     const valid: Revision<DiscoveryDraft>[] = [], invalid: EarlyStageReason[] = [];
     for (const draft of rows) {
-      const refusal = this.#draftRefusal(project, stage, draft);
-      if (refusal) invalid.push(refusal); else valid.push(draft);
+      const refusal = this.#draftRefusal(project, stage, draft, entryRefs);
+      if (refusal && !(refusal.code === "early_draft_stale"
+        && this.#supersededInputDraft(project, entryRefs, draft))) invalid.push(refusal);
+      else if (!refusal) valid.push(draft);
     }
     if (valid.length > 1) return { outcome: { ...this.#base(project, "select_draft", stage, null, valid.map(reference), null,
       reason("early_draft_ambiguous", stage, "Several compatible drafts require an explicit draftId", "draftId")), turnsUsed: 0, handoff: false } };
     if (valid.length === 1) return { draft: valid[0]! };
     if (invalid.length) return { outcome: { ...this.#base(project, "blocked", stage, null, valid.map(reference), null, invalid[0]!), turnsUsed: 0, handoff: false } };
-    try { return { draft: this.engine.prepareEarlyStage(project, stage, execution.hold) }; }
+    try { return { draft: this.engine.prepareEarlyStage(project, stage, execution.hold,
+      stage === "discovery" ? entryRefs : []) }; }
     catch (error) {
       if (error instanceof RunControlLost) return { outcome: this.#controlOutcome(project, error, 0) };
       if (error instanceof EngineError) return { outcome: { ...this.#base(project, "blocked", stage, null, [], null,
@@ -205,12 +547,40 @@ export class EarlyStageDriver {
     }
   }
 
-  #draftRefusal(project: string, stage: UpstreamStage, draft: Revision<DiscoveryDraft> | null): EarlyStageReason | null {
+  #activeStageDraft(project: string, stage: UpstreamStage, artifact: Revision<StageArtifact> | null,
+    entryRefs: Ref[]): Ref | null {
+    const content = artifact?.value.content as unknown as Partial<StageContent> | undefined;
+    const recorded = isRef(content?.draft) ? content.draft : null;
+    if (!recorded || stage !== "discovery") return recorded;
+    const draft = this.engine.store.get<DiscoveryDraft>(recorded.id);
+    return draft && this.#supersededInputDraft(project, entryRefs, draft) ? null : recorded;
+  }
+
+  #supersededInputDraft(project: string, entryRefs: Ref[], draft: Revision<DiscoveryDraft>): boolean {
+    if (draft.value.stage !== "discovery") return false;
+    const currentRef = entryRefs.find(ref => ref.id === inputId(project));
+    if (!currentRef || currentRef.revision <= 1) return false;
+    const current = this.engine.store.get<EarlyStageInput>(currentRef.id, currentRef.revision);
+    if (!current || current.kind !== EARLY_INPUT_KIND || canonical(reference(current)) !== canonical(currentRef)
+      || current.value.contract !== EARLY_INPUT_CONTRACT || current.value.projectId !== project
+      || current.value.actor !== DRIVER_ACTOR || !isRef(current.value.project) || !isRef(current.value.source)) return false;
+    const priorRef = draft.value.inputs.find(ref => ref.id === current.id);
+    if (!priorRef || priorRef.revision >= current.revision) return false;
+    const prior = this.engine.store.get<EarlyStageInput>(priorRef.id, priorRef.revision);
+    if (!prior || prior.kind !== EARLY_INPUT_KIND || canonical(reference(prior)) !== canonical(priorRef)
+      || prior.value.contract !== EARLY_INPUT_CONTRACT || prior.value.projectId !== project
+      || prior.value.actor !== DRIVER_ACTOR || !isRef(prior.value.project) || !isRef(prior.value.source)
+      || canonical(prior.value.project) !== canonical(current.value.project)) return false;
+    return canonical(draft.value.inputs) === canonical(uniqueRefs([prior.value.project, prior.value.source, reference(prior)]));
+  }
+
+  #draftRefusal(project: string, stage: UpstreamStage, draft: Revision<DiscoveryDraft> | null,
+    entryRefs: Ref[]): EarlyStageReason | null {
     if (!draft || draft.kind !== "discovery-draft" || draft.value.projectId !== project || draft.value.stage !== stage
       || draft.value.level !== "R0" || draft.value.consumer !== STAGES[STAGES.indexOf(stage) + 1])
       return reason("early_draft_foreign", draft?.id ?? stage, "The selected draft does not belong to this project stage", "draftId");
     const prior = predecessor(stage);
-    const required = prior ? this.engine.pipeline.inspect(project, prior).guards : [];
+    const required = prior ? this.engine.pipeline.inspect(project, prior).guards : entryRefs;
     if (canonical(draft.value.inputs) !== canonical(required))
       return reason("early_draft_stale", draft.id, "The saved draft does not name the current prerequisite basis", "inputs");
     const specs = draft.value.contractVersion === 4 ? VERSION4_REQUIREMENTS[stage]

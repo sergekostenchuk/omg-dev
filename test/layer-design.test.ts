@@ -66,7 +66,7 @@ test("two products build L2 then L3 through commands from assessed designs, pres
       assert.ok(built.value.nodes.some(node => node.kind === (level === 2 ? "operation" : "work")));
       if (level === 2) assert.ok(built.value.nodes.every(node => node.kind !== "work"));
       assert.deepEqual(engine.graphs.gate(project).findings, []);
-      assert.deepEqual(engine.refinement.buildLayer(project, level, reference(answered), built.revision, "local-owner"), built);
+      assert.deepEqual(engine.refinement.buildLayer(project, level, reference(answered), built.revision, "local-caller"), built);
       engine.refinement.sealLayer(project, level, 0);
     }
     assert.deepEqual(store.get<Graph>(initial.id, initial.revision)!.value, initial.value);

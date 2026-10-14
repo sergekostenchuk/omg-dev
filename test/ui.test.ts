@@ -7,7 +7,9 @@ import { chromium } from "playwright";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { createProductServer } from "../src/server.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
+import { answerDiscoveryFixture, preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { preparedField } from "./preparation-fixture.js";
 import { git } from "../src/runtime/environment.js";
 import { reference } from "../src/pipeline/contracts.js";
 
@@ -33,6 +35,17 @@ test("browser completes source→discovery→acceptance, survives reload and fit
   await page.getByRole("button", { name: "Проверить по источнику", exact: true }).click();
   await page.getByLabel("Ваше решение", { exact: true }).fill("Планировать посадки без потери заметок");
   await page.getByRole("button", { name: "Принять решение", exact: true }).click();
+  const project = store.list<{ id: string }>("project")[0]!.value.id;
+  const discovery = store.list<DiscoveryDraft>("discovery-draft").find(row => row.value.projectId === project
+    && row.value.stage === "discovery")!;
+  const source = store.list<{ projectId: string; content: string }>("source")
+    .find(row => row.value.projectId === project)!;
+  for (const id of discovery.value.questions) {
+    const question = store.get<Question>(id)!;
+    if (question.value.spec.kind === "design") answerDiscoveryFixture(engine, project,
+      store.get<DiscoveryDraft>(discovery.id)!, question, preparedField(project, question.value.spec.field), source);
+  }
+  await page.getByRole("button", { name: "Обновить", exact: true }).click();
   await page.getByRole("button", { name: "Собрать результат стадии", exact: true }).click();
   await page.getByRole("button", { name: "Принять результат", exact: true }).click();
   await page.getByRole("status").filter({ hasText: "Результат принят" }).waitFor();
@@ -72,6 +85,51 @@ test("browser completes source→discovery→acceptance, survives reload and fit
   await page.getByRole("heading", { name: "Концепция", exact: true }).waitFor();
   await page.screenshot({ path: join(output, "mobile.png"), fullPage: true });
   assert.deepEqual(errors, []);
+});
+
+test("browser labels fact, owner decision and model design by provenance and offers no manual design answer", { timeout: 60_000 }, async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-in1-ui-")), store = new Store(join(root, "state.sqlite"));
+  const engine = new ProductEngine(store); engine.execute({ type: "create-project", project: "p", title: "Input labels" });
+  const source = engine.discovery.evidence.document("p", "instruction", "Build the requested product", "text/plain", 0);
+  const discovery = engine.prepare("p", "discovery");
+  const questions = discovery.value.questions.map(id => store.get<Question>(id)!);
+  const brief = questions.find(row => row.value.spec.field === "brief")!;
+  const objective = questions.find(row => row.value.spec.field === "objective")!;
+  const researchPlan = questions.find(row => row.value.spec.field === "researchPlan")!;
+  engine.discovery.fact(brief.id, brief.revision, reference(source),
+    { kind: "text-range", start: 0, end: source.value.content.length });
+  engine.discovery.decision(objective.id, objective.revision, "local-caller", "Build the requested product");
+  answerDiscoveryFixture(engine, "p", store.get<DiscoveryDraft>(discovery.id)!, researchPlan,
+    preparedField("p", "researchPlan"), source);
+  const plain = engine.discovery.create("p", "concept", "R0", "operation-map", [
+    { field: "plainProposal", kind: "design", prompt: "Saved plain proposal", risk: "Proposal missing",
+      schema: { type: "string", minLength: 1 } },
+    { field: "pendingProposal", kind: "design", prompt: "Pending model proposal", risk: "Proposal missing",
+      schema: { type: "string", minLength: 1 } },
+  ]);
+  const plainQuestion = store.get<Question>(plain.value.questions[0]!)!;
+  engine.discovery.decision(plainQuestion.id, plainQuestion.revision, "local-caller", "A project proposal");
+  const server = createProductServer(engine);
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const browser = await chromium.launch({ channel: "chrome", headless: true });
+  t.after(async () => { await browser.close(); await new Promise<void>(resolve => server.close(() => resolve()));
+    store.close(); rmSync(root, { recursive: true, force: true }); });
+  const page = await browser.newPage();
+  await page.goto(`http://127.0.0.1:${(server.address() as { port: number }).port}/#token=${server.accessToken}`);
+  await page.getByRole("tab", { name: "Исследования", exact: true }).click();
+  const article = (prompt: string) => page.locator("article.question").filter({ hasText: prompt }).first();
+  assert.match(await article(brief.value.spec.prompt).locator(".eyebrow").innerText(), /ПОДТВЕРЖДАЕМЫЙ ФАКТ/);
+  assert.match(await article(objective.value.spec.prompt).locator(".eyebrow").innerText(), /РЕШЕНИЕ ВЛАДЕЛЬЦА/);
+  assert.match(await article(researchPlan.value.spec.prompt).locator(".eyebrow").innerText(), /ПРЕДЛОЖЕНИЕ МОДЕЛИ/);
+  assert.match(await article(researchPlan.value.spec.prompt).innerText(), /Принято по независимой оценке исследования\./);
+  assert.match(await article("Saved plain proposal").innerText(), /Зафиксировано проектное предложение\./);
+  assert.match(await article("Saved plain proposal").locator(".eyebrow").innerText(), /ПРОЕКТНОЕ ПРЕДЛОЖЕНИЕ/);
+  assert.doesNotMatch(await article("Saved plain proposal").locator(".eyebrow").innerText(), /МОДЕЛИ/);
+  const pending = article("Pending model proposal");
+  assert.match(await pending.locator(".eyebrow").innerText(), /ПРЕДЛОЖЕНИЕ МОДЕЛИ/);
+  assert.match(await pending.innerText(), /Ответ даёт исследование стадии\./);
+  assert.equal(await pending.locator("form").count(), 0);
+  assert.equal(await pending.getByRole("button", { name: "Проверить по источнику" }).count(), 0);
 });
 
 test("browser compiles the accepted map and reloads the generated task dependencies", { timeout: 60_000 }, async t => {

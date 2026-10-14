@@ -11,6 +11,7 @@ import { readerPilotSchema, type ReaderPilotSettings } from "../discovery/reader
 import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
 import { obligationPolicySchema, type ObligationPolicy } from '../graph/obligation-policy.js';
 import type { AdapterLineageDeclaration } from '../adapters/adapter-lineage.js';
+import type { EarlyStageInstruction } from './early-stage-driver.js';
 
 export type ProductCommand =
   | {type:"recover-legacy-operation";project:string;operation:Ref;token:string}
@@ -34,7 +35,9 @@ export type ProductCommand =
   | { type: "om-regate"; project: string }
   | { type: "set-map-status"; project: string; expected: number; base: Ref; nodes: MapStatusDelta['nodes'] }
   | { type: "research-stage"; project: string; draftId: string; maxTurns: number }
-  | { type: "early-stage-run"; project: string; maxTurns: number; maxCalls: number; draftId?: string; outcomes?: string[] }
+  | { type: "early-stage-run"; project: string; maxTurns: number; maxCalls: number; draftId?: string; outcomes?: string[];
+      instruction?: EarlyStageInstruction }
+  | { type: "revise-early-stage-input"; project: string; expected: number; instruction: EarlyStageInstruction }
   | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
   | { type: "model-usage"; project: string; since: number }
   | { type: "configure-reader-pilot"; project: string; expected: number; settings: ReaderPilotSettings }
@@ -104,10 +107,20 @@ const omContinue = command("om-continue", { project });
 omContinue.properties['resumeStop'] = text;
 // RL3 (№4218): the owner's explicit release of the wait on the policies their reopening asked — the pass then decides them by OWN1.
 omContinue.properties['release'] = { const: "regate_owner_policy" };
+const selector = { oneOf: [
+  object({ kind: { const: "json-pointer" }, pointer: { type: "string" } }),
+  object({ kind: { const: "text-range" }, start: expected, end: { type: "integer", minimum: 1 } }),
+] };
+const instruction = object({ title: string, id: project,
+  text: { type: "string", minLength: 1, maxLength: 5_000_000 }, media: { enum: ["text/plain", "application/json"] },
+  brief: selector });
+instruction.properties['objective'] = selector;
 const earlyStageRun = command("early-stage-run", { project,
   maxTurns: { type: "integer", minimum: 1, maximum: 100 }, maxCalls: { type: "integer", minimum: 1, maximum: 100 } });
 earlyStageRun.properties['draftId'] = string;
 earlyStageRun.properties['outcomes'] = { type: "array", minItems: 1, items: text };
+earlyStageRun.properties['instruction'] = instruction;
+const reviseEarlyStageInput = command("revise-early-stage-input", { project, expected, instruction });
 const schema = { oneOf: [
   omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("om-decisions", { project }),
@@ -130,7 +143,7 @@ const schema = { oneOf: [
     code: { type: "array", items: object({ path: string, access: { enum: ["read", "write"] }, status: { const: "existing" } }) },
   }) } }),
   command("research-stage", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
-  earlyStageRun,
+  earlyStageRun, reviseEarlyStageInput,
   command("research-phase", { project, phase: { enum: ["R1", "R2", "L2", "L3"] }, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("model-usage", { project, since: expected }),
   command("configure-reader-pilot", { project, expected, settings: readerPilotSchema }),
@@ -158,10 +171,7 @@ const schema = { oneOf: [
   command("source-file", { project, id: project, path: string, media: { enum: ["text/plain", "application/json"] }, expected }),
   command("answer-decision", { question: string, expected, value: {} }),
   command("answer-decision", { mode: { const: "discovery-condition" }, project, draft: string, verdictRef: ref, conditionId: string, optionId: string }),
-  command("answer-fact", { question: string, expected, source: ref, selector: { oneOf: [
-    object({ kind: { const: "json-pointer" }, pointer: { type: "string" } }),
-    object({ kind: { const: "text-range" }, start: expected, end: { type: "integer", minimum: 1 } }),
-  ] } }),
+  command("answer-fact", { question: string, expected, source: ref, selector }),
   command("reopen-question", { question: string, expected }),
   command("save-graph", { project, expected, graph: { type: "object" } }),
   command("build-map", { project, draftId: string, expected }),
