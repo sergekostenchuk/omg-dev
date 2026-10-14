@@ -1,3 +1,4 @@
+import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchFailure, earlyResearchCorrection, requireAssessmentReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { Evidence } from '../evidence/evidence.js';
 import type { ModelCall } from '../runtime/model-usage.js';
@@ -98,7 +99,9 @@ function advanceAssessment(store: Store, draft: Revision<DiscoveryDraft>, questi
 
 const APPLICATION = 'assessment-application/v1' as const;
 const PAID_ORIGIN = 'assessment-paid-origin/v1' as const;
+const NEIGHBOR_ORIGIN = 'assessment-paid-origin/v2' as const;
 export interface AssessmentPaidOriginInput {
+  materialContract?: typeof STAGE_NEIGHBOR_CONTEXT;
   pending: Ref;
   root: string;
   graph: Ref | null;
@@ -109,7 +112,7 @@ export interface AssessmentPaidOriginInput {
   runtimeAdmission: RuntimeAdmission;
 }
 export interface AssessmentPaidOrigin extends AssessmentPaidOriginInput {
-  contract: typeof PAID_ORIGIN;
+  contract: typeof PAID_ORIGIN | typeof NEIGHBOR_ORIGIN;
   projectId: string;
   session: string;
   application: string;
@@ -281,7 +284,7 @@ export function readAssessmentPaidOrigin(store: Store, projectId: string, pendin
   if (record.kind !== 'assessment-paid-origin' || record.revision !== 1 || !object(value)
     || record.hash !== hashJson(value)
     || Object.keys(value).sort().join(',') !== fields.sort().join(',')
-    || value.contract !== PAID_ORIGIN || value.projectId !== projectId || value.session !== sessionId
+    || ![PAID_ORIGIN, NEIGHBOR_ORIGIN].includes(value.contract) || value.projectId !== projectId || value.session !== sessionId
     || value.application !== applicationId(sessionId, 1)
     || !same(value.pending, pending) || !isRef(value.draft) || !isRef(value.question) || !isRef(value.environment)
     || !Array.isArray(value.inputs) || !value.inputs.every(isRef)
@@ -298,6 +301,8 @@ export function readAssessmentPaidOrigin(store: Store, projectId: string, pendin
     || !(value.profile === null || isRef(value.profile)) || !Array.isArray(value.guards)
     || !same(value.guards, uniqueTransactionGuards(value.guards)))
     applicationInvalid(id, 'Malformed immutable paid assessment origin');
+  if (value.contract === NEIGHBOR_ORIGIN && value.context.assessmentContextContract !== STAGE_NEIGHBOR_CONTEXT)
+    applicationInvalid(id, 'The new paid origin lost its explicit stage material contract');
   exact(store, pending, 'research-turn');
   exact(store, value.draft, 'discovery-draft');
   const originalQuestion = exact<Question>(store, value.question, 'question');
@@ -539,7 +544,7 @@ function applicationWrite(session: Write, context: Record<string, any>, prompt: 
 function paidOriginWrite(store: Store, id: string, input: AssessmentPaidOriginInput, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   environment: Revision<Environment>, context: Record<string, any>, prompt: string, dispatch: Environment,
   profile: Ref | null, guards: TransactionGuard[]): Write {
-  const value: AssessmentPaidOrigin = { contract: PAID_ORIGIN, projectId: draft.value.projectId, session: id,
+  const value: AssessmentPaidOrigin = { contract: input.materialContract === STAGE_NEIGHBOR_CONTEXT ? NEIGHBOR_ORIGIN : PAID_ORIGIN, projectId: draft.value.projectId, session: id,
     application: applicationId(id, 1),
     pending: input.pending, root: input.root, graph: input.graph, legacyPaths: JSON.parse(canonical(input.legacyPaths)),
     reads: JSON.parse(canonical(input.reads)), runtime: JSON.parse(canonical(input.runtime)),
@@ -638,6 +643,37 @@ function renewApplication(store: Store, record: Revision<Application>, session: 
   const renewed: Write = { id: record.id, kind: record.kind, expected: record.revision, value: { ...app, state: 'renewed', after: pendingRef(next) } };
   store.writeMany([next, renewed, applicationWrite(next, context, prompt, dispatch.reviewer, dispatch, profile, admitted, pendingRef(renewed), app.origin)],
     uniqueTransactionGuards([reference(record), reference(session), ...admitted, ...(physical ? [reference(physical.call)] : [])]));
+}
+
+type DirectAssessmentMaterials = { context: Record<string, any>; prompt: string; guards: TransactionGuard[] };
+
+/** A direct caller has no paid-origin. Its existing application owns the material era and original context. */
+export function readDirectAssessmentMaterials(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
+  environment: Revision<Environment>, basis: Record<string, any>, legacyPrompt: string): DirectAssessmentMaterials | null {
+  const legacyId = `assessment-session:${hashJson([reference(question), reference(environment), draft.value.inputs, basis])}`;
+  const legacy = store.get<Session>(legacyId);
+  if (legacy && !assessmentSessionEra(legacy) && !legacy.value.result)
+    return { context: basis, prompt: legacyPrompt, guards: [reference(draft)] };
+  const matches = store.list<ApplicationSession>('assessment-session').filter(session => {
+    const binding = session.value.binding;
+    return session.id.startsWith('assessment-session:v1:') && isRef(binding?.draft) && binding.draft.id === draft.id
+      && same(binding.question, reference(question)) && same(binding.environment, reference(environment))
+      && same(binding.inputs, draft.value.inputs);
+  }).flatMap<DirectAssessmentMaterials>(session => {
+    const app = readApplication(store, session).value;
+    // Only an unfinished attempt can select the recovery branch. Completed
+    // applications are selected by the caller's full current context instead.
+    if (app.state === 'applied') return [];
+    const { assessmentContextContract, stageNeighbors: _neighbors, ...original } = app.context;
+    if (!same(original, basis)) return [];
+    if (assessmentContextContract !== undefined && assessmentContextContract !== STAGE_NEIGHBOR_CONTEXT)
+      applicationInvalid(session.id, 'The direct producer names an unknown assessment material contract');
+    if (assessmentContextContract === STAGE_NEIGHBOR_CONTEXT && !object(app.context.stageNeighbors))
+      applicationInvalid(session.id, 'The direct producer lost its declared neighbor material');
+    return [{ context: app.context, prompt: app.prompt, guards: app.guards }];
+  });
+  if (matches.length > 1) applicationInvalid(question.id, 'Several direct sessions claim this exact question, candidate and basis');
+  return matches[0] ?? null;
 }
 
 async function assessmentSessionInternal(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,

@@ -1,3 +1,4 @@
+import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from './requirements.js';
 import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
@@ -19,7 +20,7 @@ import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
   type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
 import { earlyResearchConsumerFailure, captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
-  prepareResearchConsumerIntent, readResearchConsumerIntent,
+  assessmentReadView, prepareResearchConsumerIntent, readResearchConsumerIntent,
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
   readContextIdentityAt, readContextTurnHistoryAt, projectPaidLayerDesignRefusal,
@@ -1003,9 +1004,13 @@ export class Researcher {
               requireCondition(action.searched.every(ref => consulted.some(item => canonical(item) === canonical(ref)))
                 && ownerHadPriorRead,
               "owner_escalation_premature", "Research must consult actual sources before involving the owner");
-              const instruction = "Determine if a user question is unavoidable. Check existing owner statements, available evidence, actual searches, and remaining research options. Return JSON {necessary:boolean, reason:string}. necessary=true only for unavailable essential information or an undecided owner-only choice after relevant research. Technical failure is not a reason. Do not invent facts.";
+              const neighborView = usesStageNeighbors(draft.value.stage) ? assessmentReadView(this.store) : null;
+              const neighbors = neighborView ? stageNeighbors(neighborView.store, draft, question) : { context: null, guards: [] };
+              const neighborReads = neighborView?.finish();
+              const instruction = "Determine if a user question is unavoidable. Check existing owner statements, available evidence, actual searches, and remaining research options. Return JSON {necessary:boolean, reason:string}. necessary=true only for unavailable essential information or an undecided owner-only choice after relevant research. Technical failure is not a reason. Do not invent facts." + (neighborView ? STAGE_NEIGHBOR_INSTRUCTION + ' A request already resolved by the accepted prefix does not require another owner choice.' : '');
               const escalationContext = { role: "assess-escalation", question: question.value.spec,
-                request: action, inventory: sources.inventory(), history };
+                request: action, inventory: sources.inventory(), history,
+                ...(neighborView ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: neighbors.context } : {}) };
               if (early) {
                 const prior = [...intents].sort((a, b) => b.value.generation - a.value.generation).find(item => item.value.kind === 'escalation-assessor'
                   && item.value.cursor.pendingTurn?.id === pendingTurn.id && item.value.state === 'refused'
@@ -1014,14 +1019,15 @@ export class Researcher {
                 if (failure) Object.assign(escalationContext, { failures: [earlyResearchCorrection(
                   'escalation-assessor', failure, reference(prior!), question.value)] });
               }
-              const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...consulted,
+              const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...neighbors.guards, ...consulted,
                 ...action.searched, reference(pendingTurn), ...turns.map(reference)]);
               const intent = prepareResearchConsumerIntent(this.store, {
                 projectId: project, kind: "escalation-assessor", key: hashJson([id, pendingTurn.value.number, "escalation-assessor"]),
                 owner: reference(run), draft: reference(draft), question: reference(question),
                 role: dispatch.reviewer, dispatch, profile: pilot ? reference(pilot) : null,
                 cursor: { run: id, turn: pendingTurn.value.number, pendingTurn: reference(pendingTurn),
-                  instruction, context: escalationContext }, basis,
+                  instruction, context: escalationContext,
+                  ...(neighborReads ? { contextContract: STAGE_NEIGHBOR_CONTEXT, neighborReads } : {}) }, basis,
                 guards: uniqueTransactionGuards([reference(run), reference(draft), reference(question),
                   reference(environment), ...basis, ...(pilot ? [reference(pilot)] : [])]) }, retryPermits);
               escalationIntent = intent;

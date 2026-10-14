@@ -1,3 +1,4 @@
+import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { activeSynthesisNotes, consolidationInput } from './conclusion-consolidation.js';
 import { FOUNDATION_FIELDS, contextSections, selectedQuestion, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
 import type { Store, Revision } from "../storage/store.js";
@@ -70,6 +71,10 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   const archivedBody = body;
   const relatedResearch = body['discoveryContext'];
+  const neighborMaterial = body['assessmentContextContract'] === STAGE_NEIGHBOR_CONTEXT
+    ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: body['stageNeighbors'] } : null;
+  if (neighborMaterial) requireCondition(neighborMaterial.stageNeighbors?.contract === 'stage-neighbors/v1',
+    'context_stage_neighbors_incomplete', `[${question.id}] The assessor needs its declared stage material`);
   const hasQuestion = Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader';
   const selected = hasQuestion ? selectedQuestion(question, archivedBody) : null;
   const contract = selected ? { id: question.id, ...question.value.spec } : null;
@@ -82,6 +87,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (relatedResearch !== undefined) requireCondition(packet.discoveryContext
       && canonical(packet.discoveryContext) === canonical(relatedResearch),
     'context_discovery_incomplete', `[${question.id}] The packed question lost its accepted research grounds`);
+    if (neighborMaterial) requireCondition(packet.assessmentContextContract === STAGE_NEIGHBOR_CONTEXT
+      && packet.stageNeighbors !== undefined && canonical(packet.stageNeighbors) === canonical(neighborMaterial.stageNeighbors),
+    'context_stage_neighbors_incomplete', `[${question.id}] The packed assessor lost its accepted stage neighbors`);
     if (contract) {
       for (const [field, expected] of Object.entries(contract))
         requireCondition(packet.question && Object.hasOwn(packet.question, field)
@@ -96,7 +104,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     requireCondition(Array.isArray(body['synthesisNotes']) && body['consolidation']
       && Number.isSafeInteger(body['consolidation'].targetChars) && body['consolidation'].targetChars > 0,
     'consolidation_context_invalid', 'Consolidation needs its saved notes and bounded output target');
-    const packet = { dispatchMode: 'consolidation', question: projectedQuestion,
+    const packet = { dispatchMode: 'consolidation', question: projectedQuestion, ...neighborMaterial,
       ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
       synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
       consolidation: {...consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars, body['consolidation'].format === 2 ? 2 : 1),
@@ -152,6 +160,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (projectedQuestion) { body['question'] = projectedQuestion; if (Object.hasOwn(original, 'questions')) body['questions'] = [projectedQuestion]; }
     if(original['assessmentState'])body['value']=assessmentValue;
     if(relatedResearch !== undefined)body['discoveryContext']=relatedResearch;
+    if(neighborMaterial)Object.assign(body,neighborMaterial);
     if(candidate) body['candidate']=replaceFoundationCopies(candidate,{...original,value:undefined},reference(archive),store);
     if(proposalChanges) body['proposalChanges']=replaceFoundationCopies(proposalChanges,{...original,previousProposal:undefined},reference(archive),store);
   }
@@ -172,12 +181,14 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     delete body['synthesisNotes']; delete body['assessmentNotes']; delete body['checkpoints'];
   }
   if (body['dispatchMode'] === "planning" && !options.continuation) {
-    const reserved = relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length;
+    const reserved = (relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length)
+      + (neighborMaterial ? JSON.stringify(neighborMaterial).length : 0);
     const packet = planningContext(body,reference(archive),maxChars-reserved,options.contextChars,archivedBody);
     if(relatedResearch !== undefined)packet.discoveryContext=relatedResearch;
+    if(neighborMaterial)Object.assign(packet,neighborMaterial);
     return finish(packet);
   }
-  const mandatory = ["discoveryContext", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["assessmentContextContract", "stageNeighbors", "discoveryContext", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation

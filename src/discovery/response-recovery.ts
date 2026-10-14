@@ -1,3 +1,4 @@
+import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
 import { consolidationInput } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -255,6 +256,28 @@ function consumerShape(value: unknown, id: string): asserts value is ResearchCon
       || value.state === 'refused' && (value.outputs !== null || value.refusal === null))
     consumerInvalid(id, 'The intent state contradicts its exact physical and application references');
 }
+/** Only the explicit new C producer declares these reads. Old paid cursors keep
+ * their original context and never acquire today's neighboring heads. */
+function requireEscalationNeighbors(store: Store, intent: ResearchConsumerIntent, id: string): void {
+  if (intent.kind !== 'escalation-assessor' || intent.cursor.contextContract === undefined) return;
+  if (intent.cursor.contextContract !== STAGE_NEIGHBOR_CONTEXT
+    || intent.cursor.context.assessmentContextContract !== STAGE_NEIGHBOR_CONTEXT
+    || !object(intent.cursor.neighborReads) || intent.cursor.neighborReads.contract !== 'assessment-read/v1')
+    consumerInvalid(id, 'The escalation lost its declared stage material and exact read proof');
+  const draft = store.get<DiscoveryDraft>(intent.draft.id, intent.draft.revision);
+  const question = store.get<Question>(intent.question.id, intent.question.revision);
+  if (!draft || !question || canonical(reference(draft)) !== canonical(intent.draft)
+    || canonical(reference(question)) !== canonical(intent.question))
+    consumerInvalid(id, 'The escalation lost its original draft or question');
+  const view = assessmentReadView(store, intent.cursor.neighborReads as AssessmentReadProof);
+  const neighbors = stageNeighbors(view.store, draft, question);
+  view.finish();
+  if (!neighbors.context || intent.cursor.context.stageNeighbors === undefined
+    || canonical(neighbors.context) !== canonical(intent.cursor.context.stageNeighbors)
+    || neighbors.guards.some(ref => !intent.guards.some(guard => canonical(guard) === canonical(ref))
+      || !intent.basis.some(basis => canonical(basis) === canonical(ref))))
+    consumerInvalid(id, 'The escalation material does not derive from its exact accepted neighbors');
+}
 export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<ResearchConsumerIntent> {
   if (!store || typeof store.get !== 'function' || !isRef(ref)) consumerInvalid('research-consumer-intent', 'An exact saved intent is required');
   const saved = store.get<ResearchConsumerIntent>(ref.id, ref.revision);
@@ -267,6 +290,7 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
   if (!origin || origin.kind !== saved.kind || hashJson(origin.value) !== origin.hash) consumerInvalid(saved.id, 'The original prepared intent is missing');
   consumerShape(origin.value, origin.id);
   if (origin.value.state !== 'prepared') consumerInvalid(saved.id, 'The original intent was not prepared');
+  requireEscalationNeighbors(store, origin.value, origin.id);
   if (origin.value.generation === 0) {
     if (origin.value.previous !== null) consumerInvalid(saved.id, 'The first generation cannot claim a predecessor');
   } else {
@@ -1307,6 +1331,7 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
     rootKey: input.key, generation, previous: replacing ? reference(previous!) : previous?.value.previous ?? null,
     state: 'prepared', call: null, request: null, archive: null, outputs: null, refusal: null };
   consumerShape(value, 'research-consumer-intent');
+  requireEscalationNeighbors(store, value, 'research-consumer-intent');
   if (previous && !sameLogicalConsumerStep(previous.value, value))
     consumerInvalid(previous.id, 'A retry generation changed the original logical step');
   const id = researchConsumerIntentId(value.projectId, value.kind, value.key, generation);

@@ -5646,3 +5646,122 @@ test('DRY5FIX C concurrent resumes dispatch only one correction for the saved ne
   assert.ok(results.some(result => result.status === 'fulfilled' && result.value.value.status === 'needs_owner'));
   assert.equal(f.calls().length, 4);
 });
+
+
+import { preparedField as asm1Prepared } from './preparation-fixture.js';
+import { stageNeighbors as asm1Neighbors, STAGE_NEIGHBOR_CONTEXT as ASM1_CONTEXT } from '../src/discovery/stage-neighbors.js';
+import type { DiscoveryDraft as Asm1Draft } from '../src/discovery/discovery.js';
+
+function asm1Escalation(t: test.TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-asm1-c-')), database = join(root, 'state.sqlite');
+  const stores: Store[] = [], open = () => { const db = new Store(database); stores.push(db); return new ProductEngine(db); };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = open(), wire = join(root, 'wire.ndjson');
+  engine.execute({ type: 'create-project', project: 'p', title: 'Accepted neighbors before owner escalation' });
+  const source = engine.discovery.evidence.document('p', 'basis', 'The owner must select a private account.', 'text/plain', 0);
+  const adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, String.raw`import{readFileSync,appendFileSync,existsSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,path=${JSON.stringify(wire)};
+const prior=existsSync(path)?readFileSync(path,'utf8').trim().split('\n').filter(Boolean).length:0;
+appendFileSync(path,JSON.stringify(r)+'\n');
+const q=s.questions?.[0]??s.question,source=${JSON.stringify(reference(source))};
+const research=s.role==='assess-escalation'?{necessary:true,reason:'A private account has not been selected'}
+ :prior===0?{action:'read_source',source,start:0,end:8}:{action:'need_owner',question:q.id,reason:'Choose the private account',searched:[source]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:null}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 10000 }, 0);
+  const draft = engine.discovery.forStage('p', 'concept', 'concept');
+  for (const id of draft.value.questions.slice(0, -1)) {
+    const q = engine.store.get<Question>(id)!;
+    engine.discovery.decision(id, q.revision, 'owner', asm1Prepared('p', q.value.spec.field));
+  }
+  const current = engine.store.get<Asm1Draft>(draft.id)!, chosen = engine.store.get<Question>(draft.value.questions.at(-1)!)!;
+  const neighbors = asm1Neighbors(engine.store, current, chosen).context!;
+  const calls = () => readFileSync(wire, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const run = (e = engine) => e.researcher.run('p', draft.id, 4);
+  return { engine, open, current, chosen, neighbors, calls, run };
+}
+
+test('ASM1 C receives accepted neighbors with an explicit saved era and preserves the owner-assessment instruction', async t => {
+  const f = asm1Escalation(t);
+  const result = await f.run();
+  assert.equal(result.value.status, 'needs_owner', result.value.error ?? 'Owner review should finish');
+  assert.equal(f.calls().length, 3);
+  const call = f.calls()[2];
+  assert.equal(call.subject.role, 'assess-escalation');
+  assert.deepEqual(call.subject.stageNeighbors, f.neighbors);
+  assert.equal(call.subject.assessmentContextContract, ASM1_CONTEXT);
+  assert.match(call.prompt, /user question is unavoidable/);
+  assert.match(call.prompt, /stageNeighbors/);
+  assert.equal(call.subject.request.action, 'need_owner');
+  const intent = f.engine.store.list<ResearchConsumerIntent>('research-consumer-intent').find(row => row.value.kind === 'escalation-assessor')!;
+  assert.equal(intent.value.cursor.contextContract, ASM1_CONTEXT);
+  assert.ok(intent.value.cursor.neighborReads.reads.length > 0);
+  assert.equal(readResearchConsumerIntent(f.open().store, reference(intent)).value.state, 'applied');
+  const q = f.engine.store.get<Question>(f.neighbors.fields[0]!.question.id)!;
+  f.engine.discovery.reopen(q.id, q.revision);
+  assert.deepEqual(readResearchConsumerIntent(f.open().store, reference(intent)).value.cursor.context.stageNeighbors, f.neighbors);
+  assert.equal(f.calls().length, 3);
+});
+
+test('ASM1 C resumes its paid receipt after a new Store without another model call', async t => {
+  const f = asm1Escalation(t), db = f.engine.store, original = db.writeMany.bind(db); let stopped = false;
+  db.writeMany = ((writes: Write[], guards: any = []) => {
+    const result = original(writes, guards);
+    if (!stopped && writes.some(w => w.kind === 'model-response') && db.list('model-call').length === 3) {
+      stopped = true; throw new Error('ASM1 paid C crash');
+    }
+    return result;
+  }) as typeof db.writeMany;
+  const interrupted = await f.run(); db.writeMany = original;
+  assert.equal(interrupted.value.status, 'paused');
+  assert.match(interrupted.value.error ?? '', /ASM1 paid C crash/);
+  assert.ok(stopped); assert.equal(f.calls().length, 3);
+  const result = await f.run(f.open());
+  assert.equal(result.value.status, 'needs_owner', result.value.error ?? 'The same paid C should apply');
+  assert.equal(f.calls().length, 3);
+  assert.deepEqual(f.calls()[2].subject.stageNeighbors, f.neighbors);
+});
+
+test('ASM1 C guards an accepted neighbor against native reopen during publication', async t => {
+  const f = asm1Escalation(t), db = f.engine.store, other = f.open(), original = db.writeMany.bind(db); let changed = false;
+  db.writeMany = ((writes: Write[], guards: any = []) => {
+    if (!changed && writes.some(w => w.kind === 'research-consumer-intent'
+      && (w.value as any).kind === 'escalation-assessor' && (w.value as any).state === 'applied')) {
+      changed = true;
+      const q = other.store.get<Question>(f.neighbors.fields[0]!.question.id)!;
+      other.discovery.reopen(q.id, q.revision);
+    }
+    return original(writes, guards);
+  }) as typeof db.writeMany;
+  const result = await f.run(); db.writeMany = original;
+  assert.ok(changed); assert.equal(result.value.status, 'paused');
+  assert.equal(f.calls().length, 3);
+  const intent = db.list<ResearchConsumerIntent>('research-consumer-intent').find(row => row.value.kind === 'escalation-assessor')!;
+  assert.notEqual(intent.value.state, 'applied');
+  assert.equal(db.get<Question>(f.chosen.id)!.value.status, 'open');
+  assert.deepEqual(readResearchConsumerIntent(f.open().store, reference(intent)).value.cursor.context.stageNeighbors, f.neighbors);
+});
+
+
+test('ASM1 round3 current C after native reopens receives new neighbor refs while its completed old intent remains historical', async t => {
+  const f = asm1Escalation(t); await f.run();
+  const before = f.engine.store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .find(row => row.value.kind === 'escalation-assessor')!;
+  const other = f.open(), selectedBefore = other.store.get<Question>(f.chosen.id)!;
+  // A completed C is an owner-choice gate, not a model answer. Close that gate
+  // through the product before starting another current evaluation.
+  other.discovery.decision(selectedBefore.id, selectedBefore.revision, 'owner', asm1Prepared('p', selectedBefore.value.spec.field));
+  assert.equal((await f.run(other)).value.status, 'completed');
+  const q = other.store.get<Question>(f.neighbors.fields[0]!.question.id)!;
+  const opened = other.discovery.reopen(q.id, q.revision);
+  other.discovery.decision(opened.id, opened.revision, 'owner', 'Changed audience');
+  const selected = other.store.get<Question>(f.chosen.id)!; other.discovery.reopen(selected.id, selected.revision);
+  const result = await f.run(f.open());
+  assert.equal(result.value.status, 'needs_owner', result.value.error ?? 'A new current C must finish');
+  const calls = f.calls().filter(row => row.subject.role === 'assess-escalation');
+  assert.equal(calls.length, 2); assert.equal(calls[1].subject.stageNeighbors.fields[0].value, 'Changed audience');
+  assert.notDeepEqual(calls[1].subject.stageNeighbors.fields[0].question, calls[0].subject.stageNeighbors.fields[0].question);
+  assert.deepEqual(readResearchConsumerIntent(f.open().store, reference(before)), before);
+});
