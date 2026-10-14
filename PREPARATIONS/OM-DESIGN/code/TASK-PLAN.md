@@ -2362,7 +2362,7 @@
 - Отдаёт: —
 - Читает записи: точная цепочка плана M8 → horizon → input → принятые стадии; общий отбор SP1a
 - Пишет записи: раздел выбранной спецификации в task context v2 и preplan; версия контекста плана в хэше и в основании нового допуска G5
-- Разрешённые пути: `src/om/selected-specification.ts`, `src/compiler/context.ts`, `src/compiler/model.ts`, `src/compiler/compiler.ts`, `src/compiler/om-readers.ts`, `src/om/compiler-readers.ts`, `src/om/atomic-gate.ts`, `test/om-task-context.test.ts`, `test/om-atomic-gate.test.ts`, `test/compiler.test.ts`, `test/om-compiler-readers.test.ts`, `test/execution.test.ts`
+- Разрешённые пути: `src/om/selected-specification.ts`, `src/compiler/context.ts`, `src/compiler/model.ts`, `src/compiler/compiler.ts`, `src/compiler/om-readers.ts`, `src/om/compiler-readers.ts`, `src/om/atomic-gate.ts`, `test/om-task-context.test.ts`, `test/om-atomic-gate.test.ts`, `test/compiler.test.ts`, `test/om-compiler-readers.test.ts`, `test/execution.test.ts`, `src/om/task-specification.ts`
 - Из движка как есть: №4714; SP1a
 - После: SP1a, AT3a
 - Тесты сверх обязательных:
