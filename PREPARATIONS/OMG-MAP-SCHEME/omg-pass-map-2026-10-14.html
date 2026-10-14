@@ -174,7 +174,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 <div class="page">
   <header class="head">
     <div class="l">
-      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · + оркестратор</div>
+      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · + оркестратор</div>
       <h1>Проход продукта: <b>от идеи до задачи</b></h1>
       <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки.</p>
     </div>
@@ -216,6 +216,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <span>Discovery</span><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
     <span>Концепция</span><a href="#c-what">Что это</a><a href="#c-input">Вход</a><a href="#c-process">Обработка</a><a href="#c-output">Выход</a><a href="#c-records">Записи</a><a href="#c-doors">Двери</a><a href="#c-gaps">Пробелы</a><a href="#c-missed">Упускали</a>
     <span>Карта L1</span><a href="#m-what">Что это</a><a href="#m-input">Вход</a><a href="#m-process">Обработка</a><a href="#m-output">Выход</a><a href="#m-records">Записи</a><a href="#m-doors">Двери</a><a href="#m-gaps">Пробелы</a><a href="#m-missed">Упускали</a>
+    <span>Спецификация</span><a href="#s-what">Что это</a><a href="#s-input">Вход</a><a href="#s-process">Обработка</a><a href="#s-output">Выход</a><a href="#s-records">Записи</a><a href="#s-doors">Двери</a><a href="#s-gaps">Пробелы</a><a href="#s-missed">Упускали</a>
     <span>Итог</span><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
   </nav>
 
@@ -580,6 +581,121 @@ ul.plain b{color:var(--ink);font-weight:500}
     </div>
   </div>
 
+  <!-- ===================== SPECIFICATION ===================== -->
+  <div class="block" id="b-spec">
+    <div class="bh2"><h2>Стадия 4 · <b>Спецификация</b></h2><small>выход карты → спецификация → её потребители · сведено с Codex-omg №4591</small></div>
+    <div class="grid">
+      <section class="sec wide" id="s-what">
+        <h3>Что такое спецификация</h3>
+        <p>Спецификация превращает ответственности и пути L1 в <b>точные договоры наблюдаемого поведения</b>: когда действие допустимо, с какими входами, что оно гарантирует, чего не делает, что происходит при отказе, повторе и восстановлении. Она не выбирает продукт заново, не перепридумывает топологию L1 и не обязана заранее назвать файлы, функции и тесты. Но «ошибки обрабатываются» — не спецификация: из неё нельзя вывести результат ошибки.</p>
+        <div class="tw"><table>
+          <thead><tr><th>Два вида «контрактов»</th><th>Что это</th></tr></thead>
+          <tbody>
+            <tr><td><code>specification.behaviorContracts[]</code></td><td>Договоры поведения: участник, вход, успех, отказ, запреты, состояние, совместимость, доказательство</td></tr>
+            <tr><td><code>mapDesign.contracts[]</code></td><td>Схемы передаваемых данных артефактов и портов. Схема JSON не доказывает соблюдения поведения — например, запрета скрытого платного повтора</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px"><b>Граница с OM:</b> политику поведения нельзя откладывать как техническую мелочь; выбор исполнителя уже сформулированной политики можно передать OM адресным вопросом. «Не делать скрытый повтор» должно быть известно до детализации; какой блок хранит статус запроса — допустимый вопрос OM.</p>
+      </section>
+      <section class="sec" id="s-input">
+        <h3>Вход</h3>
+        <ol class="chain">
+          <li><span><b>Когда.</b> Карта принята и актуальна.</span></li>
+          <li><span><b>Кто.</b> <code>prepare-stage specification</code> — вызывающая сторона (DRV1).</span></li>
+          <li><span><b>Вопросы.</b> behavior → constraints → behaviorContracts; consumer = features.</span></li>
+          <li><span><b>Автор видит.</b> Карту целиком (journey, operationRequirements, mapDesign), conceptSections, из Discovery — actors, outcomes, constraints; поля стадии; вопрос со схемой.</span></li>
+          <li><span><b>Не видит.</b> externalSystems, риски, неизвестные, отчёт и вердикт Discovery — дальний предшественник; DS1 этого не меняет. Отдельной проекции графа нет — и не нужно.</span></li>
+          <li><span><b>Оценщик.</b> FieldSpec, значение, предшественники, наблюдения; соседних полей стадии — нет.</span></li>
+        </ol>
+      </section>
+      <section class="sec" id="s-process">
+        <h3>Обработка: что код доказывает и чего нет</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Проверка</th><th>Устанавливает</th><th>Не следует</th></tr></thead>
+          <tbody>
+            <tr><td>Схема, версия</td><td>Форма своей стадии и эры</td><td>Что текст верен и достаточен</td></tr>
+            <tr><td>Уникальные id договоров</td><td>Адресуемость</td><td>Что договоры не противоречат</td></tr>
+            <tr><td>actor есть в Discovery</td><td>Известный участник</td><td>Что у него есть полномочия</td></tr>
+            <tr><td>outcome — артефакт L1</td><td>Действительный результат карты</td><td>Что успех его достигает</td></tr>
+            <tr><td>requirements с тем же outcome</td><td>Связь с требованиями</td><td>Что смысл критериев реализован</td></tr>
+            <tr><td>Каждое требование покрыто</td><td>Нет требования без ссылки</td><td>Что покрытие полное по смыслу</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px"><b>Код не требует:</b> отражения ограничений Discovery; ссылки entry на узел или порт и inputs на артефакты; id в state при приёмке; согласия behavior и договоров; переноса failure и recovery карты; исполнимости compatibility и proof. Находки адресуются полю behaviorContracts.</p>
+      </section>
+      <section class="sec wide" id="s-output">
+        <h3>Выход: кому что нужно</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Потребитель</th><th>Что получает</th><th>Предел</th></tr></thead>
+          <tbody>
+            <tr><td>Фичи</td><td>Все поля: behavior, constraints, behaviorContracts; две нити ссылок</td><td>Нити проверены строго, но мостика behavior[i] ↔ договор нет; имя requirements перегружено</td></tr>
+            <tr><td><code>buildOmInput</code></td><td>Нормализованный договор: id, nodes, requirements, outcome, actor, success, failures, forbiddenEffects, state, proof</td><td><b>entry, inputs, compatibility</b> и поле constraints в него не входят</td></tr>
+            <tr><td>Вопрос OM о nodes / state</td><td>Нормализованный договор, допустимые узлы и участники</td><td>Три поля договора не в прямом материале</td></tr>
+            <tr><td>Задача установления фактов</td><td>Договоры по связанным nodes (<code>run-bases.ts:277</code>)</td><td>Указатели на нормализованный вход</td></tr>
+            <tr><td>L2 / L3</td><td>Выборочный бриф, граф, материалы</td><td>Смысл договора должен перейти в операции, работы, тесты</td></tr>
+            <tr><td>R0, pilot / planning</td><td>R0 — Discovery и conceptSections, не договоры; pilot — specificationConstraints</td><td>Договоры не становятся обязательствами графа сами</td></tr>
+            <tr><td>Компилятор, исполнитель</td><td>Контекст из графа и задачи (<code>compiler/context.ts:45</code>)</td><td>Не из полного specification.fields — проверить только buildOmInput недостаточно</td></tr>
+            <tr><td>Владелец</td><td>Общие проекции, JSON</td><td>Нет сводки «обещание → отказ и запрет → доказательство → кто реализует»</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="s-records">
+        <h3>Где записывается и как адресуется</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Сущность</th><th>Адрес</th></tr></thead>
+          <tbody>
+            <tr><td>Черновик</td><td><code>discovery:&lt;p&gt;:&lt;uuid&gt;</code>, stage = specification</td></tr>
+            <tr><td>Выход стадии</td><td><code>stage:&lt;p&gt;:specification</code>, content = draft, fields, graph = null</td></tr>
+            <tr><td>Договор</td><td>Семантический id внутри точной версии; JSON pointer — по индексу</td></tr>
+            <tr><td>Строка behavior</td><td>Только индекс в точной версии</td></tr>
+            <tr><td>Успех, отказ, запрет</td><td>id договора + поле + индекс</td></tr>
+            <tr><td>Граница состояния</td><td>Текст; после решения OM — id блока или участника</td></tr>
+            <tr><td>Вход OM</td><td><code>om-input:&lt;p&gt;</code> + refs стадий в sources</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="s-doors">
+        <h3>Остановки и двери</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Остановка</th><th>Дверь</th></tr></thead>
+          <tbody>
+            <tr><td>Лимит ходов</td><td>Продолжить тот же research-stage</td></tr>
+            <tr><td>Оценка insufficient / conflicting</td><td>Исправление на тех же основаниях</td></tr>
+            <tr><td>Находка приёмки</td><td>Исправить названное поле</td></tr>
+            <tr><td>Неверная форма ответа</td><td>DRY5FIX</td></tr>
+            <tr><td>Сменилось основание</td><td>Явный пересмотр, старое не применять</td></tr>
+            <tr><td>Неизвестно само поведение</td><td>Исследование или вопрос потребителю; не окончательный договор</td></tr>
+            <tr><td>Нужен выбор владельца</td><td>Варианты с последствиями, не «напишите rollback»</td></tr>
+            <tr><td>Нет nodes / state</td><td>Адресное решение OM</td></tr>
+            <tr><td>Спецификация принята</td><td>Запуск фич</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="s-gaps">
+        <h3>Пробелы перехода карта → спецификация <small>вердикт Codex</small></h3>
+        <ul class="plain">
+          <li><b>Нет nodes, границы прозой</b> — факт, но чинить в спецификации не нужно: штатные разрывы OM. До HX4 важнее доставить полный договор для этого решения.</li>
+          <li><b>Две нити</b> — подтверждено; минимум — согласованный материал автору и оценщику, удаление behavior — отдельная миграция.</li>
+          <li><b>constraints</b> — читают ещё фичи и planning; связи с ограничениями Discovery нет.</li>
+          <li><b>Ограничения Discovery в договорах</b> — структурно не требуются: продолжение общего класса переноса (DS1.2).</li>
+          <li><b>Нет проекции графа</b> — не дефект: mapDesign передан целиком.</li>
+          <li><b>Новое: усечённый договор в OM</b> — entry, inputs, compatibility не доходят до выбранного договора (SP1).</li>
+          <li><b>Новое: оценщик без соседних полей</b> — согласие трёх ответов не обеспечено (ASM1, общий класс для концепции, карты, спецификации).</li>
+        </ul>
+      </section>
+      <section class="sec" id="s-missed">
+        <h3>Что упускали</h3>
+        <ul class="plain">
+          <li><b>Неизвестное нельзя прятать в proof или compatibility</b>: у договоров нет своего списка вопросов; неизвестно само поведение — не выдавать окончательный договор.</li>
+          <li><b>state=none / external</b> всё равно требует writer, authority, rollback — заполнять случайным id ради снятия разрыва нельзя.</li>
+          <li><b>Критерий, способ доказательства и выполненное доказательство</b> — разные сущности; принятая спецификация ≠ проверенная реализация.</li>
+          <li><b>Владелец не автор недописанной спецификации</b>: только настоящие компромиссы с вариантами.</li>
+          <li><b>Подпись «решение владельца»</b> у design в UI относится и сюда.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+
   <!-- ===================== SUMMARY ===================== -->
   <div class="block">
     <div class="bh2"><h2>Итог</h2><small>предложение оркестратора · классы — по Codex №4585 и №4587 · не выдано</small></div>
@@ -594,17 +710,19 @@ ul.plain b{color:var(--ink);font-weight:500}
             <tr><td>3</td><td>WB1 + WB1b</td><td>Модель ищет и читает интернет через движок</td><td>Discovery</td><td><span class="pill warn">части готовы</span></td></tr>
             <tr><td>4</td><td>IN1 — вход и понимание</td><td>brief автоматически; objective = слова владельца; понимание модели с авторством</td><td>Вход</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>5</td><td>DS1.1 — двери не-go</td><td>Выбор через полномочие владельца; продолжение по недостающему</td><td>Discovery</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>6</td><td>DS1.2 — перенос обязательств</td><td>Отчёт → preparation → conceptSections → implements, контракты, пути: Ref Discovery + constraint id → requirement ids; код — охват, оценщик — применение</td><td>Discovery → концепция → карта</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>7</td><td>L1A — договор авторства L1</td><td>Доставить externalSystems и основания; реестр обязательных outcome-id и правило «id результата = id артефакта»; оценщику карты — operationRequirements и обязанность согласия текста с топологией</td><td>Карта L1</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>8</td><td>UNK1 — неизвестное ранней стадии</td><td>Адресный исход: материал / возврат к основанию / выбор; позднему — с потребителем и сроком</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>9</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию, на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>10</td><td>DS1.3 — итог владельцу</td><td>Читаемый вид стадий из принятых записей; верное авторство; в GraphPanel — путь, условия, отказы, статус «кандидат / принято»</td><td>Discovery, концепция, карта</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>6</td><td>DS1.2 — перенос обязательств</td><td>Отчёт → preparation → conceptSections → implements, пути → договоры поведения: Ref Discovery + constraint id → requirement ids; код — охват, оценщик — применение</td><td>Discovery → концепция → карта → спецификация</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>7</td><td>L1A — материал автора карты</td><td>Доставить externalSystems и основания; реестр обязательных outcome-id и правило «id результата = id артефакта»</td><td>Карта L1</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>8</td><td>ASM1 — контекст оценщика</td><td>Оценщик видит принятые соседние поля своей стадии и критерий их согласия: 4 поля концепции; operationRequirements ↔ mapDesign; behavior / constraints / договоры</td><td>концепция, карта, спецификация</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>9</td><td>SP1 — полный договор у потребителей</td><td>Выбранный behaviorContract целиком (entry, inputs, compatibility) рядом с нормализованным — вопросам OM, задачам фактов, детализации работ</td><td>спецификация → OM</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>10</td><td>UNK1 — неизвестное ранней стадии</td><td>Адресный исход: материал / возврат к основанию / выбор; позднему — с потребителем и сроком</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>11</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию, на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>12</td><td>DS1.3 — итог владельцу</td><td>Читаемый вид стадий из принятых записей; верное авторство; в GraphPanel — путь, условия, статус; сводка договоров поведения</td><td>все ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
           </tbody>
         </table></div>
         <p style="margin-top:12px"><b>Не добавлять до HX4</b> (Codex №4587): включение порога ради checkKind; удаление audience/outcome/acceptance; утверждение владельцем каждой концепции и требования; новую модель-оркестратор; перенос текстов источников во все требования; перепроверку принятой истории.</p>
         <ul class="plain">
-          <li><b>Риск:</b> 10 задач вместо «почти готово» — живой HX4 сдвигается; оценку в часах честно дать нельзя до описей.</li>
-          <li><b>Риск:</b> задачи 4–8 трогают одни файлы ранних стадий — последовательно, не параллельно.</li>
+          <li><b>Риск:</b> 12 задач вместо «почти готово» — живой HX4 сдвигается; оценку в часах честно дать нельзя до описей.</li>
+          <li><b>Риск:</b> задачи 4–8 трогают одни файлы ранних стадий — последовательно, не параллельно; SP1 — в файлах OM, может идти параллельно.</li>
           <li><b>Риск:</b> HX4 может честно закончиться insufficient_evidence — поиск с NL99 бедный.</li>
         </ul>
       </section>
@@ -612,7 +730,7 @@ ul.plain b{color:var(--ink);font-weight:500}
         <h3>Решения владельца</h3>
         <div class="decide">
           <div><span><b>Принять схему</b> Discovery и перехода в концепцию как определение?</span></div>
-          <div><span><b>Разбивка</b>: десять задач по одному классу (рекомендация) — или иначе?</span></div>
+          <div><span><b>Разбивка</b>: двенадцать задач по одному классу (рекомендация) — или иначе?</span></div>
           <div><span><b>DRV1</b>: HX4 должен доказать автономность «идея → план» (тогда драйвер нужен до HX4) — или достаточно механического сценария команд?</span></div>
         </div>
       </section>
@@ -709,7 +827,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 
     {id:"map",n:"Стадия 3",st:"part",g:1,t:"Карта L1",io:["stage:concept","граф L1"],top:76,
      sum:"Модель ответственности и прохода: блоки, передаваемые результаты, контракты, пути успеха, отказа и восстановления.",
-     d:[["Что делает","Проектирует, кто в продукте за что отвечает, что передаётся между блоками и как участник доходит до результата, безопасного отказа или восстановления. L1 — графовая проекция выхода стадии operation-map."],["Берёт","Концепцию целиком; из Discovery — actors, outcomes, constraints, journeys (без externalSystems, risks, unknowns)."],["Отдаёт","stage:<p>:operation-map → graph-layer:<p>:1: спецификации — артефакты-результаты и контракты; фичам — артефакты; OM — id узлов, артефактов, коннекторов, доказанный слой; очереди OM — успешный путь."],["Пробелы","Внешние системы не доставляются; правило «outcome-id = id артефакта» не дано модели; текст operationRequirements не сопоставлен с топологией; покрытие сценариев грубое; вид пути владельцу частичный.",GAP],["Задачи","L1A · DS1.2 · DS1.3 · DRV1",TASK]],
+     d:[["Что делает","Проектирует, кто в продукте за что отвечает, что передаётся между блоками и как участник доходит до результата, безопасного отказа или восстановления. L1 — графовая проекция выхода стадии operation-map."],["Берёт","Концепцию целиком; из Discovery — actors, outcomes, constraints, journeys (без externalSystems, risks, unknowns)."],["Отдаёт","stage:<p>:operation-map → graph-layer:<p>:1: спецификации — артефакты-результаты и контракты; фичам — артефакты; OM — id узлов, артефактов, коннекторов, доказанный слой; очереди OM — успешный путь."],["Пробелы","Внешние системы не доставляются; правило «outcome-id = id артефакта» не дано модели; текст operationRequirements не сопоставлен с топологией; покрытие сценариев грубое; вид пути владельцу частичный.",GAP],["Задачи","L1A · ASM1 · DS1.2 · DS1.3 · DRV1",TASK]],
      nodes:[
       {id:"trigger",x:0,y:160,role:"оператор → движок",st:"part",g:1,t:"prepare-stage operation-map",io:["concept accepted","черновик"],bh:"Концепция обязана быть принята; inputs — её guards; потребитель — спецификация.",
        d:[["Что делает","engine.prepare: проверяет принятую и актуальную концепцию; её guards — точные inputs черновика; consumer = specification."],["Пробел","Переход от концепции к карте запускает вызывающая сторона — тот же общий класс драйвера, что для концепции.",GAP],["Задача","DRV1",TASK]]},
@@ -720,9 +838,9 @@ ul.plain b{color:var(--ink);font-weight:500}
       {id:"model",x:660,y:160,role:"модель",st:"yes",g:0,t:"Модель · проект карты",io:["пакет","3 ответа"],bh:"Блоки, артефакты, контракты, порты, коннекторы, рёбра, journeys, joins.",
        d:[["Что проектирует","nodes product/block с purpose, benefit, beneficiary, implements, outcome; artifacts (смысл, сохранность, чувствительность); contracts; ports; connectors (кто производит артефакт, кто получает); edges requires / on_success / on_failure / returns_to; journeys (actor, variant, entry, path, outcome, terminal); joins (schema.ts:14, 42)."],["Три стрелки","Connector — передача артефакта; on_failure — переход при отказе; requires — зависимость. Смешивать нельзя."],["Не вправе","Подменять требования, выдавать описание за работающую реализацию, писать код, тесты, атомарные задачи."]]},
       {id:"assess",x:880,y:160,role:"оценщик",st:"part",g:1,t:"Оценщик",io:["ответ","supported / нет"],bh:"FieldSpec · значение · prerequisites · проекция L1 · замечания.",
-       d:[["Что проверяет","Полезность блоков, достаточность путей, поддержку утверждений, согласие с требованиями и ограничениями. Supported — обоснованность проекта, не работающая реализация."],["Не видит","Соседних полей стадии: при оценке mapDesign принятого operationRequirements у него может не быть (research-assessment.ts:183)."],["Пробел","Согласие текстовых обязанностей с топологией и применение ограничений никто не проверяет с обоими материалами.",GAP],["Задача","L1A, DS1.2",TASK]]},
+       d:[["Что проверяет","Полезность блоков, достаточность путей, поддержку утверждений, согласие с требованиями и ограничениями. Supported — обоснованность проекта, не работающая реализация."],["Не видит","Соседних полей стадии: при оценке mapDesign принятого operationRequirements у него может не быть (research-assessment.ts:183)."],["Пробел","Согласие текстовых обязанностей с топологией и применение ограничений никто не проверяет с обоими материалами.",GAP],["Задача","ASM1 — контекст оценщика; DS1.2",TASK]]},
       {id:"opreq",x:1100,y:0,role:"ответ",st:"part",g:1,t:"operationRequirements",io:["ответ","обязанности · покрытие"],bh:"По результату: производитель, потребители, предпосылки, успех, отказ, восстановление; conceptCoverage.",
-       d:[["Что это","outcomes[{outcome, producerResponsibility, consumers, prerequisites, success, failure, recoveryResponsibility}] и conceptCoverage[{requirement, outcome}]."],["Пробел","Код проверяет outcome и покрытие, но не сопоставляет producerResponsibility, consumers, success, failure, recovery с конкретными блоками, портами и переходами — это текст.",GAP],["Задача","L1A",TASK]]},
+       d:[["Что это","outcomes[{outcome, producerResponsibility, consumers, prerequisites, success, failure, recoveryResponsibility}] и conceptCoverage[{requirement, outcome}]."],["Пробел","Код проверяет outcome и покрытие, но не сопоставляет producerResponsibility, consumers, success, failure, recovery с конкретными блоками, портами и переходами — это текст.",GAP],["Задача","L1A + ASM1",TASK]]},
       {id:"design",x:1100,y:220,role:"ответ",st:"part",g:1,t:"mapDesign",io:["ответ","граф без реестров"],bh:"Граф L1; actors и requirements подставит движок. outcome-id Discovery = id артефакта результата.",
        d:[["Что это","graphV2Schema без version, id, title, actors, requirements, researchObligations; horizon пуст (builder.ts:8–16). Прохождение JSON-схемы — ещё не прохождение договора L1."],["Цепочка id","Discovery.outcomes[id] → requirement.outcome → artifact.id → node.outcome / journey.outcome → operationRequirements / behavior / feature outcome. Действующий контракт графа (semantics)."],["Пробел","Правило и реестр обязательных outcome-id модели явно не даны.",GAP],["Задача","L1A",TASK]]},
       {id:"journey",x:1100,y:440,role:"ответ",st:"part",g:0,t:"journey (верхний)",io:["ответ","string[]"],bh:"Дубль: канон путей — graph.journeys и сценарии Discovery.",
@@ -748,9 +866,43 @@ ul.plain b{color:var(--ink);font-weight:500}
       {f:"checks",t:"opreq",l:"находки → переоткрыть поле",k:"alt",loop:"above",depth:70,ff:.3,tf:.75},
       {f:"stage",t:"owner3",l:"вид",fs:"b",ff:.2,ts:"r",tf:.5}
      ]},
-    {id:"spec",n:"Стадия 4",st:"yes",g:0,mock:1,t:"Спецификация",io:["требования · карта","контракты поведения"],
-     sum:"Проверяемое поведение: вход, результат, отказы, запрещённые последствия, состояние, доказательство.",
-     d:[["Что делает","Каждое требование концепции покрывает контрактом поведения с тем же результатом карты."],["Берёт","conceptSections целиком, карту; из Discovery — actors, outcomes, constraints."],["Отдаёт","behaviorContracts для фич и OM."],["Подробная карта","Следующим шагом.",TASK]]},
+    {id:"spec",n:"Стадия 4",st:"part",g:1,t:"Спецификация",io:["stage:operation-map","договоры поведения"],top:40,
+     sum:"Точные договоры поведения: вход, участник, результат, отказы, запреты, состояние, повтор, восстановление, совместимость.",
+     d:[["Что делает","Превращает ответственности и пути L1 в точные договоры наблюдаемого поведения: когда действие допустимо, с какими входами, что гарантирует, чего не делает, что при отказе, повторе и восстановлении. Не выбирает продукт заново, не перепридумывает L1, не проектирует файлы и тесты."],["Берёт","Карту целиком (journey, operationRequirements, mapDesign); conceptSections; из Discovery — actors, outcomes, constraints."],["Отдаёт","stage:<p>:specification: фичам — все поля и две нити ссылок; OM — нормализованные договоры и разрывы nodes/state для решения в проходе."],["Пробелы","entry, inputs, compatibility не доходят до OM в выбранном договоре; оценщик не видит соседних полей; ограничения Discovery не обязаны отражаться в договорах.",GAP],["Задачи","SP1 · ASM1 · DS1.2 · DS1.3 · DRV1",TASK]],
+     nodes:[
+      {id:"trigger",x:0,y:160,role:"оператор → движок",st:"part",g:1,t:"prepare-stage specification",io:["карта accepted","черновик"],bh:"Карта обязана быть принята; inputs — её guards; потребитель — фичи.",
+       d:[["Что делает","engine.prepare: pipeline.inspect(operation-map) = accepted; guards → inputs; consumer = features."],["Пробел","Переход запускает вызывающая сторона — общий класс драйвера.",GAP],["Задача","DRV1",TASK]]},
+      {id:"draft",x:220,y:160,role:"запись",st:"yes",g:0,t:"Черновик спецификации",io:["inputs: Ref карты","3 вопроса"],bh:"behavior → constraints → behaviorContracts — все design.",
+       d:[["Вопросы","behavior — непустой список уникальных строк; constraints — такой же список; behaviorContracts — адресуемые договоры, с оценкой (requirements.ts:24, 37). Первые два — бывшие решения владельца, теперь предложения модели."]]},
+      {id:"packet",x:440,y:160,role:"движок",st:"part",g:1,t:"Запрос модели",io:["черновик + карта","пакет"],bh:"Карта целиком · conceptSections · Discovery: actors, outcomes, constraints.",
+       d:[["Что внутри","Принятая карта целиком — journey, operationRequirements, mapDesign; conceptSections; из Discovery — actors, outcomes, constraints; поля стадии (при третьем вопросе видны behavior и constraints); вопрос со схемой; источники, история, замечания."],["Не дефект","Отдельной проекции графа нет, но mapDesign передан целиком — второй копии не нужно."],["Пробел","externalSystems, риски, неизвестные, отчёт и вердикт Discovery не доходят — для спецификации Discovery уже дальний предшественник. Существенные выводы должны прийти через перенос в требования.",GAP],["Задача","DS1.2",TASK]]},
+      {id:"model",x:660,y:160,role:"модель",st:"yes",g:0,t:"Модель · договоры",io:["пакет","3 ответа"],bh:"Предлагает будущее поведение; не выдаёт придуманную возможность вендора за факт.",
+       d:[["Что формулирует","behavior, constraints и behaviorContracts: id, requirements, actor, entry, inputs, outcome, success, failures, forbiddenEffects, state {durability, writer, authority, rollback, restart, replay}, compatibility, proof."],["Два вида контрактов","behaviorContracts — договоры поведения; mapDesign.contracts — схемы данных артефактов и портов. Схема JSON не доказывает соблюдения поведения."],["Граница","Политику поведения нельзя откладывать; выбор исполнителя уже сформулированной политики — можно передать OM."]]},
+      {id:"assess",x:880,y:160,role:"оценщик",st:"part",g:1,t:"Оценщик",io:["ответ","supported / нет"],bh:"Видит значение и предшественников, но не соседние поля стадии.",
+       d:[["Что проверяет","Полноту, полезность потребителю, согласие с намерением и ограничениями, поддержку фактов (research-assessment.ts:39)."],["Не видит","Отдельного полного draft.fields: согласие behavior, constraints и behaviorContracts независимой оценкой не обеспечено."],["Пробел","Пример риска: в constraints запрещён скрытый повтор, а договор его разрешает — оценщик договора этого не увидит.",GAP],["Задача","ASM1 — контекст оценщика",TASK]]},
+      {id:"behavior",x:1100,y:0,role:"ответ",st:"yes",g:0,t:"behavior (строки)",io:["ответ","фичи по индексу"],bh:"Фичи ссылаются номерами строк; живое поле.",
+       d:[["Кто читает","Фичи — features[].requirements = индексы behavior, каждое behavior покрыто фичей (stage-checks.ts:278); buildOmInput; packet-brief по индексам фич."],["Предел","Мостика behavior[i] ↔ behaviorContracts[k] нет; у строки нет устойчивого id — адрес только индекс в точной версии."],["Вердикт","Удалять до HX4 нельзя — потребители и история; обеспечить согласованность."]]},
+      {id:"contracts",x:1100,y:220,role:"ответ · главный",st:"part",g:1,t:"behaviorContracts",io:["ответ","договоры поведения"],bh:"id · requirements · actor · entry · inputs · outcome · success · failures · forbiddenEffects · state · compatibility · proof",
+       d:[["Что это","Адресуемая детализация поведения. Связь с требованиями концепции и outcome-артефактом L1."],["В OM уходит","Нормализованный договор: id, nodes, requirements, outcome, actor, success, failures, forbiddenEffects, state, proof (om/input.ts:282)."],["Пробел","entry, inputs, compatibility обязательны в ответе, но не входят в нормализованный договор и в обычный бриф OM — модель OM должна сама дочитывать их по Ref.",GAP],["Задача","SP1 — полный договор у потребителей",TASK]]},
+      {id:"constraints",x:1100,y:440,role:"ответ",st:"part",g:0,t:"constraints (строки)",io:["ответ","фичи · planning"],bh:"Читают фичи, planning-context, pilot; связи с ограничениями Discovery нет.",
+       d:[["Кто читает","Фичи (поле целиком), planning-context, pilot-context."],["Предел","Нет связи с constraint-id Discovery; в нормализованный вход OM не входит."]]},
+      {id:"checks",x:1320,y:220,role:"код",st:"yes",g:1,t:"Проверки приёмки",io:["поля","accept / находки"],bh:"id уникальны · actor есть · outcome — артефакт L1 · требования с тем же outcome · каждое требование покрыто.",
+       d:[["Что проверяет","Уникальность id договоров; actor ∈ actors Discovery; outcome ∈ артефактов L1; requirements существуют и с тем же outcome; каждое требование концепции покрыто договором (preparation-validation.ts:51)."],["Не требует","Отражения ограничений Discovery; ссылки entry на узел/порт и inputs на артефакты; id в state при приёмке; согласия behavior и договоров; переноса failure/recovery карты; исполнимости compatibility и proof.",GAP],["Находки","Адресуются полю behaviorContracts: research-feedback, переоткрытие поля."]]},
+      {id:"stage",x:1540,y:220,role:"запись",st:"yes",g:0,mono:1,t:"stage:<p>:specification",io:["accept","вход фич и OM"],bh:"content = draft, fields, graph = null.",
+       d:[["Что это","Принятая версия: поля и доказательства приёмки. Принятие — обоснованная постановка, не проверенная реализация."],["Адрес договора","Ref спецификации + contract id; JSON pointer — по индексу внутри точной версии."]]},
+      {id:"omgap",x:1540,y:440,role:"OM · разрывы",st:"yes",g:0,t:"Разрывы nodes · state",io:["договор без привязки","решение в OM"],bh:"contract_node_unbound, contract_boundary_prose — design-decision, срок om-pass.",
+       d:[["Что это","Нет nodes → contract_node_unbound; writer/authority/rollback прозой → contract_boundary_prose. Оба — design-decision со сроком om-pass; applyInputDecisions даёт модели OM назвать блоки и участников (gaps.ts:43, addressing.ts:143)."],["Вердикт","Не отказ: NODES_REQUIRED_SINCE = null (и в DS1). DRY5 прошёл с этими разрывами до входа OM. Порог не включать — он же управляет checkKind."],["Предел","Случайный id ради снятия разрыва — не решение; state=none/external требует смысла, а не заполнения."]]},
+      {id:"owner4",x:1320,y:440,role:"для владельца",st:"no",g:1,t:"Вид договоров владельцу",io:["принятая стадия","обещанное поведение"],bh:"Действие → вход → результат → отказы → запреты → состояние → совместимость → проверка → кто реализует.",
+       d:[["Что нужно","Из точного принятого выхода: действие и участник; вход; обещанный результат; допустимые отказы и продолжение; запреты; что сохраняется, как повтор и восстановление; совместимость и основания; чем будет проверено; какие фичи и работы это реализуют."],["Как сейчас","Общие проекции и JSON; сводки договоров с трассой нет; design подписан как «решение владельца».",GAP],["Задача","DS1.3",TASK]]}
+     ],
+     edges:[
+      {f:"trigger",t:"draft",l:"inputs · consumer"},{f:"draft",t:"packet",l:"3 вопроса"},{f:"packet",t:"model",l:"запрос"},
+      {f:"model",t:"assess",l:"ответ"},{f:"assess",t:"behavior",l:"supported",fs:"t",ff:.7,ts:"l",tf:.5},{f:"assess",t:"contracts",l:"supported"},{f:"assess",t:"constraints",l:"supported",fs:"b",ff:.6,ts:"l",tf:.5},
+      {f:"contracts",t:"checks",l:"fields"},{f:"checks",t:"stage",l:"accept"},
+      {f:"checks",t:"contracts",l:"находки → переоткрыть поле",k:"alt",loop:"below",depth:44},
+      {f:"stage",t:"omgap",l:"buildOmInput",fs:"b",ff:.5,ts:"t",tf:.5},
+      {f:"stage",t:"owner4",l:"вид",fs:"b",ff:.15,ts:"r",tf:.5}
+     ]},
     {id:"feat",n:"Стадия 5",st:"yes",g:0,mock:1,t:"Фичи",io:["контракты","фичи"],
      sum:"Поставка частями: требования фичи — ровно требования её контрактов; оставшиеся вопросы — со сроком.",
      d:[["Что делает","Группирует контракты в фичи с пользой, потребителем, критериями и оставшимися вопросами."],["Отдаёт","features + featurePreparation для OM."],["Подробная карта","Следующим шагом.",TASK]]},
@@ -772,20 +924,25 @@ ul.plain b{color:var(--ink);font-weight:500}
     {f:"con.stage",t:"map.trigger",l:"accepted · guards",lc:"stage:concept — conceptSections"},
     {f:"con.stage",t:"map.packet",l:"prerequisites: концепция целиком",route:"above",depth:40,ff:.35},
     {f:"con.stage",t:"map.build",l:"conceptSections → requirements",route:"above",depth:84,ff:.65},
-    {f:"map.stage",t:"spec",l:"граф L1 · артефакты = outcomes",lc:"stage:operation-map — L1"},
+    {f:"map.stage",t:"spec.trigger",l:"accepted · guards",lc:"stage:operation-map — L1"},
+    {f:"map.stage",t:"spec.packet",l:"prerequisites: карта целиком",route:"above",depth:40,ff:.4},
+    {f:"spec.stage",t:"feat",l:"behavior · constraints · behaviorContracts",lc:"stage:specification"},
+    {f:"spec.stage",t:"om",l:"нормализованные договоры (без entry · inputs · compatibility)",route:"above",depth:40,ff:.8},
+    {f:"spec.omgap",t:"om",l:"nodes · state → решение OM",k:"alt",route:"below",depth:44,ff:.5},
+    {f:"disc.stage",t:"spec.packet",l:"actors · outcomes · constraints",route:"below",depth:198,ff:.14},
     {f:"map.stage",t:"om",l:"graph-layer:1 · journeys → очередь OM",route:"below",depth:44,ff:.7},
     {f:"map.graph",t:"feat",l:"артефакты L1 → outcome фич",route:"below",depth:88,ff:.5},
     {f:"spec",t:"feat",l:"контракты"},
     {f:"feat",t:"om",l:"фичи"},
     {f:"om",t:"run",l:"атомарный план"},
-    {f:"con.stage",t:"spec",l:"требования → покрыть контрактами",route:"below",depth:44,ff:.45},
+    {f:"con.stage",t:"spec.packet",l:"conceptSections → покрыть договорами",route:"above",depth:128,ff:.5},
     {f:"con.stage",t:"om",l:"требования + критерии {id}#n",route:"below",depth:88,ff:.65},
     {f:"disc.stage",t:"map.packet",l:"actors · outcomes · constraints · journeys",lc:"actors · outcomes · constraints · journeys",route:"below",depth:132,ff:.3},
     {f:"disc.stage",t:"map.build",l:"preparation → actors · outcomes · journeys",route:"below",depth:154,ff:.22},
     {f:"disc.stage",t:"om",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
     {f:"disc.web",t:"om",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6}
   ];
-  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec","feat","om","run"];
+  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec.packet","spec.model","spec.assess","spec.contracts","spec.checks","spec.stage","feat","om","run"];
 
   function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
   var S={},N={};
