@@ -2320,7 +2320,7 @@
 - Отдаёт: —
 - Читает записи: принятые стадии specification и features с точными Ref; нормализованный вход B1
 - Пишет записи: обязательный раздел выбранной спецификации в пакете вопроса OM; декларация briefSelection корня пакета
-- Разрешённые пути: `src/om/selected-specification.ts`, `src/om/input.ts`, `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/selected-specification.test.ts`, `test/om-packet-brief.test.ts`, `test/om-question-packet.test.ts`, `test/om-input.test.ts`, `test/om-model-call.test.ts`
+- Разрешённые пути: `src/om/selected-specification.ts`, `src/om/input.ts`, `src/om/packet-brief.ts`, `src/om/question-packet.ts`, `test/selected-specification.test.ts`, `test/om-packet-brief.test.ts`, `test/om-question-packet.test.ts`, `test/om-input.test.ts`, `test/om-model-call.test.ts`, `test/om-run.test.ts`
 - Из движка как есть: №4710; №4714; WB1b
 - После: DS1, WB1, WB1b
 - Тесты сверх обязательных:
