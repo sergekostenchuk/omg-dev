@@ -21,9 +21,10 @@
 
 Выведена кодом из путей, чтений и цели задачи. В отчёте по КАЖДОМУ пункту — имя теста, который его закрывает, либо одна фраза, почему класс здесь неприменим.
 
-- **ЭРА ВЫВОДА (урок 41).** Ты меняешь файлы, которые уже выводят или проверяют сохранённые записи: `src/product/commands.ts`, `src/cli.ts`. Регрессия: код базы `4d94bd64c7e2` (загруженный из Git целиком, отдельный процесс) пишет свои записи → новый код читает их после перезапуска с тем же результатом. Если вывод меняется — маркер договора в новых записях, история по правилу своей эры, без перебора. Если это только выделение общего механизма — докажи неизменность вывода прежними тестами без правки их ожиданий.
+- **ЭРА ВЫВОДА (урок 41; слово владельца «тест смотрит только актуальную версию», 13.10.2026).** Ты меняешь файлы, которые уже выводят или проверяют сохранённые записи: `src/product/commands.ts`, `src/cli.ts`. Регрессия — ТОЛЬКО для форматов, которые есть в живых базах (omg-live): образец записи из снимка живой базы читает новый код с тем же результатом. Старый движок из Git для этого НЕ запускать; формата нет в живых базах — регрессию эры не делать, строкой в отчёте. Если вывод меняется — маркер договора в новых записях, история по правилу своей эры, без перебора. Если это только выделение общего механизма — докажи неизменность вывода прежними тестами без правки их ожиданий.
 - **ОКНА И ИСТОРИЯ (уроки 21, 38).** Подготовка ничего не пишет и возвращает записи и охраны; запись — одной охраняемой транзакцией. Охрана захватывается ДО проверки, которую защищает (урок 42). Регрессия: вторым Store меняется КАЖДАЯ охраняемая голова между подготовкой и записью — отказ без частичной записи. Историческое чтение — по точным сохранённым основаниям, без текущих голов; текущий допуск проверяет текущую ЛИНИЮ, а не голову одной записи.
 - **ЧТЕНИЕ НЕ СЛАБЕЕ ЗАПИСИ (урок 45, решение владельца 26.09.2026).** Обязателен, если задача вводит читателя, потребителя, исторический путь, повтор, возобновление, поставщика или вторую проверку поверх сохранённой записи — своей или другого производителя. Признаки стыка: новый код на записях прежнего производителя; производная запись над источниками (журнал, ведомость, индекс, серия); флаг current/historical или отдельный путь истории/повтора; вторая реализация проверки того же договора; физический или облегчённый читатель либо код отказа как положительное доказательство; ветвь эры по наличию поля; основание из нескольких точных ссылок разных производителей. Каждый такой путь принимает только то, что законный производитель этой эры мог записать: запись заново выводится из её точных источников ТЕМ ЖЕ общим читателем, что у производителя (одна реализация, включая совместность оснований и обязательные поля эры); форма, хэш, Ref, kind, наличие поля, код отказа и местные копии правил доказательством не являются. Регрессия на каждый вид читаемой записи: в отдельном временном Store — изменённая копия настоящей записи с пересчитанным hash/id под точным Ref (подмена содержания; удаление каждого обязательного поля; противоречивое сочетание полей; подлинная часть другого среза) → типизированный отказ ДО записи (без новых ревизий и сдвига голов) и при историческом чтении, в том числе после переоткрытия Store; контроль — законная запись и история прежней эры читаются. Мутация: в общем читателе заменить повторный вывод на успех после сверки хэша с Ref — регрессии обязаны упасть. В отчёте — таблица «запись · производитель · общий ВЫВОД · тест» по ВСЕМ читаемым сохранённым записям: в клетке «общий вывод» — функция, которая ЗАНОВО строит тело записи (включая все производные поля: результат, offset/cursor, счётчики, состояние) из точного исходного состояния и источников и используется И производителем, И историческим читателем; клетка, где указана лишь проверка вида, формы, привязок, hash или Ref, считается НЕЗАПОЛНЕННОЙ (так вернули D8.4, №1235-1: result/offset синтеза проверялись формой). Пустая или незаполненная клетка — сдача не принимается.
+- **ПОДДЕЛКА СОБСТВЕННЫХ ЗАПИСЕЙ — НЕ ДЕЛАТЬ, ВСЕ ПУТИ ДВИЖКА (решение владельца 28.09.2026, ответ ревьюера №1661; распространено 13.10.2026, №4516).** Живой прогон ведёт один оператор: отдельные матрицы тестов и проверки против РУЧНОЙ подделки или порчи собственной локальной базы (пересчитанный хэш, подменённое поле своей записи, искусственная classification) не делать. ДЕЛАТЬ: различать подлинный результат одной попытки/владельца/ordinal, предъявленный другой (повторы и перезапуски сами создают соседство похожих записей); проверять недоверенный ответ модели; пользоваться общими читателями и точными связями; историческое чтение — ради продолжения после перезапуска. Если строка договора нужна только против ручной подделки — вопрос до кода, не реализация.
 - **ТАБЛИЦА ИСХОДА (урок 46).** Если в договоре есть таблица исхода — по каждой её строке тест с номером строки; своих строк не добавлять.
 - **ПУТИ.** Перечисли в отчёте ВСЕ публичные пути к защищаемому действию (прямой вызов, цикл, повтор, восстановление, историческое чтение); общий шаг выполняется на каждом — регрессия на каждый путь.
 
@@ -37,12 +38,12 @@
 
 ## Карточка задачи
 
-- Точная база: ветка `om/module`, коммит `4d94bd64c7e2`. Версия правил: `level2-rules.mjs` sha256 `520f1e3c9388`.
+- Точная база: ветка `om/module`, коммит `3cef0e61c339`. Версия правил: `level2-rules.mjs` sha256 `520f1e3c9388`.
 - Правила: `rules-general`
 - Читает записи: команды продукта (src/product/commands.ts)
 - Пишет записи: интерфейс сервиса движка и подключения
 - Из движка как есть: продуктовые команды om-start/om-continue/om-state/om-stop/om-spend/om-fsck; проект SEC1
-- Уже сделано до тебя: NR «Доверенное чтение: записанное с хэшем читается как есть, проверяется только новое (класс «проверенное чтение», 58 мест)» (src/om/model-call.ts, src/om/repeat-gate.ts, src/om/question-packet.ts, src/om/series.ts, src/om/answers-gate.ts, src/om/input.ts, src/om/frame-obligations.ts, src/om/layer-basis.ts, src/om/gaps.ts, src/om/gap-lines.ts, src/om/routes.ts, src/om/obligations.ts, src/om/refusal-journal.ts, src/om/accepted-answer.ts, src/om/assessment.ts, src/om/atomic-gate.ts, src/om/frame-candidate.ts, src/om/result-identity.ts, src/om/horizon.ts, src/graph/task-obligations.ts, src/storage/store.ts, src/evidence/evidence.ts, src/history/proofs.ts, src/storage/store-view.ts, src/om/refusal.ts); OWN1 «Режим «обхода»: на вопросы владельца и вопросы без производителя отвечает модель (партия MC2), позднее обязательство назначается блоку-потребителю по умолчанию — проход не встаёт в unable» (src/om/answers-gate.ts, src/om/routes.ts, src/om/addressing.ts, src/om/input.ts, src/om/obligations.ts, src/om/packet-brief.ts, src/om/gaps.ts, src/om/owner-result.ts, src/om/achievements.ts, src/om/run.ts, src/om/answer-form.ts, src/product/commands.ts, src/product/engine.ts); RL3 «Переоткрытие принятого L3 по двери AT1 явной командой владельца: принятые работы, не проходящие текущий G5, перепроектируются штатным путём (вопросы готовности B1 → модель → G5 → settle), затем M8 → компиляция; L1 и L2 не трогаются» (src/product/commands.ts, src/om/run.ts, src/om/gaps.ts, src/om/frame-proposals.ts, src/om/frame-accept.ts)
+- Уже сделано до тебя: NR «Доверенное чтение: записанное с хэшем читается как есть, проверяется только новое (класс «проверенное чтение», 58 мест)» (src/om/model-call.ts, src/om/repeat-gate.ts, src/om/question-packet.ts, src/om/series.ts, src/om/answers-gate.ts, src/om/input.ts, src/om/frame-obligations.ts, src/om/layer-basis.ts, src/om/gaps.ts, src/om/gap-lines.ts, src/om/routes.ts, src/om/obligations.ts, src/om/refusal-journal.ts, src/om/accepted-answer.ts, src/om/assessment.ts, src/om/atomic-gate.ts, src/om/frame-candidate.ts, src/om/result-identity.ts, src/om/horizon.ts, src/graph/task-obligations.ts, src/storage/store.ts, src/evidence/evidence.ts, src/history/proofs.ts, src/storage/store-view.ts, src/om/refusal.ts); OWN1 «Режим «обхода»: на вопросы владельца и вопросы без производителя отвечает модель (партия MC2), позднее обязательство назначается блоку-потребителю по умолчанию — проход не встаёт в unable» (src/om/answers-gate.ts, src/om/routes.ts, src/om/addressing.ts, src/om/input.ts, src/om/obligations.ts, src/om/packet-brief.ts, src/om/gaps.ts, src/om/owner-result.ts, src/om/achievements.ts, src/om/run.ts, src/om/answer-form.ts, src/product/commands.ts, src/product/engine.ts); RL3 «Переоткрытие принятого L3 по двери AT1 явной командой владельца: принятые работы, не проходящие текущий G5, перепроектируются штатным путём (вопросы готовности B1 → модель → G5 → settle), затем M8 → компиляция; L1 и L2 не трогаются» (src/product/commands.ts, src/product/engine.ts, src/om/run.ts, src/om/gaps.ts, src/om/input.ts, src/om/frame-proposals.ts, src/om/frame-accept.ts); WB1 «Модель прохода исследует интернет сама: действия web_search и web_fetch в протоколе исследования; движок исполняет их через шлюз (NL99), сохраняет снимок страницы как Source происхождения web и возвращает модели; дальше обычные read_source/read_bundle и строгие citations» (src/discovery/web-research.ts, src/evidence/evidence.ts, src/runtime/environment.ts, src/product/commands.ts, src/discovery/research-model.ts, src/discovery/research-consumer-transition.ts, src/discovery/research-runner.ts, src/discovery/response-recovery.ts, src/discovery/research-sources.ts, src/discovery/research-continuation.ts, src/discovery/pilot-context.ts, src/discovery/reading-plan.ts, src/discovery/planning-context.ts, src/discovery/working-context.ts, src/discovery/continuation-packet.ts, src/graph/research-basis.ts, src/discovery/early-research-outcome.ts); DRV1 «Драйвер ранних стадий: соединение существующих производителей — сохранённый однозначный или явно выбранный draft → StageResearch (с build-map и приёмкой) → следующая стадия → после features штатный om-start / coldStart; без нового prepare на повтор, без второго accept; общий стоп на границах новых A/B/C и HTTP; общий maxTurns и отдельный физический maxCalls; исходы различимы машинно» (src/product/early-stage-driver.ts, src/product/commands.ts, src/product/engine.ts, src/product/stage-research.ts, src/discovery/consumer-research.ts, src/discovery/research-runner.ts, src/discovery/research-protocol.ts, src/discovery/web-research.ts, src/om/run-driver.ts, src/om/run-control.ts, src/discovery/invocation-progress.ts); IN1 «Поручение без приписывания модели воли владельца: вход драйвера записывает дословное поручение (Source), brief точным selector, objective — дословной целью владельца или точной копией brief; модельное понимание остаётся design (researchPlan); автор копирования и точный источник различимы; метки окна по kind — НЕ в IN1: UI только с разрешения владельца, переносится в DS1.3» (src/product/early-stage-driver.ts, src/product/commands.ts, src/product/engine.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -89,6 +90,28 @@
 - `src/product/engine.ts`
 - `src/om/frame-proposals.ts`
 - `src/om/frame-accept.ts`
+- `src/discovery/web-research.ts`
+- `src/runtime/environment.ts`
+- `src/discovery/research-model.ts`
+- `src/discovery/research-consumer-transition.ts`
+- `src/discovery/research-runner.ts`
+- `src/discovery/response-recovery.ts`
+- `src/discovery/research-sources.ts`
+- `src/discovery/research-continuation.ts`
+- `src/discovery/pilot-context.ts`
+- `src/discovery/reading-plan.ts`
+- `src/discovery/planning-context.ts`
+- `src/discovery/working-context.ts`
+- `src/discovery/continuation-packet.ts`
+- `src/graph/research-basis.ts`
+- `src/discovery/early-research-outcome.ts`
+- `src/product/early-stage-driver.ts`
+- `src/product/stage-research.ts`
+- `src/discovery/consumer-research.ts`
+- `src/discovery/research-protocol.ts`
+- `src/om/run-driver.ts`
+- `src/om/run-control.ts`
+- `src/discovery/invocation-progress.ts`
 
 ### Границы незавершённой интеграции
 
@@ -99,7 +122,7 @@
 - успех
 - КАЖДЫЙ код отказа единицы
 - отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4)
-- подделка входа: чужое пространство имён, подменённый хэш, имитация статусного поля
+- недоверенный вход: ответ модели не по форме или с чужими ссылками, подлинный результат другой попытки/владельца → отказ с адресом (подделку собственной базы не тестировать — решение владельца 28.09, 13.10)
 - окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7)
 - ДО КОДА — проект Codex-omg вместе с SEC1: исследование, как подключают такие движки в харнесы (MCP, плагины Claude Code/Codex/Cursor), и как продукты выдают и сохраняют ключ владельца (ключ восстановления, связка ключей ОС, экспорт); пути уточняются проектом
 - один и тот же сценарий проекта через MCP и через CLI даёт одинаковые записи
