@@ -2471,7 +2471,7 @@
 - Отдаёт: —
 - Читает записи: RoleBinding роли и mode вызова
 - Пишет записи: выбор команды роли по mode одним resolver; адресный отказ отсутствующей клетки
-- Разрешённые пути: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`, `test/role-mode.test.ts`
+- Разрешённые пути: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`, `test/role-mode.test.ts`, `ui/app.tsx`, `test/ui.test.ts`
 - Из движка как есть: №4856; №4864
 - После: DRV1, IN1, AT3a
 - Тесты сверх обязательных:
