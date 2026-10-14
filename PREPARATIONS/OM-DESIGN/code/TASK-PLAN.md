@@ -2384,7 +2384,7 @@
 - Отдаёт: —
 - Читает записи: сохранённые drafts и стадии проекта; исходы StageResearch, DS1, DRY5FIX
 - Пишет записи: ход ранних стадий до om-start; общий стоп и учёт вызовов ранних ролей
-- Разрешённые пути: `src/product/early-stage-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/consumer-research.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-protocol.ts`, `src/discovery/web-research.ts`, `src/om/run-driver.ts`, `src/om/run-control.ts`, `src/discovery/invocation-progress.ts`, `test/early-stage-driver.test.ts`, `test/om-run-driver.test.ts`, `test/stage-research.test.ts`, `src/discovery/response-recovery.ts`
+- Разрешённые пути: `src/product/early-stage-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/consumer-research.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-protocol.ts`, `src/discovery/web-research.ts`, `src/om/run-driver.ts`, `src/om/run-control.ts`, `src/discovery/invocation-progress.ts`, `test/early-stage-driver.test.ts`, `test/om-run-driver.test.ts`, `test/stage-research.test.ts`, `src/discovery/response-recovery.ts`, `src/discovery/assessment-session.ts`
 - Из движка как есть: №4676; №4687; №4611
 - После: DS1, DRY5FIX, WB1, WB1b, L1A
 - Тесты сверх обязательных:
