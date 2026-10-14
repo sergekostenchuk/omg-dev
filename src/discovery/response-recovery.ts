@@ -1,3 +1,4 @@
+import { earlyResearchStage, earlyResearchFailure, EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
 import { consolidationInput } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Ajv } from 'ajv';
@@ -778,6 +779,26 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
   let action: ResearchAction;
   try { action = researchAction(before.value.action); }
   catch { consumerInvalid(before.id, 'The original paid turn action is invalid'); }
+  if (after.value.status === 'completed' && after.value.observation?.code === 'research_question_reopened') {
+    const originalRef = before.value.question;
+    const questionRef = after.value.observation.question, draftRef = after.value.observation.draft;
+    const original = isRef(originalRef) ? store.get<Question>(originalRef.id, originalRef.revision) : null;
+    const reopened = isRef(questionRef) ? store.get<Question>(questionRef.id, questionRef.revision) : null;
+    const draft = isRef(draftRef) ? store.get<DiscoveryDraft>(draftRef.id, draftRef.revision) : null;
+    if (!original || !reopened || !draft || canonical(reference(original)) !== canonical(originalRef)
+      || canonical(reference(reopened)) !== canonical(questionRef) || canonical(reference(draft)) !== canonical(draftRef))
+      consumerInvalid(before.id, 'The reopened turn lost its exact draft and question');
+    return { kind: 'question-reopened', original, reopened, draft };
+  }
+  if (after.value.status === 'completed' && after.value.observation?.contract === EARLY_RESEARCH_OUTCOME) {
+    const draftRef = producer.value.draft, questionRef = before.value.question;
+    const draft = store.get<DiscoveryDraft>(draftRef.id, draftRef.revision);
+    const question = isRef(questionRef) ? store.get<Question>(questionRef.id, questionRef.revision) : null;
+    if (!draft || !question || canonical(reference(draft)) !== canonical(draftRef)
+      || canonical(reference(question)) !== canonical(questionRef))
+      consumerInvalid(before.id, 'The early model refusal lost its exact original contract');
+    return { kind: 'early-model-refusal', draft, question };
+  }
   const localRefusal = projectPaidLocalRefusal(before.value as ManagedResearchTurn);
   if (localRefusal) return localRefusal.proof;
   if (action.action === 'read_context' && after.value.status === 'pending'
@@ -917,16 +938,6 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
     if (after.value.error !== null) {
       const refusal = projectPaidLayerDesignRefusal(store, producer, before);
       if (refusal) return refusal.proof;
-    }
-    if (after.value.observation?.code === 'research_question_reopened') {
-      const questionRef = after.value.observation.question;
-      const draftRef = after.value.observation.draft;
-      const reopened = isRef(questionRef) ? store.get<Question>(questionRef.id, questionRef.revision) : null;
-      const draft = isRef(draftRef) ? store.get<DiscoveryDraft>(draftRef.id, draftRef.revision) : null;
-      if (!reopened || !draft || canonical(reference(reopened)) !== canonical(questionRef)
-        || canonical(reference(draft)) !== canonical(draftRef))
-        consumerInvalid(before.id, 'The reopened answer lost its exact draft and question');
-      return { kind: 'question-reopened', original, reopened, draft };
     }
     if (after.value.observation?.code === 'research_proposal_invalid') {
       const refusalRef = after.value.observation.refusal;
@@ -1171,8 +1182,9 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
   }
   return saved;
 }
-function checkConsumerClaimOrigins(store: Store): void {
+function checkConsumerClaimOrigins(store: Store, projectId?: string, draftId?: string): void {
   for (const call of store.list<ModelCall>('model-call')) {
+    if (projectId !== undefined && (call.value.projectId !== projectId || draftId !== undefined && call.value.draftId !== draftId)) continue;
     const managed = call.id.startsWith('model-call:consumer:v1:');
     const intentRef = (call.value as ModelCall & { consumerIntent?: Ref }).consumerIntent;
     if (!managed && intentRef === undefined) continue;
@@ -1186,9 +1198,11 @@ function checkConsumerClaimOrigins(store: Store): void {
       consumerInvalid(call.id, 'The physical call is not owned by its declared consumer intent');
   }
 }
-export function findResearchConsumerIntent(store: Store, projectId: string, kind: ResearchConsumerKind, key: string): Revision<ResearchConsumerIntent> | null {
-  checkConsumerClaimOrigins(store);
+export function findResearchConsumerIntent(store: Store, projectId: string, kind: ResearchConsumerKind, key: string, draftId?: string): Revision<ResearchConsumerIntent> | null {
+  checkConsumerClaimOrigins(store, draftId ? projectId : undefined, draftId);
   const found = store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .filter(record => !draftId || record.value.projectId === projectId && record.value.draft.id === draftId
+      && record.value.kind === kind && record.value.rootKey === key)
     .map(record => readResearchConsumerIntent(store, reference(record)))
     .filter(record => record.value.projectId === projectId && record.value.kind === kind && record.value.rootKey === key)
     .sort((a, b) => a.value.generation - b.value.generation);
@@ -1198,11 +1212,12 @@ export function findResearchConsumerIntent(store: Store, projectId: string, kind
 }
 /** Capture only refusals proved before this public invocation began. Internal
  * resumes and child operations must reuse this snapshot, not collect a new one. */
-export function captureResearchConsumerRetryPermits(store: Store, projectId: string): Ref[] {
+export function captureResearchConsumerRetryPermits(store: Store, projectId: string, draftId?: string): Ref[] {
   if (!store || typeof store.list !== 'function' || typeof projectId !== 'string' || !projectId)
     consumerInvalid('research-consumer-intent', 'A retry permit needs its original project');
-  checkConsumerClaimOrigins(store);
+  checkConsumerClaimOrigins(store, draftId ? projectId : undefined, draftId);
   return store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .filter(record => !draftId || record.value.projectId === projectId && record.value.draft.id === draftId)
     .map(record => readResearchConsumerIntent(store, reference(record)))
     .filter(record => record.value.projectId === projectId && retryableResearchConsumerRefusal(store, record))
     .map(reference);
@@ -1210,16 +1225,20 @@ export function captureResearchConsumerRetryPermits(store: Store, projectId: str
 export function listPendingResearchConsumerIntents(store: Store, projectId: string, draftId: string): Revision<ResearchConsumerIntent>[] {
   if (!store || typeof store.list !== 'function' || typeof projectId !== 'string' || !projectId || typeof draftId !== 'string' || !draftId)
     consumerInvalid('research-consumer-intent', 'Pending lookup needs a project and original draft address');
-  checkConsumerClaimOrigins(store);
-  return store.list<ResearchConsumerIntent>('research-consumer-intent').map(record => readResearchConsumerIntent(store, reference(record)))
+  const scoped = earlyResearchStage(store.get<DiscoveryDraft>(draftId)?.value.stage);
+  checkConsumerClaimOrigins(store, scoped ? projectId : undefined, scoped ? draftId : undefined);
+  return store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .filter(record => !scoped || record.value.projectId === projectId && record.value.draft.id === draftId).map(record => readResearchConsumerIntent(store, reference(record)))
     .filter(record => record.value.projectId === projectId && record.value.draft.id === draftId
       && ['prepared', 'running'].includes(record.value.state));
 }
 export function listResearchConsumerIntents(store: Store, projectId: string, draftId: string): Revision<ResearchConsumerIntent>[] {
   if (!store || typeof store.list !== 'function' || typeof projectId !== 'string' || !projectId || typeof draftId !== 'string' || !draftId)
     consumerInvalid('research-consumer-intent', 'Intent lookup needs a project and original draft address');
-  checkConsumerClaimOrigins(store);
-  return store.list<ResearchConsumerIntent>('research-consumer-intent').map(record => readResearchConsumerIntent(store, reference(record)))
+  const scoped = earlyResearchStage(store.get<DiscoveryDraft>(draftId)?.value.stage);
+  checkConsumerClaimOrigins(store, scoped ? projectId : undefined, scoped ? draftId : undefined);
+  return store.list<ResearchConsumerIntent>('research-consumer-intent')
+    .filter(record => !scoped || record.value.projectId === projectId && record.value.draft.id === draftId).map(record => readResearchConsumerIntent(store, reference(record)))
     .filter(record => record.value.projectId === projectId && record.value.draft.id === draftId);
 }
 export function findPendingResearchConsumerIntent(store: Store, projectId: string, kind: ResearchConsumerKind,
@@ -1256,7 +1275,8 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   if (!object(input)) consumerInvalid('research-consumer-intent', 'A complete consumer admission is required');
   if (!Array.isArray(permits) || !permits.every(isRef))
     consumerInvalid('research-consumer-intent', 'Retry permits must be exact saved terminal references');
-  const previous = findResearchConsumerIntent(store, input.projectId, input.kind, input.key);
+  const scoped = earlyResearchStage(store.get<DiscoveryDraft>(input.draft.id, input.draft.revision)?.value.stage);
+  const previous = findResearchConsumerIntent(store, input.projectId, input.kind, input.key, scoped ? input.draft.id : undefined);
   const replacing = !!previous && retryableResearchConsumerRefusal(store, previous)
     && permits.some(permit => canonical(permit) === canonical(reference(previous)));
   let currentRefusedCall: Ref | null = null;
@@ -1634,14 +1654,28 @@ function noModelResponse(text: string, protocol: unknown, requestId: unknown, st
     && NO_RESPONSE_ERRORS.includes(adapterErrorCode(stderr) ?? '') ? 'envelope' : null;
 }
 /**
- * RS3: a refused paid step another generation may answer — a provider failure without a model response. Before RS3 a
- * failure that left only its own envelope was saved as the terminal research_provider_failed; it reads in its era and is
- * the same physical failure, so it is retried the same way.
+ * A new external generation may answer a proved provider failure or an early
+ * model reply error. The original refusal and its physical evidence stay terminal.
+ * Pre-RS3 envelope-only failures retain their original representation.
  */
+export function earlyResearchConsumerFailure(store: Store, intent: Revision<ResearchConsumerIntent>): EngineError | null {
+  if (!['analyst', 'escalation-assessor'].includes(intent.value.kind)) return null;
+  const draft = store.get<DiscoveryDraft>(intent.value.draft.id, intent.value.draft.revision);
+  const question = store.get<Question>(intent.value.question.id, intent.value.question.revision);
+  if (!draft || !question || canonical(reference(draft)) !== canonical(intent.value.draft)
+    || canonical(reference(question)) !== canonical(intent.value.question))
+    consumerInvalid(intent.id, 'The early reply lost its original draft or question');
+  if (!earlyResearchStage(draft.value.stage)) return null;
+  const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  if (paid.kind !== 'response') return null;
+  return earlyResearchFailure(draft.value, question.value,
+    intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload);
+}
 export function retryableResearchConsumerRefusal(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
   const refusal = intent.value.state === 'refused' ? intent.value.refusal : null;
   if (!refusal) return false;
   if (refusal.kind === 'provider-failed') return true;
+  if (refusal.kind === 'consumer-invalid' && earlyResearchConsumerFailure(store, intent)) return true;
   if (refusal.kind !== 'terminal' || refusal.code !== 'research_provider_failed') return false;
   const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
   return paid.kind === 'provider-failed' && paid.envelope === true;
@@ -1658,10 +1692,9 @@ export function readResearchConsumerExecution(store: Store, projectId: string, i
   const intent = readResearchConsumerIntent(store, reference(head));
   return readResearchConsumerExecutionFromIntent(store, projectId, intent);
 }
-/** Terminalize the exact physical outcome. Only a proved empty provider
- * failure is eligible for a later external generation permit. A received but
- * unlawful reply is saved as an unresumable refusal with the exact code the
- * common transition throws on it. */
+/** Terminalize the exact physical outcome. Retry eligibility is derived
+ * separately from this immutable attempt by the common rule; saving the
+ * refusal never grants another call inside the current invocation. */
 export function refuseResearchConsumerIntent(store: Store, intentRef: Ref,
   expectedCode?: string): Revision<ResearchConsumerIntent> {
   const supplied = readResearchConsumerIntent(store, intentRef);
@@ -1912,10 +1945,8 @@ function actionResponseRefusalCode(intent: Revision<ResearchConsumerIntent>,
   paid: ResearchConsumerExecution): string | null {
   if (paid.kind !== 'response') consumerInvalid(intent.id, 'A semantic refusal needs its received response');
   if (intent.value.kind === 'escalation-assessor') {
-    const verdict = paid.payload as { necessary?: unknown; reason?: unknown } | null;
-    return verdict && typeof verdict.necessary === 'boolean'
-      && typeof verdict.reason === 'string' && verdict.reason.trim().length > 0
-      ? null : 'escalation_assessment_invalid';
+    try { requireEscalationReply(paid.payload); return null; }
+    catch (error) { if (error instanceof EngineError) return error.code; throw error; }
   }
   try { researchAction(paid.payload); return null; }
   catch (error) {

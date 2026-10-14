@@ -1,3 +1,4 @@
+import { earlyResearchFailure, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { Ajv } from 'ajv';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
@@ -1238,6 +1239,7 @@ export type TurnTransitionProof =
   | { kind: 'accepted-answer'; inputs: AcceptedPaidAnswerInputs;
       /** D8.4e: the proven K; mandatory for a turn of the binding era. */
       binding?: { ref: Ref; value: ResearchAcceptanceBinding } }
+  | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question> }
   | { kind: 'question-reopened'; original: Revision<Question>;
       reopened: Revision<Question>; draft: Revision<DiscoveryDraft> }
   | { kind: 'repeat-context'; current: ContextReadIdentityInput;
@@ -1521,6 +1523,20 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     return { ...before, status: 'completed', assessment: matched.assessment,
       observation: matched.observation, error: null, acceptance: chain,
       ...(bindingRef ? { acceptanceBinding: bindingRef } : {}) };
+  }
+  if (proof.kind === 'early-model-refusal') {
+    const { draft, question } = proof;
+    requireCondition(draft.kind === 'discovery-draft' && question.kind === 'question'
+      && hashJson(draft.value) === draft.hash && hashJson(question.value) === question.hash
+      && canonical(before.question) === canonical(exactRef(question))
+      && question.value.draftId === draft.id && draft.value.questions.includes(question.id)
+      && (!('question' in action) || action.question === question.id),
+    'research_consumer_intent_invalid', 'The early refusal lost its exact draft and selected question');
+    const failure = earlyResearchFailure(draft.value, question.value, 'analyst', action);
+    requireCondition(failure, 'research_consumer_intent_invalid', 'A valid early reply cannot become a model refusal');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { contract: EARLY_RESEARCH_OUTCOME, code: failure.code, details: failure.details ?? null,
+        draft: exactRef(draft), question: exactRef(question) }, error: failure.message };
   }
   if (proof.kind === 'question-reopened') {
     const { original, reopened, draft } = proof;

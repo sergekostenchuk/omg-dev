@@ -5562,3 +5562,87 @@ for (const [name, code, retryable] of [['adapter_failed (the model may have answ
     assert.deepEqual(readers(reopened, reference(intent2), reference(call2)), expected, 'The sibling receipt is never read');
     assert.equal(captureResearchConsumerRetryPermits(reopened, 'p').some(permit => permit.id === intent.id), retryable);
   });
+
+function dry5EscalationFixture(t: test.TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-dry5-escalation-')), database = join(root, 'state.sqlite');
+  const stores: Store[] = [], open = () => { const db = new Store(database); stores.push(db); return new ProductEngine(db); };
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = open(), wire = join(root, 'wire.ndjson'), mode = join(root, 'mode'); writeFileSync(mode, 'escalation');
+  engine.execute({ type: 'create-project', project: 'p', title: 'Early escalation retry' });
+  const source = engine.discovery.evidence.document('p', 'basis', 'Evidence exists, but the owner has not chosen the private account.', 'text/plain', 0);
+  const adapter = join(root, 'adapter.mjs');
+  writeFileSync(adapter, `import{readFileSync,appendFileSync,existsSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,path=${JSON.stringify(wire)};
+const prior=existsSync(path)?readFileSync(path,'utf8').trim().split('\\n').filter(Boolean).length:0;
+appendFileSync(path,JSON.stringify(r)+'\\n');
+const q=s.questions?.[0]??s.question,source=${JSON.stringify(reference(source))};
+let research;
+if(s.role==='assess-answer')research={verdict:'supported',reasons:[]};
+else if(s.role==='assess-escalation')research=prior===2?{necessary:'yes'}:{necessary:true,reason:'The owner must choose their private account'};
+else if(readFileSync(${JSON.stringify(mode)},'utf8')==='answer')research={action:'answer',question:q.id,value:{result:'Documented choice'},citations:[{source,selector:{kind:'text-range',start:0,end:8}}]};
+else research=prior===0?{action:'read_source',source,start:0,end:8}:{action:'need_owner',question:q.id,reason:'Choose the private account',searched:[source]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:null}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 10000 }, 0);
+  const draft = engine.discovery.create('p', 'discovery', 'R0', 'discovery', [{ field: 'result', kind: 'design',
+    prompt: 'Resolve the account choice', risk: 'No account selected', schema: { type: 'object', required: ['result'],
+      properties: { result: { type: 'string' } }, additionalProperties: false } }]);
+  const calls = () => readFileSync(wire, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  return { engine, open, draft, calls, mode };
+}
+test('DRY5FIX M10: restart retries only the malformed escalation assessor with its contract', async t => {
+  const f = dry5EscalationFixture(t);
+  const first = await f.engine.researcher.run('p', f.draft.id, 8);
+  assert.equal(first.value.pauseCode, 'escalation_assessment_invalid'); assert.equal(f.calls().length, 3);
+  const result = await f.open().researcher.run('p', f.draft.id, 8);
+  assert.equal(result.value.status, 'needs_owner'); assert.equal(f.calls().length, 4);
+  assert.equal(f.calls()[3].subject.role, 'assess-escalation');
+  assert.equal(f.calls()[3].subject.failures[0].code, 'escalation_assessment_invalid');
+  assert.ok(f.calls()[3].subject.failures[0].responseContract);
+});
+test('DRY5FIX C several native reopens retire the old candidate without transferring it', async t => {
+  const f = dry5EscalationFixture(t);
+  await f.engine.researcher.run('p', f.draft.id, 8); assert.equal(f.calls().length, 3);
+  const question = f.engine.store.get<Question>(f.draft.value.questions[0]!)!;
+  const reopened = f.engine.discovery.reopen(question.id, question.revision);
+  f.engine.discovery.reopen(reopened.id, reopened.revision);
+  writeFileSync(f.mode, 'answer');
+  const engine = f.open(), result = await engine.researcher.run('p', f.draft.id, 8);
+  assert.equal(result.value.status, 'completed', result.value.error ?? '');
+  assert.equal(f.calls().length, 5);
+  for (const turn of engine.store.list<ResearchTurn>('research-turn').filter(row => row.value.run === result.id))
+    assert.doesNotThrow(() => readResearchConsumerTurn(engine.store, reference(turn)));
+});
+
+for (const boundary of ['receipt', 'before-outcome', 'after-outcome'])
+test(`DRY5FIX C ${boundary}: recovery closes only the received erroneous assessment`, async t => {
+  const f = dry5EscalationFixture(t), store = f.engine.store;
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    const match = writes.some(write => boundary === 'receipt'
+      ? write.kind === 'model-response' && (write.value as any).text?.includes('"necessary":"yes"')
+      : write.kind === 'research-consumer-intent' && (write.value as any).kind === 'escalation-assessor'
+        && (write.value as any).state === 'refused');
+    if (!hit && match) {
+      hit = true; if (boundary !== 'before-outcome') original(writes, guards);
+      throw new Error('DRY5FIX interrupted escalation persistence');
+    }
+    return original(writes, guards);
+  }) as typeof store.writeMany;
+  await f.engine.researcher.run('p', f.draft.id, 8);
+  store.writeMany = original; assert.ok(hit); assert.equal(f.calls().length, 3);
+  if (boundary !== 'after-outcome') {
+    const resumed = await f.open().researcher.run('p', f.draft.id, 8);
+    assert.equal(resumed.value.pauseCode, 'escalation_assessment_invalid'); assert.equal(f.calls().length, 3);
+  }
+  assert.equal((await f.open().researcher.run('p', f.draft.id, 8)).value.status, 'needs_owner');
+  assert.equal(f.calls().length, 4); assert.equal(f.calls()[3].subject.role, 'assess-escalation');
+});
+test('DRY5FIX C concurrent resumes dispatch only one correction for the saved need_owner', async t => {
+  const f = dry5EscalationFixture(t);
+  await f.engine.researcher.run('p', f.draft.id, 8); assert.equal(f.calls().length, 3);
+  const results = await Promise.allSettled([f.open().researcher.run('p', f.draft.id, 8), f.open().researcher.run('p', f.draft.id, 8)]);
+  assert.ok(results.some(result => result.status === 'fulfilled' && result.value.value.status === 'needs_owner'));
+  assert.equal(f.calls().length, 4);
+});

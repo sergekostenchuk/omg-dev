@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { setTimeout as d83Delay } from 'node:timers/promises';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { assessmentSession } from '../src/discovery/assessment-session.js';
+import { assessmentSession, assessmentPacket } from '../src/discovery/assessment-session.js';
 import { readResearchExecution, readResearchResponse } from '../src/discovery/response-recovery.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
@@ -1929,3 +1929,159 @@ process.stdout.write(JSON.stringify({protocol:request.protocol,requestId:request
     assert.ok(reopened.get<any>(raw.id, raw.revision)!.value.consumerExecution, 'The forged sibling is in the store');
     assert.equal(read(reopened, reference(forged)), expected, 'The sibling receipt is never read');
   });
+
+function dry5AssessmentAdapter(f: ReturnType<typeof resumeFixture>, payload: unknown, providerAfter = false, following: unknown[] = []) {
+  writeFileSync(f.environment.value.reviewer.command.args[0]!, `import{readFileSync,appendFileSync,existsSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),wire=${JSON.stringify(join(f.root, 'wire.ndjson'))};
+const prior=existsSync(wire)?readFileSync(wire,'utf8').trim().split('\\n').filter(Boolean).length:0;
+appendFileSync(wire,JSON.stringify(r)+'\\n');
+if(${providerAfter}&&prior===1){console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,usage:null}));console.error(JSON.stringify({error:'provider_failed'}));process.exit(1);}
+const research=(${JSON.stringify([payload, ...following])})[prior]??{verdict:'supported',reasons:[]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+}
+for (const [row, payload] of [
+  ['M8', { action: 'answer' }], ['M9 absent reasons', { verdict: 'supported' }],
+  ['M9 wrong reasons', { verdict: 'supported', reasons: 42 }], ['M9 checkpoint', { action: 'assessment_checkpoint' }]
+] as const) test(`DRY5FIX B ${row}: direct public session retries only its exact assessment`, async t => {
+  const f = resumeFixture(t); dry5AssessmentAdapter(f, payload);
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' }); callsOnce(f, 1);
+  const failed = f.store.list<any>('assessment-application')[0]!;
+  assert.equal(failed.value.state, 'model-refused');
+  assert.equal(f.store.list('assessment-barrier').length, 1, 'Only this exact candidate may correct its assessment');
+  assert.deepEqual(await f.invoke(f.fresh()), verdict); callsOnce(f, 2);
+  assert.equal(f.sent()[1].subject.failures[0].code, 'assessment_invalid');
+  assert.ok(f.sent()[1].subject.failures[0].responseContract);
+  const count = f.sent().length;
+  assert.deepEqual(await f.invoke(f.fresh()), verdict); assert.equal(f.sent().length, count);
+});
+for (const boundary of ['receipt', 'before-outcome', 'after-outcome'] as const)
+test(`DRY5FIX B crash ${boundary}: exact bytes close once before any permitted new call`, async t => {
+  const f = resumeFixture(t); dry5AssessmentAdapter(f, { verdict: 'supported' });
+  const restore = interruptAt(f.store, writes => writes.some(write => boundary === 'receipt'
+    ? write.kind === 'model-response' : write.kind === 'assessment-application' && (write.value as any).state === 'model-refused'),
+  boundary !== 'before-outcome');
+  await assert.rejects(f.invoke(), { code: 'fixture_application_crash' }); restore(); callsOnce(f, 1);
+  if (boundary !== 'after-outcome') {
+    await assert.rejects(f.invoke(f.fresh()), { code: 'assessment_invalid' }); callsOnce(f, 1);
+  }
+  assert.deepEqual(await f.invoke(f.fresh()), verdict); callsOnce(f, 2);
+});
+test('DRY5FIX B two external resumers reserve one corrective assessment', async t => {
+  const f = resumeFixture(t); dry5AssessmentAdapter(f, { verdict: 'supported' });
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  const results = await Promise.allSettled([f.invoke(f.fresh()), f.invoke(f.fresh())]);
+  assert.ok(results.some(result => result.status === 'fulfilled'));
+  callsOnce(f, 2);
+  assert.deepEqual(await f.invoke(f.fresh()), verdict); callsOnce(f, 2);
+});
+test('DRY5FIX B changed source refuses fresh correction while preserving the malformed receipt', async t => {
+  const f = resumeFixture(t); dry5AssessmentAdapter(f, { verdict: 'supported' });
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  f.engine.discovery.evidence.document('p', 'basis', 'Changed', 'text/plain', f.source.revision);
+  await assert.rejects(f.invoke(f.fresh())); callsOnce(f, 1);
+});
+
+test('DRY5FIX B a new candidate cannot bypass the failed assessment under the same question', async t => {
+  const f = resumeFixture(t); dry5AssessmentAdapter(f, { verdict: 'supported' });
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  await assert.rejects(assessmentSession(f.fresh(), f.draft, f.question, f.environment, f.environment.value,
+    undefined, { ...f.context, value: { result: 'different candidate' } }, 'Assess a different candidate'),
+  { code: 'research_context_application_refused' }); callsOnce(f, 1);
+  assert.deepEqual(await f.invoke(f.fresh()), verdict); callsOnce(f, 2);
+});
+test('DRY5FIX B invalid packet/cursor is an engine error before the reply classifier', () => {
+  const current = { projectId: 'p', offset: 1, notes: [], focus: null, result: null }, context = { value: 'candidate' };
+  for (const sent of [undefined, { evidencePage: { offset: 0 } },
+    { evidencePage: { offset: 1, end: 2 }, candidatePage: { total: 999, offset: 0, complete: true } }])
+    assert.throws(() => assessmentPacket(current, context, sent), { code: 'assessment_invalid' });
+});
+
+test('DRY5FIX B correction reason survives an intervening provider refusal on the same candidate', async t => {
+  const f = resumeFixture(t); dry5AssessmentAdapter(f, { verdict: 'supported' }, true);
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  await assert.rejects(f.invoke(f.fresh()), { code: 'research_provider_failed' }); assert.equal(f.sent().length, 2);
+  assert.deepEqual(await f.invoke(f.fresh()), verdict); assert.equal(f.sent().length, 3);
+  assert.equal(f.sent()[2].subject.failures[0].code, 'assessment_invalid');
+});
+
+
+test('DRY5FIX B each subsequent malformed candidate retains its own barrier until its correction completes', async t => {
+  const f = resumeFixture(t), negative = { verdict: 'insufficient', reasons: ['Revise'] };
+  dry5AssessmentAdapter(f, { verdict: 'supported' }, false, [negative, { verdict: 'supported' }, negative]);
+  const candidate = (name: string, db = f.fresh()) => assessmentSession(db, f.draft, f.question, f.environment,
+    f.environment.value, undefined, { ...f.context, value: { result: name } }, 'Assess next proposal');
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  const first = f.store.list<any>('assessment-barrier')[0]!;
+  assert.deepEqual(await f.invoke(f.fresh()), negative); callsOnce(f, 2);
+  const completed = f.store.get(first.id)!;
+  await assert.rejects(candidate('B'), { code: 'assessment_invalid' }); callsOnce(f, 3);
+  const second = f.store.get<any>(first.id)!;
+  assert.equal(second.revision, 3); assert.equal(second.value.completion, undefined);
+  assert.notDeepEqual(second.value.refusal, first.value.refusal);
+  await assert.rejects(candidate('C'), { code: 'research_context_application_refused' }); callsOnce(f, 3);
+  assert.deepEqual(await candidate('B'), negative); callsOnce(f, 4);
+  assert.equal(f.store.get(first.id)!.revision, 4);
+  assert.deepEqual(await candidate('C'), verdict); callsOnce(f, 5);
+  assert.deepEqual(await f.invoke(f.fresh()), negative);
+  assert.deepEqual(await candidate('B'), negative);
+  assert.deepEqual(await candidate('C'), verdict); callsOnce(f, 5);
+  assert.deepEqual(f.store.get(first.id, first.revision), first);
+  assert.deepEqual(f.store.get(first.id, completed.revision), completed);
+});
+
+for (const after of [false, true])
+test(`DRY5FIX B negative correction and barrier completion are atomic at ${after ? 'after' : 'before'} write`, async t => {
+  const f = resumeFixture(t), negative = { verdict: 'conflicting', reasons: ['Revise'] };
+  dry5AssessmentAdapter(f, { verdict: 'supported' }, false, [negative]);
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  const candidate = () => assessmentSession(f.fresh(), f.draft, f.question, f.environment, f.environment.value,
+    undefined, { ...f.context, value: { result: 'B' } }, 'Assess next proposal');
+  const restore = interruptAt(f.store, writes => writes.some(write => write.kind === 'assessment-barrier'
+    && Boolean((write.value as any).completion)), after);
+  await assert.rejects(f.invoke(), { code: 'fixture_application_crash' }); restore(); callsOnce(f, 2);
+  if (!after) { await assert.rejects(candidate(), { code: 'research_context_application_refused' }); callsOnce(f, 2); }
+  assert.deepEqual(await f.invoke(f.fresh()), negative); callsOnce(f, 2);
+  assert.deepEqual(await candidate(), verdict); callsOnce(f, 3);
+});
+
+test('DRY5FIX B an earlier completed model correction cannot release a later technical barrier', async t => {
+  const f = resumeFixture(t), negative = { verdict: 'insufficient', reasons: ['Revise'] };
+  dry5AssessmentAdapter(f, { verdict: 'supported' }, false, [negative]);
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  assert.deepEqual(await f.invoke(f.fresh()), negative); callsOnce(f, 2);
+  const candidate = (name: string, db = f.fresh()) => assessmentSession(db, f.draft, f.question, f.environment,
+    f.environment.value, undefined, { ...f.context, value: { result: name } }, 'Assess next proposal');
+  const original = f.store.writeMany.bind(f.store); let changed = false;
+  f.store.writeMany = ((writes: Write[], guards = []) => {
+    const saved = original(writes, guards);
+    if (!changed && writes.some(write => write.kind === 'model-response')) { changed = true; f.createPilot(f.fresh()); }
+    return saved;
+  }) as typeof f.store.writeMany;
+  await assert.rejects(candidate('B', f.store), { code: 'research_context_application_refused' });
+  f.store.writeMany = original; assert.ok(changed); callsOnce(f, 3);
+  const barrier = f.store.list<any>('assessment-barrier')[0]!;
+  assert.equal(barrier.revision, 3); assert.equal(barrier.value.completion, undefined);
+  assert.equal(f.store.get<any>(barrier.value.refusal.id, barrier.value.refusal.revision)!.value.state, 'refused');
+  await assert.rejects(candidate('B'), { code: 'research_context_application_refused' });
+  await assert.rejects(candidate('C'), { code: 'research_context_application_refused' }); callsOnce(f, 3);
+  assert.deepEqual(await f.invoke(f.fresh()), negative); callsOnce(f, 3);
+});
+
+test('DRY5FIX B a changed admission at the negative-result CAS cannot complete the model barrier', async t => {
+  const f = resumeFixture(t), negative = { verdict: 'insufficient', reasons: ['Revise'] };
+  dry5AssessmentAdapter(f, { verdict: 'supported' }, false, [negative]);
+  await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
+  const original = f.store.writeMany.bind(f.store); let changed = false;
+  f.store.writeMany = ((writes: Write[], guards = []) => {
+    if (!changed && writes.some(write => write.kind === 'assessment-barrier' && Boolean((write.value as any).completion))) {
+      changed = true; f.createPilot(f.fresh());
+    }
+    return original(writes, guards);
+  }) as typeof f.store.writeMany;
+  await assert.rejects(f.invoke(), { code: 'research_context_application_refused' });
+  f.store.writeMany = original; assert.ok(changed); callsOnce(f, 2);
+  assert.equal(f.store.list<any>('assessment-barrier')[0]!.value.completion, undefined);
+  await assert.rejects(assessmentSession(f.fresh(), f.draft, f.question, f.environment, f.environment.value,
+    undefined, { ...f.context, value: { result: 'B' } }, 'Assess next proposal'), { code: 'research_context_application_refused' });
+  await assert.rejects(f.invoke(f.fresh()), { code: 'research_context_application_refused' }); callsOnce(f, 2);
+});

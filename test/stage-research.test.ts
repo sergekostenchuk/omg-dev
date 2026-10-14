@@ -196,3 +196,223 @@ test("a map retry cannot adopt a competing graph written after consumer feedback
   assert.equal(store.history("graph:p").length, 1);
   assert.equal(store.get("stage:p:operation-map"), null);
 });
+
+const DRY5_ADAPTER = `import{readFileSync,writeFileSync,appendFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,statePath=process.argv[5],fault=JSON.parse(readFileSync(statePath,'utf8'));
+appendFileSync(process.argv[3],JSON.stringify(r)+'\\n');
+const q=s.questions?.[0]??s.question,field=q.field,values=JSON.parse(readFileSync(process.argv[2],'utf8'));
+const source=(s.inventory?.sources??s.originals?.sources??[]).find(x=>x.location==='values');
+let foreign=false;
+let research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}:
+{action:'answer',question:q.id,value:values[field],citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+field}}]};
+const assessor=['assessor-action','assessor-fields'].includes(fault.mode);
+if(fault.remaining>0&&field===fault.field&&(assessor?s.role==='assess-answer':s.role==='research')){
+ fault.remaining--;writeFileSync(statePath,JSON.stringify(fault));
+ if(fault.mode==='provider'){console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,usage:null}));console.error(JSON.stringify({error:'provider_failed'}));process.exit(1);}
+ const citations=research.citations??[];
+ const actions={bundle:{action:'read_bundle',purpose:'Read',inputs:[{path:'irrelevant.txt',media:'text/plain'}]},
+ delta:{action:'answer_delta',question:q.id,base:source?.ref,upserts:{},removes:{},citations},
+ plan:{action:'read_plan',question:q.id,reads:[{action:'read',path:'irrelevant.txt',media:'text/plain'}]},
+ synthesize:{action:'synthesize',question:q.id},'need-research':{action:'need_research',question:q.id,missing:['evidence']},
+ unknown:{action:'need_source',question:q.id},missing:{action:'answer',question:q.id},value:{...research,value:42},
+ 'assessor-action':{action:'answer'},'assessor-fields':{verdict:'supported'}};
+ if(fault.mode==='foreign')foreign=true;else research=actions[fault.mode];
+}
+const envelope=foreign?JSON.parse(readFileSync(process.argv[3]+'.responses','utf8').split('\\n')[0]):{protocol:r.protocol,requestId:r.requestId,research,usage:null};
+appendFileSync(process.argv[3]+'.responses',JSON.stringify(envelope)+'\\n');
+console.log(JSON.stringify(envelope));`;
+
+function dry5StageFixture(t: test.TestContext, mode: string, field = 'preparation') {
+  const f = fixture(t); f.setup('p');
+  const fault = join(f.root, 'fault.json');
+  writeFileSync(fault, JSON.stringify({ mode, field, remaining: 1 }));
+  writeFileSync(join(f.root, 'adapter.mjs'), DRY5_ADAPTER.replace('process.argv[5]', JSON.stringify(fault)));
+  const calls = () => readFileSync(join(f.root, 'p.calls'), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const open = () => { const db = new Store(f.path); t.after(() => db.close()); return new ProductEngine(db); };
+  return { ...f, fault, calls, open };
+}
+
+for (const [row, mode, code] of [
+  ['M1', 'bundle', 'reader_pilot_required'], ['M2', 'delta', 'reader_pilot_required'],
+  ['M3', 'plan', 'reading_plan_disabled'], ['M4', 'synthesize', 'research_question_foreign'],
+  ['M4b', 'need-research', 'research_question_foreign'], ['M5', 'unknown', 'research_response_invalid'],
+  ['M6', 'missing', 'research_response_invalid'], ['M7', 'value', 'answer_invalid'],
+  ['M8', 'assessor-action', 'assessment_invalid'], ['M9', 'assessor-fields', 'assessment_invalid']
+]) test(`DRY5FIX ${row}: public stage pauses once, new Store corrects only the failed role`, async t => {
+  const f = dry5StageFixture(t, mode!); const draft = f.engine.prepare('p', 'discovery');
+  const first = await f.engine.stageResearch.run('p', draft.id, 20);
+  assert.equal(first.status, 'paused');
+  assert.equal((f.store.get(first.research!.id)!.value as { pauseCode: string }).pauseCode, code);
+  const count = f.calls().length, assessor = mode!.startsWith('assessor');
+  const before = f.store.list('model-call');
+  const next = f.open(); const result = await next.stageResearch.run('p', draft.id, 20);
+  assert.equal(result.status, 'accepted', JSON.stringify(result));
+  assert.equal(f.calls().length - count, assessor ? 1 : 2);
+  const corrected = f.calls()[count].subject;
+  assert.ok(corrected.failures?.some((failure: {code:string}) => failure.code === code), JSON.stringify(corrected));
+  assert.ok(corrected.failures[0].responseContract);
+  assert.equal(corrected.role, assessor ? 'assess-answer' : 'research');
+  for (const call of before) assert.deepEqual(next.store.get(call.id), call, 'Original paid calls remain intact');
+});
+
+for (const negative of ['insufficient', 'conflicting'] as const)
+test(`DRY5FIX B corrected ${negative} admits the next analyst proposal and survives restart at nine calls`, async t => {
+  const f = dry5StageFixture(t, 'assessor-fields');
+  writeFileSync(join(f.root, 'adapter.mjs'), `import{readFileSync,appendFileSync,existsSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,wire=process.argv[3];
+const prior=existsSync(wire)?readFileSync(wire,'utf8').trim().split('\\n').map(x=>JSON.parse(x)):[];
+appendFileSync(wire,JSON.stringify(r)+'\\n');
+const q=s.questions?.[0]??s.question,values=JSON.parse(readFileSync(process.argv[2],'utf8'));
+const source=(s.inventory?.sources??s.originals?.sources??[]).find(x=>x.location==='values');
+let research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}:
+{action:'answer',question:q.id,value:values[q.field],citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+q.field}}]};
+if(q.field==='preparation'&&s.role==='assess-answer'){
+ const n=prior.filter(x=>x.subject.role==='assess-answer'&&x.subject.question.field==='preparation').length;
+ if(n===0)research={verdict:'supported'};
+ if(n===1)research={verdict:${JSON.stringify(negative)},reasons:['Revise the proposal']};
+}
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:null}));`);
+  const draft = f.engine.prepare('p', 'discovery'), first = await f.engine.stageResearch.run('p', draft.id, 20);
+  assert.equal(first.status, 'paused');
+  assert.equal((f.store.get<any>(first.research!.id)!.value).pauseCode, 'assessment_invalid');
+  assert.equal(f.calls().length, 6);
+  const original = f.store.list<any>('assessment-barrier')[0]!;
+  const second = await f.open().stageResearch.run('p', draft.id, 20);
+  assert.equal(second.status, 'accepted', JSON.stringify(second));
+  assert.equal(f.calls().length, 9);
+  assert.deepEqual(f.calls().slice(6).map(r => r.subject.role), ['assess-answer', 'research', 'assess-answer']);
+  assert.deepEqual(f.store.get(original.id, original.revision), original, 'The original refusal remains historical');
+  const barrier = f.store.get<any>(original.id)!;
+  assert.equal(barrier.revision, 2); assert.ok(barrier.value.completion);
+  const completed = f.store.get<any>(barrier.value.completion.id, barrier.value.completion.revision)!;
+  assert.equal(completed.value.state, 'applied');
+  assert.equal(f.store.get<any>(completed.value.after.id, completed.value.after.revision)!.value.result.verdict, negative);
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'accepted');
+  assert.equal(f.calls().length, 9);
+});
+
+for (const stage of UPSTREAM_STAGES) test(`DRY5FIX R: ordinary retry on ${stage} obeys its own current questions`, async t => {
+  const f = dry5StageFixture(t, 'missing', REQUIREMENTS[stage].at(-1)!.field);
+  writeFileSync(f.fault, JSON.stringify({ mode: 'missing', field: REQUIREMENTS[stage].at(-1)!.field, remaining: 0 }));
+  for (const prior of UPSTREAM_STAGES.slice(0, UPSTREAM_STAGES.indexOf(stage))) {
+    const draft = f.engine.prepare('p', prior);
+    assert.equal((await f.engine.stageResearch.run('p', draft.id, 30)).status, 'accepted');
+  }
+  writeFileSync(f.fault, JSON.stringify({ mode: 'missing', field: REQUIREMENTS[stage].at(-1)!.field, remaining: 1 }));
+  const draft = f.engine.prepare('p', stage);
+  assert.equal((await f.engine.stageResearch.run('p', draft.id, 30)).status, 'paused');
+  const count = f.calls().length;
+  const result = await f.open().stageResearch.run('p', draft.id, 30);
+  assert.equal(result.status, 'accepted', JSON.stringify(result));
+  assert.equal(f.calls().length - count, 2);
+});
+
+function dry5Stop(store: Store, match: (write: Write) => boolean, after = false) {
+  const original = store.writeMany.bind(store); let hit = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    if (!hit && writes.some(match)) {
+      hit = true; if (after) original(writes, guards);
+      throw new Error('DRY5FIX deliberate process boundary');
+    }
+    return original(writes, guards);
+  }) as typeof store.writeMany;
+  return () => { store.writeMany = original; assert.ok(hit, 'The real persistence boundary was reached'); };
+}
+for (const mode of ['bundle', 'assessor-fields']) test(`DRY5FIX O: two native reopens after ${mode} remain readable`, async t => {
+  const f = dry5StageFixture(t, mode), draft = f.engine.prepare('p', 'discovery');
+  const restore = mode === 'bundle' ? dry5Stop(f.store, write => write.kind === 'research-turn'
+    && (write.value as any).observation?.contract === 'early-research-outcome/v1') : null;
+  assert.equal((await f.engine.stageResearch.run('p', draft.id, 20)).status, 'paused'); restore?.();
+  const q = draft.value.questions.map(id => f.store.get<Question>(id)!).find(q => q.value.spec.field === 'preparation')!;
+  const reopened = f.engine.discovery.reopen(q.id, q.revision); f.engine.discovery.reopen(q.id, reopened.revision);
+  const count = f.calls().length, engine = f.open();
+  assert.equal((await engine.stageResearch.run('p', draft.id, 20)).status, 'accepted');
+  assert.equal(f.calls().length - count, 2);
+  const { readResearchConsumerTurn } = await import('../src/discovery/response-recovery.js');
+  const { reference } = await import('../src/pipeline/contracts.js');
+  for (const turn of engine.store.list('research-turn')) assert.doesNotThrow(() => readResearchConsumerTurn(engine.store, reference(turn)));
+});
+test('DRY5FIX P: new draft and another project coexist with genuine read_bundle/reopen history', async t => {
+  const f = dry5StageFixture(t, 'bundle'), draft = f.engine.prepare('p', 'discovery');
+  let restore = dry5Stop(f.store, write => write.kind === 'research-turn'
+    && (write.value as any).observation?.contract === 'early-research-outcome/v1');
+  await f.engine.stageResearch.run('p', draft.id, 20); restore();
+  const q = draft.value.questions.map(id => f.store.get<Question>(id)!).find(q => q.value.spec.field === 'preparation')!;
+  f.engine.discovery.reopen(q.id, q.revision);
+  restore = dry5Stop(f.store, write => write.kind === 'research-turn'
+    && (write.value as any).observation?.code === 'research_question_reopened', true);
+  await f.engine.stageResearch.run('p', draft.id, 20); restore();
+  const history = f.store.list('research-turn');
+  const engine = f.open(), freshDraft = engine.prepare('p', 'discovery');
+  assert.equal((await engine.stageResearch.run('p', freshDraft.id, 30)).status, 'accepted');
+  f.setup('neighbor'); const neighbor = f.engine.prepare('neighbor', 'discovery');
+  assert.equal((await f.engine.stageResearch.run('neighbor', neighbor.id, 30)).status, 'accepted');
+  for (const old of history) assert.deepEqual(engine.store.get(old.id), old);
+});
+for (const boundary of ['receipt', 'before-outcome', 'after-outcome'])
+test(`DRY5FIX A ${boundary}: resume saved bytes before permitting the corrective send`, async t => {
+  const f = dry5StageFixture(t, boundary === 'receipt' ? 'missing' : 'bundle'), draft = f.engine.prepare('p', 'discovery');
+  const q = draft.value.questions.map(id => f.store.get<Question>(id)!).find(q => q.value.spec.field === 'preparation')!;
+  const restore = dry5Stop(f.store, write => boundary === 'receipt'
+    ? write.kind === 'model-response' && (write.value as any).text?.includes('"action":"answer"')
+      && (write.value as any).text?.includes(q.id)
+    : write.kind === 'research-turn' && (write.value as any).observation?.contract === 'early-research-outcome/v1', boundary !== 'before-outcome');
+  await f.engine.stageResearch.run('p', draft.id, 20); restore(); const count = f.calls().length;
+  if (boundary !== 'after-outcome') {
+    assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'paused'); assert.equal(f.calls().length, count);
+  }
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'accepted');
+  assert.equal(f.calls().length - count, 2);
+});
+test('DRY5FIX A concurrent retries make one correction and accepted replay makes no call', async t => {
+  const f = dry5StageFixture(t, 'missing'), draft = f.engine.prepare('p', 'discovery');
+  await f.engine.stageResearch.run('p', draft.id, 20); const count = f.calls().length;
+  const outcomes = await Promise.allSettled([f.open().stageResearch.run('p', draft.id, 20), f.open().stageResearch.run('p', draft.id, 20)]);
+  assert.ok(outcomes.some(result => result.status === 'fulfilled' && result.value.status === 'accepted'));
+  assert.equal(f.calls().length - count, 2);
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'accepted'); assert.equal(f.calls().length - count, 2);
+});
+
+for (const mode of ['missing', 'value', 'assessor-fields']) test(`DRY5FIX ${mode}: another erroneous correction stops at the external boundary`, async t => {
+  const f = dry5StageFixture(t, mode), draft = f.engine.prepare('p', 'discovery');
+  writeFileSync(f.fault, JSON.stringify({ mode, field: 'preparation', remaining: 2 }));
+  assert.equal((await f.engine.stageResearch.run('p', draft.id, 20)).status, 'paused'); const count = f.calls().length;
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'paused'); assert.equal(f.calls().length - count, 1);
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'accepted');
+  assert.equal(f.calls().length - count, mode === 'assessor-fields' ? 2 : 3);
+});
+test('DRY5FIX a genuine earlier response cannot authorize correction of a foreign requestId', async t => {
+  const f = dry5StageFixture(t, 'foreign'), draft = f.engine.prepare('p', 'discovery');
+  const first = await f.engine.stageResearch.run('p', draft.id, 20);
+  assert.equal(first.status, 'paused');
+  assert.equal((f.store.get(first.research!.id)!.value as {pauseCode:string}).pauseCode, 'research_response_foreign');
+  const count = f.calls().length;
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'paused'); assert.equal(f.calls().length, count);
+});
+
+test('DRY5FIX A correction reason survives an intervening proved provider failure', async t => {
+  const f = dry5StageFixture(t, 'missing'), draft = f.engine.prepare('p', 'discovery');
+  assert.equal((await f.engine.stageResearch.run('p', draft.id, 20)).status, 'paused');
+  writeFileSync(f.fault, JSON.stringify({ mode: 'provider', field: 'preparation', remaining: 1 }));
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'paused'); const count = f.calls().length;
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'accepted');
+  assert.equal(f.calls().length - count, 2);
+  assert.equal(f.calls()[count].subject.failures[0].code, 'research_response_invalid');
+});
+test('DRY5FIX A native question change at refusal write cannot partially close the old attempt', async t => {
+  const f = dry5StageFixture(t, 'bundle'), draft = f.engine.prepare('p', 'discovery'), other = f.open();
+  const original = f.store.writeMany.bind(f.store); let moved = false;
+  f.store.writeMany = ((writes: Write[], guards = []) => {
+    if (!moved && writes.some(write => write.kind === 'research-turn' && (write.value as any).observation?.contract === 'early-research-outcome/v1')) {
+      moved = true;
+      const question = other.store.get<Question>(draft.value.questions.find(id => other.store.get<Question>(id)!.value.spec.field === 'preparation')!)!;
+      other.discovery.reopen(question.id, question.revision);
+    }
+    return original(writes, guards);
+  }) as typeof f.store.writeMany;
+  try { assert.equal((await f.engine.stageResearch.run('p', draft.id, 20)).status, 'paused'); }
+  finally { f.store.writeMany = original; }
+  assert.ok(moved); const count = f.calls().length;
+  assert.equal(f.store.list<any>('research-turn').filter(turn => turn.value.observation?.contract === 'early-research-outcome/v1').length, 0);
+  assert.equal((await f.open().stageResearch.run('p', draft.id, 20)).status, 'accepted'); assert.equal(f.calls().length - count, 2);
+});

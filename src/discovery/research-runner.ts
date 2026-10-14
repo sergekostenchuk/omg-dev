@@ -1,3 +1,4 @@
+import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
@@ -15,7 +16,7 @@ import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectSynthesisHandoffTurn, acceptanceEraOf, acceptanceBindingId,
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
   type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
-import { captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
+import { earlyResearchConsumerFailure, captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
   prepareResearchConsumerIntent, readResearchConsumerIntent,
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
@@ -104,7 +105,9 @@ export class Researcher {
     // pilot is a lawful reason to refuse NEW work, never to lose a result the
     // project already paid for. assessAnswer on a priorOrigin reads only the
     // saved materials (environment, dispatch, context, prompt, runtime proofs).
+    const early = earlyResearchStage(draft.value.stage);
     const recordedTurns = this.store.list<ResearchTurn>("research-turn")
+      .filter(turn => !early || turn.value.run === id)
       .map(turn => readResearchConsumerTurn(this.store, reference(turn)) as Revision<ResearchTurn>)
       .filter(turn => turn.value.run === id);
     const pendingPaidTurns = recordedTurns.filter(turn => turn.id.startsWith("research-turn:v1:")
@@ -194,7 +197,7 @@ export class Researcher {
     const sources = new ResearchSources(this.store, project, effective.root);
     // A child may use only the retry allowance visible at the external run
     // boundary. A refusal produced inside this run cannot authorize g+1.
-    const retryPermits = captureResearchConsumerRetryPermits(this.store, project);
+    const retryPermits = captureResearchConsumerRetryPermits(this.store, project, early ? draftId : undefined);
     const intents = listResearchConsumerIntents(this.store, project, draftId);
     const unfinished = intents.filter(intent => (intent.value.state === "prepared" || intent.value.state === "running")
       && (!(intent.value.kind === "synthesis" || intent.value.kind === "consolidation")
@@ -213,7 +216,7 @@ export class Researcher {
       && intent.value.cursor.delivery.run === id && Number.isSafeInteger(intent.value.cursor.delivery.turn)
       && intent.value.cursor.delivery.turn > 0
       && !this.store.get(paidTurnId(id, intent.value.cursor.delivery.turn))
-      && findResearchConsumerIntent(this.store, project, intent.value.kind, intent.value.key)?.id === intent.id);
+      && findResearchConsumerIntent(this.store, project, intent.value.kind, intent.value.key, early ? draftId : undefined)?.id === intent.id);
     // RS3 (№4414): only a provider failure without a response is answered by another generation; any other saved refusal
     // of the step is its outcome, restored below — never prepared again under a new run revision.
     const refusedSynthesis = settledSynthesis.filter(intent => retryableResearchConsumerRefusal(this.store, intent));
@@ -254,7 +257,7 @@ export class Researcher {
     const refusedAction = [...intents.filter(intent => intent.value.state === "refused"
       && ["analyst", "reading-planner", "escalation-assessor"].includes(intent.value.kind)
       && intent.value.cursor.run === id
-      && findResearchConsumerIntent(this.store, project, intent.value.kind, intent.value.key)?.id === intent.id
+      && findResearchConsumerIntent(this.store, project, intent.value.kind, intent.value.key, early ? draftId : undefined)?.id === intent.id
       && !retryableResearchConsumerRefusal(this.store, intent)),
       ...settledSynthesis.filter(intent => !retryableResearchConsumerRefusal(this.store, intent))];
     requireCondition(refusedAction.length <= 1, "research_consumer_intent_invalid",
@@ -480,9 +483,15 @@ export class Researcher {
             turn--;
             continue;
           }
+          const firstReopened = originalQuestion ? this.store.get<Question>(originalQuestion.id, originalQuestion.revision + 1) : null;
+          const reopenChain = originalQuestion && firstReopened && forcedQuestion.revision > originalQuestion.revision
+            && Array.from({ length: forcedQuestion.revision - originalQuestion.revision }, (_, index) =>
+              this.store.get<Question>(originalQuestion.id, originalQuestion.revision + index + 1))
+              .every(question => question?.kind === 'question' && canonical(question.value) === canonical({ ...originalQuestion.value,
+                beforeHash: hashJson(draft!.value.fields[originalQuestion.value.spec.field]), status: 'open', answer: null }));
           const reopened = originalQuestion?.kind === "question"
             && canonical(reference(originalQuestion)) === canonical(forcedQuestionRef)
-            && forcedQuestion.revision === originalQuestion.revision + 1
+            && reopenChain
             && forcedQuestion.value.projectId === project && forcedQuestion.value.draftId === draftId
             && draft.value.questions.includes(forcedQuestion.id)
             && forcedPendingTurn.value.number === run.value.turns
@@ -494,7 +503,7 @@ export class Researcher {
                 value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
               { id: forcedPendingTurn.id, kind: forcedPendingTurn.kind, expected: forcedPendingTurn.revision,
                 value: projectResearchTurnRevision(forcedPendingTurn.value as ManagedResearchTurn,
-                  { kind: 'question-reopened', original: originalQuestion!, reopened: forcedQuestion,
+                  { kind: 'question-reopened', original: originalQuestion!, reopened: firstReopened!,
                     draft }) }
             ], [reference(run), reference(forcedPendingTurn), reference(forcedQuestion), reference(draft)]);
             run = saved[0]! as Revision<ResearchRun>;
@@ -571,6 +580,18 @@ export class Researcher {
           prerequisites: researchPrerequisites(this.store, draft.value), operationMap: researchGraphContext(this.store, draft.value),
           contextWorkspace:workspace.entries.map(entry=>entry.result),
           inventory: sources.inventory(), history: researchHistory(this.store, draft.value, history), consumerFeedback: consumerFeedback(this.store, draft.value) };
+        if (early) {
+          const failedIntent = [...intents].sort((a, b) => b.value.cursor.turn - a.value.cursor.turn
+            || b.value.generation - a.value.generation).find(item => item.value.kind === 'analyst'
+            && item.value.question.id === pending[0]!.id && item.value.state === 'refused'
+            && retryPermits.some(ref => ref.id === item.id) && earlyResearchConsumerFailure(this.store, item));
+          const failedTurn = [...turns].reverse().find(item => item.value.question?.id === pending[0]!.id
+            && (item.value.observation as { contract?: string } | null)?.contract === EARLY_RESEARCH_OUTCOME);
+          const failure = failedIntent ? earlyResearchConsumerFailure(this.store, failedIntent)
+            : failedTurn ? earlyResearchFailure(draft.value, pending[0]!.value, 'analyst', failedTurn.value.action) : null;
+          if (failure) Object.assign(context, { failures: [earlyResearchCorrection('analyst', failure,
+            reference(failedIntent ?? failedTurn!), pending[0]!.value)] });
+        }
         if (savedMaterials) Object.assign(context, {savedMaterials, savedOnly: true, workingSelections: [], readings: [], focus: null, previousProposal: null, previousProposalRef: null, history: []});
         if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
           && pendingSynthesis(this.store, draft, pending[0]!, environment, context)) mode = "synthesis";
@@ -722,6 +743,23 @@ export class Researcher {
         let ownerConsulted: Ref[] | null = null;
         let ownerHadPriorRead = false;
         try {
+          if (early && (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
+            && isRef(pendingTurn.value.question) && (!('question' in action) || action.question === pendingTurn.value.question.id)) {
+            const producer = readResearchConsumerIntent(this.store, (pendingTurn.value as ManagedResearchTurn).consumerIntent);
+            const originalDraft = this.store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
+            const originalQuestion = this.store.get<Question>(pendingTurn.value.question.id, pendingTurn.value.question.revision)!;
+            const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action);
+            if (failure) {
+              const value = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn,
+                { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion });
+              const saved = this.store.writeMany<ResearchTurn | ResearchRun>([
+                { id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision, value },
+                { id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, status: 'paused',
+                  pauseCode: failure.code, error: `[${pendingTurn.id}] ${failure.message}` } }
+              ], [reference(run), reference(pendingTurn), reference(pending[0]!), reference(draft)]);
+              return saved[1]! as Revision<ResearchRun>;
+            }
+          }
           if (planning && pendingTurn.value.dispatchMode && !pendingTurn.value.plannedBy) requireCondition(pendingTurn.value.dispatchMode === "planning"
             ? ["read_plan", "synthesize", "pause"].includes(action.action)
             : ["answer", "answer_delta", "checkpoint", "read_context", "need_research", "need_owner", "pause"].includes(action.action),
@@ -903,6 +941,14 @@ export class Researcher {
               const instruction = "Determine if a user question is unavoidable. Check existing owner statements, available evidence, actual searches, and remaining research options. Return JSON {necessary:boolean, reason:string}. necessary=true only for unavailable essential information or an undecided owner-only choice after relevant research. Technical failure is not a reason. Do not invent facts.";
               const escalationContext = { role: "assess-escalation", question: question.value.spec,
                 request: action, inventory: sources.inventory(), history };
+              if (early) {
+                const prior = [...intents].sort((a, b) => b.value.generation - a.value.generation).find(item => item.value.kind === 'escalation-assessor'
+                  && item.value.cursor.pendingTurn?.id === pendingTurn.id && item.value.state === 'refused'
+                  && retryPermits.some(ref => ref.id === item.id) && earlyResearchConsumerFailure(this.store, item));
+                const failure = prior ? earlyResearchConsumerFailure(this.store, prior) : null;
+                if (failure) Object.assign(escalationContext, { failures: [earlyResearchCorrection(
+                  'escalation-assessor', failure, reference(prior!), question.value)] });
+              }
               const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...consulted,
                 ...action.searched, reference(pendingTurn), ...turns.map(reference)]);
               const intent = prepareResearchConsumerIntent(this.store, {
@@ -1216,9 +1262,8 @@ export class Researcher {
     const saved = this.store.writeMany<ResearchRun | ResearchTurn>(prepared.writes, prepared.guards);
     return { run: saved[0]! as Revision<ResearchRun>, turn: saved[1]! as Revision<ResearchTurn>, sent: paid.subject };
   }
-  /** C13/C62: a paid analyst/planner payload that cannot become an action is
-   * the intent's terminal typed refusal, bound to its exact call — not a raw
-   * exception that would make the next run pay for the same step again. */
+  /** A malformed reply closes its exact physical attempt. Only the next
+   * external entry may obtain a separately admitted corrective generation. */
   private consumerAction(intent: Revision<ResearchConsumerIntent>, payload: unknown): ResearchAction {
     try { return researchAction(payload); }
     catch (failure) {
@@ -1254,15 +1299,16 @@ export class Researcher {
       run = this.save(run, { status: "running", owner, error: null, pauseCode: null }, [reference(intent)]);
     }
     const paid = await this.receivedIntent(intent, dispatch, pilot, signal);
-    const verdict = paid.payload as { necessary?: unknown; reason?: unknown } | null;
-    if (!(verdict && typeof verdict.necessary === "boolean" && typeof verdict.reason === "string"
-      && verdict.reason.trim())) {
-      // C13/C62: the malformed verdict is this intent's terminal typed refusal.
+    try { requireEscalationReply(paid.payload); }
+    catch (error) {
+      if (!(error instanceof EngineError) || error.code !== 'escalation_assessment_invalid') throw error;
+      // C13/C62: preserve this attempt's addressed malformed verdict.
       const refused = refuseResearchConsumerIntent(this.store, reference(intent), 'escalation_assessment_invalid');
       throw new EngineError('escalation_assessment_invalid',
         `[${refused.id}] Escalation assessment requires an explicit decision and reason; paid call ${refused.value.refusal!.call.id}`,
         { intent: reference(refused), call: refused.value.refusal!.call });
     }
+    const verdict = paid.payload as { necessary: boolean; reason: string };
     if (verdict.necessary) {
       const current = new ResearchSources(this.store, intent.value.projectId,
         this.environments.effective(intent.value.projectId).root).list().map(reference);
