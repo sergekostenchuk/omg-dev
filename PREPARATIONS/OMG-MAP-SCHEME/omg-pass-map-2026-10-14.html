@@ -1,0 +1,887 @@
+<title>Проход продукта OMG</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: n8n-style pipeline of collapsible stage cards on a dot-grid canvas; an expanded stage becomes a dashed frame with its own node map; cross-stage links land on inner nodes. Harnessy graphite + cognac. Single dark look by design. */
+:root{
+  color-scheme:dark;
+  --bg:#101012; --panel:#141416; --raised:#1b1b1e; --tile:#202024; --line:#242428; --line2:#2d2d32;
+  --ink:#ececee; --ink2:#9a9aa2; --ink3:#66666e;
+  --accent:#c27a34; --accent-hi:#d89c54; --accent-soft:rgba(194,122,52,.14); --accent-line:rgba(194,122,52,.5); --accent-faint:rgba(194,122,52,.035);
+  --ok:#3fbf6f; --ok-soft:rgba(63,191,111,.14); --bad:#c9566e; --bad-soft:rgba(163,48,75,.2); --warn:#e0b23c; --warn-soft:rgba(224,178,60,.14);
+  --dot:#1f1f23; --edge:#585860; --edge-alt:#4a4a52; --edge-tie:#3a3a42; --shadow:rgba(0,0,0,.38);
+  --font:"Inter",-apple-system,"Segoe UI",Roboto,sans-serif; --mono:"JetBrains Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--ink);font:14px/1.5 var(--font);margin:0}
+.page{padding-inline:clamp(16px,2.4vw,28px);padding-block:20px 48px;max-width:1760px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px 24px}
+.head .l{min-width:0;flex:1 1 520px}
+.eyebrow{font:500 10.5px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink3)}
+h1{margin:4px 0 6px;font-size:24px;font-weight:600;letter-spacing:-.01em;text-wrap:balance}
+h1 b{color:var(--accent);font-weight:600}
+.def{margin:0;color:var(--ink2);max-width:84ch;font-size:13.5px}
+.def strong{color:var(--ink);font-weight:500}
+.legend{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 8px;border-radius:999px;font:500 9.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;border:1px solid var(--line2);color:var(--ink2);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:transparent;background:var(--ok-soft)}
+.pill.acc{color:var(--accent);border-color:transparent;background:var(--accent-soft)}
+.pill.warn{color:var(--warn);border-color:transparent;background:var(--warn-soft)}
+.pill.bad{color:var(--bad);border-color:transparent;background:var(--bad-soft)}
+.mk{width:16px;height:16px;border-radius:50%;display:inline-grid;place-items:center;font:600 9.5px var(--mono);border:1.5px solid var(--warn);color:var(--warn);background:var(--raised)}
+.foot{font:10.5px var(--mono);color:var(--ink3)}
+
+.bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.chip{height:28px;padding:0 12px;border-radius:9px;border:1px solid var(--line2);background:var(--raised);color:var(--ink2);font:500 12px var(--font);cursor:pointer}
+.chip:hover{color:var(--ink);border-color:#3c3c44}
+.chip[aria-pressed="true"]{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+.sep{width:1px;height:20px;background:var(--line2);margin:0 4px}
+.hint{margin-left:auto;font:10.5px var(--mono);color:var(--ink3)}
+
+.stagewrap{position:relative}
+.canvas{position:relative;height:clamp(460px,76vh,900px);border:1px solid var(--line);border-radius:14px;background:var(--panel);background-image:radial-gradient(circle at 1px 1px,var(--dot) 1px,transparent 1px);background-size:22px 22px;overflow:hidden;cursor:grab;user-select:none;-webkit-user-select:none;touch-action:none}
+.canvas.panning{cursor:grabbing}
+.view{position:absolute;left:0;top:0;width:10px;height:10px;transform-origin:0 0}
+.edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none;z-index:2}
+.edges path.e{fill:none;stroke:var(--edge);stroke-width:1.5;transition:opacity .18s,stroke .18s}
+.edges path.e.alt{stroke:var(--edge-alt);stroke-dasharray:5 4}
+.edges path.e.tie{stroke:var(--edge-tie);stroke-dasharray:2 3}
+.edges path.e.x{stroke-width:1.75}
+.edges path.e.on{stroke:var(--accent);stroke-width:2}
+.edges path.e.dim{opacity:.08}
+.edges .ah{fill:var(--edge)}.edges .ah-on{fill:var(--accent)}
+.lbl{position:absolute;transform:translate(-50%,-50%);font:10px var(--mono);color:var(--ink2);background:var(--panel);border:1px solid var(--line2);border-radius:5px;padding:1px 6px;white-space:nowrap;pointer-events:none;transition:opacity .18s;z-index:4}
+.lbl.alt{color:var(--ink3);border-style:dashed}
+.lbl.x{color:var(--ink)}
+.lbl.on{color:var(--accent);border-color:var(--accent);background:var(--raised)}
+.lbl.dim{opacity:.1}
+
+.frame{position:absolute;border:1px dashed var(--accent-line);border-radius:18px;background:var(--accent-faint);z-index:1}
+.frame .fh{position:absolute;left:0;right:0;top:0;height:40px;display:flex;align-items:center;gap:8px;padding:0 10px 0 14px;cursor:grab;border-bottom:1px dashed rgba(194,122,52,.22)}
+.frame .fh .ft{font:600 10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent);white-space:nowrap}
+.frame .fh .fs{font:10px var(--mono);color:var(--ink3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.frame .fh .btns{margin-left:auto;display:flex;gap:4px}
+.ib{height:24px;min-width:24px;padding:0 8px;border-radius:7px;border:1px solid var(--line2);background:var(--raised);color:var(--ink2);font:500 11px var(--font);cursor:pointer;white-space:nowrap}
+.ib:hover{color:var(--accent);border-color:var(--accent-line)}
+
+.scard{position:absolute;width:236px;border:1px solid var(--line2);border-radius:14px;background:var(--raised);padding:10px 12px 10px;box-shadow:0 12px 34px var(--shadow);cursor:pointer;transition:border-color .15s,opacity .2s,box-shadow .15s;z-index:3}
+.scard:hover{border-color:#4a4a52}
+.scard.exp:hover{border-color:var(--accent-line)}
+.scard .meta{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.scard .meta .pill{height:17px;padding:0 6px;font-size:8.5px;line-height:16px}
+.scard .t{font-weight:600;font-size:15px;line-height:1.2;margin-bottom:4px}
+.scard .io{font:10px var(--mono);color:var(--ink3);line-height:1.45}
+.scard .io i{color:var(--accent);font-style:normal;margin:0 3px}
+.scard .sum{margin-top:6px;padding-top:6px;border-top:1px dashed var(--line2);font-size:11px;line-height:1.45;color:var(--ink2)}
+.scard .ft2{margin-top:8px;display:flex;align-items:center;gap:6px}
+.scard .go{font:500 10px var(--mono);color:var(--accent);letter-spacing:.04em}
+.scard .soon{font:10px var(--mono);color:var(--ink3)}
+.scard .ft2 .ib{margin-left:auto}
+.scard .mark,.node .mark{position:absolute;right:-7px;top:-7px;width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font:600 10px var(--mono);border:1.5px solid var(--warn);background:var(--raised);color:var(--warn)}
+
+.node{position:absolute;width:176px;border:1px solid var(--line2);border-radius:12px;background:var(--raised);padding:7px 10px 8px;box-shadow:0 10px 30px var(--shadow);cursor:pointer;transition:border-color .15s,opacity .2s,box-shadow .15s;z-index:3}
+.node:hover{border-color:#4a4a52}
+.node .meta{display:flex;align-items:center;gap:6px;margin-bottom:5px;min-height:17px}
+.node .meta .pill{height:16px;padding:0 6px;font-size:8.5px;max-width:104px;overflow:hidden;text-overflow:ellipsis;display:block;line-height:15px}
+.st{margin-left:auto;display:inline-flex;align-items:center;gap:4px;font:9.5px var(--mono);color:var(--ink3);white-space:nowrap}
+.st::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.st.ok{color:var(--ok)}.st.acc{color:var(--accent)}.st.warn{color:var(--warn)}.st.bad{color:var(--bad)}
+.node .t{font-weight:500;font-size:12.5px;line-height:1.25;margin-bottom:4px}
+.node .t.mono{font:500 11.5px var(--mono)}
+.node .io{font:10px var(--mono);color:var(--ink3);line-height:1.45}
+.node .io i{color:var(--accent);font-style:normal;margin:0 3px}
+.node .bh{margin-top:5px;padding-top:5px;border-top:1px dashed var(--line2);font-size:10.5px;line-height:1.4;color:var(--ink2)}
+.node .outs{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.node .outs .pill{height:16px;padding:0 6px;font-size:8.5px}
+.node.dec{border-color:var(--accent-line)}
+.node.on,.scard.on{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),0 10px 30px var(--shadow)}
+.node.near,.scard.near{border-color:var(--accent-line)}
+.node.dim,.scard.dim{opacity:.26}
+.dragging{cursor:grabbing!important;box-shadow:0 18px 44px rgba(0,0,0,.55)!important}
+
+.zoom{position:absolute;right:12px;bottom:12px;display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--line2);border-radius:10px;background:var(--raised);z-index:6}
+.zoom button{min-width:28px;height:26px;padding:0 7px;border:0;border-radius:7px;background:transparent;color:var(--ink2);font:500 14px/1 var(--font);cursor:pointer}
+.zoom button:hover{background:var(--tile);color:var(--ink)}
+.zoom button.fit{font-size:11.5px}
+.zoom b{font:500 10.5px var(--mono);color:var(--ink3);min-width:44px;text-align:center;font-variant-numeric:tabular-nums}
+
+.detail{position:absolute;top:12px;right:12px;width:360px;max-height:calc(100% - 64px);overflow:auto;border:1px solid var(--line2);border-radius:14px;background:var(--raised);box-shadow:0 18px 50px rgba(0,0,0,.5);padding:14px 16px 16px;z-index:7}
+.detail .top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.detail .x{margin-left:auto;width:26px;height:26px;border-radius:8px;border:1px solid var(--line2);background:var(--tile);color:var(--ink2);cursor:pointer;font:14px/1 var(--font)}
+.detail .x:hover{color:var(--ink)}
+.detail h2{margin:8px 0 2px;font-size:16px;font-weight:600;text-wrap:balance}
+.detail .io{font:10.5px var(--mono);color:var(--ink3);margin-bottom:10px}
+.detail .io i{color:var(--accent);font-style:normal;margin:0 3px}
+.detail dl{margin:0;display:flex;flex-direction:column;gap:10px}
+.detail dt{font:500 9.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3);margin-bottom:2px}
+.detail dd{margin:0;font-size:12.5px;line-height:1.5;color:var(--ink2)}
+.detail dd.gap{color:var(--warn)}
+.detail dd.task{color:var(--accent-hi);font-family:var(--mono);font-size:11.5px}
+.detail .links{margin-top:12px;padding-top:10px;border-top:1px dashed var(--line2);display:flex;flex-direction:column;gap:4px}
+.detail .links button{all:unset;cursor:pointer;font:10.5px var(--mono);color:var(--ink2);padding:2px 0}
+.detail .links button:hover{color:var(--accent)}
+.detail .links button i{font-style:normal;color:var(--ink3);margin-right:4px}
+.detail .act{margin-top:12px}
+
+.nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.nav span{font:500 10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3);margin:0 4px 0 6px}
+.nav a{font:500 11.5px var(--font);color:var(--ink2);text-decoration:none;border:1px solid var(--line2);border-radius:8px;padding:4px 10px;background:var(--panel)}
+.nav a:hover{color:var(--accent);border-color:var(--accent-line)}
+.block{display:flex;flex-direction:column;gap:14px;margin-top:10px}
+.bh2{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--line2);padding-bottom:8px}
+.bh2 h2{margin:0;font-size:20px;font-weight:600}
+.bh2 h2 b{color:var(--accent);font-weight:600}
+.bh2 small{font:500 10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:14px}
+.sec{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:16px 18px;min-width:0}
+.sec.wide{grid-column:1/-1}
+.sec h3{margin:0 0 10px;font-size:15px;font-weight:600;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.sec h3 small{font:500 10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3)}
+.sec p{margin:0 0 10px;color:var(--ink2);font-size:13px;max-width:92ch}
+.sec p b{color:var(--ink);font-weight:500}
+.tw{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:12.5px;min-width:560px}
+th{text-align:left;font:500 9.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3);padding:6px 10px;border-bottom:1px solid var(--line2);white-space:nowrap}
+td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--ink2);line-height:1.45}
+td:first-child{color:var(--ink);font-weight:500}
+td code,li code,p code{font:11px var(--mono);color:var(--ink);background:var(--tile);padding:1px 5px;border-radius:4px}
+tr:last-child td{border-bottom:0}
+.chain{list-style:none;margin:0 0 12px;padding:0;display:flex;flex-direction:column}
+.chain li{display:grid;grid-template-columns:22px 1fr;gap:8px;align-items:start;font-size:12.5px;color:var(--ink2);padding:5px 0;position:relative}
+.chain li::before{content:"";width:9px;height:9px;border-radius:50%;border:1.5px solid var(--accent);margin:4px 0 0 6px;background:var(--panel);z-index:1}
+.chain li:not(:last-child)::after{content:"";position:absolute;left:10px;top:16px;bottom:-6px;width:1px;background:var(--accent-line)}
+.chain li b{color:var(--ink);font-weight:500}
+ul.plain{margin:0;padding-left:18px;color:var(--ink2);font-size:12.5px;display:flex;flex-direction:column;gap:6px}
+ul.plain b{color:var(--ink);font-weight:500}
+.kinds{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.decide{display:flex;flex-direction:column;gap:10px;counter-reset:q}
+.decide div{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start;font-size:13px;color:var(--ink2)}
+.decide div::before{counter-increment:q;content:counter(q);width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font:600 11px var(--mono);color:var(--accent);background:var(--accent-soft)}
+.decide b{color:var(--ink);font-weight:500}
+
+@media (max-width:820px){
+  .detail{position:static;width:auto;max-height:none;margin-top:12px}
+  .canvas{height:64vh}
+  .hint{margin-left:0;width:100%}
+  h1{font-size:21px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="page">
+  <header class="head">
+    <div class="l">
+      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — Codex-omg №4587 · + оркестратор</div>
+      <h1>Проход продукта: <b>от идеи до задачи</b></h1>
+      <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки.</p>
+    </div>
+    <div class="legend" aria-label="Обозначения">
+      <span class="pill ok">есть</span><span class="pill acc">в DS1</span><span class="pill warn">частично</span><span class="pill bad">нет</span><span class="pill">макет</span>
+      <span class="mk" aria-hidden="true">!</span><span class="foot">пробел</span>
+    </div>
+  </header>
+
+  <div class="bar" role="toolbar" aria-label="Управление картой">
+    <button class="chip" data-mode="" aria-pressed="true">Весь поток</button>
+    <button class="chip" data-mode="chain" aria-pressed="false">Цепочка фактов</button>
+    <button class="chip" data-mode="gaps" aria-pressed="false">Пробелы</button>
+    <span class="sep" aria-hidden="true"></span>
+    <button class="chip" id="expAll">Развернуть всё</button>
+    <button class="chip" id="colAll">Свернуть всё</button>
+    <button class="chip" id="resetPos">Сбросить расположение</button>
+    <span class="hint">клик по стадии — развернуть · тяните блоки и рамки · колесо — масштаб · пустое поле — сдвиг</span>
+  </div>
+
+  <div class="stagewrap">
+    <div class="canvas" id="canvas">
+      <div class="view" id="view">
+        <svg class="edges" id="edges" aria-hidden="true">
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah" d="M0,0 L10,5 L0,10 z"/></marker>
+            <marker id="ah-on" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ah-on" d="M0,0 L10,5 L0,10 z"/></marker>
+          </defs>
+        </svg>
+      </div>
+      <div class="zoom" aria-label="Масштаб">
+        <button type="button" id="zout" aria-label="Уменьшить">−</button><b id="zval">100%</b><button type="button" id="zin" aria-label="Увеличить">+</button><button type="button" class="fit" id="zfit">вписать</button>
+      </div>
+    </div>
+    <aside class="detail" id="detail" hidden aria-live="polite"></aside>
+  </div>
+
+  <nav class="nav" aria-label="Разделы">
+    <span>Discovery</span><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
+    <span>Концепция</span><a href="#c-what">Что это</a><a href="#c-input">Вход</a><a href="#c-process">Обработка</a><a href="#c-output">Выход</a><a href="#c-records">Записи</a><a href="#c-doors">Двери</a><a href="#c-gaps">Пробелы</a><a href="#c-missed">Упускали</a>
+    <span>Итог</span><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
+  </nav>
+
+  <!-- ===================== DISCOVERY ===================== -->
+  <div class="block" id="b-discovery">
+    <div class="bh2"><h2>Стадия 1 · <b>Discovery</b></h2><small>что, кому, как · сведено с Codex-omg №4585</small></div>
+    <div class="grid">
+      <section class="sec wide" id="d-consumers">
+        <h3>Кому что нужно от Discovery <small>потребители выхода</small></h3>
+        <p>Discovery превращает поручение в обоснованное решение: что нужно, кому и зачем, какой вариант, в каких рамках, что неизвестно — или в обоснованный останов. Она закрывает внешние вопросы, от которых зависит допустимость продукта. Позднее исследование может уточнять, но <b>не вправе молча отменить</b> принятое ограничение — только адресный возврат к основанию (поправка Codex №4587).</p>
+        <div class="tw"><table>
+          <thead><tr><th>Потребитель</th><th>Что ему нужно</th><th>Как получает сейчас</th><th>Чего не хватает</th></tr></thead>
+          <tbody>
+            <tr><td>Владелец</td><td>Что поняли; что нашли и на чём основано; вариант; ограничения; что неизвестно; вердикт и следующий шаг; только настоящие выборы — с вариантами и последствиями</td><td>Общий UI, JSON, экспорт стадии</td><td>Связного читаемого итога; двери выбора по условию</td></tr>
+            <tr><td>Концепция</td><td>Всё: участники и результаты с id, выбранный вариант, обязательные ограничения, основания</td><td>Полные поля ближайшего предшественника — и автору, и оценщику (<code>research-context.ts:14</code>, <code>research-assessment.ts:183</code>)</td><td>Обязанности применить вариант и ограничения</td></tr>
+            <tr><td>Карта L1</td><td>Участники, результаты, применимые сценарии из 17 вариантов</td><td><code>buildL1</code> (<code>graph/builder.ts:27–42</code>)</td><td>—</td></tr>
+            <tr><td>Спецификация, фичи</td><td>Смысловые границы через требования концепции</td><td>Из Discovery — только actors, outcomes, constraints</td><td>Предел, не ставший требованием, теряется</td></tr>
+            <tr><td>OM</td><td>Принятые стадии; unknowns с consumer и moment; externalSystems для R0; факты с источниками</td><td><code>buildOmInput</code>, R0 (<code>refinement.ts:61–66</code>), каталог Source (<code>packet-brief.ts:59</code>)</td><td>Покрытия ограничений и открытых вопросов отчёта</td></tr>
+            <tr><td>Компилятор, исполнитель</td><td>Что реализовать; точные ограничения; документация; как проверить</td><td>Требования, контракты, researchObligations, evidence-index</td><td>Прослеживаемости вывода Discovery до задачи</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="d-chain">
+        <h3>Что нужно OMG: цепочка без угадывания</h3>
+        <ol class="chain">
+          <li><span><b>Source</b> + выделение · происхождение, время, предел</span></li>
+          <li><span><b>Результат отчёта</b> · id, вывод, цитаты</span></li>
+          <li><span><b>Ограничение / внешний контракт / вариант / открытый вопрос</b></span></li>
+          <li><span><b>Строка preparation</b> · основание: Ref отчёта + адрес</span></li>
+          <li><span><b>Требование концепции</b> или вопрос с consumer и moment</span></li>
+          <li><span><b>Контракт → фича → работа OM</b></span></li>
+          <li><span><b>Пакет задачи</b> · условие и материал</span></li>
+        </ol>
+        <ul class="plain">
+          <li><b>Код проверяет</b> ссылки, версии, цитаты, покрытие, потребителя и срок неизвестного.</li>
+          <li><b>Оценщик проверяет</b>, что цитата подтверждает вывод и смысл ограничения сохранён.</li>
+          <li><b>У каждого существенного открытого вопроса один исход</b>: закрыт, стал unknown с consumer и moment, или обоснованно неприменим.</li>
+        </ul>
+        <div class="kinds"><span class="pill acc">выбор владельца</span><span class="pill">web · сообщено в документе</span><span class="pill">наблюдение среды</span><span class="pill">проектное предложение</span><span class="pill warn">неизвестное</span></div>
+      </section>
+      <section class="sec" id="d-outcomes">
+        <h3>Исходы и двери</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Исход</th><th>Что делает продукт</th><th>Как продолжить</th></tr></thead>
+          <tbody>
+            <tr><td>go</td><td>preparation → проверка → приёмка</td><td>Следующая стадия штатно</td></tr>
+            <tr><td>conditional · выбор</td><td>Условия, варианты, последствия</td><td>Выбор → решение → новый вердикт</td></tr>
+            <tr><td>conditional · факт</td><td>Какое свидетельство нужно</td><td>Материал → отчёт и вердикт заново</td></tr>
+            <tr><td>insufficient_evidence</td><td>Чего не хватает</td><td>Продолжить по недостающему в бюджете</td></tr>
+            <tr><td>no_go</td><td>Обоснованный отказ</td><td>Только новые условия или основания</td></tr>
+            <tr><td>ошибка формы ответа</td><td>Отказ этой попытке</td><td>DRY5FIX: обычный повтор</td></tr>
+            <tr><td>сбой поиска, лимит</td><td>Техника ≠ вывод</td><td>Штатное восстановление</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="d-owner">
+        <h3>Вход и участие владельца</h3>
+        <ul class="plain">
+          <li><b>Владелец даёт</b> идею и жёсткие условия. Модели, среда, бюджет — настройки OMG.</li>
+          <li><b>Движок</b> сохраняет идею как Source, создаёт проект и черновик, ставит brief выдержкой.</li>
+          <li><b>objective</b> — только слова владельца; сейчас копия идеи, вписанная оркестратором.</li>
+          <li><b>Понимание</b> формулирует модель в первом шаге плана — как своё предложение.</li>
+          <li><b>Вопрос владельцу</b> — только при существенно разных трактовках, с вариантами и последствиями; через полномочие владельца.</li>
+        </ul>
+      </section>
+      <section class="sec" id="d-records">
+        <h3>Где записывается</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Что</th><th>Запись</th></tr></thead>
+          <tbody>
+            <tr><td>Проект, среда</td><td><code>project:&lt;p&gt;</code>, <code>environment:&lt;p&gt;</code></td></tr>
+            <tr><td>Идея, документы, веб-снимки</td><td><code>source:&lt;p&gt;:…</code></td></tr>
+            <tr><td>Вопросы</td><td><code>discovery-draft</code>, <code>question</code></td></tr>
+            <tr><td>Ответы и оценки</td><td><code>research-answer</code> + <code>research-assessment</code></td></tr>
+            <tr><td>Ходы модели</td><td><code>research-run</code>, ходы</td></tr>
+            <tr><td>Выбор условия</td><td>новое: решение с verdict Ref + condition / option id</td></tr>
+            <tr><td>Принятая Discovery</td><td><code>stage:&lt;p&gt;:discovery</code></td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="d-state">
+        <h3>Что есть сейчас</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Возможность</th><th>om/module</th><th>DS1</th></tr></thead>
+          <tbody>
+            <tr><td>План → отчёт → 4 вердикта</td><td><span class="pill bad">нет</span></td><td><span class="pill acc">написано</span></td></tr>
+            <tr><td>Поиск в интернете моделью</td><td><span class="pill bad">нет</span></td><td>WB1 / WB1b остановлены</td></tr>
+            <tr><td>Понимание с авторством</td><td><span class="pill bad">нет</span></td><td><span class="pill warn">частично</span></td></tr>
+            <tr><td>Дверь выбора, продолжение после не-go</td><td><span class="pill bad">нет</span></td><td><span class="pill bad">нет</span></td></tr>
+            <tr><td>Отчёт → preparation → требования</td><td><span class="pill warn">частично</span></td><td><span class="pill bad">нет</span></td></tr>
+            <tr><td>Восстановление после ошибки модели</td><td><span class="pill warn">частично</span></td><td>DRY5FIX готов</td></tr>
+            <tr><td>Итог владельцу</td><td><span class="pill warn">общий UI</span></td><td><span class="pill bad">нет</span></td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="d-missed">
+        <h3>Что упускали</h3>
+        <ul class="plain">
+          <li><b>Меряли формы, а не исследование</b>: DRY5 доказал маршрут, не исследование.</li>
+          <li><b>Достаточность</b> — ответ на решающие вопросы, не число страниц.</li>
+          <li><b>Авторство смысла</b>: желание владельца, интерпретация модели, факт, решение — различимы.</li>
+          <li><b>Передать обязательство, а не страницу.</b></li>
+          <li><b>Исследование не даёт права действовать</b> — ключей, подписки, полномочий.</li>
+          <li><b>Владелец как потребитель</b> отсутствовал в критерии успеха.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+
+  <!-- ===================== CONCEPT ===================== -->
+  <div class="block" id="b-concept">
+    <div class="bh2"><h2>Стадия 2 · <b>Концепция</b></h2><small>выход Discovery → концепция → её потребители · сведено с Codex-omg №4587</small></div>
+    <div class="grid">
+      <section class="sec wide" id="c-what">
+        <h3>Что такое концепция</h3>
+        <p>Концепция превращает <b>исследованную потребность и выбранные границы</b> продукта в <b>адресуемые продуктовые требования</b>: кто получает пользу (участник по id), какой результат должен появиться (результат по id), какое наблюдаемое поведение его обеспечивает и по каким признакам результат годится. С неё начинается сквозная нить требований: карта покрывает их ответственностями, контракты поведения ссылаются на них, фичи наследуют, OM строит работы.</p>
+        <div class="tw"><table>
+          <thead><tr><th>Стадия</th><th>Основной вопрос</th><th>Чего не подменяет</th></tr></thead>
+          <tbody>
+            <tr><td>Discovery</td><td>Что нужно людям, зачем, какие варианты имеют основания, возможно ли?</td><td>—</td></tr>
+            <tr><td>Концепция</td><td>Какой продукт в этих границах даст нужный результат?</td><td>Не выбирает незаметно другой продукт, не переписывает выбор владельца, не проектирует файлы и тесты, не выдаёт предположение об API за факт. Новое проектное предложение — вправе</td></tr>
+            <tr><td>Карта L1</td><td>Как продукт проходит от действия участника к результату через ответственности, данные, переходы?</td><td>Раздел концепции группирует требования, блок карты несёт ответственность — это не раскладка разделов в прямоугольники</td></tr>
+            <tr><td>Спецификация / фичи</td><td>Как ведёт себя решение и какими возможностями поставляется?</td><td>—</td></tr>
+            <tr><td>OM</td><td>Как сделать это работами в данной среде?</td><td>—</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="c-input">
+        <h3>Вход: что, откуда, когда, кто запускает</h3>
+        <ol class="chain">
+          <li><span><b>Когда.</b> Discovery принята: research-stage сам записывает принятую стадию (в v5 — только при go). Согласования владельцем не нужно.</span></li>
+          <li><span><b>Кто запускает.</b> <code>prepare-stage concept</code> — вызывает CLI, UI или программа. Автоматического перехода между ранними стадиями нет; каждый вызов создаёт <b>новый</b> черновик.</span></li>
+          <li><span><b>Чем.</b> <code>engine.prepare</code> (<code>engine.ts:94–100</code>): берёт текущую принятую Discovery и её guards → точные inputs черновика; потребитель — <code>operation-map</code>.</span></li>
+          <li><span><b>Что создаётся.</b> <code>discovery-draft</code> стадии concept (метка R0 — это метка общего механизма, не фаза OM) и 4 вопроса: <code>audience</code>, <code>outcome</code>, <code>acceptance</code>, <code>conceptSections</code> — все design.</span></li>
+          <li><span><b>Что видит модель.</b> Discovery целиком как prerequisites (brief, objective, preparation; после DS1 — ещё план, отчёт, вердикт с вариантом); текущие поля концепции; выбранный вопрос со схемой; источники; история; замечания (<code>research-runner.ts:569</code>).</span></li>
+          <li><span><b>Что видит оценщик.</b> Discovery целиком, предложенное значение, контракт вопроса, наблюдения, замечания (<code>research-assessment.ts:183</code>). Соседних полей концепции — нет.</span></li>
+        </ol>
+        <p><b>DS1 контракт концепции не меняет</b>: <code>REQUIREMENTS.concept</code> и <code>sectionSchema</code> прежние; новый материал приходит обычным путём prerequisites.</p>
+      </section>
+      <section class="sec" id="c-process">
+        <h3>Обработка: шаги и проверки</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Шаг</th><th>Кто</th><th>Что происходит</th></tr></thead>
+          <tbody>
+            <tr><td>Ответ</td><td>модель</td><td>Движок выдаёт первый неотвеченный вопрос; модель читает материал или предлагает значение; может заявить нехватку или нужный выбор владельца</td></tr>
+            <tr><td>Форма</td><td>код</td><td>Форма действия и значения, разрешённость действия, цитаты на точные Source</td></tr>
+            <tr><td>Оценка</td><td>оценщик</td><td>Полнота, польза для потребителя, согласие с целью и ограничениями, поддержка фактов наблюдениями: supported / insufficient / conflicting</td></tr>
+            <tr><td>Запись</td><td>движок</td><td>При supported — ответ и оценка сохраняются, значение уходит в поле черновика</td></tr>
+            <tr><td>Приёмка</td><td>код</td><td>Принадлежность; поля = черновик; вопросы по контракту версии и отвечены; вход — точная принятая Discovery; id разделов и требований уникальны; beneficiary есть среди actors; пара outcome + beneficiary есть в Discovery; каждый outcome покрыт; graph = null (<code>stage-checks.ts:241</code>, <code>preparation-validation.ts:31</code>)</td></tr>
+            <tr><td>Находки</td><td>движок → модель</td><td>С полем — research-feedback, переоткрывается только это поле, модель исправляет в бюджете; без поля — blocked. Сбой, ошибка протокола и смена входа — отдельные исходы</td></tr>
+            <tr><td>Принятие</td><td>движок</td><td><code>pipeline.accept</code> → <code>stage:&lt;p&gt;:concept</code></td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px"><b>Проверки не доказывают</b>: что требование сохраняет конкретный лимит вендора; что критерий измерим и достаточен; что требование реализует заявленную пользу; что не пропало существенное неизвестное. Совпадение id — структурная связь, не смысловая.</p>
+      </section>
+      <section class="sec wide" id="c-output">
+        <h3>Выход: кому что нужно от концепции</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Потребитель</th><th>Что получает</th><th>Для чего</th><th>Проверка / предел</th></tr></thead>
+          <tbody>
+            <tr><td>Владелец</td><td>Поля стадии через UI, JSON, экспорт</td><td>Понять предлагаемый продукт и поправить расхождение</td><td>Нет связного вида «потребность → вариант → требования → основания → неизвестное»; UI подписывает design-ответы как «решение владельца» (<code>ui/app.tsx:117</code>)</td></tr>
+            <tr><td>Автор и оценщик карты L1</td><td>Концепция целиком; из Discovery — actors, outcomes, constraints, journeys</td><td>Спроектировать ответственности и проходы</td><td>Оценщик — смысл, код — связи и покрытие</td></tr>
+            <tr><td><code>buildL1</code></td><td>Из требований: id, section, outcome, beneficiary, statement</td><td>Реестр требований в графе</td><td>acceptance и benefit в граф не копируются — их читают по Ref концепции</td></tr>
+            <tr><td>conceptCoverage карты</td><td>requirement id → outcome</td><td>Какой результат карты покрывает требование</td><td>Каждое требование покрыто; чужие пары запрещены</td></tr>
+            <tr><td>Спецификация</td><td>conceptSections целиком; карта — подробно</td><td>behaviorContracts с id требований, исходами, отказами, состоянием, доказательством</td><td>Каждое требование имеет контракт; outcome сохраняется</td></tr>
+            <tr><td>Фичи</td><td>conceptSections и спецификация</td><td>Связать возможности с контрактами</td><td>Требования фичи = объединение требований её контрактов</td></tr>
+            <tr><td><code>buildOmInput</code></td><td>id разделов и требований; критерии <code>{id}#{n}</code>; Ref концепции</td><td>Вход OM и разрывы технической определённости</td><td>Нет checkKind → штатный разрыв design-decision, OM выбирает вид проверки позже</td></tr>
+            <tr><td>Пакеты модели OM</td><td>Полный текст выбранных требований с Ref</td><td>Уточнять нужную обязанность, не угадывать по id</td><td>Отбор по потребителю</td></tr>
+            <tr><td>R0, reading-planner, pilot</td><td>conceptSections; pilot — ещё верхнее acceptance</td><td>Продуктовый смысл в техническом исследовании</td><td>Производное хранит свой источник</td></tr>
+            <tr><td>Компилятор, исполнитель, ревьюер</td><td>Через граф и план: требования, контракты, проверки, researchObligations, evidence-index</td><td>Сделать и проверить работу</td><td>Существенное обязательство должно быть в привязанном содержании</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="c-records">
+        <h3>Где записывается и как адресуется</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Что</th><th>Запись / адрес</th></tr></thead>
+          <tbody>
+            <tr><td>Принятый вход</td><td><code>stage:&lt;p&gt;:discovery</code> — точная ревизия и хэш</td></tr>
+            <tr><td>Исследование концепции</td><td><code>discovery:&lt;p&gt;:&lt;uuid&gt;</code>, stage = concept</td></tr>
+            <tr><td>Вопросы</td><td><code>question:&lt;p&gt;:&lt;uuid&gt;</code> с FieldSpec</td></tr>
+            <tr><td>Работа модели</td><td>research-run, ходы, intent / call / response, архивы контекста</td></tr>
+            <tr><td>Ответ и оценка</td><td>research-answer, research-assessment</td></tr>
+            <tr><td>Замечания</td><td>research-feedback: вопросы, поле, находки</td></tr>
+            <tr><td>Принятая концепция</td><td><code>stage:&lt;p&gt;:concept</code>: content = draft, fields, graph = null; inputs и доказательства</td></tr>
+            <tr><td>Требование</td><td>Ref концепции + requirement.id; в JSON — <code>/content/fields/conceptSections/i/requirements/j</code></td></tr>
+            <tr><td>Критерий</td><td><code>requirementId#n</code> во входе OM — смысл держится точным Ref концепции</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="c-doors">
+        <h3>Исходы и двери на концепции</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Исход</th><th>Сейчас</th><th>Нужная дверь</th></tr></thead>
+          <tbody>
+            <tr><td>Discovery принята</td><td>Можно prepare-stage concept</td><td>Механический запуск или продолжение без согласования владельца</td></tr>
+            <tr><td>Discovery не-go (v5)</td><td>Концепция не открывается</td><td>Двери Discovery, а не концепция вопреки</td></tr>
+            <tr><td>Замечание к полю</td><td>research-feedback + переоткрытие поля</td><td>Исправленный ответ с историей</td></tr>
+            <tr><td>Существенное неизвестное</td><td>Есть эскалация, нет полного маршрута</td><td>Материал, адресный возврат к Discovery или выбор владельца</td></tr>
+            <tr><td>Неверный ответ модели</td><td>DRY5 показал застревания</td><td>DRY5FIX</td></tr>
+            <tr><td>Вход изменился</td><td>research_context_stale / input_stale</td><td>Новый проход по новой версии</td></tr>
+            <tr><td>Бюджет, сбой</td><td>Пауза, вызовы сохранены</td><td>Продолжение с сохранённого места</td></tr>
+            <tr><td>Концепция принята</td><td>Точная запись, доступ потребителям</td><td>Следующая стадия</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="c-gaps">
+        <h3>Пробелы перехода Discovery → концепция <small>вердикт Codex</small></h3>
+        <ul class="plain">
+          <li><b>Ограничения Discovery → требования — пробел подтверждён.</b> Нужна одна адресуемая связь: Ref Discovery + constraint id → requirement id(s), со смыслом применения в statement или acceptance. Код — полнота охвата, оценщик — что поведение соблюдает предел.</li>
+          <li><b>Вариант и отчёт — доставляются, применение не закреплено.</b> Тот же класс, что и предыдущий.</li>
+          <li><b>Неизвестные — нет рабочей двери.</b> Если неизвестное меняет вариант, результат или существенный критерий — материал, возврат к Discovery или выбор владельца. Иначе — названному позднему потребителю со сроком. <code>need_research</code> требует planning-режима и не готов для ранних стадий.</li>
+          <li><b>Запуск — нет драйвера.</b> Нужен механизм, который продолжает сохранённый проход и после accepted запускает следующую стадию в бюджете.</li>
+          <li><b>checkKind — не блокер.</b> Порог <code>NODES_REQUIRED_SINCE = null</code>; OM закрывает разрыв адресно. Концепция обязана дать проверяемый критерий результата.</li>
+          <li><b>audience · outcome · acceptance — дубль, но не мёртвые.</b> Сокращение — оптимизация после решения о каноне, не ремонт до HX4.</li>
+          <li><b>Авторство в UI</b> — design-ответ подписан «решение владельца».</li>
+        </ul>
+      </section>
+      <section class="sec" id="c-missed">
+        <h3>Что упускали <small>видно только при соединении стадий</small></h3>
+        <ul class="plain">
+          <li><b>Успех формы ≠ качество продукта.</b> Связь outcome с id не доказывает, что продукт решает задачу.</li>
+          <li><b>Отрицательное поведение — часть концепции</b>: например, недопустимость обещать неподдерживаемый способ доступа.</li>
+          <li><b>«По подписке» и «по API» — не технические факты.</b> Концепция опирается на исследованный способ доступа.</li>
+          <li><b>Карта не заменяет канон требований</b>: критерии и основания читают в концепции по Ref.</li>
+          <li><b>Смена принятого входа</b> — отдельный продуктовый переход; stale обнаруживается, перенос не делается.</li>
+          <li><b>Смена схемы — не только промпт</b>: FieldSpec сверяется с эталоном версии; «нет живых записей — меняем на месте» не общий закон.</li>
+          <li><b>Один consumer у вопроса — не все потребители</b>: концепцию читают карта, спецификация, фичи, OM, исполнитель.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+
+  <!-- ===================== SUMMARY ===================== -->
+  <div class="block">
+    <div class="bh2"><h2>Итог</h2><small>предложение оркестратора · классы — по Codex №4585 и №4587 · не выдано</small></div>
+    <div class="grid">
+      <section class="sec wide" id="tasks">
+        <h3>Минимум до живого HX4 <small>одна задача — один класс</small></h3>
+        <div class="tw"><table>
+          <thead><tr><th>#</th><th>Задача</th><th>Результат</th><th>Стадии</th><th>Состояние</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>DS1 — ядро v5</td><td>План → отчёт → вердикт → preparation при go</td><td>Discovery</td><td><span class="pill acc">написана</span></td></tr>
+            <tr><td>2</td><td>DRY5FIX</td><td>Ошибка модели → отказ попытки и обычный повтор</td><td>все ранние</td><td><span class="pill acc">готова</span></td></tr>
+            <tr><td>3</td><td>WB1 + WB1b</td><td>Модель ищет и читает интернет через движок</td><td>Discovery</td><td><span class="pill warn">части готовы</span></td></tr>
+            <tr><td>4</td><td>IN1 — вход и понимание</td><td>brief автоматически; objective = слова владельца; понимание модели с авторством</td><td>Вход</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>5</td><td>DS1.1 — двери не-go</td><td>Выбор через полномочие владельца; продолжение по недостающему</td><td>Discovery</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>6</td><td>DS1.2 — перенос обязательств</td><td>Отчёт → preparation → conceptSections: Ref Discovery + constraint id → requirement ids; код — охват, оценщик — применение</td><td>Discovery → концепция</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>7</td><td>UNK1 — неизвестное ранней стадии</td><td>Адресный исход: материал / возврат к основанию / выбор; позднему — с потребителем и сроком</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>8</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию, на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>9</td><td>DS1.3 — итог владельцу</td><td>Читаемый вид Discovery и концепции из принятых записей; верное авторство в UI</td><td>Discovery, концепция</td><td><span class="pill bad">новая</span></td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:12px"><b>Не добавлять до HX4</b> (Codex №4587): включение порога ради checkKind; удаление audience/outcome/acceptance; утверждение владельцем каждой концепции и требования; новую модель-оркестратор; перенос текстов источников во все требования; перепроверку принятой истории.</p>
+        <ul class="plain">
+          <li><b>Риск:</b> 9 задач вместо «почти готово» — живой HX4 сдвигается; оценку в часах честно дать нельзя до описей.</li>
+          <li><b>Риск:</b> задачи 4–7 трогают одни файлы ранних стадий — последовательно, не параллельно.</li>
+          <li><b>Риск:</b> HX4 может честно закончиться insufficient_evidence — поиск с NL99 бедный.</li>
+        </ul>
+      </section>
+      <section class="sec wide" id="decide">
+        <h3>Решения владельца</h3>
+        <div class="decide">
+          <div><span><b>Принять схему</b> Discovery и перехода в концепцию как определение?</span></div>
+          <div><span><b>Разбивка</b>: девять задач по одному классу (рекомендация) — или иначе?</span></div>
+          <div><span><b>DRV1</b>: HX4 должен доказать автономность «идея → план» (тогда драйвер нужен до HX4) — или достаточно механического сценария команд?</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+  <div class="foot">Источники: ~/REPORTS/review/omg-discovery-global-4584_141026.md · ~/REPORTS/review/omg-concept-handoff-4586_141026.md · om/module c4a88faf · копия DS1 ~/omg-wt/omg-ds1-cx</div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var ST={yes:["ok","есть"],ds1:["acc","в DS1"],part:["warn","частично"],no:["bad","нет"]};
+  var GAP=1,TASK=2;
+
+  /* ---------- stages: collapsed card + optional inner map ---------- */
+  var STAGES=[
+    {id:"in",n:"Вход",st:"part",g:1,t:"Вход",io:["идея","Source · draft"],
+     sum:"Идея сохраняется как Source; движок создаёт проект, среду и черновик Discovery.",
+     d:[["Что делает","Принимает идею владельца и механически готовит работу: Source идеи, проект, среда, черновик Discovery, brief — точная выдержка."],["Пробел","objective — копия идеи, вписанная оркестратором; понимания модели нет.",GAP],["Задача","IN1 — вход и понимание",TASK]],
+     nodes:[
+      {id:"owner",x:0,y:0,role:"владелец",st:"yes",g:0,t:"Владелец",io:["идея","поручение"],bh:"Даёт идею и жёсткие условия. Выбирает только из готовых вариантов.",
+       d:[["Что делает","Даёт исходное поручение и уже известные жёсткие условия. Модели, среда и бюджет — настройки работы OMG, не требования продукта."],["Что нужно от продукта","Убедиться, что поняли правильно. До трат на стадии и OM — честный ответ: можно, нельзя или при каких условиях. Только настоящие выборы с вариантами и последствиями. Видеть итог каждой стадии с верным авторством."],["Не делает","Не ищет материал, не пишет ответы за модель, не утверждает каждое требование."]]},
+      {id:"init",x:0,y:200,role:"движок",st:"part",g:1,t:"Вход и инициализация",io:["идея","Source · draft"],bh:"create-project → source-document → configure → prepare-stage. brief — точная выдержка идеи.",
+       d:[["Что делает","Без смысловой переработки: Source идеи, проект, среда, черновик Discovery, brief точным выделением."],["Как сейчас","В HX3 и сухой прогонке оркестратор вручную ставил brief (answer-fact 0..137) и objective (answer-decision) — копию идеи."],["Как должно","objective — только слова владельца. Понимание формулирует модель как своё предложение."],["Записи","project:<p> · source:<p>:idea · environment:<p> · discovery-draft · question"],["Пробел","Копия идеи выдаётся за понимание; авторство смешивается.",GAP],["Задача","IN1",TASK]]}
+     ],
+     edges:[{f:"owner",t:"init",l:"идея"}]},
+
+    {id:"disc",n:"Стадия 1",st:"ds1",g:1,t:"Discovery",io:["идея","stage:discovery"],
+     sum:"Понимание и план → поиск в интернете → отчёт с цитатами → вердикт → анкета для цепочки. Или обоснованный отказ.",
+     d:[["Что делает","Превращает поручение в обоснованное решение: что нужно, кому и зачем, какой вариант, в каких рамках, что неизвестно — или обоснованный останов. Закрывает внешние вопросы, от которых зависит допустимость продукта."],["Отдаёт","stage:<p>:discovery: концепции — все поля (автору и оценщику); карте L1 — actors, outcomes, journeys; OM — actors, unknowns, externalSystems, каталог Source."],["Пробелы","Нет поиска в интернете (WB1), дверей после не-go, переноса отчёта в анкету, итога владельцу.",GAP],["Задачи","DS1 · WB1 + WB1b · IN1 · DS1.1 · DS1.2 · DS1.3",TASK]],
+     nodes:[
+      {id:"plan",x:0,y:170,role:"модель",st:"part",g:1,t:"1 · Понимание и план",io:["brief · objective","researchPlan"],bh:"Потребность, результат, границы, «зачем». Домен → роли → вопросы, реализуемость, источники.",
+       d:[["Что делает","Понимание поручения как предложение модели и план: домен, роли-перспективы, стартовые вопросы, вопросы реализуемости, источники, результат."],["Как сейчас","DS1: researchPlan есть; отдельного понимания с авторством нет."],["Проверка","Код — форма, id, непустые источники. Оценщик — штатная оценка."],["Пробел","Понимание не выделено и не отличено от слов владельца.",GAP],["Задача","DS1 + IN1",TASK]]},
+      {id:"web",x:220,y:170,role:"модель → движок",st:"no",g:1,t:"2 · Исследование",io:["вопросы плана","Source web"],bh:"web_search → web_fetch → снимок (адрес, время, sha256) → read_source → цитаты.",
+       d:[["Что делает","Модель просит поиск и загрузку; движок сохраняет снимок как Source вида web; дальше чтение и строгие цитаты."],["Как сейчас","В om/module нет; WB1/WB1b остановлены, части готовы."],["Правила","Поиск — навигация, текст страницы — материал. Сбой поиска ≠ «аналогов нет». Web — «сообщено в документе»."],["Риск","С NL99 надёжно отвечает один поисковик.",GAP],["Задача","WB1 + WB1b",TASK]]},
+      {id:"report",x:440,y:170,role:"модель · оценщик",st:"ds1",g:0,t:"3 · Отчёт",io:["Source · цитаты","researchReport"],bh:"Выводы по вопросам плана с цитатами. Варианты, ограничения, экономика, открытые вопросы.",
+       d:[["Что делает","results с выводом, цитатами и пределами; openQuestions; вариант; ограничения; «взять / адаптировать / построить»."],["Проверка","Код — ссылки на план, цитаты существуют. Оценщик — цитата подтверждает вывод."],["Задача","DS1",TASK]]},
+      {id:"verdict",x:660,y:170,role:"модель · оценщик",st:"ds1",g:1,dec:1,t:"4 · Вердикт",io:["отчёт Ref","исход"],bh:"",
+       d:[["Что делает","Исход по текущему отчёту: outcome, причина, вариант, основания, условия evidence или owner_choice."],["Как сейчас","DS1: одна функция исхода; go — к анкете; остальные — пауза с кодом."],["Пробел","После паузы нет рабочих дверей.",GAP],["Задача","DS1 + DS1.1",TASK]]},
+      {id:"prep",x:880,y:170,role:"модель · оценщик",st:"part",g:1,t:"5 · Preparation",io:["go + отчёт","анкета"],bh:"actors · outcomes · 17 сценариев · constraints · externalSystems · risks · unknowns.",
+       d:[["Что делает","Разворачивает вариант в анкету для всей цепочки."],["Как сейчас","Поле v4 со старым промптом; на вердикт и отчёт опираться не обязано."],["Как должно","Каждое ограничение отчёта — строка constraints со ссылкой на отчёт; externalSystems — со ссылками; открытые вопросы — закрыты или unknown с consumer и moment."],["Пробел","Анкета не привязана к исследованию.",GAP],["Задача","DS1.2",TASK]]},
+      {id:"stage",x:1100,y:170,role:"запись",st:"yes",g:0,mono:1,t:"stage:<p>:discovery",io:["приёмка","вход концепции"],bh:"research-stage принимает сам. no_go стадию не принимает.",
+       d:[["Что это","Принятая Discovery: content = draft, fields, graph."],["Правило","Принятие ответа и допуск следующей стадии — разные вещи."],["Кому","Концепции — все поля; карте L1 — actors, outcomes, journeys; OM — actors, unknowns, externalSystems."]]},
+      {id:"summary",x:880,y:0,role:"для владельца",st:"no",g:1,t:"Итог владельцу",io:["принятые записи","читаемый вид"],bh:"Поняли · нашли · вариант · ограничения · неизвестно · вердикт · что выбрать.",
+       d:[["Что делает","Один читаемый итог из тех же принятых записей."],["Как сейчас","Общий UI/JSON/экспорт; связного итога нет."],["Пробел","Владелец не видит результата исследования в понятном виде.",GAP],["Задача","DS1.3",TASK]]},
+      {id:"choice",x:440,y:400,role:"владелец",st:"no",g:1,t:"Выбор по условию",io:["условие","решение"],bh:"Модель даёт варианты с последствиями; выбор — через полномочие владельца.",
+       d:[["Что делает","Варианты с id и последствиями, включая отказ; решение с точной привязкой к вердикту и условию."],["Дальше","Вердикт переоткрывается → новый вердикт с учётом решения."],["Как сейчас","Нет: answer-decision не знает условия; actor ≠ удостоверение владельца.",GAP],["Задача","DS1.1",TASK]]},
+      {id:"nogo",x:660,y:400,role:"итог",st:"ds1",g:0,t:"no_go · отказ",io:["вердикт","итог"],bh:"Невозможно в исследованных условиях. Концепция не открывается.",
+       d:[["Что делает","Отрицательный итог с причинами — полезный результат."],["Как продолжить","Только новые условия или основания."]]}
+     ],
+     edges:[
+      {f:"plan",t:"web",l:"вопросы плана"},{f:"web",t:"report",l:"Source web"},{f:"report",t:"verdict",l:"отчёт Ref"},
+      {f:"verdict",t:"prep",l:"go"},{f:"prep",t:"stage",l:"приёмка"},{f:"verdict",t:"summary",l:"вид"},
+      {f:"verdict",t:"choice",l:"conditional",k:"alt"},{f:"choice",t:"verdict",l:"решение",k:"alt",fs:"t",ff:.8,ts:"b",tf:.25},
+      {f:"verdict",t:"nogo",l:"no_go",k:"alt"},{f:"verdict",t:"web",l:"нужен факт · insufficient",k:"alt",loop:"above",depth:95,ff:.3,tf:.7}
+     ]},
+
+    {id:"con",n:"Стадия 2",st:"part",g:1,t:"Концепция",io:["stage:discovery","conceptSections"],top:70,
+     sum:"Превращает исследованную потребность и границы в адресуемые требования: кому, какой результат, какое поведение, как принять.",
+     d:[["Что делает","Из принятой Discovery строит разделы и требования: id, утверждение, польза, получатель (actor id), результат (outcome id), критерии приёмки. С неё начинается нить требований до задачи."],["Берёт","stage:<p>:discovery целиком — и автор, и оценщик (после DS1 — ещё план, отчёт, вердикт с вариантом)."],["Отдаёт","stage:<p>:concept: карте L1 — требования и покрытие; спецификации — что покрыть контрактами; фичам — требования контрактов; OM — требования и критерии."],["Пробелы","Применение ограничений и варианта не обязательно; нет двери для существенного неизвестного; нет драйвера запуска; UI путает авторство.",GAP],["Задачи","DS1.2 · UNK1 · DRV1 · DS1.3",TASK]],
+     nodes:[
+      {id:"trigger",x:0,y:160,role:"оператор → движок",st:"part",g:1,t:"prepare-stage concept",io:["Discovery accepted","черновик"],bh:"Discovery обязана быть принята; inputs — её guards; потребитель — карта L1.",
+       d:[["Когда","После приёмки Discovery: research-stage принимает её сам (в v5 — только при go). Согласования владельцем не нужно."],["Что делает","engine.prepare (engine.ts:94–100): берёт текущую принятую Discovery, её guards становятся точными inputs черновика; потребитель — operation-map."],["Пробел","Драйвера нет: команду даёт оператор. Каждый вызов создаёт новый черновик (новый UUID) — повтор не продолжает, а начинает заново. continuePreparation — другой цикл (R2/L3).",GAP],["Задача","DRV1 — драйвер ранних стадий",TASK]]},
+      {id:"draft",x:220,y:160,role:"запись",st:"yes",g:0,t:"Черновик концепции",io:["inputs: Ref Discovery","4 вопроса"],bh:"audience · outcome · acceptance · conceptSections — все design.",
+       d:[["Что это","discovery-draft стадии concept. Метка R0 — метка общего механизма исследований, не фаза OM."],["Вопросы","audience — получатели; outcome — возможность продукта; acceptance — общие признаки годности (бывшие решения владельца, с v2 — design: отвечает модель); conceptSections — канон требований."],["Записи","discovery:<p>:<uuid> · question:<p>:<uuid> ×4"]]},
+      {id:"packet",x:440,y:160,role:"движок",st:"yes",g:0,t:"Запрос модели",io:["черновик + Discovery","пакет"],bh:"Discovery целиком · поля концепции · вопрос со схемой · источники · история · замечания.",
+       d:[["Что внутри","prerequisites — принятая Discovery целиком (research-context.ts:14); текущие поля концепции; выбранный вопрос с контрактом; источники; история ходов; замечания потребителя (research-runner.ts:569)."],["Продолжения","Действует упаковка: архив и адреса остаются, но не весь текст повторяется. Обязательный материал (вариант, ограничения) должен доходить и в продолжение."],["DS1","Контракт концепции не меняется; план, отчёт и вердикт приходят через prerequisites."]]},
+      {id:"model",x:660,y:160,role:"модель",st:"yes",g:0,t:"Модель · ответы",io:["пакет","4 ответа"],bh:"Отвечает по вопросу за раз: читает материал или предлагает значение с цитатами.",
+       d:[["Что делает","Движок выдаёт первый неотвеченный вопрос. Модель читает материал либо предлагает значение; может заявить существенную нехватку или нужный выбор владельца. Для требования: id, statement, benefit, beneficiary (actor id), outcome (outcome id), acceptance[]."],["Вправе","Новое проектное предложение. Не вправе: выдумать факт, выбрать другой продукт, переписать выбор владельца."],["Код","Форма действия и значения, разрешённость действия, цитаты на точные Source."]]},
+      {id:"assess",x:880,y:160,role:"оценщик",st:"part",g:1,t:"Оценщик",io:["ответ","supported / insufficient / conflicting"],bh:"Discovery целиком · значение · контракт вопроса · наблюдения · замечания.",
+       d:[["Что проверяет","Полноту, пользу для потребителя, согласие с целью и ограничениями, поддержку фактов наблюдениями (research-assessment.ts:39, 183)."],["Не видит","Соседних полей концепции — согласие четырёх полей никто не проверяет."],["Пробел","Нет явной обязанности и критерия «применены ли вариант и каждое ограничение»; одна правильная ссылка при противоположном тексте не должна давать supported.",GAP],["Задача","DS1.2",TASK]]},
+      {id:"sections",x:1100,y:50,role:"выход",st:"part",g:1,t:"conceptSections",io:["ответ","разделы · требования"],bh:"requirement: id · statement · benefit · beneficiary · outcome · acceptance[]",
+       d:[["Что это","Канон требований. Читают: buildL1 (builder.ts:29), conceptCoverage карты, спецификация, фичи, buildOmInput (om/input.ts:233), пакеты OM, R0, reading-planner, pilot."],["Критерии","Строки. Вид проверки checkKind выбирает OM позже — штатный разрыв design-decision (порог NODES_REQUIRED_SINCE = null). Концепция обязана дать проверяемое условие результата; «всё работает» — недостаточно."],["Пробел","Нет связи требования с ограничением и результатом отчёта Discovery; применение предела не проверяется.",GAP],["Задача","DS1.2",TASK]]},
+      {id:"legacy",x:1100,y:290,role:"поля",st:"part",g:0,t:"audience · outcome · acceptance",io:["ответы","общий контекст"],bh:"Дублируют часть канона; идут карте общим контекстом; acceptance читает pilot.",
+       d:[["Что это","Три поля из LEGACY_REQUIREMENTS, теперь design. Каждое — отдельный ответ и оценка модели."],["Кто читает","Карта — как часть полного предшественника; acceptance — pilot-context.ts:181; UI и экспорт."],["Вердикт","Дубль, но не мёртвые. Сократить до проекций канона — оптимизация после решения о каноне, не ремонт до HX4."]]},
+      {id:"checks",x:1320,y:160,role:"код",st:"yes",g:1,t:"Проверки приёмки",io:["поля","accept / находки"],bh:"Принадлежность · вопросы по версии · точный вход · id уникальны · actor и outcome есть · outcome покрыт · graph = null.",
+       d:[["Что проверяет","Результат принадлежит проекту и стадии; поля = черновик; вопросы по контракту версии и отвечены; вход — точная принятая Discovery; уникальные section.id и requirement.id; beneficiary среди actors; пара outcome + beneficiary есть в Discovery; каждый outcome покрыт; graph = null (stage-checks.ts:241, preparation-validation.ts:31)."],["Находки","С полем — research-feedback, переоткрывается только это поле, модель исправляет. Без поля — blocked."],["Не доказывает","Сохранение лимита вендора; измеримость критерия; реальную пользу; что не пропало неизвестное.",GAP]]},
+      {id:"stage",x:1540,y:160,role:"запись",st:"yes",g:0,mono:1,t:"stage:<p>:concept",io:["accept","вход карты L1"],bh:"Принятая концепция: draft, fields, graph = null.",
+       d:[["Что это","pipeline.accept → stage:<p>:concept с inputs и доказательствами."],["Адрес требования","Ref концепции + requirement.id; в JSON — /content/fields/conceptSections/i/requirements/j."],["Адрес критерия","requirementId#n во входе OM; смысл держится точным Ref концепции."]]},
+      {id:"door",x:660,y:400,role:"модель → движок",st:"no",g:1,t:"Неизвестное · выбор",io:["нехватка","материал / возврат / выбор"],bh:"Не угадывать: материал, адресный возврат к Discovery или выбор владельца из вариантов.",
+       d:[["Правило","Если неизвестное меняет допустимый вариант, обещанный результат или существенный критерий — концепция не принимает молчаливое предположение: получить материал, адресно вернуться к Discovery или дать владельцу выбор из объяснённых вариантов. Иначе — передать названному позднему потребителю со сроком."],["Как сейчас","need_research требует planning-режима и не является готовой дверью ранних стадий (research-runner.ts:734); need_owner — reason/searched, без вариантов.",GAP],["Задача","UNK1 — неизвестное ранней стадии",TASK]]},
+      {id:"owner2",x:1320,y:400,role:"для владельца",st:"no",g:1,t:"Итог концепции владельцу",io:["принятые записи","читаемый вид"],bh:"Получатель · результат · требования и критерии · ограничения с основаниями · неизвестное · дальше.",
+       d:[["Что делает","Читаемый вид из принятых записей: какой продукт, для кого, требования и критерии, ограничения с основаниями, что неизвестно, куда дальше."],["Как сейчас","UI помечает любой не-fact как «РЕШЕНИЕ ВЛАДЕЛЬЦА» — модельное предложение выглядит одобренным владельцем (ui/app.tsx:117).",GAP],["Задача","DS1.3 — итог владельцу",TASK]]}
+     ],
+     edges:[
+      {f:"trigger",t:"draft",l:"inputs · consumer"},{f:"draft",t:"packet",l:"4 вопроса"},{f:"packet",t:"model",l:"запрос"},
+      {f:"model",t:"assess",l:"ответ"},{f:"assess",t:"sections",l:"supported"},{f:"assess",t:"legacy",l:"supported"},
+      {f:"sections",t:"checks",l:"fields"},{f:"legacy",t:"checks",l:"fields"},{f:"checks",t:"stage",l:"accept"},
+      {f:"checks",t:"model",l:"находки → исправление поля",k:"alt",loop:"above",depth:175},
+      {f:"model",t:"door",l:"нехватка · выбор",k:"alt",fs:"b",ff:.3,ts:"t",tf:.3},
+      {f:"door",t:"model",l:"материал · решение",k:"alt",fs:"t",ff:.75,ts:"b",tf:.75},
+      {f:"stage",t:"owner2",l:"вид",fs:"b",ff:.2,ts:"r",tf:.5}
+     ]},
+
+    {id:"map",n:"Стадия 3",st:"yes",g:0,mock:1,t:"Карта L1",io:["требования · сценарии","граф L1"],
+     sum:"Ответственности, данные и переходы: у каждого результата путь к успеху, каждый применимый сценарий — путь.",
+     d:[["Что делает","Строит L1-топологию: блоки, артефакты, соединения, пути успеха, отказа и восстановления; покрытие требований и сценариев."],["Берёт","Концепцию целиком; из Discovery — actors, outcomes, constraints, journeys (buildL1, graph/builder.ts:27–42)."],["Отдаёт","Граф L1 и operationRequirements с conceptCoverage."],["Подробная карта","Следующим шагом — разберём так же, как Discovery и концепцию.",TASK]]},
+    {id:"spec",n:"Стадия 4",st:"yes",g:0,mock:1,t:"Спецификация",io:["требования · карта","контракты поведения"],
+     sum:"Проверяемое поведение: вход, результат, отказы, запрещённые последствия, состояние, доказательство.",
+     d:[["Что делает","Каждое требование концепции покрывает контрактом поведения с тем же результатом карты."],["Берёт","conceptSections целиком, карту; из Discovery — actors, outcomes, constraints."],["Отдаёт","behaviorContracts для фич и OM."],["Подробная карта","Следующим шагом.",TASK]]},
+    {id:"feat",n:"Стадия 5",st:"yes",g:0,mock:1,t:"Фичи",io:["контракты","фичи"],
+     sum:"Поставка частями: требования фичи — ровно требования её контрактов; оставшиеся вопросы — со сроком.",
+     d:[["Что делает","Группирует контракты в фичи с пользой, потребителем, критериями и оставшимися вопросами."],["Отдаёт","features + featurePreparation для OM."],["Подробная карта","Следующим шагом.",TASK]]},
+    {id:"om",n:"OM",st:"part",g:1,mock:1,t:"OM",io:["5 стадий","атомарный план"],
+     sum:"buildOmInput сшивает всё по id; проход OM уточняет L2/L3 до атомарных работ.",
+     d:[["Что делает","Сшивает пять стадий по id (buildOmInput, om/input.ts), закрывает разрывы (в том числе checkKind критериев), ведёт технический разбор до атомарных работ."],["Берёт","Требования и критерии концепции, контракты, фичи; из Discovery — actors, unknowns, externalSystems, каталог Source."],["Пробел","Нет обязательного покрытия ограничений и открытых вопросов отчёта Discovery.",GAP],["Подробная карта","Следующим шагом.",TASK]]},
+    {id:"run",n:"Финал",st:"part",g:1,mock:1,t:"Компиляция и исполнение",io:["атомарный план","пакеты задач · код"],
+     sum:"Компилятор выпускает пакеты задач с требованиями, контрактами и материалом; исполнитель пишет код, ревью проверяет.",
+     d:[["Что делает","Пакет задачи: требования, контракты, researchObligations, evidence-index связанных записей (compiler/context.ts, compiler.ts:193–229)."],["Пробел","Прослеживаемость существенного вывода Discovery до задачи не установлена.",GAP],["Подробная карта","Следующим шагом.",TASK]]}
+  ];
+
+  /* ---------- links between stages; they land on inner nodes when a stage is expanded ---------- */
+  var CROSS=[
+    {f:"in.init",t:"disc.plan",l:"brief · objective",lc:"идея · brief · objective"},
+    {f:"disc.summary",t:"in.owner",l:"итог владельцу",route:"above",depth:40},
+    {f:"disc.stage",t:"con.trigger",l:"accepted · guards",lc:"stage:discovery — все поля"},
+    {f:"disc.stage",t:"con.packet",l:"prerequisites: Discovery целиком",route:"above",depth:40,ff:.8,tf:.5},
+    {f:"con.door",t:"disc.plan",l:"адресный возврат к исследованию",k:"alt",route:"below",depth:44,ff:.5,tf:.5},
+    {f:"con.stage",t:"map",l:"conceptSections · требования"},
+    {f:"map",t:"spec",l:"outcomes · пути"},
+    {f:"spec",t:"feat",l:"контракты"},
+    {f:"feat",t:"om",l:"фичи"},
+    {f:"om",t:"run",l:"атомарный план"},
+    {f:"con.stage",t:"spec",l:"требования → покрыть контрактами",route:"below",depth:44,ff:.45},
+    {f:"con.stage",t:"om",l:"требования + критерии {id}#n",route:"below",depth:88,ff:.65},
+    {f:"disc.stage",t:"map",l:"actors · outcomes · journeys",route:"below",depth:132,ff:.3},
+    {f:"disc.stage",t:"om",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
+    {f:"disc.web",t:"om",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6}
+  ];
+  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map","spec","feat","om","run"];
+
+  function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+  var S={},N={};
+  STAGES.forEach(function(s){S[s.id]=s;(s.nodes||[]).forEach(function(n){n.key=s.id+"."+n.id;n.stage=s.id;N[n.key]=n;});});
+
+  var canvas=document.getElementById("canvas"),view=document.getElementById("view"),svg=document.getElementById("edges"),detail=document.getElementById("detail");
+  var NSV="http://www.w3.org/2000/svg";
+
+  /* ---------- per-viewer state ---------- */
+  var KEY="omg-pass-map-v2",exp={},off={},soff={};
+  try{var saved=JSON.parse(localStorage.getItem(KEY)||"null");if(saved){exp=saved.exp||{};off=saved.off||{};soff=saved.soff||{};}}catch(_){}
+  function save(){try{localStorage.setItem(KEY,JSON.stringify({exp:exp,off:off,soff:soff}));}catch(_){}}
+
+  /* ---------- DOM ---------- */
+  var cardEl={},frameEl={},nodeEl={};
+  STAGES.forEach(function(s){
+    var c=document.createElement("div");
+    c.className="scard"+(s.nodes?" exp":"");c.dataset.key=s.id;c.tabIndex=0;c.setAttribute("role","button");
+    c.setAttribute("aria-label",s.t+(s.nodes?" — развернуть":""));
+    c.innerHTML='<div class="meta"><span class="pill acc">'+esc(s.n)+'</span><span class="st '+ST[s.st][0]+'">'+ST[s.st][1]+'</span>'+(s.mock?'<span class="pill">макет</span>':'')+'</div>'+
+      '<div class="t">'+esc(s.t)+'</div><div class="io">'+esc(s.io[0])+'<i>→</i>'+esc(s.io[1])+'</div>'+
+      '<div class="sum">'+esc(s.sum)+'</div>'+
+      '<div class="ft2">'+(s.nodes?'<span class="go">развернуть ▸</span>':'<span class="soon">подробная карта — следующий шаг</span>')+
+      '<button type="button" class="ib" data-act="info" aria-label="Подробнее">ⓘ</button></div>'+
+      (s.g?'<span class="mark" title="пробел">!</span>':'');
+    view.appendChild(c);cardEl[s.id]=c;
+    if(!s.nodes)return;
+    var f=document.createElement("div");f.className="frame";f.dataset.stage=s.id;
+    f.innerHTML='<div class="fh"><span class="ft">'+esc(s.n)+' · '+esc(s.t)+'</span><span class="fs">'+esc(s.io[0])+' → '+esc(s.io[1])+'</span>'+
+      '<span class="btns"><button type="button" class="ib" data-act="info" aria-label="Подробнее о стадии">ⓘ</button><button type="button" class="ib" data-act="collapse">свернуть ▾</button></span></div>';
+    view.insertBefore(f,svg);frameEl[s.id]=f;
+    s.nodes.forEach(function(n){
+      var d=document.createElement("div"),t=ST[n.st];
+      d.className="node"+(n.dec?" dec":"");d.dataset.key=n.key;d.tabIndex=0;d.setAttribute("role","button");d.setAttribute("aria-label",n.t);
+      var h='<div class="meta"><span class="pill">'+esc(n.role)+'</span><span class="st '+t[0]+'">'+t[1]+'</span></div>'+
+        '<div class="t'+(n.mono?" mono":"")+'">'+esc(n.t)+'</div><div class="io">'+esc(n.io[0])+'<i>→</i>'+esc(n.io[1])+'</div>';
+      if(n.dec)h+='<div class="outs"><span class="pill ok">go</span><span class="pill warn">conditional</span><span class="pill warn">insufficient</span><span class="pill bad">no_go</span></div>';
+      else h+='<div class="bh">'+esc(n.bh)+'</div>';
+      if(n.g)h+='<span class="mark" title="пробел">!</span>';
+      d.innerHTML=h;view.appendChild(d);nodeEl[n.key]=d;
+    });
+  });
+
+  /* ---------- layout ---------- */
+  var PAD=22,HEAD=48,GAPX=130,TOP=200,pos={};
+  function o(map,k){return map[k]||[0,0];}
+  function isExp(sid){return !!(exp[sid]&&S[sid].nodes);}
+  function layout(){
+    STAGES.forEach(function(s){var e=isExp(s.id);cardEl[s.id].hidden=e;
+      if(s.nodes){frameEl[s.id].hidden=!e;s.nodes.forEach(function(n){nodeEl[n.key].hidden=!e;});}});
+    var dims={},H=0;
+    STAGES.forEach(function(s){
+      if(isExp(s.id)){
+        var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+        s.nodes.forEach(function(n){var el=nodeEl[n.key],of=o(off,n.key),px=n.x+of[0],py=n.y+of[1];
+          x0=Math.min(x0,px);y0=Math.min(y0,py);x1=Math.max(x1,px+el.offsetWidth);y1=Math.max(y1,py+el.offsetHeight);});
+        dims[s.id]={w:x1-x0+PAD*2,h:y1-y0+HEAD+(s.top||0)+PAD,x0:x0,y0:y0};
+      } else dims[s.id]={w:cardEl[s.id].offsetWidth,h:cardEl[s.id].offsetHeight};
+      H=Math.max(H,dims[s.id].h);
+    });
+    var cx=40;
+    STAGES.forEach(function(s){
+      var d=dims[s.id],so=o(soff,s.id),X=cx+so[0],Y=TOP+(H-d.h)/2+so[1];
+      pos[s.id]={x:X,y:Y,w:d.w,h:d.h};
+      if(isExp(s.id)){
+        var f=frameEl[s.id];f.style.left=X+"px";f.style.top=Y+"px";f.style.width=d.w+"px";f.style.height=d.h+"px";
+        s.nodes.forEach(function(n){var of=o(off,n.key),el=nodeEl[n.key];
+          el.style.left=(X+PAD+n.x+of[0]-d.x0)+"px";el.style.top=(Y+HEAD+(s.top||0)+n.y+of[1]-d.y0)+"px";});
+      } else {var c=cardEl[s.id];c.style.left=X+"px";c.style.top=Y+"px";}
+      cx+=d.w+GAPX;
+    });
+    var mx=0,my=0;STAGES.forEach(function(s){var p=pos[s.id];mx=Math.max(mx,p.x+p.w);my=Math.max(my,p.y+p.h);});
+    svg.setAttribute("width",mx+800);svg.setAttribute("height",my+800);
+    svg.style.width=(mx+800)+"px";svg.style.height=(my+800)+"px";
+    drawEdges();apply();
+  }
+
+  /* ---------- edges ---------- */
+  function box(el){return {x:el.offsetLeft,y:el.offsetTop,w:el.offsetWidth,h:el.offsetHeight};}
+  function resolve(ep){var p=ep.split("."),sid=p[0];
+    if(p[1]&&isExp(sid))return {key:ep,el:nodeEl[ep],sid:sid};
+    return {key:sid,el:cardEl[sid],sid:sid};}
+  function port(b,side,f){if(f==null)f=.5;
+    if(side==="r")return [b.x+b.w,b.y+b.h*f];if(side==="l")return [b.x,b.y+b.h*f];
+    if(side==="t")return [b.x+b.w*f,b.y];return [b.x+b.w*f,b.y+b.h];}
+  function ctrl(p,side,k){if(side==="r")return [p[0]+k,p[1]];if(side==="l")return [p[0]-k,p[1]];if(side==="t")return [p[0],p[1]-k];return [p[0],p[1]+k];}
+  function curve(a,b,e){
+    if(e.loop){
+      var dep=e.depth||70,p1,p2,yy;
+      if(e.loop==="below"){p1=port(a,"b",e.ff);p2=port(b,"b",e.tf);yy=Math.max(p1[1],p2[1])+dep;}
+      else{p1=port(a,"t",e.ff);p2=port(b,"t",e.tf);yy=Math.min(p1[1],p2[1])-dep;}
+      return "M"+p1[0]+","+p1[1]+" C"+p1[0]+","+yy+" "+p2[0]+","+yy+" "+p2[0]+","+p2[1];
+    }
+    var fs=e.fs,ts=e.ts;
+    if(!fs||!ts){
+      if(b.x>=a.x+a.w-8){fs="r";ts="l";}
+      else if(b.x+b.w<=a.x+8){fs="l";ts="r";}
+      else if(b.y>=a.y){fs="b";ts="t";}
+      else{fs="t";ts="b";}
+    }
+    var pa=port(a,fs,e.fs?e.ff:null),pb=port(b,ts,e.ts?e.tf:null);
+    var k=Math.max(44,Math.abs(pb[0]-pa[0])/2,Math.abs(pb[1]-pa[1])/2);
+    var c1=ctrl(pa,fs,k),c2=ctrl(pb,ts,k);
+    return "M"+pa[0]+","+pa[1]+" C"+c1[0]+","+c1[1]+" "+c2[0]+","+c2[1]+" "+pb[0]+","+pb[1];
+  }
+  /* orthogonal route under (or over) every stage it spans, so it never cuts through a frame */
+  function routed(a,b,e){
+    var below=e.route==="below",p1=port(a,below?"b":"t",e.ff),p2=port(b,below?"b":"t",e.tf);
+    var lo=Math.min(p1[0],p2[0]),hi=Math.max(p1[0],p2[0]),base=below?Math.max(p1[1],p2[1]):Math.min(p1[1],p2[1]);
+    STAGES.forEach(function(s){var p=pos[s.id];if(p.x<hi&&p.x+p.w>lo)base=below?Math.max(base,p.y+p.h):Math.min(base,p.y);});
+    var yy=below?base+(e.depth||40):base-(e.depth||40),r=12,dir=p2[0]<p1[0]?-1:1,sg=below?1:-1;
+    if(Math.abs(p2[0]-p1[0])<2*r)return "M"+p1[0]+","+p1[1]+" L"+p1[0]+","+yy+" L"+p2[0]+","+p2[1];
+    return "M"+p1[0]+","+p1[1]+" L"+p1[0]+","+(yy-sg*r)+" Q"+p1[0]+","+yy+" "+(p1[0]+dir*r)+","+yy+
+      " L"+(p2[0]-dir*r)+","+yy+" Q"+p2[0]+","+yy+" "+p2[0]+","+(yy-sg*r)+" L"+p2[0]+","+p2[1];
+  }
+  var drawn=[];
+  function drawEdges(){
+    drawn.forEach(function(d){d.p.remove();d.lb.remove();});drawn=[];
+    var list=[];
+    STAGES.forEach(function(s){if(!isExp(s.id))return;
+      (s.edges||[]).forEach(function(e){list.push({a:s.id+"."+e.f,b:s.id+"."+e.t,ae:nodeEl[s.id+"."+e.f],be:nodeEl[s.id+"."+e.t],e:e,l:e.l});});});
+    var seen={};
+    CROSS.forEach(function(e){
+      var A=resolve(e.f),B=resolve(e.t),pair=A.key+">"+B.key;
+      if(seen[pair])return;seen[pair]=1;
+      var dup=CROSS.filter(function(x){return resolve(x.f).key+">"+resolve(x.t).key===pair;}).length>1;
+      list.push({a:A.key,b:B.key,ae:A.el,be:B.el,e:e,l:dup?(e.lc||e.l):e.l,x:1});
+    });
+    list.forEach(function(it){
+      var p=document.createElementNS(NSV,"path"),A=box(it.ae),B=box(it.be);
+      p.setAttribute("d",it.e.route?routed(A,B,it.e):curve(A,B,it.e));
+      p.setAttribute("class","e"+(it.e.k?" "+it.e.k:"")+(it.x?" x":""));
+      p.setAttribute("marker-end","url(#ah)");svg.appendChild(p);
+      var len=p.getTotalLength(),pt=p.getPointAtLength(len/2);
+      var lb=document.createElement("div");lb.className="lbl"+(it.e.k==="alt"?" alt":"")+(it.x?" x":"");
+      lb.textContent=it.l;lb.style.left=pt.x+"px";lb.style.top=pt.y+"px";view.appendChild(lb);
+      drawn.push({a:it.a,b:it.b,p:p,lb:lb});
+    });
+  }
+
+  /* ---------- highlight ---------- */
+  var sel=null,mode="";
+  function visibleKeys(){var k=[];STAGES.forEach(function(s){if(isExp(s.id))s.nodes.forEach(function(n){k.push(n.key);});else k.push(s.id);});return k;}
+  function gOf(key){return N[key]?N[key].g:S[key].g;}
+  function apply(){
+    var ns=null,es=null,vis=visibleKeys();
+    if(sel){ns={};ns[sel]=1;es={};drawn.forEach(function(d,i){if(d.a===sel||d.b===sel){es[i]=1;ns[d.a]=1;ns[d.b]=1;}});}
+    else if(mode==="gaps"){ns={};es={};vis.forEach(function(k){if(gOf(k))ns[k]=1;});}
+    else if(mode==="chain"){ns={};es={};
+      vis.forEach(function(k){if(CHAIN.indexOf(k)>=0||(!N[k]&&CHAIN.some(function(c){return c.split(".")[0]===k;})))ns[k]=1;});
+      drawn.forEach(function(d,i){if(ns[d.a]&&ns[d.b])es[i]=1;});}
+    vis.forEach(function(k){var el=N[k]?nodeEl[k]:cardEl[k];
+      el.classList.toggle("on",k===sel);el.classList.toggle("near",!!ns&&!!ns[k]&&k!==sel);el.classList.toggle("dim",!!ns&&!ns[k]);});
+    drawn.forEach(function(d,i){var on=!!es&&!!es[i],dim=!!es&&!es[i];
+      d.p.classList.toggle("on",on);d.p.classList.toggle("dim",dim);d.p.setAttribute("marker-end",on?"url(#ah-on)":"url(#ah)");
+      d.lb.classList.toggle("on",on);d.lb.classList.toggle("dim",dim);});
+  }
+
+  /* ---------- detail card ---------- */
+  function label(key){return N[key]?N[key].t:S[key].t;}
+  function openDetail(key){
+    sel=key;var it=N[key]||S[key],st=ST[it.st];
+    var h='<div class="top"><span class="pill'+(N[key]?'':' acc')+'">'+esc(N[key]?it.role:it.n)+'</span><span class="pill '+st[0]+'">'+st[1]+'</span>'+
+      (it.g?'<span class="mk" title="пробел">!</span>':'')+'<button type="button" class="x" data-act="close" aria-label="Закрыть">×</button></div>'+
+      '<h2>'+esc(it.t)+'</h2><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div><dl>';
+    it.d.forEach(function(r){h+='<div><dt>'+esc(r[0])+'</dt><dd'+(r[2]===GAP?' class="gap"':r[2]===TASK?' class="task"':'')+'>'+esc(r[1])+'</dd></div>';});
+    h+='</dl>';
+    var inc=drawn.filter(function(d){return d.b===key;}),out=drawn.filter(function(d){return d.a===key;});
+    if(inc.length||out.length){h+='<div class="links">';
+      inc.forEach(function(d){h+='<button type="button" data-go="'+esc(d.a)+'"><i>← '+esc(d.lb.textContent)+'</i>'+esc(label(d.a))+'</button>';});
+      out.forEach(function(d){h+='<button type="button" data-go="'+esc(d.b)+'"><i>→ '+esc(d.lb.textContent)+'</i>'+esc(label(d.b))+'</button>';});
+      h+='</div>';}
+    if(S[key]&&S[key].nodes)h+='<div class="act"><button type="button" class="ib" data-act="toggle" data-stage="'+key+'">'+(isExp(key)?'свернуть стадию ▾':'развернуть стадию ▸')+'</button></div>';
+    detail.innerHTML=h;detail.hidden=false;detail.scrollTop=0;apply();
+  }
+  function closeDetail(){sel=null;detail.hidden=true;detail.innerHTML="";apply();}
+  detail.addEventListener("click",function(ev){
+    var b=ev.target.closest("button");if(!b)return;
+    if(b.dataset.act==="close"){closeDetail();return;}
+    if(b.dataset.act==="toggle"){toggle(b.dataset.stage);return;}
+    if(b.dataset.go)openDetail(b.dataset.go);
+  });
+
+  /* ---------- expand / collapse ---------- */
+  function toggle(sid){
+    if(!S[sid].nodes)return;
+    var before=pos[sid]?pos[sid].x*sc+tx:null;
+    exp[sid]=!exp[sid];sel=null;detail.hidden=true;detail.innerHTML="";layout();
+    if(before!==null){tx+=before-(pos[sid].x*sc+tx);draw();}
+    save();
+  }
+  document.getElementById("expAll").addEventListener("click",function(){STAGES.forEach(function(s){if(s.nodes)exp[s.id]=true;});closeDetail();layout();fit();save();});
+  document.getElementById("colAll").addEventListener("click",function(){exp={};closeDetail();layout();fit();save();});
+  document.getElementById("resetPos").addEventListener("click",function(){off={};soff={};layout();fit();save();});
+  Array.prototype.slice.call(document.querySelectorAll(".chip[data-mode]")).forEach(function(c){
+    c.addEventListener("click",function(){mode=c.dataset.mode;sel=null;detail.hidden=true;
+      Array.prototype.slice.call(document.querySelectorAll(".chip[data-mode]")).forEach(function(x){x.setAttribute("aria-pressed",x===c?"true":"false");});apply();});
+  });
+
+  /* ---------- pan, zoom, drag ---------- */
+  var sc=1,tx=0,ty=0,zval=document.getElementById("zval");
+  function draw(){view.style.transform="translate("+tx+"px,"+ty+"px) scale("+sc+")";zval.textContent=Math.round(sc*100)+"%";}
+  function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+  function bounds(){var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+    STAGES.forEach(function(s){var p=pos[s.id];x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x+p.w);y1=Math.max(y1,p.y+p.h);});
+    drawn.forEach(function(d){var b=d.p.getBBox();x0=Math.min(x0,b.x);y0=Math.min(y0,b.y);x1=Math.max(x1,b.x+b.width);y1=Math.max(y1,b.y+b.height);});
+    return {x:x0,y:y0,w:x1-x0,h:y1-y0};}
+  function fit(){
+    var r=canvas.getBoundingClientRect(),b=bounds();
+    var f=Math.min((r.width-48)/b.w,(r.height-48)/b.h,1.1);
+    if(f<.4){sc=.55;tx=16-b.x*sc;ty=(r.height-b.h*sc)/2-b.y*sc;}
+    else{sc=f;tx=(r.width-b.w*sc)/2-b.x*sc;ty=(r.height-b.h*sc)/2-b.y*sc;}
+    draw();
+  }
+  function zoomAt(ns,px,py){ns=clamp(ns,.2,2.4);tx=px-(px-tx)*(ns/sc);ty=py-(py-ty)*(ns/sc);sc=ns;draw();}
+  document.getElementById("zin").addEventListener("click",function(){var r=canvas.getBoundingClientRect();zoomAt(sc*1.2,r.width/2,r.height/2);});
+  document.getElementById("zout").addEventListener("click",function(){var r=canvas.getBoundingClientRect();zoomAt(sc/1.2,r.width/2,r.height/2);});
+  document.getElementById("zfit").addEventListener("click",fit);
+  canvas.addEventListener("wheel",function(ev){
+    ev.preventDefault();var r=canvas.getBoundingClientRect();
+    var dy=ev.deltaMode===1?ev.deltaY*16:ev.deltaY;
+    zoomAt(sc*Math.exp(-dy*.0022),ev.clientX-r.left,ev.clientY-r.top);
+  },{passive:false});
+
+  var drag=null;
+  canvas.addEventListener("pointerdown",function(ev){
+    if(ev.pointerType==="mouse"&&ev.button!==0)return;
+    if(ev.target.closest(".zoom")||ev.target.closest("button"))return;
+    var nd=ev.target.closest(".node"),cd=ev.target.closest(".scard"),fh=ev.target.closest(".fh");
+    var kind="pan",key=null,start=[tx,ty],el=null;
+    if(nd){kind="node";key=nd.dataset.key;start=o(off,key).slice();el=nd;}
+    else if(cd){kind="stage";key=cd.dataset.key;start=o(soff,key).slice();el=cd;}
+    else if(fh){kind="stage";key=fh.parentNode.dataset.stage;start=o(soff,key).slice();el=fh.parentNode;}
+    drag={kind:kind,key:key,start:start,x:ev.clientX,y:ev.clientY,id:ev.pointerId,moved:false,el:el};
+  });
+  canvas.addEventListener("pointermove",function(ev){
+    if(!drag||ev.pointerId!==drag.id)return;
+    var dx=ev.clientX-drag.x,dy=ev.clientY-drag.y;
+    if(!drag.moved){if(Math.abs(dx)+Math.abs(dy)<5)return;drag.moved=true;try{canvas.setPointerCapture(drag.id);}catch(_){}
+      if(drag.kind==="pan")canvas.classList.add("panning");else if(drag.el)drag.el.classList.add("dragging");}
+    if(drag.kind==="pan"){tx=drag.start[0]+dx;ty=drag.start[1]+dy;draw();}
+    else{var v=[Math.round(drag.start[0]+dx/sc),Math.round(drag.start[1]+dy/sc)];
+      if(drag.kind==="node")off[drag.key]=v;else soff[drag.key]=v;layout();}
+  });
+  function endDrag(ev){
+    if(!drag||(ev&&ev.pointerId!==drag.id))return;
+    var d=drag;drag=null;canvas.classList.remove("panning");if(d.el)d.el.classList.remove("dragging");
+    if(d.moved){if(d.kind!=="pan")save();return;}
+    if(d.kind==="node"){sel===d.key?closeDetail():openDetail(d.key);}
+    else if(d.kind==="stage"&&d.el&&d.el.classList.contains("scard")){S[d.key].nodes?toggle(d.key):openDetail(d.key);}
+    else if(d.kind==="pan"&&sel)closeDetail();
+  }
+  canvas.addEventListener("pointerup",endDrag);
+  canvas.addEventListener("pointercancel",function(){if(drag&&drag.el)drag.el.classList.remove("dragging");drag=null;canvas.classList.remove("panning");});
+
+  view.addEventListener("click",function(ev){
+    var b=ev.target.closest("button");if(!b)return;
+    var host=b.closest(".scard")||b.closest(".frame");if(!host)return;
+    var sid=host.dataset.key||host.dataset.stage;
+    if(b.dataset.act==="info")openDetail(sid);
+    else if(b.dataset.act==="collapse")toggle(sid);
+  });
+  view.addEventListener("keydown",function(ev){
+    if(ev.key!=="Enter"&&ev.key!==" ")return;
+    if(ev.target.closest("button"))return;
+    var nd=ev.target.closest(".node"),cd=ev.target.closest(".scard");
+    if(nd){ev.preventDefault();sel===nd.dataset.key?closeDetail():openDetail(nd.dataset.key);}
+    else if(cd){ev.preventDefault();var k=cd.dataset.key;S[k].nodes?toggle(k):openDetail(k);}
+  });
+  document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&sel)closeDetail();});
+
+  layout();fit();
+  if(document.fonts&&document.fonts.ready)document.fonts.ready.then(function(){layout();fit();});
+})();
+</script>
