@@ -100,6 +100,10 @@ h1 b{color:var(--accent);font-weight:600}
 .node.on,.scard.on{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),0 10px 30px var(--shadow)}
 .node.near,.scard.near{border-color:var(--accent-line)}
 .node.dim,.scard.dim{opacity:.26}
+.frame.subf{border-color:rgba(154,154,162,.42);background:rgba(154,154,162,.025)}
+.frame.subf .fh{border-bottom-color:rgba(154,154,162,.2)}
+.frame.subf .fh .ft{color:var(--ink)}
+.scard.sub{width:212px}
 .dragging{cursor:grabbing!important;box-shadow:0 18px 44px rgba(0,0,0,.55)!important}
 
 .zoom{position:absolute;right:12px;bottom:12px;display:flex;align-items:center;gap:2px;padding:3px;border:1px solid var(--line2);border-radius:10px;background:var(--raised);z-index:6}
@@ -174,7 +178,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 <div class="page">
   <header class="head">
     <div class="l">
-      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · + оркестратор</div>
+      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · + оркестратор</div>
       <h1>Проход продукта: <b>от идеи до задачи</b></h1>
       <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки.</p>
     </div>
@@ -217,6 +221,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <span>Концепция</span><a href="#c-what">Что это</a><a href="#c-input">Вход</a><a href="#c-process">Обработка</a><a href="#c-output">Выход</a><a href="#c-records">Записи</a><a href="#c-doors">Двери</a><a href="#c-gaps">Пробелы</a><a href="#c-missed">Упускали</a>
     <span>Карта L1</span><a href="#m-what">Что это</a><a href="#m-input">Вход</a><a href="#m-process">Обработка</a><a href="#m-output">Выход</a><a href="#m-records">Записи</a><a href="#m-doors">Двери</a><a href="#m-gaps">Пробелы</a><a href="#m-missed">Упускали</a>
     <span>Спецификация</span><a href="#s-what">Что это</a><a href="#s-input">Вход</a><a href="#s-process">Обработка</a><a href="#s-output">Выход</a><a href="#s-records">Записи</a><a href="#s-doors">Двери</a><a href="#s-gaps">Пробелы</a><a href="#s-missed">Упускали</a>
+    <span>Фичи</span><a href="#f-what">Что это</a><a href="#f-input">Вход</a><a href="#f-process">Обработка</a><a href="#f-output">Выход</a><a href="#f-questions">Вопросы</a><a href="#f-records">Записи</a><a href="#f-gaps">Пробелы</a>
     <span>Итог</span><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
   </nav>
 
@@ -696,6 +701,118 @@ ul.plain b{color:var(--ink);font-weight:500}
     </div>
   </div>
 
+  <!-- ===================== FEATURES ===================== -->
+  <div class="block" id="b-feat">
+    <div class="bh2"><h2>Стадия 5 · <b>Фичи</b></h2><small>выход спецификации → фичи → вход OM · сведено с Codex-omg №4594</small></div>
+    <div class="grid">
+      <section class="sec wide" id="f-what">
+        <h3>Что такое фича</h3>
+        <p>Фича отвечает на вопрос: <b>какую законченную способность получает участник, какой полезный результат она даёт и какие обязательства реализует</b>. Это последняя продуктовая сшивка перед OM. У фичи один outcome и один получатель пользы; реализация может проходить через много блоков, связь с другими результатами — в interactions.</p>
+        <div class="tw"><table>
+          <thead><tr><th>Сущность</th><th>Что определяет</th><th>Граница</th></tr></thead>
+          <tbody>
+            <tr><td>Требование концепции</td><td>Польза, получатель, результат, критерии</td><td>Не раскладка работ</td></tr>
+            <tr><td>Договор спецификации</td><td>Точное поведение</td><td>Не обязан совпадать с одной фичей</td></tr>
+            <tr><td><b>Фича</b></td><td>Способность вокруг полезного результата</td><td>Не файл, не модуль, не атомарная задача, не готовность</td></tr>
+            <tr><td>Блок / операция OM</td><td>Ответственность и способ получить результат</td><td>Может участвовать в нескольких фичах</td></tr>
+            <tr><td>Работа L3</td><td>Конкретное изменение с кодом, тестами, интеграциями</td><td>Без перепридумывания продукта</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec" id="f-input">
+        <h3>Вход</h3>
+        <ol class="chain">
+          <li><span><b>Когда.</b> Спецификация принята и актуальна.</span></li>
+          <li><span><b>Кто.</b> <code>prepare-stage features</code>; consumer = om-g2 — не автоматический запуск OM.</span></li>
+          <li><span><b>Вопросы.</b> features → featurePreparation (moment-вариант, с оценкой).</span></li>
+          <li><span><b>Автор видит.</b> Спецификацию целиком, conceptSections, из Discovery — actors, outcomes, constraints; при подготовке — принятый список фич.</span></li>
+          <li><span><b>Не видит.</b> Поля карты: только Ref. Нет каталога артефактов L1 для interactions.</span></li>
+          <li><span><b>Оценщик.</b> Значение, предшественники, наблюдения; принятого списка фич — нет.</span></li>
+        </ol>
+      </section>
+      <section class="sec" id="f-process">
+        <h3>Обработка: что гарантируют проверки</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Проверка</th><th>Гарантирует</th><th>Не гарантирует</th></tr></thead>
+          <tbody>
+            <tr><td>outcome — артефакт L1</td><td>Реальный результат карты</td><td>Что способность его обеспечивает</td></tr>
+            <tr><td>Индексы behavior, покрытие</td><td>Старая нить разрешается</td><td>Что новая нить ей соответствует</td></tr>
+            <tr><td>title + outcome подготовки</td><td>Подготовка связана с фичей</td><td>Устойчивый id</td></tr>
+            <tr><td>requirements = объединение договоров</td><td>Новая нить без лишнего и потерь</td><td>Соответствие индексам behavior</td></tr>
+            <tr><td>Каждый договор потреблён</td><td>Нет договора без потребителя</td><td>Что положения договора дошли до работы</td></tr>
+            <tr><td>interactions.outcome существует</td><td>Указан реальный артефакт</td><td>Что условие верно и реализуется</td></tr>
+            <tr><td>Нет блокирующих вопросов</td><td>Стадия без объявленного блокера</td><td>Что срок верен и есть исполнимая дверь</td></tr>
+          </tbody>
+        </table></div>
+      </section>
+      <section class="sec wide" id="f-output">
+        <h3>Выход: что переходит в OM</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Исходное поле</th><th>В нормализованном входе OM</th></tr></thead>
+          <tbody>
+            <tr><td>title, outcome</td><td>Сохранены</td></tr>
+            <tr><td>Индексы behavior</td><td><code>behaviorIndexes</code></td></tr>
+            <tr><td>id требований концепции</td><td><code>requirementIds</code></td></tr>
+            <tr><td>id договоров</td><td><code>contracts</code></td></tr>
+            <tr><td>beneficiary, benefit, success, failures, interactions</td><td><b>Не переносятся</b> — остаются в принятой стадии по Ref</td></tr>
+            <tr><td>remainingQuestions</td><td>Отдельно в <code>input.questions</code>: текст, consumer, blocks, source, moment; kind = null</td></tr>
+          </tbody>
+        </table></div>
+        <div class="tw" style="margin-top:12px"><table>
+          <thead><tr><th>Потребитель в OM</th><th>Как использует фичи</th><th>Предел</th></tr></thead>
+          <tbody>
+            <tr><td><code>startRun</code></td><td>outcomes фич — допустимые цели прохода</td><td>Цель — результат, а не фича: две фичи с одним outcome не выбираются отдельно</td></tr>
+            <tr><td><code>horizon</code></td><td>Блоки-производители выбранных outcomes и зависимости L1</td><td>Условие из interactions зависимость графа не создаёт</td></tr>
+            <tr><td>Очередь</td><td>Успешный journey L1 по outcomes горизонта</td><td>Не backlog фич</td></tr>
+            <tr><td>Классификация разрывов</td><td>Через фичи находит блоки — адресатов ремонта</td><td>Структурный путь</td></tr>
+            <tr><td>Бриф модели OM</td><td>Связанные фичи и строки behavior</td><td>Подготовка фичи целиком не прикладывается</td></tr>
+            <tr><td>Компилятор, исполнитель</td><td>Работа L3 из графа и задачи</td><td>interactions.condition сам не становится коннектором и тестом</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px"><b>Переход в OM уже частично автоматизирован:</b> <code>om-start</code> при отсутствии входа делает coldStart — сам строит B1, намерение, горизонт, разрывы, маршруты и очередь. Драйверу ранних стадий нужно дойти до этой команды, а не строить вход заново.</p>
+      </section>
+      <section class="sec" id="f-questions">
+        <h3>Оставшиеся вопросы: срок и исполнитель</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Срок</th><th>По смыслу</th><th>Исполнитель в коде</th></tr></thead>
+          <tbody>
+            <tr><td>om-pass</td><td>Без ответа нельзя закончить проектирование</td><td>Адресный разрыв блокирует проход</td></tr>
+            <tr><td>feasibility</td><td>Условие выполнимости до готовности плана</td><td>R3 / M8 readiness — нужно назначение и подтверждение</td></tr>
+            <tr><td>task-start</td><td>Меняющееся условие перед работой</td><td>taskStartProofs — нужна runtime-проверка</td></tr>
+            <tr><td>task-result</td><td>Ответ только на результате реализации</td><td>Тесты конкретной работы</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px">Срок сам ничего не исполняет: без допустимого доказательства или назначения поздний вопрос честно остаётся открытым. feasibility здесь — техническая выполнимость плана, а не вердикт реализуемости Discovery.</p>
+      </section>
+      <section class="sec" id="f-records">
+        <h3>Записи и адресация</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Что</th><th>Адрес</th></tr></thead>
+          <tbody>
+            <tr><td>Принятая стадия</td><td><code>stage:&lt;p&gt;:features</code>, graph = null</td></tr>
+            <tr><td>Фича</td><td>Индекс в точной версии; title и outcome — значения</td></tr>
+            <tr><td>Подготовка</td><td>Связь по title + outcome</td></tr>
+            <tr><td>Нормализованная фича</td><td><code>om-input:&lt;p&gt;.input.features</code> + index</td></tr>
+            <tr><td>Вопрос фичи</td><td><code>feature:&lt;index&gt;:&lt;n&gt;</code> + source Ref; n — после сортировки</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px">Индексы нестабильны между версиями, но подмены ответов не доказано: точные sources, refresh с изменёнными стадиями отвергается. Миграция к feature-id до HX4 не обязательна.</p>
+      </section>
+      <section class="sec" id="f-gaps">
+        <h3>Пробелы <small>вердикт Codex</small></h3>
+        <ul class="plain">
+          <li><b>Содержание подготовки не доходит до OM</b> — benefit, success, failures, interactions (SP1).</li>
+          <li><b>Нет каталога L1 у автора фич</b>, а interactions обязаны ссылаться на артефакты (SP1).</li>
+          <li><b>Оценщик подготовки без списка фич</b> (ASM1).</li>
+          <li><b>Поздний вопрос без исполнителя</b> — moment не исполняет (UNK1).</li>
+          <li><b>Ограничения</b> — тот же сквозной перенос (DS1.2): уникальные failures и interactions не отбрасывать.</li>
+          <li><b>Описанное взаимодействие не меняет L1</b>: новая зависимость — показать воплощение или адресно пересмотреть основание.</li>
+          <li><b>Состав ≠ приоритет</b>: очереди выпуска и флагов по feature-id нет.</li>
+        </ul>
+      </section>
+    </div>
+  </div>
+
   <!-- ===================== SUMMARY ===================== -->
   <div class="block">
     <div class="bh2"><h2>Итог</h2><small>предложение оркестратора · классы — по Codex №4585 и №4587 · не выдано</small></div>
@@ -712,10 +829,10 @@ ul.plain b{color:var(--ink);font-weight:500}
             <tr><td>5</td><td>DS1.1 — двери не-go</td><td>Выбор через полномочие владельца; продолжение по недостающему</td><td>Discovery</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>6</td><td>DS1.2 — перенос обязательств</td><td>Отчёт → preparation → conceptSections → implements, пути → договоры поведения: Ref Discovery + constraint id → requirement ids; код — охват, оценщик — применение</td><td>Discovery → концепция → карта → спецификация</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>7</td><td>L1A — материал автора карты</td><td>Доставить externalSystems и основания; реестр обязательных outcome-id и правило «id результата = id артефакта»</td><td>Карта L1</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>8</td><td>ASM1 — контекст оценщика</td><td>Оценщик видит принятые соседние поля своей стадии и критерий их согласия: 4 поля концепции; operationRequirements ↔ mapDesign; behavior / constraints / договоры</td><td>концепция, карта, спецификация</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>9</td><td>SP1 — полный договор у потребителей</td><td>Выбранный behaviorContract целиком (entry, inputs, compatibility) рядом с нормализованным — вопросам OM, задачам фактов, детализации работ</td><td>спецификация → OM</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>10</td><td>UNK1 — неизвестное ранней стадии</td><td>Адресный исход: материал / возврат к основанию / выбор; позднему — с потребителем и сроком</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
-            <tr><td>11</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию, на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>8</td><td>ASM1 — контекст оценщика</td><td>Оценщик видит принятые соседние поля своей стадии и критерий их согласия: 4 поля концепции; operationRequirements ↔ mapDesign; behavior / constraints / договоры; список фич ↔ подготовка</td><td>концепция, карта, спецификация, фичи</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>9</td><td>SP1 — полный материал у потребителей</td><td>Выбранный договор целиком (entry, inputs, compatibility) и подготовка фичи целиком (benefit, success, failures, interactions) рядом с нормализованными связями — вопросам OM, задачам фактов, детализации; автору и оценщику фич — каталог артефактов L1</td><td>спецификация, фичи → OM</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>10</td><td>UNK1 — неизвестное и его исполнимая передача</td><td>Ранняя дверь: материал / возврат к основанию / выбор. Поздний вопрос: видимые потребитель, срок, допустимое доказательство и рабочая дверь — либо честное ожидание</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>11</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию и в конце om-start (coldStart уже строит вход OM), на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>12</td><td>DS1.3 — итог владельцу</td><td>Читаемый вид стадий из принятых записей; верное авторство; в GraphPanel — путь, условия, статус; сводка договоров поведения</td><td>все ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
           </tbody>
         </table></div>
@@ -903,9 +1020,45 @@ ul.plain b{color:var(--ink);font-weight:500}
       {f:"stage",t:"omgap",l:"buildOmInput",fs:"b",ff:.5,ts:"t",tf:.5},
       {f:"stage",t:"owner4",l:"вид",fs:"b",ff:.15,ts:"r",tf:.5}
      ]},
-    {id:"feat",n:"Стадия 5",st:"yes",g:0,mock:1,t:"Фичи",io:["контракты","фичи"],
-     sum:"Поставка частями: требования фичи — ровно требования её контрактов; оставшиеся вопросы — со сроком.",
-     d:[["Что делает","Группирует контракты в фичи с пользой, потребителем, критериями и оставшимися вопросами."],["Отдаёт","features + featurePreparation для OM."],["Подробная карта","Следующим шагом.",TASK]]},
+    {id:"feat",n:"Стадия 5",st:"part",g:1,t:"Фичи",io:["stage:specification","способности продукта"],top:76,
+     sum:"Законченные способности продукта: один результат, получатель пользы, связанные требования и договоры, взаимодействия, оставшиеся вопросы.",
+     d:[["Что делает","Собирает договоры поведения в полезные способности: какую законченную способность получает участник, какой результат она даёт, какие обязательства реализует. Не файл, не модуль, не атомарная работа, не факт готовности."],["Берёт","Спецификацию целиком; conceptSections; из Discovery — actors, outcomes, constraints. Карту — только Ref, без полей."],["Отдаёт","stage:<p>:features → om-start: outcomes фич — цели прохода и горизонта; связи требований и договоров; оставшиеся вопросы со сроком. Нормализованная фича OM теряет benefit, success, failures, interactions."],["Пробелы","Нет каталога артефактов L1 у автора; оценщик подготовки не видит списка фич; содержание подготовки не доходит до задания OM; поздний вопрос без исполнителя.",GAP],["Задачи","SP1 · ASM1 · UNK1 · DS1.2 · DS1.3 · DRV1",TASK]],
+     nodes:[
+      {id:"trigger",x:0,y:160,role:"оператор → движок",st:"part",g:1,t:"prepare-stage features",io:["спецификация accepted","черновик"],bh:"Спецификация обязана быть принята; consumer = om-g2.",
+       d:[["Что делает","engine.prepare: принятая актуальная спецификация, guards → inputs; consumer = om-g2. consumer не означает автоматический запуск OM."],["Пробел","Переход запускает вызывающая сторона (DRV1); дальше нужна команда om-start.",GAP],["Задача","DRV1",TASK]]},
+      {id:"draft",x:220,y:160,role:"запись",st:"yes",g:0,t:"Черновик фич",io:["inputs: Ref спецификации","2 вопроса"],bh:"features → featurePreparation (moment-вариант, с оценкой).",
+       d:[["Вопросы","features — [{title, outcome, requirements: индексы behavior}]; featurePreparation — [{featureTitle, outcome, requirements (id концепции), behaviorContracts, beneficiary, benefit, success, failures, interactions, remainingQuestions с moment}] (requirements.ts:28; preparation-contracts.ts:55)."]]},
+      {id:"packet",x:440,y:160,role:"движок",st:"part",g:1,t:"Запрос модели",io:["черновик + спецификация","пакет"],bh:"Спецификация целиком · conceptSections · Discovery: actors, outcomes, constraints · карта — только Ref.",
+       d:[["Что внутри","Спецификация целиком; conceptSections; из Discovery — actors, outcomes, constraints; поля стадии (при подготовке виден принятый список features); вопрос со схемой; источники, история, замечания."],["Отличие","В отличие от спецификации, mapDesign фичам не передаётся: в prerequisites остаётся Ref карты, но поля пусты; operationMap = null."],["Пробел","Для interactions нужен каталог артефактов L1 с их смыслом, производителями и потребителями — в обычном брифе его нет.",GAP],["Задача","SP1 — полный материал",TASK]]},
+      {id:"model",x:660,y:160,role:"модель",st:"yes",g:0,t:"Модель · способности",io:["пакет","2 ответа"],bh:"Группирует договоры в способности вокруг одного результата; раскрывает взаимодействия и нерешённое.",
+       d:[["Что делает","Предлагает состав способностей, связывает с требованиями и договорами, объясняет пользу, успех и отказы, взаимодействия, оставшиеся вопросы."],["Граница","Один outcome и один beneficiary на фичу; реализация может проходить через много блоков. Не изобретать внешнее свойство или цель владельца ради удобной фичи."],["Пример HX","«Отправить запрос выбранной модели через выбранный способ подключения и получить ответ либо понятный отказ» — форма, не решение за Discovery."]]},
+      {id:"assess",x:880,y:160,role:"оценщик",st:"part",g:1,t:"Оценщик",io:["ответ","supported / нет"],bh:"Смысл и основания; при оценке подготовки не видит принятого списка фич.",
+       d:[["Что проверяет","Полноту, полезность, согласие с намерением и ограничениями, поддержку фактов (research-assessment.ts:39)."],["Пробел","Принятый список features при оценке featurePreparation отдельно не передаётся — сверка подготовки со списком на него не опирается.",GAP],["Задача","ASM1 — контекст оценщика",TASK]]},
+      {id:"features",x:1100,y:0,role:"ответ",st:"yes",g:0,t:"features",io:["ответ","title · outcome · индексы behavior"],bh:"Способности; ссылки на строки behavior номерами; outcome — артефакт L1.",
+       d:[["Что это","[{title, outcome, requirements: индексы specification.behavior}]."],["Проверки","outcome ∈ артефактов L1; индексы в пределах; каждое behavior покрыто фичей; layerGate L1 (stage-checks.ts:278)."],["Адрес","Индекс в точной версии стадии; title и outcome — значения, не идентичность."]]},
+      {id:"prep",x:1100,y:220,role:"ответ · главный",st:"part",g:1,t:"featurePreparation",io:["ответ","подготовка способности"],bh:"requirements · behaviorContracts · beneficiary · benefit · success · failures · interactions · remainingQuestions",
+       d:[["Что это","Содержательное обоснование способности; связь с фичей — совпадением featureTitle + outcome."],["Проверки","Одна подготовка на фичу; beneficiary и пара outcome есть в Discovery; договоры и требования с тем же outcome; requirements = объединение требований выбранных договоров; interactions.outcome ∈ артефактов; каждый договор потреблён фичей (preparation-validation.ts:61)."],["Пробел","В OM уходят только связи; benefit, success, failures, interactions с condition не доставляются в задание OM — например, условие отмены до повторного запроса может не дойти до работы и теста.",GAP],["Задача","SP1 — полный материал выбранной фичи",TASK]]},
+      {id:"questions",x:1100,y:440,role:"ответ",st:"part",g:1,t:"remainingQuestions",io:["подготовка","вопросы OM"],bh:"question · consumer · blocksCurrentStage · moment — без kind и id.",
+       d:[["Что это","Нерешённое по способности: текст, потребитель (строка), блокирует ли стадию, срок moment ∈ om-pass | feasibility | task-start | task-result."],["Две оси","blocksCurrentStage — мешает ли принять фичи сейчас; moment — когда ответ нужен потребителю. false не закрывает вопрос."],["Путь","→ buildOmInput.questions (kind = null) → адресация OM: узел-потребитель и вид знания → ответ в проходе или позднее обязательство → доказательство у потребителя (gaps.ts:286, addressing.ts:125)."],["Пробел","Поздний вопрос получает исполнителя, только если есть допустимое доказательство: task-result — тесты работы; environment-confirmation — runtime-проверка. Иначе остаётся открытым — moment сам ничего не исполняет.",GAP],["Задача","UNK1 — неизвестное и его исполнимая передача",TASK]]},
+      {id:"checks",x:1320,y:220,role:"код",st:"yes",g:0,t:"Проверки приёмки",io:["поля","accept / находки"],bh:"Обе нити ссылок, покрытие behavior и договоров, outcome и interactions — артефакты L1, нет блокирующих вопросов.",
+       d:[["Что проверяет","Старую нить (индексы behavior, покрытие) и новую (подготовка, договоры, требования); outcome и interactions ∈ артефактов L1; нет remainingQuestions с blocksCurrentStage = true."],["Не гарантирует","Что способность обеспечивает результат; смысловое соответствие нитей; что interactions отражены в топологии; верность сроков вопросов."],["Находки","Старой нити → поле features; подготовки → поле featurePreparation; без поля — blocked."]]},
+      {id:"stage",x:1540,y:220,role:"запись",st:"yes",g:0,mono:1,t:"stage:<p>:features",io:["accept","om-start"],bh:"content = draft, fields, graph = null.",
+       d:[["Что это","Принятая постановка состава продукта — не готовность фич."],["Дальше","Команда om-start: при отсутствии om-input — coldStart (run-driver.ts:107): writeRunBases строит вход, намерение, горизонт, разрывы, маршруты и очередь штатными производителями."]]},
+      {id:"norm",x:1540,y:440,role:"OM · вход",st:"part",g:1,t:"Нормализованная фича",io:["фича + подготовка","om-input.features"],bh:"index · title · outcome · behaviorIndexes · requirementIds · contracts.",
+       d:[["Сохраняется","index, title, outcome, behaviorIndexes, requirementIds, contracts; remainingQuestions — отдельно в input.questions с id feature:<index>:<n> (om/input.ts:298)."],["Не переносится","beneficiary, benefit, success, failures, interactions с condition.",GAP],["Единица запуска","Цель om-start — outcomes, не фичи: две фичи с одним outcome не выбираются как независимые цели (run.ts:373)."]]},
+      {id:"owner5",x:1320,y:440,role:"для владельца",st:"no",g:1,t:"Вид способностей владельцу",io:["принятая стадия","обещанные способности"],bh:"Способности · польза · отказы · зависимости · что вошло в проход · что открыто.",
+       d:[["Что нужно","Список обещанных способностей с пользой, отказами, зависимостями, выбранным охватом и открытыми условиями. Принятая постановка ≠ готовый продукт."],["Как сейчас","StagePanel / QuestionPanel с данными и статусами; предметной сводки нет.",GAP],["Задача","DS1.3",TASK]]}
+     ],
+     edges:[
+      {f:"trigger",t:"draft",l:"inputs · consumer"},{f:"draft",t:"packet",l:"2 вопроса"},{f:"packet",t:"model",l:"запрос"},
+      {f:"model",t:"assess",l:"ответ"},{f:"assess",t:"features",l:"supported",fs:"t",ff:.7,ts:"l",tf:.5},{f:"assess",t:"prep",l:"supported"},
+      {f:"prep",t:"questions",l:"remainingQuestions"},
+      {f:"features",t:"checks",l:"fields",loop:"above",depth:26},{f:"prep",t:"checks",l:"fields"},{f:"checks",t:"stage",l:"accept"},
+      {f:"checks",t:"features",l:"находки → переоткрыть поле",k:"alt",loop:"above",depth:70,ff:.3,tf:.75},
+      {f:"checks",t:"prep",l:"находки → переоткрыть поле",k:"alt",loop:"below",depth:40,ff:.3,tf:.75},
+      {f:"stage",t:"norm",l:"buildOmInput",fs:"b",ff:.5,ts:"t",tf:.5},
+      {f:"stage",t:"owner5",l:"вид",fs:"b",ff:.15,ts:"r",tf:.5}
+     ]},
     {id:"om",n:"OM",st:"part",g:1,mock:1,t:"OM",io:["5 стадий","атомарный план"],
      sum:"buildOmInput сшивает всё по id; проход OM уточняет L2/L3 до атомарных работ.",
      d:[["Что делает","Сшивает пять стадий по id (buildOmInput, om/input.ts), закрывает разрывы (в том числе checkKind критериев), ведёт технический разбор до атомарных работ."],["Берёт","Требования и критерии концепции, контракты, фичи; из Discovery — actors, unknowns, externalSystems, каталог Source."],["Пробел","Нет обязательного покрытия ограничений и открытых вопросов отчёта Discovery.",GAP],["Подробная карта","Следующим шагом.",TASK]]},
@@ -926,14 +1079,17 @@ ul.plain b{color:var(--ink);font-weight:500}
     {f:"con.stage",t:"map.build",l:"conceptSections → requirements",route:"above",depth:84,ff:.65},
     {f:"map.stage",t:"spec.trigger",l:"accepted · guards",lc:"stage:operation-map — L1"},
     {f:"map.stage",t:"spec.packet",l:"prerequisites: карта целиком",route:"above",depth:40,ff:.4},
-    {f:"spec.stage",t:"feat",l:"behavior · constraints · behaviorContracts",lc:"stage:specification"},
     {f:"spec.stage",t:"om",l:"нормализованные договоры (без entry · inputs · compatibility)",route:"above",depth:40,ff:.8},
     {f:"spec.omgap",t:"om",l:"nodes · state → решение OM",k:"alt",route:"below",depth:44,ff:.5},
     {f:"disc.stage",t:"spec.packet",l:"actors · outcomes · constraints",route:"below",depth:198,ff:.14},
     {f:"map.stage",t:"om",l:"graph-layer:1 · journeys → очередь OM",route:"below",depth:44,ff:.7},
-    {f:"map.graph",t:"feat",l:"артефакты L1 → outcome фич",route:"below",depth:88,ff:.5},
+    {f:"map.graph",t:"feat.checks",l:"артефакты L1 → проверка outcome · interactions",route:"below",depth:88,ff:.5},
     {f:"spec",t:"feat",l:"контракты"},
-    {f:"feat",t:"om",l:"фичи"},
+    {f:"spec.stage",t:"feat.trigger",l:"accepted · guards",lc:"stage:specification"},
+    {f:"spec.stage",t:"feat.packet",l:"prerequisites: спецификация целиком",route:"above",depth:40,ff:.35},
+    {f:"feat.stage",t:"om",l:"om-start → coldStart",lc:"stage:features → om-start"},
+    {f:"feat.norm",t:"om",l:"нормализованные фичи (без benefit · success · failures · interactions)",route:"below",depth:44,ff:.5},
+    {f:"feat.questions",t:"om",l:"оставшиеся вопросы → адресация OM",k:"alt",route:"below",depth:88,ff:.5},
     {f:"om",t:"run",l:"атомарный план"},
     {f:"con.stage",t:"spec.packet",l:"conceptSections → покрыть договорами",route:"above",depth:128,ff:.5},
     {f:"con.stage",t:"om",l:"требования + критерии {id}#n",route:"below",depth:88,ff:.65},
@@ -942,89 +1098,119 @@ ul.plain b{color:var(--ink);font-weight:500}
     {f:"disc.stage",t:"om",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
     {f:"disc.web",t:"om",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6}
   ];
-  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec.packet","spec.model","spec.assess","spec.contracts","spec.checks","spec.stage","feat","om","run"];
+  var CHAIN=["disc.web","disc.report","disc.verdict","disc.prep","disc.stage","con.packet","con.model","con.assess","con.sections","con.checks","con.stage","map.packet","map.model","map.assess","map.design","map.build","map.graph","map.checks","map.stage","spec.packet","spec.model","spec.assess","spec.contracts","spec.checks","spec.stage","feat.packet","feat.model","feat.prep","feat.checks","feat.stage","feat.norm","om","run"];
 
   function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
-  var S={},N={};
-  STAGES.forEach(function(s){S[s.id]=s;(s.nodes||[]).forEach(function(n){n.key=s.id+"."+n.id;n.stage=s.id;N[n.key]=n;});});
+
+  /* ---------- registry: containers (stages, sub-blocks) and fixed nodes, addressed by dotted paths ---------- */
+  var IT={},ORDER=[];
+  function reg(item,key,parent,kind){
+    item.key=key;item.parent=parent;item.kind=kind;IT[key]=item;ORDER.push(key);
+    if(kind==="node")return;
+    (item.nodes||[]).forEach(function(n){reg(n,key+"."+n.id,key,"node");});
+    (item.subs||[]).forEach(function(s){reg(s,key+"."+s.id,key,"sub");});
+  }
+  STAGES.forEach(function(s){reg(s,s.id,null,"stage");});
+  function expandable(k){var it=IT[k];return it.kind!=="node"&&!!(it.nodes||it.subs);}
 
   var canvas=document.getElementById("canvas"),view=document.getElementById("view"),svg=document.getElementById("edges"),detail=document.getElementById("detail");
   var NSV="http://www.w3.org/2000/svg";
 
   /* ---------- per-viewer state ---------- */
-  var KEY="omg-pass-map-v2",exp={},off={},soff={};
+  var KEY="omg-pass-map-v3",exp={},off={},soff={};
   try{var saved=JSON.parse(localStorage.getItem(KEY)||"null");if(saved){exp=saved.exp||{};off=saved.off||{};soff=saved.soff||{};}}catch(_){}
   function save(){try{localStorage.setItem(KEY,JSON.stringify({exp:exp,off:off,soff:soff}));}catch(_){}}
+  function opened(k){return !!exp[k]&&expandable(k);}
+  function shown(k){var p=IT[k].parent;return p===null||(shown(p)&&opened(p));}
 
   /* ---------- DOM ---------- */
   var cardEl={},frameEl={},nodeEl={};
-  STAGES.forEach(function(s){
-    var c=document.createElement("div");
-    c.className="scard"+(s.nodes?" exp":"");c.dataset.key=s.id;c.tabIndex=0;c.setAttribute("role","button");
-    c.setAttribute("aria-label",s.t+(s.nodes?" — развернуть":""));
-    c.innerHTML='<div class="meta"><span class="pill acc">'+esc(s.n)+'</span><span class="st '+ST[s.st][0]+'">'+ST[s.st][1]+'</span>'+(s.mock?'<span class="pill">макет</span>':'')+'</div>'+
-      '<div class="t">'+esc(s.t)+'</div><div class="io">'+esc(s.io[0])+'<i>→</i>'+esc(s.io[1])+'</div>'+
-      '<div class="sum">'+esc(s.sum)+'</div>'+
-      '<div class="ft2">'+(s.nodes?'<span class="go">развернуть ▸</span>':'<span class="soon">подробная карта — следующий шаг</span>')+
+  function stHtml(st){var t=ST[st];return '<span class="st '+t[0]+'">'+t[1]+'</span>';}
+  ORDER.forEach(function(k){
+    var it=IT[k];
+    if(it.kind==="node"){
+      var d=document.createElement("div");
+      d.className="node"+(it.dec?" dec":"");d.dataset.key=k;d.tabIndex=0;d.setAttribute("role","button");d.setAttribute("aria-label",it.t);
+      var h='<div class="meta"><span class="pill">'+esc(it.role)+'</span>'+stHtml(it.st)+'</div>'+
+        '<div class="t'+(it.mono?" mono":"")+'">'+esc(it.t)+'</div><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div>';
+      if(it.dec)h+='<div class="outs"><span class="pill ok">go</span><span class="pill warn">conditional</span><span class="pill warn">insufficient</span><span class="pill bad">no_go</span></div>';
+      else h+='<div class="bh">'+esc(it.bh)+'</div>';
+      if(it.g)h+='<span class="mark" title="пробел">!</span>';
+      d.innerHTML=h;view.appendChild(d);nodeEl[k]=d;return;
+    }
+    var ex=expandable(k),c=document.createElement("div");
+    c.className="scard"+(ex?" exp":"")+(it.kind==="sub"?" sub":"");c.dataset.key=k;c.tabIndex=0;c.setAttribute("role","button");
+    c.setAttribute("aria-label",it.t+(ex?" — развернуть":""));
+    c.innerHTML='<div class="meta"><span class="pill acc">'+esc(it.n)+'</span>'+stHtml(it.st)+(it.mock?'<span class="pill">макет</span>':'')+'</div>'+
+      '<div class="t">'+esc(it.t)+'</div><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div>'+
+      '<div class="sum">'+esc(it.sum)+'</div>'+
+      '<div class="ft2">'+(ex?'<span class="go">развернуть ▸</span>':'<span class="soon">'+(it.soon||"подробная карта — следующий шаг")+'</span>')+
       '<button type="button" class="ib" data-act="info" aria-label="Подробнее">ⓘ</button></div>'+
-      (s.g?'<span class="mark" title="пробел">!</span>':'');
-    view.appendChild(c);cardEl[s.id]=c;
-    if(!s.nodes)return;
-    var f=document.createElement("div");f.className="frame";f.dataset.stage=s.id;
-    f.innerHTML='<div class="fh"><span class="ft">'+esc(s.n)+' · '+esc(s.t)+'</span><span class="fs">'+esc(s.io[0])+' → '+esc(s.io[1])+'</span>'+
-      '<span class="btns"><button type="button" class="ib" data-act="info" aria-label="Подробнее о стадии">ⓘ</button><button type="button" class="ib" data-act="collapse">свернуть ▾</button></span></div>';
-    view.insertBefore(f,svg);frameEl[s.id]=f;
-    s.nodes.forEach(function(n){
-      var d=document.createElement("div"),t=ST[n.st];
-      d.className="node"+(n.dec?" dec":"");d.dataset.key=n.key;d.tabIndex=0;d.setAttribute("role","button");d.setAttribute("aria-label",n.t);
-      var h='<div class="meta"><span class="pill">'+esc(n.role)+'</span><span class="st '+t[0]+'">'+t[1]+'</span></div>'+
-        '<div class="t'+(n.mono?" mono":"")+'">'+esc(n.t)+'</div><div class="io">'+esc(n.io[0])+'<i>→</i>'+esc(n.io[1])+'</div>';
-      if(n.dec)h+='<div class="outs"><span class="pill ok">go</span><span class="pill warn">conditional</span><span class="pill warn">insufficient</span><span class="pill bad">no_go</span></div>';
-      else h+='<div class="bh">'+esc(n.bh)+'</div>';
-      if(n.g)h+='<span class="mark" title="пробел">!</span>';
-      d.innerHTML=h;view.appendChild(d);nodeEl[n.key]=d;
-    });
+      (it.g?'<span class="mark" title="пробел">!</span>':'');
+    view.appendChild(c);cardEl[k]=c;
+    if(!ex)return;
+    var f=document.createElement("div");f.className="frame"+(it.kind==="sub"?" subf":"");f.dataset.key=k;
+    f.innerHTML='<div class="fh"><span class="ft">'+esc(it.n)+' · '+esc(it.t)+'</span><span class="fs">'+esc(it.io[0])+' → '+esc(it.io[1])+'</span>'+
+      '<span class="btns"><button type="button" class="ib" data-act="info" aria-label="Подробнее">ⓘ</button><button type="button" class="ib" data-act="collapse">свернуть ▾</button></span></div>';
+    view.insertBefore(f,svg);frameEl[k]=f;
   });
 
-  /* ---------- layout ---------- */
-  var PAD=22,HEAD=48,GAPX=130,TOP=200,pos={};
+  /* ---------- layout (recursive) ---------- */
+  var PAD=22,HEAD=48,GAPX=130,SUBGAP=96,TOP=200,pos={},dims={};
   function o(map,k){return map[k]||[0,0];}
-  function isExp(sid){return !!(exp[sid]&&S[sid].nodes);}
+  function setVisibility(){
+    ORDER.forEach(function(k){
+      var it=IT[k],vis=shown(k);
+      if(it.kind==="node"){nodeEl[k].hidden=!vis;return;}
+      var op=opened(k);cardEl[k].hidden=!vis||op;if(frameEl[k])frameEl[k].hidden=!vis||!op;
+    });
+  }
+  function measure(k){
+    var it=IT[k],d;
+    if(opened(k)&&it.nodes){
+      var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+      it.nodes.forEach(function(n){var el=nodeEl[n.key],of=o(off,n.key),px=n.x+of[0],py=n.y+of[1];
+        x0=Math.min(x0,px);y0=Math.min(y0,py);x1=Math.max(x1,px+el.offsetWidth);y1=Math.max(y1,py+el.offsetHeight);});
+      d={w:x1-x0+PAD*2,h:y1-y0+HEAD+(it.top||0)+PAD,x0:x0,y0:y0};
+    } else if(opened(k)&&it.subs){
+      var w=0,h=0;it.subs.forEach(function(s,i){var c=measure(s.key);w+=c.w+(i?SUBGAP:0);h=Math.max(h,c.h);});
+      d={w:w+PAD*2,h:h+HEAD+(it.top||0)+PAD,inner:h};
+    } else d={w:cardEl[k].offsetWidth,h:cardEl[k].offsetHeight};
+    dims[k]=d;return d;
+  }
+  function place(k,X,Y){
+    var it=IT[k],d=dims[k];pos[k]={x:X,y:Y,w:d.w,h:d.h};
+    if(!opened(k)){cardEl[k].style.left=X+"px";cardEl[k].style.top=Y+"px";return;}
+    var f=frameEl[k];f.style.left=X+"px";f.style.top=Y+"px";f.style.width=d.w+"px";f.style.height=d.h+"px";
+    if(it.nodes)it.nodes.forEach(function(n){var of=o(off,n.key),el=nodeEl[n.key];
+      el.style.left=(X+PAD+n.x+of[0]-d.x0)+"px";el.style.top=(Y+HEAD+(it.top||0)+n.y+of[1]-d.y0)+"px";});
+    else{var cx=X+PAD,top=Y+HEAD+(it.top||0);
+      it.subs.forEach(function(s){var c=dims[s.key],so=o(soff,s.key);place(s.key,cx+so[0],top+(d.inner-c.h)/2+so[1]);cx+=c.w+SUBGAP;});}
+  }
   function layout(){
-    STAGES.forEach(function(s){var e=isExp(s.id);cardEl[s.id].hidden=e;
-      if(s.nodes){frameEl[s.id].hidden=!e;s.nodes.forEach(function(n){nodeEl[n.key].hidden=!e;});}});
-    var dims={},H=0;
-    STAGES.forEach(function(s){
-      if(isExp(s.id)){
-        var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
-        s.nodes.forEach(function(n){var el=nodeEl[n.key],of=o(off,n.key),px=n.x+of[0],py=n.y+of[1];
-          x0=Math.min(x0,px);y0=Math.min(y0,py);x1=Math.max(x1,px+el.offsetWidth);y1=Math.max(y1,py+el.offsetHeight);});
-        dims[s.id]={w:x1-x0+PAD*2,h:y1-y0+HEAD+(s.top||0)+PAD,x0:x0,y0:y0};
-      } else dims[s.id]={w:cardEl[s.id].offsetWidth,h:cardEl[s.id].offsetHeight};
-      H=Math.max(H,dims[s.id].h);
-    });
-    var cx=40;
-    STAGES.forEach(function(s){
-      var d=dims[s.id],so=o(soff,s.id),X=cx+so[0],Y=TOP+(H-d.h)/2+so[1];
-      pos[s.id]={x:X,y:Y,w:d.w,h:d.h};
-      if(isExp(s.id)){
-        var f=frameEl[s.id];f.style.left=X+"px";f.style.top=Y+"px";f.style.width=d.w+"px";f.style.height=d.h+"px";
-        s.nodes.forEach(function(n){var of=o(off,n.key),el=nodeEl[n.key];
-          el.style.left=(X+PAD+n.x+of[0]-d.x0)+"px";el.style.top=(Y+HEAD+(s.top||0)+n.y+of[1]-d.y0)+"px";});
-      } else {var c=cardEl[s.id];c.style.left=X+"px";c.style.top=Y+"px";}
-      cx+=d.w+GAPX;
-    });
-    var mx=0,my=0;STAGES.forEach(function(s){var p=pos[s.id];mx=Math.max(mx,p.x+p.w);my=Math.max(my,p.y+p.h);});
-    svg.setAttribute("width",mx+800);svg.setAttribute("height",my+800);
-    svg.style.width=(mx+800)+"px";svg.style.height=(my+800)+"px";
+    setVisibility();
+    var H=0;STAGES.forEach(function(s){H=Math.max(H,measure(s.key).h);});
+    pos={};var cx=40;
+    STAGES.forEach(function(s){var d=dims[s.key],so=o(soff,s.key);place(s.key,cx+so[0],TOP+(H-d.h)/2+so[1]);cx+=d.w+GAPX;});
+    var mx=0,my=0;Object.keys(pos).forEach(function(k){var p=pos[k];mx=Math.max(mx,p.x+p.w);my=Math.max(my,p.y+p.h);});
+    svg.setAttribute("width",mx+900);svg.setAttribute("height",my+900);svg.style.width=(mx+900)+"px";svg.style.height=(my+900)+"px";
     drawEdges();apply();
   }
 
   /* ---------- edges ---------- */
+  function elOf(k){return IT[k].kind==="node"?nodeEl[k]:opened(k)?frameEl[k]:cardEl[k];}
   function box(el){return {x:el.offsetLeft,y:el.offsetTop,w:el.offsetWidth,h:el.offsetHeight};}
-  function resolve(ep){var p=ep.split("."),sid=p[0];
-    if(p[1]&&isExp(sid))return {key:ep,el:nodeEl[ep],sid:sid};
-    return {key:sid,el:cardEl[sid],sid:sid};}
+  /* the deepest representation of an address that is on screen */
+  function resolve(ep){
+    var parts=ep.split("."),cur=parts[0];
+    for(var i=1;i<parts.length;i++){
+      if(!opened(cur))return cur;
+      var next=cur+"."+parts[i];if(!IT[next])return cur;
+      if(IT[next].kind==="node")return next;
+      cur=next;
+    }
+    return cur;
+  }
   function port(b,side,f){if(f==null)f=.5;
     if(side==="r")return [b.x+b.w,b.y+b.h*f];if(side==="l")return [b.x,b.y+b.h*f];
     if(side==="t")return [b.x+b.w*f,b.y];return [b.x+b.w*f,b.y+b.h];}
@@ -1048,11 +1234,11 @@ ul.plain b{color:var(--ink);font-weight:500}
     var c1=ctrl(pa,fs,k),c2=ctrl(pb,ts,k);
     return "M"+pa[0]+","+pa[1]+" C"+c1[0]+","+c1[1]+" "+c2[0]+","+c2[1]+" "+pb[0]+","+pb[1];
   }
-  /* orthogonal route under (or over) every stage it spans, so it never cuts through a frame */
+  /* orthogonal route under (or over) every block it spans, so it never cuts through a frame */
   function routed(a,b,e){
     var below=e.route==="below",p1=port(a,below?"b":"t",e.ff),p2=port(b,below?"b":"t",e.tf);
     var lo=Math.min(p1[0],p2[0]),hi=Math.max(p1[0],p2[0]),base=below?Math.max(p1[1],p2[1]):Math.min(p1[1],p2[1]);
-    STAGES.forEach(function(s){var p=pos[s.id];if(p.x<hi&&p.x+p.w>lo)base=below?Math.max(base,p.y+p.h):Math.min(base,p.y);});
+    Object.keys(pos).forEach(function(k){if(!shown(k))return;var p=pos[k];if(p.x<hi&&p.x+p.w>lo)base=below?Math.max(base,p.y+p.h):Math.min(base,p.y);});
     var yy=below?base+(e.depth||40):base-(e.depth||40),r=12,dir=p2[0]<p1[0]?-1:1,sg=below?1:-1;
     if(Math.abs(p2[0]-p1[0])<2*r)return "M"+p1[0]+","+p1[1]+" L"+p1[0]+","+yy+" L"+p2[0]+","+p2[1];
     return "M"+p1[0]+","+p1[1]+" L"+p1[0]+","+(yy-sg*r)+" Q"+p1[0]+","+yy+" "+(p1[0]+dir*r)+","+yy+
@@ -1061,18 +1247,23 @@ ul.plain b{color:var(--ink);font-weight:500}
   var drawn=[];
   function drawEdges(){
     drawn.forEach(function(d){d.p.remove();d.lb.remove();});drawn=[];
-    var list=[];
-    STAGES.forEach(function(s){if(!isExp(s.id))return;
-      (s.edges||[]).forEach(function(e){list.push({a:s.id+"."+e.f,b:s.id+"."+e.t,ae:nodeEl[s.id+"."+e.f],be:nodeEl[s.id+"."+e.t],e:e,l:e.l});});});
-    var seen={};
-    CROSS.forEach(function(e){
-      var A=resolve(e.f),B=resolve(e.t),pair=A.key+">"+B.key;
-      if(seen[pair])return;seen[pair]=1;
-      var dup=CROSS.filter(function(x){return resolve(x.f).key+">"+resolve(x.t).key===pair;}).length>1;
-      list.push({a:A.key,b:B.key,ae:A.el,be:B.el,e:e,l:dup?(e.lc||e.l):e.l,x:1});
+    var list=[],seen={};
+    function addLinks(arr,prefix){
+      arr.forEach(function(e){
+        var a=resolve(prefix+e.f),b=resolve(prefix+e.t),pair=a+">"+b;
+        if(a===b||seen[pair])return;seen[pair]=1;
+        var dup=arr.filter(function(x){return resolve(prefix+x.f)+">"+resolve(prefix+x.t)===pair;}).length>1;
+        list.push({a:a,b:b,e:e,l:dup?(e.lc||e.l):e.l,x:1});
+      });
+    }
+    ORDER.forEach(function(k){
+      var it=IT[k];if(it.kind==="node"||!shown(k)||!opened(k))return;
+      if(it.nodes)(it.edges||[]).forEach(function(e){list.push({a:k+"."+e.f,b:k+"."+e.t,e:e,l:e.l});});
+      if(it.subs&&it.links)addLinks(it.links,k+".");
     });
+    addLinks(CROSS,"");
     list.forEach(function(it){
-      var p=document.createElementNS(NSV,"path"),A=box(it.ae),B=box(it.be);
+      var p=document.createElementNS(NSV,"path"),A=box(elOf(it.a)),B=box(elOf(it.b));
       p.setAttribute("d",it.e.route?routed(A,B,it.e):curve(A,B,it.e));
       p.setAttribute("class","e"+(it.e.k?" "+it.e.k:"")+(it.x?" x":""));
       p.setAttribute("marker-end","url(#ah)");svg.appendChild(p);
@@ -1085,16 +1276,17 @@ ul.plain b{color:var(--ink);font-weight:500}
 
   /* ---------- highlight ---------- */
   var sel=null,mode="";
-  function visibleKeys(){var k=[];STAGES.forEach(function(s){if(isExp(s.id))s.nodes.forEach(function(n){k.push(n.key);});else k.push(s.id);});return k;}
-  function gOf(key){return N[key]?N[key].g:S[key].g;}
+  function visibleKeys(){return ORDER.filter(function(k){return shown(k)&&(IT[k].kind==="node"||!opened(k));});}
+  function under(c,k){return c===k||c.indexOf(k+".")===0;}
+  function anyGap(k){return IT[k].g||ORDER.some(function(x){return x.indexOf(k+".")===0&&IT[x].g;});}
   function apply(){
     var ns=null,es=null,vis=visibleKeys();
     if(sel){ns={};ns[sel]=1;es={};drawn.forEach(function(d,i){if(d.a===sel||d.b===sel){es[i]=1;ns[d.a]=1;ns[d.b]=1;}});}
-    else if(mode==="gaps"){ns={};es={};vis.forEach(function(k){if(gOf(k))ns[k]=1;});}
+    else if(mode==="gaps"){ns={};es={};vis.forEach(function(k){if(IT[k].kind==="node"?IT[k].g:anyGap(k))ns[k]=1;});}
     else if(mode==="chain"){ns={};es={};
-      vis.forEach(function(k){if(CHAIN.indexOf(k)>=0||(!N[k]&&CHAIN.some(function(c){return c.split(".")[0]===k;})))ns[k]=1;});
+      vis.forEach(function(k){if(CHAIN.some(function(c){return under(c,k);}))ns[k]=1;});
       drawn.forEach(function(d,i){if(ns[d.a]&&ns[d.b])es[i]=1;});}
-    vis.forEach(function(k){var el=N[k]?nodeEl[k]:cardEl[k];
+    vis.forEach(function(k){var el=elOf(k);
       el.classList.toggle("on",k===sel);el.classList.toggle("near",!!ns&&!!ns[k]&&k!==sel);el.classList.toggle("dim",!!ns&&!ns[k]);});
     drawn.forEach(function(d,i){var on=!!es&&!!es[i],dim=!!es&&!es[i];
       d.p.classList.toggle("on",on);d.p.classList.toggle("dim",dim);d.p.setAttribute("marker-end",on?"url(#ah-on)":"url(#ah)");
@@ -1102,39 +1294,38 @@ ul.plain b{color:var(--ink);font-weight:500}
   }
 
   /* ---------- detail card ---------- */
-  function label(key){return N[key]?N[key].t:S[key].t;}
   function openDetail(key){
-    sel=key;var it=N[key]||S[key],st=ST[it.st];
-    var h='<div class="top"><span class="pill'+(N[key]?'':' acc')+'">'+esc(N[key]?it.role:it.n)+'</span><span class="pill '+st[0]+'">'+st[1]+'</span>'+
+    sel=key;var it=IT[key],st=ST[it.st],isNode=it.kind==="node";
+    var h='<div class="top"><span class="pill'+(isNode?'':' acc')+'">'+esc(isNode?it.role:it.n)+'</span><span class="pill '+st[0]+'">'+st[1]+'</span>'+
       (it.g?'<span class="mk" title="пробел">!</span>':'')+'<button type="button" class="x" data-act="close" aria-label="Закрыть">×</button></div>'+
       '<h2>'+esc(it.t)+'</h2><div class="io">'+esc(it.io[0])+'<i>→</i>'+esc(it.io[1])+'</div><dl>';
-    it.d.forEach(function(r){h+='<div><dt>'+esc(r[0])+'</dt><dd'+(r[2]===GAP?' class="gap"':r[2]===TASK?' class="task"':'')+'>'+esc(r[1])+'</dd></div>';});
+    (it.d||[]).forEach(function(r){h+='<div><dt>'+esc(r[0])+'</dt><dd'+(r[2]===GAP?' class="gap"':r[2]===TASK?' class="task"':'')+'>'+esc(r[1])+'</dd></div>';});
     h+='</dl>';
     var inc=drawn.filter(function(d){return d.b===key;}),out=drawn.filter(function(d){return d.a===key;});
     if(inc.length||out.length){h+='<div class="links">';
-      inc.forEach(function(d){h+='<button type="button" data-go="'+esc(d.a)+'"><i>← '+esc(d.lb.textContent)+'</i>'+esc(label(d.a))+'</button>';});
-      out.forEach(function(d){h+='<button type="button" data-go="'+esc(d.b)+'"><i>→ '+esc(d.lb.textContent)+'</i>'+esc(label(d.b))+'</button>';});
+      inc.forEach(function(d){h+='<button type="button" data-go="'+esc(d.a)+'"><i>← '+esc(d.lb.textContent)+'</i>'+esc(IT[d.a].t)+'</button>';});
+      out.forEach(function(d){h+='<button type="button" data-go="'+esc(d.b)+'"><i>→ '+esc(d.lb.textContent)+'</i>'+esc(IT[d.b].t)+'</button>';});
       h+='</div>';}
-    if(S[key]&&S[key].nodes)h+='<div class="act"><button type="button" class="ib" data-act="toggle" data-stage="'+key+'">'+(isExp(key)?'свернуть стадию ▾':'развернуть стадию ▸')+'</button></div>';
+    if(expandable(key))h+='<div class="act"><button type="button" class="ib" data-act="toggle" data-key="'+esc(key)+'">'+(opened(key)?'свернуть ▾':'развернуть ▸')+'</button></div>';
     detail.innerHTML=h;detail.hidden=false;detail.scrollTop=0;apply();
   }
   function closeDetail(){sel=null;detail.hidden=true;detail.innerHTML="";apply();}
   detail.addEventListener("click",function(ev){
     var b=ev.target.closest("button");if(!b)return;
     if(b.dataset.act==="close"){closeDetail();return;}
-    if(b.dataset.act==="toggle"){toggle(b.dataset.stage);return;}
+    if(b.dataset.act==="toggle"){toggle(b.dataset.key);return;}
     if(b.dataset.go)openDetail(b.dataset.go);
   });
 
   /* ---------- expand / collapse ---------- */
-  function toggle(sid){
-    if(!S[sid].nodes)return;
-    var before=pos[sid]?pos[sid].x*sc+tx:null;
-    exp[sid]=!exp[sid];sel=null;detail.hidden=true;detail.innerHTML="";layout();
-    if(before!==null){tx+=before-(pos[sid].x*sc+tx);draw();}
+  function toggle(k){
+    if(!expandable(k))return;
+    var before=pos[k]?pos[k].x*sc+tx:null;
+    exp[k]=!exp[k];sel=null;detail.hidden=true;detail.innerHTML="";layout();
+    if(before!==null&&pos[k]){tx+=before-(pos[k].x*sc+tx);draw();}
     save();
   }
-  document.getElementById("expAll").addEventListener("click",function(){STAGES.forEach(function(s){if(s.nodes)exp[s.id]=true;});closeDetail();layout();fit();save();});
+  document.getElementById("expAll").addEventListener("click",function(){ORDER.forEach(function(k){if(expandable(k))exp[k]=true;});closeDetail();layout();fit();save();});
   document.getElementById("colAll").addEventListener("click",function(){exp={};closeDetail();layout();fit();save();});
   document.getElementById("resetPos").addEventListener("click",function(){off={};soff={};layout();fit();save();});
   Array.prototype.slice.call(document.querySelectorAll(".chip[data-mode]")).forEach(function(c){
@@ -1147,17 +1338,17 @@ ul.plain b{color:var(--ink);font-weight:500}
   function draw(){view.style.transform="translate("+tx+"px,"+ty+"px) scale("+sc+")";zval.textContent=Math.round(sc*100)+"%";}
   function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
   function bounds(){var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
-    STAGES.forEach(function(s){var p=pos[s.id];x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x+p.w);y1=Math.max(y1,p.y+p.h);});
+    STAGES.forEach(function(s){var p=pos[s.key];x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x+p.w);y1=Math.max(y1,p.y+p.h);});
     drawn.forEach(function(d){var b=d.p.getBBox();x0=Math.min(x0,b.x);y0=Math.min(y0,b.y);x1=Math.max(x1,b.x+b.width);y1=Math.max(y1,b.y+b.height);});
     return {x:x0,y:y0,w:x1-x0,h:y1-y0};}
   function fit(){
     var r=canvas.getBoundingClientRect(),b=bounds();
     var f=Math.min((r.width-48)/b.w,(r.height-48)/b.h,1.1);
-    if(f<.4){sc=.55;tx=16-b.x*sc;ty=(r.height-b.h*sc)/2-b.y*sc;}
+    if(f<.3){sc=.45;tx=16-b.x*sc;ty=(r.height-b.h*sc)/2-b.y*sc;}
     else{sc=f;tx=(r.width-b.w*sc)/2-b.x*sc;ty=(r.height-b.h*sc)/2-b.y*sc;}
     draw();
   }
-  function zoomAt(ns,px,py){ns=clamp(ns,.2,2.4);tx=px-(px-tx)*(ns/sc);ty=py-(py-ty)*(ns/sc);sc=ns;draw();}
+  function zoomAt(ns,px,py){ns=clamp(ns,.12,2.4);tx=px-(px-tx)*(ns/sc);ty=py-(py-ty)*(ns/sc);sc=ns;draw();}
   document.getElementById("zin").addEventListener("click",function(){var r=canvas.getBoundingClientRect();zoomAt(sc*1.2,r.width/2,r.height/2);});
   document.getElementById("zout").addEventListener("click",function(){var r=canvas.getBoundingClientRect();zoomAt(sc/1.2,r.width/2,r.height/2);});
   document.getElementById("zfit").addEventListener("click",fit);
@@ -1174,8 +1365,8 @@ ul.plain b{color:var(--ink);font-weight:500}
     var nd=ev.target.closest(".node"),cd=ev.target.closest(".scard"),fh=ev.target.closest(".fh");
     var kind="pan",key=null,start=[tx,ty],el=null;
     if(nd){kind="node";key=nd.dataset.key;start=o(off,key).slice();el=nd;}
-    else if(cd){kind="stage";key=cd.dataset.key;start=o(soff,key).slice();el=cd;}
-    else if(fh){kind="stage";key=fh.parentNode.dataset.stage;start=o(soff,key).slice();el=fh.parentNode;}
+    else if(cd){kind="box";key=cd.dataset.key;start=o(soff,key).slice();el=cd;}
+    else if(fh){kind="box";key=fh.parentNode.dataset.key;start=o(soff,key).slice();el=fh.parentNode;}
     drag={kind:kind,key:key,start:start,x:ev.clientX,y:ev.clientY,id:ev.pointerId,moved:false,el:el};
   });
   canvas.addEventListener("pointermove",function(ev){
@@ -1192,7 +1383,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     var d=drag;drag=null;canvas.classList.remove("panning");if(d.el)d.el.classList.remove("dragging");
     if(d.moved){if(d.kind!=="pan")save();return;}
     if(d.kind==="node"){sel===d.key?closeDetail():openDetail(d.key);}
-    else if(d.kind==="stage"&&d.el&&d.el.classList.contains("scard")){S[d.key].nodes?toggle(d.key):openDetail(d.key);}
+    else if(d.kind==="box"&&d.el&&d.el.classList.contains("scard")){expandable(d.key)?toggle(d.key):openDetail(d.key);}
     else if(d.kind==="pan"&&sel)closeDetail();
   }
   canvas.addEventListener("pointerup",endDrag);
@@ -1201,16 +1392,16 @@ ul.plain b{color:var(--ink);font-weight:500}
   view.addEventListener("click",function(ev){
     var b=ev.target.closest("button");if(!b)return;
     var host=b.closest(".scard")||b.closest(".frame");if(!host)return;
-    var sid=host.dataset.key||host.dataset.stage;
-    if(b.dataset.act==="info")openDetail(sid);
-    else if(b.dataset.act==="collapse")toggle(sid);
+    var k=host.dataset.key;
+    if(b.dataset.act==="info")openDetail(k);
+    else if(b.dataset.act==="collapse")toggle(k);
   });
   view.addEventListener("keydown",function(ev){
     if(ev.key!=="Enter"&&ev.key!==" ")return;
     if(ev.target.closest("button"))return;
     var nd=ev.target.closest(".node"),cd=ev.target.closest(".scard");
     if(nd){ev.preventDefault();sel===nd.dataset.key?closeDetail():openDetail(nd.dataset.key);}
-    else if(cd){ev.preventDefault();var k=cd.dataset.key;S[k].nodes?toggle(k):openDetail(k);}
+    else if(cd){ev.preventDefault();var k=cd.dataset.key;expandable(k)?toggle(k):openDetail(k);}
   });
   document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&sel)closeDetail();});
 
