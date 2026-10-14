@@ -20,9 +20,12 @@ export class ResearchSources {
     return { sources: this.list().map(item => {
       // File bytes are delivered by read/read_source/search when requested.
       // Repeating every captured code header in every request wastes context.
-      const excerpt = item.value.origin.kind === "file" ? "" : item.value.content.slice(0, 3000);
-      return { ref: reference(item), kind: item.value.origin.kind, location: item.value.origin.location,
+      // A web snapshot repeats in every later request: a short orientation, its text is read by read_source (WB1).
+      const origin = item.value.origin;
+      const excerpt = origin.kind === "file" ? "" : item.value.content.slice(0, origin.kind === "web" ? 500 : 3000);
+      return { ref: reference(item), kind: origin.kind, location: origin.location,
         ...(item.value.provenance?{provenance:item.value.provenance}:{}),
+        ...(origin.kind === "web" ? { fetchedAt: origin.fetchedAt, completeness: origin.completeness } : {}),
         media: item.value.mediaType, length: item.value.content.length, excerpt, truncated: item.value.content.length > excerpt.length };
     }),
       files: files.slice(0, 2000), filesTruncated: files.length > 2000 };

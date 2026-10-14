@@ -157,7 +157,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     body['conclusionRefs']=conclusions.references; body['conclusionUnresolved']=conclusions.unresolved; body['conclusionEncoding']=CONCLUSION_ENCODING;
     if(body['history']) {
       const history=body['history'] as any[];
-      const read=[...history].reverse().find(h=>h.action && typeof h.action==='object' && ['read','read_source','read_context','search'].includes(h.action.action));
+      const read=[...history].reverse().find(h=>h.action && typeof h.action==='object' && ['read','read_source','read_context','search','web_search','web_fetch'].includes(h.action.action));
       if(read) body['currentRead']=read;
       body['corrections']=correctionIndex(history,reference(archive));delete body['history'];
     }
@@ -169,7 +169,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if(relatedResearch !== undefined)packet.discoveryContext=relatedResearch;
     return finish(packet);
   }
-  const mandatory = ["discoveryContext", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["discoveryContext", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation

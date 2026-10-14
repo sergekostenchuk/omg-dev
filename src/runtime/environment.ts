@@ -9,13 +9,43 @@ import { safeRelativePath } from "../graph/topology.js";
 import { reference, isRef, type Ref, type Finding } from "../pipeline/contracts.js";
 
 export interface RoleBinding { actor: string; model: string; effort: string; command: Command; speed?: "fast" | "inherited" }
+/** Stage-wide web research allowance. The operator sets it for the launch; nothing in it is a sufficiency criterion. */
+export interface WebResearchLimits { httpAttempts: number; pages: number; receivedChars: number; responseBytes: number }
+/** The gateway endpoint (a tunnel the launch provides) and its limits; the model passes only a query or URL. */
+export interface WebResearchSettings { enabled: boolean; gatewayUrl: string; timeoutMs: number; limits: WebResearchLimits }
 export interface Environment {
   projectId: string; workspace: string; implementer: RoleBinding; reviewer: RoleBinding;
   fullCheck: Command; timeoutMs: number;
   requestCapacityChars?: number;
+  webResearch?: WebResearchSettings;
 }
 export function isRequestCapacityChars(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+const positive = (value: unknown, max: number) => typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= max;
+export function requireWebResearchSettings(project: string, value: unknown): asserts value is WebResearchSettings {
+  const fail = (field: string, message: string): never => {
+    throw new EngineError("environment_invalid", message, { target: `environment:${project}`, field: `webResearch.${field}` });
+  };
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail("", "Web research settings must be an object");
+  const settings = value as Record<string, any>;
+  const extra = Object.keys(settings).find(key => !["enabled", "gatewayUrl", "timeoutMs", "limits"].includes(key));
+  if (extra) fail(extra, "Web research settings carry only enabled, gatewayUrl, timeoutMs and limits");
+  if (typeof settings.enabled !== "boolean") fail("enabled", "Web research must be explicitly enabled or disabled");
+  let gateway: URL | null = null;
+  try { gateway = typeof settings.gatewayUrl === "string" ? new URL(settings.gatewayUrl) : null; } catch { gateway = null; }
+  if (!gateway || !["http:", "https:"].includes(gateway.protocol) || gateway.username || gateway.password
+    || gateway.search || gateway.hash || settings.gatewayUrl.length > 2048)
+    fail("gatewayUrl", "The gateway is an http(s) endpoint without credentials, query or fragment");
+  if (!(typeof settings.timeoutMs === "number" && Number.isSafeInteger(settings.timeoutMs)
+    && settings.timeoutMs >= 1_000 && settings.timeoutMs <= 600_000)) fail("timeoutMs", "The gateway timeout is 1000..600000 ms");
+  const limits = settings.limits;
+  if (!limits || typeof limits !== "object" || Array.isArray(limits)
+    || Object.keys(limits).sort().join() !== "httpAttempts,pages,receivedChars,responseBytes") fail("limits", "Limits name httpAttempts, pages, receivedChars and responseBytes");
+  if (!positive(limits.httpAttempts, 100_000)) fail("limits.httpAttempts", "httpAttempts is a positive bounded integer");
+  if (!positive(limits.pages, 100_000)) fail("limits.pages", "pages is a positive bounded integer");
+  if (!positive(limits.receivedChars, 1_000_000_000)) fail("limits.receivedChars", "receivedChars is a positive bounded integer");
+  if (!positive(limits.responseBytes, 64_000_000)) fail("limits.responseBytes", "responseBytes is a positive integer up to 64000000");
 }
 export function uniqueTransactionGuards(values: readonly TransactionGuard[]): TransactionGuard[] {
   const checked = checkTransactionGuards(values);
@@ -109,10 +139,11 @@ export function inspectRepository(environment: Environment, graph: Graph): { sta
     return { state: { root, head, tree, files: [...files].map(([path, hash]) => ({ path, hash })).sort((a, b) => a.path.localeCompare(b.path)) }, findings };
   } catch (error) { findings.push({ code: "repository_unavailable", target: environment.workspace, message: error instanceof Error ? error.message : "Repository unavailable" }); return { state: null, findings }; }
 }
-function requireEnvironmentCapacity(project: string, value: { requestCapacityChars?: unknown }): void {
+function requireEnvironmentCapacity(project: string, value: { requestCapacityChars?: unknown; webResearch?: unknown }): void {
   if (Object.hasOwn(value, "requestCapacityChars") && !isRequestCapacityChars(value.requestCapacityChars))
     throw new EngineError("environment_invalid", "Request capacity must be a positive safe integer measured in characters",
       { target: `environment:${project}`, field: "requestCapacityChars" });
+  if (Object.hasOwn(value, "webResearch")) requireWebResearchSettings(project, value.webResearch);
 }
 /** The saved contract is pure: historical reads never recheck PATH, files or repository heads. */
 function requireSavedEnvironment(project: string, value: Environment): void {

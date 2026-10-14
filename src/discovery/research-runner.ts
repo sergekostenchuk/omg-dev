@@ -14,7 +14,7 @@ import type { ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } fr
 import { researchAction, researchCall } from "./research-protocol.js";
 import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectResearchTurnRevision, projectSourceReadingTurn, projectPaidLocalRefusal, projectRepeatedContextRead,
-  projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES,
+  projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES, responseAction, webResearchCapability, admittedResearchAction,
   projectSynthesisHandoffTurn, acceptanceEraOf, acceptanceBindingId,
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
   type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
@@ -24,10 +24,11 @@ import { earlyResearchConsumerFailure, captureResearchConsumerRetryPermits, find
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
   readContextIdentityAt, readContextTurnHistoryAt, projectPaidLayerDesignRefusal,
   PreparedManagedProposalRefusal,
-  refuseResearchConsumerIntent, pinnedLayerDeltaStore, readResearchAcceptanceBinding,
+  refuseResearchConsumerIntent, pinnedLayerDeltaStore, readResearchAcceptanceBinding, intentWebCapability,
   type ManagedProposalRefusal,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { ResearchSources } from "./research-sources.js";
+import { executeWebTurn, webBudgetView, webResearchGuide, type WebResearchOutcome } from "./web-research.js";
 import { SOURCE_READ_CONTRACT, type Source } from "../evidence/evidence.js";
 import { assessAnswer, readResearchAssessmentAt } from "./research-assessment.js";
 import { readAssessmentPaidOrigin, paidAssessmentTerminal } from "./assessment-session.js";
@@ -136,7 +137,7 @@ export class Researcher {
       // turn accepted by new code) — such a K is checked, never silenced.
       && (acceptanceEraOf(forcedPendingTurn.value as ManagedResearchTurn) === 'binding'
         || this.store.get(acceptanceBindingId(project, forcedPendingTurn.id)) !== null)) {
-      const paid = researchAction(forcedPendingTurn.value.action);
+      const paid = admittedResearchAction(forcedPendingTurn.value.action);
       if (paid.action === 'answer' || paid.action === 'answer_delta') {
         const pendingRun = this.store.get<ResearchRun>(id);
         try {
@@ -166,7 +167,7 @@ export class Researcher {
     if (forcedPendingTurn) {
       const savedOrigin = readAssessmentPaidOrigin(this.store, project, reference(forcedPendingTurn));
       if (savedOrigin && paidAssessmentTerminal(this.store, project, reference(forcedPendingTurn))) {
-        const paid = researchAction(forcedPendingTurn.value.action);
+        const paid = admittedResearchAction(forcedPendingTurn.value.action);
         requireCondition(paid.action === 'answer' || paid.action === 'answer_delta',
           'research_assessment_binding_invalid', 'A paid origin must belong to an answer turn');
         const savedQuestion = this.store.get<Question>(savedOrigin.value.question.id, savedOrigin.value.question.revision);
@@ -303,7 +304,7 @@ export class Researcher {
         && pendingTurn.value.status === "pending"
         && canonical(pendingTurn.value.question) === canonical(questionRef)
         && outstanding.value.cursor.run === id && outstanding.value.cursor.turn === run.value.turns
-        && researchAction(pendingTurn.value.action).action === "need_owner") {
+        && admittedResearchAction(pendingTurn.value.action).action === "need_owner") {
         readResearchConsumerTurn(this.store, reference(pendingTurn));
         const gate = this.discovery.gate(project, reference(draft));
         if (gate.findings.length === 0) {
@@ -371,7 +372,7 @@ export class Researcher {
         if (savedOrigin) {
           requireCondition(!restoreOnly || paidAssessmentTerminal(this.store,project,reference(forcedPendingTurn)),
             'research_contract_upgrade_required', `[${draftId}] Restore preserves the paid answer without starting a new assessment`);
-          const paid = researchAction(forcedPendingTurn.value.action);
+          const paid = admittedResearchAction(forcedPendingTurn.value.action);
           requireCondition(paid.action === 'answer' || paid.action === 'answer_delta',
             'research_assessment_binding_invalid', 'A paid origin must belong to an answer turn');
           const savedQuestion = this.store.get<Question>(savedOrigin.value.question.id, savedOrigin.value.question.revision);
@@ -463,7 +464,7 @@ export class Researcher {
             && originalTurn.value.status === "pending" && canonical(originalTurn.value.question) === canonical(outstanding.value.question),
             "research_consumer_intent_invalid", "The reader's original pending turn is missing or changed");
           readResearchConsumerTurn(this.store, reference(originalTurn));
-          const originalAction = researchAction(originalTurn.value.action);
+          const originalAction = admittedResearchAction(originalTurn.value.action);
           requireCondition(originalAction.action === "read_bundle", "research_consumer_intent_invalid",
             "The reader continuation belongs to a source bundle action");
           const result = await resumeReadBundleIntent(this.store, reference(outstanding), dispatch, pilot, signal, retryPermits);
@@ -626,11 +627,16 @@ export class Researcher {
             : failedProducer ? earlyResearchFailure(
               this.store.get<DiscoveryDraft>(failedProducer.value.draft.id, failedProducer.value.draft.revision)!.value,
               this.store.get<Question>(failedProducer.value.question.id, failedProducer.value.question.revision)!.value,
-              'analyst', failedTurn!.value.action, failedProducer.value.cursor.context?.discoveryContext ?? null) : null;
+              'analyst', failedTurn!.value.action, failedProducer.value.cursor.context?.discoveryContext ?? null,
+              intentWebCapability(this.store, failedProducer)) : null;
+          // WB1 (№4639): the cause follows the failed call; the actions offered follow the dispatch of this new call.
           if (failure) Object.assign(context, { failures: [earlyResearchCorrection('analyst', failure,
-            reference(failedIntent ?? failedTurn!), pending[0]!.value)] });
+            reference(failedIntent ?? failedTurn!), pending[0]!.value, webResearchCapability(draft.value.stage, 'analyst', dispatch))] });
         }
         if (related.context) Object.assign(context, { discoveryContext: related.context });
+        // WB1: only the Discovery analyst call that carries the web capability is offered web actions and the budget left.
+        if (!mode && webResearchCapability(draft.value.stage, 'analyst', dispatch))
+          Object.assign(context, { webResearch: webResearchGuide(webBudgetView(this.store, project, draft.value.stage, dispatch.webResearch!)) });
         if (savedMaterials) Object.assign(context, {savedMaterials, savedOnly: true, workingSelections: [], readings: [], focus: null, previousProposal: null, previousProposalRef: null, history: []});
         if (planning && mode === "planning" && (turns.at(-1)?.value.action as ResearchAction | undefined)?.action === "need_research"
           && pendingSynthesis(this.store, draft, pending[0]!, environment, context)) mode = "synthesis";
@@ -680,7 +686,7 @@ export class Researcher {
               "research_consumer_intent_invalid", "The pending turn belongs to another consumer family");
           }
         }
-        if (pendingTurn) action = researchAction(pendingTurn.value.action);
+        if (pendingTurn) action = admittedResearchAction(pendingTurn.value.action);
         else {
           // The reserved position and the logical budget of a synthesis task
           // are charged once and atomically with the session record that
@@ -747,7 +753,7 @@ export class Researcher {
                   reference(draft), reference(pending[0]!), reference(environment), ...draft.value.inputs]));
               run = replayed[0]! as Revision<ResearchRun>;
               pendingTurn = replayed[1]! as Revision<ResearchTurn>;
-              action = researchAction(pendingTurn.value.action);
+              action = admittedResearchAction(pendingTurn.value.action);
             } else {
             const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...(outcome?.guards ?? []), ...related.guards, ...turns.map(reference),
               ...sources.list().map(reference)]);
@@ -768,7 +774,7 @@ export class Researcher {
                 { id: paidTurnId(id, number), absent: true }]) }, retryPermits);
             const applied = await this.applyActionIntent(intent, run, dispatch, pilot, owner, limit, signal);
             run = applied.run; pendingTurn = applied.turn; sent = applied.sent;
-            action = researchAction(pendingTurn.value.action);
+            action = admittedResearchAction(pendingTurn.value.action);
             }
           }
         }
@@ -781,17 +787,19 @@ export class Researcher {
         let capturedProposalRefusal: PreparedManagedProposalRefusal | null = null;
         let ownerConsulted: Ref[] | null = null;
         let ownerHadPriorRead = false;
+        let webOutcome: WebResearchOutcome | null = null;
         try {
           if (early && (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
             && isRef(pendingTurn.value.question) && (!('question' in action) || action.question === pendingTurn.value.question.id)) {
             const producer = readResearchConsumerIntent(this.store, (pendingTurn.value as ManagedResearchTurn).consumerIntent);
             const originalDraft = this.store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
             const originalQuestion = this.store.get<Question>(pendingTurn.value.question.id, pendingTurn.value.question.revision)!;
+            const web = intentWebCapability(this.store, producer);
             const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action,
-              producer.value.cursor.context?.discoveryContext ?? null);
+              producer.value.cursor.context?.discoveryContext ?? null, web);
             if (failure) {
               const value = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn,
-                { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer });
+                { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer, ...(web ? { web: true } : {}) });
               const saved = this.store.writeMany<ResearchTurn | ResearchRun>([
                 { id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision, value },
                 { id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, status: 'paused',
@@ -927,6 +935,12 @@ export class Researcher {
               'research_consumer_intent_invalid', 'The paid excerpt lost its exact source');
             turnProof = { kind: 'source-excerpt', readContract: SOURCE_READ_CONTRACT, projectId: project,
               source: { ref: reference(source), value: source.value } };
+          }
+          else if (action.action === "web_search" || action.action === "web_fetch") {
+            // WB1: the engine performs the paid web action through the gateway and completes this turn itself from
+            // the saved capture. Today's environment admits a new HTTP request; a lost gateway pauses the same turn.
+            webOutcome = await executeWebTurn({ store: this.store, projectId: project, stage: draft.value.stage,
+              environment: this.store.get<Environment>(`environment:${project}`)!, turn: pendingTurn });
           }
           else if (action.action === "pause") stop = { status: "paused", error: action.reason };
           else {
@@ -1076,12 +1090,14 @@ export class Researcher {
               "research_response_invalid", "assessment_invalid", "research_call_allowance", "research_preview_ready",
               "research_assessment_materials_invalid", "research_assessment_binding_invalid", "research_proposal_refusal_invalid",
               "layer_delta_base_invalid", "layer_delta_revision_invalid"].includes(failure.code)
-              || ["pilot_", "budget_", "continuation_", "research_context_", "research_consumer_", "reader_", "model_call_", "process_"].some(prefix=>failure.code.startsWith(prefix))
+              || ["pilot_", "budget_", "continuation_", "research_context_", "research_consumer_", "reader_", "model_call_", "process_",
+                "web_gateway_", "web_research_budget", "web_turn_"].some(prefix=>failure.code.startsWith(prefix))
               || failure.code.endsWith("_no_progress"))) throw failure;
             error = failure instanceof Error ? failure.message : "Research action failed";
             if (failure instanceof EngineError) observation = { code: failure.code, details: failure.details };
           }
         }
+        if (webOutcome) { forcedPendingTurn = null; continue; }
         const completedTurn = { id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision,
           value: capturedSearch ? capturedSearch.turn
             : turnProof?.kind === 'source-excerpt' ? projectSourceReadingTurn(pendingTurn.value, project, turnProof.source)
@@ -1226,8 +1242,8 @@ export class Researcher {
           { ref: { id: acceptanceBindingId(project, turn.id), revision: 1 }, reason: 'missing' });
       return null;
     }
-    const deltaStore = researchAction(turn.value.action).action === 'answer_delta'
-      ? pinnedLayerDeltaStore(this.store, researchAction(turn.value.action) as LayerDelta) : undefined;
+    const deltaStore = admittedResearchAction(turn.value.action).action === 'answer_delta'
+      ? pinnedLayerDeltaStore(this.store, admittedResearchAction(turn.value.action) as LayerDelta) : undefined;
     const bound = findAcceptedPaidAnswerChain(this.store, project, turn, original, answered, deltaStore, pair);
     if (!bound) return null;
     return { ...bound.proof, inputs: bound.inputs,
@@ -1289,7 +1305,7 @@ export class Researcher {
     const projected = projectPaidTurnAdmission(run.value, {
       runId: run.id, intent: reference(originalIntent), response: paid.payload,
       question: selectedQuestion, owner, limit, context: cursor.context,
-      ...(cursor.mode ? { mode: cursor.mode } : {}) });
+      ...(cursor.mode ? { mode: cursor.mode } : {}), ...(intentWebCapability(this.store, intent) ? { web: true } : {}) });
     const writes: Write[] = [
       { id: run.id, kind: run.kind, expected: run.revision,
         value: projected.run },
@@ -1311,7 +1327,7 @@ export class Researcher {
   /** A malformed reply closes its exact physical attempt. Only the next
    * external entry may obtain a separately admitted corrective generation. */
   private consumerAction(intent: Revision<ResearchConsumerIntent>, payload: unknown): ResearchAction {
-    try { return researchAction(payload); }
+    try { return responseAction(payload, intentWebCapability(this.store, intent)); }
     catch (failure) {
       if (!(failure instanceof EngineError) || !ACTION_RESPONSE_REFUSAL_CODES.has(failure.code)) throw failure;
       const refused = refuseResearchConsumerIntent(this.store, reference(intent), failure.code);
@@ -1335,7 +1351,7 @@ export class Researcher {
       && canonical(pending.value.question) === canonical(intent.value.question),
       "research_consumer_intent_invalid", "The original pending owner question is missing or changed");
     readResearchConsumerTurn(this.store, reference(pending));
-    const action = researchAction(pending.value.action);
+    const action = admittedResearchAction(pending.value.action);
     requireCondition(action.action === "need_owner", "research_consumer_intent_invalid",
       "The escalation assessor belongs to an owner question");
     if (intent.value.state === "prepared" && (run.value.status !== "running"

@@ -5,6 +5,7 @@ import { EngineError, requireCondition } from '../errors.js';
 import { tokenUsage, type ModelCall } from '../runtime/model-usage.js';
 import { isRef, reference, type Ref, type Finding } from '../pipeline/contracts.js';
 import { normalizeResearchAction } from './research-action-normalization.js';
+import { webAction, WEB_ACTIONS, projectWebApplication, WEB_CAPTURE_CONTRACT, type WebCapture } from './web-research.js';
 import { queuedChildReached } from './reading-plan.js';
 import type { ReaderResult } from './reader.js';
 import type { ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
@@ -190,6 +191,28 @@ export function researchAction(value: unknown): ResearchAction {
       'An uncited checkpoint needs actual proposed content or an explicit unresolved question');
   }
   return value;
+}
+
+/** WB1 (№4639): web research is a capability of one call — the Discovery analyst whose SAVED dispatch enabled it.
+ * Today's environment never reclassifies a saved call. */
+export function webResearchCapability(stage: unknown, role: unknown, dispatch: { webResearch?: { enabled?: unknown } } | null | undefined): boolean {
+  return stage === 'discovery' && role === 'analyst' && dispatch?.webResearch?.enabled === true;
+}
+const isWebPayload = (value: unknown): boolean => value !== null && typeof value === 'object'
+  && WEB_ACTIONS.includes((value as { action?: unknown }).action as string);
+/** A paid reply classified by its own call: without the capability the shared parser — and its original
+ * research_response_invalid — is unchanged; with it a web action is checked by its own contract. */
+export function responseAction(value: unknown, web: boolean): ResearchAction {
+  if (!web || !isWebPayload(value)) return researchAction(value);
+  try { return webAction(value); }
+  catch (error) {
+    if (error instanceof EngineError) throw new EngineError('research_response_invalid', error.message, error.details);
+    throw error;
+  }
+}
+/** The action of a turn that already exists: a web turn exists only after its call was admitted with the capability. */
+export function admittedResearchAction(value: unknown): ResearchAction {
+  return isWebPayload(value) ? webAction(value) : researchAction(value);
 }
 
 export interface PaidReaderResultInput {
@@ -832,7 +855,7 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
     requireCondition(entry.context,
       'research_consumer_intent_invalid',
       'An earlier addressed read lost its exact checked original');
-    const action = researchAction(prior.action);
+    const action = admittedResearchAction(prior.action);
     requireCondition(action.action === 'read_context',
       'research_consumer_intent_invalid', 'The original addressed action is invalid');
     const result = prior.observation as ProjectedContextRead;
@@ -847,7 +870,7 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
 export function projectRepeatedContextRead(before: ManagedResearchTurn,
   current: ContextReadIdentityInput,
   history: ContextTurnHistoryProof[]): { previous: Ref; history: Ref[] } | null {
-  const action = researchAction(before.action);
+  const action = admittedResearchAction(before.action);
   requireCondition(action.action === 'read_context' && isRef(before.question)
     && canonical(action) === canonical(current.action)
     && canonical(before.question) === canonical(current.question)
@@ -866,7 +889,7 @@ export function projectRepeatedContextRead(before: ManagedResearchTurn,
   for (const entry of [...history].reverse()) {
     const prior = entry.turn.value;
     if (prior.question?.id !== before.question.id) continue;
-    const priorAction = researchAction(prior.action);
+    const priorAction = admittedResearchAction(prior.action);
     if (priorAction.action === 'checkpoint' || priorAction.action === 'answer'
       || priorAction.action === 'answer_delta') break;
     if (prior.error || prior.status !== 'completed' || priorAction.action !== 'read_context') continue;
@@ -941,7 +964,7 @@ export function projectResearchSearchCapture(input: ResearchSearchCaptureInput):
   { id: string; ref: Ref; value: ResearchSearchCaptureValue } {
   const { projectId, turn, parent, query, workspace, sources, process } = input;
   requireSearchQuery(query);
-  const action = researchAction(turn.value.action);
+  const action = admittedResearchAction(turn.value.action);
   requireCondition(turn.kind === 'research-turn' && hashJson(turn.value) === turn.hash
     && turn.value.status === 'pending' && action.action === 'search'
     && action.query === query && typeof projectId === 'string' && projectId.length > 0
@@ -958,7 +981,7 @@ export function projectResearchSearchCapture(input: ResearchSearchCaptureInput):
   if (isRef(turn.value.plannedBy)) {
     const parentRef = turn.value.plannedBy;
     const original = parent?.original, queued = parent?.queued;
-    const parentAction = original ? researchAction(original.value.action) : null;
+    const parentAction = original ? admittedResearchAction(original.value.action) : null;
     const rawChildren = queued?.value.observation && typeof queued.value.observation === 'object'
       ? (queued.value.observation as { children?: unknown }).children : null;
     const children: unknown[] | null = Array.isArray(rawChildren) ? rawChildren : null;
@@ -1067,7 +1090,7 @@ function paidLocalRefusalReason(before: ManagedResearchTurn,
 export function projectPaidLocalRefusal(before: ManagedResearchTurn): {
   proof: { kind: PaidLocalRefusalKind }; turn: ManagedResearchTurn; failure: EngineError;
 } | null {
-  const reason = paidLocalRefusalReason(before, researchAction(before.action));
+  const reason = paidLocalRefusalReason(before, admittedResearchAction(before.action));
   if (!reason) return null;
   const proof = { kind: reason.kind };
   return { proof, turn: projectResearchTurnRevision(before, proof),
@@ -1078,6 +1101,8 @@ export interface PaidTurnAdmission {
   runId: string; intent: Ref; response: unknown; question: Ref | null;
   owner: ResearchRun['owner']; limit: number; context: unknown;
   mode?: 'planning' | 'synthesis';
+  /** WB1: the capability of the producing call, from its saved dispatch (webResearchCapability). */
+  web?: boolean;
 }
 
 export interface AcceptedPaidAnswerInputs {
@@ -1096,7 +1121,7 @@ export interface AcceptedPaidAnswerInputs {
 export function matchAcceptedPaidAnswer(input: AcceptedPaidAnswerInputs):
   { assessment: Ref; observation: { verdict: 'supported'; reasons: string[] } } | null {
   const { projectId, draftBefore, draftAfter, questionBefore, questionAfter, answer, assessment } = input;
-  const action = researchAction(input.action);
+  const action = admittedResearchAction(input.action);
   if (action.action !== 'answer' && action.action !== 'answer_delta') return null;
   const field = questionBefore.value.spec.field;
   const proposal = action.action === 'answer' ? action.value : input.expandedProposal;
@@ -1184,7 +1209,7 @@ export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdm
     && before.turns >= 0 && Number.isSafeInteger(before.requestChars) && before.requestChars >= 0
     && Number.isSafeInteger(input.limit) && input.limit > 0 && input.intent.revision === 1,
   'research_consumer_intent_invalid', 'A paid turn needs its exact prior run and original intent');
-  const action = researchAction(input.response);
+  const action = responseAction(input.response, input.web === true);
   const next = before.turns + 1;
   const run: ResearchRun = { ...before, status: 'running', turns: next,
     limit: input.limit, owner: input.owner,
@@ -1240,7 +1265,10 @@ export type TurnTransitionProof =
   | { kind: 'accepted-answer'; inputs: AcceptedPaidAnswerInputs;
       /** D8.4e: the proven K; mandatory for a turn of the binding era. */
       binding?: { ref: Ref; value: ResearchAcceptanceBinding } }
-  | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question>; producer: Revision<ResearchConsumerIntent> }
+  | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question>;
+      producer: Revision<ResearchConsumerIntent>; web?: boolean }
+  /** WB1: a web turn completes only from its saved capture (gateway answer or local refusal). */
+  | { kind: 'web'; projectId: string; capture: Revision<WebCapture> }
   | { kind: 'question-reopened'; original: Revision<Question>;
       reopened: Revision<Question>; draft: Revision<DiscoveryDraft> }
   | { kind: 'repeat-context'; current: ContextReadIdentityInput;
@@ -1249,7 +1277,7 @@ export type TurnTransitionProof =
 /** Includes queued children whose historical addresses predate managed turns. */
 export function projectSourceReadingTurn<T extends ResearchTurn>(before: T, projectId: string,
   source: { ref: Ref; value: Source }): T {
-  const action = researchAction(before.action);
+  const action = admittedResearchAction(before.action);
   requireCondition(before.status === 'pending' && before.error === null && before.assessment === null
     && action.action === 'read_source' && canonical(action.source) === canonical(source.ref),
     'research_consumer_intent_invalid', 'Only an exact pending source read can produce this result');
@@ -1265,7 +1293,7 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
   requireCondition(before.status === 'pending' && before.error === null
     && before.contract === 'research-consumer-turn/v1',
   'research_consumer_intent_invalid', 'Only a pending paid turn can be completed');
-  const action = researchAction(before.action);
+  const action = admittedResearchAction(before.action);
   if (proof.kind === 'mode-refusal' || proof.kind === 'reading-plan-refusal'
     || proof.kind === 'reading-mode-refusal' || proof.kind === 'search-query-refusal') {
     const reason = paidLocalRefusalReason(before, action);
@@ -1525,6 +1553,15 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       observation: matched.observation, error: null, acceptance: chain,
       ...(bindingRef ? { acceptanceBinding: bindingRef } : {}) };
   }
+  if (proof.kind === 'web') {
+    const { capture, projectId } = proof;
+    requireCondition(capture.kind === 'web-capture' && hashJson(capture.value) === capture.hash
+      && capture.value.contract === WEB_CAPTURE_CONTRACT && capture.value.projectId === projectId
+      && capture.value.turn.hash === hashJson(before) && canonical(capture.value.action) === canonical(before.action)
+      && (action.action === 'web_search' || action.action === 'web_fetch' || capture.value.response.kind === 'refused'),
+    'research_consumer_intent_invalid', 'The web completion lost its exact capture of this pending turn');
+    return projectWebApplication(projectId, before, capture).turn as ManagedResearchTurn;
+  }
   if (proof.kind === 'early-model-refusal') {
     const { draft, question, producer } = proof;
     requireCondition(producer.kind === 'research-consumer-intent' && hashJson(producer.value) === producer.hash
@@ -1538,7 +1575,7 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       && (!('question' in action) || action.question === question.id),
     'research_consumer_intent_invalid', 'The early refusal lost its exact draft and selected question');
     const failure = earlyResearchFailure(draft.value, question.value, 'analyst', action,
-      producer.value.cursor.context?.discoveryContext ?? null);
+      producer.value.cursor.context?.discoveryContext ?? null, proof.web === true);
     requireCondition(failure, 'research_consumer_intent_invalid', 'A valid early reply cannot become a model refusal');
     return { ...before, status: 'completed', assessment: null,
       observation: { contract: EARLY_RESEARCH_OUTCOME, code: failure.code, details: failure.details ?? null,
@@ -1592,7 +1629,7 @@ export function assertResearchTurnTransition(before: ManagedResearchTurn,
 /** The paid pause is a terminal turn and a paused run in the same transaction. */
 export function projectPaidPause(beforeRun: ResearchRun, beforeTurn: ManagedResearchTurn):
   { run: ResearchRun; turn: ManagedResearchTurn } {
-  const action = researchAction(beforeTurn.action);
+  const action = admittedResearchAction(beforeTurn.action);
   requireCondition(action.action === 'pause', 'research_consumer_intent_invalid',
     'Only the exact paid pause can pause its run');
   return { run: { ...beforeRun, status: 'paused', error: action.reason, pauseCode: null },
@@ -1605,7 +1642,7 @@ export function projectPaidOwnerReview(beforeRun: ResearchRun, beforeTurn: Manag
   verdict: { necessary: boolean; reason: string; [key: string]: unknown },
   owner: ResearchRun['owner'], limit: number):
   { run: ResearchRun; turn: ManagedResearchTurn } {
-  const action = researchAction(beforeTurn.action);
+  const action = admittedResearchAction(beforeTurn.action);
   requireCondition(action.action === 'need_owner' && typeof verdict.necessary === 'boolean'
     && typeof verdict.reason === 'string' && verdict.reason.trim().length > 0
     && beforeTurn.question !== null && beforeTurn.question.id === action.question

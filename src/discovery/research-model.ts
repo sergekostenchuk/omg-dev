@@ -4,6 +4,7 @@ import type { Observation, Selector } from "../evidence/evidence.js";
 import type { LayerDelta } from "./layer-delta.js";
 import type { BundleInput } from "./reader.js";
 import type { ContextPage } from "./working-context.js";
+import type { WebAction } from "./web-research.js";
 
 export interface ResearchAssessment {
   runtimeProofs?: import('../graph/runtime-evidence.js').RuntimeEvidence[];
@@ -19,7 +20,8 @@ export type ResearchRead =
   | { action: "read_context"; purpose?: string; record: Ref; pointer: string; page?: ContextPage }
   | { action: "search"; query: string }
   | { action: "read_source"; source: Ref; start: number; end: number }
-  | { action: "read"; path: string; media: "text/plain" | "application/json" };
+  | { action: "read"; path: string; media: "text/plain" | "application/json" }
+  | WebAction;
 export type ResearchAction =
   | ResearchRead
   | { action: "read_plan"; question: string; reads: ResearchRead[] }

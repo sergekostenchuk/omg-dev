@@ -98,7 +98,10 @@ export function resolveResearchBasis(store: Store, project: string, report: Tech
     const selected = observed(document.id, document.citation);
     if (!selected) continue;
     const { source, observation } = selected;
-    if (!['owner-document', 'document-observation'].includes(document.kind) || source.value.origin.kind !== 'owner-document'
+    // A web snapshot reports what a page said (WB1, №4552): never the owner's intent.
+    const documentary = source.value.origin.kind === 'owner-document'
+      || source.value.origin.kind === 'web' && document.kind === 'document-observation';
+    if (!['owner-document', 'document-observation'].includes(document.kind) || !documentary
       || source.value.provenance && document.kind==='owner-document') {
       fail('document_evidence_required', document.id, 'Documentary basis requires a document source and an explicit proof limit'); continue;
     }

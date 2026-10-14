@@ -28,11 +28,12 @@ import { canonical, digest, hashJson } from '../canonical.js';
 import { reference, isRef, uniqueRefs, type Ref, type Finding } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { Evidence, SOURCE_READ_CONTRACT, type Source, type Observation, type Selector } from '../evidence/evidence.js';
+import { webCaptureId, type WebCapture } from './web-research.js';
 import { processStart } from '../runtime/process-identity.js';
 import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executionOf } from './model-call-recovery.js';
 import { isResearchPreview } from './research-preview.js';
 import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply,
-  isReservationOnlySessionStep, researchAction,
+  isReservationOnlySessionStep, admittedResearchAction, responseAction, webResearchCapability,
   projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
   projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
@@ -384,7 +385,7 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
     if (paid.kind === 'response' && !synthesisFamily && saved.value.kind !== 'reader') {
       // C13/C62: the saved refusal code must be the one this exact paid
       // payload deterministically derives — the check needs no current state.
-      if (actionResponseRefusalCode(saved, paid) !== refusal.code)
+      if (actionResponseRefusalCode(store, saved, paid) !== refusal.code)
         consumerInvalid(saved.id, 'The refused consumer code differs from the exact paid response');
     }
     if (paid.kind === 'response' && synthesisFamily) {
@@ -417,7 +418,7 @@ function managedSearchParent(store: Store, child: Revision<Record<string, any>>)
  * historical input. */
 function readManagedSearchCompletion(store: Store, before: Revision<Record<string, any>>,
   after: Revision<Record<string, any>>, parent = managedSearchParent(store, before)) {
-  const action = researchAction(before.value.action);
+  const action = admittedResearchAction(before.value.action);
   if (action.action !== 'search' || after.value.status !== 'completed' || after.value.error !== null)
     consumerInvalid(before.id, 'A completed managed search lost its exact pending action');
   const captureRef = after.value.observation?.capture;
@@ -579,7 +580,7 @@ export function pinnedLayerDeltaStore(store: Store, delta: LayerDelta): Store {
 export function projectPaidLayerDesignRefusal(store: Store, producer: Revision<ResearchConsumerIntent>,
   before: Revision<Record<string, any>>, admission: 'current' | 'historical' = 'historical'):
   { proof: LayerDesignRefusalProof; turn: ManagedResearchTurn; failure: EngineError } | null {
-  const action = researchAction(before.value.action);
+  const action = admittedResearchAction(before.value.action);
   const delivery = producer.value.cursor.delivery;
   if ((action.action !== 'answer' && action.action !== 'answer_delta') || before.kind !== 'research-turn'
     || before.value.status !== 'pending' || hashJson(before.value) !== before.hash
@@ -660,7 +661,7 @@ export function projectPaidLayerDesignRefusal(store: Store, producer: Revision<R
       || (saved.value as ManagedResearchTurn).contract !== 'research-consumer-turn/v1') return null;
     try { readResearchConsumerTurn(store, prior); }
     catch { return null; }
-    const previousAction = researchAction(saved.value.action);
+    const previousAction = admittedResearchAction(saved.value.action);
     if (previousAction.action !== 'answer_delta'
       || canonical(previousAction.base) !== canonical(graphRef)) return null;
     prior = previousAction.revises;
@@ -732,7 +733,7 @@ export function readManagedProposalRefusalAt(store: Store, projectId: string, tu
     'research_proposal_refusal_invalid', `[${id}] Technical refusal belongs to another assessment`);
   const first = readResearchConsumerTurn(store, value.turn);
   const pending = readResearchConsumerTurn(store, value.pending);
-  const paid = researchAction(first.value.action);
+  const paid = admittedResearchAction(first.value.action);
   requireCondition(pending.value.status === 'pending' && canonical(reference(pending)) === canonical(value.pending)
     && canonical(pending.value.question) === canonical(value.question)
     && (paid.action === 'answer' || paid.action === 'answer_delta') && paid.question === question.id,
@@ -777,7 +778,7 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
   if (before.value.status !== 'pending')
     consumerInvalid(before.id, 'A completed paid turn cannot acquire another transition');
   let action: ResearchAction;
-  try { action = researchAction(before.value.action); }
+  try { action = admittedResearchAction(before.value.action); }
   catch { consumerInvalid(before.id, 'The original paid turn action is invalid'); }
   if (after.value.status === 'completed' && after.value.observation?.code === 'research_question_reopened') {
     const originalRef = before.value.question;
@@ -798,7 +799,8 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
       || canonical(reference(question)) !== canonical(questionRef))
       consumerInvalid(before.id, 'The early model refusal lost its exact original contract');
     return { kind: 'early-model-refusal', draft, question,
-      producer: readResearchConsumerIntent(store, before.value.consumerIntent) };
+      producer: readResearchConsumerIntent(store, before.value.consumerIntent),
+      ...(intentWebCapability(store, producer) ? { web: true } : {}) };
   }
   const localRefusal = projectPaidLocalRefusal(before.value as ManagedResearchTurn);
   if (localRefusal) return localRefusal.proof;
@@ -893,6 +895,13 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
       || canonical(checkpoint.value) !== canonical(expected.value))
       consumerInvalid(before.id, 'The completed checkpoint is not the paid action result');
     return { kind: 'checkpoint', checkpoint: { ref: expected.ref, value: expected.value } };
+  }
+  if ((action.action === 'web_search' || action.action === 'web_fetch') && after.value.status === 'completed') {
+    // WB1: every web completion (page, search, saved failure, refusal) derives from the capture of this exact turn.
+    const capture = store.get<WebCapture>(webCaptureId(reference(before)));
+    if (!capture || capture.kind !== 'web-capture' || hashJson(capture.value) !== capture.hash)
+      consumerInvalid(before.id, 'The completed web turn lost its saved capture');
+    return { kind: 'web', projectId: producer.value.projectId, capture };
   }
   if ((action.action === 'read' || action.action === 'read_source')
     && after.value.status === 'completed' && after.value.error === null) {
@@ -1089,7 +1098,7 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
     }
     if (saved.revision > 1 && saved.value.status === 'completed') {
       const first = store.get<Record<string, any>>(saved.id, 1);
-      if (first && researchAction(first.value.action).action === 'search') {
+      if (first && admittedResearchAction(first.value.action).action === 'search') {
         // The completion's pending basis is the revision it directly follows —
         // after a lawful retry that is the retried pending revision (P), never
         // the stored original ref (O). Finding the managed parent from P also
@@ -1671,7 +1680,7 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   if (paid.kind !== 'response') return null;
   return earlyResearchFailure(draft.value, question.value,
     intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
-    intent.value.cursor.context?.discoveryContext ?? null);
+    intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent));
 }
 export function retryableResearchConsumerRefusal(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
   const refusal = intent.value.state === 'refused' ? intent.value.refusal : null;
@@ -1729,7 +1738,7 @@ export function refuseResearchConsumerIntent(store: Store, intentRef: Ref,
     // C13/C62: an analyst/planner/escalation reply that cannot become an
     // action or verdict ends as a typed terminal consumer refusal bound to
     // this exact response — never a fabricated action or a re-payment.
-    const proved = actionResponseRefusalCode(intent, paid);
+    const proved = actionResponseRefusalCode(store, intent, paid);
     if (!proved) consumerInvalid(intent.id, 'A validly formed paid response cannot become a semantic refusal');
     if (expectedCode !== undefined && expectedCode !== proved)
       consumerInvalid(intent.id, 'The claimed refusal differs from the exact paid response');
@@ -1940,17 +1949,23 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
   return { kind: 'terminal', code: 'research_response_foreign', ...base };
 }
 
+/** WB1 (№4639): the web capability of one saved call — its exact draft's stage, its role and its saved dispatch. */
+export function intentWebCapability(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
+  const draft = store.get<DiscoveryDraft>(intent.value.draft.id, intent.value.draft.revision);
+  return webResearchCapability(draft?.value.stage, intent.value.kind, intent.value.dispatch);
+}
+
 /** The terminal refusal code a paid analyst/planner/escalation payload
  * deterministically produces, or null when the payload is well formed. The
  * derivation uses only the saved intent and response — no mutable heads. */
-function actionResponseRefusalCode(intent: Revision<ResearchConsumerIntent>,
+function actionResponseRefusalCode(store: Store, intent: Revision<ResearchConsumerIntent>,
   paid: ResearchConsumerExecution): string | null {
   if (paid.kind !== 'response') consumerInvalid(intent.id, 'A semantic refusal needs its received response');
   if (intent.value.kind === 'escalation-assessor') {
     try { requireEscalationReply(paid.payload); return null; }
     catch (error) { if (error instanceof EngineError) return error.code; throw error; }
   }
-  try { researchAction(paid.payload); return null; }
+  try { responseAction(paid.payload, intentWebCapability(store, intent)); return null; }
   catch (error) {
     if (error instanceof EngineError && ACTION_RESPONSE_REFUSAL_CODES.has(error.code)) return error.code;
     throw error;
@@ -2039,7 +2054,7 @@ export function readResearchAcceptanceBinding(store: Store, projectId: string, t
     lost(value.pending, 'pending-turn');
   const intent = readResearchConsumerIntent(store, value.intent);
   let action: ResearchAction;
-  try { action = researchAction(pending.value.action); }
+  try { action = admittedResearchAction(pending.value.action); }
   catch { return lost(value.pending, 'action'); }
   if ((action.action !== 'answer' && action.action !== 'answer_delta') || action.question !== value.questionBefore.id)
     lost(value.pending, 'action');
@@ -2112,7 +2127,7 @@ function storedAcceptedAnswerInputs(store: Store, before: Revision<Record<string
   if (canonical(reference(questionBefore)) !== canonical(reference(original))
     || canonical(reference(checkedAssessment)) !== canonical(reference(assessment)))
     consumerInvalid(before.id, 'The saved accepted-answer chain names other records');
-  const action = researchAction(before.value.action);
+  const action = admittedResearchAction(before.value.action);
   let expandedProposal: unknown;
   if (action.action === 'answer_delta')
     expandedProposal = expandLayerDelta(pinnedLayerDeltaStore(store, action), draftBefore, original, action);
@@ -2322,7 +2337,7 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
       || canonical(pending.value.question) !== canonical(intent.value.question))
       consumerInvalid(intent.id, 'Escalation lost its exact pending owner turn');
     let action: ResearchAction;
-    try { action = researchAction(pending.value.action); }
+    try { action = admittedResearchAction(pending.value.action); }
     catch { consumerInvalid(intent.id, 'The pending owner action is invalid'); }
     const verdict = paid.payload;
     if (action.action !== 'need_owner' || !object(verdict) || typeof verdict.necessary !== 'boolean'
@@ -2335,7 +2350,7 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
     expectedTurn = projected.turn;
   } else {
     let action: ResearchAction;
-    try { action = researchAction(paid.payload); }
+    try { action = responseAction(paid.payload, intentWebCapability(store, intent)); }
     catch { consumerInvalid(intent.id, 'The runner action does not parse from its paid response'); }
     if (!Number.isSafeInteger(priorRun.value.turns) || intent.value.cursor.turn !== priorRun.value.turns + 1
       || !Number.isSafeInteger(priorRun.value.requestChars) || priorRun.value.requestChars < 0)
@@ -2349,7 +2364,8 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
       runId: priorRun.id, intent: reference(origin), response: paid.payload,
       question: selectedQuestion,
       owner: runWrite.value.owner as ResearchRun['owner'], limit: runWrite.value.limit,
-      context: intent.value.cursor.context, ...(intent.value.cursor.mode ? { mode: intent.value.cursor.mode } : {}) });
+      context: intent.value.cursor.context, ...(intent.value.cursor.mode ? { mode: intent.value.cursor.mode } : {}),
+      ...(intentWebCapability(store, intent) ? { web: true } : {}) });
     expectedRun = projected.run;
     // D8.4e: the era of a SAVED application is its own producer's form — a
     // turn written without the acceptance marker is the earlier era. A live
@@ -2844,7 +2860,7 @@ export function readContextTurnHistoryAt(store: Store, projectId: string,
     let context: ContextTurnHistoryProof['context'];
     if (checked.value.status === 'completed' && checked.value.error === null
       && checked.value.question?.id === question.id) {
-      const action = researchAction(checked.value.action);
+      const action = admittedResearchAction(checked.value.action);
       if (action.action === 'read_context') {
         const { action: _action, observation: _observation, question: _question, ...source } =
           checkedContextIdentity(store, projectId, draft, question, action, checked.value.observation);

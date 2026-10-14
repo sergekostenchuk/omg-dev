@@ -13,7 +13,7 @@ import { isReaderResultRef } from "./pilot-context.js";
 import { EngineError } from "../errors.js";
 import { foldContextEvent, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
-import { projectCheckpointValue, researchAction, matchAcceptedPaidAnswer,
+import { projectCheckpointValue, admittedResearchAction, matchAcceptedPaidAnswer,
   type AcceptedPaidAnswerInputs } from './research-consumer-transition.js';
 import { expandLayerDelta } from './layer-delta.js';
 
@@ -186,7 +186,7 @@ export function findAcceptedPaidAnswerChain(store: Store, projectId: string,
   turn: Revision<ResearchTurn>, original: Revision<Question>, answered: Revision<Question>,
   deltaStore?: Store, pair?: { before: number; after: number }): { proof: { assessment: Ref; observation: { verdict: 'supported'; reasons: string[] } };
     inputs: AcceptedPaidAnswerInputs; answer: Revision<ResearchAnswer>; assessment: Revision<ResearchAssessment> } | null {
-  const action = researchAction(turn.value.action);
+  const action = admittedResearchAction(turn.value.action);
   if (action.action !== 'answer' && action.action !== 'answer_delta') return null;
   const answerRef = answered.value.answer;
   const answer = isRef(answerRef) ? store.get<ResearchAnswer>(answerRef.id, answerRef.revision) : null;

@@ -6,10 +6,35 @@ import { requireCondition } from "../errors.js";
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { safeRelativePath } from "../graph/topology.js";
 
+/** A received web page, kept as one immutable snapshot of its capture. HTTP success does not prove the extraction
+ * complete and the digest does not prove the page true: completeness is reported as unknown. */
+export interface WebSnapshotOrigin {
+  kind: 'web'; location: string; requestedUrl: string; finalUrl: string; fetchedAt: string; status: number | null;
+  capture: Ref; extraction: string; completeness: 'unknown'; truncated: { gateway: boolean; local: boolean };
+}
 export interface Source {
   provenance?: { kind: 'runtime-observation'; record: Ref };
-  projectId: string; origin: { kind: "file" | "owner-document"; location: string };
+  projectId: string; origin: { kind: "file" | "owner-document"; location: string } | WebSnapshotOrigin;
   content: string; mediaType: "text/plain" | "application/json"; sha256: string;
+}
+export const SOURCE_MAX_BYTES = 5_000_000;
+export interface WebPage { requestedUrl: string; finalUrl: string; fetchedAt: string; status: number | null;
+  text: string; extraction: string; truncated: boolean }
+/** Pure: the snapshot write of one capture. Its id carries the capture, so fetching again makes a new snapshot. */
+export function projectWebSource(projectId: string, capture: Ref, page: WebPage): { id: string; kind: 'source'; value: Source } {
+  requireCondition(typeof projectId === 'string' && projectId.length > 0 && isRef(capture) && page
+    && typeof page.text === 'string' && typeof page.requestedUrl === 'string' && typeof page.finalUrl === 'string'
+    && typeof page.fetchedAt === 'string' && (page.status === null || Number.isSafeInteger(page.status))
+    && typeof page.extraction === 'string' && typeof page.truncated === 'boolean',
+    'source_invalid', 'A web snapshot needs its capture, URLs, time, status, extraction and text');
+  let content = page.text;
+  const local = Buffer.byteLength(content) > SOURCE_MAX_BYTES;
+  if (local) content = Buffer.from(content, 'utf8').subarray(0, SOURCE_MAX_BYTES).toString('utf8').replace(/�+$/, '');
+  return { id: `source:${projectId}:web:${capture.hash}`, kind: 'source', value: { projectId,
+    origin: { kind: 'web', location: page.finalUrl, requestedUrl: page.requestedUrl, finalUrl: page.finalUrl,
+      fetchedAt: page.fetchedAt, status: page.status, capture, extraction: page.extraction, completeness: 'unknown',
+      truncated: { gateway: page.truncated, local } },
+    content, mediaType: 'text/plain', sha256: digest(content) } };
 }
 export type Selector = { kind: "json-pointer"; pointer: string } | { kind: "text-range"; start: number; end: number };
 export interface Observation { projectId: string; source: Ref; selector: Selector; value: Json }
@@ -47,10 +72,11 @@ export function projectSourceReading(projectId: string, source: Ref, value: Sour
     selector: range.served ? { kind: 'text-range', ...range.served } : null,
     value: range.served ? value.content.slice(range.served.start, range.served.end) : null };
 }
-/** The captured digest was computed from the captured content when the source was written; only the file on disk is new. */
+/** The captured digest was computed from the captured content when the source was written; only the file on disk is new.
+ * A web snapshot is its saved text: citing it never goes back to the network. */
 export function sourceIsCurrent(source: Source): boolean {
   try {
-    return source.origin.kind === "owner-document" || (source.origin.kind === "file"
+    return source.origin.kind === "owner-document" || source.origin.kind === "web" || (source.origin.kind === "file"
       && realpathSync(source.origin.location) === source.origin.location
       && digest(readFileSync(source.origin.location)) === source.sha256);
   } catch { return false; }
