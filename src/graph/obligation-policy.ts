@@ -64,7 +64,7 @@ export function validateObligationPolicy(store: Store, scope: ResearchScope): Re
       for (const ref of assignment.documentaryAllowance.sources) {
         const document = store.get<Source>(ref.id, ref.revision);
         requireCondition(document?.kind === 'source' && document.hash === ref.hash && document.value.projectId === scope.projectId
-          && document.value.origin.kind === 'owner-document', 'obligation_document_allowance_invalid',
+          && ['owner-document', 'web'].includes(document.value.origin.kind), 'obligation_document_allowance_invalid',
         'An allowance must bind exact document sources of this project; a filename or an owner assertion is not sufficient');
       }
     }

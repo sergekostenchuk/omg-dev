@@ -482,7 +482,7 @@ function citationGround(store: Store, project: string, citation: AnswerCitation,
     }
     const ground: AnswerGround = { observation, state: value.sha256,
       proofLimit: value.origin.kind === 'file' ? 'repository-observation'
-        : era === 'legacy' ? 'quoted-intent-requires-attribution' : 'reported-not-runtime-proof' };
+        : value.origin.kind === 'owner-document' && era === 'legacy' ? 'quoted-intent-requires-attribution' : 'reported-not-runtime-proof' };
     return copy({ source, ground });
   } catch (error) { if (error instanceof AnswerFailure) return { ok: false, refusal: error.refusal }; throw error; } },
   () => fail('answer_unconfirmed', citation.source.id, 'history', 'A citation has cyclic historical sources'));
@@ -532,7 +532,7 @@ function checkedSource(store: Store, project: string, ref: Ref): Revision<Source
   // Evidence capture wrote the digest of this exact body; a citation never rehashes it.
   check(object(value) && value.projectId === project && typeof value.content === 'string'
     && ['text/plain', 'application/json'].includes(value.mediaType) && object(value.origin)
-    && ['file', 'owner-document'].includes(value.origin.kind) && text(value.origin.location),
+    && ['file', 'owner-document', 'web'].includes(value.origin.kind) && text(value.origin.location),
     'answer_unconfirmed', ref.id, 'source', 'Evidence must retain its project, origin and content digest');
   if (value.mediaType === 'application/json') {
     try { JSON.parse(value.content); }

@@ -414,7 +414,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         check(sourceRecord.id.startsWith(`source:${request.project}:`) && source.projectId === request.project
           && typeof source.content === "string" && digest(source.content) === source.sha256
           && ["text/plain", "application/json"].includes(source.mediaType) && object(source.origin)
-          && ["file", "owner-document"].includes(source.origin.kind) && typeof source.origin.location === "string",
+          && ["file", "owner-document", "web"].includes(source.origin.kind) && typeof source.origin.location === "string",
         "observation.source", "Saved evidence must preserve its content, digest, project and origin");
         let extracted: Json;
         if (raw.selector.kind === "text-range") {

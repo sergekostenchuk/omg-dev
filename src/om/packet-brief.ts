@@ -63,7 +63,7 @@ export function briefMaterial(store: Store, project: string, workspace: string, 
     const row = store.get<Source>(ref.id, ref.revision);
     if (!row || row.kind !== 'source' || !same(reference(row), ref) || !ref.id.startsWith(`source:${project}:`)
       || !object(row.value) || row.value.projectId !== project || !object(row.value.origin)
-      || !['file', 'owner-document'].includes(row.value.origin.kind) || typeof row.value.origin.location !== 'string'
+      || !['file', 'owner-document', 'web'].includes(row.value.origin.kind) || typeof row.value.origin.location !== 'string'
       || typeof row.value.content !== 'string' || digest(row.value.content) !== row.value.sha256
       || !['text/plain', 'application/json'].includes(row.value.mediaType))
       invalid(`catalogue.${ref.id}`, 'Every catalogue source must resolve to its exact original project and content');
@@ -108,7 +108,7 @@ export function packetPrompt(packet: unknown, requestId?: string): string {
   briefReadings(packet);
   if (packet.brief.manifest.some((row: unknown) => !object(row) || typeof row.label !== 'string'
     || row.domain !== 'source' || !isRef(row.source) || !object(row.origin)
-    || !['file', 'owner-document'].includes(row.origin.kind) || typeof row.origin.location !== 'string'
+    || !['file', 'owner-document', 'web'].includes(row.origin.kind) || typeof row.origin.location !== 'string'
     || typeof row.path !== 'string' || row.unit !== 'UTF-16' || !Number.isSafeInteger(row.length) || row.length < 0
     || !['whole', 'omitted'].includes(row.completeness) || typeof row.reason !== 'string' || !Array.isArray(row.ranges)
     || row.ranges.some((range: unknown) => !object(range) || !Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end)
@@ -348,7 +348,7 @@ function selectMaterial(basis: BriefBasis, payload: Record<string, any>) {
     .filter(source => !contentEra(basis.briefContract) || source.value.origin.kind === 'file').flatMap(imports)));
   const linked = canonical([basis.input, basis.gaps.map(gap => gap.evidence)]);
   const words = basis.graph.nodes.filter(row => nodeIds.has(row.id)).flatMap(row => row.title.toLowerCase().split(/[^\p{L}\p{N}]+/u)).filter(word => word.length > 3);
-  for (const source of sources.filter(source => source.value.origin.kind === 'owner-document').sort(byLength)) {
+  for (const source of sources.filter(source => ['owner-document', 'web'].includes(source.value.origin.kind)).sort(byLength)) {
     if (linked.includes(canonical(source.reference))) add(source, 'exact reference in accepted context');
     else if (words.some(word => source.path.toLowerCase().includes(word))
       || [...nodeIds].some(id => source.path.split(/[^\p{L}\p{N}-]+/u).some(part => part === id || part.endsWith(`-${id}`))))

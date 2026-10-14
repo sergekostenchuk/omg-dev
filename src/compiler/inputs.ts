@@ -73,7 +73,7 @@ export function resolveExternalSource(store: Store, project: string, graph: Grap
   const value = record.value;
   if (value.projectId !== project || typeof value.content !== "string" || typeof value.sha256 !== "string"
     || !["text/plain", "application/json"].includes(value.mediaType) || !object(value.origin)
-    || !["file", "owner-document"].includes(value.origin.kind) || typeof value.origin.location !== "string")
+    || !["file", "owner-document", "web"].includes(value.origin.kind) || typeof value.origin.location !== "string")
     missing("source.value");
   let canonicalHash: string;
   try { canonicalHash = hashJson(value); }

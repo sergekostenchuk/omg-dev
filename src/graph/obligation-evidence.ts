@@ -14,7 +14,7 @@ export function requireDocumentarySources(store: Store, project: string, spec: F
     const allowance = obligation.assignment?.documentaryAllowance;
     if (allowance && !allowance.sources.some(ref => {
       const source = store.get<Source>(ref.id);
-      return source?.kind === 'source' && source.value.projectId === project && source.value.origin.kind === 'owner-document'
+      return source?.kind === 'source' && source.value.projectId === project && ['owner-document', 'web'].includes(source.value.origin.kind)
         && canonical(reference(source)) === canonical(ref) && sourceIsCurrent(source.value);
     })) throw new EngineError('obligation_document_source_unavailable',`[${obligation.id}] The exact document permitted by the scope is unavailable or changed; do not spend another call against an unusable evidence contract`);
   }
