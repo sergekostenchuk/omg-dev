@@ -185,7 +185,7 @@ ul.plain b{color:var(--ink);font-weight:500}
 <div class="page">
   <header class="head">
     <div class="l">
-      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · Исполнение — №4597 · + оркестратор</div>
+      <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · Исполнение — №4597 · Вход — №4600 · + оркестратор</div>
       <h1>Проход продукта: <b>от идеи до задачи</b></h1>
       <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки.</p>
     </div>
@@ -224,6 +224,7 @@ ul.plain b{color:var(--ink);font-weight:500}
   </div>
 
   <nav class="nav" aria-label="Разделы">
+    <span>Вход</span><a href="#i-what">Что это</a><a href="#i-when">Когда что</a><a href="#i-secrets">Секреты</a><a href="#i-owner">Владелец</a><a href="#i-gaps">Пробелы</a>
     <span>Discovery</span><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
     <span>Концепция</span><a href="#c-what">Что это</a><a href="#c-input">Вход</a><a href="#c-process">Обработка</a><a href="#c-output">Выход</a><a href="#c-records">Записи</a><a href="#c-doors">Двери</a><a href="#c-gaps">Пробелы</a><a href="#c-missed">Упускали</a>
     <span>Карта L1</span><a href="#m-what">Что это</a><a href="#m-input">Вход</a><a href="#m-process">Обработка</a><a href="#m-output">Выход</a><a href="#m-records">Записи</a><a href="#m-doors">Двери</a><a href="#m-gaps">Пробелы</a><a href="#m-missed">Упускали</a>
@@ -233,6 +234,97 @@ ul.plain b{color:var(--ink);font-weight:500}
     <span>Исполнение</span><a href="#x-what">Что это</a><a href="#x-in">Вход модели</a><a href="#x-out">Ответ модели</a><a href="#x-cards">Пять задач</a><a href="#x-phase">Фаза задачи</a><a href="#x-records">Записи</a><a href="#x-gaps">Пробелы</a>
     <span>Итог</span><a href="#tasks">До HX4</a><a href="#decide">Решения</a>
   </nav>
+
+  <!-- ===================== INPUT ===================== -->
+  <div class="block" id="b-in">
+    <div class="bh2"><h2>Вход · <b>от идеи до первого вызова Discovery</b></h2><small>подблоки A–F раскрываются на карте · сведено с Codex-omg №4600</small></div>
+    <div class="grid">
+      <section class="sec wide" id="i-what">
+        <h3>Что такое вход</h3>
+        <p>Вход сохраняет <b>кому и какой продукт нужен, что действительно сказал владелец и в каких разрешённых условиях движок начинает работать</b>. Результат — проект с адресуемым исходным поручением и настроенным исследовательским вызовом. Это не отдельная стадия pipeline (первая стадия — Discovery) и не место для архитектуры, API вендора или вердикта реализуемости.</p>
+        <div class="tw"><table>
+          <thead><tr><th>Не смешивать</th><th>Что это</th></tr></thead>
+          <tbody>
+            <tr><td>Проект пользователя</td><td>То, что OMG проектирует и затем реализует</td></tr>
+            <tr><td>Среда самого OMG</td><td>БД, адаптеры, аккаунт модели, поиск WB1, будущий Git workspace</td></tr>
+            <tr><td>Среда будущего продукта</td><td>Подписка и ключ вендора для HX. Аккаунт модели OMG о них ничего не доказывает</td></tr>
+          </tbody>
+        </table></div>
+        <pre style="margin:12px 0 0;padding:12px 14px;border:1px solid var(--line2);border-radius:10px;background:var(--raised);font:11px/1.6 var(--mono);color:var(--ink2);overflow-x:auto">cli init &lt;БД&gt;
+create-project(project, title)
+source-document(project, id=idea, text=&lt;слова владельца&gt;, media, expected=0)
+configure(project, expected, environment=&lt;папка · роли · команды · пределы&gt;)
+prepare-stage(project, discovery)            → ids берутся из ответа, не сочиняются
+answer-fact(brief, Source Ref, selector)     [если механически привязываем ввод]
+answer-decision(objective, явная цель)       [если она уже дана]
+research-stage(project, draftId, maxTurns)
+— позже, до OM: configure с requestCapacityChars · configure-om-dispatch · om-start</pre>
+      </section>
+      <section class="sec wide" id="i-when">
+        <h3>Что обязательно когда</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Условие</th><th>Первый вызов Discovery</th><th>До OM / M8 / исполнения</th></tr></thead>
+          <tbody>
+            <tr><td>БД и проект</td><td>Да</td><td>Те же адреса и история</td></tr>
+            <tr><td>Исходная идея</td><td>Нужна для осмысленного исследования</td><td>Не заменять домыслами</td></tr>
+            <tr><td>brief / objective вручную</td><td>Нет — оптимизация, если намерение известно</td><td>Обоснованы при принятии Discovery</td></tr>
+            <tr><td>Существующий workspace</td><td>Да (realpath, cwd вызова)</td><td>Целевой Git root</td></tr>
+            <tr><td>Git и initial commit</td><td>Нет для документального старта</td><td>Да для M8; к исполнению — чистая база</td></tr>
+            <tr><td>implementer + reviewer + fullCheck</td><td>Да, уже сейчас</td><td>Режимы работают для coding и review</td></tr>
+            <tr><td>Авторизация модели OMG</td><td>Фактически к отправке; configure не проверяет</td><td>Не путать с доступами HX</td></tr>
+            <tr><td>requestCapacityChars + dispatch</td><td>Нет</td><td>Да для OM</td></tr>
+            <tr><td>Поиск WB1</td><td>До первого web-запроса</td><td>Недоступность — техника, не «вариантов нет»</td></tr>
+            <tr><td>Подписка и ключ будущего продукта</td><td>Не нужен для публичных фактов</td><td>Подтверждение там, где от него зависит решение или запуск</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px"><b>Меры не путать:</b> maxTurns — шаги цикла; timeoutMs — предел процесса; requestCapacityChars — вместимость запроса; деньги — разрешение владельца. 180 с антибана — оснастка этого запуска, не продукт.</p>
+      </section>
+      <section class="sec" id="i-secrets">
+        <h3>Секреты, подписки, полномочия</h3>
+        <div class="tw"><table>
+          <thead><tr><th>Объект</th><th>В проекте</th><th>Реальное значение</th></tr></thead>
+          <tbody>
+            <tr><td>Идея</td><td>Текст, Source Ref</td><td>Владелец</td></tr>
+            <tr><td>Вендор / режим</td><td>Явный выбор или предложение с основаниями</td><td>Владелец — обязательное, модель — остальное</td></tr>
+            <tr><td>API secret</td><td>Назначение и способ разрешения — не значение</td><td>Разрешённое хранилище адаптера</td></tr>
+            <tr><td>Subscription session</td><td>Тип подключения, handle, пределы</td><td>Законная сессия через выбранный интерфейс</td></tr>
+            <tr><td>Аккаунт модели OMG</td><td>Роль, модель, адаптер — не токен</td><td>Настройка runtime</td></tr>
+            <tr><td>Web gateway</td><td>URL без секретов, лимиты</td><td>Оператор</td></tr>
+            <tr><td>Оплата / публикация</td><td>Явное решение о границах</td><td>Защищённый вход владельца</td></tr>
+          </tbody>
+        </table></div>
+        <ul class="plain" style="margin-top:10px">
+          <li><b>Общего vault нет:</b> секрет в command.args или Source становится сохранённым содержимым.</li>
+          <li><b>runProcess</b> передаёт ребёнку ограниченный env — API_KEY из оболочки адаптер не увидит.</li>
+          <li><b>Владелец ≠ оператор:</b> OwnerAuthority (H2) — только для om-owner-result; source-document, configure, answer-decision её не проходят.</li>
+        </ul>
+      </section>
+      <section class="sec" id="i-owner">
+        <h3>Что видит и выбирает владелец</h3>
+        <ul class="plain">
+          <li><b>Нужный вид:</b> «Ваше поручение» → «Как понята задача» с допущениями → «Что исследуется» → модель и граница запуска → только реальные блокеры с ближайшим действием. Без id, pointer, hash.</li>
+          <li><b>Владелец</b> — идея, обязательные условия, новое платное подключение, секрет, существенное ограничение, смена цели. <b>Оператор</b> — путь, адаптер, вместимость.</li>
+          <li><b>Подтверждение понимания</b> — не ритуал: показать и дать исправить; спросить — только при расходящихся трактовках.</li>
+          <li><b>UI сейчас:</b> «Новый продукт» создаёт только project; «Источники» и «Среда и роли» есть; StagePanel — ручные ответы; чат не становится Source и не запускает Discovery; non-fact подписан «решение владельца».</li>
+        </ul>
+      </section>
+      <section class="sec wide" id="i-gaps">
+        <h3>Пробелы и классы <small>вердикт Codex</small></h3>
+        <div class="tw"><table>
+          <thead><tr><th>Класс</th><th>Риск</th><th>Минимальный результат</th><th>Когда нужен</th></tr></thead>
+          <tbody>
+            <tr><td>IN1</td><td>objective — копия идеи; понимание не показано; авторство смешано</td><td>Один ввод → Source; механическая привязка brief и явной цели; понимание в первом плане</td><td>До обещания «владелец дал только идею»</td></tr>
+            <tr><td>DS1 + WB1</td><td>Перечитывание 137 знаков не исследует</td><td>Модель сама ищет через движок; снимки, цитаты, исходы</td><td>До содержательного HX4</td></tr>
+            <tr><td>DRY5FIX</td><td>Ошибка модели — тупик</td><td>Адресный отказ хода и обычный повтор</td><td>До автономного прохода</td></tr>
+            <tr><td>DRV1</td><td>Шаги CLI вручную; UI не запускает research</td><td>Драйвер продолжает до осмысленной остановки</td><td>Для «идея → план»</td></tr>
+            <tr><td><b>CFG1</b> — режим роли по фазе</td><td>--compact-research ломает implement, review, chat; configure и M8 не видят</td><td>Режимы и профили по фазам без тихой замены среды; отказ до отправки</td><td>До чата и исполнения этой конфигурацией</td></tr>
+            <tr><td><b>ENV1</b> — условия среды вовремя</td><td>Нет Git HEAD, команды проверки, capacity — всплывает поздно</td><td>Показывать известные отсутствующие условия и срок, существующими проверками</td><td>К нужной фазе, без нового этапа перед Discovery</td></tr>
+          </tbody>
+        </table></div>
+        <p style="margin-top:10px"><b>Не нужно до первого вызова:</b> отдельный intake-артефакт, обязательный sign-off понимания, все ключи будущего продукта, полный прогон несуществующего кода, ручное исследование воркером, reader-pilot.</p>
+      </section>
+    </div>
+  </div>
 
   <!-- ===================== DISCOVERY ===================== -->
   <div class="block" id="b-discovery">
@@ -1080,6 +1172,8 @@ ul.plain b{color:var(--ink);font-weight:500}
             <tr><td>11</td><td>DRV1 — драйвер ранних стадий</td><td>Продолжает сохранённый проход, после accepted запускает следующую стадию и в конце om-start (coldStart уже строит вход OM), на остановке — адресный исход</td><td>ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>12</td><td>DS1.3 — итог владельцу</td><td>Читаемый вид стадий из принятых записей; верное авторство; в GraphPanel — путь, условия, статус; сводка договоров поведения</td><td>все ранние стадии</td><td><span class="pill bad">новая</span></td></tr>
             <tr><td>13</td><td>PR1 — ремонт плана по needs_plan</td><td>Адресная находка contract_unexecutable / plan-ревью → исправление принятого L3 → новый план; оплаченный кандидат сохраняется. Нужна, только если HX4 доходит до кодирования</td><td>исполнение → OM</td><td><span class="pill bad">условная</span></td></tr>
+            <tr><td>14</td><td>CFG1 — режим роли по фазе</td><td>Профили или режимы адаптера для research, implement, review, chat без тихой замены запечатанной среды; отказ до отправки неподдержанного режима</td><td>вход → исполнение</td><td><span class="pill bad">новая</span></td></tr>
+            <tr><td>15</td><td>ENV1 — условия среды вовремя</td><td>Показывать известные отсутствующие условия (Git HEAD, команда проверки, capacity, шлюз) и срок необходимости существующими проверками</td><td>вход → M8</td><td><span class="pill bad">новая</span></td></tr>
           </tbody>
         </table></div>
         <p style="margin-top:12px"><b>Не добавлять до HX4</b> (Codex №4587): включение порога ради checkKind; удаление audience/outcome/acceptance; утверждение владельцем каждой концепции и требования; новую модель-оркестратор; перенос текстов источников во все требования; перепроверку принятой истории.</p>
@@ -1093,7 +1187,7 @@ ul.plain b{color:var(--ink);font-weight:500}
         <h3>Решения владельца</h3>
         <div class="decide">
           <div><span><b>Принять схему</b> Discovery и перехода в концепцию как определение?</span></div>
-          <div><span><b>Разбивка</b>: двенадцать задач по одному классу (рекомендация) — или иначе?</span></div>
+          <div><span><b>Разбивка</b>: пятнадцать задач по одному классу (PR1, CFG1, ENV1 — к своей фазе) (рекомендация) — или иначе?</span></div>
           <div><span><b>DRV1</b>: HX4 должен доказать автономность «идея → план» (тогда драйвер нужен до HX4) — или достаточно механического сценария команд?</span></div>
           <div><span><b>Условия запуска HX4</b>: задать Git workspace, среду исполнителей и команды проверок до M8; граница прохода — «дойти до плана».</span></div>
         </div>
@@ -1114,17 +1208,105 @@ ul.plain b{color:var(--ink);font-weight:500}
 
   /* ---------- stages: collapsed card + optional inner map ---------- */
   var STAGES=[
-    {id:"in",n:"Вход",st:"part",g:1,t:"Вход",io:["идея","Source · draft"],
-     sum:"Идея сохраняется как Source; движок создаёт проект, среду и черновик Discovery.",
-     d:[["Что делает","Принимает идею владельца и механически готовит работу: Source идеи, проект, среда, черновик Discovery, brief — точная выдержка."],["Пробел","objective — копия идеи, вписанная оркестратором; понимания модели нет.",GAP],["Задача","IN1 — вход и понимание",TASK]],
-     nodes:[
-      {id:"owner",x:0,y:0,role:"владелец",st:"yes",g:0,t:"Владелец",io:["идея","поручение"],bh:"Даёт идею и жёсткие условия. Выбирает только из готовых вариантов.",
-       d:[["Что делает","Даёт исходное поручение и уже известные жёсткие условия. Модели, среда и бюджет — настройки работы OMG, не требования продукта."],["Что нужно от продукта","Убедиться, что поняли правильно. До трат на стадии и OM — честный ответ: можно, нельзя или при каких условиях. Только настоящие выборы с вариантами и последствиями. Видеть итог каждой стадии с верным авторством."],["Не делает","Не ищет материал, не пишет ответы за модель, не утверждает каждое требование."]]},
-      {id:"init",x:0,y:200,role:"движок",st:"part",g:1,t:"Вход и инициализация",io:["идея","Source · draft"],bh:"create-project → source-document → configure → prepare-stage. brief — точная выдержка идеи.",
-       d:[["Что делает","Без смысловой переработки: Source идеи, проект, среда, черновик Discovery, brief точным выделением."],["Как сейчас","В HX3 и сухой прогонке оркестратор вручную ставил brief (answer-fact 0..137) и objective (answer-decision) — копию идеи."],["Как должно","objective — только слова владельца. Понимание формулирует модель как своё предложение."],["Записи","project:<p> · source:<p>:idea · environment:<p> · discovery-draft · question"],["Пробел","Копия идеи выдаётся за понимание; авторство смешивается.",GAP],["Задача","IN1",TASK]]}
-     ],
-     edges:[{f:"owner",t:"init",l:"идея"}]},
+    {id:"in",n:"Вход",st:"part",g:1,t:"Вход",io:["идея владельца","первый вызов Discovery"],top:30,
+     sum:"Сохранить поручение и авторство, настроить разрешённую среду, создать черновик Discovery и сделать первый модельный вызов.",
+     d:[["Что это","Не отдельная стадия pipeline: первая стадия — Discovery. Вход — путь от идеи до первого вызова: проект, Source поручения, среда, черновик, research-stage. Не определяет архитектуру, не узнаёт API вендора, не выносит реализуемость."],["Три среды","Проект пользователя (что проектируем); среда самого OMG (БД, адаптеры, аккаунт модели, поиск WB1, будущий Git); среда будущего продукта (подписка и ключ вендора). Аккаунт модели OMG ничего не доказывает о подключении будущего HX."],["Поправки Codex","init — не единственный путь создания БД; configure не проверяет Git; brief/objective не обязаны быть заполнены заранее; answer-decision не проходит OwnerAuthority; --compact-research ломает implement/review/chat; до OM нужна requestCapacityChars."],["Пробелы","IN1 — авторство и понимание; DRV1 — драйвер; общего vault для секретов нет; режимы ролей по фазам; условия среды выясняются поздно.",GAP],["Задачи","IN1 · DRV1 · CFG1 · ENV1",TASK]],
+     subs:[
+      {id:"a",n:"A",st:"yes",g:0,t:"Экземпляр и проект",io:["БД · id · название","project:<p>"],
+       sum:"Открыть или создать SQLite, создать проект с CAS expected = 0.",
+       d:[["Проверки","Путь БД — обычный файл; форма команды; CAS создания. Повтор create-project — не «продолжить»: читать существующий проект."],["Пробел","Обещание «БД не создаётся без init» не выполнено: command и serve тоже создают Store."]],
+       nodes:snake([
+        {id:"a1",role:"владелец · оператор",st:"yes",g:0,t:"Выбор хранилища и проекта",io:["решение","БД · id"],bh:"Где хранить состояние OMG и какой проект создаётся.",d:[["Действие","A1."]]},
+        {id:"a2",role:"оператор",st:"yes",g:0,t:"cli init / serve",io:["путь БД","запуск"],bh:"CLI-вход; для UI — serve <db>.",d:[["Действие","A2 (cli.ts:11)."]]},
+        {id:"a3",role:"код",st:"yes",g:0,t:"Store",io:["путь","SQLite + схема"],bh:"Открывает или создаёт БД, применяет миграции.",d:[["Действие","A3 (store.ts:149)."]]},
+        {id:"a4",role:"код",st:"yes",g:0,t:"Проверка команды",io:["create-project","форма · id"],bh:"Общий parser, формат project id.",d:[["Действие","A4 (commands.ts:144)."]]},
+        {id:"a5",role:"код · запись",st:"yes",g:0,t:"project:<p>",io:["команда","expected 0"],bh:"CAS создания проекта.",d:[["Действие","A5 (engine.ts:317)."]]},
+        {id:"a6",role:"запись · UI",st:"yes",g:0,t:"Проект открыт",io:["project","стадии без результата"],bh:"UI показывает начальные стадии.",d:[["Действие","A6. В одной БД может быть несколько проектов."]]}
+       ],3),
+       edges:[{f:"a1",t:"a2"},{f:"a2",t:"a3"},{f:"a3",t:"a4"},{f:"a4",t:"a5"},{f:"a5",t:"a6"}].map(lbl)},
 
+      {id:"b",n:"B",st:"part",g:1,t:"Поручение и авторство",io:["слова владельца","Source · brief · objective"],
+       sum:"Сохранить идею один раз как Source; brief — точная выдержка; objective — только явное намерение; понимание — модель.",
+       d:[["Что работает","source-document без Environment; текст до 5 МБ; source-file — с выбранной средой и безопасным путём; answer-fact — настоящий диапазон; изменение — через reopen-question."],["Не доказывает","origin owner-document — способ поступления, не подпись владельца; документ оператора — не разрешение на расходы; у decision нет Source selector."],["IN1","Исходный текст — один раз; brief без платной интерпретации; objective — из явного намерения; понимание — в первом researchPlan, без отдельного вызова и без «подтвердите всё»."],["Пробел","Копия идеи в objective выдаётся за понимание; авторство смешивается.",GAP],["Задача","IN1",TASK]],
+       nodes:snake([
+        {id:"b1",role:"владелец",st:"yes",g:0,t:"Идея своими словами",io:["замысел","текст + условия"],bh:"Известные условия — да; техническую модель — нет.",d:[["Действие","B1."]]},
+        {id:"b2",role:"оператор · интерфейс",st:"part",g:0,t:"source-document",io:["текст","команда"],bh:"Точные слова; своя интерпретация — отдельно.",d:[["Действие","B2. UI «Новый продукт» создаёт только project; Source и исследование не создаёт; чат не становится Source."]]},
+        {id:"b3",role:"код · запись",st:"yes",g:0,t:"source:<p>:idea",io:["текст","Source Ref"],bh:"content, mediaType, sha256, projectId, origin.",d:[["Действие","B3 (evidence.ts:61)."]]},
+        {id:"b4",role:"код",st:"yes",g:0,t:"prepare-stage discovery",io:["проект","draft + вопросы"],bh:"Своя версия контракта.",d:[["Действие","B4 — подробно в D."]]},
+        {id:"b5",role:"оператор · код",st:"part",g:0,t:"answer-fact brief",io:["Source + selector","brief"],bh:"Точная привязка исходного поручения — механически.",d:[["Действие","B5 (discovery.ts:150). Можно оставить исследователю — другая цена первого прохода."]]},
+        {id:"b6",role:"владелец · код",st:"part",g:1,t:"objective",io:["явное намерение","цель"],bh:"Только то, что сказал владелец; иначе вопрос остаётся.",d:[["Как сейчас","answer-decision с actor вызывающего (local-owner) — не OwnerAuthority H2."],["Пробел","Копия идеи — не понимание.",GAP],["Задача","IN1",TASK]]},
+        {id:"b7",role:"модель Discovery",st:"part",g:1,t:"Понимание",io:["поручение","интерпретация"],bh:"Понимание, границы, допущения — своя интерпретация, не выбор владельца.",d:[["Действие","B7 — после первого вызова, в researchPlan (DS1)."],["Задача","IN1",TASK]]},
+        {id:"b8",role:"владелец",st:"no",g:0,t:"Выбор трактовки",io:["варианты","выбор"],bh:"Только при неоднозначности, которую не решает исследование.",d:[["Действие","B8. Не обязательный ритуал подтверждения."]]}
+       ],4),
+       edges:[{f:"b1",t:"b2"},{f:"b2",t:"b3"},{f:"b3",t:"b4"},{f:"b4",t:"b5"},{f:"b5",t:"b6"},{f:"b6",t:"b7",l:"первый вызов"},{f:"b7",t:"b8",l:"неоднозначность",k:"alt"}].map(lbl)},
+
+      {id:"c",n:"C",st:"part",g:1,t:"Среда и разрешённые возможности",io:["папка · роли · команды · пределы","environment:<p>"],
+       sum:"configure: workspace, implementer и reviewer (разные actor), fullCheck, timeout; доступ модели и шлюз WB1 — инфраструктура.",
+       d:[["Environment","projectId, workspace, implementer / reviewer {actor, model, effort, command, speed?}, fullCheck, timeoutMs, requestCapacityChars?; с WB1 — webResearch {enabled, gatewayUrl, timeoutMs, limits}."],["Предел проверки","realpath и исполнимость executable; аргументы не запускаются; node ≠ рабочий adapter.js; разные actor ≠ интеллектуальная независимость."],["Секреты","Общего secretRef / vault нет. Секрет в command.args или Source становится сохранённым содержимым. runProcess передаёт ребёнку ограниченный env: API_KEY из оболочки адаптер не увидит."],["Пробел","--compact-research разрешён только для research: implement, review, chat получат adapter_mode_invalid — configure и M8 этого не видят.",GAP],["Задача","CFG1 — режим роли по фазе",TASK]],
+       nodes:snake([
+        {id:"c1",role:"владелец",st:"yes",g:0,t:"Разрешения",io:["аккаунты · расходы","разрешение"],bh:"Аккаунты, расходы, передача данных, изменения доступа.",d:[["Действие","C1."]]},
+        {id:"c2",role:"оператор",st:"yes",g:0,t:"Папка, адаптеры, модели",io:["выбор","roles"],bh:"Реально существующие adapter commands, model, effort, actor.",d:[["Действие","C2."]]},
+        {id:"c3",role:"оператор",st:"yes",g:0,t:"timeout · fullCheck",io:["пределы","команды"],bh:"Параметры — не доказательство успешности.",d:[["Действие","C3."]]},
+        {id:"c4",role:"код",st:"yes",g:0,t:"configure: realpath · executable",io:["environment","проверка"],bh:"Форма и доступность исполняемых файлов.",d:[["Действие","C4 (environment.ts:159)."]]},
+        {id:"c5",role:"код",st:"yes",g:0,t:"implementer ≠ reviewer",io:["actors","допуск"],bh:"После начала execution смена sourceRoot запрещена.",d:[["Действие","C5."]]},
+        {id:"c6",role:"запись",st:"yes",g:0,t:"environment · workspace",io:["проверено","Ref"],bh:"Новая конфигурация — новый Ref; оплаченный вызов не подменяется.",d:[["Действие","C6."]]},
+        {id:"c7",role:"оператор · инфраструктура",st:"part",g:1,t:"Логин модели · шлюз WB1",io:["инфраструктура","доступно"],bh:"Логин адаптера, endpoint / туннель шлюза.",d:[["Действие","C7: проверка формы gatewayUrl — не проверка живого туннеля; ssh-туннель код не создаёт."],["Пробел","Режимы ролей по фазам и известные условия среды.",GAP],["Задача","CFG1 · ENV1",TASK]]},
+        {id:"c8",role:"код",st:"yes",g:0,t:"Точная Environment к вызову",io:["Ref","адрес вызова"],bh:"Берётся перед отправкой и сохраняется в адресе вызова.",d:[["Действие","C8."]]}
+       ],4),
+       edges:[{f:"c1",t:"c2"},{f:"c2",t:"c3"},{f:"c3",t:"c4"},{f:"c4",t:"c5"},{f:"c5",t:"c6"},{f:"c6",t:"c7"},{f:"c7",t:"c8"}].map(lbl)},
+
+      {id:"d",n:"D",st:"yes",g:0,t:"Черновик Discovery",io:["prepare-stage","draft · вопросы · research-stage"],
+       sum:"Создать черновик Discovery своей версии, при необходимости механически привязать brief / objective, запустить research-stage.",
+       d:[["Версии","v4: brief → objective → preparation. DS1 / v5: brief → objective → researchPlan → researchReport → verdict → preparation."],["Важно","research-stage сам собирает и принимает стадию; accept-stage не обязателен. Повтор research-stage продолжает тот же черновик — новый prepare-stage начинает новое исследование."],["Пробел","Переход и продолжение — вызывающая сторона (DRV1).",GAP]],
+       nodes:snake([
+        {id:"d1",role:"оператор · драйвер",st:"part",g:0,t:"prepare-stage discovery",io:["проект","новое исследование"],bh:"Один раз на новое исследование.",d:[["Действие","D1 (engine.ts:94)."]]},
+        {id:"d2",role:"код",st:"yes",g:0,t:"Проверка проекта",io:["project","inputs = []"],bh:"У Discovery нет предшественника.",d:[["Действие","D2."]]},
+        {id:"d3",role:"код · запись",st:"yes",g:0,t:"Discovery.forStage",io:["контракт","draft"],bh:"stage discovery, level R0, consumer concept, версия.",d:[["Действие","D3 (discovery.ts:57). R0 здесь — метка механизма, не begin-research R0."]]},
+        {id:"d4",role:"запись",st:"yes",g:0,t:"question × N",io:["FieldSpec","status open"],bh:"Уникальные id, fields = null.",d:[["Действие","D4."]]},
+        {id:"d5",role:"код · оператор",st:"part",g:0,t:"brief · objective",io:["B5 / B6","поля"],bh:"Если поручение и цель уже точно привязаны.",d:[["Действие","D5."]]},
+        {id:"d6",role:"оператор · драйвер",st:"part",g:1,t:"research-stage",io:["draftId · maxTurns","цикл"],bh:"maxTurns — шаги цикла, не точный предел вызовов.",d:[["Действие","D6."],["Задача","DRV1",TASK]]},
+        {id:"d7",role:"код",st:"yes",g:0,t:"Восстановить · первый вопрос",io:["оплаченное","первый unresolved"],bh:"Сначала восстановить сохранённое, затем выбрать вопрос.",d:[["Действие","D7 (research-runner.ts:510, 92)."]]},
+        {id:"d8",role:"модель",st:"yes",g:0,t:"Задача Discovery",io:["вопрос","не весь план"],bh:"Модель получает задачу Discovery, а не план реализации.",d:[["Действие","D8."]]}
+       ],4),
+       edges:[{f:"d1",t:"d2"},{f:"d2",t:"d3"},{f:"d3",t:"d4"},{f:"d4",t:"d5"},{f:"d5",t:"d6"},{f:"d6",t:"d7"},{f:"d7",t:"d8"}].map(lbl)},
+
+      {id:"e",n:"E",st:"yes",g:0,t:"Первый модельный вызов",io:["вопрос + среда","research action"],
+       sum:"Собрать контекст и пакет, сохранить намерение и физический вызов до отправки, получить одно действие исследовательского протокола.",
+       d:[["Контекст","role research, stage discovery, level R0, consumer concept; fields; questions (id, kind, prompt, risk, schema); prerequisites []; contextWorkspace, inventory (Source Ref, excerpt до 3000 знаков), history, consumerFeedback."],["Оболочка","{protocol: omg-agent/v1, requestId, mode: research, model, effort, prompt, subject}; analyst — implementer, оценщик — reviewer; лимит упаковщика раннего пути — 300 000 знаков."],["Предел","search на базе ищет по проекту, не в интернете — веб даёт WB1. exit 0 и succeeded ≠ принятая Discovery."]],
+       nodes:snake([
+        {id:"e1",role:"код",st:"yes",g:0,t:"Среда и источники",io:["Environment","effective"],bh:"Ранний путь работает без reader-pilot.",d:[["Действие","E1."]]},
+        {id:"e2",role:"код · запись",st:"yes",g:0,t:"research-run",io:["draft + Environment","run"],bh:"Создать или продолжить цикл.",d:[["Действие","E2."]]},
+        {id:"e3",role:"код",st:"yes",g:0,t:"Контекст вопроса",io:["fields · schema · Sources","контекст"],bh:"Поля, вопрос со схемой, каталог, история, замечания.",d:[["Действие","E3 (research-runner.ts:569)."]]},
+        {id:"e4",role:"код",st:"yes",g:0,t:"Упаковка",io:["контекст","запрос"],bh:"Ограниченный запрос, разрешимые адреса, вместимость.",d:[["Действие","E4."]]},
+        {id:"e5",role:"запись",st:"yes",g:0,t:"intent · model-call",io:["запрос","до отправки"],bh:"Consumer intent и адрес физического вызова.",d:[["Действие","E5 (research-runner.ts:699)."]]},
+        {id:"e6",role:"код",st:"yes",g:0,t:"Адаптер в workspace",io:["JSON","процесс"],bh:"timeout и процесс отслеживает движок.",d:[["Действие","E6 (research-protocol.ts:211, 290)."]]},
+        {id:"e7",role:"модель analyst",st:"yes",g:0,t:"Действие исследования",io:["пакет","одно action"],bh:"read / search / checkpoint / answer / need_owner / pause …",d:[["Действие","E7."]]},
+        {id:"e8",role:"код · запись",st:"yes",g:0,t:"Ответ сохранён",io:["ответ","проверен"],bh:"Адрес и форма — до применения.",d:[["Действие","E8. Восстановление идёт к применению, а не к новой отправке."]]},
+        {id:"e9",role:"код · оценщик",st:"yes",g:0,t:"Чтение или оценка",io:["action","вопрос / draft"],bh:"Выполнить чтение или оценить ответ, затем обновить.",d:[["Действие","E9. Двери: чтение, needs_owner, сохранённый отказ, пауза maxTurns; не все ошибки модели имеют обычный повтор — DRY5FIX."]]}
+       ],5),
+       edges:[{f:"e1",t:"e2"},{f:"e2",t:"e3"},{f:"e3",t:"e4"},{f:"e4",t:"e5"},{f:"e5",t:"e6"},{f:"e6",t:"e7"},{f:"e7",t:"e8"},{f:"e8",t:"e9"}].map(lbl)},
+
+      {id:"f",n:"F",st:"part",g:1,t:"Отложенные условия",io:["знание об условиях","OM · M8 · исполнение"],
+       sum:"Что понадобится позже: capacity и dispatch к OM; Git-база, команды, пути к M8; доступы к task-start; доказательства к task-result.",
+       d:[["Когда что","Первый вызов: БД, проект, Source, Environment, workspace, авторизация модели. Не нужно: Git, dispatch, reader-pilot, ключи будущего продукта. До OM: requestCapacityChars, configure-om-dispatch, согласованные режимы. До M8: Git root, HEAD, tree, команды, пути. До task-start: реальные права и доступы."],["Меры не путать","maxTurns — шаги; timeoutMs — процесс; requestCapacityChars — вместимость; деньги — разрешение владельца. 180 с антибана — оснастка запуска, не продукт."],["Пробел","Условия выясняются поздно: нет Git HEAD или настоящей команды проверки обнаружится на M8.",GAP],["Задача","ENV1 — известные условия вовремя",TASK]],
+       nodes:snake([
+        {id:"f1",role:"модель Discovery",st:"yes",g:0,t:"Варианты и доступ",io:["исследование","условия"],bh:"Не запрашивает секреты для исследования документации.",d:[["Действие","F1."]]},
+        {id:"f2",role:"владелец",st:"yes",g:0,t:"Существенные условия",io:["варианты","выбор · разрешения"],bh:"Только существенные условия, расходы, права.",d:[["Действие","F2."]]},
+        {id:"f3",role:"код · модель",st:"part",g:0,t:"Ограничение или неизвестное",io:["условие","с потребителем и сроком"],bh:"Перенос дальше по цепочке.",d:[["Действие","F3 — классы DS1.2, UNK1."]]},
+        {id:"f4",role:"оператор",st:"part",g:1,t:"К OM: capacity · dispatch",io:["среда","согласована"],bh:"requestCapacityChars, configure-om-dispatch, реальный workspace.",d:[["Действие","F4 (capacity.ts:26: без capacity — capacity_missing)."],["Задача","ENV1",TASK]]},
+        {id:"f5",role:"код M8",st:"yes",g:0,t:"M8: Git и команды",io:["workspace","inspection"],bh:"Git root, HEAD, tree, чистота, команды, пути, обязательства.",d:[["Действие","F5 (environment.ts:81). Не запускает будущие тесты."]]},
+        {id:"f6",role:"код исполнения",st:"yes",g:0,t:"task-start",io:["задача","права и входы"],bh:"Перед конкретной задачей — реальные доступы.",d:[["Действие","F6 (task-obligations.ts:44)."]]},
+        {id:"f7",role:"модель · код",st:"yes",g:0,t:"task-result",io:["результат","доказательство"],bh:"Подтверждает созданный результат, не прежнее обещание среды.",d:[["Действие","F7."]]}
+       ],4),
+       edges:[{f:"f1",t:"f2"},{f:"f1",t:"f3"},{f:"f2",t:"f4",k:"alt"},{f:"f3",t:"f4"},{f:"f4",t:"f5"},{f:"f5",t:"f6"},{f:"f6",t:"f7"}].map(lbl)}
+     ],
+     links:[
+      {f:"a.a6",t:"b.b2",l:"проект открыт",lc:"A → B"},
+      {f:"b.b4",t:"d.d1",l:"prepare-stage",lc:"B → D"},
+      {f:"c.c8",t:"e.e1",l:"Environment Ref",lc:"C → E"},
+      {f:"d.d8",t:"e.e3",l:"первый вопрос",lc:"D → E"},
+      {f:"c.c6",t:"f.f4",l:"перед OM / M8",k:"alt",route:"below",depth:40}
+     ]},
     {id:"disc",n:"Стадия 1",st:"ds1",g:1,t:"Discovery",io:["идея","stage:discovery"],
      sum:"Понимание и план → поиск в интернете → отчёт с цитатами → вердикт → анкета для цепочки. Или обоснованный отказ.",
      d:[["Что делает","Превращает поручение в обоснованное решение: что нужно, кому и зачем, какой вариант, в каких рамках, что неизвестно — или обоснованный останов. Закрывает внешние вопросы, от которых зависит допустимость продукта."],["Отдаёт","stage:<p>:discovery: концепции — все поля (автору и оценщику); карте L1 — actors, outcomes, journeys; OM — actors, unknowns, externalSystems, каталог Source."],["Пробелы","Нет поиска в интернете (WB1), дверей после не-go, переноса отчёта в анкету, итога владельцу.",GAP],["Задачи","DS1 · WB1 + WB1b · IN1 · DS1.1 · DS1.2 · DS1.3",TASK]],
@@ -1663,8 +1845,8 @@ ul.plain b{color:var(--ink);font-weight:500}
 
   /* ---------- links between stages; they land on inner nodes when a stage is expanded ---------- */
   var CROSS=[
-    {f:"in.init",t:"disc.plan",l:"brief · objective",lc:"идея · brief · objective"},
-    {f:"disc.summary",t:"in.owner",l:"итог владельцу",route:"above",depth:40},
+    {f:"in.e.e9",t:"disc.plan",l:"первый research action",lc:"идея → первый вызов Discovery"},
+    {f:"disc.summary",t:"in.b.b1",l:"итог владельцу",route:"above",depth:40},
     {f:"disc.stage",t:"con.trigger",l:"accepted · guards",lc:"stage:discovery — все поля"},
     {f:"disc.stage",t:"con.packet",l:"prerequisites: Discovery целиком",route:"above",depth:40,ff:.8,tf:.5},
     {f:"con.door",t:"disc.plan",l:"адресный возврат к исследованию",k:"alt",route:"below",depth:44,ff:.5,tf:.5},
