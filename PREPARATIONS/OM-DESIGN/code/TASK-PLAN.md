@@ -2538,7 +2538,7 @@
 - Отдаёт: —
 - Читает записи: unknowns принятых старших стадий
 - Пишет записи: observation.unknown хода и пауза research_material_missing
-- Разрешённые пути: `src/discovery/research-model.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-context.ts`, `test/early-unknown.test.ts`, `test/research-call-resume.test.ts`
+- Разрешённые пути: `src/discovery/research-model.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-context.ts`, `test/early-unknown.test.ts`, `test/research-call-resume.test.ts`, `test/stage-research.test.ts`
 - Из движка как есть: №4672; №4686
 - После: DS1, DRY5FIX, WB1, L1A, DRV1, ASM1, ASM1.1
 - Тесты сверх обязательных:
