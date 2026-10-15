@@ -1329,3 +1329,19 @@ test("DRY6-02 return 1: the cited Source changes after the stop cancelled B — 
   assert.ok(f.calls(trace).length > calls, JSON.stringify(next.reason));
   assert.equal(restarted.list<any>("discovery-draft").length, 1, "The same draft continues");
 });
+
+test("ENV1 DRV1 hands accepted features to OM through the same admission as om-start: a workspace without Git refuses both alike before any B1, pass or call", async t => {
+  const f = fixture(t), project = "garden";
+  preparedFeatures(f.engine, project, gardenGraph());
+  const { trace } = f.configure(project);
+  refinedLayers(f.engine, project);
+  rmSync(join(f.root, "repo", ".git"), { recursive: true, force: true });
+  const driven = await f.engine.execute({ type: "early-stage-run", project, maxTurns: 10, maxCalls: 10 }) as EarlyStageOutcome;
+  const direct = await f.engine.execute({ type: "om-start", project }) as { ok: boolean; refusal?: { code: string; at: { target: string; field?: string } } };
+  assert.equal(driven.reason?.code, "environment_not_ready", JSON.stringify([driven.end, driven.reason]));
+  assert.equal(direct.ok, false);
+  assert.deepEqual([direct.refusal!.code, direct.refusal!.at.target, direct.refusal!.at.field], [driven.reason!.code, driven.reason!.target, driven.reason!.field],
+    "One admission for both entries");
+  assert.equal(f.store.get(`om-input:${project}`), null, "No B1");
+  assert.equal(f.calls(trace).length, 0, "No call");
+});

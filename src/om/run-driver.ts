@@ -1,6 +1,8 @@
 import { EngineError, requireCondition } from "../errors.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { storeView } from "../storage/store-view.js";
+import { omStartReadiness } from "./environment-readiness.js";
 import { readDispatch } from "./dispatch.js";
 import { recoverOmModelCall } from "./model-call.js";
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
@@ -60,6 +62,20 @@ function outcome(store: Store, project: string, end: PassEnd, refusal: Refusal |
 function ended(store: Store, project: string, refusal: Refusal): OmResult<Sealed<PassOutcome>> {
   const end = CONTROL_ENDS[refusal.code];
   return end ? delivered(outcome(store, project, end, refusal)) as OmResult<Sealed<PassOutcome>> : { ok: false, refusal };
+}
+
+/** Read-only precedence check; acquireRunExecution remains the final CAS after readiness. */
+function busyExecution(control: RunControlStatus): Refusal | null {
+  const head = control.control, execution = head?.value.execution;
+  if (!head || !execution) return null;
+  const state = runOwnerState(execution.owner);
+  if (state === "gone") return null;
+  const busy = refused("run_busy", state === "alive"
+    ? "Another live executor holds this pass; it is not displaced"
+    : "The executor of this pass cannot be observed; an unproved death is not a free pass",
+  { unit: UNIT, target: head.id, field: "execution", ref: reference(head) }, "owner");
+  if (busy.ok) throw new Error("Unreachable");
+  return busy.refusal;
 }
 
 async function drive(store: Store, project: string, request: RunRequest, execution: RunExecution, start: Ref): Promise<OmResult<Sealed<PassOutcome>>> {
@@ -124,23 +140,49 @@ export async function startPass(store: Store, request: PassStartRequest): Promis
   }
   const dispatch = dispatchOf(store, project);
   if (!dispatch.ok) return dispatch;
+  let runRequest = dispatch.value;
+  // ENV1 (№4864 §4): a NEW pass — cold or on a saved input — starts only on its observed conditions: refused before any
+  // write (no B1, pass, call or execution); their guards ride in every transaction that creates the pass. A saved pass is
+  // continued under its own record.
+  let guards: TransactionGuard[] = [];
+  if (!run) {
+    // ENV1 preserves the old control precedence without acquiring anything: a free but unready start writes no control,
+    // while a holder already observed above remains busy even when today's environment is not ready.
+    const busy = busyExecution(control);
+    if (busy) return ended(store, project, busy);
+    const ready = omStartReadiness(store, project);
+    if (!ready.ok) return ended(store, project, ready.refusal);
+    guards = [...ready.value.guards];
+    // The readiness observation may race the preliminary dispatch read above. Select again after that observation:
+    // its guards then either protect this exact selection through the first write or refuse the changed window.
+    const current = dispatchOf(store, project);
+    if (!current.ok) return current;
+    runRequest = current.value;
+  }
   return held(store, project, async execution => {
-    const started = store.get(`om-input:${project}`) ? startRun(store, { project, ...intent }, execution.hold) : coldStart(store, project, intent, execution);
+    const started = store.get(`om-input:${project}`) ? startRun(guarded(store, guards), { project, ...intent }, execution.hold)
+      : coldStart(store, project, intent, execution, guards);
     if (!started.ok) return ended(store, project, started.refusal);
-    return drive(store, project, dispatch.value, execution, reference(started.value));
+    return drive(store, project, runRequest, execution, reference(started.value));
   });
 }
 /**
  * A project without any OM record: the machine producer of H1.1 writes its first B1, the pass with its launch intent and
  * the bases of that intent (the point H1.1 provides for it), under the held control.
  */
-function coldStart(store: Store, project: string, intent: { outcomes?: readonly string[] }, execution: RunExecution): OmResult<Revision<RunRecord>> {
+function coldStart(store: Store, project: string, intent: { outcomes?: readonly string[] }, execution: RunExecution,
+  guards: readonly TransactionGuard[] = []): OmResult<Revision<RunRecord>> {
   try {
-    const built = writeRunBases(new RunControlGate(store, project, execution.hold).view(), { project, ...intent });
+    // Every write of the build carries the guards — its B1, its pass (written through startRun inside) and its bases.
+    const built = writeRunBases(guarded(new RunControlGate(store, project, execution.hold).view(), guards), { project, ...intent });
     if (!built.ok) return built;
     const run = savedRun(store, project);
     return run ? { ok: true, value: run } : refused("record_missing", "The machine bases wrote no pass", { unit: UNIT, target: `om-run:${project}`, field: "run" }, "producer");
   } catch (error) { if (error instanceof RunControlLost) return { ok: false, refusal: error.refusal }; throw error; }
+}
+/** ENV1: the store whose every write of the new pass also carries the guards of the conditions it was admitted on. */
+function guarded(store: Store, guards: readonly TransactionGuard[]): Store {
+  return guards.length ? storeView(store, { write: (inputs, own) => store.writeMany(inputs, [...own, ...guards]) }) : store;
 }
 /** Continues the existing pass with its saved intent; it never creates a pass and never lifts a stop. */
 export async function continuePass(store: Store, request: PassRequest): Promise<OmResult<Sealed<PassOutcome>>> {

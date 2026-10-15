@@ -29,6 +29,7 @@ export type ProductCommand =
   | { type: "om-start"; project: string; outcomes?: string[] }
   | { type: "om-continue"; project: string; resumeStop?: string; release?: "regate_owner_policy" }
   | { type: "om-state"; project: string }
+  | { type: "environment-readiness"; project: string }
   | { type: "om-spend"; project: string }
   | { type: "om-stop"; project: string }
   | { type: "om-fsck"; project: string }
@@ -130,7 +131,7 @@ const reviseEarlyStageInput = command("revise-early-stage-input", { project, exp
 const stageSummary = command("stage-summary", { project, stage });
 stageSummary.properties['draftId'] = string;
 const schema = { oneOf: [
-  omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
+  omStart, omContinue, command("om-state", { project }), command("environment-readiness", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("om-decisions", { project }),
   // RL3 (№4205): the owner's explicit reopening of a completed pass's accepted L3 by the AT1 door.
   command("om-regate", { project }),

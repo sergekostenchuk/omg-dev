@@ -5,6 +5,7 @@ import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
 import { configureDispatch } from '../om/dispatch.js';
 import { continuePass, readPass, resumeStoppedPass, startPass, stopPass } from '../om/run-driver.js';
+import { readEnvironmentReadiness } from '../om/environment-readiness.js';
 import { regateRun, releaseRegateWait } from '../om/run.js';
 import { spendReport } from '../om/spend-report.js';
 import { writeGuarded } from '../om/refs.js';
@@ -315,6 +316,8 @@ export class ProductEngine {
         return continuePass(this.store, { project: command.project });
       }
       case "om-state": this.#project(command.project); return readPass(this.store, { project: command.project });
+      // ENV1: the read-only conditions of the environment, each with its moment; it writes and admits nothing.
+      case "environment-readiness": this.#project(command.project); return readEnvironmentReadiness(this.store, { project: command.project });
       case "om-spend": this.#project(command.project); return spendReport(this.store, { project: command.project });
       case "om-stop": this.#project(command.project); return stopPass(this.store, { project: command.project });
       // NR1 (№3646): the integrity check of the database on request; it also runs by itself at every om-start and om-continue.

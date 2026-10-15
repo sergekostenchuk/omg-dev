@@ -22,10 +22,13 @@ import type { Graph } from "../src/graph/model.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
 import type { RoutesRecord } from "../src/om/routes.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
-import { readRunControl, runControlId } from "../src/om/run-control.js";
+import { acquireRunExecution, readRunControl, releaseRunExecution, runControlId,
+  type RunExecution } from "../src/om/run-control.js";
 import { continuePass, readPass, resumeStoppedPass, startPass, stopPass, type PassOutcome } from "../src/om/run-driver.js";
 import { advanceRun, readRun, runId, startRun, type RunRecord, type RunRequest } from "../src/om/run.js";
 import { gardenGraph } from "./om-fixture.js";
+import { omStartReadiness, readEnvironmentReadiness } from "../src/om/environment-readiness.js";
+import { Environments, type Environment } from "../src/runtime/environment.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
@@ -47,10 +50,18 @@ const snapshot = (store: Store): Ref[] => store.list().map(reference);
  * environment whose roles run the scripted adapter, and the dispatch configured by E4.1. A cold project has no OM
  * record at all; otherwise B1 exists with every other decision addressed.
  */
-function driverFixture(t: TestContext, cold = false, questions = ["encoding"], refine = true) {
-  const root = mkdtempSync(join(tmpdir(), "omg-h13-drive-")), database = join(root, "state.sqlite"), workspace = join(root, "repo");
-  mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "H1.3 pass repository\n");
-  git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
+/** ENV1: the environment a fixture configures — by default a committed Git root, capacity and the dispatch. */
+interface FixtureEnvironment { repo?: "git" | "none" | "no-head" | "nested"; capacity?: boolean; dispatch?: boolean;
+  fullCheck?: { executable: string; args: string[] } }
+const commitAll = (workspace: string) => {
+  git(workspace, ["add", "-A"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
+};
+function driverFixture(t: TestContext, cold = false, questions = ["encoding"], refine = true, env: FixtureEnvironment = {}) {
+  const root = mkdtempSync(join(tmpdir(), "omg-h13-drive-")), database = join(root, "state.sqlite"), repository = join(root, "repo");
+  const mode = env.repo ?? "git", workspace = mode === "nested" ? join(repository, "sub") : repository;
+  mkdirSync(workspace, { recursive: true }); writeFileSync(join(workspace, "README.md"), "H1.3 pass repository\n");
+  if (mode !== "none") git(repository, ["init", "-b", "main"]);
+  if (mode === "git" || mode === "nested") commitAll(repository);
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   preparedFeatures(engine, project, gardenGraph(), field => {
@@ -64,7 +75,8 @@ function driverFixture(t: TestContext, cold = false, questions = ["encoding"], r
   engine.environments.configure(project, { workspace,
     implementer: { actor: "run-implementer", model: "fixture", effort: "high", speed: "fast", command },
     reviewer: { actor: "run-reviewer", model: "fixture-reviewer", effort: "medium", command },
-    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: 100_000 }, 0);
+    fullCheck: env.fullCheck ?? { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000,
+    ...(env.capacity === false ? {} : { requestCapacityChars: 100_000 }) }, 0);
   if (refine) refinedLayers(engine, project);
   if (!cold) {
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
@@ -78,10 +90,10 @@ function driverFixture(t: TestContext, cold = false, questions = ["encoding"], r
     });
     if (decisions.length) ok(writeAddressing(store, { project, input: reference(base), graph, decisions }));
   }
-  const dispatch = ok(configureDispatch(store, { project, protocol: "codex-stdio" })).dispatch;
-  return { root, database, dispatch,
+  const dispatch = env.dispatch === false ? null : ok(configureDispatch(store, { project, protocol: "codex-stdio" })).dispatch;
+  return { root, database, workspace, repository, get engine() { return engine; }, dispatch: dispatch!,
     get store() { return store; },
-    request(): RunRequest { return { project, dispatch }; },
+    request(): RunRequest { return { project, dispatch: dispatch! }; },
     steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ database: store.path, steps })); },
     sent(): { requestId: string }[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : []; },
     pause(name: string) { return join(root, `${name}.pause.json`); },
@@ -397,4 +409,182 @@ test("R2 R6 №1991-4 №1991-7 H1.3 legacy N2 × the bases over it: a stop on t
   const run = ok(readRun(f.store, { project }))!;
   assert.ok(!f.store.history(run.id).some(row => ["bases_stale", "d2_bases"].includes((row.value as unknown as RunRecord).state.phase === "waiting"
     ? ((row.value as unknown as RunRecord).state as { wait: { code: string } }).wait.code : "")), "The drive never stood on bases_stale or d2_bases");
+});
+
+// ENV1 (contract №4864 §4): the conditions of a NEW OM pass are observed at its start, before any B1, pass record or call.
+const conditionOf = (store: Store, name: string) => readEnvironmentReadiness(store, { project }).conditions.find(row => row.condition === name)!;
+function reconfigure(store: Store, change: Partial<Omit<Environment, "projectId">>) {
+  const head = store.get<Environment>(`environment:${project}`)!, { projectId: _projectId, ...value } = head.value;
+  return new Environments(store).configure(project, { ...value, ...change }, head.revision);
+}
+async function heldStart(f: Fixture, name: string) {
+  f.steps([holding(f.pause(name))]);
+  const driving = startPass(f.store, { project });
+  const first = await Promise.race([checkpoint(f.pause(name)).then(() => null), driving]);
+  if (first) assert.fail(`The start ended before its first dispatch: ${JSON.stringify(first.ok ? first.value.end : first.refusal)}`);
+  other(f.database, store => ok(stopPass(store, { project })));
+  return ok(await driving) as PassOutcome;
+}
+
+for (const cold of [true, false])
+test(`ENV1 a live execution precedes readiness for a ${cold ? "cold project" : "saved B1"}; once free, the unready environment writes nothing`, async t => {
+  const f = driverFixture(t, cold, ["encoding"], true, { repo: "none" });
+  const execution = ok(acquireRunExecution(f.store, { project })) as RunExecution;
+  const occupied = snapshot(f.store);
+  try {
+    const busy = ok(await startPass(f.store, { project }));
+    assert.deepEqual([busy.end, busy.refusal?.code, busy.refusal?.at.field], ["busy", "run_busy", "execution"],
+      "The existing executor wins over today's readiness refusal");
+    assert.deepEqual(busy.refusal, refusal(acquireRunExecution(f.store, { project })),
+      "The read-only precedence check returns the same refusal as the final executor CAS");
+    assert.deepEqual(snapshot(f.store), occupied, "The read-only busy check writes nothing");
+    assert.equal(f.sent().length, 0, "A busy start sends nothing");
+  } finally {
+    releaseRunExecution(f.store, execution);
+  }
+
+  const free = snapshot(f.store);
+  const unready = refusal(await startPass(f.store, { project }));
+  assert.deepEqual([unready.code, unready.at.field], ["environment_not_ready", "repository"],
+    "The free executor exposes the addressed readiness refusal");
+  assert.deepEqual(snapshot(f.store), free, "A free but unready start writes no control, B1, pass or call");
+  assert.equal(f.sent().length, 0);
+  assert.equal(ok(readRun(f.store, { project })), null);
+  assert.equal(cold ? f.store.get(`om-input:${project}`) : null, null, "A cold refusal creates no B1");
+});
+
+for (const repo of ["none", "no-head", "nested"] as const)
+test(`ENV1 a ${repo} workspace: the research runners stand, the status names the repository, a new pass writes and calls nothing; after the operator's fix the same start goes on`, async t => {
+  const f = driverFixture(t, true, ["encoding"], true, { repo });
+  assert.deepEqual(["research:implementer", "research:reviewer"].map(name => conditionOf(f.store, name).state), ["available", "available"],
+    "Documentary research keeps its runner");
+  const repository = conditionOf(f.store, "repository");
+  assert.deepEqual([repository.state, repository.code, repository.requiredBy], repo === "nested" ? ["invalid", "repository_root", "om-start"]
+    : ["missing", repo === "none" ? "repository_unavailable" : "repository_head_missing", "om-start"]);
+  const before = snapshot(f.store);
+  const refused = refusal(await startPass(f.store, { project }));
+  assert.deepEqual([refused.code, refused.at.field, refused.at.target], ["environment_not_ready", "repository", repository.at]);
+  assert.deepEqual(snapshot(f.store), before, "No B1, pass or call record");
+  assert.equal(f.sent().length, 0, "Nothing is sent");
+  if (repo === "none") { git(f.repository, ["init", "-b", "main"]); commitAll(f.repository); }
+  else if (repo === "no-head") commitAll(f.repository);
+  // Selecting another folder would invalidate the refined layers made on this workspace; the operator makes it a root.
+  else { git(f.workspace, ["init", "-b", "main"]); commitAll(f.workspace); }
+  assert.equal(conditionOf(f.store, "repository").state, "available");
+  assert.equal((await heldStart(f, "fixed")).end, "stopped");
+  assert.ok(f.store.get(`om-input:${project}`) && ok(readRun(f.store, { project })), "The same start now writes the pass");
+});
+
+test("ENV1 a saved om-input without a pass gets the same admission at startRun: refused before the pass; after the fix the start goes on", async t => {
+  const f = driverFixture(t, false, ["encoding"], true, { repo: "no-head" });
+  const input = reference(f.store.get(`om-input:${project}`)!);
+  assert.equal(ok(readRun(f.store, { project })), null);
+  const before = snapshot(f.store);
+  assert.deepEqual([refusal(await startPass(f.store, { project })).code], ["environment_not_ready"]);
+  assert.deepEqual(snapshot(f.store), before);
+  commitAll(f.repository);
+  assert.equal((await heldStart(f, "saved")).end, "stopped");
+  assert.ok(ok(readRun(f.store, { project })), "The pass is written on the saved input");
+  assert.deepEqual(reference(f.store.get(`om-input:${project}`, input.revision)!), input, "The saved B1 history stays");
+});
+
+for (const change of ["environment", "dispatch"] as const)
+test(`ENV1 a second Store changes the ${change} after the admission and before the first write of the new pass: it refuses and nothing of the pass is written`, async t => {
+  const f = driverFixture(t, true);
+  const original = f.store.writeMany.bind(f.store); let moved = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    if (!moved && writes.some(write => write.id === `om-input:${project}` || write.id === runId(project))) {
+      moved = true;
+      other(f.database, store => change === "environment" ? reconfigure(store, { timeoutMs: 11_000 })
+        : ok(configureDispatch(store, { project, protocol: "devin-stdio" })));
+    }
+    return original<T>(writes, guards);
+  };
+  let result: Awaited<ReturnType<typeof startPass>>;
+  try { result = await startPass(f.store, { project }); } finally { f.store.writeMany = original; }
+  assert.ok(moved, "The change landed inside the window");
+  assert.equal(refusal(result).code, "input_stale");
+  assert.equal(f.store.get(`om-input:${project}`), null, "No B1");
+  assert.equal(ok(readRun(f.store, { project })), null, "No pass");
+  assert.equal(f.sent().length, 0);
+});
+
+test("ENV1 a dispatch switched after the first selection and before readiness is the guarded dispatch used by the new pass", async t => {
+  const f = driverFixture(t, true);
+  const original = f.store.get.bind(f.store); let activeReads = 0, moved = false;
+  f.store.get = function<T = Json>(id: string, revision?: number): Revision<T> | null {
+    const found = original<T>(id, revision);
+    if (!moved && revision === undefined && id === `adapter:${project}:active` && ++activeReads === 1) {
+      moved = true;
+      other(f.database, store => ok(configureDispatch(store, { project, protocol: "devin-stdio" })));
+    }
+    return found;
+  };
+  const outcome = await heldStart(f, "dispatch-selection");
+  assert.equal(outcome.end, "stopped");
+  assert.ok(moved, "The dispatch moved between the first selection and the readiness snapshot");
+  const call = f.store.list<OmModelCall>("model-call")[0]!;
+  assert.equal(call.value.om.request.dispatch.adapter.id, `adapter:${project}:active`,
+    "The call uses the dispatch selected by the readiness snapshot, not the stale earlier selection");
+});
+
+test("ENV1 a check script the product will write is a future condition — neither ready nor a refusal — and the check is never run here", async t => {
+  const f = driverFixture(t, true, ["encoding"], true, { fullCheck: { executable: process.execPath, args: ["scripts/check.mjs"] } });
+  assert.deepEqual([conditionOf(f.store, "check").state, conditionOf(f.store, "check").requiredBy], ["future", "check"]);
+  assert.equal(omStartReadiness(f.store, project).ok, true, "A future check does not forbid OM");
+  const marker = join(f.root, "check-ran");
+  mkdirSync(join(f.workspace, "scripts"), { recursive: true });
+  writeFileSync(join(f.workspace, "scripts", "check.mjs"), `import{writeFileSync}from'node:fs';writeFileSync(${JSON.stringify(marker)},'ran');`);
+  assert.equal(conditionOf(f.store, "check").state, "unverified", "An existing check is not reported ready either");
+  assert.equal((await heldStart(f, "check")).end, "stopped");
+  assert.equal(existsSync(marker), false, "No baseline run");
+});
+
+test("ENV1 a saved pass is continued under its own record: today's missing repository is shown, but neither blocks the continuation nor reinterprets history", async t => {
+  const { f, stop } = await stoppedAtFirstDispatch(t);
+  rmSync(join(f.repository, ".git"), { recursive: true, force: true });
+  assert.equal(conditionOf(f.store, "repository").state, "missing", "Today's status names it");
+  const saved = ok(readPass(f.store, { project }));
+  assert.ok(saved.run, "The saved pass reads as it is");
+  ok(resumeStoppedPass(f.store, { project, stop }));
+  const continued = await startPass(f.store, { project });
+  assert.notEqual(continued.ok ? null : continued.refusal.code, "environment_not_ready", "A saved pass is not started again");
+});
+
+test("ENV1 a change between the new B1 and its pass refuses the pass; the B1 stands as a saved input and the next start takes it without a second B1", async t => {
+  const f = driverFixture(t, true);
+  const original = f.store.writeMany.bind(f.store); let moved = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    if (!moved && writes.some(write => write.id === runId(project))) { moved = true; other(f.database, store => reconfigure(store, { timeoutMs: 11_000 })); }
+    return original<T>(writes, guards);
+  };
+  let result: Awaited<ReturnType<typeof startPass>>;
+  try { result = await startPass(f.store, { project }); } finally { f.store.writeMany = original; }
+  assert.ok(moved);
+  assert.equal(refusal(result).code, "input_stale");
+  assert.equal(ok(readRun(f.store, { project })), null, "No pass on the stale reading");
+  const input = reference(f.store.get(`om-input:${project}`)!);
+  assert.equal((await heldStart(f, "after")).end, "stopped");
+  assert.ok(ok(readRun(f.store, { project })), "The pass is written on today's conditions");
+  assert.deepEqual(reference(f.store.get(`om-input:${project}`, input.revision)!), input);
+  assert.equal(f.store.history(`om-input:${project}`).length >= 1, true);
+});
+
+for (const missing of ["capacity", "dispatch"] as const)
+test(`ENV1 a missing ${missing}: the status names its address before OM; the start refuses before any write; after configure the same start goes on without a second B1`, async t => {
+  // The dispatch is configured under a capacity: without one the operator configures both, capacity first.
+  const f = driverFixture(t, true, ["encoding"], true, missing === "capacity" ? { capacity: false, dispatch: false } : { dispatch: false });
+  const shown = conditionOf(f.store, missing);
+  assert.deepEqual([shown.state, shown.requiredBy], ["missing", "om-start"]);
+  assert.equal(shown.at, missing === "capacity" ? `environment:${project}` : `adapter:${project}:codex-stdio`);
+  const before = snapshot(f.store);
+  const refused = refusal(await startPass(f.store, { project }));
+  assert.equal(refused.code, missing === "capacity" ? "capacity_missing" : "record_missing");
+  assert.deepEqual(snapshot(f.store), before, "Nothing is written");
+  assert.equal(f.sent().length, 0);
+  if (missing === "capacity") reconfigure(f.store, { requestCapacityChars: 100_000 });
+  ok(configureDispatch(f.store, { project, protocol: "codex-stdio" }));
+  assert.equal(conditionOf(f.store, missing).state, "available");
+  assert.equal((await heldStart(f, "configured")).end, "stopped");
+  assert.equal(f.store.history(`om-input:${project}`).length, 1, "One B1");
 });

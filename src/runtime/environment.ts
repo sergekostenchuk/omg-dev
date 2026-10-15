@@ -1,5 +1,5 @@
 import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { checkTransactionGuards, Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -155,6 +155,30 @@ export function workspacePath(root: string, path: string): string {
   requireCondition(!within.split(/[\\/]/).some(part => part.toLowerCase() === ".git"),
     "path_invalid", "A work path cannot resolve into Git metadata");
   return target;
+}
+/**
+ * ENV1: the exact Git root of a workspace and its resolvable HEAD and tree, read now — a local observation of the moment,
+ * never a lasting proof and not the M8 inspection (no write scope, files, tests or executors). Dirty is shown, not refused.
+ */
+export interface RepositoryHead { root: string; head: string; tree: string; dirty: boolean }
+export function repositoryHead(workspace: string): RepositoryHead {
+  let root: string;
+  try { root = realpathSync(workspace); }
+  catch { throw new EngineError("repository_unavailable", "The workspace does not exist", { target: workspace }); }
+  let top: string;
+  try { top = realpathSync(git(root, ["rev-parse", "--show-toplevel"])); }
+  catch { throw new EngineError("repository_unavailable", "The workspace is not a Git repository", { target: root }); }
+  if (top !== root) throw new EngineError("repository_root", "Select the Git repository root, not a folder inside it", { target: root, root: top });
+  let head: string, tree: string;
+  try { head = git(root, ["rev-parse", "--verify", "HEAD"]); tree = git(root, ["rev-parse", "HEAD^{tree}"]); }
+  catch { throw new EngineError("repository_head_missing", "The repository has no commit yet", { target: root }); }
+  return { root, head, tree, dirty: git(root, ["status", "--porcelain", "--untracked-files=all"]) !== "" };
+}
+/** ENV1: the script a `node <file>` command runs — a path to look at when the form names one; never its content or auth. */
+export function commandModulePath(command: Command, cwd: string): string | null {
+  const first = command.args[0];
+  return /^node(\.exe)?$/i.test(basename(command.executable)) && first !== undefined && !first.startsWith("-") && /\.[cm]?js$/.test(first)
+    ? resolve(cwd, first) : null;
 }
 export function inspectRepository(environment: Environment, graph: Graph): { state: RepositoryState | null; findings: Finding[] } {
   const findings: Finding[] = [];
