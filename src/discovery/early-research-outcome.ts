@@ -1,7 +1,8 @@
 import { Ajv } from 'ajv';
 import { EngineError, requireCondition } from '../errors.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
-import { requireDiscoveryProposal, type DiscoveryContext } from './discovery-outcome.js';
+import { requireDiscoveryProposal, type DiscoveryBasisCatalogue, type DiscoveryContext } from './discovery-outcome.js';
+import { conceptApplicationFindings, requiresConceptApplications } from './preparation-validation.js';
 import { researchAction, responseAction } from './research-consumer-transition.js';
 import { canonical } from '../canonical.js';
 import { isRef, type Ref, type StageArtifact } from '../pipeline/contracts.js';
@@ -48,7 +49,8 @@ export function earlyUpstreamTargets(store: Store, draft: DiscoveryDraft): Early
  * This rule classifies only reply errors; it never grants a physical dispatch. */
 export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
   role: 'analyst' | 'assessor' | 'escalation-assessor', payload: unknown,
-  discovery: DiscoveryContext | null = null, web = false, unknown: EarlyUnknownAdmission | null = null): EngineError | null {
+  discovery: DiscoveryContext | null = null, web = false, unknown: EarlyUnknownAdmission | null = null,
+  catalogue: DiscoveryBasisCatalogue | null = null): EngineError | null {
   requireCondition(draft && typeof draft.stage === 'string' && draft.stage && question && question.draftId && question.projectId === draft.projectId
     && Array.isArray(draft.questions) && question.spec?.schema !== undefined
     && ['analyst', 'assessor', 'escalation-assessor'].includes(role),
@@ -84,13 +86,21 @@ export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
         // admission still rejects a valid paid answer whose grounds have moved.
         requireDiscoveryProposal(draft, { id: action.question, value: question },
           action.value, discovery, action.citations.length);
+        if (requiresConceptApplications(draft, question)) {
+          if (catalogue === null) throw new EngineError('basis_application_material_invalid',
+            'A concept answer needs the exact Discovery catalogue delivered with this call',
+            { field: 'discoveryBasisCatalogue' });
+          const finding = conceptApplicationFindings(action.value, catalogue)[0];
+          if (finding) throw new EngineError(finding.code, `[${finding.target}] ${finding.message}`, finding);
+        }
       }
     }
   } catch (error) {
     if (error instanceof EngineError && ['research_response_invalid', 'reader_pilot_required',
       'reading_plan_disabled', 'research_question_foreign', 'research_upstream_invalid', 'answer_invalid',
       'assessment_invalid', 'escalation_assessment_invalid', 'discovery_basis_stale',
-      'discovery_constraint_missing', 'discovery_constraint_stale', 'discovery_research_invalid'].includes(error.code)) return error;
+      'discovery_constraint_missing', 'discovery_constraint_stale', 'discovery_research_invalid',
+      'basis_application_invalid', 'basis_application_missing'].includes(error.code)) return error;
     throw error;
   }
   return null;

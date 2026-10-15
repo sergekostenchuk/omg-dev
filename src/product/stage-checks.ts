@@ -1,4 +1,4 @@
-import { discoveryOutcome } from '../discovery/discovery-outcome.js';
+import { discoveryBasisCatalogue, discoveryOutcome } from '../discovery/discovery-outcome.js';
 import { readOmInput } from '../om/input.js';
 import { isPlainObject } from '../om/refusal.js';
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
@@ -18,7 +18,7 @@ import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
 import { resultGate } from "../execution/result.js";
-import { preparationFindings } from "../discovery/preparation-validation.js";
+import { conceptApplicationFindings, preparationFindings } from "../discovery/preparation-validation.js";
 import { assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { readModelCallRecovery } from "../discovery/model-call-recovery.js";
 
@@ -278,6 +278,24 @@ export class StageChecks {
         const source = this.store.get<StageArtifact>(stageId(context.projectId, name));
         return (source?.value.content as unknown as StageContent | undefined)?.fields ?? null;
       }, outcomes?.value.projection.artifacts.map(artifact => artifact.id) ?? []));
+    }
+    if (stage === 'concept' && version === 6) {
+      const source = context.inputs[0];
+      try {
+        requireCondition(source?.value.stage === 'discovery' && source.value.status === 'accepted',
+          'basis_application_material_invalid',
+          `[${stageId(context.projectId, 'discovery')}] The concept needs its exact accepted Discovery source`);
+        const fields = (source.value.content as unknown as StageContent)?.fields;
+        requireCondition(fields && typeof fields === 'object' && !Array.isArray(fields),
+          'basis_application_material_invalid', `[${source.id}] Accepted Discovery fields are missing`);
+        const catalogue = discoveryBasisCatalogue({ ref: reference(source), fields });
+        result.findings.push(...conceptApplicationFindings(content.fields['conceptSections'] ?? null, catalogue));
+        result.guards.push(reference(source));
+      } catch (error) {
+        if (!(error instanceof EngineError)) throw error;
+        result.findings.push({ code: error.code, target: source?.id ?? stageId(context.projectId, 'discovery'),
+          field: 'conceptSections', message: error.message });
+      }
     }
     const prior = context.inputs[0];
     if (prior && !draft.value.inputs.some(input => input.id === prior.id && input.hash === prior.hash && input.revision === prior.revision)) result.findings.push({ code: "research_context_stale", target: stage, message: "Research must bind the accepted prerequisite used by this stage" });

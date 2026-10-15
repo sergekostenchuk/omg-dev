@@ -4,7 +4,7 @@ import { FOUNDATION_FIELDS, contextSections, selectedQuestion, replaceFoundation
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
-import { reference, type Ref } from "../pipeline/contracts.js";
+import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { planningContext } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
@@ -57,6 +57,12 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
+  if (draft.value.contractVersion === 6 && draft.value.stage === 'concept') requireCondition(
+    body['discoveryBasisCatalogue']?.contract === 'discovery-basis-catalogue/v1'
+      && isRef(body['discoveryBasisCatalogue'].source)
+      && Array.isArray(body['discoveryBasisCatalogue'].constraints)
+      && body['discoveryBasisCatalogue'].variant !== undefined,
+    'context_discovery_incomplete', `[${question.id}] Concept v6 needs the exact accepted Discovery basis catalogue`);
   const priorSources=priorEvidenceSources(body['priorEvidence']??[]);
   if(priorSources.length)body['priorEvidenceSources']=priorSources;
   const inventory = body['inventory'] as any;
@@ -71,6 +77,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   const archivedBody = body;
   const relatedResearch = body['discoveryContext'];
+  const relatedCatalogue = body['discoveryBasisCatalogue'];
   const neighborMaterial = body['assessmentContextContract'] === STAGE_NEIGHBOR_CONTEXT
     ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: body['stageNeighbors'] } : null;
   if (neighborMaterial) requireCondition(neighborMaterial.stageNeighbors?.contract === 'stage-neighbors/v1',
@@ -87,6 +94,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (relatedResearch !== undefined) requireCondition(packet.discoveryContext
       && canonical(packet.discoveryContext) === canonical(relatedResearch),
     'context_discovery_incomplete', `[${question.id}] The packed question lost its accepted research grounds`);
+    if (relatedCatalogue !== undefined) requireCondition(packet.discoveryBasisCatalogue !== undefined
+      && canonical(packet.discoveryBasisCatalogue) === canonical(relatedCatalogue),
+    'context_discovery_incomplete', `[${question.id}] The packed question lost its exact Discovery basis catalogue`);
     if (neighborMaterial) requireCondition(packet.assessmentContextContract === STAGE_NEIGHBOR_CONTEXT
       && packet.stageNeighbors !== undefined && canonical(packet.stageNeighbors) === canonical(neighborMaterial.stageNeighbors),
     'context_stage_neighbors_incomplete', `[${question.id}] The packed assessor lost its accepted stage neighbors`);
@@ -160,6 +170,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (projectedQuestion) { body['question'] = projectedQuestion; if (Object.hasOwn(original, 'questions')) body['questions'] = [projectedQuestion]; }
     if(original['assessmentState'])body['value']=assessmentValue;
     if(relatedResearch !== undefined)body['discoveryContext']=relatedResearch;
+    if(relatedCatalogue !== undefined)body['discoveryBasisCatalogue']=relatedCatalogue;
     if(neighborMaterial)Object.assign(body,neighborMaterial);
     if(candidate) body['candidate']=replaceFoundationCopies(candidate,{...original,value:undefined},reference(archive),store);
     if(proposalChanges) body['proposalChanges']=replaceFoundationCopies(proposalChanges,{...original,previousProposal:undefined},reference(archive),store);
@@ -182,13 +193,15 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   }
   if (body['dispatchMode'] === "planning" && !options.continuation) {
     const reserved = (relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length)
+      + (relatedCatalogue === undefined ? 0 : JSON.stringify({discoveryBasisCatalogue:relatedCatalogue}).length)
       + (neighborMaterial ? JSON.stringify(neighborMaterial).length : 0);
     const packet = planningContext(body,reference(archive),maxChars-reserved,options.contextChars,archivedBody);
     if(relatedResearch !== undefined)packet.discoveryContext=relatedResearch;
+    if(relatedCatalogue !== undefined)packet.discoveryBasisCatalogue=relatedCatalogue;
     if(neighborMaterial)Object.assign(packet,neighborMaterial);
     return finish(packet);
   }
-  const mandatory = ["assessmentContextContract", "stageNeighbors", "discoveryContext", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation

@@ -37,7 +37,7 @@ import { readAssessmentPaidOrigin, paidAssessmentTerminal } from "./assessment-s
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 import { processStart } from "../runtime/process-identity.js";
 import { reuseResearch } from "./research-reuse.js";
-import { researchPrerequisites, researchGraphContext } from "./research-context.js";
+import { readDiscoveryBasisMaterial, researchPrerequisites, researchGraphContext } from "./research-context.js";
 import type { Graph } from '../graph/model.js';
 import { consumerFeedback } from "./consumer-feedback.js";
 import { researchHistory } from "./research-history.js";
@@ -609,6 +609,8 @@ export class Researcher {
         const workspace=addressedWorkspace(this.store,turns,pending[0]!);
         const related = forcedPendingTurn ? { context: null, guards: [] }
           : discoveryContext(this.store, draft, pending[0]!);
+        const conceptMaterial = draft.value.contractVersion === 6 && draft.value.stage === 'concept'
+          ? readDiscoveryBasisMaterial(this.store, draft.value) : null;
         const context = pilot ? { ...pilotContext(this.store, draft, pending[0]!),
           ...(mode ? { dispatchMode: mode, repositoryRoot: effective.root } : {}),
           researchMissing: ([...turns].reverse().find(t => t.value.question?.id === pending[0]!.id
@@ -646,12 +648,14 @@ export class Researcher {
           const failure = failedIntent ? earlyResearchConsumerFailure(this.store, failedIntent)
             : failedProducer ? earlyResearchFailure(failedDraft!.value, failedQuestion!.value,
               'analyst', failedTurn!.value.action, failedProducer.value.cursor.context?.discoveryContext ?? null,
-              intentWebCapability(this.store, failedProducer), earlyUnknownAdmission(this.store, failedProducer, failedDraft!, failedQuestion!)) : null;
+              intentWebCapability(this.store, failedProducer), earlyUnknownAdmission(this.store, failedProducer, failedDraft!, failedQuestion!),
+              failedProducer.value.cursor.context?.discoveryBasisCatalogue ?? null) : null;
           // WB1 (№4639): the cause follows the failed call; the actions offered follow the dispatch of this new call.
           if (failure) Object.assign(context, { failures: [earlyResearchCorrection('analyst', failure,
             reference(failedIntent ?? failedTurn!), pending[0]!.value, webResearchCapability(draft.value.stage, 'analyst', dispatch), !mode)] });
         }
         if (related.context) Object.assign(context, { discoveryContext: related.context });
+        if (conceptMaterial) Object.assign(context, { discoveryBasisCatalogue: conceptMaterial.catalogue });
         // WB1: only the Discovery analyst call that carries the web capability is offered web actions and the budget left.
         if (!mode && webResearchCapability(draft.value.stage, 'analyst', dispatch))
           Object.assign(context, { webResearch: webResearchGuide(webBudgetView(this.store, project, draft.value.stage, dispatch.webResearch!)) });
@@ -794,7 +798,8 @@ export class Researcher {
               pendingTurn = replayed[1]! as Revision<ResearchTurn>;
               action = admittedResearchAction(pendingTurn.value.action);
             } else {
-            const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...(outcome?.guards ?? []), ...related.guards, ...turns.map(reference),
+            const basis = uniqueRefs([...draft.value.inputs, ...(conceptMaterial?.guards ?? []), ...effective.guards,
+              ...(outcome?.guards ?? []), ...related.guards, ...turns.map(reference),
               ...sources.list().map(reference)]);
             const layerGraph = draft.value.stage === 'om-g2' && pending[0]!.value.spec.field === 'layerDesign'
               ? this.store.get<Graph>(`graph:${project}`) : null;
@@ -838,7 +843,8 @@ export class Researcher {
             const web = intentWebCapability(this.store, producer);
             const admission = earlyUnknownAdmission(this.store, producer, originalDraft, originalQuestion);
             const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action,
-              producer.value.cursor.context?.discoveryContext ?? null, web, admission);
+              producer.value.cursor.context?.discoveryContext ?? null, web, admission,
+              producer.value.cursor.context?.discoveryBasisCatalogue ?? null);
             if (failure) {
               const value = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn,
                 { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer, ...(web ? { web: true } : {}),
@@ -1052,9 +1058,11 @@ export class Researcher {
               const neighborView = usesStageNeighbors(draft.value.stage) ? assessmentReadView(this.store) : null;
               const neighbors = neighborView ? stageNeighbors(neighborView.store, draft, question) : { context: null, guards: [] };
               const neighborReads = neighborView?.finish();
-              const instruction = "Determine if a user question is unavoidable. Check existing owner statements, available evidence, actual searches, and remaining research options. Return JSON {necessary:boolean, reason:string}. necessary=true only for unavailable essential information or an undecided owner-only choice after relevant research. Technical failure is not a reason. Do not invent facts." + (neighborView ? STAGE_NEIGHBOR_INSTRUCTION + ' A request already resolved by the accepted prefix does not require another owner choice.' : '');
+              const instruction = "Determine if a user question is unavoidable. Check existing owner statements, available evidence, actual searches, and remaining research options. Return JSON {necessary:boolean, reason:string}. necessary=true only for unavailable essential information or an undecided owner-only choice after relevant research. Technical failure is not a reason. Do not invent facts." + (neighborView ? STAGE_NEIGHBOR_INSTRUCTION + ' A request already resolved by the accepted prefix does not require another owner choice.' : '')
+                + (conceptMaterial ? ' The accepted Discovery catalogue states the selected variant and constraints; use it when judging whether an owner choice is still missing.' : '');
               const escalationContext = { role: "assess-escalation", question: question.value.spec,
                 request: action, inventory: sources.inventory(), history,
+                ...(conceptMaterial ? { discoveryBasisCatalogue: conceptMaterial.catalogue } : {}),
                 ...(neighborView ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: neighbors.context } : {}) };
               if (early) {
                 const prior = [...intents].sort((a, b) => b.value.generation - a.value.generation).find(item => item.value.kind === 'escalation-assessor'
@@ -1064,7 +1072,8 @@ export class Researcher {
                 if (failure) Object.assign(escalationContext, { failures: [earlyResearchCorrection(
                   'escalation-assessor', failure, reference(prior!), question.value)] });
               }
-              const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...neighbors.guards, ...consulted,
+              const basis = uniqueRefs([...draft.value.inputs, ...effective.guards, ...neighbors.guards,
+                ...(conceptMaterial?.guards ?? []), ...consulted,
                 ...action.searched, reference(pendingTurn), ...turns.map(reference)]);
               const intent = prepareResearchConsumerIntent(this.store, {
                 projectId: project, kind: "escalation-assessor", key: hashJson([id, pendingTurn.value.number, "escalation-assessor"]),

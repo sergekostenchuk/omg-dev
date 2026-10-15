@@ -3,7 +3,8 @@ import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEGACY_REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
 import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../discovery/preparation-contracts.js";
-import { preparationFindings } from "../discovery/preparation-validation.js";
+import { conceptApplicationFindings, preparationFindings } from "../discovery/preparation-validation.js";
+import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 import { readAcceptedResearchAnswer } from "../discovery/discovery.js";
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
@@ -520,6 +521,19 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
     const covered = new Set(features.flatMap((feature: unknown) => object(feature) && Array.isArray(feature.requirements) ? feature.requirements : []));
     if (covered.size !== behaviors.length || [...covered].some(value => !Number.isSafeInteger(value) || Number(value) < 0 || Number(value) >= behaviors.length))
       return refuse("stage_not_accepted", "Prepared features must cover every specified behavior", at(result.features.ref.id, "features.requirements", result.features.ref), "producer");
+  }
+  if (result.concept.contractVersion === 6) {
+    try {
+      const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
+      const applications = conceptApplicationFindings(result.concept.fields['conceptSections'] ?? null, catalogue);
+      if (applications.length) return refuse('stage_not_accepted',
+        `${applications[0]!.code}: ${applications[0]!.message}`,
+        at(result.concept.ref.id, applications[0]!.target.slice(1), result.concept.ref), 'producer');
+    } catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      return refuse('stage_not_accepted', `${error.code}: ${error.message}`,
+        at(result.discovery.ref.id, 'content.fields', result.discovery.ref), 'producer');
+    }
   }
   const outcomes = (result['operation-map'].fields['mapDesign'] as Row)?.artifacts;
   if (Array.isArray(outcomes)) for (const stage of INPUT_STAGES) {

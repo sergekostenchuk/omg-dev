@@ -1730,7 +1730,8 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   if (paid.kind !== 'response') return null;
   return earlyResearchFailure(draft.value, question.value,
     intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
-    intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question));
+    intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question),
+    intent.value.cursor.context?.discoveryBasisCatalogue ?? null);
 }
 /** UNK1 (№4686 §3): the unknown-era admission of one early analyst call, from its saved cursor and original draft — null in
  * the DRY5FIX era, so an old need_research keeps its refusal. */

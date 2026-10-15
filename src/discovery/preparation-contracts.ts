@@ -1,5 +1,5 @@
 import { sealed } from "../om/refusal.js";
-import type { Json } from "../canonical.js";
+import { HASH_PATTERN, type Json } from "../canonical.js";
 import type { FieldSpec } from "./discovery.js";
 
 export const JOURNEY_VARIANTS = ["success", "first_use", "repeated_use", "reload_restart_resume", "cancel_stop_retry",
@@ -38,6 +38,17 @@ export const preparationMomentSchema = object({ ...preparation, unknowns: list(o
 
 export const sectionSchema = list(object({ id: text, title: text, requirements: list(object({ id: text, statement: text,
   benefit: text, beneficiary: text, outcome: text, acceptance: texts(1) }), 1) }), 1);
+
+const basisApplication = object({
+  contract: { const: 'basis-application/v1' },
+  basis: object({ record: object({ id: text, revision: { type: 'integer', minimum: 1 },
+    hash: { type: 'string', pattern: HASH_PATTERN } }), pointer: { type: 'string' } }),
+  appliedAt: texts(1),
+});
+export const conceptApplicationsSchema = list(object({ id: text, title: text,
+  requirements: list(object({ id: text, statement: text, benefit: text, beneficiary: text,
+    outcome: text, acceptance: texts(1), applications: list(basisApplication) }), 1),
+}), 1);
 
 export const operationRequirementsSchema = object({
   outcomes: list(object({ outcome: text, producerResponsibility: text, consumers: texts(1), prerequisites: texts(),
@@ -124,4 +135,8 @@ export const DISCOVERY_PREPARATION = { ...UPSTREAM_MOMENT_DETAILS.discovery,
 } satisfies FieldSpec;
 
 // V6 preparation is filled by its stage tasks without mutating released schemas/prompts.
-export const VERSION6_UPSTREAM_DETAILS = sealed({ ...UPSTREAM_MOMENT_DETAILS, discovery: DISCOVERY_PREPARATION }) as unknown as typeof UPSTREAM_MOMENT_DETAILS;
+export const VERSION6_UPSTREAM_DETAILS = sealed({ ...UPSTREAM_MOMENT_DETAILS, discovery: DISCOVERY_PREPARATION,
+  concept: { ...UPSTREAM_MOMENT_DETAILS.concept, schema: conceptApplicationsSchema,
+    prompt: UPSTREAM_MOMENT_DETAILS.concept.prompt +
+      ' Для каждого requirement явно укажи applications (в том числе [] при отсутствии назначения). basis копирует точный адрес из discoveryBasisCatalogue; appliedAt указывает только на собственные statement, benefit или acceptance. Покрой выбранный вариант и каждое ограничение каталога хотя бы одним предметным применением. Не меняй смысл ограничения: объясни в требовании, как оно действует на результат и критерий принятия.' },
+}) as unknown as typeof UPSTREAM_MOMENT_DETAILS;

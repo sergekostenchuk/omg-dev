@@ -1,7 +1,48 @@
 import type { Json } from "../canonical.js";
-import type { Finding, Stage } from "../pipeline/contracts.js";
+import { isRef, type Finding, type Stage } from "../pipeline/contracts.js";
+import { EngineError } from '../errors.js';
+import { resolveBasisApplications, type BasisApplicationOwner } from './basis-application.js';
+import type { DiscoveryBasisCatalogue } from './discovery-outcome.js';
+import type { DiscoveryDraft, Question } from './discovery.js';
 
 type Row = Record<string, any>;
+export const requiresConceptApplications = (draft: DiscoveryDraft, question: Question): boolean =>
+  draft.contractVersion === 6 && draft.stage === 'concept' && question.spec.field === 'conceptSections';
+/** The catalogue is the exact accepted Discovery material supplied by the caller.
+ * The same pure check is used before assessment and at stage admission. */
+export function conceptApplicationFindings(value: Json, catalogue: DiscoveryBasisCatalogue): Finding[] {
+  const finding = (code: string, target: string, message: string): Finding =>
+    ({ code, target, field: 'conceptSections', message });
+  if (!Array.isArray(value)) return [finding('basis_application_invalid', '/conceptSections',
+    'Concept applications need an explicit section list')];
+  if (catalogue?.contract !== 'discovery-basis-catalogue/v1' || !isRef(catalogue.source)
+    || !Array.isArray(catalogue.constraints)
+    || !catalogue.variant) return [finding('basis_application_material_invalid', '/discoveryBasisCatalogue',
+      'The exact accepted Discovery catalogue is required')];
+  const owners: BasisApplicationOwner[] = [];
+  for (const [sectionIndex, section] of value.entries()) {
+    const requirements = section && typeof section === 'object' && !Array.isArray(section)
+      ? (section as Record<string, unknown>)['requirements'] : null;
+    if (!Array.isArray(requirements)) return [finding('basis_application_invalid', `/conceptSections/${sectionIndex}/requirements`,
+      'Each concept section needs its explicit requirements')];
+    for (const [requirementIndex] of requirements.entries()) owners.push({
+      pointer: `/${sectionIndex}/requirements/${requirementIndex}`,
+      fields: ['statement', 'benefit', 'acceptance'], required: [],
+    });
+  }
+  try {
+    resolveBasisApplications({ field: 'conceptSections', value,
+      catalogue: [...catalogue.constraints, catalogue.variant], owners,
+      required: [...catalogue.constraints.map(entry => entry.address), catalogue.variant.address] });
+    return [];
+  } catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    const details = error.details as { pointer?: unknown } | undefined;
+    const pointer = typeof details?.pointer === 'string' ? details.pointer : '';
+    return [finding(error.code, `/conceptSections${pointer}`, error.message)];
+  }
+}
+
 export function preparationFindings(stage: Stage, fields: Record<string, Json>, upstream: (stage: Stage) => Record<string, Json> | null,
   graphOutcomes: string[]): Finding[] {
   const findings: Finding[] = [];
