@@ -2752,9 +2752,9 @@
   - таблица исходов №5186 §4 — каждая строка тестом
   - регрессии №5186 §7: маскарад actor/HTTP/прямой producer; перекрёстные H2↔Discovery grants; чужая/мёртвая authority; подмена условия; окно второго Store перед writeMany; настоящий CLI stdin в дочернем процессе → новый процесс → повтор; конкуренция двух Store; conditional с двумя условиями до нового verdict; v1 по своей эре без новой оплаты; stage-summary после смены основания кандидата
 
-### RD1 · read_source: предел 50 000 UTF-16 назван модели в договоре чтения (initial/continuation/correction); доказанное превышение по фактически выдаваемому диапазону — исправимый отказ DRY5FIX (оплаченный ход завершается, следующий A получает адресную обратную связь и новый вызов под бюджетом), без автоматического усечения; старые producer — прежнее чтение по своей эре
+### RD1 · read_source — обрезание: новый source-read/v2 сохраняет requested целиком, served=[start,min(end,length,start+50000)], outcome=clipped с точным selector/value; предел назван модели в инструкции read_source; старые v1/legacy/отказы — по своей эре; synthesis-session распознаёт и проверяет v2
 
-**Цель.** Находка живого HX4 15.10 22:32 (вызов 11: read_source web-capture 0..59513 → research_excerpt_limit → вечный stage_paused, повтор callsMade 0). Договор Codex-omg №5261 (9/10) ~/REPORTS/review/omg-rd1-contract-5261_161026.md. Класс общий для 5 ранних стадий (research-runner). Восстановление зависшего HX4 — штатный reopen-question researchReport + early-stage-run того же draft (договор §Восстановление).
+**Цель.** Находка живого HX4 15.10 22:32 (вызов 11: read_source web-capture 0..59513 → research_excerpt_limit → вечный stage_paused, повтор callsMade 0). Окончательный договор Codex-omg №5265 (9/10, обрезание; заменяет №5261) ~/REPORTS/review/omg-rd1-clipping-contract-5259-5260_161026.md. Класс общий для 5 ранних стадий (research-runner). Тот же HX4 продолжается обычным early-stage-run того же draft (зависший action pending, впервые завершается v2): clipped 0..50000 из 0..59513, callsMade 0, HTTP 0.
 
 - Правила: `rules-general`
 - Единицы карты: —
@@ -2762,14 +2762,15 @@
 - Отдаёт: —
 - Читает записи: projectSourceReading, early-research-outcome классификатор, research-runner договор A
 - Пишет записи: предел read_source в договоре чтения; исправимый отказ превышения
-- Разрешённые пути: `src/evidence/evidence.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/working-context.ts`, `test/research.test.ts`, `test/research-call-resume.test.ts`
+- Разрешённые пути: `src/evidence/evidence.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/synthesis-session.ts`, `test/research.test.ts`
 - Из движка как есть: №5261; DRY5FIX; RS1
 - После: OC1
 - Тесты сверх обязательных:
-  - таблица исходов №5261 — каждая строка тестом
+  - таблица исходов №5265 — каждая строка
   - большой источник на каждой из 5 ранних стадий
-  - старые отказанные excerpt-записи и прежние producer — по своей эре
-  - восстановление сохранённого оплаченного 0..59513: reopen-question → новый A под бюджетом, без повторной оплаты
+  - reader bundle sourceReadRange v1 неизменен; старые v1/legacy/отказы по своей эре
+  - synthesis-session: v2 outside проверяет Source
+  - проба на снимке HX4: clipped 0..50000 из 0..59513, callsMade 0, HTTP 0
 
 ### AT3b · Маршрут дефекта плана в OM: один публичный repair-plan с ветвью OM → запись дефекта → пробел D1 над принятым L3 → пакет исправления работы → redefine → G5 → settle → явное возобновление завершённого прохода → M8 → compile
 
