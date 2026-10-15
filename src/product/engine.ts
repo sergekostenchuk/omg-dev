@@ -31,7 +31,7 @@ import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, type UpstreamStage } from "../discovery/requirements.js";
+import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -232,7 +232,7 @@ export class ProductEngine {
   }
   exportStage(project: string, stage: Stage): string {
     this.#project(project);
-    if (stage === "discovery") {
+    if (UPSTREAM_STAGES.includes(stage as UpstreamStage)) {
       const summary = stageSummary(this.store, project, stage);
       const ref = summary.accepted?.artifact ?? summary.currentStage;
       if (!ref) return renderStageSummary(summary);

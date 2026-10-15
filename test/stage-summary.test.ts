@@ -5,10 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hashJson, type Json } from "../src/canonical.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
+import type { ResearchRun } from "../src/discovery/research-model.js";
 import { projectWebSource } from "../src/evidence/evidence.js";
+import type { Graph } from "../src/graph/model.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { reference, stageId } from "../src/pipeline/contracts.js";
-import { renderStageSummary, stageSummary } from "../src/product/stage-summary.js";
+import { reference, stageId, type StageArtifact } from "../src/pipeline/contracts.js";
+import { renderStageSummary, stageSummary, type DiscoveryStageSummary,
+  type StructuredStageSummary } from "../src/product/stage-summary.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { preparedField } from "./preparation-fixture.js";
 import { answerDiscoveryFixture, preparedFeatures, withHistoricalUpstream } from "./product-fixture.js";
@@ -122,9 +125,9 @@ test("DS1.3a keeps the accepted result and selects its normally reopened questio
     .find(question => question.value.spec.field === "objective")!;
   f.engine.execute({ type: "reopen-question", question: objective.id, expected: objective.revision });
   const stamp = f.store.changeStamp();
-  const automatic = f.engine.execute({ type: "stage-summary", project: "reopened", stage: "discovery" }) as ReturnType<typeof stageSummary>;
+  const automatic = f.engine.execute({ type: "stage-summary", project: "reopened", stage: "discovery" }) as DiscoveryStageSummary;
   const explicit = f.engine.execute({ type: "stage-summary", project: "reopened", stage: "discovery",
-    draftId: accepted.draft.id }) as ReturnType<typeof stageSummary>;
+    draftId: accepted.draft.id }) as DiscoveryStageSummary;
   assert.equal(automatic.accepted?.artifact.hash, accepted.artifact.hash);
   assert.deepEqual(automatic.candidates, []);
   assert.equal(automatic.candidate?.draft.id, accepted.draft.id);
@@ -147,7 +150,7 @@ test("DS1.3a isolates a stale current candidate from accepted history and expose
     media: "text/plain", expected: accepted.source.revision });
   const second = new Store(f.database); t.after(() => second.close());
   const engine = new ProductEngine(second), stamp = second.changeStamp();
-  const summary = engine.execute({ type: "stage-summary", project: "stale", stage: "discovery" }) as ReturnType<typeof stageSummary>;
+  const summary = engine.execute({ type: "stage-summary", project: "stale", stage: "discovery" }) as DiscoveryStageSummary;
   const exported = engine.execute({ type: "export-stage", project: "stale", stage: "discovery" }) as string;
   assert.equal(summary.accepted?.artifact.hash, accepted.artifact.hash);
   assert.equal(summary.accepted?.report?.results[0]?.citations[0]?.quote, accepted.source.value.content);
@@ -177,9 +180,9 @@ test("DS1.3a isolates stale choice history after a revised research plan from th
 
   const second = new Store(f.database); t.after(() => second.close());
   const engine = new ProductEngine(second), stamp = second.changeStamp();
-  const automatic = engine.execute({ type: "stage-summary", project: "plan-revised", stage: "discovery" }) as ReturnType<typeof stageSummary>;
+  const automatic = engine.execute({ type: "stage-summary", project: "plan-revised", stage: "discovery" }) as DiscoveryStageSummary;
   const explicit = engine.execute({ type: "stage-summary", project: "plan-revised", stage: "discovery",
-    draftId: originalDraft.id }) as ReturnType<typeof stageSummary>;
+    draftId: originalDraft.id }) as DiscoveryStageSummary;
   const exported = engine.execute({ type: "export-stage", project: "plan-revised", stage: "discovery" }) as string;
   for (const summary of [automatic, explicit]) {
     assert.equal(summary.accepted?.artifact.hash, accepted.artifact.hash);
@@ -223,8 +226,8 @@ test("DS1.3a gives a real nonempty owner-choice history its own refusal after th
 
   const second = new Store(f.database); t.after(() => second.close());
   const engine = new ProductEngine(second), stamp = second.changeStamp();
-  const automatic = engine.execute({ type: "stage-summary", project, stage: "discovery" }) as ReturnType<typeof stageSummary>;
-  const explicit = engine.execute({ type: "stage-summary", project, stage: "discovery", draftId: initial.id }) as ReturnType<typeof stageSummary>;
+  const automatic = engine.execute({ type: "stage-summary", project, stage: "discovery" }) as DiscoveryStageSummary;
+  const explicit = engine.execute({ type: "stage-summary", project, stage: "discovery", draftId: initial.id }) as DiscoveryStageSummary;
   const exported = engine.execute({ type: "export-stage", project, stage: "discovery" }) as string;
   for (const summary of [automatic, explicit]) {
     assert.equal(summary.accepted?.artifact.hash, accepted.hash);
@@ -337,7 +340,7 @@ test("DS1.3a refuses to guess between lawful unbound candidates and accepts an e
   const ambiguous = stageSummary(f.store, "choice", "discovery");
   assert.equal(ambiguous.candidate, null);
   assert.deepEqual(new Set(ambiguous.candidates.map(item => item.id)), new Set([first.id, second.id]));
-  const selected = f.engine.execute({ type: "stage-summary", project: "choice", stage: "discovery", draftId: first.id }) as ReturnType<typeof stageSummary>;
+  const selected = f.engine.execute({ type: "stage-summary", project: "choice", stage: "discovery", draftId: first.id }) as DiscoveryStageSummary;
   assert.equal(selected.candidate?.draft.id, first.id);
   assert.deepEqual(selected.candidates, []);
   f.engine.execute({ type: "create-project", project: "other", title: "other" });
@@ -419,4 +422,233 @@ test("DS1.3a renders saved web URLs, capture time, quote and documentary proof l
     ["https://example.test/request", "https://example.test/final", "2026-10-15T00:00:00.000Z",
       "Saved web statement", "reported-not-runtime-proof"]);
   assert.equal(f.store.changeStamp(), before);
+});
+
+test("DS1.3b keeps accepted concept, L1, specification and features separate from newer candidates and exports the same reader", t => {
+  const f = fixture(t), project = "all-stages";
+  preparedFeatures(f.engine, project);
+  for (const stage of ["concept", "operation-map", "specification", "features"] as const) {
+    const before = stageSummary(f.store, project, stage);
+    assert.equal(before.accepted?.state, "accepted");
+    assert.equal(before.accepted?.material.stage, stage);
+    assert.equal(before.candidate, null);
+    assert.deepEqual(f.engine.execute({ type: "stage-summary", project, stage }), before);
+    const candidate = f.engine.prepare(project, stage);
+    const after = stageSummary(f.store, project, stage);
+    assert.equal(after.accepted?.artifact.hash, before.accepted?.artifact.hash);
+    assert.equal(after.accepted?.state, "accepted");
+    assert.equal(after.candidate?.draft.id, candidate.id);
+    const exported = f.engine.execute({ type: "export-stage", project, stage }) as string;
+    assert.match(exported, /Принятый результат/);
+    assert.ok(exported.lastIndexOf("## Исходный JSON") > exported.indexOf("Принятый результат"));
+  }
+  const firstConcept = stageSummary(f.store, project, "concept").candidate!.draft;
+  const secondConcept = f.engine.prepare(project, "concept");
+  const ambiguous = stageSummary(f.store, project, "concept");
+  assert.equal(ambiguous.candidate, null);
+  assert.deepEqual(new Set(ambiguous.candidates.map(item => item.id)), new Set([firstConcept.id, secondConcept.id]));
+  const explicit = f.engine.execute({ type: "stage-summary", project, stage: "concept", draftId: firstConcept.id }) as
+    StructuredStageSummary;
+  assert.equal(explicit.candidate?.draft.id, firstConcept.id);
+  const reopened = new Store(f.database);
+  try {
+    for (const stage of ["concept", "operation-map", "specification", "features"] as const)
+      assert.equal(stageSummary(reopened, project, stage).accepted?.artifact.hash,
+        stageSummary(f.store, project, stage).accepted?.artifact.hash);
+  } finally { reopened.close(); }
+});
+
+test("DS1.3b auto-selects the sole structured candidate whose accepted question was normally reopened", t => {
+  const f = fixture(t), project = "reopened-concept";
+  preparedFeatures(f.engine, project);
+  const accepted = stageSummary(f.store, project, "concept").accepted!;
+  const draft = f.store.get<DiscoveryDraft>(accepted.draft.id, accepted.draft.revision)!;
+  const question = draft.value.questions.map(id => f.store.get<Question>(id)!)
+    .find(item => item.value.spec.field === "audience")!;
+  f.engine.execute({ type: "reopen-question", question: question.id, expected: question.revision });
+
+  const reopened = new Store(f.database); t.after(() => reopened.close());
+  const automatic = stageSummary(reopened, project, "concept");
+  const explicit = stageSummary(reopened, project, "concept", draft.id);
+  assert.equal(automatic.accepted?.artifact.hash, accepted.artifact.hash);
+  assert.deepEqual(automatic.candidates, []);
+  assert.deepEqual(automatic.candidate?.draft, explicit.candidate?.draft);
+  assert.equal(automatic.candidate?.draft.id, draft.id);
+  assert.deepEqual(automatic.candidate?.questions.find(item => item.field === "audience"),
+    { ref: reference(reopened.get<Question>(question.id)!), field: "audience", status: "open" });
+});
+
+test("DS1.3b reads genuine legacy specification and features without inventing fields absent in their era", t => {
+  const f = fixture(t);
+  withHistoricalUpstream("63d2b07", () => preparedFeatures(f.engine, "legacy-v1"));
+  const specification = stageSummary(f.store, "legacy-v1", "specification");
+  assert.equal(specification.accepted?.contractVersion, 1);
+  assert.equal(specification.accepted?.material.stage, "specification");
+  if (specification.accepted?.material.stage === "specification") {
+    assert.deepEqual(specification.accepted.material.behavior?.value, ["behavior for legacy-v1"]);
+    assert.equal(specification.accepted.material.behaviorContracts, null);
+  }
+  assert.ok(specification.accepted?.limitations.some(item => item.includes("behaviorContracts отсутствует")));
+  const features = stageSummary(f.store, "legacy-v1", "features");
+  assert.equal(features.accepted?.contractVersion, 1);
+  if (features.accepted?.material.stage === "features") {
+    assert.deepEqual(features.accepted.material.features?.value,
+      [{ title: "Deliver result", outcome: "legacy-v1-result", requirements: [0] }]);
+    assert.equal(features.accepted.material.preparation, null);
+  }
+  assert.ok(features.accepted?.limitations.some(item => item.includes("featurePreparation отсутствует")));
+});
+
+test("DS1.3b preserves the complete specification contract and both requirement identity threads", t => {
+  const f = fixture(t), project = "complete-contract";
+  preparedFeatures(f.engine, project);
+  const specification = stageSummary(f.store, project, "specification");
+  assert.equal(specification.accepted?.material.stage, "specification");
+  if (specification.accepted?.material.stage !== "specification") assert.fail("specification material is absent");
+  const contracts = specification.accepted.material.behaviorContracts!.value as unknown as Record<string, unknown>[];
+  assert.deepEqual(contracts[0], (preparedField(project, "behaviorContracts") as Json[])[0]);
+  assert.deepEqual(Object.keys(contracts[0]!).sort(), ["actor", "compatibility", "entry", "failures", "forbiddenEffects",
+    "id", "inputs", "outcome", "proof", "requirements", "state", "success"].sort());
+  assert.deepEqual(specification.accepted.material.behavior?.value, ["behavior for complete-contract"]);
+
+  const features = stageSummary(f.store, project, "features");
+  assert.equal(features.accepted?.material.stage, "features");
+  if (features.accepted?.material.stage !== "features") assert.fail("features material is absent");
+  const legacy = features.accepted.material.features!.value as unknown as { requirements: number[] }[];
+  const prepared = features.accepted.material.preparation!.value as unknown as
+    { requirements: string[]; behaviorContracts: string[]; remainingQuestions: unknown[] }[];
+  assert.deepEqual(legacy[0]?.requirements, [0], "legacy behavior indexes remain indexes");
+  assert.deepEqual(prepared[0]?.requirements, [`${project}-R1`]);
+  assert.deepEqual(prepared[0]?.behaviorContracts, [`${project}-B1`]);
+  assert.deepEqual(prepared[0]?.remainingQuestions, []);
+});
+
+test("DS1.3b keeps the exact accepted L1 path when only the full graph L2 changes", t => {
+  const f = fixture(t), project = "stable-l1";
+  preparedFeatures(f.engine, project);
+  const before = stageSummary(f.store, project, "operation-map");
+  assert.equal(before.accepted?.material.stage, "operation-map");
+  if (before.accepted?.material.stage !== "operation-map") assert.fail("operation-map material is absent");
+  const layer = before.accepted.material.layer;
+  assert.ok(layer.journeys.some(item => item.terminal === "success"));
+  assert.ok(layer.journeys.some(item => item.terminal === "safe_failure"));
+  assert.equal(layer.fullGraph, null, "a current graph head is not an accepted full-graph proof");
+  const graph = f.store.get<Graph>(`graph:${project}`)!;
+  const changed = structuredClone(graph.value), operation = changed.nodes.find(item => item.kind === "operation")!;
+  operation.title = `${operation.title} revised only at L2`;
+  f.engine.graphs.save(project, changed, graph.revision, "local-caller");
+  const after = stageSummary(f.store, project, "operation-map");
+  assert.equal(after.accepted?.material.stage, "operation-map");
+  if (after.accepted?.material.stage !== "operation-map") assert.fail("operation-map material is absent after graph change");
+  assert.deepEqual(after.accepted.material.layer.ref, layer.ref);
+  assert.equal(after.accepted.material.layer.acceptedPathChanged, false);
+  assert.notEqual(after.accepted.material.layer.currentGraph?.revision, layer.currentGraph?.revision);
+  assert.equal(after.accepted.material.layer.fullGraphChanged, null);
+  assert.match(renderStageSummary(after), /Принятый путь отличается от текущей L1: нет/);
+});
+
+test("DS1.3b gives an addressed refusal when a lawful operation-map draft has no L1 layer Ref", t => {
+  const f = fixture(t), project = "missing-layer", accepted = acceptDiscovery(f.engine, project);
+  const concept = f.engine.prepare(project, "concept");
+  for (const id of concept.value.questions) {
+    const question = f.store.get<Question>(id)!;
+    f.engine.discovery.decision(id, question.revision, "local-caller", preparedField(project, question.value.spec.field));
+  }
+  const conceptStage = f.engine.draft(project, "concept", concept.id, 0);
+  f.engine.pipeline.accept(project, "concept", conceptStage.revision);
+  assert.equal(f.store.get(`graph-layer:${project}:1`), null);
+  const operation = f.engine.prepare(project, "operation-map");
+  f.engine.draft(project, "operation-map", operation.id, 0);
+  const summary = stageSummary(f.store, project, "operation-map");
+  assert.equal(summary.accepted, null);
+  assert.equal(summary.candidate?.graphFailure?.code, "stage_summary_layer_missing");
+  assert.match(summary.candidate?.graphFailure?.message ?? "", /content\/graph/);
+  assert.match(renderStageSummary(summary), /stage_summary_layer_missing/);
+  assert.ok(accepted.artifact, "the prerequisite was produced through the public path");
+});
+
+test("DS1.3b keeps accepted L1 readable when a newer candidate has no layer", t => {
+  const f = fixture(t), project = "accepted-with-missing-candidate-layer";
+  preparedFeatures(f.engine, project);
+  const previous = stageSummary(f.store, project, "operation-map").accepted!;
+  const accepted = f.store.get<StageArtifact>(previous.artifact.id, previous.artifact.revision)!;
+  f.engine.pipeline.draft(project, "operation-map",
+    { ...(accepted.value.content as object), graph: null } as Json, accepted.revision);
+
+  const reopened = new Store(f.database); t.after(() => reopened.close());
+  const engine = new ProductEngine(reopened);
+  const summary = engine.execute({ type: "stage-summary", project, stage: "operation-map" }) as StructuredStageSummary;
+  const exported = engine.execute({ type: "export-stage", project, stage: "operation-map" }) as string;
+  assert.deepEqual(summary.accepted?.artifact, previous.artifact);
+  assert.equal(summary.candidate?.graphFailure?.code, "stage_summary_layer_missing");
+  assert.match(exported, /Ранее принято; сейчас пересмотрено/);
+  assert.match(exported, /stage_summary_layer_missing/);
+});
+
+test("DS1.3b keeps an own candidate after its saved prerequisite stops being the current head", t => {
+  const f = fixture(t), project = "structured-stale-prerequisite";
+  preparedFeatures(f.engine, project);
+  const candidate = f.engine.prepare(project, "specification");
+  const before = stageSummary(f.store, project, "specification", candidate.id);
+  const operation = f.store.get<StageArtifact>(stageId(project, "operation-map"))!;
+  f.engine.pipeline.draft(project, "operation-map", operation.value.content, operation.revision);
+
+  const reopened = new Store(f.database); t.after(() => reopened.close());
+  const automatic = stageSummary(reopened, project, "specification");
+  const explicit = stageSummary(reopened, project, "specification", candidate.id);
+  assert.deepEqual(automatic.accepted?.artifact, before.accepted?.artifact);
+  assert.equal(automatic.candidate?.draft.id, candidate.id);
+  assert.equal(explicit.candidate?.draft.id, candidate.id);
+  assert.equal(automatic.candidate?.upstreamFailure, null,
+    "the exact historical accepted prerequisite remains the candidate's proof");
+
+  preparedFeatures(f.engine, "other-structured-candidate");
+  const foreign = f.engine.prepare("other-structured-candidate", "specification");
+  assert.throws(() => stageSummary(reopened, project, "specification", foreign.id),
+    { code: "stage_summary_draft_foreign" });
+});
+
+test("DS1.3b keeps accepted, candidate and paused run independent for every structured stage", async t => {
+  const f = fixture(t);
+  for (const stage of ["concept", "operation-map", "specification", "features"] as const) {
+    const project = `structured-paused-${stage}`;
+    preparedFeatures(f.engine, project);
+    const accepted = stageSummary(f.store, project, stage).accepted!;
+    configurePauseAdapter(f.root, f.engine, project);
+    const candidate = f.engine.prepare(project, stage);
+    f.engine.draft(project, stage, candidate.id, accepted.artifact.revision);
+    const paused = await f.engine.stageResearch.run(project, candidate.id, 4);
+    assert.equal(paused.status, "paused");
+    assert.ok(paused.reason);
+
+    const reopened = new Store(f.database);
+    try {
+      const summary = stageSummary(reopened, project, stage);
+      assert.deepEqual(summary.accepted?.artifact, accepted.artifact);
+      assert.equal(summary.candidate?.draft.id, candidate.id);
+      assert.deepEqual(summary.candidate?.run?.ref, paused.research);
+      assert.equal(summary.candidate?.state, "paused");
+      assert.equal(summary.candidate?.run?.pauseCode, paused.reason.code);
+      assert.equal(summary.candidate?.run?.error, "fixture pause");
+      assert.equal(summary.candidate?.door, "research-stage");
+      assert.match(renderStageSummary(summary), new RegExp(paused.reason.code));
+    } finally { reopened.close(); }
+  }
+});
+
+test("DS1.3b preserves the exact owner question and door of a structured needs-owner run", async t => {
+  const f = fixture(t), project = "structured-owner-pause", accepted = acceptDiscovery(f.engine, project);
+  configurePauseAdapter(f.root, f.engine, project, "need-owner", accepted.source);
+  const draft = f.engine.prepare(project, "concept");
+  const paused = await f.engine.stageResearch.run(project, draft.id, 5);
+  assert.equal(paused.status, "needs_owner");
+
+  const reopened = new Store(f.database); t.after(() => reopened.close());
+  const saved = reopened.get<ResearchRun>(paused.research!.id, paused.research!.revision)!;
+  const summary = stageSummary(reopened, project, "concept");
+  assert.deepEqual(summary.candidate?.run?.ref, paused.research);
+  assert.equal(summary.candidate?.state, "needs_owner");
+  assert.equal(summary.candidate?.run?.question?.id, saved.value.ownerQuestion?.question);
+  assert.equal(summary.candidate?.door, "answer-decision");
+  assert.match(renderStageSummary(summary), /The exact owner answer is required/);
 });
