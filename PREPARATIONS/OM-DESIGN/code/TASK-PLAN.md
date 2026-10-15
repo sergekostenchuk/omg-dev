@@ -2762,7 +2762,7 @@
 - Отдаёт: —
 - Читает записи: projectSourceReading, early-research-outcome классификатор, research-runner договор A
 - Пишет записи: предел read_source в договоре чтения; исправимый отказ превышения
-- Разрешённые пути: `src/evidence/evidence.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/synthesis-session.ts`, `test/research.test.ts`
+- Разрешённые пути: `src/evidence/evidence.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/synthesis-session.ts`, `test/research.test.ts`, `test/synthesis-finalization.test.ts`
 - Из движка как есть: №5261; DRY5FIX; RS1
 - После: OC1
 - Тесты сверх обязательных:
