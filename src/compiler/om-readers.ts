@@ -89,21 +89,30 @@ export interface AcceptedFrameView {
     readonly gate: { readonly name: "G3"; readonly basis?: never } | { readonly name: "G5"; readonly basis: Ref } } }> | null;
 }
 export interface AtomicGateView { readonly request: { readonly candidate: Ref; readonly neighbors: Ref;
-  readonly taskContextContract?: "omg-task-context/v2" } }
+  readonly taskContextContract?: "omg-task-context/v2" | "omg-task-context/v3" } }
 export type TaskContextBasis = { contract: "omg-task-context/v1"; gate: Ref }
-  | { contract: "omg-task-context/v2"; gate: Ref; horizon: Ref; input: Ref };
-export interface TaskSpecification {
-  contract: "selected-specification/v1";
+  | { contract: "omg-task-context/v2" | "omg-task-context/v3"; gate: Ref; horizon: Ref; input: Ref };
+export interface SpecificationBases {
+  catalogue: { contract: 'discovery-basis-catalogue/v1'; source: Ref;
+    constraints: { address: { record: Ref; pointer: string }; value: Json }[];
+    variant: { address: { record: Ref; pointer: string }; value: Json } };
+  selected: { owner: { record: Ref; pointer: string };
+    bases: { address: { record: Ref; pointer: string }; value: Json }[] }[];
+}
+interface TaskSpecificationContent {
   contracts: { source: Ref; index: number; pointer: string; value: Json;
     effective: { source: Ref; pointer: string; value: Json } }[];
   preparations: { source: Ref; index: number; pointer: string; featureIndex: number; value: Json }[];
   constraints: { source: Ref; pointer: string; value: Json };
 }
-export interface TaskSpecificationRequest { project: string; input: Ref; requirements: string[]; nodes: string[] }
+export type TaskSpecification = TaskSpecificationContent & ({ contract: 'selected-specification/v1' }
+  | { contract: 'selected-specification/v2'; bases: SpecificationBases });
+export interface TaskSpecificationRequest { project: string; input: Ref; requirements: string[]; nodes: string[];
+  contract?: 'selected-specification/v1' | 'selected-specification/v2' }
 /** Narrow selection input shared with the pure task selector in OM. */
 export interface TaskSpecificationSelection {
-  project: string; inputRef: Ref;
-  input: { sources: (Ref & { stage: string })[];
+  project: string; inputRef: Ref; contract?: 'selected-specification/v1' | 'selected-specification/v2';
+  input: { sources: (Ref & { stage: string; contractVersion?: number | null })[];
     contracts: { id: string; nodes: string[] | null; requirements: string[] }[];
     features: { index: number; title: string; outcome: string; requirementIds: string[]; contracts: string[] }[] };
   accepted: { stage: string; ref: Ref; fields: Record<string, Json> }[];

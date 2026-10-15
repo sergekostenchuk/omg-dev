@@ -11,6 +11,7 @@ export function taskSpecificationReader(select: TaskSpecificationSelector = sele
   return (store, request) => {
     if (!(request && typeof request.project === 'string' && isRef(request.input)
       && Array.isArray(request.requirements) && request.requirements.every(id => typeof id === 'string' && id.length)
+      && (!Object.hasOwn(request, 'contract') || ['selected-specification/v1', 'selected-specification/v2'].includes(request.contract!))
       && Array.isArray(request.nodes) && request.nodes.every(id => typeof id === 'string' && id.length)))
       throw new EngineError('context_source_invalid', 'Task selection needs its exact input, requirements and node ancestry',
         { unit: 'V2', target: request?.input?.id ?? 'task-specification', field: 'request' });
@@ -26,7 +27,7 @@ export function taskSpecificationReader(select: TaskSpecificationSelector = sele
       accepted.push({ stage: source.stage, ref: reference(row.value), fields: structuredClone(content.fields) });
     }
     return delivered(sealed(select({ project: request.project, inputRef: request.input, input, accepted,
-      requirements: request.requirements, nodes: request.nodes })));
+      requirements: request.requirements, nodes: request.nodes, ...(request.contract ? { contract: request.contract } : {}) })));
   };
 }
 

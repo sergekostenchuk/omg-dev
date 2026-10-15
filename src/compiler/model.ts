@@ -24,8 +24,12 @@ export interface CompiledTask {
   ownership?: WriteGrant[];
 }
 export const TASK_CONTEXT_CONTRACT = 'omg-task-context/v2' as const;
+export const BASIS_TASK_CONTEXT_CONTRACT = 'omg-task-context/v3' as const;
+export type TaskContextContract = typeof TASK_CONTEXT_CONTRACT | typeof BASIS_TASK_CONTEXT_CONTRACT;
+export const isTaskContextContract = (value: unknown): value is TaskContextContract =>
+  value === TASK_CONTEXT_CONTRACT || value === BASIS_TASK_CONTEXT_CONTRACT;
 export interface MachinePlan {
-  taskContextContract?: typeof TASK_CONTEXT_CONTRACT;
+  taskContextContract?: TaskContextContract;
   derivation?: 'external-inputs/v1';
   version: 1 | 2; projectId: string; graph: Ref; environment: Ref; stage: Ref; feasibility: Ref;
   base: NonNullable<Feasibility['repository']>; guards: Ref[]; tasks: CompiledTask[];
@@ -50,7 +54,7 @@ export function checkedPlanDerivation(plan: Revision<MachinePlan>, project?: str
     || !value || typeof value !== 'object' || Array.isArray(value)) invalid('plan');
   if (value.derivation !== EXTERNAL_INPUT_DERIVATION) invalid('derivation');
   if (value.version !== 2) invalid('version');
-  if (Object.hasOwn(value, 'taskContextContract') && value.taskContextContract !== TASK_CONTEXT_CONTRACT) invalid('taskContextContract');
+  if (Object.hasOwn(value, 'taskContextContract') && !isTaskContextContract(value.taskContextContract)) invalid('taskContextContract');
   if (typeof value.projectId !== 'string' || !value.projectId.length
     || (project !== undefined && project !== value.projectId)) invalid('projectId');
   const { hash, ...body } = value;

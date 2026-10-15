@@ -1,7 +1,9 @@
 import { canonical, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import type { TaskSpecification, TaskSpecificationSelection } from '../compiler/om-readers.js';
+import type { SpecificationBases, TaskSpecification, TaskSpecificationSelection } from '../compiler/om-readers.js';
 import { isRef, stageId, type Ref } from '../pipeline/contracts.js';
+import { resolveBasisApplications } from '../discovery/basis-application.js';
+import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 
 /**
  * SP1 (№4714 §3): the accepted specification a consumer is given whole — the original behavior contracts, the feature
@@ -9,23 +11,35 @@ import { isRef, stageId, type Ref } from '../pipeline/contracts.js';
  * network, no model; the same inputs give the same result. The normalized B1 rows stay the binding view of nodes/state.
  */
 export const SELECTED_SPECIFICATION_CONTRACT = 'selected-specification/v1' as const;
+export const BASIS_SPECIFICATION_CONTRACT = 'selected-specification/v2' as const;
+export type SpecificationContract = typeof SELECTED_SPECIFICATION_CONTRACT | typeof BASIS_SPECIFICATION_CONTRACT;
+/** Only the declared producers of the catalogue and application-bearing stages choose this era. */
+export function hasBasisApplications(sources: readonly { stage: string; contractVersion?: number | null }[]): boolean {
+  return ['discovery', 'concept', 'specification'].every(stage => {
+    const rows = sources.filter(source => source.stage === stage);
+    return rows.length === 1 && rows[0]!.contractVersion === 6;
+  });
+}
 export const SELECTED_SPECIFICATION_CODES = Object.freeze(['selected_specification_basis_invalid', 'selected_specification_unresolved'] as const);
 
 export interface AcceptedStageFields { stage: string; ref: Ref; fields: Record<string, Json> }
 export interface SelectedSpecificationRequest {
   project: string;
+  contract?: SpecificationContract;
   /** The exact stage sources of the B1 input the selection stands on. */
-  sources: readonly (Ref & { stage: string })[];
+  sources: readonly (Ref & { stage: string; contractVersion?: number | null })[];
   accepted: readonly AcceptedStageFields[];
   contracts: readonly string[];
   features: readonly { index: number; title: string; outcome: string }[];
 }
-export interface SelectedSpecification {
-  contract: typeof SELECTED_SPECIFICATION_CONTRACT;
+interface SelectedSpecificationContent {
   contracts: { source: Ref; index: number; pointer: string; value: Json }[];
   preparations: { source: Ref; index: number; pointer: string; featureIndex: number; value: Json }[];
   constraints: { source: Ref; pointer: string; value: Json };
 }
+
+export type SelectedSpecification = SelectedSpecificationContent & ({ contract: typeof SELECTED_SPECIFICATION_CONTRACT }
+  | { contract: typeof BASIS_SPECIFICATION_CONTRACT; bases: SpecificationBases });
 
 type Row = Record<string, Json>;
 const object = (value: unknown): value is Row => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -42,7 +56,7 @@ export function preparationMatches(preparations: readonly unknown[], feature: { 
     ? [{ index, value: prep }] : []);
 }
 
-function stage(request: SelectedSpecificationRequest, name: 'specification' | 'features'): AcceptedStageFields {
+function stage(request: SelectedSpecificationRequest, name: 'discovery' | 'concept' | 'specification' | 'features'): AcceptedStageFields {
   const source = request.sources.filter(row => row.stage === name);
   if (source.length !== 1 || !isRef(source[0]) || source[0]!.id !== stageId(request.project, name))
     failure('selected_specification_basis_invalid', stageId(request.project, name), 'sources', `The input names exactly one ${name} stage of this project`);
@@ -78,8 +92,13 @@ export function selectSpecification(request: SelectedSpecificationRequest): Sele
     const { index, value } = matches[0]!;
     return { source: exact(features.ref), index, pointer: `${FIELDS}/featurePreparation/${index}`, featureIndex: feature.index, value: value as Json };
   }).sort((a, b) => a.index - b.index);
-  return { contract: SELECTED_SPECIFICATION_CONTRACT, contracts, preparations: prepared,
+  const content = { contracts, preparations: prepared,
     constraints: { source: exact(specification.ref), pointer: `${FIELDS}/constraints`, value: constraints as Json } };
+  if (request.contract === BASIS_SPECIFICATION_CONTRACT)
+    return structuredClone({ ...content, contract: BASIS_SPECIFICATION_CONTRACT, bases: selectedBases(request, content) });
+  if (request.contract !== undefined && request.contract !== SELECTED_SPECIFICATION_CONTRACT)
+    failure('selected_specification_basis_invalid', request.project, 'contract', 'The selection needs a known saved material contract');
+  return structuredClone({ contract: SELECTED_SPECIFICATION_CONTRACT, ...content });
 }
 
 
@@ -95,7 +114,7 @@ export function selectTaskSpecification(request: TaskSpecificationSelection): Ta
   const features = input.features.filter(feature => feature.requirementIds.some(id => required.has(id))
     || feature.contracts.some(id => ids.has(id)));
   const selected = selectSpecification({ project, sources: input.sources, accepted,
-    contracts: [...ids], features });
+    contracts: [...ids], features, ...(request.contract ? { contract: request.contract } : {}) });
   return structuredClone({ ...selected, contracts: selected.contracts.map(row => {
     const id = (row.value as Row).id;
     const effective = contracts.filter(item => item.value.id === id);
@@ -104,4 +123,64 @@ export function selectTaskSpecification(request: TaskSpecificationSelection): Ta
     const resolved = effective[0]!;
     return { ...row, effective: { source: exact(inputRef), pointer: `/contracts/${resolved.index}`, value: resolved.value as unknown as Json } };
   }) });
+}
+
+
+/** Resolve only the immutable catalogue; feature inheritance does not expand the selected assignment. */
+function selectedBases(request: SelectedSpecificationRequest, selected: SelectedSpecificationContent): SpecificationBases {
+  if (!hasBasisApplications(request.sources))
+    failure('selected_specification_basis_invalid', request.project, 'sources.contractVersion',
+      'Basis material requires v6 producers for Discovery, concept and specification');
+  const discovery = stage(request, 'discovery'), concept = stage(request, 'concept'), specification = stage(request, 'specification');
+  const catalogue = (() => {
+    try { return discoveryBasisCatalogue(discovery); }
+    catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      failure('selected_specification_basis_invalid', discovery.ref.id, '/content/fields', error.message, discovery.ref);
+    }
+  })();
+  const entries = [...catalogue.constraints, catalogue.variant];
+  const rawContracts = specification.fields.behaviorContracts;
+  const sections = concept.fields.conceptSections;
+  if (!Array.isArray(rawContracts) || !Array.isArray(sections))
+    failure('selected_specification_basis_invalid', specification.ref.id, FIELDS, 'The application sources retain their explicit lists');
+  const requirements = sections.flatMap((section, index) => {
+    if (!object(section) || !Array.isArray(section.requirements))
+      failure('selected_specification_basis_invalid', concept.ref.id, `${FIELDS}/conceptSections/${index}`, 'Accepted sections retain their requirements');
+    return section.requirements.map((value, requirementIndex) => ({ value, pointer: `/${index}/requirements/${requirementIndex}` }));
+  });
+  const names = (value: unknown, target: string, field: string): string[] => {
+    if (!Array.isArray(value) || !value.every(id => typeof id === 'string' && id.length))
+      failure('selected_specification_basis_invalid', target, field, 'An inherited basis needs an explicit identity list');
+    return value;
+  };
+  const applications = (source: AcceptedStageFields, field: string, pointer: string, allowed: string[]) => {
+    try {
+      return resolveBasisApplications({ field, value: source.fields[field], catalogue: entries,
+        owners: [{ pointer, fields: allowed, required: [] }], required: [] }).map(row => row.basis);
+    } catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      failure('selected_specification_basis_invalid', source.ref.id, `${FIELDS}/${field}${pointer}`, error.message, source.ref);
+    }
+  };
+  const contractBases = (index: number) => applications(specification, 'behaviorContracts', `/${index}`,
+    ['entry', 'inputs', 'success', 'failures', 'forbiddenEffects', 'state', 'compatibility', 'proof']);
+  const inherited = (value: Json, target: string): SpecificationBases['catalogue']['constraints'] => {
+    if (!object(value)) failure('selected_specification_basis_invalid', target, 'featurePreparation', 'The selected preparation is an object');
+    const result = names(value.requirements, target, 'requirements').flatMap(id => {
+      const rows = requirements.filter(row => object(row.value) && row.value.id === id);
+      if (rows.length !== 1) failure('selected_specification_unresolved', id, 'requirements', 'Each inherited requirement has one exact source');
+      return applications(concept, 'conceptSections', rows[0]!.pointer, ['statement', 'benefit', 'acceptance']);
+    });
+    for (const id of names(value.behaviorContracts, target, 'behaviorContracts')) {
+      const rows = rawContracts.flatMap((row, index) => object(row) && row.id === id ? [index] : []);
+      if (rows.length !== 1) failure('selected_specification_unresolved', id, 'behaviorContracts', 'Each inherited contract has one exact source');
+      result.push(...contractBases(rows[0]!));
+    }
+    return [...new Map(result.map(row => [canonical(row.address), row])).values()];
+  };
+  return { catalogue, selected: [
+    ...selected.contracts.map(row => ({ owner: { record: row.source, pointer: row.pointer }, bases: contractBases(row.index) })),
+    ...selected.preparations.map(row => ({ owner: { record: row.source, pointer: row.pointer }, bases: inherited(row.value, row.source.id) })),
+  ] };
 }

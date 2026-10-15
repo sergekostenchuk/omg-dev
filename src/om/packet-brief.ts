@@ -18,7 +18,7 @@ import { isPlainObject, type Refusal } from './refusal.js';
 import { bindingFlowIdentity } from '../graph/flow-identity.js';
 import { ONE_ARTIFACT, WAKE_TEST } from './frame-proposals.js';
 import { isTestFile, isTestSupport, validSnapshot, type RepositorySnapshot, type SnapshotFiles, type TestCasesRow, type TestMapRow } from './impact.js';
-import { selectSpecification } from './selected-specification.js';
+import { selectSpecification, BASIS_SPECIFICATION_CONTRACT, SELECTED_SPECIFICATION_CONTRACT } from './selected-specification.js';
 
 export const BRIEF_PACKET_CONTRACT = 'om-packet/brief-v1' as const;
 export const WORKS_BRIEF_PACKET_CONTRACT = 'om-packet/works-brief-v1' as const;
@@ -32,6 +32,8 @@ export const BRIEF_REOPEN_CONTRACT = 'om-brief/v3' as const;
  * root declares it; parts, continuations and corrections keep their root's; a root saved without it keeps its own bytes.
  */
 export const BRIEF_SELECTION_CONTRACT = 'om-brief-selection/v1' as const;
+export const BASIS_BRIEF_SELECTION_CONTRACT = 'om-brief-selection/v2' as const;
+export type BriefSelectionContract = typeof BRIEF_SELECTION_CONTRACT | typeof BASIS_BRIEF_SELECTION_CONTRACT;
 const SELECTED_RULE = 'selected is the accepted original specification behind this scope: the full behavior contracts and feature preparations it selects and every specification constraint, each at its exact stage reference (a context label) and JSON pointer. contracts above are their effective B1 rows: where nodes or state differ, the B1 row is the binding decision and the original text stays as accepted. This material does not widen the assignment, its writable paths, ownership or permitted actions.';
 /** What v2 brought holds in v3 too. */
 const contentEra = (value: unknown): boolean => value === BRIEF_CONTENT_CONTRACT || value === BRIEF_REOPEN_CONTRACT;
@@ -285,7 +287,7 @@ function impactSection(basis: BriefBasis): string[] {
 export interface BriefBasis {
   briefContract?: typeof BRIEF_CONTENT_CONTRACT | typeof BRIEF_REOPEN_CONTRACT;
   /** SP1: the selection era of the packet root; absent in a root saved before it. */
-  selection?: typeof BRIEF_SELECTION_CONTRACT;
+  selection?: BriefSelectionContract;
   /** AT1 (№4091 п.5): the saved snapshot and test map of a works chain of the impact era; absent before it. */
   impact?: BriefImpact;
   /** OBL1 (№3773): the bindings era of the step — its works section shows the exact binding data of its D7 obligations. */
@@ -500,9 +502,11 @@ function scopedInput(payload: Record<string, any>, basis: BriefBasis) {
   const behavior = (specification?.fields.behavior ?? []) as Json[];
   // SP1 (№4714 §2.5): the same scope, whole — the originals of the contracts and features selected above, never wider.
   const selected = basis.selection ? { ...selectSpecification({ project: basis.project, sources: input.sources ?? [], accepted: basis.accepted,
+    contract: basis.selection === BASIS_BRIEF_SELECTION_CONTRACT ? BASIS_SPECIFICATION_CONTRACT : SELECTED_SPECIFICATION_CONTRACT,
     contracts: contracts.map((row: { id: string }) => row.id),
     features: features.map((row: { index: number; title: string; outcome: string }) => ({ index: row.index, title: row.title, outcome: row.outcome })) }),
-  rule: SELECTED_RULE } : null;
+  rule: SELECTED_RULE + (basis.selection === BASIS_BRIEF_SELECTION_CONTRACT
+    ? ' bases contains the exact Discovery variant and the complete project constraint catalogue as shared context. bases.selected resolves only the bases inherited by the selected contracts and preparations; the catalogue does not assign every project constraint to every task and grants no additional paths or ownership.' : '') } : null;
   return { ...(selected ? { selected } : {}), requirementText, features, behavior: [...new Set<number>(features.flatMap((row: Record<string, any>) => row.behaviorIndexes))]
     .sort((a, b) => a - b).map(index => ({ source: specification!.ref, index, text: behavior[index] })),
     requirements: (input.requirements ?? []).filter((row: { id: string }) => requirementIds.has(row.id)),
@@ -1046,7 +1050,7 @@ function compactSchema(schema: any): any {
 export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Record<string, any> {
   if (Object.hasOwn(basis, 'briefContract') && !contentEra(basis.briefContract))
     invalid('briefContract', 'The selected brief content contract must be supported');
-  if (Object.hasOwn(basis, 'selection') && basis.selection !== BRIEF_SELECTION_CONTRACT)
+  if (Object.hasOwn(basis, 'selection') && basis.selection !== BRIEF_SELECTION_CONTRACT && basis.selection !== BASIS_BRIEF_SELECTION_CONTRACT)
     invalid('selection', 'The declared specification selection version must be supported');
   basis = { ...basis, material: { ...basis.material, sources: [...basis.material.sources].sort((a, b) => compare(a.path, b.path) || compare(canonical(a.reference), canonical(b.reference))) } };
   const labels = labelMap(payload, basis);

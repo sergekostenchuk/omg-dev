@@ -1,7 +1,7 @@
 import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION, BRIEF_CONTENT_CONTRACT, BRIEF_REOPEN_CONTRACT, NEIGHBOR_CONTRACT, briefContract, briefMaterial, boundedBrief, briefRepairRule, packetPrompt, packetFingerprint, graphIndex, reopenedMaterial, resolveBriefAnswer, type BriefBasis, type BriefLabel,
   briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot,
-  IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact, BRIEF_SELECTION_CONTRACT } from './packet-brief.js';
-import { SELECTED_SPECIFICATION_CODES } from './selected-specification.js';
+  IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact, BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT, type BriefSelectionContract } from './packet-brief.js';
+import { SELECTED_SPECIFICATION_CODES, hasBasisApplications } from './selected-specification.js';
 import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, IMPACT_PARSER, deriveTestMap, isRepository, readSnapshot, resolveSnapshot, transitionField } from './impact.js';
 import { IMPACT_SEMANTIC_CODES } from '../graph/semantics.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
@@ -168,7 +168,7 @@ export interface QuestionPacketRecord {
   briefContract?: typeof BRIEF_CONTENT_CONTRACT | typeof BRIEF_REOPEN_CONTRACT;
   /** SP1 (№4714 §2.1): a brief root issued after SP1 declares that its brief carries the selected specification whole;
    * its parts, continuations and corrections keep it; absent in a root saved before. */
-  briefSelection?: typeof BRIEF_SELECTION_CONTRACT;
+  briefSelection?: BriefSelectionContract;
   /** MP2 (№2968 §2, row 19): the neighbour set a brief root issued after MP2 saved; absent in a packet MP1 issued. */
   briefNeighbors?: { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] };
   /**
@@ -1117,7 +1117,7 @@ function contentContract(store: Store, request: QuestionPacketRequest, contract:
  */
 function selectionContract(store: Store, request: QuestionPacketRequest, contract: QuestionPacketRecord['packetContract'], saved?: QuestionPacketRecord) {
   const target = packetId(request, saved ? saved.answerProtocol : PACKET_ANSWER_PROTOCOL, contract);
-  if (saved && Object.hasOwn(saved, 'briefSelection') && (saved.briefSelection !== BRIEF_SELECTION_CONTRACT || !briefContract(contract)))
+  if (saved && Object.hasOwn(saved, 'briefSelection') && (![BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT].includes(saved.briefSelection!) || !briefContract(contract)))
     fail('packet_record_invalid', target, 'briefSelection', 'Only a brief packet can declare the supported selection version');
   if (!briefContract(contract)) return undefined;
   const predecessors = [...(request.continuation ? [request.continuation.packet] : []),
@@ -1126,7 +1126,11 @@ function selectionContract(store: Store, request: QuestionPacketRequest, contrac
   const inherited = predecessors[0]?.value.briefSelection;
   if (predecessors.some(prior => prior.value.briefSelection !== inherited))
     fail('packet_chain_invalid', target, 'briefSelection', 'All preceding steps preserve the selection version of their root');
-  const chosen = saved ? saved.briefSelection : predecessors.length ? inherited : BRIEF_SELECTION_CONTRACT;
+  const chosen = saved ? saved.briefSelection : predecessors.length ? inherited : (() => {
+    const routes = take(readRoutes(store, { project: request.project, record: request.routes }));
+    const input = take(readOmInput(store, request.project, routes.record.value.request.gaps.sources.input));
+    return hasBasisApplications(input.value.input.sources) ? BASIS_BRIEF_SELECTION_CONTRACT : BRIEF_SELECTION_CONTRACT;
+  })();
   if (saved && predecessors.length && chosen !== inherited)
     fail('packet_chain_invalid', target, 'briefSelection', 'A saved descendant preserves its proved root selection version');
   return chosen;

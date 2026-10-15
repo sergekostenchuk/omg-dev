@@ -1343,7 +1343,7 @@ test('AT1 return №4155 п.2, №4160 п.2: G5 accepts the five declared forms;
 });
 
 
-for (const stageName of ['specification', 'features'] as const)
+for (const stageName of ['discovery', 'concept', 'specification', 'features'] as const)
 test(`SP1b G5 v2 refuses a native ${stageName} head change in its publication window without partial acceptance`, async t => {
   const f = await atomicFixture(t), prepared = ok(prepareWorksAcceptance(f.store, f.request));
   assert.equal(prepared.state, 'accepted');

@@ -13,7 +13,7 @@ import { neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFea
   readTaskContextBasis, readTaskSpecification, type TaskSpecification, type TaskContextBasis, type OmReaderResult } from "./om-readers.js";
 import { historicalTrace, withHistoricalReads } from "../history/proofs.js";
 import { readRecord } from "../om/refs.js";
-import { TASK_CONTEXT_CONTRACT, type CompiledTask, type MachinePlan } from "./model.js";
+import { TASK_CONTEXT_CONTRACT, BASIS_TASK_CONTEXT_CONTRACT, isTaskContextContract, type TaskContextContract, type CompiledTask, type MachinePlan } from "./model.js";
 
 export interface ContextText { text: string; chars: number; utf8Bytes: number; hash: string }
 export function boundedContext(value: unknown, maxChars: number): ContextText {
@@ -26,7 +26,7 @@ export function boundedContext(value: unknown, maxChars: number): ContextText {
 
 export interface TaskContextSource { graph: Graph; task: CompiledTask; fullCheck: Command }
 export interface PreplanContextSource extends TaskContextSource {
-  taskContextContract?: typeof TASK_CONTEXT_CONTRACT;
+  taskContextContract?: TaskContextContract;
   specification?: TaskSpecification;
   project: string;
   basis: { candidate: Ref; environment: Ref };
@@ -34,7 +34,7 @@ export interface PreplanContextSource extends TaskContextSource {
   neighbors: Revision<NeighborCollection>;
 }
 export interface PlanTaskContextSources {
-  specification?: { basis: Extract<TaskContextBasis, { contract: typeof TASK_CONTEXT_CONTRACT }>; tasks: Record<string, TaskSpecification> };
+  specification?: { basis: Exclude<TaskContextBasis, { contract: "omg-task-context/v1" }>; tasks: Record<string, TaskSpecification> };
   plan: Ref; graph: Ref; candidate: Ref; references: Ref[];
   neighbors: NeighborSources; deliveryOwnership: DeliveryOwnershipBasis;
 }
@@ -100,7 +100,7 @@ function take<T>(result: OmReaderResult<T>): T {
 function requirePlan(plan: Revision<MachinePlan>): void {
   if (!object(plan) || !isRef(plan) || plan.kind !== "plan" || !object(plan.value)) invalid("plan");
   const value = plan.value;
-  if (Object.hasOwn(value, 'taskContextContract') && value.taskContextContract !== TASK_CONTEXT_CONTRACT) invalid('plan.taskContextContract', plan.id);
+  if (Object.hasOwn(value, 'taskContextContract') && !isTaskContextContract(value.taskContextContract)) invalid('plan.taskContextContract', plan.id);
   if (value.taskContextContract && !value.feasibility?.id.startsWith('om-feasibility:')) invalid('plan.feasibility', plan.id);
   if (!text(value.projectId) || ![value.graph, value.environment, value.feasibility].every(isRef)
     || !Array.isArray(value.guards) || !value.guards.every(isRef)
@@ -173,7 +173,7 @@ export function loadTaskContextSources(store: Store, plan: Revision<MachinePlan>
       const basis = take(readTaskContextBasis(source, { project, record: plan.value.feasibility }));
       if (basis.contract !== plan.value.taskContextContract) invalid('plan.taskContextContract', plan.id);
       return { basis, tasks: Object.fromEntries(plan.value.tasks.map(task => [task.id,
-        loadTaskSpecification(source, project, basis.input, plan.value.graphSnapshot, task)])) };
+        loadTaskSpecification(source, project, basis.input, plan.value.graphSnapshot, task, readTaskSpecification, basis.contract)])) };
     })() : undefined;
     return sealed({ ...(specification ? { specification } : {}), plan: reference(plan), graph: plan.value.graph, candidate: candidateRef, references: uniqueRefs(references),
       neighbors: { identity: [...new Set([...candidate.value.fills, ...(fills ?? [])]
@@ -310,13 +310,13 @@ function planNeighbors(plan: Revision<MachinePlan>, task: CompiledTask, sources:
 
 // The compiler uses its installed slot; direct G5 supplies the same OM reader without requiring product assembly.
 export function loadTaskSpecification(store: Store, project: string, input: Ref, graph: Graph, task: CompiledTask,
-  reader: typeof readTaskSpecification = readTaskSpecification): TaskSpecification {
-  return copy(take(reader(store, { project, input, requirements: (task.requirements ?? []).map(row => row.id),
+  reader: typeof readTaskSpecification = readTaskSpecification, contract: TaskContextContract = TASK_CONTEXT_CONTRACT): TaskSpecification {
+  return copy(take(reader(store, { project, input, contract: contract === BASIS_TASK_CONTEXT_CONTRACT ? 'selected-specification/v2' : 'selected-specification/v1', requirements: (task.requirements ?? []).map(row => row.id),
     nodes: new RefinementRelations(graph).ancestry(task.node).map(node => node.id) }))) as TaskSpecification;
 }
 
-function requireSpecification(value: unknown, target: string): asserts value is TaskSpecification {
-  if (!object(value) || value['contract'] !== 'selected-specification/v1' || !Array.isArray(value['contracts'])
+function requireSpecification(value: unknown, target: string, contract: TaskContextContract): asserts value is TaskSpecification {
+  if (!object(value) || value['contract'] !== (contract === BASIS_TASK_CONTEXT_CONTRACT ? 'selected-specification/v2' : 'selected-specification/v1') || !Array.isArray(value['contracts'])
     || !Array.isArray(value['preparations']) || !object(value['constraints']) || !isRef(value['constraints']['source'])
     || value['constraints']['pointer'] !== '/content/fields/constraints' || !Array.isArray(value['constraints']['value'])) invalid('selectedSpecification', target);
   const row = (value: unknown): value is Record<string, unknown> => object(value) && isRef(value['source'])
@@ -326,13 +326,26 @@ function requireSpecification(value: unknown, target: string): asserts value is 
     || !Object.hasOwn(entry['effective'], 'value')) invalid('selectedSpecification.contracts', target);
   for (const entry of value['preparations']) if (!row(entry) || entry['pointer'] !== `/content/fields/featurePreparation/${entry['index']}`
     || !Number.isSafeInteger(entry['featureIndex']) || (entry['featureIndex'] as number) < 0) invalid('selectedSpecification.preparations', target);
+  if (contract === BASIS_TASK_CONTEXT_CONTRACT) {
+    const bases = value['bases'];
+    if (!object(bases) || !object(bases['catalogue']) || bases['catalogue']['contract'] !== 'discovery-basis-catalogue/v1'
+      || !isRef(bases['catalogue']['source']) || !Array.isArray(bases['catalogue']['constraints'])
+      || !Array.isArray(bases['selected'])) invalid('selectedSpecification.bases', target);
+    const address = (entry: unknown): boolean => object(entry) && isRef(entry['record']) && typeof entry['pointer'] === 'string';
+    const entry = (item: unknown): boolean => object(item) && address(item['address']) && Object.hasOwn(item, 'value');
+    if (!entry(bases['catalogue']['variant']) || !bases['catalogue']['constraints'].every(entry)
+      || bases['selected'].some(item => !object(item) || !address(item['owner']) || !Array.isArray(item['bases']) || !item['bases'].every(entry)))
+      invalid('selectedSpecification.bases', target);
+    const owners = [...value['contracts'], ...value['preparations']].map(item => ({ record: item['source'], pointer: item['pointer'] }));
+    if (canonical(owners) !== canonical(bases['selected'].map(item => item['owner']))) invalid('selectedSpecification.bases.selected', target);
+  }
 }
 function contextWithSpecification(value: unknown, maxChars: number, specification: Sealed<TaskSpecification> | undefined, target: string): ContextText {
   try { return boundedContext(value, maxChars); }
   catch (error) {
     if (specification && error instanceof EngineError && error.code === 'context_budget_exceeded')
       throw new EngineError(error.code, error.message, { ...(error.details as object), unit: 'V2', target, field: 'selectedSpecification',
-        sources: uniqueRefs([specification.constraints.source, ...specification.contracts.flatMap(row => [row.source, row.effective.source]),
+        sources: uniqueRefs([...(specification.contract === 'selected-specification/v2' ? [specification.bases.catalogue.source] : []), specification.constraints.source, ...specification.contracts.flatMap(row => [row.source, row.effective.source]),
           ...specification.preparations.map(row => row.source)]) });
     throw error;
   }
@@ -343,11 +356,11 @@ function contextWithSpecification(value: unknown, maxChars: number, specificatio
 export function preplanTaskContext(source: PreplanContextSource, maxChars: number): ContextText {
   source = copy(source); requireContentSource(source);
   const packet = requireNeighbors(source), { task, project, basis, neighbors } = source;
-  if (Object.hasOwn(source, 'taskContextContract') && source.taskContextContract !== TASK_CONTEXT_CONTRACT) invalid('taskContextContract', task.id);
+  if (Object.hasOwn(source, 'taskContextContract') && !isTaskContextContract(source.taskContextContract)) invalid('taskContextContract', task.id);
   const specification = source.taskContextContract ? source.specification : undefined;
-  if (source.taskContextContract) requireSpecification(specification, task.id);
+  if (source.taskContextContract) requireSpecification(specification, task.id, source.taskContextContract);
   else if (Object.hasOwn(source, 'specification')) invalid('taskContextContract', task.id);
-  return contextWithSpecification({ version: source.taskContextContract ? 'omg-task-context/preplan-v2' : "omg-task-context/preplan-v1",
+  return contextWithSpecification({ version: source.taskContextContract === BASIS_TASK_CONTEXT_CONTRACT ? 'omg-task-context/preplan-v3' : source.taskContextContract ? 'omg-task-context/preplan-v2' : "omg-task-context/preplan-v1",
     binding: { candidate: basis.candidate, environment: basis.environment, neighbors: reference(neighbors), task: task.id },
     ...omContent(source, packet, neighbors.value.source.ownership), ...(specification ? { selectedSpecification: specification } : {}),
     details: { source: "works-candidate", project, candidate: basis.candidate, task: task.id,
@@ -372,7 +385,7 @@ export function taskContext(plan: Revision<MachinePlan>, fullCheck: Command, tas
   const specification = plan.value.taskContextContract ? checked?.specification?.tasks[task.id] : undefined;
   if (plan.value.taskContextContract) {
     if (checked?.specification?.basis.contract !== plan.value.taskContextContract) invalid('sources.taskContextContract', plan.id);
-    requireSpecification(specification, task.id);
+    requireSpecification(specification, task.id, plan.value.taskContextContract);
   } else if (checked?.specification) invalid('sources.taskContextContract', plan.id);
   return contextWithSpecification({ version: plan.value.taskContextContract ?? "omg-task-context/v1", binding: { plan: reference(plan), graph: plan.value.graph, task: task.id,
     base: { commit: plan.value.base.head, tree: plan.value.base.tree } },

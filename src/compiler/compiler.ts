@@ -8,7 +8,7 @@ import { hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { isRef, reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
-import { checkedPlanDerivation, planDerivation, EXTERNAL_INPUT_DERIVATION, TASK_CONTEXT_CONTRACT, type MachinePlan } from "./model.js";
+import { checkedPlanDerivation, planDerivation, EXTERNAL_INPUT_DERIVATION, isTaskContextContract, type MachinePlan } from "./model.js";
 import { deriveTasks } from "./derive.js";
 import { resolveArtifact, resolvePlanExternalSource } from "./inputs.js";
 import { requireBasis } from "./basis.js";
@@ -35,7 +35,7 @@ export class Compiler {
     requireCondition(checked.findings.length === 0 && feasibility.value.repository, "feasibility_not_ready", "Current R3 proof is required");
     const contextBasis = om ? readTaskContextBasis(this.store, { project, record: feasibilityRef }) : null;
     if (contextBasis && !contextBasis.ok) throw new EngineError(contextBasis.refusal.code, contextBasis.refusal.message, contextBasis.refusal.at);
-    const taskContextContract = contextBasis?.ok && contextBasis.value.contract === TASK_CONTEXT_CONTRACT ? TASK_CONTEXT_CONTRACT : undefined;
+    const taskContextContract = contextBasis?.ok && isTaskContextContract(contextBasis.value.contract) ? contextBasis.value.contract : undefined;
     const record = this.store.get<Graph>(`graph:${project}`)!; const graph = requireGraph(record.value);
     const environment = this.environments.get(project);
     const owners = new Owners(this.store, project, feasibility.value.repository!);
@@ -91,7 +91,7 @@ export class Compiler {
     const derivation = planDerivation(plan.id);
     const om = requireBasis(this.store, plan.value);
     if (Object.hasOwn(plan.value, 'taskContextContract')) {
-      if (plan.value.taskContextContract !== TASK_CONTEXT_CONTRACT || !om) throw new EngineError('context_source_invalid',
+      if (!isTaskContextContract(plan.value.taskContextContract) || !om) throw new EngineError('context_source_invalid',
         'A declared task context needs its M8 producer and known contract', { unit: 'V2', target: plan.id, field: 'taskContextContract' });
       const basis = readTaskContextBasis(this.store, { project: plan.value.projectId, record: plan.value.feasibility });
       if (!basis.ok) throw new EngineError(basis.refusal.code, basis.refusal.message, basis.refusal.at);

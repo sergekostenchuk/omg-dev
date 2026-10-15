@@ -3,7 +3,7 @@ import { EngineError } from '../errors.js';
 import { loadTaskSpecification, preplanTaskContext } from '../compiler/context.js';
 import { deriveTasks } from '../compiler/derive.js';
 import { resolveExternalSource } from '../compiler/inputs.js';
-import { TASK_CONTEXT_CONTRACT, type TaskInput } from '../compiler/model.js';
+import { TASK_CONTEXT_CONTRACT, BASIS_TASK_CONTEXT_CONTRACT, isTaskContextContract, type TaskContextContract, type TaskInput } from '../compiler/model.js';
 import { readWriter, type WriterProof } from '../ownership/owners.js';
 import type { Environment, ExecutionRoot } from '../runtime/environment.js';
 import type { Graph } from '../graph/model.js';
@@ -18,6 +18,7 @@ import { noteUntracedRead, Store, type Revision, type Write } from '../storage/s
 import { provenReads, registerSourceOverlay } from '../storage/store-view.js';
 import { readCapacity as readCapacityOf } from './capacity.js';
 import { taskSpecificationReader } from './task-specification.js';
+import { hasBasisApplications } from './selected-specification.js';
 import { readDeliveries as readDeliveriesOf } from './deliveries.js';
 import { prepareSettleCandidate as prepareSettleCandidateOf, readAcceptedFrame as readAcceptedFrameOf, readRejectedCandidate as readRejectedCandidateOf, type AcceptedFrameRequest } from './frame-accept.js';
 import type { CandidateRequest, FrameCandidateRecord } from './frame-candidate.js';
@@ -104,7 +105,7 @@ export interface WorkProposalSource { kind: 'part' | 'assembly' | 'reuse'; recor
 export interface AtomicGateRequest {
   project: string; candidate: Ref; neighbors: Ref; environment: Ref; gaps: GapReadRequest; results: WorkProposalSource[]; sources: Ref[];
   snapshot?: RepositorySnapshot | null;
-  taskContextContract?: typeof TASK_CONTEXT_CONTRACT;
+  taskContextContract?: TaskContextContract;
 }
 export interface AtomicGateRecord {
   contract: typeof ATOMIC_GATE_CONTRACT | typeof ATOMIC_GATE_IMPACT_CONTRACT; project: string; request: AtomicGateRequest;
@@ -152,7 +153,7 @@ function requireRequest(store: Store, request: AtomicGateRequest): void {
     || ![request.candidate, request.neighbors, request.environment].every(isRef) || !object(request.gaps)
     || !sourcesShape(request.results) || !sourcesRefs(request.sources)
     || Object.hasOwn(request, 'snapshot') && request.snapshot !== null && !validSnapshot(request.snapshot)
-    || Object.hasOwn(request, 'taskContextContract') && request.taskContextContract !== TASK_CONTEXT_CONTRACT
+    || Object.hasOwn(request, 'taskContextContract') && !isTaskContextContract(request.taskContextContract)
     || Object.keys(request).some(key => !['project', 'candidate', 'neighbors', 'environment', 'gaps', 'results', 'sources', 'snapshot', 'taskContextContract'].includes(key))) invalid('request');
 }
 
@@ -161,9 +162,13 @@ const normalizedGateRequest = (request: AtomicGateRequest): AtomicGateRequest =>
 const gateId = (request: AtomicGateRequest) => `om-atomic-gate:${request.project}:${hashJson(request)}`;
 function issuedRequest(store: Store, request: AtomicGateRequest): AtomicGateRequest {
   request = normalizedGateRequest(request);
-  // A saved G5 keeps its own era, including current re-admission through C5. A new identity measures v2.
-  if (request.taskContextContract || store.get(gateId(request))) return request;
-  return { ...request, taskContextContract: TASK_CONTEXT_CONTRACT };
+  // A saved G5 keeps its era. New work derives the contract from its immutable B1 producers, never field presence.
+  if (store.get(gateId(request))) return request;
+  const input = take(readOmInput(store, request.project, request.gaps.sources.input)).value.input;
+  const contract = hasBasisApplications(input.sources) ? BASIS_TASK_CONTEXT_CONTRACT : TASK_CONTEXT_CONTRACT;
+  if (request.taskContextContract && request.taskContextContract !== contract)
+    invalid('taskContextContract');
+  return { ...request, taskContextContract: contract };
 }
 
 /** A preview has the same exact revisions as the one final transaction; it never writes to the store. */
@@ -436,7 +441,7 @@ function packetCapacity(store: Store, request: AtomicGateRequest, candidate: Fra
   const findings: Finding[] = [...derived.obligations.findings];
   for (const task of derived.tasks) {
     const selected = request.taskContextContract ? { taskContextContract: request.taskContextContract,
-      specification: loadTaskSpecification(store, request.project, request.gaps.sources.input, graph, task, readTaskSpecification) } : {};
+      specification: loadTaskSpecification(store, request.project, request.gaps.sources.input, graph, task, readTaskSpecification, request.taskContextContract) } : {};
     try { preplanTaskContext({ project: request.project, graph, task, fullCheck: fullCheck!,
       basis: { candidate: request.candidate, environment: request.environment }, neighbors, ...selected }, limit); }
     catch (error) {

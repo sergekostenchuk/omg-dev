@@ -4162,7 +4162,7 @@ test('RB1 №4343: an answer B1 applied to a transition the reopening found reac
 });
 
 // ---- SP1a (№4714): the accepted specification whole in the questions of OM — the saved selection era of a packet root ----
-import { BRIEF_SELECTION_CONTRACT, type BriefLabel } from '../src/om/packet-brief.js';
+import { BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT, deriveBrief, boundedBrief, type BriefBasis, type BriefLabel } from '../src/om/packet-brief.js';
 
 /** The scope section of a saved brief packet and its context labels, read as the model reads them. */
 function sp1Scope(record: Sealed<Revision<QuestionPacketRecord>>) {
@@ -4318,4 +4318,53 @@ test('SP1a №4714 §5 «принадлежность источника»: a la
   for (const row of [...sp1Scope(read).input.selected.contracts, sp1Scope(read).input.selected.constraints])
     assert.deepEqual(sp1Scope(read).label(row.source), selectedFrom, 'The saved selection keeps its exact stage revision');
   assert.deepEqual(snapshot(f.store), before);
+});
+
+
+/** v6 field projections can be exercised before DS1.2lh enables their actual producers. No Store bytes are changed. */
+function ds12BriefFixture(t: TestContext) {
+  const p = packetFixture(t), { f } = p, request = sp1FieldRequest(p, 'ds12m-bases');
+  const record = ok(prepareQuestionPacket(f.store, request)).record, payload = clone(record.value.packet) as Record<string, any>;
+  payload.responseForm.schema = clone(packetAnswerSchema('field'));
+  const input = { ...clone(f.input.value.input), sources: f.input.value.input.sources.map(source => ({ ...source, contractVersion: 6 })) };
+  const accepted = input.sources.map(source => {
+    const row = f.store.get<{ content: { fields: Record<string, Json> } }>(source.id, source.revision)!;
+    return { stage: source.stage, ref: reference(row), fields: clone(row.value.content.fields) };
+  });
+  const discovery = accepted.find(row => row.stage === 'discovery')!;
+  const preparation = discovery.fields['preparation'] as Record<string, Json>;
+  const address = { record: discovery.ref, pointer: '/content/fields/preparation/constraints/0' };
+  const variant = { record: discovery.ref, pointer: '/content/fields/verdict/variant' };
+  const app = (basis: typeof address, pointer: string) => ({ contract: 'basis-application/v1', basis, appliedAt: [pointer] });
+  preparation['constraints'] = [{ id: 'keep-session-local', rule: 'Never copy subscription credentials into the API path.', basis: 'owner requirement' }];
+  discovery.fields['verdict'] = { outcome: 'go', variant: 'One vendor, separate API credentials' };
+  const sections = accepted.find(row => row.stage === 'concept')!.fields['conceptSections'] as any[];
+  sections.forEach((section, index) => section.requirements.forEach((row: any, at: number) => {
+    row.applications = [app(address, `/${index}/requirements/${at}/statement`), app(variant, `/${index}/requirements/${at}/benefit`)];
+  }));
+  const contracts = accepted.find(row => row.stage === 'specification')!.fields['behaviorContracts'] as any[];
+  contracts.forEach((row, index) => { row.applications = [app(address, `/${index}/entry`), app(variant, `/${index}/compatibility`)]; });
+  const graph = f.store.get<Graph>(`graph:${f.project}`)!;
+  const basis: BriefBasis = { selection: BASIS_BRIEF_SELECTION_CONTRACT, project: f.project, graph: graph.value, node: null,
+    gaps: p.routes.value.batches.find(batch => batch.id === request.batch)!.items.map(item => ({
+      question: item.gap, target: item.target, field: item.field, ref: item.record, evidence: [] })),
+    contexts: [reference(f.input), reference(graph), ...accepted.map(row => row.ref)], input: input as unknown as Json,
+    accepted, material: { sources: [], references: [], guards: [] }, materialBudget: 0, codes: [] };
+  return { payload, basis, store: f.store };
+}
+
+test('DS1.2m brief v2 carries resolved bases whole in initial, continuation and correction projections', t => {
+  const f = ds12BriefFixture(t), before = snapshot(f.store);
+  const selected = (packet: Record<string, any>) => JSON.parse(packetPrompt(packet).split('# Scope and exact context\n')[1]!.split('\n')[0]!).input.selected;
+  const initial = deriveBrief(f.payload, f.basis), full = selected(initial);
+  assert.equal(full.contract, 'selected-specification/v2'); assert.ok(full.contracts.length > 0);
+  assert.ok(full.bases.selected.length > 0); assert.equal(full.bases.catalogue.variant.value, 'One vendor, separate API credentials');
+  assert.equal(full.bases.catalogue.constraints[0].value.rule, 'Never copy subscription credentials into the API path.');
+  for (const extra of [{ continuation: { round: 1 } }, { correction: { reason: 'Keep the same selected contract' } }])
+    assert.deepEqual(selected(deriveBrief({ ...f.payload, ...extra }, f.basis)), full);
+  const limit = packetPrompt(initial).length;
+  assert.equal(packetPrompt(boundedBrief(f.payload, f.basis, limit)).length, limit);
+  const tooSmall = boundedBrief(f.payload, f.basis, limit - 1);
+  assert.ok(packetPrompt(tooSmall).length > limit - 1, 'Mandatory bases remain whole for the issuing gate to refuse the request');
+  assert.deepEqual(selected(tooSmall), full); assert.deepEqual(snapshot(f.store), before);
 });

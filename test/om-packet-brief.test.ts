@@ -797,7 +797,7 @@ test('SP1a №4714 §3: the section is mandatory — boundedBrief never trims it
 
 test('SP1a №4714 §2.1: an unsupported declaration and a basis without the exact selected stages are addressed refusals of the brief', t => {
   const f = selectionBasis(t);
-  assert.throws(() => deriveBrief(f.input, { ...f.basis, selection: 'om-brief-selection/v2' as typeof BRIEF_SELECTION_CONTRACT }),
+  assert.throws(() => deriveBrief(f.input, { ...f.basis, selection: 'om-brief-selection/v3' as typeof BRIEF_SELECTION_CONTRACT }),
     (error: unknown) => error instanceof EngineError && error.code === 'packet_brief_invalid' && (error.details as { field: string }).field === 'selection');
   assert.throws(() => deriveBrief(f.input, { ...f.basis, selection: BRIEF_SELECTION_CONTRACT, accepted: f.basis.accepted.filter(row => row.stage !== 'features') }),
     (error: unknown) => error instanceof EngineError && error.code === 'selected_specification_basis_invalid'

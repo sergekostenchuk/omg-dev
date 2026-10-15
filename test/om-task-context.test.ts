@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import '../src/om/compiler-readers.js';
-import { selectTaskSpecification } from '../src/om/selected-specification.js';
+import { selectTaskSpecification, hasBasisApplications } from '../src/om/selected-specification.js';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, digest, hashJson } from '../src/canonical.js';
 import { preplanTaskContext, taskContext, taskContextContent, type ContextText, type PlanTaskContextSources } from '../src/compiler/context.js';
 import { deriveTasks } from '../src/compiler/derive.js';
-import { TASK_CONTEXT_CONTRACT, type CompiledTask, type MachinePlan } from '../src/compiler/model.js';
+import { TASK_CONTEXT_CONTRACT, BASIS_TASK_CONTEXT_CONTRACT, type CompiledTask, type MachinePlan } from '../src/compiler/model.js';
 import type { TaskSpecification, TaskSpecificationSelection, OmReaderResult } from '../src/compiler/om-readers.js';
 import type { AtomicGateRequest } from '../src/om/atomic-gate.js';
 import { EngineError } from '../src/errors.js';
@@ -633,7 +633,7 @@ test('SP1b current G5 and compiled v2 plan deliver the same full material and la
 });
 
 
-for (const changedBasis of ['specification', 'environment'] as const)
+for (const changedBasis of ['discovery', 'concept', 'specification', 'environment'] as const)
 test(`SP1b compile guards ${changedBasis} changed by another Store before publishing the v2 plan`, async t => {
   const f = await sp1CurrentWorks(t);
   const { Store } = await import('../src/storage/store.js');
@@ -647,9 +647,9 @@ test(`SP1b compile guards ${changedBasis} changed by another Store before publis
   f.store.writeMany = ((writes: import('../src/storage/store.js').Write[], guards = []) => {
     if (!shifted && writes.some(row => row.kind === 'plan')) {
       shifted = true;
-      if (changedBasis === 'specification') {
-        const stage = otherStore.get<StageArtifact>(`stage:${f.project}:specification`)!;
-        other.pipeline.draft(f.project, 'specification', stage.value.content, stage.revision);
+      if (changedBasis !== 'environment') {
+        const stage = otherStore.get<StageArtifact>(`stage:${f.project}:${changedBasis}`)!;
+        other.pipeline.draft(f.project, changedBasis, stage.value.content, stage.revision);
       } else {
         const environment = other.environments.get(f.project), { projectId: _project, ...value } = environment.value;
         other.environments.configure(f.project, { ...value, requestCapacityChars: 250_000 }, environment.revision);
@@ -686,4 +686,121 @@ test('SP1b exact plan repeat guards the current stage before returning an existi
   assert.throws(() => engine.compiler.compile(f.project), { code: 'plan_stale' });
   f.store.get = get;
   assert.ok(shifted); assert.equal(f.store.list('plan').length, 1); assert.deepEqual(f.store.get(plan.id), plan);
+});
+
+
+// These are pure accepted-field projections, not hand-written Store records or a substitute v6 producer.
+function ds12Selection(): TaskSpecificationSelection {
+  const request = sp1Selection(), discovery = ref(`stage:${project}:discovery`), concept = ref(`stage:${project}:concept`);
+  const basis = (index: number) => ({ record: discovery, pointer: `/content/fields/preparation/constraints/${index}` });
+  const variant = { record: discovery, pointer: '/content/fields/verdict/variant' };
+  const report = ref(`research-answer:${project}:report`);
+  const application = (address: typeof variant, pointer: string) => ({ contract: 'basis-application/v1', basis: { record: { ...address.record }, pointer: address.pointer }, appliedAt: [pointer] });
+  request.contract = 'selected-specification/v2'; request.requirements = ['R'];
+  request.input.sources.forEach(source => { source.contractVersion = 6; });
+  request.input.sources.push({ ...discovery, stage: 'discovery', contractVersion: 6 }, { ...concept, stage: 'concept', contractVersion: 6 });
+  request.accepted.push({ stage: 'discovery', ref: discovery, fields: {
+    preparation: { constraints: [
+      { id: 'no-export', rule: 'The selected vendor session stays local; do not export its credentials.', basis: canonical({ report, pointer: '/constraints/0' }) },
+      { id: 'no-extra-rights', rule: 'A separate maintenance task does not widen this task.', basis: 'owner requirement' },
+    ] }, researchReport: { constraints: ['The selected vendor session stays local; do not export its credentials.'] },
+    verdict: { outcome: 'go', variant: 'one vendor with separate API credentials', researchReport: { ...report } },
+  } }, { stage: 'concept', ref: concept, fields: { conceptSections: [{ id: 'section', requirements: ['R', 'F', 'elsewhere'].map((id, index) => ({
+    id, statement: `statement ${id}`, benefit: 'bounded behavior', acceptance: ['no credential export'],
+    applications: [application(basis(index === 0 ? 0 : 1), `/0/requirements/${index}/statement`), application(variant, `/0/requirements/${index}/acceptance/0`)],
+  })) }] } });
+  const specification = request.accepted.find(row => row.stage === 'specification')!;
+  (specification.fields['behaviorContracts'] as any[]).forEach((row, index) => {
+    row.applications = [application(basis(row.id === 'unrelated' ? 1 : 0), `/${index}/entry`)];
+  });
+  const features = request.accepted.find(row => row.stage === 'features')!;
+  (features.fields['featurePreparation'] as any[]).forEach((row, index) => {
+    row.requirements = index === 0 ? ['F'] : index === 1 ? ['elsewhere'] : ['R'];
+    row.behaviorContracts = index === 2 ? ['required'] : ['unrelated'];
+  });
+  return request;
+}
+
+test('DS1.2m v2 resolves selected bases and carries the complete project catalogue without expanding the task', () => {
+  const request = ds12Selection(), original = canonical(request), selected = selectTaskSpecification(request);
+  assert.equal(selected.contract, 'selected-specification/v2'); if (selected.contract !== 'selected-specification/v2') return;
+  assert.deepEqual(selected.contracts.map(row => (row.value as any).id), ['required']);
+  assert.deepEqual(selected.bases.catalogue.constraints.map(row => (row.value as any).id), ['no-export', 'no-extra-rights']);
+  assert.equal(selected.bases.catalogue.variant.value, 'one vendor with separate API credentials');
+  assert.deepEqual(selected.bases.selected[0]!.bases, [selected.bases.catalogue.constraints[0]]);
+  assert.deepEqual(selected.bases.selected[1]!.bases.map(row => row.address),
+    [selected.bases.catalogue.constraints[0]!.address, selected.bases.catalogue.variant.address]);
+  assert.equal(selected.bases.selected.some(row => row.bases.some(entry => (entry.value as any)?.id === 'no-extra-rights')), false,
+    'Global catalogue context does not assign every constraint to every selected task');
+  assert.equal(canonical(request), original);
+  (selected.bases.catalogue.constraints[0]!.value as any).rule = 'caller edit';
+  const again = selectTaskSpecification(request); assert.equal(again.contract, 'selected-specification/v2');
+  if (again.contract === 'selected-specification/v2') assert.notEqual((again.bases.catalogue.constraints[0]!.value as any).rule, 'caller edit');
+});
+
+test('DS1.2m selection era is explicit for all catalogue/application producers; mixed sources retain the old contract', () => {
+  const request = ds12Selection(); assert.equal(hasBasisApplications(request.input.sources), true);
+  for (const stage of ['discovery', 'concept', 'specification']) {
+    for (const version of [null, 4, 5]) {
+      const sources = clone(request.input.sources); sources.find(row => row.stage === stage)!.contractVersion = version;
+      assert.equal(hasBasisApplications(sources), false, `${stage} ${version}`);
+    }
+  }
+  const sources = clone(request.input.sources); sources.find(row => row.stage === 'features')!.contractVersion = 5;
+  assert.equal(hasBasisApplications(sources), true, 'Features inherit the selected applications, not a second author-written list');
+  request.contract = 'selected-specification/v1'; const old = selectTaskSpecification(request);
+  assert.equal(old.contract, 'selected-specification/v1'); assert.equal(Object.hasOwn(old, 'bases'), false,
+    'A saved old selection is not expanded by fields present in the source');
+});
+
+for (const defect of ['missing-variant', 'missing-constraints', 'missing-applications', 'foreign-basis', 'missing-source', 'mixed-era'] as const)
+test(`DS1.2m declared v2 refuses ${defect} with an address instead of dropping mandatory material`, () => {
+  const request = ds12Selection(), discovery = request.accepted.find(row => row.stage === 'discovery')!;
+  const contracts = request.accepted.find(row => row.stage === 'specification')!.fields['behaviorContracts'] as any[];
+  if (defect === 'missing-variant') delete (discovery.fields['verdict'] as any).variant;
+  if (defect === 'missing-constraints') delete (discovery.fields['preparation'] as any).constraints;
+  if (defect === 'missing-applications') delete contracts[1].applications;
+  if (defect === 'foreign-basis') contracts[1].applications[0].basis.record = ref('stage:another:discovery');
+  if (defect === 'missing-source') request.accepted = request.accepted.filter(row => row.stage !== 'discovery');
+  if (defect === 'mixed-era') request.input.sources.find(row => row.stage === 'concept')!.contractVersion = 5;
+  assert.throws(() => selectTaskSpecification(request), (error: unknown) => error instanceof EngineError
+    && !!(error.details as any)?.field && !!((error.details as any)?.target || (error.details as any)?.pointer));
+});
+
+function ds12ContextFixture() {
+  const f = sp1ContextFixture(), specification = selectTaskSpecification(ds12Selection());
+  f.saved.value.taskContextContract = BASIS_TASK_CONTEXT_CONTRACT;
+  f.saved.hash = hashJson(f.saved.value); f.sources.plan = reference(f.saved);
+  f.sources.specification = { ...f.sources.specification!, basis: { ...f.sources.specification!.basis, contract: BASIS_TASK_CONTEXT_CONTRACT },
+    tasks: { [f.task.id]: specification } };
+  return { ...f, specification, request: { ...f.request, taskContextContract: BASIS_TASK_CONTEXT_CONTRACT, specification } };
+}
+
+test('DS1.2m preplan/v3 and task/v3 carry identical bases at the exact capacity boundary without new authority', () => {
+  const f = ds12ContextFixture(), pre = preplanTaskContext(f.request, 1_000_000);
+  const actual = taskContext(f.saved, FULL_CHECK, f.task.id, 1_000_000, f.sources);
+  const before = canonical(f.task), payload = JSON.parse(pre.text), task = JSON.parse(actual.text);
+  assert.equal(payload.version, 'omg-task-context/preplan-v3'); assert.equal(task.version, BASIS_TASK_CONTEXT_CONTRACT);
+  assert.deepEqual(payload.selectedSpecification, f.specification); assert.deepEqual(task.selectedSpecification, f.specification);
+  for (const result of [payload, task]) {
+    assert.deepEqual(result.scope.writePaths, f.task.writePaths);
+    assert.deepEqual(result.deliveryOwnership, JSON.parse(preplanTaskContext(fixture().request, 1_000_000).text).deliveryOwnership);
+  }
+  assert.equal(canonical(f.task), before);
+  assert.deepEqual(preplanTaskContext(f.request, pre.chars), pre);
+  assert.deepEqual(taskContext(f.saved, FULL_CHECK, f.task.id, actual.chars, f.sources), actual);
+  assert.throws(() => preplanTaskContext(f.request, pre.chars - 1), (error: unknown) => error instanceof EngineError
+    && error.code === 'context_budget_exceeded' && (error.details as any).requiredChars === pre.chars
+    && (error.details as any).sources.some((source: Ref) => source.id === `stage:${project}:discovery`));
+  assert.throws(() => taskContext(f.saved, FULL_CHECK, f.task.id, actual.chars - 1, f.sources), (error: unknown) => error instanceof EngineError
+    && error.code === 'context_budget_exceeded' && (error.details as any).requiredChars === actual.chars);
+});
+
+test('DS1.2m v3 refuses omitted basis material and a v1 selection while saved v2 still has its exact old shape', () => {
+  const f = ds12ContextFixture(), missing = clone(f.request) as any;
+  delete missing.specification.bases; sourceError(() => preplanTaskContext(missing, 1_000_000), 'selectedSpecification.bases');
+  const old = sp1ContextFixture();
+  sourceError(() => preplanTaskContext({ ...f.request, specification: old.specification }, 1_000_000), 'selectedSpecification');
+  assert.equal(JSON.parse(preplanTaskContext(old.request, 1_000_000).text).version, 'omg-task-context/preplan-v2');
+  assert.equal(Object.hasOwn(JSON.parse(taskContext(old.saved, FULL_CHECK, old.task.id, 1_000_000, old.sources).text).selectedSpecification, 'bases'), false);
 });
