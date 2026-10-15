@@ -900,3 +900,76 @@ test('DS1-R2 missing delivered grounds are an input refusal, not an erroneous mo
  for(const grounds of [null,incomplete])assert.throws(
   ()=>earlyResearchFailure(draft.value,question.value,'analyst',action,grounds),{code:'discovery_basis_missing'});
 });
+
+
+import { discoveryBasisCatalogue } from '../src/discovery/discovery-outcome.js';
+import { EngineError } from '../src/errors.js';
+
+test('DS1.2a D accepted Discovery preserves report links, owner constraints and the chosen variant as exact catalogue values', async t => {
+  const f = fixture(t); f.setup('catalogue');
+  const draft = f.engine.prepare('catalogue', 'discovery');
+  const result = await f.engine.stageResearch.run('catalogue', draft.id, 8);
+  assert.equal(result.status, 'accepted', JSON.stringify(result));
+  const stage = f.store.get<{ content: { fields: Record<string, Json> } }>(result.stage!.id, result.stage!.revision)!;
+  const source = { ref: reference(stage), fields: stage.value.content.fields }, before = canonical(source);
+  const calls = f.store.list('model-call').length, catalogue = discoveryBasisCatalogue(source);
+  assert.equal(catalogue.contract, 'discovery-basis-catalogue/v1'); assert.deepEqual(catalogue.source, reference(stage));
+  const constraints = (source.fields.preparation as any).constraints;
+  assert.equal(catalogue.constraints.length, constraints.length, 'The report is not duplicated as a second obligation');
+  for (const [index, entry] of catalogue.constraints.entries()) {
+    assert.deepEqual(entry.address, { record: reference(stage), pointer: `/content/fields/preparation/constraints/${index}` });
+    assert.deepEqual(entry.value, constraints[index]);
+  }
+  const reported = catalogue.constraints.find(entry => (entry.value as any).rule === 'Local inputs and outputs only')!;
+  assert.deepEqual(JSON.parse((reported.value as any).basis), { report: result.discovery!.report, pointer: '/constraints/0' });
+  const extra = catalogue.constraints.find(entry => (entry.value as any).basis === 'Accepted fixture scope')!;
+  assert.ok(extra); assert.equal(Object.hasOwn(extra, 'report'), false); assert.equal(Object.hasOwn(reported, 'citations'), false);
+  assert.deepEqual(catalogue.variant, { address: { record: reference(stage), pointer: '/content/fields/verdict/variant' },
+    value: (source.fields.verdict as any).variant });
+  const concept = f.engine.prepare('catalogue', 'concept'), oldMaterial = canonical(researchPrerequisites(f.store, concept.value));
+  (catalogue.constraints[0]!.value as any).rule = 'caller edit';
+  assert.equal(canonical(source), before); assert.notEqual((discoveryBasisCatalogue(source).constraints[0]!.value as any).rule, 'caller edit');
+  assert.equal(canonical(researchPrerequisites(f.store, concept.value)), oldMaterial, 'The existing v5 context is not expanded');
+  assert.equal(f.store.list('model-call').length, calls);
+});
+
+test('DS1.2a D missing material has an address; empty constraints and an exact variant remain explicit', () => {
+  const valid = { ref: { id: 'stage:catalogue:discovery', revision: 1, hash: 'a'.repeat(64) },
+    fields: { preparation: { constraints: [{ id: 'scope', rule: 'Local only', basis: 'owner choice' }] },
+      verdict: { outcome: 'go', variant: 'local' } } };
+  const cases: [string, (value: any) => void][] = [
+    ['source', value => { delete value.ref; }], ['source', value => { value.ref.id = 'stage:catalogue:concept'; }],
+    ['fields', value => { delete value.fields; }], ['preparation', value => { delete value.fields.preparation; }],
+    ['preparation', value => { delete value.fields.preparation.constraints; }], ['preparation', value => { value.fields.preparation.constraints = null; }],
+    ...['id', 'rule', 'basis'].map(field => ['preparation', (value: any) => { delete value.fields.preparation.constraints[0][field]; }] as [string, (value: any) => void]),
+    ['verdict', value => { delete value.fields.verdict; }], ['verdict', value => { delete value.fields.verdict.variant; }],
+    ['verdict', value => { value.fields.verdict.outcome = 'conditional'; }],
+  ];
+  for (const [field, change] of cases) {
+    const candidate = structuredClone(valid); change(candidate);
+    assert.throws(() => discoveryBasisCatalogue(candidate), (error: unknown) => error instanceof EngineError
+      && error.code === 'discovery_basis_catalogue_invalid' && (error.details as any).field === field
+      && typeof (error.details as any).pointer === 'string');
+  }
+  valid.fields.preparation.constraints = [];
+  assert.deepEqual(discoveryBasisCatalogue(valid).constraints, []);
+  assert.equal(discoveryBasisCatalogue(valid).variant.value, 'local');
+});
+
+test('DS1.2a D a second Store advances Discovery; old catalogue remains exact and its source guards current publication', async t => {
+  const f = fixture(t); f.setup('history'); const draft = f.engine.prepare('history', 'discovery');
+  const result = await f.engine.stageResearch.run('history', draft.id, 8); assert.equal(result.status, 'accepted');
+  const saved = f.store.get<{ content: { fields: Record<string, Json> } }>(result.stage!.id, result.stage!.revision)!;
+  const before = discoveryBasisCatalogue({ ref: reference(saved), fields: saved.value.content.fields });
+  const second = new Store(f.path);
+  try {
+    const content = structuredClone(saved.value.content); (content.fields.verdict as any).variant = 'new draft variant';
+    const revised = new ProductEngine(second).pipeline.draft('history', 'discovery', content, saved.revision);
+    assert.ok(revised.revision > saved.revision);
+    const historical = f.store.get<typeof saved.value>(saved.id, saved.revision)!;
+    assert.deepEqual(discoveryBasisCatalogue({ ref: reference(historical), fields: historical.value.content.fields }), before);
+    assert.throws(() => f.store.writeMany([], [before.source]), (error: unknown) => error instanceof EngineError
+      && /stale|conflict/.test(error.code), 'The exact catalogue source participates in the consumer transaction guard');
+    assert.deepEqual(reference(f.store.get(saved.id)!), reference(revised));
+  } finally { second.close(); }
+});

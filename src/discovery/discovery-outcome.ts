@@ -1,7 +1,8 @@
 import type { ResearchAssessment } from './research-model.js';
 import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
-import { requireCondition } from '../errors.js';
+import { EngineError, requireCondition } from '../errors.js';
+import type { BasisCatalogueEntry } from './basis-application.js';
 import type { Store, Revision } from '../storage/store.js';
 import { reference, uniqueRefs, isRef, type Ref, type Finding } from '../pipeline/contracts.js';
 import { Discovery, type DiscoveryDraft, type Question } from './discovery.js';
@@ -78,6 +79,41 @@ export function discoveryConstraintBindings(selected: DiscoveryContext['fields']
   return report ? ((report.value as any).constraints as string[]).map((rule, index) =>
     ({ basis: canonical({ report: report.answer, pointer: `/constraints/${index}` }), rule })) : [];
 }
+export interface DiscoveryBasisCatalogue {
+  contract: 'discovery-basis-catalogue/v1';
+  source: Ref;
+  constraints: BasisCatalogueEntry[];
+  variant: BasisCatalogueEntry;
+}
+
+/** The caller proves this exact accepted stage. Projection never follows current questions or heads,
+ * and the original report basis stays on its constraint instead of becoming a second obligation. */
+export function discoveryBasisCatalogue(source: { ref: Ref; fields: Record<string, Json> }): DiscoveryBasisCatalogue {
+  const fail = (field: string, pointer: string, message: string): never => {
+    throw new EngineError('discovery_basis_catalogue_invalid', message,
+      { target: typeof source?.ref?.id === 'string' ? source.ref.id : 'discovery', field, pointer });
+  };
+  const record = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+  const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+  if (!source || !isRef(source.ref) || !source.ref.id.startsWith('stage:') || !source.ref.id.endsWith(':discovery'))
+    return fail('source', '', 'The catalogue requires an exact Discovery stage reference');
+  if (!record(source.fields)) return fail('fields', '/content/fields', 'The catalogue requires explicit accepted fields');
+  const preparation = source.fields.preparation, verdict = source.fields.verdict;
+  if (!record(preparation) || !Array.isArray(preparation.constraints))
+    return fail('preparation', '/content/fields/preparation/constraints', 'The accepted constraints must be explicit, including an empty list');
+  if (!record(verdict) || verdict.outcome !== 'go' || !text(verdict.variant))
+    return fail('verdict', '/content/fields/verdict/variant', 'The catalogue requires the accepted go variant');
+  const ref = { id: source.ref.id, revision: source.ref.revision, hash: source.ref.hash };
+  const constraints = preparation.constraints.map((value: unknown, index: number): BasisCatalogueEntry => {
+    const pointer = `/content/fields/preparation/constraints/${index}`;
+    if (!record(value) || !text(value.id) || !text(value.rule) || !text(value.basis))
+      return fail('preparation', pointer, 'Each accepted constraint retains its explicit id, rule and original basis');
+    return { address: { record: ref, pointer }, value: JSON.parse(canonical(value)) as Json };
+  });
+  return structuredClone({ contract: 'discovery-basis-catalogue/v1', source: ref, constraints,
+    variant: { address: { record: ref, pointer: '/content/fields/verdict/variant' }, value: verdict.variant } });
+}
+
 function requirePreparation(value: Json, selected: DiscoveryContext['fields'], questionId: string): void {
   requireCondition((selected.verdict?.value as any)?.outcome === 'go', 'discovery_go_required',
     `[${questionId}] Preparation requires the new accepted go verdict`);
