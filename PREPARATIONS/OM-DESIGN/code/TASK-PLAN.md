@@ -2535,7 +2535,7 @@
 - Отдаёт: —
 - Читает записи: готовые таблицы v6, applications C/S, наследование L/H, доставка M
 - Пишет записи: переключение производителей новой работы на v6
-- Разрешённые пути: `src/discovery/requirements.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/research-runner.ts`, `test/discovery-v6-era.test.ts`, `test/ds12-v6-release.test.ts`
+- Разрешённые пути: `src/discovery/requirements.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/research-runner.ts`, `test/discovery-v6-era.test.ts`, `test/ds12-v6-release.test.ts`, `test/product-fixture.ts`, `test/map-design.test.ts`, `test/om-call-record.test.ts`, `test/om-series.test.ts`, `test/early-stage-briefs.test.ts`, `test/om-runtime-confirmation.test.ts`
 - Из движка как есть: №4870; №4877
 - После: DS1.2lh, DS1.2m, DS1.2s, DS1.2c, DS1.2e, DRY6-02, DS1.3b, ENV1
 - Тесты сверх обязательных:
