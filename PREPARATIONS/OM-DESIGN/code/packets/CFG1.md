@@ -5,7 +5,7 @@
 ## Как работать
 
 - Ты воркер блока OM движка OMG. Рабочая копия — твоя копия, названная в сообщении о выдаче (на точной базе из карточки). Основную копию `~/OMG`, базу `.omg/state.sqlite` и `live-source` не трогай и не читай на запись.
-- Писать разрешено ТОЛЬКО в эти файлы: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`, `test/role-mode.test.ts`, `ui/app.tsx`, `test/ui.test.ts`, `test/om-capacity.test.ts`. Нужен другой файл — остановись и сообщи: это отход от задачи, а не твоё решение.
+- Писать разрешено ТОЛЬКО в эти файлы: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`, `test/role-mode.test.ts`, `ui/app.tsx`, `test/ui.test.ts`, `test/om-capacity.test.ts`, `test/om-compiler-readers.test.ts`. Нужен другой файл — остановись и сообщи: это отход от задачи, а не твоё решение.
 - Источник истины — правила ниже. Они приняты ревьюером. Если правило кажется неверным, неполным или противоречит движку — НЕ обходи его кодом: остановись и опиши противоречие с примером. Поведение продукта сам не выбирай.
 - Отсутствующая возможность — типизированный отказ с адресом, не заглушка и не значение по умолчанию.
 - Код движка, названный «как есть», не правится. Пробный код `PREPARATIONS/OM-DESIGN/proto/` — сценарии и контрпримеры ревью, а не код к переносу: он возвращался ревьюером 15 раз.
@@ -22,7 +22,7 @@
 Выведена кодом из путей, чтений и цели задачи. В отчёте по КАЖДОМУ пункту — имя теста, который его закрывает, либо одна фраза, почему класс здесь неприменим.
 
 - **ЭРА ВЫВОДА (урок 41; слово владельца «тест смотрит только актуальную версию», 13.10.2026).** Ты меняешь файлы, которые уже выводят или проверяют сохранённые записи: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`. Регрессия — ТОЛЬКО для форматов, которые есть в живых базах (omg-live): образец записи из снимка живой базы читает новый код с тем же результатом. Старый движок из Git для этого НЕ запускать; формата нет в живых базах — регрессию эры не делать, строкой в отчёте. Если вывод меняется — маркер договора в новых записях, история по правилу своей эры, без перебора. Если это только выделение общего механизма — докажи неизменность вывода прежними тестами без правки их ожиданий.
-- **ПРЕЖНИЕ ОЖИДАНИЯ.** В путях есть существующие наборы: `test/ui.test.ts`, `test/om-capacity.test.ts`. Каждое изменённое или удалённое ожидание — перечислить в отчёте с причиной; ослаблять проверки нельзя.
+- **ПРЕЖНИЕ ОЖИДАНИЯ.** В путях есть существующие наборы: `test/ui.test.ts`, `test/om-capacity.test.ts`, `test/om-compiler-readers.test.ts`. Каждое изменённое или удалённое ожидание — перечислить в отчёте с причиной; ослаблять проверки нельзя.
 - **ОКНА И ИСТОРИЯ (уроки 21, 38).** Подготовка ничего не пишет и возвращает записи и охраны; запись — одной охраняемой транзакцией. Охрана захватывается ДО проверки, которую защищает (урок 42). Регрессия: вторым Store меняется КАЖДАЯ охраняемая голова между подготовкой и записью — отказ без частичной записи. Историческое чтение — по точным сохранённым основаниям, без текущих голов; текущий допуск проверяет текущую ЛИНИЮ, а не голову одной записи.
 - **ВНЕШНИЙ ИСПОЛНИТЕЛЬ (уроки 39, 40).** Явный автомат состояний; полученный внешний результат сохраняется до применения и независимо от него. Регрессия: остановка после КАЖДОЙ сохраняющей транзакции и потеря процесса → законный исход, без повторного внешнего действия и без удвоения расхода.
 - **ОТСУТСТВИЕ И ПОЛНОТА (урок 19, №459, №656).** Отрицательный результат доказывается полным источником с охраной (индекс/CAS), а не списком вызывающего; отсутствие ≠ явное пустое. Отсутствие записи, от которого зависит допуск, охраняется в транзакции отрицательной охраной Store `{id, absent: true}` (D8.0, урок 43), не повторным чтением. Регрессия: новая запись между чтением и записью (в том числе штатное СОЗДАНИЕ отсутствовавшей записи вторым Store после подготовки); подмена полной ведомости неполной.
@@ -42,12 +42,12 @@
 
 ## Карточка задачи
 
-- Точная база: ветка `om/module`, коммит `f08507f2dd57`. Версия правил: `level2-rules.mjs` sha256 `520f1e3c9388`.
+- Точная база: ветка `om/module`, коммит `95dbefb8c803`. Версия правил: `level2-rules.mjs` sha256 `520f1e3c9388`.
 - Правила: `rules-general`
 - Читает записи: RoleBinding роли и mode вызова
 - Пишет записи: выбор команды роли по mode одним resolver; адресный отказ отсутствующей клетки
 - Из движка как есть: №4856; №4864
-- Уже сделано до тебя: DRV1 «Драйвер ранних стадий: соединение существующих производителей — сохранённый однозначный или явно выбранный draft → StageResearch (с build-map и приёмкой) → следующая стадия → после features штатный om-start / coldStart; без нового prepare на повтор, без второго accept; общий стоп на границах новых A/B/C и HTTP; общий maxTurns и отдельный физический maxCalls; исходы различимы машинно» (src/product/early-stage-driver.ts, src/product/commands.ts, src/product/engine.ts, src/product/stage-research.ts, src/discovery/consumer-research.ts, src/discovery/research-runner.ts, src/discovery/research-protocol.ts, src/discovery/web-research.ts, src/om/run-driver.ts, src/om/run-control.ts, src/discovery/invocation-progress.ts, src/discovery/response-recovery.ts, src/discovery/assessment-session.ts); IN1 «Поручение без приписывания модели воли владельца: вход драйвера записывает дословное поручение (Source), brief точным selector, objective — дословной целью владельца или точной копией brief; модельное понимание остаётся design (researchPlan); автор копирования и точный источник различимы; метки окна по kind — design как «предложение модели», без отправки в answer-fact (разрешение владельца 14.10)» (src/product/early-stage-driver.ts, src/product/commands.ts, src/product/engine.ts); AT3a «Исполнение (исправленный AT0): адресная находка плана в ответе ревью и исход реализации contract_unexecutable с проверкой адреса движком; раннее падение полной проверки разбирает существующая роль reviewer, а не прекращает ход до ревью» (src/execution/runner.ts, src/execution/protocol.ts, src/execution/model.ts, src/adapters/codex-stdio.ts)
+- Уже сделано до тебя: DRV1 «Драйвер ранних стадий: соединение существующих производителей — сохранённый однозначный или явно выбранный draft → StageResearch (с build-map и приёмкой) → следующая стадия → после features штатный om-start / coldStart; без нового prepare на повтор, без второго accept; общий стоп на границах новых A/B/C и HTTP; общий maxTurns и отдельный физический maxCalls; исходы различимы машинно» (src/product/early-stage-driver.ts, src/product/commands.ts, src/product/engine.ts, src/product/stage-research.ts, src/discovery/consumer-research.ts, src/discovery/research-runner.ts, src/discovery/research-protocol.ts, src/discovery/web-research.ts, src/om/run-driver.ts, src/om/run-control.ts, src/discovery/invocation-progress.ts, src/discovery/response-recovery.ts, src/discovery/assessment-session.ts); IN1 «Поручение без приписывания модели воли владельца: вход драйвера записывает дословное поручение (Source), brief точным selector, objective — дословной целью владельца или точной копией brief; модельное понимание остаётся design (researchPlan); автор копирования и точный источник различимы; метки окна по kind — design как «предложение модели», без отправки в answer-fact (разрешение владельца 14.10)» (src/product/early-stage-driver.ts, src/product/commands.ts, src/product/engine.ts); AT3a «Исполнение (исправленный AT0): адресная находка плана в ответе ревью и исход реализации contract_unexecutable с проверкой адреса движком; раннее падение полной проверки разбирает существующая роль reviewer, а не прекращает ход до ревью» (src/execution/runner.ts, src/execution/protocol.ts, src/execution/model.ts, src/adapters/codex-stdio.ts); SP1b «Та же выбранная спецификация в контексте задачи исполнителя и в предварительном измерении G5: версия контекста плана taskContextContract v2 в хэше плана, чтение точной цепочки M8/horizon/input/stages через нижний интерфейс читателей, полный материал в packetCapacity; старый план и старый допуск — v1 без изменений» (src/om/selected-specification.ts, src/compiler/context.ts, src/compiler/model.ts, src/compiler/compiler.ts, src/compiler/om-readers.ts, src/om/compiler-readers.ts, src/om/atomic-gate.ts, src/om/task-specification.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -76,6 +76,14 @@
 - `src/execution/protocol.ts`
 - `src/execution/model.ts`
 - `src/adapters/codex-stdio.ts`
+- `src/om/selected-specification.ts`
+- `src/compiler/context.ts`
+- `src/compiler/model.ts`
+- `src/compiler/compiler.ts`
+- `src/compiler/om-readers.ts`
+- `src/om/compiler-readers.ts`
+- `src/om/atomic-gate.ts`
+- `src/om/task-specification.ts`
 
 ### Границы незавершённой интеграции
 

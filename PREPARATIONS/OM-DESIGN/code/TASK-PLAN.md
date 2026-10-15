@@ -2703,9 +2703,9 @@
 - Отдаёт: —
 - Читает записи: RoleBinding роли и mode вызова
 - Пишет записи: выбор команды роли по mode одним resolver; адресный отказ отсутствующей клетки
-- Разрешённые пути: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`, `test/role-mode.test.ts`, `ui/app.tsx`, `test/ui.test.ts`, `test/om-capacity.test.ts`
+- Разрешённые пути: `src/runtime/environment.ts`, `src/product/commands.ts`, `src/discovery/research-protocol.ts`, `src/om/model-call.ts`, `src/execution/protocol.ts`, `src/product/chat.ts`, `src/discovery/reader-pilot.ts`, `test/role-mode.test.ts`, `ui/app.tsx`, `test/ui.test.ts`, `test/om-capacity.test.ts`, `test/om-compiler-readers.test.ts`
 - Из движка как есть: №4856; №4864
-- После: DRV1, IN1, AT3a
+- После: DRV1, IN1, AT3a, SP1b
 - Тесты сверх обязательных:
   - одна настройка проходит analyst/assessor research, OM research, implement, review, chat через разные локальные argv-маркеры; compact только у выбранного research; wire metadata совпадает с эффективным binding
   - каждый реально запрашиваемый mode без команды — адресный отказ, 0 model-call/send/spawn; после configure тот же путь запускается; неиспользуемый chat не блокирует research
