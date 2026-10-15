@@ -35,7 +35,7 @@ import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEr
 import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply } from './research-consumer-transition.js';
 import { earlyResearchStage } from './early-research-outcome.js';
-import { RunControlGate, RunControlLost } from '../om/run-control.js';
+import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite } from '../om/run-control.js';
 
 export { researchAction } from './research-consumer-transition.js';
 
@@ -339,6 +339,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   let physicalResult: import('../runtime/process.js').ProcessResult | null = null;
   let stopRefusal: EngineError | null = null;
   let heldSpawn: EngineError | null = null;
+  let stopCancel: ReturnType<RunControlGate['cancelledBy']> = null;
   let spawnedPid: number | null = null;
   const controlAbort = control ? new AbortController() : null;
   const forwardAbort = () => controlAbort?.abort();
@@ -386,6 +387,11 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
         : new EngineError('process_record_failed', failure instanceof Error ? failure.message : 'The spawned provider was not durably recorded');
       throw failure;
     }
+    // DRY6-02: a cancellation is linked to the common stop only when this call's own watch aborted it for a stop of its
+    // admitted generation; an external signal, a timeout or any other end gains no such proof.
+    if (failure instanceof EngineError && failure.code === 'process_cancelled' && controlAbort?.signal.reason === RUN_CONTROL_MOVED) {
+      try { stopCancel = control!.cancelledBy(); } catch (lostControl) { if (!(lostControl instanceof RunControlLost)) throw lostControl; }
+    }
     patch.status = "failed"; patch.error = failure instanceof EngineError ? failure.code : "research_call_failed"; throw failure;
   } finally {
     stopWatching?.();
@@ -408,9 +414,12 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
         patch.response = { ...patch.response!, record: { id: saved.id, revision: 1, hash: hashJson(saved.value) } };
       }
       try {
-        call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision,
-          value: { ...call.value, ...patch, finishedAt: Date.now(), ...(runtime?.status === 'captured'
-            ? { runtime: { ...runtime, status: 'unavailable', error: 'call_runtime_finalize_pending' } } : {}) } }, ...responseWrites])[0]!;
+        const terminal: ModelCall = { ...call.value, ...patch, finishedAt: Date.now(), ...(runtime?.status === 'captured'
+          ? { runtime: { ...runtime, status: 'unavailable', error: 'call_runtime_finalize_pending' } } : {}) };
+        const linked = stopCancel && patch.status === 'failed' && patch.error === 'process_cancelled'
+          ? [callStopCancelWrite(environment.projectId, { id: call.id, revision: call.revision + 1, hash: hashJson(terminal) }, stopCancel)] : [];
+        call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision, value: terminal },
+          ...responseWrites, ...linked])[0]!;
       } catch (error) {
         if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code) || !physicalResult) throw error;
         // A recovery may win the runtime CAS. Keep the observed physical bytes

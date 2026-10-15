@@ -17,7 +17,7 @@ import '../om/obligations.js';
 // obligations into the lower compiler slot (R3+R4).
 import '../om/compiler-readers.js';
 import { declareAdapterLineage } from '../adapters/adapter-lineage.js';
-import { recoverResearchResponse } from '../discovery/response-recovery.js';
+import { recoverResearchResponse, permitCancelledCallRetry } from '../discovery/response-recovery.js';
 import { recoverContextSession } from '../discovery/context-recovery.js';
 import { allocateResearchTrial } from '../discovery/research-trial.js';
 import { retryPlannedRead } from '../discovery/reading-plan.js';
@@ -252,6 +252,8 @@ export class ProductEngine {
       case 'observe-runtime': this.#project(command.project); return observeRuntime(this.store,command.project,command);
       case 'recover-runtime-observation': this.#project(command.project); return recoverRuntimeObservation(this.store,command.project,command.observation);
       case 'apply-obligation-policy': this.#project(command.project); return applyObligationPolicy(this.store,command.project,command.scope,command.policy);
+      // DRY6-02: the explicit addressed door of an older cancelled attempt — one new attempt of exactly that call.
+      case "permit-cancelled-call-retry": this.#project(command.project); return permitCancelledCallRetry(this.store, command, this.actor);
       case "recover-model-call": {
         this.#project(command.project);
         const value = this.store.get<Record<string, unknown>>(command.call.id)?.value;

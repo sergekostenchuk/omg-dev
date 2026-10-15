@@ -16,6 +16,7 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { isAbsolute, normalize } from 'node:path';
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
+import { stopCancelledCall } from "../om/run-control.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import { recoveredResponseBoundary, recoveryAssessmentSessionId, recoverySessionWrites, markRecoveredSessionWritten,
@@ -661,7 +662,7 @@ function requireRetryable(store: Store, app: Application) {
   const outcome = executionOutcome(store, app, app.received);
   if (outcome.kind === 'provider-failed') return outcome;
   if (outcome.kind === 'terminal'
-    && ['run_stopped', 'run_control_changed'].includes(outcome.code)) return outcome;
+    && ['run_stopped', 'run_control_changed', 'process_cancelled'].includes(outcome.code)) return outcome;
   if (outcome.kind === 'response' && ['model-refused', 'renewed'].includes(app.state)
     && app.replyOutcomeContract === EARLY_RESEARCH_OUTCOME && app.resolution) {
     const before = exact<ApplicationSession>(store, app.session, 'assessment-session'), binding = before.value.binding!;
@@ -694,11 +695,25 @@ function renewApplication(store: Store, record: Revision<Application>, session: 
   const physical = unsent ? null : requireRetryable(store, app);
   const guards = uniqueTransactionGuards([...currentAdmission(store, draft, question, environment, context, extraGuards, barrier ? reference(barrier) : undefined), ...retained]);
   if (pilot && !guards.some(guard => same(guard, reference(pilot)))) applicationInvalid(record.id, 'The new profile must be the currently configured admission');
+  // DRY6-02 returns 1–2: an attempt whose original basis moved is never renewed on the old basis, whichever renewable
+  // state it is in; the moved record is the proved dependency refusal of this exact application, and so carries its
+  // recovery door. The basis is the transitive one of the check that failed: every record that check itself read at its
+  // head — the Source an observation cites, the Source of a prior reader-result's observation behind an immutable
+  // container — matched against the application's original guards. A correction barrier, a raised profile or a
+  // reconfigured environment of a retry is not read by these checks and is never named. No moved basis record — the
+  // check's own failure stands (bytes changed on disk under the same Source record invent no witness).
+  const refuseMoved = (read: TransactionGuard[]) => {
+    const basis = new Set(read.map(guard => guard.id));
+    const changed = changedDependency(store, app.guards.filter(guard => basis.has(guard.id)));
+    if (changed) refuseApplication(store, record, changed.reason, changed.guards);
+  };
   const checked = evaluateWorkspace(store, session);
-  if (checked.failure) throw checked.failure;
+  if (checked.failure) { refuseMoved(checked.guards); throw checked.failure; }
   const evidence = assessmentReadView(store);
-  for (const observation of context.observations) requireCondition(new Evidence(evidence.store).verify(observation),
-    'research_context_application_source_stale', 'Renewal must preserve the exact supported observations');
+  for (const observation of context.observations) if (!new Evidence(evidence.store).verify(observation)) {
+    evidence.finish(); refuseMoved(evidence.guards);
+    throw new EngineError('research_context_application_source_stale', 'Renewal must preserve the exact supported observations');
+  }
   evidence.finish();
   const admitted = uniqueTransactionGuards([...guards, ...checked.guards, ...evidence.guards]);
   const next: Write = { id: session.id, kind: session.kind, expected: session.revision, value: { ...session.value,
@@ -917,7 +932,10 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
           readModelCallRecovery(store, app.projectId, reference(call));
           refuseApplication(store, application, { kind: 'call', call: reference(call), code: 'process_lost' }, [reference(call)]);
         }
-        if (['process_timeout', 'process_cancelled'].includes(call.value.error ?? '') && !call.value.response)
+        // DRY6-02: a dispatched attempt the common stop cancelled (its saved stop link) is retryable — the next attempt is
+        // admitted only after the explicit resume of that stop; any other cancellation or timeout stays a refusal.
+        if (['process_timeout', 'process_cancelled'].includes(call.value.error ?? '') && !call.value.response
+          && !(call.value.error === 'process_cancelled' && stopCancelledCall(store, call)))
           refuseApplication(store, application, { kind: 'call', call: reference(call), code: call.value.error! }, [reference(call)]);
         const outcome = executionOutcome(store, app, reference(call));
         if (outcome.kind === 'provider-failed' || outcome.kind === 'terminal') {
@@ -927,7 +945,9 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
           // admission. Renewal checks the fresh context before the next call.
           uniqueTransactionGuards([reference(application), reference(session), reference(outcome.call)]));
           throw new EngineError(outcome.kind === 'terminal' ? outcome.code : 'research_provider_failed',
-            outcome.kind === 'terminal'
+            outcome.kind === 'terminal' && outcome.code === 'process_cancelled'
+              ? `[${call.id}] The common stop cancelled the dispatched attempt; the explicit resume of that stop admits one new attempt`
+              : outcome.kind === 'terminal'
               ? `[${call.id}] Control refused the request before dispatch; the exact unsubmitted attempt is preserved`
               : `[${call.id}] Provider failed without a research response; the exact attempt is preserved`);
         }

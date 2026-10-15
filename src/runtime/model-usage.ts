@@ -31,6 +31,8 @@ export interface ModelCall {
   packet?: { archive: Ref; kind: string; maxChars: number };
   budget?: { segment: Ref; groups: string[]; estimate: import("./research-budget.js").CallEstimate };
   questionId?: string | null;
+  /** The producer of the call: its consumer intent (analyst/planner/escalation) or its assessment application. */
+  consumerIntent?: Ref; assessmentApplication?: Ref;
   startedAt: number; finishedAt: number | null; status: "running" | "succeeded" | "failed";
   requested: RoleBinding; confirmed: { model: string | null; effort: string | null; speed: string | null };
   request: { chars: number; bytes: number; hash: string; record?: Ref };

@@ -1128,3 +1128,204 @@ test("DRY6-01 return 1: a refusal of B's continuation after a completed lookup, 
   assert.notEqual(next.reason?.code, "research_context_application_refused", JSON.stringify(next.reason));
   assert.equal(restarted.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.stage === "concept").length, 1, "The same draft continues");
 });
+
+// DRY6-02 (contract №4961 (b)): the common stop stays immediate; its explicit resume admits one new generation of the
+// dispatched attempt it cancelled, proved by the stop link saved with the call's terminal.
+test("DRY6-02 A: a stop after the analyst received its stdin cancels it; repeats under the stop send nothing; two resumes converge and admit exactly one new generation on the same draft", async t => {
+  const f = fixture(t), { trace, earlyHold, earlyPause } = f.setup("p");
+  writeFileSync(earlyHold, "research");
+  const driving = f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100,
+    instruction: instruction("p") }) as Promise<EarlyStageOutcome>;
+  await pauseCount(earlyPause, 1);
+  const stop = stopFrom(f.database, "p");
+  const stopped = await driving;
+  assert.deepEqual([stopped.end, stopped.reason?.code], ["stopped", "run_stopped"]);
+  rmSync(earlyHold);
+  const [cancelled, ...others] = f.store.list<any>("model-call").filter(row => row.value.error === "process_cancelled");
+  assert.ok(cancelled); assert.equal(others.length, 0);
+  const link = f.store.get<any>(`call-stop-cancel:${cancelled.id}`)!;
+  assert.deepEqual([link.value.stop, link.value.call], [stop, reference(cancelled)], "The cancellation is linked to exactly this stop");
+  const intent = f.store.get<any>(cancelled.value.consumerIntent.id)!;
+  const calls = f.calls(trace).length;
+  assert.throws(() => f.engine.execute({ type: "permit-cancelled-call-retry", project: "p", call: reference(cancelled) }),
+    { code: "call_retry_permit_unneeded" }, "A proved stop is lifted by its resume, not by the door");
+
+  const restarted = new Store(f.database); t.after(() => restarted.close());
+  const under = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.deepEqual([under.end, under.budget.callsMade, f.calls(trace).length], ["stopped", 0, calls], "Nothing is sent while the stop stands");
+
+  for (const db of [new Store(f.database), new Store(f.database)]) {
+    try { assert.equal(resumeStoppedPass(db, { project: "p", stop }).ok, true); } finally { db.close(); }
+  }
+  const next = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 1 }) as EarlyStageOutcome;
+  assert.equal(next.budget.callsMade, 1, JSON.stringify(next.reason));
+  const generations = restarted.list<any>("research-consumer-intent")
+    .filter(row => row.value.kind === intent.value.kind && row.value.key === intent.value.key);
+  assert.deepEqual(generations.map(row => row.value.generation).sort(), [intent.value.generation, intent.value.generation + 1],
+    "One new generation of the same work");
+  const fresh = generations.find(row => row.value.generation === intent.value.generation + 1)!;
+  assert.deepEqual([fresh.value.draft, fresh.value.question.id], [intent.value.draft, intent.value.question.id], "The same draft and question");
+  assert.equal(restarted.get<any>(cancelled.id)!.value.error, "process_cancelled", "The earlier attempt keeps its record and possible cost");
+
+  const again = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.equal(restarted.list<any>("research-consumer-intent").filter(row => row.value.kind === intent.value.kind
+    && row.value.key === intent.value.key).length, 2, "The permission is not spent twice");
+  assert.notEqual(again.reason?.code, "process_cancelled", JSON.stringify(again.reason));
+});
+
+for (const role of ["assess-answer", "assess-escalation"] as const)
+test(`DRY6-02 ${role === "assess-answer" ? "B" : "C"}: a stop after ${role} received its stdin cancels it; the explicit resume admits exactly one new attempt of that role on the same draft`, async t => {
+  const f = fixture(t), { values, trace, earlyHold, earlyPause } = f.setup("p");
+  if (role === "assess-escalation") {
+    const fields = JSON.parse(readFileSync(values, "utf8")); fields.needOwner = true; writeFileSync(values, JSON.stringify(fields));
+  }
+  writeFileSync(earlyHold, role);
+  const driving = f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100,
+    instruction: instruction("p") }) as Promise<EarlyStageOutcome>;
+  await pauseCount(earlyPause, 1);
+  const stop = stopFrom(f.database, "p");
+  assert.equal((await driving).end, "stopped");
+  rmSync(earlyHold);
+  const [cancelled] = f.store.list<any>("model-call").filter(row => row.value.error === "process_cancelled");
+  assert.ok(cancelled && f.store.get(`call-stop-cancel:${cancelled.id}`), "The cancellation is linked to the stop");
+  if (role === "assess-answer")
+    assert.equal(f.store.get<any>(cancelled.value.assessmentApplication.id)!.value.state, "retryable", "B keeps its exact candidate");
+  const roleCalls = () => f.calls(trace).filter(row => row.role === role).length, before = roleCalls();
+  const restarted = new Store(f.database); t.after(() => restarted.close());
+  assert.equal((await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome).end,
+    "stopped");
+  assert.equal(roleCalls(), before, "Nothing is sent while the stop stands");
+  assert.equal(resumeStoppedPass(restarted, { project: "p", stop }).ok, true);
+  const next = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 1 }) as EarlyStageOutcome;
+  assert.deepEqual([next.budget.callsMade, roleCalls()], [1, before + 1], `Exactly one new ${role} attempt: ${JSON.stringify(next.reason)}`);
+  const latest = restarted.list<any>("model-call").sort((a, b) => b.value.startedAt - a.value.startedAt)[0]!;
+  if (role === "assess-answer") {
+    const application = restarted.get<any>(latest.value.assessmentApplication.id)!, original = restarted.get<any>(cancelled.value.assessmentApplication.id)!;
+    assert.equal(application.value.session.id, original.value.session.id, "The same candidate's session");
+  } else {
+    const intent = restarted.get<any>(latest.value.consumerIntent.id)!, first = restarted.get<any>(cancelled.value.consumerIntent.id)!;
+    assert.deepEqual([intent.value.key, intent.value.generation], [first.value.key, first.value.generation + 1], "The same escalation, one generation on");
+  }
+  assert.equal(restarted.list<any>("discovery-draft").length, 1, "The same draft");
+});
+
+test("DRY6-02 a new stop after the resume and before any stdin sends nothing; its own resume still admits one generation", async t => {
+  const f = fixture(t), { trace, earlyHold, earlyPause } = f.setup("p");
+  writeFileSync(earlyHold, "research");
+  const driving = f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100,
+    instruction: instruction("p") }) as Promise<EarlyStageOutcome>;
+  await pauseCount(earlyPause, 1);
+  const first = stopFrom(f.database, "p"); await driving; rmSync(earlyHold);
+  const calls = f.calls(trace).length, restarted = new Store(f.database); t.after(() => restarted.close());
+  assert.equal(resumeStoppedPass(restarted, { project: "p", stop: first }).ok, true);
+  const second = stopFrom(f.database, "p");
+  const blocked = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.deepEqual([blocked.end, blocked.budget.callsMade, f.calls(trace).length], ["stopped", 0, calls], "The new stop holds the admitted attempt");
+  assert.equal(resumeStoppedPass(restarted, { project: "p", stop: second }).ok, true);
+  const next = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 1 }) as EarlyStageOutcome;
+  assert.equal(next.budget.callsMade, 1);
+  const [cancelled] = restarted.list<any>("model-call").filter(row => row.value.error === "process_cancelled");
+  const intent = restarted.get<any>(cancelled!.value.consumerIntent.id)!;
+  assert.equal(restarted.list<any>("research-consumer-intent").filter(row => row.value.key === intent.value.key).length, 2, "One generation, not two");
+});
+
+test("DRY6-02 an external abort is not the stop: no link and no automatic retry; the explicit addressed door permits one attempt of exactly that call once", async t => {
+  const f = fixture(t), { trace, earlyHold, earlyPause } = f.setup("p");
+  const draft = f.engine.prepare("p", "discovery");
+  writeFileSync(earlyHold, "research");
+  const controller = new AbortController(), running = f.engine.researcher.run("p", draft.id, 20, controller.signal);
+  await pauseCount(earlyPause, 1); controller.abort();
+  const paused = await running; rmSync(earlyHold);
+  assert.deepEqual([paused.value.status, paused.value.pauseCode], ["paused", "process_cancelled"]);
+  const [cancelled] = f.store.list<any>("model-call").filter(row => row.value.error === "process_cancelled");
+  assert.equal(f.store.get(`call-stop-cancel:${cancelled!.id}`), null, "An external abort gains no stop link");
+  const calls = f.calls(trace).length, analyst = () => f.calls(trace).filter(row => row.role === "research").length, sent = analyst();
+  const repeat = await f.engine.stageResearch.run("p", draft.id, 20);
+  assert.deepEqual([repeat.status, repeat.reason?.code, f.calls(trace).length], ["paused", "process_cancelled", calls], "No automatic retry");
+
+  const door = { type: "permit-cancelled-call-retry", project: "p", call: reference(cancelled!) };
+  assert.throws(() => f.engine.execute({ ...door, call: reference(f.store.get(cancelled!.id, 1)!) }), { code: "call_retry_permit_stale" });
+  const permit = f.engine.execute(door) as Revision<any>;
+  assert.deepEqual(permit.value.call, reference(cancelled!));
+  assert.deepEqual(f.engine.execute(door), permit, "A repeated door returns the same permit");
+  const resumed = await f.engine.stageResearch.run("p", draft.id, 1);
+  assert.equal(analyst(), sent + 1, `One new analyst attempt: ${JSON.stringify(resumed.reason)}`);
+  const intent = f.store.get<any>(cancelled!.value.consumerIntent.id)!;
+  assert.equal(f.store.list<any>("research-consumer-intent").filter(row => row.value.key === intent.value.key).length, 2, "One new generation");
+  assert.throws(() => f.engine.execute(door), { code: "call_retry_permit_stale" }, "A spent permit is not granted again");
+  assert.equal(f.store.get<any>(cancelled!.id)!.value.error, "process_cancelled", "The earlier attempt and its possible cost stay");
+});
+
+test("DRY6-02 a timeout is not a cancellation: no link, no retry, and the door refuses it", async t => {
+  const f = fixture(t), { earlyHold } = f.setup("p");
+  const draft = f.engine.prepare("p", "discovery");
+  writeFileSync(earlyHold, "research");
+  const paused = await f.engine.researcher.run("p", draft.id, 20); rmSync(earlyHold);
+  assert.equal(paused.value.pauseCode, "process_timeout");
+  const [timed] = f.store.list<any>("model-call").filter(row => row.value.error === "process_timeout");
+  assert.equal(f.store.get(`call-stop-cancel:${timed!.id}`), null);
+  assert.throws(() => f.engine.execute({ type: "permit-cancelled-call-retry", project: "p", call: reference(timed!) }), { code: "call_retry_permit_invalid" });
+});
+
+test("DRY6-02 two Stores continuing at once after the resume spend the one permission once", async t => {
+  const f = fixture(t), { earlyHold, earlyPause } = f.setup("p");
+  writeFileSync(earlyHold, "research");
+  const driving = f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100,
+    instruction: instruction("p") }) as Promise<EarlyStageOutcome>;
+  await pauseCount(earlyPause, 1);
+  const stop = stopFrom(f.database, "p"); await driving; rmSync(earlyHold);
+  const [cancelled] = f.store.list<any>("model-call").filter(row => row.value.error === "process_cancelled");
+  const key = f.store.get<any>(cancelled!.value.consumerIntent.id)!.value.key;
+  const one = new Store(f.database), two = new Store(f.database); t.after(() => { one.close(); two.close(); });
+  assert.equal(resumeStoppedPass(one, { project: "p", stop }).ok, true);
+  const ends = await Promise.all([one, two].map(db => new ProductEngine(db).execute({ type: "early-stage-run", project: "p",
+    maxTurns: 100, maxCalls: 1 }) as Promise<EarlyStageOutcome>));
+  assert.ok(ends.some(end => end.budget.callsMade === 1), JSON.stringify(ends.map(end => [end.end, end.reason?.code])));
+  assert.equal(f.store.list<any>("research-consumer-intent").filter(row => row.value.key === key).length, 2, "Exactly one new generation");
+});
+
+test("DRY6-02 an external abort of B is not the stop: its refusal stays and the door names the reopen door of the assessed question", async t => {
+  const f = fixture(t), { earlyHold, earlyPause } = f.setup("p");
+  const draft = f.engine.prepare("p", "discovery");
+  writeFileSync(earlyHold, "assess-answer");
+  const controller = new AbortController(), running = f.engine.researcher.run("p", draft.id, 20, controller.signal);
+  await pauseCount(earlyPause, 1); controller.abort();
+  await running; rmSync(earlyHold);
+  const [cancelled] = f.store.list<any>("model-call").filter(row => row.value.error === "process_cancelled");
+  assert.equal(f.store.get(`call-stop-cancel:${cancelled!.id}`), null);
+  assert.equal(f.store.get<any>(cancelled!.value.assessmentApplication.id)!.value.state, "refused", "The earlier refusal is not reinterpreted");
+  assert.throws(() => f.engine.execute({ type: "permit-cancelled-call-retry", project: "p", call: reference(cancelled!) }),
+    (error: unknown) => error instanceof EngineError && error.code === "call_retry_permit_unsupported" && /reopen/.test(error.message));
+});
+
+test("DRY6-02 return 1: the cited Source changes after the stop cancelled B — the retryable attempt becomes the proved refusal with the exact door; a restart repeats it without a call; the command continues the same draft", async t => {
+  const f = fixture(t), { trace, earlyHold, earlyPause } = f.setup("p");
+  writeFileSync(earlyHold, "assess-answer");
+  const driving = f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100,
+    instruction: instruction("p") }) as Promise<EarlyStageOutcome>;
+  await pauseCount(earlyPause, 1);
+  const stop = stopFrom(f.database, "p");
+  assert.equal((await driving).end, "stopped");
+  rmSync(earlyHold);
+  const [cancelled] = f.store.list<any>("model-call").filter(row => row.value.error === "process_cancelled");
+  const application = f.store.get<any>(cancelled!.value.assessmentApplication.id)!;
+  assert.equal(application.value.state, "retryable");
+  const source = f.store.list<any>("source").find(row => row.value.origin.location === "values")!;
+  f.engine.discovery.evidence.document("p", "values", source.value.content + " ", "application/json", source.revision);
+  const restarted = new Store(f.database); t.after(() => restarted.close());
+  assert.equal(resumeStoppedPass(restarted, { project: "p", stop }).ok, true);
+  const calls = f.calls(trace).length;
+  const paused = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  const door = paused.reason?.door;
+  assert.ok(door, JSON.stringify(paused.reason));
+  assert.deepEqual([paused.reason!.code, door!.changed?.kind, door!.changed?.expected.id, door!.application.id],
+    ["research_context_application_refused", "source", source.id, application.id], "The moved Source is named; the stale citation is never sent");
+  assert.equal(paused.reason!.target, door!.question.id, "The address is the assessed question");
+  assert.equal(f.calls(trace).length, calls, "Nothing is sent on the old citation");
+  const again = await new ProductEngine(new Store(f.database)).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.deepEqual([again.reason?.door, again.budget.callsMade], [door, 0], "A restart repeats the same door without a call");
+  new ProductEngine(restarted).execute(door!.command);
+  const next = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 2 }) as EarlyStageOutcome;
+  assert.ok(f.calls(trace).length > calls, JSON.stringify(next.reason));
+  assert.equal(restarted.list<any>("discovery-draft").length, 1, "The same draft continues");
+});

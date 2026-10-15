@@ -31,7 +31,7 @@ import { writeRoutes } from "../src/om/routes.js";
 import { beginAttempt, openSeries, seriesAddress, type AnyRepairSeries, type AttemptGoal } from "../src/om/series.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
 import { acquireRunExecution, admitRunControl, readRunControl, releaseRunExecution, resumeStoppedRun, runControlId, RunControlGate,
-  RunControlLost, RUN_CONTROL_CODES, stopRun, type RunControlRecord, type RunExecution } from "../src/om/run-control.js";
+  RunControlLost, RUN_CONTROL_CODES, stopRun, type RunControlRecord, type RunExecution, RUN_CONTROL_MOVED, liftedStop } from "../src/om/run-control.js";
 import { resumeStoppedPass, stopPass } from "../src/om/run-driver.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -477,4 +477,25 @@ await model.runModelCall(store, ${JSON.stringify(f.request)}, undefined, executi
   assert.ok(recovered.value.recovery, "The common recovery closed the lost call");
   ok(resumeStoppedPass(f.store, { project: f.project, stop: stopped.control!.value.stop!.token }));
   assert.equal(f.sent().length, 1, "Nothing was sent again");
+});
+
+test("DRY6-02 the watch cancels with the moved reason; cancelledBy names only a stop of the admitted generation; liftedStop names only the explicit resume of that stop", async t => {
+  const f = bareStore(t), gate = new RunControlGate(f.store, "p"); gate.admit();
+  const controller = new AbortController(), stopWatching = gate.watch(controller, 5); t.after(stopWatching);
+  assert.equal(gate.cancelledBy(), null, "No stop, no link");
+  const stop = ok(other(f.database, store => stopRun(store, { project: "p" }))).control!, token = stop.value.stop!.token;
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(controller.signal.reason, RUN_CONTROL_MOVED, "The watch names why it cancelled");
+  assert.deepEqual(gate.cancelledBy(), { control: reference(stop), admitted: null, stop: token });
+  assert.equal(liftedStop(f.store, "p", token), null, "A standing stop is not lifted");
+  const resumed = ok(other(f.database, store => resumeStoppedRun(store, { project: "p", stop: token })));
+  assert.deepEqual(reference(liftedStop(f.store, "p", token)!), reference(resumed));
+  assert.equal(liftedStop(f.store, "p", "foreign-stop"), null, "A foreign token is never lifted");
+  const q = ok(other(f.database, store => stopRun(store, { project: "q" }))).control!;
+  ok(other(f.database, store => resumeStoppedRun(store, { project: "q", stop: q.value.stop!.token })));
+  assert.equal(liftedStop(f.store, "p", q.value.stop!.token), null, "Another project's resume lifts nothing here");
+  const later = new RunControlGate(f.store, "p"); later.admit();
+  const second = ok(other(f.database, store => stopRun(store, { project: "p" }))).control!;
+  assert.equal(later.cancelledBy()?.stop, second.value.stop!.token, "A stop of the admitted generation is named");
+  assert.equal(gate.cancelledBy(), null, "A stop of a later generation does not name an earlier admission");
 });

@@ -19,6 +19,7 @@ import { prepareLateModelReceipt, readLateModelReceipt, readModelCallRecovery, t
 import type { Question } from '../src/discovery/discovery.js';
 import { Environments, git, uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { configureReaderPilot, pilotEnvironment } from '../src/discovery/reader-pilot.js';
+import { readBundle } from '../src/discovery/reader.js';
 import { ensureWorktree } from '../src/execution/worktree.js';
 import { EngineError } from '../src/errors.js';
 import { hashJson } from '../src/canonical.js';
@@ -1980,6 +1981,138 @@ test('DRY5FIX B changed source refuses fresh correction while preserving the mal
   await assert.rejects(f.invoke(), { code: 'assessment_invalid' });
   f.engine.discovery.evidence.document('p', 'basis', 'Changed', 'text/plain', f.source.revision);
   await assert.rejects(f.invoke(f.fresh())); callsOnce(f, 1);
+});
+
+// DRY6-02 return 1 (№5070), the class beyond the stop path: whichever renewable state the attempt is in — a proved provider
+// failure (retryable) or a refused model answer with its correction barrier (model-refused) — a changed cited Source is the
+// proved dependency refusal of that exact application with its door, never a bare source_stale; restart reads the same.
+for (const state of ['retryable', 'model-refused'] as const)
+test(`DRY6-02 return 1: a ${state} assessment whose cited Source changed is refused by that Source with its door`, async t => {
+  const f = resumeFixture(t);
+  if (state === 'retryable') d83EmptyProviderThenSuccess(f); else dry5AssessmentAdapter(f, { verdict: 'supported' });
+  await assert.rejects(f.invoke(), { code: state === 'retryable' ? 'research_provider_failed' : 'assessment_invalid' });
+  const failed = f.store.list<any>('assessment-application')[0]!;
+  assert.equal(failed.value.state, state); assert.equal(f.sent().length, 1);
+  assert.equal(f.store.list('assessment-barrier').length, state === 'model-refused' ? 1 : 0);
+  const changed = f.engine.discovery.evidence.document('p', 'basis', 'Changed', 'text/plain', f.source.revision);
+  await assert.rejects(f.invoke(f.fresh()), { code: 'research_context_application_refused' });
+  assert.equal(f.sent().length, 1, 'No call is paid on the old citation');
+  const db = f.fresh(), refused = db.get<any>(failed.id)!;
+  assert.equal(refused.revision, failed.revision + 1); assert.equal(refused.value.state, 'refused');
+  assert.deepEqual(refused.value.refusal, { kind: 'dependency', expected: reference(f.source), actual: reference(changed) },
+    'The moved Source is named, not the permitted barrier of the correction');
+  const door = assessmentRefusalDoor(db, refused);
+  assert.deepEqual([door.code, door.changed?.kind, door.question, door.command], ['research_context_application_refused', 'source',
+    reference(f.question), { type: 'reopen-question', question: f.question.id, expected: f.question.revision }]);
+  const heads = db.list();
+  await assert.rejects(f.invoke(db), { code: 'research_context_application_refused' });
+  assert.deepEqual(db.list(), heads); assert.equal(f.sent().length, 1);
+});
+
+// DRY6-02 return 2 (№5105, №5109): the basis of the failed check is transitive and actual. A prior reader-result is an
+// immutable container; the workspace check reads, through the common readPilotContext, the Source of the SELECTED
+// observation at its head. Its new revision refuses the retryable renewal by that Source with the door — never the bare
+// research_evidence_stale; a changed Source of another observation of the same reading is no cause at all.
+async function dry6PriorReaderAssessment(f: ReturnType<typeof resumeFixture>, documents: [string, string][]) {
+  const wire = join(f.root, 'wire.ndjson'), refFile = join(f.root, 'reader-ref.json');
+  writeFileSync(f.environment.value.reviewer.command.args[0]!, `import{readFileSync,appendFileSync,existsSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,log=${JSON.stringify(wire)};
+const previous=existsSync(log)?readFileSync(log,'utf8').trim().split('\\n').map(JSON.parse):[];
+appendFileSync(log,JSON.stringify(r)+'\\n');let research;
+if(s.role==='reader')research={selections:s.sources.map((v,i)=>({sourceIndex:i,firstLine:v.lines[0][0],lastLine:v.lines.at(-1)[0]})),unresolved:[]};
+else if(!s.contextWorkspace.length)research={action:'read_context',record:JSON.parse(readFileSync(${JSON.stringify(refFile)},'utf8')),pointer:'/observations/0/value'};
+else if(previous.filter(x=>x.subject.role==='assess-answer').length===1){process.stderr.write('Local provider failed without response');process.exit(1);}
+else research={verdict:'supported',reasons:[]};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const command = f.environment.value.reviewer.command;
+  const settings = { experimental: true, active: true, stopAfter: 'L2',
+    reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command }, agentCommand: command,
+    maxRequestChars: 100000, maxReadChars: 60000, maxReplyChars: 10000, maxCalls: 10, maxReportedTokens: 100000 };
+  let pilot = configureReaderPilot(f.store, f.engine.environments, 'p', settings, 0);
+  const sources = documents.map(([name, content]) => f.engine.discovery.evidence.document('p', name, content, 'text/plain', 0));
+  const reader = await readBundle(f.store, f.environment.value, pilot, reference(f.question), 'Read the independent prior basis',
+    sources.map(source => ({ source: reference(source) })));
+  writeFileSync(refFile, JSON.stringify(reference(reader)));
+  assert.equal((reader.value as any).observations[0].source.id, sources[0]!.id, 'The selected observation reads the first Source');
+  const invoke = (db = f.store) => assessmentSession(db, f.draft, f.question, f.environment, pilotEnvironment(f.environment.value, pilot.value),
+    pilot, f.context, 'Assess original and looked-up evidence');
+  await assert.rejects(invoke(), { code: 'research_provider_failed' });
+  const failed = f.store.list<any>('assessment-application').find(app => app.value.state === 'retryable')!;
+  assert.ok(failed);
+  assert.equal(f.store.get<any>(failed.value.session.id, failed.value.session.revision)!.value.workspace.entries[0].result.record.id, reader.id);
+  // The pilot admits a retry after a failure of unknown usage only with an explicit reserve for that exact call.
+  const reserve = (db: Store) => {
+    const call = db.list<ModelCall>('model-call').find(call => call.value.status === 'failed' && call.value.error === 'research_provider_failed')!;
+    pilot = configureReaderPilot(db, new Environments(db), 'p', { ...settings, unknownReserves: [{ call: reference(call), tokens: 1 }] }, pilot.revision);
+  };
+  return { invoke, reserve, reader, sources, failed };
+}
+
+test('DRY6-02 return 2: a prior reader-result whose selected observation Source changed refuses the retryable renewal by that Source with its door', async t => {
+  const f = resumeFixture(t), { invoke, reader, sources: [source], failed } = await dry6PriorReaderAssessment(f, [['prior-basis', 'XY']]);
+  assert.ok(failed.value.guards.some((guard: any) => guard.id === source!.id && guard.revision === source!.revision && guard.hash === source!.hash),
+    'The Source behind the reader-result is an original guard');
+  const moved = f.engine.discovery.evidence.document('p', 'prior-basis', 'Changed XY', 'text/plain', source!.revision);
+  assert.deepEqual(f.store.get(reader.id), reader, 'The reader-result itself is unchanged');
+  const count = f.sent().length, db = f.fresh();
+  await assert.rejects(invoke(db), { code: 'research_context_application_refused' });
+  assert.equal(f.sent().length, count, 'No call is paid on the old prior reading');
+  const refused = db.get<any>(failed.id)!;
+  assert.equal(refused.value.state, 'refused');
+  assert.deepEqual(refused.value.refusal, { kind: 'dependency', expected: reference(source!), actual: reference(moved) });
+  const door = assessmentRefusalDoor(db, refused);
+  assert.deepEqual([door.changed?.kind, door.question, door.command], ['source', reference(f.question),
+    { type: 'reopen-question', question: f.question.id, expected: f.question.revision }]);
+  const heads = db.list();
+  await assert.rejects(invoke(f.fresh()), { code: 'research_context_application_refused' });
+  assert.deepEqual(db.list(), heads); assert.equal(f.sent().length, count, 'A restart repeats the refusal without a call');
+  // The door is the ordinary reopen of the same assessed question in the same draft; it opens nothing automatically.
+  const drafts = db.list('discovery-draft');
+  new ProductEngine(db).execute(door.command);
+  const reopened = db.get<Question>(f.question.id)!;
+  assert.deepEqual([reopened.revision, reopened.value.draftId], [f.question.revision + 1, f.draft.id]);
+  assert.deepEqual(db.list('discovery-draft'), drafts, 'The same draft continues'); assert.equal(f.sent().length, count);
+});
+
+test('DRY6-02 return 2: a changed Source of another observation of the same prior reading, or the reserve raised for the retry, is no cause — the renewal pays its one retry', async t => {
+  const f = resumeFixture(t), { invoke, reserve, sources: [selected, other], failed } = await dry6PriorReaderAssessment(f, [['prior-basis', 'XY'], ['unrelated', 'UV']]);
+  assert.ok(!failed.value.guards.some((guard: any) => guard.id === other!.id), 'The unselected observation is not a dependency of the check');
+  f.engine.discovery.evidence.document('p', 'unrelated', 'Changed UV', 'text/plain', other!.revision);
+  const count = f.sent().length, db = f.fresh();
+  reserve(db);
+  assert.deepEqual(await invoke(db), verdict);
+  assert.equal(f.sent().length, count + 1, 'Exactly the one permitted retry is sent');
+  assert.equal(db.get<any>(failed.id)!.value.state, 'renewed');
+  assert.equal(db.list<any>('assessment-application').some(app => app.value.state === 'refused'), false);
+  assert.deepEqual(db.get(selected!.id), selected);
+});
+
+// DRY6-02 return 2: an unsent prepared intent renewed by an explicit limit increase after its cited Source changed is
+// refused by that Source — the raised profile it is renewed with is not the named cause.
+test('DRY6-02 return 2: a prepared intent renewed by a raised limit after its cited Source changed is refused by that Source with its door', async t => {
+  const f = resumeFixture(t, 'checkpoint'), limited = d83LimitedAssessment(f), before = await d83AtPreparedLimit(f, limited);
+  const moved = f.engine.discovery.evidence.document('p', 'basis', 'Changed', 'text/plain', f.source.revision);
+  limited.raise(); const db = f.fresh();
+  await assert.rejects(limited.invoke(db), { code: 'research_context_application_refused' });
+  assert.equal(f.sent().length, 1, 'The unsent intent is never sent on the old citation');
+  const refused = db.get<any>(before.application.id)!;
+  assert.equal(refused.value.state, 'refused');
+  assert.deepEqual(refused.value.refusal, { kind: 'dependency', expected: reference(f.source), actual: reference(moved) });
+  assert.equal(assessmentRefusalDoor(db, refused).changed?.kind, 'source');
+});
+
+// DRY6-02 return 2, the negative control: bytes changed on disk under the same Source record are no moved basis record —
+// the renewal keeps its own source_stale, writes no refusal and invents no dependency witness.
+test('DRY6-02 return 2: changed file bytes under the same Source record keep the bare source_stale without a refusal or witness', async t => {
+  const f = resumeFixture(t), file = d83FileAssessment(f); d83EmptyProviderThenSuccess(f);
+  await assert.rejects(file.invoke(), { code: 'research_provider_failed' });
+  const failed = f.store.list<any>('assessment-application')[0]!;
+  assert.equal(failed.value.state, 'retryable');
+  writeFileSync(file.path, 'Changed on disk only\n');
+  const db = f.fresh(), heads = db.list();
+  await assert.rejects(file.invoke(db), { code: 'research_context_application_source_stale' });
+  assert.deepEqual(db.list(), heads, 'Nothing is written'); assert.deepEqual(db.get(file.source.id), file.source);
+  assert.equal(db.get<any>(failed.id)!.value.state, 'retryable'); assert.equal(f.sent().length, 1);
 });
 
 test('DRY5FIX B a new candidate cannot bypass the failed assessment under the same question', async t => {

@@ -161,14 +161,76 @@ export class RunControlGate {
    * by another store or process reaches the live executor during its call, not after (№1910 п.6). The watch reads
    * one record at a bounded interval and is cleared after the call.
    */
+  /**
+   * DRY6-02: the exact stop that moved this admission on, if a stop did — the stopped control revision of the generation
+   * the work was admitted in. Any other movement (another executor, a newer generation) names no stop.
+   */
+  cancelledBy(): { control: Ref; admitted: Ref | null; stop: string } | null {
+    const admission = this.admit(), head = currentControl(this.store, this.project);
+    if (!head?.value.stop || !moved(this.store, admission)) return null;
+    const held = admission.hold.control, admitted = held ? this.store.get<RunControlRecord>(held.id, held.revision) : null;
+    if (held ? !(admitted && checkRecord(admitted.value, this.project) && admitted.value.generation === head.value.generation)
+      : !(head.revision === 1 && head.value.generation === 1)) return null;
+    return { control: reference(head), admitted: held, stop: head.value.stop.token };
+  }
   watch(controller: AbortController, intervalMs = 200): () => void {
     const admission = this.admit();
     const timer = setInterval(() => {
       // A read that fails proves no stop; the call's own guarded writes still decide.
-      try { if (moved(this.store, admission)) controller.abort(); } catch { /* no evidence either way */ }
+      try { if (moved(this.store, admission)) controller.abort(RUN_CONTROL_MOVED); } catch { /* no evidence either way */ }
     }, intervalMs);
     return () => clearInterval(timer);
   }
+}
+
+/** DRY6-02: the abort reason of a call cancelled by its watch because its control moved on — never an external signal. */
+export const RUN_CONTROL_MOVED = Object.freeze({ reason: "run-control-moved" as const });
+
+/**
+ * DRY6-02 (contract №4961 (b)): the proof that the common stop cancelled one dispatched call, saved with the call's terminal
+ * in the same transaction — the exact stopped control of the generation the call was admitted in. The string
+ * process_cancelled, an external abort signal or today's environment prove nothing.
+ */
+export const CALL_STOP_CANCEL_KIND = "call-stop-cancel";
+export const CALL_STOP_CANCEL_CONTRACT = "call-stop-cancel/v1" as const;
+export const callStopCancelId = (call: string): string => `${CALL_STOP_CANCEL_KIND}:${call}`;
+export interface CallStopCancel {
+  readonly contract: typeof CALL_STOP_CANCEL_CONTRACT; readonly projectId: string;
+  readonly call: Ref; readonly control: Ref; readonly admitted: Ref | null; readonly stop: string;
+}
+export function callStopCancelWrite(projectId: string, call: Ref, link: { control: Ref; admitted: Ref | null; stop: string }): Write {
+  return { id: callStopCancelId(call.id), kind: CALL_STOP_CANCEL_KIND, expected: 0,
+    value: { contract: CALL_STOP_CANCEL_CONTRACT, projectId, call, control: link.control, admitted: link.admitted, stop: link.stop } };
+}
+/** The stop that cancelled this exact terminal of a call, or null when no link was saved with it. */
+export function stopCancelledCall(store: Store, saved: Revision<object>): { stop: string; control: Revision<RunControlRecord> } | null {
+  const link = store.get<CallStopCancel>(callStopCancelId(saved.id));
+  if (!link) return null;
+  const call = saved as Revision<Record<string, unknown>>;
+  const fail = (message: string): never => {
+    throw new EngineError("call_stop_cancel_invalid", `[${link.id}] ${message}`, { call: reference(call), link: reference(link) });
+  };
+  const value = link.value, projectId = call.value["projectId"];
+  if (link.kind !== CALL_STOP_CANCEL_KIND || !object(value) || value.contract !== CALL_STOP_CANCEL_CONTRACT || value.projectId !== projectId
+    || !isText(projectId) || !isRef(value.call) || !sameRef(value.call, reference(call)) || !isText(value.stop))
+    fail("The link does not name this exact terminal of the call");
+  if (call.value["status"] !== "failed" || call.value["error"] !== "process_cancelled" || call.value["response"] !== null)
+    fail("Only a cancelled call without a response is linked to a stop");
+  const control = isRef(value.control) ? store.get<RunControlRecord>(value.control.id, value.control.revision) : null;
+  if (!control || control.kind !== RUN_CONTROL_KIND || !sameRef(reference(control), value.control) || !checkRecord(control.value, projectId as string)
+    || control.value.stop?.token !== value.stop) fail("The link names no saved stop of this project");
+  const held = value.admitted, admitted = held === null ? null : isRef(held) ? store.get<RunControlRecord>(held.id, held.revision) : undefined;
+  if (admitted === undefined || (admitted === null ? !(control!.revision === 1 && control!.value.generation === 1)
+    : !(sameRef(reference(admitted), held as Ref) && checkRecord(admitted.value, projectId as string)
+      && admitted.value.generation === control!.value.generation)))
+    fail("The stop does not belong to the generation the call was admitted in");
+  return { stop: value.stop, control: control! };
+}
+/** The control revision whose explicit resume lifted exactly this stop, or null while it still stands. */
+export function liftedStop(store: Store, project: string, stop: string): Revision<RunControlRecord> | null {
+  requireProject(store, project);
+  return store.history<RunControlRecord>(runControlId(project))
+    .find(row => checkRecord(row.value, project) && row.value.stop === null && row.value.resumed === stop) ?? null;
 }
 
 // ---- The executor: one owner of the pass by CAS, never by a pid, a local map or a lease (№1910 п.2). ----

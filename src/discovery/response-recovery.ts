@@ -32,6 +32,7 @@ import { Evidence, SOURCE_READ_CONTRACT, type Source, type Observation, type Sel
 import { webCaptureId, type WebCapture } from './web-research.js';
 import { processStart } from '../runtime/process-identity.js';
 import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executionOf } from './model-call-recovery.js';
+import { stopCancelledCall, liftedStop } from '../om/run-control.js';
 import { isResearchPreview } from './research-preview.js';
 import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply,
   isReservationOnlySessionStep, admittedResearchAction, responseAction, webResearchCapability, earlyUnknownEra, EARLY_UNKNOWN,
@@ -1598,7 +1599,7 @@ interface ResearchExecutionContext {
 export type ResearchExecution = ResearchExecutionContext & (
   { kind: 'response'; payload: unknown; response: Ref }
   | { kind: 'provider-failed'; response: Ref }
-  | { kind: 'terminal'; code: 'run_stopped' | 'run_control_changed'; response: null });
+  | { kind: 'terminal'; code: 'run_stopped' | 'run_control_changed' | 'process_cancelled'; response: null });
 
 /** The receipt records runProcess's close result, not an interpretation of its
  * status label. Both producers share the same physical proof. */
@@ -1663,8 +1664,21 @@ function assessmentExecution(store: Store, call: Revision<ModelCall>, value: Rec
   return physicalExecution(store, call, value, 'assessmentExecution', 'assessmentApplication', 'assessment-execution/v1');
 }
 
-function assessmentControlTerminal(store: Store, call: Revision<ModelCall>): 'run_stopped' | 'run_control_changed' | null {
+function assessmentControlTerminal(store: Store, call: Revision<ModelCall>): 'run_stopped' | 'run_control_changed' | 'process_cancelled' | null {
   const code = call.value.error;
+  // DRY6-02: a dispatched assessor call the common stop cancelled, proved by its saved stop link; the terminal must follow
+  // its exact running dispatch with nothing else changed.
+  if (call.value.status === 'failed' && call.value.response === null && code === 'process_cancelled') {
+    if (!stopCancelledCall(store, call)) return null;
+    const running = store.get<ModelCall>(call.id, call.revision - 1);
+    const same = (value: ModelCall) => Object.fromEntries(Object.entries(value)
+      .filter(([field]) => !['status', 'finishedAt', 'error', 'runtime'].includes(field)));
+    requireCondition(running?.kind === 'model-call' && running.value.status === 'running' && running.value.response === null
+      && running.value.error === null && canonical(same(running.value)) === canonical(same(call.value))
+      && Number.isSafeInteger(call.value.finishedAt) && Number(call.value.finishedAt) >= call.value.startedAt,
+    'response_recovery_execution_invalid', 'The stop-cancelled terminal must immediately follow its exact running dispatch');
+    return 'process_cancelled';
+  }
   if (call.value.status !== 'failed' || call.value.response !== null
     || !['run_stopped', 'run_control_changed'].includes(code ?? '')) return null;
   const before = store.get<ModelCall>(call.id, call.revision - 1), claim = store.get<ModelCall>(call.id, 1);
@@ -1786,9 +1800,71 @@ export function retryableResearchConsumerRefusal(store: Store, intent: Revision<
     return paid.kind === 'terminal' && paid.response === null && paid.code === refusal.code
       && executionOf(paid.call.value)?.phase === 'claimed';
   }
+  if (refusal.kind === 'terminal' && refusal.code === 'process_cancelled') return cancelledCallRetryable(store, intent);
   if (refusal.kind !== 'terminal' || refusal.code !== 'research_provider_failed') return false;
   const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
   return paid.kind === 'provider-failed' && paid.envelope === true;
+}
+
+/**
+ * DRY6-02 (contract №4961 (b)): one new generation of a dispatched A/C attempt cancelled without a response — only after the
+ * explicit resume of exactly the stop proved to have cancelled it, or by the explicit addressed permit of that exact call
+ * for an older terminal without such a proof. A cancelled process has no physical result to receive (its run rejects before
+ * close), so there is nothing to apply first; the earlier attempt keeps its record and its possible cost.
+ */
+function cancelledCallRetryable(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
+  const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  if (paid.kind !== 'terminal' || paid.response !== null || paid.code !== 'process_cancelled') return false;
+  const cancelled = stopCancelledCall(store, paid.call);
+  if (cancelled) return liftedStop(store, intent.value.projectId, cancelled.stop) !== null;
+  return readCallRetryPermit(store, paid.call, intent) !== null;
+}
+
+export const CALL_RETRY_PERMIT_KIND = 'call-retry-permit';
+export const CALL_RETRY_PERMIT_CONTRACT = 'call-retry-permit/v1' as const;
+export const callRetryPermitId = (call: string): string => `${CALL_RETRY_PERMIT_KIND}:${call}`;
+export interface CallRetryPermit { contract: typeof CALL_RETRY_PERMIT_CONTRACT; projectId: string; call: Ref; intent: Ref; actor: string }
+function readCallRetryPermit(store: Store, call: Revision<ModelCall>, intent: Revision<ResearchConsumerIntent>): Revision<CallRetryPermit> | null {
+  const permit = store.get<CallRetryPermit>(callRetryPermitId(call.id));
+  if (!permit) return null;
+  const value = permit.value;
+  requireCondition(permit.kind === CALL_RETRY_PERMIT_KIND && object(value) && value.contract === CALL_RETRY_PERMIT_CONTRACT
+    && value.projectId === intent.value.projectId && canonical(value.call) === canonical(reference(call))
+    && canonical(value.intent) === canonical(reference(intent)) && typeof value.actor === 'string' && value.actor.trim().length > 0,
+  'call_retry_permit_invalid', `[${permit.id}] The permit names another call or intent`);
+  return permit;
+}
+/**
+ * DRY6-02: the explicit addressed door for an older dispatched A/C attempt cancelled without a response and without a saved
+ * stop link: the caller permits ONE new attempt of that exact call. Nothing old is reinterpreted — the terminal, its intent
+ * refusal and any possible cost stay; no new draft, no repeat of accepted questions. A repeat returns the same permit.
+ */
+export function permitCancelledCallRetry(store: Store, request: { project: string; call: Ref }, actor: string): Revision<CallRetryPermit> {
+  const refuse = (code: string, message: string): never => {
+    throw new EngineError(code, `[${isRef(request?.call) ? request.call.id : 'model-call'}] ${message}`, { call: request?.call ?? null });
+  };
+  if (!request || typeof request.project !== 'string' || !request.project || !isRef(request.call) || typeof actor !== 'string' || !actor.trim())
+    refuse('call_retry_permit_invalid', 'The door names its project, the exact call and its actor');
+  const call = store.get<ModelCall>(request.call.id);
+  if (!call || call.kind !== 'model-call' || canonical(reference(call)) !== canonical(request.call) || call.value.projectId !== request.project)
+    refuse('call_retry_permit_stale', 'The named call is not the current terminal of this project');
+  if (call!.value.status !== 'failed' || call!.value.error !== 'process_cancelled' || call!.value.response !== null)
+    refuse('call_retry_permit_invalid', 'Only a dispatched attempt cancelled without a response is permitted again');
+  if (stopCancelledCall(store, call!)) refuse('call_retry_permit_unneeded', 'The common stop is proved for this call; its explicit resume permits the attempt');
+  if (!isRef(call!.value.consumerIntent))
+    refuse('call_retry_permit_unsupported', 'An assessor B attempt is recovered through the reopen door of its assessed question');
+  // The call names the intent revision it was sent under; its refusal is that intent's current head.
+  const sent = readResearchConsumerIntent(store, call!.value.consumerIntent!), now = store.get<ResearchConsumerIntent>(sent.id);
+  const intent = now ? readResearchConsumerIntent(store, reference(now)) : sent;
+  const head = findResearchConsumerIntent(store, request.project, intent.value.kind, intent.value.key, intent.value.draft.id);
+  if (intent.value.state !== 'refused' || intent.value.refusal?.kind !== 'terminal' || intent.value.refusal.code !== 'process_cancelled'
+    || canonical(intent.value.refusal.call) !== canonical(reference(call!)) || head?.id !== intent.id)
+    refuse('call_retry_permit_stale', 'The call is not the refused current attempt of its work');
+  const existing = readCallRetryPermit(store, call!, intent);
+  if (existing) return existing;
+  return store.writeMany<CallRetryPermit>([{ id: callRetryPermitId(call!.id), kind: CALL_RETRY_PERMIT_KIND, expected: 0,
+    value: { contract: CALL_RETRY_PERMIT_CONTRACT, projectId: request.project, call: reference(call!), intent: reference(intent), actor } }],
+  [reference(call!), reference(intent)])[0]!;
 }
 
 /** The same exact physical proof is used for recovery and ordinary retry.
