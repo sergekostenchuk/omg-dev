@@ -1,7 +1,7 @@
 import type { Revision, Store } from "../storage/store.js";
-import { STAGES, reference, stageId, type StageArtifact } from "../pipeline/contracts.js";
+import { STAGES, isRef, reference, stageId, type StageArtifact } from "../pipeline/contracts.js";
 import type { DiscoveryDraft } from "./discovery.js";
-import { canonical } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import type { Graph } from "../graph/model.js";
 import type { Ref } from "../pipeline/contracts.js";
@@ -10,6 +10,41 @@ import { researchGapDeferred } from '../graph/research-scope.js';
 import type { PlanDefect } from "../graph/plan-defects.js";
 import { projectGraph } from "../graph/project.js";
 import { layerRelationContext } from '../graph/layer-assembly.js';
+import { discoveryBasisCatalogue, type DiscoveryBasisCatalogue } from './discovery-outcome.js';
+
+export interface DiscoveryBasisMaterial {
+  source: Ref;
+  catalogue: DiscoveryBasisCatalogue;
+  guards: Ref[];
+}
+
+/** Read the one accepted Discovery stage named by this draft, never the current stage head. */
+export function readDiscoveryBasisMaterial(store: Store, draft: DiscoveryDraft): DiscoveryBasisMaterial {
+  const project = typeof draft?.projectId === 'string' && draft.projectId ? draft.projectId : null;
+  const id = project === null ? 'discovery' : stageId(project, 'discovery');
+  const fail = (field: string, message: string): never => {
+    throw new EngineError('discovery_basis_catalogue_invalid', `[${id}] ${message}`, { target: id, field });
+  };
+  if (project === null || !Array.isArray(draft.inputs))
+    return fail('inputs', 'The draft needs its project and exact accepted Discovery inputs');
+  const refs = draft.inputs.filter(ref => ref?.id === id);
+  if (refs.length !== 1) return fail('inputs', 'The draft needs exactly one accepted Discovery source');
+  const ref = refs[0]!;
+  if (!isRef(ref)) return fail('inputs', 'The Discovery source needs its full historical reference');
+  const record = store.get<StageArtifact>(ref.id, ref.revision);
+  if (!record || record.kind !== 'stage' || record.hash !== ref.hash || hashJson(record.value) !== record.hash
+    || record.value.projectId !== project || record.value.stage !== 'discovery'
+    || record.value.status !== 'accepted')
+    return fail('inputs', 'The draft lost its exact accepted Discovery source');
+  const content = record.value.content;
+  if (!content || typeof content !== 'object' || Array.isArray(content)
+    || !Object.hasOwn(content, 'fields') || !content.fields || typeof content.fields !== 'object'
+    || Array.isArray(content.fields))
+    return fail('content.fields', 'The accepted Discovery fields are missing');
+  const source = reference(record);
+  return { source, catalogue: discoveryBasisCatalogue({ ref: source, fields: content.fields as Record<string, Json> }),
+    guards: [{ ...source }] };
+}
 
 const MAP_RULES = [
   "Engine rule (buildL1): every Discovery preparation.outcomes[].id remains the id of a result artifact and the outcome of a success journey. Do not rename these results; additional intermediate artifacts are allowed.",

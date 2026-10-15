@@ -21,7 +21,7 @@ import { executeWebTurn } from "../src/discovery/web-research.js";
 import type { Environment } from "../src/runtime/environment.js";
 import type { StageResearchResult } from "../src/product/stage-research.js";
 import { consumerFeedback, rejectResearch, type ConsumerFeedback } from "../src/discovery/consumer-feedback.js";
-import { researchGraphContext, researchPrerequisites } from "../src/discovery/research-context.js";
+import { readDiscoveryBasisMaterial, researchGraphContext, researchPrerequisites } from "../src/discovery/research-context.js";
 import { canonical, type Json } from "../src/canonical.js";
 
 // Controlled process provider proves routing/acceptance, not live model quality.
@@ -927,10 +927,27 @@ test('DS1.2a D accepted Discovery preserves report links, owner constraints and 
   assert.deepEqual(catalogue.variant, { address: { record: reference(stage), pointer: '/content/fields/verdict/variant' },
     value: (source.fields.verdict as any).variant });
   const concept = f.engine.prepare('catalogue', 'concept'), oldMaterial = canonical(researchPrerequisites(f.store, concept.value));
+  const read = readDiscoveryBasisMaterial(f.store, concept.value);
+  assert.deepEqual(read, { source: reference(stage), catalogue: discoveryBasisCatalogue(source), guards: [reference(stage)] });
+  for (const inputs of [[], [reference(stage), reference(stage)],
+    [{ ...reference(stage), hash: 'b'.repeat(64) }],
+    [{ ...reference(stage), id: 'stage:other:discovery' }],
+    [{ ...reference(stage), revision: undefined } as unknown as ReturnType<typeof reference>]])
+    assert.throws(() => readDiscoveryBasisMaterial(f.store, { ...concept.value, inputs }),
+      (error: unknown) => error instanceof EngineError && error.code === 'discovery_basis_catalogue_invalid'
+        && (error.details as any).field === 'inputs');
+  assert.throws(() => readDiscoveryBasisMaterial(f.store, { ...concept.value, inputs: null } as unknown as DiscoveryDraft),
+    (error: unknown) => error instanceof EngineError && error.code === 'discovery_basis_catalogue_invalid'
+      && (error.details as any).field === 'inputs');
   (catalogue.constraints[0]!.value as any).rule = 'caller edit';
   assert.equal(canonical(source), before); assert.notEqual((discoveryBasisCatalogue(source).constraints[0]!.value as any).rule, 'caller edit');
   assert.equal(canonical(researchPrerequisites(f.store, concept.value)), oldMaterial, 'The existing v5 context is not expanded');
   assert.equal(f.store.list('model-call').length, calls);
+  const missingFields = f.store.write({ id: stage.id, kind: 'stage', expected: stage.revision,
+    value: { ...stage.value, content: {} } });
+  assert.throws(() => readDiscoveryBasisMaterial(f.store, { ...concept.value, inputs: [reference(missingFields)] }),
+    (error: unknown) => error instanceof EngineError && error.code === 'discovery_basis_catalogue_invalid'
+      && (error.details as any).field === 'content.fields');
 });
 
 test('DS1.2a D missing material has an address; empty constraints and an exact variant remain explicit', () => {
@@ -960,15 +977,18 @@ test('DS1.2a D a second Store advances Discovery; old catalogue remains exact an
   const f = fixture(t); f.setup('history'); const draft = f.engine.prepare('history', 'discovery');
   const result = await f.engine.stageResearch.run('history', draft.id, 8); assert.equal(result.status, 'accepted');
   const saved = f.store.get<{ content: { fields: Record<string, Json> } }>(result.stage!.id, result.stage!.revision)!;
-  const before = discoveryBasisCatalogue({ ref: reference(saved), fields: saved.value.content.fields });
+  const concept = f.engine.prepare('history', 'concept');
+  const material = readDiscoveryBasisMaterial(f.store, concept.value), before = material.catalogue;
   const second = new Store(f.path);
   try {
     const content = structuredClone(saved.value.content); (content.fields.verdict as any).variant = 'new draft variant';
     const revised = new ProductEngine(second).pipeline.draft('history', 'discovery', content, saved.revision);
     assert.ok(revised.revision > saved.revision);
     const historical = f.store.get<typeof saved.value>(saved.id, saved.revision)!;
+    assert.deepEqual(readDiscoveryBasisMaterial(f.store, concept.value), material,
+      'The historical reader stays on the draft input after the head changes');
     assert.deepEqual(discoveryBasisCatalogue({ ref: reference(historical), fields: historical.value.content.fields }), before);
-    assert.throws(() => f.store.writeMany([], [before.source]), (error: unknown) => error instanceof EngineError
+    assert.throws(() => f.store.writeMany([], material.guards), (error: unknown) => error instanceof EngineError
       && /stale|conflict/.test(error.code), 'The exact catalogue source participates in the consumer transaction guard');
     assert.deepEqual(reference(f.store.get(saved.id)!), reference(revised));
   } finally { second.close(); }
