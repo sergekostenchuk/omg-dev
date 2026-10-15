@@ -2535,7 +2535,7 @@
 - Отдаёт: —
 - Читает записи: готовые таблицы v6, applications C/S, наследование L/H, доставка M
 - Пишет записи: переключение производителей новой работы на v6
-- Разрешённые пути: `src/discovery/requirements.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/research-runner.ts`, `test/discovery-v6-era.test.ts`, `test/ds12-v6-release.test.ts`, `test/product-fixture.ts`, `test/map-design.test.ts`, `test/om-call-record.test.ts`, `test/om-series.test.ts`, `test/early-stage-briefs.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/stage-research.test.ts`, `test/early-research-outcome.test.ts`, `src/discovery/research-assessment.ts`, `test/assessment-session-resume.test.ts`, `test/direct-assessment-acceptance.test.ts`, `test/early-stage-driver.test.ts`, `test/early-unknown.test.ts`, `test/operation-map-material.test.ts`, `test/product.test.ts`, `test/research-call-resume.test.ts`, `test/web-source-consumers.test.ts`, `src/om/gaps.ts`, `src/product/stage-summary.ts`, `test/stage-summary.test.ts`, `test/om-task-context.test.ts`
+- Разрешённые пути: `src/discovery/requirements.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/research-runner.ts`, `test/discovery-v6-era.test.ts`, `test/ds12-v6-release.test.ts`, `test/product-fixture.ts`, `test/map-design.test.ts`, `test/om-call-record.test.ts`, `test/om-series.test.ts`, `test/early-stage-briefs.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/stage-research.test.ts`, `test/early-research-outcome.test.ts`, `src/discovery/research-assessment.ts`, `test/assessment-session-resume.test.ts`, `test/direct-assessment-acceptance.test.ts`, `test/early-stage-driver.test.ts`, `test/early-unknown.test.ts`, `test/operation-map-material.test.ts`, `test/product.test.ts`, `test/research-call-resume.test.ts`, `test/web-source-consumers.test.ts`, `src/om/gaps.ts`, `src/product/stage-summary.ts`, `test/stage-summary.test.ts`, `test/om-task-context.test.ts`, `test/om-question-packet.test.ts`, `test/om-atomic-gate.test.ts`
 - Из движка как есть: №4870; №4877
 - После: DS1.2lh, DS1.2m, DS1.2s, DS1.2c, DS1.2e, DRY6-02, DS1.3b, ENV1
 - Тесты сверх обязательных:
@@ -2745,7 +2745,7 @@
 - Отдаёт: —
 - Читает записи: owner-authority (H2), discovery-decision, discovery-outcome, stage-summary
 - Пишет записи: scoped owner-action discovery-condition-choice; decision v2 с сессией и основаниями; CLI owner-discovery-choice
-- Разрешённые пути: `src/product/owner-authority.ts`, `src/discovery/discovery-decision.ts`, `src/discovery/discovery-outcome.ts`, `src/product/stage-summary.ts`, `src/cli.ts`, `test/discovery-decision.test.ts`, `test/stage-research.test.ts`, `test/stage-summary.test.ts`
+- Разрешённые пути: `src/product/owner-authority.ts`, `src/discovery/discovery-decision.ts`, `src/discovery/discovery-outcome.ts`, `src/product/stage-summary.ts`, `src/cli.ts`, `test/discovery-decision.test.ts`, `test/stage-research.test.ts`, `test/stage-summary.test.ts`, `test/ds12-v6-release.test.ts`
 - Из движка как есть: №4990 §7; №5186; H2.0
 - После: DS1.2v
 - Тесты сверх обязательных:

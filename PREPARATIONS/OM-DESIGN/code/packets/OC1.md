@@ -5,7 +5,7 @@
 ## Как работать
 
 - Ты воркер блока OM движка OMG. Рабочая копия — твоя копия, названная в сообщении о выдаче (на точной базе из карточки). Основную копию `~/OMG`, базу `.omg/state.sqlite` и `live-source` не трогай и не читай на запись.
-- Писать разрешено ТОЛЬКО в эти файлы: `src/product/owner-authority.ts`, `src/discovery/discovery-decision.ts`, `src/discovery/discovery-outcome.ts`, `src/product/stage-summary.ts`, `src/cli.ts`, `test/discovery-decision.test.ts`, `test/stage-research.test.ts`, `test/stage-summary.test.ts`. Нужен другой файл — остановись и сообщи: это отход от задачи, а не твоё решение.
+- Писать разрешено ТОЛЬКО в эти файлы: `src/product/owner-authority.ts`, `src/discovery/discovery-decision.ts`, `src/discovery/discovery-outcome.ts`, `src/product/stage-summary.ts`, `src/cli.ts`, `test/discovery-decision.test.ts`, `test/stage-research.test.ts`, `test/stage-summary.test.ts`, `test/ds12-v6-release.test.ts`. Нужен другой файл — остановись и сообщи: это отход от задачи, а не твоё решение.
 - Источник истины — правила ниже. Они приняты ревьюером. Если правило кажется неверным, неполным или противоречит движку — НЕ обходи его кодом: остановись и опиши противоречие с примером. Поведение продукта сам не выбирай.
 - Отсутствующая возможность — типизированный отказ с адресом, не заглушка и не значение по умолчанию.
 - Код движка, названный «как есть», не правится. Пробный код `PREPARATIONS/OM-DESIGN/proto/` — сценарии и контрпримеры ревью, а не код к переносу: он возвращался ревьюером 15 раз.
@@ -40,12 +40,12 @@
 
 ## Карточка задачи
 
-- Точная база: ветка `om/module`, коммит `f51a7d577534`. Версия правил: `level2-rules.mjs` sha256 `520f1e3c9388`.
+- Точная база: ветка `om/module`, коммит `4dc199d7eeb7`. Версия правил: `level2-rules.mjs` sha256 `520f1e3c9388`.
 - Правила: `rules-general`
 - Читает записи: owner-authority (H2), discovery-decision, discovery-outcome, stage-summary
 - Пишет записи: scoped owner-action discovery-condition-choice; decision v2 с сессией и основаниями; CLI owner-discovery-choice
 - Из движка как есть: №4990 §7; №5186; H2.0
-- Уже сделано до тебя: DS1.2v «DS1.2 выпуск v6: переключение производителей новой работы на v6 (текущая константа, engine.ts — новые prepare/draft/build-map без подмены исторического dispatch) и все сквозные проверки v6 на настоящем производителе: Discovery v6 → концепция → L1 → ТЗ → фичи → OM-root selected/v2 и G5 task/v3; оплаченная история v5 не повторяется» (src/discovery/requirements.ts, src/product/engine.ts, src/product/stage-research.ts, src/discovery/research-runner.ts)
+- Уже сделано до тебя: DS1.2v «DS1.2 выпуск v6: переключение производителей новой работы на v6 (текущая константа, engine.ts — новые prepare/draft/build-map без подмены исторического dispatch) и все сквозные проверки v6 на настоящем производителе: Discovery v6 → концепция → L1 → ТЗ → фичи → OM-root selected/v2 и G5 task/v3; оплаченная история v5 не повторяется» (src/discovery/requirements.ts, src/product/engine.ts, src/product/stage-research.ts, src/discovery/research-runner.ts, src/discovery/research-assessment.ts, src/om/gaps.ts, src/product/stage-summary.ts)
 
 ### Соседи — от кого получаешь и кому отдаёшь (из стрелок карты)
 
@@ -61,6 +61,9 @@
 - `src/product/engine.ts`
 - `src/product/stage-research.ts`
 - `src/discovery/research-runner.ts`
+- `src/discovery/research-assessment.ts`
+- `src/om/gaps.ts`
+- `src/product/stage-summary.ts`
 
 ### Границы незавершённой интеграции
 
