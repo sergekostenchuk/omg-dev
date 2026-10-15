@@ -18,7 +18,7 @@ import { RunControlGate, RunControlLost, type RunControlHold } from './run-contr
 import { ResearchSources } from '../discovery/research-sources.js';
 import { contextValue } from '../discovery/working-context.js';
 import { sourceIsCurrent, type Source } from '../evidence/evidence.js';
-import { uniqueTransactionGuards, workspacePath, readEnvironmentAt, type Environment } from '../runtime/environment.js';
+import { resolveRoleMode, uniqueTransactionGuards, workspacePath, readEnvironmentAt, type Environment } from '../runtime/environment.js';
 import { tokenUsage, type TokenUsage, type ModelCall } from '../runtime/model-usage.js';
 import type { ProcessResult } from '../runtime/process.js';
 import { delivered, refused, sealed, isPlainObject, localErrors, localRefusals, transfer, transferring, type Refusal, type OmResult, type Sealed, type SourceCode, type SourceCodes } from './refusal.js';
@@ -1318,13 +1318,14 @@ function modelAssignment(store: Store, request: ModelCallRequest) {
   readDispatchAdapter(store, request.dispatch.adapter);
   const environment = configured.value as Environment;
   if (!object(environment)) fail('dispatch_contract_invalid', configured.id, 'environment', 'A dispatch environment must be a record');
-  const binding = environment[request.role];
-  if (environment.projectId !== request.project || !object(binding) || !text(binding.actor)
-    || !text(binding.model) || !text(binding.effort) || !object(binding.command)
-    || !text(binding.command.executable) || !Array.isArray(binding.command.args)
-    || !binding.command.args.every(arg => typeof arg === 'string') || !text(environment.workspace)
+  const configuredBinding = environment[request.role];
+  if (environment.projectId !== request.project || !object(configuredBinding) || !text(configuredBinding.actor)
+    || !text(configuredBinding.model) || !text(configuredBinding.effort) || !object(configuredBinding.command)
+    || !text(configuredBinding.command.executable) || !Array.isArray(configuredBinding.command.args)
+    || !configuredBinding.command.args.every(arg => typeof arg === 'string') || !text(environment.workspace)
     || !Number.isSafeInteger(environment.timeoutMs) || environment.timeoutMs < 100 || environment.timeoutMs > 3_600_000)
     fail('dispatch_contract_invalid', configured.id, request.role, 'The exact environment must provide a complete executor binding');
+  const binding = resolveRoleMode(request.role, configuredBinding, 'research');
   const wire = take(adapterRequest({ requestId: payload.requestId, packet: payload as Json, model: binding.model,
     effort: binding.effort, ...(binding.speed === undefined ? {} : { speed: binding.speed }) }));
   const series = take(readAnySeriesAt(store, request.project, packet.value.request.attempt.series));
@@ -1932,12 +1933,13 @@ function transportAssignment(store: Store, request: ModelTransportRequest, histo
     { unit: 'E4', target: request.call.id, id: `environment:${request.project}`, kind: 'environment' })).value as Environment;
   readDispatchAdapter(store, call.value.dispatch.adapter);
   if (!object(environment)) fail('dispatch_contract_invalid', request.call.id, 'environment', 'A dispatch environment must be a record');
-  const binding = environment[request.role];
-  if (environment.projectId !== request.project || !object(binding)
-    || !text(binding.actor) || !object(binding.command) || !text(binding.command.executable)
-    || !Array.isArray(binding.command.args) || !binding.command.args.every(arg => typeof arg === 'string')
+  const configuredBinding = environment[request.role];
+  if (environment.projectId !== request.project || !object(configuredBinding)
+    || !text(configuredBinding.actor) || !object(configuredBinding.command) || !text(configuredBinding.command.executable)
+    || !Array.isArray(configuredBinding.command.args) || !configuredBinding.command.args.every(arg => typeof arg === 'string')
     || !text(environment.workspace) || !Number.isSafeInteger(environment.timeoutMs) || environment.timeoutMs < 100 || environment.timeoutMs > 3_600_000)
     fail('dispatch_contract_invalid', request.call.id, 'dispatch', 'The admitted dispatch must supply the exact supported adapter and environment binding');
+  const binding = resolveRoleMode(request.role, configuredBinding, 'research');
   const wire = take(adapterRequest({ requestId: call.value.call, packet: request.packet,
     model: binding.model, effort: binding.effort, ...(binding.speed === undefined ? {} : { speed: binding.speed }) }));
   return { call, environment, binding, wire };
@@ -4637,7 +4639,7 @@ function deriveAssignmentEnvironment(before: Environment, after: Environment, se
   const common = (value: Environment) => ({ workspace: value.workspace, timeoutMs: value.timeoutMs,
     capacity: value.requestCapacityChars ?? null });
   const roleValue = (value: Environment, role: 'implementer' | 'reviewer') => {
-    const binding = value[role];
+    const binding = resolveRoleMode(role, value[role], 'research');
     return { actor: binding.actor, model: binding.model, effort: binding.effort,
       speed: binding.speed ?? 'inherited', command: binding.command };
   };

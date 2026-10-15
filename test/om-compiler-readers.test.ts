@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { canonical } from '../src/canonical.js';
+import { canonical, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { gateFeasibility, neighborsOf, readAcceptedFrame, readAtomicGate, readDeliveries, readFeasibility, readFrame, readNeighbors,
   readWorksFrame, readTaskContextBasis, readTaskSpecification, registerCompilerOmReaders, type CompilerOmReaders, type ObligationHandoffForm } from '../src/compiler/om-readers.js';
@@ -283,7 +283,12 @@ const rows = store => { const all = store.list().flatMap(row => store.history(ro
 function open(database) { const store = new Store(database); return { store, engine: new ProductEngine(store) }; }
 function reconfigure(engine, store, project) {
   const environment = store.get('environment:' + project), { projectId: _project, ...value } = environment.value;
-  return engine.environments.configure(project, { ...value, timeoutMs: value.timeoutMs + 1000 }, environment.revision);
+  // CFG1 declares this marker on a fresh revision. The old producer preserves the explicit
+  // field without interpreting it; both implementations can still be compared exactly.
+  const declared = role => ({ ...role, commandContract: 'role-command/universal-v1' });
+  return engine.environments.configure(project, { ...value,
+    implementer: declared(value.implementer), reviewer: declared(value.reviewer),
+    timeoutMs: value.timeoutMs + 1000 }, environment.revision);
 }
 function compiled(out, engine, project) {
   const plan = attempt(out, 'compile', () => engine.compiler.compile(project));
@@ -419,6 +424,11 @@ test('R3+R4 on a saved legal base the slot reproduces the base implementation ex
       else sameButReferences(current[variant]![name], JSON.stringify(base[variant]![name]), `${variant}.${name}: records/Ref, guards, text and hash`);
   // The scenario reached each OM read it claims to compare, rather than agreeing on an early refusal.
   const m8 = current['m8']!, plan = value(m8, 'compile') as { value: { feasibility: Ref; tasks: unknown[] } };
+  const shifted = value(m8, 'shift') as { hash: string; value: {
+    implementer: { commandContract?: string }; reviewer: { commandContract?: string } } };
+  assert.equal(shifted.value.implementer.commandContract, 'role-command/universal-v1');
+  assert.equal(shifted.value.reviewer.commandContract, 'role-command/universal-v1');
+  assert.equal(shifted.hash, hashJson(shifted.value), 'The fresh environment hash includes its declared role contract');
   assert.ok(plan.value.feasibility.id.startsWith('om-feasibility:'));
   assert.deepEqual((value(m8, 'feasibilityGate') as { findings: unknown[] }).findings, []);
   assert.deepEqual((value(m8, 'planGate') as { findings: unknown[] }).findings, []);

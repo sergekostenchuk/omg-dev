@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import type { Store, Revision, Write } from "../storage/store.js";
 import type { Ref } from "../pipeline/contracts.js";
 import { tokenUsage, type TokenUsage } from "../runtime/model-usage.js";
-import type { Environment, RoleBinding } from "../runtime/environment.js";
+import { resolveRoleMode, type Environment, type RoleBinding } from "../runtime/environment.js";
 import { executeProcess, type ProcessObserver } from "./process.js";
 import type { CompiledTask } from "../compiler/model.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -124,6 +124,7 @@ function reportedUsage(stdout: string, requestId: string): TokenUsage | null {
 export async function callAgent(role: RoleBinding, environment: Environment, mode: "implement" | "review",
   prompt: string, subject: unknown, maxChars: number, usage: (value: AgentUsage) => void, observer: ProcessObserver, signal?: AbortSignal,
   send?: (request: { hash: string; chars: number }) => ExecutionSendHandle): Promise<Record<string, unknown>> {
+  role = resolveRoleMode(mode === "implement" ? "implementer" : "reviewer", role, mode);
   const requestId = randomUUID();
   const request = boundedContext({ protocol: "omg-agent/v1", requestId, mode, model: role.model, effort: role.effort,
     ...(role.speed ? { speed: role.speed } : {}), prompt, subject }, maxChars);

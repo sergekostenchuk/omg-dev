@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { runProcess } from "../runtime/process.js";
 import { isProcessStopRefusal, writeProcessStopWitness } from "../runtime/process-identity.js";
 import type { Environment, RoleBinding } from "../runtime/environment.js";
-import { uniqueTransactionGuards } from '../runtime/environment.js';
+import { resolveRoleMode, uniqueTransactionGuards } from '../runtime/environment.js';
 import { EngineError, requireCondition } from "../errors.js";
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import type { ModelCall } from "../runtime/model-usage.js";
@@ -148,6 +148,9 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: ResearchCallAudit): Promise<unknown> {
   recoveryDispatchBoundary();
+  const roleName = role.actor === environment.implementer.actor ? 'implementer'
+    : role.actor === environment.reviewer.actor ? 'reviewer' : 'reader';
+  role = resolveRoleMode(roleName, role, 'research');
   let consumerIntent: Revision<ResearchConsumerIntent> | null = null;
   // Preview bypasses only the unsaved intent it synthesized for a prospective
   // request. A durable intent may already own a paid reply, which must be

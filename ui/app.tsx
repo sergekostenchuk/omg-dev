@@ -190,8 +190,8 @@ function Settings({ view, providers, cmd, run, busy }: { view: View; providers: 
   return <section><h2>Среда и роли</h2><p className="muted">Выбор сохраняется в движке. Смена совместимой модели сохраняет устройство карты и стадий.</p><form onSubmit={e => { e.preventDefault(); void run(() => {
     const commands = advanced ? JSON.parse(custom) : { implementer: provider?.command, reviewer: provider?.command };
     const environment: Omit<Environment, "projectId"> = { workspace,
-      implementer: { actor: initial?.implementer.actor ?? "implementation-worker", model: worker, effort: workerEffort, command: commands.implementer },
-      reviewer: { actor: initial?.reviewer.actor ?? "independent-reviewer", model: reviewer, effort: reviewEffort, command: commands.reviewer }, fullCheck: { executable: check, args: JSON.parse(args) }, timeoutMs: initial?.timeoutMs ?? 600_000 };
+      implementer: { ...initial?.implementer, actor: initial?.implementer.actor ?? "implementation-worker", model: worker, effort: workerEffort, command: commands.implementer },
+      reviewer: { ...initial?.reviewer, actor: initial?.reviewer.actor ?? "independent-reviewer", model: reviewer, effort: reviewEffort, command: commands.reviewer }, fullCheck: { executable: check, args: JSON.parse(args) }, timeoutMs: initial?.timeoutMs ?? 600_000 };
     return cmd({ type: "configure", project: view.project.value.id, expected: view.environment?.revision ?? 0, environment });
   }); }}><Field label="Корень Git-репозитория"><div className="input-action"><input required value={workspace} onChange={e => setWorkspace(e.target.value)} placeholder="Выберите рабочую папку"/><button type="button" className="secondary" onClick={() => setFolders(true)}>Выбрать папку</button></div></Field>
     <div className="provider-status">{provider?.available ? "● Codex CLI доступен" : "Codex CLI не найден. Можно подключить собственный адаптер."}</div><datalist id="models">{provider?.models.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}</datalist>

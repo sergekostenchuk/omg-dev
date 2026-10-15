@@ -8,7 +8,7 @@ import { EngineError } from "../src/errors.js";
 import { boundedContext } from "../src/compiler/context.js";
 import { callAgent } from "../src/execution/protocol.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { Environments, isRequestCapacityChars, type Environment } from "../src/runtime/environment.js";
+import { Environments, UNIVERSAL_ROLE_COMMAND, isRequestCapacityChars, type Environment } from "../src/runtime/environment.js";
 import { Store } from "../src/storage/store.js";
 import { readCapacity, CAPACITY_REFUSAL_CODES, type CapacityRequest } from "../src/om/capacity.js";
 import { type OmResult, type Refusal } from "../src/om/refusal.js";
@@ -88,9 +88,11 @@ test("V1 rejects every invalid configured scalar before IO and leaves environmen
 
 test("V1 missing capacity never falls back to reader pilot, planning, physicalLimits or caller budgets", t => {
   const f = fixture(t), environment = f.configure(f.settings);
-  const legacyBody = { ...f.settings, workspace: realpathSync(f.settings.workspace), projectId: PROJECT };
-  assert.deepEqual(environment.value, legacyBody);
-  assert.equal(environment.hash, hashJson(legacyBody));
+  const configuredBody = { ...f.settings, workspace: realpathSync(f.settings.workspace), projectId: PROJECT,
+    implementer: { ...f.settings.implementer, commandContract: UNIVERSAL_ROLE_COMMAND },
+    reviewer: { ...f.settings.reviewer, commandContract: UNIVERSAL_ROLE_COMMAND } };
+  assert.deepEqual(environment.value, configuredBody);
+  assert.equal(environment.hash, hashJson(configuredBody));
   f.store.write({ id: `reader-pilot:${PROJECT}`, kind: "reader-pilot", expected: 0,
     value: { projectId: PROJECT, maxRequestChars: 111, maxReportedTokens: 9999999,
       physicalLimits: { maxRequestChars: 222, maxReplyChars: 333, basis: "another consumer" }, planning: { maxRequestChars: 444 } } });

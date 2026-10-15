@@ -10,7 +10,7 @@ import { createProductServer } from "../src/server.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import { answerDiscoveryFixture, preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
-import { git } from "../src/runtime/environment.js";
+import { git, MODE_ROLE_COMMANDS, resolveRoleMode } from "../src/runtime/environment.js";
 import { reference } from "../src/pipeline/contracts.js";
 
 test("browser completes source→discovery→acceptance, survives reload and fits desktop/mobile", { timeout: 60_000 }, async t => {
@@ -67,12 +67,27 @@ test("browser completes source→discovery→acceptance, survives reload and fit
   await page.getByLabel("Аргументы команды (JSON-массив)", { exact: true }).fill('["--version"]');
   await page.getByRole("button", { name: "Сохранить среду и роли", exact: true }).click();
   await page.getByRole("status").filter({ hasText: "Изменения сохранены" }).waitFor();
+  const configured = engine.environments.get(project), chatProgram = join(root, "ui-chat-agent.mjs");
+  writeFileSync(chatProgram, `import {readFileSync} from 'node:fs'; const r=JSON.parse(readFileSync(0,'utf8')); console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,text:'Режимная команда чата сохранена'}));`);
+  const { projectId: _projectId, ...settings } = configured.value;
+  engine.environments.configure(project, { ...settings,
+    implementer: { ...settings.implementer, commandContract: MODE_ROLE_COMMANDS,
+      modeCommands: { implement: settings.implementer.command, chat: { executable: process.execPath, args: [chatProgram] } } },
+    reviewer: { ...settings.reviewer, commandContract: MODE_ROLE_COMMANDS,
+      modeCommands: { review: settings.reviewer.command } } }, configured.revision);
+  await page.reload(); await page.getByRole("tab", { name: "Среда и роли", exact: true }).click();
+  await page.getByRole("button", { name: "Сохранить среду и роли", exact: true }).click();
+  await page.getByRole("status").filter({ hasText: "Изменения сохранены" }).waitFor();
+  const preserved = engine.environments.get(project);
+  assert.equal(preserved.value.implementer.commandContract, MODE_ROLE_COMMANDS);
+  assert.deepEqual(resolveRoleMode("implementer", preserved.value.implementer, "chat").command,
+    { executable: process.execPath, args: [chatProgram] });
   await page.getByRole("tab", { name: "Чат", exact: true }).click();
   await page.getByLabel("Сообщение", { exact: true }).fill("Объясни состояние проекта");
   await page.getByRole("button", { name: "Отправить выбранной модели", exact: true }).click();
-  const reply = page.locator(".bubble.assistant").filter({ hasText: "Проверенный ответ тестового исполнителя" });
+  const reply = page.locator(".bubble.assistant").filter({ hasText: "Режимная команда чата сохранена" });
   await reply.waitFor();
-  assert.equal((await reply.innerText()).replace(/\s+/g, " "), "ui-worker Проверенный ответ тестового исполнителя");
+  assert.equal((await reply.innerText()).replace(/\s+/g, " "), "ui-worker Режимная команда чата сохранена");
   await page.reload(); await page.getByRole("tab", { name: "Среда и роли", exact: true }).click();
   assert.equal(await page.locator("fieldset").nth(0).getByLabel("Модель", { exact: true }).inputValue(), "ui-worker");
   assert.equal(await page.getByLabel("Собственный адаптер по протоколу OMG").isChecked(), true);

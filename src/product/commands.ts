@@ -87,6 +87,10 @@ const command = (type: string, properties: Record<string, unknown>) => object({ 
 const processCommand = object({ executable: string, args: { type: "array", items: { type: "string" } } });
 const role = object({ actor: string, model: string, effort: { enum: ["low", "medium", "high", "xhigh", "max", "ultra"] }, command: processCommand });
 role.properties['speed'] = { enum: ["inherited", "fast"] };
+role.properties['commandContract'] = { enum: ["role-command/universal-v1", "role-command/modes-v1"] };
+role.properties['modeCommands'] = { type: "object", additionalProperties: false, required: [], properties: {
+  implement: processCommand, review: processCommand, chat: processCommand,
+} };
 const environmentSettings = object({ workspace: string, implementer: role, reviewer: role, fullCheck: processCommand,
   timeoutMs: { type: "integer", minimum: 100, maximum: 3600000 } });
 // Added after object() fixed the required set, so a configure without it stays valid; the saved-environment validator judges the value.

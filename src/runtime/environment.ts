@@ -8,7 +8,19 @@ import type { Command, Graph } from "../graph/model.js";
 import { safeRelativePath } from "../graph/topology.js";
 import { reference, isRef, type Ref, type Finding } from "../pipeline/contracts.js";
 
-export interface RoleBinding { actor: string; model: string; effort: string; command: Command; speed?: "fast" | "inherited" }
+export const UNIVERSAL_ROLE_COMMAND = "role-command/universal-v1" as const;
+export const MODE_ROLE_COMMANDS = "role-command/modes-v1" as const;
+export type RoleCommandContract = typeof UNIVERSAL_ROLE_COMMAND | typeof MODE_ROLE_COMMANDS;
+export type RoleMode = "research" | "implement" | "review" | "chat";
+export type EnvironmentRole = "implementer" | "reviewer";
+export interface RoleModeCommands { implement?: Command; review?: Command; chat?: Command }
+export interface RoleBinding {
+  actor: string; model: string; effort: string; command: Command; speed?: "fast" | "inherited";
+  /** Absent only on genuine historical records. New configure writes an explicit contract. */
+  commandContract?: RoleCommandContract;
+  /** Research always uses `command`; the declared mode contract never falls back for these cells. */
+  modeCommands?: RoleModeCommands;
+}
 /** Stage-wide web research allowance. The operator sets it for the launch; nothing in it is a sufficiency criterion. */
 export interface WebResearchLimits { httpAttempts: number; pages: number; receivedChars: number; responseBytes: number }
 /** The gateway endpoint (a tunnel the launch provides) and its limits; the model passes only a query or URL. */
@@ -85,6 +97,44 @@ function requireCommand(command: Command): void {
   requireCondition(command && typeof command.executable === "string" && command.executable.length > 0
     && Array.isArray(command.args) && command.args.every(arg => typeof arg === "string"), "command_unavailable", "Executable and argument array are required");
 }
+function requireRoleBinding(roleName: EnvironmentRole, role: RoleBinding): void {
+  requireCondition(role && typeof role.actor === "string" && role.actor.trim()
+    && typeof role.model === "string" && role.model.trim() && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort)
+    && (role.speed === undefined || ["inherited", "fast"].includes(role.speed)),
+  "role_invalid", `The ${roleName} role needs an identity, model and supported effort`);
+  requireCommand(role.command);
+  const contract = role.commandContract;
+  requireCondition(contract === undefined || contract === UNIVERSAL_ROLE_COMMAND || contract === MODE_ROLE_COMMANDS,
+    "role_invalid", `The ${roleName} command contract must be universal or mode-specific`);
+  if (contract === undefined || contract === UNIVERSAL_ROLE_COMMAND) {
+    requireCondition(role.modeCommands === undefined, "role_invalid", "A universal role cannot carry mode-specific commands",
+    );
+    return;
+  }
+  requireCondition(role.modeCommands !== null && typeof role.modeCommands === "object" && !Array.isArray(role.modeCommands),
+    "role_invalid", `The ${roleName} mode-specific role declares its command cells`);
+  const allowed = roleName === "implementer" ? ["implement", "chat"] : ["review"];
+  const names = Object.keys(role.modeCommands!);
+  requireCondition(names.every(name => allowed.includes(name)), "role_invalid", "A role carries only commands for its own modes",
+  );
+  for (const name of names) requireCommand(role.modeCommands![name as keyof RoleModeCommands]!);
+}
+/** One pure choice for every invocation and M8 check. The caller supplies the internal product role and purpose. */
+export function resolveRoleMode(roleName: EnvironmentRole | "reader", role: RoleBinding, mode: RoleMode): RoleBinding {
+  const allowed = roleName === "implementer" ? ["research", "implement", "chat"]
+    : roleName === "reviewer" ? ["research", "review"] : ["research"];
+  const command = allowed.includes(mode) && mode !== "research" && role.commandContract === MODE_ROLE_COMMANDS
+    ? role.modeCommands?.[mode as keyof RoleModeCommands] : allowed.includes(mode) ? role.command : undefined;
+  if (!command) throw new EngineError("role_mode_missing", `The ${roleName} role has no ${mode} command`, { role: roleName, mode });
+  requireCommand(command);
+  return command === role.command ? role : { ...role, command };
+}
+function configuredRole(role: RoleBinding): RoleBinding {
+  return role.commandContract === undefined ? { ...role, commandContract: UNIVERSAL_ROLE_COMMAND } : role;
+}
+function configuredCommands(role: RoleBinding): Command[] {
+  return [role.command, ...Object.values(role.modeCommands ?? {})];
+}
 export function executablePath(command: Command, cwd: string): string {
   requireCommand(command);
   const candidates = isAbsolute(command.executable) || /[\\/]/.test(command.executable)
@@ -113,8 +163,10 @@ export function inspectRepository(environment: Environment, graph: Graph): { sta
     requireCondition(realpathSync(git(root, ["rev-parse", "--show-toplevel"])) === root, "repository_root", "Select the Git repository root");
     const head = git(root, ["rev-parse", "HEAD"]); const tree = git(root, ["rev-parse", "HEAD^{tree}"]);
     if (git(root, ["status", "--porcelain", "--untracked-files=all"])) findings.push({ code: "repository_dirty", target: root, message: "Repository has uncommitted changes" });
-    for (const [role, binding] of [["implementer", environment.implementer], ["reviewer", environment.reviewer]] as const) {
-      try { executablePath(binding.command, root); } catch { findings.push({ code: "executor_unavailable", target: role, message: "Selected executor is unavailable" }); }
+    for (const [role, binding, mode] of [["implementer", environment.implementer, "implement"], ["reviewer", environment.reviewer, "review"]] as const) {
+      try { executablePath(resolveRoleMode(role, binding, mode).command, root); }
+      catch (error) { findings.push({ code: error instanceof EngineError && error.code === "role_mode_missing" ? error.code : "executor_unavailable",
+        target: `${role}:${mode}`, message: error instanceof Error ? error.message : "Selected executor is unavailable" }); }
     }
     if (environment.implementer.actor === environment.reviewer.actor) findings.push({ code: "reviewer_not_independent", target: "reviewer", message: "Implementer and reviewer identities must differ" });
     try { executablePath(environment.fullCheck, root); } catch { findings.push({ code: "check_unavailable", target: "fullCheck", message: "Full-run command is unavailable" }); }
@@ -152,13 +204,8 @@ function requireSavedEnvironment(project: string, value: Environment): void {
     && Number.isSafeInteger(value.timeoutMs) && value.timeoutMs >= 100 && value.timeoutMs <= 3_600_000,
     "environment_invalid", "A saved environment has its project, normalized absolute workspace and bounded timeout");
   requireEnvironmentCapacity(project, value);
-  for (const role of [value.implementer, value.reviewer]) {
-    requireCondition(role && typeof role.actor === "string" && role.actor.trim()
-      && typeof role.model === "string" && role.model.trim() && ["low", "medium", "high", "xhigh", "max", "ultra"].includes(role.effort)
-      && (role.speed === undefined || ["inherited", "fast"].includes(role.speed)),
-      "role_invalid", "Each role needs an identity, model and supported effort");
-    requireCommand(role.command);
-  }
+  requireRoleBinding("implementer", value.implementer);
+  requireRoleBinding("reviewer", value.reviewer);
   requireCommand(value.fullCheck);
   requireCondition(value.implementer.actor !== value.reviewer.actor, "reviewer_not_independent", "Implementer and reviewer must differ");
 }
@@ -182,9 +229,11 @@ export class Environments {
     const workspace = realpathSync(value.workspace);
     const root = this.store.get<ExecutionRoot>(`execution-root:${projectId}`);
     requireCondition(!root || root.value.sourceRoot === workspace, "workspace_in_use", "Create a new project to use another repository after execution has begun");
-    const saved: Environment = { ...value, workspace, projectId };
+    const saved: Environment = { ...value, workspace, projectId,
+      implementer: configuredRole(value.implementer), reviewer: configuredRole(value.reviewer) };
     requireSavedEnvironment(projectId, saved);
-    executablePath(value.implementer.command, workspace); executablePath(value.reviewer.command, workspace); executablePath(value.fullCheck, workspace);
+    for (const command of [...configuredCommands(saved.implementer), ...configuredCommands(saved.reviewer), saved.fullCheck])
+      executablePath(command, workspace);
     const selected = this.store.get<{ path: string }>(`workspace:${projectId}`);
     const writes: { id: string; kind: string; expected: number; value: unknown }[] = [
       { id: `environment:${projectId}`, kind: "environment", expected, value: saved },
