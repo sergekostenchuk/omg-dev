@@ -3,7 +3,9 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { answerDiscoveryCondition } from '../src/discovery/discovery-decision.js';
 import { ProductEngine } from '../src/product/engine.js';
+import { DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation } from '../src/product/owner-authority.js';
 import { RESEARCH_CONTRACT_VERSION, VERSION5_REQUIREMENTS } from '../src/discovery/requirements.js';
 import { Store } from '../src/storage/store.js';
 import { preparedField } from './preparation-fixture.js';
@@ -72,8 +74,18 @@ for (const outcome of ['go', 'no_go', 'conditional', 'insufficient_evidence'] as
     } finally { opened.close(); }
     if (outcome === 'conditional') {
       const choice = result.discovery!.ownerChoices[0]!;
-      f.engine.execute({ type: 'answer-decision', mode: 'discovery-condition', project: outcome,
-        draft: draft.id, verdictRef: choice.verdictRef, conditionId: choice.conditionId, optionId: 'local' });
+      const request = { project: outcome, draft: draft.id, verdictRef: choice.verdictRef,
+        reportRef: result.discovery!.report!, conditionId: choice.conditionId, optionId: 'local' };
+      const sessions = new DiscoveryChoiceSessions(f.store);
+      const issued = issueDiscoveryChoiceInvitation(f.store, request);
+      assert.equal(issued.ok, true, JSON.stringify(issued));
+      if (!issued.ok) return;
+      const exchanged = sessions.exchange({ project: outcome, invitation: issued.value.invitation });
+      assert.equal(exchanged.ok, true, JSON.stringify(exchanged));
+      if (!exchanged.ok) return;
+      try {
+        answerDiscoveryCondition(f.store, request, sessions.authority(exchanged.value.bearer));
+      } finally { sessions.revoke(exchanged.value.bearer); }
       const after = new Store(f.database);
       try {
         const revised = await new ProductEngine(after).stageResearch.run(outcome, draft.id, 4);

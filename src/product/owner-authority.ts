@@ -33,12 +33,22 @@ export const OWNER_SESSION_PREFIX = 'owner-session:';
 export const OWNER_GRANT_LIFETIME_MS = 10 * 60_000;
 export const OWNER_SESSION_LIFETIME_MS = 30 * 60_000;
 
+/** OC1: a separate authority branch for one exact Discovery condition choice. */
+export const DISCOVERY_CHOICE_ACTION = 'discovery-condition-choice';
+export const DISCOVERY_CHOICE_GRANT_CONTRACT = 'owner-session-grant/v2';
+export const DISCOVERY_CHOICE_SESSION_CONTRACT = 'owner-session/v2';
+export const DISCOVERY_CHOICE_GRANT_PREFIX = 'owner-discovery-grant:';
+export const DISCOVERY_CHOICE_SESSION_PREFIX = 'owner-discovery-session:';
+export const DISCOVERY_CHOICE_GRANT_KIND = 'owner-session-grant';
+export const DISCOVERY_CHOICE_SESSION_KIND = 'owner-session';
+
 export const OWNER_AUTHORITY_REFUSAL_CODES = Object.freeze([
   'owner_invitation_invalid', 'owner_invitation_foreign', 'owner_invitation_expired', 'owner_invitation_spent',
   'owner_project_missing', 'owner_session_missing', 'owner_session_revoked', 'owner_session_expired',
   'owner_session_state_invalid', 'owner_authority_invalid', 'owner_authority_foreign',
 ] as const);
 export type OwnerAuthorityRefusalCode = typeof OWNER_AUTHORITY_REFUSAL_CODES[number];
+type DiscoveryChoiceAuthorityRefusalCode = OwnerAuthorityRefusalCode | 'discovery_choice_invalid';
 
 export interface OwnerSessionGrant {
   contract: typeof OWNER_GRANT_CONTRACT; id: string; database: string; project: string;
@@ -52,13 +62,30 @@ export interface OwnerSession {
   expiresAt: number; state: 'open' | 'closed'; closedAt?: number;
 }
 
+export interface DiscoveryChoiceScope {
+  project: string; draft: string; verdictRef: Ref; reportRef: Ref; conditionId: string; optionId: string;
+}
+export interface DiscoveryChoiceSessionGrant {
+  contract: typeof DISCOVERY_CHOICE_GRANT_CONTRACT; id: string; database: string;
+  action: typeof DISCOVERY_CHOICE_ACTION; method: typeof OWNER_PAIRING_METHOD; scope: DiscoveryChoiceScope;
+  issuedAt: number; expiresAt: number; proof: string;
+}
+export interface DiscoveryChoiceSession {
+  contract: typeof DISCOVERY_CHOICE_SESSION_CONTRACT; grant: Ref; database: string;
+  action: typeof DISCOVERY_CHOICE_ACTION; method: typeof OWNER_PAIRING_METHOD; scope: DiscoveryChoiceScope;
+  session: string; openedAt: number; expiresAt: number; state: 'open' | 'closed'; closedAt?: number;
+}
+
 /** The deterministic session address of one exact grant Ref — the one-time-exchange CAS target. */
 export function ownerSessionId(grant: Ref): string {
   return `${OWNER_SESSION_PREFIX}${hashJson({ id: grant.id, revision: grant.revision, hash: grant.hash })}`;
 }
+export function discoveryChoiceSessionId(grant: Ref): string {
+  return `${DISCOVERY_CHOICE_SESSION_PREFIX}${hashJson({ id: grant.id, revision: grant.revision, hash: grant.hash })}`;
+}
 
 class AuthorityFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function deny(code: OwnerAuthorityRefusalCode, target: string, field: string, message: string): never {
+function deny(code: DiscoveryChoiceAuthorityRefusalCode, target: string, field: string, message: string): never {
   const result = refused(code, message, { unit: 'H2', target, field }, 'owner');
   if (!result.ok) throw new AuthorityFailure(result.refusal);
   throw new EngineError('owner_authority_internal', 'Refusal unexpectedly produced a value');
@@ -187,17 +214,22 @@ export class OwnerAuthority {
     });
   }
 }
+const OWNER_AUTHORITY_EXERCISE = OwnerAuthority.prototype.exercise;
 /**
  * Producer-side check of a supplied authority. Anything that is not a minted live OwnerAuthority — a lookalike object,
  * a Ref, a string, a record hash — is refused before any store read or write is prepared.
  */
 export function requireOwnerAuthority(candidate: unknown, request: { store: Store; project: string; action: string }):
   OmResult<Sealed<{ session: Ref }>> {
-  if (!(candidate instanceof OwnerAuthority))
+  if (candidate instanceof DiscoveryChoiceAuthority)
+    return refused('owner_authority_foreign',
+      'Discovery choice authority cannot authorize an owner-result action',
+      { unit: 'H2', target: 'authority', field: 'action' }, 'owner');
+  if (!(candidate instanceof OwnerAuthority) || !AUTHORITIES.has(candidate))
     return refused('owner_authority_invalid',
       'Owner authority is the opaque object minted by the owner session exchange',
       { unit: 'H2', target: 'authority', field: 'authority' }, 'owner');
-  return candidate.exercise(request);
+  return OWNER_AUTHORITY_EXERCISE.call(candidate, request);
 }
 
 /**
@@ -276,6 +308,204 @@ export class OwnerSessions {
       const closed: OwnerSession = { ...head.value, state: 'closed', closedAt: Date.now() };
       const written = take(writeGuarded<OwnerSession>(this.#store, { unit: 'H2', target: head.id,
         writes: [{ id: head.id, kind: OWNER_SESSION_KIND, expected: head.revision, value: closed }],
+        guards: [exactRef(reference(head))] }));
+      return { session: exactRef(reference(written[0]!)) };
+    });
+  }
+}
+
+const DISCOVERY_MINT = Symbol('discovery-choice-authority-mint');
+const DISCOVERY_AUTHORITIES = new WeakSet<DiscoveryChoiceAuthority>();
+
+const sameScope = (left: DiscoveryChoiceScope, right: DiscoveryChoiceScope): boolean =>
+  hashJson(left) === hashJson(right);
+
+function requireDiscoveryScope(value: unknown, target = 'discovery-choice',
+  code: DiscoveryChoiceAuthorityRefusalCode = 'discovery_choice_invalid'): DiscoveryChoiceScope {
+  if (!shape(value) || !isText(value.project) || !isText(value.draft) || !isRef(value.verdictRef)
+    || !isRef(value.reportRef) || !isText(value.conditionId) || !isText(value.optionId)
+    || Object.keys(value).some(key => !['project', 'draft', 'verdictRef', 'reportRef', 'conditionId', 'optionId'].includes(key)))
+    deny(code, target, 'scope',
+      'A Discovery choice scope names project, draft, exact verdict/report, condition and option only');
+  return { project: value.project as string, draft: value.draft as string,
+    verdictRef: exactRef(value.verdictRef as Ref), reportRef: exactRef(value.reportRef as Ref),
+    conditionId: value.conditionId as string, optionId: value.optionId as string };
+}
+
+function provenDiscoveryChoiceGrant(record: Revision<DiscoveryChoiceSessionGrant>): Revision<DiscoveryChoiceSessionGrant> {
+  const value = record.value;
+  if (!shape(value) || value.contract !== DISCOVERY_CHOICE_GRANT_CONTRACT || !isText(value.id)
+    || record.id !== `${DISCOVERY_CHOICE_GRANT_PREFIX}${value.id}` || !isText(value.database)
+    || value.action !== DISCOVERY_CHOICE_ACTION || value.method !== OWNER_PAIRING_METHOD
+    || !Number.isSafeInteger(value.issuedAt) || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= value.issuedAt
+    || typeof value.proof !== 'string' || !/^[a-f0-9]{64}$/.test(value.proof)
+    || !shape(value.scope) || Object.keys(value).some(key => !['contract', 'id', 'database', 'action', 'method',
+      'scope', 'issuedAt', 'expiresAt', 'proof'].includes(key)))
+    deny('owner_invitation_invalid', record.id, 'contract', 'A Discovery invitation keeps its complete v2 provenance');
+  requireDiscoveryScope(value.scope, record.id, 'owner_invitation_invalid');
+  return record;
+}
+
+function provenDiscoveryChoiceSession(record: Revision<DiscoveryChoiceSession>): Revision<DiscoveryChoiceSession> {
+  const value = record.value;
+  if (!shape(value) || value.contract !== DISCOVERY_CHOICE_SESSION_CONTRACT || !isRef(value.grant)
+    || record.id !== discoveryChoiceSessionId(value.grant) || !isText(value.database)
+    || value.action !== DISCOVERY_CHOICE_ACTION || value.method !== OWNER_PAIRING_METHOD || !isText(value.session)
+    || !Number.isSafeInteger(value.openedAt) || !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= value.openedAt
+    || (value.state !== 'open' && value.state !== 'closed')
+    || (value.state === 'closed' && !Number.isSafeInteger(value.closedAt))
+    || (value.state === 'open' && Object.hasOwn(value, 'closedAt')) || !shape(value.scope)
+    || Object.keys(value).some(key => !['contract', 'grant', 'database', 'action', 'method', 'scope', 'session',
+      'openedAt', 'expiresAt', 'state', 'closedAt'].includes(key)))
+    deny('owner_session_state_invalid', record.id, 'contract', 'A Discovery owner session keeps its complete v2 provenance');
+  requireDiscoveryScope(value.scope, record.id, 'owner_session_state_invalid');
+  return record;
+}
+
+export function readDiscoveryChoiceSessionGrant(store: Store, record: unknown):
+  OmResult<Sealed<Revision<DiscoveryChoiceSessionGrant>>> {
+  return run(() => provenDiscoveryChoiceGrant(take(readRecord<DiscoveryChoiceSessionGrant>(store, record,
+    { unit: 'OC1', target: isRef(record) ? record.id : 'grant', idPrefix: DISCOVERY_CHOICE_GRANT_PREFIX,
+      kind: DISCOVERY_CHOICE_GRANT_KIND }))));
+}
+
+export function readDiscoveryChoiceSession(store: Store, record: unknown):
+  OmResult<Sealed<Revision<DiscoveryChoiceSession>>> {
+  return run(() => provenDiscoveryChoiceSession(take(readRecord<DiscoveryChoiceSession>(store, record,
+    { unit: 'OC1', target: isRef(record) ? record.id : 'session', idPrefix: DISCOVERY_CHOICE_SESSION_PREFIX,
+      kind: DISCOVERY_CHOICE_SESSION_KIND }))));
+}
+
+export function issueDiscoveryChoiceInvitation(store: Store, request: unknown):
+  OmResult<Sealed<{ invitation: string; grant: Ref; expiresAt: number }>> {
+  return run(() => {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'A Discovery invitation needs a Store');
+    const scope = requireDiscoveryScope(request);
+    const project = store.get(`project:${scope.project}`);
+    if (!project) deny('owner_project_missing', scope.project, 'project',
+      'A Discovery invitation is issued for an existing project only');
+    const secret = randomBytes(32).toString('hex'), id = randomBytes(16).toString('hex'), issuedAt = Date.now();
+    const grant: DiscoveryChoiceSessionGrant = { contract: DISCOVERY_CHOICE_GRANT_CONTRACT, id,
+      database: store.databaseId, action: DISCOVERY_CHOICE_ACTION, method: OWNER_PAIRING_METHOD, scope,
+      issuedAt, expiresAt: issuedAt + OWNER_GRANT_LIFETIME_MS, proof: digest(secret) };
+    const written = take(writeGuarded<DiscoveryChoiceSessionGrant>(store, { unit: 'OC1',
+      target: `${DISCOVERY_CHOICE_GRANT_PREFIX}${id}`,
+      writes: [{ id: `${DISCOVERY_CHOICE_GRANT_PREFIX}${id}`, kind: DISCOVERY_CHOICE_GRANT_KIND, expected: 0, value: grant }],
+      guards: [exactRef(reference(project))] }));
+    return { invitation: `${id}.${secret}`, grant: exactRef(reference(written[0]!)), expiresAt: grant.expiresAt };
+  });
+}
+
+export class DiscoveryChoiceAuthority {
+  readonly #sessions: DiscoveryChoiceSessions; readonly #store: Store; readonly #digest: string;
+  readonly #sessionId: string; readonly #scope: DiscoveryChoiceScope;
+  constructor(token: symbol, sessions: DiscoveryChoiceSessions, store: Store, bearerDigest: string,
+    sessionId: string, scope: DiscoveryChoiceScope) {
+    requireCondition(token === DISCOVERY_MINT, 'owner_authority_invalid',
+      'Discovery choice authority is minted by its scoped session exchange only');
+    this.#sessions = sessions; this.#store = store; this.#digest = bearerDigest;
+    this.#sessionId = sessionId; this.#scope = scope; DISCOVERY_AUTHORITIES.add(this);
+  }
+  exercise(request: { store: Store; action: string; scope: DiscoveryChoiceScope }):
+    OmResult<Sealed<{ session: Ref }>> {
+    return run(() => {
+      if (!DISCOVERY_AUTHORITIES.has(this)) deny('owner_authority_invalid', 'authority', 'authority',
+        'Discovery authority is an object of the closed scoped registry');
+      if (request.store !== this.#store || request.action !== DISCOVERY_CHOICE_ACTION
+        || !sameScope(request.scope, this.#scope))
+        deny('owner_authority_foreign', this.#sessionId, 'scope',
+          'Discovery authority is bound to one Store and one exact condition option');
+      const found = this.#store.get<DiscoveryChoiceSession>(this.#sessionId);
+      if (!found) deny('owner_session_missing', this.#sessionId, 'session', 'The Discovery owner session record is absent');
+      const session = provenDiscoveryChoiceSession(found);
+      if (session.value.state !== 'open') deny('owner_session_revoked', this.#sessionId, 'session',
+        'The Discovery owner session is revoked');
+      if (this.#sessions.sessionOf(this.#digest) !== this.#sessionId)
+        deny('owner_session_missing', this.#sessionId, 'session', 'The Discovery owner session is not live in this process');
+      if (session.value.expiresAt <= Date.now()) deny('owner_session_expired', this.#sessionId, 'session',
+        'The Discovery owner session has expired');
+      if (session.value.database !== this.#store.databaseId || !sameScope(session.value.scope, this.#scope))
+        deny('owner_authority_foreign', this.#sessionId, 'scope',
+          'The Discovery owner session is bound to another database or choice');
+      return { session: exactRef(reference(session)) };
+    });
+  }
+}
+const DISCOVERY_AUTHORITY_EXERCISE = DiscoveryChoiceAuthority.prototype.exercise;
+
+export function requireDiscoveryChoiceAuthority(candidate: unknown,
+  request: { store: Store; action: string; scope: DiscoveryChoiceScope }): OmResult<Sealed<{ session: Ref }>> {
+  if (candidate instanceof OwnerAuthority)
+    return refused('owner_authority_foreign', 'Owner-result authority cannot authorize a Discovery choice',
+      { unit: 'OC1', target: 'authority', field: 'action' }, 'owner');
+  if (!(candidate instanceof DiscoveryChoiceAuthority) || !DISCOVERY_AUTHORITIES.has(candidate))
+    return refused('owner_authority_invalid',
+      'Use the trusted owner-discovery-choice CLI for this exact condition option',
+      { unit: 'OC1', target: 'authority', field: 'authority' }, 'owner');
+  return DISCOVERY_AUTHORITY_EXERCISE.call(candidate, request);
+}
+
+export class DiscoveryChoiceSessions {
+  readonly #store: Store;
+  readonly #live = new Map<string, { session: string; authority: DiscoveryChoiceAuthority }>();
+  constructor(store: Store) {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'The Discovery session registry needs a Store');
+    this.#store = store;
+  }
+  sessionOf(bearerDigest: string): string | null { return this.#live.get(bearerDigest)?.session ?? null; }
+  exchange(request: unknown): OmResult<Sealed<{ bearer: string; session: Ref; expiresAt: number }>> {
+    return run(() => {
+      if (!shape(request) || !isText(request.project) || !isText(request.invitation)
+        || Object.keys(request).some(key => !['project', 'invitation'].includes(key)))
+        deny('owner_invitation_invalid', 'discovery-session', 'request',
+          'A Discovery session exchange needs a project and invitation');
+      const project = request.project as string, parts = (request.invitation as string).split('.');
+      if (parts.length !== 2 || !/^[a-f0-9]{32}$/.test(parts[0]!) || !/^[a-f0-9]{64}$/.test(parts[1]!))
+        deny('owner_invitation_invalid', project, 'invitation', 'An invitation is <grant-id>.<secret>');
+      const found = this.#store.get<DiscoveryChoiceSessionGrant>(`${DISCOVERY_CHOICE_GRANT_PREFIX}${parts[0]}`);
+      if (!found) deny('owner_invitation_invalid', project, 'invitation', 'Unknown Discovery invitation');
+      const grant = provenDiscoveryChoiceGrant(found);
+      if (!timingSafeEqual(Buffer.from(digest(parts[1]!), 'hex'), Buffer.from(grant.value.proof, 'hex')))
+        deny('owner_invitation_invalid', project, 'invitation', 'The invitation secret does not verify');
+      if (grant.value.database !== this.#store.databaseId || grant.value.scope.project !== project
+        || grant.value.action !== DISCOVERY_CHOICE_ACTION)
+        deny('owner_invitation_foreign', project, 'invitation',
+          'The invitation belongs to another database, project or action');
+      const now = Date.now();
+      if (grant.value.expiresAt <= now) deny('owner_invitation_expired', project, 'invitation',
+        'The Discovery invitation has expired');
+      const grantRef = exactRef(reference(grant)), sessionId = discoveryChoiceSessionId(grantRef);
+      if (this.#store.get(sessionId)) deny('owner_invitation_spent', project, 'invitation',
+        'The Discovery invitation is already exchanged');
+      const session: DiscoveryChoiceSession = { contract: DISCOVERY_CHOICE_SESSION_CONTRACT, grant: grantRef,
+        database: grant.value.database, action: DISCOVERY_CHOICE_ACTION, method: OWNER_PAIRING_METHOD,
+        scope: grant.value.scope, session: randomBytes(16).toString('hex'), openedAt: now,
+        expiresAt: now + OWNER_SESSION_LIFETIME_MS, state: 'open' };
+      const written = take(writeGuarded<DiscoveryChoiceSession>(this.#store, { unit: 'OC1', target: sessionId,
+        writes: [{ id: sessionId, kind: DISCOVERY_CHOICE_SESSION_KIND, expected: 0, value: session }],
+        guards: [grantRef] }));
+      const bearer = randomBytes(32).toString('hex'), key = digest(bearer);
+      this.#live.set(key, { session: sessionId,
+        authority: new DiscoveryChoiceAuthority(DISCOVERY_MINT, this, this.#store, key, sessionId, grant.value.scope) });
+      return { bearer, session: exactRef(reference(written[0]!)), expiresAt: session.expiresAt };
+    });
+  }
+  authority(bearer: unknown): DiscoveryChoiceAuthority | null {
+    return typeof bearer === 'string' && /^[a-f0-9]{64}$/.test(bearer)
+      ? this.#live.get(digest(bearer))?.authority ?? null : null;
+  }
+  revoke(bearer: unknown): OmResult<Sealed<{ session: Ref }>> {
+    return run(() => {
+      const key = typeof bearer === 'string' ? digest(bearer) : null;
+      const live = key ? this.#live.get(key) : undefined;
+      if (!live) deny('owner_session_missing', 'discovery-session', 'bearer', 'No live Discovery session carries this bearer');
+      this.#live.delete(key!);
+      const head = this.#store.get<DiscoveryChoiceSession>(live!.session);
+      if (!head) deny('owner_session_missing', live!.session, 'session', 'The Discovery session record is absent');
+      if (head.value.state === 'closed') return { session: exactRef(reference(head)) };
+      const closed: DiscoveryChoiceSession = { ...head.value, state: 'closed', closedAt: Date.now() };
+      const written = take(writeGuarded<DiscoveryChoiceSession>(this.#store, { unit: 'OC1', target: head.id,
+        writes: [{ id: head.id, kind: DISCOVERY_CHOICE_SESSION_KIND, expected: head.revision, value: closed }],
         guards: [exactRef(reference(head))] }));
       return { session: exactRef(reference(written[0]!)) };
     });

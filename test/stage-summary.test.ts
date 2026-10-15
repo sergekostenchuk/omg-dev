@@ -15,6 +15,20 @@ import { renderStageSummary, stageSummary, type DiscoveryStageSummary,
 import { Store, type Revision } from "../src/storage/store.js";
 import { preparedField } from "./preparation-fixture.js";
 import { answerDiscoveryFixture, currentUpstreamFixtureValue, preparedFeatures, withHistoricalUpstream } from "./product-fixture.js";
+import { answerDiscoveryCondition } from "../src/discovery/discovery-decision.js";
+import { DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation } from "../src/product/owner-authority.js";
+import type { Ref } from "../src/pipeline/contracts.js";
+import { discoveryDecisionId, type DiscoveryConditionDecisionV1 } from "../src/discovery/discovery-outcome.js";
+
+function ownerChoice(store: Store, request: {project:string;draft:string;verdictRef:Ref;reportRef:Ref;
+ conditionId:string;optionId:string}) {
+  const sessions=new DiscoveryChoiceSessions(store),issued=issueDiscoveryChoiceInvitation(store,request);
+  if(!issued.ok)throw new Error(issued.refusal.code);
+  const exchanged=sessions.exchange({project:request.project,invitation:issued.value.invitation});
+  if(!exchanged.ok)throw new Error(exchanged.refusal.code);
+  try{return answerDiscoveryCondition(store,request,sessions.authority(exchanged.value.bearer)).decision;}
+  finally{sessions.revoke(exchanged.value.bearer);}
+}
 
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "omg-stage-summary-"));
@@ -207,8 +221,9 @@ test("DS1.3a gives a real nonempty owner-choice history its own refusal after th
   const initial = f.engine.prepare(project, "discovery");
   answerDiscovery(f.engine, project, initial, source, { outcome: "conditional", through: "verdict" });
   const conditional = stageSummary(f.store, project, "discovery", initial.id), choice = conditional.candidate!.ownerChoices[0]!;
-  f.engine.execute({ type: "answer-decision", mode: "discovery-condition", project, draft: initial.id,
-    verdictRef: choice.verdictRef, conditionId: choice.conditionId, optionId: choice.options[0]!.optionId });
+  ownerChoice(f.store,{project,draft:initial.id,verdictRef:choice.verdictRef,
+    reportRef:conditional.candidate!.report!.field.answer,conditionId:choice.conditionId,
+    optionId:choice.options[0]!.optionId});
   const recorded = stageSummary(f.store, project, "discovery", initial.id);
   assert.equal(recorded.candidate?.choiceHistoryFailure, null);
   assert.deepEqual(recorded.candidate?.decisions.map(item => [item.conditionId, item.optionId, item.round !== null]),
@@ -272,14 +287,19 @@ test("DS1.3a reports lawful nonaccepted outcomes and an unfinished candidate wit
     if (outcome === "conditional") {
       const choice = summary.candidate?.ownerChoices[0];
       assert.equal(choice?.address.pointer, "/value/conditions/0");
-      assert.equal(summary.candidate?.door, "answer-decision:discovery-condition");
-      f.engine.execute({ type: "answer-decision", mode: "discovery-condition", project, draft: draft.id,
-        verdictRef: choice!.verdictRef, conditionId: choice!.conditionId, optionId: choice!.options[0]!.optionId });
+      assert.equal(summary.candidate?.door, "owner-discovery-choice");
+      ownerChoice(f.store,{project,draft:draft.id,verdictRef:choice!.verdictRef,
+        reportRef:summary.candidate!.report!.field.answer,conditionId:choice!.conditionId,
+        optionId:choice!.options[0]!.optionId});
       const revised = stageSummary(f.store, project, "discovery");
       assert.equal(revised.candidate?.state, "researching");
       assert.deepEqual(revised.candidate?.decisions.map(item =>
-        [item.conditionId, item.optionId, item.actor, item.round !== null]),
-      [[choice!.conditionId, choice!.options[0]!.optionId, "local-caller", true]]);
+        [item.conditionId, item.optionId, item.actor, item.authority, item.round !== null]),
+      [[choice!.conditionId, choice!.options[0]!.optionId, "local-owner", "local-owner-authority", true]]);
+      assert.ok(revised.candidate?.decisions[0]?.session);
+      assert.ok(revised.candidate?.decisions[0]?.grant);
+      assert.deepEqual(revised.candidate?.decisions[0]?.report, summary.candidate?.report?.field.answer);
+      assert.match(renderStageSummary(revised), /Выбор по локальному полномочию владельца/);
       assert.equal(revised.candidate?.choiceHistoryFailure, null);
       assert.equal(revised.candidate?.door, "research-stage");
     }
@@ -296,6 +316,26 @@ test("DS1.3a reports lawful nonaccepted outcomes and an unfinished candidate wit
   assert.match(renderStageSummary(summary), /Исход: исследование не завершено/);
   assert.match(renderStageSummary(summary), /The fixture explicitly proposes a bounded local transformation/);
   assert.equal(f.store.changeStamp(), stamp);
+});
+
+test("OC1 stage summary keeps a lawful v1 choice historical and does not invent owner authority", t => {
+  const f=fixture(t),project="historical-choice";
+  f.engine.execute({type:"create-project",project,title:project});
+  const source=f.engine.discovery.evidence.document(project,"basis","Historical choice source","text/plain",0);
+  const draft=f.engine.prepare(project,"discovery");
+  answerDiscovery(f.engine,project,draft,source,{outcome:"conditional",through:"verdict"});
+  const before=stageSummary(f.store,project,"discovery",draft.id),choice=before.candidate!.ownerChoices[0]!;
+  const value:DiscoveryConditionDecisionV1={contract:"discovery-condition-decision/v1",projectId:project,
+    draftId:draft.id,verdictRef:choice.verdictRef,conditionId:choice.conditionId,
+    optionId:choice.options[0]!.optionId,actor:"historical-caller"};
+  f.store.write({id:discoveryDecisionId(project,draft.id,choice.verdictRef,choice.conditionId),
+    kind:"discovery-condition-decision",expected:0,value});
+  const reopened=new Store(f.database);
+  try {
+    const summary=stageSummary(reopened,project,"discovery",draft.id),saved=summary.candidate!.decisions[0]!;
+    assert.equal(saved.authority,"historical-caller");assert.equal(saved.session,null);assert.equal(saved.grant,null);
+    assert.match(renderStageSummary(summary),/Исторический выбор вызывающего; полномочие не зафиксировано/);
+  } finally {reopened.close();}
 });
 
 test("DS1.3a selects only the run linked to the candidate draft and never a foreign last run", async t => {

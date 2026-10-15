@@ -7,6 +7,9 @@ import type { Store, Revision } from '../storage/store.js';
 import { reference, uniqueRefs, isRef, type Ref, type Finding } from '../pipeline/contracts.js';
 import { Discovery, type DiscoveryDraft, type Question } from './discovery.js';
 import { DISCOVERY_RESEARCH_FIELDS } from './preparation-contracts.js';
+import { DISCOVERY_CHOICE_ACTION, OWNER_GRANT_LIFETIME_MS, OWNER_SESSION_LIFETIME_MS,
+  readDiscoveryChoiceSession, readDiscoveryChoiceSessionGrant,
+  type DiscoveryChoiceScope, type DiscoveryChoiceSession, type DiscoveryChoiceSessionGrant } from '../product/owner-authority.js';
 
 const fields = ['brief', 'objective', 'researchPlan', 'researchReport', 'verdict', 'preparation'] as const;
 type Field = typeof fields[number];
@@ -28,9 +31,19 @@ export interface DiscoveryChoice {
   project: string; draft: string; verdictRef: Ref; conditionId: string; condition: string; criterion: string;
   options: DiscoveryChoiceOption[];
 }
-export interface DiscoveryConditionDecision {
+export interface DiscoveryConditionDecisionV1 {
   contract: 'discovery-condition-decision/v1'; projectId: string; draftId: string; verdictRef: Ref;
   conditionId: string; optionId: string; actor: string;
+}
+export interface DiscoveryConditionDecisionV2 {
+  contract: 'discovery-condition-decision/v2'; database: string; projectId: string; draftId: string;
+  verdictRef: Ref; reportRef: Ref; conditionId: string; optionId: string; actor: string; session: Ref;
+}
+export type DiscoveryConditionDecision = DiscoveryConditionDecisionV1 | DiscoveryConditionDecisionV2;
+export interface DiscoveryConditionDecisionView {
+  record: Revision<DiscoveryConditionDecision>; option: DiscoveryChoiceOption;
+  authority: 'historical-caller' | 'local-owner-authority';
+  session: Revision<DiscoveryChoiceSession> | null; grant: Revision<DiscoveryChoiceSessionGrant> | null;
 }
 export interface DiscoveryChoiceRound {
   contract: 'discovery-choice-round/v1'; projectId: string; draftId: string; verdictRef: Ref; reportRef: Ref;
@@ -44,6 +57,72 @@ export const discoveryDecisionId = (project: string, draft: string, verdict: Ref
   `discovery-condition-decision:${hashJson([project, draft, verdict, condition])}`;
 export const discoveryChoiceRoundId = (project: string, draft: string, verdict: Ref) =>
   `discovery-choice-round:${hashJson([project, draft, verdict])}`;
+
+function choiceError(code: string, target: string, message: string): never {
+  throw new EngineError(code, `[${target}] ${message}`);
+}
+
+/**
+ * The one exact reader shared by current outcome, historical context, producer replay and stage-summary. V1 retains
+ * its historical caller semantics. V2 proves the saved open session revision and its scoped grant; current liveness
+ * is deliberately irrelevant after the choice was committed.
+ */
+export function readDiscoveryConditionDecision(store: Store, request: {
+  project: string; draft: string; verdictRef: Ref; reportRef: Ref; conditionId: string; record?: Ref;
+}): DiscoveryConditionDecisionView {
+  const id = discoveryDecisionId(request.project, request.draft, request.verdictRef, request.conditionId);
+  const verdict = store.get<{ projectId: string; question: string; value: {
+    outcome: string; researchReport: Ref; conditions: { id: string; kind: string; options?: DiscoveryChoiceOption[] }[];
+  }}>(request.verdictRef.id, request.verdictRef.revision);
+  if (!verdict || !same(reference(verdict), request.verdictRef) || verdict.kind !== 'research-answer'
+    || verdict.value.projectId !== request.project || verdict.value.value.outcome !== 'conditional'
+    || !same(verdict.value.value.researchReport, request.reportRef))
+    return choiceError('discovery_choice_invalid', id, 'The saved choice needs its exact conditional verdict and report');
+  const condition = verdict.value.value.conditions.find(item => item.id === request.conditionId);
+  if (!condition || condition.kind !== 'owner_choice' || !Array.isArray(condition.options))
+    return choiceError('discovery_choice_invalid', id, 'The saved choice must address an offered owner condition');
+  const found = request.record ? store.get<DiscoveryConditionDecision>(request.record.id, request.record.revision)
+    : store.get<DiscoveryConditionDecision>(id);
+  if (!found || found.id !== id || found.kind !== 'discovery-condition-decision' || found.revision !== 1
+    || request.record && !same(reference(found), request.record))
+    return choiceError('discovery_choice_invalid', id, 'The exact saved Discovery choice is missing');
+  const value = found.value;
+  if (!object(value) || value.projectId !== request.project || value.draftId !== request.draft
+    || !isRef(value.verdictRef) || !same(value.verdictRef, request.verdictRef) || value.conditionId !== request.conditionId
+    || typeof value.optionId !== 'string' || typeof value.actor !== 'string' || value.actor.trim().length === 0)
+    return choiceError('discovery_choice_invalid', id, 'The saved Discovery choice is foreign or malformed');
+  const option = condition.options.find(item => item.optionId === value.optionId);
+  if (!option) return choiceError('discovery_choice_invalid', id, 'The saved Discovery choice names no offered option');
+  if (value.contract === 'discovery-condition-decision/v1') {
+    if (Object.keys(value).some(key => !['contract', 'projectId', 'draftId', 'verdictRef', 'conditionId', 'optionId', 'actor'].includes(key)))
+      return choiceError('discovery_choice_invalid', id, 'The historical v1 choice has unexpected authority fields');
+    return { record: found, option, authority: 'historical-caller', session: null, grant: null };
+  }
+  if (value.contract !== 'discovery-condition-decision/v2' || value.database !== store.databaseId
+    || value.actor !== 'local-owner'
+    || !isRef(value.reportRef) || !same(value.reportRef, request.reportRef) || !isRef(value.session)
+    || Object.keys(value).some(key => !['contract', 'database', 'projectId', 'draftId', 'verdictRef', 'reportRef',
+      'conditionId', 'optionId', 'actor', 'session'].includes(key)))
+    return choiceError('discovery_choice_invalid', id, 'The v2 choice lost its database, report or session proof');
+  const sessionResult = readDiscoveryChoiceSession(store, value.session);
+  if (!sessionResult.ok) throw new EngineError(sessionResult.refusal.code, sessionResult.refusal.message, sessionResult.refusal.at);
+  const session = sessionResult.value;
+  const grantResult = readDiscoveryChoiceSessionGrant(store, session.value.grant);
+  if (!grantResult.ok) throw new EngineError(grantResult.refusal.code, grantResult.refusal.message, grantResult.refusal.at);
+  const grant = grantResult.value;
+  const scope: DiscoveryChoiceScope = { project: request.project, draft: request.draft,
+    verdictRef: request.verdictRef, reportRef: request.reportRef, conditionId: request.conditionId,
+    optionId: value.optionId };
+  if (session.value.state !== 'open' || session.value.database !== value.database
+    || session.value.action !== DISCOVERY_CHOICE_ACTION || !same(session.value.scope, scope)
+    || grant.value.database !== value.database || grant.value.action !== DISCOVERY_CHOICE_ACTION
+    || !same(grant.value.scope, scope) || !same(session.value.grant, reference(grant))
+    || grant.value.expiresAt !== grant.value.issuedAt + OWNER_GRANT_LIFETIME_MS
+    || session.value.openedAt < grant.value.issuedAt || session.value.openedAt >= grant.value.expiresAt
+    || session.value.expiresAt !== session.value.openedAt + OWNER_SESSION_LIFETIME_MS)
+    return choiceError('discovery_choice_invalid', id, 'The v2 choice breaks its saved session and grant scope');
+  return { record: found, option, authority: 'local-owner-authority', session, grant };
+}
 
 /** Only choices whose normal reopen belongs to this question's history are delivered.
  * The exact old verdict stays visible; matching condition ids never transfer a choice. */
@@ -59,13 +138,14 @@ function choiceHistory(store: Store, draft: Revision<DiscoveryDraft>): { values:
     const round = store.get<DiscoveryChoiceRound>(discoveryChoiceRoundId(draft.value.projectId, draft.id, row.value.answer));
     if (!round || round.value.reopened.revision > q.revision) continue;
     const verdict = store.get<{value: Json}>(round.value.verdictRef.id, round.value.verdictRef.revision)!;
-    const conditions = (verdict.value.value as any).conditions as any[];
     const decisions = round.value.decisions.map(ref => {
-      const decision = store.get<DiscoveryConditionDecision>(ref.id, ref.revision)!;
-      const condition = conditions.find(c => c.id === decision.value.conditionId);
-      const option = condition.options.find((o: DiscoveryChoiceOption) => o.optionId === decision.value.optionId);
-      guards.push(reference(decision));
-      return { ref: reference(decision), value: decision.value, option };
+      const saved = store.get<DiscoveryConditionDecision>(ref.id, ref.revision);
+      requireCondition(saved, 'discovery_choice_invalid', `[${ref.id}] The choice round lost a decision`);
+      const proved = readDiscoveryConditionDecision(store, { project: draft.value.projectId, draft: draft.id,
+        verdictRef: round.value.verdictRef, reportRef: round.value.reportRef,
+        conditionId: saved.value.conditionId, record: ref });
+      guards.push(reference(proved.record));
+      return { ref: reference(proved.record), value: proved.record.value, option: proved.option };
     });
     guards.push(reference(round), reference(verdict), round.value.reportRef);
     values.push({ round: reference(round), verdict: { ref: reference(verdict), value: verdict.value.value },
@@ -291,7 +371,12 @@ export function discoveryOutcome(store: Store, draft: Revision<DiscoveryDraft>):
   const conditions = answer.conditions.filter((condition: any) => {
     if (state !== 'conditional' || condition.kind !== 'owner_choice') return true;
     const decision = store.get<DiscoveryConditionDecision>(discoveryDecisionId(draft.value.projectId, draft.id, verdict.answer, condition.id));
-    if (decision) { read.guards.push(reference(decision)); return false; }
+    if (decision) {
+      const proved = readDiscoveryConditionDecision(store, { project: draft.value.projectId, draft: draft.id,
+        verdictRef: verdict.answer, reportRef: read.context.researchReport!.answer,
+        conditionId: condition.id, record: reference(decision) });
+      read.guards.push(reference(proved.record)); return false;
+    }
     ownerChoices.push({ project: draft.value.projectId, draft: draft.id, verdictRef: verdict.answer,
       conditionId: condition.id, condition: condition.condition, criterion: condition.criterion, options: condition.options });
     return true;

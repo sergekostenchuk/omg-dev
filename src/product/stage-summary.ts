@@ -1,7 +1,7 @@
 import { Ajv } from "ajv";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { discoveryConstraintBindings, discoveryContext, discoveryDecisionId, discoveryOutcome,
-  type DiscoveryChoice, type DiscoveryChoiceOption, type DiscoveryConditionDecision } from "../discovery/discovery-outcome.js";
+  readDiscoveryConditionDecision, type DiscoveryChoice, type DiscoveryConditionDecision } from "../discovery/discovery-outcome.js";
 import { readAcceptedResearchAnswer, type Decision, type DiscoveryDraft, type Fact, type Question } from "../discovery/discovery.js";
 import { LEGACY_REQUIREMENTS, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS,
   VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
@@ -60,7 +60,8 @@ export interface SummaryRun {
 export interface SummaryOwnerChoice extends DiscoveryChoice { address: SummaryAddress }
 export interface SummaryChoiceDecision {
   ref: Ref; round: Ref | null; verdict: Ref; conditionId: string; optionId: string;
-  option: string; choice: "accept" | "decline"; actor: string;
+  option: string; choice: "accept" | "decline"; actor: string; report: Ref;
+  authority: "historical-caller" | "local-owner-authority"; session: Ref | null; grant: Ref | null;
 }
 export interface SummaryFailure { code: string; message: string; question: Ref | null }
 export interface SummaryCandidate {
@@ -701,15 +702,15 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
           || !Array.isArray(condition.options)) continue;
         const saved = store.get<DiscoveryConditionDecision>(discoveryDecisionId(project, draft.id, outcome.verdict, condition.id));
         if (!saved) continue;
-        const option = condition.options.find(item => object(item) && item.optionId === saved.value.optionId) as DiscoveryChoiceOption | undefined;
-        requireCondition(saved.kind === "discovery-condition-decision" && saved.revision === 1
-          && saved.value.contract === "discovery-condition-decision/v1" && saved.value.projectId === project
-          && saved.value.draftId === draft.id && same(saved.value.verdictRef, outcome.verdict)
-          && saved.value.conditionId === condition.id && typeof saved.value.actor === "string" && saved.value.actor.trim().length > 0
-          && option !== undefined, "stage_summary_choice_invalid",
-        `[${saved.id}] The saved Discovery choice is foreign or does not select an offered option`);
-        decisions.push({ ref: reference(saved), round: null, verdict: outcome.verdict, conditionId: saved.value.conditionId,
-          optionId: saved.value.optionId, option: option.label, choice: option.choice, actor: saved.value.actor });
+        requireCondition(outcome.report, "stage_summary_choice_invalid", `[${saved.id}] The current choice lost its report`);
+        const proved = readDiscoveryConditionDecision(store, { project, draft: draft.id, verdictRef: outcome.verdict,
+          reportRef: outcome.report, conditionId: condition.id, record: reference(saved) });
+        decisions.push({ ref: reference(proved.record), round: null, verdict: outcome.verdict,
+          conditionId: proved.record.value.conditionId, optionId: proved.record.value.optionId,
+          option: proved.option.label, choice: proved.option.choice, actor: proved.record.value.actor,
+          report: outcome.report, authority: proved.authority,
+          session: proved.session ? reference(proved.session) : null,
+          grant: proved.grant ? reference(proved.grant) : null });
       }
     } catch (error) {
       conditions.length = 0; ownerChoices.length = 0; decisions.length = 0; reasonAddress = null;
@@ -723,13 +724,17 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
       try {
         const history = discoveryContext(store, draft, verdictQuestion).context?.ownerDecisions ?? [];
         for (const round of history) for (const item of round.decisions) {
-          const saved = exact<DiscoveryConditionDecision>(store, item.ref);
-          requireCondition(saved.kind === "discovery-condition-decision" && same(saved.value, item.value)
-            && typeof item.option?.label === "string" && (item.option.choice === "accept" || item.option.choice === "decline"),
-          "stage_summary_choice_invalid", `[${item.ref.id}] The saved Discovery choice history is incomplete or foreign`);
+          const proved = readDiscoveryConditionDecision(store, { project, draft: draft.id,
+            verdictRef: round.verdict.ref, reportRef: round.report,
+            conditionId: item.value.conditionId, record: item.ref });
+          requireCondition(same(proved.record.value, item.value), "stage_summary_choice_invalid",
+            `[${item.ref.id}] The saved Discovery choice history is incomplete or foreign`);
           if (!decisions.some(decision => same(decision.ref, item.ref))) decisions.push({ ref: item.ref, round: round.round,
-            verdict: round.verdict.ref, conditionId: item.value.conditionId, optionId: item.value.optionId,
-            option: item.option.label, choice: item.option.choice, actor: item.value.actor });
+            verdict: round.verdict.ref, conditionId: proved.record.value.conditionId,
+            optionId: proved.record.value.optionId, option: proved.option.label, choice: proved.option.choice,
+            actor: proved.record.value.actor, report: round.report, authority: proved.authority,
+            session: proved.session ? reference(proved.session) : null,
+            grant: proved.grant ? reference(proved.grant) : null });
         }
       } catch (error) { choiceHistoryFailure = candidateFailure(error, records); }
     }
@@ -737,7 +742,7 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
   let run: SummaryRun | null = null, runFailure: SummaryFailure | null = null;
   try { run = candidateRun(store, project, draft); }
   catch (error) { runFailure = candidateFailure(error, records); }
-  const door = ownerChoices.length ? "answer-decision:discovery-condition"
+  const door = ownerChoices.length ? "owner-discovery-choice"
     : verdictQuestion?.value.status === "open" && decisions.length ? "research-stage"
     : run?.door ?? (admission || outcome?.state === "researching" ? "research-stage" : null);
   return { draft: reference(draft), contractVersion: draft.value.contractVersion ?? 1,
@@ -1044,7 +1049,10 @@ export function renderStageSummary(summary: StageSummary): string {
     for (const condition of candidate.conditions) lines.push(`- условие [${addressText(condition.address)}]: ${canonical(condition.value)}`);
     for (const choice of candidate.ownerChoices) lines.push(`- требуется выбор [${addressText(choice.address)}]: ${choice.conditionId}`,
       ...choice.options.map(option => `  - ${option.optionId}: ${option.label} (${option.choice})`));
-    for (const decision of candidate.decisions) lines.push(`- записанный выбор ${decision.conditionId}: ${decision.optionId} — ${decision.option}; ${decision.ref.id}@${decision.ref.revision}`);
+    for (const decision of candidate.decisions) lines.push(`- записанный выбор ${decision.conditionId}: ${decision.optionId} — ${decision.option}; ${decision.ref.id}@${decision.ref.revision}`,
+      decision.authority === "local-owner-authority"
+        ? `  - Выбор по локальному полномочию владельца; report ${decision.report.id}@${decision.report.revision}; session ${decision.session!.id}@${decision.session!.revision}; grant ${decision.grant!.id}@${decision.grant!.revision}`
+        : `  - Исторический выбор вызывающего; полномочие не зафиксировано; report ${decision.report.id}@${decision.report.revision}`);
     lines.push(`Дверь: ${candidate.door ?? "не зафиксирована"}`);
     if (candidate.run) lines.push(`Запуск: ${candidate.run.ref.id}@${candidate.run.ref.revision}; состояние: ${candidate.run.status}`,
       `Код паузы: ${candidate.run.pauseCode ?? "нет"}`,

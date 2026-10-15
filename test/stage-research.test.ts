@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { reference } from '../src/pipeline/contracts.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { buildOmInput, type InputRequest, type InputStages, writeOmInput } from '../src/om/input.js';
 import { hasBasisApplications, selectTaskSpecification } from '../src/om/selected-specification.js';
 import type { TaskSpecificationSelection } from '../src/compiler/om-readers.js';
@@ -27,6 +27,18 @@ import { consumerFeedback, rejectResearch, type ConsumerFeedback } from "../src/
 import { readDiscoveryBasisMaterial, researchGraphContext, researchPrerequisites } from "../src/discovery/research-context.js";
 import { readResearchAssessmentAt } from "../src/discovery/research-assessment.js";
 import { canonical, type Json } from "../src/canonical.js";
+import { answerDiscoveryCondition } from "../src/discovery/discovery-decision.js";
+import { DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation } from "../src/product/owner-authority.js";
+
+function ownerChoice(store: Store, request: {project:string;draft:string;verdictRef:Ref;
+ reportRef:Ref;conditionId:string;optionId:string}) {
+ const sessions=new DiscoveryChoiceSessions(store),issued=issueDiscoveryChoiceInvitation(store,request);
+ if(!issued.ok)throw new Error(issued.refusal.code);
+ const exchanged=sessions.exchange({project:request.project,invitation:issued.value.invitation});
+ if(!exchanged.ok)throw new Error(exchanged.refusal.code);
+ try{return answerDiscoveryCondition(store,request,sessions.authority(exchanged.value.bearer)).decision;}
+ finally{sessions.revoke(exchanged.value.bearer);}
+}
 
 // Controlled process provider proves routing/acceptance, not live model quality.
 const ADAPTER = `import {boundDiscoveryValue} from ${JSON.stringify(new URL('./preparation-fixture.js',import.meta.url).href)};
@@ -325,8 +337,8 @@ test(`DS1.1 supported ${state} keeps owner conditions as report data without off
  assert.equal(result.status,'paused');assert.equal(result.discovery?.state,state);
  assert.deepEqual(result.discovery?.ownerChoices,[]);assert.deepEqual(result.discovery?.conditions,verdict.conditions);
  assert.equal(result.findings[0]?.code,`discovery_${state}`);
- assert.throws(()=>f.engine.execute({type:'answer-decision',mode:'discovery-condition',project:'p',draft:draft.id,
-  verdictRef:result.discovery!.verdict!,conditionId:'scope',optionId:'accept'}),{code:'discovery_choice_stale'});
+ assert.throws(()=>ownerChoice(f.store,{project:'p',draft:draft.id,verdictRef:result.discovery!.verdict!,
+  reportRef:result.discovery!.report!,conditionId:'scope',optionId:'accept'}),{code:'discovery_choice_stale'});
  const calls=f.store.list('model-call').map(reference),reopened=new Store(f.path);
  try {
   const repeat=await new ProductEngine(reopened).stageResearch.run('p',draft.id,8);
@@ -457,12 +469,12 @@ for (const option of ['accept','decline']) test(`DS1.1 real stage conditional â†
  f.setup('p','normal',{verdict,choiceRound:true});const draft=f.engine.prepare('p','discovery');
  const first=await f.engine.stageResearch.run('p',draft.id,8);assert.equal(first.status,'needs_owner',JSON.stringify(first));
  const choice=first.discovery!.ownerChoices[0]!;
- const command={type:'answer-decision' as const,mode:'discovery-condition' as const,project:'p',draft:draft.id,
-  verdictRef:choice.verdictRef,conditionId:choice.conditionId,optionId:option};
- const saved=f.engine.execute(command),calls=f.store.list('model-call').length;
+ const command={project:'p',draft:draft.id,verdictRef:choice.verdictRef,reportRef:first.discovery!.report!,
+  conditionId:choice.conditionId,optionId:option};
+ const saved=ownerChoice(f.store,command),calls=f.store.list('model-call').length;
  const restarted=new Store(f.path);
  try {
-  const engine=new ProductEngine(restarted);assert.deepEqual(engine.execute(command),saved);
+  const engine=new ProductEngine(restarted);assert.deepEqual(ownerChoice(restarted,command),saved);
   assert.equal(restarted.list('model-call').length,calls);
   const next=await engine.stageResearch.run('p',draft.id,4);
   assert.equal(next.discovery?.state,option==='accept'?'go':'no_go',JSON.stringify(next));
