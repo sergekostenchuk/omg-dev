@@ -7,7 +7,7 @@ import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref, type Finding } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -29,6 +29,16 @@ import { readModelCallRecovery } from "../discovery/model-call-recovery.js";
  * instance, no cache, and a traced or guarded view is never unwrapped. The validators are only bound here; the
  * Pipeline calls them after the kit is complete.
  */
+/** Admission and reconstruction dispatch on the saved producer, independently of the next producer. */
+export function stageResearchContract(stage: UpstreamStage, version: number, accepted: boolean) {
+  const contracts = { 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS,
+    4: VERSION4_REQUIREMENTS, 5: VERSION5_REQUIREMENTS, 6: VERSION6_REQUIREMENTS };
+  const requirements = Object.hasOwn(contracts, version) ? contracts[version as keyof typeof contracts] : null;
+  return { supported: !!requirements && (accepted || version === RESEARCH_CONTRACT_VERSION),
+    requirements: structuredClone((requirements ?? REQUIREMENTS)[stage]),
+    checkMapDesign: [3, 4, 5, 6].includes(version) };
+}
+
 export interface Project { id: string; title: string }
 export interface StageContent { draft: Ref; fields: Record<string, Json>; graph: Ref | null }
 
@@ -256,9 +266,10 @@ export class StageChecks {
     result.findings.push(...outcome.findings); result.guards.push(...outcome.guards);
     const version = draft.value.contractVersion ?? 1;
     const legacy = version === 1;
-    if ((version !== RESEARCH_CONTRACT_VERSION && !context.accepted) || ![1, 2, 3, 4, RESEARCH_CONTRACT_VERSION].includes(version))
+    const contract = stageResearchContract(stage as UpstreamStage, version, context.accepted === true);
+    if (!contract.supported)
       result.findings.push({ code: "research_contract_upgrade_required", target: stage, message: "New stage acceptance requires the enriched research contract; legacy history remains readable" });
-    const expected = (legacy ? LEGACY_REQUIREMENTS : version === 2 ? VERSION2_REQUIREMENTS : version === 3 ? VERSION3_REQUIREMENTS : version === 4 ? VERSION4_REQUIREMENTS : REQUIREMENTS)[stage as UpstreamStage];
+    const expected = contract.requirements;
     const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
     if (canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
     if (!legacy && result.findings.length === 0) {
@@ -273,7 +284,7 @@ export class StageChecks {
     if (stage === "operation-map") {
       if (!isRef(content.graph)) result.findings.push({ code: "graph_missing", target: stage, message: "An operation map is required" });
       else { const graphResult = this.graphs.layerGate(context.projectId, 1, content.graph); result.findings.push(...graphResult.findings); result.guards.push(...graphResult.guards); }
-      if ([3, 4, 5].includes(version) && result.findings.length === 0) {
+      if (contract.checkMapDesign && result.findings.length === 0) {
         const graph = this.store.get<Graph>(`graph:${context.projectId}`)!;
         const initial = this.store.get<StageArtifact>(stageId(context.projectId, "discovery"))!.value.content as unknown as StageContent;
         const concept = this.store.get<StageArtifact>(stageId(context.projectId, "concept"))!.value.content as unknown as StageContent;

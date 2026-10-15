@@ -1,7 +1,7 @@
 import { Ajv, type AnySchema } from "ajv";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
-import { LEGACY_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
+import { LEGACY_REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
 import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../discovery/preparation-contracts.js";
 import { preparationFindings } from "../discovery/preparation-validation.js";
 import { readAcceptedResearchAnswer } from "../discovery/discovery.js";
@@ -334,7 +334,11 @@ export function gateInput(result: InputBuildResult): Sealed<{ passed: boolean; c
   return sealed({ passed, codes: [...new Set(result.refusals.map(item => item.code))].sort(order) });
 }
 
-const contractsByVersion = sealed({ 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS, 4: VERSION4_REQUIREMENTS, [RESEARCH_CONTRACT_VERSION]: REQUIREMENTS });
+const contractsByVersion = sealed({ 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS, 4: VERSION4_REQUIREMENTS, 5: VERSION5_REQUIREMENTS, 6: VERSION6_REQUIREMENTS });
+/** Exact B1 stage proof selects a literal historical table, never the current producer alias. */
+export function inputResearchRequirements(version: number | null) {
+  return contractsByVersion[(version ?? 1) as keyof typeof contractsByVersion] ?? null;
+}
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 
 function requireInputRequest(store: Store, request: InputRequest): void {
@@ -402,7 +406,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         && object(draft.fields) && canonical(draft.fields) === canonical(content.fields), "content.draft", "The exact draft must belong to this stage and preserve its fields");
       const version = Object.hasOwn(draft, "contractVersion") ? draft.contractVersion : null;
       check(version === null || Number.isSafeInteger(version) && version > 0, "contractVersion", "The exact draft version is malformed");
-      const specs = contractsByVersion[(version ?? 1) as keyof typeof contractsByVersion]?.[stage];
+      const specs = inputResearchRequirements(version)?.[stage];
       check(specs, "contractVersion", "The draft uses an unknown historical contract");
       check(Array.isArray(draft.questions) && draft.questions.every(text) && Array.isArray(draft.inputs) && draft.inputs.every(isRef),
         "content.draft", "The research question and input sets must be explicit");

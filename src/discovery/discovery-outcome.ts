@@ -134,7 +134,9 @@ const schema = new Ajv({ strict: true, allowUnionTypes: true });
 const same = (a: unknown, b: unknown) => a !== undefined && b !== undefined && canonical(a) === canonical(b);
 const object = (value: unknown) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const researchSchemas = new Map(DISCOVERY_RESEARCH_FIELDS.map(spec => [spec.field, schema.compile(spec.schema as object)]));
-export const isDiscoveryV5 = (draft: DiscoveryDraft) => draft.stage === 'discovery' && draft.contractVersion === 5;
+// The v5 research gate is also the explicit subject route of v6. Keep the exported name for its consumers.
+export const isDiscoveryV5 = (draft: DiscoveryDraft) => draft.stage === 'discovery'
+  && (draft.contractVersion === 5 || draft.contractVersion === 6);
 
 /** Read the accepted prefix in question order. A reopened question stops the
  * prefix even though the draft deliberately retains its previous field value. */

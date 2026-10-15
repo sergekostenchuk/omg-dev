@@ -1,5 +1,6 @@
+import { sealed } from "../om/refusal.js";
 import type { FieldSpec } from "./discovery.js";
-import { UPSTREAM_DETAILS, UPSTREAM_MOMENT_DETAILS, DISCOVERY_RESEARCH_FIELDS, DISCOVERY_PREPARATION } from "./preparation-contracts.js";
+import { UPSTREAM_DETAILS, UPSTREAM_MOMENT_DETAILS, DISCOVERY_RESEARCH_FIELDS, DISCOVERY_PREPARATION, VERSION6_UPSTREAM_DETAILS } from "./preparation-contracts.js";
 import { mapDesignSchema } from "../graph/builder.js";
 import type { Json } from "../canonical.js";
 
@@ -46,7 +47,15 @@ export const VERSION4_REQUIREMENTS = Object.fromEntries(UPSTREAM_STAGES.map(stag
   VERSION3_REQUIREMENTS[stage].map(spec => spec.field === UPSTREAM_DETAILS[stage].field ? UPSTREAM_MOMENT_DETAILS[stage] : spec),
 ])) as Record<UpstreamStage, FieldSpec[]>;
 
-export const REQUIREMENTS: Record<UpstreamStage, FieldSpec[]> = { ...VERSION4_REQUIREMENTS,
+export const VERSION5_REQUIREMENTS: Record<UpstreamStage, FieldSpec[]> = { ...VERSION4_REQUIREMENTS,
   discovery: [...VERSION4_REQUIREMENTS.discovery.filter(spec => spec.field !== "preparation"),
     ...DISCOVERY_RESEARCH_FIELDS, DISCOVERY_PREPARATION],
 };
+
+// Future producers use separate values; changing v6 cannot alter paid v5 material.
+export const VERSION6_REQUIREMENTS = sealed(Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
+  VERSION5_REQUIREMENTS[stage].map(spec => spec.field === VERSION6_UPSTREAM_DETAILS[stage].field
+    ? VERSION6_UPSTREAM_DETAILS[stage] : spec),
+]))) as unknown as Record<UpstreamStage, FieldSpec[]>;
+// DS1.2lh activates v6 only after the complete material contract is ready.
+export const REQUIREMENTS = VERSION5_REQUIREMENTS;

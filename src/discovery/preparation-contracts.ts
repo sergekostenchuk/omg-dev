@@ -1,3 +1,4 @@
+import { sealed } from "../om/refusal.js";
 import type { Json } from "../canonical.js";
 import type { FieldSpec } from "./discovery.js";
 
@@ -121,3 +122,6 @@ export const DISCOVERY_RESEARCH_FIELDS = [
 export const DISCOVERY_PREPARATION = { ...UPSTREAM_MOMENT_DETAILS.discovery,
   prompt: UPSTREAM_MOMENT_DETAILS.discovery.prompt + " Разверни выбранный verdict.variant из discoveryContext в результаты, сценарии и внешние системы. Каждое ограничение принятого researchReport перенеси в preparation.constraints: rule сохраняет его смысл, basis точно копирует готовый адрес из discoveryContext.reportConstraints. Ограничение нельзя отбросить молча: для ошибочного или чужого варианту ограничения сначала переоткрывается отчёт. Дополнительные ограничения поручения сохраняй со своим основанием. Сохрани риски и оставшиеся неизвестные исследованного варианта с их moment. Учитывай точные решения владельца из discoveryContext.ownerDecisions, но выбор владельца не доказывает реализуемость.",
 } satisfies FieldSpec;
+
+// V6 preparation is filled by its stage tasks without mutating released schemas/prompts.
+export const VERSION6_UPSTREAM_DETAILS = sealed({ ...UPSTREAM_MOMENT_DETAILS, discovery: DISCOVERY_PREPARATION }) as unknown as typeof UPSTREAM_MOMENT_DETAILS;

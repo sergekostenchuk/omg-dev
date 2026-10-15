@@ -45,7 +45,7 @@ export class StageResearch {
       const replay = { status: checked.state === "accepted" ? "accepted" as const : "blocked" as const,
         stage: reference(artifact), research: null, feedback: null, findings: checked.findings,
         ...(discovery ? { discovery } : {}) };
-      return (draft.value.contractVersion ?? 1) < RESEARCH_CONTRACT_VERSION ? replay
+      return (draft.value.contractVersion ?? 1) < 5 ? replay
         : { ...replay, turnsUsed: 0, reason: checked.findings[0] ?? null };
     }
     const stoppedFinding = { code: 'run_stopped', target: runControlId(project),
@@ -67,17 +67,21 @@ export class StageResearch {
     }
     const control = readRunControl(store, { project });
     if (!control.ok) throw new EngineError(control.refusal.code, control.refusal.message, control.refusal.at);
-    if (draft.value.contractVersion===4) {
+    if ([4, 5, 6].includes(draft.value.contractVersion ?? 1)
+      && draft.value.contractVersion! < RESEARCH_CONTRACT_VERSION) {
       const restored = await restorePaid(), run=store.get<ResearchRun>(`research-run:${hashJson([project,draftId])}`);
       if (control.value.stopped) return {status:'stopped',stage:artifact?reference(artifact):null,
         research:restored?reference(restored):run?reference(run):null,feedback:null,findings:[stoppedFinding],turnsUsed:0,reason:stoppedFinding};
-      if (restored?.value.pauseCode && restored.value.pauseCode !== 'research_contract_upgrade_required')
+      if (restored?.value.pauseCode && !['research_contract_upgrade_required', 'research_restore_complete'].includes(restored.value.pauseCode))
         return {status:'paused',stage:artifact?reference(artifact):null,research:reference(restored),feedback:null,
           findings:[{code:restored.value.pauseCode,target:draftId,message:restored.value.error ?? 'The saved paid turn could not be restored'}],
           turnsUsed:0,reason:{code:restored.value.pauseCode,target:draftId,message:restored.value.error ?? 'The saved paid turn could not be restored'}};
+      const message = draft.value.contractVersion === 4
+        ? 'Paid v4 work is retained; prepare Discovery v5 before new research or acceptance'
+        : `Paid v${draft.value.contractVersion} work is retained; prepare Discovery v${RESEARCH_CONTRACT_VERSION} before new research or acceptance`;
+      const reason = {code:'research_contract_upgrade_required',target:draftId,message};
       return {status:'paused',stage:artifact?reference(artifact):null,research:run?reference(run):null,feedback:null,
-        findings:[{code:'research_contract_upgrade_required',target:draftId,message:'Paid v4 work is retained; prepare Discovery v5 before new research or acceptance'}],
-        turnsUsed:0,reason:{code:'research_contract_upgrade_required',target:draftId,message:'Paid v4 work is retained; prepare Discovery v5 before new research or acceptance'}};
+        findings:[reason],turnsUsed:0,reason};
     }
     requireCondition(draft.value.contractVersion === RESEARCH_CONTRACT_VERSION, "research_contract_upgrade_required", "New stage research requires the current contract");
     if (control.value.stopped) {
