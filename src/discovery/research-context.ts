@@ -1,4 +1,4 @@
-import type { Store } from "../storage/store.js";
+import type { Revision, Store } from "../storage/store.js";
 import { STAGES, reference, stageId, type StageArtifact } from "../pipeline/contracts.js";
 import type { DiscoveryDraft } from "./discovery.js";
 import { canonical } from "../canonical.js";
@@ -70,6 +70,19 @@ function operationMapMaterial(store: Store, draft: DiscoveryDraft) {
     catalogue: { outcomes, actors, requirements }, engineRules: { origin: "engine-rule", rules: [...MAP_RULES] } };
 }
 
+const UNKNOWN_RULE = 'Accepted Discovery unknowns with their consumer and moment. A later moment does not resolve an unknown now:'
+  + ' a claim this stage needs from it stays an explicit unknown (need_research), never an assumption; an assessor does not support'
+  + ' an answer that assumes it.';
+/** UNK1 (№4686 §3 п.4): the accepted Discovery unknowns, each at its exact stage reference and pointer, for every early
+ * stage after Discovery. Whether one affects this stage is the analyst's and assessor's judgement, not the engine's. */
+function discoveryUnknowns(record: Revision<StageArtifact>) {
+  const preparation = ((record.value.content as { fields?: Record<string, unknown> })?.fields ?? {})['preparation'];
+  const rows = preparation && typeof preparation === "object" ? (preparation as Record<string, unknown>)['unknowns'] : undefined;
+  if (!Array.isArray(rows)) return undefined;
+  return { rule: UNKNOWN_RULE, items: rows.map((row, index) => ({ ...(row as Record<string, unknown>),
+    source: { record: reference(record), pointer: `/content/fields/preparation/unknowns/${index}` } })) };
+}
+
 /** The immediate accepted prerequisite carries the detailed handoff; older stages
  * supply identities needed for traceability, without duplicating every report. */
 export function researchPrerequisites(store: Store, draft: DiscoveryDraft) {
@@ -90,8 +103,11 @@ export function researchPrerequisites(store: Store, draft: DiscoveryDraft) {
           ...(draft.stage === "operation-map" ? { journeys: preparation['journeys'], externalSystems: preparation['externalSystems'] } : {}) };
       } else if (name === "conceptSections" && Array.isArray(value)) identities[name] = value;
     }
+    const unknowns = record.value.stage === "discovery" && ["concept", "operation-map", "specification", "features"].includes(draft.stage)
+      ? discoveryUnknowns(record) : undefined;
     return { ref: reference(record), stage: record.value.stage, fields: record === latest ? fields : identities,
-      ...(mapMaterial && record.value.stage === "concept" ? { operationMapMaterial: mapMaterial } : {}) };
+      ...(mapMaterial && record.value.stage === "concept" ? { operationMapMaterial: mapMaterial } : {}),
+      ...(unknowns ? { unknowns } : {}) };
   });
 }
 

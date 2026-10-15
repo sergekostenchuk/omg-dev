@@ -3,6 +3,9 @@ import { EngineError, requireCondition } from '../errors.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import { requireDiscoveryProposal, type DiscoveryContext } from './discovery-outcome.js';
 import { researchAction, responseAction } from './research-consumer-transition.js';
+import { canonical } from '../canonical.js';
+import { isRef, type Ref, type StageArtifact } from '../pipeline/contracts.js';
+import type { Store } from '../storage/store.js';
 
 export const EARLY_RESEARCH_OUTCOME = 'early-research-outcome/v1' as const;
 export const earlyResearchStage = (stage: unknown): boolean =>
@@ -27,11 +30,25 @@ export function requireEscalationReply(response: any): void {
   'escalation_assessment_invalid', 'Escalation assessment requires an explicit decision and reason');
 }
 
+/** UNK1 (№4686 §3): the admission of the unknown era for one early analyst call — its current question and the exact
+ * accepted input stages of its draft with their field names, the only addresses an upstream may name. */
+export interface EarlyUnknownAdmission { questionId: string; targets: { stage: Ref; fields: string[] }[] }
+/** The exact accepted input stages of a draft, read at their own revisions — never today's heads. */
+export function earlyUpstreamTargets(store: Store, draft: DiscoveryDraft): EarlyUnknownAdmission['targets'] {
+  return draft.inputs.flatMap(ref => {
+    const record = isRef(ref) ? store.get<StageArtifact>(ref.id, ref.revision) : null;
+    const fields = (record?.value.content as { fields?: unknown } | undefined)?.fields;
+    return record?.kind === 'stage' && record.hash === ref.hash && record.value.status === 'accepted'
+      && record.value.projectId === draft.projectId && fields !== null && typeof fields === 'object' && !Array.isArray(fields)
+      ? [{ stage: { id: ref.id, revision: ref.revision, hash: ref.hash }, fields: Object.keys(fields).sort() }] : [];
+  });
+}
+
 /** Physical ownership and packet/cursor admission must be proved by the caller.
  * This rule classifies only reply errors; it never grants a physical dispatch. */
 export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
   role: 'analyst' | 'assessor' | 'escalation-assessor', payload: unknown,
-  discovery: DiscoveryContext | null = null, web = false): EngineError | null {
+  discovery: DiscoveryContext | null = null, web = false, unknown: EarlyUnknownAdmission | null = null): EngineError | null {
   requireCondition(draft && typeof draft.stage === 'string' && draft.stage && question && question.draftId && question.projectId === draft.projectId
     && Array.isArray(draft.questions) && question.spec?.schema !== undefined
     && ['analyst', 'assessor', 'escalation-assessor'].includes(role),
@@ -42,7 +59,17 @@ export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
     else if (role === 'escalation-assessor') requireEscalationReply(payload);
     else {
       // WB1: web actions only with the capability of this exact call (webResearchCapability of its saved dispatch).
-      const action = responseAction(payload, web && role === 'analyst');
+      const action = responseAction(payload, web && role === 'analyst', unknown !== null && role === 'analyst');
+      // UNK1: in the unknown era an addressed need_research on the current question is a result, not a reply error.
+      if (unknown && action.action === 'need_research') {
+        if (action.question !== unknown.questionId)
+          throw new EngineError('research_question_foreign', 'An unknown must name the current question');
+        const target = action.upstream && unknown.targets.find(row => canonical(row.stage) === canonical(action.upstream!.stage));
+        if (action.upstream && (!target || !target.fields.includes(action.upstream.field)))
+          throw new EngineError('research_upstream_invalid',
+            'An upstream address names an exact accepted input stage of this draft and one of its fields', { upstream: action.upstream });
+        return null;
+      }
       if (action.action === 'read_bundle' || action.action === 'answer_delta')
         throw new EngineError('reader_pilot_required', action.action === 'read_bundle'
           ? 'A source bundle needs the configured reader experiment' : 'Layer deltas require the configured experiment');
@@ -61,7 +88,7 @@ export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
     }
   } catch (error) {
     if (error instanceof EngineError && ['research_response_invalid', 'reader_pilot_required',
-      'reading_plan_disabled', 'research_question_foreign', 'answer_invalid',
+      'reading_plan_disabled', 'research_question_foreign', 'research_upstream_invalid', 'answer_invalid',
       'assessment_invalid', 'escalation_assessment_invalid', 'discovery_basis_stale',
       'discovery_constraint_missing', 'discovery_constraint_stale', 'discovery_research_invalid'].includes(error.code)) return error;
     throw error;
@@ -75,14 +102,20 @@ const WEB_CORRECTION = ' Web research is available: web_search {query, purpose} 
 const WEB_CORRECTION_ACTIONS = [{ action: 'web_search', required: ['action', 'query', 'purpose'] },
   { action: 'web_fetch', required: ['action', 'url', 'purpose'] }];
 
+/** UNK1: the door of the unknown era, named to a corrective request whose NEW call is of that era. */
+const UNKNOWN_CORRECTION = ' When the saved material cannot answer the selected question, return need_research {question, missing[]}'
+  + ' instead of inventing a value; add upstream {stage, field} only to name an exact accepted input stage reference and its field'
+  + ' that must be revised.';
+const UNKNOWN_CORRECTION_ACTION = { action: 'need_research', required: ['action', 'question', 'missing'], optional: ['upstream'] };
+
 export function earlyResearchCorrection(role: 'analyst' | 'assessor' | 'escalation-assessor',
-  error: EngineError, attempt: unknown, question: Question, web = false): Record<string, unknown> {
+  error: EngineError, attempt: unknown, question: Question, web = false, unknown = false): Record<string, unknown> {
   return { contract: EARLY_RESEARCH_OUTCOME, role, attempt, code: error.code, message: error.message,
     details: error.details ?? null, responseContract: role === 'analyst'
       ? { action: 'answer', required: ['action', 'question', 'value', 'citations'], question: question.spec,
         instruction: 'Use the selected question ID, a value satisfying its schema and exact source citations. Reader/planner actions are unavailable on this stage.'
-          + (web ? WEB_CORRECTION : ''),
-        ...(web ? { webActions: WEB_CORRECTION_ACTIONS } : {}) }
+          + (web ? WEB_CORRECTION : '') + (unknown ? UNKNOWN_CORRECTION : ''),
+        ...(web ? { webActions: WEB_CORRECTION_ACTIONS } : {}), ...(unknown ? { unknownAction: UNKNOWN_CORRECTION_ACTION } : {}) }
       : role === 'assessor' ? { verdict: ['supported', 'insufficient', 'conflicting'], reasons: 'string[]',
         instruction: 'Correct only the assessment reply; preserve the supplied candidate and evidence cursor.' }
         : { necessary: 'boolean', reason: 'nonempty string', instruction: 'Correct only the escalation assessment.' } };

@@ -19,6 +19,12 @@ export interface ResearchAssessment {
   researcher: string; assessor: string; environment: Ref;
   reusedFrom?: Ref;
 }
+/** UNK1 (№4686 §3): the completed turn of an early analyst that cannot answer its current question from the saved material.
+ * The engine derives draft, question and field; missing is the model's; searched are the run's actually saved reads. */
+export interface EarlyUnknown {
+  contract: 'early-research-unknown/v1'; draft: Ref; question: Ref; field: string; missing: string[]; searched: Ref[];
+  door: 'research' | 'upstream'; upstream?: { stage: Ref; field: string };
+}
 export interface ResearchAnswer { projectId: string; question: string; assessment: Ref; value: Json }
 export type ResearchRead =
   | { action: "read_bundle"; purpose: string; inputs: BundleInput[] }
@@ -31,7 +37,10 @@ export type ResearchAction =
   | ResearchRead
   | { action: "read_plan"; question: string; reads: ResearchRead[] }
   | { action: "synthesize"; question: string }
-  | { action: "need_research"; question: string; missing: string[] }
+  | { action: "need_research"; question: string; missing: string[];
+    /** UNK1 (№4686 §3): only in the early analyst era that admits the unknown door — the exact accepted input stage and
+     * its field whose revision the missing material needs. Never guessed from the missing text. */
+    upstream?: { stage: Ref; field: string } }
   | ({ action: "answer_delta"; question: string; citations: { source: Ref; selector: Selector }[] } & LayerDelta)
   | { action: "checkpoint"; question: string; value: Json; citations: { source: Ref; selector: Selector }[]; unresolved: string[] }
   | { action: "answer"; question: string; value: Json; citations: { source: Ref; selector: Selector }[] }

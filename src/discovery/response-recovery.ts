@@ -1,5 +1,5 @@
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
-import { earlyResearchStage, earlyResearchFailure, EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
+import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
 import { consolidationInput } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Ajv } from 'ajv';
@@ -26,7 +26,7 @@ import { archivedContext, contextValue } from './working-context.js';
 import { contextWorkspace } from './context-workspace.js';
 
 import { canonical, digest, hashJson } from '../canonical.js';
-import { reference, isRef, uniqueRefs, type Ref, type Finding } from '../pipeline/contracts.js';
+import { reference, isRef, uniqueRefs, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { Evidence, SOURCE_READ_CONTRACT, type Source, type Observation, type Selector } from '../evidence/evidence.js';
 import { webCaptureId, type WebCapture } from './web-research.js';
@@ -34,7 +34,7 @@ import { processStart } from '../runtime/process-identity.js';
 import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executionOf } from './model-call-recovery.js';
 import { isResearchPreview } from './research-preview.js';
 import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply,
-  isReservationOnlySessionStep, admittedResearchAction, responseAction, webResearchCapability,
+  isReservationOnlySessionStep, admittedResearchAction, responseAction, webResearchCapability, earlyUnknownEra, EARLY_UNKNOWN,
   projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
   projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
@@ -815,6 +815,8 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
       consumerInvalid(before.id, 'The reopened turn lost its exact draft and question');
     return { kind: 'question-reopened', original, reopened, draft };
   }
+  if (after.value.status === 'completed' && after.value.observation?.contract === EARLY_UNKNOWN)
+    return earlyUnknownProof(store, readResearchConsumerIntent(store, before.value.consumerIntent), before);
   if (after.value.status === 'completed' && after.value.observation?.contract === EARLY_RESEARCH_OUTCOME) {
     const draftRef = producer.value.draft, questionRef = before.value.question;
     const draft = store.get<DiscoveryDraft>(draftRef.id, draftRef.revision);
@@ -822,11 +824,12 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
     if (!draft || !question || canonical(reference(draft)) !== canonical(draftRef)
       || canonical(reference(question)) !== canonical(questionRef))
       consumerInvalid(before.id, 'The early model refusal lost its exact original contract');
-    return { kind: 'early-model-refusal', draft, question,
-      producer: readResearchConsumerIntent(store, before.value.consumerIntent),
-      ...(intentWebCapability(store, producer) ? { web: true } : {}) };
+    const refusalProducer = readResearchConsumerIntent(store, before.value.consumerIntent);
+    const admission = earlyUnknownAdmission(store, refusalProducer, draft, question);
+    return { kind: 'early-model-refusal', draft, question, producer: refusalProducer,
+      ...(intentWebCapability(store, producer) ? { web: true } : {}), ...(admission ? { unknown: admission } : {}) };
   }
-  const localRefusal = projectPaidLocalRefusal(before.value as ManagedResearchTurn);
+  const localRefusal = projectPaidLocalRefusal(before.value as ManagedResearchTurn, earlyUnknownEra(producer.value.cursor));
   if (localRefusal) return localRefusal.proof;
   if (action.action === 'read_context' && after.value.status === 'pending'
     && after.value.observation?.code === 'research_no_progress') {
@@ -1727,7 +1730,50 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   if (paid.kind !== 'response') return null;
   return earlyResearchFailure(draft.value, question.value,
     intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
-    intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent));
+    intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question));
+}
+/** UNK1 (№4686 §3): the unknown-era admission of one early analyst call, from its saved cursor and original draft — null in
+ * the DRY5FIX era, so an old need_research keeps its refusal. */
+export function earlyUnknownAdmission(store: Store, intent: Revision<ResearchConsumerIntent>, draft: Revision<DiscoveryDraft>,
+  question: Revision<Question>) {
+  return intent.value.kind === 'analyst' && earlyUnknownEra(intent.value.cursor)
+    ? { questionId: question.id, targets: earlyUpstreamTargets(store, draft.value) } : null;
+}
+/**
+ * UNK1 (№4686 §3): the one derivation of an early unknown turn — its producer, the exact draft and question of that producer,
+ * the sources the run actually read before this turn, and the exact upstream stage the paid action names. The runner
+ * completes the turn with it and the historical reader proves the completed turn with it.
+ */
+export function earlyUnknownProof(store: Store, producer: Revision<ResearchConsumerIntent>, turn: Revision<Record<string, any>>): TurnTransitionProof {
+  const draft = store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision);
+  const questionRef = turn.value.question;
+  const question = isRef(questionRef) ? store.get<Question>(questionRef.id, questionRef.revision) : null;
+  if (!draft || !question || canonical(reference(draft)) !== canonical(producer.value.draft)
+    || canonical(reference(question)) !== canonical(questionRef))
+    consumerInvalid(turn.id, 'The early unknown lost its exact original draft or question');
+  let action: ResearchAction;
+  try { action = admittedResearchAction(turn.value.action); }
+  catch { consumerInvalid(turn.id, 'The early unknown lost its paid action'); }
+  if (action.action !== 'need_research') consumerInvalid(turn.id, 'An early unknown completes a paid need_research');
+  // The searched material is what each earlier turn's FIRST completed revision saved — the read source (ref), the fetched
+  // page (source) or the web capture (capture). Immutable history: the writer and every later reader derive the same list.
+  const read = store.list<ResearchTurn>('research-turn').filter(row => row.value.run === turn.value.run && row.value.number < turn.value.number)
+    .sort((a, b) => a.value.number - b.value.number)
+    .flatMap(row => {
+      const completed = store.history<ResearchTurn>(row.id).find(item => item.value.status === 'completed');
+      const seen = completed?.value.observation as { ref?: unknown; source?: unknown; capture?: unknown } | null | undefined;
+      const ref = [seen?.ref, seen?.source, seen?.capture].find(isRef);
+      return ref ? [ref] : [];
+    });
+  const searched = [...new Map(read.map(ref => [canonical(ref), { id: ref.id, revision: ref.revision, hash: ref.hash }])).values()];
+  let upstream: { stage: Revision<StageArtifact>; field: string } | undefined;
+  if (action.upstream) {
+    const stage = store.get<StageArtifact>(action.upstream.stage.id, action.upstream.stage.revision);
+    if (!stage || canonical(reference(stage)) !== canonical(action.upstream.stage))
+      consumerInvalid(turn.id, 'The upstream address names no exact saved stage');
+    upstream = { stage, field: action.upstream.field };
+  }
+  return { kind: 'early-unknown', draft, question, producer, searched, ...(upstream ? { upstream } : {}) };
 }
 export function retryableResearchConsumerRefusal(store: Store, intent: Revision<ResearchConsumerIntent>): boolean {
   const refusal = intent.value.state === 'refused' ? intent.value.refusal : null;
@@ -2009,6 +2055,11 @@ export function intentWebCapability(store: Store, intent: Revision<ResearchConsu
   const draft = store.get<DiscoveryDraft>(intent.value.draft.id, intent.value.draft.revision);
   return webResearchCapability(draft?.value.stage, intent.value.kind, intent.value.dispatch);
 }
+/** The action of a paid reply read by its own saved intent: the web capability of its dispatch (WB1) and the
+ * early-actions era of its cursor (UNK1). One reader for the runner, the refusal code and the historical proof. */
+export function intentResponseAction(store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown): ResearchAction {
+  return responseAction(payload, intentWebCapability(store, intent), earlyUnknownEra(intent.value.cursor));
+}
 
 /** The terminal refusal code a paid analyst/planner/escalation payload
  * deterministically produces, or null when the payload is well formed. The
@@ -2020,7 +2071,7 @@ function actionResponseRefusalCode(store: Store, intent: Revision<ResearchConsum
     try { requireEscalationReply(paid.payload); return null; }
     catch (error) { if (error instanceof EngineError) return error.code; throw error; }
   }
-  try { responseAction(paid.payload, intentWebCapability(store, intent)); return null; }
+  try { intentResponseAction(store, intent, paid.payload); return null; }
   catch (error) {
     if (error instanceof EngineError && ACTION_RESPONSE_REFUSAL_CODES.has(error.code)) return error.code;
     throw error;
@@ -2405,7 +2456,7 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
     expectedTurn = projected.turn;
   } else {
     let action: ResearchAction;
-    try { action = responseAction(paid.payload, intentWebCapability(store, intent)); }
+    try { action = intentResponseAction(store, intent, paid.payload); }
     catch { consumerInvalid(intent.id, 'The runner action does not parse from its paid response'); }
     if (!Number.isSafeInteger(priorRun.value.turns) || intent.value.cursor.turn !== priorRun.value.turns + 1
       || !Number.isSafeInteger(priorRun.value.requestChars) || priorRun.value.requestChars < 0)
@@ -2420,7 +2471,7 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
       question: selectedQuestion,
       owner: runWrite.value.owner as ResearchRun['owner'], limit: runWrite.value.limit,
       context: intent.value.cursor.context, ...(intent.value.cursor.mode ? { mode: intent.value.cursor.mode } : {}),
-      ...(intentWebCapability(store, intent) ? { web: true } : {}) });
+      ...(intentWebCapability(store, intent) ? { web: true } : {}), ...(earlyUnknownEra(intent.value.cursor) ? { unknown: true } : {}) });
     expectedRun = projected.run;
     // D8.4e: the era of a SAVED application is its own producer's form — a
     // turn written without the acceptance marker is the earlier era. A live

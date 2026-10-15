@@ -1,14 +1,14 @@
-import { earlyResearchFailure, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
+import { earlyResearchFailure, EARLY_RESEARCH_OUTCOME, type EarlyUnknownAdmission } from './early-research-outcome.js';
 import { Ajv } from 'ajv';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { tokenUsage, type ModelCall } from '../runtime/model-usage.js';
-import { isRef, reference, type Ref, type Finding } from '../pipeline/contracts.js';
+import { isRef, reference, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
 import { normalizeResearchAction } from './research-action-normalization.js';
 import { webAction, WEB_ACTIONS, projectWebApplication, WEB_CAPTURE_CONTRACT, type WebCapture } from './web-research.js';
 import { queuedChildReached } from './reading-plan.js';
 import type { ReaderResult } from './reader.js';
-import type { ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
+import type { EarlyUnknown, ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
 import { projectSourceReading, SOURCE_READ_CONTRACT, type Observation, type Selector, type Source } from '../evidence/evidence.js';
 import type { ReaderSelection } from './reader.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
@@ -176,6 +176,30 @@ export function projectResearchPhysicalReply(raw: string, requestId: string,
   }
 }
 
+/**
+ * UNK1 (№4686 §3): the early analyst action era that admits the unknown door — `need_research` on the current question
+ * completes the turn with observation.unknown. Fixed in the intent cursor before the send; every producer, classifier,
+ * projection and historical reader takes it from there. An intent without it keeps the DRY5FIX era: a refusal.
+ */
+export const EARLY_ACTIONS = 'early-research-actions/v2' as const;
+export const EARLY_UNKNOWN = 'early-research-unknown/v1' as const;
+export const earlyUnknownEra = (cursor: unknown): boolean =>
+  cursor !== null && typeof cursor === 'object' && (cursor as { earlyActions?: unknown }).earlyActions === EARLY_ACTIONS;
+const validateEarlyNeed = new Ajv({ allErrors: true }).compile<Extract<ResearchAction, { action: 'need_research' }>>({
+  type: 'object', additionalProperties: false, required: ['action', 'question', 'missing'], properties: {
+    action: { const: 'need_research' }, question: text, missing: { type: 'array', minItems: 1, items: text },
+    upstream: object({ stage: ref, field: text }) } });
+const isNeedResearch = (value: unknown): boolean => value !== null && typeof value === 'object'
+  && (value as { action?: unknown }).action === 'need_research';
+/** The early need_research of the unknown era — the global planning schema is not widened after the fact. */
+function earlyNeedResearch(value: unknown): Extract<ResearchAction, { action: 'need_research' }> {
+  value = normalizeResearchAction(value);
+  if (!validateEarlyNeed(value)) throw new EngineError('research_response_invalid',
+    'An early need_research names its question, the missing material and optionally an exact upstream stage and field',
+    validateEarlyNeed.errors);
+  return value;
+}
+
 /** One action parser for transport, writes, and historical transition proofs. */
 export function researchAction(value: unknown): ResearchAction {
   value = normalizeResearchAction(value);
@@ -202,7 +226,8 @@ const isWebPayload = (value: unknown): boolean => value !== null && typeof value
   && WEB_ACTIONS.includes((value as { action?: unknown }).action as string);
 /** A paid reply classified by its own call: without the capability the shared parser — and its original
  * research_response_invalid — is unchanged; with it a web action is checked by its own contract. */
-export function responseAction(value: unknown, web: boolean): ResearchAction {
+export function responseAction(value: unknown, web: boolean, unknown = false): ResearchAction {
+  if (unknown && isNeedResearch(value)) return earlyNeedResearch(value);
   if (!web || !isWebPayload(value)) return researchAction(value);
   try { return webAction(value); }
   catch (error) {
@@ -212,6 +237,8 @@ export function responseAction(value: unknown, web: boolean): ResearchAction {
 }
 /** The action of a turn that already exists: a web turn exists only after its call was admitted with the capability. */
 export function admittedResearchAction(value: unknown): ResearchAction {
+  // UNK1: an upstream address exists only in a turn admitted by the unknown era.
+  if (isNeedResearch(value) && Object.hasOwn(value as object, 'upstream')) return earlyNeedResearch(value);
   return isWebPayload(value) ? webAction(value) : researchAction(value);
 }
 
@@ -1060,8 +1087,10 @@ type PaidLocalRefusalReason = { kind: PaidLocalRefusalKind; code: string; messag
  * checked before a plan, mode transition or search can run. A failure outside
  * this finite set stays pending instead of acquiring an invented completion. */
 function paidLocalRefusalReason(before: ManagedResearchTurn,
-  action: ResearchAction): PaidLocalRefusalReason | null {
+  action: ResearchAction, unknown: boolean): PaidLocalRefusalReason | null {
   const mode = before.dispatchMode;
+  // UNK1: in the unknown era an early need_research on the current question is the unknown door, not a mode transition.
+  if (unknown && action.action === 'need_research' && isRef(before.question) && action.question === before.question.id) return null;
   if (!before.plannedBy && (mode === 'planning' || mode === 'synthesis')) {
     const allowed = mode === 'planning'
       ? ['read_plan', 'synthesize', 'pause']
@@ -1087,12 +1116,12 @@ function paidLocalRefusalReason(before: ManagedResearchTurn,
   return null;
 }
 
-export function projectPaidLocalRefusal(before: ManagedResearchTurn): {
+export function projectPaidLocalRefusal(before: ManagedResearchTurn, unknown = false): {
   proof: { kind: PaidLocalRefusalKind }; turn: ManagedResearchTurn; failure: EngineError;
 } | null {
-  const reason = paidLocalRefusalReason(before, admittedResearchAction(before.action));
+  const reason = paidLocalRefusalReason(before, admittedResearchAction(before.action), unknown);
   if (!reason) return null;
-  const proof = { kind: reason.kind };
+  const proof = { kind: reason.kind, ...(unknown ? { unknown: true as const } : {}) };
   return { proof, turn: projectResearchTurnRevision(before, proof),
     failure: new EngineError(reason.code, reason.message) };
 }
@@ -1103,6 +1132,8 @@ export interface PaidTurnAdmission {
   mode?: 'planning' | 'synthesis';
   /** WB1: the capability of the producing call, from its saved dispatch (webResearchCapability). */
   web?: boolean;
+  /** UNK1: the early-actions era of the producing intent, from its saved cursor (earlyUnknownEra). */
+  unknown?: boolean;
 }
 
 export interface AcceptedPaidAnswerInputs {
@@ -1209,7 +1240,7 @@ export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdm
     && before.turns >= 0 && Number.isSafeInteger(before.requestChars) && before.requestChars >= 0
     && Number.isSafeInteger(input.limit) && input.limit > 0 && input.intent.revision === 1,
   'research_consumer_intent_invalid', 'A paid turn needs its exact prior run and original intent');
-  const action = responseAction(input.response, input.web === true);
+  const action = responseAction(input.response, input.web === true, input.unknown === true);
   const next = before.turns + 1;
   const run: ResearchRun = { ...before, status: 'running', turns: next,
     limit: input.limit, owner: input.owner,
@@ -1240,7 +1271,12 @@ export function projectSynthesisHandoffTurn(input: { intent: Ref; runId: string;
 
 export type TurnTransitionProof =
   | { kind: 'pause' }
-  | { kind: PaidLocalRefusalKind }
+  /** UNK1: `unknown` names the unknown era of the producing intent; absent in the DRY5FIX era. */
+  | { kind: PaidLocalRefusalKind; unknown?: true }
+  /** UNK1 (№4686 §3): an early need_research on the current question of the unknown era — the turn completes with
+   * observation.unknown. searched are the run's actually saved reads, derived by the caller's common reader. */
+  | { kind: 'early-unknown'; draft: Revision<DiscoveryDraft>; question: Revision<Question>;
+      producer: Revision<ResearchConsumerIntent>; searched: Ref[]; upstream?: { stage: Revision<StageArtifact>; field: string } }
   | LayerDesignRefusalProof
   | { kind: 'technical-refusal'; result: { ref: Ref; value: {
       contract: 'research-proposal-refusal/v1'; projectId: string; turn: Ref;
@@ -1266,7 +1302,9 @@ export type TurnTransitionProof =
       /** D8.4e: the proven K; mandatory for a turn of the binding era. */
       binding?: { ref: Ref; value: ResearchAcceptanceBinding } }
   | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question>;
-      producer: Revision<ResearchConsumerIntent>; web?: boolean }
+      producer: Revision<ResearchConsumerIntent>; web?: boolean;
+      /** UNK1: the unknown-era admission of the producer (earlyUnknownAdmission); absent in the DRY5FIX era. */
+      unknown?: EarlyUnknownAdmission }
   /** WB1: a web turn completes only from its saved capture (gateway answer or local refusal). */
   | { kind: 'web'; projectId: string; capture: Revision<WebCapture> }
   | { kind: 'question-reopened'; original: Revision<Question>;
@@ -1296,7 +1334,7 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
   const action = admittedResearchAction(before.action);
   if (proof.kind === 'mode-refusal' || proof.kind === 'reading-plan-refusal'
     || proof.kind === 'reading-mode-refusal' || proof.kind === 'search-query-refusal') {
-    const reason = paidLocalRefusalReason(before, action);
+    const reason = paidLocalRefusalReason(before, action, 'unknown' in proof && proof.unknown === true);
     requireCondition(reason?.kind === proof.kind, 'research_consumer_intent_invalid',
       'The original paid action does not produce this local refusal');
     return { ...before, status: 'completed', assessment: null,
@@ -1562,6 +1600,38 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     'research_consumer_intent_invalid', 'The web completion lost its exact capture of this pending turn');
     return projectWebApplication(projectId, before, capture).turn as ManagedResearchTurn;
   }
+  if (proof.kind === 'early-unknown') {
+    const { draft, question, producer, searched } = proof;
+    requireCondition(producer.kind === 'research-consumer-intent' && hashJson(producer.value) === producer.hash
+      && canonical(exactRef(producer)) === canonical(before.consumerIntent) && producer.value.kind === 'analyst'
+      && earlyUnknownEra(producer.value.cursor)
+      && canonical(producer.value.draft) === canonical(exactRef(draft))
+      && canonical(producer.value.question) === canonical(exactRef(question))
+      && draft.kind === 'discovery-draft' && question.kind === 'question'
+      && hashJson(draft.value) === draft.hash && hashJson(question.value) === question.hash
+      && canonical(before.question) === canonical(exactRef(question))
+      && question.value.draftId === draft.id && draft.value.questions.includes(question.id)
+      && action.action === 'need_research' && action.question === question.id
+      && Array.isArray(searched) && searched.every(isRef),
+    'research_consumer_intent_invalid', 'The early unknown lost its exact producer, draft and current question');
+    let upstream: EarlyUnknown['upstream'];
+    if (action.upstream) {
+      const stage = proof.upstream?.stage, fields = (stage?.value.content as { fields?: unknown } | undefined)?.fields;
+      requireCondition(stage?.kind === 'stage' && hashJson(stage.value) === stage.hash
+        && canonical(exactRef(stage)) === canonical(action.upstream.stage)
+        && draft.value.inputs.some(ref => canonical(ref) === canonical(exactRef(stage)))
+        && stage.value.status === 'accepted' && stage.value.projectId === draft.value.projectId
+        && proof.upstream!.field === action.upstream.field && fields !== null && typeof fields === 'object'
+        && Object.hasOwn(fields, action.upstream.field),
+      'research_consumer_intent_invalid', 'The upstream address is not an exact accepted input stage and field of this draft');
+      upstream = { stage: exactRef(stage), field: action.upstream.field };
+    } else requireCondition(proof.upstream === undefined, 'research_consumer_intent_invalid',
+      'An upstream stage needs the explicit upstream address of the paid action');
+    const unknown: EarlyUnknown = { contract: EARLY_UNKNOWN, draft: exactRef(draft), question: exactRef(question),
+      field: question.value.spec.field, missing: [...action.missing], searched: [...searched],
+      door: upstream ? 'upstream' : 'research', ...(upstream ? { upstream } : {}) };
+    return { ...before, status: 'completed', assessment: null, error: null, observation: { contract: EARLY_UNKNOWN, unknown } };
+  }
   if (proof.kind === 'early-model-refusal') {
     const { draft, question, producer } = proof;
     requireCondition(producer.kind === 'research-consumer-intent' && hashJson(producer.value) === producer.hash
@@ -1574,8 +1644,14 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       && question.value.draftId === draft.id && draft.value.questions.includes(question.id)
       && (!('question' in action) || action.question === question.id),
     'research_consumer_intent_invalid', 'The early refusal lost its exact draft and selected question');
+    // UNK1: the refusal is classified in the action era of its own producer — the same admission the runner classified with.
+    const unknown = proof.unknown ?? null;
+    requireCondition((producer.value.kind === 'analyst' && earlyUnknownEra(producer.value.cursor)) === (unknown !== null)
+      && (!unknown || unknown.questionId === question.id && unknown.targets.every(row =>
+        draft.value.inputs.some(input => canonical(input) === canonical(row.stage)))),
+    'research_consumer_intent_invalid', 'The early refusal names the action era of its own producer');
     const failure = earlyResearchFailure(draft.value, question.value, 'analyst', action,
-      producer.value.cursor.context?.discoveryContext ?? null, proof.web === true);
+      producer.value.cursor.context?.discoveryContext ?? null, proof.web === true, unknown);
     requireCondition(failure, 'research_consumer_intent_invalid', 'A valid early reply cannot become a model refusal');
     return { ...before, status: 'completed', assessment: null,
       observation: { contract: EARLY_RESEARCH_OUTCOME, code: failure.code, details: failure.details ?? null,

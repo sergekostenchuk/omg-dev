@@ -511,7 +511,7 @@ if(fault.remaining>0&&field===fault.field&&(assessor?s.role==='assess-answer':s.
  const actions={bundle:{action:'read_bundle',purpose:'Read',inputs:[{path:'irrelevant.txt',media:'text/plain'}]},
  delta:{action:'answer_delta',question:q.id,base:source?.ref,upserts:{},removes:{},citations},
  plan:{action:'read_plan',question:q.id,reads:[{action:'read',path:'irrelevant.txt',media:'text/plain'}]},
- synthesize:{action:'synthesize',question:q.id},'need-research':{action:'need_research',question:q.id,missing:['evidence']},
+ synthesize:{action:'synthesize',question:q.id},'need-research-upstream':{action:'need_research',question:q.id,missing:['evidence'],upstream:{stage:{id:'stage:p:concept',revision:1,hash:'0'.repeat(64)},field:'audience'}},
  unknown:{action:'need_source',question:q.id},missing:{action:'answer',question:q.id},value:{...research,value:42},
  'assessor-action':{action:'answer'},'assessor-fields':{verdict:'supported'}};
  if(fault.mode==='foreign')foreign=true;else research=actions[fault.mode];
@@ -533,7 +533,7 @@ function dry5StageFixture(t: test.TestContext, mode: string, field = 'preparatio
 for (const [row, mode, code] of [
   ['M1', 'bundle', 'reader_pilot_required'], ['M2', 'delta', 'reader_pilot_required'],
   ['M3', 'plan', 'reading_plan_disabled'], ['M4', 'synthesize', 'research_question_foreign'],
-  ['M4b', 'need-research', 'research_question_foreign'], ['M5', 'unknown', 'research_response_invalid'],
+  ['M4b', 'need-research-upstream', 'research_upstream_invalid'], ['M5', 'unknown', 'research_response_invalid'],
   ['M6', 'missing', 'research_response_invalid'], ['M7', 'value', 'answer_invalid'],
   ['M8', 'assessor-action', 'assessment_invalid'], ['M9', 'assessor-fields', 'assessment_invalid']
 ]) test(`DRY5FIX ${row}: public stage pauses once, new Store corrects only the failed role`, async t => {
