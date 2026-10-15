@@ -1,4 +1,4 @@
-import { answerDiscoveryFixture } from './product-fixture.js';
+import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-fixture.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -2829,12 +2829,13 @@ function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = 
             { kind: 'text-range', start: 0, end: source.value.content.length });
           else {
             const field = question.value.spec.field;
-            const value = field === 'mapDesign' ? designOf(store.get<Graph>(`graph:${project}`)!.value) as unknown as Json
-              : preparedField(project, field);
+            const value = currentUpstreamFixtureValue(engine, project, field,
+              field === 'mapDesign' ? designOf(store.get<Graph>(`graph:${project}`)!.value) as unknown as Json
+                : preparedField(project, field));
             if (field === 'preparation') (value as Record<string, Json>).unknowns = ids.map(id => ({ id,
               question: `What is ${id}${suffix}?`, consumer: 'unresolved-consumer', moment: 'om-pass', blocksCurrentStage: false,
               resolution: 'Resolve the question during OM' }));
-            if (stage === 'discovery' && draft.value.contractVersion === 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
+            if (stage === 'discovery' && (draft.value.contractVersion ?? 0) >= 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
               answerDiscoveryFixture(engine, project, engine.store.get<import('../src/discovery/discovery.js').DiscoveryDraft>(draft.id)!, question, value, source);
             else engine.discovery.decision(id, question.revision, 'owner', value);
           }

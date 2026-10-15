@@ -14,7 +14,7 @@ import { renderStageSummary, stageSummary, type DiscoveryStageSummary,
   type StructuredStageSummary } from "../src/product/stage-summary.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { preparedField } from "./preparation-fixture.js";
-import { answerDiscoveryFixture, preparedFeatures, withHistoricalUpstream } from "./product-fixture.js";
+import { answerDiscoveryFixture, currentUpstreamFixtureValue, preparedFeatures, withHistoricalUpstream } from "./product-fixture.js";
 
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "omg-stage-summary-"));
@@ -389,12 +389,13 @@ test("DS1.3a detects a second Store changing a selected head during the read", t
   finally { f.store.get = original; }
 });
 
-test("DS1.3a reads genuine v3, v4 and v5 accepted histories by their own contracts", t => {
+test("DS1.3a reads saved v3–v5 histories and the current v6 stage by their own contracts", t => {
   const f = fixture(t);
   withHistoricalUpstream("1189043f4bc7", () => preparedFeatures(f.engine, "v3"));
   withHistoricalUpstream("e9c1ca5c41fb80508559aeab41da8f3da7422953", () => preparedFeatures(f.engine, "v4"));
-  preparedFeatures(f.engine, "v5");
-  for (const [project, version] of [["v3", 3], ["v4", 4], ["v5", 5]] as const) {
+  withHistoricalUpstream("4dc199d7eeb73128ec4d39a9154216d9cbf32a1f", () => preparedFeatures(f.engine, "v5"));
+  preparedFeatures(f.engine, "v6");
+  for (const [project, version] of [["v3", 3], ["v4", 4], ["v5", 5], ["v6", 6]] as const) {
     const summary = stageSummary(f.store, project, "discovery");
     assert.equal(summary.accepted?.contractVersion, version);
     if (version < 5) {
@@ -402,6 +403,9 @@ test("DS1.3a reads genuine v3, v4 and v5 accepted histories by their own contrac
       assert.ok(summary.accepted?.limitations.every(item => item.includes(`contractVersion ${version}`)));
     } else assert.equal(summary.accepted?.verdict?.outcome, "go");
   }
+  const v6 = stageSummary(f.store, "v6", "specification");
+  assert.equal(v6.accepted?.contractVersion, 6);
+  assert.ok(v6.accepted?.fields.some(field => field.field === "behaviorContracts"));
 });
 
 test("DS1.3a renders saved web URLs, capture time, quote and documentary proof limit without fetching", t => {
@@ -506,8 +510,10 @@ test("DS1.3b preserves the complete specification contract and both requirement 
   assert.equal(specification.accepted?.material.stage, "specification");
   if (specification.accepted?.material.stage !== "specification") assert.fail("specification material is absent");
   const contracts = specification.accepted.material.behaviorContracts!.value as unknown as Record<string, unknown>[];
-  assert.deepEqual(contracts[0], (preparedField(project, "behaviorContracts") as Json[])[0]);
-  assert.deepEqual(Object.keys(contracts[0]!).sort(), ["actor", "compatibility", "entry", "failures", "forbiddenEffects",
+  const accepted = f.store.get<StageArtifact>(stageId(project, "specification"))!;
+  const fields = accepted.value.content as { fields: { behaviorContracts: Json[] } };
+  assert.deepEqual(contracts[0], fields.fields.behaviorContracts[0]);
+  assert.deepEqual(Object.keys(contracts[0]!).sort(), ["actor", "applications", "compatibility", "entry", "failures", "forbiddenEffects",
     "id", "inputs", "outcome", "proof", "requirements", "state", "success"].sort());
   assert.deepEqual(specification.accepted.material.behavior?.value, ["behavior for complete-contract"]);
 
@@ -552,7 +558,8 @@ test("DS1.3b gives an addressed refusal when a lawful operation-map draft has no
   const concept = f.engine.prepare(project, "concept");
   for (const id of concept.value.questions) {
     const question = f.store.get<Question>(id)!;
-    f.engine.discovery.decision(id, question.revision, "local-caller", preparedField(project, question.value.spec.field));
+    f.engine.discovery.decision(id, question.revision, "local-caller", currentUpstreamFixtureValue(f.engine, project,
+      question.value.spec.field, preparedField(project, question.value.spec.field)));
   }
   const conceptStage = f.engine.draft(project, "concept", concept.id, 0);
   f.engine.pipeline.accept(project, "concept", conceptStage.revision);

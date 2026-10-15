@@ -31,8 +31,8 @@ test('DS1.2e the released v5 requirement literal and all schema/prompt bytes sta
   };
   assert.equal(literal(current, 'VERSION5_REQUIREMENTS'), literal(source, 'REQUIREMENTS'));
   assert.equal(hashJson(VERSION5_REQUIREMENTS), V5_HASH);
-  assert.equal(RESEARCH_CONTRACT_VERSION, 5, 'Preparation of v6 does not activate its producer');
-  assert.equal(REQUIREMENTS, VERSION5_REQUIREMENTS);
+  assert.equal(RESEARCH_CONTRACT_VERSION, 6, 'The complete v6 contract is now the producer');
+  assert.equal(REQUIREMENTS, VERSION6_REQUIREMENTS);
 });
 
 test('DS1.2e v6 policy values are deeply frozen and share no mutable object with v5', () => {
@@ -88,12 +88,12 @@ else {
 }
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research}));`;
 
-test('DS1.2e real accepted v5 replay keeps the DRV1 public shape and paid bytes after a new Store', async t => {
+test('DS1.2v current v6 accepted replay keeps the DRV1 public shape and paid bytes after a new Store', async t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-v6-era-')), database = join(root, 'state.sqlite');
   const store = new Store(database), engine = new ProductEngine(store), project = 'era-replay';
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   engine.execute({ type: 'create-project', project, title: project });
-  const values = Object.fromEntries(VERSION5_REQUIREMENTS.discovery.map(spec => [spec.field, preparedField(project, spec.field)]));
+  const values = Object.fromEntries(REQUIREMENTS.discovery.map(spec => [spec.field, preparedField(project, spec.field)]));
   values.brief = 'A simple local harness'; values.objective = 'A simple local harness';
   const path = join(root, 'values.json'), adapter = join(root, 'adapter.mjs');
   writeFileSync(path, JSON.stringify(values)); writeFileSync(adapter, ADAPTER);
@@ -103,7 +103,7 @@ test('DS1.2e real accepted v5 replay keeps the DRV1 public shape and paid bytes 
     implementer: { actor: 'author', model: 'fixture', effort: 'medium', command },
     reviewer: { actor: 'assessor', model: 'fixture', effort: 'medium', command },
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 10_000 }, 0);
-  const draft = engine.prepare(project, 'discovery'); assert.equal(draft.value.contractVersion, 5);
+  const draft = engine.prepare(project, 'discovery'); assert.equal(draft.value.contractVersion, 6);
   const questions = draft.value.questions.map(id => store.get<Question>(id)!);
   const brief = questions.find(q => q.value.spec.field === 'brief')!, objective = questions.find(q => q.value.spec.field === 'objective')!;
   engine.discovery.fact(brief.id, brief.revision, reference(source), { kind: 'json-pointer', pointer: '/brief' });

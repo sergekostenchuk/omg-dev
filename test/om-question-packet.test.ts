@@ -4162,7 +4162,7 @@ test('RB1 №4343: an answer B1 applied to a transition the reopening found reac
 });
 
 // ---- SP1a (№4714): the accepted specification whole in the questions of OM — the saved selection era of a packet root ----
-import { BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT, deriveBrief, boundedBrief, type BriefBasis, type BriefLabel } from '../src/om/packet-brief.js';
+import { BASIS_BRIEF_SELECTION_CONTRACT, deriveBrief, boundedBrief, type BriefBasis, type BriefLabel } from '../src/om/packet-brief.js';
 
 /** The scope section of a saved brief packet and its context labels, read as the model reads them. */
 function sp1Scope(record: Sealed<Revision<QuestionPacketRecord>>) {
@@ -4174,9 +4174,9 @@ function sp1Scope(record: Sealed<Revision<QuestionPacketRecord>>) {
 /** Every selected element is the exact accepted original at its own stage Ref and pointer, bounded by the scoped rows. */
 function sp1Delivered(store: Store, input: Ref, record: Sealed<Revision<QuestionPacketRecord>>) {
   const { input: scope, label } = sp1Scope(record), selected = scope.selected;
-  assert.equal(record.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'A new root declares the selection era');
+  assert.equal(record.value.briefSelection, BASIS_BRIEF_SELECTION_CONTRACT, 'A new root declares the selection era');
   assert.ok(selected, 'The brief shows the selected specification');
-  assert.equal(selected.contract, 'selected-specification/v1');
+  assert.equal(selected.contract, 'selected-specification/v2');
   const sources = store.get<{ input: { sources: (Ref & { stage: string })[] } }>(input.id, input.revision)!.value.input.sources;
   const exact = (stage: string) => { const { id, revision, hash } = sources.find(row => row.stage === stage)!; return { id, revision, hash }; };
   const fields = (stage: string) => store.get<{ content: { fields: Record<string, Json[]> } }>(exact(stage).id, exact(stage).revision)!.value.content.fields;
@@ -4200,6 +4200,10 @@ function sp1Delivered(store: Store, input: Ref, record: Sealed<Revision<Question
   assert.deepEqual(label(selected.constraints.source), exact('specification'));
   assert.equal(selected.constraints.pointer, '/content/fields/constraints');
   assert.deepEqual(selected.constraints.value, fields('specification').constraints);
+  assert.deepEqual(label(selected.bases.catalogue.source), exact('discovery'), 'The v6 catalogue is from the exact accepted Discovery');
+  assert.deepEqual(selected.bases.selected.map((row: any) => ({ record: label(row.owner.record), pointer: row.owner.pointer })),
+    [...selected.contracts, ...selected.preparations].map((row: any) => ({ record: label(row.source), pointer: row.pointer })),
+    'Each selected original carries its own exact application address');
   assert.ok(selected.rule.includes('the B1 row is the binding decision'));
   return selected;
 }
@@ -4300,7 +4304,7 @@ test('SP1a №4714 §5 «бюджет»: the selected section is mandatory — w
   const blocked = ok(writeQuestionPacket(f.store, { ...request, environment: reference(environment) })).record;
   assert.equal(blocked.value.state, 'blocked'); assert.equal(blocked.value.refusal?.code, 'packet_too_large');
   assert.equal(blocked.value.packet, null);
-  assert.equal(blocked.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'The blocked root keeps its era');
+  assert.equal(blocked.value.briefSelection, BASIS_BRIEF_SELECTION_CONTRACT, 'The blocked root keeps its era');
   assert.deepEqual(f.store.list('model-call'), [], 'No model call is made');
   f.restart();
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(blocked) })), blocked);

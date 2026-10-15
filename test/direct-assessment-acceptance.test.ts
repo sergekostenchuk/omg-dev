@@ -12,8 +12,9 @@ import { assessAnswer, directAssessmentBasis } from '../src/discovery/research-a
 import { reuseResearch } from '../src/discovery/research-reuse.js';
 import { readAcceptedResearchAnswer, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
 import { DIRECT_ASSESSMENT_ORIGIN, type ResearchAnswer, type ResearchAssessment } from '../src/discovery/research-model.js';
-import { reference } from '../src/pipeline/contracts.js';
+import { reference, uniqueRefs, type Ref } from '../src/pipeline/contracts.js';
 import { preparedField } from './preparation-fixture.js';
+import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-fixture.js';
 
 /**
  * ASM1.1 (№4791): a direct early-stage assessment is bound to the exact material its assessor saw — the accepted prefix of
@@ -39,16 +40,30 @@ console.log(JSON.stringify({ protocol: request.protocol, requestId: request.requ
   const environment = engine.environments.configure('p', { workspace: repo, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
     reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
   const source = engine.discovery.evidence.document('p', 'basis', 'AB', 'text/plain', 0);
-  const draft = engine.discovery.forStage('p', 'concept', 'operation-map');
+  const discovery = engine.prepare('p', 'discovery');
+  for (const id of discovery.value.questions) {
+    const question = store.get<Question>(id)!;
+    if (question.value.spec.kind === 'fact') engine.discovery.fact(id, question.revision, reference(source),
+      { kind: 'text-range', start: 0, end: 2 });
+    else if (['researchPlan', 'researchReport', 'verdict', 'preparation'].includes(question.value.spec.field))
+      answerDiscoveryFixture(engine, 'p', store.get<DiscoveryDraft>(discovery.id)!, question,
+        preparedField('p', question.value.spec.field), source);
+    else engine.discovery.decision(id, question.revision, 'owner', preparedField('p', question.value.spec.field));
+  }
+  const discoveryArtifact = engine.draft('p', 'discovery', discovery.id, 0);
+  const acceptedDiscovery = engine.pipeline.accept('p', 'discovery', discoveryArtifact.revision);
+  const draft = engine.prepare('p', 'concept');
   const questions = draft.value.questions.map(id => store.get<Question>(id)!);
   for (const q of questions.slice(0, -1)) engine.discovery.decision(q.id, q.revision, 'owner', preparedField('p', q.value.spec.field));
   const selected = questions.at(-1)!;
-  const candidate = { action: 'answer' as const, question: selected.id, value: preparedField('p', 'conceptSections'),
+  const candidate = { action: 'answer' as const, question: selected.id,
+    value: currentUpstreamFixtureValue(engine, 'p', 'conceptSections', preparedField('p', 'conceptSections')),
     citations: [{ source: reference(source), selector: { kind: 'text-range' as const, start: 0, end: 2 } }] };
   const calls = () => existsSync(wire) ? readFileSync(wire, 'utf8').trim().split('\n').length : 0;
   const delivered = () => existsSync(wire) ? readFileSync(wire, 'utf8').trim().split('\n').map(line => JSON.parse(line)
     .subject.stageNeighbors.fields.find((row: { field: string }) => row.field === 'audience')?.value) : [];
-  return { root, file, repo, environment, source, draft, questions, selected, candidate, calls, delivered,
+  const sent = () => existsSync(wire) ? readFileSync(wire, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
+  return { root, file, repo, environment, source, acceptedDiscovery, draft, questions, selected, candidate, calls, delivered, sent,
     verdict: (value: Json) => writeFileSync(control, JSON.stringify(value)),
     get store() { return store; }, get engine() { return engine; },
     restart() { store.close(); store = new Store(file); engine = new ProductEngine(store); },
@@ -86,8 +101,17 @@ test('ASM1.1 №4791 a new direct assessment names its exact completed assessor 
   assert.equal(assessment.value.verdict, 'supported');
   assert.equal(assessment.value.origin?.contract, DIRECT_ASSESSMENT_ORIGIN);
   const neighbors = f.questions.slice(0, -1).map(q => f.store.get<Question>(q.id)!);
+  const shown = f.sent()[0].subject;
+  assert.deepEqual(shown.stageNeighbors.fields.map((row: { question: Ref; answer: Ref }) =>
+    [row.question, row.answer]), neighbors.map(q => [reference(q), q.value.answer!]));
+  assert.deepEqual(shown.discoveryBasisCatalogue.source, reference(f.acceptedDiscovery));
+  const discovery = shown.discoveryContext;
+  const basis = uniqueRefs([shown.discoveryBasisCatalogue.source,
+    ...shown.stageNeighbors.fields.flatMap((row: { question: Ref; answer: Ref }) => [row.question, row.answer]),
+    ...(discovery ? Object.values(discovery.fields).flatMap((row: any): Ref[] => [row.question, row.answer]) : []),
+    ...(discovery ? discovery.ownerDecisions.flatMap((round: any): Ref[] => round.decisions.map((decision: any) => decision.ref)) : [])]);
   assert.deepEqual(directAssessmentBasis(f.store, assessment)!.map(ref => canonical(ref)).sort(),
-    neighbors.flatMap(q => [reference(q), q.value.answer!]).map(ref => canonical(ref)).sort(), 'Every neighbor question and answer the assessor saw');
+    basis.map(ref => canonical(ref)).sort(), 'Every exact Discovery and neighbor reference the assessor saw');
   f.restart();
   assert.deepEqual(directAssessmentBasis(f.store, f.store.get<ResearchAssessment>(assessment.id)!), directAssessmentBasis(f.store, assessment));
 });
@@ -170,7 +194,7 @@ test('ASM1.1 №4791 regression 5: an accepted bound answer reads by its own era
 test('ASM1.1 №4791 regression 6: a bound direct result is not a reuse candidate for another draft; the ordinary assessment of the new question stays available', async t => {
   const f = fixture(t), assessment = await f.assess();
   f.accept(assessment);
-  const next = f.engine.discovery.forStage('p', 'concept', 'operation-map');
+  const next = f.engine.discovery.forStage('p', 'concept', 'operation-map', [reference(f.acceptedDiscovery)]);
   const nextQuestions = next.value.questions.map(id => f.store.get<Question>(id)!);
   for (const q of nextQuestions.slice(0, -1)) f.engine.discovery.decision(q.id, q.revision, 'owner', preparedField('p', q.value.spec.field));
   const target = f.store.get<Question>(nextQuestions.at(-1)!.id)!;

@@ -591,7 +591,7 @@ async function sp1CurrentWorks(t: TestContext) {
   return fixture.acceptedWorksFixture(t);
 }
 
-test('SP1b current G5 and compiled v2 plan deliver the same full material and later stages cannot replace its exact sources', async t => {
+test('SP1b current G5 and compiled v3 plan deliver the same full material and later stages cannot replace its exact sources', async t => {
   const f = await sp1CurrentWorks(t);
   const { ProductEngine } = await import('../src/product/engine.js');
   const { writeFeasibility } = await import('../src/om/feasibility.js');
@@ -601,18 +601,21 @@ test('SP1b current G5 and compiled v2 plan deliver the same full material and la
   const engine = new ProductEngine(f.store), m8 = ok(writeFeasibility(f.store, f.feasibility));
   ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
   const plan = engine.compiler.compile(f.project);
-  assert.equal(plan.value.taskContextContract, TASK_CONTEXT_CONTRACT);
+  assert.equal(plan.value.taskContextContract, BASIS_TASK_CONTEXT_CONTRACT);
   assert.equal(plan.value.derivation, 'external-inputs/v1');
-  assert.equal(f.gate.value.request.taskContextContract, TASK_CONTEXT_CONTRACT);
+  assert.equal(f.gate.value.request.taskContextContract, BASIS_TASK_CONTEXT_CONTRACT);
   assert.deepEqual(engine.compiler.compile(f.project), plan);
   const sources = loadTaskContextSources(f.store, plan)!;
   const task = plan.value.tasks[0]!, neighbors = ok(readNeighbors(f.store, { project: f.project, neighbors: f.gate.value.request.neighbors }));
   const actual = engine.compiler.context(f.project, reference(plan), task.id, 1_000_000);
   const selected = JSON.parse(actual.text).selectedSpecification;
+  assert.equal(JSON.parse(actual.text).version, BASIS_TASK_CONTEXT_CONTRACT);
+  assert.equal(selected.contract, 'selected-specification/v2');
   assert.ok(selected.contracts.length > 0); assert.ok(selected.preparations.length > 0);
   const preplan = preplanTaskContext({ project: f.project, graph: plan.value.graphSnapshot, task,
     fullCheck: f.environment.value.fullCheck, basis: { candidate: f.gate.value.request.candidate, environment: plan.value.environment },
-    neighbors: neighbors as Revision<NeighborCollection>, taskContextContract: TASK_CONTEXT_CONTRACT, specification: selected }, 1_000_000);
+    neighbors: neighbors as Revision<NeighborCollection>, taskContextContract: BASIS_TASK_CONTEXT_CONTRACT, specification: selected }, 1_000_000);
+  assert.equal(JSON.parse(preplan.text).version, 'omg-task-context/preplan-v3');
   assert.deepEqual(JSON.parse(preplan.text).selectedSpecification, selected);
   assert.deepEqual(sources.specification!.tasks[task.id], selected);
   const raw = f.store.get(selected.contracts[0].source.id, selected.contracts[0].source.revision)!;

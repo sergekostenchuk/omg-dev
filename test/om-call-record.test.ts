@@ -1,4 +1,4 @@
-import { answerDiscoveryFixture } from './product-fixture.js';
+import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-fixture.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -965,9 +965,10 @@ function mechanismFixture(t: test.TestContext, label: string, StoreType: typeof 
           engine.discovery.fact(id, question.revision, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
         else {
           const field = question.value.spec.field;
-          const value = field === "mapDesign" ? designOf(f.store.get<Graph>(`graph:${PROJECT}`)!.value) as unknown as Json : preparedField(PROJECT, field);
+          const value = currentUpstreamFixtureValue(engine, PROJECT, field,
+            field === "mapDesign" ? designOf(f.store.get<Graph>(`graph:${PROJECT}`)!.value) as unknown as Json : preparedField(PROJECT, field));
           if (field === "preparation") (value as Record<string, Json>).unknowns = ids.map(mechanismQuestion);
-          if (stage === 'discovery' && draft.value.contractVersion === 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
+          if (stage === 'discovery' && (draft.value.contractVersion ?? 0) >= 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
               answerDiscoveryFixture(engine, PROJECT, engine.store.get<import('../src/discovery/discovery.js').DiscoveryDraft>(draft.id)!, question, value, source);
             else engine.discovery.decision(id, question.revision, "owner", value);
         }

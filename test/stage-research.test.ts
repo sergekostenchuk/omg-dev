@@ -1,6 +1,9 @@
 import { execFileSync } from 'node:child_process';
 import { reference } from '../src/pipeline/contracts.js';
-import { buildOmInput, type InputStages, writeOmInput } from '../src/om/input.js';
+import { buildOmInput, type InputRequest, type InputStages, writeOmInput } from '../src/om/input.js';
+import { hasBasisApplications, selectTaskSpecification } from '../src/om/selected-specification.js';
+import type { TaskSpecificationSelection } from '../src/compiler/om-readers.js';
+import { startRun } from '../src/om/run.js';
 import { resumeStoppedPass, stopPass } from '../src/om/run-driver.js';
 import { discoveryOutcome } from '../src/discovery/discovery-outcome.js';
 import test from "node:test";
@@ -22,6 +25,7 @@ import type { Environment } from "../src/runtime/environment.js";
 import type { StageResearchResult } from "../src/product/stage-research.js";
 import { consumerFeedback, rejectResearch, type ConsumerFeedback } from "../src/discovery/consumer-feedback.js";
 import { readDiscoveryBasisMaterial, researchGraphContext, researchPrerequisites } from "../src/discovery/research-context.js";
+import { readResearchAssessmentAt } from "../src/discovery/research-assessment.js";
 import { canonical, type Json } from "../src/canonical.js";
 
 // Controlled process provider proves routing/acceptance, not live model quality.
@@ -37,6 +41,26 @@ if(c.role==='assess-answer')research=process.argv[4]==='opposite-constraint'&&c.
  ?{verdict:'conflicting',reasons:['Correct address, but the rule reverses the local-only report constraint']}:{verdict:'supported',reasons:[]};
 else {const q=c.questions[0],source=c.inventory.sources.find(s=>s.location==='values'),values=JSON.parse(readFileSync(process.argv[2],'utf8'));
  const value=boundDiscoveryValue(q.field,structuredClone(values[q.field]),c.discoveryContext);
+ if(q.field==='conceptSections'&&c.discoveryBasisCatalogue) {
+  const catalogue=c.discoveryBasisCatalogue;
+  for(const [sectionIndex,section] of value.entries())
+   for(const [requirementIndex,requirement] of section.requirements.entries())
+    requirement.applications=[catalogue.variant,...catalogue.constraints].map(entry=>({
+     contract:'basis-application/v1',basis:entry.address,
+     appliedAt:['/'+sectionIndex+'/requirements/'+requirementIndex+'/'+(entry===catalogue.variant?'statement':'acceptance/0')],
+    }));
+ }
+ if(q.field==='behaviorContracts'&&c.discoveryBasisCatalogue) {
+  const sections=c.prerequisites?.find(row=>row.stage==='concept')?.fields?.conceptSections??[];
+  const requirements=sections.flatMap(section=>section.requirements);
+  for(const [index,contract] of value.entries()) {
+   const selected=new Set(contract.requirements),bases=new Map();
+   for(const requirement of requirements.filter(row=>selected.has(row.id)))
+    for(const application of requirement.applications??[])bases.set(JSON.stringify(application.basis),application.basis);
+   contract.applications=[...bases.values()].map(address=>({contract:'basis-application/v1',basis:address,
+    appliedAt:[address.pointer.includes('/verdict/')?'/'+index+'/entry':'/'+index+'/success/0']}));
+  }
+ }
  if(values.choiceRound&&q.field==='verdict'&&c.discoveryContext?.ownerDecisions.length) {
    const round=c.discoveryContext.ownerDecisions.at(-1),declined=round.decisions.some(d=>d.option.choice==='decline');
    value.outcome=declined?'no_go':'go';value.conditions=[];value.reason=declined?'Owner declined the necessary scope':'The selected condition and report support the proposed scope';
@@ -85,7 +109,7 @@ function fixture(t: { after(fn: () => void): void }) {
 }
 
 test("stage command automatically repairs consumer rejections and accepts all upstream stages for two products", async t => {
-  const { engine, store, root, setup } = fixture(t);
+  const { engine, store, path, root, setup } = fixture(t);
   for (const project of ["garden", "invoice"]) {
     setup(project);
     for (const stage of UPSTREAM_STAGES) {
@@ -97,6 +121,21 @@ test("stage command automatically repairs consumer rejections and accepts all up
       const result = await engine.execute({ type: "research-stage", project, draftId: draft.id, maxTurns: 8 }) as StageResearchResult;
       assert.equal(result.status, "accepted", JSON.stringify({ result, run: result.research && store.get(result.research.id)?.value }));
       assert.equal(engine.pipeline.inspect(project, stage).state, "accepted");
+      if (stage === "operation-map" || stage === "features") {
+        const field = stage === "operation-map" ? "operationRequirements" : "features";
+        const firstAssessment = store.list<ResearchTurn>("research-turn").find(turn =>
+          turn.value.assessment && turn.value.question
+          && store.get<Question>(turn.value.question.id)?.value.projectId === project
+          && store.get<Question>(turn.value.question.id)?.value.spec.field === field);
+        assert.ok(firstAssessment?.value.assessment, `${field} has a paid assessment before its candidate`);
+        const calls = store.list("model-call").length;
+        const historical = new Store(path);
+        try {
+          assert.deepEqual(readResearchAssessmentAt(historical, project, firstAssessment.id,
+            firstAssessment.value.assessment).id, firstAssessment.value.assessment.id);
+          assert.equal(historical.list("model-call").length, calls, "Historical replay uses no new model call");
+        } finally { historical.close(); }
+      }
       const count = store.list("research-turn").length;
       const again = await engine.stageResearch.run(project, draft.id, 8);
       assert.equal(again.status, "accepted"); assert.equal(store.list("research-turn").length, count);
@@ -479,7 +518,7 @@ test('DS1.2 local-only report constraint reaches all later stages and a concrete
   }
   const result=await f.engine.stageResearch.run('p',draft.id,8);assert.equal(result.status,'accepted',JSON.stringify({result,run:result.research&&f.store.get(result.research.id)?.value}));
   const artifact=f.store.get<any>(result.stage!.id)!;
-  stages[stage]={ref:reference(artifact),contractVersion:5,fields:artifact.value.content.fields};
+  stages[stage]={ref:reference(artifact),contractVersion:draft.value.contractVersion,fields:artifact.value.content.fields};
  }
  const logs=readFileSync(join(f.root,'p.calls'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
  for(const field of ['conceptSections','mapDesign','behaviorContracts','featurePreparation']) {
@@ -488,6 +527,22 @@ test('DS1.2 local-only report constraint reaches all later stages and a concrete
    .some((c:any)=>c.rule==='Local inputs and outputs only'&&c.basis.includes('/constraints/0')),field);
  }
  const built=buildOmInput(stages as InputStages);assert.deepEqual(built.refusals,[]);assert.ok(built.input);
+ const input=writeOmInput(f.store,{project:'p',expected:0,
+  stages:Object.fromEntries(UPSTREAM_STAGES.map(stage=>[stage,stages[stage].ref])) as InputRequest['stages']});
+ assert.equal(input.ok,true,JSON.stringify(input));
+ if(!input.ok)return;
+ assert.equal(hasBasisApplications(input.value.value.input.sources),true,'The real v6 producer declares selection/v2 at B1');
+ const pass=startRun(f.store,{project:'p'});assert.equal(pass.ok,true,JSON.stringify(pass));
+ if(pass.ok)assert.deepEqual(pass.value.value.input,reference(input.value),'The OM pass starts on this exact v6 B1');
+ const selected=selectTaskSpecification({project:'p',contract:'selected-specification/v2',
+  inputRef:reference(input.value),input:structuredClone(input.value.value.input) as unknown as TaskSpecificationSelection['input'],
+  accepted:UPSTREAM_STAGES.map(stage=>({stage,ref:stages[stage].ref,fields:stages[stage].fields})),
+  requirements:[...input.value.value.input.contracts[0]!.requirements],nodes:[]});
+ assert.equal(selected.contract,'selected-specification/v2');
+ if(selected.contract==='selected-specification/v2') {
+  assert.ok(selected.bases.catalogue.constraints.length,'The OM task keeps the full Discovery catalogue');
+  assert.ok(selected.bases.selected.some(row=>row.bases.length),'The task keeps its selected requirement grounds');
+ }
  const requirement=built.input.requirements.find(r=>r.id==='p-R1')!;
  assert.ok(requirement);assert.ok(built.input.criteria.some(c=>c.requirement===requirement.id));
  assert.ok(built.input.contracts.some(c=>c.requirements.includes(requirement.id)&&c.forbiddenEffects.includes('Transmitting input or output to an external service')));
@@ -500,9 +555,26 @@ const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,statePath=process.argv[5]
 appendFileSync(process.argv[3],JSON.stringify(r)+'\\n');
 const q=s.questions?.[0]??s.question,field=q.field,values=JSON.parse(readFileSync(process.argv[2],'utf8'));
 const source=(s.inventory?.sources??s.originals?.sources??[]).find(x=>x.location==='values');
+const value=boundDiscoveryValue(field,structuredClone(values[field]),s.discoveryContext);
+if(field==='conceptSections'&&s.discoveryBasisCatalogue) {
+ const catalogue=s.discoveryBasisCatalogue;
+ for(const [sectionIndex,section] of value.entries())
+  for(const [requirementIndex,requirement] of section.requirements.entries())
+   requirement.applications=[catalogue.variant,...catalogue.constraints].map(entry=>({
+    contract:'basis-application/v1',basis:entry.address,
+    appliedAt:['/'+sectionIndex+'/requirements/'+requirementIndex+'/'+(entry===catalogue.variant?'statement':'acceptance/0')],
+   }));
+}
+if(field==='behaviorContracts'&&s.discoveryBasisCatalogue) {
+ for(const [index,contract] of value.entries()) {
+  contract.applications=[s.discoveryBasisCatalogue.variant,...s.discoveryBasisCatalogue.constraints].map(entry=>({
+   contract:'basis-application/v1',basis:entry.address,
+   appliedAt:[entry===s.discoveryBasisCatalogue.variant?'/'+index+'/entry':'/'+index+'/success/0']}));
+ }
+}
 let foreign=false;
 let research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}:
-{action:'answer',question:q.id,value:boundDiscoveryValue(field,values[field],s.discoveryContext),citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+field}}]};
+{action:'answer',question:q.id,value,citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+field}}]};
 const assessor=['assessor-action','assessor-fields'].includes(fault.mode);
 if(fault.remaining>0&&field===fault.field&&(assessor?s.role==='assess-answer':s.role==='research')){
  fault.remaining--;writeFileSync(statePath,JSON.stringify(fault));
@@ -554,7 +626,7 @@ for (const [row, mode, code] of [
 });
 
 for (const negative of ['insufficient', 'conflicting'] as const)
-test(`DRY5FIX B corrected ${negative} admits the next analyst proposal and survives restart at nine scenario calls plus six v5 research calls`, async t => {
+test(`DRY5FIX B corrected ${negative} admits the next analyst proposal and survives restart at nine scenario calls plus six current research calls`, async t => {
   const f = dry5StageFixture(t, 'assessor-fields');
   writeFileSync(join(f.root, 'adapter.mjs'), `import {boundDiscoveryValue} from ${JSON.stringify(new URL('./preparation-fixture.js',import.meta.url).href)};
 import{readFileSync,appendFileSync,existsSync}from'node:fs';
@@ -574,7 +646,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   const draft = f.engine.prepare('p', 'discovery'), first = await f.engine.stageResearch.run('p', draft.id, 20);
   assert.equal(first.status, 'paused');
   assert.equal((f.store.get<any>(first.research!.id)!.value).pauseCode, 'assessment_invalid');
-  // v5 adds three assessed research fields before the unchanged preparation/retry sequence.
+  // The current contract keeps three assessed research fields before the preparation/retry sequence.
   const researchFields = ['researchPlan', 'researchReport', 'verdict'];
   assert.deepEqual(f.calls().filter(r => researchFields.includes((r.subject.questions?.[0] ?? r.subject.question).field))
     .map(r => [(r.subject.questions?.[0] ?? r.subject.question).field, r.subject.role]),

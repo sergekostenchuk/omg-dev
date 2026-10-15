@@ -304,6 +304,14 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const pilotPacket = !priorOrigin && pilot ? pilotContext(store, draft, question) : null;
   const assessmentObservations=[...observations,...runtime.supporting];
   const proposedInheritance = inheritanceProposal(draft.value, question.value, action.value);
+  // New v6 producers capture these prerequisite reads with the paid answer.
+  // A restore must consume the same reads before stageNeighbors, while older
+  // producers keep their original (uncaptured) prerequisite material.
+  if (priorOrigin && !originalPilot && draft.value.contractVersion === 6
+    && ['specification', 'operation-map', 'features'].includes(draft.value.stage))
+    requireCondition(same(priorOrigin.value.context['prerequisites'],
+      researchPrerequisites(inputStore, draft.value, proposedInheritance)),
+      'research_assessment_binding_invalid', `[${question.id}] The saved assessor lost its original prerequisites`);
   const computedContext = priorOrigin ? null : pilotPacket ? { ...pilotPacket, ...(basisBindings ? { bases: basisBindings } : {}), ...(runtime.proofs.length?{runtimeProofs:runtime.proofs}:{}), role: "assess-answer", question: question.value.spec,
     sourceLocations: sourceLocations!,
     value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value, draft.value.level === "R2" ? 3 : 2, question.value.spec.layerAssembly) : action.value,
@@ -510,9 +518,13 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
         || specificationApplicationFindings(action.value, basisMaterial.concept!, basisMaterial.catalogue).length === 0),
     'research_assessment_binding_invalid', `[${turnId}] The paid assessment lost its original applications or catalogue`);
   const proposedInheritance = inheritanceProposal(capturedDraft.value, question.value, action.value);
-  if (proposedInheritance) requireCondition(same(outcome.context.prerequisites,
-    researchPrerequisites(view.store, capturedDraft.value, proposedInheritance)),
-    'research_assessment_binding_invalid', `[${turnId}] The paid assessment lost its selected requirement grounds`);
+  // The v6 producer captures this derivation for every map/feature question,
+  // including questions before the final candidate. Replay exactly one read.
+  if (proposedInheritance || capturedDraft.value.contractVersion === 6
+    && ['operation-map', 'features'].includes(capturedDraft.value.stage))
+    requireCondition(same(outcome.context.prerequisites,
+      researchPrerequisites(view.store, capturedDraft.value, proposedInheritance)),
+      'research_assessment_binding_invalid', `[${turnId}] The paid assessment lost its selected requirement grounds`);
   const withNeighbors = origin.value.contract === 'assessment-paid-origin/v2';
   if (withNeighbors) {
     const neighbors = stageNeighbors(view.store, capturedDraft, question);

@@ -34,7 +34,7 @@ export const LEGACY_REQUIREMENTS: Record<UpstreamStage, FieldSpec[]> = {
     } },
   ],
 };
-export const RESEARCH_CONTRACT_VERSION = 5;
+export const RESEARCH_CONTRACT_VERSION = 6;
 export const VERSION2_REQUIREMENTS = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
   [...LEGACY_REQUIREMENTS[stage].map(spec => ({ ...spec, kind: spec.kind === "decision" && spec.field !== "objective" ? "design" as const : spec.kind })), UPSTREAM_DETAILS[stage]],
 ])) as Record<UpstreamStage, FieldSpec[]>;
@@ -57,5 +57,4 @@ export const VERSION6_REQUIREMENTS = sealed(Object.fromEntries(UPSTREAM_STAGES.m
   VERSION5_REQUIREMENTS[stage].map(spec => spec.field === VERSION6_UPSTREAM_DETAILS[stage].field
     ? VERSION6_UPSTREAM_DETAILS[stage] : spec),
 ]))) as unknown as Record<UpstreamStage, FieldSpec[]>;
-// DS1.2lh activates v6 only after the complete material contract is ready.
-export const REQUIREMENTS = VERSION5_REQUIREMENTS;
+export const REQUIREMENTS = VERSION6_REQUIREMENTS;

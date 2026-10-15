@@ -287,7 +287,7 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
       && source.id === question.source.id && source.revision === question.source.revision && source.hash === question.source.hash) : [];
     if (producer.length !== 1 || !['discovery', 'features'].includes(producer[0]!.stage)
       || !Object.hasOwn(producer[0]!, 'contractVersion')
-      || (producer[0]!.contractVersion !== null && ![1, 2, 3, 4, 5].includes(producer[0]!.contractVersion!))) {
+      || (producer[0]!.contractVersion !== null && ![1, 2, 3, 4, 5, 6].includes(producer[0]!.contractVersion!))) {
       fail('gap_source_missing', question.id, 'source', 'A question must identify its exact stage producer and contract era'); continue;
     }
     if ((producer[0]!.contractVersion ?? 0) >= QUESTION_MOMENT_CONTRACT_VERSION && !Object.hasOwn(question, 'moment')) {

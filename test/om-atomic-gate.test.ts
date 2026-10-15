@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, digest, hashJson, type Json } from '../src/canonical.js';
 import { loadTaskSpecification, preplanTaskContext } from '../src/compiler/context.js';
+import { BASIS_TASK_CONTEXT_CONTRACT } from '../src/compiler/model.js';
 import { resolveArtifact, resolveExternalSource } from '../src/compiler/inputs.js';
 import { Evidence, type Source } from '../src/evidence/evidence.js';
 import { git, type RepositoryState } from '../src/runtime/environment.js';
@@ -98,7 +99,7 @@ function measuredContexts(store: Store, gate: AtomicGateRecord) {
     fullCheck: environment.value.fullCheck, basis: { candidate: request.candidate, environment: request.environment },
     neighbors: neighbors as Revision<NeighborCollection>, ...(request.taskContextContract ? {
       taskContextContract: request.taskContextContract, specification: loadTaskSpecification(store, request.project,
-        request.gaps.sources.input, graph, task) } : {}) }, 1_000_000) }));
+        request.gaps.sources.input, graph, task, undefined, request.taskContextContract) } : {}) }, 1_000_000) }));
 }
 
 function addressFixtureFields(store: Store, project: string, input: Ref, graph: Ref, layers: Ref[], extra: InputDecisionProposal['decision'][] = []) {
@@ -502,12 +503,13 @@ test('F5 accepts real E2.1 and E4 work results with two distinct consumers, reba
   assert.ok(!resolved.collection.gaps.some(gap => gap.code === 'obligation_open' && gap.blocking
     && gap.evidence.some(evidence => evidence.origin === 'works')), 'The final candidate resolves its original L3 obligations');
   const contexts = measuredContexts(f.store, passed.value as AtomicGateRecord);
+  assert.equal(passed.value.request.taskContextContract, BASIS_TASK_CONTEXT_CONTRACT);
   assert.equal(contexts.length, candidate.value.graph.horizon.length);
   assert.ok(contexts.some(item => item.task.researchObligations!.length === 2));
   for (const item of contexts) {
     const payload = JSON.parse(item.context.text);
-    assert.equal(payload.version, 'omg-task-context/preplan-v2');
-    assert.equal(payload.selectedSpecification.contract, 'selected-specification/v1');
+    assert.equal(payload.version, 'omg-task-context/preplan-v3');
+    assert.equal(payload.selectedSpecification.contract, 'selected-specification/v2');
     assert.deepEqual(payload.criteria.researchObligations, item.task.researchObligations);
     assert.ok(payload.binding.candidate); assert.ok(payload.binding.environment); assert.ok(payload.binding.neighbors);
   }
@@ -669,7 +671,7 @@ test('F5 declared work goal closes accepted L3 gaps and confirms progress throug
   assert.deepEqual(heads(f.store), latest); assert.equal(f.sent().length, beforeSend);
 });
 
-test('F5 G5 capacity measures the complete V2 value at the exact boundary and rejects without changing accepted bases', async t => {
+test('F5 G5 capacity measures the complete current task context at the exact boundary and rejects without changing accepted bases', async t => {
   const f = await atomicFixture(t), before = heads(f.store), sent = f.sent().length;
   const initial = ok(prepareWorksAcceptance(f.store, f.request)), pendingGate = gateWrite(initial);
   assert.equal(initial.state, 'accepted', JSON.stringify({ seed: f.seedRoot, findings: gateWrite(initial).value.result.findings })); assert.deepEqual(heads(f.store), before);
@@ -1344,10 +1346,10 @@ test('AT1 return №4155 п.2, №4160 п.2: G5 accepts the five declared forms;
 
 
 for (const stageName of ['discovery', 'concept', 'specification', 'features'] as const)
-test(`SP1b G5 v2 refuses a native ${stageName} head change in its publication window without partial acceptance`, async t => {
+test(`SP1b G5 current context refuses a native ${stageName} head change in its publication window without partial acceptance`, async t => {
   const f = await atomicFixture(t), prepared = ok(prepareWorksAcceptance(f.store, f.request));
   assert.equal(prepared.state, 'accepted');
-  assert.equal(gateWrite(prepared).value.request.taskContextContract, 'omg-task-context/v2');
+  assert.equal(gateWrite(prepared).value.request.taskContextContract, BASIS_TASK_CONTEXT_CONTRACT);
   const other = new Store(f.database); t.after(() => other.close());
   const stage = other.get<import('../src/pipeline/contracts.js').StageArtifact>(`stage:${f.project}:${stageName}`)!;
   new ProductEngine(other).pipeline.draft(f.project, stageName, stage.value.content, stage.revision);
@@ -1375,7 +1377,7 @@ test('SP1b G5 rejects the full specification where the old preplan fits, includi
       const result = prepareWorksAcceptance(store, request);
       assert.equal(result.ok, true, JSON.stringify(result));
       const prepared = result.value, gate = prepared.writes.find(write => write.id === prepared.record.value.gate.id).value;
-      assert.equal(gate.request.taskContextContract, 'omg-task-context/v2');
+      assert.equal(gate.request.taskContextContract, ${JSON.stringify(BASIS_TASK_CONTEXT_CONTRACT)});
       emptySlot();
       console.log(JSON.stringify({ state: prepared.state, gate }));
     } finally { store.close(); }

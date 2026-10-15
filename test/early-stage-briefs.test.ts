@@ -12,7 +12,7 @@ import {ProductEngine} from '../src/product/engine.js';
 import {reference, type Ref} from '../src/pipeline/contracts.js';
 import {canonical, type Json} from '../src/canonical.js';
 import type {Question} from '../src/discovery/discovery.js';
-import {REQUIREMENTS,UPSTREAM_STAGES,VERSION4_REQUIREMENTS,RESEARCH_CONTRACT_VERSION} from '../src/discovery/requirements.js';
+import {REQUIREMENTS,UPSTREAM_STAGES,VERSION4_REQUIREMENTS,VERSION5_REQUIREMENTS,RESEARCH_CONTRACT_VERSION} from '../src/discovery/requirements.js';
 import {contextValue,workingContext} from '../src/discovery/working-context.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {previewResearch} from '../src/discovery/research-preview.js';
@@ -20,16 +20,18 @@ import {continuationPrompt} from '../src/discovery/continuation-packet.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 import {readBundle,readReaderResultAt} from '../src/discovery/reader.js';
 import {readResearchConsumerTurn} from '../src/discovery/response-recovery.js';
-import {preparedFeatures} from './product-fixture.js';
+import {currentUpstreamFixtureValue,preparedFeatures} from './product-fixture.js';
 import {preparedField} from './preparation-fixture.js';
 import {exampleGraph} from './graph-fixture.js';
 import {enrichedGraph} from './enriched-graph-fixture.js';
 import {designOf} from '../src/graph/builder.js';
+import {readDiscoveryBasisMaterial,researchPrerequisites} from '../src/discovery/research-context.js';
 
-function fixture(t:test.TestContext) {
+function fixture(t:test.TestContext, acceptedPrefix=false) {
  const root=mkdtempSync(join(tmpdir(),'omg-rs4-')),store=new Store(join(root,'state.sqlite')),engine=new ProductEngine(store);
  t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
- engine.execute({type:'create-project',project:'p',title:'Local protocol fixture'});
+ if(acceptedPrefix)preparedFeatures(engine,'p');
+ else engine.execute({type:'create-project',project:'p',title:'Local protocol fixture'});
  const path=join(root,'adapter.mjs'),log=join(root,'wire.jsonl');
  const values:Record<string,Json>=Object.fromEntries(UPSTREAM_STAGES.flatMap(stage=>REQUIREMENTS[stage].map(s=>[s.field,preparedField('p',s.field)])));
  values['mapDesign']=designOf(enrichedGraph(exampleGraph('p'),'p',values['preparation'],values['conceptSections'])) as unknown as Json;
@@ -75,6 +77,11 @@ test('RS4 real early-stage analyst and assessor producers retain their complete 
  const f=fixture(t);
  for(const stage of UPSTREAM_STAGES) {
   const draft=f.engine.prepare('p',stage);
+  if(stage==='concept'||stage==='specification') {
+   const field=stage==='concept'?'conceptSections':'behaviorContracts';
+   f.values[field]=currentUpstreamFixtureValue(f.engine,'p',field,f.values[field]!);
+   writeFileSync(join(f.root,'values.json'),JSON.stringify(f.values));
+  }
   for(const id of draft.value.questions) {
    const q=f.store.get<Question>(id)!;
    if(q.value.spec.kind==='fact')f.engine.discovery.fact(id,q.revision,reference(f.source),{kind:'json-pointer',pointer:'/'+q.value.spec.field});
@@ -99,13 +106,17 @@ test('RS4 real early-stage analyst and assessor producers retain their complete 
 });
 
 test('RS4 all 18 real early FieldSpecs survive both producer question shapes, including a selected non-first question',async t=>{
- const f=fixture(t);writeFileSync(join(f.root,'mode'),'pause');let count=0;
+ const f=fixture(t,true);writeFileSync(join(f.root,'mode'),'pause');let count=0;
  for(const stage of UPSTREAM_STAGES) {
-  const draft=f.engine.discovery.forStage('p',stage,'compilation');
+  const draft=f.engine.prepare('p',stage);
   for(const id of draft.value.questions)for(const shape of ['question','questions']) {
    const q=f.store.get<Question>(id)!,who={...f.environment.value.implementer,actor:stage+':'+q.id+':'+shape};
    const all=draft.value.questions.map(id=>({id,...f.store.get<Question>(id)!.value.spec}));
-   const body={role:'research',stage,[shape]:shape==='question'?{id,...q.value.spec}:all,fields:{[q.value.spec.field]:null}};
+   const body={role:'research',stage,[shape]:shape==='question'?{id,...q.value.spec}:all,fields:{[q.value.spec.field]:null},
+    ...(['concept','specification'].includes(stage) ? {
+     discoveryBasisCatalogue:readDiscoveryBasisMaterial(f.store,draft.value).catalogue,
+     ...(stage==='specification'?{prerequisites:researchPrerequisites(f.store,draft.value)}:{})
+    }:{})};
    const audit={store:f.store,draftId:draft.id,questionId:q.id,purpose:'analyst'};
    await researchCall(who,f.environment.value,'Exact forms: answer with citations:{source,selector}; fixture.',body,undefined,audit);
    const preview=await previewResearch(()=>researchCall(who,f.environment.value,'Exact forms: answer with citations:{source,selector}; fixture.',body,undefined,audit));
@@ -321,9 +332,9 @@ test('RS4 exact archive indexes retain sizes and counts, and empty protocol arra
 });
 
 
-test('DS1-01 Discovery v5 plans have domain-specific perspectives and sources; v4 and moment stay unchanged', t => {
+test('DS1-01 Discovery v6 keeps the researched plan and prior v4/v5 contracts', t => {
  const f=fixture(t),draft=f.engine.prepare('p','discovery');
- assert.equal(draft.value.contractVersion,5);assert.equal(RESEARCH_CONTRACT_VERSION,5);
+ assert.equal(draft.value.contractVersion,6);assert.equal(RESEARCH_CONTRACT_VERSION,6);
  assert.deepEqual(draft.value.questions.map(id=>f.store.get<Question>(id)!.value.spec.field),
   ['brief','objective','researchPlan','researchReport','verdict','preparation']);
  assert.deepEqual(VERSION4_REQUIREMENTS.discovery.map(q=>q.field),['brief','objective','preparation']);
@@ -331,7 +342,14 @@ test('DS1-01 Discovery v5 plans have domain-specific perspectives and sources; v
  assert.deepEqual({...currentPreparation,prompt:priorPreparation.prompt},priorPreparation);
  assert.ok(currentPreparation.prompt.startsWith(priorPreparation.prompt));
  assert.match(currentPreparation.prompt,/discoveryContext.reportConstraints/);
- for(const stage of UPSTREAM_STAGES.filter(stage=>stage!=='discovery'))assert.deepEqual(REQUIREMENTS[stage],VERSION4_REQUIREMENTS[stage]);
+ assert.deepEqual(REQUIREMENTS.discovery,VERSION5_REQUIREMENTS.discovery);
+ for(const stage of UPSTREAM_STAGES.filter(stage=>stage==='operation-map'||stage==='features'))
+  assert.deepEqual(REQUIREMENTS[stage],VERSION4_REQUIREMENTS[stage]);
+ for(const stage of ['concept','specification'] as const) {
+  const detail=REQUIREMENTS[stage].at(-1)!;
+  assert.match(detail.prompt,/applications/);
+  assert.equal(new Ajv({strict:true}).compile(detail.schema as object)(preparedField('p',detail.field)),false);
+ }
  const spec=REQUIREMENTS.discovery.find(q=>q.field==='researchPlan')!,validate=new Ajv({strict:true}).compile(spec.schema as object);
  assert.equal(spec.kind,'design');assert.equal(spec.proof,'assessment');
  const plans=[

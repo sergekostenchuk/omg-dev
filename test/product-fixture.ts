@@ -5,14 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { discoveryContext } from '../src/discovery/discovery-outcome.js';
+import { discoveryBasisCatalogue, discoveryContext } from '../src/discovery/discovery-outcome.js';
 import type { ResearchAssessment } from '../src/discovery/research-model.js';
 import type { Environment } from '../src/runtime/environment.js';
 import type { Question, DiscoveryDraft } from '../src/discovery/discovery.js';
 import type { Revision } from '../src/storage/store.js';
 import type { ProductEngine } from "../src/product/engine.js";
-import { UPSTREAM_STAGES, VERSION4_REQUIREMENTS } from "../src/discovery/requirements.js";
-import { reference } from "../src/pipeline/contracts.js";
+import { UPSTREAM_STAGES, VERSION5_REQUIREMENTS } from "../src/discovery/requirements.js";
+import { reference, stageId, type StageArtifact } from "../src/pipeline/contracts.js";
 import { exampleGraph } from "./graph-fixture.js";
 import type { Graph } from "../src/graph/model.js";
 import { preparedField, boundDiscoveryValue } from "./preparation-fixture.js";
@@ -26,6 +26,43 @@ const upstreamEra = new AsyncLocalStorage<string>();
 /** Scope a neighboring fixture without changing its default for other tests. */
 export function withHistoricalUpstream<T>(commit: string, fixture: () => T): T {
   return upstreamEra.run(commit, fixture);
+}
+
+/** Current fixture proposals use the exact accepted Discovery basis. */
+export function currentUpstreamFixtureValue(engine: ProductEngine, project: string, field: string, value: Json): Json {
+  if (field !== 'conceptSections' && field !== 'behaviorContracts') return value;
+  const discovery = engine.store.get<StageArtifact>(stageId(project, 'discovery'));
+  if (!discovery) return value;
+  const fields = (discovery.value.content as { fields: Record<string, Json> }).fields;
+  const catalogue = discoveryBasisCatalogue({ ref: reference(discovery), fields });
+  const rows = structuredClone(value) as Record<string, unknown>[];
+  if (field === 'conceptSections') {
+    for (const [sectionIndex, section] of rows.entries()) {
+      const requirements = section['requirements'] as Record<string, unknown>[];
+      for (const [requirementIndex, requirement] of requirements.entries()) {
+        requirement['applications'] = [catalogue.variant, ...catalogue.constraints].map(entry => ({
+          contract: 'basis-application/v1', basis: entry.address,
+          appliedAt: [`/${sectionIndex}/requirements/${requirementIndex}/${entry === catalogue.variant ? 'statement' : 'acceptance/0'}`],
+        }));
+      }
+    }
+  } else {
+    const concept = engine.store.get<StageArtifact>(stageId(project, 'concept'));
+    const sections = ((concept?.value.content as { fields?: Record<string, Json> } | undefined)?.fields?.['conceptSections'] ?? []) as Record<string, unknown>[];
+    const requirements = sections.flatMap(section => section['requirements'] as Record<string, unknown>[]);
+    for (const [index, contract] of rows.entries()) {
+      const selected = new Set(contract['requirements'] as string[]);
+      const basis = new Map<string, typeof catalogue.variant.address>();
+      for (const requirement of requirements.filter(row => selected.has(row['id'] as string)))
+        for (const application of requirement['applications'] as { basis: typeof catalogue.variant.address }[])
+          basis.set(JSON.stringify(application.basis), application.basis);
+      contract['applications'] = [...basis.values()].map(address => ({
+        contract: 'basis-application/v1', basis: address,
+        appliedAt: [address.pointer.includes('/verdict/') ? `/${index}/entry` : `/${index}/success/0`],
+      }));
+    }
+  }
+  return rows as Json;
 }
 
 export function preparedFeatures(engine: ProductEngine, project: string, graph: Graph = exampleGraph(project),
@@ -43,8 +80,9 @@ export function preparedFeatures(engine: ProductEngine, project: string, graph: 
       if (question.value.spec.kind === "fact") engine.discovery.fact(id, 1, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
       else {
         const field = question.value.spec.field;
-        const value = field === "mapDesign" ? designOf(graph) as unknown as Json : valueFor(field);
-        if (stage === 'discovery' && draft.value.contractVersion === 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
+        const value = currentUpstreamFixtureValue(engine, project, field,
+          field === "mapDesign" ? designOf(graph) as unknown as Json : valueFor(field));
+        if (stage === 'discovery' && (draft.value.contractVersion ?? 0) >= 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
           answerDiscoveryFixture(engine, project, engine.store.get<DiscoveryDraft>(draft.id)!, engine.store.get<Question>(id)!, value, source);
         else engine.discovery.decision(id, 1, "owner", value);
       }
@@ -90,7 +128,7 @@ function historicalFeatures(engine: ProductEngine, project: string, graph: Graph
   const repository = fileURLToPath(new URL('../../', import.meta.url));
   const root = mkdtempSync(join(tmpdir(), 'omg-upstream-era-'));
   const loader = join(root, 'loader.mjs'), producer = join(root, 'producer.mjs');
-  const values = Object.fromEntries([...new Set(Object.values(VERSION4_REQUIREMENTS).flat()
+  const values = Object.fromEntries([...new Set(Object.values(VERSION5_REQUIREMENTS).flat()
     .filter(spec => spec.kind !== 'fact' && spec.field !== 'mapDesign').map(spec => spec.field))]
     .map(field => [field, valueFor(field)]));
   try {

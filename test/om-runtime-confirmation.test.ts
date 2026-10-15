@@ -189,7 +189,7 @@ function b11ExactMomentChain(f: ReturnType<typeof fixture>, origin: 'unknowns' |
   assert.deepEqual(original, f.unaddressed); assert.deepEqual(addressed, f.input);
   assert.deepEqual(gaps, f.gaps); assert.deepEqual(ledger.handoff, f.ledger.handoff);
   const stage = origin === 'unknowns' ? 'discovery' : 'features';
-  assert.equal(original.value.input.sources.find(source => source.stage === stage)!.contractVersion, 5);
+  assert.equal(original.value.input.sources.find(source => source.stage === stage)!.contractVersion, 6);
   assert.equal(original.value.input.questions.length, moments.length);
   for (const [index, moment] of moments.entries()) {
     const question = original.value.input.questions.find(item => item.question === `Observe local runtime condition ${index}`)!;

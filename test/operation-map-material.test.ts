@@ -16,6 +16,7 @@ import { previewResearch } from '../src/discovery/research-preview.js';
 import type { Graph } from '../src/graph/model.js';
 import { designOf } from '../src/graph/builder.js';
 import { preparedField } from './preparation-fixture.js';
+import { currentUpstreamFixtureValue } from './product-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 
@@ -79,6 +80,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
     for (const stage of ['discovery', 'concept'] as const) {
       const draft = prepare(stage), result = await run(draft.id);
       assert.equal(result.status, 'accepted', JSON.stringify(result));
+      if (stage === 'discovery') writeFileSync(join(root, 'values.json'), JSON.stringify({ ...values,
+        conceptSections: currentUpstreamFixtureValue(engine, 'p', 'conceptSections', values['conceptSections']) }));
     }
     return prepare('operation-map');
   };
@@ -95,8 +98,11 @@ for (const external of [true, false]) test(`L1A real map shares exact material w
   assert.equal(result.status, 'accepted', JSON.stringify(result));
   assert.equal(draft.value.contractVersion, RESEARCH_CONTRACT_VERSION);
   assert.deepEqual(draft.value.questions.map(id => f.store.get<Question>(id)!.value.spec), REQUIREMENTS['operation-map']);
-  const expected = researchPrerequisites(f.store, draft.value), material = expected[0]!.operationMapMaterial!;
-  assert.equal(material.contract, 'operation-map-material/v1');
+  const acceptedDraft = f.store.get<DiscoveryDraft>(draft.id)!;
+  const expected = researchPrerequisites(f.store, acceptedDraft.value), material = expected[0]!.operationMapMaterial!;
+  assert.equal(material.contract, 'operation-map-material/v2');
+  const basis = (material as unknown as { basis: { requirements: { id: string; grounds: unknown[] }[] } }).basis;
+  assert.ok(basis.requirements.some(row => row.id === f.requirement && row.grounds.length > 0));
   assert.deepEqual(material.catalogue.outcomes.map(x => x.id), [f.outcome]);
   assert.deepEqual(material.catalogue.actors.map(x => x.id), [f.actor]);
   assert.deepEqual(material.catalogue.requirements.map(x => [x.id, x.outcome]), [[f.requirement, f.outcome]]);
@@ -112,10 +118,14 @@ for (const external of [true, false]) test(`L1A real map shares exact material w
   for (const field of ['operationRequirements', 'mapDesign']) for (const role of ['analyst', 'assessor']) {
     const pair = wires.filter(w => w.subject.question.field === field && w.subject.continuation.role === role);
     assert.equal(pair.length, role === 'analyst' ? 3 : 2);
-    assert.deepEqual(pair[0].subject.prerequisites, expected, `${role} ${field}: initial delivery`);
+    const delivered = structuredClone(expected);
+    const selected = delivered[0]!.operationMapMaterial as unknown as { basis: { coverage: unknown[]; blocks: unknown[] } };
+    if (field === 'operationRequirements') selected.basis.coverage = [];
+    if (field !== 'mapDesign' || role !== 'assessor') selected.basis.blocks = [];
+    assert.deepEqual(pair[0].subject.prerequisites, delivered, `${role} ${field}: initial delivery`);
     assert.equal(pair[1].subject.continuation.kind, 'continuation');
-    assert.deepEqual(addressed(f.store, pair[1].subject.continuation.foundation, '/body/prerequisites'), expected);
-    assert.deepEqual(addressed(f.store, pair[1].subject.continuation.current, '/body/prerequisites/0/operationMapMaterial'), material);
+    assert.deepEqual(addressed(f.store, pair[1].subject.continuation.foundation, '/body/prerequisites'), delivered);
+    assert.deepEqual(addressed(f.store, pair[1].subject.continuation.current, '/body/prerequisites/0/operationMapMaterial'), selected);
     assert.ok(pair[1].subject.continuation.foundationPointers.includes('/body/prerequisites'));
     for (const wire of pair) for (const section of wire.subject.working.sections)
       addressed(f.store, wire.subject.working.archive, section.pointer);
@@ -146,7 +156,8 @@ for (const role of ['analyst', 'assessor']) test(`L1A paid ${role} map request r
   assert.ok(hit); assert.notEqual(stopped.status, 'accepted');
   const before = f.wires(), roleCount = before.filter(w => w.subject.continuation.role === role).length;
   const archives = f.store.list('research-context'), db = f.open();
-  assert.equal((await f.run(draft.id, db)).status, 'accepted');
+  const resumed = await f.run(draft.id, db);
+  assert.equal(resumed.status, 'accepted', JSON.stringify(resumed));
   assert.equal(f.wires().filter(w => w.subject.continuation.role === role).length, roleCount, 'No replacement call for a paid reply');
   for (const row of archives) assert.deepEqual(db.get(row.id, row.revision), row, 'Saved request is never rebuilt');
   if (role === 'assessor') assert.equal(f.wires().length, before.length, 'Terminal B completes without any new call');

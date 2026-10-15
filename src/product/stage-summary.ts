@@ -4,7 +4,7 @@ import { discoveryConstraintBindings, discoveryContext, discoveryDecisionId, dis
   type DiscoveryChoice, type DiscoveryChoiceOption, type DiscoveryConditionDecision } from "../discovery/discovery-outcome.js";
 import { readAcceptedResearchAnswer, type Decision, type DiscoveryDraft, type Fact, type Question } from "../discovery/discovery.js";
 import { LEGACY_REQUIREMENTS, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS,
-  VERSION4_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
+  VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
 import type { ResearchAssessment, ResearchRun } from "../discovery/research-model.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Observation, Selector, Source } from "../evidence/evidence.js";
@@ -223,7 +223,8 @@ function candidateFailure(error: unknown, questions: Revision<Question>[]): Summ
 
 function requirements(version: number, stage: UpstreamStage) {
   return (version === 1 ? LEGACY_REQUIREMENTS : version === 2 ? VERSION2_REQUIREMENTS
-    : version === 3 ? VERSION3_REQUIREMENTS : version === 4 ? VERSION4_REQUIREMENTS : REQUIREMENTS)[stage];
+    : version === 3 ? VERSION3_REQUIREMENTS : version === 4 ? VERSION4_REQUIREMENTS
+    : version === 5 ? VERSION5_REQUIREMENTS : REQUIREMENTS)[stage];
 }
 
 function researchReportSummary(proofs: ExactProofReader, project: string, plan: FieldRead,
@@ -378,7 +379,7 @@ function readAccepted(store: Store, artifact: Revision<StageArtifact>, current: 
   const draft = proofs.require<DiscoveryDraft>(content.draft, "Discovery draft");
   const version = draft.value.contractVersion ?? 1;
   requireCondition(draft.kind === "discovery-draft" && draft.value.projectId === artifact.value.projectId
-    && draft.value.stage === "discovery" && draft.value.level === "R0" && [1, 2, 3, 4, 5].includes(version)
+    && draft.value.stage === "discovery" && draft.value.level === "R0" && [1, 2, 3, 4, 5, 6].includes(version)
     && same(draft.value.fields, content.fields), "stage_summary_draft_invalid",
   `[${draft.id}] The accepted Discovery draft is malformed, foreign or differs from the stage`);
   const expected = requirements(version, "discovery");
@@ -448,7 +449,7 @@ function candidateResearch(store: Store, project: string, draft: Revision<Discov
     verdict: SummaryResearchVerdict | null; failure: SummaryFailure | null } {
   let researchPlan: SummaryField | null = null, report: SummaryResearchReport | null = null;
   let verdict: SummaryResearchVerdict | null = null, failure: SummaryFailure | null = null;
-  if ((draft.value.contractVersion ?? 1) !== 5) return { researchPlan, report, verdict, failure };
+  if ((draft.value.contractVersion ?? 1) < 5) return { researchPlan, report, verdict, failure };
   const readable = (field: string): Revision<Question> | null => {
     const index = records.findIndex(question => question.value.spec.field === field);
     if (index < 0 || !records.slice(0, index + 1).every(question => question.value.status === "answered")) return null;
@@ -602,7 +603,7 @@ function readStructuredAccepted(store: Store, artifact: Revision<StageArtifact>,
   const consumer = STAGES[STAGES.indexOf(stage) + 1];
   requireCondition(draft.kind === "discovery-draft" && draft.value.projectId === artifact.value.projectId
     && draft.value.stage === stage && draft.value.level === "R0" && draft.value.consumer === consumer
-    && [1, 2, 3, 4, 5].includes(version) && same(draft.value.fields, content.fields)
+    && [1, 2, 3, 4, 5, 6].includes(version) && same(draft.value.fields, content.fields)
     && draft.value.inputs.some(ref => same(ref, input)), "stage_summary_draft_invalid",
   `[${draft.id}] The accepted ${stage} draft is malformed, foreign or differs from the stage`);
   const expected = requirements(version, stage), specs = draft.value.questions.map(id => proofs.head<Question>(id, `${stage} question`).value.spec);
@@ -716,7 +717,7 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
     }
   }
   const verdictQuestion = records.find(question => question.value.spec.field === "verdict");
-  if ((draft.value.contractVersion ?? 1) === 5 && verdictQuestion) {
+  if ((draft.value.contractVersion ?? 1) >= 5 && verdictQuestion) {
     const before = records.slice(0, records.indexOf(verdictQuestion));
     if (before.every(question => question.value.status === "answered")) {
       try {
@@ -773,7 +774,7 @@ function selectDiscoveryCandidate(store: Store, project: string, explicit: strin
   const entryRefs = currentEntryRefs(store, project);
   const valid = (draft: Revision<DiscoveryDraft> | null): draft is Revision<DiscoveryDraft> => Boolean(draft
     && draft.kind === "discovery-draft" && draft.value.projectId === project && draft.value.stage === "discovery"
-    && draft.value.level === "R0" && draft.value.consumer === "concept" && [4, 5].includes(draft.value.contractVersion ?? 1)
+    && draft.value.level === "R0" && draft.value.consumer === "concept" && [4, 5, 6].includes(draft.value.contractVersion ?? 1)
     && same(draft.value.inputs, entryRefs));
   if (explicit !== undefined) {
     const draft = store.get<DiscoveryDraft>(explicit);
@@ -853,7 +854,7 @@ function selectStructuredCandidate(store: Store, project: string, stage: Summary
   const consumer = STAGES[STAGES.indexOf(stage) + 1], prior = predecessor(stage), priorId = prior ? stageId(project, prior) : null;
   const valid = (draft: Revision<DiscoveryDraft> | null): draft is Revision<DiscoveryDraft> => Boolean(draft
     && draft.kind === "discovery-draft" && draft.value.projectId === project && draft.value.stage === stage
-    && draft.value.level === "R0" && draft.value.consumer === consumer && [1, 2, 3, 4, 5].includes(draft.value.contractVersion ?? 1)
+    && draft.value.level === "R0" && draft.value.consumer === consumer && [1, 2, 3, 4, 5, 6].includes(draft.value.contractVersion ?? 1)
     && priorId !== null && Array.isArray(draft.value.inputs)
     && draft.value.inputs.some(ref => isRef(ref) && ref.id === priorId));
   if (explicit !== undefined) {

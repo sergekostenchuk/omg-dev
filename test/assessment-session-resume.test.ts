@@ -2222,42 +2222,46 @@ test('DRY5FIX B a changed admission at the negative-result CAS cannot complete t
 
 
 import { preparedField as asm1Field } from './preparation-fixture.js';
-import { answerDiscoveryFixture } from './product-fixture.js';
+import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-fixture.js';
+import { UPSTREAM_STAGES } from '../src/discovery/requirements.js';
 import type { DiscoveryDraft as Asm1Draft } from '../src/discovery/discovery.js';
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from '../src/discovery/stage-neighbors.js';
+import { readDiscoveryBasisMaterial } from '../src/discovery/research-context.js';
 import { readResearchAssessmentAt as asm1ReadAssessment } from '../src/discovery/research-assessment.js';
 import { workingContext as asm1Working } from '../src/discovery/working-context.js';
 
 async function asm1Fixture(t: test.TestContext, stage: 'concept' | 'operation-map' | 'specification' | 'features' = 'concept',
   continuation = false) {
   const f = resumeFixture(t);
-  if (stage === 'operation-map') {
-    // L1A map packets bind the accepted Discovery/concept chain, including its catalogue.
-    for (const prior of ['discovery', 'concept'] as const) {
-      const upstream = f.engine.prepare('p', prior);
-      for (const id of upstream.value.questions) {
-        const question = f.store.get<Question>(id)!;
-        if (question.value.spec.kind === 'fact')
-          f.engine.discovery.fact(id, question.revision, reference(f.source), f.observation.selector);
-        else if (prior === 'discovery' && ['researchPlan', 'researchReport', 'verdict', 'preparation'].includes(question.value.spec.field))
-          answerDiscoveryFixture(f.engine, 'p', f.store.get<Asm1Draft>(upstream.id)!, question,
-            asm1Field('p', question.value.spec.field), f.source);
-        else f.engine.discovery.decision(id, question.revision, 'owner', asm1Field('p', question.value.spec.field));
-      }
-      const artifact = f.engine.draft('p', prior, upstream.id, 0);
-      f.engine.pipeline.accept('p', prior, artifact.revision);
+  const { designOf } = await import('../src/graph/builder.js');
+  const { exampleGraph } = await import('./graph-fixture.js');
+  const { enrichedGraph } = await import('./enriched-graph-fixture.js');
+  const graph = enrichedGraph(exampleGraph('p'), 'p');
+  f.engine.graphs.save('p', graph, 0, 'owner');
+  for (const prior of UPSTREAM_STAGES.slice(0, UPSTREAM_STAGES.indexOf(stage))) {
+    const upstream = f.engine.prepare('p', prior);
+    for (const id of upstream.value.questions) {
+      const question = f.store.get<Question>(id)!;
+      if (question.value.spec.kind === 'fact')
+        f.engine.discovery.fact(id, question.revision, reference(f.source), f.observation.selector);
+      else if (prior === 'discovery' && ['researchPlan', 'researchReport', 'verdict', 'preparation'].includes(question.value.spec.field))
+        answerDiscoveryFixture(f.engine, 'p', f.store.get<Asm1Draft>(upstream.id)!, question,
+          asm1Field('p', question.value.spec.field), f.source);
+      else f.engine.discovery.decision(id, question.revision, 'owner',
+        currentUpstreamFixtureValue(f.engine, 'p', question.value.spec.field,
+          question.value.spec.field === 'mapDesign' ? designOf(graph) as any : asm1Field('p', question.value.spec.field)));
     }
+    const artifact = f.engine.draft('p', prior, upstream.id, 0);
+    f.engine.pipeline.accept('p', prior, artifact.revision);
   }
-  const draft = stage === 'operation-map' ? f.engine.prepare('p', stage) : f.engine.discovery.forStage('p', stage, stage);
+  const draft = f.engine.prepare('p', stage);
   const questions = draft.value.questions.map(id => f.store.get<Question>(id)!);
   for (const q of questions.slice(0, -1)) f.engine.discovery.decision(q.id, q.revision, 'owner', asm1Field('p', q.value.spec.field));
   const selected = questions.at(-1)!;
-  let value = asm1Field('p', selected.value.spec.field);
+  let value = currentUpstreamFixtureValue(f.engine, 'p', selected.value.spec.field,
+    asm1Field('p', selected.value.spec.field));
   if (stage === 'operation-map') {
-    const { designOf } = await import('../src/graph/builder.js');
-    const { exampleGraph } = await import('./graph-fixture.js');
-    const { enrichedGraph } = await import('./enriched-graph-fixture.js');
-    value = designOf(enrichedGraph(exampleGraph('p'), 'p')) as any;
+    value = designOf(graph) as any;
   }
   const candidate = { action: 'answer' as const, question: selected.id, value,
     citations: [{ source: reference(f.source), selector: f.observation.selector }] };
@@ -2267,7 +2271,8 @@ appendFileSync(${JSON.stringify(join(f.root, 'wire.ndjson'))},JSON.stringify(r)+
 const research=s.role==='assess-answer'?${continuation ? "(!s.contextWorkspace.length?{action:'read_context',record:s.working.archive,pointer:'/body/stageNeighbors/fields/0/value'}:{verdict:'supported',reasons:[]})" : "{verdict:'supported',reasons:[]}"}:${JSON.stringify(candidate)};
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const current = f.store.get<Asm1Draft>(draft.id)!;
-  return { ...f, selected, current, candidate, neighbors: stageNeighbors(f.store, current, selected).context!,
+  return { ...f, selected, current, candidate, priorAssessments: f.store.list('research-assessment').length,
+    neighbors: stageNeighbors(f.store, current, selected).context!,
     run: (db = f.store) => new ProductEngine(db).researcher.run('p', draft.id, 1),
     direct: (db = f.store) => assessAnswer(db, selected, candidate, f.environment, f.workspace) };
 }
@@ -2338,7 +2343,7 @@ test('ASM1 B a native neighbor reopen in the publication window refuses a mixed 
   assert.ok(changed); assert.equal(result.value.status, 'paused');
   assert.equal(f.store.get<Question>(f.selected.id)!.value.status, 'open');
   assert.equal(f.store.list('research-assessment-binding').length, 0);
-  assert.equal(f.store.list('research-assessment').length, 0);
+  assert.equal(f.store.list('research-assessment').length, f.priorAssessments);
   const app = f.store.list<any>('assessment-application').at(-1)!;
   assert.equal(app.value.state, 'refused');
   assert.equal(app.value.refusal.kind, 'dependency');
@@ -2362,6 +2367,7 @@ test('ASM1 B/C packing preserves mandatory neighbors for initial and continuatio
   const f = await asm1Fixture(t);
   for (const role of ['assess-answer', 'assess-escalation']) {
     const body = { role, question: f.selected.value.spec, assessmentContextContract: STAGE_NEIGHBOR_CONTEXT,
+      discoveryBasisCatalogue: readDiscoveryBasisMaterial(f.store, f.current.value).catalogue,
       stageNeighbors: f.neighbors, request: { reason: 'Choose a private account' }, history: [] };
     const initial = asm1Working(f.store, 'p', f.current.id, f.selected.id, body, 100000, { common: true });
     const continued = asm1Working(f.store, 'p', f.current.id, f.selected.id, body, 100000,
@@ -2400,6 +2406,7 @@ async function asm1DirectV1(f: Awaited<ReturnType<typeof asm1Fixture>>) {
   const { researchPrerequisites, researchGraphContext } = await import('../src/discovery/research-context.js');
   const { consumerFeedback } = await import('../src/discovery/consumer-feedback.js');
   const context = { role: 'assess-answer', question: f.selected.value.spec, value: f.candidate.value, observations: [f.observation],
+    discoveryBasisCatalogue: readDiscoveryBasisMaterial(f.store, f.current.value).catalogue,
     prerequisites: researchPrerequisites(f.store, f.current.value), operationMap: researchGraphContext(f.store, f.current.value),
     consumerFeedback: consumerFeedback(f.store, f.current.value) };
   // The still-supported direct session producer takes this explicit unmarked material; no saved record is rewritten.
@@ -2426,9 +2433,10 @@ test(`ASM1 return direct B ${era}: a paid receipt keeps its original application
   assert.equal(applied.value.prompt, application.value.prompt);
   const later = await f.direct(f.fresh());
   if (era === 'unmarked') {
-    // ASM1.1 (№4791 §3 п.2, п.5): the recovered unmarked attempt keeps its earlier contract — no origin. The later current
-    // call is a new material on today's prefix, so it is a different, bound assessment, never the recovered one.
-    assert.equal(result.value.origin, undefined, 'The recovered attempt is not marked with a material it never saw');
+    // A current v6 direct attempt binds its Discovery catalogue even when the
+    // caller did not declare stage neighbors. Recovery never adds neighbors to that saved packet.
+    assert.equal(result.value.origin?.contract, DIRECT_ASSESSMENT_ORIGIN);
+    assert.equal(Object.hasOwn(applied.value.context, 'stageNeighbors'), false);
     assert.equal(later.value.origin?.contract, DIRECT_ASSESSMENT_ORIGIN);
     assert.notEqual(later.id, result.id);
   } else assert.deepEqual(later, result);
@@ -2465,7 +2473,7 @@ test('ASM1 return direct B keeps a paid neighbor context after native reopen and
   const refused = f.store.get<any>(app.id)!;
   assert.equal(refused.value.state, 'refused'); assert.equal(refused.value.refusal.kind, 'dependency');
   assert.deepEqual(refused.value.context, app.value.context); assert.equal(f.store.list('assessment-session').length, 1);
-  assert.equal(f.store.list('research-assessment').length, 0); callsOnce(f, 1);
+  assert.equal(f.store.list('research-assessment').length, f.priorAssessments); callsOnce(f, 1);
 });
 
 
@@ -2527,7 +2535,7 @@ test('ASM1 round3 a native neighbor change before returning an already applied d
   }) as typeof f.store.writeMany;
   await assert.rejects(f.direct(), { code: 'input_stale' }); f.store.writeMany = write;
   assert.ok(changed); callsOnce(f, 1);
-  assert.equal(f.store.list('research-assessment').length, 1);
+  assert.equal(f.store.list('research-assessment').length, f.priorAssessments + 1);
   assert.ok(f.store.list<any>('assessment-application').every(row => row.value.state === 'applied'));
 });
 
@@ -2590,7 +2598,7 @@ test('ASM1 round3 a native reopen during direct paid publication preserves the r
   assert.ok(changed); callsOnce(f, 1);
   const app = f.store.list<any>('assessment-application')[0]!;
   assert.equal(app.value.state, 'refused'); assert.equal(app.value.refusal.kind, 'dependency');
-  assert.equal(f.store.list('research-assessment').length, 0);
+  assert.equal(f.store.list('research-assessment').length, f.priorAssessments);
   assert.equal(f.store.list('model-response').length, 1);
 });
 

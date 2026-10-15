@@ -119,8 +119,17 @@ const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,controlPath=process.argv[
 appendFileSync(process.argv[3],JSON.stringify(r)+'\\n');
 const q=s.questions?.[0]??s.question,field=q.field,values=JSON.parse(readFileSync(process.argv[2],'utf8'));
 const source=(s.inventory?.sources??[]).find(x=>x.location==='values')??{ref:control.values};
+const value=boundDiscoveryValue(field,values[field],s.discoveryContext);
+if(field==='conceptSections'&&s.discoveryBasisCatalogue)
+ for(const [sectionIndex,section] of value.entries())for(const [requirementIndex,requirement] of section.requirements.entries())
+  requirement.applications=[s.discoveryBasisCatalogue.variant,...s.discoveryBasisCatalogue.constraints].map(entry=>({
+   contract:'basis-application/v1',basis:entry.address,appliedAt:['/'+sectionIndex+'/requirements/'+requirementIndex+'/'+
+    (entry===s.discoveryBasisCatalogue.variant?'statement':'acceptance/0')]}));
+if(field==='behaviorContracts'&&s.discoveryBasisCatalogue)
+ for(const [index,contract] of value.entries())contract.applications=[s.discoveryBasisCatalogue.variant,...s.discoveryBasisCatalogue.constraints].map(entry=>({
+  contract:'basis-application/v1',basis:entry.address,appliedAt:[entry===s.discoveryBasisCatalogue.variant?'/'+index+'/entry':'/'+index+'/success/0']}));
 let research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}:
-{action:'answer',question:q.id,value:boundDiscoveryValue(field,values[field],s.discoveryContext),citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+field}}]};
+{action:'answer',question:q.id,value,citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+field}}]};
 if(control.web===field&&s.role==='research'&&s.webResearch&&!control.fetched){
  control.fetched=true;writeFileSync(controlPath,JSON.stringify(control));
  research={action:'web_fetch',url:'https://example.org/tariff',purpose:'the tariff table'};

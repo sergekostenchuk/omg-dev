@@ -1,7 +1,7 @@
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
-import { UPSTREAM_STAGES, type UpstreamStage } from './requirements.js';
+import { RESEARCH_CONTRACT_VERSION } from './requirements.js';
 import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext } from "./research-limits.js";
@@ -109,10 +109,12 @@ export class Researcher {
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
     const early = earlyResearchStage(draft.value.stage);
-    const restoreOnly = options.restoreOnly === true || draft.value.contractVersion === 4 && UPSTREAM_STAGES.includes(draft.value.stage as UpstreamStage);
+    const formerEarlyContract = early && typeof draft.value.contractVersion === 'number'
+      && draft.value.contractVersion >= 4 && draft.value.contractVersion < RESEARCH_CONTRACT_VERSION;
+    const restoreOnly = options.restoreOnly === true || formerEarlyContract;
     requireCondition(!restoreOnly || early, 'research_restore_invalid', 'Restore-only applies only to early-stage paid work');
-    const restoreComplete = draft.value.contractVersion === 4
-      ? { code: 'research_contract_upgrade_required', message: `[${draftId}] Previous paid work is settled; prepare Discovery v5 before new work` }
+    const restoreComplete = formerEarlyContract
+      ? { code: 'research_contract_upgrade_required', message: `[${draftId}] Previous paid work is settled; prepare Discovery v${RESEARCH_CONTRACT_VERSION} before new work` }
       : { code: 'research_restore_complete', message: `[${draftId}] Saved paid work is settled; restoration cannot begin a new action` };
     const id = `research-run:${hashJson([project, draftId])}`;
     // №2000-8: the prologue's first duty is restoring a PROVEN paid terminal —

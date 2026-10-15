@@ -10,7 +10,7 @@ import { Evidence, type Source } from '../src/evidence/evidence.js';
 import { executeWebTurn } from '../src/discovery/web-research.js';
 import type { ResearchTurn } from '../src/discovery/research-model.js';
 import type { Environment } from '../src/runtime/environment.js';
-import { answerDiscoveryFixture } from './product-fixture.js';
+import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-fixture.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { canonical, type Json } from '../src/canonical.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -107,7 +107,8 @@ function upstream(f: ReturnType<typeof fixture>, source: Revision<Source>, value
       else if (stage === 'discovery' && ['researchPlan', 'researchReport', 'verdict', 'preparation'].includes(field))
         // Discovery v5 (DS1): researched answers whose assessment cites the genuine web snapshot.
         answerDiscoveryFixture(f.engine, f.project, f.store.get<DiscoveryDraft>(draft.id)!, f.store.get<Question>(id)!, valueFor(field), source);
-      else f.engine.discovery.decision(id, 1, 'owner', field === 'mapDesign' ? designOf(graph) as unknown as Json : valueFor(field));
+      else f.engine.discovery.decision(id, 1, 'owner', currentUpstreamFixtureValue(f.engine, f.project, field,
+        field === 'mapDesign' ? designOf(graph) as unknown as Json : valueFor(field)));
     }
     const artifact = f.engine.draft(f.project, stage, draft.id, 0);
     f.engine.pipeline.accept(f.project, stage, artifact.revision);

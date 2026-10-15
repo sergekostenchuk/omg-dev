@@ -5649,6 +5649,7 @@ test('DRY5FIX C concurrent resumes dispatch only one correction for the saved ne
 
 
 import { preparedField as asm1Prepared } from './preparation-fixture.js';
+import { answerDiscoveryFixture as asm1AnswerDiscovery, currentUpstreamFixtureValue } from './product-fixture.js';
 import { stageNeighbors as asm1Neighbors, STAGE_NEIGHBOR_CONTEXT as ASM1_CONTEXT } from '../src/discovery/stage-neighbors.js';
 import type { DiscoveryDraft as Asm1Draft } from '../src/discovery/discovery.js';
 
@@ -5671,7 +5672,19 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   const command = { executable: process.execPath, args: [adapter] };
   engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
     reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 10000 }, 0);
-  const draft = engine.discovery.forStage('p', 'concept', 'concept');
+  const discovery = engine.prepare('p', 'discovery');
+  for (const id of discovery.value.questions) {
+    const question = engine.store.get<Question>(id)!;
+    if (question.value.spec.kind === 'fact') engine.discovery.fact(id, question.revision, reference(source),
+      { kind: 'text-range', start: 0, end: source.value.content.length });
+    else if (['researchPlan', 'researchReport', 'verdict', 'preparation'].includes(question.value.spec.field))
+      asm1AnswerDiscovery(engine, 'p', engine.store.get<Asm1Draft>(discovery.id)!, question,
+        asm1Prepared('p', question.value.spec.field), source);
+    else engine.discovery.decision(id, question.revision, 'owner', asm1Prepared('p', question.value.spec.field));
+  }
+  const discoveryArtifact = engine.draft('p', 'discovery', discovery.id, 0);
+  engine.pipeline.accept('p', 'discovery', discoveryArtifact.revision);
+  const draft = engine.prepare('p', 'concept');
   for (const id of draft.value.questions.slice(0, -1)) {
     const q = engine.store.get<Question>(id)!;
     engine.discovery.decision(id, q.revision, 'owner', asm1Prepared('p', q.value.spec.field));
@@ -5752,7 +5765,8 @@ test('ASM1 round3 current C after native reopens receives new neighbor refs whil
   const other = f.open(), selectedBefore = other.store.get<Question>(f.chosen.id)!;
   // A completed C is an owner-choice gate, not a model answer. Close that gate
   // through the product before starting another current evaluation.
-  other.discovery.decision(selectedBefore.id, selectedBefore.revision, 'owner', asm1Prepared('p', selectedBefore.value.spec.field));
+  other.discovery.decision(selectedBefore.id, selectedBefore.revision, 'owner',
+    currentUpstreamFixtureValue(other, 'p', selectedBefore.value.spec.field, asm1Prepared('p', selectedBefore.value.spec.field)));
   assert.equal((await f.run(other)).value.status, 'completed');
   const q = other.store.get<Question>(f.neighbors.fields[0]!.question.id)!;
   const opened = other.discovery.reopen(q.id, q.revision);

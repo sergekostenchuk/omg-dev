@@ -41,6 +41,13 @@ else {const q=c.questions[0],source=c.inventory.sources.find(s=>s.location==='va
    {action:'read_source',source:source.ref,start:0,end:source.length};}
  else if(values.modelPause)research={action:'pause',reason:'Fixture model pause'};
  else {const value=boundDiscoveryValue(q.field,structuredClone(values[q.field]),c.discoveryContext);
+  if(q.field==='conceptSections'&&c.discoveryBasisCatalogue)
+   for(const [sectionIndex,section] of value.entries())for(const [requirementIndex,requirement] of section.requirements.entries())
+    requirement.applications=[c.discoveryBasisCatalogue.variant,...c.discoveryBasisCatalogue.constraints].map(entry=>({contract:'basis-application/v1',basis:entry.address,
+     appliedAt:['/'+sectionIndex+'/requirements/'+requirementIndex+'/'+(entry===c.discoveryBasisCatalogue.variant?'statement':'acceptance/0')]}));
+  if(q.field==='behaviorContracts'&&c.discoveryBasisCatalogue)
+   for(const [index,contract] of value.entries())contract.applications=[c.discoveryBasisCatalogue.variant,...c.discoveryBasisCatalogue.constraints].map(entry=>({
+    contract:'basis-application/v1',basis:entry.address,appliedAt:[entry===c.discoveryBasisCatalogue.variant?'/'+index+'/entry':'/'+index+'/success/0']}));
   if(q.field==='conceptSections'&&!c.consumerFeedback.length)value[0].requirements[0].outcome='invalid-outcome';
   if(q.field==='mapDesign'&&!c.consumerFeedback.length)value.nodes[0].outcome='missing-artifact';
   research={action:'answer',question:q.id,value,citations:[{source:source.ref,selector:{kind:'json-pointer',pointer:'/'+q.field}}]};}}
