@@ -1,14 +1,16 @@
 import { digest } from "../canonical.js";
 import { requireCondition } from "../errors.js";
 import { Store } from "./store.js";
+import { referenceSites } from "./reference-sites.js";
 
 /**
  * NR1 (№3633, №3635): the integrity check of a whole database, like git fsck. Reads are trusted (№3591): a record is read
  * as it was written and never checked again on the way. Damage that hashes and references can show is found here, by
  * one explicit scan outside every step of the pass: a body that is not the one its sha256 was written for, a revision or
- * event that is missing or out of order, a head that is not the last revision, and a reference {id, revision, hash} in a
- * body that names a revision the store does not hold or holds with another hash. It changes nothing; its cost is the
- * history, paid only when it is run.
+ * event that is missing or out of order, a head that is not the last revision, and every reference declared by a stored
+ * record contract that names a revision the store does not hold or holds with another hash. JSON evidence and model data
+ * remain data even when an object inside them resembles a reference. It changes nothing; its cost is the history, paid
+ * only when it is run.
  */
 export const INTEGRITY_FINDING_CODES = Object.freeze([
   "revision_corrupt", "revision_gap", "head_invalid", "event_missing", "event_duplicate", "event_order",
@@ -20,12 +22,6 @@ export interface IntegrityFinding {
   ref: { id: string; revision: number; hash: string } | null; message: string;
 }
 export interface IntegrityReport { lastSequence: number; revisions: number; events: number; references: number; findings: IntegrityFinding[] }
-
-const HASH = /^[a-f0-9]{64}$/;
-const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
-const isReference = (value: Record<string, unknown>): value is { id: string; revision: number; hash: string } =>
-  typeof value["id"] === "string" && Number.isSafeInteger(value["revision"]) && (value["revision"] as number) > 0
-  && typeof value["hash"] === "string" && HASH.test(value["hash"]);
 
 export function checkStoreIntegrity(store: Store): IntegrityReport {
   requireCondition(store instanceof Store, "integrity_request_invalid", "The integrity check reads a store");
@@ -68,26 +64,20 @@ function checkSnapshot(store: Store): IntegrityReport {
         found("event_missing", id, revision, "A stored revision has no event that made it");
     if (heads.get(id) !== line.length) found("head_invalid", id, heads.get(id) ?? null, `The head is not the last revision ${line.length}`);
   }
-  // Pass 2: every reference in every body names a revision the store holds with exactly that hash.
+  // Pass 2: every reference declared by the record's saved contract names exact stored bytes.
   let references = 0;
   for (const row of store.integrityRevisions()) {
     if (row.revision > (covered.get(row.id) ?? 0)) continue;
     let body: unknown;
     try { body = JSON.parse(row.body); } catch { continue; }
-    const visit = (value: unknown, path: string): void => {
-      if (Array.isArray(value)) { value.forEach((item, index) => visit(item, `${path}[${index}]`)); return; }
-      if (!object(value)) return;
-      if (isReference(value)) {
-        references++;
-        const target = hashes.get(value.id)?.[value.revision - 1];
-        if (target === undefined) found("reference_missing", row.id, row.revision, "A reference names a revision the store does not hold",
-          path, { id: value.id, revision: value.revision, hash: value.hash });
-        else if (target !== value.hash) found("reference_forged", row.id, row.revision, "A reference names a revision the store holds with another hash",
-          path, { id: value.id, revision: value.revision, hash: value.hash });
-      }
-      for (const [key, item] of Object.entries(value)) visit(item, path ? `${path}.${key}` : key);
-    };
-    visit(body, "");
+    for (const { field, ref } of referenceSites(row.kind, body)) {
+      references++;
+      const target = hashes.get(ref.id)?.[ref.revision - 1];
+      if (target === undefined) found("reference_missing", row.id, row.revision, "A reference names a revision the store does not hold",
+        field, ref);
+      else if (target !== ref.hash) found("reference_forged", row.id, row.revision, "A reference names a revision the store holds with another hash",
+        field, ref);
+    }
   }
   return { lastSequence, revisions, events: events.length, references, findings };
 }

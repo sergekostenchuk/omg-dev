@@ -8,6 +8,8 @@ import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { observeStore, Store, type Revision, type Write } from "../src/storage/store.js";
+import { checkStoreIntegrity } from "../src/storage/fsck.js";
+import { referenceSites } from "../src/storage/reference-sites.js";
 import { historicalProofCounters } from "../src/history/proofs.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
@@ -18,6 +20,7 @@ import type { Graph } from "../src/graph/model.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { git } from "../src/runtime/environment.js";
 import { Evidence } from "../src/evidence/evidence.js";
+import { assessAnswer } from "../src/discovery/research-assessment.js";
 import type { FrameRead, FrameRequest } from "../src/om/frame-obligations.js";
 import type { HorizonRecords } from "../src/om/horizon.js";
 import type { OmInputRecord } from "../src/om/input.js";
@@ -4921,6 +4924,50 @@ test("LP7 row 22 (run): the routes, packets, paid applied answer and close the b
 import { continuePass, startPass } from "../src/om/run-driver.js";
 import { configureDispatch } from "../src/om/dispatch.js";
 import { prepareRunBases as lp81PrepareRunBases } from "../src/om/run-bases.js";
+
+test("DRY6-03 public om-start: a real assessor read_context keeps reference-shaped JSON as data after restart", async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-dry6-03-run-")), database = join(root, "state.sqlite");
+  const workspace = join(root, "repo"), adapter = join(root, "adapter.mjs"), assessedProject = "assessment-json";
+  mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "fixture\n");
+  git(workspace, ["add", "."]); git(workspace, ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "base"]);
+  writeFileSync(adapter, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;const research=!s.contextWorkspace?.length?{action:'read_context',record:s.working.archive,pointer:'/body/observations/0/value'}:{verdict:'supported',reasons:[]};console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  let store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  engine.execute({ type: "create-project", project: assessedProject, title: "Reference-shaped JSON evidence" });
+  const command = { executable: process.execPath, args: [adapter] };
+  const environment = engine.environments.configure(assessedProject, { workspace,
+    implementer: { actor: "author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "assessor", model: "fixture", effort: "high", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10000 }, 0);
+  const fake = { id: "fixture-report", revision: 1, hash: "0".repeat(64) }, payload = { nested: [fake] };
+  const source = engine.discovery.evidence.document(assessedProject, "json", JSON.stringify({ payload }), "application/json", 0);
+  const draft = engine.discovery.create(assessedProject, "discovery", "R0", "compilation",
+    [{ field: "proposal", kind: "design", prompt: "Preserve JSON", risk: "Losing data", schema: { type: "object" } }]);
+  const question = store.get<any>(draft.value.questions[0]!)!;
+  const assessment = await assessAnswer(store, question,
+    { action: "answer", question: question.id, value: payload,
+      citations: [{ source: reference(source), selector: { kind: "json-pointer", pointer: "/payload" } }] },
+    environment, workspace);
+  assert.equal(assessment.value.verdict, "supported");
+  const session = store.list<any>("assessment-session").find(row => row.value.workspace?.entries?.length)!;
+  assert.ok(session, "The lawful assessor saved its requested original");
+  const sites = referenceSites(session.kind, session.value);
+  assert.equal(sites.some(site => site.ref.id === fake.id), false);
+  assert.ok(sites.some(site => site.field === "workspace.entries[0].result.record"));
+  assert.ok(sites.some(site => site.field === "binding.question" && site.ref.id === question.id));
+  assert.deepEqual(checkStoreIntegrity(store).findings, []);
+  const gateProject = "dry6-03-gate";
+  store.write({ id: `om-integrity:${gateProject}`, kind: "om-integrity", expected: 0,
+    value: { contract: "om-integrity/v1", project: gateProject, checkedAt: 1, lastSequence: 1,
+      revisions: 1, events: 1, references: 1, findings: [{ code: "reference_missing", id: session.id,
+        revision: session.revision, field: "workspace.entries[0].result.value.nested[0]", ref: fake,
+        message: "Old shape-only diagnostic" }] } });
+  store.close(); store = new Store(database); engine = new ProductEngine(store);
+  assert.deepEqual(checkStoreIntegrity(store).findings, []);
+  const result = await startPass(store, { project: gateProject });
+  assert.equal(refusal(result).code, "environment_missing", "om-start passed integrity and reached its next requirement");
+});
+
 const LP81_BASE_COMMIT = "ea207137a7e26a96792f12a3bffd8bc255df59f2";
 type Reopened = { phase: "reopened"; from: Ref; reasons: RunReason[]; ground: { step?: RunStep; wait?: RunWait; complete?: Ref[] } };
 const passRows = (store: Store) => store.history(runId(project)).map(row => (row.value as unknown as RunRecord).state.phase);

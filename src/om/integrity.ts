@@ -8,9 +8,11 @@ import { EngineError } from "../errors.js";
 /**
  * NR1 (№3633, №3646): om-fsck, as in git. During a pass every record is read as it was written (№3591): the engine is its
  * only writer. The whole check of the database — each body against its sha256, every line of revisions and events, every
- * head, every reference {id, revision, hash} in every body — runs by itself at each om-start and om-continue, and on
- * request. Damage found stops the pass before it starts, with the exact addresses (store_damaged, for the owner); the check
- * repairs nothing. Its cost is the history, paid once per start, never per step (2.3 s on the live copy of 5 276 revisions).
+ * head, every reference declared by each stored record contract — runs by itself at each om-start and om-continue, and on
+ * request. Arbitrary JSON remains data; an old diagnostic report can therefore describe a missing address without becoming
+ * a new broken link itself. Damage found stops the pass before it starts, with the exact addresses (store_damaged, for the
+ * owner); the check repairs nothing. Its cost is the history, paid once per start, never per step (2.3 s on the live copy of
+ * 5 276 revisions).
  */
 const UNIT = "NR1.fsck";
 export const INTEGRITY_KIND = "om-integrity";
