@@ -74,6 +74,7 @@ export type ProductCommand =
   | { type: "draft-stage"; project: string; stage: UpstreamStage; draftId: string; expected: number }
   | { type: "accept-stage"; project: string; stage: Stage; expected: number }
   | { type: "project"; project: string }
+  | { type: "stage-summary"; project: string; stage: Stage; draftId?: string }
   | { type: "export-stage"; project: string; stage: Stage };
 
 const string = { type: "string", minLength: 1, maxLength: 4000 };
@@ -125,6 +126,8 @@ earlyStageRun.properties['draftId'] = string;
 earlyStageRun.properties['outcomes'] = { type: "array", minItems: 1, items: text };
 earlyStageRun.properties['instruction'] = instruction;
 const reviseEarlyStageInput = command("revise-early-stage-input", { project, expected, instruction });
+const stageSummary = command("stage-summary", { project, stage });
+stageSummary.properties['draftId'] = string;
 const schema = { oneOf: [
   omStart, omContinue, command("om-state", { project }), command("om-spend", { project }), command("om-stop", { project }), command("om-fsck", { project }),
   command("om-decisions", { project }),
@@ -182,7 +185,7 @@ const schema = { oneOf: [
   command("refine-graph", { project, expected, draft: ref }),
   command("draft-stage", { project, stage: { enum: UPSTREAM_STAGES }, draftId: string, expected }),
   command("accept-stage", { project, stage, expected }),
-  command("project", { project }), command("export-stage", { project, stage }),
+  command("project", { project }), stageSummary, command("export-stage", { project, stage }),
 ] };
 const validate = new Ajv({ allErrors: true }).compile<ProductCommand>(schema);
 export function parseCommand(value: unknown): ProductCommand {

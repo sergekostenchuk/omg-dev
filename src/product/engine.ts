@@ -60,6 +60,7 @@ import { listOwnerQuestions, writeOwnerResult, type OwnerReaders } from "../om/o
 import { readOmInput } from "../om/input.js";
 import { readRoutes } from "../om/routes.js";
 import { RunControlGate, type RunControlHold } from "../om/run-control.js";
+import { renderStageSummary, stageSummary } from "./stage-summary.js";
 
 export type { Project, StageContent } from "./stage-checks.js";
 /** H2.0: the om readers the owner producer shares with the G4b gate — handed in so om/owner-result stays off the ring. */
@@ -230,7 +231,16 @@ export class ProductEngine {
     }
   }
   exportStage(project: string, stage: Stage): string {
-    this.#project(project); const projection = this.pipeline.inspect(project, stage);
+    this.#project(project);
+    if (stage === "discovery") {
+      const summary = stageSummary(this.store, project, stage);
+      const ref = summary.accepted?.artifact ?? summary.currentStage;
+      if (!ref) return renderStageSummary(summary);
+      const artifact = this.store.get<StageArtifact>(ref.id, ref.revision);
+      requireCondition(artifact?.hash === ref.hash, "artifact_missing", "The summarized stage artifact is unavailable");
+      return `${renderStageSummary(summary)}\n## Исходный JSON\n\n\`\`\`json\n${JSON.stringify(artifact.value.content, null, 2)}\n\`\`\`\n`;
+    }
+    const projection = this.pipeline.inspect(project, stage);
     requireCondition(projection.artifact, "artifact_missing", "Stage has no artifact yet");
     return `# ${stage}\n\nState: ${projection.state}\nRevision: ${projection.artifact.revision}\nSHA-256: ${projection.artifact.hash}\n\n\`\`\`json\n${JSON.stringify(projection.artifact.value.content, null, 2)}\n\`\`\`\n`;
   }
@@ -379,6 +389,7 @@ export class ProductEngine {
         return this.#production(command.project, guards, () => this.pipeline.accept(command.project, command.stage, command.expected, guards));
       }
       case "project": return this.projection(command.project);
+      case "stage-summary": this.#project(command.project); return stageSummary(this.store, command.project, command.stage, command.draftId);
       case "export-stage": return this.exportStage(command.project, command.stage);
     }
   }
