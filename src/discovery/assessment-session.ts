@@ -445,12 +445,75 @@ function changedDependency(store: Store, guards: TransactionGuard[]): { reason: 
   }
   return null;
 }
-function throwApplicationRefusal(record: Revision<Application>): never {
+function applicationRefusalCode(record: Revision<Application>): string {
   const reason = record.value.refusal;
-  const code = reason?.kind === 'response' && (reason.code === 'research_no_progress' || reason.code.startsWith('research_context_'))
+  return reason?.kind === 'response' && (reason.code === 'research_no_progress' || reason.code.startsWith('research_context_'))
     ? reason.code : 'research_context_application_refused';
-  throw new EngineError(code, `[${record.id}] Original assessment admission cannot be applied; reopen this question explicitly`,
+}
+function throwApplicationRefusal(record: Revision<Application>): never {
+  throw new EngineError(applicationRefusalCode(record), `[${record.id}] Original assessment admission cannot be applied; reopen this question explicitly`,
     { application: reference(record), refusal: record.value.refusal });
+}
+
+/**
+ * DRY6-01 (contract №4961 (b)): the exact recovery door of a refused original assessment, derived from the saved application
+ * alone — old ones included — by its readers; the refusal itself is thrown exactly as before. The address is the assessed question of the application's session binding, never the changed
+ * dependency; the command's CAS basis is that question's head now. What changed is named by its own record kind, so a Source
+ * or environment change is not presented as a neighbour. A technical recovery action, not an owner decision.
+ */
+export const ASSESSMENT_REFUSAL_DOOR = 'assessment-refusal-door/v1' as const;
+export interface AssessmentRefusalDoor {
+  contract: typeof ASSESSMENT_REFUSAL_DOOR; code: string; application: Ref; question: Ref; current: Ref;
+  changed: { expected: TransactionGuard; actual: Ref | null; kind: string | null } | null;
+  command: { type: 'reopen-question'; question: string; expected: number };
+}
+export function assessmentRefusalDoor(store: Store, saved: Revision<Application>): AssessmentRefusalDoor {
+  if (saved.kind !== 'assessment-application' || saved.value.state !== 'refused' || !saved.value.refusal)
+    throw new EngineError('assessment_refusal_door_invalid', `[${saved.id}] Only a refused assessment application names a recovery door`,
+      { application: reference(saved) });
+  // The common reader of the producer: identity, unchanged admission and the refusal proof — the door trusts nothing else.
+  const session = isRef(saved.value.session) ? store.get<ApplicationSession>(saved.value.session.id) : null;
+  if (!session || session.kind !== 'assessment-session') applicationInvalid(saved.id, 'The refused application lost its session');
+  const record = readApplication(store, session, reference(saved)), refusal = record.value.refusal!;
+  const binding = exact<ApplicationSession>(store, record.value.session, 'assessment-session').value.binding;
+  const current = binding && isRef(binding.question) && isRef(binding.draft) ? store.get<Question>(binding.question.id) : null;
+  if (!binding || !current || current.kind !== 'question' || current.value.projectId !== record.value.projectId
+    || current.value.draftId !== binding.draft.id)
+    throw new EngineError('assessment_refusal_door_invalid',
+      `[${record.id}] The refused assessment names no current question of its own draft to reopen`,
+      { application: reference(record), question: binding?.question ?? null });
+  return { contract: ASSESSMENT_REFUSAL_DOOR, code: applicationRefusalCode(record), application: reference(record),
+    question: binding.question, current: reference(current),
+    changed: refusal.kind === 'dependency' ? { expected: refusal.expected, actual: refusal.actual, kind: store.get(refusal.expected.id)?.kind ?? null } : null,
+    command: { type: 'reopen-question', question: current.id, expected: current.revision } };
+}
+/**
+ * DRY6-01: the door of a research run paused by the refused original assessment of one of its pending paid turns — the
+ * refusal the runner restores on every entry: the CURRENT application of the turn's exact paid session (a continuation
+ * after a lookup or a checkpoint has its own application; the origin names only the first), read by the common reader,
+ * or the barrier of the turn's question where one lawfully exists — matched to the run's own pause code. Read only; the
+ * run record keeps its form. Two distinct candidates are an addressed ambiguity.
+ */
+export function runAssessmentRefusalDoor(store: Store, projectId: string,
+  run: Revision<{ status: string; pauseCode?: string | null }>): AssessmentRefusalDoor | null {
+  if (run.value.status !== 'paused' || !run.value.pauseCode) return null;
+  const refused = new Map<string, Revision<Application>>();
+  for (const turn of store.list<{ run: string; status: string; question: Ref | null }>('research-turn')) {
+    if (turn.value.run !== run.id || turn.value.status !== 'pending') continue;
+    const origin = readAssessmentPaidOrigin(store, projectId, reference(turn));
+    const session = origin ? store.get<ApplicationSession>(origin.value.session) : null;
+    if (origin && (!session || session.kind !== 'assessment-session'))
+      applicationInvalid(origin.id, 'The paid assessor session of this turn is missing');
+    const barrier = isRef(turn.value.question) ? readBarrier(store, projectId, turn.value.question) : null;
+    for (const application of [session ? readApplication(store, session) : null,
+      barrier && !barrier.value.completion ? exact<Application>(store, barrier.value.refusal, 'assessment-application') : null])
+      if (application?.kind === 'assessment-application' && application.value.state === 'refused'
+        && applicationRefusalCode(application) === run.value.pauseCode) refused.set(application.id, application);
+  }
+  if (refused.size > 1) throw new EngineError('assessment_refusal_door_invalid', `[${run.id}] Several refused assessments claim this pause`,
+    { run: reference(run), applications: [...refused.values()].map(reference) });
+  const [only] = refused.values();
+  return only ? assessmentRefusalDoor(store, only) : null;
 }
 function barrierGuard(project: string, question: Ref): TransactionGuard {
   return { id: `assessment-barrier:${hashJson([project, question])}`, absent: true };

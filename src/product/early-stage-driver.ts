@@ -13,12 +13,14 @@ import { acquireRunExecution, admitRunControl, releaseRunExecution, RunControlGa
 import type { Refusal } from "../om/refusal.js";
 import type { Project, StageContent, ProductEngine } from "./engine.js";
 import type { StageResearchResult } from "./stage-research.js";
+import type { AssessmentRefusalDoor } from "../discovery/assessment-session.js";
 
 export type EarlyStageEnd = "stage_paused" | "needs_owner" | "conditional" | "no_go" | "insufficient_evidence"
   | "blocked" | "select_draft" | "stopped" | "busy" | "om_ready" | "om_complete" | "om_unable"
   | "om_waiting" | "om_stopped" | "om_busy" | "om_refused";
 
-export interface EarlyStageReason { code: string; target: string; message: string; field?: string }
+/** DRY6-01: a stage paused on a refused original assessment carries its exact machine door (reopen of the assessed question). */
+export interface EarlyStageReason { code: string; target: string; message: string; field?: string; door?: AssessmentRefusalDoor }
 export interface EarlyStageBudget {
   maxTurns: number; turnsUsed: number; turnsRemaining: number;
   maxCalls: number; callsMade: number; callsRemaining: number;
@@ -607,7 +609,8 @@ export class EarlyStageDriver {
       : result.status === "blocked" ? "blocked" : "stage_paused";
     const finding = result.reason;
     return { ...this.#base(project, end, stage, draft, [], result, finding
-      ? reason(finding.code, finding.target, finding.message, finding.field) : null), turnsUsed: result.turnsUsed ?? 0, handoff: false };
+      ? { ...reason(finding.code, finding.target, finding.message, finding.field), ...(finding.door ? { door: finding.door } : {}) } : null),
+      turnsUsed: result.turnsUsed ?? 0, handoff: false };
   }
 
   #controlOutcome(project: string, error: unknown, turnsUsed: number): EarlyResult {

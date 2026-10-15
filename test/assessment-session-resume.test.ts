@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { setTimeout as d83Delay } from 'node:timers/promises';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { assessmentSession, assessmentPacket } from '../src/discovery/assessment-session.js';
+import { assessmentSession, assessmentPacket, assessmentRefusalDoor } from '../src/discovery/assessment-session.js';
 import { readResearchExecution, readResearchResponse } from '../src/discovery/response-recovery.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { assessAnswer } from '../src/discovery/research-assessment.js';
@@ -2459,4 +2459,67 @@ test('ASM1 round3 a native reopen during direct paid publication preserves the r
   assert.equal(app.value.state, 'refused'); assert.equal(app.value.refusal.kind, 'dependency');
   assert.equal(f.store.list('research-assessment').length, 0);
   assert.equal(f.store.list('model-response').length, 1);
+});
+
+// DRY6-01 (contract №4961 (b)): the refused original assessment names the assessed question and its exact machine door.
+const DRY601_KIND = { 'reader-pilot': 'reader-pilot', 'execution-root': 'execution-root', environment: 'environment', question: 'question',
+  draft: 'discovery-draft', source: 'source' } as const;
+function dry601Refuse(f: ReturnType<typeof resumeFixture>, dependency: keyof typeof DRY601_KIND) {
+  const original = f.store.writeMany.bind(f.store); let injected = false;
+  f.store.writeMany = ((writes: Write[], guards = []) => {
+    if (!injected && writes.some(write => write.kind === 'assessment-session' && Boolean((write.value as any).result))) {
+      injected = true; const other = f.fresh();
+      if (dependency === 'reader-pilot') f.createPilot(other);
+      else if (dependency === 'execution-root') f.createRoot(other);
+      else {
+        const row = dependency === 'environment' ? f.environment : dependency === 'question' ? f.question : dependency === 'draft' ? f.draft : f.source;
+        other.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+      }
+    }
+    return original(writes, guards);
+  }) as typeof f.store.writeMany;
+  return () => { f.store.writeMany = original; assert.ok(injected, 'The dependency moved during the assessment'); };
+}
+const refusalOf = (promise: Promise<unknown>) => promise.then(() => assert.fail('The assessment must refuse'), (error: unknown) => {
+  assert.ok(error instanceof EngineError); return error; });
+
+for (const dependency of Object.keys(DRY601_KIND) as (keyof typeof DRY601_KIND)[])
+test(`DRY6-01 a ${dependency} changed during the assessment: the refusal names the assessed question and its exact reopen door, the change by its own kind; a restart repeats the same door without a call`, async t => {
+  const f = resumeFixture(t), restore = dry601Refuse(f, dependency);
+  const refused = await refusalOf(f.invoke()); restore();
+  assert.equal(refused.code, 'research_context_application_refused');
+  const app = f.store.list<any>('assessment-application')[0]!, head = f.store.get<Question>(f.question.id)!;
+  assert.deepEqual((refused.details as { application: unknown }).application, reference(app), 'The refusal itself is unchanged');
+  const door = assessmentRefusalDoor(f.store, app);
+  assert.deepEqual(door, { contract: 'assessment-refusal-door/v1', code: 'research_context_application_refused', application: reference(app),
+    question: reference(f.question), current: reference(head),
+    changed: { expected: app.value.refusal.expected, actual: app.value.refusal.actual, kind: DRY601_KIND[dependency] },
+    command: { type: 'reopen-question', question: f.question.id, expected: head.revision } });
+  const again = await refusalOf(f.invoke(f.fresh()));
+  assert.deepEqual((again.details as { application: unknown }).application, reference(app));
+  assert.deepEqual(assessmentRefusalDoor(f.fresh(), app), door, 'A restart derives the same door from the same saved application'); callsOnce(f, 1);
+});
+
+test('DRY6-01 the named command reopens the assessed question without reading any text and the next assessment is new; a concurrent reopen first is a CAS refusal that changes nothing', async t => {
+  const f = resumeFixture(t), restore = dry601Refuse(f, 'reader-pilot');
+  await refusalOf(f.ordinary()); restore();
+  const refused = f.store.list<any>('assessment-application')[0]!, door = assessmentRefusalDoor(f.store, refused);
+  const other = new ProductEngine(f.fresh());
+  other.execute({ type: 'reopen-question', question: f.question.id, expected: f.store.get<Question>(f.question.id)!.revision });
+  const moved = f.store.get<Question>(f.question.id)!;
+  assert.throws(() => new ProductEngine(f.fresh()).execute(door.command), (error: unknown) => error instanceof EngineError && error.code === 'question_stale');
+  assert.deepEqual(reference(f.store.get<Question>(f.question.id)!), reference(moved), 'The refused command changed nothing');
+  await refusalOf(f.ordinary(f.fresh()));
+  const current = assessmentRefusalDoor(f.fresh(), f.store.get<any>(refused.id)!);
+  assert.deepEqual(current.command, { type: 'reopen-question', question: f.question.id, expected: moved.revision }, 'The door follows the head');
+  new ProductEngine(f.fresh()).execute(current.command);
+  const q = f.store.get<Question>(f.question.id)!;
+  const assessment = await f.ordinary(f.fresh(), q); assert.equal(assessment.value.verdict, 'supported'); callsOnce(f, 2);
+});
+
+test('DRY6-01 an applied assessment has no recovery door: an addressed refusal', async t => {
+  const f = resumeFixture(t); assert.deepEqual(await f.invoke(), verdict);
+  const applied = f.store.list<any>('assessment-application')[0]!; assert.equal(applied.value.state, 'applied');
+  assert.throws(() => assessmentRefusalDoor(f.store, applied), (error: unknown) => error instanceof EngineError
+    && error.code === 'assessment_refusal_door_invalid' && JSON.stringify(error.details).includes(applied.id));
 });

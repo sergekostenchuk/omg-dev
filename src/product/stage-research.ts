@@ -8,6 +8,7 @@ import { researchForConsumer, designFindings } from "../discovery/consumer-resea
 import { requireCondition, EngineError } from "../errors.js";
 import { reference, stageId, type Finding, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { readRunControl, runControlId } from "../om/run-control.js";
+import { runAssessmentRefusalDoor, type AssessmentRefusalDoor } from "../discovery/assessment-session.js";
 import type { Revision } from "../storage/store.js";
 
 export interface StageResearchResult {
@@ -16,8 +17,10 @@ export interface StageResearchResult {
   stage: Ref | null; research: Ref | null; feedback: Ref | null; findings: Finding[];
   // Accepted stages from contracts before v5 replay the public result shape of
   // their producer. Current runs always report both fields.
-  turnsUsed?: number; reason?: Finding | null;
+  turnsUsed?: number; reason?: StageReason | null;
 }
+/** DRY6-01: a pause on a refused original assessment names the assessed question and its exact recovery door. */
+export type StageReason = Finding & { door?: AssessmentRefusalDoor };
 
 export interface StageResearchOptions { restoreOnly?: boolean }
 
@@ -122,8 +125,11 @@ export class StageResearch {
     }, artifact ? reference(artifact) : null);
     const { artifact: accepted, ...rest } = result;
     const research = rest.research ? store.get<ResearchRun>(rest.research.id, rest.research.revision) : null;
-    const findings = rest.findings.length || !research?.value.pauseCode ? rest.findings
-      : [{ code: research.value.pauseCode, target: draftId, message: research.value.error ?? 'Research paused' }];
+    const door = research && !rest.findings.length ? runAssessmentRefusalDoor(store, project, research) : null;
+    const paused: StageReason | null = rest.findings.length || !research?.value.pauseCode ? null : door
+      ? { code: research.value.pauseCode, target: door.question.id, message: research.value.error ?? 'Research paused', door }
+      : { code: research.value.pauseCode, target: draftId, message: research.value.error ?? 'Research paused' };
+    const findings: Finding[] = paused ? [paused] : rest.findings;
     const currentControl = readRunControl(store, { project });
     if (!currentControl.ok) throw new EngineError(currentControl.refusal.code, currentControl.refusal.message, currentControl.refusal.at);
     const status = rest.status !== 'accepted' && currentControl.value.stopped ? 'stopped' as const : rest.status;

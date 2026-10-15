@@ -1027,3 +1027,104 @@ test("DRV1 public stopped entry applies a saved web capture without HTTP or anot
   ["stopped", "run_stopped", "stopped", 0, calls, 1, "completed"]);
   assert.equal(reopened.get<any>("om-run-control:p")!.value.stop!.token, stop);
 });
+
+// DRY6-01 (contract №4961 (b)): during the assessor B of one concept question a second Store lawfully reopens its answered
+// neighbour; the adapter does it itself, so the change falls inside the real assessment of the public pass.
+const NEIGHBOR_ADAPTER = ADAPTER.replace("let research;", `let research;
+const order=process.argv[5]+'.neighbor';
+if(c.role==='assess-answer'&&existsSync(order)){const o=JSON.parse(readFileSync(order,'utf8'));
+ if(c.question?.field===o.at){(await import('node:fs')).rmSync(order);
+  const {Store}=await import(${JSON.stringify(new URL("../src/storage/store.js", import.meta.url).href)});
+  const {ProductEngine}=await import(${JSON.stringify(new URL("../src/product/engine.js", import.meta.url).href)});
+  const s=new Store(o.db);
+  try{const d=s.list('discovery-draft').filter(r=>r.value.projectId===o.project&&r.value.stage===o.stage).at(-1);
+   const q=d.value.questions.map(id=>s.get(id)).find(r=>r.value.spec.field===o.reopen);
+   new ProductEngine(s).execute({type:'reopen-question',question:q.id,expected:q.revision});}
+  finally{s.close();}}}`);
+
+test("DRY6-01 a lawful neighbour reopen during B pauses the public pass with the exact machine door; a restart repeats it without a call; another project keeps its own door; the named command continues the same draft", async t => {
+  const f = fixture(t);
+  writeFileSync(join(f.root, "adapter.mjs"), NEIGHBOR_ADAPTER);
+  const pause = async (project: string) => {
+    const { trace, earlyHold } = f.setup(project);
+    writeFileSync(`${earlyHold}.neighbor`, JSON.stringify({ db: f.database, project, stage: "concept", at: "outcome", reopen: "audience" }));
+    const result = await f.engine.execute({ type: "early-stage-run", project, maxTurns: 100, maxCalls: 100,
+      instruction: instruction(project) }) as EarlyStageOutcome;
+    const drafts = f.store.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.projectId === project && row.value.stage === "concept");
+    assert.equal(drafts.length, 1);
+    const byField = (field: string) => drafts[0]!.value.questions.map(id => f.store.get<Question>(id)!).find(q => q.value.spec.field === field)!;
+    return { result, trace, outcome: byField("outcome"), audience: byField("audience"), draft: drafts[0]! };
+  };
+  const p = await pause("p"), door = p.result.reason!.door!;
+  assert.deepEqual([p.result.end, p.result.stage, p.result.reason?.code, p.result.reason?.target],
+    ["stage_paused", "concept", "research_context_application_refused", p.outcome.id], "The address is the assessed question, not the neighbour");
+  assert.deepEqual([door.question.id, door.current, door.changed?.kind, door.changed?.expected.id, door.command],
+    [p.outcome.id, reference(p.outcome), "question", p.audience.id, { type: "reopen-question", question: p.outcome.id, expected: p.outcome.revision }]);
+  assert.deepEqual(p.result.stageResult?.reason?.door, door, "StageResearch delivers the door the driver reports");
+  const application = f.store.get<{ state: string }>(door.application.id)!;
+  assert.equal(application.value.state, "refused");
+
+  const calls = f.calls(p.trace).length;
+  const restarted = new Store(f.database); t.after(() => restarted.close());
+  const again = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.deepEqual([again.end, again.reason, again.budget.callsMade, f.calls(p.trace).length], [p.result.end, p.result.reason, 0, calls],
+    "An unchanged repeat pays nothing and names the same door");
+
+  const q = await pause("q"), other = q.result.reason!.door!;
+  assert.deepEqual([other.question.id, other.command.question], [q.outcome.id, q.outcome.id]);
+  assert.notEqual(other.application.id, door.application.id);
+  const repeat = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.deepEqual(repeat.reason?.door, door, "Each project keeps its own door");
+
+  new ProductEngine(restarted).execute(door.command);
+  const next = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 6 }) as EarlyStageOutcome;
+  assert.ok(f.calls(p.trace).length > calls, "The reopened questions are researched again");
+  assert.notEqual(next.reason?.code, "research_context_application_refused", JSON.stringify(next.reason));
+  assert.equal(restarted.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.projectId === "p" && row.value.stage === "concept").length, 1,
+    "The same draft continues");
+  assert.equal(restarted.get<{ state: string }>(door.application.id)!.value.state, "refused", "The old supported verdict is never applied");
+});
+
+test("DRY6-01 return 1: a refusal of B's continuation after a completed lookup, before its next send, carries the exact public door; a restart repeats it without a call; the command continues the same draft", async t => {
+  const f = fixture(t), { trace } = f.setup("p");
+  writeFileSync(join(f.root, "adapter.mjs"), ADAPTER.replace(
+    "if(c.role==='assess-answer')research={verdict:'supported',reasons:[]};",
+    "if(c.role==='assess-answer')research=c.question?.field==='outcome'&&!c.contextWorkspace?.length?{action:'read_context',record:c.working.archive,pointer:'/body/stageNeighbors/fields/0/value'}:{verdict:'supported',reasons:[]};"));
+  const original = f.store.writeMany.bind(f.store); let injected = false;
+  f.store.writeMany = function<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] {
+    const saved = original<T>(writes, guards);
+    const session = writes.find(write => write.kind === "assessment-session" && (write.value as any).workspace?.entries?.length);
+    if (!injected && session) {
+      const binding = (session.value as any).binding;
+      const question = f.store.get<Question>(binding.question.id)!, draft = f.store.get<DiscoveryDraft>(binding.draft.id)!;
+      if (question.value.spec.field === "outcome" && draft.value.stage === "concept") {
+        injected = true; const other = new Store(f.database);
+        try {
+          const audience = draft.value.questions.map(id => other.get<Question>(id)!).find(q => q.value.spec.field === "audience")!;
+          new ProductEngine(other).execute({ type: "reopen-question", question: audience.id, expected: audience.revision });
+        } finally { other.close(); }
+      }
+    }
+    return saved;
+  };
+  let result: EarlyStageOutcome;
+  try { result = await f.engine.execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100, instruction: instruction("p") }) as EarlyStageOutcome; }
+  finally { f.store.writeMany = original; }
+  assert.ok(injected, "The neighbour moved between the lookup and the next B send");
+  const refused = f.store.list<any>("assessment-application").filter(row => row.value.state === "refused");
+  assert.equal(refused.length, 1);
+  assert.equal(refused[0]!.value.received, null, "The continuation was refused before any send");
+  const { assessmentRefusalDoor } = await import("../src/discovery/assessment-session.js");
+  const direct = assessmentRefusalDoor(f.store, refused[0]!);
+  const outcome = f.store.get<Question>(direct.question.id)!;
+  assert.equal(outcome.value.spec.field, "outcome");
+  assert.deepEqual([result.reason?.code, result.reason?.target, result.reason?.door], ["research_context_application_refused", outcome.id, direct]);
+  const count = f.calls(trace).length, restarted = new Store(f.database); t.after(() => restarted.close());
+  const repeat = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  assert.deepEqual([repeat.reason?.door, f.calls(trace).length], [direct, count], "The same door, no call");
+  new ProductEngine(restarted).execute(direct.command);
+  const next = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 6 }) as EarlyStageOutcome;
+  assert.ok(f.calls(trace).length > count);
+  assert.notEqual(next.reason?.code, "research_context_application_refused", JSON.stringify(next.reason));
+  assert.equal(restarted.list<DiscoveryDraft>("discovery-draft").filter(row => row.value.stage === "concept").length, 1, "The same draft continues");
+});
