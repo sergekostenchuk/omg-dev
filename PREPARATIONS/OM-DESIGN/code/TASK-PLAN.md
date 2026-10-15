@@ -2517,7 +2517,7 @@
 - Отдаёт: —
 - Читает записи: implements/conceptCoverage карты, behaviorContracts фичи, каталог
 - Пишет записи: выведенное наследование оснований L1 и фич в материале A/B
-- Разрешённые пути: `src/discovery/research-context.ts`, `src/discovery/preparation-validation.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `test/research-call-resume.test.ts`, `test/assessment-session-resume.test.ts`, `test/basis-inheritance.test.ts`
+- Разрешённые пути: `src/discovery/research-context.ts`, `src/discovery/preparation-validation.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `test/research-call-resume.test.ts`, `test/assessment-session-resume.test.ts`, `test/basis-inheritance.test.ts`, `src/discovery/research-assessment.ts`
 - Из движка как есть: №4862; №4870
 - После: DS1.2s, DS1.2c, UNK1, DS1.2m, DRY6-02
 - Тесты сверх обязательных:
