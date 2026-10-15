@@ -1,5 +1,6 @@
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
-import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
+import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections,
+  requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from './requirements.js';
 import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
@@ -609,7 +610,7 @@ export class Researcher {
         const workspace=addressedWorkspace(this.store,turns,pending[0]!);
         const related = forcedPendingTurn ? { context: null, guards: [] }
           : discoveryContext(this.store, draft, pending[0]!);
-        const conceptMaterial = draft.value.contractVersion === 6 && draft.value.stage === 'concept'
+        const conceptMaterial = draft.value.contractVersion === 6 && ['concept', 'specification'].includes(draft.value.stage)
           ? readDiscoveryBasisMaterial(this.store, draft.value) : null;
         const context = pilot ? { ...pilotContext(this.store, draft, pending[0]!),
           ...(mode ? { dispatchMode: mode, repositoryRoot: effective.root } : {}),
@@ -649,7 +650,8 @@ export class Researcher {
             : failedProducer ? earlyResearchFailure(failedDraft!.value, failedQuestion!.value,
               'analyst', failedTurn!.value.action, failedProducer.value.cursor.context?.discoveryContext ?? null,
               intentWebCapability(this.store, failedProducer), earlyUnknownAdmission(this.store, failedProducer, failedDraft!, failedQuestion!),
-              failedProducer.value.cursor.context?.discoveryBasisCatalogue ?? null) : null;
+              failedProducer.value.cursor.context?.discoveryBasisCatalogue ?? null,
+              deliveredConceptSections(failedProducer.value.cursor.context, failedDraft!.value)) : null;
           // WB1 (№4639): the cause follows the failed call; the actions offered follow the dispatch of this new call.
           if (failure) Object.assign(context, { failures: [earlyResearchCorrection('analyst', failure,
             reference(failedIntent ?? failedTurn!), pending[0]!.value, webResearchCapability(draft.value.stage, 'analyst', dispatch), !mode)] });
@@ -844,7 +846,8 @@ export class Researcher {
             const admission = earlyUnknownAdmission(this.store, producer, originalDraft, originalQuestion);
             const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action,
               producer.value.cursor.context?.discoveryContext ?? null, web, admission,
-              producer.value.cursor.context?.discoveryBasisCatalogue ?? null);
+              producer.value.cursor.context?.discoveryBasisCatalogue ?? null,
+              deliveredConceptSections(producer.value.cursor.context, originalDraft.value));
             if (failure) {
               const value = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn,
                 { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer, ...(web ? { web: true } : {}),
@@ -1063,6 +1066,8 @@ export class Researcher {
               const escalationContext = { role: "assess-escalation", question: question.value.spec,
                 request: action, inventory: sources.inventory(), history,
                 ...(conceptMaterial ? { discoveryBasisCatalogue: conceptMaterial.catalogue } : {}),
+                ...(draft.value.contractVersion === 6 && draft.value.stage === 'specification'
+                  ? { prerequisites: researchPrerequisites(this.store, draft.value) } : {}),
                 ...(neighborView ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: neighbors.context } : {}) };
               if (early) {
                 const prior = [...intents].sort((a, b) => b.value.generation - a.value.generation).find(item => item.value.kind === 'escalation-assessor'

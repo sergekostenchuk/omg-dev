@@ -1,13 +1,15 @@
-import type { Json } from "../canonical.js";
+import { canonical, type Json } from "../canonical.js";
 import { isRef, type Finding, type Stage } from "../pipeline/contracts.js";
 import { EngineError } from '../errors.js';
-import { resolveBasisApplications, type BasisApplicationOwner } from './basis-application.js';
+import { resolveBasisApplications, type BasisAddress, type BasisApplicationOwner } from './basis-application.js';
 import type { DiscoveryBasisCatalogue } from './discovery-outcome.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 
 type Row = Record<string, any>;
 export const requiresConceptApplications = (draft: DiscoveryDraft, question: Question): boolean =>
   draft.contractVersion === 6 && draft.stage === 'concept' && question.spec.field === 'conceptSections';
+export const requiresSpecificationApplications = (draft: DiscoveryDraft, question: Question): boolean =>
+  draft.contractVersion === 6 && draft.stage === 'specification' && question.spec.field === 'behaviorContracts';
 /** The catalogue is the exact accepted Discovery material supplied by the caller.
  * The same pure check is used before assessment and at stage admission. */
 export function conceptApplicationFindings(value: Json, catalogue: DiscoveryBasisCatalogue): Finding[] {
@@ -40,6 +42,53 @@ export function conceptApplicationFindings(value: Json, catalogue: DiscoveryBasi
     const details = error.details as { pointer?: unknown } | undefined;
     const pointer = typeof details?.pointer === 'string' ? details.pointer : '';
     return [finding(error.code, `/conceptSections${pointer}`, error.message)];
+  }
+}
+
+/** A contract inherits exactly the grounds of the accepted requirements it names. */
+export function specificationApplicationFindings(value: Json, concept: Json, catalogue: DiscoveryBasisCatalogue): Finding[] {
+  const finding = (code: string, target: string, message: string): Finding =>
+    ({ code, target, field: 'behaviorContracts', message });
+  if (!Array.isArray(value)) return [finding('basis_application_invalid', '/behaviorContracts',
+    'Behavior contracts need an explicit list')];
+  const conceptFinding = conceptApplicationFindings(concept, catalogue)[0];
+  if (conceptFinding) return [finding('basis_application_material_invalid', '/behaviorContracts',
+    `The accepted concept grounds are invalid: ${conceptFinding.message}`)];
+  const requirements = new Map<string, BasisAddress[]>();
+  for (const section of concept as Record<string, unknown>[]) {
+    for (const requirement of section['requirements'] as Record<string, unknown>[]) {
+      const id = requirement['id'];
+      if (typeof id !== 'string' || !id || requirements.has(id)) return [finding('basis_application_material_invalid',
+        '/behaviorContracts', 'Accepted concept requirements need distinct nonempty identifiers')];
+      requirements.set(id, (requirement['applications'] as { basis: BasisAddress }[]).map(row => row.basis));
+    }
+  }
+  const owners: BasisApplicationOwner[] = [];
+  for (const [index, contract] of value.entries()) {
+    const refs = contract && typeof contract === 'object' && !Array.isArray(contract)
+      ? (contract as Record<string, unknown>)['requirements'] : null;
+    if (!Array.isArray(refs) || !refs.length || refs.some(id => typeof id !== 'string' || !requirements.has(id)))
+      return [finding('basis_application_invalid', `/behaviorContracts/${index}/requirements`,
+        'Each behavior contract must name accepted concept requirements')];
+    const inherited = new Map<string, BasisAddress>();
+    for (const id of refs as string[]) for (const address of requirements.get(id)!) inherited.set(canonical(address), address);
+    owners.push({ pointer: `/${index}`,
+      fields: ['entry', 'inputs', 'success', 'failures', 'forbiddenEffects', 'state', 'compatibility', 'proof'],
+      required: [...inherited.values()] });
+  }
+  try {
+    const resolved = resolveBasisApplications({ field: 'behaviorContracts', value,
+      catalogue: [...catalogue.constraints, catalogue.variant], owners, required: [] });
+    for (const row of resolved) for (const target of row.targets)
+      if (Array.isArray(target.value) && target.value.length === 0)
+        return [finding('basis_application_invalid', `/behaviorContracts${target.pointer}`,
+          'An empty behavior list does not apply an inherited ground')];
+    return [];
+  } catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    const details = error.details as { pointer?: unknown } | undefined;
+    const pointer = typeof details?.pointer === 'string' ? details.pointer : '';
+    return [finding(error.code, `/behaviorContracts${pointer}`, error.message)];
   }
 }
 

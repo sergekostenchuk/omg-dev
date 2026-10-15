@@ -3,7 +3,7 @@ import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEGACY_REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
 import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../discovery/preparation-contracts.js";
-import { conceptApplicationFindings, preparationFindings } from "../discovery/preparation-validation.js";
+import { conceptApplicationFindings, preparationFindings, specificationApplicationFindings } from "../discovery/preparation-validation.js";
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 import { readAcceptedResearchAnswer } from "../discovery/discovery.js";
 import { buildL1 } from "../graph/builder.js";
@@ -529,6 +529,20 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
       if (applications.length) return refuse('stage_not_accepted',
         `${applications[0]!.code}: ${applications[0]!.message}`,
         at(result.concept.ref.id, applications[0]!.target.slice(1), result.concept.ref), 'producer');
+    } catch (error) {
+      if (!(error instanceof EngineError)) throw error;
+      return refuse('stage_not_accepted', `${error.code}: ${error.message}`,
+        at(result.discovery.ref.id, 'content.fields', result.discovery.ref), 'producer');
+    }
+  }
+  if (result.specification.contractVersion === 6) {
+    try {
+      const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
+      const applications = specificationApplicationFindings(result.specification.fields['behaviorContracts'] ?? null,
+        result.concept.fields['conceptSections'] ?? null, catalogue);
+      if (applications.length) return refuse('stage_not_accepted',
+        `${applications[0]!.code}: ${applications[0]!.message}`,
+        at(result.specification.ref.id, applications[0]!.target.slice(1), result.specification.ref), 'producer');
     } catch (error) {
       if (!(error instanceof EngineError)) throw error;
       return refuse('stage_not_accepted', `${error.code}: ${error.message}`,

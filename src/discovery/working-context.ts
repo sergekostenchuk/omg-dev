@@ -4,7 +4,7 @@ import { FOUNDATION_FIELDS, contextSections, selectedQuestion, replaceFoundation
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
-import { isRef, reference, type Ref } from "../pipeline/contracts.js";
+import { isRef, reference, stageId, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { planningContext } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
@@ -57,12 +57,18 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
-  if (draft.value.contractVersion === 6 && draft.value.stage === 'concept') requireCondition(
+  if (draft.value.contractVersion === 6 && ['concept', 'specification'].includes(draft.value.stage)) requireCondition(
     body['discoveryBasisCatalogue']?.contract === 'discovery-basis-catalogue/v1'
       && isRef(body['discoveryBasisCatalogue'].source)
       && Array.isArray(body['discoveryBasisCatalogue'].constraints)
       && body['discoveryBasisCatalogue'].variant !== undefined,
-    'context_discovery_incomplete', `[${question.id}] Concept v6 needs the exact accepted Discovery basis catalogue`);
+    'context_discovery_incomplete', `[${question.id}] ${draft.value.stage} v6 needs the exact accepted Discovery basis catalogue`);
+  if (draft.value.contractVersion === 6 && draft.value.stage === 'specification') requireCondition(
+    draft.value.inputs.filter(ref => ref.id === stageId(projectId, 'concept')).length === 1
+      && Array.isArray(body['prerequisites']) && body['prerequisites'].filter((row: any) => row?.stage === 'concept'
+        && isRef(row?.ref) && draft.value.inputs.some(ref => canonical(ref) === canonical(row.ref))
+        && Array.isArray(row?.fields?.conceptSections)).length === 1,
+    'context_discovery_incomplete', `[${question.id}] Specification v6 needs its exact accepted concept requirements`);
   const priorSources=priorEvidenceSources(body['priorEvidence']??[]);
   if(priorSources.length)body['priorEvidenceSources']=priorSources;
   const inventory = body['inventory'] as any;

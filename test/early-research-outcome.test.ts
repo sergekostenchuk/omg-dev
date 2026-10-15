@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { earlyResearchFailure, requireAssessmentReply } from '../src/discovery/early-research-outcome.js';
+import { deliveredConceptSections, earlyResearchFailure, requireAssessmentReply } from '../src/discovery/early-research-outcome.js';
 import { discoveryBasisCatalogue } from '../src/discovery/discovery-outcome.js';
 import { conceptApplicationsSchema } from '../src/discovery/preparation-contracts.js';
+import { VERSION6_REQUIREMENTS } from '../src/discovery/requirements.js';
+import { preparedField } from './preparation-fixture.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 
 const draft = { projectId: 'p', stage: 'discovery', questions: ['q'] } as DiscoveryDraft;
@@ -76,4 +78,45 @@ test('DS1.2c a malformed v6 concept application is a correctable answer error on
   assert.throws(() => classify(valid, null), { code: 'basis_application_material_invalid' });
   assert.equal(earlyResearchFailure({ ...conceptDraft, contractVersion: 5 }, conceptQuestion, 'analyst',
     { action: 'answer', question: 'q', value: valid, citations: answer.citations }), null);
+});
+
+test('DS1.2s the original v6 specification cursor classifies missing or foreign grounds as a completed proposal refusal', () => {
+  const catalogue = discoveryBasisCatalogue({ ref: { id: 'stage:p:discovery', revision: 1, hash: 'c'.repeat(64) }, fields: {
+    preparation: { constraints: [{ id: 'offline', rule: 'Read saved results offline', basis: 'accepted report' }] },
+    verdict: { outcome: 'go', variant: 'A local route' },
+  } });
+  const apply = (basis: typeof catalogue.variant.address, appliedAt: string) =>
+    ({ contract: 'basis-application/v1', basis, appliedAt: [appliedAt] });
+  const concept = [{ id: 'journey', requirements: [{ id: 'p-R1', statement: 'Provide a local route', benefit: 'Use results',
+    beneficiary: 'p-user', outcome: 'p-result', acceptance: ['Read saved results offline'], applications: [
+      apply(catalogue.variant.address, '/0/requirements/0/statement'),
+      apply(catalogue.constraints[0]!.address, '/0/requirements/0/acceptance/0'),
+    ] }] }];
+  const conceptRef = { id: 'stage:p:concept', revision: 1, hash: 'd'.repeat(64) };
+  const specification = { ...draft, stage: 'specification', contractVersion: 6,
+    inputs: [conceptRef] } as DiscoveryDraft;
+  const specQuestion = { ...question, stage: 'specification', spec: VERSION6_REQUIREMENTS.specification.find(row =>
+    row.field === 'behaviorContracts')! } as Question;
+  const rows = structuredClone(preparedField('p', 'behaviorContracts')) as any[];
+  rows[0].applications = [apply(catalogue.variant.address, '/0/entry'),
+    apply(catalogue.constraints[0]!.address, '/0/success/0')];
+  const cursor = { discoveryBasisCatalogue: catalogue,
+    prerequisites: [{ ref: conceptRef, stage: 'concept', fields: { conceptSections: concept } }] };
+  const classify = (value: unknown, delivered = cursor) => earlyResearchFailure(specification, specQuestion,
+    'analyst', { action: 'answer', question: 'q', value, citations: answer.citations }, null, false, null,
+    delivered.discoveryBasisCatalogue, deliveredConceptSections(delivered, specification));
+  assert.equal(classify(rows), null);
+  const missing = structuredClone(rows);
+  missing[0].applications.pop();
+  assert.equal(classify(missing)?.code, 'basis_application_missing');
+  const foreign = structuredClone(rows);
+  foreign[0].applications[0].basis.pointer = '/content/fields/verdict/outcome';
+  assert.equal(classify(foreign)?.code, 'basis_application_invalid');
+  assert.equal(deliveredConceptSections({ ...cursor, prerequisites: [{ ...cursor.prerequisites[0],
+    ref: { ...conceptRef, id: 'stage:other:concept' } }] }, specification), null);
+  assert.throws(() => earlyResearchFailure(specification, specQuestion, 'analyst',
+    { action: 'answer', question: 'q', value: rows, citations: answer.citations }, null, false, null, catalogue, null),
+  { code: 'basis_application_material_invalid' });
+  assert.equal(earlyResearchFailure({ ...specification, contractVersion: 5 }, specQuestion, 'analyst',
+    { action: 'answer', question: 'q', value: rows, citations: answer.citations }), null);
 });

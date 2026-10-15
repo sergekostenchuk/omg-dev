@@ -1,5 +1,6 @@
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
-import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
+import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, deliveredConceptSections,
+  EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
 import { consolidationInput } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Ajv } from 'ajv';
@@ -1745,7 +1746,8 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   return earlyResearchFailure(draft.value, question.value,
     intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
     intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question),
-    intent.value.cursor.context?.discoveryBasisCatalogue ?? null);
+    intent.value.cursor.context?.discoveryBasisCatalogue ?? null,
+    deliveredConceptSections(intent.value.cursor.context, draft.value));
 }
 /** UNK1 (№4686 §3): the unknown-era admission of one early analyst call, from its saved cursor and original draft — null in
  * the DRY5FIX era, so an old need_research keeps its refusal. */

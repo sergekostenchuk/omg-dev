@@ -56,12 +56,16 @@ export const operationRequirementsSchema = object({
   conceptCoverage: list(object({ requirement: text, outcome: text }), 1),
 });
 
-export const behaviorContractsSchema = list(object({
+const behaviorContract = {
   id: text, requirements: texts(1), actor: text, entry: text, inputs: texts(), outcome: text,
   success: texts(1), failures: texts(1), forbiddenEffects: texts(1),
   state: object({ durability: { enum: ["durable", "reconstructible", "external", "none"] }, writer: text,
     authority: text, rollback: text, restart: text, replay: text }),
   compatibility: text, proof: text,
+};
+export const behaviorContractsSchema = list(object(behaviorContract), 1);
+export const behaviorContractsApplicationsSchema = list(object({ ...behaviorContract,
+  applications: list(basisApplication),
 }), 1);
 
 const featurePreparation = {
@@ -139,4 +143,7 @@ export const VERSION6_UPSTREAM_DETAILS = sealed({ ...UPSTREAM_MOMENT_DETAILS, di
   concept: { ...UPSTREAM_MOMENT_DETAILS.concept, schema: conceptApplicationsSchema,
     prompt: UPSTREAM_MOMENT_DETAILS.concept.prompt +
       ' Для каждого requirement явно укажи applications (в том числе [] при отсутствии назначения). basis копирует точный адрес из discoveryBasisCatalogue; appliedAt указывает только на собственные statement, benefit или acceptance. Покрой выбранный вариант и каждое ограничение каталога хотя бы одним предметным применением. Не меняй смысл ограничения: объясни в требовании, как оно действует на результат и критерий принятия.' },
+  specification: { ...UPSTREAM_MOMENT_DETAILS.specification, schema: behaviorContractsApplicationsSchema,
+    prompt: UPSTREAM_MOMENT_DETAILS.specification.prompt +
+      ' Для каждого behaviorContract явно укажи applications, включая [] только если его requirements не наследуют оснований. Из принятых conceptSections возьми точные applications каждого названного requirement: каждое из их оснований примени к собственному поведению или границе договора (entry, inputs, success, failures, forbiddenEffects, state, compatibility, proof). basis копирует адрес из discoveryBasisCatalogue; appliedAt указывает на содержательное место внутри этого договора. constraints ТЗ оставь отдельным массивом строк: новые проектные ограничения оцениваются по смыслу, а не получают вымышленное происхождение.' },
 }) as unknown as typeof UPSTREAM_MOMENT_DETAILS;

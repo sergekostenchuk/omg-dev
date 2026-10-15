@@ -18,7 +18,7 @@ import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
 import { resultGate } from "../execution/result.js";
-import { conceptApplicationFindings, preparationFindings } from "../discovery/preparation-validation.js";
+import { conceptApplicationFindings, preparationFindings, specificationApplicationFindings } from "../discovery/preparation-validation.js";
 import { assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { readModelCallRecovery } from "../discovery/model-call-recovery.js";
 
@@ -295,6 +295,42 @@ export class StageChecks {
         if (!(error instanceof EngineError)) throw error;
         result.findings.push({ code: error.code, target: source?.id ?? stageId(context.projectId, 'discovery'),
           field: 'conceptSections', message: error.message });
+      }
+    }
+    if (stage === 'specification' && version === 6) {
+      const operation = context.inputs[0];
+      try {
+        const conceptRef = operation?.value.inputs[0];
+        requireCondition(operation?.value.stage === 'operation-map' && isRef(conceptRef)
+          && conceptRef.id === stageId(context.projectId, 'concept'),
+          'basis_application_material_invalid', '[concept] Specification needs its exact accepted concept');
+        const concept = this.store.get<StageArtifact>(conceptRef.id, conceptRef.revision);
+        requireCondition(concept?.kind === 'stage' && canonical(reference(concept)) === canonical(conceptRef)
+          && concept.value.projectId === context.projectId && concept.value.stage === 'concept'
+          && concept.value.status === 'accepted', 'basis_application_material_invalid',
+          `[${conceptRef.id}] Specification lost its accepted concept`);
+        const discoveryRef = concept.value.inputs[0];
+        requireCondition(concept.value.inputs.length === 1 && isRef(discoveryRef)
+          && discoveryRef.id === stageId(context.projectId, 'discovery'),
+          'basis_application_material_invalid', `[${concept.id}] Concept needs its exact Discovery source`);
+        const discovery = this.store.get<StageArtifact>(discoveryRef.id, discoveryRef.revision);
+        requireCondition(discovery?.kind === 'stage' && canonical(reference(discovery)) === canonical(discoveryRef)
+          && discovery.value.projectId === context.projectId && discovery.value.stage === 'discovery'
+          && discovery.value.status === 'accepted', 'basis_application_material_invalid',
+          `[${discoveryRef.id}] Specification lost its accepted Discovery source`);
+        const discoveryFields = (discovery.value.content as unknown as StageContent)?.fields;
+        const conceptFields = (concept.value.content as unknown as StageContent)?.fields;
+        requireCondition(discoveryFields && conceptFields && typeof discoveryFields === 'object'
+          && typeof conceptFields === 'object' && !Array.isArray(discoveryFields) && !Array.isArray(conceptFields),
+          'basis_application_material_invalid', '[behaviorContracts] Accepted source fields are missing');
+        const catalogue = discoveryBasisCatalogue({ ref: reference(discovery), fields: discoveryFields });
+        result.findings.push(...specificationApplicationFindings(content.fields['behaviorContracts'] ?? null,
+          conceptFields['conceptSections'] ?? null, catalogue));
+        result.guards.push(reference(concept), reference(discovery));
+      } catch (error) {
+        if (!(error instanceof EngineError)) throw error;
+        result.findings.push({ code: error.code, target: operation?.id ?? stageId(context.projectId, 'operation-map'),
+          field: 'behaviorContracts', message: error.message });
       }
     }
     const prior = context.inputs[0];

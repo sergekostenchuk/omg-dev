@@ -2,10 +2,11 @@ import { Ajv } from 'ajv';
 import { EngineError, requireCondition } from '../errors.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import { requireDiscoveryProposal, type DiscoveryBasisCatalogue, type DiscoveryContext } from './discovery-outcome.js';
-import { conceptApplicationFindings, requiresConceptApplications } from './preparation-validation.js';
+import { conceptApplicationFindings, requiresConceptApplications,
+  requiresSpecificationApplications, specificationApplicationFindings } from './preparation-validation.js';
 import { researchAction, responseAction } from './research-consumer-transition.js';
-import { canonical } from '../canonical.js';
-import { isRef, type Ref, type StageArtifact } from '../pipeline/contracts.js';
+import { canonical, type Json } from '../canonical.js';
+import { isRef, stageId, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 
 export const EARLY_RESEARCH_OUTCOME = 'early-research-outcome/v1' as const;
@@ -45,12 +46,26 @@ export function earlyUpstreamTargets(store: Store, draft: DiscoveryDraft): Early
   });
 }
 
+/** The analyst's original cursor, rather than today's stage heads, supplies the S grounds. */
+export function deliveredConceptSections(context: unknown, draft: DiscoveryDraft): Json | null {
+  const prerequisites = context && typeof context === 'object'
+    ? (context as { prerequisites?: unknown }).prerequisites : null;
+  const exact = Array.isArray(draft?.inputs) ? draft.inputs.filter(ref =>
+    ref.id === stageId(draft.projectId, 'concept')) : [];
+  if (!Array.isArray(prerequisites) || exact.length !== 1 || !isRef(exact[0])) return null;
+  const concepts = prerequisites.filter(row => row && typeof row === 'object' && row.stage === 'concept');
+  if (concepts.length !== 1 || !isRef(concepts[0]?.ref)
+    || canonical(concepts[0].ref) !== canonical(exact[0])
+    || !Array.isArray(concepts[0]?.fields?.conceptSections)) return null;
+  return concepts[0].fields.conceptSections as Json;
+}
+
 /** Physical ownership and packet/cursor admission must be proved by the caller.
  * This rule classifies only reply errors; it never grants a physical dispatch. */
 export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
   role: 'analyst' | 'assessor' | 'escalation-assessor', payload: unknown,
   discovery: DiscoveryContext | null = null, web = false, unknown: EarlyUnknownAdmission | null = null,
-  catalogue: DiscoveryBasisCatalogue | null = null): EngineError | null {
+  catalogue: DiscoveryBasisCatalogue | null = null, concept: Json | null = null): EngineError | null {
   requireCondition(draft && typeof draft.stage === 'string' && draft.stage && question && question.draftId && question.projectId === draft.projectId
     && Array.isArray(draft.questions) && question.spec?.schema !== undefined
     && ['analyst', 'assessor', 'escalation-assessor'].includes(role),
@@ -91,6 +106,13 @@ export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
             'A concept answer needs the exact Discovery catalogue delivered with this call',
             { field: 'discoveryBasisCatalogue' });
           const finding = conceptApplicationFindings(action.value, catalogue)[0];
+          if (finding) throw new EngineError(finding.code, `[${finding.target}] ${finding.message}`, finding);
+        }
+        if (requiresSpecificationApplications(draft, question)) {
+          if (catalogue === null || concept === null) throw new EngineError('basis_application_material_invalid',
+            'A specification answer needs the exact Discovery catalogue and concept requirements delivered with this call',
+            { field: catalogue === null ? 'discoveryBasisCatalogue' : 'prerequisites' });
+          const finding = specificationApplicationFindings(action.value, concept, catalogue)[0];
           if (finding) throw new EngineError(finding.code, `[${finding.target}] ${finding.message}`, finding);
         }
       }
