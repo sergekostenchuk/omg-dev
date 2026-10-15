@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); недоверенный вход: ответ модели не по форме или с чужими ссылками, подлинный результат другой попытки/владельца → отказ с адресом (подделку собственной базы не тестировать — решение владельца 28.09, 13.10); окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 193. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → L1A → DRV1 → ASM1 → ASM1.1 → UNK1 → DS1.2a → DS1.2m → DRY6-03 → AT3b → IN1 → CFG1 → AT4 → DS1.2e → DS1.2c → DRY6-01 → DS1.3a → DS1.3b → DRY6-02 → DS1.2s → DS1.2lh → DS1.2v → ENV1 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 193. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → L1A → DRV1 → ASM1 → ASM1.1 → UNK1 → DS1.2a → DS1.2m → DRY6-03 → AT3b → IN1 → CFG1 → AT4 → DS1.2e → DS1.2c → DRY6-01 → DS1.3a → DS1.3b → DRY6-02 → ENV1 → DS1.2s → DS1.2lh → DS1.2v → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -2519,7 +2519,7 @@
 - Пишет записи: выведенное наследование оснований L1 и фич в материале A/B
 - Разрешённые пути: `src/discovery/research-context.ts`, `src/discovery/preparation-validation.ts`, `src/discovery/research-runner.ts`, `src/discovery/response-recovery.ts`, `test/research-call-resume.test.ts`, `test/assessment-session-resume.test.ts`, `test/basis-inheritance.test.ts`, `src/discovery/research-assessment.ts`
 - Из движка как есть: №4862; №4870
-- После: DS1.2s, DS1.2c, UNK1, DS1.2m, DRY6-02
+- После: DS1.2s, DS1.2c, UNK1, DS1.2m, DRY6-02, ENV1
 - Тесты сверх обязательных:
   - ограничение проходит C → L1 (по implements) → S → H (по выбранным договорам); наследование выведено кодом из реально выбранных ID
   - автор карты и фич и их B получают вариант, каталог и основания требований; оплаченные ответы старой эры восстанавливаются без повторного вызова
@@ -2537,7 +2537,7 @@
 - Пишет записи: переключение производителей новой работы на v6
 - Разрешённые пути: `src/discovery/requirements.ts`, `src/product/engine.ts`, `src/product/stage-research.ts`, `src/discovery/research-runner.ts`, `test/discovery-v6-era.test.ts`, `test/ds12-v6-release.test.ts`
 - Из движка как есть: №4870; №4877
-- После: DS1.2lh, DS1.2m, DS1.2s, DS1.2c, DS1.2e, DRY6-02, DS1.3b
+- После: DS1.2lh, DS1.2m, DS1.2s, DS1.2c, DS1.2e, DRY6-02, DS1.3b, ENV1
 - Тесты сверх обязательных:
   - СКВОЗНАЯ v6 до OM (перенесено из DS1.2m по №4900/№4901): после включения производителей v6 — настоящий OM-root selected/v2 → parts/correction и новый G5/task-v3 на законном v6 B1 (Discovery + concept + specification v6); смешанный префикс — прежний договор
   - ВКЛЮЧЕНИЕ v6 (перенесено из DS1.2e по №4925/№4926): после переключения производителей — четыре исхода Discovery v6 и owner_choice, mapDesign drift v6, оплаченные v5 A/B/C и web capture → 0 повторов/HTTP и адресная дверь новой работы, точная форма legacy replay выпущенных эр — на настоящем производителе, без подмены модулей в тесте
@@ -2726,7 +2726,7 @@
 - Пишет записи: проекция условий среды с requiredBy; охраны условий в записи startRun/writeRunBases нового OM
 - Разрешённые пути: `src/om/environment-readiness.ts`, `src/runtime/environment.ts`, `src/om/run-driver.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/environment-readiness.test.ts`, `test/om-run-driver.test.ts`, `test/early-stage-driver.test.ts`
 - Из движка как есть: №4856; №4864; CFG1; DRV1
-- После: DRV1, IN1, CFG1, DS1.2e, DS1.2lh, DRY6-02, DS1.2v, DS1.3b
+- После: DRV1, IN1, CFG1, DRY6-02, DS1.3b
 - Тесты сверх обязательных:
   - не-Git, Git без HEAD, вложенный вместо корня: Discovery с рабочим runner доступен, status называет недостающее, новый OM не пишет B1/run и не вызывает модель; после исправления среды повтор проходит
   - capacity/dispatch: status до OM показывает адреса; DRV1 и прямой om-start отказывают одинаково до записи/оплаты; после configure повтор без дублей
