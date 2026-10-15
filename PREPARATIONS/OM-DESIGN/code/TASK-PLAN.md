@@ -2499,7 +2499,7 @@
 - Отдаёт: —
 - Читает записи: каталог оснований и requirements концепции; ответ модели behaviorContracts
 - Пишет записи: applications у behaviorContracts v6
-- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/preparation-validation.ts`, `src/discovery/research-assessment.ts`, `test/preparation.test.ts`, `test/spec-basis-application.test.ts`
+- Разрешённые пути: `src/discovery/preparation-contracts.ts`, `src/discovery/preparation-validation.ts`, `src/discovery/research-assessment.ts`, `test/preparation.test.ts`, `test/spec-basis-application.test.ts`, `src/product/stage-checks.ts`, `src/om/input.ts`
 - Из движка как есть: №4862; №4870
 - После: DS1.2c
 - Тесты сверх обязательных:
