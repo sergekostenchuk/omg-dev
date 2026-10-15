@@ -1654,7 +1654,8 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     const failure = earlyResearchFailure(draft.value, question.value, 'analyst', action,
       producer.value.cursor.context?.discoveryContext ?? null, proof.web === true, unknown,
       producer.value.cursor.context?.discoveryBasisCatalogue ?? null,
-      deliveredConceptSections(producer.value.cursor.context, draft.value));
+      deliveredConceptSections(producer.value.cursor.context, draft.value),
+      producer.value.cursor.context?.prerequisites ?? null);
     requireCondition(failure, 'research_consumer_intent_invalid', 'A valid early reply cannot become a model refusal');
     return { ...before, status: 'completed', assessment: null,
       observation: { contract: EARLY_RESEARCH_OUTCOME, code: failure.code, details: failure.details ?? null,

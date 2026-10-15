@@ -651,7 +651,8 @@ export class Researcher {
               'analyst', failedTurn!.value.action, failedProducer.value.cursor.context?.discoveryContext ?? null,
               intentWebCapability(this.store, failedProducer), earlyUnknownAdmission(this.store, failedProducer, failedDraft!, failedQuestion!),
               failedProducer.value.cursor.context?.discoveryBasisCatalogue ?? null,
-              deliveredConceptSections(failedProducer.value.cursor.context, failedDraft!.value)) : null;
+              deliveredConceptSections(failedProducer.value.cursor.context, failedDraft!.value),
+              failedProducer.value.cursor.context?.prerequisites ?? null) : null;
           // WB1 (№4639): the cause follows the failed call; the actions offered follow the dispatch of this new call.
           if (failure) Object.assign(context, { failures: [earlyResearchCorrection('analyst', failure,
             reference(failedIntent ?? failedTurn!), pending[0]!.value, webResearchCapability(draft.value.stage, 'analyst', dispatch), !mode)] });
@@ -847,7 +848,8 @@ export class Researcher {
             const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action,
               producer.value.cursor.context?.discoveryContext ?? null, web, admission,
               producer.value.cursor.context?.discoveryBasisCatalogue ?? null,
-              deliveredConceptSections(producer.value.cursor.context, originalDraft.value));
+              deliveredConceptSections(producer.value.cursor.context, originalDraft.value),
+              producer.value.cursor.context?.prerequisites ?? null);
             if (failure) {
               const value = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn,
                 { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer, ...(web ? { web: true } : {}),
@@ -1066,7 +1068,7 @@ export class Researcher {
               const escalationContext = { role: "assess-escalation", question: question.value.spec,
                 request: action, inventory: sources.inventory(), history,
                 ...(conceptMaterial ? { discoveryBasisCatalogue: conceptMaterial.catalogue } : {}),
-                ...(draft.value.contractVersion === 6 && draft.value.stage === 'specification'
+                ...(draft.value.contractVersion === 6 && ['specification', 'operation-map', 'features'].includes(draft.value.stage)
                   ? { prerequisites: researchPrerequisites(this.store, draft.value) } : {}),
                 ...(neighborView ? { assessmentContextContract: STAGE_NEIGHBOR_CONTEXT, stageNeighbors: neighbors.context } : {}) };
               if (early) {

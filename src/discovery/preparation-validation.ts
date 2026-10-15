@@ -10,6 +10,10 @@ export const requiresConceptApplications = (draft: DiscoveryDraft, question: Que
   draft.contractVersion === 6 && draft.stage === 'concept' && question.spec.field === 'conceptSections';
 export const requiresSpecificationApplications = (draft: DiscoveryDraft, question: Question): boolean =>
   draft.contractVersion === 6 && draft.stage === 'specification' && question.spec.field === 'behaviorContracts';
+/** The feature's selected contracts, rather than another model field, determine its requirement set. */
+export function selectedFeatureRequirements(contracts: { id: string; requirements: string[] }[], selected: string[]): string[] {
+  return [...new Set(contracts.filter(contract => selected.includes(contract.id)).flatMap(contract => contract.requirements))];
+}
 /** The catalogue is the exact accepted Discovery material supplied by the caller.
  * The same pure check is used before assessment and at stage admission. */
 export function conceptApplicationFindings(value: Json, catalogue: DiscoveryBasisCatalogue): Finding[] {
@@ -159,7 +163,7 @@ export function preparationFindings(stage: Stage, fields: Record<string, Json>, 
         fail("feature_beneficiary_foreign", detail['featureTitle'], "Feature must preserve the beneficiary of its outcome and concept requirements");
       for (const ref of detail['behaviorContracts'] as string[]) if (!behaviors.some(contract => contract['id'] === ref && contract['outcome'] === detail['outcome'])) fail("feature_contract_foreign", ref, "Feature must bind a behavior contract with the same outcome");
       for (const ref of detail['requirements'] as string[]) if (!requirements.some(requirement => requirement['id'] === ref && requirement['outcome'] === detail['outcome'])) fail("feature_requirement_foreign", ref, "Feature must preserve its concept requirement's outcome");
-      const inherited = new Set(behaviors.filter(contract => detail['behaviorContracts'].includes(contract['id'])).flatMap(contract => contract['requirements'] as string[]));
+      const inherited = new Set(selectedFeatureRequirements(behaviors as { id: string; requirements: string[] }[], detail['behaviorContracts'] as string[]));
       if (inherited.size !== detail['requirements'].length || (detail['requirements'] as string[]).some(id => !inherited.has(id)))
         fail("feature_requirements_incomplete", detail['featureTitle'], "Feature must preserve exactly the requirements of its bound behavior contracts");
       for (const interaction of detail['interactions'] as Row[]) if (!graphOutcomes.includes(interaction['outcome'])) fail("feature_interaction_missing", interaction['outcome'], "Feature interaction must bind a known map outcome");

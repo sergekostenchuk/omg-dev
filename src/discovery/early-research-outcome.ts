@@ -8,6 +8,7 @@ import { researchAction, responseAction } from './research-consumer-transition.j
 import { canonical, type Json } from '../canonical.js';
 import { isRef, stageId, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
+import { inheritanceCandidateFailure } from './research-context.js';
 
 export const EARLY_RESEARCH_OUTCOME = 'early-research-outcome/v1' as const;
 export const earlyResearchStage = (stage: unknown): boolean =>
@@ -65,7 +66,8 @@ export function deliveredConceptSections(context: unknown, draft: DiscoveryDraft
 export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
   role: 'analyst' | 'assessor' | 'escalation-assessor', payload: unknown,
   discovery: DiscoveryContext | null = null, web = false, unknown: EarlyUnknownAdmission | null = null,
-  catalogue: DiscoveryBasisCatalogue | null = null, concept: Json | null = null): EngineError | null {
+  catalogue: DiscoveryBasisCatalogue | null = null, concept: Json | null = null,
+  prerequisites: unknown = null): EngineError | null {
   requireCondition(draft && typeof draft.stage === 'string' && draft.stage && question && question.draftId && question.projectId === draft.projectId
     && Array.isArray(draft.questions) && question.spec?.schema !== undefined
     && ['analyst', 'assessor', 'escalation-assessor'].includes(role),
@@ -115,6 +117,8 @@ export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
           const finding = specificationApplicationFindings(action.value, concept, catalogue)[0];
           if (finding) throw new EngineError(finding.code, `[${finding.target}] ${finding.message}`, finding);
         }
+        const inheritance = inheritanceCandidateFailure(draft, question.spec.field, action.value, prerequisites);
+        if (inheritance) throw inheritance;
       }
     }
   } catch (error) {
@@ -122,7 +126,7 @@ export function earlyResearchFailure(draft: DiscoveryDraft, question: Question,
       'reading_plan_disabled', 'research_question_foreign', 'research_upstream_invalid', 'answer_invalid',
       'assessment_invalid', 'escalation_assessment_invalid', 'discovery_basis_stale',
       'discovery_constraint_missing', 'discovery_constraint_stale', 'discovery_research_invalid',
-      'basis_application_invalid', 'basis_application_missing'].includes(error.code)) return error;
+      'basis_application_invalid', 'basis_application_missing', 'basis_inheritance_material_invalid'].includes(error.code)) return error;
     throw error;
   }
   return null;

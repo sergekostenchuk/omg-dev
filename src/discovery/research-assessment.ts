@@ -10,7 +10,8 @@ import { realpathSync } from 'node:fs';
 import { requireCondition, EngineError } from "../errors.js";
 import type { Question, DiscoveryDraft } from "./discovery.js";
 import { DIRECT_ASSESSMENT_ORIGIN, type ResearchAction, type ResearchAssessment } from "./research-model.js";
-import { readDiscoveryBasisMaterial, researchPrerequisites, researchGraphContext } from "./research-context.js";
+import { readDiscoveryBasisMaterial, researchPrerequisites, researchGraphContext,
+  type InheritanceProposal } from "./research-context.js";
 import { consumerFeedback } from "./consumer-feedback.js";
 import { pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
 import { pilotContext } from "./pilot-context.js";
@@ -40,6 +41,12 @@ interface ResearchAssessmentBinding {
   session: Ref; application: Ref; reads: AssessmentReadProof;
 }
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
+function inheritanceProposal(draft: DiscoveryDraft, question: Question, value: Json): InheritanceProposal | undefined {
+  if (draft.contractVersion !== 6) return undefined;
+  if (draft.stage === 'operation-map' && question.spec.field === 'mapDesign') return { field: 'mapDesign', value };
+  if (draft.stage === 'features' && question.spec.field === 'featurePreparation') return { field: 'featurePreparation', value };
+  return undefined;
+}
 function assessmentPrompt(bases: ResearchAssessment['bases'] | undefined, obligationContract: unknown,
   discoveryPreparation = false, neighbors = false, conceptApplications = false, specificationGrounds = false): string {
   return "Evaluate whether the supplied observations actually support the proposed answer to this exact question and all its required details. Source hashes prove identity only. A fact needs relevant evidence of the claimed behavior, not an unrelated quote, a plan, or model confidence. For kind=decision, only existing explicit owner intent supports the value. For kind=design, evaluate a model-authored proposal for completeness, usefulness to the named consumer, consistency with the supplied intent and constraints; it may introduce a design but must not pretend it is existing implementation or a new owner decision. Reject invented facts, unsupported inapplicability, and empty generic filler. Return JSON {verdict: supported|insufficient|conflicting, reasons: string[]}. If unsupported or contradictory explain exactly why. Do not change files or perform external actions." + (bases ? " bases[].proofLimit limits the claim: quoted-intent-requires-attribution requires establishing explicit attributable owner intent, not trusting the document ingestion label; reported-not-runtime-proof is a documentary report and does not establish current environment behavior or completed implementation. Preserve documentary support with its stated limits instead of promoting it to a repository fact or discarding it." : "") + (obligationContract ? " Assess each coverage member against its fixed assignment.kind and consumer. A documentaryAllowance only admits the named source: the actual claim must stay within assignment.documentaryAllowance.claimLimit and the quoted evidence. Reject broader claims; admission of a document does not certify runtime behavior or implementation." : "") + (discoveryPreparation ? ' For Discovery preparation, compare every rule with its addressed report constraint: a correct basis with opposite meaning is not supported. The outcomes, scenarios and external systems must develop verdict.variant without replacing it; preserve its risks and unresolved questions with their moments. Exact owner choices select conditions, not facts of feasibility.' : '') + (neighbors ? STAGE_NEIGHBOR_INSTRUCTION + ' If a necessary premise is missing, classify support as insufficient.' : '') + (conceptApplications ? ' For conceptSections, compare each requirement and its acceptance criterion with the exact selected variant and every addressed constraint in discoveryBasisCatalogue. An address alone does not establish semantic consistency: reject an application whose requirement reverses the source rule. Evaluate the proposed benefit and outcome against the accepted Discovery goals. If the source material is insufficient, say what evidence is missing rather than inventing support.' : '') + (specificationGrounds ? ' For specification, compare the separate constraints strings with the exact selected Discovery variant and constraints; a new project limit is a proposal, not invented source provenance. For behaviorContracts, check each inherited requirement ground against the addressed entry, inputs, success, failures, forbiddenEffects, state, compatibility or proof of that same contract. An exact address alone does not establish semantic consistency. Use the accepted conceptSections in prerequisites and the accepted prior fields in stageNeighbors; do not treat pending fields as accepted.' : '');
@@ -296,14 +303,16 @@ export async function assessAnswer(store: Store, question: Revision<Question>, a
   const basisBindings = bases?.map(({ quote: _quote, ...binding }) => binding);
   const pilotPacket = !priorOrigin && pilot ? pilotContext(store, draft, question) : null;
   const assessmentObservations=[...observations,...runtime.supporting];
+  const proposedInheritance = inheritanceProposal(draft.value, question.value, action.value);
   const computedContext = priorOrigin ? null : pilotPacket ? { ...pilotPacket, ...(basisBindings ? { bases: basisBindings } : {}), ...(runtime.proofs.length?{runtimeProofs:runtime.proofs}:{}), role: "assess-answer", question: question.value.spec,
     sourceLocations: sourceLocations!,
     value: question.value.spec.field === "layerDesign" ? layerDeltaView(store, draft.value.projectId, action.value, draft.value.level === "R2" ? 3 : 2, question.value.spec.layerAssembly) : action.value,
     representation: question.value.spec.field === "layerDesign" ? "changes_against_exact_base_after_machine_L2_validation" : "complete_field",
     observations:assessmentObservations, consumerFeedback: consumerFeedback(store, draft.value) }
     : { role: "assess-answer", ...(basisBindings ? { bases: basisBindings } : {}), ...(runtime.proofs.length?{runtimeProofs:runtime.proofs}:{}), question: question.value.spec, value: action.value, observations:assessmentObservations,
-      prerequisites: researchPrerequisites(draft.value.contractVersion === 6 && draft.value.stage === 'specification'
-        ? inputStore : store, draft.value), operationMap: researchGraphContext(store, draft.value),
+      prerequisites: researchPrerequisites(draft.value.contractVersion === 6
+        && ['specification', 'operation-map', 'features'].includes(draft.value.stage)
+        ? inputStore : store, draft.value, proposedInheritance), operationMap: researchGraphContext(store, draft.value),
       consumerFeedback: consumerFeedback(store, draft.value) };
   if (computedContext && related.context) Object.assign(computedContext, { discoveryContext: related.context });
   if (computedContext && basisMaterial) Object.assign(computedContext, { discoveryBasisCatalogue: basisMaterial.catalogue });
@@ -500,6 +509,10 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
       && (!requiresSpecificationApplications(capturedDraft.value, question.value)
         || specificationApplicationFindings(action.value, basisMaterial.concept!, basisMaterial.catalogue).length === 0),
     'research_assessment_binding_invalid', `[${turnId}] The paid assessment lost its original applications or catalogue`);
+  const proposedInheritance = inheritanceProposal(capturedDraft.value, question.value, action.value);
+  if (proposedInheritance) requireCondition(same(outcome.context.prerequisites,
+    researchPrerequisites(view.store, capturedDraft.value, proposedInheritance)),
+    'research_assessment_binding_invalid', `[${turnId}] The paid assessment lost its selected requirement grounds`);
   const withNeighbors = origin.value.contract === 'assessment-paid-origin/v2';
   if (withNeighbors) {
     const neighbors = stageNeighbors(view.store, capturedDraft, question);
