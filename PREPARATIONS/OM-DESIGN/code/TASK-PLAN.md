@@ -2798,7 +2798,7 @@
 - Отдаёт: —
 - Читает записи: 
 - Пишет записи: 
-- Разрешённые пути: `src/discovery/research-protocol.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-runner.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/assessment-session.ts`, `src/discovery/synthesis-session.ts`, `src/discovery/conclusion-consolidation.ts`, `src/discovery/reader.ts`, `src/discovery/reading-plan.ts`, `src/storage/reference-sites.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/research-capacity.test.ts`, `test/assessment-session-resume.test.ts`
+- Разрешённые пути: `src/discovery/research-protocol.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-runner.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/assessment-session.ts`, `src/discovery/synthesis-session.ts`, `src/discovery/conclusion-consolidation.ts`, `src/discovery/reader.ts`, `src/discovery/reading-plan.ts`, `src/storage/reference-sites.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/research-capacity.test.ts`, `test/assessment-session-resume.test.ts`, `test/research-call-resume.test.ts`, `test/conclusion-consolidation.test.ts`, `test/synthesis-session-fixture.ts`
 - Из движка как есть: №5353; №5361; RD1
 - После: SR1c, FL1, RD2b
 - Тесты сверх обязательных:
