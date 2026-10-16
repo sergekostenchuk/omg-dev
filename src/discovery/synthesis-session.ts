@@ -14,7 +14,7 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { checkpoint } from "./research-continuation.js";
-import { Evidence, sourceIsCurrent, SOURCE_READ_CONTRACT } from "../evidence/evidence.js";
+import { Evidence, sourceIsCurrent, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2 } from "../evidence/evidence.js";
 import { readReaderResultAt, readerResultCurrent } from "./reader.js";
 import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWrites, markRecoveredSessionWritten,
   isResponseRecovery, prepareResearchConsumerIntent, readResearchConsumerIntent, findResearchConsumerIntent,
@@ -84,7 +84,8 @@ const checkpointInstruction = " A context-only page without primary Source evide
  * it for engine material. Returns the children still to walk. */
 function verifyMaterialReading(store: Store, draft: Revision<DiscoveryDraft>, value: Record<string, any>): unknown[] {
   if (!isRef(value.source)
-    || !(value.contract === SOURCE_READ_CONTRACT || (value.selector && Object.hasOwn(value, 'value'))))
+    || !(value.contract === SOURCE_READ_CONTRACT || value.contract === SOURCE_READ_CONTRACT_V2
+      || (value.selector && Object.hasOwn(value, 'value'))))
     return Object.values(value);
   requireCondition(value.projectId === draft.value.projectId && new Evidence(store).verifyReading(value),
     'synthesis_evidence_stale', 'A material source changed; do not reuse stale synthesis notes');

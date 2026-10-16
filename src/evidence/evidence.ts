@@ -39,8 +39,12 @@ export function projectWebSource(projectId: string, capture: Ref, page: WebPage)
 export type Selector = { kind: "json-pointer"; pointer: string } | { kind: "text-range"; start: number; end: number };
 export interface Observation { projectId: string; source: Ref; selector: Selector; value: Json }
 export const SOURCE_READ_CONTRACT = 'source-read/v1' as const;
+export const SOURCE_READ_CONTRACT_V2 = 'source-read/v2' as const;
+export const SOURCE_READ_MAX_CHARS = 50_000;
+const SOURCE_READ_V1_MAX_CHARS = 50_000;
+export type SourceReadContract = typeof SOURCE_READ_CONTRACT | typeof SOURCE_READ_CONTRACT_V2;
 export interface SourceReadRange {
-  contract: typeof SOURCE_READ_CONTRACT; outcome: 'complete' | 'clipped' | 'outside';
+  contract: SourceReadContract; outcome: 'complete' | 'clipped' | 'outside';
   requested: { start: number; end: number }; served: { start: number; end: number } | null;
   length: number; unit: 'utf16';
 }
@@ -59,14 +63,32 @@ export function sourceReadRange(length: number, requested: { start: number; end:
   const end = Math.min(requested.end, length);
   return { ...common, outcome: end < requested.end ? 'clipped' : 'complete', served: { start: requested.start, end } };
 }
+/** A new local reading keeps the original request and bounds only the text actually served. */
+export function sourceReadRangeV2(length: number, requested: { start: number; end: number }): SourceReadRange {
+  requireCondition(Number.isSafeInteger(length) && length >= 0 && requested
+    && Number.isSafeInteger(requested.start) && Number.isSafeInteger(requested.end)
+    && requested.start >= 0 && requested.end >= requested.start,
+    'selector_invalid', 'A source read needs ordered nonnegative UTF-16 coordinates');
+  const common = { contract: SOURCE_READ_CONTRACT_V2, requested: { start: requested.start, end: requested.end },
+    length, unit: 'utf16' as const };
+  if (requested.start >= length) return { ...common, outcome: 'outside', served: null };
+  // The three differences are safe integers; adding their minimum cannot exceed length.
+  const end = requested.start + Math.min(requested.end - requested.start,
+    length - requested.start, SOURCE_READ_MAX_CHARS);
+  return { ...common, outcome: end < requested.end ? 'clipped' : 'complete', served: { start: requested.start, end } };
+}
 export function projectSourceReading(projectId: string, source: Ref, value: Source,
-  requested: { start: number; end: number }): SourceReading {
+  requested: { start: number; end: number }, contract: SourceReadContract = SOURCE_READ_CONTRACT): SourceReading {
   requireCondition(isRef(source) && source.id.startsWith(`source:${projectId}:`)
     && value?.projectId === projectId && typeof value.content === 'string'
     && digest(value.content) === value.sha256 && hashJson(value) === source.hash, 'source_invalid', 'The read needs exact source content from this project');
   requireCondition(requested && requested.end > requested.start, 'selector_invalid', 'A source read needs a nonempty requested range');
-  const range = sourceReadRange(value.content.length, requested);
-  requireCondition(!range.served || range.served.end - range.served.start <= 50_000,
+  requireCondition(contract === SOURCE_READ_CONTRACT || contract === SOURCE_READ_CONTRACT_V2,
+    'research_consumer_intent_invalid', 'Unknown source read contract');
+  const range = contract === SOURCE_READ_CONTRACT_V2
+    ? sourceReadRangeV2(value.content.length, requested) : sourceReadRange(value.content.length, requested);
+  if (contract === SOURCE_READ_CONTRACT) requireCondition(!range.served
+    || range.served.end - range.served.start <= SOURCE_READ_V1_MAX_CHARS,
     'research_excerpt_limit', 'Read a smaller source range');
   return { ...range, projectId, source,
     selector: range.served ? { kind: 'text-range', ...range.served } : null,
@@ -131,22 +153,23 @@ export class Evidence {
     }
     return { projectId, source: reference(source), selector, value: JSON.parse(canonical(value)) as Json };
   }
-  readSource(projectId: string, sourceRef: Ref, requested: { start: number; end: number }): SourceReading {
+  readSource(projectId: string, sourceRef: Ref, requested: { start: number; end: number },
+    contract: SourceReadContract = SOURCE_READ_CONTRACT): SourceReading {
     requireCondition(isRef(sourceRef), 'evidence_input_invalid', 'A read needs an exact source reference');
     const source = this.store.get<Source>(sourceRef.id);
     requireCondition(source?.kind === 'source' && source.value.projectId === projectId,
       'source_missing', 'A real source from this project is required');
     requireCondition(canonical(reference(source)) === canonical(sourceRef) && sourceIsCurrent(source.value),
       'source_stale', 'The requested source has changed or disappeared');
-    return projectSourceReading(projectId, sourceRef, source.value, requested);
+    return projectSourceReading(projectId, sourceRef, source.value, requested, contract);
   }
   verifyReading(reading: unknown): boolean {
     try {
       if (!reading || typeof reading !== 'object') return false;
       if (!Object.hasOwn(reading, 'contract')) return this.verify(reading as Observation);
       const value = reading as SourceReading;
-      return value.contract === SOURCE_READ_CONTRACT
-        && canonical(this.readSource(value.projectId, value.source, value.requested)) === canonical(value);
+      return (value.contract === SOURCE_READ_CONTRACT || value.contract === SOURCE_READ_CONTRACT_V2)
+        && canonical(this.readSource(value.projectId, value.source, value.requested, value.contract)) === canonical(value);
     } catch { return false; }
   }
   verify(observation: Observation): boolean {

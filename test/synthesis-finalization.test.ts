@@ -315,7 +315,7 @@ else research={action:'pause',reason:'RS5 material reached synthesis'};`);
   assert.equal(synthesis.length, 1, JSON.stringify(run.value));
   const session = f.store.list<any>('synthesis-session')[0]!;
   const readings: any[] = [];
-  const visit = (v: any) => { if (!v || typeof v !== 'object') return; if (v.contract === 'source-read/v1') readings.push(v); else Object.values(v).forEach(visit); };
+  const visit = (v: any) => { if (!v || typeof v !== 'object') return; if (v.contract === 'source-read/v2') readings.push(v); else Object.values(v).forEach(visit); };
   visit(session.value.basis.materials);
   assert.equal(readings.length, 1); assert.equal(readings[0].outcome, outcome);
   assert.deepEqual(readings[0].requested, requested); assert.deepEqual(readings[0].served, { start: 0, end: length });

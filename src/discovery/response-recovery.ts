@@ -29,7 +29,8 @@ import { contextWorkspace } from './context-workspace.js';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { reference, isRef, uniqueRefs, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
-import { Evidence, SOURCE_READ_CONTRACT, type Source, type Observation, type Selector } from '../evidence/evidence.js';
+import { Evidence, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2,
+  type Source, type Observation, type Selector } from '../evidence/evidence.js';
 import { webCaptureId, type WebCapture } from './web-research.js';
 import { processStart } from '../runtime/process-identity.js';
 import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executionOf } from './model-call-recovery.js';
@@ -1110,7 +1111,7 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
       const sourceRef = saved.value.action.source;
       const source = isRef(sourceRef) ? store.get<Source>(sourceRef.id, sourceRef.revision) : null;
       const run = before && typeof before.value.run === 'string' ? store.get<{projectId: string}>(before.value.run, 1) : null;
-      if (saved.value.observation.contract !== SOURCE_READ_CONTRACT || !before
+      if (![SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2].includes(saved.value.observation.contract) || !before
         || before.kind !== 'research-turn' || hashJson(before.value) !== before.hash
         || !run || run.kind !== 'research-run' || hashJson(run.value) !== run.hash
         || !source || source.kind !== 'source' || canonical(reference(source)) !== canonical(sourceRef))
@@ -1121,7 +1122,7 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
       if (parent) readResearchConsumerTurn(store, reference(parent.queued));
       try {
         const expected = projectSourceReadingTurn(before.value as ResearchTurn, run.value.projectId,
-          { ref: reference(source), value: source.value });
+          { ref: reference(source), value: source.value }, saved.value.observation.contract);
         if (canonical(expected) !== canonical(saved.value)) consumerInvalid(saved.id, 'The queued read differs from its exact source result');
       } catch { consumerInvalid(saved.id, 'The queued source read cannot be derived from its original bytes'); }
     }

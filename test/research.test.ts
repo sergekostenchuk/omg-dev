@@ -1,4 +1,4 @@
-import { hashJson } from '../src/canonical.js';
+import { digest, hashJson } from '../src/canonical.js';
 import { execFileSync } from 'node:child_process';
 import { EngineError } from '../src/errors.js';
 import type { Write } from '../src/storage/store.js';
@@ -6,8 +6,10 @@ import { readResearchConsumerTurn } from '../src/discovery/response-recovery.js'
 import { readBundle, readReaderResultAt, resumeReadBundleIntent, readerResumeStep } from '../src/discovery/reader.js';
 import { configureReaderPilot, pilotEnvironment } from '../src/discovery/reader-pilot.js';
 import { latestFocus } from '../src/discovery/research-continuation.js';
+import { synthesisSession, readSynthesisSession } from '../src/discovery/synthesis-session.js';
 import { pilotContext, readPilotContext, retainPilotRead } from '../src/discovery/pilot-context.js';
 import { preparedFeatures } from './product-fixture.js';
+import { UPSTREAM_STAGES } from '../src/discovery/requirements.js';
 import type { Question } from '../src/discovery/discovery.js';
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -16,6 +18,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
+import { SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_MAX_CHARS,
+  sourceReadRange, sourceReadRangeV2 } from '../src/evidence/evidence.js';
 import { reference } from "../src/pipeline/contracts.js";
 import type { ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
 import type { FieldSpec } from "../src/discovery/discovery.js";
@@ -69,6 +73,179 @@ function fixture(t: { after(fn: () => void): void }, scenario = "normal") {
   };
   return { root, store, engine, configure };
 }
+
+test('RD1 source-read/v2 serves exact bounded UTF-16 windows while v1 and reader ranges keep their era', t => {
+  const { engine, configure } = fixture(t); configure('p');
+  const content = 'x'.repeat(49_999) + '😀' + 'y'.repeat(9_513);
+  const source = reference(engine.discovery.evidence.document('p', 'long', content, 'text/plain', 0));
+  const evidence = engine.discovery.evidence;
+  for (const size of [49_999, 50_000, 50_001, 59_514]) {
+    const reading = evidence.readSource('p', source, { start: 0, end: size }, SOURCE_READ_CONTRACT_V2);
+    assert.equal(reading.contract, SOURCE_READ_CONTRACT_V2);
+    assert.deepEqual(reading.requested, { start: 0, end: size });
+    assert.deepEqual(reading.served, { start: 0, end: Math.min(size, SOURCE_READ_MAX_CHARS) });
+    assert.equal(reading.value, content.slice(0, Math.min(size, SOURCE_READ_MAX_CHARS)));
+    assert.equal(reading.outcome, size > SOURCE_READ_MAX_CHARS ? 'clipped' : 'complete');
+    assert.equal(reading.length, content.length);
+    assert.equal(reading.unit, 'utf16');
+    assert.equal(evidence.verifyReading(reading), true);
+  }
+  const first = evidence.readSource('p', source, { start: 0, end: content.length }, SOURCE_READ_CONTRACT_V2);
+  const second = evidence.readSource('p', source,
+    { start: first.served!.end, end: content.length }, SOURCE_READ_CONTRACT_V2);
+  assert.equal(String(first.value) + String(second.value), content);
+  assert.deepEqual(second.served, { start: 50_000, end: content.length });
+  assert.equal(second.outcome, 'complete');
+  const offset = evidence.readSource('p', source, { start: 100, end: 59_514 }, SOURCE_READ_CONTRACT_V2);
+  assert.deepEqual(offset.served, { start: 100, end: 50_100 });
+  assert.equal(offset.selector?.kind, 'text-range');
+  const eof = evidence.readSource('p', source, { start: 59_510, end: 60_000 }, SOURCE_READ_CONTRACT_V2);
+  assert.equal(eof.outcome, 'clipped'); assert.deepEqual(eof.served, { start: 59_510, end: content.length });
+  const outside = evidence.readSource('p', source, { start: content.length, end: content.length + 1 }, SOURCE_READ_CONTRACT_V2);
+  assert.equal(outside.outcome, 'outside'); assert.equal(outside.served, null);
+  assert.equal(outside.selector, null); assert.equal(outside.value, null);
+  assert.equal(evidence.verifyReading(outside), true);
+  assert.equal(evidence.verifyReading({ ...first, served: { start: 1, end: 50_001 } }), false);
+  assert.equal(evidence.verifyReading({ ...outside, length: 10 }), false);
+  assert.throws(() => evidence.readSource('p', source, { start: 0, end: content.length }), { code: 'research_excerpt_limit' });
+  assert.equal(evidence.readSource('p', source, { start: 0, end: 50_000 }).contract, SOURCE_READ_CONTRACT);
+  assert.equal(sourceReadRange(content.length, { start: 0, end: content.length }).served?.end, content.length);
+  assert.deepEqual(sourceReadRangeV2(Number.MAX_SAFE_INTEGER,
+    { start: Number.MAX_SAFE_INTEGER - 100, end: Number.MAX_SAFE_INTEGER }).served,
+    { start: Number.MAX_SAFE_INTEGER - 100, end: Number.MAX_SAFE_INTEGER });
+  assert.throws(() => sourceReadRangeV2(100, { start: 2, end: 1 }), { code: 'selector_invalid' });
+  assert.throws(() => evidence.readSource('p', source, { start: 1, end: 1 }, SOURCE_READ_CONTRACT_V2), { code: 'selector_invalid' });
+  assert.throws(() => evidence.readSource('foreign', source, { start: 0, end: 1 }, SOURCE_READ_CONTRACT_V2),
+    { code: 'source_missing' });
+  assert.throws(() => evidence.readSource('p', source, { start: 0, end: 1 }, 'source-read/v9' as any),
+    { code: 'research_consumer_intent_invalid' });
+  engine.discovery.evidence.document('p', 'long', 'changed', 'text/plain', 1);
+  assert.throws(() => evidence.readSource('p', source, { start: 0, end: 1 }, SOURCE_READ_CONTRACT_V2),
+    { code: 'source_stale' });
+});
+
+test('RD1 cold restart completes one paid pending read as v2 without redispatch', async t => {
+  const { root, store, engine, configure } = fixture(t); configure('p');
+  const source = engine.discovery.evidence.document('p', 'large', 'A'.repeat(59_513), 'text/plain', 0);
+  const draft = engine.prepare('p', 'discovery');
+  writeFileSync(join(root, 'adapter.mjs'), `import {readFileSync,appendFileSync} from 'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8'));
+appendFileSync(${JSON.stringify(join(root, 'wire.jsonl'))},JSON.stringify(r)+'\\n');
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_source',
+source:${JSON.stringify(reference(source))},start:0,end:59513}}));`);
+  const original = store.writeMany.bind(store); let interrupted = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    if (!interrupted && writes.some(write => write.kind === 'research-turn'
+      && (write.value as ResearchTurn).status === 'completed'
+      && ((write.value as ResearchTurn).action as { action?: string }).action === 'read_source')) {
+      interrupted = true; throw new EngineError('fixture_interrupted', 'Local read completion interrupted');
+    }
+    return original(writes, guards);
+  }) as typeof store.writeMany;
+  await engine.researcher.run('p', draft.id, 1);
+  store.writeMany = original;
+  assert.equal(interrupted, true);
+  const before = store.list<ResearchTurn>('research-turn').find(turn =>
+    (turn.value.action as { action?: string }).action === 'read_source')!;
+  assert.equal(before.value.status, 'pending'); assert.equal(before.value.observation, null);
+  const calls = store.list('model-call'), responses = store.list('model-response');
+  assert.equal(calls.length, 1); assert.equal(responses.length, 1);
+  const paidRequest = JSON.parse(readFileSync(join(root, 'wire.jsonl'), 'utf8').trim());
+  assert.match(paidRequest.prompt, /50,000 UTF-16|50000 UTF-16/);
+  const restarted = new Store(join(root, 'state.sqlite')); t.after(() => restarted.close());
+  await new ProductEngine(restarted).researcher.run('p', draft.id, 1);
+  const completed = restarted.get<ResearchTurn>(before.id)!;
+  assert.equal(completed.value.status, 'completed'); assert.equal(completed.value.error, null);
+  const reading = completed.value.observation as any;
+  assert.equal(reading.contract, SOURCE_READ_CONTRACT_V2);
+  assert.equal(reading.outcome, 'clipped');
+  assert.deepEqual(reading.requested, { start: 0, end: 59_513 });
+  assert.deepEqual(reading.served, { start: 0, end: 50_000 });
+  assert.equal(reading.value, source.value.content.slice(0, 50_000));
+  assert.deepEqual(readResearchConsumerTurn(restarted, reference(completed)), completed);
+  assert.deepEqual(restarted.list('model-call'), calls);
+  assert.deepEqual(restarted.list('model-response'), responses);
+  assert.equal(readFileSync(join(root, 'wire.jsonl'), 'utf8').trim().split('\n').length, 1);
+});
+
+test('RD1 next analyst can request exactly the clipped tail under the delivered instruction', async t => {
+  const { root, store, engine, configure } = fixture(t); configure('p');
+  const content = 'A'.repeat(59_513);
+  const source = engine.discovery.evidence.document('p', 'large', content, 'text/plain', 0);
+  const draft = engine.prepare('p', 'discovery');
+  writeFileSync(join(root, 'adapter.mjs'), `import {readFileSync,appendFileSync} from 'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;
+appendFileSync(${JSON.stringify(join(root, 'wire.jsonl'))},JSON.stringify(r)+'\\n');
+const reads=[...(c.history??[]),c.currentRead].filter(t=>t?.action?.action==='read_source');
+const start=reads.at(-1)?.observation?.served?.end??0;
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_source',
+source:${JSON.stringify(reference(source))},start,end:59513}}));`);
+  await engine.researcher.run('p', draft.id, 2);
+  const turns = store.list<ResearchTurn>('research-turn').filter(turn =>
+    (turn.value.action as { action?: string }).action === 'read_source').sort((a, b) => a.value.number - b.value.number);
+  assert.equal(turns.length, 2);
+  assert.deepEqual(turns.map(turn => (turn.value.observation as any).served),
+    [{ start: 0, end: 50_000 }, { start: 50_000, end: 59_513 }]);
+  assert.equal(turns.map(turn => (turn.value.observation as any).value).join(''), content);
+  assert.ok(turns.every(turn => turn.value.status === 'completed' && turn.value.error === null));
+  const sent = readFileSync(join(root, 'wire.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(sent.length, 2);
+  for (const request of sent) {
+    assert.match(request.prompt, /50000 UTF-16/);
+    assert.match(request.prompt, /start=served\.end/);
+    assert.match(request.prompt, /Never treat a clipped result as having read all of requested/);
+  }
+});
+
+test('RD1 question revision changing in the read/write window leaves the paid read pending', async t => {
+  const { root, store, engine, configure } = fixture(t); configure('p');
+  const source = engine.discovery.evidence.document('p', 'large', 'A'.repeat(59_513), 'text/plain', 0);
+  const draft = engine.prepare('p', 'discovery');
+  writeFileSync(join(root, 'adapter.mjs'), `import {readFileSync} from 'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_source',
+source:${JSON.stringify(reference(source))},start:0,end:59513}}));`);
+  const other = new Store(join(root, 'state.sqlite')); t.after(() => other.close());
+  const original = store.writeMany.bind(store); let changed = false;
+  store.writeMany = ((writes: Write[], guards = []) => {
+    if (!changed && writes.some(write => write.kind === 'research-turn'
+      && (write.value as ResearchTurn).status === 'completed'
+      && ((write.value as ResearchTurn).action as { action?: string }).action === 'read_source')) {
+      changed = true;
+      const question = other.get<Question>(draft.value.questions[0]!)!;
+      new ProductEngine(other).discovery.reopen(question.id, question.revision);
+    }
+    return original(writes, guards);
+  }) as typeof store.writeMany;
+  const run = await engine.researcher.run('p', draft.id, 1);
+  store.writeMany = original;
+  assert.equal(changed, true);
+  assert.equal(run.value.pauseCode, 'input_stale');
+  const turn = store.list<ResearchTurn>('research-turn').find(item =>
+    (item.value.action as { action?: string }).action === 'read_source')!;
+  assert.equal(turn.value.status, 'pending'); assert.equal(turn.value.observation, null);
+  assert.equal(store.list('model-call').length, 1); assert.equal(store.list('model-response').length, 1);
+});
+
+for (const stage of UPSTREAM_STAGES) test(`RD1 ${stage} serves a long source without a research_excerpt_limit pause`, async t => {
+  const { root, store, engine, configure } = fixture(t);
+  preparedFeatures(engine, 'p'); configure('p');
+  const source = engine.discovery.evidence.document('p', 'large', 'L'.repeat(59_513), 'text/plain', 0);
+  const draft = engine.prepare('p', stage);
+  writeFileSync(join(root, 'adapter.mjs'), `import {readFileSync} from 'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8'));
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_source',
+source:${JSON.stringify(reference(source))},start:0,end:59513}}));`);
+  const run = await engine.researcher.run('p', draft.id, 1);
+  const turn = store.list<ResearchTurn>('research-turn').find(item =>
+    (item.value.action as { action?: string }).action === 'read_source'
+    && item.value.run === run.id);
+  assert.ok(turn, JSON.stringify({ stage, run: run.value }));
+  assert.equal(turn.value.status, 'completed'); assert.equal(turn.value.error, null);
+  assert.deepEqual((turn.value.observation as any).served, { start: 0, end: 50_000 });
+  assert.equal((turn.value.observation as any).outcome, 'clipped');
+  assert.deepEqual(readResearchConsumerTurn(store, reference(turn)), turn);
+  assert.notEqual(run.value.pauseCode, 'research_excerpt_limit');
+});
 
 test("research command connects a process provider, evidence assessment and downstream acceptance for two products", async t => {
   const { store, engine, configure } = fixture(t);
@@ -224,6 +401,31 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   const environment = pilotEnvironment(engine.environments.get('p').value, pilot.value);
   return { root, store, engine, draft, question, pilot, environment };
 }
+
+test('RD1 v2 outside remains source-checked by synthesis after a restart', async t => {
+  const { root, store, engine, draft, question, pilot } = await rs1BundleFixture(t);
+  const source = engine.discovery.evidence.document('p', 'v2-outside', 'abc', 'text/plain', 0);
+  const reading = engine.discovery.evidence.readSource('p', reference(source),
+    { start: 3, end: 10 }, SOURCE_READ_CONTRACT_V2);
+  assert.equal(reading.selector, null); assert.equal(reading.outcome, 'outside');
+  writeFileSync(join(root, 'adapter.mjs'), `import {readFileSync} from 'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'pause',reason:'RD1 stop'}}));`);
+  const environment = engine.environments.get('p');
+  const dispatch = pilotEnvironment(environment.value, pilot.value);
+  const context = { ...pilotContext(store, draft, question),
+    workingSelections: [{ kind: 'context', value: reading }] };
+  const invoke = (view: Store) => synthesisSession(view, draft, question, environment, dispatch, pilot,
+    context, 'Return one action');
+  assert.equal((await invoke(store)).action, 'pause');
+  const session = store.list<any>('synthesis-session')[0]!;
+  const restarted = new Store(join(root, 'state.sqlite')); t.after(() => restarted.close());
+  assert.deepEqual(readSynthesisSession(restarted, reference(session)), session);
+  restarted.write({ id: source.id, kind: source.kind, expected: source.revision,
+    value: { ...source.value, content: 'changed', sha256: digest('changed') } });
+  const calls = restarted.list('model-call');
+  await assert.rejects(invoke(restarted), { code: 'synthesis_evidence_stale' });
+  assert.deepEqual(restarted.list('model-call'), calls);
+});
 
 for (const outsideOnly of [false, true]) test(`RS1 bundle ${outsideOnly ? 'outside only' : 'mixed clipped and outside'} preserves requested inputs and replays after restart`, async t => {
   const { root, store, engine, question, pilot, environment } = await rs1BundleFixture(t);
@@ -475,7 +677,7 @@ test('RS1 grouped read_source outside does not cancel the following clipped chil
   configureReaderPilot(store, engine.environments, 'p', { ...settings,
     planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 } }, pilot.revision);
   writeFileSync(join(root, 'adapter.mjs'), `import {readFileSync,appendFileSync} from 'node:fs';
-const r=JSON.parse(readFileSync(0,'utf8'));appendFileSync(${JSON.stringify(join(root, 'calls.txt'))},'planner\\n');
+const r=JSON.parse(readFileSync(0,'utf8'));appendFileSync(${JSON.stringify(join(root, 'calls.txt'))},JSON.stringify(r.prompt)+'\\n');
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_plan',question:r.subject.question.id,reads:[
 {action:'read_source',source:${JSON.stringify(reference(source))},start:100,end:200},
 {action:'read_source',source:${JSON.stringify(reference(source))},start:0,end:200}]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
@@ -487,6 +689,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{
   assert.ok(children.every(turn => turn.value.status === 'completed' && turn.value.error === null));
   for (const turn of children) assert.deepEqual(readResearchConsumerTurn(store, reference(turn)), turn);
   assert.equal(store.list('model-call').length, 1);
+  assert.match(JSON.parse(readFileSync(join(root, 'calls.txt'), 'utf8').trim()), /50000 UTF-16/);
   const child = children[0]!;
   const damaged = store.write({ id: child.id, kind: child.kind, expected: child.revision,
     value: { ...child.value, observation: { ...(child.value.observation as object), length: 900 } } });

@@ -10,7 +10,8 @@ import { webAction, WEB_ACTIONS, projectWebApplication, WEB_CAPTURE_CONTRACT, ty
 import { queuedChildReached } from './reading-plan.js';
 import type { ReaderResult } from './reader.js';
 import type { EarlyUnknown, ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
-import { projectSourceReading, SOURCE_READ_CONTRACT, type Observation, type Selector, type Source } from '../evidence/evidence.js';
+import { projectSourceReading, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2,
+  type SourceReadContract, type Observation, type Selector, type Source } from '../evidence/evidence.js';
 import type { ReaderSelection } from './reader.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { Revision, Store } from '../storage/store.js';
@@ -1291,7 +1292,7 @@ export type TurnTransitionProof =
       projectId: string; draft: Ref; question: Ref; status: 'unassessed';
       proposal: unknown; observations: Observation[];
       unresolved: string[] } } }
-  | { kind: 'source-excerpt'; readContract?: typeof SOURCE_READ_CONTRACT; projectId: string; source: { ref: Ref; value: Source } }
+  | { kind: 'source-excerpt'; readContract?: SourceReadContract; projectId: string; source: { ref: Ref; value: Source } }
   | { kind: 'source-read'; projectId: string; source: { ref: Ref; value: Source } }
   | { kind: 'reading-plan-queued'; children: Ref[] }
   | { kind: 'reading-mode' }
@@ -1315,13 +1316,14 @@ export type TurnTransitionProof =
 
 /** Includes queued children whose historical addresses predate managed turns. */
 export function projectSourceReadingTurn<T extends ResearchTurn>(before: T, projectId: string,
-  source: { ref: Ref; value: Source }): T {
+  source: { ref: Ref; value: Source }, readContract: SourceReadContract = SOURCE_READ_CONTRACT): T {
   const action = admittedResearchAction(before.action);
   requireCondition(before.status === 'pending' && before.error === null && before.assessment === null
     && action.action === 'read_source' && canonical(action.source) === canonical(source.ref),
     'research_consumer_intent_invalid', 'Only an exact pending source read can produce this result');
   return { ...before, status: 'completed', error: null,
-    observation: projectSourceReading(projectId, source.ref, source.value, { start: action.start, end: action.end }) };
+    observation: projectSourceReading(projectId, source.ref, source.value,
+      { start: action.start, end: action.end }, readContract) };
 }
 
 /** Pure producer projection. Callers must first prove each supplied record by
@@ -1460,8 +1462,9 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       && digest(proof.source.value.content) === proof.source.value.sha256,
     'research_consumer_intent_invalid', 'The source excerpt differs from its checked paid source');
     if (proof.readContract !== undefined) {
-      requireCondition(proof.readContract === SOURCE_READ_CONTRACT, 'research_consumer_intent_invalid', 'Unknown source read contract');
-      return projectSourceReadingTurn(before, proof.projectId, proof.source);
+      requireCondition(proof.readContract === SOURCE_READ_CONTRACT || proof.readContract === SOURCE_READ_CONTRACT_V2,
+        'research_consumer_intent_invalid', 'Unknown source read contract');
+      return projectSourceReadingTurn(before, proof.projectId, proof.source, proof.readContract);
     }
     requireCondition(action.end - action.start <= 50_000 && action.end <= proof.source.value.content.length,
       'research_consumer_intent_invalid', 'The historical excerpt exceeds its source');
