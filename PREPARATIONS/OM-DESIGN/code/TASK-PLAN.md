@@ -2817,7 +2817,7 @@
 - Отдаёт: —
 - Читает записи: 
 - Пишет записи: 
-- Разрешённые пути: `src/discovery/context-workspace.ts`, `src/discovery/working-context.ts`, `src/discovery/research-runner.ts`, `test/research-delivery.test.ts`, `src/discovery/research-limits.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`
+- Разрешённые пути: `src/discovery/context-workspace.ts`, `src/discovery/working-context.ts`, `src/discovery/research-runner.ts`, `test/research-delivery.test.ts`, `src/discovery/research-limits.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/continuation-packet.ts`
 - Из движка как есть: RD2b; №5353
 - После: RD2a
 - Тесты сверх обязательных:
