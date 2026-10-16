@@ -2782,9 +2782,9 @@
 - Отдаёт: —
 - Читает записи: 
 - Пишет записи: 
-- Разрешённые пути: `src/evidence/evidence.ts`, `src/evidence/source-structure.ts`, `src/discovery/research-sources.ts`, `src/discovery/web-research.ts`, `src/discovery/working-context.ts`, `test/source-structure.test.ts`, `test/web-research.test.ts`, `test/web-source-consumers.test.ts`, `src/compiler/inputs.ts`, `src/om/input.ts`, `src/om/accepted-answer.ts`, `src/om/model-call.ts`, `src/om/packet-brief.ts`
+- Разрешённые пути: `src/evidence/evidence.ts`, `src/evidence/source-structure.ts`, `src/discovery/research-sources.ts`, `src/discovery/web-research.ts`, `src/discovery/working-context.ts`, `test/source-structure.test.ts`, `test/web-research.test.ts`, `test/web-source-consumers.test.ts`, `src/compiler/inputs.ts`, `src/om/input.ts`, `src/om/accepted-answer.ts`, `src/om/model-call.ts`, `src/om/packet-brief.ts`, `src/discovery/research-consumer-transition.ts`, `src/storage/reference-sites.ts`
 - Из движка как есть: —
-- После: RD1
+- После: RD1, DRY6-03
 - Тесты сверх обязательных:
   - таблица исходов №5278 — каждая строка
   - пробы по риску №5278
