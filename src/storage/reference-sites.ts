@@ -13,6 +13,7 @@ interface RecordReferenceSemantics {
   kind: string;
   contract: string | null;
   data: readonly PathPattern[];
+  refs?: readonly PathPattern[];
 }
 
 const contextLookupData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
@@ -138,6 +139,13 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "synthesis-session", contract: "synthesis-session/v2", data: synthesisSessionData() },
   { kind: "web-capture", contract: "web-capture/v1", data: [["response"]] },
   { kind: "web-capture", contract: "web-capture/v2", data: [["response"]] },
+  { kind: "web-capture", contract: "web-capture/v3", data: [["response"]],
+    refs: [["turn"], ["environment"], ["material", "reservation"], ["budget"]] },
+  { kind: "web-admissions", contract: "web-admissions/v1", data: [],
+    refs: [["pending", INDEX, "turn"], ["pending", INDEX, "environment"]] },
+  { kind: "web-budget", contract: "web-budget/v2", data: [],
+    refs: [["migratedFrom"], ["charges", INDEX, "capture"], ["reservations", INDEX, "turn"],
+      ["reservations", INDEX, "environment"]] },
   { kind: "om-integrity", contract: "om-integrity/v1", data: [["findings", INDEX, "ref"]] },
 ];
 
@@ -190,6 +198,7 @@ export function referenceSites(kind: string, value: unknown): ReferenceSite[] {
   const data = RECORD_REFERENCE_SEMANTICS
     .filter(rule => rule.kind === kind && rule.contract === contract)
     .flatMap(rule => rule.data);
+  const declared = RECORD_REFERENCE_SEMANTICS.find(rule => rule.kind === kind && rule.contract === contract)?.refs;
   const sites: ReferenceSite[] = [];
   const visit = (current: unknown, path: PathSegment[]): void => {
     if (data.some(pattern => matches(pattern, path))) return;
@@ -199,7 +208,7 @@ export function referenceSites(kind: string, value: unknown): ReferenceSite[] {
     }
     if (!object(current)) return;
     if (isReference(current)) {
-      sites.push({ field: shown(path), ref: current });
+      if (!declared || declared.some(pattern => matches(pattern, path))) sites.push({ field: shown(path), ref: current });
       return;
     }
     const methodIndex = sourceTableMethodIndex(current);

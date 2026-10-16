@@ -14,7 +14,7 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { checkpoint } from "./research-continuation.js";
-import { Evidence, sourceIsCurrent, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2 } from "../evidence/evidence.js";
+import { Evidence, sourceIsCurrent, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3 } from "../evidence/evidence.js";
 import { readReaderResultAt, readerResultCurrent } from "./reader.js";
 import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWrites, markRecoveredSessionWritten,
   isResponseRecovery, prepareResearchConsumerIntent, readResearchConsumerIntent, findResearchConsumerIntent,
@@ -83,8 +83,22 @@ const checkpointInstruction = " A context-only page without primary Source evide
  * delivered value is verified source content, so the walk does not look inside
  * it for engine material. Returns the children still to walk. */
 function verifyMaterialReading(store: Store, draft: Revision<DiscoveryDraft>, value: Record<string, any>): unknown[] {
+  if (value.contract === 'research-search-capture/v2') {
+    requireCondition(Array.isArray(value.sources), 'synthesis_evidence_stale', 'The structured search lost its Source catalogue');
+    for (const fragment of value.sources) {
+      const source = isRef(fragment.source) ? store.get<any>(fragment.source.id) : null;
+      requireCondition(source?.kind === 'source' && canonical(reference(source)) === canonical(fragment.source)
+        && source.value.projectId === draft.value.projectId && sourceIsCurrent(source.value),
+      'synthesis_evidence_stale', 'A searched Source changed before synthesis continued');
+      if (fragment.selector) requireCondition(canonical(new Evidence(store).observe(draft.value.projectId,
+        fragment.source, fragment.selector).value) === canonical(fragment.excerpt),
+      'synthesis_evidence_stale', 'A search fragment must retain its exact clean Source slice');
+    }
+    return [];
+  }
   if (!isRef(value.source)
     || !(value.contract === SOURCE_READ_CONTRACT || value.contract === SOURCE_READ_CONTRACT_V2
+      || value.contract === SOURCE_READ_CONTRACT_V3
       || (value.selector && Object.hasOwn(value, 'value'))))
     return Object.values(value);
   requireCondition(value.projectId === draft.value.projectId && new Evidence(store).verifyReading(value),

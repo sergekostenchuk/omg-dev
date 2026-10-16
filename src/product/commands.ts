@@ -99,10 +99,15 @@ const environmentSettings = object({ workspace: string, implementer: role, revie
 // Added after object() fixed the required set, so a configure without it stays valid; the saved-environment validator judges the value.
 environmentSettings.properties['requestCapacityChars'] = { type: "integer", minimum: 1 };
 // WB1 (№4552): optional like the capacity; without it the project keeps working without web research.
-environmentSettings.properties['webResearch'] = object({ enabled: { type: "boolean" }, gatewayUrl: string,
-  timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
-  limits: object({ httpAttempts: { type: "integer", minimum: 1 }, pages: { type: "integer", minimum: 1 },
-    receivedChars: { type: "integer", minimum: 1 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) });
+environmentSettings.properties['webResearch'] = { oneOf: [
+  object({ enabled: { type: "boolean" }, gatewayUrl: string,
+    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
+    limits: object({ httpAttempts: { type: "integer", minimum: 1 }, pages: { type: "integer", minimum: 1 },
+      receivedChars: { type: "integer", minimum: 1 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) }),
+  object({ enabled: { type: "boolean" }, gatewayUrl: string,
+    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 }, budgetContract: { const: 'web-budget/v2' },
+    limits: object({ materialChars: { const: 2000000 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) })
+] };
 const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});

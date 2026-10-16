@@ -23,8 +23,11 @@ export interface RoleBinding {
 }
 /** Stage-wide web research allowance. The operator sets it for the launch; nothing in it is a sufficiency criterion. */
 export interface WebResearchLimits { httpAttempts: number; pages: number; receivedChars: number; responseBytes: number }
-/** The gateway endpoint (a tunnel the launch provides) and its limits; the model passes only a query or URL. */
-export interface WebResearchSettings { enabled: boolean; gatewayUrl: string; timeoutMs: number; limits: WebResearchLimits }
+export interface WebMaterialLimits { materialChars: 2_000_000; responseBytes: number }
+/** The gateway endpoint (a tunnel the launch provides) and its saved budget era. */
+export type WebResearchSettings =
+  | { enabled: boolean; gatewayUrl: string; timeoutMs: number; limits: WebResearchLimits; budgetContract?: never }
+  | { enabled: boolean; gatewayUrl: string; timeoutMs: number; limits: WebMaterialLimits; budgetContract: 'web-budget/v2' };
 export interface Environment {
   projectId: string; workspace: string; implementer: RoleBinding; reviewer: RoleBinding;
   fullCheck: Command; timeoutMs: number;
@@ -41,7 +44,7 @@ export function requireWebResearchSettings(project: string, value: unknown): ass
   };
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("", "Web research settings must be an object");
   const settings = value as Record<string, any>;
-  const extra = Object.keys(settings).find(key => !["enabled", "gatewayUrl", "timeoutMs", "limits"].includes(key));
+  const extra = Object.keys(settings).find(key => !["enabled", "gatewayUrl", "timeoutMs", "limits", "budgetContract"].includes(key));
   if (extra) fail(extra, "Web research settings carry only enabled, gatewayUrl, timeoutMs and limits");
   if (typeof settings.enabled !== "boolean") fail("enabled", "Web research must be explicitly enabled or disabled");
   let gateway: URL | null = null;
@@ -52,6 +55,15 @@ export function requireWebResearchSettings(project: string, value: unknown): ass
   if (!(typeof settings.timeoutMs === "number" && Number.isSafeInteger(settings.timeoutMs)
     && settings.timeoutMs >= 1_000 && settings.timeoutMs <= 600_000)) fail("timeoutMs", "The gateway timeout is 1000..600000 ms");
   const limits = settings.limits;
+  if (settings.budgetContract === 'web-budget/v2') {
+    if (!limits || typeof limits !== 'object' || Array.isArray(limits)
+      || Object.keys(limits).sort().join() !== 'materialChars,responseBytes')
+      fail('limits', 'The material budget names materialChars and responseBytes');
+    if (limits.materialChars !== 2_000_000) fail('limits.materialChars', 'The new stage material ceiling is exactly 2000000 UTF-16 units');
+    if (!positive(limits.responseBytes, 64_000_000)) fail('limits.responseBytes', 'responseBytes is a positive technical byte cap');
+    return;
+  }
+  if (Object.hasOwn(settings, 'budgetContract')) fail('budgetContract', 'Unknown saved web budget era');
   if (!limits || typeof limits !== "object" || Array.isArray(limits)
     || Object.keys(limits).sort().join() !== "httpAttempts,pages,receivedChars,responseBytes") fail("limits", "Limits name httpAttempts, pages, receivedChars and responseBytes");
   if (!positive(limits.httpAttempts, 100_000)) fail("limits.httpAttempts", "httpAttempts is a positive bounded integer");

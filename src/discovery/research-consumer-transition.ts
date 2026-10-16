@@ -6,12 +6,15 @@ import { EngineError, requireCondition } from '../errors.js';
 import { tokenUsage, type ModelCall } from '../runtime/model-usage.js';
 import { isRef, reference, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
 import { normalizeResearchAction } from './research-action-normalization.js';
-import { webAction, WEB_ACTIONS, projectWebApplication, WEB_CAPTURE_CONTRACT, WEB_CAPTURE_CONTRACT_V2, type WebCapture } from './web-research.js';
+import { webAction, WEB_ACTIONS, projectWebApplication, WEB_CAPTURE_CONTRACT, WEB_CAPTURE_CONTRACT_V2,
+  WEB_CAPTURE_CONTRACT_V3, type WebMaterialBudget, type WebCapture } from './web-research.js';
 import { queuedChildReached } from './reading-plan.js';
 import type { ReaderResult } from './reader.js';
 import type { EarlyUnknown, ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
-import { projectSourceReading, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2,
-  type SourceReadContract, type Observation, type Selector, type Source } from '../evidence/evidence.js';
+import { projectSourceReading, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3,
+  sourceReadContract, type SourceReadContract, type Observation, type Selector, type Source } from '../evidence/evidence.js';
+import { searchStructuredSource, STRUCTURED_SEARCH_CONTRACT, SEARCH_TEXT_LIMIT, SEARCH_FRAGMENT_LIMIT,
+  safeTextEnd, type StructuredFragment } from '../evidence/source-navigation.js';
 import type { ReaderSelection } from './reader.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { Revision, Store } from '../storage/store.js';
@@ -948,13 +951,58 @@ export interface ResearchSearchCaptureInput {
   query: string; workspace: string;
   sources: { ref: Ref; value: Source }[];
   process: ResearchSearchProcess;
+  searchContract?: 'research-search-capture/v1' | typeof STRUCTURED_SEARCH_CONTRACT;
 }
 export interface ResearchSearchCaptureValue {
-  contract: 'research-search-capture/v1'; projectId: string;
+  contract: 'research-search-capture/v1' | typeof STRUCTURED_SEARCH_CONTRACT; projectId: string;
   turn: Ref; run: string; question: Ref | null; consumerIntent: Ref;
   plannedBy: Ref | null; query: string; workspace: string;
   sources: Ref[]; process: ResearchSearchProcess;
-  observation: ResearchSearchObservation;
+  observation: ResearchSearchObservation | StructuredResearchSearchObservation;
+}
+
+export interface StructuredResearchSearchObservation {
+  contract: typeof STRUCTURED_SEARCH_CONTRACT;
+  sources: ({ source: Ref; offset: number; excerpt: string; selector?: { kind: 'text-range'; start: number; end: number };
+    sectionPath?: StructuredFragment['sectionPath']; heading?: StructuredFragment['heading']; sentenceSplit?: boolean })[];
+  repositoryMatches: string; repositoryStatus: ResearchSearchObservation['repositoryStatus'];
+  found: number; delivered: number; truncated: boolean; hasMore: boolean; displayedChars: number;
+}
+
+/** New mixed search counts every displayed Source and repository character in one envelope. */
+export function projectResearchSearchObservationV2(query: string,
+  sources: readonly { ref: Ref; value: Source }[], process: ResearchSearchProcess): StructuredResearchSearchObservation {
+  requireSearchQuery(query);
+  const old = projectResearchSearchObservation(query, sources, process);
+  const delivered: StructuredResearchSearchObservation['sources'] = [];
+  let found = 0, displayedChars = 0, clipped = false;
+  const sorted = [...sources].sort((left, right) => canonical(left.ref).localeCompare(canonical(right.ref)));
+  for (const source of sorted) {
+    const slots = SEARCH_FRAGMENT_LIMIT - delivered.length, room = SEARCH_TEXT_LIMIT - displayedChars;
+    if (sourceReadContract(source.value, source.ref) === SOURCE_READ_CONTRACT_V3) {
+      const result = searchStructuredSource(source.value.content, source.value.structure!, query, slots, room);
+      found += result.found; displayedChars += result.displayedChars; clipped ||= result.truncated;
+      for (const fragment of result.fragments) delivered.push({ source: source.ref, offset: fragment.matchOffsets[0]!, excerpt: fragment.text,
+        ...(fragment.range.end > fragment.range.start ? { selector: { kind: 'text-range' as const, ...fragment.range } } : {}),
+        sectionPath: fragment.sectionPath, heading: fragment.heading, sentenceSplit: fragment.sentenceSplit });
+    } else {
+      const legacy = old.sources.find(row => canonical(row.source) === canonical(source.ref));
+      if (!legacy) continue;
+      found++;
+      const end = safeTextEnd(legacy.excerpt, Math.min(legacy.excerpt.length, room));
+      if (slots <= 0 || end <= 0) { clipped = true; continue; }
+      delivered.push({ ...legacy, excerpt: legacy.excerpt.slice(0, end) }); displayedChars += end;
+      clipped ||= end < legacy.excerpt.length;
+    }
+  }
+  const repositoryText = process.stdout ?? '';
+  const repositoryMatches = repositoryText.slice(0,
+    safeTextEnd(repositoryText, Math.min(repositoryText.length, SEARCH_TEXT_LIMIT - displayedChars)));
+  displayedChars += repositoryMatches.length;
+  const truncated = clipped || repositoryMatches.length < repositoryText.length || old.repositoryStatus === 'unavailable_or_truncated';
+  return { contract: STRUCTURED_SEARCH_CONTRACT, sources: delivered, repositoryMatches,
+    repositoryStatus: old.repositoryStatus, found, delivered: delivered.length,
+    truncated, hasMore: truncated, displayedChars };
 }
 
 /** Shared query admission for the ordinary search and managed capture. */
@@ -1044,12 +1092,17 @@ export function projectResearchSearchCapture(input: ResearchSearchCaptureInput):
     'research_search_capture_invalid', 'The search has no paid consumer origin');
     consumerIntent = managed.consumerIntent;
   }
-  const observation = projectResearchSearchObservation(query, sources, process);
-  const value: ResearchSearchCaptureValue = { contract: 'research-search-capture/v1',
+  const contract = input.searchContract ?? 'research-search-capture/v1';
+  requireCondition(contract === 'research-search-capture/v1' || contract === STRUCTURED_SEARCH_CONTRACT,
+    'research_search_capture_invalid', 'Unknown saved search projection');
+  const observation = contract === STRUCTURED_SEARCH_CONTRACT
+    ? projectResearchSearchObservationV2(query, sources, process)
+    : projectResearchSearchObservation(query, sources, process);
+  const value: ResearchSearchCaptureValue = { contract,
     projectId, turn: exactRef(turn), run: turn.value.run, question: turn.value.question,
     consumerIntent, plannedBy, query, workspace,
     sources: sources.map(source => source.ref), process, observation };
-  const hash = hashJson(value), id = `research-search-capture:v1:${hash}`;
+  const hash = hashJson(value), id = `research-search-capture:${contract === STRUCTURED_SEARCH_CONTRACT ? 'v2' : 'v1'}:${hash}`;
   return { id, ref: { id, revision: 1, hash }, value };
 }
 
@@ -1308,7 +1361,7 @@ export type TurnTransitionProof =
       /** UNK1: the unknown-era admission of the producer (earlyUnknownAdmission); absent in the DRY5FIX era. */
       unknown?: EarlyUnknownAdmission }
   /** WB1: a web turn completes only from its saved capture (gateway answer or local refusal). */
-  | { kind: 'web'; projectId: string; capture: Revision<WebCapture> }
+  | { kind: 'web'; projectId: string; capture: Revision<WebCapture>; budget?: Revision<WebMaterialBudget> | null }
   | { kind: 'question-reopened'; original: Revision<Question>;
       reopened: Revision<Question>; draft: Revision<DiscoveryDraft> }
   | { kind: 'repeat-context'; current: ContextReadIdentityInput;
@@ -1462,7 +1515,8 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       && digest(proof.source.value.content) === proof.source.value.sha256,
     'research_consumer_intent_invalid', 'The source excerpt differs from its checked paid source');
     if (proof.readContract !== undefined) {
-      requireCondition(proof.readContract === SOURCE_READ_CONTRACT || proof.readContract === SOURCE_READ_CONTRACT_V2,
+      requireCondition(proof.readContract === SOURCE_READ_CONTRACT || proof.readContract === SOURCE_READ_CONTRACT_V2
+        || proof.readContract === SOURCE_READ_CONTRACT_V3,
         'research_consumer_intent_invalid', 'Unknown source read contract');
       return projectSourceReadingTurn(before, proof.projectId, proof.source, proof.readContract);
     }
@@ -1598,12 +1652,13 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
   if (proof.kind === 'web') {
     const { capture, projectId } = proof;
     requireCondition(capture.kind === 'web-capture' && hashJson(capture.value) === capture.hash
-      && (capture.value.contract === WEB_CAPTURE_CONTRACT || capture.value.contract === WEB_CAPTURE_CONTRACT_V2)
+      && (capture.value.contract === WEB_CAPTURE_CONTRACT || capture.value.contract === WEB_CAPTURE_CONTRACT_V2
+        || capture.value.contract === WEB_CAPTURE_CONTRACT_V3)
       && capture.value.projectId === projectId
       && capture.value.turn.hash === hashJson(before) && canonical(capture.value.action) === canonical(before.action)
       && (action.action === 'web_search' || action.action === 'web_fetch' || capture.value.response.kind === 'refused'),
     'research_consumer_intent_invalid', 'The web completion lost its exact capture of this pending turn');
-    return projectWebApplication(projectId, before, capture).turn as ManagedResearchTurn;
+    return projectWebApplication(projectId, before, capture, proof.budget).turn as ManagedResearchTurn;
   }
   if (proof.kind === 'early-unknown') {
     const { draft, question, producer, searched } = proof;

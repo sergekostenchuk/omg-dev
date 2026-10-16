@@ -32,7 +32,7 @@ import { earlyResearchConsumerFailure, captureResearchConsumerRetryPermits, find
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { ResearchSources } from "./research-sources.js";
 import { executeWebTurn, webBudgetView, webResearchGuide, type WebResearchOutcome } from "./web-research.js";
-import { Evidence, SOURCE_READ_CONTRACT_V2, SOURCE_READ_MAX_CHARS, type Source } from "../evidence/evidence.js";
+import { Evidence, sourceReadContract, SOURCE_READ_MAX_CHARS, type Source } from "../evidence/evidence.js";
 import { assessAnswer, readResearchAssessmentAt } from "./research-assessment.js";
 import { readAssessmentPaidOrigin, paidAssessmentTerminal } from "./assessment-session.js";
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
@@ -56,7 +56,7 @@ import { pendingSynthesis, synthesisSession, findUnfinishedSynthesisSession, syn
   synthesisDeliveryMarks } from "./synthesis-session.js";
 
 const PILOT_INSTRUCTION = `\nThis is the bounded R1/L2 reader experiment. Work only on context.question. The core preserves product intent and constraints; the catalogues identify exact additional context. For semantic source investigation prefer one related bundle: {"action":"read_bundle","purpose":"what to establish, including exceptions","inputs":[{"path":"relative/file","media":"text/plain"}]} or inputs [{"source":{"id":"...","revision":1,"hash":"..."}}]. Each bundle input may include range:{start,end} with original character offsets for a large source; partial windows are marked explicitly. The configured reader selects coordinates and the engine returns original text, never a paraphrase. For exact accepted map/stage/research data use {"action":"read_context","record":{"id":"...","revision":1,"hash":"..."},"pointer":"/projection/nodes/0"}; use the provided catalogue references and pointers. For original source verification read_source remains available. Source and context records are different: citations must use source references, not graph/stage record references. Retained readings and unresolved information are in the current packet. Do not re-read them without a concrete missing detail. Return a complete answer to this technical field; do not regenerate other answered fields or the project history. Missing contextual detail requires addressed reading, not an invented answer or a question to the owner.`;
-const SOURCE_READ_INSTRUCTION = `\nread_source returns at most ${SOURCE_READ_MAX_CHARS} UTF-16 code units per action. If the requested range is longer, the result has outcome=clipped, keeps the full requested range, and gives only served and its exact text. Never treat a clipped result as having read all of requested. To read the rest, send another read_source with start=served.end.`;
+const SOURCE_READ_INSTRUCTION = `\nSource inventory names each saved read contract. Historical and unstructured source-read/v2 returns at most ${SOURCE_READ_MAX_CHARS} UTF-16 code units per action; outcome=clipped covers only served, not all requested. Never treat a clipped result as having read all of requested. Structured source-read/v3 gives a document of at most 60000 UTF-16 units in one read. For a larger structured source, first use its TOC and search {query}, then read_source at an addressed section range; a non-addressed whole-document request returns only overview and is not body evidence. Addressed windows end at paragraph boundaries, may fetch a tail shorter than 10000, and never cross the selected section. The result preserves requested and gives exact served, requestedCovered and documentComplete separately. Continue with another read_source using start=served.end when needed. Search returns at most 10 fragments and 50000 UTF-16 units including headings, section paths and repository navigation. It uses the matching paragraph plus one neighbour each side (two inward at an edge), merges text blocks shorter than 200 within the section, and bounds a paragraph longer than 5000 to 2000 units before and after the match. Overlaps are merged; truncated/hasMore signal omitted material. Fragments carry exact Source ranges and section paths; headings are navigation, not body proof.`;
 const DELTA_INSTRUCTION = `\nFor the L2 layerDesign question, return answer_delta instead of a full graph: {"action":"answer_delta","question":"current question ID","base":context.graphBase,"upserts":{"nodes":[complete new nodes or changed fields of existing nodes],"connectors":[connector IDs and changed fields; preserve upper bindings when replacing the bindings array]},"removes":{},"citations":[...source citations...]}. Allowed collections: nodes, connectors, contracts, artifacts, edges, journeys, joins, anchors, tests, packets, transfers. Objects are upserted by ID; untouched objects and unspecified fields of existing objects are inherited by the engine. Include all changes needed for the complete L2, preserve L1, and do not add L3. The provided question schema describes the assembled design, not fields that must all be repeated in your response. A previous failed proposal is supplied for correction when available. To correct it, set revises to context.previousProposalRef and send only the entities/fields that change; the engine applies these changes to the saved proposal, not to an empty layer. Keep base equal to context.graphBase. Provide citations for the assembled result. Omit revises only when intentionally replacing the entire previous proposal.`;
 
 /** UNK1 (№4686 §3): the unknown door of the early analyst era 'early-research-actions/v2', named to every new early call. */
@@ -999,12 +999,13 @@ export class Researcher {
             turnProof = { kind: 'source-read', projectId: project,
               source: { ref: reference(source), value: source.value } };
           } else if (action.action === "read_source") {
-            observation = new Evidence(this.store).readSource(project, action.source,
-              { start: action.start, end: action.end }, SOURCE_READ_CONTRACT_V2);
             const source = this.store.get<Source>(action.source.id, action.source.revision);
             requireCondition(source && canonical(reference(source)) === canonical(action.source),
               'research_consumer_intent_invalid', 'The paid excerpt lost its exact source');
-            turnProof = { kind: 'source-excerpt', readContract: SOURCE_READ_CONTRACT_V2, projectId: project,
+            const readContract = sourceReadContract(source.value, action.source);
+            observation = new Evidence(this.store).readSource(project, action.source,
+              { start: action.start, end: action.end }, readContract);
+            turnProof = { kind: 'source-excerpt', readContract, projectId: project,
               source: { ref: reference(source), value: source.value } };
           }
           else if (action.action === "web_search" || action.action === "web_fetch") {

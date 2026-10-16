@@ -29,9 +29,9 @@ import { contextWorkspace } from './context-workspace.js';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { reference, isRef, uniqueRefs, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
 import { EngineError, requireCondition } from '../errors.js';
-import { Evidence, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2,
+import { Evidence, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3,
   type Source, type Observation, type Selector } from '../evidence/evidence.js';
-import { webCaptureId, type WebCapture } from './web-research.js';
+import { webCaptureId, readWebCaptureBudget, type WebCapture } from './web-research.js';
 import { processStart } from '../runtime/process-identity.js';
 import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executionOf } from './model-call-recovery.js';
 import { stopCancelledCall, liftedStop } from '../om/run-control.js';
@@ -472,7 +472,7 @@ function readManagedSearchCompletion(store: Store, before: Revision<Record<strin
   const projected = projectSearchTurnCompletion({ projectId: intent.value.projectId,
     turn: before as Revision<ResearchTurn>, store, ...(parent ? { parent } : {}),
     query: action.query, workspace: intent.value.dispatch.workspace,
-    sources, process: capture.value.process });
+    sources, process: capture.value.process, searchContract: capture.value.contract });
   if (capture.id !== projected.capture.id
     || canonical(reference(capture)) !== canonical(projected.capture.ref)
     || canonical(capture.value) !== canonical(projected.capture.value)
@@ -931,7 +931,7 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
     const capture = store.get<WebCapture>(webCaptureId(reference(before)));
     if (!capture || capture.kind !== 'web-capture' || hashJson(capture.value) !== capture.hash)
       consumerInvalid(before.id, 'The completed web turn lost its saved capture');
-    return { kind: 'web', projectId: producer.value.projectId, capture };
+    return { kind: 'web', projectId: producer.value.projectId, capture, budget: readWebCaptureBudget(store, capture) };
   }
   if ((action.action === 'read' || action.action === 'read_source')
     && after.value.status === 'completed' && after.value.error === null) {
@@ -1111,7 +1111,7 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
       const sourceRef = saved.value.action.source;
       const source = isRef(sourceRef) ? store.get<Source>(sourceRef.id, sourceRef.revision) : null;
       const run = before && typeof before.value.run === 'string' ? store.get<{projectId: string}>(before.value.run, 1) : null;
-      if (![SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2].includes(saved.value.observation.contract) || !before
+      if (![SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(saved.value.observation.contract) || !before
         || before.kind !== 'research-turn' || hashJson(before.value) !== before.hash
         || !run || run.kind !== 'research-run' || hashJson(run.value) !== run.hash
         || !source || source.kind !== 'source' || canonical(reference(source)) !== canonical(sourceRef))

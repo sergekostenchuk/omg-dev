@@ -1,18 +1,22 @@
 import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { Store, type Revision, type Write } from "../storage/store.js";
-import { Evidence, sourceIsCurrent, type Source } from "../evidence/evidence.js";
+import { Evidence, sourceIsCurrent, sourceReadContract, type Source } from "../evidence/evidence.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
 import { digest } from "../canonical.js";
 import { workspacePath, gitBytes } from "../runtime/environment.js";
 import type { ResearchTurn } from './research-model.js';
-import { projectResearchSearchObservation, projectSearchTurnCompletion, requireSearchQuery,
+import { projectResearchSearchObservation, projectResearchSearchObservationV2, projectSearchTurnCompletion, requireSearchQuery,
   type ResearchSearchProcess } from './research-consumer-transition.js';
 
 export class ResearchSources {
   constructor(private readonly store: Store, private readonly project: string, private readonly root: string) {}
   list() {
-    return this.store.list<Source>("source").filter(item => item.value.projectId === this.project && sourceIsCurrent(item.value));
+    return this.store.list<Source>("source").filter(item => {
+      if (item.value.projectId !== this.project) return false;
+      sourceReadContract(item.value, reference(item));
+      return sourceIsCurrent(item.value);
+    });
   }
   inventory() {
     let files: string[] = [];
@@ -24,6 +28,7 @@ export class ResearchSources {
       const origin = item.value.origin;
       const excerpt = origin.kind === "file" ? "" : item.value.content.slice(0, origin.kind === "web" ? 500 : 3000);
       return { ref: reference(item), kind: origin.kind, location: origin.location,
+        readContract: sourceReadContract(item.value, reference(item)),
         ...(item.value.provenance?{provenance:item.value.provenance}:{}),
         ...(origin.kind === "web" ? { fetchedAt: origin.fetchedAt, completeness: origin.completeness } : {}),
         ...(origin.kind === 'web' && 'documentContract' in origin && item.value.structure
@@ -44,7 +49,9 @@ export class ResearchSources {
     return new Evidence(this.store).file(this.project, key, this.root, path, media, old?.revision ?? 0);
   }
   excerpt(ref: Ref, start: number, end: number) {
-    return new Evidence(this.store).readSource(this.project, ref, { start, end });
+    const source = this.store.get<Source>(ref.id, ref.revision);
+    return new Evidence(this.store).readSource(this.project, ref, { start, end },
+      source ? sourceReadContract(source.value, ref) : undefined);
   }
   private searchFacts(query: string) {
     requireSearchQuery(query);
@@ -62,7 +69,9 @@ export class ResearchSources {
   }
   search(query: string) {
     const facts = this.searchFacts(query);
-    return projectResearchSearchObservation(query, facts.sources, facts.process);
+    return facts.sources.some(source => sourceReadContract(source.value, source.ref) === 'source-read/v3')
+      ? projectResearchSearchObservationV2(query, facts.sources, facts.process)
+      : projectResearchSearchObservation(query, facts.sources, facts.process);
   }
   /** Prepare the capture and turn result from one Source enumeration and one
    * git grep. The caller writes both with its run in one guarded transaction. */
@@ -71,7 +80,9 @@ export class ResearchSources {
     { turn: ResearchTurn; capture: Write; captureRef: Ref; guards: Ref[] } {
     const facts = this.searchFacts(query);
     const projected = projectSearchTurnCompletion({ projectId: this.project,
-      turn, store: this.store, ...(parent ? { parent } : {}), query, workspace: this.root, ...facts });
+      turn, store: this.store, ...(parent ? { parent } : {}), query, workspace: this.root,
+      ...(facts.sources.some(source => sourceReadContract(source.value, source.ref) === 'source-read/v3')
+        ? { searchContract: 'research-search-capture/v2' as const } : {}), ...facts });
     const capture: Write = { id: projected.capture.id,
       kind: 'research-search-capture', expected: 0, value: projected.capture.value };
     return { turn: projected.turn, capture, captureRef: projected.capture.ref,

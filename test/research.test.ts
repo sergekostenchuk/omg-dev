@@ -1,3 +1,6 @@
+import { executeWebTurn } from '../src/discovery/web-research.js';
+import { ResearchSources } from '../src/discovery/research-sources.js';
+import { workingContext } from '../src/discovery/working-context.js';
 import { digest, hashJson } from '../src/canonical.js';
 import { execFileSync } from 'node:child_process';
 import { EngineError } from '../src/errors.js';
@@ -18,8 +21,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_MAX_CHARS,
+import { SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3, SOURCE_READ_MAX_CHARS,
   sourceReadRange, sourceReadRangeV2 } from '../src/evidence/evidence.js';
+import { projectResearchSearchObservationV2 } from '../src/discovery/research-consumer-transition.js';
 import { reference } from "../src/pipeline/contracts.js";
 import type { ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
 import type { FieldSpec } from "../src/discovery/discovery.js";
@@ -122,6 +126,38 @@ test('RD1 source-read/v2 serves exact bounded UTF-16 windows while v1 and reader
   engine.discovery.evidence.document('p', 'long', 'changed', 'text/plain', 1);
   assert.throws(() => evidence.readSource('p', source, { start: 0, end: 1 }, SOURCE_READ_CONTRACT_V2),
     { code: 'source_stale' });
+});
+
+test('SR1c source-read/v3 gives whole clean Markdown or a non-evidentiary overview and preserves v2 replay', async t => {
+  const { store, engine, configure } = fixture(t); configure('p');
+  const small = reference(await structuredWebSource({ root: '', store, engine }, '# Intro\n' + 'a'.repeat(59_500), 'small'));
+  const read = engine.discovery.evidence.readSource('p', small, { start: 3, end: 12 }, SOURCE_READ_CONTRACT_V3);
+  assert.equal(read.outcome, 'complete');
+  assert.equal(read.value, '# Intro\n' + 'a'.repeat(59_500));
+  assert.equal(read.expanded, true); assert.equal(read.documentComplete, true);
+  assert.equal(engine.discovery.evidence.verifyReading(read), true);
+  const bigText = '# First\n' + 'b'.repeat(3_000) + 'Needle' + 'c'.repeat(57_001);
+  const big = reference(await structuredWebSource({ root: '', store, engine }, bigText, 'big'));
+  const overview = engine.discovery.evidence.readSource('p', big,
+    { start: 0, end: bigText.length }, SOURCE_READ_CONTRACT_V3);
+  assert.equal(overview.outcome, 'overview'); assert.equal(overview.selector, null);
+  assert.equal(overview.documentComplete, false);
+  assert.equal(engine.discovery.evidence.verifyReading(overview), true);
+  assert.equal(engine.discovery.evidence.verifyReading({ ...overview, documentComplete: true }), false);
+  const addressed = engine.discovery.evidence.readSource('p', big,
+    { start: 8, end: 59_500 }, SOURCE_READ_CONTRACT_V3);
+  assert.equal(addressed.selector?.kind, 'text-range');
+  assert.equal(addressed.value, bigText.slice(addressed.served!.start, addressed.served!.end));
+  assert.equal(engine.discovery.evidence.verifyReading(addressed), true);
+  const historical = engine.discovery.evidence.readSource('p', big,
+    { start: 0, end: bigText.length }, SOURCE_READ_CONTRACT_V2);
+  assert.equal(historical.served?.end, 50_000);
+  assert.equal(engine.discovery.evidence.verifyReading(historical), true);
+  const search = projectResearchSearchObservationV2('needle', [{ ref: big,
+    value: store.get<any>(big.id)!.value }], { stdout: null, status: 1, signal: null, error: null });
+  assert.equal(search.contract, 'research-search-capture/v2');
+  assert.ok(search.sources.length > 0);
+  assert.equal(search.sources[0]!.sectionPath?.at(-1)?.title, 'First');
 });
 
 test('RD1 cold restart completes one paid pending read as v2 without redispatch', async t => {
@@ -1128,4 +1164,194 @@ test("RS3 №4414: an assessor failing with the codex-stdio envelope is a provid
   assert.equal(roles.filter(role => role === "research").length, f.draft.value.questions.length + 1, "The researcher is not called again for the assessed answer");
   assert.ok(roles.filter(role => role === "assess-answer").length >= 2, "The assessment is asked again");
   assert.equal(f.store.get<ResearchTurn>(candidate.id)!.value.status, "completed");
+});
+
+async function structuredWebSource(f: { root: string; store: Store; engine: ProductEngine }, content: string, key = 'web') {
+  const { projectId: _project, ...old } = f.engine.environments.get('p').value;
+  const environment = f.engine.environments.configure('p', { ...old,
+    webResearch: { enabled: true, gatewayUrl: 'http://127.0.0.1:18890', timeoutMs: 5000,
+      budgetContract: 'web-budget/v2', limits: { materialChars: 2_000_000, responseBytes: 16_000_000 } } },
+  f.engine.environments.get('p').revision);
+  const run = f.store.write({ id: `research-run:sr1c:${key}`, kind: 'research-run', expected: 0,
+    value: { projectId: 'p', draftId: `sr1c-source:${key}` } });
+  const url = `https://example.org/${key}.md`;
+  const turn = f.store.write<ResearchTurn>({ id: `research-turn:sr1c:${key}`, kind: 'research-turn', expected: 0,
+    value: { run: run.id, number: 1, action: { action: 'web_fetch', url, purpose: 'saved document' },
+      status: 'pending', assessment: null, observation: null, error: null, question: null } });
+  const bytes = Buffer.from(content);
+  const result = await executeWebTurn({ store: f.store, projectId: 'p', stage: 'discovery', environment, turn,
+    transport: async () => ({ status: 200, body: { contract: 'web-document/v2', requested_url: url,
+      selected_url: url, final_url: url, fetched_at: '2026-10-16T00:00:00.000Z', status: 200, success: true,
+      failure: null, redirects: [], attempts: [],
+      raw: { encoding: 'base64', data: bytes.toString('base64'), byteLength: bytes.length, sha256: digest(bytes), mediaType: 'text/markdown' },
+      clean: { text: content, utf16Length: content.length, sha256: digest(content), mediaType: 'text/markdown' },
+      method: { kind: 'native-markdown', version: 'sr1c-fixture/v1' },
+      signals: { rawTruncated: false, cleanTruncated: false, completeness: 'unknown' } } }) });
+  return result.source!;
+}
+
+for (const stage of UPSTREAM_STAGES) test(`SR1c ${stage}: actual web Source 59513 is delivered whole and replayed after restart`, async t => {
+  const f = fixture(t); preparedFeatures(f.engine, 'p'); f.configure('p');
+  const source = await structuredWebSource(f, '# Intro\n' + 'z'.repeat(59_505));
+  assert.equal(source.value.content.length, 59_513);
+  const draft = f.engine.prepare('p', stage);
+  writeFileSync(join(f.root, 'adapter.mjs'), `import {readFileSync,appendFileSync} from 'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8'));appendFileSync(${JSON.stringify(join(f.root, 'calls.txt'))},JSON.stringify(r)+'\n');
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_source',source:${JSON.stringify(reference(source))},start:10,end:20}}));`.replace("+'\n'", "+'\\n'"));
+  const run = await f.engine.researcher.run('p', draft.id, 1);
+  const turn = f.store.list<ResearchTurn>('research-turn').find(item => item.value.run === run.id && (item.value.action as any).action === 'read_source')!;
+  assert.ok(turn, JSON.stringify(run.value));
+  const reading = turn.value.observation as any;
+  assert.equal(reading.contract, 'source-read/v3'); assert.equal(reading.value, source.value.content);
+  assert.equal(reading.documentComplete, true); assert.equal(reading.expanded, true);
+  const reopened = new Store(join(f.root, 'state.sqlite')); t.after(() => reopened.close());
+  assert.deepEqual(readResearchConsumerTurn(reopened, reference(turn)), turn);
+  const request = JSON.parse(readFileSync(join(f.root, 'calls.txt'), 'utf8').trim());
+  assert.match(request.prompt, /source-read\/v3/); assert.match(JSON.stringify(request.subject), /source-read\/v3/);
+  assert.match(JSON.stringify(request.subject), /source-toc-page\/v1/);
+  assert.equal(reopened.list('model-call').length, 1);
+});
+
+for (const action of ['read_source', 'search'] as const)
+  test(`SR1c paid ${action} -> loss before local completion -> restart -> exact replay without new model or HTTP`, async t => {
+    const f = fixture(t); f.configure('p');
+    const source = await structuredWebSource(f, '# Part\n' + 'data '.repeat(12_001) + 'Needle.');
+    const draft = f.engine.prepare('p', 'discovery');
+    const value = action === 'read_source' ? { action, source: reference(source), start: 0, end: source.value.content.length }
+      : { action, query: 'Needle' };
+    writeFileSync(join(f.root, 'adapter.mjs'), `import {readFileSync,appendFileSync} from 'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8'));appendFileSync(${JSON.stringify(join(f.root, 'calls.txt'))},'call\\n');
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:${JSON.stringify(value)}}));`);
+    const write = f.store.writeMany.bind(f.store); let lost = false;
+    f.store.writeMany = ((writes: Write[], guards = []) => {
+      if (!lost && writes.some(w => w.kind === 'research-turn' && (w.value as any).status === 'completed')) {
+        lost = true; throw new EngineError('input_stale', 'Local completion interrupted');
+      }
+      return write(writes, guards);
+    }) as typeof f.store.writeMany;
+    await f.engine.researcher.run('p', draft.id, 1); f.store.writeMany = write; assert.ok(lost);
+    const calls = f.store.list('model-call'), responses = f.store.list('model-response'), captures = f.store.list('web-capture');
+    const reopened = new Store(join(f.root, 'state.sqlite')); t.after(() => reopened.close());
+    const run = await new ProductEngine(reopened).researcher.run('p', draft.id, 1);
+    const turn = reopened.list<ResearchTurn>('research-turn').find(item => item.value.run === run.id && (item.value.action as any).action === action)!;
+    assert.equal(turn.value.status, 'completed', JSON.stringify(run.value));
+    assert.deepEqual(readResearchConsumerTurn(reopened, reference(turn)), turn);
+    assert.deepEqual(reopened.list('model-call'), calls); assert.deepEqual(reopened.list('model-response'), responses);
+    assert.deepEqual(reopened.list('web-capture'), captures);
+    assert.equal(readFileSync(join(f.root, 'calls.txt'), 'utf8').trim(), 'call');
+    if (action === 'read_source') {
+      const observation = turn.value.observation as any;
+      assert.equal(observation.outcome, 'overview'); assert.equal(observation.selector, null); assert.equal(observation.documentComplete, false);
+    } else assert.equal((turn.value.observation as any).contract, 'research-search-capture/v2');
+  });
+
+test('SR1c mixed-source search counts repository text, exact heading ranges and last fragment clipping in one envelope', async t => {
+  const f = fixture(t); f.configure('p');
+  const content = ('Needle ' + 'x'.repeat(990) + '\n\n').repeat(65);
+  const source = await structuredWebSource(f, content);
+  const legacy = f.engine.discovery.evidence.document('p', 'legacy', 'Needle old text', 'text/plain', 0);
+  const facts = [{ ref: reference(source), value: source.value }, { ref: reference(legacy), value: legacy.value }];
+  const result = projectResearchSearchObservationV2('Needle', facts,
+    { stdout: 'repository matches'.repeat(4000), status: 0, signal: null, error: null });
+  assert.ok(result.displayedChars <= 50_000); assert.equal(result.hasMore, true); assert.equal(result.truncated, true);
+  assert.equal(result.displayedChars, result.repositoryMatches.length + result.sources.reduce((sum, row) =>
+    sum + row.excerpt.length + (row.heading?.text.length ?? 0) + (row.sectionPath ?? []).reduce((n, part) => n + (part.title?.length ?? 0), 0), 0));
+  const one = projectResearchSearchObservationV2('Needle', [facts[0]!], { stdout: '', status: 1, signal: null, error: null });
+  assert.equal(one.delivered, 1); assert.equal(one.truncated, true, 'partial final fragment is explicit even if all fragments were selected');
+});
+
+test('SR1c grouped overview/read/search and synthesis retain exact v3 material without claiming a body read', async t => {
+  const f = await rs1BundleFixture(t);
+  const source = await structuredWebSource(f, '# One\n' + 'x'.repeat(60_000) + ' Needle.');
+  const legacy = f.engine.discovery.evidence.document('p', 'sr1c-mixed', 'Needle legacy material', 'text/plain', 0);
+  const settings: Record<string, unknown> = { ...f.pilot.value }; delete settings.projectId;
+  const pilot = configureReaderPilot(f.store, f.engine.environments, 'p', { ...settings,
+    planning: { fields: [f.question.value.spec.field], maxRequestChars: 100_000, maxRounds: 3 } }, f.pilot.revision);
+  const ref = reference(source);
+  writeFileSync(join(f.root, 'adapter.mjs'), `import {readFileSync} from 'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_plan',question:r.subject.question.id,reads:[
+{action:'read_source',source:${JSON.stringify(ref)},start:0,end:${source.value.content.length}},
+{action:'read_source',source:${JSON.stringify(ref)},start:6,end:100},
+{action:'search',query:'Needle'}]},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  await f.engine.researcher.run('p', f.question.value.draftId, 4);
+  const children = f.store.list<ResearchTurn>('research-turn').filter(turn => turn.value.plannedBy)
+    .sort((a, b) => a.value.number - b.value.number);
+  assert.equal(children.length, 3);
+  assert.equal((children[0]!.value.observation as any).outcome, 'overview');
+  assert.equal((children[1]!.value.observation as any).contract, 'source-read/v3');
+  assert.equal((children[2]!.value.observation as any).contract, 'research-search-capture/v2');
+  for (const turn of children) assert.deepEqual(readResearchConsumerTurn(f.store, reference(turn)), turn);
+  const overview = children[0]!.value.observation;
+  writeFileSync(join(f.root, 'adapter.mjs'), `import {readFileSync} from 'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'pause',reason:'Fixture end'},usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  const environment = f.engine.environments.get('p');
+  const context = { ...pilotContext(f.store, f.draft, f.question), workingSelections: [{ kind: 'context', value: overview },
+    { kind: 'context', value: children[2]!.value.observation }] };
+  const result = await synthesisSession(f.store, f.draft, f.question, environment, pilotEnvironment(environment.value, pilot.value),
+    pilot, context, 'Use only delivered body evidence');
+  assert.equal(result.action, 'pause');
+  const session = f.store.list<any>('synthesis-session')[0]!;
+  const restarted = new Store(join(f.root, 'state.sqlite')); t.after(() => restarted.close());
+  assert.deepEqual(readSynthesisSession(restarted, reference(session)), session);
+  const body = { inventory: new ResearchSources(f.store, 'p', f.root).inventory(), focus: overview,
+    workingSelections: [{ kind: 'context', value: overview }] };
+  const initial = workingContext(f.store, 'p', f.draft.id, f.question.id, body, 50_000, { common: true });
+  const continued = workingContext(f.store, 'p', f.draft.id, f.question.id, body, 50_000, { continuation: true, previous: initial.working.archive });
+  assert.ok(continued.sourceCatalogue); assert.match(JSON.stringify(continued), /overview/);
+  assert.match(JSON.stringify(continued), /documentComplete.*false/);
+  new ProductEngine(restarted).discovery.evidence.document('p', 'sr1c-mixed', 'Changed owner material', 'text/plain', legacy.revision);
+  const calls = restarted.list('model-call');
+  await assert.rejects(synthesisSession(restarted, f.draft, f.question, environment, pilotEnvironment(environment.value, pilot.value),
+    pilot, context, 'Use only delivered body evidence'), { code: 'synthesis_evidence_stale' });
+  assert.deepEqual(restarted.list('model-call'), calls);
+  assert.deepEqual(readResearchConsumerTurn(restarted, reference(children[2]!)), children[2], 'historical search uses its exact source revisions');
+});
+
+test('SR1c mixed Source search applies ten-fragment cap once to the entire response', async t => {
+  const f = fixture(t); f.configure('p');
+  for (let i = 0; i < 4; i++) await structuredWebSource(f,
+    Array.from({ length: 3 }, (_, j) => `# Section ${i}/${j}\nNeedle ${'x'.repeat(220)}\n`).join(''), `mixed-${i}`);
+  const result = new ResearchSources(f.store, 'p', f.root).search('Needle') as any;
+  assert.equal(result.found, 12); assert.equal(result.delivered, 10);
+  assert.equal(result.sources.length, 10); assert.equal(result.hasMore, true);
+  assert.ok(result.displayedChars <= 50_000);
+});
+
+for (const planned of [false, true]) test(`SR1c R2 multiprocess: ${planned ? 'planned' : 'ordinary'} search capture and turn reject a changed Source without repayment`, async t => {
+  const f = planned ? await rs1BundleFixture(t) : fixture(t);
+  if ('configure' in f) f.configure('p');
+  await structuredWebSource(f, '# Part\nNeedle structured document.');
+  const legacy = f.engine.discovery.evidence.document('p', 'changing', 'Needle original', 'text/plain', 0);
+  const second = new Store(join(f.root, 'state.sqlite')); t.after(() => second.close());
+  const draft = 'draft' in f ? f.draft : f.engine.prepare('p', 'discovery');
+  if ('pilot' in f) {
+    const settings: Record<string, unknown> = { ...f.pilot.value }; delete settings.projectId;
+    configureReaderPilot(f.store, f.engine.environments, 'p', { ...settings,
+      planning: { fields: [f.question.value.spec.field], maxRequestChars: 100_000, maxRounds: 3 } }, f.pilot.revision);
+  }
+  writeFileSync(join(f.root, 'adapter.mjs'), `import {readFileSync} from 'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:
+${planned ? "{action:'read_plan',question:r.subject.question.id,reads:[{action:'search',query:'Needle'}]}" : "{action:'search',query:'Needle'}"}}));`);
+  const write = f.store.writeMany.bind(f.store); let changed = false;
+  f.store.writeMany = ((writes: Write[], guards = []) => {
+    if (!changed && writes.some(row => row.kind === 'research-search-capture')) {
+      changed = true;
+      const script = `import {Store} from ${JSON.stringify(new URL('../src/storage/store.js', import.meta.url).href)};
+import {ProductEngine} from ${JSON.stringify(new URL('../src/product/engine.js', import.meta.url).href)};
+const store=new Store(process.argv[1]);try{new ProductEngine(store).discovery.evidence.document('p','changing','Needle revised','text/plain',${legacy.revision});}finally{store.close();}`;
+      execFileSync(process.execPath, ['--input-type=module', '-e', script, join(f.root, 'state.sqlite')], { timeout: 10_000 });
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  const paused = await f.engine.researcher.run('p', draft.id, planned ? 2 : 1); f.store.writeMany = write;
+  assert.equal(changed, true); assert.equal(paused.value.status, 'paused'); assert.equal(paused.value.pauseCode, 'input_stale');
+  assert.equal(f.store.list('research-search-capture').length, 0);
+  const calls = f.store.list('model-call'), responses = f.store.list('model-response');
+  const resumed = await new ProductEngine(second).researcher.run('p', draft.id, planned ? 2 : 1);
+  const capture = second.list<any>('research-search-capture')[0]!;
+  assert.equal(capture.value.contract, 'research-search-capture/v2');
+  assert.deepEqual(capture.value.sources.find((row: any) => row.id === legacy.id), reference(second.get(legacy.id)!));
+  const turn = second.list<ResearchTurn>('research-turn').find(row => row.value.run === resumed.id && (row.value.action as any).action === 'search')!;
+  assert.equal(turn.value.status, 'completed'); assert.deepEqual(readResearchConsumerTurn(second, reference(turn)), turn);
+  assert.deepEqual(second.list('model-call'), calls); assert.deepEqual(second.list('model-response'), responses);
 });

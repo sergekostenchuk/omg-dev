@@ -3,7 +3,8 @@ import { relative, resolve, isAbsolute } from "node:path";
 import { Store, type Revision } from "../storage/store.js";
 import { digest, canonical, hashJson, type Json } from "../canonical.js";
 import { buildSourceStructure, verifySourceStructure, type SourceStructure } from "./source-structure.js";
-import { requireCondition } from "../errors.js";
+import { selectStructuredRead, requireNavigationStructure, STRUCTURED_READ_CONTRACT, type StructuredReadSelection } from './source-navigation.js';
+import { EngineError, requireCondition } from "../errors.js";
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { safeRelativePath } from "../graph/topology.js";
 
@@ -143,13 +144,30 @@ export type Selector = { kind: "json-pointer"; pointer: string } | { kind: "text
 export interface Observation { projectId: string; source: Ref; selector: Selector; value: Json }
 export const SOURCE_READ_CONTRACT = 'source-read/v1' as const;
 export const SOURCE_READ_CONTRACT_V2 = 'source-read/v2' as const;
+export const SOURCE_READ_CONTRACT_V3 = STRUCTURED_READ_CONTRACT;
 export const SOURCE_READ_MAX_CHARS = 50_000;
 const SOURCE_READ_V1_MAX_CHARS = 50_000;
-export type SourceReadContract = typeof SOURCE_READ_CONTRACT | typeof SOURCE_READ_CONTRACT_V2;
+export type SourceReadContract = typeof SOURCE_READ_CONTRACT | typeof SOURCE_READ_CONTRACT_V2 | typeof SOURCE_READ_CONTRACT_V3;
+/** New operations select their policy from the declared Source era, never from a missing index. */
+export function sourceReadContract(value: Source, source?: Ref): SourceReadContract {
+  if (Object.hasOwn(value, 'structure') || (value.origin.kind === 'web' && 'documentContract' in value.origin)) {
+    try { requireNavigationStructure(value.content, value.structure!); }
+    catch (error) {
+      if (error instanceof EngineError && error.code === 'source_structure_invalid')
+        throw new EngineError(error.code, error.message, { source: source ?? null });
+      throw error;
+    }
+    return SOURCE_READ_CONTRACT_V3;
+  }
+  return SOURCE_READ_CONTRACT_V2;
+}
 export interface SourceReadRange {
-  contract: SourceReadContract; outcome: 'complete' | 'clipped' | 'outside';
+  contract: SourceReadContract; outcome: 'complete' | 'clipped' | 'outside' | 'overview';
   requested: { start: number; end: number }; served: { start: number; end: number } | null;
   length: number; unit: 'utf16';
+  selectionReason?: StructuredReadSelection['selectionReason']; expanded?: boolean;
+  requestedCovered?: boolean; documentComplete?: boolean; paragraphSplit?: boolean;
+  nextAction?: StructuredReadSelection['nextAction'];
 }
 export interface SourceReading extends SourceReadRange {
   projectId: string; source: Ref; selector: Selector | null; value: Json;
@@ -186,16 +204,26 @@ export function projectSourceReading(projectId: string, source: Ref, value: Sour
     && value?.projectId === projectId && typeof value.content === 'string'
     && digest(value.content) === value.sha256 && hashJson(value) === source.hash, 'source_invalid', 'The read needs exact source content from this project');
   requireCondition(requested && requested.end > requested.start, 'selector_invalid', 'A source read needs a nonempty requested range');
-  requireCondition(contract === SOURCE_READ_CONTRACT || contract === SOURCE_READ_CONTRACT_V2,
+  requireCondition(contract === SOURCE_READ_CONTRACT || contract === SOURCE_READ_CONTRACT_V2
+    || contract === SOURCE_READ_CONTRACT_V3,
     'research_consumer_intent_invalid', 'Unknown source read contract');
-  const range = contract === SOURCE_READ_CONTRACT_V2
-    ? sourceReadRangeV2(value.content.length, requested) : sourceReadRange(value.content.length, requested);
+  if (contract === SOURCE_READ_CONTRACT_V3) {
+    requireCondition(sourceReadContract(value, source) === SOURCE_READ_CONTRACT_V3, 'source_structure_invalid', 'A v3 read needs its declared Source index');
+  }
+  const range = contract === SOURCE_READ_CONTRACT_V3
+    ? { contract, ...selectStructuredRead(value.content, value.structure!, requested) }
+    : contract === SOURCE_READ_CONTRACT_V2
+      ? sourceReadRangeV2(value.content.length, requested) : sourceReadRange(value.content.length, requested);
   if (contract === SOURCE_READ_CONTRACT) requireCondition(!range.served
     || range.served.end - range.served.start <= SOURCE_READ_V1_MAX_CHARS,
     'research_excerpt_limit', 'Read a smaller source range');
   return { ...range, projectId, source,
     selector: range.served ? { kind: 'text-range', ...range.served } : null,
-    value: range.served ? value.content.slice(range.served.start, range.served.end) : null };
+    value: range.served ? value.content.slice(range.served.start, range.served.end)
+      : range.outcome === 'overview' ? JSON.parse(canonical({ length: value.content.length, structureHash: value.structure!.structureHash,
+        toc: value.structure!.sections.map(section => ({ id: section.id, level: section.level,
+          title: section.title, parentId: section.parentId, headingRange: section.headingRange,
+          bodyRange: section.bodyRange })), nextAction: range.nextAction })) as Json : null };
 }
 /** The captured digest was computed from the captured content when the source was written; only the file on disk is new.
  * A web snapshot is its saved text: citing it never goes back to the network. */
@@ -292,7 +320,8 @@ export class Evidence {
       if (!reading || typeof reading !== 'object') return false;
       if (!Object.hasOwn(reading, 'contract')) return this.verify(reading as Observation);
       const value = reading as SourceReading;
-      return (value.contract === SOURCE_READ_CONTRACT || value.contract === SOURCE_READ_CONTRACT_V2)
+      return (value.contract === SOURCE_READ_CONTRACT || value.contract === SOURCE_READ_CONTRACT_V2
+        || value.contract === SOURCE_READ_CONTRACT_V3)
         && canonical(this.readSource(value.projectId, value.source, value.requested, value.contract)) === canonical(value);
     } catch { return false; }
   }
