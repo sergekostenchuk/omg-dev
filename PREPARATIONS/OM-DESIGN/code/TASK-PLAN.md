@@ -6,7 +6,7 @@
 
 **Обязательные тесты каждой задачи:** успех; КАЖДЫЙ код отказа единицы; отсутствие обязательного поля, источника или набора → типизированный отказ с адресом (Т4); недоверенный вход: ответ модели не по форме или с чужими ссылками, подлинный результат другой попытки/владельца → отказ с адресом (подделку собственной базы не тестировать — решение владельца 28.09, 13.10); окно между проверкой и записью: смена охраняемой записи → отказ, а не тихая запись (Т7).
 
-Задач: 198. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → L1A → DRV1 → ASM1 → ASM1.1 → UNK1 → DS1.2a → DS1.2m → DRY6-03 → IN1 → DS1.2e → DS1.2c → DRY6-01 → CFG1 → DS1.3a → DS1.3b → DRY6-02 → DS1.2s → ENV1 → DS1.2lh → DS1.2v → OC1 → RD1 → SR1b → SR1c → FL1 → AT3b → AT4 → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
+Задач: 200. Порядок выдачи (по зависимостям): A1 → A2 → A3 → A3.1 → A4 → A5 → A3.2 → B0 → B1 → B2 → C2 → C3 → D1 → C4 → C5 → C5.2 → D2 → D3 → D5 → D3.1 → D4 → V1 → E1 → E2 → A3.3 → E3 → E4 → D7 → F1 → F2 → E2.1 → F3 → F4 → V2 → F5 → S1 → D8.0 → D8 → D8.1 → D8.3 → D8.2 → B1.1 → G1 → G1.1 → G1.2 → G1.3 → G1.4 → G2 → G3 → A6 → E6 → B3.0a → C1 → B3.0b → B3 → C5.1a → C5.1b → E5.0 → E5 → E5.1 → D6 → H1.0a → H1.0b → H1.0c → D8.4a → D8.5 → H1.0d → H1 → Q1 → E4.1 → H1.1 → S1.1 → H1.2 → H1.3 → H2 → H1.4 → E2.2 → S1.3 → D8.4b → D8.4c → D8.4d → D8.4e → D8.4.2 → T-DIET → H1.5 → S1.4 → S1.2 → V3 → S1.5 → R1 → R2 → R5 → Q2 → Q2b → Q3 → Q2.1 → R6 → R3 → Q4 → R44 → Q5 → D8.5.1 → AD1 → PF1 → LP2 → LP3 → H2.0 → LP4 → FJ1 → T48 → Q2.2 → LP1 → PF2 → PR1 → MP1 → MP2 → MP3 → MP1.1 → LP5 → LP6 → LP7 → PF3 → PF3.1 → PF4 → PF3.3 → NR → LP8 → D8.3.1 → D8.4.1 → OWN1 → OWN1.1 → OBL1 → OWN1.2 → FA1 → G5 → G5.1 → G6 → G6.2 → G6.1 → EX1 → EX1.1 → EX2 → EX3 → EX4 → EX5 → EX6 → AT1 → AT3a → RL3 → PF5 → PF6 → RB1 → RS1 → RS2 → RS4 → RS3 → DS1 → RS5 → DRY5FIX → WB1 → WB1b → SP1a → SP1b → L1A → DRV1 → ASM1 → ASM1.1 → UNK1 → DS1.2a → DS1.2m → DRY6-03 → IN1 → DS1.2e → DS1.2c → DRY6-01 → CFG1 → DS1.3a → DS1.3b → DRY6-02 → DS1.2s → ENV1 → DS1.2lh → DS1.2v → OC1 → RD1 → SR1b → SR1c → FL1 → AT3b → AT4 → RD2b → RD2a → CORE1 → P1 → P2 → P3 → AD2 → DV1 → INT1 → SEC1.
 
 ## Срез A · Основа: отказы, точные ссылки, серии и попытки, ворота повтора G7, лестница после остановки
 
@@ -652,7 +652,7 @@
 
 ## Срез D · Пробелы и маршруты: M5, G4, M6, G4b
 
-Каждый пробел заполняется; ответ кодом раньше модели. Задач: 116.
+Каждый пробел заполняется; ответ кодом раньше модели. Задач: 118.
 
 ### D1 · M5 · набор пробелов и G4 · ворота пробелов (F5.1)
 
@@ -2769,6 +2769,44 @@
   - каждый затронутый тест проходит адресно 3 раза подряд
   - ни одного execFileSync tar с input в test/
 
+### RD2b · RD2b — точная ограниченная доставка сохранённых оригиналов и коллекций (A/B/C, планировщик, история, индексы, старые большие результаты) с границей и продолжением; проверка тождества сохраняется; восстановление HX4 и after-снимков доставки
+
+**Цель.** Живой HX4 16.10 07:30: read_context /body/history → research_context_undelivered, тупик. Нагрузочная репетиция STRESS1 (~/OMG-PROJECTS/stress1): 44 тупика = 25 pilot_core_limit + 19 research_context_undelivered, все 5 стадий. Договор Codex-omg №5353 + §8 (№5361), 9/10: ~/REPORTS/review/omg-rd2-contract-5353_161026.md; выборка снимков ~/REPORTS/review/omg-rd2-stress1-5361-manifest.json.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: 
+- Пишет записи: 
+- Разрешённые пути: `src/discovery/research-delivery.ts`, `src/discovery/context-workspace.ts`, `src/discovery/working-context.ts`, `src/discovery/planning-context.ts`, `src/discovery/research-limits.ts`, `src/discovery/research-continuation.ts`, `src/discovery/research-protocol.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-runner.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/assessment-session.ts`, `src/discovery/synthesis-session.ts`, `src/discovery/conclusion-consolidation.ts`, `src/discovery/reader.ts`, `src/discovery/reading-plan.ts`, `src/storage/reference-sites.ts`, `test/research-delivery.test.ts`, `test/research-call-resume.test.ts`, `test/assessment-session-resume.test.ts`, `test/synthesis-finalization.test.ts`, `test/stage-research.test.ts`, `test/om-fsck.test.ts`
+- Из движка как есть: №5353; №5361; RD1
+- После: SR1c, FL1
+- Тесты сверх обязательных:
+  - таблица исходов №5353 §3 — каждая строка
+  - восстановление каждого из 44 after-снимков STRESS1 штатными командами без отката/SQL/нового draft
+  - повтор STRESS1 — 0 технических тупиков, пять accepted → om_ready без откатов
+  - уже принятая история не становится отказом
+
+### RD2a · RD2a — допустимый размер новых модельных результатов объявлен; oversized answer/reasons/citations/checkpoint/need_owner/summary — отказ до application с сохранением оплаченного response и коррекцией той же роли; физическая дверь permit-limited-call-retry для process_output_limit
+
+**Цель.** Живой HX4 16.10 07:30: read_context /body/history → research_context_undelivered, тупик. Нагрузочная репетиция STRESS1 (~/OMG-PROJECTS/stress1): 44 тупика = 25 pilot_core_limit + 19 research_context_undelivered, все 5 стадий. Договор Codex-omg №5353 + §8 (№5361), 9/10: ~/REPORTS/review/omg-rd2-contract-5353_161026.md; выборка снимков ~/REPORTS/review/omg-rd2-stress1-5361-manifest.json.
+
+- Правила: `rules-general`
+- Единицы карты: —
+- Получает от: —
+- Отдаёт: —
+- Читает записи: 
+- Пишет записи: 
+- Разрешённые пути: `src/discovery/research-protocol.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/response-recovery.ts`, `src/discovery/research-runner.ts`, `src/discovery/early-research-outcome.ts`, `src/discovery/assessment-session.ts`, `src/discovery/synthesis-session.ts`, `src/discovery/conclusion-consolidation.ts`, `src/discovery/reader.ts`, `src/discovery/reading-plan.ts`, `src/storage/reference-sites.ts`, `src/product/commands.ts`, `src/product/engine.ts`, `test/research-capacity.test.ts`
+- Из движка как есть: №5353; №5361; RD1
+- После: SR1c, FL1, RD2b
+- Тесты сверх обязательных:
+  - таблица исходов №5353 §3 — каждая строка
+  - восстановление каждого из 44 after-снимков STRESS1 штатными командами без отката/SQL/нового draft
+  - повтор STRESS1 — 0 технических тупиков, пять accepted → om_ready без откатов
+  - уже принятая история не становится отказом
+
 ### RD1 · read_source — обрезание: новый source-read/v2 сохраняет requested целиком, served=[start,min(end,length,start+50000)], outcome=clipped с точным selector/value; предел назван модели в инструкции read_source; старые v1/legacy/отказы — по своей эре; synthesis-session распознаёт и проверяет v2
 
 **Цель.** Находка живого HX4 15.10 22:32 (вызов 11: read_source web-capture 0..59513 → research_excerpt_limit → вечный stage_paused, повтор callsMade 0). Окончательный договор Codex-omg №5265 (9/10, обрезание; заменяет №5261) ~/REPORTS/review/omg-rd1-clipping-contract-5259-5260_161026.md. Класс общий для 5 ранних стадий (research-runner). Тот же HX4 продолжается обычным early-stage-run того же draft (зависший action pending, впервые завершается v2): clipped 0..50000 из 0..59513, callsMade 0, HTTP 0.
@@ -2878,7 +2916,7 @@
 - Пишет записи: пакет ядра
 - Разрешённые пути: `package.json`, `tsconfig.json`, `scripts/check-backend.mjs`, `test/fixtures/core1-records.ts`, `test/assessment-session-resume.test.ts`, `test/discovery.test.ts`, `test/execution-external-input.test.ts`, `test/om-accepted-answer.test.ts`, `test/om-achievements.test.ts`, `test/om-addressing.test.ts`, `test/om-answers-gate.test.ts`, `test/om-call-record.test.ts`, `test/om-compiler-readers.test.ts`, `test/om-composite-keys.test.ts`, `test/om-feasibility-boundary.test.ts`, `test/om-feasibility-projection.test.ts`, `test/om-feasibility.test.ts`, `test/om-frame-accept.test.ts`, `test/om-frame-candidate.test.ts`, `test/om-gap-lines.test.ts`, `test/om-gaps.test.ts`, `test/om-legacy-operation-lock.test.ts`, `test/om-legacy-route-closure.test.ts`, `test/om-model-call.test.ts`, `test/om-operation-cost.test.ts`, `test/om-probe.test.ts`, `test/om-question-packet.test.ts`, `test/om-refusal-journal.test.ts`, `test/om-repeat-gate.test.ts`, `test/om-result-identity.test.ts`, `test/om-routes.test.ts`, `test/om-run.test.ts`, `test/om-runtime-confirmation.test.ts`, `test/om-series-current.test.ts`, `test/om-series.test.ts`, `test/om-task-context.test.ts`, `test/om-task-neighbors.test.ts`, `test/om-work-zone.test.ts`, `test/preparation.test.ts`, `test/reader-pilot.test.ts`, `test/research-call-resume.test.ts`, `test/runtime-absence-r3.test.ts`, `test/runtime-absence-research.test.ts`, `test/storage.test.ts`, `test/store-view.test.ts`
 - Из движка как есть: опись легаси №3654/№3655 (классы а–д, доля времени прогона, раздел «ядро для поставки»); граф импортов: 187 из 193 модулей достижимы из cli/server — легаси в ветвях и маршрутах, не в файлах
-- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1, SP1a, SP1b, ASM1.1, CFG1, ENV1, DS1.2a, DS1.2e, DS1.2c, DS1.2s, DS1.2lh, DS1.2m, DRY6-01, DRY6-02, DRY6-03, DS1.2v, DS1.3a, DS1.3b, RD1, FL1
+- После: NR, LP8, D8.3.1, D8.4.1, OWN1, OWN1.1, OBL1, OWN1.2, FA1, G5, G5.1, G6, G6.2, G6.1, EX1, EX1.1, EX2, EX3, EX4, EX5, EX6, AT1, AT3a, AT3b, AT4, RL3, PF5, RB1, RS1, RS2, RS3, RS4, RS5, DS1, WB1, L1A, DRV1, UNK1, IN1, ASM1, SP1a, SP1b, ASM1.1, CFG1, ENV1, DS1.2a, DS1.2e, DS1.2c, DS1.2s, DS1.2lh, DS1.2m, DRY6-01, DRY6-02, DRY6-03, DS1.2v, DS1.3a, DS1.3b, RD1, FL1, RD2a
 - Тесты сверх обязательных:
   - ЧАСТЬ А (слово пользователя ~22:10 «тест смотрит только актуальную версию»; вопрос Opus-1 №3686, разрешение оркестратора): 41 файл тестов, запускающих старый движок из git, и один модуль образцов test/fixtures/core1-records.ts — формат не в живой базе → сценарий удалить; формат в живой базе → образец из снимка 1554, читает нынешний код; проверки нового не трогать
   - ДО КОДА части Б — опись легаси и список удаляемого показать пользователю; удалять после его «да»
@@ -2897,7 +2935,7 @@
 - Пишет записи: интерфейс сервиса движка и подключения
 - Разрешённые пути: `src/product/commands.ts`, `src/cli.ts`, `src/service/server.ts`, `test/service.test.ts`
 - Из движка как есть: продуктовые команды om-start/om-continue/om-state/om-stop/om-spend/om-fsck; проект SEC1
-- После: NR, OWN1, RL3, WB1, DRV1, IN1, CFG1, ENV1, DRY6-02, DS1.3b, OC1, SR1c
+- После: NR, OWN1, RL3, WB1, DRV1, IN1, CFG1, ENV1, DRY6-02, DS1.3b, OC1, SR1c, RD2a
 - Тесты сверх обязательных:
   - ДО КОДА — проект Codex-omg вместе с SEC1: исследование, как подключают такие движки в харнесы (MCP, плагины Claude Code/Codex/Cursor), и как продукты выдают и сохраняют ключ владельца (ключ восстановления, связка ключей ОС, экспорт); пути уточняются проектом
   - один и тот же сценарий проекта через MCP и через CLI даёт одинаковые записи
