@@ -26,6 +26,12 @@ export class ResearchSources {
       return { ref: reference(item), kind: origin.kind, location: origin.location,
         ...(item.value.provenance?{provenance:item.value.provenance}:{}),
         ...(origin.kind === "web" ? { fetchedAt: origin.fetchedAt, completeness: origin.completeness } : {}),
+        ...(origin.kind === 'web' && 'documentContract' in origin && item.value.structure
+          ? { method: origin.method, truncation: origin.truncated,
+              structureHash: item.value.structure.structureHash,
+              toc: { contract: 'source-toc/v1', sections: item.value.structure.sections.map(section => ({
+                id: section.id, level: section.level, title: section.title, parentId: section.parentId,
+                headingRange: section.headingRange, bodyRange: section.bodyRange })) } } : {}),
         media: item.value.mediaType, length: item.value.content.length, excerpt, truncated: item.value.content.length > excerpt.length };
     }),
       files: files.slice(0, 2000), filesTruncated: files.length > 2000 };

@@ -4,7 +4,7 @@ import type { Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { git, type RepositoryState } from "../runtime/environment.js";
 import { treeFile } from "../runtime/git-files.js";
-import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
+import { sourceIsCurrent, isWebDocumentSource, type Source } from "../evidence/evidence.js";
 import { reference, isRef, uniqueRefs, type Ref } from "../pipeline/contracts.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { hashJson, digest, canonical } from "../canonical.js";
@@ -72,7 +72,7 @@ export function resolveExternalSource(store: Store, project: string, graph: Grap
     || record.hash !== source.hash || record.kind !== "source" || !object(record.value)) return missing("source");
   const value = record.value;
   if (value.projectId !== project || typeof value.content !== "string" || typeof value.sha256 !== "string"
-    || !["text/plain", "application/json"].includes(value.mediaType) || !object(value.origin)
+    || !(["text/plain", "application/json"].includes(value.mediaType) || isWebDocumentSource(value)) || !object(value.origin)
     || !["file", "owner-document", "web"].includes(value.origin.kind) || typeof value.origin.location !== "string")
     missing("source.value");
   let canonicalHash: string;

@@ -12,7 +12,7 @@ import type { ResearchTurn } from '../src/discovery/research-model.js';
 import type { Environment } from '../src/runtime/environment.js';
 import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-fixture.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
-import { canonical, type Json } from '../src/canonical.js';
+import { canonical, digest, type Json } from '../src/canonical.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
@@ -64,9 +64,14 @@ function fixture(t: test.TestContext) {
       request.on('end', () => {
         const url = JSON.parse(raw).url as string, text = pages.get(url) ?? '';
         response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({ requested_url: url, resolved_url: url, redirects: [], final_url: url,
-          fetched_at: new Date(Date.UTC(2026, 9, 14, 4, 0, ++fetched)).toISOString(), status: 200, success: true, failure: null, text,
-          truncated: false, chars_total: text.length, chars: text.length, sha256: '', extraction: 'crawl4ai/raw_markdown', completeness: 'unknown' }));
+        const bytes = Buffer.from(text, 'utf8');
+        response.end(JSON.stringify({ contract: 'web-document/v2', requested_url: url, selected_url: url,
+          redirects: [], final_url: url, fetched_at: new Date(Date.UTC(2026, 9, 14, 4, 0, ++fetched)).toISOString(),
+          status: 200, success: true, failure: null,
+          raw: { encoding: 'base64', data: bytes.toString('base64'), mediaType: 'text/markdown', byteLength: bytes.length, sha256: digest(bytes) },
+          clean: { text, mediaType: 'text/markdown', utf16Length: text.length, sha256: digest(text) },
+          method: { kind: 'native-markdown', version: 'test/v1' },
+          signals: { rawTruncated: false, cleanTruncated: false, completeness: 'unknown' }, attempts: [] }));
       });
     });
     await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve));
@@ -119,7 +124,7 @@ function upstream(f: ReturnType<typeof fixture>, source: Revision<Source>, value
 test('WB1b web source crosses accepted upstream stages, OM input, documentary brief and exact citation after restart', async t => {
   const f = fixture(t), source = (await f.web()), stages = upstream(f, source);
   const origin = source.value.origin as Extract<Source['origin'], { kind: 'web' }>;
-  assert.equal(f.store.get<{ contract: string }>(origin.capture.id, origin.capture.revision)!.value.contract, 'web-capture/v1',
+  assert.equal(f.store.get<{ contract: string }>(origin.capture.id, origin.capture.revision)!.value.contract, 'web-capture/v2',
     'the snapshot comes from a genuine WB1 capture');
   const discovery = f.store.get<DiscoveryDraft>(f.store.get<any>(stages.discovery.id, stages.discovery.revision)!.value.content.draft.id)!;
   const reportQuestion = discovery.value.questions.map(id => f.store.get<Question>(id)!).find(q => q.value.spec.field === 'researchReport')!;

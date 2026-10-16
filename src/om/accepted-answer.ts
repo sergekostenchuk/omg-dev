@@ -8,7 +8,7 @@ import { basename, dirname } from 'node:path';
 import type { DiscoveryDraft, FieldSpec, Question } from '../discovery/discovery.js';
 import { readAcceptedResearchAnswer } from '../discovery/discovery.js';
 import type { ResearchAnswer, ResearchAssessment } from '../discovery/research-model.js';
-import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from '../evidence/evidence.js';
+import { Evidence, sourceIsCurrent, isWebDocumentSource, type Observation, type Selector, type Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type Write } from '../storage/store.js';
 import { captureView, pendingOverlay, provenStore } from '../storage/store-view.js';
@@ -531,7 +531,7 @@ function checkedSource(store: Store, project: string, ref: Ref): Revision<Source
   const source = exact<Source>(store, project, ref, 'source'), value = source.value;
   // Evidence capture wrote the digest of this exact body; a citation never rehashes it.
   check(object(value) && value.projectId === project && typeof value.content === 'string'
-    && ['text/plain', 'application/json'].includes(value.mediaType) && object(value.origin)
+    && (['text/plain', 'application/json'].includes(value.mediaType) || isWebDocumentSource(value)) && object(value.origin)
     && ['file', 'owner-document', 'web'].includes(value.origin.kind) && text(value.origin.location),
     'answer_unconfirmed', ref.id, 'source', 'Evidence must retain its project, origin and content digest');
   if (value.mediaType === 'application/json') {

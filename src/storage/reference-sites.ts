@@ -137,6 +137,7 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "synthesis-session", contract: null, data: synthesisSessionData() },
   { kind: "synthesis-session", contract: "synthesis-session/v2", data: synthesisSessionData() },
   { kind: "web-capture", contract: "web-capture/v1", data: [["response"]] },
+  { kind: "web-capture", contract: "web-capture/v2", data: [["response"]] },
   { kind: "om-integrity", contract: "om-integrity/v1", data: [["findings", INDEX, "ref"]] },
 ];
 
@@ -146,6 +147,26 @@ const object = (value: unknown): value is Record<string, unknown> =>
 const isReference = (value: Record<string, unknown>): value is Record<string, unknown> & StoredReference =>
   typeof value["id"] === "string" && Number.isSafeInteger(value["revision"]) && Number(value["revision"]) > 0
   && typeof value["hash"] === "string" && HASH.test(value["hash"] as string);
+
+/** Gateway method JSON remains data when copied from a captured document into a Source or its inventory row. */
+function webMethodOwner(value: Record<string, unknown>): boolean {
+  if (value["kind"] === "web" && value["documentContract"] === "web-document/v2")
+    return object(value["capture"]) && isReference(value["capture"]);
+  return value["kind"] === "web" && value["media"] === "text/markdown"
+    && object(value["ref"]) && isReference(value["ref"])
+    && typeof value["ref"].id === "string" && value["ref"].id.startsWith("source:")
+    && typeof value["structureHash"] === "string" && HASH.test(value["structureHash"])
+    && object(value["toc"]) && (value["toc"].contract === "source-toc/v1"
+      || value["toc"].contract === "source-toc-page/v1");
+}
+
+function sourceTableMethodIndex(value: Record<string, unknown>): number {
+  if (!Array.isArray(value["columns"]) || !Array.isArray(value["rows"])) return -1;
+  const columns = value["columns"];
+  if (!columns.every(column => typeof column === "string") || new Set(columns).size !== columns.length)
+    return -1;
+  return columns.indexOf("method");
+}
 
 function contractOf(value: unknown): string | null {
   return object(value) && typeof value["contract"] === "string" ? value["contract"] : null;
@@ -181,7 +202,28 @@ export function referenceSites(kind: string, value: unknown): ReferenceSite[] {
       sites.push({ field: shown(path), ref: current });
       return;
     }
-    for (const [key, item] of Object.entries(current)) visit(item, [...path, key]);
+    const methodIndex = sourceTableMethodIndex(current);
+    if (methodIndex >= 0) {
+      const columns = current["columns"] as string[];
+      const rows = current["rows"] as unknown[][];
+      for (const [rowIndex, row] of rows.entries()) {
+        if (!Array.isArray(row) || row.length !== columns.length) {
+          visit(row, [...path, "rows", rowIndex]);
+          continue;
+        }
+        const entry = Object.fromEntries(columns.map((column, index) => [column, row[index]]));
+        row.forEach((cell, index) => {
+          if (index !== methodIndex || !webMethodOwner(entry))
+            visit(cell, [...path, "rows", rowIndex, index]);
+        });
+      }
+      for (const [key, item] of Object.entries(current)) if (key !== "rows") visit(item, [...path, key]);
+      return;
+    }
+    for (const [key, item] of Object.entries(current)) {
+      if (key === "method" && webMethodOwner(current)) continue;
+      visit(item, [...path, key]);
+    }
   };
   visit(value, []);
   return sites;

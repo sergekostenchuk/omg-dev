@@ -17,7 +17,7 @@ import { pendingOverlay, storeView } from '../storage/store-view.js';
 import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 import { ResearchSources } from '../discovery/research-sources.js';
 import { contextValue } from '../discovery/working-context.js';
-import { sourceIsCurrent, type Source } from '../evidence/evidence.js';
+import { sourceIsCurrent, isWebDocumentSource, type Source } from '../evidence/evidence.js';
 import { resolveRoleMode, uniqueTransactionGuards, workspacePath, readEnvironmentAt, type Environment } from '../runtime/environment.js';
 import { tokenUsage, type TokenUsage, type ModelCall } from '../runtime/model-usage.js';
 import type { ProcessResult } from '../runtime/process.js';
@@ -288,7 +288,7 @@ function exactSource(store: Store, project: string, ref: Ref, current: boolean):
   if (!object(record.value) || record.value.projectId !== project || typeof record.value.content !== 'string'
     || digest(record.value.content) !== record.value.sha256 || !object(record.value.origin)
     || !['file', 'owner-document', 'web'].includes(record.value.origin.kind) || !text(record.value.origin.location)
-    || !['text/plain', 'application/json'].includes(record.value.mediaType))
+    || !(['text/plain', 'application/json'].includes(record.value.mediaType) || isWebDocumentSource(record.value)))
     fail('model_delivery_invalid', ref.id, 'source', 'A read source belongs to this project and retains its captured bytes', ref);
   // An empty file is still a valid read. Nonempty sources also use D5's shared historical selector/checksum proof.
   if (record.value.content.length) take(readAnswerCitations(store, { project,

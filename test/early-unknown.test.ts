@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Json } from '../src/canonical.js';
+import { digest, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -391,10 +391,16 @@ async function pageGateway(t: TestContext) {
     request.on('end', () => {
       hits.push(new URL(request.url!, 'http://gateway').pathname);
       const url = (JSON.parse(raw || '{}') as { url?: string }).url ?? '', text = 'Tariff table: not published yet';
+      const bytes = Buffer.from(text, 'utf8');
       response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({ requested_url: url, resolved_url: url, redirects: [], final_url: url, fetched_at: '2026-10-14T00:00:01+00:00',
-        status: 200, success: true, failure: null, text, truncated: false, chars_total: text.length, chars: text.length, sha256: 'x',
-        extraction: 'crawl4ai/raw_markdown', completeness: 'unknown' }));
+      response.end(JSON.stringify({ contract: 'web-document/v2', requested_url: url, selected_url: url,
+        redirects: [], attempts: [], final_url: url, fetched_at: '2026-10-14T00:00:01+00:00',
+        status: 200, success: true, failure: null,
+        raw: { encoding: 'base64', data: bytes.toString('base64'), mediaType: 'text/markdown',
+          byteLength: bytes.length, sha256: digest(bytes) },
+        clean: { text, mediaType: 'text/markdown', utf16Length: text.length, sha256: digest(text) },
+        method: { kind: 'native-markdown', version: 'omg-document/2.0.1' },
+        signals: { rawTruncated: false, cleanTruncated: false, completeness: 'unknown' } }));
     });
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));

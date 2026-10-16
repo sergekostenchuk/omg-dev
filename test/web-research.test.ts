@@ -9,6 +9,7 @@ import { Environments, type Environment, type WebResearchSettings } from '../src
 import { Evidence, SOURCE_MAX_BYTES, type Source } from '../src/evidence/evidence.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { digest } from '../src/canonical.js';
+import { archivedContext, contextPage, contextValue, workingContext } from '../src/discovery/working-context.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import type { ResearchTurn } from '../src/discovery/research-model.js';
@@ -23,9 +24,11 @@ import { exampleGraph } from './graph-fixture.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { designOf } from '../src/graph/builder.js';
 import { ResearchSources } from '../src/discovery/research-sources.js';
+import { referenceSites } from '../src/storage/reference-sites.js';
+import { checkStoreIntegrity } from '../src/storage/fsck.js';
 import type { StageResearchResult } from '../src/product/stage-research.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
-import { executeWebTurn, webBudgetView, webCaptureId, webAction, webUrlRefusal, type WebCapture } from '../src/discovery/web-research.js';
+import { executeWebTurn, webBudgetView, webCaptureId, webAction, webUrlRefusal, WEB_CAPTURE_CONTRACT, type WebCapture } from '../src/discovery/web-research.js';
 
 type Route = (body: any, url: URL) => { status: number; body: unknown } | 'drop' | 'hang';
 const code = (expected: string) => (error: unknown) => error instanceof EngineError && error.code === expected;
@@ -79,9 +82,16 @@ function fixture(t: test.TestContext, web?: WebResearchSettings | null, project 
 const hit = (url: string, title = 'Title') => ({ url, title, snippet: `About ${title}`, score: 1, engines: ['google cse'] });
 const searchBody = (q: string, results: unknown[], unresponsive: [string, string][] = [], engines = ['google cse', 'mojeek']) =>
   ({ status: 200, body: { query: q, results, engines_queried: engines, unresponsive_engines: unresponsive, elapsed_ms: 5 } });
-const page = (url: string, text: string, extra: Record<string, unknown> = {}) => ({ status: 200, body: { requested_url: url, resolved_url: url,
-  redirects: [], final_url: url, fetched_at: '2026-10-14T00:00:01+00:00', status: 200, success: true, failure: null, text,
-  truncated: false, chars_total: text.length, chars: text.length, sha256: 'x', extraction: 'crawl4ai/raw_markdown', completeness: 'unknown', ...extra } });
+const page = (url: string, text: string, extra: Record<string, unknown> = {}) => {
+  const bytes = Buffer.from(text, 'utf8');
+  const { truncated = false, ...overrides } = extra;
+  return { status: 200, body: { contract: 'web-document/v2', requested_url: url, selected_url: url,
+    redirects: [], final_url: url, fetched_at: '2026-10-14T00:00:01+00:00', status: 200, success: true, failure: null,
+    raw: { encoding: 'base64', data: bytes.toString('base64'), mediaType: 'text/markdown', byteLength: bytes.length, sha256: digest(bytes) },
+    clean: { text, mediaType: 'text/markdown', utf16Length: text.length, sha256: digest(text) },
+    method: { kind: 'native-markdown', version: 'test/v1' },
+    signals: { rawTruncated: false, cleanTruncated: truncated, completeness: 'unknown' }, attempts: [], ...overrides } };
+};
 
 test('WB1-01 configure keeps an environment without webResearch unchanged and validates the setting it carries', async t => {
   const plain = fixture(t, null);
@@ -138,11 +148,18 @@ test('WB1-04 web_fetch saves an immutable web snapshot that read_source and exac
   const outcome = await f.run(turn);
   const source = outcome.source!;
   assert.equal(source.value.origin.kind, 'web');
-  assert.deepEqual(source.value.origin, { kind: 'web', location: 'https://example.org/pricing', requestedUrl: 'https://example.org/pricing',
-    finalUrl: 'https://example.org/pricing', fetchedAt: '2026-10-14T00:00:01+00:00', status: 200,
-    capture: reference(f.store.get(webCaptureId(reference(turn)))!), extraction: 'crawl4ai/raw_markdown', completeness: 'unknown',
+  assert.deepEqual(source.value.origin, { kind: 'web', documentContract: 'web-document/v2',
+    location: 'https://example.org/pricing', requestedUrl: 'https://example.org/pricing',
+    selectedUrl: 'https://example.org/pricing', finalUrl: 'https://example.org/pricing',
+    fetchedAt: '2026-10-14T00:00:01+00:00', status: 200,
+    capture: reference(f.store.get(webCaptureId(reference(turn)))!),
+    raw: { pointer: '/response/reply/raw', sha256: digest(Buffer.from(text)), byteLength: Buffer.byteLength(text), mediaType: 'text/markdown' },
+    method: { kind: 'native-markdown', version: 'test/v1' }, extraction: 'native-markdown', completeness: 'unknown',
     truncated: { gateway: false, local: false } });
-  assert.equal(source.value.content, text); assert.equal(source.value.sha256, digest(text)); assert.equal(source.value.mediaType, 'text/plain');
+  assert.equal(source.value.content, text); assert.equal(source.value.sha256, digest(text));
+  assert.equal(source.value.mediaType, 'text/markdown'); assert.equal(source.value.structure?.contentSha256, digest(text));
+  assert.equal(f.store.get<WebCapture>(webCaptureId(reference(turn)))!.value.contract, 'web-capture/v2');
+  assert.equal(g.hits[0]!.body.representation, 'web-document/v2');
   const observation = outcome.turn.value.observation as any;
   assert.deepEqual(observation.source, reference(source)); assert.equal(observation.completeness, 'unknown'); assert.equal(observation.length, text.length);
   const evidence = new Evidence(f.store), start = text.indexOf('Subscription'), end = text.indexOf('OAuth.') + 6;
@@ -159,8 +176,12 @@ test('WB1-04 web_fetch saves an immutable web snapshot that read_source and exac
 
 for (const [label, reply, status] of [
   ['404', (url: string) => page(url, 'Not found page', { status: 404 }), 404],
-  ['anti-bot', (url: string) => page(url, '', { success: false, failure: 'Blocked by anti-bot protection', status: 200 }), 200],
-  ['unresolved host', (url: string) => page(url, '', { success: false, failure: 'unresolved: no such host', status: null, final_url: null }), null],
+  ['anti-bot', (url: string) => page(url, '', { success: false,
+    failure: { code: 'anti_bot', message: 'Blocked by anti-bot protection' }, status: 200,
+    raw: null, clean: null, method: null }), 200],
+  ['unresolved host', (url: string) => page(url, '', { success: false,
+    failure: { code: 'unresolved', message: 'unresolved: no such host' }, status: null, final_url: null,
+    raw: null, clean: null, method: null }), null],
 ] as const) test(`WB1-05 a ${label} page is a saved result without a snapshot; the model may choose another URL`, async t => {
   const g = await gateway(t, { fetch: body => reply(body.url) });
   const f = fixture(t, settings(g.url));
@@ -508,7 +529,7 @@ const QUOTE = 'Third-party tools use API keys';
 const WEB_ADAPTER = `import {boundDiscoveryValue} from ${JSON.stringify(new URL('./preparation-fixture.js', import.meta.url).href)};
 import {readFileSync,appendFileSync,writeFileSync,existsSync} from 'node:fs';
 const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject,mode=process.argv[4]||'normal',statePath=process.argv[5];
-if(!c.inventory)c.inventory={sources:c.originals?.sources??[]};
+if(!c.inventory)c.inventory={sources:c.sourceCatalogue?.sources??c.originals?.sources??[]};
 if(!Array.isArray(c.inventory.sources)){const t=c.inventory.sources;c.inventory.sources=t.rows.map(row=>Object.fromEntries(t.columns.map((column,i)=>[column,row[i]])));}
 const state=existsSync(statePath)?JSON.parse(readFileSync(statePath,'utf8')):{};
 const q=c.questions?.[0]??c.question,cur=c.currentRead,kind=cur?.action?.action;
@@ -664,4 +685,251 @@ test('I6-07 a paid web reply saved before its turn recovers after restart withou
   assert.equal(result.status, 'accepted', JSON.stringify(result));
   assert.equal(f.reportCalls().length, 4, 'the paid web_search reply is recovered, not requested again');
   assert.deepEqual(g.hits.map(h => h.path), ['/search', '/fetch']);
+});
+
+test('SR1b v2 capture keeps selected raw bytes apart from clean Markdown and exact URL provenance', async t => {
+  const requested = 'https://example.org/docs', selected = 'https://example.org/docs.md';
+  const raw = Buffer.from('<nav>links</nav><main># Guide\nAPI uses keys.</main>', 'utf8');
+  const clean = '# Guide\nAPI uses keys.';
+  const apparentRef = { id: 'source:unrelated', revision: 1, hash: 'f'.repeat(64) };
+  const g = await gateway(t, { fetch: body => page(body.url, clean, { selected_url: selected, final_url: selected,
+    raw: { encoding: 'base64', data: raw.toString('base64'), mediaType: 'text/html', byteLength: raw.length, sha256: digest(raw) },
+    method: { kind: 'html-main', version: 'sr1a/v2', sourceUrl: requested, discovery: { candidate: apparentRef } },
+    attempts: [{ url: requested, status: 200, selected: true }] }) });
+  const f = fixture(t, settings(g.url));
+  const turn = f.pending({ action: 'web_fetch', url: requested, purpose: 'read article' });
+  const result = await f.run(turn), source = result.source!;
+  const capture = f.store.get<WebCapture>(result.capture!.id, result.capture!.revision)!;
+  assert.equal(capture.value.contract, 'web-capture/v2');
+  assert.equal(capture.value.response.kind, 'fetch-v2');
+  assert.equal((capture.value.response as any).reply.raw.data, raw.toString('base64'));
+  assert.deepEqual(referenceSites('web-capture', capture.value).map(site => site.field).sort(), ['environment', 'turn'],
+    'arbitrary gateway metadata cannot masquerade as an engine reference');
+  assert.equal(source.value.mediaType, 'text/markdown'); assert.equal(source.value.content, clean);
+  assert.equal(source.value.structure!.sections[1]!.title, 'Guide');
+  const origin = source.value.origin as any;
+  assert.equal(origin.requestedUrl, requested); assert.equal(origin.selectedUrl, selected);
+  assert.equal(origin.raw.pointer, '/response/reply/raw'); assert.equal(origin.raw.sha256, digest(raw));
+  assert.equal((contextValue(capture.value, origin.raw.pointer) as any).data, raw.toString('base64'));
+  assert.equal(g.hits[0]!.body.representation, 'web-document/v2');
+  assert.equal(new Evidence(f.store).verify(new Evidence(f.store).observe('p', reference(source),
+    { kind: 'text-range', start: clean.indexOf('API'), end: clean.length })), true);
+});
+
+test('SR1b gateway metadata stays data in Source, inventory, compressed catalogue and archived context', async t => {
+  const url = 'https://example.org/docs';
+  const apparentRef = { id: 'source:unrelated', revision: 1, hash: 'f'.repeat(64) };
+  const g = await gateway(t, { fetch: body => page(body.url, '# Guide\nAPI uses keys.', {
+    method: { kind: 'html-main', version: 'sr1a/v2', discovery: { candidate: apparentRef } },
+    signals: { rawTruncated: false, cleanTruncated: false, completeness: 'unknown', note: apparentRef },
+  }) });
+  const f = fixture(t, settings(g.url));
+  const engine = new ProductEngine(f.store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'Metadata proof' });
+  const result = await f.run(f.pending({ action: 'web_fetch', url, purpose: 'read' }));
+  const source = result.source!;
+  const capture = f.store.get<WebCapture>(result.capture!.id)!;
+  assert.deepEqual(referenceSites('web-capture', capture.value).map(site => site.field).sort(),
+    ['environment', 'turn'], 'method and signals remain data in the original capture');
+  assert.deepEqual(checkStoreIntegrity(f.store).findings, []);
+  const sourceSites = referenceSites('source', source.value).map(site => site.field);
+  assert.ok(sourceSites.includes('origin.capture'));
+  assert.ok(!sourceSites.some(field => field.startsWith('origin.method.')));
+  const draft = engine.prepare('p', 'discovery');
+  const inventory = new ResearchSources(f.store, 'p', f.root).inventory();
+  const packet = workingContext(f.store, 'p', draft.id, draft.value.questions[0]!,
+    { role: 'reader', inventory }, 10000, { purpose: 'reader' });
+  const archive = f.store.get(packet.working.archive.id)!;
+  const archiveSites = referenceSites('research-context', archive.value).map(site => site.field);
+  assert.ok(archiveSites.some(field => field.endsWith('inventory.sources[0].ref')));
+  assert.ok(!archiveSites.some(field => field.includes('.method.')));
+  const copied = { contract: 'research-consumer-intent/v1', cursor: { context: { sourceCatalogue: packet.sourceCatalogue } } };
+  const copiedSites = referenceSites('research-consumer-intent', copied).map(site => site.field);
+  assert.ok(copiedSites.some(field => field.includes('sourceCatalogue.sources') && field.endsWith('.ref')));
+  assert.ok(copiedSites.some(field => field.includes('toc.address.record')));
+  assert.ok(!copiedSites.some(field => field.includes('.method.')));
+  const row = inventory.sources[0]!;
+  const columns = Object.keys(row).sort();
+  const compressed = { contract: 'research-consumer-intent/v1', cursor: { context: {
+    sourceCatalogue: { sources: { columns, rows: [columns.map(column => (row as any)[column])] } },
+  } } };
+  const tableSites = referenceSites('research-consumer-intent', compressed).map(site => site.field);
+  assert.ok(tableSites.includes(`cursor.context.sourceCatalogue.sources.rows[0][${columns.indexOf('ref')}]`));
+  assert.ok(!tableSites.includes(`cursor.context.sourceCatalogue.sources.rows[0][${columns.indexOf('method')}].discovery.candidate`));
+  const untrustedTable = { contract: 'research-consumer-intent/v1', cursor: { context: {
+    sourceCatalogue: { sources: { columns: ['kind', 'method'], rows: [['web', apparentRef]] } },
+  } } };
+  assert.ok(referenceSites('research-consumer-intent', untrustedTable).some(site => site.ref.id === apparentRef.id),
+    'an incomplete table cannot hide a genuine reference');
+  assert.deepEqual(checkStoreIntegrity(f.store).findings, []);
+  const started = await engine.execute({ type: 'om-start', project: 'p' });
+  assert.notEqual((started as any)?.refusal?.code, 'store_damaged');
+  const missingCapture = { ...source.value, origin: { ...source.value.origin,
+    capture: { id: 'web-capture:missing', revision: 1, hash: '0'.repeat(64) } } };
+  assert.ok(referenceSites('source', missingCapture).some(site => site.field === 'origin.capture'),
+    'a genuine missing capture remains a reference');
+  f.store.write({ id: 'source:p:broken-capture', kind: 'source', expected: 0, value: missingCapture });
+  assert.ok(checkStoreIntegrity(f.store).findings.some(finding => finding.code === 'reference_missing'
+    && finding.field === 'origin.capture'), 'fsck still reports the genuinely absent capture');
+});
+
+test('SR1b declared v2 missing bytes, mismatched hashes and foreign URLs never create a capture or Source', async t => {
+  const url = 'https://example.org/article';
+  const valid = page(url, '# Article').body as Record<string, any>;
+  const failures = [
+    { label: 'missing raw', body: { ...valid, raw: undefined } },
+    { label: 'missing clean', body: { ...valid, clean: undefined } },
+    { label: 'wrong raw hash', body: { ...valid, raw: { ...valid.raw, sha256: '0'.repeat(64) } } },
+    { label: 'wrong clean length', body: { ...valid, clean: { ...valid.clean, utf16Length: 1 } } },
+    { label: 'foreign requested URL', body: { ...valid, requested_url: 'https://other.example/article' } },
+    { label: 'unknown contract', body: { ...valid, contract: 'web-document/v3' } },
+  ];
+  for (const failure of failures) {
+    const g = await gateway(t, { fetch: () => ({ status: 200, body: failure.body }) });
+    const f = fixture(t, settings(g.url), `p-${failure.label.replaceAll(' ', '-')}`);
+    const turn = f.pending({ action: 'web_fetch', url, purpose: 'p' });
+    await assert.rejects(f.run(turn), code('web_gateway_response_invalid'), failure.label);
+    assert.equal(f.store.get(webCaptureId(reference(turn))), null, failure.label);
+    assert.equal(f.store.list('source').length, 0, failure.label);
+  }
+});
+
+test('SR1b gateway v2 failure object remains an addressed saved result without a Source', async t => {
+  const url = 'https://example.org/denied';
+  const g = await gateway(t, { fetch: () => ({ status: 200, body: {
+    contract: 'web-document/v2', requested_url: url, selected_url: null, final_url: null,
+    fetched_at: '2026-10-16T00:00:00+00:00', status: null, success: false,
+    failure: { code: 'robots_denied', message: 'The selected page disallows this reader' },
+    redirects: [], attempts: [], raw: null, clean: null, method: null,
+    signals: { rawTruncated: false, cleanTruncated: false, completeness: 'unknown' },
+  } }) });
+  const f = fixture(t, settings(g.url));
+  const turn = f.pending({ action: 'web_fetch', url, purpose: 'p' });
+  const result = await f.run(turn);
+  assert.equal(result.source, null);
+  assert.equal(result.turn.value.error, null);
+  assert.equal((result.turn.value.observation as any).failureCode, 'robots_denied');
+  assert.match((result.turn.value.observation as any).failure, /disallows/);
+  const capture = f.store.get<WebCapture>(webCaptureId(reference(turn)))!;
+  assert.equal(capture.value.contract, 'web-capture/v2');
+  assert.deepEqual((capture.value.response as any).reply.failure,
+    { code: 'robots_denied', message: 'The selected page disallows this reader' });
+  assert.equal(f.store.list('source').length, 0);
+});
+
+test('SR1b failed extraction checks the selected raw checksum before saving even without clean text', async t => {
+  const url = 'https://example.org/empty';
+  const raw = Buffer.from('<main></main>');
+  const reply = { ...page(url, '# unused').body, success: false,
+    failure: { code: 'extraction_empty', message: 'No clean text is available' },
+    raw: { encoding: 'base64', data: raw.toString('base64'), mediaType: 'text/html',
+      byteLength: raw.length, sha256: digest(raw) },
+    clean: { text: '', mediaType: 'text/markdown', utf16Length: 0, sha256: digest('') } };
+  const g = await gateway(t, { fetch: () => ({ status: 200, body: reply }) });
+  const f = fixture(t, settings(g.url));
+  const accepted = await f.run(f.pending({ action: 'web_fetch', url, purpose: 'p' }));
+  assert.equal(accepted.source, null);
+  assert.equal((accepted.turn.value.observation as any).failureCode, 'extraction_empty');
+  reply.raw.sha256 = '0'.repeat(64);
+  const bad = f.pending({ action: 'web_fetch', url, purpose: 'try again' });
+  await assert.rejects(f.run(bad), code('web_gateway_response_invalid'));
+  assert.equal(f.store.get(webCaptureId(reference(bad))), null);
+});
+
+test('SR1b empty selected raw is a saved extraction failure and restart makes no second HTTP request', async t => {
+  const url = 'https://example.org/empty';
+  const reply = { ...page(url, '').body, status: 204, success: false,
+    failure: { code: 'extraction_empty', message: 'No clean text is available' } };
+  const g = await gateway(t, { fetch: () => ({ status: 200, body: reply }) });
+  const f = fixture(t, settings(g.url));
+  const turn = f.pending({ action: 'web_fetch', url, purpose: 'read' });
+  const write = f.store.writeMany.bind(f.store); let crashed = false;
+  f.store.writeMany = ((writes: any[], guards: any[] = []) => {
+    if (!crashed && writes.length === 1 && writes[0]?.kind === 'research-turn'
+      && f.store.get(webCaptureId(reference(turn)))) {
+      crashed = true; throw Error('crash after failed capture before application');
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  await assert.rejects(f.run(turn), /crash after failed capture before application/);
+  f.store.writeMany = write;
+  assert.equal(f.store.get<ResearchTurn>(turn.id)!.value.status, 'pending');
+  const restarted = new Store(f.path); t.after(() => restarted.close());
+  const accepted = await f.run(restarted.get<ResearchTurn>(turn.id)!, restarted);
+  assert.equal(accepted.source, null);
+  assert.equal((accepted.turn.value.observation as any).failureCode, 'extraction_empty');
+  assert.equal(restarted.list('source').length, 0);
+  const capture = restarted.get<WebCapture>(webCaptureId(reference(turn)))!;
+  assert.equal((capture.value.response as any).reply.raw.byteLength, 0);
+  await assert.rejects(f.run(restarted.get<ResearchTurn>(turn.id)!, restarted), code('web_turn_invalid'),
+    'the completed turn cannot pay for a second HTTP request');
+  assert.equal(g.hits.length, 1);
+  const wrong = { ...reply, raw: { ...(reply as any).raw, sha256: '0'.repeat(64) } };
+  const broken = await gateway(t, { fetch: () => ({ status: 200, body: wrong }) });
+  const other = fixture(t, settings(broken.url), 'other');
+  const bad = other.pending({ action: 'web_fetch', url, purpose: 'read' });
+  await assert.rejects(other.run(bad), code('web_gateway_response_invalid'));
+  assert.equal(other.store.get(webCaptureId(reference(bad))), null);
+  const successfulEmpty = { ...reply, success: true, failure: null };
+  const invalid = await gateway(t, { fetch: () => ({ status: 200, body: successfulEmpty }) });
+  const final = fixture(t, settings(invalid.url), 'final');
+  const invalidTurn = final.pending({ action: 'web_fetch', url, purpose: 'read' });
+  await assert.rejects(final.run(invalidTurn), code('web_gateway_response_invalid'));
+});
+
+test('SR1b saved v1 web capture replays its exact text/plain era without HTTP or a new source contract', async t => {
+  const g = await gateway(t, { fetch: () => { throw Error('historical replay must not fetch'); } });
+  const f = fixture(t, settings(g.url));
+  const url = 'https://example.org/old';
+  const turn = f.pending({ action: 'web_fetch', url, purpose: 'historical page' });
+  const capture = f.store.write<WebCapture>({ id: webCaptureId(reference(turn)), kind: 'web-capture', expected: 0,
+    value: { contract: WEB_CAPTURE_CONTRACT, projectId: 'p', stage: 'discovery', turn: reference(turn),
+      action: { action: 'web_fetch', url, purpose: 'historical page' }, environment: reference(f.environment),
+      gatewayUrl: g.url, receivedAt: '2026-10-14T00:00:00.000Z', response: { kind: 'fetch',
+        reply: { requestedUrl: url, finalUrl: url, fetchedAt: '2026-10-14T00:00:01.000Z', status: 200,
+          success: true, failure: null, text: '# Old\nBody', truncated: false, extraction: 'crawl4ai/raw_markdown' } } } });
+  const result = await f.run(turn);
+  assert.equal(result.capture!.hash, capture.hash); assert.equal(g.hits.length, 0);
+  assert.equal(result.source!.value.mediaType, 'text/plain'); assert.equal(result.source!.value.structure, undefined);
+  assert.equal((result.source!.value.origin as any).documentContract, undefined);
+  assert.equal(result.source!.value.content, '# Old\nBody');
+});
+
+test('SR1b large TOC is paged with an exact archive address and survives continuation', async t => {
+  const text = Array.from({ length: 120 }, (_, index) => `## Section ${index}\nBody ${index}\n`).join('');
+  const g = await gateway(t, { fetch: body => page(body.url, text) });
+  const f = fixture(t, settings(g.url));
+  const source = (await f.run(f.pending({ action: 'web_fetch', url: 'https://example.org/toc', purpose: 'p' }))).source!;
+  const engine = new ProductEngine(f.store);
+  engine.execute({ type: 'create-project', project: 'p', title: 'TOC test' });
+  const draft = engine.prepare('p', 'discovery'), questionId = draft.value.questions[0]!;
+  const body = { role: 'reader', inventory: new ResearchSources(f.store, 'p', f.root).inventory() };
+  const first = workingContext(f.store, 'p', draft.id, questionId, body, 7_000, { purpose: 'reader' });
+  const initial = workingContext(f.store, 'p', draft.id, questionId, body, 7_000,
+    { purpose: 'reader', common: true });
+  assert.deepEqual(initial.sourceCatalogue, first.sourceCatalogue);
+  const planning = workingContext(f.store, 'p', draft.id, questionId, {
+    ...body, dispatchMode: 'planning', repositoryRoot: f.root, stage: 'discovery', level: 'R2',
+    consumer: 'compilation', core: { objective: 'Read the saved article', problem: '', actors: [],
+      constraints: [], specificationConstraints: [], concept: {}, requirements: [] },
+    map: { ref: null, nodes: [] }, catalogue: [], readings: [], directReadings: [], answers: [],
+  }, 20_000, { purpose: 'reading-planner' });
+  assert.ok(planning.sourceCatalogue, 'the planning request retains structured navigation');
+  const rows = first.sourceCatalogue.sources;
+  const items = Array.isArray(rows) ? rows : rows.rows.map((row: any[]) => Object.fromEntries(rows.columns.map((key: string, i: number) => [key, row[i]])));
+  const toc = items.find((item: any) => item.ref.id === source.id)!.toc;
+  assert.equal(toc.total, 121); assert.ok(toc.next !== null && toc.next < toc.total);
+  assert.equal(toc.structureHash, source.value.structure!.structureHash);
+  const archive = f.store.get<any>(toc.address.record.id, toc.address.record.revision)!;
+  assert.equal(archive.hash, toc.address.record.hash);
+  assert.equal((contextValue(archive.value, toc.address.pointer) as any[]).length, toc.total);
+  const saved = archivedContext(f.store, f.store.get<DiscoveryDraft>(draft.id)!, toc.address.record);
+  const tocPage = contextPage(contextValue({ body: saved.body }, toc.address.pointer),
+    { offset: toc.next, limit: 3 });
+  assert.equal(tocPage.page?.offset, toc.next);
+  assert.equal((tocPage.value as any[])[0].id, source.value.structure!.sections[toc.next]!.id);
+  const later = workingContext(f.store, 'p', draft.id, questionId, body, 7_000,
+    { purpose: 'reader', continuation: true, previous: first.working.archive });
+  assert.ok(later.sourceCatalogue, 'continuation retains the exact TOC page or archive address');
+  assert.equal(JSON.stringify(later.sourceCatalogue), JSON.stringify(first.sourceCatalogue));
 });

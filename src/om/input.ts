@@ -1,4 +1,5 @@
 import { Ajv, type AnySchema } from "ajv";
+import { isWebDocumentSource } from '../evidence/evidence.js';
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEGACY_REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
@@ -420,7 +421,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         const sourceRecord = proof(raw.source, "source"), source = sourceRecord.value;
         check(sourceRecord.id.startsWith(`source:${request.project}:`) && source.projectId === request.project
           && typeof source.content === "string" && digest(source.content) === source.sha256
-          && ["text/plain", "application/json"].includes(source.mediaType) && object(source.origin)
+          && (["text/plain", "application/json"].includes(source.mediaType) || isWebDocumentSource(source)) && object(source.origin)
           && ["file", "owner-document", "web"].includes(source.origin.kind) && typeof source.origin.location === "string",
         "observation.source", "Saved evidence must preserve its content, digest, project and origin");
         let extracted: Json;

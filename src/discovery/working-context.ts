@@ -13,7 +13,7 @@ import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summar
 
 interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number }
-const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue is the complete inventory in column/row form, including exact source refs and locations; use it without reloading the inventory. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
+const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue lists exact source refs and locations; a structured source TOC may be paged, with total, next and the exact archive address of every section. A heading is navigation, not a reading of its body. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
 
 export function contextValue(value: unknown, pointer: string): unknown {
   requireCondition(typeof pointer === "string" && (pointer === "" || pointer.startsWith("/")), "selector_invalid", "Use a JSON pointer");
@@ -51,6 +51,30 @@ export function archivedContext(store: Store, draft: Revision<DiscoveryDraft>, r
 
 /** The complete request is a product journal entry, not a replacement source.
  * Only its bounded working projection crosses the provider boundary. */
+function structuredCatalogue(inventory: any, archive: Ref, maxChars: number): Record<string, any> {
+  const sources = inventory.sources.map((source: any, index: number) => {
+    if (source.toc?.contract !== 'source-toc/v1') return source;
+    requireCondition(Array.isArray(source.toc.sections) && typeof source.structureHash === 'string',
+      'source_toc_invalid', 'A structured source needs its exact section index and hash');
+    const sections = source.toc.sections as Record<string, any>[];
+    return { ...source, toc: { contract: 'source-toc-page/v1', structureHash: source.structureHash,
+      total: sections.length, next: sections.length ? 0 : null, sections: [],
+      address: { record: archive, pointer: `/body/inventory/sources/${index}/toc/sections` } } };
+  });
+  const catalogue = { sources, files: inventory.files, filesTruncated: inventory.filesTruncated };
+  const target = Math.max(512, Math.floor(maxChars / 4));
+  for (const [index, source] of inventory.sources.entries()) {
+    if (source.toc?.contract !== 'source-toc/v1') continue;
+    const page = sources[index].toc;
+    for (const section of source.toc.sections) {
+      page.sections.push(section);
+      if (JSON.stringify(catalogue).length > target) { page.sections.pop(); break; }
+    }
+    page.next = page.sections.length < page.total ? page.sections.length : null;
+  }
+  return { sources: contextTable(sources), files: inventory.files, filesTruncated: inventory.filesTruncated };
+}
+
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
   context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
@@ -72,7 +96,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const priorSources=priorEvidenceSources(body['priorEvidence']??[]);
   if(priorSources.length)body['priorEvidenceSources']=priorSources;
   const inventory = body['inventory'] as any;
-  if (inventory?.sources && inventory.files) body['sourceCatalogue'] = {
+  const hasStructuredSources = Array.isArray(inventory?.sources)
+    && inventory.sources.some((source: any) => source?.toc?.contract === 'source-toc/v1');
+  if (!hasStructuredSources && inventory?.sources && inventory.files) body['sourceCatalogue'] = {
     sources: contextTable(inventory.sources), files: inventory.files, filesTruncated: inventory.filesTruncated,
   } as Json;
   body['unresolvedEvidence'] = (Array.isArray(body['readings']) ? body['readings'] : []).flatMap((entry: any) =>
@@ -82,6 +108,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
   const archivedBody = body;
+  const sourceNavigation = hasStructuredSources ? structuredCatalogue(inventory, reference(archive), maxChars) : null;
+  if (sourceNavigation) body = { ...body, sourceCatalogue: sourceNavigation };
   const relatedResearch = body['discoveryContext'];
   const relatedCatalogue = body['discoveryBasisCatalogue'];
   const neighborMaterial = body['assessmentContextContract'] === STAGE_NEIGHBOR_CONTEXT
@@ -97,6 +125,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (projectedQuestion) body = { ...body, question: projectedQuestion,
     ...(Object.hasOwn(body, 'questions') ? { questions: [projectedQuestion] } : {}) };
   const finish = (packet: Record<string, any>) => {
+    if (sourceNavigation) requireCondition(packet.sourceCatalogue !== undefined
+      && canonical(packet.sourceCatalogue) === canonical(sourceNavigation),
+      'source_toc_undelivered', 'The packed request lost its exact structured source catalogue');
     if (relatedResearch !== undefined) requireCondition(packet.discoveryContext
       && canonical(packet.discoveryContext) === canonical(relatedResearch),
     'context_discovery_incomplete', `[${question.id}] The packed question lost its accepted research grounds`);
@@ -134,7 +165,10 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (options.common && !options.continuation && !body['core'] && !body['synthesisState'] && !body['assessmentState']) {
     const {priorEvidence:_priorEvidence,priorEvidenceSources:_priorEvidenceSources,...initialBody}=body;
     const initial:Record<string,any>={...initialBody,working:{archive:reference(archive),instruction,sections:contextSections(archivedBody)}};
-    if (initial.inventory) delete initial.sourceCatalogue;
+    if (initial.inventory) {
+      if (sourceNavigation) delete initial.inventory;
+      else delete initial.sourceCatalogue;
+    }
     packContextWorkspace(initial,maxChars,options.contextChars);
     packPriorEvidence(initial,priorSources,reference(archive),maxChars);
     requireCondition(JSON.stringify(initial).length<=maxChars,'pilot_core_limit','Initial question context exceeds its declared envelope bound');
@@ -178,6 +212,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if(relatedResearch !== undefined)body['discoveryContext']=relatedResearch;
     if(relatedCatalogue !== undefined)body['discoveryBasisCatalogue']=relatedCatalogue;
     if(neighborMaterial)Object.assign(body,neighborMaterial);
+    if(sourceNavigation) body['sourceCatalogue']=sourceNavigation;
     if(candidate) body['candidate']=replaceFoundationCopies(candidate,{...original,value:undefined},reference(archive),store);
     if(proposalChanges) body['proposalChanges']=replaceFoundationCopies(proposalChanges,{...original,previousProposal:undefined},reference(archive),store);
   }
@@ -201,7 +236,10 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     const reserved = (relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length)
       + (relatedCatalogue === undefined ? 0 : JSON.stringify({discoveryBasisCatalogue:relatedCatalogue}).length)
       + (neighborMaterial ? JSON.stringify(neighborMaterial).length : 0);
-    const packet = planningContext(body,reference(archive),maxChars-reserved,options.contextChars,archivedBody);
+    const packet = planningContext(body,reference(archive),maxChars-reserved
+      -(sourceNavigation ? JSON.stringify({ sourceCatalogue: sourceNavigation }).length : 0),
+      options.contextChars,archivedBody);
+    if(sourceNavigation)packet.sourceCatalogue=sourceNavigation;
     if(relatedResearch !== undefined)packet.discoveryContext=relatedResearch;
     if(relatedCatalogue !== undefined)packet.discoveryBasisCatalogue=relatedCatalogue;
     if(neighborMaterial)Object.assign(packet,neighborMaterial);

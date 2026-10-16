@@ -2,7 +2,7 @@ import { posix } from 'node:path';
 import { Ajv } from 'ajv';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import type { Source } from '../evidence/evidence.js';
+import { isWebDocumentSource, type Source } from '../evidence/evidence.js';
 import { LEVEL, type Graph } from '../graph/model.js';
 import { KNOWLEDGE_KINDS } from '../graph/obligation-policy.js';
 import { taskBindingId } from '../graph/task-obligations.js';
@@ -74,7 +74,7 @@ export function briefMaterial(store: Store, project: string, workspace: string, 
       || !object(row.value) || row.value.projectId !== project || !object(row.value.origin)
       || !['file', 'owner-document', 'web'].includes(row.value.origin.kind) || typeof row.value.origin.location !== 'string'
       || typeof row.value.content !== 'string' || digest(row.value.content) !== row.value.sha256
-      || !['text/plain', 'application/json'].includes(row.value.mediaType))
+      || !(['text/plain', 'application/json'].includes(row.value.mediaType) || isWebDocumentSource(row.value)))
       invalid(`catalogue.${ref.id}`, 'Every catalogue source must resolve to its exact original project and content');
     if (current) {
       const head = store.get(ref.id);

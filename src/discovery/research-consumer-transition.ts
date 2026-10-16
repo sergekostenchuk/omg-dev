@@ -6,7 +6,7 @@ import { EngineError, requireCondition } from '../errors.js';
 import { tokenUsage, type ModelCall } from '../runtime/model-usage.js';
 import { isRef, reference, type Ref, type Finding, type StageArtifact } from '../pipeline/contracts.js';
 import { normalizeResearchAction } from './research-action-normalization.js';
-import { webAction, WEB_ACTIONS, projectWebApplication, WEB_CAPTURE_CONTRACT, type WebCapture } from './web-research.js';
+import { webAction, WEB_ACTIONS, projectWebApplication, WEB_CAPTURE_CONTRACT, WEB_CAPTURE_CONTRACT_V2, type WebCapture } from './web-research.js';
 import { queuedChildReached } from './reading-plan.js';
 import type { ReaderResult } from './reader.js';
 import type { EarlyUnknown, ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
@@ -1598,7 +1598,8 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
   if (proof.kind === 'web') {
     const { capture, projectId } = proof;
     requireCondition(capture.kind === 'web-capture' && hashJson(capture.value) === capture.hash
-      && capture.value.contract === WEB_CAPTURE_CONTRACT && capture.value.projectId === projectId
+      && (capture.value.contract === WEB_CAPTURE_CONTRACT || capture.value.contract === WEB_CAPTURE_CONTRACT_V2)
+      && capture.value.projectId === projectId
       && capture.value.turn.hash === hashJson(before) && canonical(capture.value.action) === canonical(before.action)
       && (action.action === 'web_search' || action.action === 'web_fetch' || capture.value.response.kind === 'refused'),
     'research_consumer_intent_invalid', 'The web completion lost its exact capture of this pending turn');

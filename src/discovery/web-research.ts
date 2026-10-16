@@ -1,9 +1,10 @@
 import { isIP } from "node:net";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
-import { canonical, hashJson } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { reference, type Ref } from "../pipeline/contracts.js";
-import { projectWebSource, type Source } from "../evidence/evidence.js";
+import { projectWebSource, projectWebDocumentSource, requireWebDocument, requireWebDocumentParts, WEB_DOCUMENT_CONTRACT,
+  type WebDocument, type Source } from "../evidence/evidence.js";
 import { requireWebResearchSettings, type Environment, type WebResearchSettings } from "../runtime/environment.js";
 import type { ResearchRun, ResearchTurn } from "./research-model.js";
 import { RunControlGate, RunControlLost } from "../om/run-control.js";
@@ -12,6 +13,7 @@ import { RunControlGate, RunControlLost } from "../om/run-control.js";
 export type WebAction = { action: "web_search"; query: string; purpose: string } | { action: "web_fetch"; url: string; purpose: string };
 export const WEB_ACTIONS: readonly string[] = ["web_search", "web_fetch"];
 export const WEB_CAPTURE_CONTRACT = "web-capture/v1";
+export const WEB_CAPTURE_CONTRACT_V2 = "web-capture/v2";
 export const WEB_BUDGET_CONTRACT = "web-budget/v1";
 const EXCERPT_CHARS = 1500, MAX_RESULTS = 50;
 
@@ -19,14 +21,22 @@ export interface WebSearchHit { url: string; title: string; snippet: string; sco
 export interface WebSearchReply { query: string; results: WebSearchHit[]; enginesQueried: string[]; unresponsiveEngines: { engine: string; reason: string }[] }
 export interface WebFetchReply { requestedUrl: string; finalUrl: string | null; fetchedAt: string; status: number | null; success: boolean;
   failure: string | null; text: string; truncated: boolean; extraction: string }
+export interface WebDocumentReply {
+  contract: typeof WEB_DOCUMENT_CONTRACT; requested_url: string; selected_url: string | null;
+  final_url: string | null; fetched_at: string; status: number | null; success: boolean;
+  failure: { code: string; message: string; [key: string]: Json } | null;
+  redirects: Json[]; attempts: Json[]; raw: WebDocument['raw'] | null; clean: WebDocument['clean'] | null;
+  method: WebDocument['method'] | null; signals: WebDocument['signals'] | null;
+}
 /** What the gateway answered for one pending turn, saved before it is applied. */
 export type WebCaptureResponse =
   | { kind: "search"; reply: WebSearchReply }
   | { kind: "fetch"; reply: WebFetchReply }
+  | { kind: "fetch-v2"; reply: WebDocumentReply }
   | { kind: "refused"; code: WebRefusalCode; reason: string; local?: true };
 /** Addressed action errors the model can correct; local ones are decided without HTTP and spend no budget. */
 export type WebRefusalCode = "web_url_invalid" | "web_url_forbidden" | "web_request_invalid" | "web_research_unavailable" | "web_action_invalid";
-export interface WebCapture { contract: typeof WEB_CAPTURE_CONTRACT; projectId: string; stage: string; turn: Ref; action: WebAction;
+export interface WebCapture { contract: typeof WEB_CAPTURE_CONTRACT | typeof WEB_CAPTURE_CONTRACT_V2; projectId: string; stage: string; turn: Ref; action: WebAction;
   environment: Ref; gatewayUrl: string; receivedAt: string; response: WebCaptureResponse }
 export interface WebBudget { contract: typeof WEB_BUDGET_CONTRACT; projectId: string; stage: string; attempts: number; pages: number; receivedChars: number }
 export interface WebBudgetView { limits: { httpAttempts: number; pages: number; receivedChars: number };
@@ -138,20 +148,50 @@ function searchReply(body: unknown, query: string): WebSearchReply {
   return { query, results, enginesQueried: [...(body as Record<string, any>).engines_queried], unresponsiveEngines };
 }
 
-function fetchReply(body: unknown, url: string): WebFetchReply {
-  if (!object(body) || body.requested_url !== url || typeof body.fetched_at !== "string" || typeof body.success !== "boolean"
-    || !(body.final_url === null || typeof body.final_url === "string") || !(body.status === null || Number.isSafeInteger(body.status))
-    || !(body.failure === null || typeof body.failure === "string") || typeof body.text !== "string"
-    || typeof body.truncated !== "boolean" || typeof body.extraction !== "string")
-    responseInvalid("The fetch answer lacks its URLs, time, status, outcome, text, truncation or extraction");
-  const reply = body as Record<string, any>;
-  return { requestedUrl: url, finalUrl: reply.final_url, fetchedAt: reply.fetched_at, status: reply.status, success: reply.success,
-    failure: reply.failure, text: reply.text, truncated: reply.truncated, extraction: reply.extraction };
+function fetchReply(body: unknown, url: string): Extract<WebCaptureResponse, { kind: 'fetch-v2' }> {
+  if (!object(body) || body.contract !== WEB_DOCUMENT_CONTRACT || body.requested_url !== url
+    || typeof body.fetched_at !== 'string' || typeof body.success !== 'boolean'
+    || !(body.selected_url === null || typeof body.selected_url === 'string')
+    || !(body.final_url === null || typeof body.final_url === 'string')
+    || !(body.status === null || Number.isSafeInteger(body.status))
+    || !(body.failure === null || object(body.failure))
+    || !Array.isArray(body.redirects) || !Array.isArray(body.attempts)
+    || !Object.hasOwn(body, 'raw') || !Object.hasOwn(body, 'clean')
+    || !Object.hasOwn(body, 'method') || !object(body.signals)
+    || typeof body.signals.rawTruncated !== 'boolean' || typeof body.signals.cleanTruncated !== 'boolean'
+    || body.signals.completeness !== 'unknown')
+    responseInvalid('The v2 fetch answer lacks its declared wire, URLs, outcome or document fields');
+  const reply = body as unknown as WebDocumentReply;
+  if (reply.success) {
+    if (reply.failure !== null || reply.selected_url === null || reply.final_url === null
+      || reply.raw === null || reply.clean === null || reply.method === null || reply.signals === null)
+      responseInvalid('A successful v2 fetch needs exact raw, clean, method and URLs');
+    requireWebDocument({ requestedUrl: url, selectedUrl: reply.selected_url, finalUrl: reply.final_url,
+      fetchedAt: reply.fetched_at, status: reply.status, redirects: reply.redirects, attempts: reply.attempts,
+      raw: reply.raw, clean: reply.clean, method: reply.method, signals: reply.signals });
+  } else if (!reply.failure || typeof reply.failure.code !== 'string' || !reply.failure.code
+    || typeof reply.failure.message !== 'string' || !reply.failure.message) {
+    responseInvalid('An unsuccessful v2 fetch needs an addressed failure');
+  }
+  if (!reply.success) {
+    const selected = reply.raw !== null || reply.clean !== null || reply.method !== null;
+    if (selected && (reply.raw === null || reply.clean === null || reply.method === null
+      || reply.selected_url === null || reply.final_url === null))
+      responseInvalid('A selected failed document must keep its raw, clean, method and URLs together');
+    requireWebDocumentParts(reply.raw, reply.clean, reply.method, reply.signals, false);
+  }
+  if ((reply.selected_url !== null && webUrlRefusal(reply.selected_url))
+    || (reply.final_url !== null && webUrlRefusal(reply.final_url)))
+    responseInvalid('The selected and final document URLs must remain public http(s) addresses');
+  canonical(body);
+  return { kind: 'fetch-v2', reply };
 }
 
 /** A page becomes a snapshot only when the crawler succeeded with text and the page did not answer with an error status. */
-export function isWebPage(reply: WebFetchReply): boolean {
-  return reply.success && reply.text.length > 0 && reply.finalUrl !== null && (reply.status === null || reply.status < 400);
+export function isWebPage(reply: WebFetchReply | WebDocumentReply): boolean {
+  return 'contract' in reply
+    ? reply.success && !!reply.clean?.text && reply.final_url !== null && (reply.status === null || reply.status < 400)
+    : reply.success && reply.text.length > 0 && reply.finalUrl !== null && (reply.status === null || reply.status < 400);
 }
 
 export function webBudgetId(projectId: string, stage: string): string { return `web-budget:${projectId}:${stage}`; }
@@ -193,6 +233,8 @@ function refusalTurn(turn: ResearchTurn, code: string, reason: string, details: 
 export function projectWebApplication(projectId: string, turn: ResearchTurn, capture: Revision<WebCapture>):
   { source: { id: string; kind: "source"; value: Source } | null; turn: ResearchTurn } {
   const ref = reference(capture), response = capture.value.response;
+  requireCondition((capture.value.contract === WEB_CAPTURE_CONTRACT_V2) === (response.kind === 'fetch-v2'),
+    'web_capture_invalid', 'The saved web capture response must follow its declared contract');
   if (response.kind === "refused")
     return { source: null, turn: refusalTurn(turn, response.code, response.reason, { capture: ref, action: capture.value.action,
       ...(response.local ? { local: true } : {}) }) };
@@ -204,6 +246,32 @@ export function projectWebApplication(projectId: string, turn: ResearchTurn, cap
     return { source: null, turn: completed(turn, { kind: "web_search", capture: ref, query: reply.query, receivedAt: capture.value.receivedAt,
       outcome, results: reply.results, enginesQueried: reply.enginesQueried, unresponsiveEngines: reply.unresponsiveEngines,
       note: "Search results are navigation, not evidence. Fetch a result URL with web_fetch, then read and cite the saved snapshot." }, null) };
+  }
+  if (response.kind === 'fetch-v2') {
+    const reply = response.reply;
+    requireCondition(capture.value.contract === WEB_CAPTURE_CONTRACT_V2
+      && capture.value.action.action === 'web_fetch'
+      && reply.requested_url === capture.value.action.url,
+      'web_capture_invalid', 'The document capture must bind the exact requested web action');
+    if (!isWebPage(reply))
+      return { source: null, turn: completed(turn, { kind: 'web_fetch', capture: ref, source: null,
+        requestedUrl: reply.requested_url, finalUrl: reply.final_url, status: reply.status,
+        failure: reply.failure?.message ?? (reply.status !== null && reply.status >= 400 ? `HTTP ${reply.status}` : 'No clean page text was received'),
+        ...(reply.failure ? { failureCode: reply.failure.code } : {}),
+        note: 'This page gave no snapshot; choose another URL if the material is still needed.' }, null) };
+    const document: WebDocument = { requestedUrl: reply.requested_url, selectedUrl: reply.selected_url!,
+      finalUrl: reply.final_url!, fetchedAt: reply.fetched_at, status: reply.status,
+      redirects: reply.redirects, attempts: reply.attempts, raw: reply.raw!, clean: reply.clean!,
+      method: reply.method!, signals: reply.signals! };
+    const source = projectWebDocumentSource(projectId, ref, document);
+    const sourceRef = { id: source.id, revision: 1, hash: hashJson(source.value) };
+    const origin = source.value.origin as Extract<Source['origin'], { documentContract: typeof WEB_DOCUMENT_CONTRACT }>;
+    return { source, turn: completed(turn, { kind: 'web_fetch', capture: ref, source: sourceRef,
+      requestedUrl: reply.requested_url, selectedUrl: reply.selected_url, finalUrl: reply.final_url,
+      status: reply.status, length: source.value.content.length, completeness: 'unknown',
+      truncated: origin.truncated, mediaType: 'text/markdown', structureHash: source.value.structure!.structureHash,
+      excerpt: source.value.content.slice(0, EXCERPT_CHARS),
+      note: 'The exact clean Markdown is saved as this source. Use its TOC to choose read_source ranges; titles alone are not evidence.' }, null) };
   }
   const reply = response.reply;
   if (!isWebPage(reply))
@@ -312,10 +380,10 @@ export async function executeWebTurn(input: WebResearchInput): Promise<WebResear
     const reply = action.action === "web_search"
       ? await transport(`${gateway}/search?${new URLSearchParams({ q: action.query, n: String(MAX_RESULTS) })}`,
         { method: "GET", timeoutMs: settings.timeoutMs, maxBytes: settings.limits.responseBytes })
-      : await transport(`${gateway}/fetch`, { method: "POST", body: JSON.stringify({ url: action.url }),
+      : await transport(`${gateway}/fetch`, { method: "POST", body: JSON.stringify({ url: action.url, representation: WEB_DOCUMENT_CONTRACT }),
         timeoutMs: settings.timeoutMs, maxBytes: settings.limits.responseBytes });
     if (reply.status === 200) response = action.action === "web_search"
-      ? { kind: "search", reply: searchReply(reply.body, action.query) } : { kind: "fetch", reply: fetchReply(reply.body, action.url) };
+      ? { kind: "search", reply: searchReply(reply.body, action.query) } : fetchReply(reply.body, action.url);
     else if ((reply.status === 400 || reply.status === 403) && object(reply.body)
       && ["url_invalid", "url_forbidden", "request_invalid"].includes(reply.body.error))
       response = { kind: "refused", code: `web_${reply.body.error}` as "web_url_invalid" | "web_url_forbidden" | "web_request_invalid",
@@ -326,18 +394,22 @@ export async function executeWebTurn(input: WebResearchInput): Promise<WebResear
     if (error instanceof RunControlLost)
       throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
     if (error instanceof WebTransportFailure && error.reason === "too_large" && action.action === "web_fetch")
-      response = { kind: "fetch", reply: { requestedUrl: action.url, finalUrl: null, fetchedAt: now(), status: null, success: false,
-        failure: `The page answer exceeded ${settings.limits.responseBytes} bytes`, text: "", truncated: false, extraction: "none" } };
+      response = { kind: 'fetch-v2', reply: { contract: WEB_DOCUMENT_CONTRACT, requested_url: action.url,
+        selected_url: null, final_url: null, fetched_at: now(), status: null, success: false,
+        failure: { code: 'response_too_large', message: `The page answer exceeded ${settings.limits.responseBytes} bytes` },
+        redirects: [], attempts: [], raw: null, clean: null, method: null,
+        signals: { rawTruncated: false, cleanTruncated: false, completeness: 'unknown' } } };
     else if (error instanceof WebTransportFailure)
       throw new EngineError(error.reason === "not_json" || error.reason === "too_large" ? "web_gateway_response_invalid" : "web_gateway_unavailable",
         `The web gateway answer was not obtained (${error.reason}); continue the same action after it recovers`,
         { gateway, reason: error.reason, message: error.message, turn: reference(turn), action });
     else throw error;
   }
-  const page = response.kind === "fetch" && isWebPage(response.reply);
-  const capture: WebCapture = { contract: WEB_CAPTURE_CONTRACT, projectId, stage, turn: reference(turn), action,
+  const page = response.kind === 'fetch-v2' && isWebPage(response.reply);
+  const capture: WebCapture = { contract: response.kind === 'fetch-v2' ? WEB_CAPTURE_CONTRACT_V2 : WEB_CAPTURE_CONTRACT,
+    projectId, stage, turn: reference(turn), action,
     environment: reference(environment), gatewayUrl: gateway, receivedAt: now(), response };
-  const received = response.kind === "fetch" ? response.reply.text.length : 0;
+  const received = response.kind === 'fetch-v2' ? response.reply.clean?.text.length ?? 0 : 0;
   let counter: Revision<WebBudget> = reserved;
   for (let attempt = 0; ; attempt++) {
     let written: Revision<WebCapture>;

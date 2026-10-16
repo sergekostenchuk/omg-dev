@@ -2,6 +2,7 @@ import { readFileSync, realpathSync, statSync } from "node:fs";
 import { relative, resolve, isAbsolute } from "node:path";
 import { Store, type Revision } from "../storage/store.js";
 import { digest, canonical, hashJson, type Json } from "../canonical.js";
+import { buildSourceStructure, verifySourceStructure, type SourceStructure } from "./source-structure.js";
 import { requireCondition } from "../errors.js";
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { safeRelativePath } from "../graph/topology.js";
@@ -12,10 +13,28 @@ export interface WebSnapshotOrigin {
   kind: 'web'; location: string; requestedUrl: string; finalUrl: string; fetchedAt: string; status: number | null;
   capture: Ref; extraction: string; completeness: 'unknown'; truncated: { gateway: boolean; local: boolean };
 }
+export const WEB_DOCUMENT_CONTRACT = 'web-document/v2' as const;
+export interface WebDocumentMethod { kind: string; version: string; [key: string]: Json }
+export interface WebDocumentSignals { rawTruncated: boolean; cleanTruncated: boolean; completeness: 'unknown'; [key: string]: Json }
+export interface WebDocument {
+  requestedUrl: string; selectedUrl: string; finalUrl: string; fetchedAt: string; status: number | null;
+  redirects: Json[]; attempts: Json[];
+  raw: { encoding: 'base64'; data: string; mediaType: string; byteLength: number; sha256: string };
+  clean: { text: string; mediaType: 'text/markdown'; utf16Length: number; sha256: string };
+  method: WebDocumentMethod; signals: WebDocumentSignals;
+}
+export interface WebDocumentOrigin {
+  kind: 'web'; documentContract: typeof WEB_DOCUMENT_CONTRACT; location: string;
+  requestedUrl: string; selectedUrl: string; finalUrl: string; fetchedAt: string; status: number | null;
+  capture: Ref; raw: { pointer: '/response/reply/raw'; sha256: string; byteLength: number; mediaType: string };
+  method: WebDocumentMethod; extraction: string; completeness: 'unknown';
+  truncated: { gateway: boolean; local: boolean };
+}
 export interface Source {
   provenance?: { kind: 'runtime-observation'; record: Ref };
-  projectId: string; origin: { kind: "file" | "owner-document"; location: string } | WebSnapshotOrigin;
-  content: string; mediaType: "text/plain" | "application/json"; sha256: string;
+  projectId: string; origin: { kind: "file" | "owner-document"; location: string } | WebSnapshotOrigin | WebDocumentOrigin;
+  content: string; mediaType: "text/plain" | "application/json" | "text/markdown"; sha256: string;
+  structure?: SourceStructure;
 }
 export const SOURCE_MAX_BYTES = 5_000_000;
 export interface WebPage { requestedUrl: string; finalUrl: string; fetchedAt: string; status: number | null;
@@ -36,6 +55,90 @@ export function projectWebSource(projectId: string, capture: Ref, page: WebPage)
       truncated: { gateway: page.truncated, local } },
     content, mediaType: 'text/plain', sha256: digest(content) } };
 }
+const webUrl = (value: string): boolean => {
+  try { const url = new URL(value); return (url.protocol === 'http:' || url.protocol === 'https:')
+    && !url.username && !url.password && !!url.hostname; }
+  catch { return false; }
+};
+const plainRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+  && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+
+/** A failed extraction may still carry selected bytes; those bytes require the same checksum proof. */
+export function requireWebDocumentParts(rawValue: unknown, cleanValue: unknown, methodValue: unknown,
+  signalsValue: unknown, complete: boolean): void {
+  requireCondition(plainRecord(signalsValue) && typeof signalsValue.rawTruncated === 'boolean'
+    && typeof signalsValue.cleanTruncated === 'boolean' && signalsValue.completeness === 'unknown',
+    'web_gateway_response_invalid', 'A web document needs declared completeness and truncation signals');
+  if (complete || rawValue !== null) {
+    const raw = rawValue as WebDocument['raw'];
+    requireCondition(plainRecord(raw) && raw.encoding === 'base64' && typeof raw.data === 'string'
+      && typeof raw.mediaType === 'string' && !!raw.mediaType
+      && Number.isSafeInteger(raw.byteLength) && raw.byteLength >= (complete ? 1 : 0)
+      && typeof raw.sha256 === 'string',
+      'web_gateway_response_invalid', 'The selected raw bytes need encoding, media, length and SHA-256');
+    const bytes = Buffer.from(raw.data, 'base64');
+    requireCondition(bytes.toString('base64') === raw.data && bytes.length === raw.byteLength && digest(bytes) === raw.sha256,
+      'web_gateway_response_invalid', 'The web raw bytes do not match their declared length and SHA-256');
+  }
+  if (complete || cleanValue !== null) {
+    const clean = cleanValue as WebDocument['clean'];
+    requireCondition(plainRecord(clean) && clean.mediaType === 'text/markdown'
+      && typeof clean.text === 'string' && (!complete || !!clean.text.trim())
+      && Number.isSafeInteger(clean.utf16Length) && typeof clean.sha256 === 'string'
+      && clean.text.length === clean.utf16Length && digest(clean.text) === clean.sha256,
+      'web_gateway_response_invalid', 'The clean Markdown does not match its declared UTF-16 length and SHA-256');
+  }
+  if (complete || methodValue !== null) {
+    const method = methodValue as WebDocumentMethod;
+    requireCondition(plainRecord(method) && typeof method.kind === 'string' && !!method.kind
+      && typeof method.version === 'string' && !!method.version,
+      'web_gateway_response_invalid', 'The extraction method needs its kind and version');
+  }
+  canonical({ method: methodValue, signals: signalsValue });
+}
+
+/** Validate the untrusted gateway representation before it becomes an immutable capture. */
+export function requireWebDocument(value: unknown): asserts value is WebDocument {
+  const page = value as WebDocument;
+  requireCondition(plainRecord(page) && webUrl(page.requestedUrl) && webUrl(page.selectedUrl) && webUrl(page.finalUrl)
+    && typeof page.fetchedAt === 'string' && !!page.fetchedAt
+    && (page.status === null || Number.isSafeInteger(page.status))
+    && Array.isArray(page.redirects) && Array.isArray(page.attempts),
+    'web_gateway_response_invalid', 'A web document needs exact raw, clean, method, URLs and truncation provenance');
+  requireWebDocumentParts(page.raw, page.clean, page.method, page.signals, true);
+  canonical({ redirects: page.redirects, attempts: page.attempts, method: page.method, signals: page.signals });
+}
+
+/** The gateway envelope is evidence of received bytes; the Source is the final, locally bounded clean text. */
+export function projectWebDocumentSource(projectId: string, capture: Ref, page: WebDocument):
+  { id: string; kind: 'source'; value: Source } {
+  requireCondition(typeof projectId === 'string' && !!projectId && isRef(capture),
+    'source_invalid', 'A web document needs this project and exact capture');
+  requireWebDocument(page);
+  const raw = page.raw;
+  let content = page.clean.text, local = false;
+  if (Buffer.byteLength(content, 'utf8') > SOURCE_MAX_BYTES) {
+    local = true;
+    let end = 0, bytesUsed = 0;
+    for (const character of content) {
+      const size = Buffer.byteLength(character, 'utf8');
+      if (bytesUsed + size > SOURCE_MAX_BYTES) break;
+      bytesUsed += size; end += character.length;
+    }
+    content = content.slice(0, end);
+  }
+  const structure = buildSourceStructure(content);
+  return { id: `source:${projectId}:web:${capture.hash}`, kind: 'source', value: { projectId,
+    origin: { kind: 'web', documentContract: WEB_DOCUMENT_CONTRACT, location: page.finalUrl,
+      requestedUrl: page.requestedUrl, selectedUrl: page.selectedUrl, finalUrl: page.finalUrl,
+      fetchedAt: page.fetchedAt, status: page.status, capture,
+      raw: { pointer: '/response/reply/raw', sha256: raw.sha256, byteLength: raw.byteLength, mediaType: raw.mediaType },
+      method: page.method, extraction: page.method.kind, completeness: 'unknown',
+      truncated: { gateway: page.signals.cleanTruncated, local } },
+    content, mediaType: 'text/markdown', sha256: digest(content), structure } };
+}
+
 export type Selector = { kind: "json-pointer"; pointer: string } | { kind: "text-range"; start: number; end: number };
 export interface Observation { projectId: string; source: Ref; selector: Selector; value: Json }
 export const SOURCE_READ_CONTRACT = 'source-read/v1' as const;
@@ -98,10 +201,31 @@ export function projectSourceReading(projectId: string, source: Ref, value: Sour
  * A web snapshot is its saved text: citing it never goes back to the network. */
 export function sourceIsCurrent(source: Source): boolean {
   try {
-    return source.origin.kind === "owner-document" || source.origin.kind === "web" || (source.origin.kind === "file"
-      && realpathSync(source.origin.location) === source.origin.location
-      && digest(readFileSync(source.origin.location)) === source.sha256);
+    return source.origin.kind === "owner-document"
+      || source.origin.kind === "web" && (!('documentContract' in source.origin)
+        || source.origin.documentContract === WEB_DOCUMENT_CONTRACT
+          && source.mediaType === 'text/markdown' && digest(source.content) === source.sha256
+          && !!source.structure
+          && verifySourceStructure(source.content, source.structure))
+      || source.origin.kind === "file" && realpathSync(source.origin.location) === source.origin.location
+        && digest(readFileSync(source.origin.location)) === source.sha256;
   } catch { return false; }
+}
+
+/** One shared admission check for saved Markdown web documents across documentary consumers. */
+export function isWebDocumentSource(value: unknown): value is Source {
+  if (!plainRecord(value) || value.mediaType !== 'text/markdown' || typeof value.content !== 'string'
+    || typeof value.sha256 !== 'string' || digest(value.content) !== value.sha256
+    || !plainRecord(value.origin) || value.origin.kind !== 'web'
+    || value.origin.documentContract !== WEB_DOCUMENT_CONTRACT
+    || !isRef(value.origin.capture) || !plainRecord(value.origin.raw)
+    || value.origin.raw.pointer !== '/response/reply/raw'
+    || !/^[a-f0-9]{64}$/.test(String(value.origin.raw.sha256))
+    || !Number.isSafeInteger(value.origin.raw.byteLength) || Number(value.origin.raw.byteLength) < 1
+    || typeof value.origin.raw.mediaType !== 'string' || !value.origin.raw.mediaType
+    || !plainRecord(value.origin.method) || typeof value.origin.method.kind !== 'string'
+    || typeof value.origin.method.version !== 'string' || !value.structure) return false;
+  return sourceIsCurrent(value as unknown as Source);
 }
 
 export class Evidence {
