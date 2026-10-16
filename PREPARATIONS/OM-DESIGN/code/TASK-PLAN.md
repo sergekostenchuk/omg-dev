@@ -2799,7 +2799,7 @@
 - Отдаёт: —
 - Читает записи: 
 - Пишет записи: 
-- Разрешённые пути: `src/evidence/evidence.ts`, `src/evidence/source-navigation.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-sources.ts`, `src/discovery/response-recovery.ts`, `src/discovery/synthesis-session.ts`, `src/discovery/web-research.ts`, `src/discovery/working-context.ts`, `src/product/commands.ts`, `src/runtime/environment.ts`, `test/research.test.ts`, `test/source-navigation.test.ts`, `test/web-research.test.ts`
+- Разрешённые пути: `src/evidence/evidence.ts`, `src/evidence/source-navigation.ts`, `src/discovery/research-consumer-transition.ts`, `src/discovery/research-runner.ts`, `src/discovery/research-sources.ts`, `src/discovery/response-recovery.ts`, `src/discovery/synthesis-session.ts`, `src/discovery/web-research.ts`, `src/discovery/working-context.ts`, `src/product/commands.ts`, `src/runtime/environment.ts`, `test/research.test.ts`, `test/source-navigation.test.ts`, `test/web-research.test.ts`, `src/storage/reference-sites.ts`
 - Из движка как есть: —
 - После: SR1b
 - Тесты сверх обязательных:
