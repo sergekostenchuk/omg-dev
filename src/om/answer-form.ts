@@ -380,6 +380,13 @@ function checkReads(store: Store, request: PacketAnswerRequest, packet: Revision
       refs.push(...cited.references);
     } else if (read.action === 'read_context') {
       const record = contextRecord(store, request.project, request.packet, read.record);
+      if (read.page !== undefined) {
+        if (!object(read.page) || !['items', 'utf16'].includes(read.page.unit as string)
+          || !Number.isSafeInteger(read.page.offset) || !Number.isSafeInteger(read.page.end) || !Number.isSafeInteger(read.page.total)
+          || (read.page.offset as number) < 0 || (read.page.end as number) < (read.page.offset as number) || (read.page.total as number) < (read.page.end as number)) {
+          fail('answer_form_address_invalid', request.packet, 'page', 'A context read page requires valid bounds');
+        }
+      }
       if (addressed) {
         if (!pointerSegments(read.pointer)) fail('answer_form_address_invalid', request.packet, 'pointer', 'Use a JSON pointer');
         refs.push(read.record); continue;

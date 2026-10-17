@@ -1,5 +1,7 @@
 import { packetPrompt } from '../src/om/packet-brief.js';
+import { measureAdapterWire, OM_CAPACITY_DELIVERY_CONTRACT, requireOmCapacityDelivery, type OmCapacityDelivery } from '../src/om/capacity-delivery.js';
 import { removeProofCache } from '../src/storage/schema.js';
+import { checkStoreIntegrity } from '../src/storage/fsck.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { types } from "node:util";
@@ -10,8 +12,8 @@ import { fileURLToPath } from "node:url";
 import { canonical, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import {
-  adapterRequest, readAdapterResponse,
-  type AdapterRequestInput, type AdapterResponseInput,
+  adapterRequest, readAdapterResponse, readOmContextPage,
+  type AdapterRequestInput, type AdapterResponseInput, type ReadDeliveryRecord,
 } from "../src/om/model-call.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { runProcess, type ProcessResult } from "../src/runtime/process.js";
@@ -29,6 +31,10 @@ function valueOf<T>(result: OmResult<T>): T {
 
 function request(over: Partial<AdapterRequestInput> = {}): AdapterRequestInput {
   return { requestId, packet: { question: "Who produces this contract?" }, model: "fixture", effort: "high", ...over };
+}
+function currentPacketWire(packet: unknown, speed: 'fast' | null = 'fast'): number {
+  const body = packet as Record<string, unknown>;
+  return measureAdapterWire(body, body.requestId as string, 'fixture', 'high', speed ?? undefined);
 }
 
 function envelope(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -756,7 +762,7 @@ test('E4 missing addressed file can be supplied and resumed without redispatchin
 });
 
 test('E4 cycle saves delivery overflow without a second dispatch or context truncation', async t => {
-  const f = e4Fixture(t), config = f.environment(f.packet.value.fingerprint!.chars + 100);
+  const f = e4Fixture(t), config = f.environment(currentPacketWire(f.packet.value.packet) + 100);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
   writeFileSync(join(f.root, 'e4-source.txt'), 'UTF-8 '.repeat(20_000));
@@ -765,14 +771,15 @@ test('E4 cycle saves delivery overflow without a second dispatch or context trun
   assert.equal(cycle.record.value.terminal, 'blocked'); assert.equal(f.sent().length, 1); assert.ok(cycle.record.value.next);
   const blocked = f.store.get<QuestionPacketRecord>(cycle.record.value.next.id)!;
   assert.equal(blocked.value.state, 'blocked'); assert.equal(blocked.value.packet, null);
-  assert.ok(blocked.value.fullChars! > config.value.requestCapacityChars!);
+  assert.ok(blocked.value.fullChars! <= config.value.requestCapacityChars!, 'The saved refusal is about full wire capacity, even when prompt text fits');
+  assert.equal(blocked.value.refusal?.code, 'packet_too_large');
   assert.ok(f.store.list('om-read-delivery').some(record => (record.value as {data: unknown}).data === 'UTF-8 '.repeat(20_000)));
   f.restart(); valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) }));
   assert.equal(valueOf(await runModelCycle(f.store, request)).repeated, true); assert.equal(f.sent().length, 1);
 });
 
 test('E4 cycle assembles all node parts after a source continuation with exact coverage and no hidden final call', async t => {
-  const f = e4Fixture(t, 'node'), config = f.environment(f.packet.value.fullChars! - 1);
+  const f = e4Fixture(t, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'parts');
   const total = packet.value.plan!.assignments.length;
@@ -795,7 +802,7 @@ test('E4 cycle assembles all node parts after a source continuation with exact c
 });
 
 test('S1.1 a saved assembly is proved once per operation on its original source: a repeat reuses the proof, the historical path opens no pending view, the current assembly keeps its pending proposal, a re-entry is a cycle', async t => {
-  const f = e4Fixture(t, 'node'), config = f.environment(f.packet.value.fullChars! - 1);
+  const f = e4Fixture(t, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   const total = packet.value.plan!.assignments.length;
   f.steps(Array.from({ length: total }, (_, position) => ({ research: e4Node(f, { ...packet,
@@ -839,7 +846,7 @@ test('S1.1 a saved assembly is proved once per operation on its original source:
   const snapshot = f.store.list().map(reference);
   assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: [...cycle.record.value.results] })).record, assembly.record);
   assert.deepEqual(f.store.list().map(reference), snapshot);
-  const fresh = e4Fixture(t, 'node'), freshConfig = fresh.environment(fresh.packet.value.fullChars! - 1);
+  const fresh = e4Fixture(t, 'node'), freshConfig = fresh.environment(currentPacketWire(fresh.packet.value.packet) - 1);
   const freshPacket = valueOf(writeQuestionPacket(fresh.store, { ...fresh.packetRequest, environment: reference(freshConfig) })).record;
   const freshTotal = freshPacket.value.plan!.assignments.length;
   fresh.steps(Array.from({ length: freshTotal }, (_, position) => ({ research: e4Node(fresh, { ...freshPacket,
@@ -870,7 +877,7 @@ test('S1.1 a saved assembly is proved once per operation on its original source:
 
 test('E4 carries checked works handoffs through local dispatch, split assembly, restart and exact late repeats without accepting L3', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const split of [false, true]) await t.test(split ? 'split with prior work and test' : 'whole node', async t => {
-    const f = e4WorksFixture(t), config = split ? f.environment(f.packet.value.fullChars! - 1) : f.configured;
+    const f = e4WorksFixture(t), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured;
     const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
     assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, split ? 'parts' : 'whole');
     const count = packet.value.plan!.assignments.length;
@@ -1060,7 +1067,7 @@ test('E4 mechanism field dispatch applies E3 decisions through D3 and does not m
 
 test('E4 cycle refuses missing coverage and conflicting definitions without accepting a partial node', async t => {
   for (const issue of ['coverage', 'conflict'] as const) {
-    const f = e4Fixture(t, 'node'), config = f.environment(f.packet.value.fullChars! - 1);
+    const f = e4Fixture(t, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
     assert.equal(packet.value.plan!.mode, 'parts'); assert.ok(packet.value.plan!.assignments.length > 1);
     const answers = packet.value.plan!.assignments.map((_, position) => e4Node(f, { ...packet,
@@ -1467,7 +1474,7 @@ test('E4 restarts a later node part after receipt or application and assembles o
   for (const action of ['node', 'cannot_answer'] as const) for (const stopAfter of ['received', 'applied', 'settled', 'assembly'] as const) {
     if (stopAfter === 'assembly' && action === 'cannot_answer') continue;
     await t.test(`${action}: later part ${stopAfter}`, async nested => {
-      const f = e4Fixture(nested, 'node'), config = f.environment(f.packet.value.fullChars! - 1);
+      const f = e4Fixture(nested, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
       const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
       assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'parts');
       const total = packet.value.plan!.assignments.length; assert.ok(total > 1);
@@ -2054,7 +2061,7 @@ test('32 H1.0a cycle cursor recovery after G7 uses only the exact closed product
       let request = f.request;
       if (node) {
         const split = mode === 'parts-and-continuation';
-        const config = split ? f.environment(f.packet.value.fullChars! - 1) : f.configured;
+        const config = split ? f.environment(currentPacketWire(f.packet.value.packet) - 1) : f.configured;
         const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
         const answers = packet.value.plan!.assignments.map((_, position) => ({ research: e4Node(f, { ...packet,
           value: { ...packet.value, plan: { ...packet.value.plan!, position } } } as Revision<QuestionPacketRecord>), usage }));
@@ -2152,7 +2159,7 @@ test('C13 H1.0a G7 racing cycle registration retries as closed cursor recovery',
 test('21 H1.0a MC2 complete parts require assembly, and assembly alone cannot impersonate an accepted achievement', async t => {
   for (const split of [false, true]) await t.test(split ? 'split with source child' : 'single direct part', async t => {
     const f = e4Fixture(t, 'node', 100_000, 0, 1000, true);
-    const config = split ? f.environment(f.packet.value.fullChars! - 1) : f.configured;
+    const config = split ? f.environment(currentPacketWire(f.packet.value.packet) - 1) : f.configured;
     const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
     const count = packet.value.plan!.assignments.length;
     const answers = Array.from({ length: count }, (_, position) => e4Node(f, { ...packet,
@@ -2196,7 +2203,7 @@ test('15 H1.0a exact no-progress, blocked successor and invalid assembly dischar
     const f = e4Fixture(t, terminal === 'parts-invalid' ? 'node' : 'fact', 100_000, 0, 1000, true);
     let request = f.request;
     if (terminal === 'parts-invalid') {
-      const config = f.environment(f.packet.value.fullChars! - 1);
+      const config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
       const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
       const answers = packet.value.plan!.assignments.map((_,position) => e4Node(f, { ...packet,
         value:{...packet.value,plan:{...packet.value.plan!,position}} } as Revision<QuestionPacketRecord>));
@@ -2206,7 +2213,7 @@ test('15 H1.0a exact no-progress, blocked successor and invalid assembly dischar
     } else {
       const need = e4NeedSource(f, [{action:'read',path:'e4-source.txt',media:'text/plain'}]);
       if (terminal === 'blocked') {
-        const config = f.environment(f.packet.value.fingerprint!.chars + 100);
+        const config = f.environment(currentPacketWire(f.packet.value.packet) + 100);
         const packet = valueOf(writeQuestionPacket(f.store, {...f.packetRequest, environment:reference(config)})).record;
         request = {...request,packet:reference(packet),dispatch:{...request.dispatch,config:reference(config)}};
         writeFileSync(join(f.root,'e4-source.txt'),'UTF-8 '.repeat(20_000));
@@ -2671,7 +2678,7 @@ test('34 H1.0a a completion ledger retains the exact journal context of a genuin
 
 test('20 H1.0b exact MC2 remainder cessation preserves produced parts and blocks materialization without hiding siblings', async t => {
   const { prepareCompletionCessation, writeCompletionCessation, readCompletionCessationAt } = await import('../src/om/model-call.js');
-  const measured = e4Fixture(t, 'node', 100_000, 0, 5000, false, true, true), f = e4Fixture(t, 'node', measured.packet.value.fullChars! - 1, 0, 5000, true, true, true);
+  const measured = e4Fixture(t, 'node', 100_000, 0, 5000, false, true, true), f = e4Fixture(t, 'node', currentPacketWire(measured.packet.value.packet) - 1, 0, 5000, true, true, true);
   assert.ok(f.packet.value.plan!.assignments.length > 1);
   f.steps([{ research: e4Node(f), usage }]);
   const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
@@ -3105,7 +3112,7 @@ test('C28 H1.0b selected continuation uses one compatible admission before E2, d
 
 test('C31 H1.0b equivalent configuration preserves the next exact MC2 part before its E1', async t => {
   const measured = e4Fixture(t, 'node', 100_000, 0, 5000);
-  const f = e4Fixture(t, 'node', measured.packet.value.fullChars! - 1, 0, 5000, true);
+  const f = e4Fixture(t, 'node', currentPacketWire(measured.packet.value.packet) - 1, 0, 5000, true);
   assert.ok(f.packet.value.plan!.assignments.length > 1);
   const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
   const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
@@ -3293,7 +3300,7 @@ test('C31 H1.0b selected MC2 E2 without E1 keeps every still compatible role', a
   const { prepareCompletionCause, writeCompletionCessation, readCompletionCause, readCompletionCessationAt } = await import('../src/om/model-call.js');
   const measured = e4Fixture(t, 'node', 100_000, 0, 5000);
   for (const changed of ['implementer', 'reviewer', 'both', 'common', 'none'] as const) await t.test(changed, async child => {
-    const f = e4Fixture(child, 'node', measured.packet.value.fullChars! - 1, 0, 5000, true);
+    const f = e4Fixture(child, 'node', currentPacketWire(measured.packet.value.packet) - 1, 0, 5000, true);
     const firstBody = e4Node(f); f.steps([{ research: firstBody, usage }]);
     const first = valueOf(await runModelCall(f.store, f.request)); assert.ok(first.part);
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, previous: [{ packet: f.request.packet, ...first.part! }] })).record;
@@ -3706,7 +3713,7 @@ test('LP3 (№2817 п.4, п.7) a cycle stopped between its transactions — afte
     const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
     let request = f.request, packetRequest = f.packetRequest;
     if (terminal === 'blocked') {
-      const config = f.environment(f.packet.value.fingerprint!.chars + 100);
+      const config = f.environment(currentPacketWire(f.packet.value.packet) + 100);
       packetRequest = { ...f.packetRequest, environment: reference(config) };
       const packet = h15AtCommit(f, 'b595c7b', 'era-window-packet',
         `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
@@ -3842,7 +3849,7 @@ test('LP4 (№2887 row 3) a root with a direct cause of its own is ceased by tha
 test('LP4 (№2887 row 5, §6.4) the other steps of a node whose step ceased, with no ground of their own (the environment configured back as it was), are ceased by the new cause with their own remainders: an unmaterialized part — expansion; a continuation inside the part materialized without a claim — not-dispatched; received and unapplied — application with its response and usage kept; with an applied need_source — continuation; a live call stays the common recovery\'s; the old cycle stays refused', async t => {
   const { prepareCompletionCause, writeCompletionCessation } = await import('../src/om/model-call.js');
   await t.test('expansion', async t => {
-    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = f.packet.value.fullChars! - 1, config = f.environment(capacity);
+    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = currentPacketWire(f.packet.value.packet) - 1, config = f.environment(capacity);
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
     assert.ok(packet.value.plan!.assignments.length > 1);
     const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
@@ -3931,7 +3938,7 @@ test('LP4 (№2887 row 5, §6.4) the other steps of a node whose step ceased, wi
 
 test('LP4 (№2887 §6.7) a work moved by another Store between the preparation of a cycle-step-ceased cessation and its write — the other step ceased there — refuses that write as a whole; the write prepared afresh stands', async t => {
   const { prepareCompletionCessation, writeCompletionCessation } = await import('../src/om/model-call.js');
-  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = f.packet.value.fullChars! - 1, config = f.environment(capacity);
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), capacity = currentPacketWire(f.packet.value.packet) - 1, config = f.environment(capacity);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
   f.steps([{ research: lp4Need(f, packet), usage }]);
@@ -4102,7 +4109,7 @@ test('MP2 (№2968 rows 15, 16) a correction request is proved before anything i
 });
 
 test('MP2 (№2968 row 17) a correction that does not fit is the old blocked successor without a send; one that fits is sent', async t => {
-  const f = mp2Managed(t), config = f.environment(f.packet.value.fullChars! + 40);
+  const f = mp2Managed(t), config = f.environment(currentPacketWire(f.packet.value.packet) + 40);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   assert.equal(packet.value.state, 'ready');
   const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
@@ -4214,7 +4221,7 @@ test('MP2 (№2968 row 13) join inputs are no answer check: a part whose join na
 
 test('MP2 (№2968 rows 11, 19; №3153) a correction of a part keeps the earlier parts and the root neighbour form of the chain, the parts after it stand on the corrected answer; the chain has one correction — in a first attempt and in a later one standing on a non-empty refusal journal', async t => {
   for (const retry of [false, true]) for (const refused of [1, 0]) await t.test(`${refused ? 'a later' : 'the first'} part, ${retry ? 'attempt 2 on a non-empty journal' : 'attempt 1'}`, async t => {
-    const f = mp2Managed(t, 100_000, retry), config = f.environment(f.packet.value.fullChars! - 1);
+    const f = mp2Managed(t, 100_000, retry), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record as Revision<QuestionPacketRecord>;
     assert.equal(packet.value.plan!.mode, 'parts');
     const total = packet.value.plan!.assignments.length;
@@ -4447,24 +4454,30 @@ test('MP3 main scenario, rows 1, 2, 3, 5: one need_source of several reads deliv
   assert.equal(f.store.list('call-record').length, 2);
 });
 
-// OBL1 (№3768): a whole record read by a pointer can exceed what a continuation may carry; it is delivered as its shape.
-test('OBL1 №3768 №3773 a continuation fits what its reads brought: a result that would not fit is shown as its shape and length, the delivery keeps it whole, and the answer follows; a small read is shown whole', async t => {
-  const capacity = 22_000, m = mp3Cycle(t, 'fact', capacity), { f } = m, limit = capacity;
+// OBL1 (№3768): a whole record read by a pointer can exceed what a continuation may carry.
+test('OBL1 №3768 №3773 a large context result is shown as an exact bounded fragment, the delivery stays whole, and a small read is shown whole', async t => {
+  const capacity = 26_000, m = mp3Cycle(t, 'fact', capacity), { f } = m;
   const whole = { action: 'read_context', record: reference(f.graph), pointer: '' }, small = { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' };
   const graph = f.store.get(f.graph.id, f.graph.revision)!.value as Record<string, unknown>;
-  assert.ok(canonical(graph as Json).length + packetPrompt(f.packet.value.packet).length > capacity, 'Whole, the graph would not fit beside the packet');
+  assert.ok(canonical(graph as Json).length + currentPacketWire(f.packet.value.packet) > capacity, 'Whole, the graph would not fit beside the packet');
   f.steps([{ research: m.need([whole, small]), usage }, { research: e4Fact(f), usage }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
   assert.equal(cycle.record.value.terminal, 'outcome', 'The continuation is built and answered, never blocked');
   const sent = f.sent(); assert.equal(sent.length, 2);
   const next = m.payload(sent[1].requestId);
   const data = new Map((next.sourceDeliveries[0].data as { read: Record<string, any>; data: unknown }[]).map(row => [canonical(row.read), row.data]));
-  assert.deepEqual(data.get(canonical(whole)), { contract: 'om-read-result/v1', outcome: 'too-large', requested: { pointer: '' },
-    length: canonical(graph as Json).length, limit, type: 'object', keys: Object.keys(graph).sort() });
+  const shown = data.get(canonical(whole)) as OmCapacityDelivery;
+  const delivery = f.store.list<ReadDeliveryRecord>('om-read-delivery').find(row => canonical(row.value.read as Json) === canonical(whole as unknown as Json))!;
+  assert.equal(shown.contract, OM_CAPACITY_DELIVERY_CONTRACT);
+  requireOmCapacityDelivery({ record: reference(delivery), pointer: '/data', value: delivery.value.data,
+    packet: delivery.value.packet, call: delivery.value.call, response: delivery.value.response,
+    delivery: reference(delivery) }, shown);
+  assert.ok(shown.served.end > 0 && shown.served.end < shown.requested.end);
+  assert.equal(shown.served.next, shown.served.end);
+  assert.equal(shown.text, canonical(delivery.value.data).slice(shown.served.offset, shown.served.end));
   assert.equal((data.get(canonical(small)) as { outcome: string }).outcome, 'complete');
-  assert.ok(sent[1].prompt.length <= capacity, 'The continuation fits its capacity');
-  const delivery = f.store.list<{ read: unknown; data: { outcome: string } }>('om-read-delivery').find(row => canonical(row.value.read as Json) === canonical(whole as unknown as Json))!;
-  assert.equal(delivery.value.data.outcome, 'complete', 'The delivery itself keeps the whole value');
+  assert.ok(currentPacketWire(next) <= capacity, 'The complete continuation wire fits its capacity');
+  assert.equal((delivery.value.data as { outcome: string }).outcome, 'complete', 'The delivery itself keeps the whole value');
 });
 
 test('OBL1 №3773 five reads that each fit alone but not together: the continuation shows the largest past what fits as their length and shape, keeps the rest whole, and the answer follows', async t => {
@@ -4485,15 +4498,15 @@ test('OBL1 №3773 five reads that each fit alone but not together: the continua
   assert.ok(outcomes.includes('complete') && outcomes.includes('too-large'), outcomes.join(','));
 });
 
-test('OBL1 №3780 what is new is judged by what the reader is shown: the same too-large shape asked again is research-no-progress without another send; a narrower read is progress', async t => {
-  const capacity = 22_000, m = mp3Cycle(t, 'fact', capacity), { f } = m;
+test('OBL1 №3780 what is new is judged by what the reader is shown: the same bounded fragment asked again is research-no-progress without another send; a narrower read is progress', async t => {
+  const capacity = 26_000, m = mp3Cycle(t, 'fact', capacity), { f } = m;
   const whole = { action: 'read_context', record: reference(f.graph), pointer: '' };
   f.steps([{ research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: e4Fact(f), usage }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
   assert.equal(cycle.record.value.terminal, 'research-no-progress');
-  assert.equal(f.sent().length, 2, 'The same shown shape is not paid for a third time');
+  assert.equal(f.sent().length, 2, 'The same shown fragment is not paid for a third time');
   // №3784: the same in a managed attempt, as the pass runs it — the finish sees the continuation it is written with.
-  await t.test('managed: the same shape again ends research-no-progress with its finish, after two sends', async child => {
+  await t.test('managed: the same fragment again ends research-no-progress with its finish, after two sends', async child => {
     const n = mp3Cycle(child, 'fact', capacity, true), g = n.f;
     const again = { action: 'read_context', record: reference(g.graph), pointer: '' };
     g.steps([{ research: n.need([again]), usage }, { research: n.need([again]), usage }, { research: n.need([again]), usage }, { research: e4Fact(g), usage }]);
@@ -4501,7 +4514,7 @@ test('OBL1 №3780 what is new is judged by what the reader is shown: the same t
     assert.equal(managed.record.value.terminal, 'research-no-progress');
     assert.equal(g.sent().length, 2);
   });
-  await t.test('a narrower read after the shape is progress', async child => {
+  await t.test('a narrower read after the fragment is progress', async child => {
     const n = mp3Cycle(child, 'fact', capacity), g = n.f;
     const narrow = { action: 'read_context', record: reference(g.graph), pointer: '/id' };
     g.steps([{ research: n.need([{ action: 'read_context', record: reference(g.graph), pointer: '' }]), usage }, { research: n.need([narrow]), usage },
@@ -4509,6 +4522,17 @@ test('OBL1 №3780 what is new is judged by what the reader is shown: the same t
     const narrowed = valueOf(await runModelCycle(g.store, g.request));
     assert.equal(narrowed.record.value.terminal, 'outcome');
     assert.equal(g.sent().length, 3);
+    const parent = n.packets().find(row => (row.value.packet as { requestId?: string } | null)?.requestId === g.sent()[1].requestId)!;
+    const current = n.payload(g.sent()[2].requestId);
+    assert.deepEqual(current.sourceDeliveryHistory, { contract: 'om-source-delivery-history/v1',
+      record: reference(parent), pointer: '/packet/sourceDeliveries', count: 1,
+      read: { action: 'read_context', record: reference(parent), pointer: '/packet/sourceDeliveries' } });
+    assert.deepEqual(readOmContextPage(parent.value, '/packet/sourceDeliveries', { offset: 0, end: 1, total: 1, unit: 'items' }),
+      (parent.value.packet as { sourceDeliveries: unknown[] }).sourceDeliveries);
+    const currentRecord = n.packets().find(row => (row.value.packet as { requestId?: string } | null)?.requestId === g.sent()[2].requestId)!;
+    g.restart();
+    assert.deepEqual(valueOf(readQuestionPacket(g.store, { project: g.project, record: reference(currentRecord) })), currentRecord);
+    assert.deepEqual(checkStoreIntegrity(g.store).findings, []);
   });
 });
 
@@ -4702,11 +4726,10 @@ test('MP3 row 15: a carried read that does not fit is omitted first with its rea
   const m = await mp3Delivered(t, m => [m.range(0, 40_000, m.large)]), { f } = m;
   const next = mp3Open(f, 2), probe = valueOf(prepareQuestionPacket(f.store, next.request)).record;
   assert.deepEqual(mp3Decisions(probe.value.packet), ['included']);
-  const text = packetPrompt(probe.value.packet), core = text.indexOf('\n# Carried reads');
-  const tight = f.environment(core + 2_000);
+  const tight = f.environment(currentPacketWire(probe.value.packet) - 1);
   const root = valueOf(writeQuestionPacket(f.store, { ...next.request, environment: reference(tight) })).record;
   assert.equal(root.value.state, 'ready'); assert.deepEqual(mp3Decisions(root.value.packet), ['capacity']);
-  assert.ok(packetPrompt(root.value.packet).length <= core + 2_000); assert.deepEqual(mp3Carried(root), []);
+  assert.ok(currentPacketWire(root.value.packet) <= tight.value.requestCapacityChars!); assert.deepEqual(mp3Carried(root), []);
   m.run([{ research: m.need([m.range(0, 100, m.large)], root), usage }, { research: e4CannotAnswer(f), usage }]);
   const cycle = valueOf(await runModelCycle(f.store, { ...f.request, packet: reference(root), dispatch: { ...f.request.dispatch, config: reference(tight) } }));
   assert.equal(cycle.record.value.steps.length, 2, 'Omitted carried text is not known: reading it again is progress');
@@ -4747,7 +4770,7 @@ test('MP3 window (Т7): a second Store moving an included carried source between
 });
 
 test('MP3 rows 9, 18: a new part carries the proven deliveries of the preceding part chain as a fixed set; every packet keeps the root era and no carried read becomes another edge', async t => {
-  const m = mp3Cycle(t, 'node'), { f } = m, config = f.environment(f.packet.value.fullChars! - 1);
+  const m = mp3Cycle(t, 'node'), { f } = m, config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   assert.equal(packet.value.plan!.mode, 'parts'); const total = packet.value.plan!.assignments.length; assert.ok(total >= 2);
   const answers = Array.from({ length: total }, (_, position) => e4Node(f, { ...packet,
@@ -4775,7 +4798,7 @@ test('MP3 rows 9, 18: a new part carries the proven deliveries of the preceding 
 // MP3 row 18 with the MP2 correction: a correction is a step of its root's chain — the root era and the carried set of the step it
 // corrects; the walk back over a part chain passes through a correction to the reads before it.
 function mp3Parts(t: TestContext) {
-  const m = mp3Cycle(t, 'node', 100_000, true), { f } = m, config = f.environment(f.packet.value.fullChars! - 1);
+  const m = mp3Cycle(t, 'node', 100_000, true), { f } = m, config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record as Revision<QuestionPacketRecord>;
   assert.equal(packet.value.plan!.mode, 'parts'); const total = packet.value.plan!.assignments.length; assert.ok(total >= 2);
   const at = (position: number) => ({ ...packet, value: { ...packet.value, plan: { ...packet.value.plan!, position } } }) as Revision<QuestionPacketRecord>;

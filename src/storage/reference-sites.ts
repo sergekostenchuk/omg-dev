@@ -155,6 +155,23 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     refs: [["migratedFrom"], ["charges", INDEX, "capture"], ["reservations", INDEX, "turn"],
       ["reservations", INDEX, "environment"]] },
   { kind: "om-integrity", contract: "om-integrity/v1", data: [["findings", INDEX, "ref"]] },
+  { kind: "question-packet", contract: null, data: [
+    ["packet", "correction", "answer", "value"],
+    ["packet", "correction", "answer", "text"],
+    ["packet", "sourceDeliveries", INDEX, "data", INDEX, "data", "value"],
+    ["packet", "sourceDeliveries", INDEX, "data", INDEX, "data", "text"],
+    ["packet", "sourceDeliveries", INDEX, "data", "value"],
+    ["packet", "sourceDeliveries", INDEX, "data", "text"],
+    ["packet", "materialDelivery", INDEX, "value"],
+    ["packet", "materialDelivery", INDEX, "text"],
+    ["packet", "expansion", "previous", INDEX, "nodes"],
+    ["packet", "expansion", "previous", INDEX, "tests"],
+    ["packet", "expansion", "previous", INDEX, "edges"],
+    ["packet", "expansion", "reopenedFiles", INDEX, "content"],
+  ] },
+  { kind: "om-read-delivery", contract: null, data: [["data", "value"], ["data", "text"]] },
+  { kind: "om-capacity-recovery", contract: "om-capacity-recovery/v1", data: [["delivery", "value"], ["delivery", "text"]] },
+  { kind: "om-limited-call-retry-permit", contract: "om-limited-call-retry-permit/v1", data: [] },
 ];
 
 const object = (value: unknown): value is Record<string, unknown> =>

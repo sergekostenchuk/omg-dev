@@ -110,7 +110,10 @@ async function held(store: Store, project: string, action: (execution: RunExecut
 /** LP8.1: an unable pass is weighed with its saved dispatch; without one it stands as it is. */
 function reopens(store: Store, project: string): boolean {
   const dispatch = dispatchOf(store, project);
-  return dispatch.ok && unableReopens(store, dispatch.value);
+  if (!dispatch.ok) return false;
+  if (unableReopens(store, dispatch.value)) return true;
+  return store.list('om-capacity-recovery').some(r => (r.value as any).project === project)
+    || store.list('om-limited-call-retry-permit').some(p => (p.value as any).project === project);
 }
 function dispatchOf(store: Store, project: string): OmResult<RunRequest> {
   const read = readDispatch(store, { project });

@@ -55,6 +55,7 @@ import type { Graph } from "../graph/model.js";
 import { RefinementRelations } from "../graph/relations.js";
 import type { DispatchContract } from "./call-record.js";
 import { RunControlGate, RunControlLost, type RunControlHold } from "./run-control.js";
+import { readOmCapacityRecovery, readOmLimitedCallRetryPermit } from "./capacity-delivery.js";
 
 /**
  * H1 — the pass of the OM block (№1427 as amended by №1452 and №1737).
@@ -1113,7 +1114,14 @@ function owedBy(store: Store, project: string, series: Sealed<Revision<AnyRepair
       if (!record) fail("record_missing", completionCloseId(project, binding.id), "close", "A closed managed attempt keeps its close record");
       const close = take(readCompletionCloseAt(store, project, reference(record)));
       if (!close.waiting.length) continue;
-      owed.push({ questions: attempt.goal.questions, reasons: close.waiting.map(diagnostic => {
+      const unrecovered = close.waiting.filter(diagnostic => {
+        const checked = take(readManagedModelDiagnostic(store, binding as never, diagnostic));
+        if (checked.request.packet && readOmCapacityRecovery(store, project, checked.request.packet)) return false;
+        if (checked.request.call && readOmLimitedCallRetryPermit(store, project, checked.request.call)) return false;
+        return true;
+      });
+      if (!unrecovered.length) continue;
+      owed.push({ questions: attempt.goal.questions, reasons: unrecovered.map(diagnostic => {
         const checked = take(readManagedModelDiagnostic(store, binding as never, diagnostic));
         return reasonOf("owner-control", checked.request.code, series.id, field, checked.request.message, [reference(series), reference(record), diagnostic]);
       }) });
@@ -1331,6 +1339,40 @@ function flowOrder(store: Store, scope: GapReadRequest, batches: readonly RouteB
   const byId = new Map(leaves.map(row => [row.id, row]));
   return [...leaves.filter(row => !ranked.some(item => item.id === row.id)), ...order.map(id => byId.get(id)!)];
 }
+
+/** Check if packet or an unready next packet in its cycle was recovered by recover-om-capacity */
+export function recoveredSuccessorPacket(store: Store, project: string, work: CompletionSnapshot, packet: Ref): Ref | null {
+  let direct = readOmCapacityRecovery(store, project, packet);
+  if (direct) {
+    let cur = direct.successorPacket;
+    while (true) {
+      const next = readOmCapacityRecovery(store, project, cur);
+      if (!next) break;
+      cur = next.successorPacket;
+    }
+    return cur;
+  }
+  for (const product of work.products) {
+    const row = store.get<Record<string, unknown>>(product.id, product.revision);
+    if (row?.kind === "om-model-cycle") {
+      const val = row.value as { terminal?: string; next?: Ref; request?: { packet?: Ref } };
+      if (val.terminal === "blocked" && val.next && val.request?.packet && sameRef(val.request.packet, packet)) {
+        let recovery = readOmCapacityRecovery(store, project, val.next);
+        if (recovery) {
+          let cur = recovery.successorPacket;
+          while (true) {
+            const next = readOmCapacityRecovery(store, project, cur);
+            if (!next) break;
+            cur = next.successorPacket;
+          }
+          return cur;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * The open attempt continues by its registry. A standalone attempt (no binding) is never adopted: the pass waits for
  * its own E4/E5/G7 way (№1737 п.3). For a managed one the next unfinished assignment is chosen from the work itself,
@@ -1355,22 +1397,57 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
   const scope = plan.value.request.gaps as unknown as GapReadRequest;
   const resolved = new Set(work.resolved.map(ref => canonical(ref)));
   const parentOf = new Map(work.assignments.map(row => [row.id, (row.value as CompletionAssignment).parent?.id ?? null]));
-  const resolvedIds = new Set(work.assignments.filter(row => resolved.has(canonical(reference(row)))).map(row => row.id));
+  const byId = new Map(work.assignments.map(row => [row.id, row as Revision<CompletionAssignment>]));
+
+  const hasPendingSuccessor = (row: Revision<unknown>): boolean => {
+    const value = row.value as CompletionAssignment;
+    let packet: Ref | null = null;
+    if (value.kind === "root") {
+      const found = completionPacketOf(store, project, work, reference(row as Revision<CompletionAssignment>));
+      if (found && "packet" in found && found.packet) packet = found.packet;
+    } else if (value.kind === "part" || value.kind === "continuation") {
+      let r: Revision<CompletionAssignment> | undefined = row as Revision<CompletionAssignment>;
+      while (r && r.value.parent) r = byId.get(r.value.parent.id);
+      if (r && r.value.kind === "root") {
+        const found = completionPacketOf(store, project, work, reference(r));
+        if (found && "packet" in found && found.packet) packet = found.packet;
+      }
+    }
+    if (!packet) return false;
+    const successor = recoveredSuccessorPacket(store, project, work, packet);
+    if (!successor) return false;
+    const alreadyCycled = work.products.some(product => {
+      const pRow = store.get<{ request?: { packet?: Ref } }>(product.id, product.revision);
+      return pRow?.kind === "om-model-cycle" && isRef(pRow.value.request?.packet) && sameRef(pRow.value.request.packet, successor);
+    });
+    return !alreadyCycled;
+  };
+
+  const isResolved = (row: Revision<unknown>): boolean => {
+    if (hasPendingSuccessor(row)) return false;
+    return resolved.has(canonical(reference(row)));
+  };
+  const resolvedIds = new Set(work.assignments.filter(row => isResolved(row)).map(row => row.id));
+
   // LP3 (№2817-2/-4): a part or continuation — a step of its root's own cycle — below a root that cycle already ended
   // (blocked, no progress, invalid parts or reads) is no work of the pass: its root is resolved, and the attempt goes on to
   // its close. A fact below an answered root is its own work (E5) and stays open until assessed.
   const underResolved = (row: Revision<unknown>): boolean => {
     const kind = (row.value as CompletionAssignment).kind;
     if (kind !== "part" && kind !== "continuation") return false;
-    for (let at = parentOf.get(row.id) ?? null; at !== null; at = parentOf.get(at) ?? null) if (resolvedIds.has(at)) return true;
+    if (hasPendingSuccessor(row)) return false;
+    for (let at = parentOf.get(row.id) ?? null; at !== null; at = parentOf.get(at) ?? null) {
+      const pRow = byId.get(at);
+      if (pRow && hasPendingSuccessor(pRow)) return false;
+      if (resolvedIds.has(at)) return true;
+    }
     return false;
   };
-  const open = work.assignments.filter(row => !resolved.has(canonical(reference(row))) && !underResolved(row));
+  const open = work.assignments.filter(row => !isResolved(row) && !underResolved(row));
   // An ancestor is resolved by its descendants (the facts of a root's part, the parts of a plan): only open assignments
   // that are no ancestor of another open one are worked, whatever the order of the registry.
   const parents = new Set<string>();
   for (const row of open) for (let at = parentOf.get(row.id) ?? null; at !== null && !parents.has(at); at = parentOf.get(at) ?? null) parents.add(at);
-  const byId = new Map(work.assignments.map(row => [row.id, row as Revision<CompletionAssignment>]));
   // A cycle of a packet goes on with the exact request this pass saved for it (the same cycle identity even after an
   // environment change); only a packet never cycled gets the current dispatch.
   const cycleOf = (packet: Ref): Choice => step("cycle", history.saved("cycle", row => same(row.packet, packet))
@@ -1440,7 +1517,8 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
         return step("packet", { project, routes: binding.value.plan.routes, batch: value.batch, environment: request.dispatch.config,
           attempt: { series: binding.value.series, ordinal }, previous: [], ...(ledger ? { works: ledger.works } : {}) }, series.id, ordinal);
       }
-      return cycleOf(packet);
+      const activeRoot = recoveredSuccessorPacket(store, project, work, packet) ?? packet;
+      return cycleOf(activeRoot);
     }
     // A part or continuation is a step of its root's cycle: the same saved cycle goes on with its chosen parts
     // (№1766 п.1), never a new cycle beside it.
@@ -1449,7 +1527,10 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       while (root && root.value.parent) root = byId.get(root.value.parent.id);
       const found = root && root.value.kind === "root" ? completionPacketOf(store, project, work, reference(root)) : null;
       if (found && "wait" in found) return found;
-      if (found?.packet) return cycleOf(found.packet);
+      if (found?.packet) {
+        const activePart = recoveredSuccessorPacket(store, project, work, found.packet) ?? found.packet;
+        return cycleOf(activePart);
+      }
       continue;
     }
     if (value.kind === "fact" && value.question) {
@@ -1805,11 +1886,21 @@ export function cycleStartOf(store: Store, project: string, packets: readonly Re
  * refusal of that reader — a missing, foreign or malformed record, an exact reference that does not match, links that do
  * not follow from their sources — is neither and stands as it is.
  */
-function packetPlace(store: Store, project: string, packet: Ref): OmResult<"start" | "step", SourceCode<"question-packet">> {
+function packetPlace(store: Store, project: string, packet: Ref): OmResult<"start" | "step", CycleStartCode> {
   const read = readQuestionPacket(store, { project, record: packet });
   if (!read.ok) return read;
   const request = read.value.value.request;
-  return { ok: true, value: !request.continuation && !request.correction && request.previous.length === 0 ? "start" : "step" };
+  if (request.recovery) {
+    const blocked = readQuestionPacket(store, { project, record: request.recovery.packet });
+    if (!blocked.ok) return blocked;
+    const recovery = readOmCapacityRecovery(store, project, request.recovery.packet);
+    if (!recovery || recovery.project !== project || blocked.value.value.state !== "blocked"
+      || !sameRef(recovery.blockedPacket, request.recovery.packet) || !sameRef(recovery.successorPacket, packet))
+      return refuse("run_record_invalid", "A recovered packet follows its exact blocked predecessor and saved recovery",
+        { unit: UNIT, target: packet.id, field: "recovery", ref: packet }, "producer");
+  }
+  // A proved capacity recovery is a step of its predecessor's cycle, including when the predecessor was its root.
+  return { ok: true, value: !request.recovery && !request.continuation && !request.correction && request.previous.length === 0 ? "start" : "step" };
 }
 /**
  * A saved cycle that is no work of the pass: never performed (no cycle of its exact request) and started with a packet
@@ -1820,6 +1911,8 @@ function misplacedCycle(store: Store, step: RunStep): boolean {
   if (step.action !== "cycle") return false;
   const request = step.request as { project?: unknown; packet?: unknown };
   if (typeof request.project !== "string" || !isRef(request.packet) || store.get(modelCycleId(step.request as never))) return false;
+  const read = readQuestionPacket(store, { project: request.project, record: request.packet });
+  if (read.ok && (Boolean(read.value.value.request.recovery) || Boolean(readOmCapacityRecovery(store, request.project, request.packet)))) return false;
   const place = packetPlace(store, request.project, request.packet);
   return place.ok && place.value === "step";
 }

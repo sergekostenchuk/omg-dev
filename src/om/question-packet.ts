@@ -42,12 +42,20 @@ import { historicalLayer } from '../history/proofs.js';
 import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareOmObligations, readOmObligations, type ObligationRequest, type OmObligations, type OmObligationHandoff } from './obligations.js';
+import {
+  type AddressedOmOriginal,
+  planOmCapacityDelivery,
+  measureAdapterWire,
+  registerSuccessorDeriver,
+  OM_CAPACITY_DELIVERY_CONTRACT,
+} from './capacity-delivery.js';
 
 export const QUESTION_PACKET_CODES = Object.freeze([
   'question_packet_request_invalid', 'packet_task_set_invalid', 'packet_attempt_invalid', 'packet_record_invalid',
   'packet_series_unsupported',
   'packet_context_unbounded', 'packet_too_large', 'node_unexpandable', 'packet_batch_invalid', 'packet_chain_invalid',
   'part_result_invalid', 'part_answer_invalid', 'research_no_progress', 'answer_label_unknown', 'packet_brief_invalid',
+  'needs_owner', 'context_budget_exceeded',
 ] as const);
 export interface QuestionTaskRequest {
   project: string;
@@ -158,6 +166,8 @@ export interface QuestionPacketRequest {
   continuation?: { packet: Ref; call: Ref; response: Ref; deliveries: Ref[] };
   /** MP2 (№2968 §3): the exact rejected step this packet corrects — never beside a continuation. */
   correction?: { packet: Ref; call: Ref; response: Ref; diagnostic: Ref };
+  /** RD3: explicit recovery reference to the blocked predecessor packet */
+  recovery?: { packet: Ref };
 }
 export interface QuestionPacketRecord {
   project: string; request: QuestionPacketRequest; state: 'ready' | 'blocked' | 'empty';
@@ -199,6 +209,8 @@ export interface QuestionPacketRecord {
    * kept by its parts, continuations and corrections; absent in a packet issued before, which keeps its bytes.
    */
   briefImpact?: BriefImpact;
+  /** RD3: explicit capacity delivery contract when packet uses capacity delivery / recovery */
+  capacityDelivery?: typeof OM_CAPACITY_DELIVERY_CONTRACT;
   packet: Json | null; fingerprint: { hash: string; chars: number; utf8Bytes: number } | null;
   native: { gap: Ref; draft: Ref; engineQuestion: Ref; question: Ref }[];
   plan: { mode: 'whole' | 'parts'; assignments: { connector: string | null; obligations: string[] }[]; position: number } | null;
@@ -230,6 +242,7 @@ function packetEra(store: Store, request: QuestionPacketRequest) {
   const oldContract = currentPacketContract(store, request);
   const newContract = oldContract === WORKS_PACKET_CONTRACT ? WORKS_BRIEF_PACKET_CONTRACT : BRIEF_PACKET_CONTRACT;
   const predecessors = [...(request.continuation ? [request.continuation.packet] : []), ...(request.correction ? [request.correction.packet] : []),
+    ...(request.recovery ? [request.recovery.packet] : []),
     ...request.previous.map(part => part.packet)]
     .map(ref => loadPacket(store, request.project, ref));
   const inherited = predecessors[0]?.value;
@@ -272,7 +285,9 @@ function requirePacket(store: Store, value: unknown): asserts value is QuestionP
     || Object.hasOwn(value, 'correction') && (Object.hasOwn(value, 'continuation') || !object(value.correction)
       || ![value.correction.packet, value.correction.call, value.correction.response, value.correction.diagnostic].every(isRef)
       || Object.keys(value.correction).some(key => !['packet', 'call', 'response', 'diagnostic'].includes(key)))
-    || Object.keys(value).some(key => !['project', 'routes', 'batch', 'environment', 'attempt', 'previous', 'continuation', 'correction', 'works'].includes(key))) invalid('request');
+    || Object.hasOwn(value, 'recovery') && (!object(value.recovery) || !isRef(value.recovery.packet)
+      || Object.keys(value.recovery).some(key => key !== 'packet'))
+    || Object.keys(value).some(key => !['project', 'routes', 'batch', 'environment', 'attempt', 'previous', 'continuation', 'correction', 'works', 'recovery'].includes(key))) invalid('request');
 }
 function head(store: Store, ref: Ref) {
   const found = store.get(ref.id);
@@ -556,9 +571,16 @@ function bounded(value: Json, max: number) {
   }
   catch (error) { if (error instanceof EngineError && error.code === 'context_budget_exceeded') return null; throw error; }
 }
-function blocked(code: string, target: string): Refusal {
-  const response = refused(code, code === 'node_unexpandable' ? 'Узел не раскрывается по частям: обязательный контекст превышает вместимость'
-    : 'The complete question packet exceeds the configured technical capacity', { unit: 'E2', target, field: 'packet' }, code === 'node_unexpandable' ? 'owner' : 'producer');
+function blocked(code: string, target: string, message?: string, route?: 'owner' | 'producer'): Refusal {
+  const defaultMessage = code === 'needs_owner'
+    ? 'Обязательное ядро пакета превышает вместимость: требуется решение владельца по разделению задания или конфигурации'
+    : code === 'node_unexpandable'
+      ? 'Узел не раскрывается по частям: обязательный контекст превышает вместимость'
+      : code === 'context_budget_exceeded'
+        ? 'Превышен бюджет контекста для обязательных оснований'
+        : 'The complete question packet exceeds the configured technical capacity';
+  const defaultRoute = (code === 'node_unexpandable' || code === 'needs_owner') ? 'owner' : 'producer';
+  const response = refused(code, message ?? defaultMessage, { unit: 'E2', target, field: 'packet' }, route ?? defaultRoute);
   if (!response.ok) return response.refusal;
   throw new Error('Unreachable refusal');
 }
@@ -930,27 +952,36 @@ const includedSources = (packet: Json): Ref[] => (briefReadings(packet)?.entries
  * The era is the root's: the caller asks only when the step it follows carries readings.
  */
 function chainStepReadings(store: Store, request: QuestionPacketRequest, prior: Revision<QuestionPacketRecord>, saved: QuestionPacketRecord | undefined,
-  current: boolean, packet: Json, limit: number): { packet: Json; guards: Ref[] } {
+  current: boolean, packet: Json, limit: number, fits?: (packet: Json) => boolean): { packet: Json; guards: Ref[] } {
   const savedReadings = saved ? briefReadings(saved.packet) : null;
   if (saved && !savedReadings) fail('packet_record_invalid', prior.id, 'readings', 'A chain step of the readings era keeps its readings');
   const routed = take(readRoutes(store, { project: request.project, record: request.routes })) as unknown as { record: Revision<RoutesRecord> };
   const batch = routed.record.value.batches.find(item => item.id === request.batch)!;
-  const next = json(withReadings(packet as Record<string, any>, carriedReadings(store, request, batch, current, savedReadings), limit));
+  const next = json(withReadings(packet as Record<string, any>, carriedReadings(store, request, batch, current, savedReadings), limit, fits));
   return { packet: next, guards: current ? includedSources(next) : [] };
 }
 function deriveContinuation(store: Store, request: QuestionPacketRequest, current: boolean,
   contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol'], saved?: QuestionPacketRecord) {
   const continuation = request.continuation!;
   const prior = loadPacket(store, request.project, continuation.packet);
-  const { continuation: _priorContinuation, correction: _priorCorrection, ...priorRoot } = prior.value.request;
-  const { continuation: _continuation, ...root } = request;
+  const { continuation: _priorContinuation, correction: _priorCorrection, recovery: _priorRecovery, ...priorRoot } = prior.value.request;
+  const { continuation: _continuation, recovery: _recovery, ...root } = request;
+  const matchingChain = same(root, priorRoot) || (
+    Boolean(request.recovery)
+    && root.batch === priorRoot.batch
+    && root.project === priorRoot.project
+    && same(root.routes, priorRoot.routes)
+    && same(root.previous, priorRoot.previous)
+    && root.environment.id === priorRoot.environment.id
+    && (!root.attempt || !priorRoot.attempt || root.attempt.series.id === priorRoot.attempt.series.id)
+  );
   if (prior.value.packetContract !== contract || prior.value.answerProtocol !== protocol || prior.value.state !== 'ready' || !object(prior.value.packet)
-    || !same(root, priorRoot))
+    || !matchingChain)
     fail('packet_chain_invalid', continuation.packet.id, 'continuation',
       'A continuation preserves the exact ready assignment, sources and attempt of its current-contract predecessor');
   // Reuse the saved native questions and part assignment while checking today's admission dependencies.
-  const priorDerived = derivePacket(store, prior.value.request, current, prior.value.answerProtocol, prior.value.packetContract, prior.value as QuestionPacketRecord);
-  const evidence = take(readContinuationEvidence(store, { project: request.project, ...continuation }, current));
+  const priorDerived = derivePacket(store, prior.value.request, request.recovery ? false : current, prior.value.answerProtocol, prior.value.packetContract, prior.value as QuestionPacketRecord);
+  const evidence = take(readContinuationEvidence(store, { project: request.project, ...continuation }, request.recovery ? false : current));
   const capacity = take(readCapacity(store, { project: request.project, environment: request.environment, current }));
   const guards = [...priorDerived.guards, ...capacity.guards, ...evidence.guards];
   if (current) {
@@ -971,43 +1002,118 @@ function deriveContinuation(store: Store, request: QuestionPacketRequest, curren
     basis = { ...basis, material, worksBindings: stepShowsBindings(prior.value as QuestionPacketRecord, contract, saved), priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels };
     guards.push(...material.guards);
   }
+  const includePage = shouldIncludePage(saved, prior.value as QuestionPacketRecord);
+  const useCapacityDelivery = request.recovery !== undefined || (saved ?? prior.value).capacityDelivery === OM_CAPACITY_DELIVERY_CONTRACT;
+  const envConfig = store.get(request.environment.id)?.value as any;
+  const role = envConfig?.implementer;
+  const roleModel = role?.model ?? 'codex-5.3';
+  const roleEffort = role?.effort ?? 'high';
+  const roleSpeed = role?.speed;
+  const wireFits = (value: Json) => measureAdapterWire(value, requestId, roleModel, roleEffort, roleSpeed) <= capacity.maxRequestChars;
   const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
+  const earlierDeliveries = Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries : [];
+  let carryEarlier = true;
+  const earlierAddress = { contract: 'om-source-delivery-history/v1', record: reference(prior),
+    pointer: '/packet/sourceDeliveries', count: earlierDeliveries.length,
+    read: { action: 'read_context', record: reference(prior), pointer: '/packet/sourceDeliveries' } };
   const build = (rows: readonly Json[]) => {
     const whole = json({ ...payload, requestId,
       responseForm: { ...(payload.responseForm as Record<string, Json>), requestId },
-      sourceDeliveries: [...(Array.isArray(payload.sourceDeliveries) ? payload.sourceDeliveries : []),
-        { ...continuation, data: rows as Json[] }] });
+      sourceDeliveries: [...(carryEarlier ? earlierDeliveries : []), { ...continuation, data: rows as Json[] }],
+      ...(!carryEarlier ? { sourceDeliveryHistory: earlierAddress }
+        : Object.hasOwn(payload, 'sourceDeliveryHistory') ? { sourceDeliveryHistory: payload.sourceDeliveryHistory } : {}) });
     return briefContract(contract) ? json(boundedBrief({ ...whole as object, responseForm: { protocol, requestId,
-      schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } }, basis!, capacity.maxRequestChars)) : whole;
+      schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol, includePage) } }, basis!, capacity.maxRequestChars,
+      useCapacityDelivery ? wireFits : undefined)) : whole;
+  };
+  const finalFits = (candidate: Json): boolean => {
+    if (!bounded(candidate, capacity.maxRequestChars)) return false;
+    const final = basis && briefReadings(payload) !== null
+      ? chainStepReadings(store, request, prior, saved, current, candidate, capacity.maxRequestChars,
+        useCapacityDelivery ? wireFits : undefined).packet
+      : candidate;
+    return Boolean(bounded(final, capacity.maxRequestChars)) && (!useCapacityDelivery || wireFits(final));
   };
   let packet = build(evidence.data as unknown as Json[]);
   let fingerprint = bounded(packet, capacity.maxRequestChars);
-  // OBL1 (№3773): what the reads brought never blocks the continuation that carries them — the largest delivered results
-  // are shown as their length and shape until it fits; the deliveries keep their whole data. A continuation of before
-  // keeps its own era, and so does a chain of the packet contracts before the brief.
+  if (useCapacityDelivery && earlierDeliveries.length && (!fingerprint || !finalFits(packet))) {
+    // The immutable prior packet keeps every earlier delivery. Send its exact
+    // read_context address instead of duplicating all bodies in this prompt.
+    carryEarlier = false;
+    packet = build(evidence.data as unknown as Json[]);
+    fingerprint = bounded(packet, capacity.maxRequestChars);
+  }
   const readsFit = briefContract(contract) && (saved ? saved.readsFit === true : true);
-  let novel = evidence.novel;
-  if (!fingerprint && readsFit && novel) {
+  // Repeating a read whose first bounded page was already shown is not a way
+  // to advance its cursor. The next request must name the saved original and
+  // the served.next coordinate, even if the repeated paid result is complete.
+  const priorRows = Array.isArray(payload.sourceDeliveries)
+    ? payload.sourceDeliveries.flatMap((item: any) => Array.isArray(item?.data) ? item.data : []) : [];
+  const repeatedCapacityRead = useCapacityDelivery && evidence.data.length > 0 && evidence.data.every(row =>
+    object(row) && priorRows.some((shown: unknown) => object(shown)
+      && same(shown.read, row.read) && same(shown.sources, row.sources)
+      && object(shown.data) && shown.data.contract === OM_CAPACITY_DELIVERY_CONTRACT
+      && object(shown.data.original) && shown.data.original.valueHash === hashJson(row.data as Json)));
+  let novel = evidence.novel && !repeatedCapacityRead;
+  let appliedCapacityDelivery = false;
+  let wireExceeded = useCapacityDelivery && fingerprint ? !finalFits(packet) : false;
+  if ((!fingerprint || (wireExceeded && useCapacityDelivery)) && readsFit && novel) {
     const rows = [...evidence.data] as unknown as Record<string, Json>[];
     const order = rows.map((row, index) => [index, canonical(row.data ?? null).length] as const).sort((a, b) => b[1] - a[1] || a[0] - b[0]);
     for (const [index] of order) {
+      const row = rows[index]!;
+      const rowData = row.data;
+      const deliveryRef = continuation.deliveries[index];
+      if (useCapacityDelivery) {
+        const original: AddressedOmOriginal = {
+          record: deliveryRef ?? continuation.response,
+          pointer: '/data',
+          value: rowData,
+          packet: continuation.packet,
+          call: continuation.call,
+          response: continuation.response,
+          ...(deliveryRef ? { delivery: deliveryRef } : {}),
+        };
+        const planned = planOmCapacityDelivery(original, capacity.maxRequestChars, capacity.maxRequestChars, (delivery) => {
+          const testRows = [...rows];
+          testRows[index] = { ...row, data: delivery as unknown as Json };
+          const testPacket = build(testRows);
+          return finalFits(testPacket);
+        });
+        if (planned) {
+          rows[index] = { ...row, data: planned as unknown as Json };
+          packet = build(rows);
+          fingerprint = bounded(packet, capacity.maxRequestChars);
+          wireExceeded = useCapacityDelivery && fingerprint ? !finalFits(packet) : false;
+          appliedCapacityDelivery = true;
+          if (fingerprint && !wireExceeded) break;
+        }
+      }
       rows[index] = { ...rows[index]!, data: tooLargeRead(rows[index]!.data, rows[index]!.read as { action: string }, capacity.maxRequestChars) };
       packet = build(rows); fingerprint = bounded(packet, capacity.maxRequestChars);
-      if (fingerprint) break;
+      wireExceeded = useCapacityDelivery && fingerprint ? !finalFits(packet) : false;
+      if (fingerprint && !wireExceeded) break;
+    }
+    if (appliedCapacityDelivery && wireExceeded) {
+      fingerprint = null;
     }
     // №3780: what is new is judged by what the reader is shown — the same shape again is no progress, a narrower read is.
     if (fingerprint) novel = addsKnowledge(store, prior.value as QuestionPacketRecord, rows as unknown as Json[]);
   }
   const fullChars = packetPrompt(packet).length;
   if (basis && novel && fingerprint && briefReadings(payload) !== null) {
-    const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars);
-    packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars); guards.push(...step.guards);
+    const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars,
+      useCapacityDelivery ? wireFits : undefined);
+    packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars);
+    if (useCapacityDelivery && fingerprint && !wireFits(packet)) fingerprint = null;
+    guards.push(...step.guards);
   }
   const { readsFit: _priorFit, ...priorValue } = stepEra(copy(prior.value) as QuestionPacketRecord, contract, saved);
   const value: QuestionPacketRecord = { ...priorValue, ...(readsFit ? { readsFit: true as const } : {}), request, packetContract: contract,
     ...(basis ? { briefCatalogue: basis.material.references } : {}),
     state: novel && fingerprint ? 'ready' : 'blocked', packet: novel && fingerprint ? packet : null,
     fingerprint: novel ? fingerprint : null, fullChars,
+    ...(useCapacityDelivery ? { capacityDelivery: OM_CAPACITY_DELIVERY_CONTRACT } : {}),
     refusal: !novel ? { code: 'research_no_progress', message: 'The addressed reads add no information to this attempt',
       at: { unit: 'E2', target: request.batch!, field: 'continuation', ref: continuation.response }, route: 'producer' }
       : fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
@@ -1023,13 +1129,22 @@ function deriveCorrection(store: Store, request: QuestionPacketRequest, current:
   contract: NonNullable<QuestionPacketRecord['packetContract']>, protocol: QuestionPacketRecord['answerProtocol'], saved?: QuestionPacketRecord) {
   const correction = request.correction!;
   const prior = loadPacket(store, request.project, correction.packet);
-  const { continuation: _priorContinuation, correction: _priorCorrection, ...priorRoot } = prior.value.request;
-  const { correction: _correction, ...root } = request;
+  const { continuation: _priorContinuation, correction: _priorCorrection, recovery: _priorRecovery, ...priorRoot } = prior.value.request;
+  const { correction: _correction, recovery: _recovery, ...root } = request;
+  const matchingChain = same(root, priorRoot) || (
+    Boolean(request.recovery)
+    && root.batch === priorRoot.batch
+    && root.project === priorRoot.project
+    && same(root.routes, priorRoot.routes)
+    && same(root.previous, priorRoot.previous)
+    && root.environment.id === priorRoot.environment.id
+    && (!root.attempt || !priorRoot.attempt || root.attempt.series.id === priorRoot.attempt.series.id)
+  );
   if (prior.value.packetContract !== contract || prior.value.answerProtocol !== protocol || prior.value.state !== 'ready' || !object(prior.value.packet)
-    || !same(root, priorRoot))
+    || !matchingChain)
     fail('packet_chain_invalid', correction.packet.id, 'correction',
       'A correction preserves the exact ready assignment, sources and attempt of the rejected step');
-  const priorDerived = derivePacket(store, prior.value.request, current, prior.value.answerProtocol, prior.value.packetContract, prior.value as QuestionPacketRecord);
+  const priorDerived = derivePacket(store, prior.value.request, request.recovery ? false : current, prior.value.answerProtocol, prior.value.packetContract, prior.value as QuestionPacketRecord);
   const basis = priorDerived.briefBasis;
   if (!basis) fail('packet_record_invalid', prior.id, 'brief', 'A correction needs the rederived prior assignment');
   const ground = take(readCorrectionGround(store, request.project, correction));
@@ -1045,21 +1160,65 @@ function deriveCorrection(store: Store, request: QuestionPacketRequest, current:
   const requestId = packetKey(request, protocol, contract);
   const payload = prior.value.packet as Record<string, Json>;
   const refusal = ground.refusal;
+  const includePage = shouldIncludePage(saved, prior.value as QuestionPacketRecord);
+  const useCapacityDelivery = request.recovery !== undefined || (saved ?? prior.value).capacityDelivery === OM_CAPACITY_DELIVERY_CONTRACT;
+  const envConfig = store.get(request.environment.id)?.value as any;
+  const role = envConfig?.implementer;
+  const roleModel = role?.model ?? 'codex-5.3';
+  const roleEffort = role?.effort ?? 'high';
+  const roleSpeed = role?.speed;
+  const wireFits = (value: Json) => measureAdapterWire(value, requestId, roleModel, roleEffort, roleSpeed) <= capacity.maxRequestChars;
   const kind = payload.task === 'node-expansion' ? 'node' : payload.model === 'MC1' ? 'fact' : 'field';
-  let packet = json(boundedBrief({ ...payload, requestId,
+  const makeCorrectionPacket = (answerContent: unknown) => json(boundedBrief({ ...payload, requestId,
     correction: { refusals: [{ code: refusal.code, field: refusal.at.field ?? null, message: refusal.message, rule: briefRepairRule(refusal.code) }],
-      answer: ground.raw },
-    responseForm: { protocol, requestId, schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol) } },
-  { ...basis, worksBindings: stepShowsBindings(prior.value as QuestionPacketRecord, contract, saved), priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels }, capacity.maxRequestChars));
+      answer: answerContent as Json },
+    responseForm: { protocol, requestId, schema: packetAnswerSchema(kind, packetWorkContract(prior.value as QuestionPacketRecord), protocol, includePage) } },
+  { ...basis, worksBindings: stepShowsBindings(prior.value as QuestionPacketRecord, contract, saved), priorLabels: (payload.brief as unknown as { labels: BriefLabel[] }).labels }, capacity.maxRequestChars,
+  useCapacityDelivery ? wireFits : undefined));
+  let packet = makeCorrectionPacket(ground.raw);
   let fingerprint = bounded(packet, capacity.maxRequestChars);
+  let wireExceeded = (useCapacityDelivery && fingerprint) ? measureAdapterWire(packet, requestId, roleModel, roleEffort, roleSpeed) > capacity.maxRequestChars : false;
+  let appliedCapacityDelivery = false;
+  if (!fingerprint || (wireExceeded && useCapacityDelivery)) {
+    if (useCapacityDelivery) {
+      const addressedRaw: AddressedOmOriginal = {
+        record: correction.response,
+        pointer: '/raw',
+        value: ground.raw,
+        field: 'raw',
+        packet: correction.packet,
+        call: correction.call,
+        response: correction.response,
+      };
+      const planned = planOmCapacityDelivery(addressedRaw, capacity.maxRequestChars, capacity.maxRequestChars, (delivery) => {
+        const testPacket = makeCorrectionPacket(delivery);
+        const fp = bounded(testPacket, capacity.maxRequestChars);
+        if (!fp) return false;
+        return measureAdapterWire(testPacket, requestId, roleModel, roleEffort, roleSpeed) <= capacity.maxRequestChars;
+      });
+      if (planned) {
+        packet = makeCorrectionPacket(planned);
+        fingerprint = bounded(packet, capacity.maxRequestChars);
+        wireExceeded = (useCapacityDelivery && fingerprint) ? measureAdapterWire(packet, requestId, roleModel, roleEffort, roleSpeed) > capacity.maxRequestChars : false;
+        appliedCapacityDelivery = true;
+      }
+    }
+  }
+  if (appliedCapacityDelivery && wireExceeded) {
+    fingerprint = null;
+  }
   const fullChars = packetPrompt(packet).length;
   if (fingerprint && briefReadings(payload) !== null) {
-    const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars);
-    packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars); guards.push(...step.guards);
+    const step = chainStepReadings(store, request, prior, saved, current, packet, capacity.maxRequestChars,
+      useCapacityDelivery ? wireFits : undefined);
+    packet = step.packet; fingerprint = bounded(packet, capacity.maxRequestChars);
+    if (useCapacityDelivery && fingerprint && !wireFits(packet)) fingerprint = null;
+    guards.push(...step.guards);
   }
   const value: QuestionPacketRecord = { ...stepEra(copy(prior.value) as QuestionPacketRecord, contract, saved), request, packetContract: contract,
     briefCatalogue: basis.material.references, state: fingerprint ? 'ready' : 'blocked', packet: fingerprint ? packet : null,
     fingerprint, fullChars,
+    ...(useCapacityDelivery ? { capacityDelivery: OM_CAPACITY_DELIVERY_CONTRACT } : {}),
     refusal: fingerprint ? null : blocked(payload.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', request.batch!) };
   return { value, guards: unique(guards), references: unique([...priorDerived.references, correction.packet, correction.call, correction.response,
     correction.diagnostic, ...capacity.references, ...ground.references]), writes: priorDerived.writes, briefBasis: basis };
@@ -1092,7 +1251,9 @@ function contentContract(store: Store, request: QuestionPacketRequest, contract:
     fail('packet_record_invalid', target, 'briefContract', 'Only a brief packet can declare the supported content version');
   if (!briefContract(contract)) return undefined;
   const predecessors = [...(request.continuation ? [request.continuation.packet] : []),
-    ...(request.correction ? [request.correction.packet] : []), ...request.previous.map(part => part.packet)]
+    ...(request.correction ? [request.correction.packet] : []),
+    ...(request.recovery ? [request.recovery.packet] : []),
+    ...request.previous.map(part => part.packet)]
     .map(ref => loadPacket(store, request.project, ref));
   const inherited = predecessors[0]?.value.briefContract;
   if (predecessors.some(prior => prior.value.briefContract !== inherited))
@@ -1121,7 +1282,9 @@ function selectionContract(store: Store, request: QuestionPacketRequest, contrac
     fail('packet_record_invalid', target, 'briefSelection', 'Only a brief packet can declare the supported selection version');
   if (!briefContract(contract)) return undefined;
   const predecessors = [...(request.continuation ? [request.continuation.packet] : []),
-    ...(request.correction ? [request.correction.packet] : []), ...request.previous.map(part => part.packet)]
+    ...(request.correction ? [request.correction.packet] : []),
+    ...(request.recovery ? [request.recovery.packet] : []),
+    ...request.previous.map(part => part.packet)]
     .map(ref => loadPacket(store, request.project, ref));
   const inherited = predecessors[0]?.value.briefSelection;
   if (predecessors.some(prior => prior.value.briefSelection !== inherited))
@@ -1168,6 +1331,24 @@ function worksBindingsEra(contract: QuestionPacketRecord['packetContract'], save
   if (saved && Object.hasOwn(saved, 'worksBindings') && (saved.worksBindings !== true || contract !== WORKS_BRIEF_PACKET_CONTRACT))
     fail('packet_record_invalid', saved.request.routes.id, 'worksBindings', 'Only a works brief packet declares the bindings era');
   return contract === WORKS_BRIEF_PACKET_CONTRACT && (saved ? saved.worksBindings === true : true);
+}
+function packetHasPage(record?: QuestionPacketRecord): boolean {
+  if (!record) return false;
+  const p = record.packet as Record<string, any> | null;
+  if (!p) return false;
+  const schema = p.responseForm?.schema ?? p.brief?.responseForm?.schema;
+  if (schema) return JSON.stringify(schema).includes('"page"');
+  const text = p.brief?.text;
+  if (typeof text === 'string') return text.includes('"page"');
+  return false;
+}
+function shouldIncludePage(saved?: QuestionPacketRecord, fallbackRecord?: QuestionPacketRecord, defaultIfNoRecord = true): boolean {
+  if (saved) {
+    if (packetHasPage(saved)) return true;
+    if (saved.packet !== null) return false;
+  }
+  if (fallbackRecord) return packetHasPage(fallbackRecord);
+  return defaultIfNoRecord;
 }
 type DerivedPacket = { value: QuestionPacketRecord; guards: TransactionGuard[]; references: Ref[]; writes: Write[]; briefBasis?: BriefBasis };
 /**
@@ -1267,12 +1448,17 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
   });
   ownRequirements(tasks);
   const requestId = packetKey(request, protocol, contract);
+  const rootPacket = request.previous.length ? loadPacket(store, request.project, request.previous[0]!.packet) : null;
+  if (briefContract(contract) && (saved ? saved.capacityDelivery === OM_CAPACITY_DELIVERY_CONTRACT
+    : rootPacket ? rootPacket.value.capacityDelivery === OM_CAPACITY_DELIVERY_CONTRACT : true))
+    base.capacityDelivery = OM_CAPACITY_DELIVERY_CONTRACT;
+  const includePage = shouldIncludePage(saved, rootPacket?.value, true);
   const common = { version: contract === WORKS_BRIEF_PACKET_CONTRACT ? WORKS_BRIEF_VERSION
     : contract === BRIEF_PACKET_CONTRACT ? BRIEF_VERSION : contract === WORKS_PACKET_CONTRACT ? 'om-question-packet/works-v1'
     : contract ? 'om-question-packet/v3' : protocol ? 'om-question-packet/v2' : 'om-question-packet/v1', requestId, model: batch.model,
     purpose: batch.model === 'MC1' ? 'model-research' : 'model-design', task: batch.task, kind: batch.kind, questions,
     responseForm: protocol ? { protocol, requestId, schema: packetAnswerSchema(batch.task === 'node-expansion' ? 'node' : batch.model === 'MC1' ? 'fact' : 'field',
-      packetWorkContract(base), protocol) }
+      packetWorkContract(base), protocol, includePage) }
       : batch.task === 'node-expansion'
       ? { protocol: 'omg-part/v1', requestId, proposal: PART_PROPOSAL_SCHEMA }
       : batch.model === 'MC1'
@@ -1341,9 +1527,14 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
       }
     }
   }
+  const envConfig = store.get(request.environment.id)?.value as any;
+  const role = envConfig?.implementer;
+  const wireFits = (value: Json) => measureAdapterWire(value, requestId, role?.model ?? 'codex-5.3',
+    role?.effort ?? 'high', role?.speed) <= capacity.maxRequestChars;
   const encode = (value: unknown): Json => {
     if (!briefBasis) return json(value);
-    return json(boundedBrief(value as Record<string, unknown>, briefBasis, capacity.maxRequestChars));
+    return json(boundedBrief(value as Record<string, unknown>, briefBasis, capacity.maxRequestChars,
+      base.capacityDelivery ? wireFits : undefined));
   };
   let packet = json(common);
   if (batch.task === 'node-expansion') {
@@ -1391,7 +1582,7 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     packet = encode({ ...common, expansion: whole, ...(works ? { works } : {}) });
     base.fullChars = packetPrompt(packet).length;
     base.plan = { mode: 'whole', assignments: [{ connector: null, obligations: allIds }], position: 0 };
-    if (!bounded(packet, capacity.maxRequestChars)) {
+    if (!bounded(packet, capacity.maxRequestChars) || base.capacityDelivery && !wireFits(packet)) {
       const connectors = [...new Set(open.flatMap(item => item.connector ? [item.connector] : []))].sort(order);
       const assignments = connectors.map(connector => ({ connector: connector as string | null,
         obligations: open.filter(item => item.connector === connector).map(item => item.id) }));
@@ -1402,7 +1593,7 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
       context.previous = previousParts(store, request, base.plan, references, protocol, contract);
       context.reserved = unique([...context.reserved, ...context.previous.flatMap(item => (item as unknown as {nodes: Graph['nodes']}).nodes.map(node => node.id))]);
       if (request.previous.length === assignments.length)
-        return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
+        return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites, ...(briefBasis ? { briefBasis } : {}) };
       const assignment = assignments[request.previous.length]!;
       const assigned = open.filter(item => assignment.obligations.includes(item.id));
       if (wakeEra && holdsProducerEnd(assigned)) base.wakeTests = true; else delete (base as { wakeTests?: true }).wakeTests;
@@ -1422,6 +1613,7 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     base.fullChars = packetPrompt(packet).length;
   }
   let fingerprint = bounded(packet, capacity.maxRequestChars);
+  if (base.capacityDelivery && fingerprint && !wireFits(packet)) fingerprint = null;
   if (!fingerprint) {
     base.state = 'blocked'; base.refusal = blocked(batch.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', batch.node ?? batch.id);
     // RB1 (№4291 п.1): reopened works come with all their material or not at all — when it does not fit, the refusal names
@@ -1431,15 +1623,21 @@ function derivePacketOnce(store: Store, request: QuestionPacketRequest, current:
     if (reopenedWorks.length) base.refusal = { ...base.refusal, at: { unit: 'E2', target: reopenedWorks.length === 1 ? reopenedWorks[0]! : batch.node!, field: 'reopened' },
       message: `Reopened ${reopenedWorks.join(', ')} with the whole material of their duties (${packetPrompt(packet).length} chars) exceed the capacity of one request (${capacity.maxRequestChars}): split the work by its results`,
       };
-    return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites };
+    return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites, ...(briefBasis ? { briefBasis } : {}) };
   }
   // MP3: optional carried reads in the capacity left by the fitting packet; they never block or split it.
   if (briefBasis && chainReadings(store, request, saved)) {
     const savedReadings = saved ? briefReadings(saved.packet) : null;
     if (saved && !savedReadings) fail('packet_record_invalid', requestId, 'readings', 'A packet of the readings era keeps its readings');
-    packet = json(withReadings(packet as Record<string, any>, carriedReadings(store, request, batch, current, savedReadings), capacity.maxRequestChars));
+    packet = json(withReadings(packet as Record<string, any>, carriedReadings(store, request, batch, current, savedReadings),
+      capacity.maxRequestChars, base.capacityDelivery ? wireFits : undefined));
     fingerprint = bounded(packet, capacity.maxRequestChars)!;
+    if (base.capacityDelivery && !wireFits(packet)) fingerprint = null;
     if (current) guards.push(...includedSources(packet));
+  }
+  if (!fingerprint) {
+    base.state = 'blocked'; base.refusal = blocked(batch.task === 'node-expansion' ? 'node_unexpandable' : 'packet_too_large', batch.node ?? batch.id);
+    return { value: base, guards: unique(guards), references: unique(references), writes: routeWrites, ...(briefBasis ? { briefBasis } : {}) };
   }
   base.state = 'ready'; base.packet = packet; base.fingerprint = fingerprint;
   const writes: Write[] = [...routeWrites];
@@ -1535,7 +1733,7 @@ export function writeQuestionPacket(store: Store, request: QuestionPacketRequest
     // Replaying a saved delivery transition does not admit another physical call.
     // Dispatch still requires prepareQuestionPacket's fresh current admission.
     const managed = request.attempt ? take(readCompletionBinding(store, request.project, request.attempt.series, request.attempt.ordinal)) : null;
-    const record = managed || request.continuation || request.correction || request.previous.length > 0 ? packetEra(store, request).checked : undefined;
+    const record = managed || request.continuation || request.correction || request.recovery || request.previous.length > 0 ? packetEra(store, request).checked : undefined;
     if (record) {
       return { record, existing: true, writes: [], guards: [], references: [reference(record)] };
     }
@@ -1629,7 +1827,7 @@ export function normalizePartAnswer(value: unknown, worksContract?: typeof WORKS
 export type PacketRead =
   | { action: 'read'; path: string; media: 'text/plain' | 'application/json' }
   | { action: 'read_source'; source: Ref; selector: Selector }
-  | { action: 'read_context'; record: Ref; pointer: string }
+  | { action: 'read_context'; record: Ref; pointer: string; page?: { offset: number; end: number; total: number; unit: 'items' | 'utf16' } }
   | { action: 'search'; within: string | Ref; query: string };
 export interface PacketAnswerRequest { project: string; packet: Ref; raw: string }
 export type PacketAnswer =
@@ -1658,26 +1856,40 @@ const selectorShape = { oneOf: [
   { type: 'object', additionalProperties: false, required: ['kind', 'start', 'end'], properties: {
     kind: { const: 'text-range' }, start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 } } },
 ] };
-const readShapes = (protocol: AnswerProtocol) => [
+const pageShape = {
+  type: 'object', additionalProperties: false, required: ['offset', 'end', 'total', 'unit'],
+  properties: {
+    offset: { minimum: 0, type: 'integer' },
+    end: { minimum: 0, type: 'integer' },
+    total: { minimum: 0, type: 'integer' },
+    unit: { enum: ['utf16', 'items'] },
+  },
+};
+const readShapes = (protocol: AnswerProtocol, includePage: boolean = true) => [
   { action: { const: 'read' }, path: protocol === 'omg-answer/v2' ? nonempty : readPathShape, media: { enum: ['text/plain', 'application/json'] } },
   { action: { const: 'read_source' }, source: refShape, selector: selectorShape },
-  { action: { const: 'read_context' }, record: refShape, pointer: { type: 'string' } },
+  { action: { const: 'read_context' }, record: refShape, pointer: { type: 'string' }, ...(protocol === 'omg-answer/v3' && includePage ? { page: pageShape } : {}) },
   { action: { const: 'search' }, within: { oneOf: [protocol === 'omg-answer/v2' ? nonempty : readPathShape, refShape] }, query: nonempty },
-].map(properties => ({ type: 'object', additionalProperties: false, required: Object.keys(properties), properties }));
+].map(properties => ({
+  type: 'object',
+  additionalProperties: false,
+  required: Object.keys(properties).filter(k => k !== 'page'),
+  properties,
+}));
 const factResults = { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
   required: ['questionId', 'value', 'citations'], properties: { questionId: nonempty, value: {},
     citations: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
       required: ['source', 'selector'], properties: { source: refShape, selector: selectorShape } } } } } };
 const fieldResults = { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
   required: ['target', 'field', 'value', 'basis'], properties: { target: nonempty, field: nonempty, value: {}, basis: refShape } } };
-function answerSchemaFamily(protocol: AnswerProtocol) {
+function answerSchemaFamily(protocol: AnswerProtocol, includePage: boolean = true) {
   function responseShape(properties: Record<string, unknown>) {
     const fields = { protocol: { const: protocol }, requestId: nonempty, ...properties };
     return { type: 'object', additionalProperties: false, required: Object.keys(fields), properties: fields };
   }
   const controls = [
     responseShape({ action: { const: 'need_source' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
-      missing: nonempty, reads: { type: 'array', minItems: 1, items: { oneOf: readShapes(protocol) } } }),
+      missing: nonempty, reads: { type: 'array', minItems: 1, items: { oneOf: readShapes(protocol, includePage) } } }),
     responseShape({ action: { const: 'need_owner' }, questionIds: { type: 'array', minItems: 1, uniqueItems: true, items: nonempty },
       reason: nonempty, decision: nonempty }),
     ...['cannot_answer', 'pause'].map(action => responseShape({ action: { const: action },
@@ -1691,14 +1903,19 @@ function answerSchemaFamily(protocol: AnswerProtocol) {
       bindings: { type: 'array', items: taskObligationBindingSchema } }), ...controls] },
   });
 }
-const answerSchemas = { 'omg-answer/v2': answerSchemaFamily('omg-answer/v2'), 'omg-answer/v3': answerSchemaFamily('omg-answer/v3') };
+const answerSchemas = {
+  'omg-answer/v2': answerSchemaFamily('omg-answer/v2', false),
+  'omg-answer/v3': answerSchemaFamily('omg-answer/v3', true),
+  'omg-answer/v3-nopage': answerSchemaFamily('omg-answer/v3', false),
+};
 /** One stable schema family per proven era for producer payloads, E3 and E4. */
 export function packetAnswerSchema(kind: 'node' | 'fact' | 'field', worksContract?: typeof WORKS_FRAME_CONTRACT,
-  protocol: AnswerProtocol = PACKET_ANSWER_PROTOCOL): Sealed<Json> {
+  protocol: AnswerProtocol = PACKET_ANSWER_PROTOCOL, includePage: boolean = true): Sealed<Json> {
   if (kind !== 'node' && kind !== 'fact' && kind !== 'field') invalid('answer.schema');
   if (!answerProtocols.includes(protocol)) invalid('answer.protocol');
   if (worksContract !== undefined && (worksContract !== WORKS_FRAME_CONTRACT || kind !== 'node')) invalid('answer.worksContract');
-  return answerSchemas[protocol][worksContract ? 'works' : kind] as Sealed<Json>;
+  const key = protocol === 'omg-answer/v3' && !includePage ? 'omg-answer/v3-nopage' : protocol;
+  return answerSchemas[key][worksContract ? 'works' : kind] as Sealed<Json>;
 }
 const answerSchemasAjv = new Ajv({ strict: true, allowUnionTypes: true });
 const compileAnswers = (family: ReturnType<typeof answerSchemaFamily>) => ({
@@ -2056,8 +2273,8 @@ function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNu
   if (request.previous.length > plan.assignments.length) fail('packet_chain_invalid', request.batch!, 'previous', 'The chain exceeds its assigned parts');
   return request.previous.map((item, index) => {
     const prior = loadPacket(store, request.project, item.packet);
-    const { continuation: _continuation, correction: _correction, ...priorRequest } = prior.value.request;
-    const { continuation: _currentContinuation, correction: _currentCorrection, ...rootRequest } = request;
+    const { continuation: _continuation, correction: _correction, recovery: _recovery, ...priorRequest } = prior.value.request;
+    const { continuation: _currentContinuation, correction: _currentCorrection, recovery: _currentRecovery, ...rootRequest } = request;
     const expected = { ...rootRequest, previous: request.previous.slice(0, index) };
     if (prior.value.answerProtocol !== protocol || prior.value.packetContract !== contract
       || !same(priorRequest, expected) || prior.value.state !== 'ready' || prior.value.plan?.mode !== 'parts'
@@ -2076,3 +2293,50 @@ function previousParts(store: Store, request: QuestionPacketRequest, plan: NonNu
 // The journal must not import input.ts itself (an ESM cycle would reach its reader registry before it has evaluated),
 // so this module, which already imports both, hands the existing executor in once; nothing is called here.
 registerJournalProofExecutor(historicalProof);
+
+export function deriveCapacitySuccessorPacket(
+  store: Store,
+  _project: string,
+  blockedPacket: Revision<QuestionPacketRecord>,
+  _actor: string
+): { reference: Ref; writes: Write[]; guards: TransactionGuard[]; record: Revision<QuestionPacketRecord> } {
+  const req = blockedPacket.value.request;
+  const envHead = store.get(req.environment.id);
+  const currentEnv = envHead ? reference(envHead) : req.environment;
+
+  let attempt = req.attempt;
+  if (attempt) {
+    const binding = take(readCompletionBinding(store, req.project, attempt.series, attempt.ordinal));
+    if (binding) {
+      const workHead = store.get(completionWorkId(req.project, binding.id));
+      if (workHead?.value && (workHead.value as any).closed) {
+        const seriesHead = store.get(attempt.series.id);
+        if (seriesHead && Array.isArray((seriesHead.value as any)?.attempts)) {
+          const openAttempt = (seriesHead.value as any).attempts.find((a: any) => !a.outcome);
+          if (openAttempt) {
+            attempt = {
+              series: reference(seriesHead),
+              ordinal: openAttempt.ordinal,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  const request: QuestionPacketRequest = {
+    ...req,
+    environment: currentEnv,
+    ...(attempt ? { attempt } : {}),
+    recovery: { packet: reference(blockedPacket) },
+  };
+  const prepared = take(prepareQuestionPacket(store, request));
+  return {
+    reference: reference(prepared.record),
+    writes: [...prepared.writes],
+    guards: [...prepared.guards],
+    record: prepared.record as Revision<QuestionPacketRecord>,
+  };
+}
+
+registerSuccessorDeriver({ deriveCapacitySuccessorPacket });

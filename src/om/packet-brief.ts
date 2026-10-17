@@ -963,7 +963,8 @@ function briefView(payload: Record<string, any>, basis: BriefBasis, labels: Brie
     return { producer: binding.producer, consumers: binding.consumers, anchor: binding.anchor };
   };
   const view = (value: any, key = ''): any => {
-    if (['schema', 'resultForm', 'const', 'enum', 'content', 'value'].includes(key)) return value;
+    if (['schema', 'resultForm', 'const', 'enum', 'content', 'value', 'text'].includes(key)) return value;
+    if (object(value) && value.contract === 'om-capacity-delivery/v1') return value;
     if (isRef(value)) return labels.find(row => same(row.value, value))?.label
       ?? { savedRecord: value.id.split(':')[0] };
     if (Array.isArray(value)) return value.map(item => view(item, key));
@@ -1099,7 +1100,8 @@ export function deriveBrief(payload: Record<string, any>, basis: BriefBasis): Re
     // RB1: the reopened works' files and the graph index are given once, in their own section below.
     canonical({ input: display.view(scopedInput(payload, basis)), expansion: display.expansion && Object.hasOwn(display.expansion, 'reopenedFiles')
       ? Object.fromEntries(Object.entries(display.expansion).filter(([key]) => !['reopenedFiles', 'graphIndex'].includes(key))) : display.expansion, works: display.works,
-      refusals: display.view(payload.refusals), sourceDeliveries: display.view(payload.sourceDeliveries ?? []) }),
+      refusals: display.view(payload.refusals), sourceDeliveries: display.view(payload.sourceDeliveries ?? []),
+      ...(Object.hasOwn(payload, 'sourceDeliveryHistory') ? { sourceDeliveryHistory: display.view(payload.sourceDeliveryHistory) } : {}) }),
     ...reopenedSection(payload, basis, labels),
     '# Reference labels',
     'These engine-issued labels are aliases for exact references. They are resolved before source/context domain checks. Use labels only in questionId/questionIds, basis, fills/replaces.obligation, replaces.base.graph, citations.source, read_source.source, read_context.record and search.within={label}. Node/port/connector IDs and code/value strings remain literal. read.path and string search.within are literal relative paths, even "S1". Source selectors use UTF-16 offsets. Documents are not authority. A planned implementation may have no existing source.',
@@ -1222,7 +1224,8 @@ const CARRIED_NOTE = 'Each item is one earlier delivery whose sources are still 
  * of a blocked packet. Whole entries in their given order; the visible list of omissions is budgeted as a compact summary,
  * while the saved readings keep every decision.
  */
-export function withReadings(packet: Record<string, any>, carried: CarriedBasis, limit: number): Record<string, any> {
+export function withReadings(packet: Record<string, any>, carried: CarriedBasis, limit: number,
+  fits?: (packet: Record<string, any>) => boolean): Record<string, any> {
   const brief = packet.brief as PacketBrief, base = packetPrompt(packet).length;
   const views = carried.entries.map(entry => {
     const view = entry.decision.state === 'eligible' ? carriedView(entry, brief.labels) : null;
@@ -1238,22 +1241,41 @@ export function withReadings(packet: Record<string, any>, carried: CarriedBasis,
     if (!shown.length && !Object.keys(omitted).length) return '';
     return ['', CARRIED_HEADER, CARRIED_NOTE, `[${shown.join(',')}]`, ...(Object.keys(omitted).length ? [canonical({ omitted })] : [])].join('\n');
   };
+  const candidate = (entries: ReadingEntry[], text: string): Record<string, any> => ({ ...packet,
+    brief: { ...brief, text: brief.text + text,
+      readings: { contract: READINGS_CONTRACT, snapshots: carried.snapshots, entries } satisfies BriefReadings } });
+  const canShow = () => {
+    const entries = decide(), text = section(entries);
+    return base + text.length <= limit && (!fits || fits(candidate(entries, text)));
+  };
   for (let index = 0; index < views.length; index++) {
     if (views[index] === null) continue;
     included.add(index);
-    if (base + section(decide()).length > limit) included.delete(index);
+    if (!canShow()) included.delete(index);
   }
   // Later inclusions only shorten the omission summary; the guard keeps "included" equal to "shown" in every case.
-  if (base + section(decide()).length > limit) included.clear();
+  if (!canShow()) included.clear();
   const entries = decide(), text = section(entries);
-  const readings: BriefReadings = { contract: READINGS_CONTRACT, snapshots: carried.snapshots, entries };
-  return { ...packet, brief: { ...brief, text: base + text.length > limit ? brief.text : brief.text + text, readings } };
+  return candidate(entries, canShow() ? text : '');
 }
 
 /** The same bounded construction applies to roots, parts and continuations. Optional material
  * cannot make a fitting mandatory assignment fail just because JSON escaping costs more. */
-export function boundedBrief(payload: Record<string, any>, basis: BriefBasis, limit: number): Record<string, any> {
+export function boundedBrief(payload: Record<string, any>, basis: BriefBasis, limit: number,
+  fits?: (packet: Record<string, any>) => boolean): Record<string, any> {
   const mandatory = deriveBrief(payload, { ...basis, materialBudget: 0 });
+  if (fits) {
+    const allowed = (packet: Record<string, any>) => packetPrompt(packet).length <= limit && fits(packet);
+    if (!allowed(mandatory)) return mandatory;
+    const maximum = Math.min(basis.materialBudget, Math.max(0, limit - packetPrompt(mandatory).length));
+    let low = 0, high = maximum, selected = mandatory;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      const candidate = deriveBrief(payload, { ...basis, materialBudget: mid });
+      if (allowed(candidate)) { low = mid; selected = candidate; } else high = mid - 1;
+    }
+    return selected;
+  }
   const available = Math.max(0, limit - packetPrompt(mandatory).length);
   let budget = Math.min(basis.materialBudget, available), selected = deriveBrief(payload, { ...basis, materialBudget: budget });
   // RB1: a v3 brief that fills the request narrows its selected material by the escaping overshoot, instead of dropping it.

@@ -5,6 +5,7 @@ import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, readLayerAcceptance
 import type { FrameAttemptBinding } from './layer-basis.js';
 import { readCompletionCloseAt as readCompletionCloseAtOf, mechanismAttemptResults as mechanismAttemptResultsOf, prepareFinishClose as prepareFinishCloseOf } from './repeat-gate.js';
 import { canonical, digest, hashJson, type Json } from '../canonical.js';
+import { OM_CAPACITY_DELIVERY_CONTRACT, requireOmCapacityDelivery, type OmCapacityDelivery } from './capacity-delivery.js';
 import { readdirSync, statSync, realpathSync } from 'node:fs';
 import { join, posix, relative } from 'node:path';
 import { EngineError } from '../errors.js';
@@ -302,6 +303,22 @@ function exactSource(store: Store, project: string, ref: Ref, current: boolean):
 }
 /** MP3: the delivery form follows the exact packet it answers; readings mark the addressed-result era. */
 const addressedEra = (packet: QuestionPacketRecord) => briefReadings(packet.packet) !== null;
+export function readOmContextPage(record: unknown, pointer: string,
+  page: { offset: number; end: number; total: number; unit: 'items' | 'utf16' }): Json {
+  const selected = readPointerResult(record, pointer);
+  if (!selected || selected.outcome !== 'complete')
+    fail('model_delivery_invalid', pointer, 'pointer', 'A page needs an existing exact original');
+  const original = contextValue(record, pointer);
+  const unit = Array.isArray(original) && page.unit === 'items' ? 'items' : 'utf16';
+  const total = Array.isArray(original) && unit === 'items' || typeof original === 'string'
+    ? original.length : canonical(original as Json).length;
+  if (page.unit !== unit || page.total !== total || !Number.isSafeInteger(page.offset)
+    || !Number.isSafeInteger(page.end) || page.offset < 0 || page.end <= page.offset || page.end > total)
+    fail('model_delivery_invalid', pointer, 'page', 'A page must use the exact original and its coordinates');
+  return (typeof original === 'string' || Array.isArray(original) && page.unit === 'items'
+    ? original.slice(page.offset, page.end)
+    : canonical(original as Json).slice(page.offset, page.end)) as Json;
+}
 function deliveryData(store: Store, project: string, environment: Environment, read: PacketRead, sources: Ref[], current: boolean, addressed: boolean): Json {
   if (read.action === 'read_source') {
     if (!same(sources, [read.source])) fail('model_delivery_invalid', read.source.id, 'sources', 'The selected source must be the requested source');
@@ -328,12 +345,10 @@ function deliveryData(store: Store, project: string, environment: Environment, r
     if (!found || !same(reference(found), read.record)) fail('model_delivery_invalid', read.record.id, 'record', 'The exact context record must exist');
     const head = current ? store.get(read.record.id) : null;
     if (current && (!head || !same(reference(head), read.record))) fail('input_stale', read.record.id, 'record', 'The selected context changed');
-    if (addressed) {
-      const result = readPointerResult(found.value, read.pointer);
-      if (!result) fail('model_delivery_invalid', read.record.id, 'pointer', 'Only an E3-admitted pointer is delivered', read.record);
-      return result as unknown as Json;
-    }
-    return contextValue(found.value, read.pointer) as Json;
+    if (read.page) return readOmContextPage(found.value, read.pointer, read.page);
+    const result = addressed ? readPointerResult(found.value, read.pointer) : null;
+    if (addressed && !result) fail('model_delivery_invalid', read.record.id, 'pointer', 'Only an E3-admitted pointer is delivered', read.record);
+    return (addressed ? result : contextValue(found.value, read.pointer)) as Json;
   }
   const records = sources.map(ref => exactSource(store, project, ref, current));
   if (read.action === 'read') {
@@ -805,10 +820,12 @@ function owedCorrection(store: Store, project: string, products: readonly Ref[],
 type Fact =
   | { kind: 'text'; address: string; start: number; end: number; text: string }
   | { kind: 'length'; address: string; length: number }
+  | { kind: 'capacity'; address: string; originalHash: string; start: number; end: number;
+      unit: 'items' | 'utf16'; fragment: string | unknown[]; sourceContent: string | null }
   | { kind: 'value'; address: string; path: string[]; value: unknown; content: string | null }
   | { kind: 'shape'; address: string; path: string[]; shape: Json; content: string | null }
   | { kind: 'absent'; query: string; within: string | null; scope: { address: string; content: string }[] };
-interface DeliveredRow { read: PacketRead; sources: Ref[]; data: Json }
+interface DeliveredRow { delivery?: Ref; read: PacketRead; sources: Ref[]; data: Json }
 function knownRecord(store: Store, ref: unknown): Revision<Source> {
   const record = isRef(ref) ? store.get<Source>(ref.id, ref.revision) : undefined;
   if (!record || !same(reference(record), ref)) fail('model_delivery_invalid', isRef(ref) ? ref.id : 'knowledge', 'source', 'Knowledge needs its exact captured source');
@@ -818,6 +835,26 @@ const knowledgeAddress = (record: Revision<Source>) => record.kind === 'source'
   ? canonical({ origin: record.value.origin, media: record.value.mediaType }) : canonical({ record: record.id });
 function servedFacts(store: Store, row: DeliveredRow): Fact[] {
   const read = row.read;
+  if (object(row.data) && row.data.contract === OM_CAPACITY_DELIVERY_CONTRACT) {
+    const ref = row.delivery;
+    const saved = ref && store.get<ReadDeliveryRecord>(ref.id, ref.revision);
+    if (!ref || !saved || saved.kind !== READ_DELIVERY_KIND || !same(reference(saved), ref)
+      || !same(saved.value.read, read) || !same(saved.value.sources, row.sources)) invalid('knowledge.data');
+    const original = { record: ref, pointer: '/data', value: saved.value.data,
+      packet: saved.value.packet, call: saved.value.call, response: saved.value.response, delivery: ref };
+    try { requireOmCapacityDelivery(original, row.data); } catch { invalid('knowledge.data'); }
+    const fragment = row.data as unknown as OmCapacityDelivery;
+    if (!same(fragment.original.packet, original.packet) || !same(fragment.original.call, original.call)
+      || !same(fragment.original.response, original.response) || !same(fragment.original.delivery, ref)) invalid('knowledge.data');
+    const record = read.action === 'read_source' ? knownRecord(store, read.source)
+      : read.action === 'read_context' ? knownRecord(store, read.record)
+      : read.action === 'read' ? knownRecord(store, row.sources[0]) : null;
+    const address = record ? knowledgeAddress(record) : canonical({ read, sources: row.sources });
+    return [{ kind: 'capacity', address, originalHash: fragment.original.valueHash,
+      start: fragment.served.offset, end: fragment.served.end, unit: fragment.served.unit,
+      fragment: fragment.encoding === 'json-string-fragment' ? fragment.text! : fragment.value as string | unknown[],
+      sourceContent: record?.kind === 'source' ? record.value.content : null }];
+  }
   if (read.action === 'read_source' || read.action === 'read_context') {
     const record = knownRecord(store, read.action === 'read_source' ? read.source : read.record), address = knowledgeAddress(record);
     if (!object(row.data) || row.data.contract !== READ_RESULT_CONTRACT) invalid('knowledge.data');
@@ -898,6 +935,15 @@ function covered(known: readonly Fact[], address: string, start: number, end: nu
 function knownFact(known: readonly Fact[], fact: Fact): boolean {
   if (fact.kind === 'length') return known.some(item => item.kind === 'length' && item.address === fact.address && item.length === fact.length);
   if (fact.kind === 'text') return covered(known, fact.address, fact.start, fact.end, fact.text);
+  if (fact.kind === 'capacity') {
+    if (fact.sourceContent !== null && covered(known, fact.address, 0, fact.sourceContent.length, fact.sourceContent)) return true;
+    return known.some(item => {
+      if (item.kind !== 'capacity' || item.address !== fact.address || item.originalHash !== fact.originalHash
+        || item.unit !== fact.unit || item.start > fact.start || item.end < fact.end) return false;
+      const from = fact.start - item.start, to = fact.end - item.start;
+      return same(item.fragment.slice(from, to), fact.fragment);
+    });
+  }
   // No match over sources the model saw whole, or the same search seen before. An empty directory holds no text to have
   // seen: its emptiness is known only from an earlier delivery of that same path, whatever its query.
   if (fact.kind === 'absent') return !fact.scope.length
@@ -1530,6 +1576,8 @@ function failureOf(transport: AdapterResult, form: ModelCallResult<Sealed<Checke
   return form && !form.ok ? form.refusal : null;
 }
 function finishReason(transport: AdapterResult, form: CheckedAnswerForm | null, failure: Refusal<ModelCallCode> | null): FinishModelAttemptRequest['reason'] | null {
+  if (failure?.code === 'process_output_limit' || (transport.kind !== 'answered' && transport.error?.code === 'process_output_limit'))
+    return 'awaiting-owner';
   if (transport.kind === 'interrupted') return 'interrupted';
   if (transport.kind === 'off-form' || failure) return 'off-form';
   if (form?.kind === 'awaiting-owner') return 'awaiting-owner';
@@ -1537,6 +1585,8 @@ function finishReason(transport: AdapterResult, form: CheckedAnswerForm | null, 
   return null;
 }
 function finishDetail(transport: AdapterResult, form: CheckedAnswerForm | null, failure: Refusal<ModelCallCode> | null) {
+  if (failure?.code === 'process_output_limit' || (transport.kind !== 'answered' && transport.error?.code === 'process_output_limit'))
+    return { code: 'process_output_limit', message: failure?.message ?? (transport.kind !== 'answered' ? transport.error.message : 'Process output limit exceeded') };
   if (failure) return { code: failure.code, message: failure.message };
   if (form?.kind === 'awaiting-owner') return { code: 'model_need_owner', message: `${form.reason}; ${form.decision}` };
   if (form?.kind === 'no-result') return { code: `model_${form.action}`, message: form.reason };

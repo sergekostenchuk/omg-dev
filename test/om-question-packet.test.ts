@@ -1,4 +1,5 @@
 import { packetPrompt, packetFingerprint, BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORKS_BRIEF_VERSION } from '../src/om/packet-brief.js';
+import { measureAdapterWire, OM_CAPACITY_DELIVERY_CONTRACT, requireOmCapacityDelivery, type OmCapacityDelivery } from '../src/om/capacity-delivery.js';
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -43,7 +44,7 @@ import { closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, ORI
 import { ONE_ARTIFACT, prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly } from '../src/om/model-call.js';
+import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures, refinedLayers, withHistoricalUpstream } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
@@ -51,6 +52,10 @@ import { preparedField } from './preparation-fixture.js';
 const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => any } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 const clone = structuredClone;
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
+const packetWire = (packet: unknown): number => {
+  const body = packet as Record<string, unknown>;
+  return measureAdapterWire(body, body.requestId as string, 'fixture', 'high');
+};
 const snapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 const ordered = <T>(values: readonly T[]) => [...values].sort((a, b) => canonical(a).localeCompare(canonical(b)));
 function ok<T>(result: OmResult<T>): T {
@@ -470,20 +475,21 @@ test('E2 issues native MC1 only after M6 and atomically saves the complete selec
   assert.deepEqual(snapshot(f.store), after);
 });
 
-test('E2 uses the whole canonical payload at the exact configured capacity and persists oversized MC1 as blocked without issuance', t => {
+test('E2 uses the full adapter wire at the exact configured capacity and persists oversized MC1 as blocked without issuance', t => {
   const p = packetFixture(t), { f } = p;
   const full = ok(prepareQuestionPacket(f.store, p.request)).record.value;
   assert.ok(full.packet && full.fingerprint);
-  const exact = p.environment(full.fingerprint.chars);
+  const fullWire = packetWire(full.packet);
+  const exact = p.environment(fullWire);
   const atLimit = { ...p.request, environment: reference(exact) };
   const fitting = ok(prepareQuestionPacket(f.store, atLimit));
   assert.equal(fitting.record.value.state, 'ready'); assert.equal(fitting.record.value.fingerprint!.chars, full.fingerprint.chars);
-  const tooSmall = p.environment(full.fingerprint.chars - 1), request = { ...p.request, environment: reference(tooSmall) };
+  const tooSmall = p.environment(fullWire - 1), request = { ...p.request, environment: reference(tooSmall) };
   const nativeBefore = f.store.list('question').map(reference), before = snapshot(f.store);
   const prepared = ok(prepareQuestionPacket(f.store, request));
   assert.deepEqual(snapshot(f.store), before);
   assert.equal(prepared.record.value.state, 'blocked'); assert.equal(prepared.record.value.refusal?.code, 'packet_too_large');
-  assert.ok(prepared.record.value.fullChars! > tooSmall.value.requestCapacityChars!);
+  assert.ok(fullWire > tooSmall.value.requestCapacityChars!);
   assert.deepEqual(prepared.record.value.native, []);
   assert.ok(prepared.writes.every(write => !['question', 'discovery-draft', 'mc1-question'].includes(write.kind)));
   const saved = ok(writeQuestionPacket(f.store, request));
@@ -751,7 +757,7 @@ test('E2 splits MC2 by indivisible connectors, assigns the outcome to the last p
   const p = expansionFixture(t), { f } = p;
   const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
   assert.ok(whole.fingerprint);
-  const environment = p.environment(whole.fingerprint.chars - 1);
+  const environment = p.environment(packetWire(whole.packet) - 1);
   let request = { ...p.request, environment: reference(environment) };
   const first = ok(writeQuestionPacket(f.store, request));
   const plan = first.record.value.plan!;
@@ -813,7 +819,7 @@ test('E2 splits MC2 by indivisible connectors, assigns the outcome to the last p
 test('E2 refuses a skipped part, a forged previous packet and a duplicated provenance prefix', t => {
   const p = expansionFixture(t), { f } = p;
   const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
-  const environment = p.environment(whole.fingerprint!.chars - 1), request = { ...p.request, environment: reference(environment) };
+  const environment = p.environment(packetWire(whole.packet) - 1), request = { ...p.request, environment: reference(environment) };
   const first = ok(writeQuestionPacket(f.store, request)), firstResult = partResult(p, first), proposal = firstResult.proposal;
   const prefix = { packet: reference(first.record), proposal: reference(proposal), result: reference(firstResult.record) };
   const next = ok(writeQuestionPacket(f.store, { ...request, previous: [prefix] }));
@@ -847,7 +853,7 @@ test('E2 persists an indivisible MC2 overflow and does not issue a smaller arbit
 test('E2 part provenance rejects a recomputed revision of adapter raw bytes and a substituted derived proposal', t => {
   const p = expansionFixture(t), { f } = p;
   const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
-  const environment = p.environment(whole.fingerprint!.chars - 1), request = { ...p.request, environment: reference(environment) };
+  const environment = p.environment(packetWire(whole.packet) - 1), request = { ...p.request, environment: reference(environment) };
   const packet = ok(writeQuestionPacket(f.store, request)), result = partResult(p, packet);
   const history = ok(readPartResult(f.store, { project: f.project, record: reference(result.record) }));
   const sameContent = f.store.write<LayerProposal>({ id: `om-proposal:${f.project}:copied-part`, kind: result.proposal.kind, expected: 0, value: result.proposal.value });
@@ -934,7 +940,7 @@ test('E2 receives no invented connector assignment for a native outcome-only ide
 
 test('E2 counts all prior definitions before admitting the final part and persists a late mandatory-context overflow', t => {
   const p = expansionFixture(t), { f } = p, whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
-  const environment = p.environment(whole.fingerprint!.chars - 1), request = { ...p.request, environment: reference(environment) };
+  const environment = p.environment(packetWire(whole.packet) - 1), request = { ...p.request, environment: reference(environment) };
   const first = ok(writeQuestionPacket(f.store, request));
   const firstResult = partResult(p, first, body => {
     for (let index = 0; index < 128; index++) body.nodes.push({ ...clone(body.nodes[0]!), id: `garden-prior-extra-${index}`, title: `Prior node ${index}` });
@@ -949,7 +955,7 @@ test('E2 counts all prior definitions before admitting the final part and persis
 
 test('E2 part-result admission rejects a foreign purpose, another declared attempt and missing or mismatched adapter response', t => {
   const p = expansionFixture(t), { f } = p, whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
-  const environment = p.environment(whole.fingerprint!.chars - 1);
+  const environment = p.environment(packetWire(whole.packet) - 1);
   const packet = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(environment) })), result = partResult(p, packet);
   const admitted = result.call.value;
   const sourceRequest: RecordCallRequest = { call: 'alternative', purpose: admitted.purpose, basis: admitted.basis, block: admitted.block,
@@ -1176,7 +1182,7 @@ test('E2.2 row 4: a part of a split node carries the causes of the questions it 
   assert.ok(whole.fingerprint && whole.plan!.mode === 'whole');
   assert.deepEqual((whole.packet as Record<string, Json>).refusals, one.expected, 'A whole packet of attempt 2 carries every cause');
   // Attempt 2 at a capacity the whole does not fit: the first part sends the questions of its connector alone.
-  const environment = p.environment(whole.fingerprint.chars - 1);
+  const environment = p.environment(packetWire(whole.packet) - 1);
   const first = ok(writeQuestionPacket(f.store, { ...wholeRequest, environment: reference(environment) })).record;
   const plan = first.value.plan!;
   assert.equal(first.value.state, 'ready'); assert.equal(plan.mode, 'parts'); assert.equal(plan.position, 0); assert.equal(plan.assignments.length, 2);
@@ -1270,7 +1276,7 @@ test('E2.2 row 11 (return №1, P2-2): the next part of a split node stands on t
   const series = ok(beginAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
   const request = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
   const whole = ok(prepareQuestionPacket(f.store, request)).record.value;
-  const environment = p.environment(whole.fingerprint!.chars - 1), partRequest = { ...request, environment: reference(environment) };
+  const environment = p.environment(packetWire(whole.packet) - 1), partRequest = { ...request, environment: reference(environment) };
   const firstWrite = ok(writeQuestionPacket(f.store, partRequest)), first = firstWrite.record;
   assert.equal(first.value.plan!.mode, 'parts'); assert.ok(first.value.journal);
   const result = partResult(p, firstWrite, undefined, { attempt: { series: reference(series), ordinal: 2 } });
@@ -1582,7 +1588,7 @@ test('E2 assigns a genuinely open outcome alone after C3 fills every connection 
   const expansion = (ready.value.packet as Record<string, any>).expansion;
   assert.deepEqual(expansion.assigned, [outcome.id]); assert.deepEqual(expansion.connections, []);
   assert.equal(expansion.obligations.length, p.obligations.length, 'The full upper obligations remain context, including already filled connections');
-  const environment = p.environment(ready.value.fingerprint!.chars - 1);
+  const environment = p.environment(packetWire(ready.value.packet) - 1);
   const blocked = ok(writeQuestionPacket(f.store, { ...request, environment: reference(environment) })).record;
   assert.equal(blocked.value.state, 'blocked'); assert.equal(blocked.value.refusal?.code, 'node_unexpandable');
   assert.deepEqual(blocked.value.plan!.assignments, [{ connector: null, obligations: [outcome.id] }]);
@@ -1744,7 +1750,7 @@ test('E2 admits an MC2 missing input field with a proven block consumer under th
   assert.equal(ready.value.state, 'ready'); assert.equal(ready.value.plan, null); assert.deepEqual(ready.value.native, []);
   const payload = ready.value.packet as Record<string, Json>;
   assert.equal(payload.task, 'input-field'); assert.equal(Object.hasOwn(payload, 'expansion'), false);
-  const environment = p.environment(ready.value.fingerprint!.chars - 1);
+  const environment = p.environment(packetWire(ready.value.packet) - 1);
   const blocked = ok(writeQuestionPacket(f.store, { ...request, environment: reference(environment) })).record;
   assert.equal(blocked.value.state, 'blocked'); assert.equal(blocked.value.refusal?.code, 'packet_too_large');
   f.restart();
@@ -2675,8 +2681,35 @@ for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation pres
   rejected(prepareQuestionPacket(f.store, wrong), 'packet_chain_invalid');
 });
 
+test('RD3: a fresh ordinary brief root and continuation keep the explicit capacity era', t => {
+  const p = packetFixture(t, 100_000), { f } = p;
+  const root = ok(writeQuestionPacket(f.store, p.request)).record;
+  assert.equal(root.value.state, 'ready');
+  assert.equal(root.value.packetContract, BRIEF_PACKET_CONTRACT);
+  assert.equal(root.value.capacityDelivery, OM_CAPACITY_DELIVERY_CONTRACT);
+  const delivered = sourceContinuation(p, root);
+  const child = ok(writeQuestionPacket(f.store, { ...p.request, continuation: delivered.continuation })).record;
+  assert.equal(child.value.state, 'ready');
+  assert.equal(child.value.capacityDelivery, OM_CAPACITY_DELIVERY_CONTRACT);
+  const payload = child.value.packet as Record<string, any>;
+  assert.ok(measureAdapterWire(payload, payload.requestId, 'fixture', 'high') <= 100_000);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(child) })), child);
+});
+
+test('RD3: a fresh works brief root also declares capacity delivery', async t => {
+  const f = await worksPacketFixture(t);
+  const root = ok(writeQuestionPacket(f.store, f.request())).record;
+  assert.equal(root.value.packetContract, WORKS_BRIEF_PACKET_CONTRACT);
+  assert.equal(root.value.capacityDelivery, OM_CAPACITY_DELIVERY_CONTRACT);
+  const payload = root.value.packet as Record<string, any>;
+  assert.ok(measureAdapterWire(payload, payload.requestId, 'fixture', 'high') <= 100_000);
+  f.restart();
+  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(root) })), root);
+});
+
 // OBL1 (№3773) replaces the blocked overflow: the continuation fits what the read brought by showing it as its length.
-test('E2 continuation saves overflow without truncating or reissuing native questions', t => {
+test('E2 continuation saves an exact bounded fragment without reissuing native questions', t => {
   const p = packetFixture(t, 50_000), { f } = p;
   // A complete addressed read can exceed capacity even though the original assignment fits.
   const source = new Evidence(f.store).document(f.project, 'large', 'delivered-information-'.repeat(6000), 'text/plain', 0);
@@ -2689,8 +2722,18 @@ test('E2 continuation saves overflow without truncating or reissuing native ques
   assert.equal(prepared.record.value.refusal, null);
   assert.ok(prepared.record.value.fingerprint!.chars <= 50_000);
   assert.equal(prepared.record.value.readsFit, true);
-  const shown = (prepared.record.value.packet as { sourceDeliveries: { data: { data: Record<string, unknown> }[] }[] }).sourceDeliveries.at(-1)!.data[0]!.data;
-  assert.deepEqual([shown.outcome, shown.length, shown.requested], ['too-large', source.value.content.length, { start: 0, end: source.value.content.length }]);
+  const payload = prepared.record.value.packet as unknown as { requestId: string; sourceDeliveries: { data: { data: OmCapacityDelivery }[] }[] };
+  const shown = payload.sourceDeliveries.at(-1)!.data[0]!.data;
+  const deliveryRef = delivery.continuation.deliveries[0]!;
+  const original = f.store.get<ReadDeliveryRecord>(deliveryRef.id, deliveryRef.revision)!;
+  assert.equal(shown.contract, OM_CAPACITY_DELIVERY_CONTRACT);
+  requireOmCapacityDelivery({ record: deliveryRef, pointer: '/data', value: original.value.data,
+    packet: delivery.continuation.packet, call: delivery.continuation.call,
+    response: delivery.continuation.response, delivery: deliveryRef }, shown);
+  assert.equal(shown.original.valueHash, hashJson(original.value.data));
+  assert.equal(shown.served.next, shown.served.end);
+  assert.ok(shown.served.end < shown.requested.end);
+  assert.ok(measureAdapterWire(payload as unknown as Json, payload.requestId, 'fixture', 'high') <= 50_000);
   assert.deepEqual(prepared.record.value.native, first.value.native);
   assert.equal(f.store.list('question').length, nativeCount);
   const before = snapshot(f.store);
@@ -2733,7 +2776,7 @@ test('E2 continuation rejects omitted evidence and foreign exact response or del
 test('E2 next MC2 part accepts the substantive result bound to a continued preceding part', t => {
   const p = expansionFixture(t, 100_000, 4), { f } = p;
   const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
-  const environment = p.environment(whole.fingerprint!.chars - 1);
+  const environment = p.environment(packetWire(whole.packet) - 1);
   const root = { ...p.request, environment: reference(environment) };
   const first = ok(writeQuestionPacket(f.store, root));
   assert.equal(first.record.value.plan!.mode, 'parts');
@@ -3596,7 +3639,7 @@ test('MP1.1 rows 5–8,20: actual managed correction → continuation → next p
     const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, false);
     const whole = historical ? h15AtCommit(f, MP11_BASE, 'mp11-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
       out(take(prepareQuestionPacket(store, args)).record);`, f.packetRequest) : f.packet;
-    const config = f.environment(whole.value.fullChars - 1);
+    const config = f.environment((historical ? whole.value.fullChars : packetWire(whole.value.packet)) - 1);
     const packetRequest = { ...f.packetRequest, environment: reference(config) };
     const packet = historical ? h15AtCommit(f, MP11_BASE, 'mp11-root', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
       out(take(writeQuestionPacket(store, args)).record);`, packetRequest) : ok(writeQuestionPacket(f.store, packetRequest)).record;
@@ -3668,7 +3711,7 @@ test('MP1.1 row 10: two individually proved parts from different brief versions 
     out(take(writeQuestionPacket(store, args)).record);`, oldRequest) as Revision<QuestionPacketRecord>;
   const old = ok(writeQuestionPacket(f.store, oldRequest)), oldPart = partResult(p, old); mp11Version(oldRecord, 'om-brief/v1');
   const largeEnvironment = p.environment(100_000), newWhole = ok(prepareQuestionPacket(f.store, { ...p.request, environment: reference(largeEnvironment) })).record;
-  const newEnvironment = p.environment(newWhole.value.fullChars! - 1), newRequest = { ...p.request, environment: reference(newEnvironment) };
+  const newEnvironment = p.environment(packetWire(newWhole.value.packet) - 1), newRequest = { ...p.request, environment: reference(newEnvironment) };
   const next = ok(writeQuestionPacket(f.store, newRequest)), nextPart = partResult(p, next); mp11Version(next.record, 'om-brief/v2');
   const request: QuestionPacketRequest = { ...newRequest, previous: [
     { packet: reference(oldRecord), proposal: reference(oldPart.proposal), result: reference(oldPart.record) },
@@ -3701,7 +3744,7 @@ test('LP7 row 29: a joined input packet is whole — ready when the capacity hol
     const asked = ((whole.value.packet as Record<string, Json>).questions as unknown as { id: string }[]).map(item => item.id).sort();
     assert.deepEqual(asked, joined.items.map(item => item.gap).sort(), 'One packet asks every field of the joined batch');
     if (fits) { assert.deepEqual(ok(writeQuestionPacket(f.store, request)).record, whole); continue; }
-    const small = { ...request, environment: reference(p.environment(whole.value.fullChars! - 1)) };
+    const small = { ...request, environment: reference(p.environment(packetWire(whole.value.packet) - 1)) };
     const blocked = ok(writeQuestionPacket(f.store, small)).record;
     assert.deepEqual([blocked.value.state, blocked.value.refusal?.code, blocked.value.packet, blocked.value.plan],
       ['blocked', 'packet_too_large', null, null], 'Not split into parts, not cut down to what fits');
@@ -4222,7 +4265,8 @@ test('SP1a №4714 §5 «доставка» MC1: a new root declares the selecti
 test('SP1a №4714 §5 «доставка» node and parts: an expansion root and each of its parts carry the same declaration and the same selected originals', t => {
   const p = expansionFixture(t), { f } = p;
   const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
-  const environment = p.environment(whole.fingerprint!.chars - 1);
+  const wholePayload = whole.packet as Record<string, any>;
+  const environment = p.environment(measureAdapterWire(wholePayload, wholePayload.requestId, 'fixture', 'high') - 1);
   const request = { ...p.request, environment: reference(environment) };
   const first = ok(writeQuestionPacket(f.store, request)).record;
   assert.equal(first.value.plan!.mode, 'parts');

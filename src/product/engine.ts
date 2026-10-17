@@ -4,6 +4,7 @@ import { listBypassDecisions } from "../om/addressing.js";
 import { recoverModelCall } from "../discovery/model-call-recovery.js";
 import { recoverOmModelCall } from "../om/model-call.js";
 import { configureDispatch } from '../om/dispatch.js';
+import { recoverOmCapacity, permitOmLimitedCallRetry } from '../om/capacity-delivery.js';
 import { continuePass, readPass, resumeStoppedPass, startPass, stopPass } from '../om/run-driver.js';
 import { readEnvironmentReadiness } from '../om/environment-readiness.js';
 import { regateRun, releaseRegateWait } from '../om/run.js';
@@ -255,7 +256,14 @@ export class ProductEngine {
       case 'apply-obligation-policy': this.#project(command.project); return applyObligationPolicy(this.store,command.project,command.scope,command.policy);
       // DRY6-02: the explicit addressed door of an older cancelled attempt — one new attempt of exactly that call.
       case "permit-cancelled-call-retry": this.#project(command.project); return permitCancelledCallRetry(this.store, command, this.actor);
-      case "permit-limited-call-retry": this.#project(command.project); return permitLimitedCallRetry(this.store, command, this.actor);
+      case "recover-om-capacity": this.#project(command.project); return recoverOmCapacity(this.store, command, this.actor);
+      case "permit-limited-call-retry": {
+        this.#project(command.project);
+        const value = this.store.get<Record<string, unknown>>(command.call.id)?.value;
+        return value && 'om' in value
+          ? permitOmLimitedCallRetry(this.store, command, this.actor)
+          : permitLimitedCallRetry(this.store, command, this.actor);
+      }
       case "recover-model-call": {
         this.#project(command.project);
         const value = this.store.get<Record<string, unknown>>(command.call.id)?.value;
