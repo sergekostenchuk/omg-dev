@@ -80,6 +80,11 @@ h1 b{color:var(--accent);font-weight:600}
 .detail details.dbf{display:block}
 .detail details.dbf summary{cursor:pointer;display:flex;gap:8px;list-style:none}
 .detail details.dbf dl{margin-top:6px}
+.detail .dbf .fl{all:unset;cursor:pointer;margin-left:auto;font:9.5px var(--mono);color:var(--ink3);border:1px solid var(--line2);border-radius:6px;padding:0 6px}
+.detail .dbf .fl:hover{color:var(--accent);border-color:var(--accent-line)}
+.detail .dbf.sel b{color:var(--accent)}
+.detail .dbleg{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:12px;font:10.5px var(--mono);color:var(--ink3)}
+.detail .dbleg .fl{all:unset;cursor:pointer;border:1px solid var(--line2);border-radius:6px;padding:0 6px}
 .sep{width:1px;height:20px;background:var(--line2);margin:0 4px}
 .hint{margin-left:auto;font:10.5px var(--mono);color:var(--ink3)}
 
@@ -279,7 +284,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <select class="chip" id="dbG" aria-label="Стадия"></select>
     <label class="chip" style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" id="dbP"> путь дальше</label>
     <button class="chip" id="dbX" type="button">Сбросить</button>
-    <span class="lg">сплошная — пишет · пунктир — читает · цвет — выбранный блок</span>
+    <span class="lg">клик по блоку или записи: <span style="color:var(--accent)">━ пишет</span> · <span style="color:var(--db4)">┅ читает</span> · в фильтре цвет — выбранный блок</span>
   </div>
 
   <div class="stagewrap">
@@ -3258,11 +3263,12 @@ research-stage(project, draftId, maxTurns)
     drawn.forEach(function(d,i){var on=!!es&&!!es[i],dim=!!es&&!es[i];
       d.p.classList.toggle("on",on);d.p.classList.toggle("dim",dim);d.p.setAttribute("marker-end",on?"url(#ah-on)":"url(#ah)");
       d.lb.classList.toggle("on",on);d.lb.classList.toggle("dim",dim);});
-    if(!sel)dbApply();
+    if(!sel||(dbOn&&dbF.focus))dbApply();
   }
 
   /* ---------- detail card ---------- */
   function openDetail(key){
+    if(dbOn&&DBL){dbF.k="";dbF.field="";dbF.focus=key;detail.dataset.kind="";dbEdges();}
     sel=key;var it=IT[key],st=ST[it.st],isNode=it.kind==="node";
     var h='<div class="top"><span class="pill'+(isNode?'':' acc')+'">'+esc(isNode?it.role:it.n)+'</span><span class="pill '+st[0]+'">'+st[1]+'</span>'+
       (it.g?'<span class="mk" title="пробел">!</span>':'')+'<button type="button" class="x" data-act="close" aria-label="Закрыть">×</button></div>'+
@@ -3279,7 +3285,7 @@ research-stage(project, draftId, maxTurns)
     if(expandable(key))h+='<div class="act"><button type="button" class="ib" data-act="toggle" data-key="'+esc(key)+'">'+(opened(key)?'свернуть ▾':'развернуть ▸')+'</button></div>';
     detail.innerHTML=h;detail.hidden=false;detail.scrollTop=0;apply();
   }
-  function closeDetail(){sel=null;detail.hidden=true;detail.innerHTML="";apply();}
+  function closeDetail(){sel=null;detail.hidden=true;detail.innerHTML="";detail.dataset.kind="";if(dbF.focus||dbF.k){dbClear();dbEdges();}apply();}
   detail.addEventListener("click",function(ev){
     var b=ev.target.closest("button");if(!b)return;
     if(b.dataset.act==="close"){closeDetail();return;}
@@ -3291,7 +3297,9 @@ research-stage(project, draftId, maxTurns)
   function toggle(k){
     if(!expandable(k))return;
     var before=pos[k]?pos[k].x*sc+tx:null;
-    exp[k]=!exp[k];sel=null;detail.hidden=true;detail.innerHTML="";layout();
+    exp[k]=!exp[k];sel=null;detail.hidden=true;detail.innerHTML="";
+    if(dbOn&&DBL){dbF.k="";dbF.field="";dbF.focus=k;}
+    layout();
     if(before!==null&&pos[k]){tx+=before-(pos[k].x*sc+tx);draw();}
     save();
   }
@@ -3362,7 +3370,7 @@ research-stage(project, draftId, maxTurns)
     if(d.moved){if(d.kind!=="pan")save();return;}
     if(d.kind==="node"){sel===d.key?closeDetail():openDetail(d.key);}
     else if(d.kind==="box"&&d.el&&d.el.classList.contains("scard")){expandable(d.key)?toggle(d.key):openDetail(d.key);}
-    else if(d.kind==="pan"&&sel)closeDetail();
+    else if(d.kind==="pan"&&(sel||dbF.focus||dbF.k))closeDetail();
   }
   canvas.addEventListener("pointerup",endDrag);
   canvas.addEventListener("pointercancel",function(){if(drag&&drag.el)drag.el.classList.remove("dragging");drag=null;canvas.classList.remove("panning");});

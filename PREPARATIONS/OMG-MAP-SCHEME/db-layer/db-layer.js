@@ -1,6 +1,7 @@
   /* ---------- DB layer: which block writes which record and field, and who reads it (data: db-layer/db-layer.json, inserted at build) ---------- */
   var DBL=/*@DBLAYER@*/null;
-  var dbOn=false,dbEl={},dbBox={},dbGrpEl={},dbHeadEl=null,dbDrawn=[],dbF={w:[],r:[],k:"",g:"",path:false};
+  var dbOn=false,dbEl={},dbBox={},dbGrpEl={},dbHeadEl=null,dbDrawn=[],dbF={w:[],r:[],k:"",g:"",path:false,focus:"",field:""};
+  var DBW="var(--accent)",DBR="var(--db4)";  /* click mode: writes vs reads */
   var DBC=["var(--accent)","var(--ok)","var(--warn)","var(--db4)"];
   try{var dbs=JSON.parse(localStorage.getItem(KEY+"-db")||"null");if(dbs){dbOn=!!dbs.on;dbF.g=dbs.g||"";}}catch(_){}
   function dbSave(){try{localStorage.setItem(KEY+"-db",JSON.stringify({on:dbOn,g:dbF.g}));}catch(_){}}
@@ -10,7 +11,11 @@
     for(var i=0;i<parts.length;i++){cur=cur?cur+"."+parts[i]:parts[i];if(IT[cur])out.push(IT[cur].t);else return key+" (?)";}
     return out.join(" · ");}
   function dbShortFields(arr){if(!arr||!arr.length)return "";var s=arr.slice(0,3).join(", ");return arr.length>3?s+" …":s;}
-  function dbActive(){return dbOn&&(dbF.w.length||dbF.r.length||dbF.k);}
+  function dbActive(){return dbOn&&(dbF.w.length||dbF.r.length||dbF.k||dbF.focus);}
+  /* a field picked in the record card narrows lines to entries touching that field (same top-level key or nested) */
+  function dbFieldHit(en){if(!dbF.field)return true;var top=dbF.field.split(".")[0];
+    return (en.fields||[]).some(function(f){return f===dbF.field||dbF.field.indexOf(f+".")===0||f.indexOf(dbF.field+".")===0||f.split(".")[0]===top;});}
+  function dbClear(){dbF.focus="";dbF.k="";dbF.field="";var sk=document.getElementById("dbK");if(sk)sk.value="";}
   function dbBuild(){
     if(!DBL)return;
     dbHeadEl=document.createElement("div");dbHeadEl.className="dbhead";dbHeadEl.hidden=true;
@@ -81,8 +86,11 @@
       if(dbF.path)(k.writers||[]).some(function(en){return dbUnder(en.node,w);})&&(k.readers||[]).forEach(function(en){draw(k.kind,en,false,DBC[i],true);});});});
     dbF.r.forEach(function(r,i){kinds.forEach(function(k){(k.readers||[]).forEach(function(en){if(dbUnder(en.node,r))draw(k.kind,en,false,DBC[i],true);});
       if(dbF.path)(k.readers||[]).some(function(en){return dbUnder(en.node,r);})&&(k.writers||[]).forEach(function(en){draw(k.kind,en,true,DBC[i],false);});});});
+    if(dbF.focus)kinds.forEach(function(k){
+      (k.writers||[]).forEach(function(en){if(dbUnder(en.node,dbF.focus))draw(k.kind,en,true,DBW,false);});
+      (k.readers||[]).forEach(function(en){if(dbUnder(en.node,dbF.focus))draw(k.kind,en,false,DBR,true);});});
     if(dbF.k){var k=DBL.kinds.filter(function(x){return x.kind===dbF.k;})[0];
-      if(k){(k.writers||[]).forEach(function(en){draw(k.kind,en,true,DBC[0],false);});(k.readers||[]).forEach(function(en){draw(k.kind,en,false,DBC[1],true);});
+      if(k){(k.writers||[]).filter(dbFieldHit).forEach(function(en){draw(k.kind,en,true,DBW,false);});(k.readers||[]).filter(dbFieldHit).forEach(function(en){draw(k.kind,en,false,DBR,true);});
         if(dbF.path)(k.readers||[]).forEach(function(rd){kinds.forEach(function(k2){(k2.writers||[]).forEach(function(en){if(dbUnder(en.node,rd.node)||dbUnder(rd.node,en.node))draw(k2.kind,en,true,DBC[2],false);});});});}}
   }
   /* highlight: involved blocks and records stay lit, the rest fades */
@@ -92,15 +100,20 @@
     var lit={},klit={};
     function mark(node){var r=resolve(node);lit[r]=1;}
     var kinds=DBL.kinds.filter(dbKindOn);
+    if(dbF.focus){lit[resolve(dbF.focus)]=1;kinds.forEach(function(k){
+      (k.writers||[]).forEach(function(en){if(dbUnder(en.node,dbF.focus)){klit[k.kind]=1;mark(en.node);}});
+      (k.readers||[]).forEach(function(en){if(dbUnder(en.node,dbF.focus)){klit[k.kind]=1;mark(en.node);}});});}
+    if(dbF.k){klit[dbF.k]=1;var kk=DBL.kinds.filter(function(x){return x.kind===dbF.k;})[0];
+      if(kk){(kk.writers||[]).filter(dbFieldHit).forEach(function(en){mark(en.node);});(kk.readers||[]).filter(dbFieldHit).forEach(function(en){mark(en.node);});}}
     kinds.forEach(function(k){
       var hitW=(k.writers||[]).some(function(en){return dbF.w.some(function(w){return dbUnder(en.node,w);});});
       var hitR=(k.readers||[]).some(function(en){return dbF.r.some(function(r){return dbUnder(en.node,r);});});
-      if(hitW||hitR||dbF.k===k.kind){klit[k.kind]=1;
-        if(dbF.k===k.kind||dbF.path){(k.writers||[]).forEach(function(en){mark(en.node);});(k.readers||[]).forEach(function(en){mark(en.node);});}
+      if(hitW||hitR){klit[k.kind]=1;
+        if(dbF.path){(k.writers||[]).forEach(function(en){mark(en.node);});(k.readers||[]).forEach(function(en){mark(en.node);});}
         else{(k.writers||[]).forEach(function(en){if(dbF.w.some(function(w){return dbUnder(en.node,w);}))mark(en.node);});
           (k.readers||[]).forEach(function(en){if(dbF.r.some(function(r){return dbUnder(en.node,r);}))mark(en.node);});}}
     });
-    visibleKeys().forEach(function(k){var el=elOf(k);el.classList.toggle("near",!!lit[k]);el.classList.toggle("dim",!lit[k]);el.classList.remove("on");});
+    visibleKeys().forEach(function(k){var el=elOf(k);el.classList.toggle("near",!!lit[k]&&k!==sel);el.classList.toggle("dim",!lit[k]&&k!==sel);el.classList.toggle("on",k===sel);});
     drawn.forEach(function(d){d.p.classList.add("dim");d.lb.classList.add("dim");});
     kinds.forEach(function(k){dbEl[k.kind].classList.toggle("on",!!klit[k.kind]);dbEl[k.kind].classList.toggle("dim",!klit[k.kind]);});
   }
@@ -108,7 +121,7 @@
   function dbRow(t,v,cls){return v?'<div><dt>'+esc(t)+'</dt><dd'+(cls?' class="'+cls+'"':'')+'>'+esc(v)+'</dd></div>':'';}
   function openDbDetail(kind){
     var k=DBL.kinds.filter(function(x){return x.kind===kind;})[0];if(!k)return;
-    sel=null;var c=k.card||{};
+    sel=null;var c=k.card||{};dbF.focus="";if(dbF.k!==kind){dbF.k=kind;dbF.field="";}var sk=document.getElementById("dbK");if(sk)sk.value=kind;
     var h='<div class="top"><span class="pill acc">'+(k.proposed?"предложение":"запись")+'</span><span class="pill">'+esc((DBL.groups.filter(function(g){return g.id===k.group;})[0]||{}).t||k.group)+'</span>'+
       '<button type="button" class="x" data-act="close" aria-label="Закрыть">×</button></div><h2 class="mono">'+esc(k.kind)+'</h2><div class="io">'+esc(k.idPattern||"")+'</div><dl>'+
       dbRow("Что",c.what)+dbRow("Где",c.where)+dbRow("Когда",c.when)+dbRow("Зачем",c.why)+dbRow("Что ожидают читатели",c.expects)+dbRow("Риски",c.risks,"gap")+dbRow("Сколько",c.size)+'</dl>';
@@ -121,10 +134,12 @@
     var fs=k.fields||[];
     if(fs.length){h+='<div class="dbsec">Поля ('+fs.length+') · ★ — стык между блоками</div>';
       fs.forEach(function(f){
-        if(f.iface)h+='<details class="dbf"><summary><b>★ '+esc(f.path)+'</b><i>'+esc(f.type||"")+'</i></summary><dl>'+dbRow("Что",f.what)+dbRow("Кто пишет",f.writer)+dbRow("Кто читает",f.readers)+dbRow("Что ожидают",f.expects)+dbRow("Риски",f.risks,"gap")+'</dl></details>';
-        else h+='<div class="dbf"><b>'+esc(f.path)+'</b><i>'+esc(f.type||"")+'</i>'+(f.what?'<span>'+esc(f.what)+'</span>':'')+'</div>';});}
-    h+='<div class="act"><button type="button" class="ib" data-dbf="'+esc(k.kind)+'">показать связи на схеме</button></div>';
-    detail.innerHTML=h;detail.hidden=false;detail.scrollTop=0;apply();
+        var fsel=dbF.field===f.path?' sel':'';
+        if(f.iface)h+='<details class="dbf'+fsel+'"><summary><b>★ '+esc(f.path)+'</b><i>'+esc(f.type||"")+'</i><button type="button" class="fl" data-dbfield="'+esc(f.path)+'">стрелки поля</button></summary><dl>'+dbRow("Что",f.what)+dbRow("Кто пишет",f.writer)+dbRow("Кто читает",f.readers)+dbRow("Что ожидают",f.expects)+dbRow("Риски",f.risks,"gap")+'</dl></details>';
+        else h+='<div class="dbf'+fsel+'"><b>'+esc(f.path)+'</b><i>'+esc(f.type||"")+'</i><button type="button" class="fl" data-dbfield="'+esc(f.path)+'">стрелки поля</button>'+(f.what?'<span>'+esc(f.what)+'</span>':'')+'</div>';});}
+    h+='<div class="dbleg"><span style="color:var(--accent)">━ пишет</span><span style="color:var(--db4)">┅ читает</span>'+(dbF.field?'<button type="button" class="fl" data-dbfield="">все поля</button><span>поле: '+esc(dbF.field)+'</span>':'')+'</div>';
+    var keep=detail.scrollTop,same=detail.dataset.kind===kind;detail.dataset.kind=kind;
+    detail.innerHTML=h;detail.hidden=false;detail.scrollTop=same?keep:0;dbEdges();apply();
     DBL.kinds.forEach(function(x){dbEl[x.kind].classList.toggle("on",x.kind===kind);});
   }
   function dbNodeInfo(key){
@@ -166,10 +181,10 @@
     dbT.addEventListener("click",function(){dbOn=!dbOn;dbT.setAttribute("aria-pressed",dbOn?"true":"false");dbBar.hidden=!dbOn;dbSave();layout();fit();});
     document.getElementById("dbW").addEventListener("change",function(e){var v=e.target.value;if(v&&dbF.w.indexOf(v)<0&&dbF.w.length<4)dbF.w.push(v);e.target.value="";dbRefresh();});
     document.getElementById("dbR").addEventListener("change",function(e){var v=e.target.value;if(v&&dbF.r.indexOf(v)<0&&dbF.r.length<4)dbF.r.push(v);e.target.value="";dbRefresh();});
-    document.getElementById("dbK").addEventListener("change",function(e){dbF.k=e.target.value;dbRefresh();});
+    document.getElementById("dbK").addEventListener("change",function(e){dbF.k=e.target.value;dbF.field="";dbF.focus="";if(dbF.k)openDbDetail(dbF.k);else dbRefresh();});
     document.getElementById("dbG").addEventListener("change",function(e){dbF.g=e.target.value;dbSave();layout();fit();});
     document.getElementById("dbP").addEventListener("change",function(e){dbF.path=e.target.checked;dbRefresh();});
-    document.getElementById("dbX").addEventListener("click",function(){dbF.w=[];dbF.r=[];dbF.k="";dbF.path=false;document.getElementById("dbK").value="";document.getElementById("dbP").checked=false;dbRefresh();});
+    document.getElementById("dbX").addEventListener("click",function(){dbF.w=[];dbF.r=[];dbF.k="";dbF.path=false;dbF.focus="";dbF.field="";document.getElementById("dbK").value="";document.getElementById("dbP").checked=false;dbRefresh();});
     dbBar.addEventListener("click",function(ev){var b=ev.target.closest("button");if(!b)return;
       if(b.dataset.rmw){dbF.w=dbF.w.filter(function(x){return x!==b.dataset.rmw;});dbRefresh();}
       if(b.dataset.rmr){dbF.r=dbF.r.filter(function(x){return x!==b.dataset.rmr;});dbRefresh();}});
@@ -177,5 +192,6 @@
     view.addEventListener("keydown",function(ev){if(ev.key!=="Enter"&&ev.key!==" ")return;var c=ev.target.closest(".dbk");if(c){ev.preventDefault();openDbDetail(c.dataset.kind);}});
     detail.addEventListener("click",function(ev){var b=ev.target.closest("button");if(!b)return;
       if(b.dataset.dbk)openDbDetail(b.dataset.dbk);
+      if(b.dataset.dbfield!==undefined&&detail.dataset.kind){ev.preventDefault();dbF.field=b.dataset.dbfield;openDbDetail(detail.dataset.kind);}
       if(b.dataset.dbf){dbF.k=b.dataset.dbf;document.getElementById("dbK").value=dbF.k;if(!dbOn)dbT.click();else dbRefresh();}});
   }
