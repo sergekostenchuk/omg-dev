@@ -250,7 +250,7 @@ ul.plain b{color:var(--ink);font-weight:500}
   <nav class="nav" aria-label="Разделы">
     <span>Вход</span><a href="#i-what">Что это</a><a href="#i-when">Когда что</a><a href="#i-secrets">Секреты</a><a href="#i-owner">Владелец</a><a href="#i-gaps">Пробелы</a>
     <span>Discovery</span><a href="#d-subs">Подблоки</a><a href="#d-actions">Действия модели</a><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
-    <span>New Discovery</span><a href="#nd-intro">Определение</a><a href="#nd-dossier">Досье</a><a href="#nd-axes">12 осей</a><a href="#nd-steps">Шаги</a><a href="#nd-research">Исследование</a><a href="#nd-checks">Проверки</a><a href="#nd-critique">Замечания</a><a href="#nd-consumers">Потребители</a><a href="#nd-ui">UI</a><a href="#nd-gap">Разрыв</a><a href="#nd-decide">Решения</a>
+    <span>New Discovery</span><a href="#nd-intro">Определение</a><a href="#nd-dossier">Досье</a><a href="#nd-axes">12 осей</a><a href="#nd-steps">Шаги</a><a href="#nd-research">Исследование</a><a href="#nd-checks">Проверки</a><a href="#nd-critique">Замечания</a><a href="#nd-consumers">Потребители</a><a href="#nd-ui">UI</a><a href="#nd-storage">Хранение</a><a href="#nd-gap">Разрыв</a><a href="#nd-decide">Решения</a>
     <span>Концепция</span><a href="#c-subs">Подблоки</a><a href="#c-what">Что это</a><a href="#c-input">Вход</a><a href="#c-process">Обработка</a><a href="#c-output">Выход</a><a href="#c-records">Записи</a><a href="#c-doors">Двери</a><a href="#c-gaps">Пробелы</a><a href="#c-missed">Упускали</a>
     <span>Карта L1</span><a href="#m-subs">Подблоки</a><a href="#m-what">Что это</a><a href="#m-input">Вход</a><a href="#m-process">Обработка</a><a href="#m-output">Выход</a><a href="#m-records">Записи</a><a href="#m-doors">Двери</a><a href="#m-gaps">Пробелы</a><a href="#m-missed">Упускали</a>
     <span>Спецификация</span><a href="#s-subs">Подблоки</a><a href="#s-what">Что это</a><a href="#s-input">Вход</a><a href="#s-process">Обработка</a><a href="#s-output">Выход</a><a href="#s-records">Записи</a><a href="#s-doors">Двери</a><a href="#s-gaps">Пробелы</a><a href="#s-missed">Упускали</a>
@@ -650,6 +650,28 @@ research-stage(project, draftId, maxTurns)
         <p style="margin-top:10px">Имена команд и записей — предложение для договора; утверждаются вместе с устройством стадии.</p>
       </section>
 
+      <section class="sec wide" id="nd-storage">
+        <h3>Хранение и данные <small>как это ляжет в SQLite движка · факты базы HX5 17.10</small></h3>
+        <p><b>Как устроено сейчас.</b> База проекта — файл <code>state.sqlite</code>, 11 таблиц. Смысловых таблиц нет: всё содержимое — записи в одном хранилище. <code>revisions</code> — каждая версия каждой записи (5 колонок: <code>entity_id</code>, <code>revision</code>, <code>kind</code>, <code>body</code> JSON, <code>sha256</code>; только добавляется); <code>heads</code> — последняя версия записи; <code>events</code> — порядок записи; плюс кэш доказательств (4 таблицы <code>proof_*</code>) и служебные (<code>identity</code>, <code>migrations</code>, <code>sqlite_sequence</code>, <code>snapshot_stamp</code>). Вид записи — поле <code>kind</code> (в HX5 их 31); индексы только по идентификатору, по содержимому JSON — нет.</p>
+        <div class="tw"><table>
+          <thead><tr><th>Факт HX5 (только Discovery, ~100 вызовов, 6 часов)</th><th>Значение</th><th>Что значит для New Discovery</th></tr></thead>
+          <tbody>
+            <tr><td>Размер базы</td><td>468 МБ · 2 516 версий · 1 210 записей</td><td>12 осей и два прохода при нынешнем хранении дадут гигабайты на проект</td></tr>
+            <tr><td>Копии пакетов модели</td><td>архивы контекста 223 МБ · намерения хода 169 МБ · запросы 39 МБ — 99 % объёма</td><td>Пакет хода должен ссылаться на уже сохранённое по хэшу, а не копировать его заново</td></tr>
+            <tr><td>Знание</td><td>источники 0,3 МБ · снимки страниц 1 МБ · ходы 1,4 МБ · вопросы и ответы &lt; 0,1 МБ</td><td>Досье само по себе маленькое; дорого не знание, а его повторная пересылка</td></tr>
+            <tr><td>Поиск по содержимому</td><td>только перебор записей вида</td><td>Экраны «Досье», «Ход исследования» и правило «движение по плану» без проекции будут перебором</td></tr>
+          </tbody>
+        </table></div>
+        <h4>Что нужно решить в устройстве</h4>
+        <ul class="plain">
+          <li><b>Записи досье:</b> утверждение (вид, источник с диапазоном, ось, варианты, вопрос плана), вопрос плана (класс, критерий, состояние), вариант, выбор владельца, итог, конституция — какие отдельными записями, какие частью одной, что версионируется.</li>
+          <li><b>Ссылка вместо копии:</b> пакет модели собирается из ссылок на сохранённые записи по хэшу; полный пакет хранится один раз, а не на каждый ход.</li>
+          <li><b>Проекции для экранов и правил:</b> индексируемая выборка «утверждения по оси / варианту / виду», «основания по вопросу плана и источнику» — пересчитываемая из записей, не источник истины.</li>
+          <li><b>Рост и бюджет:</b> оценка объёма на проект по глубине осей; предел, при котором движок предупреждает.</li>
+          <li><b>Эра:</b> старые записи Discovery v5/v6 читаются по своей эре; новые виды записей не переписывают прошлое.</li>
+        </ul>
+      </section>
+
       <section class="sec wide" id="nd-gap">
         <h3>Что есть сейчас и разрыв <small>аудит движка 17.10</small></h3>
         <div class="tw"><table>
@@ -665,6 +687,7 @@ research-stage(project, draftId, maxTurns)
             <tr><td>Проверка цитат и формы</td><td><span class="pill ok">есть</span> ссылки, индексы, связи план → отчёт → вердикт</td><td>Сохранить</td></tr>
             <tr><td>Выдача потребителям</td><td><span class="pill acc">частично</span> ограничения и основания идут в концепцию и OM</td><td>Проекции досье по каждому потребителю</td></tr>
             <tr><td>UI владельца</td><td><span class="pill acc">частично</span> stage-summary, owner_choice</td><td>Шесть точек касания: экран + команда + запись</td></tr>
+            <tr><td>Хранение</td><td><span class="pill bad">нет</span> пакет модели копируется целиком каждый ход (99 % базы HX5); индексов по содержимому нет</td><td>Ссылки по хэшу вместо копий; проекции для экранов и правил</td></tr>
             <tr><td>Хранитель смысла</td><td><span class="pill bad">нет</span></td><td>Конституция проекта и проверка дрейфа</td></tr>
           </tbody>
         </table></div>
