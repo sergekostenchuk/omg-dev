@@ -636,7 +636,7 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
       try {
         await researchCall(dispatch.implementer, dispatch, cursor.prompt, cursor.context, signal,
           { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot,
-            ...(durableHead ? { session: durableHead } : {}), consumerIntent: reference(intent) });
+            ...(durableHead ? { session: durableHead } : {}), consumerIntent: reference(intent), ...(isResearchPreview() ? { previewIntent: intent } : {}) });
       } catch (error) {
         if (!isResponseRecovery() && error instanceof EngineError
           && ['input_stale', 'revision_conflict', 'pilot_call_active'].includes(error.code)) {
@@ -686,6 +686,11 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
         proveRecord: record => { readReaderResultAt(store, projectId, reference(record)); } });
     } catch (error) {
       if (error instanceof EngineError && SYNTHESIS_TRANSITION_REFUSAL_CODES.has(error.code)) {
+        // A capacity refusal is an application of the paid result too. Re-admit
+        // its exact sources before writing; if its CAS races, the outer retry
+        // observes the moved basis instead of looping on the old guards.
+        if (error.code === 'research_result_capacity')
+          synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, latest);
         const refused = refuseResearchConsumerIntent(store, reference(latest), error.code);
         throw new EngineError(error.code, error.message, { intent: reference(refused), refusal: refused.value.refusal });
       }

@@ -1482,7 +1482,14 @@ test('18 a partial page writes its checkpoint, note, cursors, workspace and appl
   const checkpoints = f.store.list<any>('research-checkpoint');
   assert.ok(checkpoints.length >= 1, 'each page checkpoint is saved once');
   assert.ok(checkpoints.every(checkpoint => checkpoint.value.status === 'unassessed'));
-  assert.equal(f.session().value.notes.length, 3, 'the page and both fragment steps each saved their own note');
+  assert.equal(f.session().value.notes.filter((note: any) => !note.consolidated).length, pageSends.length - 1,
+    'each delivered nonfinal page saved its own exact note');
+  for (const note of f.session().value.notes) {
+    const saved = f.store.get<any>(note.checkpoint.id, note.checkpoint.revision);
+    assert.ok(saved, 'each note retains its exact checkpoint revision');
+    assert.deepEqual(reference(saved), note.checkpoint);
+    assert.equal(saved.value.status, 'unassessed');
+  }
   const checkpoint = checkpoints[0]!;
   assert.equal(readResearchConsumerIntent(f.store, reference(f.store.get<any>(intent.id)!)).value.state, 'applied');
   assert.ok(f.store.get<any>(intent.id)!.value.outputs.some((output: Ref) => output.id === checkpoint.id));
@@ -1797,7 +1804,11 @@ test('30 a saved checkpoint of the same draft survives a sibling draft revision;
 async function consolidationV2Fixture(t: test.TestContext, consolidationBody?: string,
   tune: { maxRequestChars?: number; padding?: number } = {}) {
   const f = await synthesisV2Fixture(t, `
-if(c.synthesisPage.complete&&(c.conclusions??[]).length===0)research={action:'checkpoint',question:c.question.id,value:{note:'F'.repeat(20000)},citations:[%CITE%],unresolved:['Keep the exception open']};
+if(c.synthesisPage.complete&&(c.conclusions??[]).length===0){
+research={action:'checkpoint',question:c.question.id,value:{note:''},citations:[%CITE%],unresolved:['Keep the exception open']};
+const allowance=c.resultCapacity.forms.find(f=>f.kind==='checkpoint').maxResultChars;
+research.value.note='F'.repeat(Math.max(0,Math.min(20000,allowance-JSON.stringify(research).length)));
+}
 else research={action:'answer',question:c.question.id,value:{note:'Complete grounded answer'},citations:[%CITE%]};`,
     { maxRequestChars: tune.maxRequestChars ?? 30000, ...(tune.padding !== undefined ? { padding: tune.padding } : {}) }, consolidationBody);
   writeFileSync(join(f.root, 'big.txt'), 'Scoped condition\n' + 'filler\n'.repeat(200));
@@ -1866,7 +1877,8 @@ test('32 a summary above its size goal is saved with its notice; capacity is dec
 
 test('33 a lawful tightening keeps the source summary, and its repeat needs no new payment', async t => {
   const f = await consolidationV2Fixture(t,
-    `research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'Tightened finding keeps every distinction'+('x'.repeat(c.consolidation.tightening?2000:16000))}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`);
+    `research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'Tightened finding keeps every distinction'+('x'.repeat(c.consolidation.tightening?2000:16000))}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`,
+    { maxRequestChars: 40000, padding: 10000 });
   const restore = f.interruptAfter(f.store, writes => writes.some(write => write.kind === 'synthesis-session'
     && Array.isArray((write.value as any).notes)
     && (write.value as any).notes.some((note: any) => note.consolidated?.tightenedFrom)));
@@ -1888,7 +1900,8 @@ test('33 a lawful tightening keeps the source summary, and its repeat needs no n
 
 test('34 an already-tightened summary that still does not fit is an addressed capacity refusal, never an unchanged loop', async t => {
   const f = await consolidationV2Fixture(t,
-    `research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'Tightened finding keeps every distinction'+('x'.repeat(16000))}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`);
+    `research={action:'checkpoint',question:c.question.id,value:{summaries:[{notes:c.consolidation.notes.map((_,i)=>i),text:'Tightened finding keeps every distinction'+('x'.repeat(16000))}],citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:[]};`,
+    { maxRequestChars: 40000, padding: 10000 });
   await assert.rejects(f.invoke(), { code: 'consolidation_capacity_exhausted' });
   const calls = f.store.list('model-call').length;
   const headRevision = f.session().revision;
@@ -1906,19 +1919,16 @@ test('35 capacity consolidation before a synthesis send leaves the unsent step w
   assert.equal(result.action, 'answer');
   const intents = f.store.list<any>('research-consumer-intent');
   const superseded = intents.find(intent => intent.value.kind === 'synthesis' && intent.value.state === 'prepared');
-  assert.ok(superseded, 'the capacity-failed synthesis step was prepared before the consolidation');
-  assert.equal(superseded.value.call, null, 'the unsent synthesis step has no physical attempt');
-  assert.equal(superseded.value.outputs, null);
-  const applied = intents.filter(intent => intent.value.state === 'applied');
-  assert.ok(applied.every(intent => intent.value.owner.revision !== superseded.value.owner.revision
-    || intent.value.kind === 'consolidation' || intent.id !== superseded.id));
-  const head = f.session();
-  assert.notEqual(head.revision, superseded.value.owner.revision,
-    'the winning continuation derived the new synthesis from the new session state');
+  assert.equal(superseded, undefined, 'preflight refuses the unfit unsent step before persisting its intent');
+  assert.equal(intents.length, 3, 'only the checkpoint, consolidation and final answer own paid steps');
+  assert.ok(intents.every(intent => intent.value.state === 'applied'));
+  assert.equal(new Set(intents.map(intent => intent.value.key)).size, intents.length, 'each paid logical step has one continuer');
+  for (const intent of intents) readResearchConsumerIntent(f.open(), reference(intent));
   const calls = f.store.list('model-call').length;
+  assert.equal(calls, 3, 'preflight never sends the unfit step');
   assert.deepEqual(await f.invoke(f.open()), result);
   assert.equal(f.store.list('model-call').length, calls);
-  assert.equal(f.store.get<any>(superseded.id)!.value.state, 'prepared', 'the superseded step never became a continuer');
+  assert.deepEqual(f.store.list('research-consumer-intent'), intents, 'repeating the saved result creates no second continuer');
 });
 
 test('36 one offset across step kinds keeps its order through the session chain and its own provenance', async t => {

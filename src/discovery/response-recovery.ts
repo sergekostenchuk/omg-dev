@@ -1,6 +1,8 @@
+import { prepareResearchEnvelope } from './research-protocol.js';
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, deliveredConceptSections,
-  EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
+  EARLY_RESEARCH_OUTCOME, requireEscalationReply, researchCapacityInput, declareResultCapacity,
+  requireResultCapacity, researchResultFailure, researchResultEnvelopeLimit, RESULT_CAPACITY, RESULT_CAPACITY_REFUSAL } from './early-research-outcome.js';
 import { consolidationInput, consolidationPage, consolidationFragment,
   CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -11,7 +13,7 @@ import { constants as systemConstants } from 'node:os';
 import type { Store, Revision, Write, TransactionGuard } from '../storage/store.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
-import { Environments, uniqueTransactionGuards } from '../runtime/environment.js';
+import { Environments, uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { Graph } from '../graph/model.js';
 import { composeLayer } from '../graph/layer-design.js';
@@ -57,7 +59,7 @@ import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
 import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queuedChildReached } from './reading-plan.js';
-import { paidOriginId, paidSessionId } from './assessment-session.js';
+import { paidOriginId, paidSessionId, limitedAssessmentRetryScope } from './assessment-session.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 
 export interface ResponseRecovery {
@@ -158,7 +160,7 @@ export interface ResearchConsumerIntent {
   state: 'prepared' | 'running' | 'applied' | 'refused';
   call: Ref | null; request: Ref | null; archive: Ref | null; outputs: Ref[] | null;
   refusal: { code: string; kind: 'provider-failed' | 'terminal' | 'reader-invalid' | 'consumer-invalid';
-    call: Ref; request: Ref; response: Ref | null; archive: Ref } | null;
+    call: Ref; request: Ref; response: Ref | null; archive: Ref; capacity?: Record<string, unknown> } | null;
 }
 export type ResearchConsumerIntentInput = Omit<ResearchConsumerIntent,
   'contract' | 'rootKey' | 'generation' | 'previous' | 'state' | 'call' | 'request' | 'archive' | 'outputs' | 'refusal'>;
@@ -177,7 +179,9 @@ function sameLogicalConsumerStep(a: ResearchConsumerIntent, b: ResearchConsumerI
 }
 function samePreparedSubject(store: Store, a: ResearchConsumerIntent, b: ResearchConsumerIntent): boolean {
   const fixed = (value: ResearchConsumerIntent) => Object.fromEntries(Object.entries(value)
-    .filter(([key]) => !['role', 'dispatch', 'profile', 'guards', ...(value.kind === 'reader' ? ['draft'] : [])].includes(key)));
+    .filter(([key]) => !['role', 'dispatch', 'profile', 'guards', ...(value.kind === 'reader' ? ['draft'] : [])].includes(key))
+    .map(([key, item]) => key === 'cursor' ? [key, Object.fromEntries(Object.entries(item)
+      .filter(([name]) => !['resultCapacity', 'resultCapacityContract', 'resultCapacityPrompt'].includes(name)))] : [key, item]));
   return canonical(fixed(a)) === canonical(fixed(b))
     && (a.kind !== 'reader' || readerDraftEquivalent(store, a.draft, b.draft, a.question));
 }
@@ -221,7 +225,7 @@ function consumerShape(value: unknown, id: string): asserts value is ResearchCon
     || !(value.call === null || isRef(value.call)) || !(value.request === null || isRef(value.request))
     || !(value.archive === null || isRef(value.archive))
     || !(value.outputs === null || Array.isArray(value.outputs) && value.outputs.every(isRef))
-    || !(value.refusal === null || object(value.refusal) && Object.keys(value.refusal).sort().join(',') === 'archive,call,code,kind,request,response'
+    || !(value.refusal === null || object(value.refusal) && Object.keys(value.refusal).sort().join(',') === (value.refusal.capacity === undefined ? 'archive,call,code,kind,request,response' : 'archive,call,capacity,code,kind,request,response')
       && ['provider-failed', 'terminal', 'reader-invalid', 'consumer-invalid'].includes(value.refusal.kind)
       && typeof value.refusal.code === 'string' && !!value.refusal.code
       && isRef(value.refusal.call) && isRef(value.refusal.request)
@@ -297,6 +301,11 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
   consumerShape(origin.value, origin.id);
   if (origin.value.state !== 'prepared') consumerInvalid(saved.id, 'The original intent was not prepared');
   requireEscalationNeighbors(store, origin.value, origin.id);
+  if (origin.value.cursor.resultCapacityContract !== undefined || origin.value.cursor.resultCapacity !== undefined) {
+    requireCondition(origin.value.cursor.resultCapacityContract === RESULT_CAPACITY,
+      'research_capacity_invalid', 'The producer lost its capacity era');
+    requireResultCapacity(origin.value.cursor.resultCapacity, consumerResultCapacity(store, origin.value), store);
+  }
   if (origin.value.generation === 0) {
     if (origin.value.previous !== null) consumerInvalid(saved.id, 'The first generation cannot claim a predecessor');
   } else {
@@ -318,6 +327,10 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
       || hashJson(step.value) !== step.hash)
       consumerInvalid(saved.id, 'A saved consumer state revision is missing or changed');
     consumerShape(step.value, step.id);
+    if (step.value.cursor.resultCapacityContract !== undefined || step.value.cursor.resultCapacity !== undefined) {
+      requireCondition(step.value.cursor.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The prepared step lost its capacity era');
+      requireResultCapacity(step.value.cursor.resultCapacity, consumerResultCapacity(store, step.value), store);
+    }
     if (previous?.value.state === 'prepared') {
       if (step.value.state === 'prepared') {
         // C23: the only lawful prepared->prepared change is the atomic rebind
@@ -408,6 +421,9 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
       || canonical([refusal.call, refusal.request, refusal.response, refusal.archive]) !== canonical([
         reference(paid.call), paid.request, paid.response, paid.archive]))
       consumerInvalid(saved.id, 'The terminal refusal lacks its exact no-response physical proof');
+    if (refusal.code === RESULT_CAPACITY_REFUSAL && paid.kind === 'response'
+      && canonical(refusal.capacity) !== canonical(consumerCapacityFailure(store, saved, paid.payload)?.details))
+      consumerInvalid(saved.id, 'The capacity refusal lost its exact declared result measurements');
     if (paid.kind === 'response' && saved.value.kind === 'reader') {
       if (readerRefusalCode(saved, paid.payload) !== refusal.code)
         consumerInvalid(saved.id, 'The refused reader code differs from the original paid selection');
@@ -1334,6 +1350,49 @@ export function listResearchConsumerIntentsByRoot(store: Store, projectId: strin
     .filter(record => record.value.projectId === projectId && record.value.kind === 'reader'
       && record.value.cursor.rootKey === rootKey);
 }
+/** Rebuild the declaration from the exact producer, never today's heads. */
+export function consumerResultCapacity(store: Store, intent: ResearchConsumerIntent) {
+  const draft = store.get<DiscoveryDraft>(intent.draft.id, intent.draft.revision);
+  const question = store.get<Question>(intent.question.id, intent.question.revision);
+  const profile = intent.profile ? store.get<ReaderPilot>(intent.profile.id, intent.profile.revision) : null;
+  requireCondition(draft && question && canonical(reference(draft)) === canonical(intent.draft)
+    && canonical(reference(question)) === canonical(intent.question)
+    && (!intent.profile || profile && canonical(reference(profile)) === canonical(intent.profile)),
+  'research_capacity_invalid', 'Result capacity needs the exact draft, question and profile');
+  const cursor = intent.cursor, context = cursor.context;
+  return researchCapacityInput({ operation: intent.key, generation: intent.generation,
+    bindings: { projectId: intent.projectId, draft: intent.draft, question: intent.question,
+      inputsHash: hashJson(draft.value.inputs), basis: intent.basis, owner: intent.owner },
+    role: ['synthesis', 'consolidation'].includes(intent.kind) ? 'synthesizer'
+      : intent.kind === 'escalation-assessor' ? 'assessor' : 'analyst',
+    purpose: intent.kind, actionMode: intent.kind === 'consolidation' ? 'consolidation'
+      : context.dispatchMode ?? cursor.mode ?? intent.kind,
+    limit: researchResultEnvelopeLimit(intent.dispatch, profile?.value),
+    physicalReplyLimit: profile?.value.physicalLimits?.maxReplyChars ?? null,
+    prompt: cursor.resultCapacityPrompt ?? cursor.prompt ?? cursor.instruction, binding: intent.role, draft: draft.value,
+    question: { id: question.id, value: question.value }, context,
+    cursor: Object.fromEntries(['sessionId', 'offset', 'materialOffset', 'run', 'turn', 'pendingTurn', 'delivery',
+      'previousProposalRef', 'contextContract'].filter(key => Object.hasOwn(cursor, key)).map(key => [key, cursor[key]])) });
+}
+export function consumerCapacityFailure(store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown) {
+  const cursor = intent.value.cursor;
+  if (cursor.resultCapacityContract === undefined && cursor.resultCapacity === undefined) return null;
+  requireCondition(cursor.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The new attempt lost its capacity era');
+  const saved = requireResultCapacity(cursor.resultCapacity, consumerResultCapacity(store, intent.value), store);
+  return researchResultFailure(saved, payload);
+}
+
+/** One bounded correction, derived from the exact terminal producer and raw reply. */
+export function consumerCapacityCorrection(store: Store, intent: Revision<ResearchConsumerIntent>) {
+  if (intent.value.state !== 'refused' || intent.value.refusal?.code !== RESULT_CAPACITY_REFUSAL) return null;
+  const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+  const failure = paid.kind === 'response' ? consumerCapacityFailure(store, intent, paid.payload) : null;
+  if (!failure || paid.kind !== 'response') consumerInvalid(intent.id, 'The capacity correction lost its original paid result');
+  return { contract: RESULT_CAPACITY, code: failure.code, attempt: reference(intent),
+    details: { ...(failure.details as Record<string, unknown>), response: paid.response },
+    instruction: 'Return a smaller complete result of the same role; preserve sources and unresolved obligations.' };
+}
+
 export function prepareResearchConsumerIntent(store: Store, input: ResearchConsumerIntentInput,
   permits: readonly Ref[] = []): Revision<ResearchConsumerIntent> {
   if (!object(input)) consumerInvalid('research-consumer-intent', 'A complete consumer admission is required');
@@ -1360,6 +1419,31 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   const value: ResearchConsumerIntent = { ...input, contract: 'research-consumer-intent/v1',
     rootKey: input.key, generation, previous: replacing ? reference(previous!) : previous?.value.previous ?? null,
     state: 'prepared', call: null, request: null, archive: null, outputs: null, refusal: null };
+  // Retain an existing attempt's era; a new external generation declares its
+  // own admission. An old paid/unsent operation is never reclassified here.
+  value.cursor = { ...input.cursor };
+  if (previous && !replacing && previous.value.state !== 'prepared') {
+    if (previous.value.cursor.resultCapacityContract !== undefined) {
+      value.cursor.resultCapacityContract = previous.value.cursor.resultCapacityContract;
+      value.cursor.resultCapacity = previous.value.cursor.resultCapacity;
+      value.cursor.resultCapacityPrompt = previous.value.cursor.resultCapacityPrompt;
+    }
+  } else {
+    const correction = previous ? consumerCapacityCorrection(store, previous) : null;
+    if (correction) value.cursor.context = { ...value.cursor.context, failures: [correction] };
+    value.cursor.resultCapacityContract = RESULT_CAPACITY;
+    const profile = value.profile ? store.get<ReaderPilot>(value.profile.id, value.profile.revision)! : undefined;
+    for (let n = 0; n < 4; n += 1) {
+      value.cursor.resultCapacity = declareResultCapacity(store, consumerResultCapacity(store, value));
+      const actual = prepareResearchEnvelope(value.role, value.dispatch, value.cursor.prompt ?? value.cursor.instruction,
+        value.cursor.context, { store, draftId: value.draft.id, questionId: value.question.id,
+          purpose: ['synthesis', 'consolidation'].includes(value.kind) ? 'analyst' : value.kind, ...(profile ? { pilot: profile } : {}) },
+        value.cursor.resultCapacity);
+      if (consumerResultCapacity(store, value).mandatoryEnvelope.prompt === actual.envelope.prompt) { value.cursor.resultCapacityPrompt = actual.envelope.prompt; break; }
+      value.cursor.resultCapacityPrompt = actual.envelope.prompt;
+      requireCondition(n < 3, 'research_capacity_configuration', 'The admission prompt has no stable packet projection');
+    }
+  }
   consumerShape(value, 'research-consumer-intent');
   requireEscalationNeighbors(store, value, 'research-consumer-intent');
   if (previous && !sameLogicalConsumerStep(previous.value, value))
@@ -1625,7 +1709,7 @@ interface ResearchExecutionContext {
 export type ResearchExecution = ResearchExecutionContext & (
   { kind: 'response'; payload: unknown; response: Ref }
   | { kind: 'provider-failed'; response: Ref }
-  | { kind: 'terminal'; code: 'run_stopped' | 'run_control_changed' | 'process_cancelled'; response: null });
+  | { kind: 'terminal'; code: 'run_stopped' | 'run_control_changed' | 'process_cancelled' | 'process_output_limit'; response: null });
 
 /** The receipt records runProcess's close result, not an interpretation of its
  * status label. Both producers share the same physical proof. */
@@ -1690,8 +1774,9 @@ function assessmentExecution(store: Store, call: Revision<ModelCall>, value: Rec
   return physicalExecution(store, call, value, 'assessmentExecution', 'assessmentApplication', 'assessment-execution/v1');
 }
 
-function assessmentControlTerminal(store: Store, call: Revision<ModelCall>): 'run_stopped' | 'run_control_changed' | 'process_cancelled' | null {
+function assessmentControlTerminal(store: Store, call: Revision<ModelCall>): 'run_stopped' | 'run_control_changed' | 'process_cancelled' | 'process_output_limit' | null {
   const code = call.value.error;
+  if (code === 'process_output_limit') { requireLimitedCallTerminal(store, call); return code; }
   // DRY6-02: a dispatched assessor call the common stop cancelled, proved by its saved stop link; the terminal must follow
   // its exact running dispatch with nothing else changed.
   if (call.value.status === 'failed' && call.value.response === null && code === 'process_cancelled') {
@@ -1768,7 +1853,7 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   if (!earlyResearchStage(draft.value.stage)) return null;
   const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
   if (paid.kind !== 'response') return null;
-  return earlyResearchFailure(draft.value, question.value,
+  return consumerCapacityFailure(store, intent, paid.payload) ?? earlyResearchFailure(draft.value, question.value,
     intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
     intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question),
     intent.value.cursor.context?.discoveryBasisCatalogue ?? null,
@@ -1822,11 +1907,20 @@ export function retryableResearchConsumerRefusal(store: Store, intent: Revision<
   const refusal = intent.value.state === 'refused' ? intent.value.refusal : null;
   if (!refusal) return false;
   if (refusal.kind === 'provider-failed') return true;
+  if (refusal.code === RESULT_CAPACITY_REFUSAL) {
+    const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+    return paid.kind === 'response' && consumerCapacityFailure(store, intent, paid.payload) !== null;
+  }
   if (refusal.kind === 'consumer-invalid' && earlyResearchConsumerFailure(store, intent)) return true;
   if (refusal.kind === 'terminal' && ['run_stopped', 'run_control_changed'].includes(refusal.code)) {
     const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
     return paid.kind === 'terminal' && paid.response === null && paid.code === refusal.code
       && executionOf(paid.call.value)?.phase === 'claimed';
+  }
+  if (refusal.kind === 'terminal' && refusal.code === 'process_output_limit') {
+    const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
+    return paid.kind === 'terminal' && paid.response === null && paid.code === 'process_output_limit'
+      && readLimitedCallRetryPermit(store, paid.call, paid.call.value.consumerIntent!) !== null;
   }
   if (refusal.kind === 'terminal' && refusal.code === 'process_cancelled') return cancelledCallRetryable(store, intent);
   if (refusal.kind !== 'terminal' || refusal.code !== 'research_provider_failed') return false;
@@ -1895,6 +1989,97 @@ export function permitCancelledCallRetry(store: Store, request: { project: strin
   [reference(call!), reference(intent)])[0]!;
 }
 
+export const LIMITED_CALL_RETRY_PERMIT = 'limited-call-retry-permit/v1' as const;
+export interface LimitedCallRetryPermit {
+  contract: typeof LIMITED_CALL_RETRY_PERMIT; projectId: string; call: Ref; terminal: Ref; consumer: Ref; actor: string;
+}
+const limitedCallRetryPermitId = (call: string) => `limited-call-retry-permit:${call}`;
+
+/** The runtime's own dispatched terminal proves loss of a complete response;
+ * neither a partial stdout nor an arbitrary failed label grants another call. */
+function requireLimitedCallTerminal(store: Store, call: Revision<ModelCall>): Revision<ModelCall> {
+  const withoutRuntime = (value: ModelCall) => Object.fromEntries(Object.entries(value).filter(([field]) => field !== 'runtime'));
+  for (;;) {
+    const prior = store.get<ModelCall>(call.id, call.revision - 1);
+    if (!prior || prior.value.status !== 'failed' || canonical(withoutRuntime(prior.value)) !== canonical(withoutRuntime(call.value))) break;
+    call = prior;
+  }
+  const before = store.get<ModelCall>(call.id, call.revision - 1);
+  const unchanged = (value: ModelCall) => Object.fromEntries(Object.entries(value)
+    .filter(([field]) => !['status', 'finishedAt', 'error', 'runtime'].includes(field)));
+  requireCondition(call.kind === 'model-call' && call.value.status === 'failed' && call.value.error === 'process_output_limit'
+    && call.value.response === null && executionOf(call.value)?.phase === 'authorized'
+    && before?.kind === 'model-call' && before.value.status === 'running' && before.value.response === null
+    && before.value.error === null && executionOf(before.value)?.phase === 'authorized'
+    && canonical(unchanged(call.value)) === canonical(unchanged(before.value))
+    && Number.isSafeInteger(call.value.finishedAt) && Number(call.value.finishedAt) >= call.value.startedAt,
+  'limited_call_retry_invalid', `[${call.id}] Only the exact dispatched output-limit terminal without a usable response may be retried`);
+  return call;
+}
+
+export function readLimitedCallRetryPermit(store: Store, call: Revision<ModelCall>, consumer: Ref): Revision<LimitedCallRetryPermit> | null {
+  const terminal = requireLimitedCallTerminal(store, call);
+  requireCondition(isRef(consumer) && [call.value.consumerIntent, call.value.assessmentApplication]
+    .some(binding => canonical(binding ?? null) === canonical(consumer)),
+  'limited_call_retry_invalid', `[${call.id}] Permission must name the exact dispatched operation`);
+  const permit = store.get<LimitedCallRetryPermit>(limitedCallRetryPermitId(call.id));
+  if (!permit) return null;
+  const issuedFor = isRef(permit.value?.call) ? store.get<ModelCall>(permit.value.call.id, permit.value.call.revision) : null;
+  requireCondition(issuedFor && canonical(reference(issuedFor)) === canonical(permit.value.call),
+    'limited_call_retry_invalid', `[${call.id}] The exact call under which permission was issued is missing`);
+  requireCondition(permit.kind === 'limited-call-retry-permit' && permit.value.contract === LIMITED_CALL_RETRY_PERMIT
+    && permit.value.projectId === call.value.projectId && isRef(permit.value.call) && permit.value.call.id === call.id
+    && canonical(permit.value.terminal) === canonical(reference(terminal))
+    && canonical(reference(requireLimitedCallTerminal(store, issuedFor))) === canonical(reference(terminal))
+    && canonical(permit.value.consumer) === canonical(consumer) && typeof permit.value.actor === 'string' && !!permit.value.actor.trim(),
+  'limited_call_retry_invalid', `[${call.id}] The saved permission must bind this exact paid attempt and its original operation`);
+  return permit;
+}
+
+export function permitLimitedCallRetry(store: Store, request: { project: string; call: Ref }, actor: string): Revision<LimitedCallRetryPermit> {
+  requireCondition(request && typeof request.project === 'string' && !!request.project && isRef(request.call)
+    && typeof actor === 'string' && !!actor.trim(), 'limited_call_retry_invalid', 'The door needs the project, exact call and actor');
+  const call = store.get<ModelCall>(request.call.id);
+  requireCondition(call?.kind === 'model-call' && call.value.projectId === request.project
+    && canonical(reference(call)) === canonical(request.call), 'limited_call_retry_stale', 'The named call is not the current terminal of this project');
+  const terminal = requireLimitedCallTerminal(store, call);
+  let consumer: Ref, guards: TransactionGuard[];
+  if (isRef(call.value.consumerIntent)) {
+    const sent = readResearchConsumerIntent(store, call.value.consumerIntent), current = store.get<ResearchConsumerIntent>(sent.id)!;
+    const intent = readResearchConsumerIntent(store, reference(current));
+    const latest = findResearchConsumerIntent(store, request.project, intent.value.kind, intent.value.key, intent.value.draft.id);
+    requireCondition(latest?.id === intent.id && intent.value.state === 'refused' && intent.value.refusal?.kind === 'terminal'
+      && intent.value.refusal.code === 'process_output_limit' && canonical(intent.value.refusal.call) === canonical(reference(terminal)),
+    'limited_call_retry_stale', `[${call.id}] This is no longer the refused current attempt of its operation`);
+    const paid = readResearchConsumerExecutionFromIntent(store, request.project, intent);
+    requireCondition(paid.kind === 'terminal' && paid.code === 'process_output_limit' && paid.response === null,
+      'limited_call_retry_invalid', `[${call.id}] The exact paid operation does not prove an output-limit failure`);
+    const draft = store.get<DiscoveryDraft>(intent.value.draft.id, intent.value.draft.revision)!;
+    consumer = call.value.consumerIntent;
+    guards = [reference(intent), intent.value.draft, intent.value.question, ...draft.value.inputs, ...intent.value.basis,
+      { id: researchConsumerIntentId(request.project, intent.value.kind, intent.value.key, intent.value.generation + 1), absent: true }];
+  } else {
+    const scope = limitedAssessmentRetryScope(store, call);
+    consumer = scope.consumer; guards = scope.guards;
+  }
+  requireCondition(transactionGuardsCurrent(store, guards), 'limited_call_retry_stale', `[${call.id}] The question, inputs or current operation changed`);
+  requireCondition(!store.list<ModelCall>('model-call').some(other => other.value.projectId === request.project
+    && other.value.draftId === call.value.draftId && other.value.questionId === call.value.questionId && other.value.status === 'running'),
+  'limited_call_retry_busy', `[${call.id}] This question already has an active physical claim`);
+  const existing = readLimitedCallRetryPermit(store, call, consumer);
+  if (existing) return existing;
+  try {
+    return store.writeMany<LimitedCallRetryPermit>([{ id: limitedCallRetryPermitId(call.id), kind: 'limited-call-retry-permit', expected: 0,
+      value: { contract: LIMITED_CALL_RETRY_PERMIT, projectId: request.project, call: reference(call), terminal: reference(terminal), consumer, actor } }],
+    uniqueTransactionGuards([reference(call), ...guards]))[0]!;
+  } catch (error) {
+    if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)
+      || !store.get(limitedCallRetryPermitId(call.id))) throw error;
+    // Re-enter all current-scope checks before returning a concurrent permit.
+    return permitLimitedCallRetry(store, request, actor);
+  }
+}
+
 /** The same exact physical proof is used for recovery and ordinary retry.
  * A terminal label alone never authorizes interpretation of paid bytes. */
 export function readResearchConsumerExecution(store: Store, projectId: string, intentRef: Ref): ResearchConsumerExecution {
@@ -1925,7 +2110,7 @@ export function refuseResearchConsumerIntent(store: Store, intentRef: Ref,
   let refusalKind: NonNullable<ResearchConsumerIntent['refusal']>['kind'];
   let refusalCode: string;
   if (paid.kind === 'response' && intent.value.kind === 'reader') {
-    if (expectedCode !== 'reader_response_invalid' && expectedCode !== 'reader_response_empty'
+    if (expectedCode !== RESULT_CAPACITY_REFUSAL && expectedCode !== 'reader_response_invalid' && expectedCode !== 'reader_response_empty'
       && expectedCode !== 'reader_selection_foreign' && expectedCode !== 'reader_output_limit')
       consumerInvalid(intent.id, 'A received response needs its proved reader refusal');
     if (readerRefusalCode(intent, paid.payload) !== expectedCode)
@@ -1949,11 +2134,14 @@ export function refuseResearchConsumerIntent(store: Store, intentRef: Ref,
   } else { refusalKind = paid.kind; refusalCode = paid.code; }
   const refusal: NonNullable<ResearchConsumerIntent['refusal']> = {
     kind: refusalKind, code: refusalCode,
-    call: reference(paid.call), request: paid.request, response: paid.response, archive: paid.archive };
+    call: reference(paid.call), request: paid.request, response: paid.response, archive: paid.archive,
+    ...(refusalCode === RESULT_CAPACITY_REFUSAL && paid.kind === 'response'
+      ? { capacity: consumerCapacityFailure(store, intent, paid.payload)!.details as Record<string, unknown> } : {}) };
   return store.writeMany<ResearchConsumerIntent>([{ id: intent.id, kind: intent.kind,
     expected: intent.revision, value: { ...intent.value, state: 'refused', refusal } }],
   uniqueTransactionGuards([reference(intent), reference(paid.call), paid.request,
-    ...(paid.response ? [paid.response] : []), paid.archive]))[0]!;
+    ...(paid.response ? [paid.response] : []), paid.archive,
+    ...(refusalCode === RESULT_CAPACITY_REFUSAL ? intent.value.guards : [])]))[0]!;
 }
 /** A public retry may settle an interrupted physical claim, but never sends
  * another request for the same intent. A refused result stays terminal. */
@@ -2115,6 +2303,11 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
       return contextValue(saved.value, pointer);
     });
   requirePlanningNavigation(envelope.subject, archiveRef, archive.value.body);
+  if (intent.value.cursor.resultCapacityContract !== undefined
+    && (envelope.prompt !== intent.value.cursor.resultCapacityPrompt
+      || canonical(envelope.subject.resultCapacity) !== canonical(intent.value.cursor.resultCapacity)
+      || canonical(archive.value.body.resultCapacity) !== canonical(intent.value.cursor.resultCapacity)))
+    consumerInvalid(intent.id, 'The paid request or archive lost its exact result declaration');
   if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
     if (archive.value.body.synthesisSession !== intent.value.owner.id
       || archive.value.body.dispatchMode !== (intent.value.kind === 'consolidation' ? 'consolidation' : 'synthesis')
@@ -2174,6 +2367,8 @@ export function intentWebCapability(store: Store, intent: Revision<ResearchConsu
 /** The action of a paid reply read by its own saved intent: the web capability of its dispatch (WB1) and the
  * early-actions era of its cursor (UNK1). One reader for the runner, the refusal code and the historical proof. */
 export function intentResponseAction(store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown): ResearchAction {
+  const failure = consumerCapacityFailure(store, intent, payload);
+  if (failure) throw failure;
   return responseAction(payload, intentWebCapability(store, intent), earlyUnknownEra(intent.value.cursor));
 }
 
@@ -2184,7 +2379,7 @@ function actionResponseRefusalCode(store: Store, intent: Revision<ResearchConsum
   paid: ResearchConsumerExecution): string | null {
   if (paid.kind !== 'response') consumerInvalid(intent.id, 'A semantic refusal needs its received response');
   if (intent.value.kind === 'escalation-assessor') {
-    try { requireEscalationReply(paid.payload); return null; }
+    try { const failure = consumerCapacityFailure(store, intent, paid.payload); if (failure) throw failure; requireEscalationReply(paid.payload); return null; }
     catch (error) { if (error instanceof EngineError) return error.code; throw error; }
   }
   try { intentResponseAction(store, intent, paid.payload); return null; }
@@ -2216,7 +2411,10 @@ function reboundUnclaimedReader(store: Store, a: ResearchConsumerIntent,
     : Array.isArray(value) ? value.map(swap)
       : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value as Record<string, unknown>)
         .map(([key, item]) => [key, swap(item)])) : value;
-  if (canonical(swap(a)) !== canonical(b)) return false;
+  const projected = swap(a) as ResearchConsumerIntent;
+  if (projected.cursor.resultCapacityContract !== undefined)
+    projected.cursor.resultCapacity = declareResultCapacity(store, consumerResultCapacity(store, projected));
+  if (canonical(projected) !== canonical(b)) return false;
   // The turn-side chain is the one shared O -> P derivation: the bound pending
   // ref reaches the new pending revision only through recorded failed attempts
   // or earlier pending replays of the same turn.
@@ -2362,6 +2560,8 @@ function storedAcceptedAnswerInputs(store: Store, before: Revision<Record<string
 }
 
 function readerRefusalCode(intent: Revision<ResearchConsumerIntent>, payload: unknown): string | null {
+  const capacity = researchResultFailure(intent.value.cursor.resultCapacity, payload);
+  if (capacity) return capacity.code;
   const sources = intent.value.cursor.context?.sources;
   if (!Array.isArray(sources) || !sources.every((source: any) => object(source)
     && isRef(source.ref) && Array.isArray(source.lines)

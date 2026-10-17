@@ -25,6 +25,7 @@ export type ProductCommand =
   | {type:'allocate-research-trial';project:string;key:string;previousPolicy:Ref;limit:number;blockLimit:number}
   | {type:"recover-model-call";project:string;call:Ref}
   | {type:"permit-cancelled-call-retry";project:string;call:Ref}
+  | {type:"permit-limited-call-retry";project:string;call:Ref}
   | {type:"continue-preparation";project:string;maxCalls:number}
   | { type: "om-start"; project: string; outcomes?: string[] }
   | { type: "om-continue"; project: string; resumeStop?: string; release?: "regate_owner_policy" }
@@ -152,6 +153,7 @@ const schema = { oneOf: [
   command('allocate-research-trial',{project,key:string,previousPolicy:ref,limit:{type:'integer',minimum:1},blockLimit:{type:'integer',minimum:1}}),
   command("recover-model-call", {project,call:ref}),
   command("permit-cancelled-call-retry", {project,call:ref}),
+  command("permit-limited-call-retry", {project,call:ref}),
   command("continue-preparation", {project,maxCalls:{type:"integer",minimum:1,maximum:100}}),
   command("set-map-status", { project, expected, base: ref, nodes: { type: "array", minItems: 1, items: object({
     id: string, status: { enum: ["existing", "future"] }, explanation: string,

@@ -1,3 +1,7 @@
+import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
+  type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
+import type { Environment, RoleBinding } from '../runtime/environment.js';
+import type { ReaderPilot } from './reader-pilot.js';
 import { Ajv } from 'ajv';
 import { EngineError, requireCondition } from '../errors.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
@@ -5,8 +9,8 @@ import { requireDiscoveryProposal, type DiscoveryBasisCatalogue, type DiscoveryC
 import { conceptApplicationFindings, requiresConceptApplications,
   requiresSpecificationApplications, specificationApplicationFindings } from './preparation-validation.js';
 import { researchAction, responseAction } from './research-consumer-transition.js';
-import { canonical, type Json } from '../canonical.js';
-import { isRef, stageId, type Ref, type StageArtifact } from '../pipeline/contracts.js';
+import { canonical, hashJson, type Json } from '../canonical.js';
+import { isRef, reference, stageId, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import type { Store } from '../storage/store.js';
 import { inheritanceCandidateFailure } from './research-context.js';
 
@@ -155,4 +159,195 @@ export function earlyResearchCorrection(role: 'analyst' | 'assessor' | 'escalati
       : role === 'assessor' ? { verdict: ['supported', 'insufficient', 'conflicting'], reasons: 'string[]',
         instruction: 'Correct only the assessment reply; preserve the supplied candidate and evidence cursor.' }
         : { necessary: 'boolean', reason: 'nonempty string', instruction: 'Correct only the escalation assessment.' } };
+}
+
+
+export const RESULT_CAPACITY = 'result-capacity/v1' as const;
+export const RESULT_CAPACITY_REFUSAL = 'research_result_capacity' as const;
+/** The existing non-pilot research envelope default, used only without a configured bound. */
+export const DEFAULT_RESEARCH_REQUEST_CHARS = 300000;
+
+/** Resolve the saved role's configured request allowance. An absent optional
+ * physical ceiling adds no restriction. Non-pilot calls without an explicit
+ * allowance keep the existing envelope default; malformed configured bounds
+ * are configuration failures before any paid result is admitted. */
+export function researchResultEnvelopeLimit(environment: Pick<Environment, 'requestCapacityChars'>,
+  pilot?: Pick<ReaderPilot, 'maxRequestChars' | 'physicalLimits'> | null): number {
+  const limits: number[] = [];
+  const add = (value: unknown, field: string) => {
+    if (!Number.isSafeInteger(value) || Number(value) <= 0)
+      throw new EngineError('research_capacity_configuration', 'Result admission needs a positive configured request limit', { field });
+    limits.push(Number(value));
+  };
+  if (environment.requestCapacityChars !== undefined) add(environment.requestCapacityChars, 'environment.requestCapacityChars');
+  if (pilot) add(pilot.maxRequestChars, 'reader-pilot.maxRequestChars');
+  if (limits.length === 0) limits.push(DEFAULT_RESEARCH_REQUEST_CHARS);
+  if (pilot?.physicalLimits !== undefined) add(pilot.physicalLimits?.maxRequestChars, 'reader-pilot.physicalLimits.maxRequestChars');
+  return Math.min(...limits);
+}
+
+export function researchResponseOutputLimit(replyChars: number | null) {
+  return { contract: 'research-output-limit/v1', combinedStdoutStderrBytes: 4_000_000, replyChars,
+    instruction: 'Return one complete JSON envelope within these physical bounds; a truncated output is never a usable response.' };
+}
+
+/** Only the mandatory admission projection. Saved history, old candidates,
+ * evidence and notes stay in their own addressed delivery; this is not a
+ * second request packer. Serialization/limits belong to research-delivery. */
+export function researchCapacityInput(input: {
+  operation: string; generation: number; bindings: Record<string, unknown>;
+  role: ResearchResultCapacityInput['role']; purpose: string; actionMode: string;
+  limit: number; physicalReplyLimit?: number | null; prompt: string; binding: RoleBinding; draft: DiscoveryDraft;
+  question: { id: string; value: Question }; context: Record<string, any>;
+  cursor?: Record<string, unknown>;
+}): ResearchResultCapacityInput {
+  const c = input.context;
+  const keys = ['discoveryContext', 'discoveryBasisCatalogue', 'assessmentContextContract', 'stageNeighbors',
+    'allowedActions', 'allowedConsumers', 'gapFields', 'researchScope', 'graphBase', 'contextEncoding',
+    'dispatchMode', 'savedOnly', 'scope', 'responseContract', 'access', 'deliveryRules', 'criteria',
+    'contextControls', 'synthesisState', 'synthesisSession', 'previousProposalRef', 'consolidation'];
+  const mandatory = Object.fromEntries(keys.filter(key => Object.hasOwn(c, key)).map(key => [key, c[key]]));
+  const operationMapMaterial = Array.isArray(c.prerequisites)
+    ? c.prerequisites.find((item: any) => item.stage === 'concept')?.operationMapMaterial : undefined;
+  if (operationMapMaterial !== undefined) mandatory.operationMapMaterial = operationMapMaterial;
+  if (Array.isArray(c.failures)) mandatory.corrections = c.failures.map((failure: any) => ({
+    attempt: failure.attempt ?? null, code: failure.code, field: failure.details?.field ?? null,
+    pointer: failure.details?.pointer ?? null, limit: failure.details?.limit ?? null, actual: failure.details?.actual ?? null,
+    deficit: failure.details?.deficit ?? null, response: failure.details?.response ?? null,
+    instruction: 'Correct only this result; full saved details are available by their exact address.' }));
+  if (['synthesis', 'consolidation'].includes(input.purpose)) {
+    requireCondition(c.contextControls && c.synthesisState && typeof c.synthesisSession === 'string'
+      && Array.isArray(c.synthesisMaterials) && Array.isArray(c.synthesisNotes),
+    'research_capacity_invalid', 'Synthesis result admission needs its exact controls, material cursor and saved carry');
+    mandatory.materialCount = c.synthesisMaterials.length;
+    mandatory.synthesisCarry = c.synthesisNotes.map((note: any) => {
+      requireCondition(isRef(note.checkpoint), 'research_capacity_invalid', 'Saved synthesis carry needs its exact checkpoint');
+      return note.checkpoint;
+    });
+  }
+  const forms = input.actionMode === 'consolidation' ? ['summary']
+    : input.purpose === 'assessor' ? ['verdict', 'assessment_checkpoint', 'read_context']
+    : input.purpose === 'escalation-assessor' ? ['escalation']
+    : input.purpose === 'reader' ? ['selections']
+    : input.purpose === 'synthesis' ? ['answer', 'answer_delta', 'checkpoint', 'read_context', 'need_research', 'need_owner', 'pause']
+    : ['answer', 'answer_delta', 'checkpoint', 'need_owner', 'need_research', 'read_context',
+      'read_source', 'search', 'read', 'read_bundle', 'read_plan', 'synthesize', 'web_search', 'web_fetch', 'pause'];
+  const envelope = { protocol: 'omg-agent/v1', requestId: '00000000-0000-0000-0000-000000000000',
+    mode: 'research', model: input.binding.model,
+    effort: input.binding.effort, ...(input.binding.speed ? { speed: input.binding.speed } : {}), prompt: input.prompt,
+    subject: { stage: input.draft.stage, level: input.draft.level, consumer: input.draft.consumer,
+      contractVersion: input.draft.contractVersion ?? 1, purpose: input.purpose,
+      question: { id: input.question.id, ...input.question.value.spec },
+      inputs: input.draft.inputs, ...mandatory, cursor: input.cursor ?? {},
+      responseOutputLimit: researchResponseOutputLimit(input.physicalReplyLimit ?? null),
+      access: { exactOriginals: true, incompletePagesAreNotComplete: true,
+        verdictRequiresCompleteCandidateAndEvidence: input.purpose === 'assessor' } } };
+  const goal = c.consolidation;
+  if (input.actionMode === 'consolidation') requireCondition(goal
+    && Number.isSafeInteger(goal.targetChars) && goal.targetChars > 0
+    && Number.isSafeInteger(goal.fullTargetChars) && goal.fullTargetChars > 0,
+  'research_capacity_invalid', 'Consolidation result admission needs its exact item and full-form targets');
+  return { operation: input.operation, generation: input.generation, bindings: input.bindings,
+    role: input.role, purpose: input.purpose, actionMode: input.actionMode,
+    envelopeLimitChars: input.limit, mandatoryEnvelope: envelope, forms: forms.map(kind => ({ kind,
+      ...(goal ? { specialLimits: { targetChars: goal.targetChars, fullTargetChars: goal.fullTargetChars } } : {}) })) };
+}
+
+export function resultCapacityFrom(input: ResearchResultCapacityInput): ResearchResultCapacity {
+  return buildResearchResultCapacity(input);
+}
+const CAPACITY_PROJECTION = 'result-capacity-projection/v1' as const;
+function projectionRecord(input: ResearchResultCapacityInput) {
+  const { projectId, draft, question } = input.bindings;
+  requireCondition(typeof projectId === 'string' && isRef(draft) && isRef(question),
+    'research_capacity_invalid', 'The admission projection needs its exact project, draft and question');
+  const value = { contract: CAPACITY_PROJECTION, projectId, draft, question, body: input.mandatoryEnvelope };
+  const hash = hashJson(value);
+  return { id: `research-context:${hash}`, kind: 'research-context', revision: 1, hash, value };
+}
+function readCapacityProjection(store: Store, record: Ref, pointer: string) {
+  requireCondition(isRef(record) && typeof pointer === 'string',
+    'research_capacity_invalid', 'The admission archive needs its exact address');
+  const saved = store.get<any>(record.id, record.revision);
+  requireCondition(pointer === '/body' && saved?.kind === 'research-context' && saved.revision === 1
+    && saved.id === `research-context:${hashJson(saved.value)}` && saved.hash === hashJson(saved.value)
+    && canonical(reference(saved)) === canonical(record) && saved.value.contract === CAPACITY_PROJECTION,
+  'research_capacity_invalid', 'The exact immutable admission projection is missing or foreign');
+  return saved.value.body as Record<string, unknown>;
+}
+
+/** The full minimum is counted once by the shared builder. The actual request
+ * carries only its exact archive address, avoiding a second question/prompt. */
+export function declareResultCapacity(store: Store, input: ResearchResultCapacityInput): ResearchResultCapacity {
+  const projection = projectionRecord(input), record = reference(projection);
+  const capacity = buildResearchResultCapacity({ ...input,
+    mandatoryArchive: { record, pointer: '/body', hash: hashJson(input.mandatoryEnvelope) } });
+  if (!store.get(projection.id)) try {
+    store.writeMany([{ id: projection.id, kind: 'research-context', expected: 0, value: projection.value }],
+      [projection.value.draft, projection.value.question]);
+  } catch (error) {
+    if (!(error instanceof EngineError && error.code === 'revision_conflict') || !store.get(projection.id)) throw error;
+  }
+  requireCondition(canonical(readCapacityProjection(store, record, '/body')) === canonical(input.mandatoryEnvelope),
+    'research_capacity_invalid', 'The saved admission projection differs from its producer');
+  return capacity;
+}
+export function researchCapacityProjection(saved: ResearchResultCapacity, store?: Store): Record<string, any> {
+  requireCondition(saved?.mandatory && typeof saved.mandatory === 'object',
+    'research_capacity_invalid', 'The result admission lost its minimum');
+  if ('projection' in saved.mandatory) return saved.mandatory.projection;
+  requireCondition(store, 'research_capacity_invalid', 'The admission archive needs its exact store');
+  requireCondition(saved.mandatory.archive && typeof saved.mandatory.archive === 'object',
+    'research_capacity_invalid', 'The result admission lost its archive');
+  const { record, pointer, hash } = saved.mandatory.archive;
+  const projection = readCapacityProjection(store, record, pointer);
+  requireCondition(hashJson(projection) === hash, 'research_capacity_invalid', 'The admission projection hash changed');
+  return projection;
+}
+export function requireResultCapacity(saved: unknown, input: ResearchResultCapacityInput, store?: Store): ResearchResultCapacity {
+  const archive = (saved as ResearchResultCapacity | undefined)?.mandatory;
+  requireCondition(!archive || typeof archive === 'object', 'research_capacity_invalid', 'The admission minimum has a foreign shape');
+  if (archive && 'archive' in archive) {
+    requireCondition(archive.archive && typeof archive.archive === 'object',
+      'research_capacity_invalid', 'The admission archive has a foreign shape');
+    requireCondition(store, 'research_capacity_invalid', 'The admission archive needs its exact store');
+    const expected = projectionRecord(input);
+    requireCondition(canonical(archive.archive.record) === canonical(reference(expected))
+      && archive.archive.pointer === '/body', 'research_capacity_invalid', 'The admission archive belongs to another producer');
+    input = { ...input, mandatoryArchive: archive.archive };
+    requireResearchResultCapacity(saved, input, (record, pointer) => readCapacityProjection(store, record, pointer));
+  } else requireResearchResultCapacity(saved, input);
+  return saved;
+}
+/** The saved marker selects the era. No current profile/head is consulted. */
+export function researchResultFailure(saved: unknown, payload: unknown): EngineError | null {
+  if (saved === undefined) return null;
+  requireCondition(saved !== null && typeof saved === 'object' && (saved as any).contract === RESULT_CAPACITY,
+    'research_capacity_invalid', 'The producer lost its declared result capacity');
+  const capacity = saved as ResearchResultCapacity;
+  requireCondition(Array.isArray(capacity.forms) && capacity.forms.length > 0
+    && capacity.forms.every(form => form && typeof form.kind === 'string'),
+  'research_capacity_invalid', 'The producer lost its declared result forms');
+  const response = payload as Record<string, any> | null;
+  const kind = capacity.actionMode === 'consolidation' ? 'summary'
+    : capacity.purpose === 'escalation-assessor' ? 'escalation'
+    : capacity.purpose === 'reader' ? 'selections'
+    : capacity.purpose === 'assessor' && !response?.action ? 'verdict' : response?.action;
+  // Invalid forms remain ordinary schema errors, not a capacity correction.
+  if (!capacity.forms.some(form => form.kind === kind)) return null;
+  const measured = measureResearchResult(capacity, kind, payload);
+  if (measured.fits) return null;
+  const field = kind === 'verdict' ? 'reasons' : kind === 'escalation' ? 'reason'
+    : ['checkpoint', 'need_owner', 'summary'].includes(kind) ? kind
+    : Array.isArray(response?.citations) && JSON.stringify(response!.citations).length > measured.allowedFieldChars ? 'citations' : 'answer';
+  return new EngineError(RESULT_CAPACITY_REFUSAL,
+    'The complete result exceeds its predeclared serialized UTF-16 allowance; return a smaller result of the same role',
+    { contract: RESULT_CAPACITY, operation: capacity.operation, generation: capacity.generation, field,
+      pointer: '/', form: kind, unit: 'utf16', limit: measured.allowedFieldChars,
+      actual: JSON.stringify(payload).length, required: measured.requiredChars, deficit: measured.deficitChars });
+}
+
+export function withoutResultCapacity(context: Record<string, any>): Record<string, any> {
+  const { resultCapacity: _capacity, resultCapacityContract: _era, resultCapacityPrompt: _prompt, resultCapacityCorrection: _correction, ...original } = context;
+  return original;
 }

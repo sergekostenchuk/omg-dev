@@ -211,7 +211,7 @@ test('context recovery preserves final-stage lookup observations while allowing 
 test('the summary target is reduced to the space left after exact context, and all new context survives compaction',async t=>{
   const f=await fixture(t,12000,80000,0.35,0,{},0,'small');
   const drive=roomyDrive(f,200000);
-  await atFinal(f,addressed(f,3,18000),false,drive.drive);
+  await atFinal(f,addressed(f,3,18000),true,drive.drive);
   const measured=drive.tighten();
   const preview=JSON.parse((await previewResearch(measured)).input);
   assert.equal(preview.subject.dispatchMode,'consolidation');

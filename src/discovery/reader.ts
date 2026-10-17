@@ -9,7 +9,7 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { prepareResearchConsumerIntent, prepareResearchConsumerApplication,
   findResearchConsumerIntent, listResearchConsumerIntentsByRoot, researchConsumerIntentId,
   readResearchConsumerExecution, readResearchConsumerIntent, readResearchConsumerTurn, captureResearchConsumerRetryPermits,
-  resumeResearchConsumerExecution, refuseResearchConsumerIntent,
+  resumeResearchConsumerExecution, refuseResearchConsumerIntent, consumerCapacityFailure, consumerCapacityCorrection, retryableResearchConsumerRefusal,
   type ResearchConsumerIntent, type ResearchConsumerIntentInput, type ResearchConsumerExecution } from "./response-recovery.js";
 import { canonical, digest, hashJson } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -278,6 +278,8 @@ function appliedReaderResult(store: Store, project: string, question: Ref, purpo
 /** Full paid output projection shared by the current writer and historical reader. */
 export function derivePaidReaderResult(store: Store, running: Revision<ResearchConsumerIntent>,
   execution: Extract<ResearchConsumerExecution, { kind: 'response' }>): ReaderResult {
+  const capacityFailure = consumerCapacityFailure(store, running, execution.payload);
+  if (capacityFailure) throw capacityFailure;
   const project = running.value.projectId, question = running.value.question;
   const cursorValue = running.value.cursor as ReaderIntentCursor;
   const cursor = readerCursor(store, running, cursorValue.rootKey, question,
@@ -616,7 +618,9 @@ function readerCursor(store: Store, intent: Revision<ResearchConsumerIntent>, ro
   requireCondition(canonical(cursor.inputs) === canonical(expectedInputs)
     && canonical(cursor.sourceOrder) === canonical(readerSourceOrder(expected)),
   'reader_intent_source_invalid', 'The saved child does not contain its exact deterministic source windows');
-  const context = { role: 'reader' as const, purpose, sources: expected.map((source, sourceIndex) => ({
+  const correction = intent.value.previous
+    ? consumerCapacityCorrection(store, readResearchConsumerIntent(store, intent.value.previous)) : null;
+  const context = { role: 'reader' as const, purpose, ...(correction ? { failures: [correction] } : {}), sources: expected.map((source, sourceIndex) => ({
     ...readerSourcePacket(source, cursor.covered.filter(item => canonical(item.source) === canonical(source.ref))), sourceIndex })) };
   requireCondition(canonical(cursor.context) === canonical(context),
     'reader_intent_context_invalid', 'The saved paid packet differs from its exact child sources');
@@ -662,7 +666,7 @@ export function readerResumeStep(store: Store, project: string, question: Ref, p
       const previous = generations[index - 1];
       requireCondition(intent.value.generation === index
         && (index === 0 ? intent.value.previous === null
-          : previous!.value.state === 'refused' && previous!.value.refusal?.kind === 'provider-failed'
+          : retryableResearchConsumerRefusal(store, previous!)
             && canonical(intent.value.previous) === canonical(reference(previous!))),
       'research_consumer_intent_invalid', 'A reader child needs one complete exact generation chain');
     }
@@ -970,7 +974,7 @@ async function applyReaderIntent(store: Store, environment: Environment, pilot: 
       const { researchCall } = await import('./research-protocol.js');
       await researchCall(pilot.value.reader, environment, cursor.instruction, cursor.context, signal,
         { store, draftId: found.value.draft.id, questionId: question.id,
-          purpose: 'reader', pilot, consumerIntent: reference(found) });
+          purpose: 'reader', pilot, consumerIntent: reference(found), ...(isResearchPreview() ? { previewIntent: found } : {}) });
     } catch (error) {
       if (!(error instanceof EngineError) || !['input_stale', 'revision_conflict',
         'pilot_call_active'].includes(error.code)) throw error;
@@ -991,9 +995,8 @@ async function applyReaderIntent(store: Store, environment: Environment, pilot: 
   try { value = derivePaidReaderResult(store, intent, execution); }
   catch (error) {
     if (error instanceof EngineError && ['reader_response_invalid', 'reader_response_empty',
-      'reader_selection_foreign', 'reader_output_limit'].includes(error.code)) {
-      const refused = refuseResearchConsumerIntent(store, reference(intent), error.code as
-        'reader_response_invalid' | 'reader_response_empty' | 'reader_selection_foreign' | 'reader_output_limit');
+      'reader_selection_foreign', 'reader_output_limit', 'research_result_capacity'].includes(error.code)) {
+      const refused = refuseResearchConsumerIntent(store, reference(intent), error.code);
       throw new EngineError(error.code, error.message, { intent: reference(refused), refusal: refused.value.refusal });
     }
     throw error;
@@ -1068,7 +1071,7 @@ async function readBundlePart(store: Store, environment: Environment, pilot: Rev
   const previous = 'intent' in step ? step.intent : null;
   if (step.kind === 'completed') return step.result;
   if (step.kind === 'assemble') return saveReaderAssembly(store, environment.projectId, step);
-  if (step.kind === 'refused' && previous!.value.refusal?.kind !== 'provider-failed')
+  if (step.kind === 'refused' && !retryableResearchConsumerRefusal(store, previous!))
     throwSavedReaderRefusal(previous!);
   if (previous && previous.value.state !== 'refused') {
     const selected = previous.value.state === 'prepared'
@@ -1178,7 +1181,7 @@ export async function readBundle(store: Store, environment: Environment, pilot: 
   const step = readerResumeStep(store, environment.projectId, question, purpose, rootInputs, consumer);
   if (step.kind === 'completed') return step.result;
   if (step.kind === 'assemble') return saveReaderAssembly(store, environment.projectId, step);
-  if (step.kind === 'refused' && step.intent.value.refusal?.kind !== 'provider-failed')
+  if (step.kind === 'refused' && !retryableResearchConsumerRefusal(store, step.intent))
     throwSavedReaderRefusal(step.intent);
   const entryPermits = retryPermits ?? captureResearchConsumerRetryPermits(store, environment.projectId);
   requireCondition(Array.isArray(entryPermits) && entryPermits.every(isRef),

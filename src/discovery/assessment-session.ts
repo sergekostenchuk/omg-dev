@@ -1,3 +1,6 @@
+import { prepareResearchEnvelope } from './research-protocol.js';
+import { researchCapacityInput, declareResultCapacity, requireResultCapacity, researchResultFailure, researchResultEnvelopeLimit,
+  withoutResultCapacity, RESULT_CAPACITY, RESULT_CAPACITY_REFUSAL } from './early-research-outcome.js';
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchFailure, earlyResearchCorrection, requireAssessmentReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { Evidence } from '../evidence/evidence.js';
@@ -21,7 +24,9 @@ import { researchAction, researchCall } from "./research-protocol.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import { recoveredResponseBoundary, recoveryAssessmentSessionId, recoverySessionWrites, markRecoveredSessionWritten,
   readResearchExecution, isResponseRecovery, markApplicationResponseRecovered, assessmentReadView, assessmentSessionEra,
-  proposalRefusalId, type AssessmentReadProof } from './response-recovery.js';
+  proposalRefusalId, readLimitedCallRetryPermit, type AssessmentReadProof } from './response-recovery.js';
+
+export function assessmentRolePrompt(prompt: string): string { return prompt + '\n' + instruction; }
 
 interface Session { [key: string]: unknown; projectId: string; offset: number; candidateOffset?:number; notes: Json[]; focus: unknown; workspace?: ContextWorkspace; result: unknown;
   binding?: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] } }
@@ -159,6 +164,7 @@ interface Application {
   origin?: Ref;
   recoveredRead?: { contract: 'assessment-read-recovery/v1'; refusal: Ref; call: Ref };
   replyOutcomeContract?: typeof EARLY_RESEARCH_OUTCOME;
+  resultCapacityRefusal?: Record<string, unknown>;
   state: 'prepared' | 'running' | 'applied' | 'refused' | 'retryable' | 'model-refused' | 'renewed'; call: Ref | null; after: Ref | null; received: Ref | null; refusal: ApplicationRefusal | null;
 }
 // Completion names the applied negative correction; later candidates retain this exact admission in their guards.
@@ -168,7 +174,7 @@ const object = (value: unknown): value is Record<string, any> => value !== null 
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const pendingRef = (write: Write): Ref => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) });
 const managedSessionId = (question: Ref, context: Record<string, any>): string =>
-  recoveryAssessmentSessionId(`assessment-session:v1:${hashJson([question, JSON.parse(JSON.stringify(context))])}`);
+  recoveryAssessmentSessionId(`assessment-session:v1:${hashJson([question, JSON.parse(JSON.stringify(withoutResultCapacity(context)))])}`);
 export function paidOriginId(projectId: string, turnId: string): string {
   return `assessment-paid-origin:v1:${hashJson({ projectId, turnId })}`;
 }
@@ -364,6 +370,16 @@ function readApplication(store: Store, session: Revision<ApplicationSession>, sa
   if (origin.value.state !== 'prepared' || origin.value.call !== null || origin.value.after !== null || origin.value.received !== null || origin.value.refusal !== null || origin.value.resolution !== null
     || !same(immutable(app), immutable(origin.value))) applicationInvalid(record.id, 'The original application admission changed');
   const before = exact<ApplicationSession>(store, app.session, 'assessment-session');
+  if (app.context.resultCapacityContract !== undefined || app.context.resultCapacity !== undefined) {
+    requireCondition(app.context.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The assessment lost its declared era');
+    try { requireResultCapacity(app.context.resultCapacity, applicationCapacityInput(store, before, app.context,
+      app.prompt, app.role, app.dispatch, app.profile), store); }
+    catch (error) {
+      if (error instanceof EngineError && error.code === 'research_capacity_invalid')
+        applicationInvalid(record.id, 'The saved result admission differs from its exact producer');
+      throw error;
+    }
+  }
   if (paid) {
     const paidOrigin = exact<AssessmentPaidOrigin>(store, app.origin!, 'assessment-paid-origin');
     const checked = readAssessmentPaidOrigin(store, app.projectId, paidOrigin.value.pending);
@@ -590,10 +606,10 @@ function permitsAssessmentCorrection(store: Store, barrier: Revision<AssessmentB
     && refused.value.refusal.code === 'context_read_limit'
     && refused.value.session.id === app.session.id
     && app.guards.some(guard => same(guard, reference(checked)))
-    && same([app.origin ?? null, app.context, app.prompt],
-      [refused.value.origin ?? null, refused.value.context, refused.value.prompt])) return true;
+    && same([app.origin ?? null, withoutResultCapacity(app.context), app.prompt],
+      [refused.value.origin ?? null, withoutResultCapacity(refused.value.context), refused.value.prompt])) return true;
   return refused.value.state === 'model-refused' && refused.value.session.id === app.session.id
-    && same(refused.value.context, app.context);
+    && same(withoutResultCapacity(refused.value.context), withoutResultCapacity(app.context));
 }
 // Renew protection for a later candidate without changing any earlier refusal or completion revision.
 function refusalBarrierWrite(barrier: Revision<AssessmentBarrier> | null, app: Application, question: Ref, refused: Write): Write[] {
@@ -624,9 +640,74 @@ function refuseApplication(store: Store, record: Revision<Application>, reason: 
     }
   }
 }
-function applicationWrite(session: Write, context: Record<string, any>, prompt: string, role: RoleBinding, dispatch: Environment, profile: Ref | null,
-  guards: TransactionGuard[], previous: Ref | null = null, origin?: Ref,
+function applicationCapacityInput(store: Store, session: { id: string; revision: number; value: ApplicationSession },
+  context: Record<string, any>, prompt: string, role: RoleBinding, dispatch: Environment, profile: Ref | null) {
+  const binding = session.value.binding!;
+  const draft = exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft');
+  const question = exact<Question>(store, binding.question, 'question');
+  const pilot = profile ? exact<ReaderPilot>(store, profile, 'reader-pilot') : null;
+  return researchCapacityInput({ operation: applicationId(session.id, session.revision), generation: session.revision - 1,
+    bindings: { projectId: session.value.projectId, session: session.id, draft: binding.draft,
+      question: binding.question, inputsHash: hashJson(binding.inputs), application: applicationId(session.id, session.revision) },
+    role: 'assessor', purpose: 'assessor', actionMode: 'assess-answer',
+    limit: researchResultEnvelopeLimit(dispatch, pilot?.value),
+    physicalReplyLimit: pilot?.value.physicalLimits?.maxReplyChars ?? null,
+    prompt: context.resultCapacityPrompt ?? assessmentRolePrompt(prompt), binding: role, draft: draft.value,
+    question: { id: question.id, value: question.value }, context: context.resultCapacityCorrection ? { ...context, failures: [context.resultCapacityCorrection] } : context,
+    cursor: { offset: session.value.offset, candidateOffset: session.value.candidateOffset ?? 0,
+      candidateTotal: JSON.stringify(context.value).length, evidenceTotal: JSON.stringify(context.observations).length,
+      completeBeforeVerdict: true } });
+}
+function assessmentDispatchContext(before: Session, id: string, context: Record<string, any>, correction?: Record<string, unknown> | null) {
+  const workspace = contextWorkspace(before.workspace, before.focus);
+  const feedback = context.resultCapacityCorrection ?? correction;
+  return { ...context, ...(feedback ? { failures: [feedback] } : {}), assessmentSession: id,
+    assessmentState: { offset: before.offset, candidateOffset: before.candidateOffset ?? 0,
+      total: JSON.stringify(context.observations).length }, assessmentNotes: before.notes,
+    contextWorkspace: workspace.entries.map(entry => entry.result), focus: null };
+}
+function admittedAssessmentContext(store: Store, session: Write, context: Record<string, any>, prompt: string,
+  role: RoleBinding, dispatch: Environment, profile: Ref | null, previous: Revision<Application> | null = null) {
+  const plain = withoutResultCapacity(context);
+  const admitted: Record<string, any> = { ...plain, resultCapacityContract: RESULT_CAPACITY };
+  if (previous) {
+    const prior = exact<Application>(store, reference(previous), 'assessment-application');
+    if (prior.value.resultCapacityRefusal && prior.value.received) {
+      const outcome = applicationResponse(store, prior.value, prior.value.received);
+      admitted.resultCapacityCorrection = { contract: RESULT_CAPACITY, attempt: reference(prior), code: RESULT_CAPACITY_REFUSAL,
+        details: { ...prior.value.resultCapacityRefusal, response: outcome.response },
+        instruction: 'Correct this assessment only; preserve the same candidate and evidence cursor.' };
+    }
+  }
+  const saved = { id: session.id, revision: session.expected + 1, value: session.value as ApplicationSession };
+  const pilot = profile ? exact<ReaderPilot>(store, profile, 'reader-pilot') : undefined;
+  for (let n = 0; n < 4; n += 1) {
+    admitted.resultCapacity = declareResultCapacity(store, applicationCapacityInput(store, saved, admitted, prompt, role, dispatch, profile));
+    const actual = prepareResearchEnvelope(role, dispatch, assessmentRolePrompt(prompt),
+      assessmentDispatchContext(saved.value, session.id, admitted), { store, draftId: saved.value.binding!.draft.id,
+        questionId: saved.value.binding!.question.id, purpose: 'assessor', ...(pilot ? { pilot } : {}) }, admitted.resultCapacity);
+    if (applicationCapacityInput(store, saved, admitted, prompt, role, dispatch, profile).mandatoryEnvelope.prompt === actual.envelope.prompt) {
+      admitted.resultCapacityPrompt = actual.envelope.prompt; break;
+    }
+    admitted.resultCapacityPrompt = actual.envelope.prompt;
+    requireCondition(n < 3, 'research_capacity_configuration', 'The assessment admission has no stable prompt');
+  }
+  return admitted;
+}
+function assessmentReplyFailure(store: Store, app: Application, payload: unknown) {
+  const context = app.context;
+  if (context.resultCapacityContract === undefined && context.resultCapacity === undefined) return null;
+  requireCondition(context.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The assessment lost its capacity era');
+  const session = exact<ApplicationSession>(store, app.session, 'assessment-session');
+  const saved = requireResultCapacity(context.resultCapacity, applicationCapacityInput(store, session,
+    context, app.prompt, app.role, app.dispatch, app.profile), store);
+  return researchResultFailure(saved, payload);
+}
+
+function applicationWrite(store: Store, session: Write, context: Record<string, any>, prompt: string, role: RoleBinding, dispatch: Environment, profile: Ref | null,
+  guards: TransactionGuard[], previous: Ref | null = null, origin?: Ref, prior: Revision<Application> | null = null,
   recoveredRead?: Application['recoveredRead']): Write {
+  context = admittedAssessmentContext(store, session, context, prompt, role, dispatch, profile, prior);
   const ref = pendingRef(session), value: Application = { contract: APPLICATION, projectId: (session.value as Session).projectId,
     session: ref, context: JSON.parse(JSON.stringify(context)), prompt, role: JSON.parse(JSON.stringify(role)), dispatch: JSON.parse(JSON.stringify(dispatch)), profile,
     guards: uniqueTransactionGuards(guards), previous, ...(origin ? { origin } : {}),
@@ -681,6 +762,10 @@ function executionOutcome(store: Store, app: Application, call: Ref) {
     requirePhysicalIdentity(exact<ModelCall>(store, app.call!, 'model-call'), outcome.call);
     if (!Object.keys(app.context).every(key => Object.hasOwn(outcome.body, key) && same(outcome.body[key], app.context[key])))
       applicationInvalid(session.id, 'The exact execution has a foreign original context');
+    if (app.context.resultCapacityContract !== undefined && outcome.kind === 'response'
+      && (!same(outcome.subject.resultCapacity, app.context.resultCapacity)
+        || !same(outcome.body.resultCapacity, app.context.resultCapacity)))
+      applicationInvalid(session.id, 'The assessment request lost its saved capacity');
     return outcome;
   } catch (error) {
     if (error instanceof EngineError) applicationInvalid(session.id, `Physical outcome is not proved: ${error.code}`);
@@ -691,6 +776,11 @@ function requireRetryable(store: Store, app: Application) {
   if (!app.received) applicationInvalid(app.session.id, 'A failed attempt needs its exact physical outcome');
   const outcome = executionOutcome(store, app, app.received);
   if (outcome.kind === 'provider-failed') return outcome;
+  if (outcome.kind === 'terminal' && outcome.code === 'process_output_limit') {
+    if (app.state === 'renewed' && !readLimitedCallRetryPermit(store, outcome.call, reference(exact(store, outcome.call.value.assessmentApplication!, 'assessment-application'))))
+      applicationInvalid(app.session.id, 'An output-limit renewal needs its exact explicit permission');
+    return outcome;
+  }
   if (outcome.kind === 'terminal'
     && ['run_stopped', 'run_control_changed', 'process_cancelled'].includes(outcome.code)) return outcome;
   if (outcome.kind === 'response' && ['model-refused', 'renewed'].includes(app.state)
@@ -699,7 +789,7 @@ function requireRetryable(store: Store, app: Application) {
     const draft = exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft');
     const question = exact<Question>(store, binding.question, 'question');
     assessmentPacket(before.value, app.context, outcome.subject);
-    const failure = correctableAssessmentReply(draft, question, before.value, app.context,
+    const failure = assessmentReplyFailure(store, app, outcome.payload) ?? correctableAssessmentReply(draft, question, before.value, app.context,
       outcome.subject, outcome.payload);
     const derived = evaluateApplication(store, app, before, draft, question, outcome, app.resolution);
     if (failure && derived.failure instanceof EngineError
@@ -714,8 +804,8 @@ function renewApplication(store: Store, record: Revision<Application>, session: 
   const app = record.value, profile = pilot ? reference(pilot) : null, before = session.value.binding!;
   const barrier = readBarrier(store, app.projectId, before.question);
   if (barrier && !permitsAssessmentCorrection(store, barrier, app)) barrierRefusal(store, barrier);
-  if (!same([app.context, app.prompt, before.draft, before.question, before.inputs],
-    [context, prompt, reference(draft), reference(question), draft.value.inputs]))
+  if (!same([withoutResultCapacity(app.context), app.prompt, before.draft, before.question, before.inputs],
+    [withoutResultCapacity(context), prompt, reference(draft), reference(question), draft.value.inputs]))
     applicationInvalid(record.id, 'Renewal cannot carry a cursor across different candidate, sources or context');
   const unsent = app.state === 'prepared' && app.call === null;
   const retained = unsent ? app.guards.filter(guard => guard.id !== app.profile?.id) : [];
@@ -724,6 +814,10 @@ function renewApplication(store: Store, record: Revision<Application>, session: 
       applicationInvalid(record.id, 'Only a compatible explicit limit increase can replace an unsent intent');
   } else if (!['retryable', 'model-refused'].includes(app.state)) applicationInvalid(record.id, 'Only an unsent intent or proved provider failure may be renewed');
   const physical = unsent ? null : requireRetryable(store, app);
+  const limitedPermit = physical?.kind === 'terminal' && physical.code === 'process_output_limit'
+    ? readLimitedCallRetryPermit(store, physical.call, physical.call.value.assessmentApplication!) : null;
+  if (physical?.kind === 'terminal' && physical.code === 'process_output_limit' && !limitedPermit)
+    throw new EngineError('process_output_limit', `[${physical.call.id}] Permit one new bounded attempt with permit-limited-call-retry`, { call: reference(physical.call) });
   const guards = uniqueTransactionGuards([...currentAdmission(store, draft, question, environment, context, extraGuards, barrier ? reference(barrier) : undefined), ...retained]);
   if (pilot && !guards.some(guard => same(guard, reference(pilot)))) applicationInvalid(record.id, 'The new profile must be the currently configured admission');
   // DRY6-02 returns 1–2: an attempt whose original basis moved is never renewed on the old basis, whichever renewable
@@ -750,8 +844,25 @@ function renewApplication(store: Store, record: Revision<Application>, session: 
   const next: Write = { id: session.id, kind: session.kind, expected: session.revision, value: { ...session.value,
     application: applicationId(session.id, session.revision + 1), binding: { draft: reference(draft), question: reference(question), environment: reference(environment), inputs: draft.value.inputs } } };
   const renewed: Write = { id: record.id, kind: record.kind, expected: record.revision, value: { ...app, state: 'renewed', after: pendingRef(next) } };
-  store.writeMany([next, renewed, applicationWrite(next, context, prompt, dispatch.reviewer, dispatch, profile, admitted, pendingRef(renewed), app.origin)],
-    uniqueTransactionGuards([reference(record), reference(session), ...admitted, ...(physical ? [reference(physical.call)] : [])]));
+  store.writeMany([next, renewed, applicationWrite(store, next, context, prompt, dispatch.reviewer, dispatch, profile, admitted, pendingRef(renewed), app.origin, record)],
+    uniqueTransactionGuards([reference(record), reference(session), ...admitted, ...(physical ? [reference(physical.call)] : []), ...(limitedPermit ? [reference(limitedPermit)] : [])]));
+}
+
+/** Read-only scope for the operator's physical retry door. The normal
+ * application reader supplies identity, cursor and paid-origin proofs. */
+export function limitedAssessmentRetryScope(store: Store, call: Revision<ModelCall>): { consumer: Ref; guards: TransactionGuard[] } {
+  requireCondition(isRef(call.value.assessmentApplication), 'limited_call_retry_invalid', `[${call.id}] The call has no bound assessment operation`);
+  const origin = exact<Application>(store, call.value.assessmentApplication, 'assessment-application');
+  const session = store.get<ApplicationSession>(origin.value.session.id);
+  requireCondition(session?.kind === 'assessment-session' && session.value.application === origin.id,
+    'limited_call_retry_stale', `[${call.id}] The assessment cursor has advanced`);
+  const app = readApplication(store, session);
+  requireCondition(['running', 'retryable'].includes(app.value.state) && app.value.call?.id === call.id,
+    'limited_call_retry_stale', `[${call.id}] The assessed candidate is no longer the current attempt`);
+  const outcome = executionOutcome(store, app.value, reference(call)), binding = session.value.binding!;
+  requireCondition(outcome.kind === 'terminal' && outcome.code === 'process_output_limit' && outcome.response === null,
+    'limited_call_retry_invalid', `[${call.id}] The bound operation has no proved output-limit terminal`);
+  return { consumer: reference(origin), guards: uniqueTransactionGuards([reference(app), reference(session), binding.draft, binding.question, ...binding.inputs, ...app.value.guards]) };
 }
 
 /** A historical paid read that exceeded the declared B reading limit keeps
@@ -772,8 +883,8 @@ function continueRefusedAssessmentRead(store: Store, record: Revision<Applicatio
     reference(barrier), reference(record), refusal.call]);
   const next: Write = { id: session.id, kind: session.kind, expected: session.revision,
     value: { ...session.value, application: applicationId(session.id, session.revision + 1) } };
-  const successor = applicationWrite(next, app.context, app.prompt, app.role, app.dispatch,
-    app.profile, guards, reference(record), app.origin,
+  const successor = applicationWrite(store, next, app.context, app.prompt, app.role, app.dispatch,
+    app.profile, guards, reference(record), app.origin, record,
     { contract: 'assessment-read-recovery/v1', refusal: reference(record), call: refusal.call });
   store.writeMany([next, successor], uniqueTransactionGuards([reference(session), reference(record),
     reference(barrier), ...guards]));
@@ -799,7 +910,7 @@ export function readDirectAssessmentMaterials(store: Store, draft: Revision<Disc
     // Only an unfinished attempt can select the recovery branch. Completed
     // applications are selected by the caller's full current context instead.
     if (app.state === 'applied') return [];
-    const { assessmentContextContract, stageNeighbors: _neighbors, ...original } = app.context;
+    const { assessmentContextContract, stageNeighbors: _neighbors, ...original } = withoutResultCapacity(app.context);
     if (!same(original, basis)) return [];
     if (assessmentContextContract !== undefined && assessmentContextContract !== STAGE_NEIGHBOR_CONTEXT)
       applicationInvalid(session.id, 'The direct producer names an unknown assessment material contract');
@@ -858,7 +969,7 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
     exact(store, paidInput.pending, 'research-turn');
     if (paidInput.graph) exact(store, paidInput.graph, 'graph');
   }
-  const basis = JSON.parse(JSON.stringify(context));
+  const basis = JSON.parse(JSON.stringify(withoutResultCapacity(context)));
   const legacyId = `assessment-session:${hashJson([reference(question), reference(environment), draft.value.inputs, basis])}`;
   const id = paidInput
     ? recoveryAssessmentSessionId(paidSessionId(draft.value.projectId, paidInput.pending.id))
@@ -878,11 +989,15 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
     const write: Write = { id, kind: 'assessment-session', expected: 0, value: { projectId: draft.value.projectId,
       offset: 0, notes: [], focus: null, result: null, contract: APPLICATION, application: applicationId(id, 1),
       binding: { draft: reference(draft), question: reference(question), environment: reference(environment), inputs: draft.value.inputs } } };
+    // Prove the supplied paid materials before the real packer reads them. Admission
+    // metadata cannot turn a foreign report/question into a packet-format failure.
     const originWrite = paidInput ? paidOriginWrite(store, id, paidInput, draft, question, environment, basis, prompt, dispatch,
       pilot ? reference(pilot) : null, guards) : null;
+    const admittedBasis = admittedAssessmentContext(store, write, basis, prompt, dispatch.reviewer, dispatch, pilot ? reference(pilot) : null);
+    if (originWrite) (originWrite.value as AssessmentPaidOrigin).context = JSON.parse(canonical(admittedBasis));
     // M+S1/A1 are written atomically under the absence of this turn's technical
     // refusal; the refusal write carries the symmetric absence of M (№2000-10).
-    try { store.writeMany([write, applicationWrite(write, basis, prompt, dispatch.reviewer, dispatch,
+    try { store.writeMany([write, applicationWrite(store, write, admittedBasis, prompt, dispatch.reviewer, dispatch,
       pilot ? reference(pilot) : null, guards, null, originWrite ? pendingRef(originWrite) : undefined),
       ...(originWrite ? [originWrite] : [])],
       uniqueTransactionGuards([...guards, ...(originWrite ? [{ id: proposalRefusalId(draft.value.projectId, paidInput!.pending.id), absent: true as const }] : [])])); }
@@ -930,7 +1045,6 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
         const binding = session.value.binding!;
         const sourceDraft = exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft');
         const sourceQuestion = exact<Question>(store, binding.question, 'question');
-        const workspace = contextWorkspace(session.value.workspace, session.value.focus);
         const checked = evaluateWorkspace(store, session);
         if (checked.failure) {
           if (!(checked.failure instanceof EngineError)) throw checked.failure;
@@ -961,7 +1075,7 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
           if (previous.value.call && previous.value.resolution) {
             const outcome = requireRetryable(store, previous.value);
             if (outcome.kind === 'response') {
-              const failure = correctableAssessmentReply(sourceDraft, sourceQuestion, before, app.context,
+              const failure = assessmentReplyFailure(store, previous.value, outcome.payload) ?? correctableAssessmentReply(sourceDraft, sourceQuestion, before, app.context,
                 outcome.subject, outcome.payload);
               if (failure) {
                 correction = failure.code === 'research_context_incomplete'
@@ -976,10 +1090,8 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
           predecessor = previous.value.previous;
         }
         try {
-          await researchCall(app.role, app.dispatch, app.prompt + '\n' + instruction,
-            { ...app.context, ...(correction ? { failures: [correction] } : {}), assessmentSession: id, assessmentState: { offset: before.offset, candidateOffset: before.candidateOffset ?? 0,
-              total: JSON.stringify(app.context.observations).length }, assessmentNotes: before.notes,
-              contextWorkspace: workspace.entries.map(entry => entry.result), focus: null }, signal,
+          await researchCall(app.role, app.dispatch, assessmentRolePrompt(app.prompt),
+            assessmentDispatchContext(before, id, app.context, correction), signal,
             { store, draftId: sourceDraft.id, questionId: sourceQuestion.id, purpose: 'assessor', ...(app.profile ? { pilot: exact<ReaderPilot>(store, app.profile, 'reader-pilot') } : {}), session: reference(session),
               application: reference(application),
               prepareCall: call => ({ writes: [{ id: application.id, kind: application.kind, expected: application.revision,
@@ -1026,7 +1138,9 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
           // admission. Renewal checks the fresh context before the next call.
           uniqueTransactionGuards([reference(application), reference(session), reference(outcome.call)]));
           throw new EngineError(outcome.kind === 'terminal' ? outcome.code : 'research_provider_failed',
-            outcome.kind === 'terminal' && outcome.code === 'process_cancelled'
+            outcome.kind === 'terminal' && outcome.code === 'process_output_limit'
+              ? `[${call.id}] Output exceeded the physical limit; permit-limited-call-retry admits one bounded attempt`
+              : outcome.kind === 'terminal' && outcome.code === 'process_cancelled'
               ? `[${call.id}] The common stop cancelled the dispatched attempt; the explicit resume of that stop admits one new attempt`
               : outcome.kind === 'terminal'
               ? `[${call.id}] Control refused the request before dispatch; the exact unsubmitted attempt is preserved`
@@ -1044,12 +1158,13 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
       if (advanced.failure instanceof EngineError) {
         // Packet defects throw here before payload classification, rather than authorizing another model call.
         assessmentPacket(session.value, app.context, response.subject);
-        const failure = correctableAssessmentReply(sourceDraft, sourceQuestion, session.value, app.context,
+        const failure = assessmentReplyFailure(store, app, response.payload) ?? correctableAssessmentReply(sourceDraft, sourceQuestion, session.value, app.context,
           response.subject, response.payload);
         if (failure && same([failure.code, failure.message, failure.details ?? null],
           [advanced.failure.code, advanced.failure.message, advanced.failure.details ?? null])) {
           const refused: Write = { id: application.id, kind: application.kind, expected: application.revision,
-            value: { ...app, state: 'model-refused', replyOutcomeContract: EARLY_RESEARCH_OUTCOME, received: reference(call), resolution: advanced.proof } };
+            value: { ...app, state: 'model-refused', replyOutcomeContract: EARLY_RESEARCH_OUTCOME, received: reference(call), resolution: advanced.proof,
+              ...(failure.code === RESULT_CAPACITY_REFUSAL ? { resultCapacityRefusal: failure.details as Record<string, unknown> } : {}) } };
           const barrier = readBarrier(store, app.projectId, binding.question), absent = barrierGuard(app.projectId, binding.question);
           if (barrier && !permitsAssessmentCorrection(store, barrier, app)) barrierRefusal(store, barrier);
           store.writeMany([refused, ...refusalBarrierWrite(barrier, app, binding.question, refused)],
@@ -1075,7 +1190,7 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
         ? [{ id: barrier.id, kind: barrier.kind, expected: barrier.revision,
           value: { ...barrier.value, completion: pendingRef(applied) } } satisfies Write] : [];
       store.writeMany([write, applied, ...release,
-        ...(!terminal ? [applicationWrite(write, app.context, app.prompt, app.role, app.dispatch, app.profile, uniqueTransactionGuards([...app.guards, ...advanced.guards]), pendingRef(applied), app.origin)] : []), ...recovered.writes],
+        ...(!terminal ? [applicationWrite(store, write, app.context, app.prompt, app.role, app.dispatch, app.profile, uniqueTransactionGuards([...app.guards, ...advanced.guards]), pendingRef(applied), app.origin, application)] : []), ...recovered.writes],
       uniqueTransactionGuards([reference(session), reference(application), ...app.guards, ...response.guards, ...advanced.guards, ...recovered.guards]));
       markRecoveredSessionWritten(recovered);
       if (terminal) return { result: nextValue.result, terminal: pendingRef(write), applied: pendingRef(applied) };
@@ -1181,6 +1296,8 @@ function evaluateApplication(store: Store, app: Application, before: Revision<Ap
     for (const observation of app.context.observations) requireCondition(new Evidence(inputs.store).verify(observation),
       'research_context_application_source_stale', 'An original observation is no longer supported by its source');
     const pilot = app.profile ? exact<ReaderPilot>(store, app.profile, 'reader-pilot') : undefined;
+    const capacityFailure = assessmentReplyFailure(store, app, paid.payload);
+    if (capacityFailure) throw capacityFailure;
     const advanced = advanceAssessment(inputs.store, draft, question, pilot, before.value, app.context, paid.subject, paid.payload);
     value = advanced.value; failure = advanced.failure;
   } catch (error) { failure = error; }
@@ -1206,7 +1323,7 @@ function proveSessionOrigin(store: Store, record: Revision<Application>, before:
       application: record.id, binding: before.value.binding };
     const expectedId = app.origin
       ? paidSessionId(app.projectId, exact<AssessmentPaidOrigin>(store, app.origin, 'assessment-paid-origin').value.pending.id)
-      : `assessment-session:v1:${hashJson([before.value.binding!.question, app.context])}`;
+      : `assessment-session:v1:${hashJson([before.value.binding!.question, withoutResultCapacity(app.context)])}`;
     if (before.revision !== 1 || before.id !== expectedId
       || !same(before.value, expected)) applicationInvalid(record.id, 'The initial session is not the declared initial cursor');
     return;
@@ -1233,8 +1350,8 @@ function proveSessionOrigin(store: Store, record: Revision<Application>, before:
       || !barrier || !same(barrier.value.refusal, app.previous) || barrier.value.completion
       || !same(before.value, { ...prior.value, application: record.id })
       || before.revision !== prior.revision + 1 || before.value.result !== null
-      || !same([app.context, app.prompt, app.role, app.dispatch, app.profile, app.origin ?? null],
-        [previous.value.context, previous.value.prompt, previous.value.role,
+      || !same([withoutResultCapacity(app.context), app.prompt, app.role, app.dispatch, app.profile, app.origin ?? null],
+        [withoutResultCapacity(previous.value.context), previous.value.prompt, previous.value.role,
           previous.value.dispatch, previous.value.profile, previous.value.origin ?? null])
       || !same(app.guards, expectedGuards))
       applicationInvalid(record.id, 'The recovered read does not continue its exact refused assessment');
@@ -1248,8 +1365,8 @@ function proveSessionOrigin(store: Store, record: Revision<Application>, before:
     const prior = exact<ApplicationSession>(store, previous.value.session, 'assessment-session'), binding = prior.value.binding!;
     const expected = { ...prior.value, application: record.id, binding: before.value.binding };
     if (!same(before.value, expected) || before.value.result !== null
-      || !same([previous.value.context, previous.value.prompt, binding.draft, binding.question, binding.inputs],
-        [app.context, app.prompt, before.value.binding!.draft, before.value.binding!.question, before.value.binding!.inputs]))
+      || !same([withoutResultCapacity(previous.value.context), previous.value.prompt, binding.draft, binding.question, binding.inputs],
+        [withoutResultCapacity(app.context), app.prompt, before.value.binding!.draft, before.value.binding!.question, before.value.binding!.inputs]))
       applicationInvalid(record.id, 'The renewed cursor changed applied pages or their original materials');
     if (previous.value.call === null) {
       if (!increasedPilot(store, previous.value.profile, app.profile)
@@ -1262,8 +1379,8 @@ function proveSessionOrigin(store: Store, record: Revision<Application>, before:
   }
   if (previous.value.state !== 'applied' || !same(previous.value.after, reference(before))
     || previous.value.session.id !== before.id || previous.value.session.revision !== before.revision - 1
-    || !same([previous.value.context, previous.value.prompt, previous.value.role, previous.value.dispatch, previous.value.profile],
-      [app.context, app.prompt, app.role, app.dispatch, app.profile]))
+    || !same([withoutResultCapacity(previous.value.context), previous.value.prompt, previous.value.role, previous.value.dispatch, previous.value.profile],
+      [withoutResultCapacity(app.context), app.prompt, app.role, app.dispatch, app.profile]))
     applicationInvalid(record.id, 'The prior application does not derive this exact continuation');
   readApplication(store, before, app.previous);
   const prior = proveAppliedAssessment(store, previous, before);

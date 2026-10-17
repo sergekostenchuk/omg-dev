@@ -2411,7 +2411,7 @@ test('ASM1 B oversized required prefix stops before a physical call', async t =>
   const first = f.store.get<Question>(f.neighbors.fields[0]!.question.id)!;
   const reopened = f.engine.discovery.reopen(first.id, first.revision);
   f.engine.discovery.decision(reopened.id, reopened.revision, 'owner', 'audience'.repeat(60000));
-  await assert.rejects(f.direct(), { code: 'pilot_core_limit' });
+  await assert.rejects(f.direct(), { code: 'research_capacity_configuration' });
   assert.equal(f.sent().length, 0);
   assert.equal(f.store.list('model-call').length, 0);
   assert.equal(f.store.list('model-response').length, 0);

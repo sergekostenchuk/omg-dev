@@ -40,17 +40,18 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:c
   const command = { executable: process.execPath, args: [path] };
   const environment = engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
     reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 30000 }, 0);
-  const pilot = configureReaderPilot(store, engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
+  // Produce the three lawful checkpoints before applying the measured transport
+  // pressure; result-capacity metadata is part of each real setup request.
+  const setupLimit = Math.max(limit, noteChars * 4 + 50000);
+  let pilot = configureReaderPilot(store, engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
     reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command }, agentCommand: command,
-    maxRequestChars: limit, maxContinuationChars: limit, conclusionShare: share,
+    maxRequestChars: setupLimit, maxContinuationChars: setupLimit, conclusionShare: 0.95,
     maxReadChars: 60000, maxReplyChars: 100000, maxCalls: 20, maxReportedTokens: 100000, ...settings }, 0);
   const r0 = engine.refinement.begin('p', 'R0'); engine.refinement.finishResearch('p', 'R0', reference(r0), 0); engine.refinement.sealLayer('p', 1, 0);
   const draft = engine.refinement.begin('p', 'R1'), question = store.get<Question>(draft.value.questions[0]!)!;
   const small = readResearchContext(store, draft, question.id, pilot, reference(store.get('graph-layer:p:1')!), '/projection/title');
   // The large material earns a genuine fragment cursor: its first pages cannot
   // fit beside the mandatory packet, so materialOffset is produced, not written.
-  // The 'small' layout instead takes four small materials — cheap and final-stage
-  // friendly — for checks that never exercise pagination.
   // The 'small' layout instead takes four modest materials — one per page at
   // any used limit — cheap and final-stage friendly, for checks that never
   // exercise pagination.
@@ -93,6 +94,11 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:c
   if (!before.id.startsWith('synthesis-session:v2:') || before.value.contract !== 'synthesis-session/v2'
     || before.value.notes.length !== (noteChars >= 40000 ? setupPaidCalls : 3))
     throw new Error('synthesis-session-fixture: expected a v2 session with produced checkpoint notes');
+  // Apply the measured settings through the real producer. The paid setup
+  // retains its own profile; no historical admission is rewritten.
+  const { projectId: _project, ...setupSettings } = pilot.value;
+  pilot = configureReaderPilot(store, engine.environments, 'p', { ...setupSettings,
+    maxRequestChars: limit, maxContinuationChars: limit, conclusionShare: share }, pilot.revision);
   // The measured operation's transport pressure is applied after the basis was
   // produced; the padding is not part of the session basis.
   if (requestPadding) context.request = { immutableCondition: 'x'.repeat(requestPadding) };

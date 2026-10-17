@@ -1,4 +1,4 @@
-import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME,
+import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME, researchResultFailure,
   type EarlyUnknownAdmission } from './early-research-outcome.js';
 import { Ajv } from 'ajv';
 import { canonical, digest, hashJson } from '../canonical.js';
@@ -315,7 +315,7 @@ export interface SynthesisSessionState {
  * the intent still running — a repeat re-derives the same refusal from the
  * proven execution without a new P (№1658-1). */
 export const SYNTHESIS_TRANSITION_REFUSAL_CODES: ReadonlySet<string> = new Set([
-  'research_response_invalid', 'research_checkpoint_empty', 'research_mode_invalid',
+  'research_result_capacity', 'research_response_invalid', 'research_checkpoint_empty', 'research_mode_invalid',
   'research_question_foreign', 'synthesis_cursor_invalid', 'synthesis_checkpoint_required',
   'synthesis_no_progress', 'research_saved_only', 'consolidation_response_invalid',
   'consolidation_coverage_invalid', 'consolidation_citations_invalid']);
@@ -481,6 +481,8 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
   requireCondition(recordValue(before) && Array.isArray(before.notes) && Number.isSafeInteger(before.offset)
     && recordValue(archive) && recordValue(subject),
   'research_context_invalid', 'The synthesis transition needs its exact saved state, packet and archive');
+  const capacityFailure = researchResultFailure(archive.resultCapacity, input.payload);
+  if (capacityFailure) throw capacityFailure;
   const questionId = input.question.id;
   const workspace = contextWorkspace(before.workspace, before.focus);
   requireCondition(!workspace.blocked, 'research_no_progress', workspace.blocked ?? 'Saved context session is blocked');
@@ -865,7 +867,7 @@ export function managedAnswerTurn(id: string, projectId: string): string | null 
  * action or a transport refusal (C13/C62). Context-level failures that occur
  * after the turn was written keep completing that turn with their typed error. */
 export const ACTION_RESPONSE_REFUSAL_CODES: ReadonlySet<string> = new Set([
-  'research_response_invalid', 'research_checkpoint_empty', 'escalation_assessment_invalid']);
+  'research_result_capacity', 'research_response_invalid', 'research_checkpoint_empty', 'escalation_assessment_invalid']);
 
 export const managedTurnId = (run: string, number: number) =>
   `research-turn:v1:${hashJson([run, number])}`;

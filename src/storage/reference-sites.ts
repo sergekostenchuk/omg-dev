@@ -57,7 +57,7 @@ const synthesisSessionData = (): PathPattern[] => [
   ...researchActionData(["pause"]),
 ];
 
-const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
+const contextBodyData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
   [...prefix, "value"],
   [...prefix, "fields"],
   [...prefix, "questions", INDEX, "schema"],
@@ -103,6 +103,12 @@ const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
     .map(field => [...prefix, "core", field] as PathPattern),
 ];
 
+const capacityData = (prefix: readonly PathPatternSegment[]): PathPattern[] =>
+  contextBodyData([...prefix, 'mandatory', 'projection', 'subject']);
+const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
+  ...contextBodyData(prefix), ...capacityData([...prefix, 'resultCapacity'])
+];
+
 /**
  * Stored contracts whose bodies contain JSON data next to engine references.
  * Everything outside these declared data subtrees keeps the historical
@@ -110,6 +116,7 @@ const contextData = (prefix: readonly PathPatternSegment[]): PathPattern[] => [
  * of silently borrowing the semantics of another era.
  */
 const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
+  { kind: "limited-call-retry-permit", contract: "limited-call-retry-permit/v1", data: [], refs: [["call"], ["terminal"], ["consumer"]] },
   { kind: "decision", contract: null, data: [["value"]] },
   { kind: "design", contract: null, data: [["value"]] },
   { kind: "fact", contract: null, data: [["observation", "value"]] },
@@ -120,12 +127,13 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "research-assessment", contract: null, data: [["value"], ["observations", INDEX, "value"]] },
   { kind: "research-checkpoint", contract: null, data: [["proposal"], ["observations", INDEX, "value"]] },
   { kind: "research-context", contract: null, data: contextData(["body"]) },
+  { kind: "research-context", contract: "result-capacity-projection/v1", data: contextBodyData(["body", "subject"]) },
   { kind: "reader-result", contract: "reader-result/v2", data: [["observations", INDEX, "value"]] },
   { kind: "pilot-reading", contract: null, data: [["observation", "value"]] },
   { kind: "research-turn", contract: "research-consumer-turn/v1", data: [
     ...researchActionData(["action"]), ...observationData(["observation"]),
   ] },
-  { kind: "research-consumer-intent", contract: "research-consumer-intent/v1", data: contextData(["cursor", "context"]) },
+  { kind: "research-consumer-intent", contract: "research-consumer-intent/v1", data: [...contextData(["cursor", "context"]), ...capacityData(["cursor", "resultCapacity"])] },
   { kind: "assessment-application", contract: "assessment-application/v1", data: contextData(["context"]) },
   { kind: "assessment-paid-origin", contract: "assessment-paid-origin/v1", data: [
     ...contextData(["context"]), ["runtime", "supporting", INDEX, "value"],

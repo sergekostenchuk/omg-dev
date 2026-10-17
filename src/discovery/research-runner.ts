@@ -1,5 +1,6 @@
+import { isResearchPreview } from './research-preview.js';
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
-import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections,
+import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { RESEARCH_CONTRACT_VERSION } from './requirements.js';
 import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
@@ -20,7 +21,7 @@ import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectSynthesisHandoffTurn, acceptanceEraOf, acceptanceBindingId, EARLY_ACTIONS, EARLY_UNKNOWN, earlyUnknownEra,
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
   type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
-import { earlyResearchConsumerFailure, captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
+import { earlyResearchConsumerFailure, consumerCapacityFailure, captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
   assessmentReadView, prepareResearchConsumerIntent, readResearchConsumerIntent,
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
@@ -1303,7 +1304,7 @@ export class Researcher {
         "research_consumer_context_stale", "The original research dispatch or reader profile changed");
       await researchCall(intent.value.role, intent.value.dispatch, cursor.instruction, cursor.context, signal,
         { store: this.store, draftId: intent.value.draft.id, questionId: intent.value.question.id,
-          purpose: intent.value.kind, ...(pilot ? { pilot } : {}), consumerIntent: reference(intent) });
+          purpose: intent.value.kind, ...(pilot ? { pilot } : {}), consumerIntent: reference(intent), ...(isResearchPreview() ? { previewIntent: intent } : {}) });
     }
     const paid = resumeResearchConsumerExecution(this.store, intent.value.projectId, reference(intent));
     requireCondition(paid.kind === "response", "research_consumer_execution_failed",
@@ -1469,12 +1470,12 @@ export class Researcher {
       run = this.save(run, { status: "running", owner, error: null, pauseCode: null }, [reference(intent)]);
     }
     const paid = await this.receivedIntent(intent, dispatch, pilot, signal);
-    try { requireEscalationReply(paid.payload); }
+    try { const failure = consumerCapacityFailure(this.store, intent, paid.payload); if (failure) throw failure; requireEscalationReply(paid.payload); }
     catch (error) {
-      if (!(error instanceof EngineError) || error.code !== 'escalation_assessment_invalid') throw error;
+      if (!(error instanceof EngineError) || !['escalation_assessment_invalid', RESULT_CAPACITY_REFUSAL].includes(error.code)) throw error;
       // C13/C62: preserve this attempt's addressed malformed verdict.
-      const refused = refuseResearchConsumerIntent(this.store, reference(intent), 'escalation_assessment_invalid');
-      throw new EngineError('escalation_assessment_invalid',
+      const refused = refuseResearchConsumerIntent(this.store, reference(intent), error.code);
+      throw new EngineError(error.code,
         `[${refused.id}] Escalation assessment requires an explicit decision and reason; paid call ${refused.value.refusal!.call.id}`,
         { intent: reference(refused), call: refused.value.refusal!.call });
     }

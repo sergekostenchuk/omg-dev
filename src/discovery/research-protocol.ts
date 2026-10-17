@@ -1,3 +1,4 @@
+import { assessmentRolePrompt } from './assessment-session.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, executionOf } from './model-call-recovery.js';
@@ -29,12 +30,12 @@ import { workingContext } from "./working-context.js";
 import { replayLimitedResponse } from "./response-replay.js";
 import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
-  readResearchConsumerIntent, resumeResearchConsumerExecution,
+  readResearchConsumerIntent, resumeResearchConsumerExecution, consumerResultCapacity,
   refuseResearchConsumerIntent, prepareResearchConsumerReservation,
   type ResearchConsumerIntent } from './response-recovery.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply } from './research-consumer-transition.js';
-import { earlyResearchStage } from './early-research-outcome.js';
+import { earlyResearchStage, requireResultCapacity, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS } from './early-research-outcome.js';
 import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite } from '../om/run-control.js';
 
 export { researchAction } from './research-consumer-transition.js';
@@ -44,6 +45,8 @@ interface ResearchCallAudit {
   session?: Ref; onContext?: (context: Record<string, any>) => void;
   application?: Ref; prepareCall?: (call: Write) => { writes: Write[]; guards: TransactionGuard[] };
   consumerIntent?: Ref;
+  /** Virtual producer only inside the no-dispatch preview scope. */
+  previewIntent?: Revision<ResearchConsumerIntent>;
 }
 type AssessmentReservation = { kind: 'replay-only' } | {
   kind: 'application'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
@@ -145,6 +148,60 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
   }
 }
 
+/** The same real packet builder declares admission and later dispatches it.
+ * Preflight may save a content-addressed archive, never a call or usage. */
+export function prepareResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
+  context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot'>,
+  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000') {
+  const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
+  const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
+    audit.questionId, audit.purpose, role.actor) : null;
+  const consolidating = (context as any)?.dispatchMode === 'consolidation';
+  const controls = (context as any)?.contextControls;
+  const finalizing = !consolidating && controls?.mode === 'finalization';
+  const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
+  const packingContext = capacity === undefined ? context : { ...context as Record<string, unknown>, resultCapacity: capacity };
+  const requestLimit = capacity === undefined ? audit?.pilot?.value.maxRequestChars ?? DEFAULT_RESEARCH_REQUEST_CHARS
+    : capacity.envelopeLimitChars;
+  const outputLimit = researchResponseOutputLimit(audit?.pilot?.value.physicalLimits?.maxReplyChars ?? null);
+  const overhead = JSON.stringify(outputLimit).length + 32 + Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
+    controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
+  const subjectFor = (limit: number) => {
+    const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
+      limit, { common: true, purpose: audit!.purpose, continuation: !packetState.initial,
+        ...(packetState.latest ? { previous: packetState.latest } : {}),
+        ...(audit!.pilot ? { contextChars: audit!.pilot.value.maxRequestChars } : {}),
+        ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}) })
+      : packingContext && typeof packingContext === 'object' && !Array.isArray(packingContext) ? { ...packingContext } : packingContext;
+    if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive, audit!.store);
+    if (packed && typeof packed === 'object') (packed as Record<string, unknown>).responseOutputLimit = outputLimit;
+    return packed;
+  };
+  let subjectLimit = requestLimit - overhead;
+  let subject = subjectFor(subjectLimit);
+  const physicalLimit = Math.min(requestLimit, audit?.pilot?.value.physicalLimits?.maxRequestChars ?? requestLimit);
+  if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
+  let input = JSON.stringify({ ...envelope, subject });
+  // Keep RD2b's measured transport adjustment in the single real builder used
+  // by both preflight and dispatch; the result marker is already in subject.
+  for (let attempt = 0; packetState && input.length > physicalLimit && attempt < 4; attempt += 1) {
+    subjectLimit -= input.length - physicalLimit + 128;
+    subject = subjectFor(subjectLimit);
+    if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
+    input = JSON.stringify({ ...envelope, subject });
+  }
+  if (capacity !== undefined) requireCondition(recordValue(subject) && Object.hasOwn(subject, 'resultCapacity')
+    && canonical(subject.resultCapacity) === canonical(capacity),
+  'research_capacity_invalid', 'The packed request must preserve its exact saved result admission');
+  if (!consolidating && context && typeof context === 'object' && Object.hasOwn(context, 'contextWorkspace'))
+    requireContextDelivery((context as any).contextWorkspace, subject as Record<string, any>);
+  requireCondition(input.length <= requestLimit, packetState?.initial === false ? "continuation_packet_limit" : "pilot_request_limit", "Full envelope exceeds its fixed transport budget; split the piece, never raise the ceiling");
+  requireCondition(!audit?.pilot?.value.physicalLimits || input.length <= audit.pilot.value.physicalLimits.maxRequestChars,
+    "budget_transport_limit", "The full envelope exceeds the declared physical transport capacity; split the material before dispatch");
+  return { packetState, subject, envelope, input, requestLimit };
+}
+
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: ResearchCallAudit): Promise<unknown> {
   recoveryDispatchBoundary();
@@ -158,12 +215,24 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const durableConsumerIntent = audit?.consumerIntent
     ? audit.store.get<ResearchConsumerIntent>(audit.consumerIntent.id, audit.consumerIntent.revision)
     : null;
-  if (audit?.consumerIntent && (!isResearchPreview() || durableConsumerIntent)) {
+  if (audit?.previewIntent) requireCondition(isResearchPreview(), 'research_preview_unbound',
+    'A virtual consumer cannot authorize an actual dispatch');
+  if (audit?.consumerIntent) {
     if (audit.application || audit.prepareCall || !audit.store) applicationAuditInvalid('A consumer intent cannot share an assessment reservation callback');
-    const supplied = readResearchConsumerIntent(audit.store, audit.consumerIntent);
-    const head = audit.store.get<ResearchConsumerIntent>(supplied.id);
-    requireCondition(head, 'research_consumer_intent_invalid', 'The selected consumer intent disappeared');
-    consumerIntent = readResearchConsumerIntent(audit.store, reference(head));
+    const virtual = isResearchPreview() && !durableConsumerIntent;
+    if (virtual) {
+      const prepared = audit.previewIntent;
+      requireCondition(prepared?.kind === 'research-consumer-intent' && prepared.value.state === 'prepared'
+        && prepared.hash === hashJson(prepared.value)
+        && canonical(reference(prepared)) === canonical(audit.consumerIntent),
+      'research_consumer_intent_invalid', 'Preview needs its exact unsent virtual producer');
+      consumerIntent = prepared;
+    } else {
+      const supplied = readResearchConsumerIntent(audit.store, audit.consumerIntent);
+      const head = audit.store.get<ResearchConsumerIntent>(supplied.id);
+      requireCondition(head, 'research_consumer_intent_invalid', 'The selected consumer intent disappeared');
+      consumerIntent = readResearchConsumerIntent(audit.store, reference(head));
+    }
     requireCondition(consumerIntent.value.projectId === environment.projectId && consumerIntent.value.draft.id === audit.draftId
       && consumerIntent.value.question.id === audit.questionId && canonical(consumerIntent.value.role) === canonical(role)
       && canonical(consumerIntent.value.dispatch) === canonical(environment)
@@ -185,6 +254,10 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     }
   }
   const assessment = assessmentReservation(audit, role, environment, context);
+  // Direct callers may pass the saved base prompt. A new admission still sends
+  // the same complete assessor instructions declared by the producer.
+  if (assessment?.kind === 'application' && assessment.application.value.context.resultCapacityContract !== undefined
+    && prompt === assessment.application.value.prompt) prompt = assessmentRolePrompt(prompt);
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
   let segment = null;
@@ -211,49 +284,17 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     }
   }
   requireCondition(!draft || Boolean(audit?.questionId), "continuation_question_missing", "A saved research draft cannot bypass the common packer by omitting its question");
-  const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
-    audit.questionId, audit.purpose, role.actor) : null;
   const requestId = randomUUID();
   const callId = consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
-  const consolidating = (context as any)?.dispatchMode === 'consolidation';
-  const controls = (context as any)?.contextControls;
-  const finalizing = !consolidating && controls?.mode === 'finalization';
-  const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
-  const requestLimit = audit?.pilot?.value.maxRequestChars ?? 300000;
-  const overhead = Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
-    controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
-  const subjectFor = (limit: number) => {
-    const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
-      limit, { common: true, purpose: audit!.purpose, continuation: !packetState.initial,
-        ...(packetState.latest ? {previous:packetState.latest} : {}),
-        ...(audit!.pilot?{contextChars:audit!.pilot.value.maxRequestChars}:{}),
-        ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxRequestChars}:{}) }) : context;
-    if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive, audit!.store);
-    return packed;
-  };
-  let subjectLimit = requestLimit - overhead;
-  let subject = subjectFor(subjectLimit);
-  const physicalLimit = Math.min(requestLimit, audit?.pilot?.value.physicalLimits?.maxRequestChars ?? requestLimit);
-  if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization')
-    envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
-  let input = JSON.stringify({ ...envelope, subject });
-  // The transport includes the prompt and continuation metadata, whose exact
-  // escaped size is not known to the working-set planner. Repack the saved
-  // originals under the measured remaining space before any paid dispatch.
-  for (let attempt = 0; packetState && input.length > physicalLimit && attempt < 4; attempt += 1) {
-    subjectLimit -= input.length - physicalLimit + 128;
-    subject = subjectFor(subjectLimit);
-    if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization')
-      envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
-    input = JSON.stringify({ ...envelope, subject });
-  }
-  if (!consolidating && context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
-    requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);
+  const capacity = consumerIntent?.value.cursor.resultCapacity
+    ?? (assessment?.kind === 'application' ? assessment.application.value.context.resultCapacity : undefined);
+  if (consumerIntent?.value.cursor.resultCapacityContract !== undefined)
+    requireResultCapacity(capacity, consumerResultCapacity(audit!.store, consumerIntent.value), audit!.store);
+  const { packetState, subject, envelope, input, requestLimit } = prepareResearchEnvelope(role, environment,
+    prompt, context, audit, capacity, requestId);
+  if (capacity !== undefined) requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,
+    'research_capacity_invalid', 'The actual role prompt differs from its predeclared result admission');
   audit?.onContext?.(subject as Record<string, any>);
-  requireCondition(input.length <= requestLimit, packetState?.initial === false ? "continuation_packet_limit" : "pilot_request_limit", "Full envelope exceeds its fixed transport budget; split the piece, never raise the ceiling");
-  requireCondition(!audit?.pilot?.value.physicalLimits || input.length <= audit.pilot.value.physicalLimits.maxRequestChars,
-    "budget_transport_limit", "The full envelope exceeds the declared physical transport capacity; split the material before dispatch");
   const recovered = operatorReplayedResponse(role, input, audit);
   if (recovered) { audit?.onContext?.(recovered.subject); return recovered.research; }
   if (assessment?.kind === 'replay-only') applicationAuditInvalid('The operator recovery did not consume its selected response');
