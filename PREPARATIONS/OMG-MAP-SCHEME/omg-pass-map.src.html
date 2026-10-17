@@ -39,6 +39,7 @@ h1 b{color:var(--accent);font-weight:600}
 .chip{height:28px;padding:0 12px;border-radius:9px;border:1px solid var(--line2);background:var(--raised);color:var(--ink2);font:500 12px var(--font);cursor:pointer}
 .chip:hover{color:var(--ink);border-color:#3c3c44}
 .chip[aria-pressed="true"]{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
+.seg{display:inline-flex;gap:4px}
 .sep{width:1px;height:20px;background:var(--line2);margin:0 4px}
 .hint{margin-left:auto;font:10.5px var(--mono);color:var(--ink3)}
 
@@ -192,7 +193,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <div class="l">
       <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · Исполнение — №4597 · Вход — №4600 · Discovery D1–D7 — №4602 · L1 M1–M7 — №4604 · спецификация P1–P7 — №4605 · фичи F1–F7 — №4607 · концепция C1–C7 — №4609 · + оркестратор</div>
       <h1>Проход продукта: <b>от идеи до задачи</b></h1>
-      <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки.</p>
+      <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки. <strong>Переключатель «Discovery · текущий / New Discovery»</strong> меняет первую стадию: текущая реализация в движке или предложенное устройство (досье реального мира по 12 осям) — вместе с её связями к концепции, карте, спецификации, фичам и OM.</p>
     </div>
     <div class="legend" aria-label="Обозначения">
       <span class="pill ok">есть</span><span class="pill acc">в DS1</span><span class="pill warn">частично</span><span class="pill bad">нет</span><span class="pill">макет</span>
@@ -206,6 +207,11 @@ ul.plain b{color:var(--ink);font-weight:500}
     <button class="chip" data-mode="gaps" aria-pressed="false">Пробелы</button>
     <button class="chip" data-mode="done" aria-pressed="false">Сделано</button>
     <select class="chip" id="doneDate" aria-label="Сделано за дату"><option value="">все даты</option></select>
+    <span class="sep" aria-hidden="true"></span>
+    <span class="seg" role="group" aria-label="Какой Discovery показать">
+      <button class="chip" data-disc="old" aria-pressed="true">Discovery · текущий</button>
+      <button class="chip" data-disc="new" aria-pressed="false">New Discovery</button>
+    </span>
     <span class="sep" aria-hidden="true"></span>
     <button class="chip" id="expAll">Развернуть всё</button>
     <button class="chip" id="colAll">Свернуть всё</button>
@@ -1603,6 +1609,119 @@ research-stage(project, draftId, maxTurns)
       {f:"d5.n9",t:"d7.n6",l:"отрицательный итог",k:"alt",route:"below",depth:46},
       {f:"s",t:"d1",l:"S обслуживает каждый ход D1–D6",k:"tie",route:"below",depth:92}
      ]},
+    {id:"ndisc",n:"Стадия 1 · New",st:"no",g:1,t:"New Discovery",io:["идея","досье реального мира"],top:30,
+     sum:"Приём → рамка и домены → план по 12 осям → исследование с методикой → досье → варианты → итог и вердикт → проекции потребителям. Хранитель держит конституцию.",
+     d:[["Что делает","Разбирается в куске реального мира, которому служит цифровой продукт: отрасль, люди, правила, рынок, деньги, данные, масштаб, последствия, реализуемость, первый результат. Выдаёт досье, на котором строят все следующие стадии."],["Подпродукт","Досье: каждое утверждение помечено — факт с источником, вывод, гипотеза, неизвестное (кто и когда закроет), решение владельца. Плюс 2–3 варианта, итог, вердикт и конституция проекта."],["Отличие от текущего","Текущий Discovery исследует один продукт и выносит go/no_go; домен — свободная строка модели, оси не названы, вариант один, широту никто не проверяет."],["Описание","PREPARATIONS/OMG-MAP-SCHEME/discovery-design-2026-10-17.html — предложение на утверждение владельца 17.10.2026.",GAP]],
+     subs:[
+      {id:"d0",n:"D0",st:"yes",g:0,t:"Приём поручения",io:["слова и материалы владельца","поручение дословно"],
+       sum:"Код сохраняет поручение и материалы владельца без трактовки — как сейчас.",
+       d:[["Как сейчас","brief и objective — дословная выборка (early-stage-driver.ts:441–479)."]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"yes",g:0,t:"Поручение дословно",io:["слова владельца","Source idea"],bh:"Текст без трактовки.",d:[["Действие","N0.1 — дословная выборка поручения."]]},
+        {id:"n2",role:"код",st:"yes",g:0,t:"Материалы владельца",io:["файлы · ссылки","Source"],bh:"Всё, что дал владелец, — источники.",d:[["Действие","N0.2 — материалы как Source с хэшем."]]},
+        {id:"n3",role:"код",st:"no",g:0,t:"Слова владельца — опора",io:["поручение","заготовка конституции"],bh:"Отсюда хранитель берёт цель.",d:[["Действие","N0.3 — дословные цели владельца для конституции."]]}
+       ],3),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"}].map(lbl)},
+      {id:"d1",n:"D1",st:"no",g:1,t:"Рамка",io:["поручение","домены · глубина осей"],
+       sum:"Тип продукта, отрасли и домены, глубина по каждой из 12 осей. Масштаб задаёт глубину.",
+       d:[["Сейчас","Домен — свободная строка researchPlan.domain, без глубины по осям.",GAP]],
+       nodes:snake([
+        {id:"n1",role:"модель",st:"no",g:1,t:"Тип продукта",io:["поручение","личный · внутренний · коммерческий · публичный"],bh:"Масштаб задаёт глубину всех осей.",d:[["Действие","N1.1."]]},
+        {id:"n2",role:"модель",st:"no",g:1,t:"Отрасли и домены",io:["поручение","карта доменов"],bh:"Строительство → снабжение, учёт, сметы…",d:[["Действие","N1.2."]]},
+        {id:"n3",role:"модель",st:"no",g:1,t:"План глубины",io:["домены · тип","глубоко · кратко · неприменимо"],bh:"Неприменимо — только с причиной.",d:[["Действие","N1.3."]]},
+        {id:"n4",role:"оценщик",st:"no",g:1,t:"Проверка рамки",io:["рамка","supported / вернуть"],bh:"Не сужено ли поручение молча.",d:[["Действие","N1.4."]]},
+        {id:"n5",role:"владелец",st:"no",g:0,t:"Трактовка",io:["расхождение","выбор"],bh:"Только если трактовки расходятся и меняют результат.",d:[["Действие","N1.5."]]}
+       ],3),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5",l:"расхождение",k:"alt"}].map(lbl)},
+      {id:"d2",n:"D2",st:"part",g:1,t:"План по осям",io:["рамка","вопросы · роли · места · критерий"],
+       sum:"По домену и оси: вопросы, роли-перспективы, места поиска (включая аналоги) и критерий достаточного ответа.",
+       d:[["Сейчас","researchPlan: домен, роли, вопросы, источники; аналоги — DS2. Оси и критерий достаточности не названы.",GAP],["Задача","DS2",TASK]],
+       nodes:snake([
+        {id:"n1",role:"модель",st:"part",g:1,t:"Вопросы по осям",io:["домен × ось","вопросы"],bh:"Носители: вопросы владельца 10 + 9.",d:[["Действие","N2.1."]]},
+        {id:"n2",role:"модель",st:"part",g:0,t:"Роли-перспективы",io:["домены","эксперты"],bh:"Отрасль, юрист региона, экономист, пользователи, инженер.",d:[["Действие","N2.2."]]},
+        {id:"n3",role:"модель",st:"part",g:0,t:"Места поиска",io:["вопрос","где искать"],bh:"Включая аналоги по домену.",d:[["Действие","N2.3."],["Задача","DS2",TASK]]},
+        {id:"n4",role:"модель",st:"no",g:1,t:"Критерий достаточности",io:["вопрос","что считать ответом"],bh:"Без него — выход по усталости.",d:[["Действие","N2.4."]]},
+        {id:"n5",role:"оценщик",st:"part",g:1,t:"Проверка плана",io:["план","supported / вернуть"],bh:"Покрыты ли все оси рамки.",d:[["Действие","N2.5."]]}
+       ],3),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"}].map(lbl)},
+      {id:"d3",n:"D3",st:"part",g:1,t:"Исследование",io:["план","сведения с видом и источником"],
+       sum:"Поиск и чтение по правилам движка; каждое сведение — с видом и источником; выход по рамке достаточности.",
+       d:[["Сейчас","web_search · web_fetch · read_source есть; веб — по настройке; видов утверждений, методики, порога достаточности и детектора повторов нет.",GAP],["Задача","SR1c · RD1 · RD4",TASK]],
+       nodes:snake([
+        {id:"n1",role:"модель",st:"part",g:1,t:"Поиск и загрузка",io:["вопрос","Source web"],bh:"Веб для Discovery — по умолчанию.",d:[["Действие","N3.1."]]},
+        {id:"n2",role:"модель",st:"yes",g:0,t:"Чтение источника",io:["Source","фрагменты"],bh:"≤60 000 целиком, большие — оглавление и поиск.",d:[["Действие","N3.2."],["Задача","SR1c · RD1",TASK]]},
+        {id:"n3",role:"модель",st:"no",g:1,t:"Вид утверждения",io:["фрагмент","факт · вывод · гипотеза · неизвестное"],bh:"Каждое сведение со своим видом.",d:[["Действие","N3.3."]]},
+        {id:"n4",role:"модель",st:"no",g:1,t:"Методика",io:["факт","дата · второй источник · опровержение"],bh:"Первичное важнее пересказа.",d:[["Действие","N3.4."]]},
+        {id:"n5",role:"движок",st:"no",g:1,t:"Рамка достаточности",io:["покрытие плана","продолжать / к досье"],bh:"≥ 80 % вопросов или 3 хода без нового.",d:[["Действие","N3.5 — числа предложены, решает владелец."]]},
+        {id:"n6",role:"движок",st:"no",g:1,t:"Детектор повторов",io:["ход","новый материал?"],bh:"Повтор без нового — сигнал к сборке.",d:[["Действие","N3.6."]]},
+        {id:"n7",role:"движок",st:"part",g:1,t:"Выдача контекста",io:["история · каталог","пакет модели"],bh:"Служебное не создаёт долг «дочитай».",d:[["Действие","N3.7."],["Задача","RD4",TASK]]}
+       ],4),
+       edges:[{f:"n1",t:"n2",l:"fetch"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6"},{f:"n6",t:"n7"},{f:"n5",t:"n1",l:"не достаточно — искать дальше",k:"alt",loop:"above",depth:30}].map(lbl)},
+      {id:"d4",n:"D4",st:"no",g:1,t:"Досье",io:["сведения","разделы по 12 осям"],
+       sum:"Разделы по осям, противоречия, неизвестные с потребителем и моментом; код проверяет покрытие, оценщик — широту.",
+       d:[["Сейчас","researchReport: плоский список «вопрос → вывод → цитаты», openQuestions; осей и видов утверждений нет.",GAP]],
+       nodes:snake([
+        {id:"n1",role:"модель",st:"no",g:1,t:"Разделы по осям",io:["сведения","досье"],bh:"12 разделов; неприменимые — с причиной.",d:[["Действие","N4.1."]]},
+        {id:"n2",role:"модель",st:"no",g:1,t:"Противоречия",io:["разделы","спорные места"],bh:"Источники расходятся — показать обе стороны.",d:[["Действие","N4.2."]]},
+        {id:"n3",role:"модель",st:"part",g:0,t:"Неизвестные",io:["пробелы","потребитель · момент"],bh:"Кто и когда закроет.",d:[["Действие","N4.3."],["Задача","UNK1",TASK]]},
+        {id:"n4",role:"код",st:"no",g:1,t:"Покрытие осей",io:["досье","полно / отказ"],bh:"Ось исследована или неприменимо с причиной.",d:[["Действие","N4.4."]]},
+        {id:"n5",role:"код",st:"yes",g:0,t:"Цитаты и ссылки",io:["утверждения","проверка"],bh:"Ссылки на реальные прочитанные места.",d:[["Действие","N4.5 (discovery-outcome.ts:298–307)."]]},
+        {id:"n6",role:"оценщик",st:"no",g:1,t:"Широта и качество",io:["досье","supported / вернуть"],bh:"Домены, роли, источники, альтернативы для масштаба.",d:[["Действие","N4.6."]]}
+       ],3),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6"}].map(lbl)},
+      {id:"d5",n:"D5",st:"no",g:1,t:"Варианты",io:["досье","выбранный вариант"],
+       sum:"2–3 варианта продукта с критериями и рекомендацией; выбирает владелец.",
+       d:[["Сейчас","Одно поле variant: text; владелец только принимает или отклоняет условие.",GAP]],
+       nodes:snake([
+        {id:"n1",role:"модель",st:"no",g:1,t:"2–3 варианта",io:["досье","варианты продукта"],bh:"Разные пути, а не один «исследованный».",d:[["Действие","N5.1."]]},
+        {id:"n2",role:"модель",st:"no",g:1,t:"Критерии",io:["варианты","ценность · кто платит · цена и срок · риск"],bh:"Сравнение по одной шкале.",d:[["Действие","N5.2."]]},
+        {id:"n3",role:"модель",st:"no",g:0,t:"Рекомендация",io:["критерии","предложение"],bh:"С объяснением выбора.",d:[["Действие","N5.3."]]},
+        {id:"n4",role:"владелец",st:"no",g:1,t:"Выбор варианта",io:["варианты","выбранный"],bh:"Одна команда владельца.",d:[["Действие","N5.4."]]}
+       ],4),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"}].map(lbl)},
+      {id:"d6",n:"D6",st:"part",g:1,t:"Итог и вердикт",io:["выбранный вариант","итог · вердикт · конституция"],
+       sum:"Что строим, для кого, первый результат, критерий успеха, не-цели; вердикт; конституция проекта.",
+       d:[["Сейчас","verdict: go / conditional / no_go / insufficient_evidence с проверкой формы и связей; итога и конституции нет.",GAP]],
+       nodes:snake([
+        {id:"n1",role:"модель",st:"part",g:1,t:"Итог",io:["вариант","что · для кого · зачем"],bh:"Первый результат, критерий успеха, не-цели.",d:[["Действие","N6.1."]]},
+        {id:"n2",role:"модель",st:"part",g:0,dec:1,t:"Вердикт",io:["итог","исход"],bh:"",d:[["Действие","N6.2 — исходы как сейчас."]]},
+        {id:"n3",role:"модель",st:"no",g:1,t:"Конституция проекта",io:["итог","опора хранителя"],bh:"Цель, потребители, не-цели, критерий успеха.",d:[["Действие","N6.3."]]},
+        {id:"n4",role:"код",st:"yes",g:0,t:"Форма и связи",io:["вердикт","проверка"],bh:"go без условий; связи план → досье → вердикт.",d:[["Действие","N6.4 (discovery-outcome.ts:308–323)."]]}
+       ],4),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"}].map(lbl)},
+      {id:"d7",n:"D7",st:"part",g:1,t:"Выдача потребителям",io:["досье · итог","проекции стадиям"],
+       sum:"Каждому потребителю — своя проекция досье; владельцу — читаемая сводка.",
+       d:[["Сейчас","stage-summary для владельца; концепции и OM уходят ограничения и основания (DS1.2); проекций по осям нет.",GAP],["Задача","DS1.2 · DS1.3",TASK]],
+       nodes:snake([
+        {id:"n1",role:"код",st:"part",g:0,t:"Сводка владельцу",io:["досье · итог","читаемый итог"],bh:"Что строим, зачем, риски, решения.",d:[["Действие","N7.1."],["Задача","DS1.3",TASK]]},
+        {id:"n2",role:"код",st:"no",g:1,t:"Проекция: концепция",io:["оси 03 · 07 · 09 · 12","вход концепции"],bh:"Люди, ценность, первый результат, не-цели.",d:[["Действие","N7.2."]]},
+        {id:"n3",role:"код",st:"no",g:1,t:"Проекция: карта L1",io:["оси 02 · 03 · 08","вход карты"],bh:"Процессы, участники, внешние системы.",d:[["Действие","N7.3."]]},
+        {id:"n4",role:"код",st:"no",g:1,t:"Проекция: спецификация",io:["оси 04 · 05 · 08 · 10","вход ТЗ"],bh:"Правила, словарь, данные, условия использования.",d:[["Действие","N7.4."]]},
+        {id:"n5",role:"код",st:"no",g:1,t:"Проекция: фичи",io:["оси 06 · 07 · 12","вход фич"],bh:"Ценность, кто платит, первый выпуск.",d:[["Действие","N7.5."]]},
+        {id:"n6",role:"код",st:"part",g:0,t:"Проекция: OM",io:["оси 05 · 08 · 11","внешние факты · неизвестные"],bh:"API, лимиты, лицензии, моменты закрытия.",d:[["Действие","N7.6."],["Задача","DS1.2",TASK]]}
+       ],3),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3"},{f:"n3",t:"n4"},{f:"n4",t:"n5"},{f:"n5",t:"n6"}].map(lbl)},
+      {id:"k",n:"K",st:"no",g:1,t:"Хранитель смысла",io:["конституция","проверка дрейфа"],
+       sum:"Держит конституцию проекта и проверяет каждую следующую стадию на дрейф от цели и не-целей.",
+       d:[["Решить","Включаем ли хранителя и где он проверяет — решение владельца.",GAP]],
+       nodes:snake([
+        {id:"n1",role:"запись",st:"no",g:1,t:"Конституция",io:["итог D6","цель · потребители · не-цели"],bh:"Меняется только поправкой владельца.",d:[["Действие","NK.1."]]},
+        {id:"n2",role:"оценщик",st:"no",g:1,t:"Проверка дрейфа",io:["выход стадии","соответствует / отклонение"],bh:"Служит ли шаг цели и первому результату.",d:[["Действие","NK.2."]]},
+        {id:"n3",role:"владелец",st:"no",g:0,t:"Поправка",io:["отклонение","новая редакция"],bh:"Только владелец меняет конституцию.",d:[["Действие","NK.3."]]}
+       ],3),
+       edges:[{f:"n1",t:"n2"},{f:"n2",t:"n3",l:"нужна поправка",k:"alt"}].map(lbl)}
+     ],
+     links:[
+      {f:"d0.n3",t:"d1.n1",l:"поручение",lc:"D0 → D1"},
+      {f:"d1.n4",t:"d2.n1",l:"рамка",lc:"D1 → D2"},
+      {f:"d2.n5",t:"d3.n1",l:"план",lc:"D2 → D3"},
+      {f:"d3.n7",t:"d4.n1",l:"сведения",lc:"D3 → D4"},
+      {f:"d4.n6",t:"d3.n1",l:"вернуть: не хватает",k:"alt",route:"above",depth:46},
+      {f:"d4.n6",t:"d5.n1",l:"досье",lc:"D4 → D5"},
+      {f:"d5.n4",t:"d6.n1",l:"выбранный вариант",lc:"D5 → D6"},
+      {f:"d6.n4",t:"d7.n1",l:"итог · вердикт",lc:"D6 → D7"},
+      {f:"d6.n3",t:"k.n1",l:"конституция",k:"tie",route:"below",depth:60}
+     ]},
     {id:"con",n:"Стадия 2",st:"part",g:1,t:"Концепция",io:["stage:discovery","conceptSections"],top:30,
      sum:"Вход и четыре вопроса → три кратких поля → канон требований → (нехватка: материал, возврат, выбор) → общая оценка ответа → приёмка → выходы карте, спецификации, фичам, OM и владельцу.",
      d:[["Что делает","Превращает исследованную потребность и допустимые границы продукта в адресуемые требования: кто получает пользу, какой результат появляется, какое поведение требуется, по каким наблюдаемым признакам результат годится. Предлагает будущее устройство продукта, не подтверждает реализацию и не подменяет намерение владельца."],["Берёт","Discovery целиком как ближайшего предшественника: brief, objective, вся preparation; в DS1 ещё researchPlan, researchReport, verdict с вариантом."],["Отдаёт","stage:<p>:concept: карте — все поля; buildL1 — реестр requirements; спецификации и фичам — conceptSections; OM — требования и критерии requirementId#n (checkKind выбирается поздно, в OM)."],["Четыре вопроса","audience, outcome, acceptance (design, у всех есть читатели) и conceptSections (канон, proof = assessment). Группы полей внутри требования — не отдельные вопросы."],["Пробелы","Нет связи требования с обязательными ограничениями и результатами исследования; оценщик не видит соседних полей концепции; у нового неизвестного нет законченного маршрута; design подписан в UI как решение владельца; переход к карте — извне.",GAP],["Задачи","DS1.2 · ASM1 · UNK1 · DS1.1 · IN1 · DRY5FIX · DRV1 · DS1.3 — новых классов нет (Codex №4609)",TASK]],
@@ -2572,9 +2691,21 @@ research-stage(project, draftId, maxTurns)
     {f:"disc.d7.n4",t:"map.m1.n5",l:"actors · outcomes · constraints · journeys",lc:"actors · outcomes · constraints · journeys",route:"below",depth:132,ff:.3},
     {f:"disc.d7.n4",t:"map.m4",l:"preparation → actors · outcomes · journeys",route:"below",depth:154,ff:.22},
     {f:"disc.d7.n4",t:"om.b1.read",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
-    {f:"disc.d2.n6",t:"om.r1.packet",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6}
+    {f:"disc.d2.n6",t:"om.r1.packet",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6},
+    {f:"in.e.e9",t:"ndisc.d0.n1",l:"идея → приём поручения",lc:"идея → New Discovery"},
+    {f:"ndisc.d7.n1",t:"in.b.b1",l:"сводка владельцу",route:"above",depth:40},
+    {f:"ndisc.d5.n4",t:"in.b.b1",l:"выбор варианта",k:"alt",route:"above",depth:70,ff:.5},
+    {f:"ndisc.d7.n2",t:"con.c1.n1",l:"досье: люди · ценность · первый результат · не-цели",lc:"досье → концепция"},
+    {f:"ndisc.d7.n2",t:"con.c1",l:"prerequisites: досье целиком",route:"above",depth:40,ff:.8,tf:.5},
+    {f:"con.c4.n5",t:"ndisc.d3.n1",l:"адресный возврат к исследованию",k:"alt",route:"below",depth:44,ff:.5,tf:.5},
+    {f:"ndisc.d7.n3",t:"map.m1.n5",l:"процессы · участники · внешние системы",route:"below",depth:132,ff:.3},
+    {f:"ndisc.d7.n4",t:"spec.p1",l:"правила домена · законы · словарь · данные",route:"below",depth:198,ff:.14},
+    {f:"ndisc.d7.n5",t:"feat.f1",l:"ценность · кто платит · первый выпуск",route:"below",depth:154,ff:.22},
+    {f:"ndisc.d7.n6",t:"om.b1.read",l:"внешние факты · неизвестные с моментом",route:"below",depth:176,ff:.55},
+    {f:"ndisc.d3.n2",t:"om.r1.packet",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6},
+    {f:"ndisc.k.n2",t:"con",l:"хранитель проверяет каждую следующую стадию",k:"tie",route:"above",depth:110,ff:.5}
   ];
-  var CHAIN=["disc.d2.n6","disc.d3.n3","disc.d4.n2","disc.d6.n4","disc.d7.n4","con.c1.n6","con.c3.a.n3","con.c5.n4","con.c3.a.n9","con.c6.n6","con.c6.n7","con.c7.n1","map.m1.n5","map.m2.n5","map.m2.n8","map.m3.a.n6","map.m3.a.n9","map.m4.n3","map.m4.n9","map.m5.n7","map.m6.n7","map.m6.n8","map.m7.n1","spec.p1.n7","spec.p4.a.n7","spec.p5.n5","spec.p4.a.n9","spec.p6.n7","spec.p6.n8","spec.p7.n1","spec.p7.n4","feat.f1.n6","feat.f2.n3","feat.f3.a.n3","feat.f5.n7","feat.f6.n6","feat.f6.n7","feat.f7.n1","feat.f7.n4","om.b1.input","om.r1.packet","om.r2.mat","om.l3.model","om.c.compiler","run.t.ctx","run.t.model","run.k.exec","run.r.review","run.c.receipt"];
+  var CHAIN=["ndisc.d3.n2","ndisc.d3.n3","ndisc.d4.n1","ndisc.d6.n1","ndisc.d6.n2","ndisc.d7.n2","ndisc.d7.n3","ndisc.d7.n4","ndisc.d7.n5","ndisc.d7.n6","disc.d2.n6","disc.d3.n3","disc.d4.n2","disc.d6.n4","disc.d7.n4","con.c1.n6","con.c3.a.n3","con.c5.n4","con.c3.a.n9","con.c6.n6","con.c6.n7","con.c7.n1","map.m1.n5","map.m2.n5","map.m2.n8","map.m3.a.n6","map.m3.a.n9","map.m4.n3","map.m4.n9","map.m5.n7","map.m6.n7","map.m6.n8","map.m7.n1","spec.p1.n7","spec.p4.a.n7","spec.p5.n5","spec.p4.a.n9","spec.p6.n7","spec.p6.n8","spec.p7.n1","spec.p7.n4","feat.f1.n6","feat.f2.n3","feat.f3.a.n3","feat.f5.n7","feat.f6.n6","feat.f6.n7","feat.f7.n1","feat.f7.n4","om.b1.input","om.r1.packet","om.r2.mat","om.l3.model","om.c.compiler","run.t.ctx","run.t.model","run.k.exec","run.r.review","run.c.receipt"];
 
   function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
 
@@ -2593,11 +2724,16 @@ research-stage(project, draftId, maxTurns)
   var NSV="http://www.w3.org/2000/svg";
 
   /* ---------- per-viewer state ---------- */
-  var KEY="omg-pass-map-v3",exp={},off={},soff={};
-  try{var saved=JSON.parse(localStorage.getItem(KEY)||"null");if(saved){exp=saved.exp||{};off=saved.off||{};soff=saved.soff||{};}}catch(_){}
-  function save(){try{localStorage.setItem(KEY,JSON.stringify({exp:exp,off:off,soff:soff}));}catch(_){}}
+  var KEY="omg-pass-map-v3",exp={},off={},soff={},DISC="old";
+  try{var saved=JSON.parse(localStorage.getItem(KEY)||"null");if(saved){exp=saved.exp||{};off=saved.off||{};soff=saved.soff||{};DISC=saved.disc==="new"?"new":"old";}}catch(_){}
+  if(location.hash==="#new-discovery")DISC="new";
+  function save(){try{localStorage.setItem(KEY,JSON.stringify({exp:exp,off:off,soff:soff,disc:DISC}));}catch(_){}}
+  /* two Discovery variants share one slot of the pipeline: only the selected one is laid out and linked */
+  function active(id){return id==="disc"?DISC==="old":id==="ndisc"?DISC==="new":true;}
+  function rootOf(k){return k.split(".")[0];}
+  function liveStages(){return STAGES.filter(function(s){return active(s.id);});}
   function opened(k){return !!exp[k]&&expandable(k);}
-  function shown(k){var p=IT[k].parent;return p===null||(shown(p)&&opened(p));}
+  function shown(k){var p=IT[k].parent;return p===null?active(k):(shown(p)&&opened(p));}
 
   /* ---------- DOM ---------- */
   var cardEl={},frameEl={},nodeEl={};
@@ -2672,9 +2808,9 @@ research-stage(project, draftId, maxTurns)
   }
   function layout(){
     setVisibility();
-    var H=0;STAGES.forEach(function(s){H=Math.max(H,measure(s.key).h);});
+    var H=0;liveStages().forEach(function(s){H=Math.max(H,measure(s.key).h);});
     pos={};var cx=40;
-    STAGES.forEach(function(s){var d=dims[s.key],so=o(soff,s.key);place(s.key,cx+so[0],TOP+(H-d.h)/2+so[1]);cx+=d.w+GAPX;});
+    liveStages().forEach(function(s){var d=dims[s.key],so=o(soff,s.key);place(s.key,cx+so[0],TOP+(H-d.h)/2+so[1]);cx+=d.w+GAPX;});
     var mx=0,my=0;Object.keys(pos).forEach(function(k){var p=pos[k];mx=Math.max(mx,p.x+p.w);my=Math.max(my,p.y+p.h);});
     svg.setAttribute("width",mx+900);svg.setAttribute("height",my+900);svg.style.width=(mx+900)+"px";svg.style.height=(my+900)+"px";
     drawEdges();apply();
@@ -2750,7 +2886,7 @@ research-stage(project, draftId, maxTurns)
       if(it.nodes)(it.edges||[]).forEach(function(e){var w=!e.loop&&!e.fs&&IT[k+"."+e.f]._wrapTo===e.t;list.push({a:k+"."+e.f,b:k+"."+e.t,e:e,l:e.l,w:w?k:null});});
       if(it.subs&&it.links)addLinks(it.links,k+".");
     });
-    addLinks(CROSS,"");
+    addLinks(CROSS.filter(function(e){return active(rootOf(e.f))&&active(rootOf(e.t));}),"");
     list.forEach(function(it){
       var p=document.createElementNS(NSV,"path"),A=box(elOf(it.a)),B=box(elOf(it.b));
       p.setAttribute("d",it.w?wrap(A,B,it.w):it.e.route?routed(A,B,it.e):curve(A,B,it.e));
@@ -2860,12 +2996,20 @@ research-stage(project, draftId, maxTurns)
       Array.prototype.slice.call(document.querySelectorAll(".chip[data-mode]")).forEach(function(x){x.setAttribute("aria-pressed",x===c?"true":"false");});apply();});
   });
 
+  function setDisc(v){DISC=v;
+    Array.prototype.slice.call(document.querySelectorAll(".chip[data-disc]")).forEach(function(x){x.setAttribute("aria-pressed",x.dataset.disc===DISC?"true":"false");});
+    sel=null;detail.hidden=true;detail.innerHTML="";layout();save();}
+  Array.prototype.slice.call(document.querySelectorAll(".chip[data-disc]")).forEach(function(c){
+    c.setAttribute("aria-pressed",c.dataset.disc===DISC?"true":"false");
+    c.addEventListener("click",function(){if(DISC!==c.dataset.disc){setDisc(c.dataset.disc);fit();}});
+  });
+
   /* ---------- pan, zoom, drag ---------- */
   var sc=1,tx=0,ty=0,zval=document.getElementById("zval");
   function draw(){view.style.transform="translate("+tx+"px,"+ty+"px) scale("+sc+")";zval.textContent=Math.round(sc*100)+"%";}
   function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
   function bounds(){var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
-    STAGES.forEach(function(s){var p=pos[s.key];x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x+p.w);y1=Math.max(y1,p.y+p.h);});
+    liveStages().forEach(function(s){var p=pos[s.key];x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x+p.w);y1=Math.max(y1,p.y+p.h);});
     drawn.forEach(function(d){var b=d.p.getBBox();x0=Math.min(x0,b.x);y0=Math.min(y0,b.y);x1=Math.max(x1,b.x+b.width);y1=Math.max(y1,b.y+b.height);});
     return {x:x0,y:y0,w:x1-x0,h:y1-y0};}
   function fit(){
