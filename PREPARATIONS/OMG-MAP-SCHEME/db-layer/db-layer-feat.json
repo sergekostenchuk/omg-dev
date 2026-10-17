@@ -1,0 +1,1830 @@
+{
+"version": "feat-1",
+"generatedFrom": "om/module d8028bf",
+"groups": [
+{
+"id": "feat",
+"t": "Фичи"
+}
+],
+"kinds": [],
+"extend": [
+{
+"kind": "project",
+"writers": [],
+"readers": [
+{
+"node": "feat.f1.n2",
+"code": "src/product/engine.ts:103 (ProductEngine.#prepare); src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"вид записи",
+"id"
+],
+"expects": "Перед подготовкой стадии фич проверяется, что проект существует и это запись project (project_missing иначе)",
+"sure": true
+},
+{
+"node": "feat.f6.n2",
+"code": "src/product/engine.ts:118 (ProductEngine.draft); src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"вид записи",
+"id"
+],
+"expects": "Перед записью черновика стадии фич проверяется, что проект существует и это запись project",
+"sure": true
+},
+{
+"node": "feat.f7.n2",
+"code": "src/product/engine.ts:311 (ProductEngine.execute); src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"вид записи",
+"id"
+],
+"expects": "Команда om-start начинается с той же проверки проекта; сам проход OM из принятых фич не стартует, пока вызывающий не отдал эту команду",
+"sure": true
+}
+]
+},
+{
+"kind": "stage",
+"writers": [
+{
+"node": "feat.f6.n2",
+"code": "src/pipeline/pipeline.ts:23 (Pipeline.draft); src/product/engine.ts:126 (ProductEngine.draft)",
+"when": "После завершённого исследования двух вопросов стадия фич записывается черновиком: content = {draft, fields, graph: null}, где fields — копия полей features и featurePreparation черновика; во входах — принятая спецификация. Карту L1 фичи не создают и не меняют",
+"fields": [
+"content",
+"status",
+"inputs",
+"proofs"
+],
+"sure": true
+},
+{
+"node": "feat.f6.n7",
+"code": "src/pipeline/pipeline.ts:116 (Pipeline.accept); src/product/stage-research.ts:118 (StageResearch.run)",
+"when": "Нет находок приёмки: запись переписывается как accepted вместе с опорами (proofs: черновик, оба вопроса, ответы, оценки, источники, принятые предшественники и печать слоя L1). Находка с названным полем — вопрос переоткрывается, запись не меняется; находка без поля — blocked",
+"fields": [
+"status",
+"proofs"
+],
+"sure": true
+},
+{
+"node": "feat.f4.a.n4",
+"code": "src/pipeline/pipeline.ts:116 (Pipeline.accept); src/discovery/preparation-validation.ts:170 (preparationFindings)",
+"when": "Неблокирующий оставшийся вопрос (blocksCurrentStage = false) не мешает приёмке и остаётся внутри принятой стадии в featurePreparation[].remainingQuestions; блокирующий (true) останавливает приёмку находкой feature_preparation_unresolved",
+"fields": [
+"content.fields.featurePreparation[].remainingQuestions",
+"status",
+"proofs"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f1.n2",
+"code": "src/product/engine.ts:105 (ProductEngine.#prepare); src/pipeline/pipeline.ts:43 (Pipeline.inspect); src/pipeline/pipeline.ts:69 (Pipeline.#inspectValue)",
+"fields": [
+"status",
+"inputs",
+"proofs",
+"версия и хэш"
+],
+"expects": "Спецификация должна быть принята и актуальна: её предшественники и опоры равны головам (input_stale, proof_stale), иначе predecessor_not_ready; охраны спецификации становятся входами нового черновика фич",
+"sure": true
+},
+{
+"node": "feat.f1.n5",
+"code": "src/product/stage-research.ts:40 (StageResearch.run)",
+"fields": [
+"status",
+"content.draft"
+],
+"expects": "Перед исследованием читается текущая запись stage:features: если стадия уже принята, исследование другого черновика отказывает (stage_already_accepted — сначала явный пересмотр), а для того же черновика возвращается готовый итог без новых вызовов",
+"sure": true
+},
+{
+"node": "feat.f2.n7",
+"code": "src/product/stage-checks.ts:355 (StageChecks.validateStage); src/om/input.ts:234 (buildOmInput); src/discovery/pilot-context.ts:187 (pilotContext)",
+"fields": [
+"content.fields.features"
+],
+"expects": "Список features читают три потребителя: приёмка фич (outcome — артефакт L1, индексы в пределах behavior, каждая строка покрыта), вход OM (название, outcome и индексы переносятся в нормализованную фичу) и режим пилота исследования уровней карты (индекс фич в материале модели); порядок и число фич — часть договорённости с OM",
+"sure": true
+},
+{
+"node": "feat.f3.a.n2",
+"code": "src/discovery/research-context.ts:365 (researchPrerequisites)",
+"fields": [
+"content.fields.preparation.actors",
+"content.fields.preparation.outcomes"
+],
+"expects": "Автор подготовки видит участников и результаты принятой Discovery (идентичности прежней стадии), чтобы назвать получателя и результат пользы; сверка beneficiary с результатом идёт позже, в приёмке (feature_beneficiary_foreign)",
+"sure": true
+},
+{
+"node": "feat.f3.a.n3",
+"code": "src/discovery/research-context.ts:262 (featureBasisMaterial)",
+"fields": [
+"content.fields.conceptSections",
+"content.fields.preparation"
+],
+"expects": "Автору подготовки выдаются и основания: требования концепции и ограничения принятой Discovery, из которых складываются основания выбранных договоров",
+"sure": true
+},
+{
+"node": "feat.f5.n3",
+"code": "src/discovery/research-assessment.ts:321 (assessAnswer); src/discovery/research-context.ts:249 (featureBasisMaterial)",
+"fields": [
+"content.fields.behavior",
+"content.fields.constraints",
+"content.fields.behaviorContracts",
+"content.fields.conceptSections",
+"content.fields.preparation"
+],
+"expects": "Оценщик получает те же предпосылки, что и автор: принятую спецификацию целиком, идентичности прежних стадий и материал оснований фич; для featurePreparation в него входят выбранные договоры и их точное объединение требований",
+"sure": true
+},
+{
+"node": "feat.f6.n1",
+"code": "src/product/stage-research.ts:101 (StageResearch.run)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Ожидаемая ревизия стадии захвачена до вызова модели; чужая правка за время исследования — revision_conflict",
+"sure": true
+},
+{
+"node": "feat.f6.n2",
+"code": "src/pipeline/pipeline.ts:31 (Pipeline.#prepareDraft)",
+"fields": [
+"status",
+"inputs",
+"proofs",
+"версия и хэш"
+],
+"expects": "Черновик пишется только поверх принятой и актуальной спецификации (predecessor_not_ready иначе); её охраны попадают в охраны записи",
+"sure": true
+},
+{
+"node": "feat.f6.n5",
+"code": "src/product/stage-checks.ts:278 (StageChecks.validateStage); src/discovery/preparation-validation.ts:109 (preparationFindings); src/discovery/preparation-validation.ts:125 (preparationFindings)",
+"fields": [
+"content.fields.preparation",
+"content.fields.conceptSections"
+],
+"expects": "Для проверки подготовки читаются принятые Discovery и концепция: получатель пользы — известный участник, результат совпадает с исходом и получателем, а требования договоров есть в концепции с тем же исходом",
+"sure": true
+},
+{
+"node": "feat.f6.n7",
+"code": "src/pipeline/pipeline.ts:111 (Pipeline.accept)",
+"fields": [
+"status",
+"inputs",
+"proofs",
+"версия и хэш"
+],
+"expects": "Принятие идёт только на той же ревизии черновика (revision_conflict иначе) и без находок осмотра (gate_rejected иначе); собранные охраны становятся опорами принятой стадии",
+"sure": true
+},
+{
+"node": "feat.f3.b.ident",
+"code": "src/discovery/preparation-validation.ts:158 (preparationFindings); src/om/input.ts:258 (buildOmInput); src/om/selected-specification.ts:55 (preparationMatches)",
+"fields": [
+"content.fields.featurePreparation[].featureTitle",
+"content.fields.featurePreparation[].outcome"
+],
+"expects": "Подготовка связана с фичей равенством featureTitle и outcome: приёмка требует ровно одну подготовку на фичу (feature_preparation_incomplete, feature_preparation_foreign), вход OM — ровно одно совпадение (feature_preparation_missing, feature_preparation_ambiguous), выбор для пакета и задачи идёт по тому же правилу",
+"sure": true
+},
+{
+"node": "feat.f3.b.benefit",
+"code": "src/discovery/preparation-validation.ts:161 (preparationFindings); src/om/selected-specification.ts:93 (selectSpecification); src/product/stage-summary.ts:573 (stageMaterial)",
+"fields": [
+"content.fields.featurePreparation[].beneficiary",
+"content.fields.featurePreparation[].benefit"
+],
+"expects": "beneficiary должен быть известным участником и получателем результата фичи; benefit код не разбирает, он доезжает целиком только в оригинале выбранной подготовки и в сводке владельцу (в нормализованный вход OM не переносится)",
+"sure": true
+},
+{
+"node": "feat.f3.b.oblig",
+"code": "src/discovery/preparation-validation.ts:164 (preparationFindings); src/om/input.ts:314 (buildOmInput); src/discovery/research-context.ts:235 (selectedFeatures)",
+"fields": [
+"content.fields.featurePreparation[].requirements",
+"content.fields.featurePreparation[].behaviorContracts"
+],
+"expects": "behaviorContracts — договоры спецификации с тем же исходом; requirements — ровно объединение требований этих договоров (feature_requirements_incomplete); вход OM сверяет оба списка с известными id и переносит их в нормализованную фичу",
+"sure": true
+},
+{
+"node": "feat.f3.b.beh",
+"code": "src/om/selected-specification.ts:93 (selectSpecification); src/product/stage-summary.ts:573 (stageMaterial)",
+"fields": [
+"content.fields.featurePreparation[].success",
+"content.fields.featurePreparation[].failures"
+],
+"expects": "success и failures код сверяет только по форме (обе коллекции непусты); смысл не проверяется и в нормализованный вход OM не переносится — исходы доезжают оригиналом выбранной подготовки и сводкой владельцу",
+"sure": false
+},
+{
+"node": "feat.f3.b.inter",
+"code": "src/discovery/preparation-validation.ts:169 (preparationFindings); src/om/selected-specification.ts:93 (selectSpecification); src/product/stage-summary.ts:573 (stageMaterial)",
+"fields": [
+"content.fields.featurePreparation[].interactions"
+],
+"expects": "outcome взаимодействия должен быть артефактом карты L1 (feature_interaction_missing); условие код не проверяет и ребром или коннектором не делает — оно доезжает оригиналом выбранной подготовки и сводкой владельцу",
+"sure": true
+},
+{
+"node": "feat.f3.b.remain",
+"code": "src/discovery/preparation-validation.ts:170 (preparationFindings); src/om/input.ts:185 (buildOmInput); src/om/input.ts:319 (buildOmInput)",
+"fields": [
+"content.fields.featurePreparation[].remainingQuestions"
+],
+"expects": "Вопрос с blocksCurrentStage = true останавливает приёмку; остальные идут в вход OM отдельными вопросами; для эры с сроком вопроса moment обязателен и из списка (input_field_missing иначе)",
+"sure": true
+},
+{
+"node": "feat.f4.a.n5",
+"code": "src/om/input.ts:319 (buildOmInput); src/om/input.ts:185 (buildOmInput); src/om/input.ts:299 (buildOmInput)",
+"fields": [
+"content.fields.featurePreparation[].remainingQuestions"
+],
+"expects": "Каждый оставшийся вопрос получает во входе OM id feature:<индекс фичи>:<n> (n — номер после сортировки), сохраняются текст, consumer, blocks, ссылка на принятую стадию и срок moment; kind = null",
+"sure": true
+},
+{
+"node": "feat.f7.n3",
+"code": "src/om/run-bases.ts:154 (inputStage)",
+"fields": [
+"версия и хэш",
+"status"
+],
+"expects": "Первый вход OM берётся по головам пяти принятых стадий, среди них features; отсутствие любой — record_missing; сам вход строит buildOmInput",
+"sure": true
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:360 (loadSources); src/om/input.ts:606 (currentAcceptance); src/om/input.ts:234 (buildOmInput)",
+"fields": [
+"вся запись",
+"status",
+"inputs",
+"proofs",
+"content.fields.features",
+"content.fields.featurePreparation"
+],
+"expects": "Фичи читаются по точной ссылке и доказываются своими опорами; из features берутся название, outcome и индексы behavior, из featurePreparation — id требований и договоров и оставшиеся вопросы; фичи должны покрывать каждую строку behavior (stage_not_accepted иначе)",
+"sure": true
+},
+{
+"node": "feat.f7.n6",
+"code": "src/om/question-packet.ts:1488 (derivePacketOnce); src/om/packet-brief.ts:504 (scopedInput); src/om/selected-specification.ts:87 (selectSpecification)",
+"fields": [
+"content.fields.features",
+"content.fields.featurePreparation"
+],
+"expects": "Пакет брифа (новый корень объявляет выбор спецификации) получает оригинал подготовки только выбранных фич — польза, исходы, взаимодействия, нерешённое — из принятой стадии с точным Ref и адресом; фичи выбираются по требованиям пакета. Это не совпадает с пометкой узла карты «полный featurePreparation не восстанавливается» (вывод)",
+"sure": true
+},
+{
+"node": "feat.f7.n7",
+"code": "src/om/task-specification.ts:22 (taskSpecificationReader); src/compiler/context.ts:314 (loadTaskSpecification); src/om/selected-specification.ts:116 (selectTaskSpecification)",
+"fields": [
+"content.fields.features",
+"content.fields.featurePreparation"
+],
+"expects": "Контекст задачи содержит оригиналы подготовок фич, выбранных по требованиям и договорам задачи; читаются из принятой стадии по ссылке из входа OM",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:592 (readStructuredAccepted); src/product/stage-summary.ts:596 (readStructuredAccepted); src/product/stage-summary.ts:607 (readStructuredAccepted)",
+"fields": [
+"вся запись"
+],
+"expects": "Принятая стадия фич читается по точной версии: во входах ровно спецификация, content — ровно draft, fields, graph (null); две части сводки — features и featurePreparation",
+"sure": true
+},
+{
+"node": "feat.f7.n9",
+"code": "src/om/input.ts:601 (currentAcceptance); src/om/input.ts:609 (currentAcceptance); src/om/input.ts:521 (loadSources)",
+"fields": [
+"версия и хэш",
+"status",
+"content.fields.features"
+],
+"expects": "Вход OM принимается только на текущей голове стадии: изменившаяся голова — input_stale, непринятая или нарушающая приёмку — stage_not_accepted с адресом; состав фич не подменяется тихо",
+"sure": true
+},
+{
+"node": "om.r0.begin",
+"code": "src/graph/refinement.ts:45 (Refinement.#inputs)",
+"fields": [
+"status",
+"версия и хэш"
+],
+"expects": "Прежний маршрут R0 требует принятые и актуальные фичи (features_not_ready иначе); их охраны входят в основания фазы",
+"sure": true
+},
+{
+"node": "om.b1.read",
+"code": "src/om/run-bases.ts:154 (inputStage)",
+"fields": [
+"версия и хэш",
+"status"
+],
+"expects": "Голова принятых фич входит в пять стадий, на которых строится B1",
+"sure": false
+},
+{
+"node": "om.b1.input",
+"code": "src/om/input.ts:234 (buildOmInput); src/om/input.ts:235 (buildOmInput)",
+"fields": [
+"content.fields.features",
+"content.fields.featurePreparation"
+],
+"expects": "Из фич берутся два поля: features (название, outcome, индексы behavior) и featurePreparation (id требований и договоров, оставшиеся вопросы)",
+"sure": true
+},
+{
+"node": "om.b1.save",
+"code": "src/om/run.ts:875 (rootIds); src/om/run.ts:879 (rootGuards)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Голова принятых фич — один из корней основ прохода: изменилась — новый шаг основ, а не повтор без эффекта (вывод)",
+"sure": false
+},
+{
+"node": "om.r1.packet",
+"code": "src/om/question-packet.ts:1488 (derivePacketOnce); src/om/packet-brief.ts:500 (scopedInput)",
+"fields": [
+"content.fields.features",
+"content.fields.featurePreparation"
+],
+"expects": "Пакет задания собирает принятые поля стадий, в том числе фич, по точным ссылкам из B1 (вывод по узлу)",
+"sure": false
+},
+{
+"node": "om.l2.assign",
+"code": "src/om/question-packet.ts:1488 (derivePacketOnce); src/om/packet-brief.ts:500 (scopedInput)",
+"fields": [
+"content.fields.features",
+"content.fields.featurePreparation"
+],
+"expects": "Пакет операций блока строится тем же сборщиком; выбранные фичи идут в него по требованиям блока (вывод по узлу)",
+"sure": false
+},
+{
+"node": "om.l3.assign",
+"code": "src/om/question-packet.ts:1488 (derivePacketOnce); src/om/packet-brief.ts:500 (scopedInput)",
+"fields": [
+"content.fields.features",
+"content.fields.featurePreparation"
+],
+"expects": "Пакет атомарных работ строится тем же сборщиком; выбранные фичи идут в него по требованиям работы (вывод по узлу)",
+"sure": false
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:444 (packetCapacity); src/om/task-specification.ts:22 (taskSpecificationReader)",
+"fields": [
+"content.fields.featurePreparation"
+],
+"expects": "G5 измеряет контекст задач вместе с выбранной спецификацией: подготовки выбранных фич читаются из принятой стадии (вывод по узлу)",
+"sure": false
+},
+{
+"node": "om.c.m9",
+"code": "src/om/handoff.ts:100 (readHandoff)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Передача проверяет происхождение: предшественник стадии OM — точно принятые фичи того же B1, их ссылка среди опор",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:314 (loadTaskSpecification); src/om/task-specification.ts:22 (taskSpecificationReader)",
+"fields": [
+"content.fields.featurePreparation"
+],
+"expects": "Контекст задачи содержит выбранные оригиналы подготовок фич из принятой стадии по ссылке из входа OM",
+"sure": true
+},
+{
+"node": "feat.f1.n8",
+"code": "src/discovery/research-consumer-transition.ts:440 (exactContextLookup)",
+"fields": [
+"content.fields",
+"версия и хэш"
+],
+"expects": "Принятая стадия из входов черновика (спецификация, концепция, Discovery) читается по точной ссылке и указателю, когда пакету не хватило материала (вывод по узлу)",
+"sure": false
+}
+]
+},
+{
+"kind": "discovery-draft",
+"writers": [
+{
+"node": "feat.f1.n4",
+"code": "src/discovery/discovery.ts:87 (Discovery.create); src/discovery/discovery.ts:90 (Discovery.create)",
+"when": "Команда prepare-stage features: создаётся черновик стадии (новый UUID при каждом вызове) с двумя пустыми полями features и featurePreparation; level = R0, consumer = om-g2; во входах — охраны принятой спецификации",
+"fields": [
+"projectId",
+"createdAt",
+"stage",
+"level",
+"consumer",
+"inputs",
+"contractVersion",
+"questions",
+"fields"
+],
+"sure": true
+},
+{
+"node": "feat.f2.n7",
+"code": "src/discovery/discovery.ts:116 (Discovery.#answer)",
+"when": "Принят ответ: значение попадает в поле черновика fields.features (список способностей); одна транзакция с записью ответа и закрытием вопроса",
+"fields": [
+"fields.features"
+],
+"sure": true
+},
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/discovery.ts:116 (Discovery.#answer)",
+"when": "Общий шаг сохранения поддержанного ответа: значение поля (features или featurePreparation) записывается в черновик; одна транзакция с ответом и закрытием вопроса",
+"fields": [
+"fields.features",
+"fields.featurePreparation"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f1.n5",
+"code": "src/product/stage-research.ts:36 (StageResearch.run)",
+"fields": [
+"projectId",
+"stage",
+"contractVersion",
+"questions"
+],
+"expects": "Исследование принимает только черновик этого проекта и одной из ранних стадий (discovery_foreign иначе)",
+"sure": true
+},
+{
+"node": "feat.f1.n7",
+"code": "src/discovery/research-runner.ts:574 (Researcher.run); src/discovery/research-runner.ts:358 (Researcher.run)",
+"fields": [
+"questions",
+"fields",
+"версия и хэш"
+],
+"expects": "Следующим берётся первый вопрос без принятого ответа: сначала features, затем featurePreparation; перед платным шагом исследование заново проверяется воротами",
+"sure": true
+},
+{
+"node": "feat.f2.n8",
+"code": "src/discovery/research-runner.ts:574 (Researcher.run)",
+"fields": [
+"questions",
+"fields.features"
+],
+"expects": "После принятого списка features следующим открывается вопрос featurePreparation: порядок вопросов задаёт черновик",
+"sure": true
+},
+{
+"node": "feat.f3.a.n1",
+"code": "src/discovery/research-runner.ts:661 (Researcher.run)",
+"fields": [
+"fields.features",
+"questions"
+],
+"expects": "Автору подготовки доставляется принятый список features: поля черновика (принятые ответы; остальные пусты) идут в пакет автора",
+"sure": true
+},
+{
+"node": "feat.f3.a.n8",
+"code": "src/discovery/research-assessment.ts:336 (assessAnswer); src/discovery/stage-neighbors.ts:37 (stageNeighbors)",
+"fields": [
+"fields.features",
+"questions",
+"версия и хэш"
+],
+"expects": "Оценщик подготовки видит принятое поле features как соседа (stageNeighbors): открытый вопрос — граница знания. Это расходится с пометкой узла «принятый список features отдельно не доставляется» (вывод)",
+"sure": false
+},
+{
+"node": "feat.f3.a.n9",
+"code": "src/discovery/consumer-research.ts:35 (researchForConsumer)",
+"fields": [
+"fields",
+"questions",
+"версия и хэш"
+],
+"expects": "Когда оба вопроса закрыты и прогон завершён, черновик читается заново и отдаётся приёмке: пишется черновик стадии и запускаются проверки",
+"sure": true
+},
+{
+"node": "feat.f5.n3",
+"code": "src/discovery/research-assessment.ts:336 (assessAnswer); src/discovery/stage-neighbors.ts:37 (stageNeighbors)",
+"fields": [
+"fields",
+"questions",
+"inputs",
+"stage",
+"contractVersion"
+],
+"expects": "Оценщик видит принятые ранее поля того же черновика (stageNeighbors): для featurePreparation — features; открытый вопрос — граница знания, его старое значение не основание",
+"sure": true
+},
+{
+"node": "feat.f5.n6",
+"code": "src/discovery/discovery.ts:206 (Discovery.#acceptSupported)",
+"fields": [
+"basisContract",
+"obligationContract",
+"inputs"
+],
+"expects": "Принимается только оценка, чьи контракты вопроса и черновика совпадают; исследователь и оценщик разные",
+"sure": true
+},
+{
+"node": "feat.f6.n1",
+"code": "src/product/stage-research.ts:36 (StageResearch.run); src/product/stage-research.ts:136 (StageResearch.run)",
+"fields": [
+"projectId",
+"stage",
+"contractVersion"
+],
+"expects": "Исследование принадлежит проекту и одной из верхних стадий; для новой работы нужна текущая версия контракта (research_contract_upgrade_required иначе)",
+"sure": true
+},
+{
+"node": "feat.f6.n2",
+"code": "src/product/engine.ts:119 (ProductEngine.draft)",
+"fields": [
+"stage",
+"projectId",
+"contractVersion",
+"fields"
+],
+"expects": "Исследование принадлежит этому проекту и стадии features, версия контракта текущая; поля стадии копируются из полей черновика",
+"sure": true
+},
+{
+"node": "feat.f6.n3",
+"code": "src/product/stage-checks.ts:256 (StageChecks.validateStage); src/product/stage-checks.ts:258 (StageChecks.validateStage); src/discovery/discovery.ts:343 (Discovery.gate)",
+"fields": [
+"stage",
+"projectId",
+"fields",
+"inputs"
+],
+"expects": "Содержимое стадии — ровно draft, fields, graph; черновик принадлежит этой стадии и проекту, поля стадии равны полям черновика (discovery_foreign иначе); ворота проверяют, что входы черновика равны головам (research_context_stale иначе)",
+"sure": true
+},
+{
+"node": "feat.f6.n8",
+"code": "src/discovery/consumer-feedback.ts:25 (rejectResearch)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Отклонение привязано к точной версии черновика: пока черновик не изменился, названные вопросы переоткрываются вместе с сохранением замечаний",
+"sure": true
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:406 (loadSources)",
+"fields": [
+"fields",
+"questions",
+"inputs",
+"stage",
+"contractVersion"
+],
+"expects": "Черновик фич читается по точной ссылке: принадлежит стадии, поля равны полям стадии, входы включают принятую спецификацию, список вопросов и входов явный",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:596 (readStructuredAccepted)",
+"fields": [
+"stage",
+"level",
+"consumer",
+"fields",
+"inputs",
+"contractVersion"
+],
+"expects": "Сводка читает черновик принятой стадии: проект, стадия features, level R0, consumer om-g2, поля равны полям стадии, версия контракта известна",
+"sure": true
+},
+{
+"node": "feat.f1.n2",
+"code": "src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue); src/product/engine.ts:105 (ProductEngine.#prepare)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Опора принятой спецификации (черновики прежних стадий) читается по своему адресу и должна быть равна голове (proof_stale иначе); тот же набор охраняет запись нового черновика фич (вывод по составу опор)",
+"sure": false
+},
+{
+"node": "feat.f1.n8",
+"code": "src/discovery/research-consumer-transition.ts:440 (exactContextLookup)",
+"fields": [
+"fields",
+"версия и хэш"
+],
+"expects": "Свой черновик читается по точной ссылке и указателю: можно дочитать принятые поля (вывод по узлу)",
+"sure": false
+}
+]
+},
+{
+"kind": "question",
+"writers": [
+{
+"node": "feat.f1.n4",
+"code": "src/discovery/discovery.ts:88 (Discovery.create)",
+"when": "Команда prepare-stage features: создаются два вопроса черновика, features и featurePreparation (вариант со сроками вопросов), оба open и без ответа",
+"fields": [
+"projectId",
+"draftId",
+"stage",
+"level",
+"consumer",
+"spec",
+"beforeHash",
+"status",
+"answer"
+],
+"sure": true
+},
+{
+"node": "feat.f2.n7",
+"code": "src/discovery/discovery.ts:118 (Discovery.#answer)",
+"when": "Принят ответ по features: вопрос закрывается (answered) и получает ссылку на запись ответа",
+"fields": [
+"status",
+"answer"
+],
+"sure": true
+},
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/discovery.ts:118 (Discovery.#answer)",
+"when": "Общий шаг: вопрос закрывается (answered) и получает ссылку на запись ответа",
+"fields": [
+"status",
+"answer"
+],
+"sure": true
+},
+{
+"node": "feat.f6.n8",
+"code": "src/discovery/consumer-feedback.ts:23 (rejectResearch)",
+"when": "Приёмка отвергла поле: затронутый вопрос переоткрывается (open, ответ снят, beforeHash — хэш поля в черновике); автор исправляет поле, а не пишет всё заново",
+"fields": [
+"status",
+"answer",
+"beforeHash"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f1.n6",
+"code": "src/discovery/research-runner.ts:661 (Researcher.run); src/discovery/research-context.ts:143 (acceptedDraftField)",
+"fields": [
+"spec",
+"status",
+"answer"
+],
+"expects": "Автору выдаётся контракт выбранного вопроса (поле, текст, схема, риск), а принятый префикс читается только по точной цепочке отвеченных вопросов: ответ на features сверяется с полем черновика",
+"sure": true
+},
+{
+"node": "feat.f1.n7",
+"code": "src/discovery/research-runner.ts:574 (Researcher.run)",
+"fields": [
+"status",
+"версия и хэш"
+],
+"expects": "Первый вопрос черновика без принятого ответа становится текущим; пока он открыт, следующий не начинается",
+"sure": true
+},
+{
+"node": "feat.f2.n8",
+"code": "src/discovery/research-runner.ts:574 (Researcher.run)",
+"fields": [
+"status",
+"версия и хэш"
+],
+"expects": "Вопрос featurePreparation берётся только после закрытия features (порядок вопросов черновика)",
+"sure": true
+},
+{
+"node": "feat.f3.a.n1",
+"code": "src/discovery/research-runner.ts:661 (Researcher.run)",
+"fields": [
+"spec",
+"status"
+],
+"expects": "В пакет автора подготовки попадает контракт вопроса featurePreparation: схема, текст, риск",
+"sure": true
+},
+{
+"node": "feat.f5.n3",
+"code": "src/discovery/stage-neighbors.ts:37 (stageNeighbors); src/discovery/stage-neighbors.ts:44 (stageNeighbors)",
+"fields": [
+"spec",
+"status",
+"answer",
+"draftId"
+],
+"expects": "Оценщик видит вопрос и ответ предыдущего поля черновика; для features предыдущих полей нет",
+"sure": true
+},
+{
+"node": "feat.f5.n6",
+"code": "src/discovery/discovery.ts:93 (Discovery.#question); src/discovery/discovery.ts:199 (Discovery.#acceptSupported)",
+"fields": [
+"status",
+"версия и хэш"
+],
+"expects": "Вопрос открыт ровно на ожидаемой версии и ещё не отвечен (question_stale, question_already_answered иначе)",
+"sure": true
+},
+{
+"node": "feat.f6.n3",
+"code": "src/discovery/discovery.ts:362 (Discovery.gate); src/product/stage-checks.ts:272 (StageChecks.validateStage)",
+"fields": [
+"status",
+"answer",
+"spec",
+"draftId"
+],
+"expects": "Ворота приёмки: оба вопроса черновика отвечены, принадлежат проекту, и их набор равен эталону своей эры; ответ принадлежит своему вопросу",
+"sure": true
+},
+{
+"node": "feat.f6.n8",
+"code": "src/discovery/consumer-feedback.ts:14 (rejectResearch)",
+"fields": [
+"spec",
+"status"
+],
+"expects": "Находки должны называть отвеченные поля этого предложения; иначе feedback_target_missing",
+"sure": true
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:416 (loadSources)",
+"fields": [
+"status",
+"answer",
+"spec",
+"draftId"
+],
+"expects": "Все вопросы черновика фич должны быть отвечены своим сохранённым ответом; набор вопросов равен эталону своей эры",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:276 (readAcceptedField); src/product/stage-summary.ts:603 (readStructuredAccepted)",
+"fields": [
+"spec",
+"status",
+"answer"
+],
+"expects": "Для каждого поля сводки (features, featurePreparation) ищется ровно один отвеченный вопрос",
+"sure": true
+},
+{
+"node": "feat.f1.n2",
+"code": "src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue); src/product/engine.ts:105 (ProductEngine.#prepare)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Опора принятой спецификации (её вопросы) читается по своему адресу и должна быть равна голове (proof_stale иначе) (вывод по составу опор)",
+"sure": false
+}
+]
+},
+{
+"kind": "research-answer",
+"writers": [
+{
+"node": "feat.f2.n7",
+"code": "src/discovery/discovery.ts:117 (Discovery.#answer)",
+"when": "Принятое значение поля features сохраняется отдельной записью-ответом, привязанной к оценке (в управляемом ходе её адрес выводится из оплаченного хода)",
+"fields": [
+"projectId",
+"question",
+"assessment",
+"value"
+],
+"sure": true
+},
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/discovery.ts:117 (Discovery.#answer)",
+"when": "Общий шаг: принятое значение поля (features или featurePreparation) сохраняется отдельной записью-ответом, привязанной к оценке",
+"fields": [
+"projectId",
+"question",
+"assessment",
+"value"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f1.n6",
+"code": "src/discovery/research-context.ts:151 (acceptedDraftField)",
+"fields": [
+"value",
+"question",
+"projectId",
+"assessment"
+],
+"expects": "Принятый ответ на features читается по точной ссылке и сверяется со значением поля черновика; расхождение — basis_inheritance_material_invalid",
+"sure": true
+},
+{
+"node": "feat.f5.n3",
+"code": "src/discovery/stage-neighbors.ts:60 (stageNeighbors)",
+"fields": [
+"value",
+"question",
+"projectId"
+],
+"expects": "Оценщик видит значение уже принятого ответа предыдущего поля (features для featurePreparation)",
+"sure": true
+},
+{
+"node": "feat.f6.n3",
+"code": "src/discovery/discovery.ts:366 (Discovery.gate); src/discovery/discovery.ts:377 (Discovery.gate)",
+"fields": [
+"assessment",
+"value",
+"projectId",
+"question"
+],
+"expects": "Ворота приёмки: ответ принадлежит своему вопросу, а его значение равно полю черновика (answer_target_mismatch иначе)",
+"sure": true
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:453 (loadSources); src/om/input.ts:458 (loadSources)",
+"fields": [
+"assessment",
+"value",
+"question",
+"projectId"
+],
+"expects": "Ответ каждого из двух полей фич читается по ссылке из принятого вопроса; значение должно равняться полю стадии и схеме своей эры",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:285 (readAcceptedField); src/product/stage-summary.ts:296 (readAcceptedField)",
+"fields": [
+"assessment",
+"value"
+],
+"expects": "Сводка читает принятый ответ по точной ссылке; значение должно воспроизводиться из ответа и совпадать с полем черновика",
+"sure": true
+},
+{
+"node": "feat.f1.n2",
+"code": "src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue); src/product/engine.ts:105 (ProductEngine.#prepare)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Опора принятой спецификации (принятые ответы прежних стадий) читается по своему адресу и должна быть равна голове (proof_stale иначе) (вывод по составу опор)",
+"sure": false
+}
+]
+},
+{
+"kind": "research-assessment",
+"writers": [
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/research-assessment.ts:378 (assessAnswer); src/discovery/research-assessment.ts:410 (assessAnswer)",
+"when": "Оценка предложенного значения поля (features или featurePreparation) как проекта, не как факта и не как решения владельца: поддержано, недостаточно или противоречит; оценщик отличается от автора; для оплаченного хода запись пишется вместе с привязкой. Неподдержанный ответ не становится стадией",
+"fields": [
+"projectId",
+"question",
+"value",
+"observations",
+"verdict",
+"reasons",
+"researcher",
+"assessor",
+"environment"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f5.n6",
+"code": "src/discovery/discovery.ts:200 (Discovery.#acceptSupported)",
+"fields": [
+"verdict",
+"question",
+"researcher",
+"assessor",
+"observations"
+],
+"expects": "Принимается только оценка с вердиктом supported для этого вопроса, исследователь ≠ оценщик, наблюдения есть и актуальны (research_not_supported иначе)",
+"sure": true
+},
+{
+"node": "feat.f6.n3",
+"code": "src/discovery/discovery.ts:385 (Discovery.gate); src/discovery/discovery.ts:386 (Discovery.gate)",
+"fields": [
+"verdict",
+"value",
+"question",
+"observations",
+"researcher",
+"assessor"
+],
+"expects": "Ворота приёмки: оценка поддерживает именно этот ответ и вопрос, значения равны, наблюдения актуальны (research_evidence_stale иначе)",
+"sure": true
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:464 (loadSources)",
+"fields": [
+"verdict",
+"question",
+"observations",
+"value",
+"researcher",
+"assessor"
+],
+"expects": "Оценка каждого поля фич читается по ссылке из ответа; нужны независимый вердикт supported, привязка к выданному вопросу и сохранённые наблюдения",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:301 (readAcceptedField)",
+"fields": [
+"verdict",
+"value",
+"researcher"
+],
+"expects": "Сводка требует точную поддержанную оценку принятого предложения модели",
+"sure": true
+},
+{
+"node": "feat.f1.n2",
+"code": "src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue); src/product/engine.ts:105 (ProductEngine.#prepare)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Опора принятой спецификации (оценки прежних стадий) читается по своему адресу и должна быть равна голове (proof_stale иначе) (вывод по составу опор)",
+"sure": false
+}
+]
+},
+{
+"kind": "research-assessment-binding",
+"writers": [
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/research-assessment.ts:401 (assessAnswer)",
+"when": "Для оплаченного (управляемого) хода оценка связывается с ним вместе с сессией оценщика и снимком прочитанного; повторная привязка к другой оценке запрещена",
+"fields": [
+"turn",
+"pending",
+"assessment",
+"session",
+"application",
+"reads"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f5.n6",
+"code": "src/discovery/discovery.ts:293 (Discovery.#managedAcceptance)",
+"fields": [
+"pending"
+],
+"expects": "Управляемое принятие: оценка привязана к цепочке версий ожидающего хода; иначе research_assessment_binding_invalid",
+"sure": true
+}
+]
+},
+{
+"kind": "research-acceptance-binding",
+"writers": [
+{
+"node": "feat.f2.n7",
+"code": "src/discovery/discovery.ts:140 (Discovery.#answer)",
+"when": "Управляемое принятие списка features: запись «K» один раз связывает оплаченный ход, оценку, ответ и соседние ревизии черновика и вопроса; существующая не переписывается",
+"fields": [
+"turn",
+"pending",
+"intent",
+"answer",
+"assessment"
+],
+"sure": true
+},
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/discovery.ts:140 (Discovery.#answer)",
+"when": "Общий шаг управляемого принятия (features или featurePreparation): запись «K» один раз связывает оплаченный ход, оценку и ответ",
+"fields": [
+"turn",
+"pending",
+"intent",
+"answer",
+"assessment"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f6.n3",
+"code": "src/discovery/discovery.ts:377 (Discovery.gate); src/discovery/discovery.ts:403 (Discovery.gate)",
+"fields": [
+"answer",
+"assessment"
+],
+"expects": "Для управляемого ответа ворота читают его запись принятия и кладут её среди опор стадии (вывод)",
+"sure": false
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:463 (loadSources)",
+"fields": [
+"answer",
+"assessment"
+],
+"expects": "Запись принятия управляемого ответа должна лежать среди опор стадии фич",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:302 (readAcceptedField)",
+"fields": [
+"answer",
+"assessment"
+],
+"expects": "Сводка требует запись принятия среди опор для управляемого ответа",
+"sure": true
+},
+{
+"node": "feat.f1.n2",
+"code": "src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue); src/product/engine.ts:105 (ProductEngine.#prepare)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Опора принятой спецификации (записи принятия прежних стадий) читается по своему адресу и должна быть равна голове (proof_stale иначе) (вывод по составу опор)",
+"sure": false
+}
+]
+},
+{
+"kind": "research-turn",
+"writers": [
+{
+"node": "feat.f2.n7",
+"code": "src/discovery/research-runner.ts:1249 (Researcher.run); src/discovery/research-runner.ts:1402 (Researcher.completeAcceptedTurn)",
+"when": "Принятый ответ по features завершает ожидающий ход оплаченного вызова: ход получает оценку и ссылку на запись принятия",
+"fields": [
+"status",
+"assessment",
+"observation",
+"action",
+"question"
+],
+"sure": true
+},
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/research-runner.ts:1249 (Researcher.run); src/discovery/research-runner.ts:1402 (Researcher.completeAcceptedTurn)",
+"when": "Общий шаг: принятый ответ завершает ожидающий ход оплаченного вызова: ход получает оценку и ссылку на запись принятия",
+"fields": [
+"status",
+"assessment",
+"observation",
+"action",
+"question"
+],
+"sure": true
+}
+],
+"readers": []
+},
+{
+"kind": "research-run",
+"writers": [
+{
+"node": "feat.f1.n7",
+"code": "src/discovery/research-runner.ts:366 (Researcher.run)",
+"when": "Начало исследования черновика фич: запись run со статусом running, числом ходов и бюджетом; дальше та же запись получает версии на каждый оплаченный шаг и паузу (вывод по узлу)",
+"fields": [
+"projectId",
+"draftId",
+"environment",
+"status",
+"turns",
+"limit",
+"inputs",
+"owner"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "feat.f1.n5",
+"code": "src/product/stage-research.ts:58 (StageResearch.run); src/product/stage-research.ts:75 (StageResearch.run)",
+"fields": [
+"status",
+"turns",
+"pauseCode",
+"error"
+],
+"expects": "Сохранённый ход оплаченного исследования восстанавливается до любого нового вызова; остановленный проект не начинает новых ходов (run_stopped)",
+"sure": true
+},
+{
+"node": "feat.f6.n1",
+"code": "src/discovery/consumer-research.ts:29 (researchForConsumer); src/discovery/consumer-research.ts:34 (researchForConsumer)",
+"fields": [
+"status",
+"turns"
+],
+"expects": "Стадия собирается только после завершённого исследования (status completed); иначе пауза или ожидание выбора владельца, число потраченных ходов считается по записи прогона",
+"sure": true
+},
+{
+"node": "feat.f6.n9",
+"code": "src/product/stage-research.ts:127 (StageResearch.run); src/product/stage-research.ts:129 (StageResearch.run)",
+"fields": [
+"pauseCode",
+"error",
+"ownerQuestion",
+"status"
+],
+"expects": "Дальше: бюджет ходов вышел или нужен выбор владельца — пауза или needs_owner с причиной из прогона, а не автопринятие",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:624 (candidateRun)",
+"fields": [
+"status",
+"ownerQuestion",
+"pauseCode"
+],
+"expects": "Для кандидата сводка показывает состояние исследования: идёт, на паузе, ждёт выбора владельца",
+"sure": true
+}
+]
+},
+{
+"kind": "research-context",
+"writers": [
+{
+"node": "feat.f1.n6",
+"code": "src/discovery/working-context.ts:154 (workingContext); src/discovery/research-runner.ts:662 (Researcher.run)",
+"when": "Перед платным вызовом пакет (поля, схемы, предпосылки Discovery, концепции, карты и спецификации, источники, история, замечания) архивируется неизменной записью; уже существующий архив не переписывается",
+"fields": [
+"draft",
+"question",
+"body"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f1.n8",
+"code": "src/discovery/research-consumer-transition.ts:429 (exactContextLookup)",
+"fields": [
+"body"
+],
+"expects": "Автор может запросить архив своего контекста по точному адресу и указателю (read_context); читается ровно та версия, что была выдана (вывод по узлу)",
+"sure": false
+},
+{
+"node": "feat.f5.n5",
+"code": "src/discovery/assessment-session.ts:96 (advanceAssessment)",
+"fields": [
+"body"
+],
+"expects": "Оценщик может запросить точный фрагмент архива контекста (read_context) и вернуться к более ранним страницам; читается ровно та версия архива, что выдана с вызовом (вывод по узлу)",
+"sure": false
+}
+]
+},
+{
+"kind": "research-consumer-intent",
+"writers": [
+{
+"node": "feat.f2.n4",
+"code": "src/discovery/research-runner.ts:843 (Researcher.run); src/discovery/response-recovery.ts:1471 (prepareResearchConsumerIntent)",
+"when": "Перед оплаченным вызовом автора сохраняется намерение: черновик, вопрос, роль, пакет и охраны; по нему вызов можно восстановить (вывод по узлу)",
+"fields": [
+"kind",
+"key",
+"owner",
+"draft",
+"question",
+"role",
+"dispatch",
+"cursor",
+"basis",
+"guards",
+"state"
+],
+"sure": false
+},
+{
+"node": "feat.f3.a",
+"code": "src/discovery/research-runner.ts:843 (Researcher.run); src/discovery/response-recovery.ts:1471 (prepareResearchConsumerIntent)",
+"when": "Перед оплаченным вызовом автора сохраняется намерение: черновик, вопрос, роль, пакет и охраны; по нему вызов можно восстановить (вывод по узлу)",
+"fields": [
+"kind",
+"key",
+"owner",
+"draft",
+"question",
+"role",
+"dispatch",
+"cursor",
+"basis",
+"guards",
+"state"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "project-dispatch",
+"writers": [
+{
+"node": "feat.f2.n4",
+"code": "src/discovery/research-protocol.ts:343 (researchCall)",
+"when": "Каждый платный вызов увеличивает счётчик вызовов проекта (serial); запись одна на проект и получает новую версию на каждый вызов (вывод по узлу)",
+"fields": [
+"projectId",
+"serial"
+],
+"sure": false
+},
+{
+"node": "feat.f3.a",
+"code": "src/discovery/research-protocol.ts:343 (researchCall)",
+"when": "Каждый платный вызов увеличивает счётчик вызовов проекта (serial); запись одна на проект и получает новую версию на каждый вызов (вывод по узлу)",
+"fields": [
+"projectId",
+"serial"
+],
+"sure": false
+},
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/research-protocol.ts:343 (researchCall)",
+"when": "Каждый платный вызов увеличивает счётчик вызовов проекта (serial); запись одна на проект и получает новую версию на каждый вызов (вывод по узлу)",
+"fields": [
+"projectId",
+"serial"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "question-dispatch",
+"writers": [
+{
+"node": "feat.f2.n4",
+"code": "src/discovery/research-protocol.ts:354 (researchCall)",
+"when": "Вызов по пакету увеличивает счётчик вызовов своего вопроса (serial); запись одна на вопрос (вывод по узлу)",
+"fields": [
+"projectId",
+"question",
+"serial"
+],
+"sure": false
+},
+{
+"node": "feat.f3.a",
+"code": "src/discovery/research-protocol.ts:354 (researchCall)",
+"when": "Вызов по пакету увеличивает счётчик вызовов своего вопроса (serial); запись одна на вопрос (вывод по узлу)",
+"fields": [
+"projectId",
+"question",
+"serial"
+],
+"sure": false
+},
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/research-protocol.ts:354 (researchCall)",
+"when": "Вызов по пакету увеличивает счётчик вызовов своего вопроса (serial); запись одна на вопрос (вывод по узлу)",
+"fields": [
+"projectId",
+"question",
+"serial"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "model-call",
+"writers": [
+{
+"node": "feat.f2.n4",
+"code": "src/discovery/research-protocol.ts:364 (researchCall)",
+"when": "Платный вызов автора, предложивший список features: заявка пишется до запуска процесса, затем получает итог (статус, расход, ответ) (вывод по узлу)",
+"fields": [
+"status",
+"request",
+"response",
+"usage",
+"purpose",
+"questionId",
+"draftId",
+"consumerIntent"
+],
+"sure": false
+},
+{
+"node": "feat.f3.a",
+"code": "src/discovery/research-protocol.ts:364 (researchCall)",
+"when": "Один платный вызов автора составляет всю featurePreparation целиком (польза, договоры, исходы, взаимодействия, нерешённое — не пять вызовов): заявка пишется до запуска, затем получает итог (вывод: по тексту узла вызов не привязан к одному шагу)",
+"fields": [
+"status",
+"request",
+"response",
+"usage",
+"purpose",
+"questionId",
+"draftId",
+"consumerIntent"
+],
+"sure": false
+},
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/research-protocol.ts:364 (researchCall)",
+"when": "Платный вызов оценщика предложенного значения поля: заявка пишется до запуска процесса, затем получает итог (вывод по узлу)",
+"fields": [
+"status",
+"request",
+"response",
+"usage",
+"purpose",
+"questionId",
+"draftId",
+"assessmentApplication"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "model-request",
+"writers": [
+{
+"node": "feat.f2.n4",
+"code": "src/discovery/research-protocol.ts:360 (researchCall)",
+"when": "Тот же платный вызов: если он идёт через пакет с рабочим контекстом, текст запроса сохраняется отдельной записью до запуска процесса (вывод по узлу)",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": false
+},
+{
+"node": "feat.f3.a",
+"code": "src/discovery/research-protocol.ts:360 (researchCall)",
+"when": "Тот же платный вызов: если он идёт через пакет с рабочим контекстом, текст запроса сохраняется отдельной записью до запуска процесса (вывод по узлу)",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": false
+},
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/research-protocol.ts:360 (researchCall)",
+"when": "Тот же платный вызов: если он идёт через пакет с рабочим контекстом, текст запроса сохраняется отдельной записью до запуска процесса (вывод по узлу)",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "model-response",
+"writers": [
+{
+"node": "feat.f2.n4",
+"code": "src/discovery/research-protocol.ts:464 (researchCall)",
+"when": "Тот же платный вызов: физический ответ сохраняется отдельной записью до разбора (вывод по узлу)",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": false
+},
+{
+"node": "feat.f3.a",
+"code": "src/discovery/research-protocol.ts:464 (researchCall)",
+"when": "Тот же платный вызов: физический ответ сохраняется отдельной записью до разбора (вывод по узлу)",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": false
+},
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/research-protocol.ts:464 (researchCall)",
+"when": "Тот же платный вызов: физический ответ сохраняется отдельной записью до разбора (вывод по узлу)",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "assessment-session",
+"writers": [
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/assessment-session.ts:1042 (assessmentSessionInternal)",
+"when": "Оценка идёт сессией оценщика: пишутся сессия с привязкой к черновику, вопросу и среде, её применение и, для оплаченного хода, запись происхождения (вывод по узлу)",
+"fields": [
+"projectId",
+"offset",
+"notes",
+"focus",
+"result",
+"contract",
+"application",
+"binding"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "assessment-application",
+"writers": [
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/assessment-session.ts:718 (applicationWrite)",
+"when": "Подготовленное применение сессии оценщика: контекст, запрос, роль и охраны сохраняются до вызова (вывод по узлу)",
+"fields": [
+"contract",
+"projectId",
+"session",
+"context",
+"prompt",
+"role",
+"dispatch",
+"state"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "assessment-paid-origin",
+"writers": [
+{
+"node": "feat.f5.n4",
+"code": "src/discovery/assessment-session.ts:734 (paidOriginWrite)",
+"when": "Для оплаченного хода автора фиксируется происхождение оценки: черновик, вопрос, среда, контекст оценщика и охраны (вывод по узлу)",
+"fields": [
+"contract",
+"projectId",
+"session",
+"application",
+"pending",
+"draft",
+"question",
+"context"
+],
+"sure": false
+}
+],
+"readers": []
+},
+{
+"kind": "research-feedback",
+"writers": [
+{
+"node": "feat.f6.n8",
+"code": "src/discovery/consumer-feedback.ts:21 (rejectResearch)",
+"when": "Приёмка отвергла ответ поля фич (например, исход фичи не существует на карте или договор не совпадает по исходу): замечания привязаны к названному полю и сохраняются; поле переоткрывается и модель исправляет его, а не пишет всё заново",
+"fields": [
+"projectId",
+"draft",
+"questions",
+"findings"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "feat.f1.n6",
+"code": "src/discovery/consumer-feedback.ts:32 (consumerFeedback); src/discovery/research-runner.ts:664 (Researcher.run)",
+"fields": [
+"projectId",
+"draft",
+"questions",
+"findings"
+],
+"expects": "Замечания читаются, пока вопрос открыт ровно на версии после отклонения (ещё не отвечен заново): автор исправляет названное поле",
+"sure": true
+},
+{
+"node": "feat.f5.n3",
+"code": "src/discovery/research-assessment.ts:324 (assessAnswer)",
+"fields": [
+"projectId",
+"draft",
+"questions",
+"findings"
+],
+"expects": "Оценщик видит те же замечания, что и исследователь",
+"sure": true
+}
+]
+},
+{
+"kind": "source",
+"writers": [],
+"readers": [
+{
+"node": "feat.f1.n8",
+"code": "src/discovery/research-runner.ts:1032 (Researcher.run)",
+"fields": [
+"content",
+"origin",
+"версия и хэш"
+],
+"expects": "Выписку из источника автор читает по точной ссылке (read_source); изменившийся источник читать нельзя (research_consumer_intent_invalid) (вывод по узлу)",
+"sure": false
+},
+{
+"node": "feat.f1.n6",
+"code": "src/discovery/research-sources.ts:15 (ResearchSources.list)",
+"fields": [
+"origin",
+"content",
+"mediaType",
+"версия и хэш"
+],
+"expects": "В пакет входит каталог источников проекта (вид, место, начало текста, размер); берутся только актуальные",
+"sure": true
+},
+{
+"node": "feat.f5.n2",
+"code": "src/discovery/research-assessment.ts:231 (assessAnswer)",
+"fields": [
+"content",
+"origin",
+"версия и хэш"
+],
+"expects": "Цитаты ответа превращаются в наблюдения по точным версиям источников проекта; изменившийся источник делает наблюдение недействительным",
+"sure": true
+},
+{
+"node": "feat.f5.n6",
+"code": "src/discovery/discovery.ts:205 (Discovery.#acceptSupported)",
+"fields": [
+"версия и хэш",
+"content"
+],
+"expects": "Наблюдения оценки проверяемы: источники цитат ещё актуальны",
+"sure": true
+},
+{
+"node": "feat.f6.n3",
+"code": "src/discovery/discovery.ts:390 (Discovery.gate)",
+"fields": [
+"версия и хэш",
+"content"
+],
+"expects": "Цитаты ответа подтверждаются: источник в опоре ещё актуален (research_evidence_stale иначе)",
+"sure": true
+},
+{
+"node": "feat.f6.n6",
+"code": "src/graph/repository.ts:137 (GraphRepository.layerGate); src/graph/repository.ts:140 (GraphRepository.layerGate)",
+"fields": [
+"версия и хэш",
+"content"
+],
+"expects": "Среди опор слоя L1 источники тоже сверяются на актуальность; изменившийся источник — graph_evidence_stale (вывод по ветке кода)",
+"sure": false
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:422 (loadSources)",
+"fields": [
+"content",
+"origin",
+"sha256",
+"mediaType"
+],
+"expects": "Сохранённое наблюдение должно быть выведено из своего источника: проект, содержимое, хэш и происхождение сохранены",
+"sure": true
+},
+{
+"node": "feat.f7.n8",
+"code": "src/product/stage-summary.ts:305 (readAcceptedField)",
+"fields": [
+"content",
+"origin"
+],
+"expects": "Сводка проверяет источники наблюдений принятого ответа",
+"sure": true
+},
+{
+"node": "feat.f1.n2",
+"code": "src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue); src/product/engine.ts:105 (ProductEngine.#prepare)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Опора принятой спецификации (источники прежних стадий) читается по своему адресу и должна быть равна голове (proof_stale иначе) (вывод по составу опор)",
+"sure": false
+}
+]
+},
+{
+"kind": "environment",
+"writers": [],
+"readers": [
+{
+"node": "feat.f1.n7",
+"code": "src/discovery/research-runner.ts:223 (Researcher.run)",
+"fields": [
+"implementer",
+"reviewer",
+"workspace"
+],
+"expects": "Перед исследованием читается действующая среда: исполнитель, проверяющий и рабочая область вызова (вывод по узлу)",
+"sure": false
+},
+{
+"node": "feat.f5.n3",
+"code": "src/discovery/research-assessment.ts:232 (assessAnswer)",
+"fields": [
+"implementer",
+"reviewer"
+],
+"expects": "Автор и оценщик — разные участники среды (assessor_not_independent иначе) (вывод по узлу)",
+"sure": false
+}
+]
+},
+{
+"kind": "design",
+"writers": [
+{
+"node": "feat.f2.n7",
+"code": "src/discovery/discovery.ts:154 (Discovery.decision)",
+"when": "Путь вызывающего: поле features имеет вид design; если его ответили командой answer-decision, пишется запись design с автором, а не оценка модели (вывод)",
+"fields": [
+"projectId",
+"actor",
+"question",
+"value"
+],
+"sure": false
+},
+{
+"node": "feat.f5.n7",
+"code": "src/discovery/discovery.ts:154 (Discovery.decision)",
+"when": "Путь вызывающего: поле featurePreparation имеет вид design; если его ответили командой answer-decision, пишется запись design с автором (вывод)",
+"fields": [
+"projectId",
+"actor",
+"question",
+"value"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "feat.f6.n3",
+"code": "src/discovery/discovery.ts:366 (Discovery.gate)",
+"fields": [
+"вид записи",
+"actor",
+"value"
+],
+"expects": "Ворота приёмки: ответ вызывающего должен называть автора, а значение — равняться полю черновика (вывод)",
+"sure": false
+}
+]
+},
+{
+"kind": "graph",
+"writers": [],
+"readers": [
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:606 (currentAcceptance); src/graph/repository.ts:130 (GraphRepository.layerGate)",
+"fields": [
+"nodes",
+"connectors",
+"artifacts"
+],
+"expects": "Та же проверка слоя L1 читает голову полного графа и сверяет с ней печать слоя (вывод по цепочке вызовов)",
+"sure": false
+}
+]
+},
+{
+"kind": "graph-layer",
+"writers": [],
+"readers": [
+{
+"node": "feat.f1.n8",
+"code": "src/discovery/research-consumer-transition.ts:440 (exactContextLookup)",
+"fields": [
+"projection"
+],
+"expects": "Карта L1 попала в пакет только ссылкой; её фрагмент автор может дочитать по точной ссылке и указателю, если слой среди входов черновика (вывод по узлу)",
+"sure": false
+},
+{
+"node": "feat.f7.n4",
+"code": "src/om/input.ts:606 (currentAcceptance); src/product/stage-checks.ts:367 (StageChecks.validateStage)",
+"fields": [
+"projection",
+"layerProofs",
+"obligations",
+"inputs"
+],
+"expects": "Текущая приёмка фич заново проверяет слой L1 (печать, поля узлов, опоры) через осмотр стадии features (вывод по цепочке вызовов)",
+"sure": false
+},
+{
+"node": "feat.f1.n2",
+"code": "src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue); src/product/engine.ts:105 (ProductEngine.#prepare)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Опора принятой спецификации (печать слоя L1 карты) читается по своему адресу и должна быть равна голове (proof_stale иначе) (вывод по составу опор)",
+"sure": false
+}
+]
+}
+]
+}
