@@ -141,8 +141,12 @@
   function dbOpts(){
     if(!DBL)return;
     var ws={},rs={};DBL.kinds.forEach(function(k){(k.writers||[]).forEach(function(en){ws[en.node]=1;});(k.readers||[]).forEach(function(en){rs[en.node]=1;});});
-    function fill(id,set,first){var s=document.getElementById(id);s.innerHTML='<option value="">'+first+'</option>';
-      Object.keys(set).sort().forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=dbLabel(n);s.appendChild(o);});}
+    /* every listed node also offers its stage and sub-block, so a whole block can be picked at once */
+    function fill(id,set,first){var s=document.getElementById(id),all={};s.innerHTML='<option value="">'+first+'</option>';
+      Object.keys(set).forEach(function(n){var parts=n.split("."),cur="";parts.forEach(function(p){cur=cur?cur+"."+p:p;if(IT[cur])all[cur]=1;});all[n]=1;});
+      Object.keys(all).sort(function(a,b){var ia=ORDER.indexOf(a),ib=ORDER.indexOf(b);return (ia<0?1e9:ia)-(ib<0?1e9:ib);}).forEach(function(n){
+        var o=document.createElement("option");o.value=n;var it=IT[n],depth=n.split(".").length-1;
+        o.textContent=(depth?"\u00a0\u00a0".repeat(depth):"")+(it&&it.kind!=="node"?"▸ "+(it.n?it.n+" · ":"")+it.t+" (весь блок)":(it?it.t:n+" (?)"));s.appendChild(o);});}
     fill("dbW",ws,"+ писатель…");fill("dbR",rs,"+ читатель…");
     var sk=document.getElementById("dbK");sk.innerHTML='<option value="">запись: все</option>';
     DBL.kinds.forEach(function(k){var o=document.createElement("option");o.value=k.kind;o.textContent=k.kind;sk.appendChild(o);});
