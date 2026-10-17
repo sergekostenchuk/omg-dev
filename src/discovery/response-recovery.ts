@@ -918,11 +918,15 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
       consumerInvalid(before.id, 'The paid addressed read lost its exact draft, question or profile');
     const record = readResearchContextRecordAt(store, draft, action);
     const maxChars = pilot?.value.maxRequestChars ?? 300000;
+    const legacySizeRefusal = after.value.error === 'Use a smaller addressed context page'
+      && after.value.observation?.code === 'context_read_limit';
     let refused = false;
-    try { projectResearchContextRead(record.value, action.record, action.pointer, action.page, maxChars); }
+    try { projectResearchContextRead(record.value, action.record, action.pointer, action.page,
+      maxChars, legacySizeRefusal ? 'legacy' : 'bounded'); }
     catch (error) { if (error instanceof EngineError) refused = true; else throw error; }
     if (refused) return { kind: 'context-refusal', recordValue: record.value,
-      record: action.record, maxChars };
+      record: action.record, maxChars,
+      ...(!legacySizeRefusal ? { projection: 'bounded' as const } : {}) };
     if (after.value.error !== null) {
       const prior = producer.value.basis.flatMap(ref => {
         const turn = store.get<ResearchTurn>(ref.id, ref.revision);
@@ -1527,7 +1531,7 @@ export interface AssessmentReadProof {
  * substitutes a captured filesystem observation for Evidence's live probe; it
  * is never a saved Source and must never be registered as transparent in S1. */
 export function assessmentReadView(store: Store, savedProof?: AssessmentReadProof | null): {
-  store: Store; proof: AssessmentReadProof; guards: TransactionGuard[]; finish(): AssessmentReadProof;
+  store: Store; proof: AssessmentReadProof; guards: TransactionGuard[]; readonly position: number; finish(): AssessmentReadProof;
 } {
   let invalid: EngineError | null = null;
   function fail(message: string): never {
@@ -1692,7 +1696,7 @@ export function assessmentReadView(store: Store, savedProof?: AssessmentReadProo
     if (typeof value === 'function') return () => fail('Assessment input views support only captured get reads');
     return value;
   } });
-  return { store: view, proof, guards, finish() {
+  return { store: view, proof, guards, get position() { return position; }, finish() {
     if (invalid) throw invalid;
     validate(proof);
     if (position !== proof.reads.length || usedFiles.size !== proof.files.length)
@@ -3266,9 +3270,10 @@ export function readResearchContextRecordAt(store: Store, draft: Revision<Discov
 }
 
 export function readResearchContextOutcomeAt(store: Store, draft: Revision<DiscoveryDraft>, _question: Revision<Question>,
-  action: Extract<ResearchAction, { action: 'read_context' }>, maxChars: number) {
+  action: Extract<ResearchAction, { action: 'read_context' }>, maxChars: number,
+  mode: 'legacy' | 'bounded' = 'bounded') {
   const record = readResearchContextRecordAt(store, draft, action);
-  return projectResearchContextRead(record.value, action.record, action.pointer, action.page, maxChars);
+  return projectResearchContextRead(record.value, action.record, action.pointer, action.page, maxChars, mode);
 }
 
 function checkedContextIdentity(store: Store, projectId: string, draft: Revision<DiscoveryDraft>,
@@ -3300,7 +3305,7 @@ export function readContextTurnHistoryAt(store: Store, projectId: string,
     let context: ContextTurnHistoryProof['context'];
     let packet: ContextTurnHistoryProof['packet'];
     if (checked.value.status === 'completed' && checked.value.error === null
-      && checked.value.question?.id === question.id) {
+      && isRef(checked.value.question) && canonical(checked.value.question) === canonical(question)) {
       const origin = (checked.value as { consumerIntent?: unknown }).consumerIntent;
       if (isRef(origin)) {
         const paid = readResearchConsumerExecution(store, projectId, origin);

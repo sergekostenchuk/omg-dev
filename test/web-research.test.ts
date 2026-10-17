@@ -11,7 +11,7 @@ import { Store, type Revision } from '../src/storage/store.js';
 import { Environments, type Environment, type WebResearchSettings } from '../src/runtime/environment.js';
 import { Evidence, SOURCE_MAX_BYTES, type Source } from '../src/evidence/evidence.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { digest } from '../src/canonical.js';
+import { digest, hashJson } from '../src/canonical.js';
 import { archivedContext, contextPage, contextValue, workingContext } from '../src/discovery/working-context.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
@@ -914,7 +914,22 @@ test('SR1b large TOC is paged with an exact archive address and survives continu
   const first = workingContext(f.store, 'p', draft.id, questionId, body, 7_000, { purpose: 'reader' });
   const initial = workingContext(f.store, 'p', draft.id, questionId, body, 7_000,
     { purpose: 'reader', common: true });
-  assert.deepEqual(initial.sourceCatalogue, first.sourceCatalogue);
+  const savedCatalogue = (packet: Record<string, any>) => {
+    const address = packet.working.materialAddresses?.find((item: any) => item.field === 'sourceCatalogue');
+    assert.ok(address, 'The complete source catalogue needs an exact archive address');
+    assert.equal(address.pointer, '/body/sourceCatalogue');
+    const archive = f.store.get<any>(address.record.id, address.record.revision)!;
+    assert.equal(archive.hash, address.record.hash);
+    const catalogue = contextValue(archive.value, address.pointer);
+    assert.equal(hashJson(catalogue), address.valueHash);
+    assert.equal(packet.sourceCatalogue, undefined, 'The addressed original is not duplicated inline');
+    const fragment = packet.materialDelivery?.[0];
+    assert.equal(fragment?.original.pointer, address.pointer);
+    assert.equal(fragment?.original.valueHash, address.valueHash);
+    assert.equal(fragment?.served.total, address.total);
+    return catalogue as any;
+  };
+  assert.deepEqual(savedCatalogue(initial), savedCatalogue(first));
   const planning = workingContext(f.store, 'p', draft.id, questionId, {
     ...body, dispatchMode: 'planning', repositoryRoot: f.root, stage: 'discovery', level: 'R2',
     consumer: 'compilation', core: { objective: 'Read the saved article', problem: '', actors: [],
@@ -922,7 +937,7 @@ test('SR1b large TOC is paged with an exact archive address and survives continu
     map: { ref: null, nodes: [] }, catalogue: [], readings: [], directReadings: [], answers: [],
   }, 20_000, { purpose: 'reading-planner' });
   assert.ok(planning.sourceCatalogue, 'the planning request retains structured navigation');
-  const rows = first.sourceCatalogue.sources;
+  const rows = savedCatalogue(first).sources;
   const items = Array.isArray(rows) ? rows : rows.rows.map((row: any[]) => Object.fromEntries(rows.columns.map((key: string, i: number) => [key, row[i]])));
   const toc = items.find((item: any) => item.ref.id === source.id)!.toc;
   assert.equal(toc.total, 121); assert.ok(toc.next !== null && toc.next < toc.total);
@@ -937,8 +952,8 @@ test('SR1b large TOC is paged with an exact archive address and survives continu
   assert.equal((tocPage.value as any[])[0].id, source.value.structure!.sections[toc.next]!.id);
   const later = workingContext(f.store, 'p', draft.id, questionId, body, 7_000,
     { purpose: 'reader', continuation: true, previous: first.working.archive });
-  assert.ok(later.sourceCatalogue, 'continuation retains the exact TOC page or archive address');
-  assert.equal(JSON.stringify(later.sourceCatalogue), JSON.stringify(first.sourceCatalogue));
+  assert.deepEqual(savedCatalogue(later), savedCatalogue(first),
+    'continuation retains the same exact TOC catalogue through its archive address');
 });
 
 async function materialFixture(t: test.TestContext, used = 0) {

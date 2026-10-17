@@ -7,7 +7,7 @@ import {Store} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {previewResearch} from '../src/discovery/research-preview.js';
-import {digest} from '../src/canonical.js';
+import {canonical,digest,hashJson} from '../src/canonical.js';
 import type {Question} from '../src/discovery/discovery.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 
@@ -79,7 +79,18 @@ test('the global ReaderPilot request limit applies to initial and continuation r
  const preview=await previewResearch(()=>call());
  assert.equal(preview.limit,300000);assert.ok(preview.chars>100000&&preview.chars<=300000);
  assert.equal(JSON.parse(preview.input).subject.continuation.kind,'continuation');
- await assert.rejects(previewResearch(()=>call(pilot,{...f.context,request:{text:'X'.repeat(350000)}})),{code:'pilot_core_limit'});
+ const oversizedRequest={text:'X'.repeat(350000)};
+ const bounded=await previewResearch(()=>call(pilot,{...f.context,request:oversizedRequest}));
+ const boundedSubject=JSON.parse(bounded.input).subject;
+ const delivery=boundedSubject.materialDelivery[0];
+ assert.ok(bounded.chars<=bounded.limit);
+ assert.equal(boundedSubject.request,undefined,'The complete original is not duplicated in the packet');
+ assert.equal(delivery.contract,'research-delivery/v1');
+ assert.equal(delivery.original.pointer,'/body/request');
+ assert.equal(delivery.original.valueHash,hashJson(oversizedRequest));
+ assert.equal(delivery.text,canonical(oversizedRequest).slice(0,delivery.served.end));
+ assert.ok(delivery.served.end>0&&delivery.served.next>0);
+ assert.equal(delivery.served.total,canonical(oversizedRequest).length);
  const physical=configureReaderPilot(f.store,f.engine.environments,'p',{...settings,physicalLimits:{maxRequestChars:100000,maxReplyChars:10000,basis:'Fixture transport capacity'}},pilot.revision);
  await assert.rejects(previewResearch(()=>call(physical)),{code:'budget_transport_limit'});
  assert.equal(f.store.list('model-call').length,1);

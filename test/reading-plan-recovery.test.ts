@@ -77,31 +77,38 @@ test('a concurrent question dispatch cannot race the idle check and reset a chil
  assert.deepEqual(f.store.get(f.child.id),f.child);
 });
 
-test('oversized planned context pages split to complete original coverage without buying another call',t=>{
+test('oversized planned context pages expose bounded continuation without buying another call',t=>{
  const text='0123456789'.repeat(600),f=fixture(t,text);
- retryPlannedRead(f.store,'p',reference(f.child));
+ const child=retryPlannedRead(f.store,'p',reference(f.child));
  const pilot={value:{projectId:'p',maxRequestChars:1300}} as Revision<ReaderPilot>;
- let run=f.run;
  const pieces:{offset:number;text:string}[]=[];
- for(let attempts=0;attempts<100;attempts++){
-  const child=f.turns().find(t=>t.value.status==='pending');if(!child)break;
-  const action=child.value.action as Extract<ResearchAction,{action:'read_context'}>;
-  try{
-    const result=readResearchContext(f.store,f.draft,f.q.id,pilot,action.record,action.pointer,action.page);
-    pieces.push({offset:result.page!.offset,text:result.value as string});
-    f.store.write<ResearchTurn>({id:child.id,kind:child.kind,expected:child.revision,value:{...child.value,status:'completed',observation:result}});
-  }catch(error){
-    assert.equal((error as {code:string}).code,'context_read_limit');
-    const split=splitPlannedContextRead(f.store,run,child,f.draft,f.q);run=split.run;
-    assert.equal(split.children.length,2);
-  }
+ const action=child.value.action as Extract<ResearchAction,{action:'read_context'}>;
+ const first=readResearchContext(f.store,f.draft,f.q.id,pilot,action.record,action.pointer,action.page);
+ assert.ok('contract' in first);
+ assert.equal(first.contract,'research-context-read/v2');
+ assert.equal(first.outcome,'clipped');
+ assert.deepEqual(first.requested,{offset:0,limit:text.length,end:text.length,total:text.length,unit:'utf16'});
+ assert.ok(first.page && first.page.next !== null && first.page.end < text.length);
+ f.store.write<ResearchTurn>({id:child.id,kind:child.kind,expected:child.revision,value:{...child.value,status:'completed',observation:first}});
+ let page=first;
+ for(let attempts=0;page.page?.next !== null && attempts<100;attempts++){
+  const offset=page.page!.offset;
+  assert.equal(page.value,text.slice(offset,page.page!.end));
+  pieces.push({offset,text:page.value as string});
+  const next=page.page!.next!;
+  page=readResearchContext(f.store,f.draft,f.q.id,pilot,action.record,action.pointer,{offset:next,limit:text.length-next});
+  assert.equal(page.page?.offset,next);
+  assert.ok(page.page!.end>next);
  }
+ assert.equal(page.page?.next,null);
+ assert.equal(page.value,text.slice(page.page!.offset,page.page!.end));
+ pieces.push({offset:page.page!.offset,text:page.value as string});
  assert.equal(f.turns().filter(t=>t.value.status==='pending').length,0);
- assert.equal(pieces.sort((a,b)=>a.offset-b.offset).map(p=>p.text).join(''),text);
+ assert.equal(pieces.map(p=>p.text).join(''),text);
  assert.equal(dispatchMode(f.turns(),f.q),'synthesis');
  assert.equal(f.store.list('model-call').length,0);
- const splitChild=f.turns().find(t=>t.value.splitFrom&&t.value.observation&&!((t.value.observation as any).splitInto))!;
- const failed=f.store.write<ResearchTurn>({id:splitChild.id,kind:splitChild.kind,expected:splitChild.revision,value:{...splitChild.value,error:'temporary source problem'}});
+ const completed=f.store.get<ResearchTurn>(child.id)!;
+ const failed=f.store.write<ResearchTurn>({id:completed.id,kind:completed.kind,expected:completed.revision,value:{...completed.value,error:'temporary source problem'}});
  const retried=retryPlannedRead(f.store,'p',reference(failed));
  const failedAgain=f.store.write<ResearchTurn>({id:retried.id,kind:retried.kind,expected:retried.revision,value:{...retried.value,status:'completed',error:'still unavailable'}});
  assert.equal(retryPlannedRead(f.store,'p',reference(failedAgain)).value.status,'pending');

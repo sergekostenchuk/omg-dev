@@ -388,9 +388,14 @@ test('DS1-05 a verdict naming another report is refused before assessor dispatch
 });
 
 test('DS1-09 exact Git v4 producer: accepted stages retain their era and paid pending restores before upgrade without new calls',async t=>{
- const root=mkdtempSync(join(tmpdir(),'omg-ds1-era-')),era=join(root,'era');mkdirSync(era);
+ const root=mkdtempSync(join(tmpdir(),'omg-ds1-era-')),era=join(root,'era'),archive=join(root,'archive.tar');mkdirSync(era);
  t.after(()=>rmSync(root,{recursive:true,force:true}));
- execFileSync('tar',['-xf','-','-C',era],{input:execFileSync('git',['archive','e9c1ca5c41fb80508559aeab41da8f3da7422953'],{maxBuffer:80<<20})});
+ execFileSync('git',['archive','--format=tar',`--output=${archive}`,'e9c1ca5c41fb80508559aeab41da8f3da7422953']);
+ try{
+  execFileSync('tar',['-xf',archive,'-C',era]);
+ }finally{
+  rmSync(archive,{force:true});
+ }
  symlinkSync(resolve('node_modules'),join(era,'node_modules'));
  execFileSync(process.execPath,[resolve('node_modules/typescript/bin/tsc'),'-p',join(era,'tsconfig.json')],{cwd:era,maxBuffer:4<<20});
  const producer=join(era,'ds1-old-producer.mjs');

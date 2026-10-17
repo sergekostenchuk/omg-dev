@@ -199,8 +199,17 @@ export function compactConclusions(value: unknown, format: 1 | 2 = 2) {
   return { items: visit(value), citations, references, unresolved };
 }
 export function correctionIndex(history:any[],archive:Ref){
-  return history.flatMap((h,index)=>h.error||h.feedback?[{number:h.number,question:h.action?.question??h.question?.id??null,action:typeof h.action==='object'?h.action.action:h.action,error:h.error??null,
-    reasons:h.feedback?.reasons??h.observation?.reasons??[],
-    findings:(Array.isArray(h.feedback?.details)?h.feedback.details:Array.isArray(h.feedback)?h.feedback:[]).map((f:any)=>({code:f.code,target:f.target,field:f.field,message:f.message,instancePath:f.instancePath,keyword:f.keyword})),
-    original:{record:archive,pointer:`/body/history/${index}`}}]:[]);
+  return history.flatMap((h,index)=>{
+    if(!h.error&&!h.feedback)return [];
+    const action=typeof h.action==='object'?h.action?.action:h.action;
+    const findings=Array.isArray(h.feedback?.details)?h.feedback.details:Array.isArray(h.feedback)?h.feedback:[];
+    return [{...(h.number===undefined?{}:{number:h.number}),question:h.action?.question??h.question?.id??null,
+      ...(action===undefined?{}:{action}),error:h.error??null,
+      reasons:h.feedback?.reasons??h.observation?.reasons??[],
+      findings:findings.map((finding:any)=>Object.fromEntries(
+        ['code','target','field','message','instancePath','keyword']
+          .filter(key=>finding&&Object.hasOwn(finding,key)&&finding[key]!==undefined)
+          .map(key=>[key,finding[key]]))),
+      original:{record:archive,pointer:`/body/history/${index}`}}];
+  });
 }

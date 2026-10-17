@@ -131,7 +131,8 @@ export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],qu
   packetForTurn?: (turn: Revision<ResearchTurn>) => Record<string, any> | null):ContextWorkspace {
   let workspace:ContextWorkspace={entries:[],sinceProgress:0};
   for(const turn of turns){
-    if(turn.value.question?.id!==question.id||turn.value.status!=='completed'||turn.value.error)continue;
+    if (!turn.value.question || canonical(turn.value.question) !== canonical(reference(question))
+      || turn.value.status !== 'completed' || turn.value.error) continue;
     const packet = packetForTurn?.(turn);
     if (packet?.working?.deliveryContract === 'research-delivery/v1')
       workspace = recordContextPacket(workspace, packet);
@@ -147,11 +148,15 @@ export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],qu
         'research_consumer_intent_invalid', 'The saved page lost its exact original record');
       const observation = turn.value.observation as ProjectedContextRead;
       result = observation;
-      const reader = isReaderResultRef(action.record)
-        ? readReaderResultAt(store, question.value.projectId, action.record) : null;
+      const selected = observation.value && typeof observation.value === 'object'
+        && !Array.isArray(observation.value) && isRef((observation.value as { ref?: unknown }).ref)
+        ? (observation.value as { ref: Ref }).ref : null;
+      const readerRef = isReaderResultRef(action.record) ? action.record
+        : selected && isReaderResultRef(selected) ? selected : null;
+      const reader = readerRef ? readReaderResultAt(store, question.value.projectId, readerRef) : null;
       contextReadIdentity({ projectId: question.value.projectId, action, observation,
         recordKind: record.kind, recordValue: record.value, question: turn.value.question,
-        ...(reader ? { readerResult: { ref: action.record, value: reader.value } } : {}) });
+        ...(reader ? { readerResult: { ref: readerRef!, value: reader.value } } : {}) });
     } else result = latestFocus(store,[turn],question) as ContextLookup|null;
     if(!result)continue;
     workspace=foldContextEvent(workspace,action,result);

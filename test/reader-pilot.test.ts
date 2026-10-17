@@ -528,28 +528,41 @@ console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,resear
   } finally { reopened.close(); }
 });
 
-test("oversized requested assessment context pauses before another call instead of being forgotten", async t => {
+test("oversized requested assessment context keeps its paid fragment and resumes with addressed pages", async t => {
   const { root, store, engine, environment, settings, pilot, draft, question } = fixture(t);
   const source = engine.discovery.evidence.file("p", "focus-source", root, "README.md", "text/plain", 0);
   const observations = [engine.discovery.evidence.observe("p", reference(source), { kind: "text-range", start: 0, end: source.value.content.length })];
   const command = join(root, "focus-provider.mjs");
   writeFileSync(command, `import {readFileSync,writeFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
 const step=existsSync('focus-step')?Number(readFileSync('focus-step','utf8')):0;writeFileSync('focus-step',String(step+1));
-const research=step===0?{action:'read_context',record:c.working.archive,pointer:'/body/extra'}:step===1?{action:'assessment_checkpoint',notes:['Still awaiting context']}:{verdict:'supported',reasons:[]};
+const correction=c.failures?.find(x=>x.code==='research_context_incomplete');
+if(correction)writeFileSync('focus-correction',JSON.stringify(correction.details));
+const details=existsSync('focus-correction')?JSON.parse(readFileSync('focus-correction','utf8')):null;
+const research=step===0?{action:'read_context',record:c.working.archive,pointer:'/body/extra'}
+  :step===1?{action:'assessment_checkpoint',notes:['Still awaiting context']}
+  :step===2?{verdict:'supported',reasons:[]}
+  :step<6?{action:'read_context',record:details.record,pointer:details.pointer,page:{offset:details.next+(step-3)*30000,limit:30000}}
+  :{verdict:'supported',reasons:[]};
 console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const selected = configureReaderPilot(store, engine.environments, "p", { ...settings, maxRequestChars: 200000, maxReadChars: 200000,
     physicalLimits:{maxRequestChars:60000,maxReplyChars:100000,basis:'Fixture transport capacity'},
     agentCommand: { executable: process.execPath, args: [command] } }, pilot.revision);
   const context = { ...pilotContext(store, draft, question), role: "assess-answer", observations, value: "candidate", extra: "exception ".repeat(10000) };
   await assert.rejects(assessmentSession(store, draft, question, environment, pilotEnvironment(environment.value, selected.value), selected, context, "Evaluate"),
-    { code: "budget_transport_limit" });
+    { code: "research_context_incomplete" });
   const session = store.list<any>("assessment-session")[0]!.value;
   assert.equal(session.result, null);
   assert.equal(session.workspace.entries[0].result.value, context.extra);
-  await assert.rejects(assessmentSession(store, draft, question, environment, pilotEnvironment(environment.value, selected.value), selected, context, "Evaluate"),
-    { code: "budget_transport_limit" });
-  assert.equal(store.list("model-call").length, 1);
-  assert.equal(store.get<Question>(question.id)!.value.status, "open");
+  const reopened = new Store(join(root, 'state.sqlite')); t.after(() => reopened.close());
+  const continued = await assessmentSession(reopened, draft, question, environment,
+    pilotEnvironment(environment.value, selected.value), selected, context, "Evaluate");
+  assert.deepEqual(continued, { verdict: 'supported', reasons: [] });
+  assert.equal(reopened.list("model-call").length, 7, 'the original paid read and verdict remain single attempts');
+  assert.ok(reopened.list<ModelCall>("model-call").every(call => call.value.status === 'succeeded'));
+  const finalSession = reopened.list<any>('assessment-session')[0]!.value;
+  assert.deepEqual(finalSession.workspace.entries.map((entry: any) => entry.result.page?.offset ?? 0),
+    [0, 39834, 69834, 99834]);
+  assert.equal(reopened.get<Question>(question.id)!.value.status, "open");
 });
 
 test("assessment continuation never reuses a verdict after its supplied research context changes", async t => {
@@ -723,8 +736,21 @@ test("planning table transport retains every navigation value and enforces the c
   assert.deepEqual(packet.constraints, base.core.constraints);
   assert.deepEqual(packet.specificationConstraints, base.core.specificationConstraints);
   const chars = JSON.stringify(packet).length;
-  assert.deepEqual(workingContext(store, "p", draft.id, question.id, body, chars), packet);
-  assert.throws(() => workingContext(store, "p", draft.id, question.id, body, chars - 1), {code:"planning_context_limit"});
+  const bounded = workingContext(store, "p", draft.id, question.id, body, chars);
+  assert.ok(JSON.stringify(bounded).length <= chars);
+  const address = bounded.working.navigationAddresses.find((item: any) => item.field === 'requirements');
+  assert.ok(address, 'The complete requirements retain their exact archive address');
+  assert.equal(address.pointer, '/body/core/requirements');
+  const delivery = bounded.materialDelivery[0];
+  assert.equal(delivery.contract, 'research-delivery/v1');
+  assert.equal(delivery.original.pointer, address.pointer);
+  assert.equal(delivery.original.valueHash, address.sourceHash);
+  assert.equal(delivery.text, canonical(body.core.requirements).slice(0, delivery.served.end));
+  assert.ok(delivery.served.end > 0 && delivery.served.next! > 0);
+  assert.equal(delivery.served.total, canonical(body.core.requirements).length);
+  const tighter = workingContext(store, "p", draft.id, question.id, body, chars - 1);
+  assert.ok(JSON.stringify(tighter).length <= chars - 1, 'The original transport ceiling is never raised');
+  assert.ok(tighter.materialDelivery[0].served.end > 0);
   assert.deepEqual(readPilotContext(store, draft, packet.working.archive, "/body/core/requirements/0/requirements/99", 1000).value, requirements[99]);
 });
 
@@ -952,17 +978,27 @@ test("synthesis resumes unshown materials after a budget pause without repeating
   const full=workingContext(store,'p',draft.id,question.id,{...context,synthesisMaterials:selections,synthesisState:{offset:0},synthesisNotes:[]},1000000);
   const limit=JSON.stringify(full).length-16000;
   const command=join(root,'paged-author.mjs');
-  writeFileSync(command,`import {readFileSync,appendFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
+  writeFileSync(command,`import {readFileSync,writeFileSync,appendFileSync,existsSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;
 appendFileSync('pages.jsonl',JSON.stringify(c.synthesisPage)+'\\n');
-const seen=[...new Set([...(c.conclusions??c.synthesisNotes).flatMap(n=>n.proposal.value.seen),...c.selectedContext.map(o=>o.source.id)])];
-const research={action:'answer',question:c.question.id,value:{seen},citations:c.selectedContext.map(o=>({source:o.source,selector:o.selector}))};
+const seen=existsSync('seen.json')?JSON.parse(readFileSync('seen.json','utf8')):[];
+const citations=existsSync('citations.json')?JSON.parse(readFileSync('citations.json','utf8')):[];
+const accept=observation=>{if(!seen.includes(observation.source.id)){seen.push(observation.source.id);citations.push({source:observation.source,selector:observation.selector});}};
+if(c.materialPage){const file='fragment-'+c.materialPage.index,prior=existsSync(file)?readFileSync(file,'utf8'):'';
+if(prior.length!==c.materialPage.offset)throw Error('Fragment offset changed');
+const exact=prior+c.materialPage.text;writeFileSync(file,exact);
+if(c.materialPage.end===c.materialPage.total)accept(JSON.parse(exact));}
+for(const observation of c.selectedContext??[])accept(observation);
+writeFileSync('seen.json',JSON.stringify(seen));writeFileSync('citations.json',JSON.stringify(citations));
+const research=c.synthesisPage.complete?{action:'answer',question:c.question.id,value:{seen},citations}
+:{action:'checkpoint',question:c.question.id,value:{seen},citations,unresolved:['Continue the exact saved material page']};
 console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const cmd={executable:process.execPath,args:[command]};
   let configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxRequestChars:limit,maxCalls:1},pilot.revision);
   const dispatch={...environment.value,implementer:{...environment.value.implementer,command:cmd}};
   await assert.rejects(synthesisSession(store,draft,question,environment,dispatch,configured,context,'Return JSON'),{code:'pilot_call_limit'});
   const paused=store.list<any>('synthesis-session')[0]!;
-  assert.ok(paused.value.offset>0&&paused.value.offset<3);assert.equal(paused.value.result,null);
+  assert.ok((paused.value.offset>0||paused.value.materialOffset>0)&&paused.value.offset<3);
+  assert.equal(paused.value.result,null);
   assert.equal(store.get<Question>(question.id)!.value.status,'open');
   const first=store.list<ModelCall>('model-call')[0]!;
   configured=configureReaderPilot(store,engine.environments,'p',{...settings,agentCommand:cmd,maxRequestChars:limit,maxCalls:10},configured.revision);
@@ -1195,7 +1231,7 @@ test('declared physical envelope capacity refuses the actual call before the ada
   const {engine,store,draft,question,environment,settings,pilot}=fixture(t);
   const bounded=configureReaderPilot(store,engine.environments,'p',{...settings,physicalLimits:{maxRequestChars:20,maxReplyChars:1000,basis:'Deterministic test transport capacity'}},pilot.revision);
   await assert.rejects(researchCall(environment.value.implementer,environment.value,'Fixture',pilotContext(store,draft,question),undefined,
-    {store,draftId:draft.id,questionId:question.id,purpose:'analyst',pilot:bounded}),{code:'budget_transport_limit'});
+    {store,draftId:draft.id,questionId:question.id,purpose:'analyst',pilot:bounded}),{code:'pilot_core_limit'});
   assert.equal(store.list('model-call').length,0);
 });
 

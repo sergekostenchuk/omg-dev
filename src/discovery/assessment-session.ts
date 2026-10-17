@@ -21,7 +21,7 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { stopCancelledCall } from "../om/run-control.js";
 import { researchAction, researchCall } from "./research-protocol.js";
-import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
+import { readResearchContext, researchContextReadEra, requireCurrentPriorContext } from "./research-limits.js";
 import { recoveredResponseBoundary, recoveryAssessmentSessionId, recoverySessionWrites, markRecoveredSessionWritten,
   readResearchExecution, isResponseRecovery, markApplicationResponseRecovered, assessmentReadView, assessmentSessionEra,
   proposalRefusalId, readLimitedCallRetryPermit, type AssessmentReadProof } from './response-recovery.js';
@@ -83,7 +83,8 @@ export function assessmentPacket(current: Session, context: Record<string, any>,
 }
 
 function advanceAssessment(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, pilot: Revision<ReaderPilot> | undefined,
-  current: Session, context: Record<string, any>, sent: Record<string, any> | undefined, response: any): { value: Session; failure?: unknown } {
+  current: Session, context: Record<string, any>, sent: Record<string, any> | undefined, response: any,
+  historicalReadEra?: 'legacy'): { value: Session; failure?: unknown } {
   const workspace = contextWorkspace(current.workspace, current.focus);
   const { offset, candidate, candidateOffset } = assessmentPacket(current, context, sent);
   requireAssessmentReply(response);
@@ -91,7 +92,8 @@ function advanceAssessment(store: Store, draft: Revision<DiscoveryDraft>, questi
     const action = researchAction(response);
     requireCondition(action.action === "read_context", "assessment_invalid", "Expected an addressed read");
     try {
-      const result = readResearchContext(store, draft, question.id, pilot, action.record, action.pointer, action.page);
+      const mode = historicalReadEra ?? researchContextReadEra(store, sent);
+      const result = readResearchContext(store, draft, question.id, pilot, action.record, action.pointer, action.page, mode);
       return { value: { ...current, focus: null, workspace: addContextLookup(workspace, result, sent!.contextWorkspace, pilot?.value.contextLimits?.maxLookups, sent) } };
     } catch (error) {
       return { value: { ...current, workspace: { ...workspace, blocked: error instanceof Error ? error.message : 'Context lookup refused' } }, failure: error };
@@ -760,7 +762,16 @@ function executionOutcome(store: Store, app: Application, call: Ref) {
     const outcome = readResearchExecution(store, app.projectId, call, session,
       exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft'), exact<Question>(store, binding.question, 'question'), app.role, app.profile);
     requirePhysicalIdentity(exact<ModelCall>(store, app.call!, 'model-call'), outcome.call);
-    if (!Object.keys(app.context).every(key => Object.hasOwn(outcome.body, key) && same(outcome.body[key], app.context[key])))
+    const bounded = outcome.subject.working?.deliveryContract === 'research-delivery/v1';
+    const correction = bounded && app.previous ? assessmentCorrection(store, app, session.value,
+      exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft'),
+      exact<Question>(store, binding.question, 'question')) : null;
+    const feedback = app.context.resultCapacityCorrection ?? correction;
+    const expectsFailures = feedback !== null || Object.hasOwn(app.context, 'failures');
+    if (!Object.keys(app.context).filter(key => !bounded || key !== 'failures')
+      .every(key => Object.hasOwn(outcome.body, key) && same(outcome.body[key], app.context[key]))
+      || bounded && (Object.hasOwn(outcome.body, 'failures') !== expectsFailures
+        || expectsFailures && !same(outcome.body.failures, feedback ? [feedback] : app.context.failures)))
       applicationInvalid(session.id, 'The exact execution has a foreign original context');
     if (app.context.resultCapacityContract !== undefined && outcome.kind === 'response'
       && (!same(outcome.subject.resultCapacity, app.context.resultCapacity)
@@ -771,6 +782,48 @@ function executionOutcome(store: Store, app: Application, call: Ref) {
     if (error instanceof EngineError) applicationInvalid(session.id, `Physical outcome is not proved: ${error.code}`);
     throw error;
   }
+}
+
+/** Derive the next correction from saved predecessor applications. The paid
+ * wire reader and the dispatcher use the same proof, including the exact
+ * refused call and context coverage that produced the feedback. */
+function assessmentCorrection(store: Store, app: Application, before: Session,
+  sourceDraft: Revision<DiscoveryDraft>, sourceQuestion: Revision<Question>): Record<string, unknown> | null {
+  let predecessor = app.previous;
+  while (predecessor) {
+    const previous = exact<Application>(store, predecessor, 'assessment-application');
+    if (previous.value.state === 'refused' && app.recoveredRead?.contract === 'assessment-read-recovery/v1'
+      && same(app.recoveredRead.refusal, predecessor)) {
+      const reason = previous.value.refusal;
+      if (reason?.kind !== 'response' || reason.code !== 'context_read_limit')
+        applicationInvalid(previous.id, 'The corrected read lost its exact size refusal');
+      const old = applicationResponse(store, previous.value, reason.call);
+      const requested = researchAction(old.payload);
+      if (requested.action !== 'read_context')
+        applicationInvalid(previous.id, 'Only an addressed read has this recovery door');
+      const configured = app.profile ? exact<ReaderPilot>(store, app.profile, 'reader-pilot') : null;
+      return { contract: 'assessment-read-correction/v1', role: 'assessor',
+        attempt: predecessor, call: reason.call, code: reason.code, requested,
+        envelopeLimitChars: configured?.value.maxRequestChars ?? 300000,
+        instruction: 'Read the same exact record and pointer with a smaller page. For an object use page encoding canonical-json; continue at page.next. The earlier call and candidate are saved.' };
+    }
+    if (previous.value.state !== 'renewed') break;
+    if (previous.value.call && previous.value.resolution) {
+      const outcome = requireRetryable(store, previous.value);
+      if (outcome.kind === 'response') {
+        const failure = assessmentReplyFailure(store, previous.value, outcome.payload)
+          ?? correctableAssessmentReply(sourceDraft, sourceQuestion, before, app.context,
+            outcome.subject, outcome.payload);
+        if (failure) return failure.code === 'research_context_incomplete'
+          ? { contract: 'assessment-context-correction/v1', role: 'assessor',
+              attempt: predecessor, call: previous.value.received, code: failure.code,
+              details: failure.details, instruction: 'The previous final verdict did not receive all saved context. Read the exact record and pointer at next, using a smaller addressed page. The candidate and prior call remain saved.' }
+          : earlyResearchCorrection('assessor', failure, predecessor, sourceQuestion.value);
+      }
+    }
+    predecessor = previous.value.previous;
+  }
+  return null;
 }
 function requireRetryable(store: Store, app: Application) {
   if (!app.received) applicationInvalid(app.session.id, 'A failed attempt needs its exact physical outcome');
@@ -1051,44 +1104,7 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
           refuseApplication(store, application, { kind: 'workspace', code: checked.failure.code }, checked.guards, [], checked.proof);
         }
         const before = session.value;
-        let correction: Record<string, unknown> | null = null;
-        let predecessor = app.previous;
-        while (predecessor) {
-          const previous = exact<Application>(store, predecessor, 'assessment-application');
-          if (previous.value.state === 'refused' && app.recoveredRead?.contract === 'assessment-read-recovery/v1'
-            && same(app.recoveredRead.refusal, predecessor)) {
-            const reason = previous.value.refusal;
-            if (reason?.kind !== 'response' || reason.code !== 'context_read_limit')
-              applicationInvalid(previous.id, 'The corrected read lost its exact size refusal');
-            const old = applicationResponse(store, previous.value, reason.call);
-            const requested = researchAction(old.payload);
-            if (requested.action !== 'read_context')
-              applicationInvalid(previous.id, 'Only an addressed read has this recovery door');
-            const configured = app.profile ? exact<ReaderPilot>(store, app.profile, 'reader-pilot') : null;
-            correction = { contract: 'assessment-read-correction/v1', role: 'assessor',
-              attempt: predecessor, call: reason.call, code: reason.code, requested,
-              envelopeLimitChars: configured?.value.maxRequestChars ?? 300000,
-              instruction: 'Read the same exact record and pointer with a smaller page. For an object use page encoding canonical-json; continue at page.next. The earlier call and candidate are saved.' };
-            break;
-          }
-          if (previous.value.state !== 'renewed') break;
-          if (previous.value.call && previous.value.resolution) {
-            const outcome = requireRetryable(store, previous.value);
-            if (outcome.kind === 'response') {
-              const failure = assessmentReplyFailure(store, previous.value, outcome.payload) ?? correctableAssessmentReply(sourceDraft, sourceQuestion, before, app.context,
-                outcome.subject, outcome.payload);
-              if (failure) {
-                correction = failure.code === 'research_context_incomplete'
-                  ? { contract: 'assessment-context-correction/v1', role: 'assessor',
-                      attempt: predecessor, call: previous.value.received, code: failure.code,
-                      details: failure.details, instruction: 'The previous final verdict did not receive all saved context. Read the exact record and pointer at next, using a smaller addressed page. The candidate and prior call remain saved.' }
-                  : earlyResearchCorrection('assessor', failure, predecessor, sourceQuestion.value);
-                break;
-              }
-            }
-          }
-          predecessor = previous.value.previous;
-        }
+        const correction = assessmentCorrection(store, app, before, sourceDraft, sourceQuestion);
         try {
           await researchCall(app.role, app.dispatch, assessmentRolePrompt(app.prompt),
             assessmentDispatchContext(before, id, app.context, correction), signal,
@@ -1288,6 +1304,27 @@ function evaluateWorkspace(store: Store, session: Revision<ApplicationSession>, 
   inputs.finish();
   return { failure, proof: inputs.proof, guards: inputs.guards };
 }
+/** Markerless paid packets have two legal application eras. The frozen read
+ * sequence, after the observation reads already consumed, identifies whether
+ * that application read the paid archive's era discriminator. Select before
+ * evaluation; neither failed replay nor today's archive head selects an era. */
+function historicalAssessmentReadEra(paid: ReturnType<typeof applicationResponse>,
+  inputs: ReturnType<typeof assessmentReadView>, saved: boolean): 'legacy' | undefined {
+  if (!saved || paid.body.contextReadContract !== undefined || !object(paid.payload)
+    || paid.payload.action !== 'read_context') return undefined;
+  const archive = paid.subject.working?.archive, requested = paid.payload.record;
+  if (!isRef(archive) || !isRef(requested)) return undefined;
+  const reads = inputs.proof.reads.slice(inputs.position);
+  const exactArchive = (entry: AssessmentReadProof['reads'][number]) => entry.id === archive.id
+    && entry.revision === archive.revision && same(entry.ref, archive);
+  // readPilotContext probes its target archive three times (checkpoint kind,
+  // context kind, exact body). Only the transitional era adds a fourth probe
+  // before them. For a different target the discriminator is the first read.
+  const probes = requested.id === archive.id && requested.revision === archive.revision ? 4 : 1;
+  const hasDiscriminator = reads.length >= probes && reads.slice(0, probes).every(exactArchive);
+  return hasDiscriminator ? undefined : 'legacy';
+}
+
 function evaluateApplication(store: Store, app: Application, before: Revision<ApplicationSession>, draft: Revision<DiscoveryDraft>,
   question: Revision<Question>, paid: ReturnType<typeof applicationResponse>, proof?: AssessmentReadProof) {
   const inputs = assessmentReadView(store, proof);
@@ -1298,7 +1335,9 @@ function evaluateApplication(store: Store, app: Application, before: Revision<Ap
     const pilot = app.profile ? exact<ReaderPilot>(store, app.profile, 'reader-pilot') : undefined;
     const capacityFailure = assessmentReplyFailure(store, app, paid.payload);
     if (capacityFailure) throw capacityFailure;
-    const advanced = advanceAssessment(inputs.store, draft, question, pilot, before.value, app.context, paid.subject, paid.payload);
+    const historicalReadEra = historicalAssessmentReadEra(paid, inputs, proof !== undefined);
+    const advanced = advanceAssessment(inputs.store, draft, question, pilot, before.value, app.context, paid.subject, paid.payload,
+      historicalReadEra);
     value = advanced.value; failure = advanced.failure;
   } catch (error) { failure = error; }
   inputs.finish();

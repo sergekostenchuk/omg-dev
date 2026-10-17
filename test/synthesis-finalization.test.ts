@@ -208,6 +208,28 @@ test('context recovery preserves final-stage lookup observations while allowing 
   assert.equal(synthesisControls(true,recovered.value.workspace,3,recovered.value.finalization).mode,'finalization');
 });
 
+test('RD2c an operator recovery of a bounded context page replays from exact originals after reopening', async t => {
+  const f = await fixture(t, 20, 100000, 0.35, 0, {}, 0, 'small');
+  const originals = addressed(f, 2);
+  await atFinal(f, originals.slice(0, 1));
+  adapter(f, `research={action:'read_context',record:${JSON.stringify(originals[0]!.record)},pointer:'/body/items/absent',purpose:'Inspect a missing original'};`);
+  await assert.rejects(f.invoke(), { code: 'research_no_progress' });
+  const blocked = f.store.get<any>(f.before.id)!;
+  const large = f.store.write({ id: 'research-context:rd2c-operator', kind: 'research-context', expected: 0,
+    value: { projectId: 'p', draft: reference(f.draft), question: reference(f.question),
+      body: { history: 'x'.repeat(250000) } } });
+  const recovered = await f.engine.execute({ type: 'recover-context-session', project: 'p',
+    session: reference(blocked), selector: { record: reference(large), pointer: '/body/history',
+      page: { offset: 0, limit: 1000000 } } }) as any;
+  const result = recovered.value.workspace.entries.at(-1).result;
+  assert.equal(result.contract, 'research-context-read/v2');
+  assert.equal(result.requested.limit, 1000000);
+  assert.ok(result.page.end > 0 && result.page.next !== null);
+  const cold = new Store(join(f.root, 'db.sqlite'));
+  t.after(() => cold.close());
+  assert.deepEqual(readSynthesisSession(cold, reference(recovered)), recovered);
+});
+
 test('the summary target is reduced to the space left after exact context, and all new context survives compaction',async t=>{
   const f=await fixture(t,12000,80000,0.35,0,{},0,'small');
   const drive=roomyDrive(f,200000);

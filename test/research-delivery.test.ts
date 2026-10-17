@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { Store } from '../src/storage/store.js';
 import type { Revision } from '../src/storage/store.js';
 import type { Question } from '../src/discovery/discovery.js';
+import type { DiscoveryDraft } from '../src/discovery/discovery.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace,
   packContextWorkspace, recordContextPacket, requireCompleteContextPacket,
@@ -15,13 +16,44 @@ import { addressArchivedMaterials, buildResearchResultCapacity, measureResearchR
   requireResearchDelivery, serveArchivedMaterial } from '../src/discovery/research-delivery.js';
 import { contextPage, contextValue, workingContext } from '../src/discovery/working-context.js';
 import { addressedWorkspace } from '../src/discovery/research-continuation.js';
-import { projectResearchContextRead, researchAction } from '../src/discovery/research-consumer-transition.js';
+import { contextReadIdentity, projectResearchContextRead, researchAction } from '../src/discovery/research-consumer-transition.js';
+import { readResearchContext, researchContextReadEra } from '../src/discovery/research-limits.js';
+import { readResearchContextOutcomeAt } from '../src/discovery/response-recovery.js';
 import { canonical, hashJson } from '../src/canonical.js';
 import { requirePlanningNavigation } from '../src/discovery/planning-context.js';
+import { correctionIndex } from '../src/discovery/continuation-packet.js';
 
 const lookup = (value: unknown): ContextLookup => ({
   record: { id: 'research-context:delivery', revision: 1, hash: 'a'.repeat(64) },
   pointer: '/body/history', value,
+});
+
+test('RD2c correction index archives only present finding fields', () => {
+  const archive = lookup(null).record;
+  const indexed = correctionIndex([{ number: 1, action: { action: 'read_plan', question: 'q' },
+    error: 'reading_plan_blocked', feedback: { details: [{ code: 'missing', field: 'plan' }] } }], archive);
+  assert.equal(indexed[0]?.findings[0]?.instancePath, undefined);
+  assert.equal(Object.hasOwn(indexed[0]?.findings[0], 'instancePath'), false);
+  assert.doesNotThrow(() => hashJson(indexed));
+});
+
+test('RD2c archives a structured source index without inventing an optional flag', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-source-index-'));
+  const store = new Store(join(root, 'db.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const draft = store.write({ id: 'discovery:p:source-index', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', stage: 'discovery', level: 'R1', consumer: 'research', inputs: [],
+      fields: {}, questions: ['question:p:source-index'] } });
+  const question = store.write({ id: 'question:p:source-index', kind: 'question', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, status: 'open', spec: { field: 'preparation',
+      prompt: 'Read the source index', risk: 'Lost source', kind: 'design', schema: { type: 'object' } } } });
+  const packet = workingContext(store, 'p', draft.id, question.id,
+    { role: 'research', dispatchMode: 'research', inventory: { files: [],
+      sources: [{ structureHash: 'a'.repeat(64), toc: { contract: 'source-toc/v1', sections: [] } }] } },
+    50_000, { common: true });
+  const archive = store.get<any>(packet.working.archive.id)!;
+  assert.equal(Object.hasOwn(archive.value.body.sourceCatalogue, 'filesTruncated'), false);
+  assert.doesNotThrow(() => hashJson(archive.value));
 });
 
 test('RD2b stores a bounded positive part of one oversized original, with exact next and no full copy', () => {
@@ -44,6 +76,151 @@ test('RD2b stores a bounded positive part of one oversized original, with exact 
   const forged = structuredClone(packet);
   forged.contextDelivery[0].value = 'forged';
   assert.throws(() => requireContextDelivery([original], forged), { code: 'research_context_undelivered' });
+});
+
+test('RD2c keeps a saved oversized read refusal as feedback, not a delivered context lookup', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-context-refusal-reopen-'));
+  const path = join(root, 'db.sqlite');
+  const store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const draft = store.write({ id: 'discovery:p:context-refusal', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', stage: 'discovery', level: 'R1', consumer: 'research', inputs: [],
+      fields: {}, questions: ['question:p:context-refusal'] } });
+  const question = store.write({ id: 'question:p:context-refusal', kind: 'question', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, status: 'open', spec: { field: 'preparation',
+      prompt: 'Read the history', risk: 'Missing context', kind: 'design', schema: { type: 'object' } } } });
+  const refusal = { number: 2, status: 'completed', action: { action: 'read_context',
+    record: reference(draft), pointer: '/body/history', page: { offset: 0, limit: 1_000_000 } },
+    observation: { code: 'context_read_limit', details: null },
+    error: 'Use a smaller addressed context page' };
+  const body = { role: 'research', dispatchMode: 'research', inventory: { sources: [], files: [], filesTruncated: false },
+    contextWorkspace: [], history: [refusal] };
+  const initial = workingContext(store, 'p', draft.id, question.id,
+    { ...body, history: [] }, 50_000, { common: true }) as Record<string, any>;
+  for (const current of [store, new Store(path)]) {
+    if (current !== store) t.after(() => current.close());
+    const packet = workingContext(current, 'p', draft.id, question.id, body, 50_000,
+      { common: true, continuation: true, previous: initial.working.archive }) as Record<string, any>;
+    assert.equal(packet.currentRead.error, refusal.error);
+    assert.equal(packet.currentRead.observation.code, refusal.observation.code);
+    assert.equal(packet.corrections[0].error, refusal.error);
+    assert.deepEqual(packet.contextWorkspace, []);
+  }
+});
+
+test('RD2c serves a bounded range from the exact archive and replays it after reopening', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-context-bounded-reopen-'));
+  const path = join(root, 'db.sqlite');
+  const store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const draft = store.write<DiscoveryDraft>({ id: 'discovery:p:context-bounded', kind: 'discovery-draft', expected: 0,
+    value: { projectId: 'p', createdAt: 1, stage: 'discovery', level: 'R1', consumer: 'research', inputs: [],
+      fields: {}, questions: ['question:p:context-bounded'] } });
+  const question = store.write<Question>({ id: 'question:p:context-bounded', kind: 'question', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, stage: 'discovery', level: 'R1', consumer: 'research',
+      beforeHash: hashJson({}), status: 'open', answer: null, spec: { field: 'preparation',
+      prompt: 'Read the history', risk: 'Missing context', kind: 'design', schema: { type: 'object' } } } });
+  const history = [{ checkpoint: 'x'.repeat(560_000) }];
+  const value = { projectId: 'p', draft: reference(draft), question: reference(question),
+    body: { history } };
+  const archive = store.write({ id: `research-context:${hashJson(value)}`, kind: 'research-context',
+    expected: 0, value });
+  const action = researchAction({ action: 'read_context', record: reference(archive),
+    pointer: '/body/history', page: { offset: 0, limit: 1_000_000 } });
+  if (action.action !== 'read_context') throw new Error('read_context action was not admitted');
+  assert.equal(researchContextReadEra(store, { working: { archive: reference(archive) } }), 'legacy');
+  assert.throws(() => researchContextReadEra(store, { working: { archive:
+    { ...reference(archive), hash: '0'.repeat(64) } } }), { code: 'research_context_invalid' });
+  const unknownEra = store.write({ id: 'research-context:unknown-read-era', kind: 'research-context', expected: 0,
+    value: { ...value, body: { ...value.body, contextReadContract: 'unknown' } } });
+  assert.throws(() => researchContextReadEra(store, { working: { archive: reference(unknownEra) } }),
+    { code: 'research_context_invalid' });
+  const first = readResearchContext(store, draft, question.id, undefined,
+    reference(archive), '/body/history', action.page);
+  assert.ok('contract' in first);
+  assert.equal(first.contract, 'research-context-read/v2');
+  assert.equal(first.outcome, 'clipped');
+  assert.deepEqual(first.requested, { offset: 0, limit: 1_000_000, end: 1, total: 1, unit: 'items' });
+  assert.equal(first.page?.encoding, 'canonical-json');
+  assert.ok(first.page && first.page.end > 0 && first.page.next !== null);
+  assert.ok(canonical(first).length <= 300_000);
+  assert.throws(() => readResearchContext(store, draft, question.id, undefined,
+    reference(archive), '/body/history', action.page, 'legacy'), { code: 'context_read_limit' });
+  assert.throws(() => projectResearchContextRead(archive.value, reference(archive),
+    '/body/history', action.page, 300_000), { code: 'context_read_limit' });
+  const cold = new Store(path);
+  t.after(() => cold.close());
+  assert.deepEqual(readResearchContextOutcomeAt(cold, draft, question, action, 300_000), first);
+  const identity = { projectId: 'p', action, observation: first, recordKind: 'research-context',
+    recordValue: archive.value, question: reference(question) };
+  assert.equal(typeof contextReadIdentity(identity), 'string');
+  assert.throws(() => contextReadIdentity({ ...identity,
+    observation: { ...first, value: String(first.value) + 'forged' } }),
+  { code: 'research_consumer_intent_invalid' });
+  const original = canonical(history);
+  let text = String(first.value), next: number | null = first.page.next;
+  while (next !== null) {
+    const subsequent = readResearchContext(cold, draft, question.id, undefined,
+      reference(archive), '/body/history', { offset: next, limit: 1_000_000, encoding: 'canonical-json' });
+    assert.equal(subsequent.page?.offset, next);
+    assert.ok(subsequent.page.end > next);
+    text += String(subsequent.value);
+    next = subsequent.page.next;
+  }
+  assert.equal(text, original);
+});
+
+test('RD2c non-first oversized array item resumes at its first canonical character', () => {
+  const value = ['prefix', { checkpoint: 'X'.repeat(8_000) }];
+  const record = lookup(null).record;
+  const first = projectResearchContextRead({ body: { history: value } }, record,
+    '/body/history', { offset: 1, limit: 1 }, 2_048, 'bounded');
+  const start = canonical(value.slice(0, 1)).length;
+  assert.equal(first.page?.offset, start);
+  assert.equal(String(first.value)[0], '{');
+  let text = String(first.value), next = first.page?.next ?? null;
+  while (next !== null) {
+    const page = projectResearchContextRead({ body: { history: value } }, record,
+      '/body/history', { offset: next, limit: 1_000_000, encoding: 'canonical-json' }, 2_048, 'bounded');
+    assert.equal(page.page?.offset, next);
+    assert.ok(page.page && page.page.end > next);
+    text += String(page.value);
+    next = page.page?.next ?? null;
+  }
+  assert.equal(text, canonical(value).slice(start));
+});
+
+test('RD2c bounds both large history shapes at each early stage from the exact source', t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-context-five-stages-'));
+  const store = new Store(join(root, 'db.sqlite'));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  for (const stage of ['discovery', 'concept', 'operation-map', 'specification', 'features'] as const) {
+    const draft = store.write<DiscoveryDraft>({ id: `discovery:p:${stage}:bounded`, kind: 'discovery-draft', expected: 0,
+      value: { projectId: 'p', createdAt: 1, stage, level: 'R1', consumer: 'research', inputs: [],
+        fields: {}, questions: [`question:p:${stage}:bounded`] } });
+    const question = store.write<Question>({ id: `question:p:${stage}:bounded`, kind: 'question', expected: 0,
+      value: { projectId: 'p', draftId: draft.id, stage, level: 'R1', consumer: 'research',
+        beforeHash: hashJson({}), status: 'open', answer: null, spec: { field: 'preparation',
+          prompt: 'Read exact history', risk: 'Incomplete history', kind: 'design', schema: { type: 'object' } } } });
+    for (const [shape, history] of [
+      ['checkpoint', [{ small: 'first' }, { checkpoint: 'x'.repeat(560_000) }]],
+      ['history', Array.from({ length: 8 }, (_, index) => ({ index, note: 'y'.repeat(50_000) }))],
+    ] as const) {
+      const value = { projectId: 'p', draft: reference(draft), question: reference(question), body: { history } };
+      const archive = store.write({ id: `research-context:${hashJson(value)}`, kind: 'research-context',
+        expected: 0, value });
+      const action = researchAction({ action: 'read_context', record: reference(archive),
+        pointer: '/body/history', page: { offset: 0, limit: 1_000_000 } });
+      if (action.action !== 'read_context') throw new Error('read_context action was not admitted');
+      const actual = readResearchContext(store, draft, question.id, undefined,
+        reference(archive), action.pointer, action.page);
+      assert.ok('contract' in actual);
+      assert.equal(actual.contract, 'research-context-read/v2', `${stage}/${shape}`);
+      assert.ok(actual.page && actual.page.end > 0 && actual.page.next !== null, `${stage}/${shape}`);
+      assert.ok(canonical(actual).length <= 300_000, `${stage}/${shape}`);
+      assert.deepEqual(readResearchContextOutcomeAt(store, draft, question, action, 300_000), actual);
+    }
+  }
 });
 
 test('RD2b planning pages its own large requirements index from the pinned source', t => {

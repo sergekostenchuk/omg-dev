@@ -9,14 +9,16 @@ import { isRef, reference, stageId, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { planningContext, requirePlanningNavigation } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
-import { contextLookupKey, packContextWorkspace, type ContextLookup } from "./context-workspace.js";
+import { contextLookupKey, packContextWorkspace, requireExactContextWorkspace, type ContextLookup } from "./context-workspace.js";
+import { exactContextLookup, projectResearchContextSelection, type ProjectedContextRead } from './research-consumer-transition.js';
+import { readReaderResultAt } from './reader.js';
 import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summary.js';
 import { addressArchivedMaterials, serveArchivedMaterial, packAddressedValue,
   requirePacketMaterialDelivery, planResearchDelivery, type AddressedOriginal } from './research-delivery.js';
 
 interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number; encoding?: 'canonical-json' }
-const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue lists exact source refs and locations; a structured source TOC may be paged, with total, next and the exact archive address of every section. A heading is navigation, not a reading of its body. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. For an oversized object or single array item, page:{offset,limit,encoding:'canonical-json'} reads exact UTF-16 characters of its canonical JSON; continue at served.next without treating a fragment as the complete value. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
+const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue lists exact source refs and locations; a structured source TOC may be paged, with total, next and the exact archive address of every section. A heading is navigation, not a reading of its body. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. An oversized requested page is delivered as a positive bounded range with its exact requested, served page and next; the original remains unchanged. The read envelope limit is declared in the result as envelopeLimitChars when clipping occurs. For an oversized object or single array item, page:{offset,limit,encoding:'canonical-json'} reads exact UTF-16 characters of its canonical JSON; continue at served.next without treating a fragment as the complete value. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
 
 export function contextValue(value: unknown, pointer: string): unknown {
   requireCondition(typeof pointer === "string" && (pointer === "" || pointer.startsWith("/")), "selector_invalid", "Use a JSON pointer");
@@ -69,7 +71,8 @@ function structuredCatalogue(inventory: any, archive: Ref, maxChars: number): Re
       total: sections.length, next: sections.length ? 0 : null, sections: [],
       address: { record: archive, pointer: `/body/inventory/sources/${index}/toc/sections` } } };
   });
-  const catalogue = { sources, files: inventory.files, filesTruncated: inventory.filesTruncated };
+  const catalogue = { sources, ...(Object.hasOwn(inventory, 'files') ? { files: inventory.files } : {}),
+    ...(Object.hasOwn(inventory, 'filesTruncated') ? { filesTruncated: inventory.filesTruncated } : {}) };
   const target = Math.max(512, Math.floor(maxChars / 4));
   for (const [index, source] of inventory.sources.entries()) {
     if (source.toc?.contract !== 'source-toc/v1') continue;
@@ -80,7 +83,7 @@ function structuredCatalogue(inventory: any, archive: Ref, maxChars: number): Re
     }
     page.next = page.sections.length < page.total ? page.sections.length : null;
   }
-  return { sources: contextTable(sources), files: inventory.files, filesTruncated: inventory.filesTruncated };
+  return { ...catalogue, sources: contextTable(sources) };
 }
 
 function conclusionSources(body: Record<string, any>, archive: Ref, questionId: string): AddressedOriginal[] {
@@ -98,6 +101,32 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
+  if (Object.hasOwn(body, 'contextWorkspace')) requireExactContextWorkspace(body['contextWorkspace'], result => {
+    const delivered = result as ProjectedContextRead;
+    const clipped = delivered.contract === 'research-context-read/v2';
+    const selected = clipped ? delivered.requested : delivered.page;
+    const page = selected ? { offset: selected.offset,
+      limit: clipped ? (selected as NonNullable<ProjectedContextRead['requested']>).limit
+        : Math.max(1, selected.end - selected.offset),
+      ...(selected.encoding ? { encoding: selected.encoding } : {}) } : undefined;
+    try {
+      const original = exactContextLookup(store, draft, question, result.record, result.pointer,
+        clipped ? undefined : page,
+        record => { readReaderResultAt(store, projectId, reference(record)); });
+      return clipped
+        ? projectResearchContextSelection(original.value, result.record, result.pointer, page,
+          delivered.envelopeLimitChars ?? 0, 'bounded') : original;
+    } catch (error) {
+      if (error instanceof EngineError && ['context_reference_foreign', 'context_missing',
+        'selector_invalid', 'context_page_invalid'].includes(error.code))
+        throw new EngineError('research_context_undelivered',
+          'The supplied context lookup is not an exact saved original');
+      throw error;
+    }
+  });
+  // The archive that owns a newly paid step fixes its context-read era. A
+  // historical archive without this marker keeps the original size refusal.
+  body['contextReadContract'] = 'research-context-read/v2';
   if (draft.value.contractVersion === 6 && ['concept', 'specification'].includes(draft.value.stage)) requireCondition(
     body['discoveryBasisCatalogue']?.contract === 'discovery-basis-catalogue/v1'
       && isRef(body['discoveryBasisCatalogue'].source)
@@ -382,7 +411,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
         const read = history[readIndex];
         const originalRead = (archivedBody['history'] as any[] | undefined)?.[readIndex];
         const observation = originalRead?.observation;
-        const key = originalRead?.action?.action === 'read_context' && observation
+        const key = originalRead?.action?.action === 'read_context' && !originalRead?.error
+          && observation && isRef(observation.record) && typeof observation.pointer === 'string'
+          && Object.hasOwn(observation, 'value')
           ? contextLookupKey(observation as ContextLookup) : null;
         const alreadyAddressed = key && Array.isArray(body['contextWorkspace'])
           && (body['contextWorkspace'] as ContextLookup[]).some(item => contextLookupKey(item) === key);
@@ -433,7 +464,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
       'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',
       'savedEvidence', 'unresolvedEvidence', 'webResearch', 'synthesisNotes',
-      'candidate', 'proposalChanges']), maxChars, materialRecord);
+      'candidate', 'proposalChanges']).filter(field => field !== 'failures'
+        || !body['assessmentState'] || JSON.stringify(body['failures']).length > Math.floor(maxChars / 3)),
+    maxChars, materialRecord);
   const retained = body['contextControls']?.version === 2 && body['synthesisState'];
   const conclusionKeys = ['conclusions','conclusionCitations','conclusionRefs','conclusionUnresolved','conclusionEncoding'];
   const carry = Object.fromEntries(conclusionKeys.filter(key => Object.hasOwn(packet,key)).map(key => [key,packet[key]]));

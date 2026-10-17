@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { digest, type Json } from '../src/canonical.js';
+import { canonical, digest, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -460,13 +460,28 @@ test('UNK1 №4686 return 1 (P2): a Source a second Store saves after the delive
   assert.ok(turn, 'The unknown was written');
   const intent = f.store.get<{ basis: { id: string }[] }>((turn.value as unknown as { consumerIntent: { id: string } }).consumerIntent.id)!;
   assert.ok(intent.value.basis.some(ref => ref.id === added.id), 'The window is real: the later basis holds the Source');
-  assert.equal(JSON.stringify(f.calls()[0]!.subject).includes(added.id), false, 'The model was not shown it');
+  const first=f.calls()[0]!.subject;
+  const {resultCapacity,...delivered}=first;
+  assert.ok(resultCapacity?.bindings?.basis?.some((ref: typeof added)=>canonical(ref)===canonical(added)),
+    'The result limit names the exact intent basis, including the concurrent Source');
+  assert.equal(JSON.stringify(delivered).includes(added.id),false,'The late Source is absent from delivered research material');
+  assert.equal(JSON.stringify(first).includes('Tariff table: available'),false,'The late Source body was not shown');
   const calls = f.calls().length;
   f.reopen();
   const next = await f.engine.stageResearch.run('p', draft.id, 20);
   assert.ok(f.calls().length > calls, 'Undelivered material admits the ordinary repeat');
   const again = f.calls()[calls]!.subject;
   assert.deepEqual([again.role, again.researchMissing], ['research', ['the tariff table']]);
-  assert.ok(JSON.stringify(again).includes(added.id), 'The late Source is delivered to the model this time');
+  const {resultCapacity: repeatedCapacity,...repeatedMaterial}=again;
+  assert.ok(repeatedCapacity?.bindings?.basis?.some((ref: typeof added)=>canonical(ref)===canonical(added)),
+    'The repeated result limit still names the exact concurrent Source');
+  assert.ok(JSON.stringify(repeatedMaterial).includes(added.id),
+    'The late Source is delivered outside the result-limit marker this time');
+  const sourceIndex=again.originals?.sources;
+  const sourceRows=Array.isArray(sourceIndex)?sourceIndex:(sourceIndex?.rows??[]).map((cells: unknown[])=>(
+    Object.fromEntries(sourceIndex.columns.map((column: string,index: number)=>[column,cells[index]]))));
+  assert.ok(sourceRows.some((source: {ref?: typeof added})=>source.ref
+    && canonical(source.ref)===canonical(added)),
+  'The repeated material gives the model the exact Source Ref in its original index');
   assert.equal(next.status, 'accepted', JSON.stringify(next));
 });

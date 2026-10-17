@@ -10,7 +10,7 @@ import { Store } from '../src/storage/store.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import type { Environment } from '../src/runtime/environment.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
-import { hashJson } from '../src/canonical.js';
+import { canonical, hashJson } from '../src/canonical.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { continuationState, continuationDispatch, replaceFoundationCopies } from '../src/discovery/continuation-packet.js';
 
@@ -77,12 +77,22 @@ test('missing/foreign question and competing bootstrap reservations cannot bypas
  assert.throws(()=>f.store.writeMany(right.writes,right.guards),{code:'revision_conflict'});
 });
 
-test('an oversized mandatory continuation stops before the adapter and cannot grow its ceiling',async t=>{
+test('an oversized mandatory continuation serves an exact bounded page without growing its ceiling',async t=>{
  const f=fixture(t),{draft,q}=question(f.store,'discovery','R0','oversize');
  await researchCall(f.role,f.env,'fixture',body(q,f.root,'analyst'),undefined,{store:f.store,draftId:draft.id,questionId:q.id,purpose:'analyst'});
- await assert.rejects(researchCall(f.role,f.env,'fixture',{...body(q,f.root,'analyst'),request:{piece:'x'.repeat(350000)}},undefined,
-  {store:f.store,draftId:draft.id,questionId:q.id,purpose:'analyst'}));
- assert.equal(readFileSync(f.log,'utf8').trim().split('\n').length,1);
+ const request={piece:'x'.repeat(350000)};let sent:any;
+ await researchCall(f.role,f.env,'fixture',{...body(q,f.root,'analyst'),request},undefined,
+  {store:f.store,draftId:draft.id,questionId:q.id,purpose:'analyst',onContext:packet=>{sent=packet;}});
+ const delivery=sent.materialDelivery?.[0];
+ assert.equal(delivery?.contract,'research-delivery/v1');
+ assert.equal(delivery.original.pointer,'/body/request');
+ const archived=f.store.get<any>(delivery.original.record.id,delivery.original.record.revision)!;
+ assert.deepEqual(contextValue(archived.value,delivery.original.pointer),request);
+ assert.equal(delivery.original.valueHash,hashJson(request));
+ assert.equal(delivery.text,canonical(request).slice(delivery.served.offset,delivery.served.end));
+ assert.ok(delivery.served.end>0&&delivery.served.next===delivery.served.end&&delivery.served.end<delivery.served.total);
+ assert.ok(!Object.hasOwn(sent,'request')&&JSON.stringify(sent).length<=300000);
+ assert.equal(readFileSync(f.log,'utf8').trim().split('\n').length,2);
  assert.equal(f.store.list('research-limit').length,0);
 });
 

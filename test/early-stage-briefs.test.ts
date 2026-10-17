@@ -10,7 +10,7 @@ import {execFileSync} from 'node:child_process';
 import {Store} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {reference, type Ref} from '../src/pipeline/contracts.js';
-import {canonical, type Json} from '../src/canonical.js';
+import {canonical, hashJson, type Json} from '../src/canonical.js';
 import type {Question} from '../src/discovery/discovery.js';
 import {REQUIREMENTS,UPSTREAM_STAGES,VERSION4_REQUIREMENTS,VERSION5_REQUIREMENTS,RESEARCH_CONTRACT_VERSION} from '../src/discovery/requirements.js';
 import {contextValue,workingContext} from '../src/discovery/working-context.js';
@@ -20,6 +20,7 @@ import {continuationPrompt} from '../src/discovery/continuation-packet.js';
 import {configureReaderPilot} from '../src/discovery/reader-pilot.js';
 import {readBundle,readReaderResultAt} from '../src/discovery/reader.js';
 import {readResearchConsumerTurn} from '../src/discovery/response-recovery.js';
+import {readSynthesisSession} from '../src/discovery/synthesis-session.js';
 import {currentUpstreamFixtureValue,preparedFeatures} from './product-fixture.js';
 import {preparedField} from './preparation-fixture.js';
 import {exampleGraph} from './graph-fixture.js';
@@ -218,15 +219,101 @@ test('RS4 native reading-planner and synthesis phases retain their own instructi
  for(const wire of wires)assertPacket(f.store,wire);
  const planner=wires.filter(w=>w.subject.continuation.role==='reading-planner'),analyst=wires.filter(w=>w.subject.continuation.role==='analyst');
  assert.ok(planner.length>=2,JSON.stringify(run.value));assert.ok(analyst.length>=2,JSON.stringify({pauseCode:run.value.pauseCode,error:run.value.error,wires:wires.map(w=>({role:w.subject.continuation.role,kind:w.subject.continuation.kind,mode:w.subject.dispatchMode}))}));
+ const session=f.store.list<any>('synthesis-session').find(item=>item.id.startsWith('synthesis-session:v2:'));
+ assert.ok(session);
+ const initial=f.store.get<any>(session.id,1)!;
+ const reads=f.store.list<any>('research-turn').filter(turn=>(turn.value.action as {action?:string}).action==='read_context'
+   && turn.value.question?.id===q.id && turn.value.number<initial.value.delivery.turn)
+   .sort((a,b)=>a.value.number-b.value.number).map(turn=>turn.value.observation);
+ assert.ok(reads.length>=1);
+ assert.deepEqual(initial.value.workspace?.entries.map((entry:any)=>entry.result),reads);
+ assert.deepEqual(readSynthesisSession(f.store,reference(session)),session);
  assert.ok(planner[0].prompt.includes('Choose what to read'));assert.ok(planner[1].prompt.includes(planner[0].prompt));
  assert.ok(analyst.every(w=>w.prompt.includes('substantive-answer phase')||w.prompt.includes('Build the final answer')));
  assert.equal(f.store.get('environment:r')!.hash,env.hash);
+ const cold=new Store(join(f.root,'state.sqlite'));
+ try {
+  assert.deepEqual(readSynthesisSession(cold,reference(session)),session);
+  const graph=cold.get<any>('graph:r')!,original=cold.get<any>('graph-layer:r:1')!;
+  const changed=structuredClone(graph.value);changed.title+=' revised after paid synthesis';
+  new ProductEngine(cold).execute({type:'save-graph',project:'r',graph:changed,expected:graph.revision});
+  assert.notEqual(cold.get('graph-layer:r:1')!.hash,original.hash);
+  assert.deepEqual(cold.get(original.id,original.revision),original);
+  const heads=cold.list();
+  assert.deepEqual(readSynthesisSession(cold,reference(session)),session);
+  assert.deepEqual(cold.list(),heads);
+ } finally {cold.close();}
+});
+
+test('RD2d planned context after reopen reaches C from the exact new question prefix',async t=>{
+ const f=fixture(t);preparedFeatures(f.engine,'r');
+ const {projectId:_projectId,...settings}=f.environment.value;
+ f.engine.environments.configure('r',settings,0);
+ const r0=f.engine.refinement.begin('r','R0');
+ f.engine.refinement.finishResearch('r','R0',reference(r0),0);
+ f.engine.refinement.sealLayer('r',1,0);
+ const draft=f.engine.refinement.begin('r','R1'),q=f.store.get<Question>(draft.value.questions[0]!)!;
+ configureReaderPilot(f.store,f.engine.environments,'r',{experimental:true,active:true,stopAfter:'L2',
+  reader:{actor:'reader',model:'fixture',effort:'medium',speed:'inherited',command:f.command},
+  agentCommand:f.command,maxCalls:30,maxReportedTokens:100000,maxRequestChars:100000,
+  maxReadChars:60000,maxReplyChars:20000,
+  planning:{fields:[q.value.spec.field],maxRequestChars:100000,maxRounds:5}},0);
+ const log=join(f.root,'planner.jsonl');
+ writeFileSync(f.path,`import{readFileSync,appendFileSync,existsSync,writeFileSync}from'node:fs';
+ const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,log=${JSON.stringify(log)};
+ appendFileSync(log,JSON.stringify(r)+'\\n');let research;
+ if(s.dispatchMode==='planning')research={action:'read_plan',question:s.question.id,reads:[{action:'read_context',record:${JSON.stringify(reference(f.store.get('graph-layer:r:1')!))},pointer:s.continuation.kind==='initial'?'/projection/title':'/projection/nodes/0/title'}]};
+ else if(!existsSync(log+'.again')){writeFileSync(log+'.again','1');research={action:'need_research',question:s.question.id,missing:['A second explicit planning decision']};}
+ else research={action:'pause',reason:'Stop after the exact new prefix'};
+ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:0,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+ const first=await f.engine.researcher.run('r',draft.id,2);
+ const oldTurns=f.store.list<any>('research-turn').filter(turn=>turn.value.run===first.id);
+ assert.ok(oldTurns.some(turn=>turn.value.action.action==='read_context'&&turn.value.status==='completed'));
+ assert.equal(f.store.list('synthesis-session').length,0);
+ const oldCalls=f.store.list('model-call');assert.equal(oldCalls.length,1);
+ const head=f.store.get<Question>(q.id)!;
+ f.engine.execute({type:'reopen-question',question:head.id,expected:head.revision});
+ const cold=new Store(join(f.root,'state.sqlite'));
+ try {
+  const resumed=await new ProductEngine(cold).researcher.run('r',draft.id,10);
+  assert.notEqual(resumed.value.pauseCode,'research_context_undelivered',resumed.value.error??'');
+  assert.notEqual(resumed.value.pauseCode,'synthesis_session_invalid',resumed.value.error??'');
+  const reopened=cold.get<Question>(q.id)!;
+  const currentReads=cold.list<any>('research-turn').filter(turn=>turn.value.run===first.id
+   && turn.value.question?.revision===reopened.revision && turn.value.action.action==='read_context'
+   && turn.value.status==='completed');
+  assert.equal(currentReads.length,1);
+  assert.equal(currentReads[0]!.value.observation.pointer,'/projection/nodes/0/title');
+  const session=cold.list<any>('synthesis-session').find(item=>item.id.startsWith('synthesis-session:v2:')
+   && canonical(item.value.binding.question)===canonical(reference(reopened))
+   && item.value.workspace?.entries.length===1);
+  assert.ok(session,'C must inherit the accepted new-revision lookup');
+  assert.deepEqual(session.value.workspace.entries.map((entry:any)=>entry.result),
+   currentReads.map(turn=>turn.value.observation));
+  assert.deepEqual(readSynthesisSession(cold,reference(session)),session);
+  const wires=readFileSync(log,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  const delivered=wires.findLast(wire=>wire.subject.continuation.role==='analyst'
+   && wire.subject.contextWorkspace?.length===1);
+  assert.ok(delivered,'the new C packet must deliver the accepted lookup');
+  assert.deepEqual(delivered.subject.contextWorkspace,currentReads.map(turn=>turn.value.observation));
+  for(const old of oldCalls)assert.deepEqual(cold.get(old.id,old.revision),old);
+  assert.equal(cold.list('model-call').length,oldCalls.length+3,'no old planned call is bought again');
+  for(const old of oldTurns) {
+   assert.deepEqual(cold.get(old.id,old.revision),old);
+   assert.deepEqual(readResearchConsumerTurn(cold,reference(old)),old);
+  }
+ } finally {cold.close();}
 });
 
 test('RS4 exact Git 8b665772 producer: old completed and paid pending history and reader continuation survive restart unchanged',async t=>{
- const root=mkdtempSync(join(tmpdir(),'omg-rs4-era-')),era=join(root,'era');mkdirSync(era);
+ const root=mkdtempSync(join(tmpdir(),'omg-rs4-era-')),era=join(root,'era'),archive=join(root,'archive.tar');mkdirSync(era);
  t.after(()=>rmSync(root,{recursive:true,force:true}));
- execFileSync('tar',['-xf','-','-C',era],{input:execFileSync('git',['archive','8b665772db793b854d86ca557d359d8479a29c9c'],{maxBuffer:80<<20})});
+ execFileSync('git',['archive','--format=tar',`--output=${archive}`,'8b665772db793b854d86ca557d359d8479a29c9c']);
+ try{
+  execFileSync('tar',['-xf',archive,'-C',era]);
+ }finally{
+  rmSync(archive,{force:true});
+ }
  symlinkSync(resolve('node_modules'),join(era,'node_modules'));
  execFileSync(process.execPath,[resolve('node_modules/typescript/bin/tsc'),'-p',join(era,'tsconfig.json')],{cwd:era,maxBuffer:4<<20});
  const script=join(era,'rs4-producer.mjs');
@@ -367,7 +454,7 @@ test('DS1-01 Discovery v6 keeps the researched plan and prior v4/v5 contracts', 
   bases:[{result:'missing',reason:'No measurement'}],conditions:[{id:'measure',kind:'evidence',condition:'Demonstrate stability',criterion:'Observed stability within the agreed envelope',fulfilled:true}]}),false);
 });
 
-test('DS1-08 packed initial and continuation deliver exact accepted grounds to analyst and assessor; overflow sends nothing',async t=>{
+test('DS1-08 packed initial and continuation deliver exact accepted grounds to analyst and assessor; oversized grounds are addressed',async t=>{
  const f=fixture(t);preparedFeatures(f.engine,'complete');
  const stage=f.store.get<any>('stage:complete:discovery')!,draft=f.store.get<DiscoveryDraft>(stage.value.content.draft.id)!;
  writeFileSync(join(f.root,'mode'),'pause');
@@ -387,7 +474,18 @@ test('DS1-08 packed initial and continuation deliver exact accepted grounds to a
   assert.deepEqual(next.subject.discoveryContext,context);assert.equal(next.subject.continuation.kind,'continuation');
   assert.ok(next.prompt.includes('Preserve this role and its material'));
   const oversized=structuredClone(body);(oversized.discoveryContext.fields.researchPlan!.value as any).deliverable='x'.repeat(350000);
-  await assert.rejects(researchCall(role,env.value,'Preserve this role and its material',oversized,undefined,audit),{code:'pilot_core_limit'});
-  assert.equal(f.store.list('model-call').length,before+1);
+  let sent:any;
+  await researchCall(role,env.value,'Preserve this role and its material',oversized,undefined,
+    {...audit,onContext:packet=>{sent=packet;}});
+  const delivery=sent.materialDelivery?.[0];
+  assert.equal(delivery?.contract,'research-delivery/v1');
+  assert.equal(delivery.original.pointer,'/body/discoveryContext');
+  const archived=f.store.get<any>(delivery.original.record.id,delivery.original.record.revision)!;
+  assert.deepEqual(contextValue(archived.value,delivery.original.pointer),oversized.discoveryContext);
+  assert.equal(delivery.original.valueHash,hashJson(oversized.discoveryContext));
+  assert.equal(delivery.text,canonical(oversized.discoveryContext).slice(delivery.served.offset,delivery.served.end));
+  assert.ok(delivery.served.end>0&&delivery.served.next===delivery.served.end&&delivery.served.end<delivery.served.total);
+  assert.ok(!Object.hasOwn(sent,'discoveryContext')&&JSON.stringify(sent).length<=300000);
+  assert.equal(f.store.list('model-call').length,before+2);
  }
 });

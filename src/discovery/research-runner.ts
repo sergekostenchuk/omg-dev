@@ -5,7 +5,7 @@ import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deli
 import { RESEARCH_CONTRACT_VERSION } from './requirements.js';
 import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
-import { readResearchContext } from "./research-limits.js";
+import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
 import { Environments, uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
@@ -588,6 +588,23 @@ export class Researcher {
         const turns = this.store.list<ResearchTurn>("research-turn").filter(item => item.value.run === id)
           .map(item => readResearchConsumerTurn(this.store, reference(item)) as Revision<ResearchTurn>)
           .sort((a, b) => a.value.number - b.value.number);
+        // A completed lookup is historical proof, but a NEW paid dispatch may
+        // not silently reuse it after its archive head changes. Restoration of
+        // an already paid turn stays on its saved exact Ref.
+        const currentContextHeads = forcedPendingTurn || synthesisOp ? [] : uniqueRefs(turns.flatMap(item => {
+          if (item.value.status !== 'completed' || item.value.error
+            || !isRef(item.value.question)
+            || canonical(item.value.question) !== canonical(reference(pending[0]!))) return [];
+          const action = admittedResearchAction(item.value.action);
+          if (action.action !== 'read_context') return [];
+          const original = this.store.get(action.record.id, action.record.revision);
+          return original?.kind === 'research-context' ? [action.record] : [];
+        }));
+        for (const original of currentContextHeads) {
+          const head = this.store.get(original.id);
+          requireCondition(head && canonical(reference(head)) === canonical(original),
+            'research_consumer_context_stale', 'A previously delivered context archive changed before new research was paid');
+        }
         const history = turns.slice(-8).map(item => item.value);
         let previousProposal = latestProposal(turns, pending[0]!.id);
         const previousProposalTurn = turns.find(turn => turn.value.action === previousProposal);
@@ -767,7 +784,9 @@ export class Researcher {
           if (synthesisEntry) {
             action = await synthesisSession(this.store, draft, pending[0]!, environment,
               dispatch, pilot, context, instruction, signal,
-              { retryPermits, delivery: { run: id, turn: reservedTurn! }, ...(reserve ? { reserve } : {}) });
+              { retryPermits, delivery: { run: id, turn: reservedTurn! }, initialWorkspace: workspace,
+                initialWorkspaceGuards: [...turns.map(reference), ...currentContextHeads],
+                ...(reserve ? { reserve } : {}) });
             run = this.store.get<ResearchRun>(id)!; // the atomic reservation moved the shared run record
             const questionId = "question" in action ? action.question : null;
             const question = questionId ? pending.find(item => item.id === questionId) : pending[0];
@@ -813,7 +832,7 @@ export class Researcher {
               pendingTurn = replayed[1]! as Revision<ResearchTurn>;
               action = admittedResearchAction(pendingTurn.value.action);
             } else {
-            const basis = uniqueRefs([...draft.value.inputs, ...(conceptMaterial?.guards ?? []), ...effective.guards,
+            const basis = uniqueRefs([...draft.value.inputs, ...currentContextHeads, ...(conceptMaterial?.guards ?? []), ...effective.guards,
               ...(outcome?.guards ?? []), ...related.guards, ...turns.map(reference),
               ...sources.list().map(reference)]);
             const layerGraph = draft.value.stage === 'om-g2' && pending[0]!.value.spec.field === 'layerDesign'
@@ -922,11 +941,12 @@ export class Researcher {
           } else if (action.action === "read_context") {
             try {
               const managedRead = (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1';
+              const readMode = researchContextReadEra(this.store, sent);
               const admitted = readResearchContext(this.store, draft, pending[0]!.id,
-                pilot ?? undefined, action.record, action.pointer, action.page);
+                pilot ?? undefined, action.record, action.pointer, action.page, readMode);
               if (managedRead) {
                 const projected = readResearchContextOutcomeAt(this.store, draft, pending[0]!, action,
-                  pilot?.value.maxRequestChars ?? 300000);
+                  pilot?.value.maxRequestChars ?? 300000, readMode);
                 requireCondition(canonical(admitted) === canonical(projected), 'research_consumer_intent_invalid',
                   'The addressed read differs from its exact historical projection');
                 observation = projected;
@@ -1171,8 +1191,10 @@ export class Researcher {
                 // response pending for recovery.
                 try {
                   const record = readResearchContextRecordAt(this.store, draft, action);
+                  const readMode = researchContextReadEra(this.store, sent);
                   const proof = { kind: 'context-refusal' as const, recordValue: record.value,
-                    record: action.record, maxChars: pilot?.value.maxRequestChars ?? 300000 };
+                    record: action.record, maxChars: pilot?.value.maxRequestChars ?? 300000,
+                    ...(readMode === 'bounded' ? { projection: 'bounded' as const } : {}) };
                   const projected = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, proof);
                   const refusal = projected.observation as { code?: unknown; details?: unknown } | null;
                   if (refusal?.code === failure.code

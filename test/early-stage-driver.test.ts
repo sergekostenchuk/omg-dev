@@ -866,9 +866,17 @@ test("DRV1 stop before B dispatch renews the same candidate only after exact res
     maxTurns: 30, maxCalls: 1 }) as EarlyStageOutcome;
   const applications = reopened.list<any>("assessment-application"), renewed = applications.find(app => app.id === before.id)!;
   const applied = applications.find(app => app.value.state === "applied")!;
+  const {resultCapacity: beforeCapacity,...beforeContext}=before.value.context;
+  const {resultCapacity: appliedCapacity,...appliedContext}=applied.value.context;
   assert.deepEqual([continued.budget.callsMade, f.calls(trace).filter(call => call.role === "assess-answer").length,
-    renewed.value.state, applied.value.previous?.id, canonical(applied.value.context), canonical(before.value.context)],
-  [1, 1, "renewed", before.id, canonical(before.value.context), canonical(before.value.context)]);
+    renewed.value.state, applied.value.previous?.id, canonical(appliedContext), canonical(beforeContext)],
+  [1, 1, "renewed", before.id, canonical(beforeContext), canonical(beforeContext)]);
+  assert.equal(appliedCapacity.bindings.application,applied.id);
+  assert.equal(appliedCapacity.operation,applied.id);
+  assert.equal(appliedCapacity.generation,beforeCapacity.generation+1);
+  assert.deepEqual({...appliedCapacity,generation:beforeCapacity.generation,operation:before.id,
+    bindings:{...appliedCapacity.bindings,application:before.id}},beforeCapacity,
+  'The new capacity marker changes only its exact application and generation');
 });
 
 test("DRV1 stop before C dispatch retries the same escalation only after exact resume", async t => {

@@ -25,7 +25,7 @@ import { EngineError } from '../src/errors.js';
 import { hashJson } from '../src/canonical.js';
 
 const verdict = { verdict: 'supported', reasons: [] };
-function resumeFixture(t: test.TestContext, mode: 'verdict' | 'checkpoint' | 'read_context' | 'oversized-context' | 'premature-context' = 'verdict') {
+function resumeFixture(t: test.TestContext, mode: 'verdict' | 'checkpoint' | 'read_context' | 'oversized-context' | 'overlimit-page' | 'premature-context' = 'verdict') {
   const root = mkdtempSync(join(tmpdir(), 'omg-assessment-resume-')), workspace = join(root, 'repo'), database = join(root, 'db.sqlite');
   mkdirSync(workspace); git(workspace, ['init', '-b', 'main']); writeFileSync(join(workspace, 'README.md'), 'AB\n');
   git(workspace, ['add', '.']); git(workspace, ['-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'base']);
@@ -42,6 +42,8 @@ ${JSON.stringify(mode)}==='premature-context'&&s.contextWorkspace.length&&!exist
   (writeFileSync(${JSON.stringify(join(root,'premature-verdict'))},'1'),{verdict:'supported',reasons:[]}):
 ${JSON.stringify(mode)}==='premature-context'&&(!s.contextWorkspace.length||s.failures?.[0]?.code==='research_context_incomplete'||next!==null)?
   {action:'read_context',record:fragment?.original?.record??latest?.record??s.working.archive,pointer:'/body/resources/a',page:{offset:s.failures?.[0]?.details?.next??next??0,limit:50000}}:
+${JSON.stringify(mode)}==='overlimit-page'&&(!s.contextWorkspace.length||next!==null)?
+  {action:'read_context',record:fragment?.original?.record??latest?.record??s.working.archive,pointer:'/body/resources/a',page:{offset:next??0,limit:1000000}}:
 ${JSON.stringify(mode)}==='oversized-context'&&(!s.contextWorkspace.length||next!==null)?
   {action:'read_context',record:fragment?.original?.record??latest?.record??s.working.archive,pointer:'/body/resources/a',...(!s.contextWorkspace.length&&!s.failures?.length?{}:{page:{offset:next??0,limit:50000}})}:
 ${JSON.stringify(mode)}==='read_context'&&!s.contextWorkspace.length?{action:'read_context',record:s.working.archive,pointer:'/body/resources/a'}:{verdict:'supported',reasons:[]};
@@ -95,6 +97,22 @@ test('RD2b preserves a refused oversized B read and continues only the assessor 
   assert.deepEqual(await f.invoke(f.fresh()), verdict);
   assert.deepEqual(restarted.list(), heads);
   callsOnce(f, 10, restarted);
+});
+
+test('RD2c new paid B overlimit page is clipped and its application replays cold', async t => {
+  const f = resumeFixture(t, 'overlimit-page');
+  f.context.resources.a = 'A'.repeat(320_000);
+  assert.deepEqual(await f.invoke(), verdict);
+  const first = f.store.list<any>('assessment-application')[0]!;
+  assert.equal(first.value.state, 'applied');
+  const session = f.store.list<any>('assessment-session')[0]!;
+  const read = session.value.workspace.entries[0].result;
+  assert.equal(read.contract, 'research-context-read/v2');
+  assert.equal(read.requested.limit, 1_000_000);
+  assert.ok(read.page.end > 0 && read.page.next !== null);
+  const calls = f.store.list('model-call').length;
+  assert.deepEqual(await f.invoke(f.fresh()), verdict);
+  assert.equal(f.store.list('model-call').length, calls);
 });
 test('RD2b accepts a paid B verdict after the explicitly requested context page, without requiring its parent', async t => {
   const f = resumeFixture(t, 'premature-context');

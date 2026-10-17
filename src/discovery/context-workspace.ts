@@ -16,6 +16,22 @@ export interface ContextCoverage {
 export interface ContextWorkspace { entries: { key: string; result: ContextLookup }[]; sinceProgress: number;
   checkpointedKeys?: string[]; deliveryCoverage?: ContextCoverage[]; blocked?: string }
 
+/** A caller cannot make an arbitrary value into a paid original merely by
+ * placing a Ref-shaped object beside it. Derivation is supplied by the exact
+ * record reader; this comparison has no store access or side effects. */
+export function requireExactContextWorkspace(results: unknown,
+  derive: (result: ContextLookup) => ContextLookup): asserts results is ContextLookup[] {
+  requireCondition(Array.isArray(results), 'research_context_undelivered',
+    'The supplied context workspace needs exact saved originals');
+  for (const result of results) {
+    requireCondition(result && typeof result === 'object' && isRef(result.record)
+      && typeof result.pointer === 'string' && Object.hasOwn(result, 'value'),
+    'research_context_undelivered', 'A supplied context lookup lost its origin, selector or value');
+    requireCondition(canonical(result) === canonical(derive(result)),
+      'research_context_undelivered', 'The supplied context differs from its exact saved original');
+  }
+}
+
 function coverageShape(result: ContextLookup, fragment?: ResearchDelivery) {
   const encoding: ContextCoverage['encoding'] = fragment?.encoding === 'json-string-fragment' || result.page?.encoding === 'canonical-json'
     || (typeof result.value !== 'string' && !Array.isArray(result.value))

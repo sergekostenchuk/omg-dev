@@ -551,9 +551,14 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
         && canonical(reference(draftRecord)) === canonical(input.draft)
         && canonical(reference(questionRecord)) === canonical(input.question),
       'context_lookup_integrity', 'The exact lookup draft or question is missing');
-      const result = exactContextLookup(store, draftRecord, questionRecord, action.record, action.pointer, action.page,
-        input.proveRecord);
-      requireCondition(canonical(result).length <= input.readLimit, 'context_read_limit', 'Use a smaller addressed context page');
+      const bounded = archive.contextReadContract === 'research-context-read/v2';
+      const original = exactContextLookup(store, draftRecord, questionRecord,
+        action.record, action.pointer, bounded ? undefined : action.page, input.proveRecord);
+      const result = bounded
+        ? projectResearchContextSelection(original.value, action.record, action.pointer,
+          action.page, input.readLimit, 'bounded')
+        : (requireCondition(canonical(original).length <= input.readLimit,
+          'context_read_limit', 'Use a smaller addressed context page'), original);
       const delivered = Array.isArray(subject.contextWorkspace) ? subject.contextWorkspace as ContextLookup[] : [];
       return { kind: 'lookup', checkpoint: null, session: { ...before, focus: null,
         ...(before.contextCorrection ? { contextCorrection: null } : {}),
@@ -707,14 +712,71 @@ export function projectContextRecoveryTransition(input: ContextRecoveryTransitio
 export type ContextReadPage = ContextPage;
 export interface ProjectedContextRead {
   record: Ref; pointer: string; value: unknown;
+  contract?: 'research-context-read/v2';
+  outcome?: 'clipped';
+  envelopeLimitChars?: number;
+  requested?: { offset: number; limit: number; end: number; total: number; unit: 'utf16' | 'items';
+    encoding?: 'canonical-json' };
   page?: { offset: number; end: number; total: number; unit: 'utf16' | 'items'; next: number | null;
     encoding?: 'canonical-json' };
+}
+
+/** The paid selector remains intact. Only its transport projection is made
+ * smaller, and the served range is derived from the immutable original. */
+export function projectResearchContextSelection(value: unknown, record: Ref, pointer: string,
+  page: ContextReadPage | undefined, maxChars: number,
+  mode: 'legacy' | 'bounded' = 'legacy'): ProjectedContextRead {
+  const original: ProjectedContextRead = { record, pointer, ...contextPage(value, page) };
+  requireCondition(Number.isSafeInteger(maxChars) && maxChars > 0,
+    'context_read_limit', 'Addressed context needs a positive character limit');
+  if (canonical(original).length <= maxChars) return original;
+  requireCondition(mode === 'bounded' && page !== undefined,
+    'context_read_limit', 'Use a smaller addressed context page');
+  const source = page.encoding === 'canonical-json' ? canonical(value) : value as string | unknown[];
+  const requestedEnd = Math.min(source.length, page.offset + page.limit);
+  const requested = { offset: page.offset, limit: page.limit, end: requestedEnd, total: source.length,
+    unit: (typeof source === 'string' ? 'utf16' : 'items') as 'utf16' | 'items',
+    ...(page.encoding ? { encoding: page.encoding } : {}) };
+  const fit = (text: string | unknown[], offset: number, total: number,
+    encoding?: 'canonical-json'): ProjectedContextRead | null => {
+    let low = 0, high = text.length;
+    const candidate = (size: number): ProjectedContextRead => {
+      const end = offset + size;
+      return { contract: 'research-context-read/v2', outcome: 'clipped', requested,
+        envelopeLimitChars: maxChars,
+        record, pointer, value: text.slice(0, size),
+        page: { offset, end, total, unit: typeof text === 'string' ? 'utf16' : 'items',
+          next: end < total ? end : null, ...(encoding ? { encoding } : {}) } };
+    };
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2);
+      if (canonical(candidate(middle)).length <= maxChars) low = middle;
+      else high = middle - 1;
+    }
+    return low > 0 ? candidate(low) : null;
+  };
+  const selected = source.slice(page.offset, requestedEnd);
+  const direct = fit(selected, page.offset, source.length, page.encoding);
+  if (direct) return direct;
+  // One array item may exceed the entire envelope. Its exact canonical JSON
+  // is addressable by UTF-16 offset, so an item-sized refusal is unnecessary.
+  if (Array.isArray(source) && requestedEnd > page.offset) {
+    const encoded = canonical(source);
+    const start = page.offset === 0 ? 0 : canonical(source.slice(0, page.offset)).length;
+    const end = requestedEnd === source.length ? encoded.length
+      : canonical(source.slice(0, requestedEnd)).length - 1;
+    const fragment = fit(encoded.slice(start, end), start, encoded.length, 'canonical-json');
+    if (fragment) return fragment;
+  }
+  throw new EngineError('context_read_limit', 'The addressed context page has no deliverable positive fragment',
+    { requested, maxChars });
 }
 
 /** Selects a value from an already checked exact record, for both live writing
  * and historical proof. The record's provenance is checked by the caller. */
 export function projectResearchContextRead(recordValue: unknown, record: Ref, pointer: string,
-  page: ContextReadPage | undefined, maxChars: number): ProjectedContextRead {
+  page: ContextReadPage | undefined, maxChars: number,
+  mode: 'legacy' | 'bounded' = 'legacy'): ProjectedContextRead {
   requireCondition(typeof pointer === 'string' && (pointer === '' || pointer.startsWith('/')),
     'selector_invalid', 'Use a JSON pointer');
   let value = recordValue;
@@ -725,12 +787,7 @@ export function projectResearchContextRead(recordValue: unknown, record: Ref, po
       'context_missing', 'Context pointer does not exist');
     value = (value as Record<string, unknown>)[key];
   }
-  const result: ProjectedContextRead = { record, pointer, ...contextPage(value, page) };
-  requireCondition(Number.isSafeInteger(maxChars) && maxChars > 0,
-    'context_read_limit', 'Addressed context needs a positive character limit');
-  requireCondition(canonical(result).length <= maxChars,
-    'context_read_limit', 'Use a smaller addressed context page');
-  return result;
+  return projectResearchContextSelection(value, record, pointer, page, maxChars, mode);
 }
 
 export interface ContextReadIdentityInput {
@@ -751,7 +808,10 @@ export function contextReadIdentity(input: ContextReadIdentityInput): string {
   requireCondition(action.action === 'read_context' && isRef(action.record)
     && typeof input.projectId === 'string' && input.projectId.length > 0
     && isRef(question) && canonical(observation) === canonical(projectResearchContextRead(
-      recordValue, action.record, action.pointer, action.page, Number.MAX_SAFE_INTEGER)),
+      recordValue, action.record, action.pointer, action.page,
+      observation.contract === 'research-context-read/v2'
+        ? observation.envelopeLimitChars ?? 0 : Number.MAX_SAFE_INTEGER,
+      observation.contract === 'research-context-read/v2' ? 'bounded' : 'legacy')),
   'research_consumer_intent_invalid', 'The repeated context is not its exact addressed result');
   const view = observation.value && typeof observation.value === 'object'
     && !Array.isArray(observation.value) && isRef((observation.value as Record<string, unknown>).ref)
@@ -900,7 +960,8 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
     'research_consumer_intent_invalid',
     'An addressed workspace omitted or substituted an earlier run turn');
     const prior = turn.value;
-    if (prior.question?.id !== question.id || prior.status !== 'completed' || prior.error) continue;
+    if (!isRef(prior.question) || canonical(prior.question) !== canonical(question)
+      || prior.status !== 'completed' || prior.error) continue;
     if (entry.packet?.working?.deliveryContract === 'research-delivery/v1')
       workspace = recordContextPacket(workspace, entry.packet);
     const kind = (prior.action as { action?: unknown } | null)?.action;
@@ -1359,7 +1420,8 @@ export type TurnTransitionProof =
       contract: 'research-proposal-refusal/v1'; projectId: string; turn: Ref;
       pending: Ref; question: Ref; findings: Finding[] } } }
   | { kind: 'read-context'; recordValue: unknown; record: Ref; maxChars: number }
-  | { kind: 'context-refusal'; recordValue: unknown; record: Ref; maxChars: number }
+  | { kind: 'context-refusal'; recordValue: unknown; record: Ref; maxChars: number;
+      projection?: 'bounded' }
   | { kind: 'delivery-refusal'; recordValue: unknown; record: Ref; maxChars: number;
       workspace: ContextWorkspace; delivered: ContextLookup[]; maxLookups?: number }
   | { kind: 'context-incomplete'; workspace: ContextWorkspace; subject: Record<string, any> }
@@ -1485,7 +1547,7 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     'research_consumer_intent_invalid', 'The addressed read changed its exact paid request');
     return { ...before, status: 'completed', error: null, observation:
       projectResearchContextRead(proof.recordValue, proof.record, action.pointer,
-        action.page, proof.maxChars) };
+        action.page, proof.maxChars, 'bounded') };
   }
   if (proof.kind === 'context-refusal') {
     requireCondition(action.action === 'read_context'
@@ -1494,7 +1556,7 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     let failure: EngineError | null = null;
     try {
       projectResearchContextRead(proof.recordValue, proof.record, action.pointer,
-        action.page, proof.maxChars);
+        action.page, proof.maxChars, proof.projection ?? 'legacy');
     } catch (error) {
       if (error instanceof EngineError) failure = error;
       else throw error;
@@ -1509,7 +1571,7 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       && canonical(action.record) === canonical(proof.record),
     'research_consumer_intent_invalid', 'The refused delivery changed its paid context request');
     const result = projectResearchContextRead(proof.recordValue, proof.record,
-      action.pointer, action.page, proof.maxChars);
+      action.pointer, action.page, proof.maxChars, 'bounded');
     let failure: EngineError | null = null;
     try { addContextLookup(proof.workspace, result, proof.delivered, proof.maxLookups); }
     catch (error) { if (error instanceof EngineError) failure = error; else throw error; }

@@ -151,7 +151,13 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:30,output_
     for (const forbidden of ["--ignore-user-config", "project_doc_max_bytes=0", "danger-full-access"]) assert.ok(!args.includes(forbidden));
     assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
     const sent = readFileSync(join(root, "compact-input.txt"), "utf8");
-    assert.ok(sent.endsWith("Exact research instruction\nSubject:\n" + JSON.stringify(subject)));
+    const boundary=sent.lastIndexOf('\nSubject:\n');
+    assert.ok(boundary>0);
+    assert.ok(sent.slice(0,boundary).endsWith('Exact research instruction'));
+    const {responseOutputLimit,...delivered}=JSON.parse(sent.slice(boundary+'\nSubject:\n'.length));
+    assert.deepEqual(delivered,subject,'The original compact request remains exact');
+    assert.deepEqual(responseOutputLimit,{contract:'research-output-limit/v1',combinedStdoutStderrBytes:4000000,
+      replyChars:null,instruction:'Return one complete JSON envelope within these physical bounds; a truncated output is never a usable response.'});
     assert.equal(store.list<ModelCall>("model-call")[0]!.value.usage!.inputTokens, 30);
     for (const mode of ["implement", "review", "chat"]) {
       const result = await runProcess(env.implementer.command, root, JSON.stringify({ protocol: "omg-agent/v1", requestId: "probe",

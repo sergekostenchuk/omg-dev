@@ -4,8 +4,8 @@ import {writeFileSync} from 'node:fs';
 import {fixture} from './synthesis-session-fixture.js';
 import {configureReaderPilot,pilotEnvironment} from '../src/discovery/reader-pilot.js';
 import {previewResearch} from '../src/discovery/research-preview.js';
-import {reference} from '../src/pipeline/contracts.js';
 import {researchAction,researchCall} from '../src/discovery/research-protocol.js';
+import {workingContext} from '../src/discovery/working-context.js';
 
 function provider(path:string,body:string){writeFileSync(path,`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;${body}\nconsole.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);}
 
@@ -57,11 +57,13 @@ test('normalization preserves exact structured facts and context without changin
 
 test('a required original may use more than half of an assessor request when the complete transport packet fits',async t=>{
   const f=await fixture(t,20,300000);
-  const text='E'.repeat(180000),source=f.engine.discovery.evidence.document('p','large-original',text,'text/plain',0);
+  const text='E'.repeat(180000);
+  const archive=workingContext(f.store,'p',f.draft.id,f.question.id,
+    {...f.context,largeOriginal:text},300000,{common:true}).working.archive;
   const env=pilotEnvironment(f.engine.environments.get('p').value,f.pilot.value);
   const before=f.store.list('model-call').length;
   const p=await previewResearch(()=>researchCall(env.reviewer,env,'Assess the supplied original',
-    {...f.context,contextWorkspace:[{record:reference(source),pointer:'/content',value:text}]},undefined,
+    {...f.context,contextWorkspace:[{record:archive,pointer:'/body/largeOriginal',value:text}]},undefined,
     {store:f.store,draftId:f.draft.id,questionId:f.question.id,purpose:'assessor',pilot:f.pilot}));
   assert.ok(p.chars>150000&&p.chars<=300000);
   assert.equal(JSON.parse(p.input).subject.contextWorkspace[0].value,text);

@@ -24,7 +24,7 @@ import { ProductEngine } from "../src/product/engine.js";
 import { SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3, SOURCE_READ_MAX_CHARS,
   sourceReadRange, sourceReadRangeV2 } from '../src/evidence/evidence.js';
 import { projectResearchSearchObservationV2 } from '../src/discovery/research-consumer-transition.js';
-import { reference } from "../src/pipeline/contracts.js";
+import { isRef, reference } from "../src/pipeline/contracts.js";
 import type { ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
 import type { FieldSpec } from "../src/discovery/discovery.js";
 import { researchInput } from "./preparation-fixture.js";
@@ -664,10 +664,14 @@ test('RS1 split bundle retains clipped requests and addressed outside children a
 });
 
 test('RS1 exact previous producer from Git keeps completed source and bundle outcomes in their era', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'omg-rs1-era-')), era = join(root, 'era'); mkdirSync(era);
+  const root = mkdtempSync(join(tmpdir(), 'omg-rs1-era-')), era = join(root, 'era'), archive = join(root, 'archive.tar'); mkdirSync(era);
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  const archive = execFileSync('git', ['archive', '94af9c4ac0a06ca1ee911d626356e07ab7850c04'], { maxBuffer: 80 << 20 });
-  execFileSync('tar', ['-xf', '-', '-C', era], { input: archive });
+  execFileSync('git', ['archive', '--format=tar', `--output=${archive}`, '94af9c4ac0a06ca1ee911d626356e07ab7850c04']);
+  try {
+    execFileSync('tar', ['-xf', archive, '-C', era]);
+  } finally {
+    rmSync(archive, { force: true });
+  }
   symlinkSync(resolve('node_modules'), join(era, 'node_modules'));
   execFileSync(process.execPath, [resolve('node_modules/typescript/bin/tsc'), '-p', join(era, 'tsconfig.json')], { cwd: era });
   const script = join(era, 'old-producer.mjs');
@@ -754,6 +758,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{
 });
 
 import { addressedWorkspace } from '../src/discovery/research-continuation.js';
+import { readResearchConsumerExecution } from '../src/discovery/response-recovery.js';
 import { readContextTurnHistoryAt } from '../src/discovery/response-recovery.js';
 import { projectAddressedWorkspace, type ManagedResearchTurn } from '../src/discovery/research-consumer-transition.js';
 import type { DiscoveryDraft } from '../src/discovery/discovery.js';
@@ -805,8 +810,13 @@ function rs2Prove(store:Store,draftId:string,number?:number) {
  const previous=turns.filter(t=>t.value.number<before.value.number);
  const exact=projectAddressedWorkspace(before.value,
   readContextTurnHistoryAt(store,'p',draft,reference(question),previous,before.value.number),reference(question));
- const current=addressedWorkspace(store,previous,question);
- assert.deepEqual(current,exact);
+ const current=addressedWorkspace(store,previous,question,turn=>{
+  const intent=(turn.value as any).consumerIntent;
+  if(!isRef(intent))return null;
+  const paid=readResearchConsumerExecution(store,'p',intent);
+  return paid.kind==='response'&&Array.isArray(paid.subject.contextWorkspace)?paid.subject:null;
+ });
+ assert.deepEqual(current,exact,'The live fold and exact historical fold use the same delivered ranges');
  return exact;
 }
 
@@ -895,7 +905,10 @@ for(const delta of [false,true])test(`RS2 accepted ${delta?'answer_delta':'answe
  assert.equal(turns.length,4);assert.equal(turns.at(-1)!.value.error,null);
  assert.equal(turns.at(-1)!.value.status,'completed');
  assert.deepEqual(readResearchConsumerTurn(restarted,reference(answer)),answer);
- assert.deepEqual(rs2Prove(restarted,f.draft.id).checkpointedKeys,[],'older-revision lookups are not silently made current');
+ const current = rs2Prove(restarted,f.draft.id);
+ assert.deepEqual(current.checkpointedKeys ?? [],[],'older-revision lookups are not silently made current');
+ assert.equal(current.entries.length,1,'only the reopened question has an addressed current lookup');
+ assert.notEqual(canonical(current.entries[0]!.result.record), canonical((turns[0]!.value.observation as any).record));
 });
 
 test('RS2 current lookup head and exact historical lookup have distinct admission, without accepting a partial history',async t=>{
@@ -909,10 +922,11 @@ test('RS2 current lookup head and exact historical lookup have distinct admissio
  assert.deepEqual(readResearchConsumerTurn(another,reference(first)),first,'today’s head does not rewrite a completed exact reading');
  const question=f.store.get<Question>(f.draft.value.questions[0]!)!;
  assert.deepEqual(addressedWorkspace(f.store,[first],question).entries,[],'the changed head is not current material');
+ const paidBefore=f.store.list('model-call').length;
  const run=await f.engine.researcher.run('p',f.draft.id,1);
  assert.equal(run.value.pauseCode,'research_consumer_context_stale');
- const pending=f.store.list<ResearchTurn>('research-turn').find(turn=>turn.value.number===2)!;
- assert.equal(pending.value.status,'pending');
+ assert.equal(f.store.list('model-call').length,paidBefore,'a changed archive head is refused before a new paid call');
+ assert.equal(f.store.list<ResearchTurn>('research-turn').find(turn=>turn.value.number===2),undefined);
  const currentDraft=f.store.get<DiscoveryDraft>(f.draft.id)!;
  assert.throws(()=>readContextTurnHistoryAt(f.store,'p',currentDraft,reference(question),[],2),{code:'research_consumer_intent_invalid'});
  const forged=f.store.write<ResearchTurn>({id:'research-turn:v1:rs2-forged',kind:'research-turn',expected:0,
@@ -922,9 +936,14 @@ test('RS2 current lookup head and exact historical lookup have distinct admissio
 });
 
 test('RS2 exact Git ecd00625 producer keeps history and packet bytes and recovers its paid pending read',async t=>{
- const root=mkdtempSync(join(tmpdir(),'omg-rs2-era-')),era=join(root,'era');mkdirSync(era);
+ const root=mkdtempSync(join(tmpdir(),'omg-rs2-era-')),era=join(root,'era'),archive=join(root,'archive.tar');mkdirSync(era);
  t.after(()=>rmSync(root,{recursive:true,force:true}));
- execFileSync('tar',['-xf','-','-C',era],{input:execFileSync('git',['archive','ecd006252f7102d5377d61e8c9911685c1aa4aeb'],{maxBuffer:80<<20})});
+ execFileSync('git',['archive','--format=tar',`--output=${archive}`,'ecd006252f7102d5377d61e8c9911685c1aa4aeb']);
+ try{
+  execFileSync('tar',['-xf',archive,'-C',era]);
+ }finally{
+  rmSync(archive,{force:true});
+ }
  symlinkSync(resolve('node_modules'),join(era,'node_modules'));
  execFileSync(process.execPath,[resolve('node_modules/typescript/bin/tsc'),'-p',join(era,'tsconfig.json')],{cwd:era});
  const producer=join(era,'rs2-old-producer.mjs');
@@ -1117,9 +1136,14 @@ test("RS3 №4414 window: a guarded head moved by a second Store between the new
 
 test("RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and DS1 requires upgrade before a new paid generation", async t => {
   const failure = rs3RealFailure(t, "codex");
-  const root = mkdtempSync(join(tmpdir(), "omg-rs3-era-")), era = join(root, "era"), data = join(root, "data");
+  const root = mkdtempSync(join(tmpdir(), "omg-rs3-era-")), era = join(root, "era"), data = join(root, "data"), archive = join(root, "archive.tar");
   mkdirSync(era); mkdirSync(data); t.after(() => rmSync(root, { recursive: true, force: true }));
-  execFileSync("tar", ["-xf", "-", "-C", era], { input: execFileSync("git", ["archive", "8b665772db79"], { maxBuffer: 80 << 20 }) });
+  execFileSync("git", ["archive", "--format=tar", `--output=${archive}`, "8b665772db79"]);
+  try {
+    execFileSync("tar", ["-xf", archive, "-C", era]);
+  } finally {
+    rmSync(archive, { force: true });
+  }
   symlinkSync(resolve("node_modules"), join(era, "node_modules"));
   execFileSync(process.execPath, [resolve("node_modules/typescript/bin/tsc"), "-p", join(era, "tsconfig.json")], { cwd: era });
   writeFileSync(join(data, "adapter.mjs"), RS3_ADAPTER);

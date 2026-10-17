@@ -1,14 +1,15 @@
 import { synthesisControls, type FinalizationState } from './synthesis-controls.js';
 import { compactConclusions } from './continuation-packet.js';
 import { activeSynthesisNotes, consolidationNeeded, consolidationLimits, consolidatedProposal, consolidationNotice, consolidationPage, CONSOLIDATION_DELIVERY, COMPACT_CHECKPOINT_INSTRUCTION, type SynthesisNote, type ConsolidationNotice } from './conclusion-consolidation.js';
-import { contextWorkspace, addContextLookup, contextProgress, contextLookupKey, requireCompleteContextPacket, type ContextWorkspace } from "./context-workspace.js";
+import { contextWorkspace, addContextLookup, contextProgress, contextLookupKey, requireCompleteContextPacket,
+  foldContextEvent, recordContextPacket, type ContextWorkspace, type ContextLookup } from "./context-workspace.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { Environment } from "../runtime/environment.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import type { ReaderPilot } from "./reader-pilot.js";
-import type { ResearchAction } from "./research-model.js";
+import type { ResearchAction, ResearchRun, ResearchTurn } from "./research-model.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -20,10 +21,12 @@ import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWr
   isResponseRecovery, prepareResearchConsumerIntent, readResearchConsumerIntent, findResearchConsumerIntent,
   listResearchConsumerIntents, prepareResearchConsumerApplication, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, captureResearchConsumerRetryPermits, projectPaidSynthesisTransition,
+  readResearchConsumerExecution, readResearchConsumerTurn, readContextIdentityAt,
   type ResearchConsumerIntent, type ResearchConsumerIntentInput } from './response-recovery.js';
-import { projectSynthesisTransition, projectContextRecoveryTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES,
+import { admittedResearchAction, contextReadIdentity, projectSynthesisTransition, projectContextRecoveryTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES,
   isReservationOnlySessionStep, synthesisReservationConsumed,
   SYNTHESIS_SESSION_CONTRACT, CONTEXT_RECOVERY_SUPERSEDE_REASON, exactContextLookup, readerDraftEquivalent,
+  projectResearchContextSelection,
   type SynthesisSessionState, type SynthesisSessionDelivery, type SynthesisTransition } from './research-consumer-transition.js';
 import { isResearchPreview } from './research-preview.js';
 
@@ -184,6 +187,110 @@ function synthesisSessionInvalid(id: string, message: string): never {
   throw new EngineError('synthesis_session_invalid', `[${id}] ${message}`);
 }
 
+/** Follow the saved split queue back to the child admitted by read_plan.
+ * Each intermediate split must name the next child's exact first revision. */
+function plannedQueueOrigin(store: Store, child: Revision<ResearchTurn>, parent: Revision<ResearchTurn>,
+  run: string): Revision<ResearchTurn> {
+  let current = child;
+  const seen = new Set<string>();
+  while (isRef(current.value.splitFrom)) {
+    if (seen.has(current.id)) synthesisSessionInvalid(current.id, 'The planned split queue contains a cycle');
+    seen.add(current.id);
+    const sourceRef = current.value.splitFrom;
+    const source = store.get<ResearchTurn>(sourceRef.id, sourceRef.revision);
+    const completed = store.get<ResearchTurn>(sourceRef.id);
+    const first = store.get<ResearchTurn>(current.id, 1);
+    const parts = (completed?.value.observation as { splitInto?: unknown } | null)?.splitInto;
+    requireCondition(source?.kind === 'research-turn' && canonical(reference(source)) === canonical(sourceRef)
+      && completed?.kind === 'research-turn' && completed.value.status === 'completed' && !completed.value.error
+      && Array.isArray(parts) && first?.kind === 'research-turn'
+      && parts.some(ref => isRef(ref) && canonical(ref) === canonical(reference(first)))
+      && source.value.run === run && current.value.run === run
+      && canonical(source.value.question) === canonical(current.value.question)
+      && canonical(source.value.plannedBy) === canonical(reference(parent))
+      && canonical(current.value.plannedBy) === canonical(reference(parent)),
+    'synthesis_session_invalid', 'The planned lookup lacks an exact split-queue parent');
+    readResearchConsumerTurn(store, reference(completed));
+    current = source;
+  }
+  return current;
+}
+
+/** Rebuild the runner prefix by historical projections only. Current material
+ * heads decide admission of a NEW synthesis step, never the authenticity of
+ * the initial workspace after a graph or Source has lawfully advanced. */
+function runnerWorkspaceAt(store: Store, delivery: SynthesisSessionDelivery,
+  question: Revision<Question>, bindingDraft: Ref): ContextWorkspace {
+  const run = store.get<ResearchRun>(delivery.run, 1);
+  requireCondition(run?.kind === 'research-run' && hashJson(run.value) === run.hash
+    && run.value.projectId === question.value.projectId && run.value.draftId === question.value.draftId,
+    'synthesis_session_invalid', 'The inherited context has no exact runner origin');
+  const turns = store.list<ResearchTurn>('research-turn')
+    .filter(turn => turn.value.run === delivery.run && turn.value.number < delivery.turn)
+    .sort((a, b) => a.value.number - b.value.number)
+    .map(turn => readResearchConsumerTurn(store, reference(turn)) as Revision<ResearchTurn>);
+  requireCondition(turns.length === delivery.turn - 1
+    && turns.every((turn, index) => turn.value.number === index + 1),
+    'synthesis_session_invalid', 'The inherited context lost its complete exact turn prefix');
+  let workspace: ContextWorkspace = { entries: [], sinceProgress: 0 };
+  for (const turn of turns) {
+    if (!isRef(turn.value.question)
+      || canonical(turn.value.question) !== canonical(reference(question))
+      || turn.value.status !== 'completed' || turn.value.error) continue;
+    const origin = (turn.value as ResearchTurn & { consumerIntent?: unknown }).consumerIntent;
+    requireCondition(turn.value.plannedBy === undefined || isRef(turn.value.plannedBy),
+      'synthesis_session_invalid', 'A planned lookup needs its exact parent Ref');
+    const parent = isRef(turn.value.plannedBy)
+      ? store.get<ResearchTurn>(turn.value.plannedBy.id, turn.value.plannedBy.revision) : null;
+    if (isRef(turn.value.plannedBy)) {
+      requireCondition(parent && canonical(reference(parent)) === canonical(turn.value.plannedBy)
+        && parent.value.run === delivery.run && parent.value.number < turn.value.number,
+        'synthesis_session_invalid', 'A planned lookup lost its exact paid queue');
+      const queued = plannedQueueOrigin(store, turn, parent!, delivery.run);
+      const firstChild = store.get<ResearchTurn>(queued.id, 1);
+      const completed = store.history<ResearchTurn>(parent!.id).find(step => {
+        const children = (step.value.observation as { children?: unknown } | null)?.children;
+        return step.value.status === 'completed' && Array.isArray(children) && firstChild
+          && children.some((child: unknown) => isRef(child) && child.id === queued.id
+            && child.revision === 1 && canonical(child) === canonical(reference(firstChild)));
+      });
+      const parentAction = completed && admittedResearchAction(completed.value.action);
+      requireCondition(completed?.value.status === 'completed' && parentAction?.action === 'read_plan'
+        && firstChild,
+        'synthesis_session_invalid', 'The planned lookup is not a child of its exact completed plan');
+      readResearchConsumerTurn(store, reference(completed!));
+    }
+    const parentOrigin = (parent?.value as ResearchTurn & { consumerIntent?: unknown } | undefined)?.consumerIntent;
+    const intent = isRef(origin) ? readResearchConsumerIntent(store, origin)
+      : isRef(parentOrigin) ? readResearchConsumerIntent(store, parentOrigin) : null;
+    let packet: Record<string, any> | null = null;
+    if (isRef(origin) && intent && ['analyst', 'reading-planner'].includes(intent.value.kind)) {
+      const paid = readResearchConsumerExecution(store, question.value.projectId, origin);
+      if (paid.kind === 'response' && Array.isArray(paid.subject.contextWorkspace)) packet = paid.subject;
+    }
+    if (packet?.working?.deliveryContract === 'research-delivery/v1')
+      workspace = recordContextPacket(workspace, packet);
+    const action = admittedResearchAction(turn.value.action);
+    if (action.action !== 'read_context') {
+      workspace = foldContextEvent(workspace, action.action);
+      continue;
+    }
+    // A divided queue entry records its children, not a delivered lookup.
+    if (turn.value.observation && typeof turn.value.observation === 'object'
+      && 'splitInto' in turn.value.observation) continue;
+    const draftRef = intent?.value.draft ?? bindingDraft;
+    const draft = store.get<DiscoveryDraft>(draftRef.id, draftRef.revision);
+    requireCondition(draft?.kind === 'discovery-draft' && canonical(reference(draft)) === canonical(draftRef)
+      && isRef(turn.value.question),
+      'synthesis_session_invalid', 'The planned lookup lost its exact draft or question');
+    const checked = readContextIdentityAt(store, question.value.projectId, draft!, turn.value.question!,
+      action, turn.value.observation);
+    contextReadIdentity(checked);
+    workspace = foldContextEvent(workspace, action.action, turn.value.observation as ContextLookup);
+  }
+  return workspace;
+}
+
 function synthesisSessionShape(value: unknown, id: string): asserts value is SynthesisSessionState {
   if (!object(value) || value.contract !== SYNTHESIS_SESSION_CONTRACT
     || typeof value.projectId !== 'string' || !value.projectId
@@ -256,6 +363,15 @@ export function readSynthesisSession(store: Store, ref: Ref): Revision<Synthesis
     basis: initial.value.basis, binding: initial.value.binding,
     // The runner's reserved position is part of the first record (№1658 К2).
     ...(initial.value.delivery != null ? { delivery: initial.value.delivery } : {}) };
+  if (initial.value.workspace !== undefined) {
+    if (!initial.value.delivery) synthesisSessionInvalid(head.id, 'A direct session cannot inherit a runner context');
+    const question = store.get<Question>(initial.value.binding.question.id, initial.value.binding.question.revision);
+    if (!question || canonical(reference(question)) !== canonical(initial.value.binding.question)
+      || canonical(initial.value.workspace) !== canonical(runnerWorkspaceAt(store, initial.value.delivery,
+        question, initial.value.binding.draft)))
+      synthesisSessionInvalid(head.id, 'The initial context differs from the exact completed runner prefix');
+    expectedInitial.workspace = initial.value.workspace;
+  }
   if (canonical(initial.value) !== canonical(expectedInitial))
     synthesisSessionInvalid(head.id, 'The initial session is not the declared initial cursor');
   const bindingDraft = store.get<DiscoveryDraft>(head.value.binding.draft.id, head.value.binding.draft.revision)!;
@@ -310,9 +426,18 @@ export function readSynthesisSession(store: Store, ref: Ref): Revision<Synthesis
         && object(recovery.selector) && isRef(recovery.selector.record) && typeof recovery.selector.pointer === 'string';
       if (valid) {
         try {
-          const result = exactContextLookup(store, bindingDraft, bindingQuestion,
-            recovery.selector.record, recovery.selector.pointer, recovery.selector.page,
-            record => { readReaderResultAt(store, head.value.projectId, reference(record)); });
+          const prove = (record: Revision<Record<string, any>>) => {
+            readReaderResultAt(store, head.value.projectId, reference(record));
+          };
+          const savedResult = step.value.workspace?.entries.at(-1)?.result as Record<string, any> | undefined;
+          const result = savedResult?.contract === 'research-context-read/v2'
+            ? projectResearchContextSelection(
+              exactContextLookup(store, bindingDraft, bindingQuestion,
+                recovery.selector.record, recovery.selector.pointer, undefined, prove).value,
+              recovery.selector.record, recovery.selector.pointer, recovery.selector.page,
+              savedResult.envelopeLimitChars, 'bounded')
+            : exactContextLookup(store, bindingDraft, bindingQuestion,
+              recovery.selector.record, recovery.selector.pointer, recovery.selector.page, prove);
           const blocked = typeof before.value.workspace?.blocked === 'string' ? before.value.workspace.blocked : null;
           const reason = blocked ?? CONTEXT_RECOVERY_SUPERSEDE_REASON;
           if (blocked === null)
@@ -446,6 +571,8 @@ export function synthesisDeliveryMarks(session: Revision<SynthesisSessionState>,
 export interface SynthesisSessionOptions {
   retryPermits?: readonly Ref[];
   delivery?: SynthesisSessionDelivery | null;
+  initialWorkspace?: ContextWorkspace;
+  initialWorkspaceGuards?: readonly Ref[];
   /** The caller's own reservation record, written atomically with the session
    * revision that carries the reservation (first record or next reservation
    * after a delivered outcome) — one guarded transition, no window (№1658 К2). */
@@ -511,6 +638,11 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
   let previewSeed: Revision<SynthesisSessionState> | null = null;
   if (!store.get(sessionId)) {
     requireCondition(!recovering, 'response_recovery_session_stale', 'The selected recovery session is missing');
+    if (opts.delivery && opts.initialWorkspace
+      && (opts.initialWorkspace.entries.length || opts.initialWorkspace.deliveryCoverage?.length))
+      requireCondition(canonical(opts.initialWorkspace) === canonical(runnerWorkspaceAt(store, opts.delivery,
+        question, reference(draft))),
+        'synthesis_session_invalid', 'The runner context changed before the synthesis session was created');
     // A previous-era unfinished operation of this same task keeps its lawful
     // recovery path (№1555 X04): the new era neither adopts its paid response
     // nor silently buys another one over it — the refusal names that session.
@@ -531,7 +663,10 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
       // The runner's reserved position and logical budget belong to the task
       // from its FIRST record — one guarded transition with the caller's
       // reservation write, never a separate intent-stage window (№1658 К2).
-      ...(opts.delivery ? { delivery: opts.delivery } : {}) };
+      ...(opts.delivery ? { delivery: opts.delivery } : {}),
+      ...(opts.delivery && opts.initialWorkspace
+        && (opts.initialWorkspace.entries.length || opts.initialWorkspace.deliveryCoverage?.length)
+        ? { workspace: opts.initialWorkspace } : {}) };
     if (isResearchPreview()) {
       // Preview leaves no durable records of the new era (№1555 X29): the
       // fresh session seed stays in memory; the intent stays virtual.
@@ -541,7 +676,8 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
       const writes: Write[] = [...(opts.reserve ? [opts.reserve.write] : []),
         { id: sessionId, kind: 'synthesis-session', expected: 0, value: initial }];
       store.writeMany<SynthesisSessionState>(writes,
-        [...(opts.reserve?.guards ?? []), reference(draft), reference(question), reference(environment), ...draft.value.inputs]);
+        [...(opts.reserve?.guards ?? []), ...(opts.initialWorkspaceGuards ?? []),
+          reference(draft), reference(question), reference(environment), ...draft.value.inputs]);
     } catch (error) {
       if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)
         || !store.get(sessionId)) throw error;

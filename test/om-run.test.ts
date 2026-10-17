@@ -2850,8 +2850,13 @@ function lp3Producer(): string {
   const repository = fileURLToPath(new URL("../../", import.meta.url));
   const root = mkdtempSync(join(tmpdir(), "omg-lp3-native-packets-"));
   lp3PacketDirectory = root;
-  const archive = execFileSync("git", ["archive", LP3_PACKET_COMMIT, "src", "package.json"], { cwd: repository, maxBuffer: 50_000_000 });
-  execFileSync("tar", ["-x", "-C", root], { input: archive });
+  const archive = join(root, "archive.tar");
+  execFileSync("git", ["archive", "--format=tar", `--output=${archive}`, LP3_PACKET_COMMIT, "src", "package.json"], { cwd: repository });
+  try {
+    execFileSync("tar", ["-xf", archive, "-C", root]);
+  } finally {
+    rmSync(archive, { force: true });
+  }
   symlinkSync(join(repository, "node_modules"), join(root, "node_modules"), "dir");
   const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
   const files = execFileSync("git", ["ls-tree", "-r", "--name-only", LP3_PACKET_COMMIT, "src"], { cwd: repository, encoding: "utf8" })
