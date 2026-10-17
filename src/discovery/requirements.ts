@@ -1,8 +1,8 @@
 import { sealed } from "../om/refusal.js";
 import type { FieldSpec } from "./discovery.js";
-import { UPSTREAM_DETAILS, UPSTREAM_MOMENT_DETAILS, DISCOVERY_RESEARCH_FIELDS, DISCOVERY_PREPARATION, VERSION6_UPSTREAM_DETAILS } from "./preparation-contracts.js";
+import { UPSTREAM_DETAILS, UPSTREAM_MOMENT_DETAILS, DISCOVERY_RESEARCH_FIELDS, DISCOVERY_PREPARATION, VERSION6_UPSTREAM_DETAILS, DISCOVERY_ANALOGUES_PROMPTS } from "./preparation-contracts.js";
 import { mapDesignSchema } from "../graph/builder.js";
-import type { Json } from "../canonical.js";
+import { canonical, type Json } from "../canonical.js";
 
 const text = { type: "string", minLength: 1 };
 const texts = { type: "array", minItems: 1, uniqueItems: true, items: text };
@@ -57,4 +57,23 @@ export const VERSION6_REQUIREMENTS = sealed(Object.fromEntries(UPSTREAM_STAGES.m
   VERSION5_REQUIREMENTS[stage].map(spec => spec.field === VERSION6_UPSTREAM_DETAILS[stage].field
     ? VERSION6_UPSTREAM_DETAILS[stage] : spec),
 ]))) as unknown as Record<UpstreamStage, FieldSpec[]>;
-export const REQUIREMENTS = VERSION6_REQUIREMENTS;
+export const VERSION6_ANALOGUES_REQUIREMENTS = sealed(structuredClone({ ...VERSION6_REQUIREMENTS,
+  discovery: VERSION6_REQUIREMENTS.discovery.map(spec => Object.hasOwn(DISCOVERY_ANALOGUES_PROMPTS, spec.field)
+    ? { ...spec, prompt: DISCOVERY_ANALOGUES_PROMPTS[spec.field as keyof typeof DISCOVERY_ANALOGUES_PROMPTS] } : spec),
+})) as unknown as Record<UpstreamStage, FieldSpec[]>;
+export const REQUIREMENTS = VERSION6_ANALOGUES_REQUIREMENTS;
+
+/** A saved complete question set selects one known edition; no prompt or schema is exempt. */
+export function selectResearchRequirements(stage: UpstreamStage, version: number, specs: unknown): FieldSpec[] | null {
+  if (!Array.isArray(specs) || !specs.every(spec => spec !== null && typeof spec === "object" && !Array.isArray(spec))) return null;
+  const historical = { 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS,
+    4: VERSION4_REQUIREMENTS, 5: VERSION5_REQUIREMENTS };
+  const tables = version === 6 ? [VERSION6_REQUIREMENTS, VERSION6_ANALOGUES_REQUIREMENTS]
+    : Object.hasOwn(historical, version) ? [historical[version as keyof typeof historical]] : [];
+  const saved = canonical(specs);
+  for (const table of tables) {
+    const expected = table[stage];
+    if (expected && canonical(expected) === saved) return sealed(expected) as unknown as FieldSpec[];
+  }
+  return null;
+}

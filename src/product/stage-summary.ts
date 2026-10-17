@@ -3,8 +3,7 @@ import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { discoveryConstraintBindings, discoveryContext, discoveryDecisionId, discoveryOutcome,
   readDiscoveryConditionDecision, type DiscoveryChoice, type DiscoveryConditionDecision } from "../discovery/discovery-outcome.js";
 import { readAcceptedResearchAnswer, type Decision, type DiscoveryDraft, type Fact, type Question } from "../discovery/discovery.js";
-import { LEGACY_REQUIREMENTS, REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS,
-  VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
+import { UPSTREAM_STAGES, selectResearchRequirements, type UpstreamStage } from "../discovery/requirements.js";
 import type { ResearchAssessment, ResearchRun } from "../discovery/research-model.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Observation, Selector, Source } from "../evidence/evidence.js";
@@ -222,12 +221,6 @@ function candidateFailure(error: unknown, questions: Revision<Question>[]): Summ
   return { code: error.code, message: error.message, question: question ? reference(question) : null };
 }
 
-function requirements(version: number, stage: UpstreamStage) {
-  return (version === 1 ? LEGACY_REQUIREMENTS : version === 2 ? VERSION2_REQUIREMENTS
-    : version === 3 ? VERSION3_REQUIREMENTS : version === 4 ? VERSION4_REQUIREMENTS
-    : version === 5 ? VERSION5_REQUIREMENTS : REQUIREMENTS)[stage];
-}
-
 function researchReportSummary(proofs: ExactProofReader, project: string, plan: FieldRead,
   reportRead: FieldRead): SummaryResearchReport {
   requireCondition(plan.assessment && reportRead.assessment,
@@ -383,9 +376,9 @@ function readAccepted(store: Store, artifact: Revision<StageArtifact>, current: 
     && draft.value.stage === "discovery" && draft.value.level === "R0" && [1, 2, 3, 4, 5, 6].includes(version)
     && same(draft.value.fields, content.fields), "stage_summary_draft_invalid",
   `[${draft.id}] The accepted Discovery draft is malformed, foreign or differs from the stage`);
-  const expected = requirements(version, "discovery");
   const specs = draft.value.questions.map(id => proofs.head<Question>(id, "Discovery question").value.spec);
-  requireCondition(same(specs, expected), "stage_summary_contract_invalid",
+  const expected = selectResearchRequirements("discovery", version, specs);
+  requireCondition(expected && same(specs, expected), "stage_summary_contract_invalid",
     `[${draft.id}] The accepted Discovery questions do not match contract version ${version}`);
   const fields = new Map<string, FieldRead>();
   for (const spec of expected) fields.set(spec.field, readAcceptedField(proofs, artifact, draft, spec.field));
@@ -607,8 +600,9 @@ function readStructuredAccepted(store: Store, artifact: Revision<StageArtifact>,
     && [1, 2, 3, 4, 5, 6].includes(version) && same(draft.value.fields, content.fields)
     && draft.value.inputs.some(ref => same(ref, input)), "stage_summary_draft_invalid",
   `[${draft.id}] The accepted ${stage} draft is malformed, foreign or differs from the stage`);
-  const expected = requirements(version, stage), specs = draft.value.questions.map(id => proofs.head<Question>(id, `${stage} question`).value.spec);
-  requireCondition(same(specs, expected), "stage_summary_contract_invalid",
+  const specs = draft.value.questions.map(id => proofs.head<Question>(id, `${stage} question`).value.spec);
+  const expected = selectResearchRequirements(stage, version, specs);
+  requireCondition(expected && same(specs, expected), "stage_summary_contract_invalid",
     `[${draft.id}] The accepted ${stage} questions do not match contract version ${version}`);
   const fields = new Map(expected.map(spec => [spec.field, readAcceptedField(proofs, artifact, draft, spec.field)]));
   const limitations: string[] = [];

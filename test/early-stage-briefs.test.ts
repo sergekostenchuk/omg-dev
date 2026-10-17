@@ -1,4 +1,4 @@
-import { discoveryContext } from '../src/discovery/discovery-outcome.js';
+import { discoveryContext, discoveryOutcome } from '../src/discovery/discovery-outcome.js';
 import type { DiscoveryDraft } from '../src/discovery/discovery.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +12,7 @@ import {ProductEngine} from '../src/product/engine.js';
 import {reference, type Ref} from '../src/pipeline/contracts.js';
 import {canonical, hashJson, type Json} from '../src/canonical.js';
 import type {Question} from '../src/discovery/discovery.js';
-import {REQUIREMENTS,UPSTREAM_STAGES,VERSION4_REQUIREMENTS,VERSION5_REQUIREMENTS,RESEARCH_CONTRACT_VERSION} from '../src/discovery/requirements.js';
+import {REQUIREMENTS,UPSTREAM_STAGES,VERSION4_REQUIREMENTS,VERSION5_REQUIREMENTS,VERSION6_REQUIREMENTS,RESEARCH_CONTRACT_VERSION} from '../src/discovery/requirements.js';
 import {contextValue,workingContext} from '../src/discovery/working-context.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {previewResearch} from '../src/discovery/research-preview.js';
@@ -26,9 +26,10 @@ import {preparedField} from './preparation-fixture.js';
 import {exampleGraph} from './graph-fixture.js';
 import {enrichedGraph} from './enriched-graph-fixture.js';
 import {designOf} from '../src/graph/builder.js';
+import {DISCOVERY_ANALOGUES_PROMPTS} from '../src/discovery/preparation-contracts.js';
 import {readDiscoveryBasisMaterial,researchPrerequisites} from '../src/discovery/research-context.js';
 
-function fixture(t:test.TestContext, acceptedPrefix=false) {
+function fixture(t:test.TestContext, acceptedPrefix=false, changeValues?:(values:Record<string,Json>)=>void) {
  const root=mkdtempSync(join(tmpdir(),'omg-rs4-')),store=new Store(join(root,'state.sqlite')),engine=new ProductEngine(store);
  t.after(()=>{store.close();rmSync(root,{recursive:true,force:true});});
  if(acceptedPrefix)preparedFeatures(engine,'p');
@@ -36,10 +37,13 @@ function fixture(t:test.TestContext, acceptedPrefix=false) {
  const path=join(root,'adapter.mjs'),log=join(root,'wire.jsonl');
  const values:Record<string,Json>=Object.fromEntries(UPSTREAM_STAGES.flatMap(stage=>REQUIREMENTS[stage].map(s=>[s.field,preparedField('p',s.field)])));
  values['mapDesign']=designOf(enrichedGraph(exampleGraph('p'),'p',values['preparation'],values['conceptSections'])) as unknown as Json;
+ changeValues?.(values);
  const source=engine.discovery.evidence.document('p','fixture',JSON.stringify(values),'application/json',0);
  writeFileSync(join(root,'values.json'),JSON.stringify(values));
  writeFileSync(path,`import{boundDiscoveryValue}from ${JSON.stringify(new URL('./preparation-fixture.js',import.meta.url).href)};
  import{readFileSync,appendFileSync,existsSync,writeFileSync}from'node:fs';
+ import assert from'node:assert/strict';
+ const ds2Prompts=${JSON.stringify(changeValues ? DISCOVERY_ANALOGUES_PROMPTS : {})};
  const root=${JSON.stringify(root)},r=JSON.parse(readFileSync(0,'utf8')),s=r.subject,q=s.question??s.questions?.[0],role=s.continuation.role;
  appendFileSync(${JSON.stringify(log)},JSON.stringify(r)+'\\n');
  const file=root+'/counts.json',counts=existsSync(file)?JSON.parse(readFileSync(file,'utf8')):{},key=s.continuation.question+':'+role;
@@ -47,11 +51,33 @@ function fixture(t:test.TestContext, acceptedPrefix=false) {
  const mode=existsSync(root+'/mode')?readFileSync(root+'/mode','utf8'):'native',source=${JSON.stringify(reference(source))};let research;
  if(mode==='pause')research={action:'pause',reason:'Local envelope fixture'};
  else if(role==='reader')research={selections:s.sources.map(x=>({sourceIndex:x.sourceIndex,firstLine:x.lines[0][0],lastLine:x.lines.at(-1)[0]})),unresolved:[]};
- else if(role==='assessor')research=n===1?{action:'assessment_checkpoint',notes:['Inspect the supplied evidence and candidate.']}:{verdict:'supported',reasons:[]};
+ else if(role==='assessor'){
+  if(ds2Prompts[q.field]){
+   assert.equal(q.prompt,ds2Prompts[q.field]);
+   assert.equal(s.candidatePage.complete,true);assert.equal(s.evidencePage.complete,true);
+   const values=JSON.parse(readFileSync(root+'/values.json','utf8'));
+   assert.deepEqual(s.value,boundDiscoveryValue(q.field,values[q.field],s.discoveryContext));
+   const evidenceFile=root+'/evidence-'+encodeURIComponent(q.id)+'.json';
+   if(s.evidencePage.offset===0){
+    const delivered=s.evidencePage.text===undefined?s.observations:JSON.parse(s.evidencePage.text);
+    writeFileSync(evidenceFile,JSON.stringify(delivered));
+   }
+   const evidence=JSON.parse(readFileSync(evidenceFile,'utf8'));assert.ok(evidence.length>0);
+   if(q.field==='researchReport'){
+    assert.match(s.value.openQuestions[0].reason,/аналогов не найдено/);
+    assert.ok(JSON.stringify(evidence).includes(values.feasibilityEvidence.technology));
+   }
+   if(q.field==='verdict'){
+    assert.equal(s.value.outcome==='go',values.feasibilityEvidence.compatibility!==null);
+    if(s.value.outcome!=='go')assert.match(s.value.reason,/совместимость/);
+   }
+  }
+  research=n===1?{action:'assessment_checkpoint',notes:['Inspect the supplied evidence and candidate.']}:{verdict:'supported',reasons:[]};
+ }
  else if(role==='escalation-assessor')research={necessary:false,reason:'Fixture goal already supplies the choice'};
  else if(n===1)research={action:'read_source',source,start:0,end:${source.value.content.length}};
  else if(mode==='escalation')research={action:'need_owner',question:q.id,reason:'Fixture escalation only',searched:[source]};
- else research={action:'answer',question:q.id,value:boundDiscoveryValue(q.field,JSON.parse(readFileSync(root+'/values.json','utf8'))[q.field],s.discoveryContext),citations:[{source,selector:{kind:'json-pointer',pointer:'/'+q.field}}]};
+ else research={action:'answer',question:q.id,value:boundDiscoveryValue(q.field,JSON.parse(readFileSync(root+'/values.json','utf8'))[q.field],s.discoveryContext),citations:[{source,selector:{kind:'json-pointer',pointer:ds2Prompts[q.field]&&q.field==='researchReport'?'/feasibilityEvidence':'/'+q.field}}]};
  console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:0,outputTokens:0,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
  const command={executable:process.execPath,args:[path]};
  const environment=engine.environments.configure('p',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'medium',command},reviewer:{actor:'assessor',model:'fixture',effort:'medium',command},fullCheck:{executable:process.execPath,args:['--version']},timeoutMs:10000},0);
@@ -429,7 +455,13 @@ test('DS1-01 Discovery v6 keeps the researched plan and prior v4/v5 contracts', 
  assert.deepEqual({...currentPreparation,prompt:priorPreparation.prompt},priorPreparation);
  assert.ok(currentPreparation.prompt.startsWith(priorPreparation.prompt));
  assert.match(currentPreparation.prompt,/discoveryContext.reportConstraints/);
- assert.deepEqual(REQUIREMENTS.discovery,VERSION5_REQUIREMENTS.discovery);
+ assert.deepEqual(VERSION6_REQUIREMENTS.discovery,VERSION5_REQUIREMENTS.discovery);
+ assert.deepEqual(REQUIREMENTS.discovery.map(spec=>Object.hasOwn(DISCOVERY_ANALOGUES_PROMPTS,spec.field)
+  ? {...spec,prompt:VERSION6_REQUIREMENTS.discovery.find(old=>old.field===spec.field)!.prompt}:spec),VERSION6_REQUIREMENTS.discovery);
+ assert.deepEqual(REQUIREMENTS.discovery.filter((spec,index)=>spec.prompt!==VERSION6_REQUIREMENTS.discovery[index]!.prompt).map(spec=>spec.field),
+  ['researchPlan','researchReport','verdict']);
+ for(const [field,prompt] of Object.entries(DISCOVERY_ANALOGUES_PROMPTS))
+  assert.equal(REQUIREMENTS.discovery.find(spec=>spec.field===field)!.prompt,prompt);
  for(const stage of UPSTREAM_STAGES.filter(stage=>stage==='operation-map'||stage==='features'))
   assert.deepEqual(REQUIREMENTS[stage],VERSION4_REQUIREMENTS[stage]);
  for(const stage of ['concept','specification'] as const) {
@@ -488,4 +520,59 @@ test('DS1-08 packed initial and continuation deliver exact accepted grounds to a
   assert.ok(!Object.hasOwn(sent,'discoveryContext')&&JSON.stringify(sent).length<=300000);
   assert.equal(f.store.list('model-call').length,before+2);
  }
+});
+
+
+for(const outcome of ['go','insufficient_evidence'] as const)
+test(`DS2 new plan/report/verdict reach A and B; absent analogues alone allow go (${outcome})`,async t=>{
+ const f=fixture(t,false,values=>{
+  const plan=values['researchPlan'] as any;
+  plan.startingQuestions.push({id:'analogues',question:'Какие полезные решения уже есть в предоставленных материалах?',why:'Использовать или адаптировать подходящее'});
+  plan.sources.push({id:'local-projects',kind:'provided local documents',what:'Проверить только предоставленный локальный проект; внешний поиск не выполнен',why:'Найти пригодные решения в доступных материалах'});
+  values['feasibilityEvidence']={technology:'Native JavaScript string transformation',component:'Node.js local file input/output',
+   compatibility:outcome==='go'?'UTF-8 input and output share the same representation':null,
+   assembly:'Read local UTF-8 text, transform its string, validate and write local UTF-8 output'};
+  const report=values['researchReport'] as any;
+  report.results[0].conclusion=outcome==='go'?'Native JavaScript string transformation and Node.js local file input/output use compatible UTF-8 representations; read, transform, validate and write gives a bounded assembly path.':
+   'Native JavaScript string transformation and Node.js local file input/output are available; the required component compatibility has not been established.';
+  report.openQuestions.push({id:'unknown-analogues',question:'analogues',reason:'аналогов не найдено в предоставленных материалах. Внешний поиск не выполнен; это не утверждение об отсутствии аналогов вообще.'});
+  const verdict=values['verdict'] as any;
+  verdict.outcome=outcome;
+  verdict.reason=outcome==='go'?'Локальная функция обоснована предоставленным описанием преобразования, совместимости входа/выхода и пути сборки. Наличие аналогов не требуется.':
+   'Независимый пробел: совместимость необходимого компонента ещё не установлена.';
+  if(outcome!=='go')report.openQuestions.push({id:'missing-component',question:'feasibility',reason:'Нет данных о совместимости необходимого компонента; это независимый вопрос реализуемости.'});
+ });
+ const draft=f.engine.prepare('p','discovery');
+ for(const id of draft.value.questions){const q=f.store.get<Question>(id)!;
+  if(q.value.spec.kind==='fact')f.engine.discovery.fact(id,q.revision,reference(f.source),{kind:'json-pointer',pointer:'/'+q.value.spec.field});
+  if(q.value.spec.kind==='decision')f.engine.discovery.decision(id,q.revision,'owner',f.values[q.value.spec.field]!);
+ }
+ const result:any=await f.engine.execute({type:'research-stage',project:'p',draftId:draft.id,maxTurns:30});
+ assert.equal(result.discovery?.state,outcome,JSON.stringify({result,providerErrors:f.store.list<any>('model-response').map(row=>row.value.assessmentExecution?.process.stderr??row.value.consumerExecution?.process.stderr).filter(Boolean)}));
+ assert.equal(result.status==='accepted',outcome==='go');
+ const wires=f.wires();
+ for(const [field,prompt] of Object.entries(DISCOVERY_ANALOGUES_PROMPTS)) {
+  const question=f.store.get<Question>(draft.value.questions.find(id=>f.store.get<Question>(id)!.value.spec.field===field)!)!;
+  const packets=wires.filter(w=>w.subject.continuation.question===question.id);
+  assert.deepEqual([...new Set(packets.map(w=>w.subject.continuation.role))].sort(),['analyst','assessor']);
+  for(const packet of packets){assertPacket(f.store,packet);assert.equal(packet.subject.question.prompt,prompt);}
+ }
+ const prompt=DISCOVERY_ANALOGUES_PROMPTS.researchPlan;
+ for(const phrase of ['для программы','для сайта','для исследования','для услуги или продукта','для мероприятия',
+  'определи свои места поиска','текущего и прошлого года','не обязательный список','не выдавай запланированный поиск за выполненный'])assert.ok(prompt.includes(phrase),phrase);
+ assert.match(prompt,/интернете сам по себе не является целью или обязательным действием/);
+ assert.match(DISCOVERY_ANALOGUES_PROMPTS.researchReport,/отдельно — основания реализуемости/);
+ assert.match(DISCOVERY_ANALOGUES_PROMPTS.verdict,/не поддерживай отказ, единственной причиной которого является отсутствие аналога/);
+ const current=f.store.get<DiscoveryDraft>(draft.id)!;
+ const report=current.value.fields['researchReport'] as any,verdict=current.value.fields['verdict'] as any;
+ assert.equal(report.openQuestions[0].question,'analogues');assert.ok(report.results.every((row:any)=>row.citations.length>0));
+ assert.equal(verdict.outcome,outcome);assert.deepEqual(verdict.conditions,[]);
+ const plan=current.value.fields['researchPlan'] as any;
+ assert.ok(plan.sources.length>0);assert.equal('analogues' in plan,false);assert.equal('url' in plan.sources.at(-1),false);
+ const paid=f.store.list('model-call').length,second=new Store(join(f.root,'state.sqlite'));
+ try {
+  const historical=second.get<DiscoveryDraft>(draft.id)!;
+  assert.deepEqual(historical,current);assert.equal(discoveryOutcome(second,historical).state,outcome);
+  assert.equal(second.list('model-call').length,paid);assert.equal(f.wires().length,wires.length);
+ } finally {second.close();}
 });

@@ -1,7 +1,7 @@
 import { canonical, digest, type Json } from "../canonical.js";
 import { Discovery, type Decision, type DiscoveryDraft, type Fact, type Question } from "../discovery/discovery.js";
 import { withInvocationAllowanceReport } from "../discovery/invocation-progress.js";
-import { UPSTREAM_STAGES, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, type UpstreamStage } from "../discovery/requirements.js";
+import { UPSTREAM_STAGES, selectResearchRequirements, type UpstreamStage } from "../discovery/requirements.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Selector, Source } from "../evidence/evidence.js";
 import { isRef, predecessor, reference, stageId, STAGES, uniqueRefs, type Ref, type StageArtifact } from "../pipeline/contracts.js";
@@ -585,14 +585,13 @@ export class EarlyStageDriver {
     const required = prior ? this.engine.pipeline.inspect(project, prior).guards : entryRefs;
     if (canonical(draft.value.inputs) !== canonical(required))
       return reason("early_draft_stale", draft.id, "The saved draft does not name the current prerequisite basis", "inputs");
-    const specs = draft.value.contractVersion === 4 ? VERSION4_REQUIREMENTS[stage]
-      : draft.value.contractVersion === 5 ? VERSION5_REQUIREMENTS[stage]
-      : draft.value.contractVersion === 6 ? VERSION6_REQUIREMENTS[stage] : null;
-    if (!specs) return reason("research_contract_upgrade_required", draft.id, "This unfinished draft has no supported research contract", "contractVersion");
-    if (!Array.isArray(draft.value.questions) || draft.value.questions.length !== specs.length)
+    if (![4, 5, 6].includes(draft.value.contractVersion ?? 1))
+      return reason("research_contract_upgrade_required", draft.id, "This unfinished draft has no supported research contract", "contractVersion");
+    if (!Array.isArray(draft.value.questions))
       return reason("early_draft_invalid", draft.id, "The saved draft lost its complete question set", "questions");
     const questions = draft.value.questions.map(id => this.engine.store.get<Question>(id));
-    if (!questions.every((question, index) => question?.kind === "question" && question.value.projectId === project
+    const specs = selectResearchRequirements(stage, draft.value.contractVersion!, questions.map(question => question?.value.spec));
+    if (!specs || !questions.every((question, index) => question?.kind === "question" && question.value.projectId === project
       && question.value.draftId === draft.id && question.value.stage === stage && question.value.level === "R0"
       && question.value.consumer === draft.value.consumer && canonical(question.value.spec) === canonical(specs[index])))
       return reason("early_draft_invalid", draft.id, "The saved draft questions do not match their stage contract", "questions");

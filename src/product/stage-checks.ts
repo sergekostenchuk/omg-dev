@@ -7,7 +7,7 @@ import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref, type Finding } from "../pipeline/contracts.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, selectResearchRequirements, type UpstreamStage } from "../discovery/requirements.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -269,9 +269,9 @@ export class StageChecks {
     const contract = stageResearchContract(stage as UpstreamStage, version, context.accepted === true);
     if (!contract.supported)
       result.findings.push({ code: "research_contract_upgrade_required", target: stage, message: "New stage acceptance requires the enriched research contract; legacy history remains readable" });
-    const expected = contract.requirements;
     const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
-    if (canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
+    const expected = selectResearchRequirements(stage as UpstreamStage, version, specs);
+    if (!expected || canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
     if (!legacy && result.findings.length === 0) {
       const outcomes = this.store.get<{ projection: { artifacts: Graph['artifacts'] } }>(`graph-layer:${context.projectId}:1`);
       result.findings.push(...preparationFindings(stage, content.fields, name => {
