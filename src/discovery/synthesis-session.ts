@@ -1,7 +1,7 @@
 import { synthesisControls, type FinalizationState } from './synthesis-controls.js';
 import { compactConclusions } from './continuation-packet.js';
-import { activeSynthesisNotes, consolidationNeeded, consolidationLimits, consolidatedProposal, consolidationNotice, COMPACT_CHECKPOINT_INSTRUCTION, type SynthesisNote, type ConsolidationNotice } from './conclusion-consolidation.js';
-import { contextWorkspace, addContextLookup, contextProgress, contextLookupKey, type ContextWorkspace } from "./context-workspace.js";
+import { activeSynthesisNotes, consolidationNeeded, consolidationLimits, consolidatedProposal, consolidationNotice, consolidationPage, CONSOLIDATION_DELIVERY, COMPACT_CHECKPOINT_INSTRUCTION, type SynthesisNote, type ConsolidationNotice } from './conclusion-consolidation.js';
+import { contextWorkspace, addContextLookup, contextProgress, contextLookupKey, requireCompleteContextPacket, type ContextWorkspace } from "./context-workspace.js";
 import { readResearchContext, requireCurrentPriorContext } from "./research-limits.js";
 import type { Store, Revision, Write, TransactionGuard } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
@@ -204,7 +204,14 @@ function synthesisSessionShape(value: unknown, id: string): asserts value is Syn
       && typeof value.delivery.run === 'string' && Number.isSafeInteger(value.delivery.turn))
     || !(value.delivered === undefined || value.delivered === null || isRef(value.delivered))
     || !(value.blockedCode === undefined || typeof value.blockedCode === 'string')
-    || !(value.recoveries === undefined || Array.isArray(value.recoveries)))
+    || !(value.recoveries === undefined || Array.isArray(value.recoveries))
+    || !(value.contextCorrection === undefined || value.contextCorrection === null
+      || object(value.contextCorrection) && value.contextCorrection.code === 'research_context_incomplete'
+        && isRef(value.contextCorrection.record) && typeof value.contextCorrection.pointer === 'string'
+        && ['items', 'utf16'].includes(value.contextCorrection.unit)
+        && Number.isSafeInteger(value.contextCorrection.total) && value.contextCorrection.total > 0
+        && Number.isSafeInteger(value.contextCorrection.next) && value.contextCorrection.next >= 0
+        && Array.isArray(value.contextCorrection.ranges)))
     synthesisSessionInvalid(id, 'The saved synthesis session lost its producer contract');
   if (id !== `synthesis-session:v2:${hashJson([value.binding.draft.id, { id: value.binding.question.id, hash: value.binding.question.hash },
     value.binding.inputs, value.basis.materials, value.basis.previousProposal, value.basis.previousProposalRef])}`)
@@ -549,7 +556,8 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     return { ...context, dispatchMode: 'synthesis', synthesisMaterials: current.basis.materials,
       synthesisSession: sessionId, synthesisState: { offset: current.offset, materialOffset: current.materialOffset ?? 0 },
       synthesisNotes: current.notes, contextWorkspace: workspace.entries.map(entry => entry.result), focus: null,
-      contextControls: controls, contextCheckpointedKeys: workspace.checkpointedKeys ?? [] };
+      contextControls: controls, contextCheckpointedKeys: workspace.checkpointedKeys ?? [],
+      ...(current.contextCorrection ? { contextCorrection: current.contextCorrection } : {}) };
   };
 
   const consolidate = async (head: Revision<SynthesisSessionState>, target = consolidationLimits(pilot.value).target,
@@ -568,7 +576,8 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     requireCondition(Number.isSafeInteger(target) && target > 0 && Number.isSafeInteger(fullTarget) && fullTarget! > 0,
       'research_context_capacity', 'Exact context and unresolved obligations leave no summary capacity inside the fixed limit');
     const goal = { targetChars: tightening ? target : Math.min(target, consolidationLimits(pilot.value).target),
-      fullTargetChars: fullTarget!, format: 2 as const, ...(tightening ? { tightening } : {}) };
+      fullTargetChars: fullTarget!, format: 2 as const,
+      ...(tightening ? { tightening } : {}) };
     const callContext = { ...buildCallContext(head), dispatchMode: 'consolidation', consolidation: goal };
     await prepareAndDrive(head, 'consolidation', callContext, '');
   };
@@ -881,13 +890,17 @@ async function legacySynthesisSession(store: Store, draft: Revision<DiscoveryDra
         'Exact context and unresolved obligations leave no summary capacity inside the fixed limit');
       const goal=recovering?context.consolidation:{targetChars:tightening?target:Math.min(target,consolidationLimits(pilot.value).target),fullTargetChars:fullTarget!,format:2,
         ...(tightening?{tightening}:{})};
+      let delivered: Record<string, any> | undefined;
       const response = researchAction(await researchCall(dispatch.implementer, dispatch, '',
         { ...callContext, dispatchMode: 'consolidation', consolidation: goal }, signal,
-        { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot, session: reference(session!) }));
-      const proposal = consolidatedProposal(response, question.id, current.notes);
+        { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot,
+          session: reference(session!), onContext: packet => { delivered = packet; } }));
+      const selected = delivered?.consolidation?.deliveryContract === CONSOLIDATION_DELIVERY
+        ? consolidationPage(current.notes, goal, delivered?.consolidation) : active;
+      const proposal = consolidatedProposal(response, question.id, current.notes, selected);
       const saved = checkpoint(store, draft, question, { ...proposal, value: proposal as unknown as Json });
       const note: SynthesisNote = { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: current.offset },
-        consolidated: { replaces: active.map(note => note.checkpoint),
+        consolidated: { replaces: selected.map(note => note.checkpoint),
           ...(!recovering || goal.format === 2 ? {format:2 as const,targetChars:goal.targetChars,fullTargetChars:goal.fullTargetChars} : {}),
           ...(tightening?{tightenedFrom:tightening.from}:{}) } };
       const notice=consolidationNotice(note);
@@ -929,7 +942,7 @@ async function legacySynthesisSession(store: Store, draft: Revision<DiscoveryDra
             'synthesis_context_purpose_missing','A final-stage lookup must identify the concrete missing fact or exception before another lookup can be delivered');
         }
         const result=readResearchContext(store,draft,question.id,pilot,action.record,action.pointer,action.page);
-        save({...current,focus:null,workspace:addContextLookup(workspace,result,sent!.contextWorkspace,pilot.value.contextLimits?.maxLookups),
+        save({...current,focus:null,workspace:addContextLookup(workspace,result,sent!.contextWorkspace,pilot.value.contextLimits?.maxLookups,sent),
           ...(controls?.stage === 'final' || final ? {finalization:{lookups:(current.finalization?.lookups??workspace.sinceProgress)+1}} : {})});
       } catch(error) {
         save({...current,workspace:{...workspace,blocked:error instanceof Error?error.message:'Context lookup refused'}});
@@ -939,7 +952,8 @@ async function legacySynthesisSession(store: Store, draft: Revision<DiscoveryDra
     }
     requireCondition(!context.savedOnly || action.action !== "need_research", "research_saved_only", "Finish from saved findings; new source reads are disabled for this recovery");
     if (page.complete && action.action !== "checkpoint") {
-      save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace), result: action }); return action;
+      requireCompleteContextPacket(workspace, sent!);
+      save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace,sent), result: action }); return action;
     }
     requireCondition(["checkpoint", "answer", "answer_delta"].includes(action.action),
       "synthesis_checkpoint_required", "Save partial findings before continuing the remaining already-read materials");
@@ -952,7 +966,7 @@ async function legacySynthesisSession(store: Store, draft: Revision<DiscoveryDra
     const saved = checkpoint(store, draft, question, { action: "checkpoint", question: question.id,
       value: proposal as unknown as Json, citations: proposal.citations,
       unresolved: proposal.action === "checkpoint" ? proposal.unresolved : ["Complete the remaining material pages before accepting this proposal"] });
-    save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace),
+    save({ ...current, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0, focus: null, workspace:contextProgress(workspace,sent),
       ...(page.end === materials.length ? {finalization:{lookups:current.finalization?.lookups??workspace.sinceProgress}} : {}), notes: [...current.notes,
       { checkpoint: reference(saved), proposal, page: { offset: current.offset, end: page.end } }] }, [reference(saved)]);
   }

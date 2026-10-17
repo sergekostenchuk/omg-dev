@@ -8,13 +8,15 @@ test('capacity evicts only packet values, while distinct originals remain unboun
  const a=lookup('a','A'.repeat(550)),b=lookup('b','B'.repeat(550)),c=lookup('c','C'.repeat(550)),d=lookup('d','D'.repeat(550));
  const state=addContextLookup(addContextLookup(addContextLookup(addContextLookup(contextWorkspace(),a),b),c),d);
  assert.equal(state.entries.length,4);
- const packet={contextWorkspace:state.entries.map(entry=>entry.result)} as Record<string,any>;
+ const packet={contextWorkspace:state.entries.map(entry=>entry.result),
+   working:{archive:{id:'research-context:workspace',revision:1,hash:'f'.repeat(64)}}} as Record<string,any>;
  packContextWorkspace(packet,6000,900);
  assert.deepEqual(packet.contextWorkspace,[d]);
- assert.equal(packet.contextIndex.length,4);
+ assert.equal(packet.contextIndexPage?.total,4);
+ assert.ok(packet.contextIndex.length>0&&packet.contextIndex.length<4);
  assert.deepEqual(state.entries.map(entry=>entry.result),[a,b,c,d]);
  const restored=addContextLookup(state,a,packet.contextWorkspace);
- const next={contextWorkspace:restored.entries.map(entry=>entry.result)};
+ const next={contextWorkspace:restored.entries.map(entry=>entry.result),working:packet.working};
  packContextWorkspace(next,6000,900);
  assert.deepEqual(next.contextWorkspace,[a]);
  assert.equal(restored.sinceProgress,5);
@@ -26,7 +28,15 @@ test('a context projection must deliver its newest original and retain the addre
  assert.throws(()=>requireContextDelivery([a,b],{contextWorkspace:[a],contextIndex:[]}),{code:'research_context_undelivered'});
  assert.throws(()=>requireContextDelivery([a,b],{contextWorkspace:[b],contextIndex:[]}),{code:'research_context_undelivered'});
  assert.throws(()=>requireContextDelivery([a],{contextWorkspace:[lookup('foreign','A')]}),{code:'research_context_undelivered'});
- assert.throws(()=>packContextWorkspace({contextWorkspace:[lookup('big','x'.repeat(10000))]},3000,1000),{code:'research_context_undelivered'});
+ const big=lookup('big','x'.repeat(10000));
+ const bounded={contextWorkspace:[big]} as Record<string,any>;
+ packContextWorkspace(bounded,3000,1000);
+ assert.deepEqual(bounded.contextWorkspace,[]);
+ assert.equal(bounded.contextDelivery[0].served.offset,0);
+ assert.ok(bounded.contextDelivery[0].served.end>0);
+ assert.equal(bounded.contextDelivery[0].served.next,bounded.contextDelivery[0].served.end);
+ requireContextDelivery([big],bounded);
+ assert.throws(()=>requireContextDelivery([big],{...bounded,contextIndex:[]}),{code:'research_context_undelivered'});
 });
 
 test('equal text from another source or revision never borrows the original evidence identity',()=>{

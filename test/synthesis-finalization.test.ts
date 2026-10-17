@@ -10,7 +10,7 @@ import { pilotContext } from '../src/discovery/pilot-context.js';
 import { join } from 'node:path';
 import { fixture } from './synthesis-session-fixture.js';
 import { reference } from '../src/pipeline/contracts.js';
-import { contextLookupKey, contextWorkspace, packContextWorkspace } from '../src/discovery/context-workspace.js';
+import { contextLookupKey, contextWorkspace, packContextWorkspace, requireContextDelivery } from '../src/discovery/context-workspace.js';
 import { readResearchContext } from '../src/discovery/research-limits.js';
 import { compactConclusions } from '../src/discovery/continuation-packet.js';
 import { synthesisControls } from '../src/discovery/synthesis-controls.js';
@@ -87,7 +87,11 @@ test('all uncheckpointed originals remain together; capacity failure is explicit
   const f=await fixture(t,20,100000,0.35,0,{},0,'small'),originals=addressed(f,3,1800);
   const packet:Record<string,any>={contextWorkspace:originals};
   packContextWorkspace(packet,9000,7000,{checkpointedKeys:[]});assert.deepEqual(packet.contextWorkspace,originals);
-  assert.throws(()=>packContextWorkspace({contextWorkspace:originals},5000,7000,{checkpointedKeys:[]}),{code:'research_context_capacity'});
+  const bounded: Record<string, any> = { contextWorkspace: originals };
+  packContextWorkspace(bounded, 5000, 7000, { checkpointedKeys: [] });
+  requireContextDelivery(originals, bounded);
+  assert.equal(bounded.contextIndex.length, 3);
+  assert.ok(bounded.contextWorkspace.length > 0 && bounded.contextWorkspace.length < 3);
   const smaller:Record<string,any>={contextWorkspace:originals};
   packContextWorkspace(smaller,6500,7000,{checkpointedKeys:originals.slice(0,2).map(contextLookupKey)});
   assert.ok(smaller.contextWorkspace.some((x:any)=>contextLookupKey(x)===contextLookupKey(originals[2]!)));
@@ -118,6 +122,34 @@ test('a final-stage read is allowed with a purpose after material completion, an
     {store:f.store,draftId:f.draft.id,questionId:f.question.id,purpose:'analyst',pilot:f.pilot,session:reference(session)});
   const p=JSON.parse((await previewResearch(f.invoke)).input);
   assert.equal(p.subject.contextControls.mode,'finalization');assert.equal(p.subject.contextControls.remainingLookups,null);assert.ok(p.prompt.includes('need_research'));assert.ok(p.prompt.includes('read_context'));
+});
+
+test('RD2b accepts C after its explicitly requested page without inventing a whole-parent obligation', async t => {
+  const f = await fixture(t, 20, 100000, 0.35, 0, {}, 0, 'small');
+  await atFinal(f, []);
+  const original = f.store.write({ id: 'research-context:rd2b-c-final', kind: 'research-context', expected: 0,
+    value: { projectId: 'p', draft: reference(f.draft), question: reference(f.question),
+      body: { resources: { a: 'A'.repeat(150000) } } } });
+  const ref = reference(original), baseline = f.store.list('model-call').length;
+  adapter(f, `const calls=existsSync('rd2b-c-calls')?Number(readFileSync('rd2b-c-calls','utf8')):0;
+if(calls>=10)throw Error('The bounded finalization did not finish in ten calls');
+writeFileSync('rd2b-c-calls',String(calls+1));
+const latest=c.contextWorkspace?.at(-1),next=c.contextCorrection?.next??latest?.page?.next??0;
+if(!latest||c.contextCorrection||latest.page?.offset>0&&latest.page?.next!==null)
+  research={action:'read_context',record:${JSON.stringify(ref)},pointer:'/body/resources/a',page:{offset:next,limit:50000},purpose:'Read the next exact saved portion'};
+else research={action:'answer',question:c.question.id,value:{finding:'Only after the full original'},citations:[${JSON.stringify(f.citation)}]};`);
+  const result = await f.invoke();
+  assert.equal(result.action, 'answer');
+  const paid = f.wires().slice(baseline).map(w => w.subject);
+  assert.equal(paid.length, 3,
+    'one addressed read, one remaining synthesis material page, then the final answer');
+  assert.ok(!paid.some(packet => packet.contextCorrection), 'the parent has no invented remaining obligation');
+  assert.deepEqual(paid[2]!.contextWorkspace.at(-1).page,
+    { offset: 0, end: 50000, total: 150000, unit: 'utf16', next: 50000 });
+  assert.equal(f.store.list('model-call').length, baseline + paid.length);
+  const saved = f.store.get<any>(f.before.id)!;
+  assert.equal(saved.value.result.action, 'answer');
+  readSynthesisSession(f.store, reference(saved));
 });
 
 test('a final-stage lookup requires a concrete purpose; a paid invalid response is retained without another invocation',async t=>{

@@ -1,19 +1,22 @@
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
-import { activeSynthesisNotes, consolidationInput } from './conclusion-consolidation.js';
+import { activeSynthesisNotes, consolidationInput, consolidationPage, consolidationFragment,
+  CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
 import { FOUNDATION_FIELDS, contextSections, selectedQuestion, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, stageId, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
-import { planningContext } from "./planning-context.js";
+import { planningContext, requirePlanningNavigation } from "./planning-context.js";
 import { contextTable } from "./context-tables.js";
-import { packContextWorkspace } from "./context-workspace.js";
+import { contextLookupKey, packContextWorkspace, type ContextLookup } from "./context-workspace.js";
 import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summary.js';
+import { addressArchivedMaterials, serveArchivedMaterial, packAddressedValue,
+  requirePacketMaterialDelivery, planResearchDelivery, type AddressedOriginal } from './research-delivery.js';
 
 interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
-export interface ContextPage { offset: number; limit: number }
-const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue lists exact source refs and locations; a structured source TOC may be paged, with total, next and the exact archive address of every section. A heading is navigation, not a reading of its body. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
+export interface ContextPage { offset: number; limit: number; encoding?: 'canonical-json' }
+const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue lists exact source refs and locations; a structured source TOC may be paged, with total, next and the exact archive address of every section. A heading is navigation, not a reading of its body. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. For an oversized object or single array item, page:{offset,limit,encoding:'canonical-json'} reads exact UTF-16 characters of its canonical JSON; continue at served.next without treating a fragment as the complete value. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
 
 export function contextValue(value: unknown, pointer: string): unknown {
   requireCondition(typeof pointer === "string" && (pointer === "" || pointer.startsWith("/")), "selector_invalid", "Use a JSON pointer");
@@ -29,11 +32,16 @@ export function contextValue(value: unknown, pointer: string): unknown {
 export function contextPage(value: unknown, page?: ContextPage) {
   if (!page) return { value };
   requireCondition(Number.isSafeInteger(page.offset) && page.offset >= 0 && Number.isSafeInteger(page.limit) && page.limit > 0
-    && (typeof value === "string" || Array.isArray(value)), "context_page_invalid", "Page a string or array with nonnegative offset and positive limit");
-  requireCondition(page.offset <= value.length, "context_page_invalid", "Page offset exceeds the original value");
-  const end = Math.min(value.length, page.offset + page.limit);
-  return { value: value.slice(page.offset, end), page: { offset: page.offset, end, total: value.length,
-    unit: typeof value === "string" ? "utf16" : "items", next: end < value.length ? end : null } };
+    && (page.encoding === undefined || page.encoding === 'canonical-json')
+    && (page.encoding === 'canonical-json' || typeof value === "string" || Array.isArray(value)),
+    "context_page_invalid", "Page a string, array, or canonical JSON with nonnegative offset and positive limit");
+  const original = page.encoding === 'canonical-json' ? canonical(value) : value as string | unknown[];
+  requireCondition(page.offset <= original.length, "context_page_invalid", "Page offset exceeds the original value");
+  const end = Math.min(original.length, page.offset + page.limit);
+  return { value: original.slice(page.offset, end), page: { offset: page.offset, end, total: original.length,
+    unit: (page.encoding === 'canonical-json' || typeof original === "string" ? "utf16" : "items") as 'utf16' | 'items',
+    next: end < original.length ? end : null,
+    ...(page.encoding === 'canonical-json' ? { encoding: page.encoding } : {}) } };
 }
 
 export function archivedContext(store: Store, draft: Revision<DiscoveryDraft>, ref: Ref) {
@@ -75,6 +83,15 @@ function structuredCatalogue(inventory: any, archive: Ref, maxChars: number): Re
   return { sources: contextTable(sources), files: inventory.files, filesTruncated: inventory.filesTruncated };
 }
 
+function conclusionSources(body: Record<string, any>, archive: Ref, questionId: string): AddressedOriginal[] {
+  for (const field of ['synthesisNotes', 'assessmentNotes', 'checkpoints', 'previousProposal']) {
+    if (body[field] !== undefined) return [{ record: archive, pointer: `/body/${field}`, value: body[field] }];
+  }
+  return (Array.isArray(body['history']) ? body['history'] : []).flatMap((turn: any, index: number) =>
+    turn.action?.question === questionId && ['checkpoint', 'answer', 'answer_delta'].includes(turn.action.action)
+      ? [{ record: archive, pointer: `/body/history/${index}/action`, value: turn.action }] : []);
+}
+
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
   context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
@@ -105,11 +122,40 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     Array.isArray(entry.unresolved) && entry.unresolved.length ? [{ reading: entry.ref ?? null, purpose: entry.purpose ?? null, unresolved: entry.unresolved }] : []);
   const value: Archive = { projectId, draft: reference(draft), question: reference(question), body };
   const id = `research-context:${hashJson(value)}`;
-  const archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
+  let archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
-  const archivedBody = body;
+  let archivedBody = body;
+  const exactArchivedFields = (packet: Record<string, any>, fields: string[]) => fields.filter(field =>
+    Object.hasOwn(packet, field) && packet[field] !== undefined
+      && Object.hasOwn(archivedBody, field)
+      && canonical(packet[field]) === canonical(archivedBody[field]));
+  const materialRecord = (field: string, material: unknown): Ref => {
+    const stable: Archive = { projectId, draft: reference(draft), question: reference(question),
+      body: { [field]: material as Json } };
+    const stableId = `research-context:${hashJson(stable)}`;
+    const saved = store.get(stableId) ?? store.writeMany([
+      { id: stableId, kind: 'research-context', expected: 0, value: stable }],
+      [reference(draft), reference(question), ...draft.value.inputs])[0]!;
+    return reference(saved);
+  };
   const sourceNavigation = hasStructuredSources ? structuredCatalogue(inventory, reference(archive), maxChars) : null;
-  if (sourceNavigation) body = { ...body, sourceCatalogue: sourceNavigation };
+  const plannerCorrections = options.common && options.continuation && body['dispatchMode'] === 'planning'
+    ? correctionIndex(body['history'] as any[] ?? [], reference(archive)) : null;
+  if (sourceNavigation || plannerCorrections?.length) {
+    // Computed transport projections are immutable originals too. Keep the
+    // raw first archive for their embedded source pointers, then bind the
+    // projected values to a second exact archive before measuring any packet.
+    const first = reference(archive);
+    archivedBody = { ...body,
+      ...(sourceNavigation ? { sourceCatalogue: sourceNavigation } : {}),
+      ...(plannerCorrections?.length ? { corrections: plannerCorrections } : {}) };
+    const projected: Archive = { projectId, draft: reference(draft), question: reference(question), body: archivedBody };
+    const projectedId = `research-context:${hashJson(projected)}`;
+    archive = store.get(projectedId) ?? store.writeMany([
+      { id: projectedId, kind: 'research-context', expected: 0, value: projected }],
+      [reference(draft), reference(question), ...draft.value.inputs, first])[0]!;
+    body = archivedBody;
+  }
   const relatedResearch = body['discoveryContext'];
   const relatedCatalogue = body['discoveryBasisCatalogue'];
   const neighborMaterial = body['assessmentContextContract'] === STAGE_NEIGHBOR_CONTEXT
@@ -125,17 +171,36 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (projectedQuestion) body = { ...body, question: projectedQuestion,
     ...(Object.hasOwn(body, 'questions') ? { questions: [projectedQuestion] } : {}) };
   const finish = (packet: Record<string, any>) => {
+    requirePacketMaterialDelivery(packet, reference(archive), (record, pointer) =>
+      contextValue(archivedContext(store, draft, record), pointer));
+    requirePlanningNavigation(packet, reference(archive), archivedBody);
+    if (Object.hasOwn(archivedBody, 'resultCapacity')) requireCondition(
+      Object.hasOwn(packet, 'resultCapacity')
+        && canonical(packet.resultCapacity) === canonical(archivedBody['resultCapacity']),
+      'research_capacity_invalid', 'The paid packet lost its saved result admission');
     if (sourceNavigation) requireCondition(packet.sourceCatalogue !== undefined
-      && canonical(packet.sourceCatalogue) === canonical(sourceNavigation),
+      && canonical(packet.sourceCatalogue) === canonical(sourceNavigation)
+      || packet.working?.navigationAddresses?.some((item: {field:string;record:Ref;pointer:string;sourceHash:string}) =>
+        item.field === 'sourceCatalogue' && canonical(item.record) === canonical(reference(archive))
+        && item.pointer === '/body/inventory' && item.sourceHash === hashJson(inventory))
+      || packet.working?.materialAddresses?.some((item: {field:string;pointer:string;valueHash:string}) =>
+        item.field === 'sourceCatalogue' && item.pointer === '/body/sourceCatalogue'
+        && item.valueHash === hashJson(sourceNavigation)),
       'source_toc_undelivered', 'The packed request lost its exact structured source catalogue');
-    if (relatedResearch !== undefined) requireCondition(packet.discoveryContext
-      && canonical(packet.discoveryContext) === canonical(relatedResearch),
+    if (relatedResearch !== undefined) requireCondition(
+      packet.discoveryContext !== undefined && canonical(packet.discoveryContext) === canonical(relatedResearch)
+      || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>
+        item.field === 'discoveryContext' && item.valueHash === hashJson(relatedResearch)),
     'context_discovery_incomplete', `[${question.id}] The packed question lost its accepted research grounds`);
-    if (relatedCatalogue !== undefined) requireCondition(packet.discoveryBasisCatalogue !== undefined
-      && canonical(packet.discoveryBasisCatalogue) === canonical(relatedCatalogue),
+    if (relatedCatalogue !== undefined) requireCondition(
+      packet.discoveryBasisCatalogue !== undefined && canonical(packet.discoveryBasisCatalogue) === canonical(relatedCatalogue)
+      || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>
+        item.field === 'discoveryBasisCatalogue' && item.valueHash === hashJson(relatedCatalogue)),
     'context_discovery_incomplete', `[${question.id}] The packed question lost its exact Discovery basis catalogue`);
     if (neighborMaterial) requireCondition(packet.assessmentContextContract === STAGE_NEIGHBOR_CONTEXT
-      && packet.stageNeighbors !== undefined && canonical(packet.stageNeighbors) === canonical(neighborMaterial.stageNeighbors),
+      && (packet.stageNeighbors !== undefined && canonical(packet.stageNeighbors) === canonical(neighborMaterial.stageNeighbors)
+        || packet.working?.materialAddresses?.some((item: {field:string;valueHash:string}) =>
+          item.field === 'stageNeighbors' && item.valueHash === hashJson(neighborMaterial.stageNeighbors))),
     'context_stage_neighbors_incomplete', `[${question.id}] The packed assessor lost its accepted stage neighbors`);
     if (contract) {
       for (const [field, expected] of Object.entries(contract))
@@ -151,30 +216,111 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     requireCondition(Array.isArray(body['synthesisNotes']) && body['consolidation']
       && Number.isSafeInteger(body['consolidation'].targetChars) && body['consolidation'].targetChars > 0,
     'consolidation_context_invalid', 'Consolidation needs its saved notes and bounded output target');
-    const packet = { dispatchMode: 'consolidation', question: projectedQuestion, ...neighborMaterial,
+    const goal = body['consolidation'];
+    const active = activeSynthesisNotes(body['synthesisNotes']);
+    const makePacket = (count: number, bounded: boolean) => ({ dispatchMode: 'consolidation', question: projectedQuestion, ...neighborMaterial,
+      ...(Object.hasOwn(body, 'resultCapacity') ? { resultCapacity: body['resultCapacity'] } : {}),
       ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
       synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
-      consolidation: {...consolidationInput(body['synthesisNotes'], body['consolidation'].targetChars, body['consolidation'].format === 2 ? 2 : 1),
-        ...(body['consolidation'].tightening ? {tightening:body['consolidation'].tightening} : {})},
-      working: { archive: reference(archive), instruction: 'Original notes are immutable at /body/synthesisNotes. No new material is delivered in this step.',
-        sections: [{ pointer: '/body/synthesisNotes' }] } };
+      consolidation: {...consolidationInput(bounded ? active.slice(0, count) : active,
+        goal.targetChars, goal.format === 2 ? 2 : 1),
+        ...(bounded ? { deliveryContract: CONSOLIDATION_DELIVERY,
+          selection: active.slice(0, count).map(note => note.checkpoint),
+          page: { offset: 0, end: count, total: active.length, next: count < active.length ? count : null },
+        } : {}),
+        ...(goal.tightening ? {tightening:goal.tightening} : {})},
+      working: { archive: reference(archive), deliveryContract: 'research-delivery/v1', instruction:
+        bounded
+          ? 'Original notes are immutable at /body/synthesisNotes. This packet covers only consolidation.page; the remaining active notes require later consolidation. No new source material is delivered.'
+          : 'Original notes are immutable at /body/synthesisNotes. No new material is delivered in this step.',
+        sections: [{ pointer: '/body/synthesisNotes' }] } });
+    let count = active.length;
+    let packet = makePacket(count, false);
+    if (JSON.stringify(packet).length > maxChars) {
+      packet = makePacket(count, true);
+      while (JSON.stringify(packet).length > maxChars && count > 1) packet = makePacket(--count, true);
+      if (JSON.stringify(packet).length > maxChars && count === 1
+        && typeof body['synthesisSession'] === 'string'
+        && body['synthesisSession'].startsWith('synthesis-session:v2:')) {
+        const original = active[0]!;
+        const previous = active.find(note => note.consolidated?.partial
+          && canonical(note.consolidated.partial.original) === canonical(original.checkpoint)) ?? null;
+        requireCondition(original.proposal.action === 'checkpoint'
+          && (!previous || previous.proposal.action === 'checkpoint'),
+        'consolidation_coverage_invalid', 'Partial consolidation needs saved checkpoint proposals');
+        const sourceIndex = body['synthesisNotes'].findIndex((note: typeof original) =>
+          canonical(note.checkpoint) === canonical(original.checkpoint));
+        const offset = previous?.consolidated?.partial?.end ?? 0;
+        const encoded = canonical(original.proposal), pointer = `/body/synthesisNotes/${sourceIndex}/proposal`;
+        const originalPage = { record: reference(archive), pointer, value: original.proposal,
+          page: { offset, end: encoded.length, total: encoded.length, unit: 'utf16', next: null,
+            encoding: 'canonical-json' as const } };
+        const fragmentPacket: Record<string, any> = {
+          dispatchMode: 'consolidation', question: projectedQuestion, ...neighborMaterial,
+          ...(Object.hasOwn(body, 'resultCapacity') ? { resultCapacity: body['resultCapacity'] } : {}),
+          ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
+          synthesisSession: body['synthesisSession'], synthesisState: body['synthesisState'],
+          consolidation: { targetChars: goal.targetChars, deliveryContract: CONSOLIDATION_FRAGMENT,
+            notes: [{ original: original.checkpoint,
+              previous: previous ? { checkpoint: previous.checkpoint,
+                value: previous.proposal.action === 'checkpoint' ? previous.proposal.value : null } : null }],
+            citations: [], references: [], unresolved: [],
+            fragment: { original: original.checkpoint, previous: previous?.checkpoint ?? null,
+              sourceIndex, offset, total: encoded.length },
+            ...(goal.tightening ? { tightening: goal.tightening } : {}) },
+          working: { archive: reference(archive), deliveryContract: 'research-delivery/v1',
+            instruction: 'This is one exact UTF-16 fragment of the saved note. Summarize only the supplied fragment together with previous, retaining every finding and uncertainty. Return a checkpoint with summaries for note index 0 and citationIds:[]. The engine retains the original note and its citations/unresolved until every fragment has been delivered; never infer the unseen remainder.',
+            sections: [{ pointer: '/body/synthesisNotes' }] },
+        };
+        const key = hashJson({ record: originalPage.record, pointer, value: originalPage.value });
+        const available = maxChars - JSON.stringify(fragmentPacket).length - 1024;
+        const delivery = available > 0 ? planResearchDelivery(originalPage, key, maxChars, available, candidate => {
+          fragmentPacket.materialDelivery = [candidate];
+          return JSON.stringify(fragmentPacket).length <= maxChars - 1024;
+        }) : null;
+        requireCondition(delivery, 'research_context_capacity',
+          'The mandatory consolidation question and prior partial summary leave no room for a positive saved note fragment');
+        fragmentPacket.materialDelivery = [delivery];
+        consolidationFragment(body['synthesisNotes'], goal, fragmentPacket);
+        return finish(fragmentPacket);
+      }
+      consolidationPage(body['synthesisNotes'], goal, packet.consolidation);
+    }
     requireCondition(JSON.stringify(packet).length <= maxChars, 'consolidation_input_limit',
       'The notes-only consolidation request exceeds the fixed ceiling; do not raise it or repeat a paid call');
     return finish(packet);
   }
   if (options.common && !options.continuation && !body['core'] && !body['synthesisState'] && !body['assessmentState']) {
     const {priorEvidence:_priorEvidence,priorEvidenceSources:_priorEvidenceSources,...initialBody}=body;
-    const initial:Record<string,any>={...initialBody,working:{archive:reference(archive),instruction,sections:contextSections(archivedBody)}};
+    const initial:Record<string,any>={...initialBody,working:{archive:reference(archive),deliveryContract:'research-delivery/v1',instruction,sections:contextSections(archivedBody)}};
     if (initial.inventory) {
       if (sourceNavigation) delete initial.inventory;
       else delete initial.sourceCatalogue;
     }
-    packContextWorkspace(initial,maxChars,options.contextChars);
+    // Two saved collections can each exceed the packet. Remove the full
+    // history while planning context pages, then page history from its exact
+    // archive address in the remaining space. Neither can crowd the other's
+    // positive first fragment out before the planner measures it.
+    const fullHistory = Object.hasOwn(initial, 'history') ? initial.history : undefined;
+    if (fullHistory !== undefined) delete initial.history;
+    const addressed = addressArchivedMaterials(initial, reference(archive),
+      exactArchivedFields(initial, ['fields', 'discoveryContext', 'discoveryBasisCatalogue',
+        'prerequisites', 'operationMap', 'inventory', 'consumerFeedback', 'request', 'sourceCatalogue']),
+      maxChars, materialRecord);
+    packContextWorkspace(initial,maxChars,options.contextChars,undefined,
+      addressed.length || fullHistory !== undefined ? 4096 : 1024);
+    if (fullHistory !== undefined) {
+      initial.history = fullHistory;
+      addressed.push(...addressArchivedMaterials(initial, reference(archive),
+        exactArchivedFields(initial, ['history']), maxChars, materialRecord));
+    }
+    serveArchivedMaterial(initial, addressed, maxChars);
     packPriorEvidence(initial,priorSources,reference(archive),maxChars);
     requireCondition(JSON.stringify(initial).length<=maxChars,'pilot_core_limit','Initial question context exceeds its declared envelope bound');
     return finish(initial);
   }
   if (options.continuation) {
+    const exactWorkspace = body['contextWorkspace'];
     const previousBody=options.previous?store.get<Archive>(options.previous.id,options.previous.revision)?.value.body:undefined;
     const mapMaterial = (value: Record<string, any> | undefined) => Array.isArray(value?.['prerequisites'])
       ? value['prerequisites'].find((item: any) => item.stage === 'concept')?.operationMapMaterial : undefined;
@@ -206,6 +352,10 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     const candidate=dynamic['candidate'],proposalChanges=dynamic['proposalChanges'],assessmentValue=dynamic['value'];
     const original=body;
     body = replaceFoundationCopies(dynamic, body, reference(archive), store);
+    // A saved lookup is an original, not a repeat of the foundation. Replacing
+    // its value inside the copy-removal walk changes its identity and makes a
+    // valid paid read fail the delivery proof (including inventory lookups).
+    if (exactWorkspace !== undefined) body['contextWorkspace'] = exactWorkspace;
     if (newMapPrerequisites) body['prerequisites'] = newMapPrerequisites;
     if (projectedQuestion) { body['question'] = projectedQuestion; if (Object.hasOwn(original, 'questions')) body['questions'] = [projectedQuestion]; }
     if(original['assessmentState'])body['value']=assessmentValue;
@@ -217,7 +367,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if(proposalChanges) body['proposalChanges']=replaceFoundationCopies(proposalChanges,{...original,previousProposal:undefined},reference(archive),store);
   }
   if (options.common && options.continuation && body['dispatchMode']==='planning') {
-    body['corrections']=(body['history'] as any[] ?? []).filter(t=>t.error).map(t=>({number:t.number,action:t.action,error:t.error,feedback:t.feedback}));
+    body['corrections'] = archivedBody['corrections'] ?? [];
     delete body['history'];
   }
   if (options.common) {
@@ -226,32 +376,50 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     body['conclusionRefs']=conclusions.references; body['conclusionUnresolved']=conclusions.unresolved; body['conclusionEncoding']=CONCLUSION_ENCODING;
     if(body['history']) {
       const history=body['history'] as any[];
-      const read=[...history].reverse().find(h=>h.action && typeof h.action==='object' && ['read','read_source','read_context','search','web_search','web_fetch'].includes(h.action.action));
-      if(read) body['currentRead']=read;
+      const readIndex=history.findLastIndex(h=>h.action && typeof h.action==='object'
+        && ['read','read_source','read_context','search','web_search','web_fetch'].includes(h.action.action));
+      if(readIndex >= 0) {
+        const read = history[readIndex];
+        const originalRead = (archivedBody['history'] as any[] | undefined)?.[readIndex];
+        const observation = originalRead?.observation;
+        const key = originalRead?.action?.action === 'read_context' && observation
+          ? contextLookupKey(observation as ContextLookup) : null;
+        const alreadyAddressed = key && Array.isArray(body['contextWorkspace'])
+          && (body['contextWorkspace'] as ContextLookup[]).some(item => contextLookupKey(item) === key);
+        body['currentRead'] = alreadyAddressed
+          ? { action: read.action, original: { record: reference(archive), pointer: `/body/history/${readIndex}` },
+              contextKey: key, delivery: 'contextWorkspace/contextDelivery' }
+          : read;
+      }
       body['corrections']=correctionIndex(history,reference(archive));delete body['history'];
     }
     delete body['synthesisNotes']; delete body['assessmentNotes']; delete body['checkpoints'];
   }
   if (body['dispatchMode'] === "planning" && !options.continuation) {
-    const reserved = (relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length)
+    const side = { ...(relatedResearch === undefined ? {} : { discoveryContext: relatedResearch }),
+      ...(relatedCatalogue === undefined ? {} : { discoveryBasisCatalogue: relatedCatalogue }),
+      ...(neighborMaterial ?? {}) };
+    const fullReserved = (relatedResearch === undefined ? 0 : JSON.stringify({discoveryContext:relatedResearch}).length)
       + (relatedCatalogue === undefined ? 0 : JSON.stringify({discoveryBasisCatalogue:relatedCatalogue}).length)
       + (neighborMaterial ? JSON.stringify(neighborMaterial).length : 0);
-    const packet = planningContext(body,reference(archive),maxChars-reserved
-      -(sourceNavigation ? JSON.stringify({ sourceCatalogue: sourceNavigation }).length : 0),
+    const reserved = Math.min(fullReserved, 8192);
+    const packet = planningContext(sourceNavigation ? body : { ...body, sourceCatalogue: undefined },
+      reference(archive),maxChars-reserved,
       options.contextChars,archivedBody);
-    if(sourceNavigation)packet.sourceCatalogue=sourceNavigation;
-    if(relatedResearch !== undefined)packet.discoveryContext=relatedResearch;
-    if(relatedCatalogue !== undefined)packet.discoveryBasisCatalogue=relatedCatalogue;
-    if(neighborMaterial)Object.assign(packet,neighborMaterial);
+    Object.assign(packet, side);
+    const addressed = addressArchivedMaterials(packet, reference(archive),
+      exactArchivedFields(packet, ['discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors']),
+      maxChars, materialRecord);
+    if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = ["assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation
     ? [...mandatory.filter(key=>FOUNDATION_FIELDS.includes(key as any)),...mandatory.filter(key=>!FOUNDATION_FIELDS.includes(key as any))] : mandatory;
   const packet: Record<string, any> = Object.fromEntries(ordered.filter(key => Object.hasOwn(body, key)).map(key => [key, body[key]]));
-  packet.working = { archive: reference(archive), instruction,
+  packet.working = { archive: reference(archive), deliveryContract: 'research-delivery/v1', instruction,
     sections: contextSections(archivedBody, Object.keys(archivedBody).filter(key => !mandatory.includes(key))).map(section => {
       const value = contextValue({ body: archivedBody }, section.pointer);
       return { ...section, chars: JSON.stringify(value).length,
@@ -259,11 +427,36 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     }), omitted: [] as string[] };
   // Defaults preserve the action protocol's collection shapes, not completeness.
   Object.assign(packet, { readings: [], directReadings: [], history: [], observations: [], checkpoints: [] });
+  const addressedCore = addressArchivedMaterials(packet, reference(archive),
+    exactArchivedFields(packet, ['fields', 'discoveryContext', 'discoveryBasisCatalogue', 'stageNeighbors',
+      'prerequisites', 'operationMap', 'inventory', 'request', 'consumerFeedback',
+      'answerContext', 'currentRead', 'originals', 'corrections', 'researchScope',
+      'mapStatus', 'mapStatusFindings', 'readPlanStatus', 'openGaps', 'failures', 'sourceCatalogue',
+      'savedEvidence', 'unresolvedEvidence', 'webResearch', 'synthesisNotes',
+      'candidate', 'proposalChanges']), maxChars, materialRecord);
   const retained = body['contextControls']?.version === 2 && body['synthesisState'];
   const conclusionKeys = ['conclusions','conclusionCitations','conclusionRefs','conclusionUnresolved','conclusionEncoding'];
   const carry = Object.fromEntries(conclusionKeys.filter(key => Object.hasOwn(packet,key)).map(key => [key,packet[key]]));
   if (retained) for (const key of conclusionKeys) delete packet[key];
-  packContextWorkspace(packet,maxChars,options.contextChars,retained ? {checkpointedKeys:body['contextCheckpointedKeys']??[]} : undefined);
+  const addressedConclusions = !retained && packet.conclusions && (JSON.stringify(packet).length > maxChars - 1024
+    || JSON.stringify(packet.conclusions).length > Math.floor(maxChars / 3))
+    ? conclusionSources(archivedBody, reference(archive), questionId) : [];
+  if (addressedConclusions.length) {
+    packet.working.conclusionOrigins = addressedConclusions.map(item => ({ record: item.record, pointer: item.pointer,
+      chars: JSON.stringify(item.value).length }));
+    delete packet.conclusions;
+    packet.working.omitted = [...new Set([...packet.working.omitted, 'conclusions'])];
+    packet.working.instruction += ' conclusionOrigins names the exact saved material behind the omitted conclusions; read those addresses before relying on an incomplete conclusion.';
+  }
+  packContextWorkspace(packet,maxChars,options.contextChars,
+    retained ? {checkpointedKeys:body['contextCheckpointedKeys']??[]} : undefined,
+    addressedConclusions.length || addressedCore.length ? 4096 : 1024);
+  // Only one material fragment occupies this slot. If a full saved field is
+  // already addressed, its first fragment has priority; conclusions retain
+  // their exact source addresses without consuming that same space twice.
+  if (addressedCore.length) serveArchivedMaterial(packet, addressedCore, maxChars);
+  else if (addressedConclusions.length) packAddressedValue(packet, 'conclusions',
+    addressedConclusions[addressedConclusions.length - 1]!, maxChars);
   if (retained) {
     const total = Math.max(0,maxChars-JSON.stringify(packet).length-2176);
     const dictionaries = {...carry}; delete dictionaries['conclusions'];
@@ -287,7 +480,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     return false;
   };
   // Reserve room for the addresses even when a value cannot be included.
-  packet.working.omitted = Object.keys(archivedBody).filter(key => !mandatory.includes(key));
+  packet.working.omitted = [...new Set([...packet.working.omitted,
+    ...Object.keys(archivedBody).filter(key => !mandatory.includes(key))])];
   if (length() > maxChars) throw new EngineError("pilot_core_limit", "Required context index exceeds the working limit", { required: length() });
   const isAssessor = Object.hasOwn(body, "assessmentState");
   packet.working.maxPageChars = Math.max(1, maxChars - length() - 512);
@@ -376,7 +570,9 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       const piece=(n:number)=>({offset,end:offset+n,total:encoded.length,complete:offset+n===encoded.length,encoding:'json-string-fragment',text:encoded.slice(offset,offset+n),original:{record:reference(archive),pointer:'/body/value'}});
       while(lo<hi){const mid=Math.ceil((lo+hi)/2);packet.candidatePage=piece(mid);if(length()<=limit)lo=mid;else hi=mid-1;}
       packet.candidatePage=piece(lo);
-      requireCondition(lo>0||offset===encoded.length,'continuation_packet_limit','No room for candidate evidence; split the assessment contract');
+      requireCondition(lo > 0 || offset === encoded.length,
+        options.continuation ? 'continuation_packet_limit' : 'pilot_core_limit',
+        'No room for candidate evidence beside the required assessment context');
     }
   }
   // Evidence pages for the assessor: concatenate fragments to recover the exact

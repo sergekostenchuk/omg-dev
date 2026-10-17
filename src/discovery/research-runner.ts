@@ -48,7 +48,7 @@ import { readBundle, readReaderResultAt, resumeReadBundleIntent } from "./reader
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead,
   addressedWorkspace, findAcceptedPaidAnswerChain } from "./research-continuation.js";
-import { addContextLookup } from './context-workspace.js';
+import { addContextLookup, requireCompleteContextPacket } from './context-workspace.js';
 import { dispatchMode, queueReadingPlan, queuedChildReached, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
 import { replayableLegacyCall } from "./response-replay.js";
@@ -610,7 +610,13 @@ export class Researcher {
         const inventory = sources.inventory();
         const checkpoints = pilot ? this.store.list<any>("research-checkpoint").filter(c => c.value.projectId === project
           && c.value.question.id === pending[0]!.id).map(c => ({ ref: reference(c), ...c.value })) : [];
-        const workspace=addressedWorkspace(this.store,turns,pending[0]!);
+        const workspace=addressedWorkspace(this.store,turns,pending[0]!, turn => {
+          const origin = (turn.value as Partial<ManagedResearchTurn>).consumerIntent;
+          if (!isRef(origin)) return null;
+          const paid = readResearchConsumerExecution(this.store, project, origin);
+          return paid.kind === 'response' && Array.isArray(paid.subject.contextWorkspace)
+            ? paid.subject : null;
+        });
         const related = forcedPendingTurn ? { context: null, guards: [] }
           : discoveryContext(this.store, draft, pending[0]!);
         const conceptMaterial = draft.value.contractVersion === 6 && ['concept', 'specification'].includes(draft.value.stage)
@@ -843,6 +849,9 @@ export class Researcher {
         let ownerHadPriorRead = false;
         let webOutcome: WebResearchOutcome | null = null;
         try {
+          if (sent?.working?.deliveryContract === 'research-delivery/v1'
+            && (action.action === 'answer' || action.action === 'answer_delta'))
+            requireCompleteContextPacket(workspace, sent);
           if (early && (pendingTurn.value as Partial<ManagedResearchTurn>).contract === 'research-consumer-turn/v1'
             && isRef(pendingTurn.value.question) && (!('question' in action) || action.question === pendingTurn.value.question.id)) {
             const producer = readResearchConsumerIntent(this.store, (pendingTurn.value as ManagedResearchTurn).consumerIntent);
@@ -1121,6 +1130,12 @@ export class Researcher {
               turnProof = { kind: 'technical-refusal', result: {
                 ref: failure.prepared.ref,
                 value: failure.prepared.write.value as ManagedProposalRefusal } };
+            } else if (failure.code === 'research_context_incomplete' && sent) {
+              const proof = { kind: 'context-incomplete' as const, workspace, subject: sent };
+              const projected = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, proof);
+              const observation = projected.observation as {code?:unknown;details?:unknown}|null;
+              if (observation?.code === failure.code && projected.error === failure.message
+                && canonical(observation.details) === canonical(failure.details)) turnProof = proof;
             } else if (failure.code === 'owner_escalation_premature' && ownerConsulted) {
               turnProof = { kind: 'premature-owner', consulted: ownerConsulted,
                 hadPriorRead: ownerHadPriorRead };

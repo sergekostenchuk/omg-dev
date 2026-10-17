@@ -23,7 +23,8 @@ export function readResearchContext(store: Store, draft: Revision<DiscoveryDraft
 
 export function requireCurrentPriorContext(store:Store,draft:Revision<DiscoveryDraft>,result:ContextLookup){
   if(store.get(result.record.id,result.record.revision)?.kind!=='reader-result')return;
-  const page=result.page?{offset:result.page.offset,limit:result.page.end-result.page.offset}:undefined;
+  const page=result.page?{offset:result.page.offset,limit:result.page.end-result.page.offset,
+    ...(result.page.encoding === 'canonical-json' ? { encoding: result.page.encoding } : {})}:undefined;
   const current=readPilotContext(store,draft,result.record,result.pointer,Number.MAX_SAFE_INTEGER,page);
   requireCondition(canonical(current)===canonical(result),'research_evidence_stale','Prior context changed before its consumer was invoked');
 }

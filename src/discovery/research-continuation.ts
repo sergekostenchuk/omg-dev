@@ -11,10 +11,10 @@ import { archivedContext, contextValue } from "./working-context.js";
 import { readerResultCurrent, readReaderResultAt } from "./reader.js";
 import { isReaderResultRef } from "./pilot-context.js";
 import { EngineError } from "../errors.js";
-import { foldContextEvent, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
+import { foldContextEvent, recordContextPacket, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
-import { projectCheckpointValue, admittedResearchAction, matchAcceptedPaidAnswer,
-  type AcceptedPaidAnswerInputs } from './research-consumer-transition.js';
+import { projectCheckpointValue, admittedResearchAction, contextReadIdentity, matchAcceptedPaidAnswer,
+  type AcceptedPaidAnswerInputs, type ProjectedContextRead } from './research-consumer-transition.js';
 import { expandLayerDelta } from './layer-delta.js';
 
 /** Keep one latest proposal even after many reads push its turn out of the
@@ -127,13 +127,32 @@ export function workingSelections(store: Store, turns: Revision<ResearchTurn>[],
 
 /** Reconstruct this question's addressed originals across run boundaries.
  * Old turns are read as history, not re-executed or retroactively rejected. */
-export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],question:Revision<Question>):ContextWorkspace {
+export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],question:Revision<Question>,
+  packetForTurn?: (turn: Revision<ResearchTurn>) => Record<string, any> | null):ContextWorkspace {
   let workspace:ContextWorkspace={entries:[],sinceProgress:0};
   for(const turn of turns){
     if(turn.value.question?.id!==question.id||turn.value.status!=='completed'||turn.value.error)continue;
+    const packet = packetForTurn?.(turn);
+    if (packet?.working?.deliveryContract === 'research-delivery/v1')
+      workspace = recordContextPacket(workspace, packet);
     const action=(turn.value.action as ResearchAction).action;
     if(action!=='read_context') { workspace=foldContextEvent(workspace,action); continue; }
-    const result=latestFocus(store,[turn],question) as ContextLookup|null;
+    let result: ContextLookup | null;
+    if (packet?.working?.deliveryContract === 'research-delivery/v1') {
+      const action = admittedResearchAction(turn.value.action);
+      requireCondition(action.action === 'read_context' && isRef(turn.value.question),
+        'research_consumer_intent_invalid', 'The saved page lost its paid context action');
+      const record = store.get(action.record.id, action.record.revision);
+      requireCondition(record && canonical(reference(record)) === canonical(action.record),
+        'research_consumer_intent_invalid', 'The saved page lost its exact original record');
+      const observation = turn.value.observation as ProjectedContextRead;
+      result = observation;
+      const reader = isReaderResultRef(action.record)
+        ? readReaderResultAt(store, question.value.projectId, action.record) : null;
+      contextReadIdentity({ projectId: question.value.projectId, action, observation,
+        recordKind: record.kind, recordValue: record.value, question: turn.value.question,
+        ...(reader ? { readerResult: { ref: action.record, value: reader.value } } : {}) });
+    } else result = latestFocus(store,[turn],question) as ContextLookup|null;
     if(!result)continue;
     workspace=foldContextEvent(workspace,action,result);
   }

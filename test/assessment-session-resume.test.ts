@@ -25,7 +25,7 @@ import { EngineError } from '../src/errors.js';
 import { hashJson } from '../src/canonical.js';
 
 const verdict = { verdict: 'supported', reasons: [] };
-function resumeFixture(t: test.TestContext, mode: 'verdict' | 'checkpoint' | 'read_context' = 'verdict') {
+function resumeFixture(t: test.TestContext, mode: 'verdict' | 'checkpoint' | 'read_context' | 'oversized-context' | 'premature-context' = 'verdict') {
   const root = mkdtempSync(join(tmpdir(), 'omg-assessment-resume-')), workspace = join(root, 'repo'), database = join(root, 'db.sqlite');
   mkdirSync(workspace); git(workspace, ['init', '-b', 'main']); writeFileSync(join(workspace, 'README.md'), 'AB\n');
   git(workspace, ['add', '.']); git(workspace, ['-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'base']);
@@ -33,9 +33,17 @@ function resumeFixture(t: test.TestContext, mode: 'verdict' | 'checkpoint' | 're
   t.after(() => { for (const store of opened) store.close(); rmSync(root, { recursive: true, force: true }); });
   const store = fresh(), engine = new ProductEngine(store), wire = join(root, 'wire.ndjson'), adapter = join(root, 'adapter.mjs');
   engine.execute({ type: 'create-project', project: 'p', title: 'Assessment continuation' });
-  writeFileSync(adapter, `import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+  writeFileSync(adapter, `import{readFileSync,appendFileSync,writeFileSync,existsSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
 appendFileSync(${JSON.stringify(wire)},JSON.stringify(r)+'\\n');
+const latest=s.contextWorkspace?.at(-1),fragment=s.contextDelivery?.[0];
+const next=fragment?.served?.next??latest?.page?.next??null;
 const research=${JSON.stringify(mode)}==='checkpoint'&&s.assessmentState.offset===0?{action:'assessment_checkpoint',notes:['Compare both original operands']}:
+${JSON.stringify(mode)}==='premature-context'&&s.contextWorkspace.length&&!existsSync(${JSON.stringify(join(root,'premature-verdict'))})?
+  (writeFileSync(${JSON.stringify(join(root,'premature-verdict'))},'1'),{verdict:'supported',reasons:[]}):
+${JSON.stringify(mode)}==='premature-context'&&(!s.contextWorkspace.length||s.failures?.[0]?.code==='research_context_incomplete'||next!==null)?
+  {action:'read_context',record:fragment?.original?.record??latest?.record??s.working.archive,pointer:'/body/resources/a',page:{offset:s.failures?.[0]?.details?.next??next??0,limit:50000}}:
+${JSON.stringify(mode)}==='oversized-context'&&(!s.contextWorkspace.length||next!==null)?
+  {action:'read_context',record:fragment?.original?.record??latest?.record??s.working.archive,pointer:'/body/resources/a',...(!s.contextWorkspace.length&&!s.failures?.length?{}:{page:{offset:next??0,limit:50000}})}:
 ${JSON.stringify(mode)}==='read_context'&&!s.contextWorkspace.length?{action:'read_context',record:s.working.archive,pointer:'/body/resources/a'}:{verdict:'supported',reasons:[]};
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const command = { executable: process.execPath, args: [adapter] };
@@ -59,6 +67,53 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   const sent = () => existsSync(wire) ? readFileSync(wire, 'utf8').trim().split('\n').map(line => JSON.parse(line)) : [];
   return { root, store, database, fresh, engine, workspace, environment, source, observation, question, draft, context, invoke, ordinary, createPilot, createRoot, sent };
 }
+
+test('RD2b preserves a refused oversized B read and continues only the assessor with a smaller exact page', async t => {
+  const f = resumeFixture(t, 'oversized-context');
+  f.context.resources.a = 'A'.repeat(400_000);
+  await assert.rejects(f.invoke(), { code: 'research_context_application_refused' });
+  const original = f.store.list<any>('assessment-application')[0]!;
+  assert.equal(original.value.state, 'refused');
+  assert.deepEqual(original.value.refusal.kind, 'response');
+  assert.equal(original.value.refusal.code, 'context_read_limit');
+  callsOnce(f, 1);
+
+  const restarted = f.fresh();
+  assert.deepEqual(await f.invoke(restarted), verdict);
+  callsOnce(f, 10, restarted);
+  assert.equal(restarted.get<any>(original.id)!.value.state, 'refused');
+  const successor = restarted.list<any>('assessment-application')
+    .find(app => app.value.recoveredRead?.contract === 'assessment-read-recovery/v1');
+  assert.ok(successor);
+  assert.deepEqual(successor.value.previous, reference(original));
+  assert.equal(successor.value.recoveredRead.call.id, original.value.call.id);
+  const correction = f.sent()[1]!.subject.failures?.[0];
+  assert.equal(correction?.code, 'context_read_limit');
+  assert.deepEqual(correction.requested.pointer, '/body/resources/a');
+  assert.ok(f.sent()[1]!.subject.assessmentState);
+  const heads = restarted.list();
+  assert.deepEqual(await f.invoke(f.fresh()), verdict);
+  assert.deepEqual(restarted.list(), heads);
+  callsOnce(f, 10, restarted);
+});
+test('RD2b accepts a paid B verdict after the explicitly requested context page, without requiring its parent', async t => {
+  const f = resumeFixture(t, 'premature-context');
+  f.context.resources.a = 'A'.repeat(400_000);
+  assert.deepEqual(await f.invoke(), verdict);
+  callsOnce(f, 2);
+  const restarted = f.fresh();
+  assert.deepEqual(await f.invoke(restarted), verdict);
+  callsOnce(f, 2, restarted);
+  const attempts = restarted.list<any>('assessment-application');
+  assert.ok(!attempts.some(app => app.value.state === 'renewed'));
+  assert.ok(!f.sent().some(call => call.subject.failures?.[0]?.code === 'research_context_incomplete'));
+  assert.deepEqual(f.sent()[1]!.subject.contextWorkspace.at(-1).page,
+    { offset: 0, end: 50_000, total: 400_000, unit: 'utf16', next: 50_000 });
+  const heads = restarted.list();
+  assert.deepEqual(await f.invoke(f.fresh()), verdict);
+  assert.deepEqual(restarted.list(), heads);
+  callsOnce(f, 2, restarted);
+});
 function callsOnce(f: ReturnType<typeof resumeFixture>, count: number, db = f.store) {
   assert.equal(f.sent().length, count); assert.equal(db.list('model-call').length, count); assert.equal(db.list('model-response').length, count);
   const usage = modelUsage(db, 'p', 0);

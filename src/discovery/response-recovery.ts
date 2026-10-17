@@ -1,7 +1,8 @@
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, deliveredConceptSections,
   EARLY_RESEARCH_OUTCOME, requireEscalationReply } from './early-research-outcome.js';
-import { consolidationInput } from './conclusion-consolidation.js';
+import { consolidationInput, consolidationPage, consolidationFragment,
+  CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { Ajv } from 'ajv';
 import { readFileSync, realpathSync } from 'node:fs';
@@ -24,6 +25,8 @@ import type { TechnicalReport } from '../graph/research-contracts.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { readerPilot, pilotEnvironment, type ReaderPilot } from './reader-pilot.js';
 import { archivedContext, contextValue } from './working-context.js';
+import { requirePacketMaterialDelivery } from './research-delivery.js';
+import { requirePlanningNavigation } from './planning-context.js';
 import { contextWorkspace } from './context-workspace.js';
 
 import { canonical, digest, hashJson } from '../canonical.js';
@@ -807,6 +810,27 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
   let action: ResearchAction;
   try { action = admittedResearchAction(before.value.action); }
   catch { consumerInvalid(before.id, 'The original paid turn action is invalid'); }
+  if (after.value.status === 'completed' && after.value.observation?.code === 'research_context_incomplete') {
+    const paid = readResearchConsumerExecutionFromIntent(store, producer.value.projectId, producer);
+    if (paid.kind !== 'response' || !isRef(before.value.question)
+      || (action.action !== 'answer' && action.action !== 'answer_delta'))
+      consumerInvalid(before.id, 'An incomplete answer lost its exact paid subject');
+    const prior = producer.value.basis.flatMap(ref => {
+      const turn = store.get<ResearchTurn>(ref.id, ref.revision);
+      if (!turn || turn.kind !== 'research-turn') return [];
+      if (canonical(reference(turn)) !== canonical(ref))
+        consumerInvalid(before.id, 'An incomplete answer changed an exact prior turn');
+      return turn.value.run === before.value.run && turn.value.number < before.value.number ? [turn] : [];
+    });
+    const draft = store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision);
+    if (!draft || canonical(reference(draft)) !== canonical(producer.value.draft))
+      consumerInvalid(before.id, 'An incomplete answer lost its exact draft');
+    const history = readContextTurnHistoryAt(store, producer.value.projectId,
+      draft, before.value.question, prior, before.value.number);
+    return { kind: 'context-incomplete',
+      workspace: projectAddressedWorkspace(before.value as ManagedResearchTurn, history, before.value.question),
+      subject: paid.subject };
+  }
   if (after.value.status === 'completed' && after.value.observation?.code === 'research_question_reopened') {
     const originalRef = before.value.question;
     const questionRef = after.value.observation.question, draftRef = after.value.observation.draft;
@@ -2080,6 +2104,17 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     || (envelope.speed ?? 'inherited') !== (intent.value.role.speed ?? 'inherited')
     || canonical(envelope.subject.working?.archive ?? null) !== canonical(archiveRef))
     consumerInvalid(intent.id, 'The saved request belongs to another physical consumer');
+  requirePacketMaterialDelivery(envelope.subject, archiveRef,
+    (record, pointer) => {
+      const saved = store.get<Record<string, any>>(record.id, record.revision);
+      requireCondition(saved?.kind === 'research-context' && canonical(reference(saved)) === canonical(record)
+        && saved.value.projectId === archive.value.projectId
+        && canonical(saved.value.draft) === canonical(archive.value.draft)
+        && canonical(saved.value.question) === canonical(archive.value.question),
+      'research_context_undelivered', 'The material address is not a saved original of this research question');
+      return contextValue(saved.value, pointer);
+    });
+  requirePlanningNavigation(envelope.subject, archiveRef, archive.value.body);
   if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
     if (archive.value.body.synthesisSession !== intent.value.owner.id
       || archive.value.body.dispatchMode !== (intent.value.kind === 'consolidation' ? 'consolidation' : 'synthesis')
@@ -2681,6 +2716,9 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     return store.get<T>(id, revision);
   } } as Store;
   const archive = archivedContext(historical, draft, archiveRef), body = archive.body as Record<string, any>;
+  requirePacketMaterialDelivery(request.subject, archiveRef,
+    (record, pointer) => contextValue(archivedContext(historical, draft, record), pointer));
+  requirePlanningNavigation(request.subject, archiveRef, body);
   const savedWorkspace = session.value.workspace;
   requireCondition(!savedWorkspace || object(savedWorkspace) && Array.isArray(savedWorkspace.entries)
     && savedWorkspace.entries.every(entry => object(entry) && object(entry.result)),
@@ -2714,13 +2752,17 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     consumerIntent = intent;
   }
   if (synthesis && body.dispatchMode === 'consolidation') {
+    const bounded = request.subject?.consolidation?.deliveryContract === CONSOLIDATION_DELIVERY;
+    const fragment = request.subject?.consolidation?.deliveryContract === CONSOLIDATION_FRAGMENT;
+    if (bounded) consolidationPage(body.synthesisNotes, body.consolidation, request.subject?.consolidation);
+    if (fragment) consolidationFragment(body.synthesisNotes, body.consolidation, request.subject);
     requireCondition(object(body.consolidation) && Number.isSafeInteger(body.consolidation.targetChars) && body.consolidation.targetChars > 0
       && request.subject.dispatchMode === 'consolidation'
       && canonical(request.subject.synthesisState) === canonical(state)
       && request.subject.synthesisSession === session.id
       && canonical(request.subject.question) === canonical({ id: question.id, ...question.value.spec })
-      && canonical(request.subject.consolidation) === canonical({...consolidationInput(body.synthesisNotes, body.consolidation.targetChars, body.consolidation.format === 2 ? 2 : 1),
-        ...(body.consolidation.tightening?{tightening:body.consolidation.tightening}:{})})
+      && (bounded || fragment || canonical(request.subject.consolidation) === canonical({...consolidationInput(body.synthesisNotes, body.consolidation.targetChars, body.consolidation.format === 2 ? 2 : 1),
+        ...(body.consolidation.tightening?{tightening:body.consolidation.tightening}:{})}))
       && !request.subject.synthesisPage && !request.subject.materialPage && !request.subject.selectedContext && !request.subject.readings,
     'response_recovery_page_foreign', 'The consolidation must contain exactly the saved notes and contract, without claiming material progress');
   } else if (synthesis) {
@@ -3056,8 +3098,16 @@ export function readContextTurnHistoryAt(store: Store, projectId: string,
   return previous.map(turn => {
     const checked = readResearchConsumerTurn(store, reference(turn)) as Revision<ResearchTurn>;
     let context: ContextTurnHistoryProof['context'];
+    let packet: ContextTurnHistoryProof['packet'];
     if (checked.value.status === 'completed' && checked.value.error === null
       && checked.value.question?.id === question.id) {
+      const origin = (checked.value as { consumerIntent?: unknown }).consumerIntent;
+      if (isRef(origin)) {
+        const paid = readResearchConsumerExecution(store, projectId, origin);
+        if (paid.kind === 'response' && Array.isArray(paid.subject.contextWorkspace)
+          && (paid.subject.contextDelivery || paid.subject.contextIndex))
+          packet = paid.subject;
+      }
       const action = admittedResearchAction(checked.value.action);
       if (action.action === 'read_context') {
         const { action: _action, observation: _observation, question: _question, ...source } =
@@ -3065,7 +3115,7 @@ export function readContextTurnHistoryAt(store: Store, projectId: string,
         context = source;
       }
     }
-    return { turn: checked, ...(context ? { context } : {}) };
+    return { turn: checked, ...(context ? { context } : {}), ...(packet ? { packet } : {}) };
   });
 }
 

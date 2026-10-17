@@ -18,9 +18,11 @@ import { searchStructuredSource, STRUCTURED_SEARCH_CONTRACT, SEARCH_TEXT_LIMIT, 
 import type { ReaderSelection } from './reader.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { Revision, Store } from '../storage/store.js';
-import { activeSynthesisNotes, consolidationNotice, consolidatedProposal,
+import { consolidationNotice, consolidatedProposal, consolidationPage,
+  consolidationFragment, partialConsolidatedProposal, CONSOLIDATION_FRAGMENT,
   type ConsolidationNotice, type SynthesisNote } from './conclusion-consolidation.js';
-import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace, foldContextEvent,
+import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace, foldContextEvent, recordContextPacket,
+  requireCompleteContextPacket,
   type ContextLookup, type ContextWorkspace } from './context-workspace.js';
 import { archivedContext, contextPage, contextValue, type ContextPage } from './working-context.js';
 import type { Graph } from '../graph/model.js';
@@ -54,8 +56,10 @@ const bundleItem = (properties: Record<string, unknown>) => {
 };
 const contextRead = object({ action: { const: 'read_context' }, record: ref, pointer: { type: 'string' } });
 contextRead.properties['purpose'] = text;
-contextRead.properties['page'] = object({ offset: { type: 'integer', minimum: 0 },
+const contextReadPage = object({ offset: { type: 'integer', minimum: 0 },
   limit: { type: 'integer', minimum: 1 } });
+contextReadPage.properties['encoding'] = { const: 'canonical-json' };
+contextRead.properties['page'] = contextReadPage;
 const readSchemas = [
   object({ action: { const: 'read_bundle' }, purpose: text,
     inputs: { type: 'array', minItems: 1, items: { oneOf: [
@@ -300,6 +304,8 @@ export interface SynthesisSessionState {
   result: ResearchAction | null; pause?: ResearchAction | null;
   delivery?: SynthesisSessionDelivery | null; delivered?: Ref | null;
   recoveries?: unknown[];
+  contextCorrection?: { code: 'research_context_incomplete'; record: Ref; pointer: string;
+    unit: string; total: number; next: number; ranges: { offset: number; end: number }[] } | null;
 }
 
 /** Payload/proof failures of a received synthesis reply are saved as the
@@ -461,7 +467,7 @@ export interface SynthesisTransitionInput {
 }
 
 export interface SynthesisTransition {
-  kind: 'consolidation' | 'pause' | 'lookup' | 'blocked' | 'result' | 'page';
+  kind: 'consolidation' | 'pause' | 'lookup' | 'blocked' | 'result' | 'page' | 'context-incomplete';
   session: SynthesisSessionState;
   checkpoint: { id: string; value: Record<string, any> } | null;
 }
@@ -486,18 +492,29 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
       && (goal.tightening === undefined || recordValue(goal.tightening) && isRef(goal.tightening.from)),
     'consolidation_state_invalid', 'The saved consolidation goal lost its exact capacity contract');
     const action = researchAction(input.payload);
-    const proposal = consolidatedProposal(action, questionId, before.notes);
+    const fragment = subject.consolidation?.deliveryContract === CONSOLIDATION_FRAGMENT
+      ? consolidationFragment(before.notes, goal, subject) : null;
+    const selected = fragment ? null : consolidationPage(before.notes, goal, subject.consolidation);
+    const proposal = fragment
+      ? partialConsolidatedProposal(action, questionId, fragment.original, fragment.previous,
+          fragment.delivery, fragment.complete)
+      : consolidatedProposal(action, questionId, before.notes, selected!);
     const checkpoint = exactCheckpoint(projectId, input.draft, input.question, {
       question: questionId, value: proposal as unknown as Json,
       citations: proposal.citations, unresolved: proposal.unresolved }, store);
-    const active = activeSynthesisNotes(before.notes);
     const note: SynthesisNote = {
       checkpoint: { id: checkpoint.id, revision: 1, hash: hashJson(checkpoint.value) }, proposal,
       page: { offset: before.offset, end: before.offset },
-      consolidated: { replaces: active.map(item => item.checkpoint),
+      consolidated: { replaces: fragment
+        ? [...(fragment.complete ? [fragment.original.checkpoint] : []),
+            ...(fragment.previous ? [fragment.previous.checkpoint] : [])]
+        : selected!.map(item => item.checkpoint),
         ...(goal.format === 2 ? { format: 2 as const, targetChars: goal.targetChars, fullTargetChars: goal.fullTargetChars } : {}),
+        ...(fragment && !fragment.complete ? { partial: { original: fragment.original.checkpoint,
+          offset: 0, end: fragment.delivery.served.end, total: fragment.delivery.served.total,
+          valueHash: hashJson(fragment.original.proposal) } } : {}),
         ...(goal.tightening ? { tightenedFrom: goal.tightening.from } : {}) } };
-    const notice = consolidationNotice(note);
+    const notice = fragment && !fragment.complete ? null : consolidationNotice(note);
     return { kind: 'consolidation', checkpoint, session: { ...before, notes: [...before.notes, note],
       ...(notice ? { notices: [...(before.notices ?? []), notice] } : {}) } };
   }
@@ -537,7 +554,8 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
       requireCondition(canonical(result).length <= input.readLimit, 'context_read_limit', 'Use a smaller addressed context page');
       const delivered = Array.isArray(subject.contextWorkspace) ? subject.contextWorkspace as ContextLookup[] : [];
       return { kind: 'lookup', checkpoint: null, session: { ...before, focus: null,
-        workspace: addContextLookup(workspace, result, delivered),
+        ...(before.contextCorrection ? { contextCorrection: null } : {}),
+        workspace: addContextLookup(workspace, result, delivered, undefined, subject),
         ...(controls?.stage === 'final' || final
           ? { finalization: { lookups: (before.finalization?.lookups ?? workspace.sinceProgress) + 1 } } : {}) } };
     } catch (error) {
@@ -552,9 +570,19 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
   requireCondition(!archive.savedOnly || action.action !== 'need_research', 'research_saved_only',
     'Finish from saved findings; new source reads are disabled for this recovery');
   if (page.complete && action.action !== 'checkpoint') {
+    try { requireCompleteContextPacket(workspace, subject); }
+    catch (error) {
+      if (!(error instanceof EngineError) || error.code !== 'research_context_incomplete') throw error;
+      const detail = error.details as { record: Ref; pointer: string; unit: string; total: number;
+        next: number; ranges: { offset: number; end: number }[] };
+      return { kind: 'context-incomplete', checkpoint: null,
+        session: { ...before, workspace: contextProgress(workspace, subject),
+          contextCorrection: { code: 'research_context_incomplete', ...detail }, ...outcomeDelivery } };
+    }
     return { kind: 'result', checkpoint: null, session: { ...before, offset: page.end,
       materialOffset: page.nextMaterialOffset ?? 0, focus: null,
-      workspace: contextProgress(workspace), result: action, ...outcomeDelivery } };
+      workspace: contextProgress(workspace, subject), result: action,
+      ...(before.contextCorrection ? { contextCorrection: null } : {}), ...outcomeDelivery } };
   }
   requireCondition(['checkpoint', 'answer', 'answer_delta'].includes(action.action),
     'synthesis_checkpoint_required', 'Save partial findings before continuing the remaining already-read materials');
@@ -573,7 +601,7 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
   const note: SynthesisNote = { checkpoint: { id: checkpoint.id, revision: 1, hash: hashJson(checkpoint.value) },
     proposal, page: { offset: before.offset, end: page.end } };
   return { kind: 'page', checkpoint, session: { ...before, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0,
-    focus: null, workspace: contextProgress(workspace),
+    focus: null, workspace: contextProgress(workspace, subject),
     ...(page.end === materials.length
       ? { finalization: { lookups: before.finalization?.lookups ?? workspace.sinceProgress } } : {}),
     notes: [...before.notes, note] } };
@@ -674,10 +702,11 @@ export function projectContextRecoveryTransition(input: ContextRecoveryTransitio
  * rule above: every projection consumes exact checked records, never a mutable
  * HEAD or a caller-supplied error. */
 
-export interface ContextReadPage { offset: number; limit: number }
+export type ContextReadPage = ContextPage;
 export interface ProjectedContextRead {
   record: Ref; pointer: string; value: unknown;
-  page?: { offset: number; end: number; total: number; unit: 'utf16' | 'items'; next: number | null };
+  page?: { offset: number; end: number; total: number; unit: 'utf16' | 'items'; next: number | null;
+    encoding?: 'canonical-json' };
 }
 
 /** Selects a value from an already checked exact record, for both live writing
@@ -694,20 +723,7 @@ export function projectResearchContextRead(recordValue: unknown, record: Ref, po
       'context_missing', 'Context pointer does not exist');
     value = (value as Record<string, unknown>)[key];
   }
-  let result: ProjectedContextRead = { record, pointer, value };
-  if (page) {
-    requireCondition(Number.isSafeInteger(page.offset) && page.offset >= 0
-      && Number.isSafeInteger(page.limit) && page.limit > 0
-      && (typeof value === 'string' || Array.isArray(value)),
-    'context_page_invalid', 'Page a string or array with nonnegative offset and positive limit');
-    requireCondition(page.offset <= value.length,
-      'context_page_invalid', 'Page offset exceeds the original value');
-    const end = Math.min(value.length, page.offset + page.limit);
-    result = { record, pointer, value: value.slice(page.offset, end),
-      page: { offset: page.offset, end, total: value.length,
-        unit: typeof value === 'string' ? 'utf16' : 'items',
-        next: end < value.length ? end : null } };
-  }
+  const result: ProjectedContextRead = { record, pointer, ...contextPage(value, page) };
   requireCondition(Number.isSafeInteger(maxChars) && maxChars > 0,
     'context_read_limit', 'Addressed context needs a positive character limit');
   requireCondition(canonical(result).length <= maxChars,
@@ -860,6 +876,8 @@ export interface ContextTurnHistoryProof {
   turn: Revision<ResearchTurn>;
   /** Required for a completed, successful read_context in this run. */
   context?: Omit<ContextReadIdentityInput, 'action' | 'observation' | 'question'>;
+  /** Exact paid subject of a new delivery-era turn, when it carried pages. */
+  packet?: Record<string, any>;
 }
 
 /** Rebuild the addressed workspace from complete exact turn history. Current
@@ -881,6 +899,8 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
     'An addressed workspace omitted or substituted an earlier run turn');
     const prior = turn.value;
     if (prior.question?.id !== question.id || prior.status !== 'completed' || prior.error) continue;
+    if (entry.packet?.working?.deliveryContract === 'research-delivery/v1')
+      workspace = recordContextPacket(workspace, entry.packet);
     const kind = (prior.action as { action?: unknown } | null)?.action;
     if (kind !== 'read_context') { workspace = foldContextEvent(workspace, String(kind)); continue; }
     if (canonical(prior.question) !== canonical(question)) continue;
@@ -1340,6 +1360,7 @@ export type TurnTransitionProof =
   | { kind: 'context-refusal'; recordValue: unknown; record: Ref; maxChars: number }
   | { kind: 'delivery-refusal'; recordValue: unknown; record: Ref; maxChars: number;
       workspace: ContextWorkspace; delivered: ContextLookup[]; maxLookups?: number }
+  | { kind: 'context-incomplete'; workspace: ContextWorkspace; subject: Record<string, any> }
   | { kind: 'read-bundle'; result: { ref: Ref; value: ReaderResult } }
   | { kind: 'checkpoint'; checkpoint: { ref: Ref; value: {
       projectId: string; draft: Ref; question: Ref; status: 'unassessed';
@@ -1388,6 +1409,17 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     && before.contract === 'research-consumer-turn/v1',
   'research_consumer_intent_invalid', 'Only a pending paid turn can be completed');
   const action = admittedResearchAction(before.action);
+  if (proof.kind === 'context-incomplete') {
+    requireCondition(action.action === 'answer' || action.action === 'answer_delta',
+      'research_consumer_intent_invalid', 'Only a final paid answer can claim incomplete context');
+    let failure: EngineError | null = null;
+    try { requireCompleteContextPacket(proof.workspace, proof.subject); }
+    catch (error) { if (error instanceof EngineError) failure = error; else throw error; }
+    requireCondition(failure?.code === 'research_context_incomplete',
+      'research_consumer_intent_invalid', 'The saved packet does not prove incomplete delivery');
+    return { ...before, status: 'completed', assessment: null,
+      observation: { code: failure.code, details: failure.details }, error: failure.message };
+  }
   if (proof.kind === 'mode-refusal' || proof.kind === 'reading-plan-refusal'
     || proof.kind === 'reading-mode-refusal' || proof.kind === 'search-query-refusal') {
     const reason = paidLocalRefusalReason(before, action, 'unknown' in proof && proof.unknown === true);

@@ -15,6 +15,7 @@ import { reference } from '../src/pipeline/contracts.js';
 import type { Question } from '../src/discovery/discovery.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { EngineError } from '../src/errors.js';
+import { withInvocationAllowance } from '../src/discovery/invocation-progress.js';
 
 /** The shared synthesis/consolidation fixture of the v2 era (№1555 X29): the
  * session state is produced exclusively by real paid producers — three exact
@@ -24,7 +25,7 @@ import { EngineError } from '../src/errors.js';
  * reported separately (`setupCalls`); tests measure the operation under review
  * relative to it. */
 export async function fixture(t: test.TestContext, noteChars = 18000, limit = 100000, share = 0.35, consolidationTextChars = 0, settings: Partial<ReaderPilotSettings> = {}, requestPadding = 0,
-  layout: 'paged' | 'small' = 'paged') {
+  layout: 'paged' | 'small' = 'paged', setupPaidCalls = 3) {
   const root = mkdtempSync(join(tmpdir(), 'omg-consolidation-')), store = new Store(join(root, 'db.sqlite')), engine = new ProductEngine(store, 'codex');
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); }); preparedFeatures(engine, 'p');
   const path = join(root, 'fixture.mjs'), log = join(root, 'wire.ndjson'), stepsFile = join(root, 'steps');
@@ -75,18 +76,23 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:c
   // continuation calibration and accounting, not a synthetic special purpose.
   await researchCall(dispatch.implementer, dispatch, 'Pause', context, undefined,
     { store, draftId: draft.id, questionId: question.id, purpose: 'analyst', pilot });
-  // The lawful setup terminator is the produced pause; an oversized notes-only
-  // continuation stops unpaid by its own refusal — both leave three real notes.
-  try {
+  if (noteChars >= 40000) {
+    // Stop the large-note case at the real fourth-call boundary, before
+    // paying for consolidation; the former transport refusal is gone.
+    try {
+      await withInvocationAllowance(setupPaidCalls, invoke);
+      throw new Error('synthesis-session-fixture: setup did not reach the fourth-call boundary');
+    } catch (error) {
+      if (!(error instanceof EngineError && error.code === 'research_call_allowance')) throw error;
+    }
+  } else {
     const stopped = await invoke();
     if (stopped.action !== 'pause') throw new Error(`synthesis-session-fixture: setup ended with ${stopped.action}, not the produced pause`);
-  } catch (error) {
-    if (!(error instanceof EngineError && error.code === 'consolidation_input_limit')) throw error;
   }
   const before = store.get<any>(store.list<any>('synthesis-session')[0]!.id)!;
   if (!before.id.startsWith('synthesis-session:v2:') || before.value.contract !== 'synthesis-session/v2'
-    || before.value.notes.length !== 3)
-    throw new Error('synthesis-session-fixture: expected a v2 session with three produced checkpoint notes');
+    || before.value.notes.length !== (noteChars >= 40000 ? setupPaidCalls : 3))
+    throw new Error('synthesis-session-fixture: expected a v2 session with produced checkpoint notes');
   // The measured operation's transport pressure is applied after the basis was
   // produced; the padding is not part of the session basis.
   if (requestPadding) context.request = { immutableCondition: 'x'.repeat(requestPadding) };

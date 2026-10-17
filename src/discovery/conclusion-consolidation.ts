@@ -1,14 +1,18 @@
-import { canonical, type Json } from '../canonical.js';
+import { canonical, hashJson, type Json } from '../canonical.js';
 import { requireCondition } from '../errors.js';
-import type { Ref } from '../pipeline/contracts.js';
+import { isRef, type Ref } from '../pipeline/contracts.js';
 import type { ResearchAction } from './research-model.js';
 import type { ReaderPilotSettings } from './reader-pilot.js';
 import { compactConclusions } from './continuation-packet.js';
+import { requireResearchDelivery, type ResearchDelivery } from './research-delivery.js';
 
 export interface SynthesisNote {
   checkpoint: Ref; proposal: ResearchAction; page: { offset: number; end: number };
-  consolidated?: { replaces: Ref[]; format?: 2; targetChars?: number; fullTargetChars?: number; tightenedFrom?: Ref };
+  consolidated?: { replaces: Ref[]; format?: 2; targetChars?: number; fullTargetChars?: number; tightenedFrom?: Ref;
+    partial?: { original: Ref; offset: number; end: number; total: number; valueHash: string } };
 }
+export const CONSOLIDATION_DELIVERY = 'consolidation-delivery/v1' as const;
+export const CONSOLIDATION_FRAGMENT = 'consolidation-fragment/v1' as const;
 
 /** Replacements are engine-owned edges. The append-only session still contains
  * every original note; only its active frontier travels on the wire. */
@@ -39,16 +43,100 @@ export const CONSOLIDATION_INSTRUCTION = 'Consolidate the supplied unassessed no
 export const COMPACT_CHECKPOINT_INSTRUCTION = ' Record each substantive finding with its primary-source citation: exact source id/revision/hash and file range or selector. Preserve the association between each finding and its citation in value, and include those citations in the checkpoint citations array. An unsupported statement belongs in unresolved as "нужен первичный текст: <specific claim>", not as an established finding. Keep the context, exceptions and earlier cited premises needed to understand the finding. Progress bookkeeping such as offset, complete, processed pages or material counts does not belong in unresolved: the engine records it. Unresolved contains substantive unknowns and missing primary text. Never invent source references or silently turn a proposal into a repository fact.';
 
 export function consolidationInput(notes: SynthesisNote[], targetChars: number, format: 1 | 2 = 2) {
-  const active = activeSynthesisNotes(notes), compact = compactConclusions(active, format);
+  const compact = compactConclusions(activeSynthesisNotes(notes), format);
   return { targetChars, notes: compact.items, citations: compact.citations, ...(format === 2 ? {references:compact.references,unresolved:compact.unresolved} : {}) };
+}
+
+/** A bounded consolidation covers an exact prefix of the current active
+ * frontier. Its remaining notes stay active until a later paid page covers
+ * them; a fragment cannot silently claim their citations or unresolved text. */
+export function consolidationPage(notes: SynthesisNote[], goal: Record<string, any>, delivered: Record<string, any>): SynthesisNote[] {
+  const active = activeSynthesisNotes(notes);
+  if (delivered?.deliveryContract !== CONSOLIDATION_DELIVERY) return active;
+  const selection = delivered.selection;
+  requireCondition(Array.isArray(selection) && selection.length > 0 && selection.length <= active.length
+    && selection.every((ref: unknown, index: number) => canonical(ref) === canonical(active[index]?.checkpoint)),
+  'consolidation_coverage_invalid', 'The bounded note page must name an exact prefix of saved checkpoints');
+  const expected = { ...consolidationInput(active.slice(0, selection.length), goal.targetChars,
+    goal.format === 2 ? 2 : 1), deliveryContract: CONSOLIDATION_DELIVERY, selection,
+    page: { offset: 0, end: selection.length, total: active.length,
+      next: selection.length < active.length ? selection.length : null },
+    ...(goal.tightening ? { tightening: goal.tightening } : {}) };
+  requireCondition(canonical(delivered) === canonical(expected),
+  'consolidation_coverage_invalid', 'The bounded note page differs from its saved originals');
+  return active.slice(0, selection.length);
+}
+
+/** Prove one contiguous slice of an old paid note against its saved archive.
+ * Partial summaries remain separate unassessed notes until the final byte is
+ * delivered; the original cannot be replaced on an early fragment. */
+export function consolidationFragment(notes: SynthesisNote[], goal: Record<string, any>,
+  packet: Record<string, any>): { original: SynthesisNote; previous: SynthesisNote | null;
+    delivery: ResearchDelivery; complete: boolean } {
+  const active = activeSynthesisNotes(notes), original = active[0];
+  const supplied = packet.consolidation, fragment = supplied?.fragment;
+  requireCondition(original && supplied?.deliveryContract === CONSOLIDATION_FRAGMENT
+    && isRef(packet.working?.archive) && Array.isArray(packet.materialDelivery)
+    && packet.materialDelivery.length === 1,
+  'consolidation_coverage_invalid', 'A partial note needs one exact saved fragment');
+  const previous = active.find(note => note.consolidated?.partial
+    && canonical(note.consolidated.partial.original) === canonical(original.checkpoint)) ?? null;
+  requireCondition(original.proposal.action === 'checkpoint'
+    && (!previous || previous.proposal.action === 'checkpoint'),
+  'consolidation_coverage_invalid', 'Partial consolidation needs saved checkpoint proposals');
+  const originalIndex = notes.findIndex(note => canonical(note.checkpoint) === canonical(original.checkpoint));
+  const encoded = canonical(original.proposal), offset = previous?.consolidated?.partial?.end ?? 0;
+  const pointer = `/body/synthesisNotes/${originalIndex}/proposal`;
+  const expectedFragment = { original: original.checkpoint, previous: previous?.checkpoint ?? null,
+    sourceIndex: originalIndex, offset, total: encoded.length };
+  const expectedNotes = [{ original: original.checkpoint,
+    previous: previous ? { checkpoint: previous.checkpoint,
+      value: previous.proposal.action === 'checkpoint' ? previous.proposal.value : null } : null }];
+  requireCondition(originalIndex >= 0 && canonical(fragment) === canonical(expectedFragment)
+    && canonical(supplied.notes) === canonical(expectedNotes)
+    && supplied.targetChars === goal.targetChars
+    && canonical(supplied.citations) === canonical([])
+    && canonical(supplied.references) === canonical([])
+    && canonical(supplied.unresolved) === canonical([])
+    && canonical(supplied.tightening ?? null) === canonical(goal.tightening ?? null)
+    && (!previous || previous.consolidated?.partial?.offset === 0
+      && previous.consolidated.partial.total === encoded.length
+      && previous.consolidated.partial.valueHash === hashJson(original.proposal)),
+  'consolidation_coverage_invalid', 'The partial note cursor differs from its saved original');
+  const address = { record: packet.working.archive as Ref, pointer, value: original.proposal,
+    page: { offset, end: encoded.length, total: encoded.length, unit: 'utf16' as const,
+      next: null, encoding: 'canonical-json' as const } };
+  const key = hashJson({ record: address.record, pointer, value: address.value });
+  const delivery = packet.materialDelivery[0];
+  requireResearchDelivery(address, key, delivery);
+  requireCondition(delivery.encoding === 'json-string-fragment' && delivery.served.offset === offset
+    && delivery.served.end > offset,
+  'consolidation_coverage_invalid', 'The partial note made no exact UTF-16 progress');
+  return { original, previous, delivery, complete: delivery.served.next === null };
+}
+
+export function partialConsolidatedProposal(action: ResearchAction, question: string,
+  original: SynthesisNote, previous: SynthesisNote | null, delivery: ResearchDelivery, complete: boolean) {
+  requireCondition(original.proposal.action === 'checkpoint'
+    && (!previous || previous.proposal.action === 'checkpoint'),
+  'consolidation_coverage_invalid', 'Partial consolidation needs saved checkpoint proposals');
+  const fragment = delivery.text;
+  requireCondition(typeof fragment === 'string' && fragment.length > 0,
+    'consolidation_coverage_invalid', 'A partial note needs the exact delivered text');
+  const pseudo: SynthesisNote = { checkpoint: original.checkpoint, page: original.page,
+    proposal: { action: 'checkpoint', question, value: { fragment }, citations: [], unresolved: [] } };
+  const proposal = consolidatedProposal(action, question, [pseudo]);
+  return { ...proposal, citations: complete ? original.proposal.citations : [],
+    unresolved: [...new Set([...(original.proposal.unresolved ?? []),
+      ...(previous?.proposal.action === 'checkpoint' ? previous.proposal.unresolved : []), ...proposal.unresolved])] };
 }
 
 /** IDs establish coverage and provenance, not semantic equivalence. The result
  * remains unassessed; final source/obligation validation and review are unchanged. */
-export function consolidatedProposal(action: ResearchAction, question: string, notes: SynthesisNote[]) {
+export function consolidatedProposal(action: ResearchAction, question: string, notes: SynthesisNote[], selected?: SynthesisNote[]) {
   requireCondition(action.action === 'checkpoint' && action.question === question && action.citations.length === 0,
     'consolidation_response_invalid', 'Consolidation requires a bound checkpoint with citation indexes, not invented citations or an answer');
-  const value = action.value as any, input = consolidationInput(notes, 0), active = activeSynthesisNotes(notes);
+  const value = action.value as any, active = selected ?? activeSynthesisNotes(notes), input = consolidationInput(active, 0);
   requireCondition(value && typeof value === 'object' && !Array.isArray(value)
     && Object.keys(value).sort().join(',') === 'citationIds,summaries'
     && Array.isArray(value.summaries) && value.summaries.length > 0 && Array.isArray(value.citationIds),

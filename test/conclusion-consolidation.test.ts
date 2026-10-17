@@ -7,12 +7,15 @@ import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { researchAction } from '../src/discovery/research-protocol.js';
 import { previewResearch } from '../src/discovery/research-preview.js';
 import { withInvocationAllowance } from '../src/discovery/invocation-progress.js';
-import { activeSynthesisNotes, consolidatedProposal, consolidationNeeded } from '../src/discovery/conclusion-consolidation.js';
+import { activeSynthesisNotes, consolidatedProposal, consolidationNeeded, consolidationPage,
+  consolidationInput, consolidationFragment, CONSOLIDATION_DELIVERY } from '../src/discovery/conclusion-consolidation.js';
 import { compactConclusions } from '../src/discovery/continuation-packet.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import type { Question } from '../src/discovery/discovery.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
+import { Store } from '../src/storage/store.js';
+import { synthesisSession } from '../src/discovery/synthesis-session.js';
 
 test('growing notes consolidate once with exact citations and unresolved items, history survives, and the same fragment resumes', async t => {
   const f = await fixture(t, 18000, 100000, 0.35, 0, {}, 45000);
@@ -61,6 +64,14 @@ test('coverage, missing fields, foreign note indexes and citation substitution f
       { code: 'consolidation_citations_invalid' });
   }
   assert.equal(f.store.get<any>(f.before.id)!.value.notes.length, 3); assert.equal(f.store.list('model-call').length, f.setupCalls);
+  const goal = { targetChars: 1000, format: 2, deliveryContract: CONSOLIDATION_DELIVERY };
+  const first = { ...consolidationInput(f.notes.slice(0, 1), 1000), deliveryContract: CONSOLIDATION_DELIVERY,
+    selection: [f.notes[0]!.checkpoint], page: { offset: 0, end: 1, total: 3, next: 1 } };
+  assert.deepEqual(consolidationPage(f.notes, goal, first), f.notes.slice(0, 1));
+  assert.throws(() => consolidationPage(f.notes, goal,
+    { ...first, selection: [f.notes[1]!.checkpoint] }), { code: 'consolidation_coverage_invalid' });
+  assert.throws(() => consolidationPage(f.notes, goal,
+    { ...first, notes: [] }), { code: 'consolidation_coverage_invalid' });
 });
 
 test('an unfit next fragment triggers consolidation even below the configurable share, without raising any ceiling', async t => {
@@ -92,7 +103,7 @@ test('an unfit next fragment triggers consolidation even below the configurable 
 test('a paid summary that misses its goal but fits the actual packet continues without another compaction', async t => {
   // The summary is produced by a real paid consolidation whose text overshoots
   // the capacity goal, yet the next synthesis packet still fits (№1555 X30).
-  const f = await fixture(t, 18000, 100000, 0.35, 12000, {}, 45000);
+  const f = await fixture(t, 18000, 100000, 0.35, 12000, {}, 35000);
   assert.equal((await f.invoke()).action, 'pause');
   const calls = f.store.list('model-call').length;
   assert.equal(f.wires().filter(w => w.subject.dispatchMode === 'consolidation').length, 1);
@@ -126,10 +137,112 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   assert.equal(next.subject.dispatchMode,'synthesis');assert.ok(JSON.stringify(next).length<=60000);
 });
 
-test('an oversized notes-only input stops before payment and never increases transport limits', async t => {
+test('three large paid notes consolidate in bounded exact pages and continue after a cold Store', async t => {
   const f = await fixture(t, 40000);
-  await assert.rejects(f.invoke(), { code: 'consolidation_input_limit' });
-  assert.equal(f.store.list('model-call').length, f.setupCalls); assert.deepEqual(f.store.get(f.before.id), f.before);
+  await assert.rejects(withInvocationAllowance(1, f.invoke), { code: 'research_call_allowance' });
+  const first = f.wires().findLast(w => w.subject.dispatchMode === 'consolidation')!.subject;
+  assert.equal(first.consolidation.page.total, 3);
+  assert.ok(first.consolidation.page.end > 0 && first.consolidation.page.end < 3);
+  assert.equal(first.consolidation.page.next, first.consolidation.page.end);
+  assert.deepEqual(first.consolidation.selection, f.notes.slice(0, first.consolidation.page.end).map(note => note.checkpoint));
+  assert.ok(JSON.stringify(first).length <= f.pilot.value.maxContinuationChars!);
+  assert.equal(f.store.list('model-call').length, f.setupCalls + 1);
+  const after = f.store.get<any>(f.before.id)!;
+  assert.deepEqual(after.value.notes.slice(0, 3), f.notes);
+  assert.equal(activeSynthesisNotes(after.value.notes).length, 4 - first.consolidation.page.end);
+  const cold = new Store(join(f.root, 'db.sqlite'));
+  try {
+    const next = JSON.parse((await previewResearch(() => synthesisSession(cold, f.draft, f.question,
+      f.environment, f.dispatch, f.pilot, f.context, 'Return the declared research action'))).input).subject;
+    assert.ok(['consolidation', 'synthesis'].includes(next.dispatchMode));
+    if (next.dispatchMode === 'consolidation') assert.ok(next.consolidation.page.end > 0);
+    else assert.ok(next.working.archive && (next.conclusions?.length ?? 0) > 0);
+    assert.equal(cold.list('model-call').length, f.setupCalls + 1);
+  } finally { cold.close(); }
+});
+
+test('one oversized paid note is delivered in exact fragments before its original can be replaced', async t => {
+  const f = await fixture(t, 280000, 100000, 0.35, 0, {}, 0, 'paged', 1);
+  const original = f.notes[0]!;
+  const first = JSON.parse((await previewResearch(f.invoke)).input).subject;
+  assert.equal(first.dispatchMode, 'consolidation', JSON.stringify({ mode: first.dispatchMode,
+    notes: f.notes.map(note => ({ action: note.proposal.action,
+      size: JSON.stringify(note.proposal).length })) }));
+  assert.equal(first.consolidation.deliveryContract, 'consolidation-fragment/v1');
+  assert.deepEqual(first.consolidation.fragment.original, original.checkpoint);
+  assert.equal(first.materialDelivery[0].served.offset, 0);
+  assert.ok(first.materialDelivery[0].served.next > 0);
+  assert.ok(JSON.stringify(first).length <= f.pilot.value.maxContinuationChars!);
+  assert.throws(() => consolidationFragment(f.notes,
+    { targetChars: first.consolidation.targetChars },
+    { ...first, materialDelivery: [{ ...first.materialDelivery[0],
+      served: { ...first.materialDelivery[0].served, next: null } }] }),
+  { code: 'research_context_undelivered' }, 'a partial fragment cannot masquerade as complete');
+  await assert.rejects(withInvocationAllowance(1, f.invoke), { code: 'research_call_allowance' });
+  const afterFirst = f.store.get<any>(f.before.id)!;
+  const partial = activeSynthesisNotes(afterFirst.value.notes);
+  assert.ok(partial.some((note: any) => note.checkpoint.id === original.checkpoint.id),
+    'a fragment cannot replace the unread original');
+  assert.ok(partial.some((note: any) => note.consolidated?.partial?.end === first.materialDelivery[0].served.end));
+  const callsAfterFirst = f.store.list('model-call').length;
+  const cold = new Store(join(f.root, 'db.sqlite'));
+  try {
+    const resume = () => synthesisSession(cold, f.draft, f.question, f.environment,
+      f.dispatch, f.pilot, f.context, 'Return the declared research action');
+    const second = JSON.parse((await previewResearch(resume)).input).subject;
+    assert.equal(second.consolidation.deliveryContract, 'consolidation-fragment/v1');
+    assert.equal(second.materialDelivery[0].served.offset, first.materialDelivery[0].served.end);
+    assert.equal(cold.list('model-call').length, callsAfterFirst,
+      'restarting never repurchases the original checkpoint');
+    for (let turn = 0; turn < 8; turn++) {
+      const frontier = activeSynthesisNotes(cold.get<any>(f.before.id)!.value.notes);
+      if (!frontier.some(note => note.checkpoint.id === original.checkpoint.id)) break;
+      await assert.rejects(withInvocationAllowance(1, resume), { code: 'research_call_allowance' });
+    }
+    const finished = activeSynthesisNotes(cold.get<any>(f.before.id)!.value.notes);
+    assert.ok(!finished.some(note => note.checkpoint.id === original.checkpoint.id),
+      'the original is replaced only after its final exact fragment');
+    const summary = finished.find(note => note.consolidated?.replaces.some(ref => ref.id === original.checkpoint.id));
+    assert.ok(summary);
+    assert.deepEqual(summary.proposal.action === 'checkpoint' ? summary.proposal.citations : [],
+      original.proposal.action === 'checkpoint' ? original.proposal.citations : []);
+    assert.equal(summary.proposal.action, 'checkpoint');
+    assert.equal(original.proposal.action, 'checkpoint');
+    if (summary.proposal.action !== 'checkpoint' || original.proposal.action !== 'checkpoint') throw Error();
+    for (const item of original.proposal.unresolved) assert.ok(summary.proposal.unresolved.includes(item));
+    assert.deepEqual(cold.get<any>(f.before.id)!.value.notes.slice(0, 1), f.notes,
+      'append-only history retains all paid originals');
+  } finally { cold.close(); }
+});
+
+test('a paid fragment recovers at the session-write window without buying its source again', async t => {
+  const f = await fixture(t, 120000, 100000, 0.35, 0, {}, 0, 'paged', 1);
+  const originalWrite = f.store.writeMany.bind(f.store); let interrupted = false;
+  f.store.writeMany = ((writes: any[], guards: any[] = []) => {
+    if (!interrupted && writes.some(write => write.kind === 'synthesis-session'
+      && write.value.notes.length === 2)) {
+      interrupted = true;
+      throw new EngineError('fixture_fragment_crash', 'The paid fragment survived its session write');
+    }
+    return originalWrite(writes, guards);
+  }) as typeof f.store.writeMany;
+  await assert.rejects(f.invoke(), { code: 'fixture_fragment_crash' });
+  f.store.writeMany = originalWrite;
+  const paid = f.store.list<ModelCall>('model-call').find(call =>
+    JSON.parse(f.store.get<any>(call.value.request.record!.id)!.value.text).subject
+      .consolidation?.deliveryContract === 'consolidation-fragment/v1')!;
+  assert.ok(paid);
+  const before = f.store.get<any>(f.before.id)!;
+  const command = { type: 'recover-research-response' as const, project: 'p',
+    call: reference(paid), session: reference(before) };
+  const receipt = await f.engine.execute(command) as any;
+  assert.equal(receipt.value.state, 'applied');
+  assert.deepEqual(await f.engine.execute(command), receipt);
+  assert.equal(f.store.list('model-call').length, f.setupCalls + 1);
+  const frontier = activeSynthesisNotes(f.store.get<any>(before.id)!.value.notes);
+  assert.equal(frontier.length, 2);
+  assert.ok(frontier.some(note => note.checkpoint.id === f.notes[0]!.checkpoint.id));
+  assert.ok(frontier.some(note => note.consolidated?.partial?.end));
 });
 
 test('paid consolidation has the same explicit recovery door across the checkpoint/session write window', async t => {

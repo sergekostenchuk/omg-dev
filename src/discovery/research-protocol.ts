@@ -223,16 +223,34 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const requestLimit = audit?.pilot?.value.maxRequestChars ?? 300000;
   const overhead = Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
     controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
-  const subject = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
-    requestLimit - overhead, { common: true, purpose: audit!.purpose, continuation: !packetState.initial, ...(packetState.latest ? {previous:packetState.latest} : {}),
-      ...(audit!.pilot?{contextChars:audit!.pilot.value.maxRequestChars}:{}),
-      ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxRequestChars}:{}) }) : context;
-  if (packetState) (subject as any).continuation = continuationMetadata(packetState, (subject as any).working.archive, audit!.store);
+  const subjectFor = (limit: number) => {
+    const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, context,
+      limit, { common: true, purpose: audit!.purpose, continuation: !packetState.initial,
+        ...(packetState.latest ? {previous:packetState.latest} : {}),
+        ...(audit!.pilot?{contextChars:audit!.pilot.value.maxRequestChars}:{}),
+        ...(audit!.pilot?{extractedChars:audit!.pilot.value.maxRequestChars}:{}) }) : context;
+    if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive, audit!.store);
+    return packed;
+  };
+  let subjectLimit = requestLimit - overhead;
+  let subject = subjectFor(subjectLimit);
+  const physicalLimit = Math.min(requestLimit, audit?.pilot?.value.physicalLimits?.maxRequestChars ?? requestLimit);
+  if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization')
+    envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
+  let input = JSON.stringify({ ...envelope, subject });
+  // The transport includes the prompt and continuation metadata, whose exact
+  // escaped size is not known to the working-set planner. Repack the saved
+  // originals under the measured remaining space before any paid dispatch.
+  for (let attempt = 0; packetState && input.length > physicalLimit && attempt < 4; attempt += 1) {
+    subjectLimit -= input.length - physicalLimit + 128;
+    subject = subjectFor(subjectLimit);
+    if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization')
+      envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
+    input = JSON.stringify({ ...envelope, subject });
+  }
   if (!consolidating && context && typeof context==='object' && Object.hasOwn(context,'contextWorkspace'))
     requireContextDelivery((context as any).contextWorkspace,subject as Record<string,any>);
   audit?.onContext?.(subject as Record<string, any>);
-  if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
-  const input = JSON.stringify({ ...envelope, subject });
   requireCondition(input.length <= requestLimit, packetState?.initial === false ? "continuation_packet_limit" : "pilot_request_limit", "Full envelope exceeds its fixed transport budget; split the piece, never raise the ceiling");
   requireCondition(!audit?.pilot?.value.physicalLimits || input.length <= audit.pilot.value.physicalLimits.maxRequestChars,
     "budget_transport_limit", "The full envelope exceeds the declared physical transport capacity; split the material before dispatch");
