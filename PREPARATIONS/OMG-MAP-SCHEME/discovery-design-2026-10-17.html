@@ -1,0 +1,259 @@
+<title>Discovery: досье реального мира</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+/* Дизайн-код omg-pass-map: графит + коньяк, одна тёмная тема (omg-pass-map-design-tokens.css + классы omg-pass-map-design-code.css). Документ: колонка секций, таблицы, цепочка шагов. */
+:root{
+  color-scheme:dark;
+  --bg:#101012; --panel:#141416; --raised:#1b1b1e; --tile:#202024; --line:#242428; --line2:#2d2d32;
+  --ink:#ececee; --ink2:#9a9aa2; --ink3:#66666e;
+  --accent:#c27a34; --accent-hi:#d89c54; --accent-soft:rgba(194,122,52,.14); --accent-line:rgba(194,122,52,.5); --accent-faint:rgba(194,122,52,.035);
+  --ok:#3fbf6f; --ok-soft:rgba(63,191,111,.14); --bad:#c9566e; --bad-soft:rgba(163,48,75,.2); --warn:#e0b23c; --warn-soft:rgba(224,178,60,.14);
+  --shadow:rgba(0,0,0,.38);
+  --font:"Inter",-apple-system,"Segoe UI",Roboto,sans-serif; --mono:"JetBrains Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:14px/1.5 var(--font);margin:0}
+.page{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:20px 48px;max-width:1240px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+.head{display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:12px 24px}
+.head .l{min-width:0;flex:1 1 520px}
+.eyebrow{font:500 10.5px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink3)}
+h1{margin:4px 0 6px;font-size:24px;font-weight:600;letter-spacing:-.01em;text-wrap:balance}
+h1 b{color:var(--accent);font-weight:600}
+.def{margin:0;color:var(--ink2);max-width:84ch;font-size:13.5px}
+.def strong{color:var(--ink);font-weight:500}
+.legend{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 8px;border-radius:999px;font:500 9.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;border:1px solid var(--line2);color:var(--ink2);white-space:nowrap}
+.pill.ok{color:var(--ok);border-color:transparent;background:var(--ok-soft)}
+.pill.acc{color:var(--accent);border-color:transparent;background:var(--accent-soft)}
+.pill.warn{color:var(--warn);border-color:transparent;background:var(--warn-soft)}
+.pill.bad{color:var(--bad);border-color:transparent;background:var(--bad-soft)}
+.nav{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.nav span{font:500 10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3);margin:0 4px 0 6px}
+.nav a{font:500 11.5px var(--font);color:var(--ink2);text-decoration:none;border:1px solid var(--line2);border-radius:8px;padding:4px 10px;background:var(--panel)}
+.nav a:hover,.nav a:focus-visible{color:var(--accent);border-color:var(--accent-line);outline:none}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,520px),1fr));gap:14px}
+.sec{border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:16px 18px;min-width:0}
+.sec.wide{grid-column:1/-1}
+.sec.key{border-color:var(--accent-line);background:linear-gradient(var(--accent-faint),var(--accent-faint)),var(--panel)}
+.sec h3{margin:0 0 10px;font-size:15px;font-weight:600;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;text-wrap:balance}
+.sec h3 small{font:500 10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3)}
+.sec h4{margin:14px 0 6px;font:500 10px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3)}
+.sec p{margin:0 0 10px;color:var(--ink2);font-size:13px;max-width:92ch}
+.sec p b{color:var(--ink);font-weight:500}
+.tw{overflow-x:auto;min-width:0}
+table{border-collapse:collapse;width:100%;font-size:12.5px;min-width:620px}
+th{text-align:left;font:500 9.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3);padding:6px 10px;border-bottom:1px solid var(--line2);white-space:nowrap}
+td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--ink2);line-height:1.45}
+td:first-child{color:var(--ink);font-weight:500}
+td .n{font:600 10.5px var(--mono);color:var(--accent);margin-right:6px}
+td code,li code,p code{font:11px var(--mono);color:var(--ink);background:var(--tile);padding:1px 5px;border-radius:4px}
+tr:last-child td{border-bottom:0}
+.d-deep{color:var(--accent-hi);font-weight:500}
+.d-short{color:var(--ink2)}
+.d-na{color:var(--ink3)}
+.chain{list-style:none;margin:0 0 4px;padding:0;display:flex;flex-direction:column}
+.chain li{display:grid;grid-template-columns:22px 1fr;gap:8px;align-items:start;font-size:12.5px;color:var(--ink2);padding:6px 0;position:relative}
+.chain li::before{content:"";width:9px;height:9px;border-radius:50%;border:1.5px solid var(--accent);margin:4px 0 0 6px;background:var(--panel);z-index:1}
+.chain li:not(:last-child)::after{content:"";position:absolute;left:10px;top:17px;bottom:-7px;width:1px;background:var(--accent-line)}
+.chain li b{color:var(--ink);font-weight:500}
+.chain .who{display:inline-flex;gap:4px;flex-wrap:wrap;margin-left:6px;vertical-align:1px}
+.chain .who .pill{height:17px;padding:0 6px;font-size:8.5px}
+.chain .io{display:block;font:10.5px var(--mono);color:var(--ink3);margin-top:2px}
+.chain .io i{color:var(--accent);font-style:normal;margin:0 3px}
+ul.plain{margin:0;padding-left:18px;color:var(--ink2);font-size:12.5px;display:flex;flex-direction:column;gap:6px}
+ul.plain b{color:var(--ink);font-weight:500}
+.kinds{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 12px}
+.decide{display:flex;flex-direction:column;gap:10px;counter-reset:q}
+.decide div{display:grid;grid-template-columns:28px 1fr;gap:10px;align-items:start;font-size:13px;color:var(--ink2)}
+.decide div::before{counter-increment:q;content:counter(q);width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font:600 11px var(--mono);color:var(--accent);background:var(--accent-soft)}
+.decide b{color:var(--ink);font-weight:500}
+.risk{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr));gap:10px}
+.risk div{border:1px solid var(--line2);border-radius:10px;padding:10px 12px;background:var(--raised);font-size:12.5px;color:var(--ink2);min-width:0}
+.risk div b{display:block;color:var(--warn);font-weight:500;margin-bottom:3px}
+.foot{font:10.5px var(--mono);color:var(--ink3);line-height:1.6}
+a{color:var(--accent-hi)}
+@media (max-width:820px){h1{font-size:21px}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="page">
+  <header class="head">
+    <div class="l">
+      <div class="eyebrow">OMG · устройство стадии · предложение на утверждение · 17.10.2026</div>
+      <h1>Discovery — <b>досье реального мира продукта</b></h1>
+      <p class="def">Discovery — вход всей машины. Цифровой продукт всегда служит куску реального мира: не строитель, а сайт строителя; не стройка, а программа учёта ресурсов строительной компании; не торт, а приложение рецептов. Поэтому прежде чем что-то проектировать, Discovery разбирается в этом мире: <strong>какая отрасль, кто в ней живёт, по каким правилам, за что платят, что уже есть</strong> — и какой цифровой продукт здесь действительно нужен. Его подпродукт — проверенное досье, на котором строят все следующие стадии.</p>
+    </div>
+    <div class="legend">
+      <span class="pill acc">предложение</span>
+      <span class="pill warn">нужно решение владельца</span>
+      <span class="pill ok">есть в движке</span>
+      <span class="pill bad">нет в движке</span>
+    </div>
+  </header>
+
+  <nav class="nav" aria-label="Разделы">
+    <span>Разделы</span>
+    <a href="#what">Стадия</a><a href="#dossier">Досье</a><a href="#axes">12 осей</a><a href="#steps">Шаги</a><a href="#research">Исследование</a><a href="#checks">Проверки</a><a href="#consumers">Потребители</a><a href="#depth">Глубина</a><a href="#gap">Разрыв</a><a href="#decide">Решения</a>
+  </nav>
+
+  <div class="grid">
+    <section class="sec" id="what">
+      <h3>Что это за стадия <small>назначение</small></h3>
+      <p><b>Делает:</b> превращает поручение владельца в понимание реального мира продукта и обоснованное решение — что строим, для кого, зачем, в каких правилах и с каким первым полезным результатом. Или обоснованный отказ: «не делать, потому что…» — это тоже полезный результат.</p>
+      <p><b>Не делает:</b> архитектуру, файлы, задачи и код — это дело карты, спецификации и OM. Но обязан дать им внешние факты (сервисы, лимиты, лицензии, законы), без которых они начнут угадывать.</p>
+      <p><b>Принцип глубины:</b> исследуется ровно столько, сколько нужно потребителям досье для качественной работы, и пропорционально масштабу продукта. Каждая ось либо исследована, либо явно «неприменимо» с причиной — молча пропущенных осей нет.</p>
+    </section>
+
+    <section class="sec key" id="dossier">
+      <h3>Подпродукт: досье <small>что выдаёт стадия</small></h3>
+      <p>Одна база знаний о продукте и его мире. Каждое утверждение несёт свой вид — чтобы потребитель видел, на что можно опереться, а что ещё предстоит проверить.</p>
+      <div class="kinds">
+        <span class="pill ok">факт · с источником</span>
+        <span class="pill acc">вывод · из каких фактов</span>
+        <span class="pill">гипотеза · как проверить</span>
+        <span class="pill warn">неизвестное · кто и когда закроет</span>
+        <span class="pill">решение владельца</span>
+      </div>
+      <h4>Состав</h4>
+      <ul class="plain">
+        <li><b>Разделы по 12 осям</b> — отрасль, мир «как есть», люди, язык домена, правила, рынок, деньги, данные и связи, масштаб, последствия, реализуемость, результат.</li>
+        <li><b>Варианты продукта</b> — 2–3 с критериями и рекомендацией; выбранный владельцем.</li>
+        <li><b>Итог</b> — что строим, для кого, зачем, первый полезный результат, критерий успеха, не-цели, вердикт: идти · идти при условиях · не идти · не хватает данных.</li>
+        <li><b>Конституция проекта</b> — короткая опора для проверки дрейфа на всех следующих стадиях.</li>
+      </ul>
+    </section>
+
+    <section class="sec wide" id="axes">
+      <h3>12 осей Discovery <small>что определить · для любого поручения</small></h3>
+      <div class="tw"><table>
+        <thead><tr><th>Ось</th><th>Что определить</th><th>Ключевые вопросы</th><th>Пример: учёт ресурсов строительной компании</th></tr></thead>
+        <tbody>
+          <tr><td><span class="n">01</span>Отрасль и домены</td><td>Отрасль(и), домены и поддомены, в которые попадает поручение</td><td>Что это за идея и в чём её смысл? Это часть чего-то большего?</td><td>Строительство → снабжение, учёт техники и материалов, сметы, расчёты с субподрядом</td></tr>
+          <tr><td><span class="n">02</span>Мир «как есть»</td><td>Текущие процессы, чем закрывают потребность сегодня, где болит и сколько стоит боль</td><td>Чем потребность закрывается сегодня? Почему перейдут? Цена перехода?</td><td>Excel и звонки прорабу, 1С у бухгалтерии; потери материалов, простои техники</td></tr>
+          <tr><td><span class="n">03</span>Люди</td><td>Роли в процессе, пользователи и их контекст, покупатель, администратор, партнёры, проверяющие</td><td>Кто потребители, их портрет? Кто покупатель, если не пользователь? Как будут пользоваться?</td><td>Прораб на объекте с телефона, без сети; снабженец; директор платит; бухгалтер сверяет</td></tr>
+          <tr><td><span class="n">04</span>Язык домена</td><td>Словарь терминов и документов отрасли</td><td>Какими словами и документами говорит этот мир?</td><td>Смета, КС-2, КС-3, М-29, наряд-допуск, ППР</td></tr>
+          <tr><td><span class="n">05</span>Правила</td><td>Законы и регион, отраслевые нормы, стандарты, лицензии, правила платформ, язык, валюта, налоги</td><td>Как регулируется законами? Какой регион? Какие данные нельзя выносить?</td><td>РФ: 152-ФЗ, первичка и ЭДО, СРО заказчиков; магазины приложений</td></tr>
+          <tr><td><span class="n">06</span>Рынок</td><td>Аналоги и конкуренты, цены, отзывы, чем отличимся, что перенять</td><td>Нужна ли идея рынку? Кто уже делает похожее и что у них хорошего?</td><td>Отраслевые ERP и модули 1С, облачные учётные сервисы; что хвалят и за что ругают</td></tr>
+          <tr><td><span class="n">07</span>Деньги</td><td>Кто платит, за что и сколько; модель; стоимость создания и содержания; окупаемость</td><td>Экономический смысл? Кто платит и кому?</td><td>Подписка за объект или пользователя; окупается снижением потерь материалов</td></tr>
+          <tr><td><span class="n">08</span>Данные и связи</td><td>Какие данные есть и у кого, чувствительность; внешние системы и интеграции</td><td>Какие данные проходят, кому принадлежат? С чем стыковаться?</td><td>Обмен с 1С, банк, ЭДО, фото и геометки с объекта</td></tr>
+          <tr><td><span class="n">09</span>Масштаб и рамка</td><td>Личный, внутренний, коммерческий или публичный; число пользователей и объёмы; ресурсы владельца; кто поддерживает</td><td>Это для себя, для компании или на продажу? Какие сроки, бюджет, кто будет вести?</td><td>Внутренний для одной компании, 3–10 объектов, 30 пользователей</td></tr>
+          <tr><td><span class="n">10</span>Последствия и риски</td><td>Цена ошибки продукта, что убьёт идею, что должно совпасть, внешние зависимости и сроки</td><td>Какие последствия от воплощения? Что должно совпасть? От чего зависит?</td><td>Ошибка учёта = прямые деньги и споры с субподрядом; зависимость от выгрузки 1С</td></tr>
+          <tr><td><span class="n">11</span>Реализуемость</td><td>Технологии, компоненты, платформы, ограничения внешних сервисов, путь сборки. Отсутствие аналогов — не довод против</td><td>Это код? Для чего? Из чего собрать и что ограничивает?</td><td>Мобильный офлайн-клиент + сервер; лимиты и формат обмена 1С</td></tr>
+          <tr><td><span class="n">12</span>Результат</td><td>Первый полезный результат, измеримый критерий успеха, минимальный пилот, не-цели</td><td>Какой ближайший полезный результат? Как поймём, что получилось? Чего не делаем?</td><td>Приход и расход материалов по одному объекту; −20 % списаний за квартал; без смет в первом выпуске</td></tr>
+        </tbody>
+      </table></div>
+      <p style="margin-top:12px">Вопросы осей собраны из списка владельца (10 вопросов) и дополнений (9) из подготовки ASVP — как носители идей, а не как канон.</p>
+    </section>
+
+    <section class="sec wide" id="steps">
+      <h3>Устройство: шаги стадии <small>кто делает · что на входе и выходе</small></h3>
+      <ol class="chain">
+        <li><span><b>D0 · Приём поручения</b><span class="who"><span class="pill">код</span></span><span class="io">слова и материалы владельца <i>→</i> поручение дословно, без трактовки</span></span></li>
+        <li><span><b>D1 · Рамка</b> — тип продукта, отрасль(и) и домены, глубина по каждой оси: глубоко · кратко · неприменимо с причиной<span class="who"><span class="pill acc">модель</span><span class="pill">оценщик</span></span><span class="io">поручение <i>→</i> карта доменов и план глубины · владельца спрашивают, только если трактовки расходятся и меняют результат</span></span></li>
+        <li><span><b>D2 · План исследования</b> — по домену и оси: вопросы, роли-перспективы (эксперт отрасли, юрист региона, экономист, исследователь пользователей, инженер), места поиска, включая аналоги, и что считать достаточным ответом<span class="who"><span class="pill acc">модель</span><span class="pill">оценщик</span></span><span class="io">рамка <i>→</i> план с критерием достаточности по каждому вопросу</span></span></li>
+        <li><span><b>D3 · Исследование</b> — поиск, чтение, проверка; каждое утверждение с видом и источником<span class="who"><span class="pill acc">модель</span><span class="pill">движок</span></span><span class="io">план <i>→</i> сведения по вопросам · выход по рамке достаточности, не по усталости</span></span></li>
+        <li><span><b>D4 · Сборка досье</b> — разделы по осям, противоречия, неизвестные с потребителем и моментом закрытия<span class="who"><span class="pill acc">модель</span><span class="pill">оценщик</span></span><span class="io">сведения <i>→</i> досье по 12 осям</span></span></li>
+        <li><span><b>D5 · Варианты</b> — 2–3 варианта продукта с критериями: ценность, кто платит, стоимость и срок, риск, верность поручению; рекомендация<span class="who"><span class="pill acc">модель</span><span class="pill">оценщик</span><span class="pill warn">владелец выбирает</span></span><span class="io">досье <i>→</i> выбранный вариант</span></span></li>
+        <li><span><b>D6 · Итог и вердикт</b> — что строим, для кого, первый результат, критерий успеха, не-цели, вердикт; конституция проекта<span class="who"><span class="pill acc">модель</span><span class="pill">оценщик</span></span><span class="io">вариант <i>→</i> итог · идти / при условиях / не идти / не хватает данных</span></span></li>
+        <li><span><b>D7 · Выдача потребителям</b> — каждому своя проекция досье, сводка владельцу<span class="who"><span class="pill">код</span></span><span class="io">досье и итог <i>→</i> входы концепции, карты, спецификации, фич, OM</span></span></li>
+      </ol>
+    </section>
+
+    <section class="sec" id="research">
+      <h3>Как вести исследование <small>правила движка, не подсказки</small></h3>
+      <ul class="plain">
+        <li><b>Внешний мир — основной источник.</b> Веб включён для Discovery по умолчанию; без него — честное «не хватает данных», а не догадки.</li>
+        <li><b>Методика:</b> первичный источник важнее пересказа; у факта дата; существенное подтверждается вторым источником; ищутся и опровержения.</li>
+        <li><b>Аналоги</b> — чтобы перенять решения. Не найдено — сказать прямо с границами поиска; это не довод против реализуемости.</li>
+        <li><b>Рамка достаточности</b> <span class="pill acc">предложение</span>: вопрос закрыт, когда выполнен его критерий из плана. Переход к досье — при покрытии ≥ 80 % вопросов плана или когда 3 хода подряд не дают нового материала; остальное уходит в неизвестные с причиной.</li>
+        <li><b>Повторы ловит движок:</b> то же чтение или поиск без нового материала — не ход, а сигнал к сборке.</li>
+        <li><b>Служебное модели не читать:</b> каталог и история выдаются движком и не создают долг «дочитай».</li>
+      </ul>
+    </section>
+
+    <section class="sec" id="checks">
+      <h3>Проверки <small>кто что гарантирует</small></h3>
+      <div class="tw"><table style="min-width:420px">
+        <thead><tr><th>Кто</th><th>Проверяет</th></tr></thead>
+        <tbody>
+          <tr><td>Код</td><td>Каждая ось исследована или «неприменимо» с причиной; у каждого утверждения вид и источник; ссылки на реальные прочитанные места; неизвестные с потребителем и моментом; варианты с критериями</td></tr>
+          <tr><td>Оценщик</td><td>Широта: все ли домены и роли охвачены для этого масштаба; качество источников; рассмотрены ли альтернативы; не сужено ли поручение молча (например, «один вендор» без обоснования)</td></tr>
+          <tr><td>Владелец</td><td>Выбор варианта; трактовка поручения — только при существенном расхождении; поправки к конституции</td></tr>
+          <tr><td>Хранитель <span class="pill warn">решить</span></td><td>На следующих стадиях: служит ли шаг цели, первому результату и не-целям из конституции</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section class="sec wide" id="consumers">
+      <h3>Потребители досье <small>кто ждёт результат и что ему нужно</small></h3>
+      <div class="tw"><table>
+        <thead><tr><th>Потребитель</th><th>Получает</th><th>Из осей</th><th>Без чего начнёт угадывать</th></tr></thead>
+        <tbody>
+          <tr><td>Владелец</td><td>Читаемая сводка: что строим, зачем, риски, варианты, что решить</td><td>все, итог</td><td>Без вариантов и последствий — решение вслепую</td></tr>
+          <tr><td>Концепция</td><td>Пользователи и покупатель, ценность, первый результат, не-цели, выбранный вариант, ограничения</td><td>03, 07, 09, 12</td><td>Кому и зачем продукт; где его границы</td></tr>
+          <tr><td>Карта L1</td><td>Процессы и участники реального мира, внешние системы, потоки данных</td><td>02, 03, 08</td><td>Реальные пути пользователей и стыки с внешним миром</td></tr>
+          <tr><td>Спецификация</td><td>Правила домена и законы, словарь, требования к данным, условия использования (офлайн, безопасность, доступность)</td><td>04, 05, 08, 10</td><td>Термины и правила, которые нельзя нарушить</td></tr>
+          <tr><td>Фичи</td><td>Основания приоритета: ценность, кто платит, что в первом выпуске, критерии успеха</td><td>06, 07, 12</td><td>Что делать первым, а что не делать вовсе</td></tr>
+          <tr><td>OM и исполнение</td><td>Внешние факты (API, лимиты, лицензии), неизвестные с моментом закрытия, ограничения среды</td><td>05, 08, 11</td><td>Факты внешних сервисов, которых нет в репозитории</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section class="sec wide" id="depth">
+      <h3>Глубина по масштабу <small>одни оси — разная глубина</small></h3>
+      <div class="tw"><table>
+        <thead><tr><th>Поручение</th><th>Люди</th><th>Правила</th><th>Рынок</th><th>Деньги</th><th>Данные и связи</th><th>Последствия</th></tr></thead>
+        <tbody>
+          <tr><td>Приложение рецептов для себя</td><td class="d-short">кратко</td><td class="d-na">неприменимо: личное</td><td class="d-short">кратко: аналоги ради идей</td><td class="d-na">неприменимо: никто не платит</td><td class="d-short">кратко</td><td class="d-short">кратко</td></tr>
+          <tr><td>Сайт строительной компании</td><td class="d-deep">глубоко: заказчики</td><td class="d-short">кратко: реклама, ПДн</td><td class="d-deep">глубоко: конкуренты, премии</td><td class="d-short">кратко: стоимость заявки</td><td class="d-short">кратко: CRM, формы</td><td class="d-short">кратко</td></tr>
+          <tr><td>Учёт ресурсов строительной компании</td><td class="d-deep">глубоко</td><td class="d-deep">глубоко: первичка, ЭДО, ПДн</td><td class="d-deep">глубоко</td><td class="d-deep">глубоко</td><td class="d-deep">глубоко: 1С, банк</td><td class="d-deep">глубоко: деньги и споры</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section class="sec wide" id="gap">
+      <h3>Что есть сейчас и разрыв <small>аудит движка 17.10</small></h3>
+      <div class="tw"><table>
+        <thead><tr><th>Часть</th><th>Сейчас</th><th>Нужно</th></tr></thead>
+        <tbody>
+          <tr><td>Рамка и домены</td><td><span class="pill bad">нет</span> домен — свободная строка модели, без глубины по осям</td><td>D1 с картой доменов и планом глубины</td></tr>
+          <tr><td>Оси исследования</td><td><span class="pill acc">частично</span> план, варианты, экономика «где существенно», аналоги (DS2)</td><td>12 осей; люди, правила, рынок, деньги, масштаб, последствия названы явно</td></tr>
+          <tr><td>Виды утверждений</td><td><span class="pill acc">частично</span> цитаты к выводам, неизвестные</td><td>Факт · вывод · гипотеза · неизвестное · решение владельца — раздельно</td></tr>
+          <tr><td>Варианты</td><td><span class="pill bad">нет</span> одно поле «вариант»; владелец только принимает или отклоняет условие</td><td>2–3 варианта с критериями; выбор владельцем</td></tr>
+          <tr><td>Достаточность</td><td><span class="pill bad">нет</span> модель решает сама; потолок только по ходам</td><td>Критерий по вопросу, порог покрытия, детектор повторов</td></tr>
+          <tr><td>Оценщик</td><td><span class="pill acc">частично</span> «подкреплено ли цитатами»</td><td>Широта, качество источников, альтернативы, молчаливое сужение</td></tr>
+          <tr><td>Проверка цитат и формы</td><td><span class="pill ok">есть</span> ссылки, индексы, связи план → отчёт → вердикт</td><td>Сохранить</td></tr>
+          <tr><td>Выдача потребителям</td><td><span class="pill acc">частично</span> ограничения и основания идут в концепцию и OM</td><td>Проекции досье по каждому потребителю</td></tr>
+          <tr><td>Хранитель смысла</td><td><span class="pill bad">нет</span></td><td>Конституция проекта и проверка дрейфа</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section class="sec" id="decide">
+      <h3>Решения владельца <small>до любой задачи</small></h3>
+      <div class="decide">
+        <div><span><b>Принять определение:</b> Discovery = досье реального мира продукта по 12 осям, с видами утверждений и вариантами.</span></div>
+        <div><span><b>Исполнители:</b> одна модель ведёт оси по очереди — или отдельные задания по доменам и ролям, идущие параллельно.</span></div>
+        <div><span><b>Выбор варианта</b> владельцем из 2–3, а не только «принять или отклонить условие».</span></div>
+        <div><span><b>Числа достаточности:</b> порог покрытия 80 % и 3 хода без нового материала — или свои.</span></div>
+        <div><span><b>Хранитель смысла</b> — включаем ли и где проверяет.</span></div>
+        <div><span><b>Порядок:</b> сначала HX5 на текущем Discovery до OM, потом перестройка Discovery по этому описанию одним планом.</span></div>
+      </div>
+    </section>
+
+    <section class="sec" id="risks">
+      <h3>Риски предложения <small>и как смягчить</small></h3>
+      <div class="risk">
+        <div><b>Раздувание исследования</b>12 осей на личном приложении — лишние вызовы. Смягчение: план глубины D1 и «неприменимо с причиной».</div>
+        <div><b>Новая эра контракта</b>Меняются схемы, а не только тексты: читатели старых записей должны понимать обе эры. Смягчение: одна эра на всю перестройку, не по кусочкам.</div>
+        <div><b>Бедный поиск</b>Шлюз NL99 отдаёт мало по рынку и законам. Смягчение: честное «не хватает данных» и список нужного материала для владельца.</div>
+        <div><b>Больше решений владельца</b>Выбор варианта добавляет развилку. Смягчение: рекомендация модели с критериями, выбор одной командой.</div>
+      </div>
+    </section>
+  </div>
+
+  <div class="foot">Носители идей: ASVP/PREPARATION/STRUCTURE.HTML (замысел 09.09: потребность, вопросы 10 + 9, документы истины, хранитель) · OMG-MAP-SCHEME/discovery-scheme-2026-10-14.md · аудит движка ~/REPORTS/discovery-audit_171026-1815.md · om/module d8028bf (DS2)</div>
+</div>
