@@ -47,6 +47,8 @@ def main(name):
         sys.exit(f"узлов нет на схеме: {bad[:10]} … всего {len(bad)}")
     groups = [g["id"] for g in layer["groups"]]
     for g in part.get("groups", []):
+        if not any(k.get("group") == g["id"] for k in part.get("kinds", [])):
+            continue  # стадия без своих видов: пустую группу не заводим
         if g["id"] not in groups:
             at = groups.index("ndisc") if "ndisc" in groups else len(groups)
             layer["groups"].insert(at, g)
