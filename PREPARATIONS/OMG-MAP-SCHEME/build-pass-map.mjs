@@ -95,5 +95,14 @@ console.log("узлов без описания:", missing.length, missing.lengt
 console.log("описаний без узла:", orphans.length, orphans.length ? orphans.join(" ") : "");
 
 if (missing.length || orphans.length) process.exit(1);
+// Слой базы: код — db-layer/db-layer.js (всегда), данные — db-layer/db-layer.json (если есть; иначе слой выключен).
+const DBJS = join(dir, "db-layer", "db-layer.js");
+const DBJSON = join(dir, "db-layer", "db-layer.json");
+const dbjs = readFileSync(DBJS, "utf8");
+let dbdata = "null";
+try { dbdata = JSON.stringify(JSON.parse(readFileSync(DBJSON, "utf8"))).replace(/</g, "\\u003c"); } catch (e) { if (e.code !== "ENOENT") throw e; }
+if (!out.includes("/*@DBLAYERJS@*/")) { console.error("нет места слоя базы /*@DBLAYERJS@*/"); process.exit(2); }
+out = out.split("/*@DBLAYERJS@*/").join(dbjs.split("/*@DBLAYER@*/null").join(dbdata));
+console.log("слой базы:", dbdata === "null" ? "данных нет — выключен" : (JSON.parse(dbdata).kinds || []).length + " видов записей");
 writeFileSync(OUT, out);
 console.log("собран:", OUT, "—", out.length, "знаков");

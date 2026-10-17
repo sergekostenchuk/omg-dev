@@ -11,7 +11,7 @@
   --ink:#ececee; --ink2:#9a9aa2; --ink3:#66666e;
   --accent:#c27a34; --accent-hi:#d89c54; --accent-soft:rgba(194,122,52,.14); --accent-line:rgba(194,122,52,.5); --accent-faint:rgba(194,122,52,.035);
   --ok:#3fbf6f; --ok-soft:rgba(63,191,111,.14); --bad:#c9566e; --bad-soft:rgba(163,48,75,.2); --warn:#e0b23c; --warn-soft:rgba(224,178,60,.14);
-  --dot:#1f1f23; --edge:#585860; --edge-alt:#4a4a52; --edge-tie:#3a3a42; --shadow:rgba(0,0,0,.38);
+  --dot:#1f1f23; --db4:#7f9cd6; --edge:#585860; --edge-alt:#4a4a52; --edge-tie:#3a3a42; --shadow:rgba(0,0,0,.38);
   --font:"Inter",-apple-system,"Segoe UI",Roboto,sans-serif; --mono:"JetBrains Mono",Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
@@ -40,6 +40,46 @@ h1 b{color:var(--accent);font-weight:600}
 .chip:hover{color:var(--ink);border-color:#3c3c44}
 .chip[aria-pressed="true"]{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft)}
 .seg{display:inline-flex;gap:4px}
+.dbbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;border:1px dashed var(--line2);border-radius:12px;background:var(--panel)}
+.dbbar .eyebrow{margin-right:4px}
+.dbbar .lg{font:10.5px var(--mono);color:var(--ink3);margin-left:auto}
+.chip.dbsel{background:var(--raised)}
+.dbk{position:absolute;width:212px;border:1px solid var(--line2);border-left:3px solid var(--edge);border-radius:10px;background:var(--panel);padding:6px 9px 8px;z-index:3;cursor:pointer;box-shadow:0 8px 24px var(--shadow);transition:opacity .2s,border-color .15s}
+.dbk.prop{border-style:dashed;border-left-style:dashed}
+.dbk .kh{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.dbk .kh .pill{height:16px;padding:0 6px;font-size:8.5px}
+.dbk .kw{margin-left:auto;font:9.5px var(--mono);color:var(--ink3)}
+.dbk .kn{font:500 11.5px var(--mono);color:var(--ink);word-break:break-all}
+.dbk .ki{font:9.5px var(--mono);color:var(--ink3);margin-top:2px;word-break:break-all}
+.dbk .kt{font-size:10.5px;line-height:1.4;color:var(--ink2);margin-top:5px;padding-top:5px;border-top:1px dashed var(--line2)}
+.dbk .kc{font:9.5px var(--mono);color:var(--ink3);margin-top:4px}
+.dbk:hover{border-color:#4a4a52}
+.dbk.on{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),0 8px 24px var(--shadow)}
+.dbk.dim{opacity:.2}
+.dbgrp{position:absolute;border:1px dashed rgba(154,154,162,.42);border-radius:16px;background:rgba(154,154,162,.025);z-index:1}
+.dbgrp .gt{position:absolute;left:14px;top:12px;font:600 10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink)}
+.dbhead{position:absolute;width:300px;border:1px solid var(--accent-line);border-radius:14px;background:var(--raised);padding:12px 14px;z-index:3;box-shadow:0 12px 34px var(--shadow)}
+.dbhead .ht{font:600 10.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin-bottom:6px}
+.dbhead .hs{font-size:11px;line-height:1.45;color:var(--ink2);margin-bottom:8px}
+.dbhead .tb{display:flex;flex-direction:column;gap:4px}
+.dbhead .tb div{display:grid;grid-template-columns:118px 1fr;gap:6px;font-size:10.5px;line-height:1.4;color:var(--ink2)}
+.dbhead .tb b{font:500 10.5px var(--mono);color:var(--ink)}
+.dbhead code{font:10px var(--mono);color:var(--ink);background:var(--tile);padding:0 4px;border-radius:4px}
+.edges path.e.db{stroke-width:1.6;opacity:.9}
+.edges path.e.db.rd{stroke-dasharray:6 4}
+.lbl.db{background:var(--raised);color:var(--ink2)}
+.detail h2.mono{font:600 14px var(--mono);word-break:break-all}
+.detail .dbsec{margin:14px 0 6px;font:500 9.5px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--ink3)}
+.detail .dbln{all:unset;display:flex;flex-direction:column;gap:1px;cursor:pointer;padding:5px 0;border-bottom:1px dashed var(--line2);font-size:11.5px;color:var(--ink2)}
+.detail .dbln b{font-weight:500;color:var(--ink)}
+.detail .dbln i{font:10px var(--mono);font-style:normal;color:var(--ink3)}
+.detail .dbln:hover b{color:var(--accent)}
+.detail .dbf{padding:4px 0;border-bottom:1px dashed var(--line2);font-size:11px;color:var(--ink2);display:flex;flex-wrap:wrap;gap:2px 8px}
+.detail .dbf b{font:500 10.5px var(--mono);color:var(--ink)}
+.detail .dbf i{font:10px var(--mono);font-style:normal;color:var(--ink3)}
+.detail details.dbf{display:block}
+.detail details.dbf summary{cursor:pointer;display:flex;gap:8px;list-style:none}
+.detail details.dbf dl{margin-top:6px}
 .sep{width:1px;height:20px;background:var(--line2);margin:0 4px}
 .hint{margin-left:auto;font:10.5px var(--mono);color:var(--ink3)}
 
@@ -224,10 +264,22 @@ ul.plain b{color:var(--ink);font-weight:500}
       <button class="chip" data-disc="new" aria-pressed="false">New Discovery</button>
     </span>
     <span class="sep" aria-hidden="true"></span>
+    <button class="chip" id="dbT" aria-pressed="false" hidden>База</button>
+    <span class="sep" aria-hidden="true"></span>
     <button class="chip" id="expAll">Развернуть всё</button>
     <button class="chip" id="colAll">Свернуть всё</button>
     <button class="chip" id="resetPos">Сбросить расположение</button>
     <span class="hint">клик по стадии — развернуть · тяните блоки и рамки · колесо — масштаб · пустое поле — сдвиг</span>
+  </div>
+  <div class="dbbar" id="dbbar" role="toolbar" aria-label="Фильтр базы" hidden>
+    <span class="eyebrow">база · фильтр</span>
+    <select class="chip" id="dbW" aria-label="Добавить писателя"></select><span id="dbWs" class="seg"></span>
+    <select class="chip" id="dbR" aria-label="Добавить читателя"></select><span id="dbRs" class="seg"></span>
+    <select class="chip" id="dbK" aria-label="Запись"></select>
+    <select class="chip" id="dbG" aria-label="Стадия"></select>
+    <label class="chip" style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" id="dbP"> путь дальше</label>
+    <button class="chip" id="dbX" type="button">Сбросить</button>
+    <span class="lg">сплошная — пишет · пунктир — читает · цвет — выбранный блок</span>
   </div>
 
   <div class="stagewrap">
@@ -3064,8 +3116,9 @@ research-stage(project, draftId, maxTurns)
     pos={};var cx=40;
     liveStages().forEach(function(s){var d=dims[s.key],so=o(soff,s.key);place(s.key,cx+so[0],TOP+(H-d.h)/2+so[1]);cx+=d.w+GAPX;});
     var mx=0,my=0;Object.keys(pos).forEach(function(k){var p=pos[k];mx=Math.max(mx,p.x+p.w);my=Math.max(my,p.y+p.h);});
+    dbLayout(my);Object.keys(dbBox).forEach(function(k){var p=dbBox[k];mx=Math.max(mx,p.x+p.w);my=Math.max(my,p.y+p.h);});
     svg.setAttribute("width",mx+900);svg.setAttribute("height",my+900);svg.style.width=(mx+900)+"px";svg.style.height=(my+900)+"px";
-    drawEdges();apply();
+    drawEdges();dbEdges();apply();
   }
 
   /* ---------- edges ---------- */
@@ -3205,6 +3258,7 @@ research-stage(project, draftId, maxTurns)
     drawn.forEach(function(d,i){var on=!!es&&!!es[i],dim=!!es&&!es[i];
       d.p.classList.toggle("on",on);d.p.classList.toggle("dim",dim);d.p.setAttribute("marker-end",on?"url(#ah-on)":"url(#ah)");
       d.lb.classList.toggle("on",on);d.lb.classList.toggle("dim",dim);});
+    if(!sel)dbApply();
   }
 
   /* ---------- detail card ---------- */
@@ -3221,6 +3275,7 @@ research-stage(project, draftId, maxTurns)
       inc.forEach(function(d){h+='<button type="button" data-go="'+esc(d.a)+'"><i>← '+esc(d.lb.textContent)+'</i>'+esc(IT[d.a].t)+'</button>';});
       out.forEach(function(d){h+='<button type="button" data-go="'+esc(d.b)+'"><i>→ '+esc(d.lb.textContent)+'</i>'+esc(IT[d.b].t)+'</button>';});
       h+='</div>';}
+    h+=dbNodeInfo(key);
     if(expandable(key))h+='<div class="act"><button type="button" class="ib" data-act="toggle" data-key="'+esc(key)+'">'+(opened(key)?'свернуть ▾':'развернуть ▸')+'</button></div>';
     detail.innerHTML=h;detail.hidden=false;detail.scrollTop=0;apply();
   }
@@ -3263,7 +3318,7 @@ research-stage(project, draftId, maxTurns)
   function bounds(){var x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
     liveStages().forEach(function(s){var p=pos[s.key];x0=Math.min(x0,p.x);y0=Math.min(y0,p.y);x1=Math.max(x1,p.x+p.w);y1=Math.max(y1,p.y+p.h);});
     drawn.forEach(function(d){var b=d.p.getBBox();x0=Math.min(x0,b.x);y0=Math.min(y0,b.y);x1=Math.max(x1,b.x+b.width);y1=Math.max(y1,b.y+b.height);});
-    return {x:x0,y:y0,w:x1-x0,h:y1-y0};}
+    return dbBounds({x:x0,y:y0,w:x1-x0,h:y1-y0});}
   function fit(){
     var r=canvas.getBoundingClientRect(),b=bounds();
     var f=Math.min((r.width-48)/b.w,(r.height-48)/b.h,1.1);
@@ -3327,6 +3382,184 @@ research-stage(project, draftId, maxTurns)
     else if(cd){ev.preventDefault();var k=cd.dataset.key;expandable(k)?toggle(k):openDetail(k);}
   });
   document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&sel)closeDetail();});
+
+  /* ---------- DB layer: which block writes which record and field, and who reads it (data: db-layer/db-layer.json, inserted at build) ---------- */
+  var DBL=null;
+  var dbOn=false,dbEl={},dbBox={},dbGrpEl={},dbHeadEl=null,dbDrawn=[],dbF={w:[],r:[],k:"",g:"",path:false};
+  var DBC=["var(--accent)","var(--ok)","var(--warn)","var(--db4)"];
+  try{var dbs=JSON.parse(localStorage.getItem(KEY+"-db")||"null");if(dbs){dbOn=!!dbs.on;dbF.g=dbs.g||"";}}catch(_){}
+  function dbSave(){try{localStorage.setItem(KEY+"-db",JSON.stringify({on:dbOn,g:dbF.g}));}catch(_){}}
+  function dbKindOn(k){return (!k.proposed||DISC==="new")&&(!dbF.g||k.group===dbF.g);}
+  function dbUnder(nodeKey,sel){return nodeKey===sel||nodeKey.indexOf(sel+".")===0;}
+  function dbLabel(key){var parts=key.split("."),cur="",out=[];
+    for(var i=0;i<parts.length;i++){cur=cur?cur+"."+parts[i]:parts[i];if(IT[cur])out.push(IT[cur].t);else return key+" (?)";}
+    return out.join(" · ");}
+  function dbShortFields(arr){if(!arr||!arr.length)return "";var s=arr.slice(0,3).join(", ");return arr.length>3?s+" …":s;}
+  function dbActive(){return dbOn&&(dbF.w.length||dbF.r.length||dbF.k);}
+  function dbBuild(){
+    if(!DBL)return;
+    dbHeadEl=document.createElement("div");dbHeadEl.className="dbhead";dbHeadEl.hidden=true;
+    var h='<div class="ht">state.sqlite · база проекта</div><div class="hs">Записи только добавляются: каждая версия — строка <code>revisions</code>; <code>heads</code> — последняя версия; <code>events</code> — порядок. Всё содержимое записи — JSON в колонке <code>body</code>.</div><div class="tb">';
+    (DBL.tables||[]).forEach(function(t){h+='<div><b>'+esc(t.name)+'</b><span>'+esc(t.note||"")+'</span></div>';});
+    h+='</div>';dbHeadEl.innerHTML=h;view.appendChild(dbHeadEl);
+    (DBL.groups||[]).forEach(function(g){var f=document.createElement("div");f.className="dbgrp";f.hidden=true;f.innerHTML='<span class="gt">'+esc(g.t)+'</span>';view.appendChild(f);dbGrpEl[g.id]=f;});
+    DBL.kinds.forEach(function(k){
+      var d=document.createElement("div");d.className="dbk"+(k.proposed?" prop":"");d.dataset.kind=k.kind;d.tabIndex=0;d.setAttribute("role","button");d.hidden=true;
+      d.setAttribute("aria-label","Запись "+k.kind);
+      d.innerHTML='<div class="kh"><span class="pill">'+(k.proposed?"предложение":"запись")+'</span><span class="kw">✎ '+(k.writers||[]).length+' · ◉ '+(k.readers||[]).length+'</span></div>'+
+        '<div class="kn">'+esc(k.kind)+'</div><div class="ki">'+esc(k.idPattern||"")+'</div>'+
+        (k.card&&k.card.what?'<div class="kt">'+esc(k.card.what)+'</div>':'')+
+        (k.card&&k.card.size?'<div class="kc">'+esc(k.card.size)+'</div>':'');
+      view.appendChild(d);dbEl[k.kind]=d;
+    });
+  }
+  /* band under the pipeline: header with tables, then one column block per group */
+  function dbLayout(bottom){
+    dbBox={};
+    if(!DBL)return;
+    var show=dbOn;
+    dbHeadEl.hidden=!show;
+    Object.keys(dbGrpEl).forEach(function(g){dbGrpEl[g].hidden=true;});
+    DBL.kinds.forEach(function(k){dbEl[k.kind].hidden=!(show&&dbKindOn(k));});
+    if(!show)return;
+    var y0=bottom+340,x=40;
+    dbHeadEl.style.left=x+"px";dbHeadEl.style.top=y0+"px";x+=dbHeadEl.offsetWidth+70;
+    (DBL.groups||[]).forEach(function(g){
+      var ks=DBL.kinds.filter(function(k){return k.group===g.id&&dbKindOn(k);});
+      if(!ks.length)return;
+      var per=7,cols=Math.ceil(ks.length/per),W=226,colH=[],gx=x+18,gy=y0+40;
+      for(var c=0;c<cols;c++)colH.push(gy);
+      ks.forEach(function(k,i){var c=Math.floor(i/per),el=dbEl[k.kind];
+        el.style.left=(gx+c*W)+"px";el.style.top=colH[c]+"px";
+        dbBox[k.kind]={x:gx+c*W,y:colH[c],w:el.offsetWidth,h:el.offsetHeight};colH[c]+=el.offsetHeight+14;});
+      var fh=Math.max.apply(null,colH)-y0+10,fw=cols*W+24,f=dbGrpEl[g.id];
+      f.hidden=false;f.style.left=x+"px";f.style.top=y0+"px";f.style.width=fw+"px";f.style.height=fh+"px";
+      dbBox["grp:"+g.id]={x:x,y:y0,w:fw,h:fh};
+      x+=fw+60;
+    });
+    dbBox["head"]={x:40,y:y0,w:dbHeadEl.offsetWidth,h:dbHeadEl.offsetHeight};
+  }
+  function dbBounds(b){if(!dbOn)return b;Object.keys(dbBox).forEach(function(k){var p=dbBox[k];
+    var x1=Math.max(b.x+b.w,p.x+p.w),y1=Math.max(b.y+b.h,p.y+p.h);b.x=Math.min(b.x,p.x);b.y=Math.min(b.y,p.y);b.w=x1-b.x;b.h=y1-b.y;});return b;}
+  /* lines: solid = writes, dashed = reads; colour = selected writer/reader */
+  function dbLine(a,b,up,color,label,dashed){
+    var e=up?{fs:"t",ts:"b",ff:.5,tf:.5}:{fs:"b",ts:"t",ff:.5,tf:.5};
+    var p=document.createElementNS(NSV,"path");p.setAttribute("d",curve(a,b,e));p.setAttribute("class","e db"+(dashed?" rd":""));
+    p.style.stroke=color;svg.appendChild(p);
+    var len=p.getTotalLength(),pt=p.getPointAtLength(len*(up?.35:.65));
+    var lb=document.createElement("div");lb.className="lbl db";lb.textContent=label||"";lb.hidden=!label;lb.style.left=pt.x+"px";lb.style.top=pt.y+"px";lb.style.borderColor=color;view.appendChild(lb);
+    dbDrawn.push({p:p,lb:lb});
+  }
+  function dbEdges(){
+    dbDrawn.forEach(function(d){d.p.remove();d.lb.remove();});dbDrawn=[];
+    if(!DBL||!dbActive())return;
+    var seen={};
+    function nodeBox(key){var r=resolve(key);return shown(r)?{key:r,b:box(elOf(r))}:null;}
+    function draw(kind,ent,isW,color,dashed){
+      if(!dbBox[kind])return;var nb=nodeBox(ent.node);if(!nb)return;
+      var id=(isW?"w":"r")+nb.key+">"+kind+color;if(seen[id])return;seen[id]=1;
+      if(isW)dbLine(nb.b,dbBox[kind],false,color,(isW?"пишет: ":"")+dbShortFields(ent.fields),false);
+      else dbLine(dbBox[kind],nb.b,true,color,"читает: "+dbShortFields(ent.fields),true);
+    }
+    var kinds=DBL.kinds.filter(dbKindOn);
+    dbF.w.forEach(function(w,i){kinds.forEach(function(k){(k.writers||[]).forEach(function(en){if(dbUnder(en.node,w))draw(k.kind,en,true,DBC[i],false);});
+      if(dbF.path)(k.writers||[]).some(function(en){return dbUnder(en.node,w);})&&(k.readers||[]).forEach(function(en){draw(k.kind,en,false,DBC[i],true);});});});
+    dbF.r.forEach(function(r,i){kinds.forEach(function(k){(k.readers||[]).forEach(function(en){if(dbUnder(en.node,r))draw(k.kind,en,false,DBC[i],true);});
+      if(dbF.path)(k.readers||[]).some(function(en){return dbUnder(en.node,r);})&&(k.writers||[]).forEach(function(en){draw(k.kind,en,true,DBC[i],false);});});});
+    if(dbF.k){var k=DBL.kinds.filter(function(x){return x.kind===dbF.k;})[0];
+      if(k){(k.writers||[]).forEach(function(en){draw(k.kind,en,true,DBC[0],false);});(k.readers||[]).forEach(function(en){draw(k.kind,en,false,DBC[1],true);});
+        if(dbF.path)(k.readers||[]).forEach(function(rd){kinds.forEach(function(k2){(k2.writers||[]).forEach(function(en){if(dbUnder(en.node,rd.node)||dbUnder(rd.node,en.node))draw(k2.kind,en,true,DBC[2],false);});});});}}
+  }
+  /* highlight: involved blocks and records stay lit, the rest fades */
+  function dbApply(){
+    DBL&&DBL.kinds.forEach(function(k){dbEl[k.kind].classList.remove("on","dim");});
+    if(!dbActive())return;
+    var lit={},klit={};
+    function mark(node){var r=resolve(node);lit[r]=1;}
+    var kinds=DBL.kinds.filter(dbKindOn);
+    kinds.forEach(function(k){
+      var hitW=(k.writers||[]).some(function(en){return dbF.w.some(function(w){return dbUnder(en.node,w);});});
+      var hitR=(k.readers||[]).some(function(en){return dbF.r.some(function(r){return dbUnder(en.node,r);});});
+      if(hitW||hitR||dbF.k===k.kind){klit[k.kind]=1;
+        if(dbF.k===k.kind||dbF.path){(k.writers||[]).forEach(function(en){mark(en.node);});(k.readers||[]).forEach(function(en){mark(en.node);});}
+        else{(k.writers||[]).forEach(function(en){if(dbF.w.some(function(w){return dbUnder(en.node,w);}))mark(en.node);});
+          (k.readers||[]).forEach(function(en){if(dbF.r.some(function(r){return dbUnder(en.node,r);}))mark(en.node);});}}
+    });
+    visibleKeys().forEach(function(k){var el=elOf(k);el.classList.toggle("near",!!lit[k]);el.classList.toggle("dim",!lit[k]);el.classList.remove("on");});
+    drawn.forEach(function(d){d.p.classList.add("dim");d.lb.classList.add("dim");});
+    kinds.forEach(function(k){dbEl[k.kind].classList.toggle("on",!!klit[k.kind]);dbEl[k.kind].classList.toggle("dim",!klit[k.kind]);});
+  }
+  /* detail: the record with its standard set — what, where, who writes, when, why, who reads and expects, risks, size */
+  function dbRow(t,v,cls){return v?'<div><dt>'+esc(t)+'</dt><dd'+(cls?' class="'+cls+'"':'')+'>'+esc(v)+'</dd></div>':'';}
+  function openDbDetail(kind){
+    var k=DBL.kinds.filter(function(x){return x.kind===kind;})[0];if(!k)return;
+    sel=null;var c=k.card||{};
+    var h='<div class="top"><span class="pill acc">'+(k.proposed?"предложение":"запись")+'</span><span class="pill">'+esc((DBL.groups.filter(function(g){return g.id===k.group;})[0]||{}).t||k.group)+'</span>'+
+      '<button type="button" class="x" data-act="close" aria-label="Закрыть">×</button></div><h2 class="mono">'+esc(k.kind)+'</h2><div class="io">'+esc(k.idPattern||"")+'</div><dl>'+
+      dbRow("Что",c.what)+dbRow("Где",c.where)+dbRow("Когда",c.when)+dbRow("Зачем",c.why)+dbRow("Что ожидают читатели",c.expects)+dbRow("Риски",c.risks,"gap")+dbRow("Сколько",c.size)+'</dl>';
+    h+='<div class="dbsec">Пишут ('+(k.writers||[]).length+')</div>';
+    (k.writers||[]).forEach(function(en){h+='<button type="button" class="dbln" data-go="'+esc(resolve(en.node))+'"><b>'+esc(dbLabel(en.node))+'</b><i>'+esc(en.code||"")+(en.sure===false?' · не проверено':'')+'</i>'+
+      (en.when?'<span>когда: '+esc(en.when)+'</span>':'')+(en.fields&&en.fields.length?'<span>поля: '+esc(en.fields.join(", "))+'</span>':'')+'</button>';});
+    h+='<div class="dbsec">Читают ('+(k.readers||[]).length+')</div>';
+    (k.readers||[]).forEach(function(en){h+='<button type="button" class="dbln" data-go="'+esc(resolve(en.node))+'"><b>'+esc(dbLabel(en.node))+'</b><i>'+esc(en.code||"")+(en.sure===false?' · не проверено':'')+'</i>'+
+      (en.fields&&en.fields.length?'<span>поля: '+esc(en.fields.join(", "))+'</span>':'')+(en.expects?'<span>ожидает: '+esc(en.expects)+'</span>':'')+'</button>';});
+    var fs=k.fields||[];
+    if(fs.length){h+='<div class="dbsec">Поля ('+fs.length+') · ★ — стык между блоками</div>';
+      fs.forEach(function(f){
+        if(f.iface)h+='<details class="dbf"><summary><b>★ '+esc(f.path)+'</b><i>'+esc(f.type||"")+'</i></summary><dl>'+dbRow("Что",f.what)+dbRow("Кто пишет",f.writer)+dbRow("Кто читает",f.readers)+dbRow("Что ожидают",f.expects)+dbRow("Риски",f.risks,"gap")+'</dl></details>';
+        else h+='<div class="dbf"><b>'+esc(f.path)+'</b><i>'+esc(f.type||"")+'</i>'+(f.what?'<span>'+esc(f.what)+'</span>':'')+'</div>';});}
+    h+='<div class="act"><button type="button" class="ib" data-dbf="'+esc(k.kind)+'">показать связи на схеме</button></div>';
+    detail.innerHTML=h;detail.hidden=false;detail.scrollTop=0;apply();
+    DBL.kinds.forEach(function(x){dbEl[x.kind].classList.toggle("on",x.kind===kind);});
+  }
+  function dbNodeInfo(key){
+    if(!DBL)return "";var w=[],r=[];
+    DBL.kinds.forEach(function(k){if((k.writers||[]).some(function(en){return dbUnder(en.node,key);}))w.push(k.kind);if((k.readers||[]).some(function(en){return dbUnder(en.node,key);}))r.push(k.kind);});
+    if(!w.length&&!r.length)return "";
+    var h='<div class="links">';
+    w.forEach(function(k){h+='<button type="button" data-dbk="'+esc(k)+'"><i>✎ пишет в базу</i>'+esc(k)+'</button>';});
+    r.forEach(function(k){h+='<button type="button" data-dbk="'+esc(k)+'"><i>◉ читает из базы</i>'+esc(k)+'</button>';});
+    return h+'</div>';
+  }
+  /* filter bar */
+  var dbBar=document.getElementById("dbbar"),dbT=document.getElementById("dbT");
+  function dbOpts(){
+    if(!DBL)return;
+    var ws={},rs={};DBL.kinds.forEach(function(k){(k.writers||[]).forEach(function(en){ws[en.node]=1;});(k.readers||[]).forEach(function(en){rs[en.node]=1;});});
+    function fill(id,set,first){var s=document.getElementById(id);s.innerHTML='<option value="">'+first+'</option>';
+      Object.keys(set).sort().forEach(function(n){var o=document.createElement("option");o.value=n;o.textContent=dbLabel(n);s.appendChild(o);});}
+    fill("dbW",ws,"+ писатель…");fill("dbR",rs,"+ читатель…");
+    var sk=document.getElementById("dbK");sk.innerHTML='<option value="">запись: все</option>';
+    DBL.kinds.forEach(function(k){var o=document.createElement("option");o.value=k.kind;o.textContent=k.kind;sk.appendChild(o);});
+    var sg=document.getElementById("dbG");sg.innerHTML='<option value="">стадия: все</option>';
+    (DBL.groups||[]).forEach(function(g){var o=document.createElement("option");o.value=g.id;o.textContent=g.t;if(g.id===dbF.g)o.selected=true;sg.appendChild(o);});
+  }
+  function dbChips(){
+    function render(id,arr,cls){var box=document.getElementById(id);box.innerHTML="";
+      arr.forEach(function(n,i){var b=document.createElement("button");b.type="button";b.className="chip dbsel";b.dataset[cls]=n;b.style.borderColor=DBC[i];b.style.color=DBC[i];
+        b.textContent=(cls==="rmw"?"✎ ":"◉ ")+dbLabel(n).split(" · ").slice(-2).join(" · ")+" ×";b.title=dbLabel(n);box.appendChild(b);});}
+    render("dbWs",dbF.w,"rmw");render("dbRs",dbF.r,"rmr");
+  }
+  function dbRefresh(){dbChips();layout();}
+  if(DBL&&dbBar){
+    dbBuild();dbOpts();dbT.hidden=false;
+    dbT.setAttribute("aria-pressed",dbOn?"true":"false");dbBar.hidden=!dbOn;
+    dbT.addEventListener("click",function(){dbOn=!dbOn;dbT.setAttribute("aria-pressed",dbOn?"true":"false");dbBar.hidden=!dbOn;dbSave();layout();fit();});
+    document.getElementById("dbW").addEventListener("change",function(e){var v=e.target.value;if(v&&dbF.w.indexOf(v)<0&&dbF.w.length<4)dbF.w.push(v);e.target.value="";dbRefresh();});
+    document.getElementById("dbR").addEventListener("change",function(e){var v=e.target.value;if(v&&dbF.r.indexOf(v)<0&&dbF.r.length<4)dbF.r.push(v);e.target.value="";dbRefresh();});
+    document.getElementById("dbK").addEventListener("change",function(e){dbF.k=e.target.value;dbRefresh();});
+    document.getElementById("dbG").addEventListener("change",function(e){dbF.g=e.target.value;dbSave();layout();fit();});
+    document.getElementById("dbP").addEventListener("change",function(e){dbF.path=e.target.checked;dbRefresh();});
+    document.getElementById("dbX").addEventListener("click",function(){dbF.w=[];dbF.r=[];dbF.k="";dbF.path=false;document.getElementById("dbK").value="";document.getElementById("dbP").checked=false;dbRefresh();});
+    dbBar.addEventListener("click",function(ev){var b=ev.target.closest("button");if(!b)return;
+      if(b.dataset.rmw){dbF.w=dbF.w.filter(function(x){return x!==b.dataset.rmw;});dbRefresh();}
+      if(b.dataset.rmr){dbF.r=dbF.r.filter(function(x){return x!==b.dataset.rmr;});dbRefresh();}});
+    view.addEventListener("click",function(ev){var c=ev.target.closest(".dbk");if(c)openDbDetail(c.dataset.kind);});
+    view.addEventListener("keydown",function(ev){if(ev.key!=="Enter"&&ev.key!==" ")return;var c=ev.target.closest(".dbk");if(c){ev.preventDefault();openDbDetail(c.dataset.kind);}});
+    detail.addEventListener("click",function(ev){var b=ev.target.closest("button");if(!b)return;
+      if(b.dataset.dbk)openDbDetail(b.dataset.dbk);
+      if(b.dataset.dbf){dbF.k=b.dataset.dbf;document.getElementById("dbK").value=dbF.k;if(!dbOn)dbT.click();else dbRefresh();}});
+  }
 
   renderDoneTable();
   renderDone();
