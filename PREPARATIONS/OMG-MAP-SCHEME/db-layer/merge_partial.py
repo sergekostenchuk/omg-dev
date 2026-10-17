@@ -64,14 +64,20 @@ def main(name):
             known[k["kind"]] = k
             added += 1
     ext = 0
-    for e in part.get("extend", []):
+    # связи к видам, которых ещё нет: ждут в "pending" и подключаются, когда вид появится
+    pending = layer.setdefault("pending", [])
+    still = []
+    for e in pending + part.get("extend", []):
         k = known.get(e["kind"])
         if k is None:
-            print("нет вида для extend:", e["kind"])
+            still.append(e)
             continue
         merge_links(k.setdefault("writers", []), e.get("writers") or [])
         merge_links(k.setdefault("readers", []), e.get("readers") or [])
         ext += len(e.get("writers") or []) + len(e.get("readers") or [])
+    layer["pending"] = still
+    if still:
+        print("ждут вида:", sorted({e["kind"] for e in still}))
     layer["version"] = layer.get("version", "") + "+" + part.get("version", name)
     LAYER.write_text(json.dumps(layer, ensure_ascii=False, indent=0))
     print(f"новых видов {added}, добавочных связей {ext}, всего видов {len(layer['kinds'])}")

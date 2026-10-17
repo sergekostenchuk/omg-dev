@@ -1,0 +1,4256 @@
+{
+"version": "run-1",
+"generatedFrom": "om/module d8028bf",
+"groups": [
+{
+"id": "run",
+"t": "Исполнение"
+}
+],
+"kinds": [
+{
+"kind": "execution-root",
+"group": "run",
+"idPattern": "execution-root:<проект>",
+"proposed": false,
+"card": {
+"what": "Управляемая рабочая копия исполнения: путь git worktree, ветка, коммит основы и текущий головной коммит. Исполнитель меняет файлы только здесь, а не в папке проекта.",
+"where": "Таблица revisions · вид «execution-root» · id execution-root:<проект>",
+"when": "Создаётся при первом запуске плана (creating), затем становится ready. Новая версия при каждом принятом коммите задачи (сдвиг head) и при парковке кандидата (новый корень).",
+"why": "Привязывает исполнение к одной папке и одной ветке: родитель коммита, права записи и проверки опираются на её точный head.",
+"expects": "Путь, ветка, base и head совпадают с реальной рабочей копией; sourceRoot равен папке из окружения; workspace — точная версия записи workspace.",
+"risks": "Копию изменили снаружи — worktree_changed, исполнение не идёт. Репозиторий сменить после начала исполнения нельзя (workspace_in_use). Парковка создаёт новый корень рядом, старую копию не удаляют.",
+"size": "HX5: записей нет · рабочая база: 1 запись (2 версии), 891 Б",
+"note": "Не показано: чтение корня при подготовке плана (graph/runtime-evidence.ts: readRuntimeEvidenceAt) — на схеме нет очевидного узла (вывод)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "sourceRoot",
+"type": "string",
+"iface": false,
+"what": "папка основного репозитория проекта (берётся из окружения)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "workspace",
+"type": "Ref",
+"iface": true,
+"what": "Ссылка на запись workspace:<проект> — точная версия выбранной папки.",
+"writer": "Создание корня (run.a.root).",
+"readers": "Смена папки после начала исполнения (in.c.c5) и действующая среда (in.c.c8); готовность M8 (om.m8.repo).",
+"expects": "Хэш ссылки равен хэшу текущей записи workspace, а sourceRoot равен папке окружения.",
+"risks": "Расхождение — execution_root_recovery: до нового планирования нужно восстановление."
+},
+{
+"path": "path",
+"type": "string",
+"iface": true,
+"what": "Путь управляемой рабочей копии (git worktree) в папке worktrees рядом с файлом базы.",
+"writer": "Создание корня (run.a.root).",
+"readers": "Проверки кандидата и запуск процессов идут в этой папке (run.k.diff, run.k.exec, run.t.adapter); зависимости подключаются сюда (run.a.ready).",
+"expects": "Папка — worktree того же репозитория; ветка и HEAD совпадают с записанными.",
+"risks": "Папка уже есть без записи — worktree_exists; изменена снаружи — worktree_changed."
+},
+{
+"path": "branch",
+"type": "string",
+"iface": false,
+"what": "ветка omg/<ключ>, на которой копятся принятые коммиты",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "base",
+"type": "string",
+"iface": false,
+"what": "коммит основы плана, с которого начато исполнение",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "head",
+"type": "string",
+"iface": true,
+"what": "Последний принятый коммит цепочки задач.",
+"writer": "Принятие коммита (run.c.done); при парковке кандидата новый корень получает head прежнего (run.s.park).",
+"readers": "Выбор задачи и родитель (run.t.run), входы и права (run.t.inputs), публикация коммита (run.c.publish), индекс писателей (run.c.receipt), готовность M8 (om.m8.repo).",
+"expects": "Равен реальному HEAD ветки и родителю следующей задачи.",
+"risks": "Ветка сдвинута снаружи — execution_parent_changed или worktree_changed; сброса (reset) движок не делает."
+},
+{
+"path": "state",
+"type": "\"creating\" | \"ready\"",
+"iface": true,
+"what": "Состояние корня: создаётся или готов.",
+"writer": "Создание корня — creating (run.a.root), готовность — ready (run.a.ready).",
+"readers": "Все дальнейшие шаги работают только с ready: план (run.a.plan), парковка (run.s.park), M8 (om.m8.repo).",
+"expects": "ready.",
+"risks": "Обрыв в состоянии creating — копия достраивается при следующем запуске; чужая ветка с тем же именем — worktree_foreign."
+}
+],
+"writers": [
+{
+"node": "run.a.root",
+"code": "src/execution/worktree.ts:57 (ensureWorktree)",
+"when": "Первый запуск плана: запись корня создаётся с состоянием creating ещё до появления папки; путь и ветка вычисляются из ключа базы и проекта",
+"fields": [
+"projectId",
+"sourceRoot",
+"workspace",
+"path",
+"branch",
+"base",
+"head",
+"state"
+],
+"sure": true
+},
+{
+"node": "run.a.ready",
+"code": "src/execution/worktree.ts:62 (ensureWorktree)",
+"when": "Рабочая копия материализована и проверена: корень переходит в ready; зависимости подключаются ссылкой",
+"fields": [
+"state"
+],
+"sure": true
+},
+{
+"node": "run.c.done",
+"code": "src/execution/commit.ts:68 (finishCommit); src/execution/commit.ts:89 (finishCommit)",
+"when": "Принятие коммита: head корня сдвигается на новый коммит в той же транзакции, что и run=committed, квитанции и индекс писателей",
+"fields": [
+"head"
+],
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Старт execute-plan доводит записанное намерение commit_pending: head корня сдвигается без новой модели и проверок",
+"fields": [
+"head"
+],
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Команда recover-execution доводит commit_pending: head корня сдвигается на сохранённый коммит",
+"fields": [
+"head"
+],
+"sure": true
+},
+{
+"node": "run.s.park",
+"code": "src/execution/park.ts:54 (parkCandidate)",
+"when": "Парковка непринятого кандидата: корень заменяется новой копией от последнего принятого head; старая копия остаётся",
+"fields": [
+"path",
+"branch",
+"base",
+"head",
+"state"
+],
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/commit.ts:68 (finishCommit); src/execution/commit.ts:89 (finishCommit)",
+"when": "Принятие коммита: head корня сдвигается на новый коммит в той же транзакции, что и run=committed, квитанции и индекс писателей",
+"fields": [
+"head"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.a.root",
+"code": "src/execution/worktree.ts:48 (ensureWorktree)",
+"fields": [
+"sourceRoot",
+"state"
+],
+"expects": "Если корень есть — он принадлежит выбранному репозиторию (worktree_foreign иначе); creating достраивается",
+"sure": true
+},
+{
+"node": "run.a.plan",
+"code": "src/execution/runner.ts:37 (planCurrentGuards); src/execution/basis.ts:21 (omExecutionRoot)",
+"fields": [
+"state",
+"projectId"
+],
+"expects": "Пока корень ready, актуальность плана проверяется по прогрессу исполнения, а не по компиляторным воротам; корень не должен измениться во время проверки",
+"sure": true
+},
+{
+"node": "run.a.wt",
+"code": "src/execution/worktree.ts:12 (requireWorktree)",
+"fields": [
+"path",
+"sourceRoot",
+"branch",
+"head"
+],
+"expects": "Папка — worktree того же репозитория, ветка и HEAD равны записанным (worktree_changed иначе)",
+"sure": false
+},
+{
+"node": "run.a.ready",
+"code": "src/execution/worktree.ts:32 (linkDependencies)",
+"fields": [
+"sourceRoot",
+"path"
+],
+"expects": "Зависимости источника подключаются ссылкой только там, где Git её игнорирует",
+"sure": true
+},
+{
+"node": "run.t.run",
+"code": "src/execution/runner.ts:393 (Executor.run)",
+"fields": [
+"head",
+"path"
+],
+"expects": "Следующая задача продолжает последний принятый результат: parent равен head корня (execution_parent_changed иначе)",
+"sure": true
+},
+{
+"node": "run.t.inputs",
+"code": "src/execution/inputs.ts:13 (executionInputs); src/execution/ownership.ts:13 (executionOwnership)",
+"fields": [
+"path",
+"head"
+],
+"expects": "Входы и права читаются на точном срезе корня: путь и head",
+"sure": true
+},
+{
+"node": "run.k.diff",
+"code": "src/execution/candidate.ts:24 (capture)",
+"fields": [
+"path",
+"branch",
+"head"
+],
+"expects": "Кандидат снимается в рабочей копии; ветка и родитель равны записанным",
+"sure": true
+},
+{
+"node": "run.c.obj",
+"code": "src/execution/commit.ts:35 (commitIntent)",
+"fields": [
+"path",
+"head"
+],
+"expects": "Коммит-объект создаётся в копии от дерева кандидата и родителя; ветка не двигается",
+"sure": true
+},
+{
+"node": "run.c.pending",
+"code": "src/execution/commit.ts:39 (commitIntent)",
+"fields": [
+"head"
+],
+"expects": "Запись корня входит в охрану транзакции намерения: если корень изменился, намерение не пишется",
+"sure": true
+},
+{
+"node": "run.c.publish",
+"code": "src/execution/commit.ts:59 (publishCommit)",
+"fields": [
+"path",
+"branch",
+"head"
+],
+"expects": "Ветка сдвигается только если HEAD равен родителю намерения (commit_parent_changed иначе)",
+"sure": true
+},
+{
+"node": "run.c.done",
+"code": "src/execution/commit.ts:65 (finishCommit)",
+"fields": [
+"path",
+"head"
+],
+"expects": "К моменту принятия HEAD копии уже равен коммиту намерения",
+"sure": true
+},
+{
+"node": "run.c.parent",
+"code": "src/execution/runner.ts:604 (Executor.run)",
+"fields": [
+"head"
+],
+"expects": "После принятия корень перечитывается: parent следующей задачи — принятый коммит, он равен head",
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:15 (recoverCommits)",
+"fields": [
+"state",
+"head"
+],
+"expects": "Корень и план намерения те же, что были при записи (recovery_basis_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:15 (recoverCommits)",
+"fields": [
+"state",
+"head"
+],
+"expects": "Корень и план намерения те же, что были при записи (recovery_basis_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.s.park",
+"code": "src/execution/park.ts:26 (parkCandidate)",
+"fields": [
+"state",
+"head"
+],
+"expects": "Корень ready и head равен родителю неудачной попытки (repair_root_changed иначе)",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:166 (loadTaskContextSources)",
+"fields": [
+"head",
+"state"
+],
+"expects": "Поставки читаются на точном срезе корня, записанном в основании M8",
+"sure": false
+},
+{
+"node": "in.c.c5",
+"code": "src/runtime/environment.ts:266 (Environments.configure)",
+"fields": [
+"sourceRoot"
+],
+"expects": "После создания корня другая папка репозитория запрещена (workspace_in_use)",
+"sure": true
+},
+{
+"node": "in.c.c8",
+"code": "src/runtime/environment.ts:285 (Environments.effective)",
+"fields": [
+"state",
+"projectId",
+"workspace",
+"sourceRoot",
+"path",
+"branch",
+"head"
+],
+"expects": "Действующая среда для нового планирования: корень ready, workspace и sourceRoot совпадают, HEAD копии равен head (execution_root_recovery иначе)",
+"sure": false
+},
+{
+"node": "in.a.a6",
+"code": "src/product/engine.ts:153 (ProductEngine.projection)",
+"fields": [
+"вся запись"
+],
+"expects": "Проекция проекта отдаёт корень исполнения интерфейсу",
+"sure": false
+},
+{
+"node": "om.m8.repo",
+"code": "src/om/feasibility.ts:227 (proveInspection)",
+"fields": [
+"projectId",
+"state",
+"workspace",
+"sourceRoot",
+"path",
+"head"
+],
+"expects": "Готовность M8 сверяет сохранённое наблюдение репозитория с корнем исполнения: ready, тот же workspace, путь и head",
+"sure": false
+},
+{
+"node": "om.m8.deliv",
+"code": "src/om/deliveries.ts:204 (ownershipSources)",
+"fields": [
+"projectId",
+"state",
+"path",
+"head"
+],
+"expects": "Поставки и владение путями читаются на срезе корня: ready, путь и 40–64-символьный head",
+"sure": false
+},
+{
+"node": "run.phase.pick",
+"code": "src/execution/runner.ts:393 (Executor.run)",
+"fields": [
+"head",
+"path"
+],
+"expects": "Следующая задача продолжает последний принятый результат: parent равен head корня (execution_parent_changed иначе)",
+"sure": true
+},
+{
+"node": "run.phase.inputs",
+"code": "src/execution/inputs.ts:13 (executionInputs); src/execution/ownership.ts:13 (executionOwnership)",
+"fields": [
+"path",
+"head"
+],
+"expects": "Входы и права читаются на точном срезе корня: путь и head",
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/commit.ts:35 (commitIntent); src/execution/commit.ts:39 (commitIntent); src/execution/commit.ts:59 (publishCommit)",
+"fields": [
+"path",
+"head",
+"branch"
+],
+"expects": "Коммит-объект создаётся в копии от дерева кандидата и родителя; ветка не двигается; Запись корня входит в охрану транзакции намерения: если корень изменился, намерение не пишется; Ветка сдвигается только если HEAD равен родителю намерения (commit_parent_changed иначе); К моменту принятия HEAD копии уже равен коммиту намерения",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:166 (loadTaskContextSources)",
+"fields": [
+"head",
+"state"
+],
+"expects": "Поставки читаются на точном срезе корня, записанном в основании M8",
+"sure": false
+}
+]
+},
+{
+"kind": "execution-lock",
+"group": "run",
+"idPattern": "execution-lock:<проект>",
+"proposed": false,
+"card": {
+"what": "Владение исполнением проекта: токен, pid и время старта процесса, который сейчас ведёт исполнение. Не даёт запустить двух исполнителей в одной рабочей копии.",
+"where": "Таблица revisions · вид «execution-lock» · id execution-lock:<проект>",
+"when": "Одна запись на проект. Новая версия при захвате (active=true) и при освобождении (active=false) — в начале и в конце execute-plan, recover-execution и ремонта плана.",
+"why": "Два исполнителя испортили бы одного кандидата; запись доказывает, кто владеет, а новые записи попытки и коммита проверяют, что замок не менялся.",
+"expects": "Захват допустим, если записи нет, она не активна или её процесс доказанно исчез (pid занят процессом с другим временем старта). Освобождает владелец токена.",
+"risks": "Живой владелец — execution_busy. Идентичность процесса не определить — process_identity_unavailable. Замок не заменяет общий run-control пасса OM: тот берётся отдельно.",
+"size": "HX5: записей нет · рабочая база: 1 запись (14 версий), 1,9 КБ",
+"note": ""
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "token",
+"type": "string",
+"iface": false,
+"what": "случайный токен захвата; освободить замок может только тот, чей токен записан",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "pid",
+"type": "number",
+"iface": true,
+"what": "pid процесса, который ведёт исполнение.",
+"writer": "Захват (run.a.lock).",
+"readers": "Следующий захват проверяет, жив ли процесс (run.a.lock); восстановление парковки (run.s.repair).",
+"expects": "pid с тем же временем старта — владелец жив.",
+"risks": "pid занят уже другим процессом — владелец считается ушедшим; процесс не определить — process_identity_unavailable."
+},
+{
+"path": "processStart",
+"type": "string",
+"iface": true,
+"what": "Время старта процесса-владельца — отличает его от нового процесса с тем же pid.",
+"writer": "Захват (run.a.lock).",
+"readers": "Следующий захват (run.a.lock); восстановление парковки (run.s.repair).",
+"expects": "Совпадает с временем старта живого процесса pid.",
+"risks": "Нельзя получить — Cannot identify this executor process (process_identity_unavailable)."
+},
+{
+"path": "active",
+"type": "boolean",
+"iface": true,
+"what": "Идёт ли исполнение у этого владельца.",
+"writer": "Захват ставит true, освобождение ставит false (run.a.lock).",
+"readers": "Следующий захват (run.a.lock); восстановление парковки (run.s.repair).",
+"expects": "false, пока никто не исполняет.",
+"risks": "Остаётся true после падения процесса; следующий запуск забирает замок, только если процесс доказанно исчез."
+}
+],
+"writers": [
+{
+"node": "run.a.lock",
+"code": "src/execution/lock.ts:14 (acquire); src/execution/lock.ts:19 (release)",
+"when": "Старт execute-plan: захват (token, pid, время старта, active=true); в конце, в finally, замок отпускается — active=false",
+"fields": [
+"projectId",
+"token",
+"pid",
+"processStart",
+"active"
+],
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/runner.ts:649 (Executor.recover)",
+"when": "Команда recover-execution берёт тот же замок на время доведения commit_pending",
+"fields": [
+"token",
+"pid",
+"processStart",
+"active"
+],
+"sure": true
+},
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:90 (PlanRepairs.#prepare)",
+"when": "Ремонт плана прежнего маршрута берёт замок на время парковки кандидата (для нового OM маршрут закрыт)",
+"fields": [
+"token",
+"pid",
+"processStart",
+"active"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "run.a.lock",
+"code": "src/execution/lock.ts:9 (acquire)",
+"fields": [
+"active",
+"pid",
+"processStart"
+],
+"expects": "Захват разрешён, если записи нет, она не активна или процесс-владелец доказанно исчез; иначе execution_busy",
+"sure": true
+},
+{
+"node": "run.t.tstart",
+"code": "src/execution/runner.ts:501 (Executor.run)",
+"fields": [
+"token"
+],
+"expects": "Запись новой попытки входит в одну транзакцию с проверкой замка: если замок изменился, попытка не создаётся",
+"sure": true
+},
+{
+"node": "run.c.pending",
+"code": "src/execution/runner.ts:600 (Executor.run)",
+"fields": [
+"token"
+],
+"expects": "Намерение коммита пишется под охраной замка",
+"sure": true
+},
+{
+"node": "run.s.repair",
+"code": "src/product/preparation-run.ts:123 (recoverLegacyOperation)",
+"fields": [
+"projectId",
+"active",
+"pid",
+"processStart",
+"token"
+],
+"expects": "Восстановление парковки требует точной идентичности исполнителя; активный замок с живым процессом не обходится",
+"sure": false
+},
+{
+"node": "run.phase.run",
+"code": "src/execution/runner.ts:501 (Executor.run)",
+"fields": [
+"token"
+],
+"expects": "Запись новой попытки входит в одну транзакцию с проверкой замка: если замок изменился, попытка не создаётся",
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/runner.ts:600 (Executor.run)",
+"fields": [
+"token"
+],
+"expects": "Намерение коммита пишется под охраной замка",
+"sure": true
+}
+]
+},
+{
+"kind": "task-run",
+"group": "run",
+"idPattern": "run:<хэш плана>:<задача без «task:»>",
+"proposed": false,
+"card": {
+"what": "Все попытки одной задачи плана в одной записи: родитель, дерево кандидата, проверки, вердикт ревью, состояние, процесс-исполнитель, расход. Новая попытка — новая версия той же записи.",
+"where": "Таблица revisions · вид «task-run» · id run:<хэш плана>:<задача без «task:»>",
+"when": "Новая версия на каждый шаг: старт попытки, ответ исполнителя, каждая проверка, ревью, решение (needs_code, needs_plan, awaiting_obligation, interrupted), намерение коммита и принятие.",
+"why": "Единственный источник правды о ходе задачи: по нему продолжают оплаченную стадию, считают исправления и доказывают, что принят именно проверенный кандидат.",
+"expects": "tree, parent и commit согласованы с git; committed возможен только после ворот: все проверки с кодом 0 на дереве, ревью pass с той же темой, обязательства доказаны, child пуст.",
+"risks": "Одна запись растёт до сотен версий: в рабочей базе 198 версий по ≈28 КБ (в проверках лежит полный stdout и stderr). Потеря процесса оставляет child — перед продолжением нужно доказать его конец. commit_pending переживает падение: его доводят recover-execution, а не повторяют реализацию.",
+"size": "HX5: записей нет · рабочая база: 1 запись (198 версий), 5,38 МБ",
+"note": "Не показано: чтение доказательств плана командой task-detail (compiler.ts: Compiler.detail) — на схеме нет узла вызова (вывод)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "plan",
+"type": "Ref",
+"iface": true,
+"what": "Точная версия плана (id, версия, хэш), по которому идёт задача.",
+"writer": "Старт попытки (run.t.tstart).",
+"readers": "Ворота принятия (run.c.gates), цепь результата (run.f.gate), индекс писателей (run.c.receipt), ремонт (run.s.repair).",
+"expects": "Равна версии плана принятой compilation.",
+"risks": "Чужой план — execution_input_foreign или ownership_foreign."
+},
+{
+"path": "taskId",
+"type": "string",
+"iface": false,
+"what": "id задачи плана (task:<хэш>); вместе с планом задаёт id записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "attempt",
+"type": "number",
+"iface": true,
+"what": "Номер попытки: растёт при исправлениях и после прерываний.",
+"writer": "Старт попытки (run.t.tstart).",
+"readers": "Адрес запуска роли (run.t.send), тема подтверждения task-start (run.t.tstart), адрес plan-находки (run.r.v2).",
+"expects": "На единицу больше предыдущего номера задачи.",
+"risks": "Предел исправлений считается по истории запусков, а не по этому числу: перезапуск его не обнуляет."
+},
+{
+"path": "state",
+"type": "RunState",
+"iface": true,
+"what": "Состояние попытки: implementing, checking, reviewing, commit_pending, committed, needs_code, needs_plan, interrupted, awaiting_obligation.",
+"writer": "Каждый шаг цикла: старт (run.t.tstart), ответ (run.k.save), ревью (run.r.save), намерение и принятие коммита (run.c.pending, run.c.done), сбой (run.s.state).",
+"readers": "Выбор задачи (run.t.run), продолжение оплаченной стадии (run.s.paid), ремонт (run.s.repair), цепь результата (run.f.gate), индекс писателей (run.c.receipt).",
+"expects": "committed пропускается как звено цепи; commit_pending доводится до committed, а не повторяется как реализация.",
+"risks": "Статус отправки (answered, lost…) и состояние попытки — разные вещи: answered не значит «проверки пройдены»."
+},
+{
+"path": "parent",
+"type": "string",
+"iface": true,
+"what": "Коммит, на котором строится кандидат: последний принятый коммит цепочки.",
+"writer": "Старт попытки (run.t.tstart).",
+"readers": "Тема ревью (run.r.subject), публикация коммита (run.c.publish), цепь результата (run.f.gate), индекс писателей (run.c.receipt).",
+"expects": "Равен head корня исполнения на момент старта.",
+"risks": "Корень сдвинули снаружи — execution_parent_changed."
+},
+{
+"path": "tree",
+"type": "string | null",
+"iface": true,
+"what": "Git-дерево кандидата.",
+"writer": "Фиксация кандидата (run.k.save).",
+"readers": "Проверки (run.k.exec), тема ревью (run.r.subject), коммит-объект (run.c.obj), квитанции (run.c.receipt).",
+"expects": "Совпадает с физическими байтами копии и отличается от дерева родителя.",
+"risks": "Файлы изменились после ответа — candidate_changed; пустое изменение — candidate_empty; git и копия расходятся — candidate_bytes_mismatch."
+},
+{
+"path": "commit",
+"type": "string | null",
+"iface": true,
+"what": "Хэш коммита из намерения принятия.",
+"writer": "Намерение коммита (run.c.pending).",
+"readers": "Публикация (run.c.publish), принятие (run.c.done), восстановление (run.a.pending, run.s.recover), цепь результата (run.f.gate).",
+"expects": "Родитель коммита равен parent, дерево равно tree.",
+"risks": "Не совпали — commit_foreign; ветка ушла — commit_parent_changed."
+},
+{
+"path": "implementation",
+"type": "string | null",
+"iface": false,
+"what": "Текстовый отчёт исполнителя о выполненной работе; движок его не разбирает",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "artifacts",
+"type": "{ id }[]",
+"iface": true,
+"what": "Идентификаторы реализованных выходов — только id, без значений.",
+"writer": "Фиксация кандидата (run.k.save).",
+"readers": "Ворота принятия (run.c.gates), квитанции (run.c.receipt).",
+"expects": "Ровно множество выходов задачи (produces).",
+"risks": "Лишний, пропущенный или с полями кроме id — artifact_set_invalid или implementation_value_unexpected."
+},
+{
+"path": "checks",
+"type": "CheckResult[]",
+"iface": true,
+"what": "Результаты всех команд проверок на байтах кандидата: команда, код, сигнал, stdout, stderr.",
+"writer": "Прогон проверок (run.k.exec): после каждой команды.",
+"readers": "Ревьюер (run.r.give), ворота принятия (run.c.gates), доказательства обязательств (run.c.proof), выдержка для исправления (run.r.code).",
+"expects": "Набор и порядок равны командам задачи и fullCheck; для принятия все с кодом 0 и без сигнала.",
+"risks": "Полный вывод хранится в записи — основной вес версии (до ≈80 КБ)."
+},
+{
+"path": "review",
+"type": "ReviewResult | null",
+"iface": true,
+"what": "Вердикт независимого ревью: verdict, kind (none, code, plan), findings; в эре execution/v2 находки с адресами.",
+"writer": "Сохранение вердикта (run.r.save).",
+"readers": "Ворота принятия (run.c.gates), исправление (run.r.code), адрес plan-находки (run.r.v2).",
+"expects": "pass — только kind none и пустые findings; в эре execution/v2 на упавшей проверке pass не допускается.",
+"risks": "Некорректный вердикт — review_invalid; pass поверх упавшей проверки — review_pass_on_failed_check."
+},
+{
+"path": "reviewSubject",
+"type": "string | null",
+"iface": true,
+"what": "Хэш (план, задача, parent, tree), к которому относится вердикт.",
+"writer": "Начало ревью (run.r.subject).",
+"readers": "Ворота принятия (run.c.gates), продолжение оплаченной стадии (run.s.paid).",
+"expects": "Равен хэшу текущего плана, задачи, родителя и дерева.",
+"risks": "Дерево изменилось — вердикт не годится для принятия (review_not_passed)."
+},
+{
+"path": "error",
+"type": "string | null",
+"iface": true,
+"what": "Причина последнего сбоя или находки ревью.",
+"writer": "Состояние попытки (run.s.state), вердикт (run.r.save).",
+"readers": "Исправляющая попытка получает её как correction.error (run.r.code, run.t.ctx).",
+"expects": "Для needs_code содержит выдержку упавшей проверки или текст находок.",
+"risks": "Для старого производителя это был хвост stderr без диагностики теста (EX2): такой слот исправления восстанавливается записью execution-recovery."
+},
+{
+"path": "planDefect",
+"type": "PlanDefect | undefined",
+"iface": true,
+"what": "Адресный дефект плана при needs_plan: источник и находки с адресами.",
+"writer": "Адрес plan-находки (run.r.v2).",
+"readers": "Ремонт договора (run.s.repair).",
+"expects": "Есть ровно при needs_plan эры AT3a; адрес называет этот план, задачу, попытку и дерево.",
+"risks": "Потребителя planDefect для исправления L3 нет (PR1): для нового OM маршрут ремонта закрыт (legacy_route_closed)."
+},
+{
+"path": "child",
+"type": "{ pid, started } | null",
+"iface": true,
+"what": "Идентичность запущенного процесса исполнителя (pid и время старта), пока он жив.",
+"writer": "Запуск supervisor-процесса (run.t.adapter); сбрасывается при выходе.",
+"readers": "Прежний процесс (run.t.group), восстановление (run.s.recover), парковка (run.s.park).",
+"expects": "null вне запуска; непустое значение при следующем входе заставляет доказать конец процесса, прежде чем продолжать.",
+"risks": "Отказ остановки хранит последнюю идентичность; пустое значение вместо неё не пишется."
+},
+{
+"path": "inputs",
+"type": "Ref[]",
+"iface": true,
+"what": "Ссылки на входы-квитанции и права записи, на которых построена попытка.",
+"writer": "Входы и права (run.t.inputs).",
+"readers": "Охрана записи намерения коммита (run.c.pending), прогресс входных квитанций (run.a.plan).",
+"expects": "Квитанции предшественников того же плана.",
+"risks": "Квитанция изменилась — input_stale при записи."
+},
+{
+"path": "usage",
+"type": "AgentUsage[]",
+"iface": false,
+"what": "Измерения запросов: роль, модель, хэш и размер запроса и ответа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "createdAt",
+"type": "number",
+"iface": false,
+"what": "время создания задачи (мс)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "updatedAt",
+"type": "number",
+"iface": false,
+"what": "время последней версии (мс)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "obligationStartProofs",
+"type": "TaskRuntimeProof[] | undefined",
+"iface": true,
+"what": "Подтверждения обязательств момента task-start.",
+"writer": "Старт попытки (run.t.tstart).",
+"readers": "Перепроверка перед отправкой (run.t.tstart), ворота принятия (run.c.gates).",
+"expects": "Ровно набор обязательств task-start задачи; субъект — план, задача, parent, номер попытки.",
+"risks": "Подтверждение изменилось до отправки — task_obligation_start_stale, технический перерыв без запуска модели."
+},
+{
+"path": "obligationResultProofs",
+"type": "TaskObligationProof[] | undefined",
+"iface": true,
+"what": "Доказательства обязательств момента task-result.",
+"writer": "Намерение коммита (run.c.proof).",
+"readers": "Ворота принятия (run.c.gates), восстановление (run.s.recover).",
+"expects": "Ровно набор task-result: выполненные контрактные тесты или настоящее runtime-подтверждение.",
+"risks": "Нет подтверждения — awaiting_obligation (кандидат сохранён); устарело до публикации — task_obligation_result_required."
+}
+],
+"writers": [
+{
+"node": "run.t.tstart",
+"code": "src/execution/runner.ts:499 (Executor.run)",
+"when": "Старт попытки: после допуска и подтверждений task-start пишется версия с attempt+1, state implementing, parent = head корня, пустыми tree/checks/review; в одной транзакции с проверкой замка, корня, оснований плана и вместимости",
+"fields": [
+"projectId",
+"plan",
+"taskId",
+"attempt",
+"state",
+"parent",
+"tree",
+"commit",
+"implementation",
+"artifacts",
+"checks",
+"review",
+"reviewSubject",
+"error",
+"child",
+"inputs",
+"usage",
+"createdAt",
+"updatedAt",
+"obligationStartProofs"
+],
+"sure": true
+},
+{
+"node": "run.t.stage",
+"code": "src/execution/runner.ts:477 (Executor.run); src/execution/runner.ts:491 (Executor.run)",
+"when": "Оплаченная стадия продолжается, а не покупается заново: попытка возвращается в checking или reviewing с сохранёнными кандидатом и проверками; отказ бюджета не тратит попытку — задача остаётся interrupted",
+"fields": [
+"state",
+"child",
+"error",
+"checks",
+"review",
+"reviewSubject"
+],
+"sure": true
+},
+{
+"node": "run.t.group",
+"code": "src/execution/runner.ts:400 (Executor.run)",
+"when": "Прежний процесс остановлен или доказанно исчез: незавершённая попытка помечается interrupted, child сбрасывается",
+"fields": [
+"state",
+"child",
+"error"
+],
+"sure": true
+},
+{
+"node": "run.t.inputs",
+"code": "src/execution/runner.ts:524 (Executor.run)",
+"when": "Входы и права разрешены: ссылки на квитанции и права записи сохраняются в попытке до отправки",
+"fields": [
+"inputs"
+],
+"sure": true
+},
+{
+"node": "run.t.adapter",
+"code": "src/execution/runner.ts:514 (Executor.run)",
+"when": "Запущен supervisor-процесс: pid и время старта сохраняются сразу при запуске и сбрасываются при выходе",
+"fields": [
+"child"
+],
+"sure": true
+},
+{
+"node": "run.t.send",
+"code": "src/execution/runner.ts:518 (Executor.run)",
+"when": "Размер запроса и ответа измеряется до и после запуска роли и записывается в usage",
+"fields": [
+"usage"
+],
+"sure": true
+},
+{
+"node": "run.k.save",
+"code": "src/execution/runner.ts:558 (Executor.run)",
+"when": "Ответ принят и кандидат зафиксирован: implementation, artifacts и tree записываются одной транзакцией с закрытием отправки",
+"fields": [
+"state",
+"implementation",
+"artifacts",
+"tree"
+],
+"sure": true
+},
+{
+"node": "run.k.exec",
+"code": "src/execution/runner.ts:572 (Executor.run)",
+"when": "После каждой команды её полный фактический результат (код, сигнал, stdout, stderr) сохраняется сразу; fullCheck идёт первым",
+"fields": [
+"checks"
+],
+"sure": true
+},
+{
+"node": "run.r.subject",
+"code": "src/execution/runner.ts:581 (Executor.run)",
+"when": "Перед запуском ревьюера сохраняется состояние reviewing и тема ревью",
+"fields": [
+"state",
+"reviewSubject"
+],
+"sure": true
+},
+{
+"node": "run.r.save",
+"code": "src/execution/runner.ts:592 (Executor.run); src/execution/runner.ts:598 (Executor.run)",
+"when": "Вердикт сохраняется вместе с закрытием отправки: pass просто записывается, отрицательный сразу решает состояние (needs_code или needs_plan) и текст находок",
+"fields": [
+"review",
+"state",
+"error",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.r.v2",
+"code": "src/execution/runner.ts:67 (reviewOutcome); src/execution/runner.ts:549 (Executor.run)",
+"when": "Plan-находка получает адрес (planDefectOf): при доказанном адресе попытка останавливается needs_plan с planDefect, иначе код продолжается с названием отказа; то же для ответа «контракт неисполним»",
+"fields": [
+"state",
+"error",
+"planDefect",
+"tree",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.c.proof",
+"code": "src/execution/commit.ts:33 (commitIntent); src/execution/recovery.ts:32 (recoverCommits)",
+"when": "Доказательства task-result добавляются в запись перед намерением коммита; при восстановлении — заново, если нужно свежее подтверждение среды",
+"fields": [
+"obligationResultProofs"
+],
+"sure": true
+},
+{
+"node": "run.c.pending",
+"code": "src/execution/commit.ts:39 (commitIntent)",
+"when": "Намерение коммита: после ворот сохраняется commit и состояние commit_pending под охраной замка, корня, входов и доказательств",
+"fields": [
+"state",
+"commit",
+"obligationResultProofs"
+],
+"sure": true
+},
+{
+"node": "run.c.done",
+"code": "src/execution/commit.ts:66 (finishCommit)",
+"when": "Принятие: state committed, child сброшен — в одной транзакции с корнем, квитанциями и индексом писателей",
+"fields": [
+"state",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:31 (recoverCommits); src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Старт execute-plan доводит commit_pending без модели и проверок; при необходимости сначала записываются свежие доказательства task-result",
+"fields": [
+"obligationResultProofs",
+"state",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:31 (recoverCommits); src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Команда recover-execution делает то же: доводит намерение коммита до committed без моделей и прогонов",
+"fields": [
+"obligationResultProofs",
+"state",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.s.state",
+"code": "src/execution/runner.ts:620 (Executor.run)",
+"when": "Сбой запуска, проверки или ворот: исход пишется состоянием interrupted, needs_code, needs_plan или awaiting_obligation, вместе с закрытием отправки; отказавшая остановка сохраняет child",
+"fields": [
+"state",
+"child",
+"error"
+],
+"sure": true
+},
+{
+"node": "run.s.await",
+"code": "src/execution/runner.ts:448 (Executor.run)",
+"when": "Кандидат ждёт подтверждения: нет task-result — awaiting_obligation; позже коммит без нового кода и ревью",
+"fields": [
+"state",
+"error"
+],
+"sure": true
+},
+{
+"node": "run.phase.run",
+"code": "src/execution/runner.ts:499 (Executor.run)",
+"when": "Старт попытки: после допуска и подтверждений task-start пишется версия с attempt+1, state implementing, parent = head корня, пустыми tree/checks/review; в одной транзакции с проверкой замка, корня, оснований плана и вместимости",
+"fields": [
+"projectId",
+"plan",
+"taskId",
+"attempt",
+"state",
+"parent",
+"tree",
+"commit",
+"implementation",
+"artifacts",
+"checks",
+"review",
+"reviewSubject",
+"error",
+"child",
+"inputs",
+"usage",
+"createdAt",
+"updatedAt",
+"obligationStartProofs"
+],
+"sure": true
+},
+{
+"node": "run.phase.inputs",
+"code": "src/execution/runner.ts:524 (Executor.run)",
+"when": "Входы и права разрешены: ссылки на квитанции и права записи сохраняются в попытке до отправки",
+"fields": [
+"inputs"
+],
+"sure": true
+},
+{
+"node": "run.phase.send",
+"code": "src/execution/runner.ts:514 (Executor.run); src/execution/runner.ts:518 (Executor.run)",
+"when": "Запущен supervisor-процесс: pid и время старта сохраняются сразу при запуске и сбрасываются при выходе; Размер запроса и ответа измеряется до и после запуска роли и записывается в usage",
+"fields": [
+"child",
+"usage"
+],
+"sure": true
+},
+{
+"node": "run.phase.cand",
+"code": "src/execution/runner.ts:558 (Executor.run)",
+"when": "Ответ принят и кандидат зафиксирован: implementation, artifacts и tree записываются одной транзакцией с закрытием отправки",
+"fields": [
+"state",
+"implementation",
+"artifacts",
+"tree"
+],
+"sure": true
+},
+{
+"node": "run.phase.checks",
+"code": "src/execution/runner.ts:572 (Executor.run)",
+"when": "После каждой команды её полный фактический результат (код, сигнал, stdout, stderr) сохраняется сразу; fullCheck идёт первым",
+"fields": [
+"checks"
+],
+"sure": true
+},
+{
+"node": "run.phase.review",
+"code": "src/execution/runner.ts:581 (Executor.run); src/execution/runner.ts:592 (Executor.run); src/execution/runner.ts:598 (Executor.run)",
+"when": "Перед запуском ревьюера сохраняется состояние reviewing и тема ревью; Вердикт сохраняется вместе с закрытием отправки: pass просто записывается, отрицательный сразу решает состояние (needs_code или needs_plan) и текст находок",
+"fields": [
+"state",
+"reviewSubject",
+"review",
+"error",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.phase.plan",
+"code": "src/execution/runner.ts:67 (reviewOutcome); src/execution/runner.ts:549 (Executor.run)",
+"when": "Plan-находка получает адрес (planDefectOf): при доказанном адресе попытка останавливается needs_plan с planDefect, иначе код продолжается с названием отказа; то же для ответа «контракт неисполним»",
+"fields": [
+"state",
+"error",
+"planDefect",
+"tree",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.phase.tresult",
+"code": "src/execution/commit.ts:33 (commitIntent); src/execution/recovery.ts:32 (recoverCommits)",
+"when": "Доказательства task-result добавляются в запись перед намерением коммита; при восстановлении — заново, если нужно свежее подтверждение среды",
+"fields": [
+"obligationResultProofs"
+],
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/commit.ts:39 (commitIntent); src/execution/commit.ts:66 (finishCommit)",
+"when": "Намерение коммита: после ворот сохраняется commit и состояние commit_pending под охраной замка, корня, входов и доказательств; Принятие: state committed, child сброшен — в одной транзакции с корнем, квитанциями и индексом писателей",
+"fields": [
+"state",
+"commit",
+"obligationResultProofs",
+"child"
+],
+"sure": true
+},
+{
+"node": "run.phase.await",
+"code": "src/execution/runner.ts:448 (Executor.run)",
+"when": "Кандидат ждёт подтверждения: нет task-result — awaiting_obligation; позже коммит без нового кода и ревью",
+"fields": [
+"state",
+"error"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.t.run",
+"code": "src/execution/runner.ts:386 (Executor.run)",
+"fields": [
+"state",
+"parent",
+"commit",
+"tree",
+"plan",
+"child"
+],
+"expects": "committed пропускается только как звено цепи: parent совпадает, у коммита именно такой родитель (execution_chain_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.t.group",
+"code": "src/execution/runner.ts:398 (Executor.run)",
+"fields": [
+"child",
+"state"
+],
+"expects": "Если процесс записан, его конец доказывается до продолжения; свидетельство остановки берётся по адресу этой попытки",
+"sure": true
+},
+{
+"node": "run.t.stage",
+"code": "src/execution/runner.ts:319 (correctionBasis); src/execution/runner.ts:170 (blindCorrection); src/execution/runner.ts:334 (paidStage)",
+"fields": [
+"state",
+"checks",
+"error",
+"review",
+"reviewSubject",
+"implementation",
+"tree",
+"parent",
+"attempt"
+],
+"expects": "Исправление берёт последнюю решённую попытку needs_code (прерванные пропускаются); оплаченная стадия возобновляется, только если копия всё ещё равна tree",
+"sure": true
+},
+{
+"node": "run.t.inputs",
+"code": "src/execution/inputs.ts:30 (executionInputs); src/execution/ownership.ts:22 (executionOwnership); src/ownership/owners.ts:115 (Owners.constructor)",
+"fields": [
+"plan",
+"taskId",
+"state",
+"commit",
+"tree"
+],
+"expects": "Квитанция предшественника привязана к run именно этой задачи того же плана (execution_input_foreign, ownership_foreign)",
+"sure": true
+},
+{
+"node": "run.s.end",
+"code": "src/execution/runner.ts:399 (Executor.run)",
+"fields": [
+"child",
+"state"
+],
+"expects": "Записанный процесс исполнителя останавливается и его конец доказывается; неопределённость не выдаётся за освобождение",
+"sure": true
+},
+{
+"node": "run.f.check",
+"code": "src/execution/inputs.ts:31 (executionInputs)",
+"fields": [
+"plan",
+"taskId",
+"state"
+],
+"expects": "Реальные квитанции производителей того же плана: run совпадает по хэшу, задаче и плану",
+"sure": true
+},
+{
+"node": "run.f.grant",
+"code": "src/execution/ownership.ts:22 (executionOwnership)",
+"fields": [
+"plan",
+"taskId"
+],
+"expects": "Будущий писатель файла — именно задача-предшественник этого плана (ownership_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.a.plan",
+"code": "src/execution/basis.ts:47 (writerProgress); src/execution/artifact-progress.ts:18 (artifactProgress); src/execution/artifact-progress.ts:30 (artifactProgress)",
+"fields": [
+"state",
+"plan",
+"taskId",
+"inputs",
+"commit"
+],
+"expects": "Изменение входных записей не делает план устаревшим, если новые записи — принятые задачи этого плана (plan_stale иначе)",
+"sure": true
+},
+{
+"node": "run.f.gate",
+"code": "src/execution/result.ts:20 (resultGate)",
+"fields": [
+"state",
+"plan",
+"taskId",
+"parent",
+"commit",
+"tree",
+"checks",
+"review",
+"reviewSubject",
+"artifacts",
+"obligationStartProofs",
+"obligationResultProofs"
+],
+"expects": "Каждая запись из runs — committed, родитель цепочки совпадает, ворота requireGates проходят заново, коммит и дерево равны git (execution_incomplete, execution_proof_invalid, execution_commit_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:14 (recoverCommits)",
+"fields": [
+"state",
+"plan",
+"taskId",
+"child",
+"parent",
+"commit",
+"tree"
+],
+"expects": "Находятся все записи проекта в состоянии commit_pending; их основание — тот же корень и план",
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:14 (recoverCommits)",
+"fields": [
+"state",
+"plan",
+"taskId",
+"child",
+"parent",
+"commit",
+"tree"
+],
+"expects": "Находятся все записи проекта в состоянии commit_pending; их основание — тот же корень и план",
+"sure": true
+},
+{
+"node": "run.s.park",
+"code": "src/execution/park.ts:20 (parkCandidate)",
+"fields": [
+"state",
+"plan",
+"taskId",
+"parent",
+"tree",
+"child"
+],
+"expects": "Паркуется только точная неудачная попытка needs_plan этого проекта (repair_run_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:45 (PlanRepairs.#withOperation); src/product/repairs.ts:94 (PlanRepairs.#prepare); src/product/repairs.ts:100 (PlanRepairs.#prepare)",
+"fields": [
+"state",
+"plan",
+"taskId",
+"parent",
+"tree",
+"review",
+"checks",
+"error"
+],
+"expects": "Ремонт прежнего маршрута начинается с точной неудачной попытки needs_plan; уже принятые задачи плана исключаются из горизонта",
+"sure": false
+},
+{
+"node": "run.c.receipt",
+"code": "src/ownership/writer-index.ts:75 (committedTransition); src/ownership/writer-index.ts:50 (writerSource); src/ownership/writer-index.ts:202 (prepareWriterIndex)",
+"fields": [
+"state",
+"commit",
+"tree",
+"plan",
+"taskId",
+"child",
+"updatedAt"
+],
+"expects": "Предыдущая версия — commit_pending, а принятая отличается от неё только state=committed, child=null и временем (writer_index_invalid иначе)",
+"sure": true
+},
+{
+"node": "run.t.tstart",
+"code": "src/execution/task-obligations.ts:57 (requireCurrentTaskStart)",
+"fields": [
+"obligationStartProofs",
+"attempt",
+"parent",
+"plan",
+"taskId"
+],
+"expects": "Перед отправкой подтверждение task-start, сохранённое в попытке, всё ещё то же и относится к этой попытке (task_obligation_start_stale иначе)",
+"sure": true
+},
+{
+"node": "run.s.paid",
+"code": "src/execution/runner.ts:339 (paidStage)",
+"fields": [
+"state",
+"implementation",
+"tree",
+"parent",
+"review",
+"reviewSubject",
+"checks"
+],
+"expects": "Оплаченная стадия возобновляется, только если попытка прервана в checking или reviewing, копия всё ещё равна tree, а родитель тот же; пройденное ревью этого дерева ведёт сразу к коммиту",
+"sure": true
+},
+{
+"node": "run.k.same",
+"code": "src/execution/runner.ts:577 (Executor.run)",
+"fields": [
+"tree",
+"checks"
+],
+"expects": "После каждой проверки дерево кандидата равно сохранённому (candidate_changed иначе)",
+"sure": true
+},
+{
+"node": "run.r.give",
+"code": "src/execution/runner.ts:584 (Executor.run)",
+"fields": [
+"parent",
+"tree",
+"artifacts",
+"checks",
+"reviewSubject"
+],
+"expects": "Ревьюеру передаются реальные результаты проверок, дерево, родитель и выходы",
+"sure": true
+},
+{
+"node": "run.r.check",
+"code": "src/execution/runner.ts:587 (Executor.run)",
+"fields": [
+"tree"
+],
+"expects": "Дерево не изменилось за время ревью (candidate_changed иначе)",
+"sure": true
+},
+{
+"node": "run.r.code",
+"code": "src/execution/runner.ts:533 (Executor.run)",
+"fields": [
+"error",
+"review",
+"checks",
+"state"
+],
+"expects": "Исправление получает выдержку упавшей проверки (или текст ошибки) и все находки ревью той попытки, которую исправляет",
+"sure": true
+},
+{
+"node": "run.c.gates",
+"code": "src/execution/commit.ts:19 (requireGates)",
+"fields": [
+"artifacts",
+"checks",
+"tree",
+"review",
+"reviewSubject",
+"parent",
+"plan",
+"taskId",
+"obligationStartProofs",
+"obligationResultProofs"
+],
+"expects": "Все выходы, полный набор проверок с кодом 0 на этом дереве, ревью pass с той же темой и обязательства доказаны (artifact_set_invalid, checks_not_passed, review_not_passed)",
+"sure": true
+},
+{
+"node": "run.c.obj",
+"code": "src/execution/commit.ts:35 (commitIntent)",
+"fields": [
+"tree",
+"parent",
+"plan",
+"taskId"
+],
+"expects": "Коммит-объект создаётся от дерева кандидата и родителя без перемещения ветки",
+"sure": true
+},
+{
+"node": "run.c.publish",
+"code": "src/execution/commit.ts:51 (publishCommit)",
+"fields": [
+"commit",
+"tree",
+"parent"
+],
+"expects": "У коммита именно такой родитель и такое дерево (commit_foreign иначе); ветка сдвигается от parent",
+"sure": true
+},
+{
+"node": "run.c.done",
+"code": "src/execution/commit.ts:64 (finishCommit)",
+"fields": [
+"state",
+"commit",
+"tree"
+],
+"expects": "Принятие возможно только из commit_pending с точным коммитом и деревом",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:166 (loadTaskContextSources)",
+"fields": [
+"state",
+"commit",
+"tree",
+"plan",
+"taskId"
+],
+"expects": "Поставки читают принятых писателей путей через общий читатель владения",
+"sure": false
+},
+{
+"node": "in.a.a6",
+"code": "src/product/engine.ts:152 (ProductEngine.projection)",
+"fields": [
+"вся запись"
+],
+"expects": "Проекция проекта отдаёт попытки интерфейсу",
+"sure": false
+},
+{
+"node": "om.m8.deliv",
+"code": "src/ownership/owners.ts:24 (writerSource); src/om/deliveries.ts:220 (ownershipSources)",
+"fields": [
+"state",
+"commit",
+"tree",
+"plan",
+"taskId"
+],
+"expects": "Владелец пути выбирается среди принятых задач; run должен быть committed и привязан к точному плану",
+"sure": false
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:406 (candidateTasks)",
+"fields": [
+"state",
+"commit",
+"tree",
+"plan",
+"taskId"
+],
+"expects": "Атомарность проверяет писателя пути на точном срезе корня",
+"sure": false
+},
+{
+"node": "om.c.compiler",
+"code": "src/compiler/compiler.ts:41 (Compiler.compile); src/compiler/compiler.ts:135 (Compiler.read)",
+"fields": [
+"state",
+"commit",
+"plan",
+"taskId"
+],
+"expects": "Права записи выводятся из принятых запусков, чьи коммиты входят в ветку основы",
+"sure": false
+},
+{
+"node": "run.phase.pick",
+"code": "src/execution/runner.ts:386 (Executor.run)",
+"fields": [
+"state",
+"parent",
+"commit",
+"tree",
+"plan",
+"child"
+],
+"expects": "committed пропускается только как звено цепи: parent совпадает, у коммита именно такой родитель (execution_chain_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.phase.inputs",
+"code": "src/execution/inputs.ts:30 (executionInputs); src/execution/ownership.ts:22 (executionOwnership); src/ownership/owners.ts:115 (Owners.constructor)",
+"fields": [
+"plan",
+"taskId",
+"state",
+"commit",
+"tree"
+],
+"expects": "Квитанция предшественника привязана к run именно этой задачи того же плана (execution_input_foreign, ownership_foreign)",
+"sure": true
+},
+{
+"node": "run.phase.receipt",
+"code": "src/ownership/writer-index.ts:75 (committedTransition); src/ownership/writer-index.ts:50 (writerSource); src/ownership/writer-index.ts:202 (prepareWriterIndex)",
+"fields": [
+"state",
+"commit",
+"tree",
+"plan",
+"taskId",
+"child",
+"updatedAt"
+],
+"expects": "Предыдущая версия — commit_pending, а принятая отличается от неё только state=committed, child=null и временем (writer_index_invalid иначе)",
+"sure": true
+},
+{
+"node": "run.phase.run",
+"code": "src/execution/task-obligations.ts:57 (requireCurrentTaskStart)",
+"fields": [
+"obligationStartProofs",
+"attempt",
+"parent",
+"plan",
+"taskId"
+],
+"expects": "Перед отправкой подтверждение task-start, сохранённое в попытке, всё ещё то же и относится к этой попытке (task_obligation_start_stale иначе)",
+"sure": true
+},
+{
+"node": "run.phase.review",
+"code": "src/execution/runner.ts:584 (Executor.run)",
+"fields": [
+"parent",
+"tree",
+"artifacts",
+"checks",
+"reviewSubject"
+],
+"expects": "Ревьюеру передаются реальные результаты проверок, дерево, родитель и выходы",
+"sure": true
+},
+{
+"node": "run.phase.fix",
+"code": "src/execution/runner.ts:533 (Executor.run)",
+"fields": [
+"error",
+"review",
+"checks",
+"state"
+],
+"expects": "Исправление получает выдержку упавшей проверки (или текст ошибки) и все находки ревью той попытки, которую исправляет",
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/commit.ts:19 (requireGates); src/execution/commit.ts:35 (commitIntent); src/execution/commit.ts:51 (publishCommit)",
+"fields": [
+"artifacts",
+"checks",
+"tree",
+"review",
+"reviewSubject",
+"parent",
+"plan",
+"taskId",
+"obligationStartProofs",
+"obligationResultProofs",
+"commit",
+"state"
+],
+"expects": "Все выходы, полный набор проверок с кодом 0 на этом дереве, ревью pass с той же темой и обязательства доказаны (artifact_set_invalid, checks_not_passed, review_not_passed); Коммит-объект создаётся от дерева кандидата и родителя без перемещения ветки; У коммита именно такой родитель и такое дерево (commit_foreign иначе); ветка сдвигается от parent; Принятие возможно только из commit_pending с точным коммитом и деревом",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:166 (loadTaskContextSources)",
+"fields": [
+"state",
+"commit",
+"tree",
+"plan",
+"taskId"
+],
+"expects": "Поставки читают принятых писателей путей через общий читатель владения",
+"sure": false
+}
+]
+},
+{
+"kind": "execution-send",
+"group": "run",
+"idPattern": "execution-send:<проект>:<хэш плана>:<задача>:<попытка>:{implement|review}:<номер>",
+"proposed": false,
+"card": {
+"what": "Журнал одного запуска роли (исполнитель или ревьюер): план, задача, попытка, роль, номер, размер запроса, группа процессов, итоговый статус и расход токенов.",
+"where": "Таблица revisions · вид «execution-send» · id execution-send:<проект>:<хэш плана>:<задача>:<попытка>:{implement|review}:<номер>",
+"when": "Две–три версии на запуск: sent — до старта адаптера; затем добавляется группа процессов; закрытие одним статусом (answered, failed, interrupted, lost, refused, not-started) в той же транзакции, что и применение результата.",
+"why": "Бюджет допуска владельца считается по этим записям; потерянный запуск закрывается без повторной оплаты; исправление видно как отдельный запуск.",
+"expects": "Открытая запись сохранена до запуска процесса; закрывается один раз; refused и not-started не тратят бюджет; roleLaunches и softInput проверяются по закрытым записям.",
+"risks": "Потерянный неприменённый ответ — lost с неизвестной ценой (держится резервом). Файл отказа шлюза execution-gate/<id>.json лежит рядом с базой, а не в ней, и писателя этого файла в коде движка нет (вывод).",
+"size": "HX5: записей нет · рабочая база: 16 записей (48 версий), 37 КБ",
+"note": "Ответ адаптера и usage читаются из stdout процесса, а не из других записей базы."
+},
+"fields": [
+{
+"path": "contract",
+"type": "string",
+"iface": false,
+"what": "метка формата execution-send/v1",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "plan",
+"type": "Ref",
+"iface": false,
+"what": "точная версия плана, под которым сделан запуск",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "task",
+"type": "string",
+"iface": false,
+"what": "задача плана (task:<хэш>)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "attempt",
+"type": "number",
+"iface": true,
+"what": "Номер попытки задачи, к которой относится запуск.",
+"writer": "Запуск роли (run.t.send).",
+"readers": "Счёт использованных исправлений (run.t.stage), проверка «ревью этой попытки уже оплачено» (run.s.paid).",
+"expects": "Совпадает с attempt записи task-run на момент запуска.",
+"risks": "Другая попытка — запуск не засчитывается ей."
+},
+{
+"path": "role",
+"type": "\"implement\" | \"review\"",
+"iface": true,
+"what": "Роль запуска: исполнитель или независимый ревьюер.",
+"writer": "Запуск роли (run.t.send).",
+"readers": "Бюджет допуска по ролям (run.t.stage, run.r.give).",
+"expects": "Одно из двух; у ролей свой резерв входных токенов.",
+"risks": "Роль определяет резерв и прогноз следующего запуска."
+},
+{
+"path": "ordinal",
+"type": "number",
+"iface": false,
+"what": "порядковый номер запуска этой роли в этой попытке (с 1)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "correction",
+"type": "boolean",
+"iface": true,
+"what": "Запуск исполнителя исправляет предыдущую попытку.",
+"writer": "Запуск роли (run.t.send).",
+"readers": "Счёт использованных исправлений и предел (run.t.stage).",
+"expects": "true только у implement после needs_code.",
+"risks": "Запуск «вслепую» (без feedback) прежнего производителя восстанавливается записью execution-recovery."
+},
+{
+"path": "admission",
+"type": "Ref | null",
+"iface": false,
+"what": "Ссылка на точную версию допуска владельца (reader-pilot), под которой сделан запуск; null — без допуска",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request",
+"type": "{ hash, chars }",
+"iface": false,
+"what": "Хэш и размер запроса в символах, сохранённые до запуска адаптера",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "group",
+"type": "{ pid, started } | null",
+"iface": true,
+"what": "Группа процессов запуска: supervisor — её лидер, адаптер и провайдер — участники.",
+"writer": "Наблюдение supervisor-процесса (run.t.adapter).",
+"readers": "Проверка «запуск ещё идёт» (run.t.group) и закрытие потерянного запуска (run.t.group).",
+"expects": "null, пока supervisor не замечен; тогда запуск не стартовал.",
+"risks": "Открытый sent с живой или неопределимой группой блокирует продолжение — executor_still_running."
+},
+{
+"path": "status",
+"type": "ExecutionSendStatus",
+"iface": true,
+"what": "sent, answered, failed, interrupted, lost, refused или not-started.",
+"writer": "Открытие — sent (run.t.send); закрытие вместе с исходом (run.k.save, run.r.save, run.s.state); потерянный запуск закрывается отдельно (run.t.group).",
+"readers": "Бюджет допуска (run.t.stage), проверка оплаченного ревью (run.s.paid), поиск открытых запусков (run.t.group).",
+"expects": "Закрывается один раз из sent; refused и not-started ничего не стоят.",
+"risks": "answered — только ответ, не результат проверок. lost — неизвестная цена: держится резервом."
+},
+{
+"path": "usage",
+"type": "TokenUsage | null",
+"iface": true,
+"what": "Расход токенов, сообщённый адаптером (входные, кэш, выходные, рассуждения).",
+"writer": "Закрытие запуска (run.k.save, run.r.save, run.s.state).",
+"readers": "Бюджет допуска: входные токены запусков плюс прогноз следующего (run.t.stage, run.r.give).",
+"expects": "Берётся из единственного объекта вывода адаптера, в том числе при сбое; иначе null — «неизвестно», не ноль.",
+"risks": "Нет расхода — запуск считается по резерву роли; превышение — execution_budget_exhausted."
+},
+{
+"path": "startedAt",
+"type": "number",
+"iface": false,
+"what": "время открытия записи (мс)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "finishedAt",
+"type": "number | null",
+"iface": false,
+"what": "время закрытия (мс); null, пока запуск открыт",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "feedback",
+"type": "ExecutionSendFeedback | null | отсутствует",
+"iface": true,
+"what": "Какую выдержку упавшей проверки увидело исправление: номер проверки, размер, признак обрезки и ссылка на попытку.",
+"writer": "Запуск роли (run.t.send); ключ есть у каждого запуска эры EX2, у раннего его нет.",
+"readers": "Восстановление слота исправления «вслепую» (run.t.stage).",
+"expects": "Только у исправляющего запуска исполнителя; ссылка basis названа точно.",
+"risks": "Отсутствие ключа само по себе не повод восстанавливать слот — нужно доказать, что вывод проверки не дошёл."
+}
+],
+"writers": [
+{
+"node": "run.t.send",
+"code": "src/execution/protocol.ts:91 (ExecutionSendHandle.constructor)",
+"when": "Запись sent сохраняется до запуска адаптера: план, задача, попытка, роль, номер, размер запроса, допуск, выдержка исправления",
+"fields": [
+"contract",
+"project",
+"plan",
+"task",
+"attempt",
+"role",
+"ordinal",
+"correction",
+"admission",
+"request",
+"group",
+"status",
+"usage",
+"startedAt",
+"finishedAt",
+"feedback"
+],
+"sure": true
+},
+{
+"node": "run.t.adapter",
+"code": "src/execution/protocol.ts:98 (ExecutionSendHandle.group)",
+"when": "Supervisor-процесс замечен: его pid и время старта записываются как группа запуска",
+"fields": [
+"group"
+],
+"sure": true
+},
+{
+"node": "run.k.save",
+"code": "src/execution/protocol.ts:105 (ExecutionSendHandle.close); src/execution/runner.ts:558 (Executor.run)",
+"when": "Закрытие запуска исполнителя (answered или неудача) пишется в одной транзакции с применением его ответа к task-run",
+"fields": [
+"status",
+"usage",
+"finishedAt"
+],
+"sure": true
+},
+{
+"node": "run.r.save",
+"code": "src/execution/runner.ts:592 (Executor.run); src/execution/runner.ts:598 (Executor.run)",
+"when": "Закрытие запуска ревьюера пишется в одной транзакции с вердиктом: потерянный процесс после неё не покупает второе ревью того же дерева",
+"fields": [
+"status",
+"usage",
+"finishedAt"
+],
+"sure": true
+},
+{
+"node": "run.s.state",
+"code": "src/execution/runner.ts:620 (Executor.run); src/execution/protocol.ts:142 (callAgent)",
+"when": "Сбой запуска закрывается статусом not-started, refused, interrupted или failed — вместе с исходом попытки",
+"fields": [
+"status",
+"usage",
+"finishedAt"
+],
+"sure": true
+},
+{
+"node": "run.t.group",
+"code": "src/execution/runner.ts:425 (Executor.run); src/execution/protocol.ts:113 (lostSendClosure)",
+"when": "Запуск остался открытым после потери процесса: закрывается своим исходом — отказ шлюза (refused), запуск не наблюдался (not-started) или неизвестный исход (lost)",
+"fields": [
+"status",
+"usage",
+"finishedAt"
+],
+"sure": true
+},
+{
+"node": "run.phase.send",
+"code": "src/execution/protocol.ts:91 (ExecutionSendHandle.constructor); src/execution/protocol.ts:98 (ExecutionSendHandle.group)",
+"when": "Запись sent сохраняется до запуска адаптера: план, задача, попытка, роль, номер, размер запроса, допуск, выдержка исправления; Supervisor-процесс замечен: его pid и время старта записываются как группа запуска",
+"fields": [
+"contract",
+"project",
+"plan",
+"task",
+"attempt",
+"role",
+"ordinal",
+"correction",
+"admission",
+"request",
+"group",
+"status",
+"usage",
+"startedAt",
+"finishedAt",
+"feedback"
+],
+"sure": true
+},
+{
+"node": "run.phase.cand",
+"code": "src/execution/protocol.ts:105 (ExecutionSendHandle.close); src/execution/runner.ts:558 (Executor.run)",
+"when": "Закрытие запуска исполнителя (answered или неудача) пишется в одной транзакции с применением его ответа к task-run",
+"fields": [
+"status",
+"usage",
+"finishedAt"
+],
+"sure": true
+},
+{
+"node": "run.phase.review",
+"code": "src/execution/runner.ts:592 (Executor.run); src/execution/runner.ts:598 (Executor.run)",
+"when": "Закрытие запуска ревьюера пишется в одной транзакции с вердиктом: потерянный процесс после неё не покупает второе ревью того же дерева",
+"fields": [
+"status",
+"usage",
+"finishedAt"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.t.group",
+"code": "src/execution/runner.ts:422 (Executor.run)",
+"fields": [
+"status",
+"group",
+"task"
+],
+"expects": "Открытые запуски этой задачи: если их группа процессов не доказана ушедшей — executor_still_running; иначе они закрываются",
+"sure": true
+},
+{
+"node": "run.t.stage",
+"code": "src/execution/runner.ts:80 (requireExecutionBudget); src/execution/runner.ts:208 (correctionsUsed); src/execution/runner.ts:488 (Executor.run)",
+"fields": [
+"status",
+"role",
+"usage",
+"correction",
+"attempt"
+],
+"expects": "Бюджет считается по сохранённым исходам запусков плана: число запусков не больше roleLaunches, входные токены с прогнозом не больше softInput; исправления считаются по запускам",
+"sure": true
+},
+{
+"node": "run.r.code",
+"code": "src/execution/runner.ts:217 (correctionRoom)",
+"fields": [
+"correction",
+"status",
+"attempt",
+"role"
+],
+"expects": "Новая исправляющая попытка открывается, только пока использованных исправлений меньше предела; считаются оплаченные запуски",
+"sure": true
+},
+{
+"node": "run.r.give",
+"code": "src/execution/runner.ts:582 (Executor.run)",
+"fields": [
+"status",
+"role",
+"usage"
+],
+"expects": "Перед запуском ревьюера бюджет допуска проверяется заново по тем же сохранённым запускам",
+"sure": true
+},
+{
+"node": "run.t.send",
+"code": "src/execution/runner.ts:508 (Executor.run)",
+"fields": [
+"role",
+"attempt"
+],
+"expects": "Номер нового запуска — число запусков этой роли в этой попытке плюс один",
+"sure": true
+},
+{
+"node": "run.s.paid",
+"code": "src/execution/runner.ts:470 (Executor.run)",
+"fields": [
+"role",
+"attempt",
+"status"
+],
+"expects": "Ревью этой попытки со статусом answered уже оплачено и повторно не покупается",
+"sure": true
+},
+{
+"node": "run.phase.fix",
+"code": "src/execution/runner.ts:217 (correctionRoom)",
+"fields": [
+"correction",
+"status",
+"attempt",
+"role"
+],
+"expects": "Новая исправляющая попытка открывается, только пока использованных исправлений меньше предела; считаются оплаченные запуски",
+"sure": true
+},
+{
+"node": "run.phase.review",
+"code": "src/execution/runner.ts:582 (Executor.run)",
+"fields": [
+"status",
+"role",
+"usage"
+],
+"expects": "Перед запуском ревьюера бюджет допуска проверяется заново по тем же сохранённым запускам",
+"sure": true
+},
+{
+"node": "run.phase.send",
+"code": "src/execution/runner.ts:508 (Executor.run)",
+"fields": [
+"role",
+"attempt"
+],
+"expects": "Номер нового запуска — число запусков этой роли в этой попытке плюс один",
+"sure": true
+}
+]
+},
+{
+"kind": "execution-recovery",
+"group": "run",
+"idPattern": "execution-recovery:<проект>:<хэш плана>:<задача>:<попытка>:implement:<номер>",
+"proposed": false,
+"card": {
+"what": "Техническое восстановление одного слота исправления: фиксирует, что исправляющий запуск прежнего производителя шёл «вслепую» — ему не показали вывод упавшей проверки.",
+"where": "Таблица revisions · вид «execution-recovery» · id execution-recovery:<проект>:<хэш плана>:<задача>:<попытка>:implement:<номер>",
+"when": "Один раз на такой запуск — когда предел исправлений задачи уже достигнут, и прежняя запись о запуске подходит под определение «вслепую». Повторный вход находит запись и ничего не восстанавливает.",
+"why": "Слот, потраченный без диагностики, не должен съедать предел исправлений (EX2).",
+"expects": "Это оплаченный запуск-исправление без поля feedback, предыдущая попытка needs_code имела упавшую проверку с диагностикой на stdout, которой нет в тексте ошибки запуска.",
+"risks": "Старое исправление не восстанавливается по одному отсутствию поля. Основание доказывается один раз при записи и позже не выводится заново; читатель проверяет только форму и адрес.",
+"size": "HX5: записей нет · рабочая база: 1 запись, 828 Б",
+"note": ""
+},
+"fields": [
+{
+"path": "contract",
+"type": "string",
+"iface": false,
+"what": "метка формата execution-recovery/v1",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "plan",
+"type": "Ref",
+"iface": false,
+"what": "точная версия плана",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "task",
+"type": "string",
+"iface": false,
+"what": "задача плана",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "send",
+"type": "Ref",
+"iface": true,
+"what": "Точная версия запуска-исправления, который шёл «вслепую».",
+"writer": "Восстановление слота (run.t.stage).",
+"readers": "Счёт исправлений: такой запуск не засчитывается (run.t.stage).",
+"expects": "Запись лежит по адресу, производному от id этого запуска.",
+"risks": "Нет точной ссылки на запуск — execution_recovery_invalid."
+},
+{
+"path": "basis",
+"type": "Ref",
+"iface": false,
+"what": "Версия попытки needs_code, чей упавший вывод исправление не получило",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "check",
+"type": "number",
+"iface": false,
+"what": "номер упавшей проверки в этой попытке",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "reason",
+"type": "string",
+"iface": false,
+"what": "причина: correction-without-check-output",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "run.t.stage",
+"code": "src/execution/runner.ts:200 (restoreBlindCorrections)",
+"when": "Предел исправлений достигнут: для каждого доказанно «слепого» исправления пишется восстановление под охраной ссылки на запуск",
+"fields": [
+"contract",
+"project",
+"plan",
+"task",
+"send",
+"basis",
+"check",
+"reason"
+],
+"sure": true
+},
+{
+"node": "run.r.code",
+"code": "src/execution/runner.ts:216 (correctionRoom)",
+"when": "Каждая ветка, решающая, открыть ли исправление, сначала восстанавливает слоты, потраченные «вслепую»; запись пишется один раз",
+"fields": [
+"contract",
+"project",
+"plan",
+"task",
+"send",
+"basis",
+"check",
+"reason"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.t.stage",
+"code": "src/execution/runner.ts:188 (readRecovery); src/execution/runner.ts:206 (correctionsUsed); src/execution/runner.ts:198 (restoreBlindCorrections)",
+"fields": [
+"send",
+"contract"
+],
+"expects": "Использованные исправления считаются без запусков, у которых есть восстановление; форма записи и адрес её запуска проверяются",
+"sure": true
+},
+{
+"node": "run.r.code",
+"code": "src/execution/runner.ts:216 (correctionRoom)",
+"fields": [
+"send"
+],
+"expects": "Предел исправлений считается заново после восстановления слотов, потраченных «вслепую»",
+"sure": true
+}
+]
+},
+{
+"kind": "artifact",
+"group": "run",
+"idPattern": "artifact:<хэш (проект, выход)>",
+"proposed": false,
+"card": {
+"what": "Квитанция реализованного выхода плана: узел, подпись и хэш договора, коммит и дерево, манифест файлов (путь и хэш) и ссылка на принятый run. Модель этих значений не сочиняет.",
+"where": "Таблица revisions · вид «artifact» · id artifact:<хэш (проект, выход)>",
+"when": "При принятии коммита задачи — по записи на каждый выход, в одной транзакции с committed. Повторная реализация того же выхода пишет новую версию той же записи.",
+"why": "Следующие задачи и последующее планирование берут её как вход: «этот выход уже реализован вот этим коммитом».",
+"expects": "Подпись узла и хэш договора равны графу; коммит — предок head; дерево равно дереву коммита; файлы равны текущим; run — committed того же плана и задачи.",
+"risks": "Граф или договор изменились — производитель «не готов». Файл изменился после реализации — artifact_stale. Значение выхода — только список файлов, бизнес-значения нет.",
+"size": "В HX5 и в рабочей базе записей этого вида нет.",
+"note": "В рабочей базе нет ни одной квитанции: значит, ни одна задача ещё не была принята через принятие коммита (вывод)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "artifact",
+"type": "string",
+"iface": false,
+"what": "Id реализованного выхода плана; вместе с проектом даёт id записи.",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "node",
+"type": "string",
+"iface": true,
+"what": "Узел графа, который выпустил выход.",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Входы следующих задач (run.t.inputs), поставки M8 (om.m8.deliv), горизонт (om.l1.om).",
+"expects": "Совпадает с производителем выхода в графе.",
+"risks": "Другой производитель — producer_not_ready."
+},
+{
+"path": "signature",
+"type": "string",
+"iface": true,
+"what": "Подпись узла: хэш узла и его тестов на момент реализации.",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Совместимость квитанции с графом (run.t.inputs, om.m8.deliv).",
+"expects": "Равна подписи узла в текущем графе.",
+"risks": "Узел или его тесты изменились — квитанция не годится как вход (producer_not_ready)."
+},
+{
+"path": "contractHash",
+"type": "string",
+"iface": true,
+"what": "Хэш схемы договора выхода.",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Совместимость квитанции с графом (run.t.inputs, om.m8.deliv).",
+"expects": "Равен хэшу схемы договора выхода в текущем графе.",
+"risks": "Договор изменился — производитель не готов."
+},
+{
+"path": "commit",
+"type": "string",
+"iface": true,
+"what": "Коммит, в котором выход реализован.",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Входы (run.t.inputs): коммит должен быть предком head корня; поставки (om.m8.deliv).",
+"expects": "Предок head; его дерево равно tree.",
+"risks": "Не предок — отказ git; дерево не совпало — artifact_foreign."
+},
+{
+"path": "tree",
+"type": "string",
+"iface": true,
+"what": "Git-дерево этого коммита",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Входы (run.t.inputs).",
+"expects": "Равно дереву коммита.",
+"risks": "Расхождение — artifact_foreign."
+},
+{
+"path": "value",
+"type": "{ files: { path, hash | null }[] }",
+"iface": true,
+"what": "Манифест файлов: путь и хэш содержимого (null — файл удалён). Бизнес-значения выхода нет.",
+"writer": "Принятие коммита (run.c.receipt): пути из writePaths задачи.",
+"readers": "Входы (run.t.inputs): сверка с текущими байтами; следующий планировщик (om.m8.deliv).",
+"expects": "Пути равны области записи узла в графе; хэш каждого файла равен хэшу содержимого в текущем дереве.",
+"risks": "Файл изменился — artifact_stale; манифест не покрывает область записи — implementation_manifest_invalid."
+},
+{
+"path": "plan",
+"type": "Ref",
+"iface": true,
+"what": "План, под которым принят выход.",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Входы (run.t.inputs, run.f.check): план и run квитанции проверяются парой.",
+"expects": "Версия плана, в котором задача производитель.",
+"risks": "Нет plan или run в графе версии 2 — implementation_proof_missing."
+},
+{
+"path": "run",
+"type": "Ref",
+"iface": true,
+"what": "Принятая версия task-run, доказывающая реализацию.",
+"writer": "Принятие коммита (run.c.receipt): ссылка на версию committed.",
+"readers": "Входы следующей задачи (run.t.inputs, run.f.check).",
+"expects": "committed; задача и план совпадают с квитанцией, commit и tree равны.",
+"risks": "Чужой run — execution_input_foreign или implementation_proof_foreign."
+}
+],
+"writers": [
+{
+"node": "run.c.receipt",
+"code": "src/execution/commit.ts:82 (finishCommit)",
+"when": "Принятие коммита: для каждого выхода задачи записывается квитанция с коммитом, деревом, манифестом файлов, планом и принятым run",
+"fields": [
+"projectId",
+"artifact",
+"node",
+"signature",
+"contractHash",
+"commit",
+"tree",
+"value",
+"plan",
+"run"
+],
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Доведение commit_pending при старте: квитанции пишутся теми же правилами, без новой модели и проверок",
+"fields": [
+"artifact",
+"commit",
+"tree",
+"value",
+"plan",
+"run"
+],
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Команда recover-execution: то же доведение — квитанции пишутся из сохранённого намерения",
+"fields": [
+"artifact",
+"commit",
+"tree",
+"value",
+"plan",
+"run"
+],
+"sure": true
+},
+{
+"node": "run.phase.receipt",
+"code": "src/execution/commit.ts:82 (finishCommit)",
+"when": "Принятие коммита: для каждого выхода задачи записывается квитанция с коммитом, деревом, манифестом файлов, планом и принятым run",
+"fields": [
+"projectId",
+"artifact",
+"node",
+"signature",
+"contractHash",
+"commit",
+"tree",
+"value",
+"plan",
+"run"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.c.receipt",
+"code": "src/execution/commit.ts:78 (finishCommit)",
+"fields": [
+"artifact"
+],
+"expects": "Предыдущая версия квитанции того же выхода (если есть) задаёт expected новой версии",
+"sure": true
+},
+{
+"node": "run.t.inputs",
+"code": "src/execution/inputs.ts:21 (executionInputs); src/compiler/inputs.ts:139 (resolveArtifact)",
+"fields": [
+"node",
+"signature",
+"contractHash",
+"commit",
+"tree",
+"value",
+"plan",
+"run"
+],
+"expects": "Квитанция совместима с графом, её коммит — предок head, дерево совпадает, файлы равны текущим, run — committed того же плана (producer_not_ready, artifact_foreign, artifact_stale, implementation_proof_foreign)",
+"sure": true
+},
+{
+"node": "run.f.check",
+"code": "src/execution/inputs.ts:29 (executionInputs)",
+"fields": [
+"plan",
+"run"
+],
+"expects": "Run квитанции — именно задача-производитель этого плана (execution_input_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.a.plan",
+"code": "src/execution/artifact-progress.ts:14 (artifactProgress); src/execution/basis.ts:77 (currentBasis)",
+"fields": [
+"artifact",
+"node",
+"plan",
+"run"
+],
+"expects": "Новая версия входной квитанции не делает план устаревшим, если её выпустила принятая задача этого плана; иначе plan_stale",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:166 (loadTaskContextSources)",
+"fields": [
+"node",
+"commit",
+"tree",
+"value"
+],
+"expects": "Контекст получает поставки: квитанции производителей входов читаются через общий читатель",
+"sure": false
+},
+{
+"node": "om.l1.om",
+"code": "src/om/horizon.ts:363 (deriveHorizon)",
+"fields": [
+"projectId",
+"artifact"
+],
+"expects": "Горизонт принимает «доступные» блоки только по точным квитанциям на артефакт этого проекта",
+"sure": false
+},
+{
+"node": "om.m8.deliv",
+"code": "src/om/deliveries.ts:96 (checkDeliveries); src/om/feasibility.ts:299 (deliveryInputs)",
+"fields": [
+"node",
+"signature",
+"contractHash",
+"commit",
+"tree",
+"value"
+],
+"expects": "Названные квитанции читаются по точным ссылкам; компилятор должен разрешить тот же результат (input_stale иначе)",
+"sure": false
+},
+{
+"node": "om.c.derive",
+"code": "src/compiler/compiler.ts:46 (Compiler.compile)",
+"fields": [
+"node",
+"signature",
+"contractHash",
+"commit",
+"tree",
+"value",
+"plan",
+"run"
+],
+"expects": "Входы задач разрешаются из квитанций производителей вне горизонта",
+"sure": false
+},
+{
+"node": "run.phase.receipt",
+"code": "src/execution/commit.ts:78 (finishCommit)",
+"fields": [
+"artifact"
+],
+"expects": "Предыдущая версия квитанции того же выхода (если есть) задаёт expected новой версии",
+"sure": true
+},
+{
+"node": "run.phase.inputs",
+"code": "src/execution/inputs.ts:21 (executionInputs); src/compiler/inputs.ts:139 (resolveArtifact)",
+"fields": [
+"node",
+"signature",
+"contractHash",
+"commit",
+"tree",
+"value",
+"plan",
+"run"
+],
+"expects": "Квитанция совместима с графом, её коммит — предок head, дерево совпадает, файлы равны текущим, run — committed того же плана (producer_not_ready, artifact_foreign, artifact_stale, implementation_proof_foreign)",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:166 (loadTaskContextSources)",
+"fields": [
+"node",
+"commit",
+"tree",
+"value"
+],
+"expects": "Контекст получает поставки: квитанции производителей входов читаются через общий читатель",
+"sure": false
+}
+]
+},
+{
+"kind": "writer-index",
+"group": "run",
+"idPattern": "writer-index:<хэш (проект, путь)>",
+"proposed": false,
+"card": {
+"what": "Индекс писателей одного пути файла: упорядоченный список принятых запусков, правивших путь, ссылка на предыдущую версию и на корень исполнения на момент записи.",
+"where": "Таблица revisions · вид «writer-index» · id writer-index:<хэш (проект, путь)>",
+"when": "Начальная версия (bootstrap) строится при подготовке поставок горизонта: в ней все уже принятые писатели пути, до первого исполнения список пуст. Каждый принятый коммит задачи добавляет версию origin=commit для каждого пути из writePaths, в одной транзакции с committed.",
+"why": "Владение путями: кто последним законно писал файл. От этого зависят права записи следующих задач и готовность плана.",
+"expects": "Версия N+1 равна N плюс один писатель; корень исполнения растёт; каждый писатель — committed запуск, чей коммит входит в ветку, а файл в нём совпадает с текущим; эра индекса соответствует эре плана.",
+"risks": "Индекс неполный или цепочка нарушена — writer_index_incomplete или writer_index_invalid. Изменённый вне записанного писателя файл — ownership_code_changed. Проверяются все версии цепочки до запечатанной.",
+"size": "HX5: записей нет · рабочая база: 29 записей, 4,5 КБ",
+"note": "Первичное построение индекса — в подготовке поставок OM, показано связью с узлом «Соседи · поставки · D7» (om.l3.neighbors)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "string",
+"iface": false,
+"what": "эра индекса: writer-index/v1 или writer-index/om-m8-v1 (по плану писателя)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "path",
+"type": "string",
+"iface": false,
+"what": "Путь файла в репозитории, которому принадлежит индекс.",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "writers",
+"type": "Ref[]",
+"iface": true,
+"what": "Принятые запуски (committed task-run), правившие этот путь, в порядке принятия.",
+"writer": "Принятие коммита (run.c.receipt) добавляет ровно одного; начальная версия (om.l3.neighbors) берёт всех уже принятых, до исполнения — пустой список.",
+"readers": "Права записи следующих задач (run.f.grant), прогресс плана (run.a.plan), готовность M8 (om.m8.deliv).",
+"expects": "Версия N+1 равна версии N плюс один писатель; каждый — committed, коммит в ветке, файл в нём совпадает.",
+"risks": "Принятый писатель вне индекса — writer_index_incomplete; нарушенная цепочка — writer_index_invalid."
+},
+{
+"path": "previous",
+"type": "Ref | null",
+"iface": true,
+"what": "Предыдущая версия индекса; null у первой.",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Прогресс плана проходит всю цепочку до запечатанной версии (run.a.plan); компилятор (om.c.compiler).",
+"expects": "Ссылка на ровно предыдущую версию того же индекса.",
+"risks": "Пропуск версии — plan_stale / writer_index_invalid."
+},
+{
+"path": "root",
+"type": "Ref | null",
+"iface": true,
+"what": "Версия корня исполнения, на которой индекс записан.",
+"writer": "Принятие коммита (run.c.receipt).",
+"readers": "Выбор писателя на срезе корня (run.f.grant, om.m8.deliv).",
+"expects": "Растёт: корень следующей версии новее предыдущей; null у пустого начального индекса.",
+"risks": "Корень не совпал с текущим — writer_index_invalid (root.current)."
+},
+{
+"path": "origin",
+"type": "{ kind: \"bootstrap\" } | { kind: \"commit\", run }",
+"iface": true,
+"what": "Происхождение версии: начальное построение или принятый коммит с точной ссылкой на run.",
+"writer": "Принятие коммита (run.c.receipt) — commit; начальное построение (om.l3.neighbors) — bootstrap.",
+"readers": "Проверка «каждый промежуточный писатель — принятая задача этого плана и пути» (run.a.plan).",
+"expects": "commit называет run, чей переход commit_pending → committed и сдвиг корня видны в истории.",
+"risks": "Другой run или чужая дата корня — origin.run / origin.root невалидны."
+}
+],
+"writers": [
+{
+"node": "run.c.receipt",
+"code": "src/execution/commit.ts:86 (finishCommit); src/ownership/writer-index.ts:215 (prepareWriterIndex)",
+"when": "Принятие коммита: для каждого пути из writePaths пишется новая версия индекса с принятым запуском, ссылкой на предыдущую версию и на новый корень",
+"fields": [
+"contract",
+"project",
+"path",
+"writers",
+"previous",
+"root",
+"origin"
+],
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Доведение commit_pending при старте: индексы путей расширяются тем же правилом",
+"fields": [
+"writers",
+"previous",
+"root",
+"origin"
+],
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:35 (recoverCommits)",
+"when": "Команда recover-execution: индексы путей расширяются из сохранённого намерения",
+"fields": [
+"writers",
+"previous",
+"root",
+"origin"
+],
+"sure": true
+},
+{
+"node": "om.l3.neighbors",
+"code": "src/om/deliveries.ts:214 (ownershipSources); src/om/neighbors.ts:326 (prepareNeighbors); src/om/neighbors.ts:336 (writeNeighbors)",
+"when": "Подготовка поставок горизонта строит начальный индекс для каждого пути записи (origin bootstrap), если его ещё нет",
+"fields": [
+"contract",
+"project",
+"path",
+"writers",
+"previous",
+"root",
+"origin"
+],
+"sure": true
+},
+{
+"node": "run.phase.receipt",
+"code": "src/execution/commit.ts:86 (finishCommit); src/ownership/writer-index.ts:215 (prepareWriterIndex)",
+"when": "Принятие коммита: для каждого пути из writePaths пишется новая версия индекса с принятым запуском, ссылкой на предыдущую версию и на новый корень",
+"fields": [
+"contract",
+"project",
+"path",
+"writers",
+"previous",
+"root",
+"origin"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.a.plan",
+"code": "src/execution/basis.ts:42 (writerProgress); src/execution/basis.ts:75 (currentBasis); src/compiler/compiler.ts:121 (Compiler.read)",
+"fields": [
+"writers",
+"previous",
+"root",
+"origin",
+"path",
+"project"
+],
+"expects": "Изменение индекса допустимо только добавлениями этого же плана: вся цепочка предыдущих версий до запечатанной, каждый промежуточный писатель — принятая задача этого плана (plan_stale иначе)",
+"sure": true
+},
+{
+"node": "run.c.receipt",
+"code": "src/ownership/writer-index.ts:199 (prepareWriterIndex)",
+"fields": [
+"writers",
+"previous",
+"root"
+],
+"expects": "Перед расширением читается голова индекса и вся цепочка; принятые писатели вне индекса — writer_index_incomplete",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/om/deliveries.ts:215 (ownershipSources)",
+"fields": [
+"writers",
+"root"
+],
+"expects": "Поставки читают сохранённый индекс по точной ссылке, без выбора голов",
+"sure": false
+},
+{
+"node": "om.m8.deliv",
+"code": "src/om/feasibility.ts:258 (deliveryInputs)",
+"fields": [
+"writers",
+"root"
+],
+"expects": "Готовность M8 читает уже сохранённый полный индекс; недостающая история — ошибка, а не пустой индекс",
+"sure": false
+},
+{
+"node": "run.phase.receipt",
+"code": "src/ownership/writer-index.ts:199 (prepareWriterIndex)",
+"fields": [
+"writers",
+"previous",
+"root"
+],
+"expects": "Перед расширением читается голова индекса и вся цепочка; принятые писатели вне индекса — writer_index_incomplete",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/om/deliveries.ts:215 (ownershipSources)",
+"fields": [
+"writers",
+"root"
+],
+"expects": "Поставки читают сохранённый индекс по точной ссылке, без выбора голов",
+"sure": false
+}
+]
+},
+{
+"kind": "parked-candidate",
+"group": "run",
+"idPattern": "parked:<хэш ссылки на run>",
+"proposed": false,
+"card": {
+"what": "Непринятый кандидат, отложенный при ремонте плана: ссылка на неудачный run, на корень, старая и новая рабочие копии, дерево и ссылка git для архива.",
+"where": "Таблица revisions · вид «parked-candidate» · id parked:<хэш ссылки на run>",
+"when": "Две версии: preparing (намерение) → parked (после архивной ссылки и создания нового корня). Только при ремонте плана прежнего маршрута.",
+"why": "Не теряет код отклонённой попытки и начинает ремонт с чистой копии от последнего принятого head.",
+"expects": "Run — точная неудачная попытка needs_plan; корень ready, head равен её родителю; дерево равно записанному; архивная ссылка пуста либо уже указывает на то же дерево.",
+"risks": "Для нового OM ремонт закрыт (legacy_route_closed): запись не пишется. Старую копию не удаляют и не сбрасывают. Ссылка указывает на другой код — repair_archive_foreign.",
+"size": "В HX5 и в рабочей базе записей этого вида нет.",
+"note": ""
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "run",
+"type": "Ref",
+"iface": true,
+"what": "Точная версия неудачной попытки needs_plan, чей кандидат отложен.",
+"writer": "Парковка (run.s.park).",
+"readers": "Улика сбоя в ремонте (run.s.repair).",
+"expects": "Состояние run — needs_plan.",
+"risks": "Другой run — repair_run_foreign."
+},
+{
+"path": "root",
+"type": "Ref",
+"iface": false,
+"what": "Версия корня исполнения, с которой началась парковка",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "previous",
+"type": "ExecutionRoot",
+"iface": false,
+"what": "Копия записи прежнего корня: старая рабочая копия остаётся нетронутой",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "next",
+"type": "ExecutionRoot",
+"iface": false,
+"what": "Новый корень: чистая копия от последнего принятого head",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "tree",
+"type": "string",
+"iface": true,
+"what": "Git-дерево отложенного кандидата",
+"writer": "Парковка (run.s.park).",
+"readers": "Улика сбоя в ремонте (run.s.repair).",
+"expects": "Равно дереву попытки; новые правки после сбоя отвергаются.",
+"risks": "Новые правки — repair_candidate_changed; неизвестные файлы — repair_candidate_unknown."
+},
+{
+"path": "archiveRef",
+"type": "string",
+"iface": false,
+"what": "Ссылка git refs/omg/candidates/<ключ>, где дерево сохранено для архива",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "state",
+"type": "\"preparing\" | \"parked\"",
+"iface": true,
+"what": "Намерение записано (preparing) или парковка завершена (parked).",
+"writer": "Парковка (run.s.park): сначала preparing, затем parked вместе с новым корнем.",
+"readers": "Освобождение операции ремонта (run.s.repair): preparing удерживает владение.",
+"expects": "parked только после архивной ссылки и материализации нового корня.",
+"risks": "Обрыв на preparing — операцию завершает восстановление; освободить её раньше нельзя (legacy_operation_pending)."
+}
+],
+"writers": [
+{
+"node": "run.s.park",
+"code": "src/execution/park.ts:42 (parkCandidate); src/execution/park.ts:52 (parkCandidate)",
+"when": "Парковка неудачной попытки needs_plan: намерение preparing, архивная ссылка git, новая рабочая копия, затем parked и замена корня одной транзакцией",
+"fields": [
+"projectId",
+"run",
+"root",
+"previous",
+"next",
+"tree",
+"archiveRef",
+"state"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.s.park",
+"code": "src/execution/park.ts:24 (parkCandidate)",
+"fields": [
+"state",
+"root",
+"tree"
+],
+"expects": "Уже завершённая парковка возвращается как есть; незавершённая сверяется с корнем и деревом (repair_root_changed иначе)",
+"sure": true
+},
+{
+"node": "run.s.repair",
+"code": "src/product/preparation-run.ts:66 (physicalLegacyState); src/product/stage-checks.ts:521 (checkedLegacyResult)",
+"fields": [
+"projectId",
+"run",
+"root",
+"previous",
+"next",
+"tree",
+"archiveRef",
+"state"
+],
+"expects": "Освобождение операции ремонта проверяет запись парковки: проект, run, корни, дерево, ссылка и состояние; preparing не освобождает",
+"sure": false
+}
+]
+},
+{
+"kind": "execution-result",
+"group": "run",
+"idPattern": "execution-result:<проект>:<хэш плана>",
+"proposed": false,
+"card": {
+"what": "Итог исполнения всего плана: ссылки на принятые запуски всех задач по порядку и финальный коммит цепочки.",
+"where": "Таблица revisions · вид «execution-result» · id execution-result:<проект>:<хэш плана>",
+"when": "Один раз, когда все задачи плана committed; повторный вход находит запись и не пишет заново.",
+"why": "Основание стадии execution: ворота результата заново проверяют полноту плана и цепочку коммитов.",
+"expects": "Число запусков равно числу задач; у каждого parent — коммит предыдущего, начиная с base.head; head равен коммиту последней задачи.",
+"risks": "Принятая стадия execution — ещё не поставка: merge, публикация и бизнес-приёмка идут отдельным решением владельца.",
+"size": "В HX5 и в рабочей базе записей этого вида нет.",
+"note": ""
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "plan",
+"type": "Ref",
+"iface": true,
+"what": "Точная версия плана, исполнение которого завершено.",
+"writer": "Итог исполнения (run.f.result).",
+"readers": "Ворота результата (run.f.gate).",
+"expects": "Равна плану принятой compilation.",
+"risks": "Чужой план — execution_plan_foreign."
+},
+{
+"path": "runs",
+"type": "Ref[]",
+"iface": true,
+"what": "Принятые запуски задач по порядку плана.",
+"writer": "Итог исполнения (run.f.result).",
+"readers": "Ворота результата (run.f.gate): каждый run заново проходит ворота.",
+"expects": "Столько же записей, сколько задач; все committed; parent цепочки идёт от основы плана.",
+"risks": "Неполно или порядок нарушен — execution_incomplete; коммит не совпал с git — execution_commit_foreign."
+},
+{
+"path": "head",
+"type": "string",
+"iface": true,
+"what": "Финальный коммит цепочки",
+"writer": "Итог исполнения (run.f.result).",
+"readers": "Ворота результата (run.f.gate).",
+"expects": "Равен коммиту последней задачи.",
+"risks": "Расхождение — execution_head_foreign."
+}
+],
+"writers": [
+{
+"node": "run.f.result",
+"code": "src/execution/runner.ts:635 (Executor.run)",
+"when": "Все задачи плана committed: результат пишется один раз под id плана; потом на него ссылается стадия execution",
+"fields": [
+"projectId",
+"plan",
+"runs",
+"head"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.f.gate",
+"code": "src/execution/result.ts:10 (resultGate)",
+"fields": [
+"projectId",
+"plan",
+"runs",
+"head"
+],
+"expects": "Запись принадлежит проекту, привязана по хэшу, число запусков равно числу задач, цепь коммитов и финальный head сходятся",
+"sure": true
+},
+{
+"node": "run.f.result",
+"code": "src/execution/runner.ts:635 (Executor.run)",
+"fields": [
+"projectId"
+],
+"expects": "Повторный вход после завершения находит уже записанный результат и не пишет второй",
+"sure": true
+}
+]
+},
+{
+"kind": "plan-defect",
+"group": "run",
+"idPattern": "plan-defect:<хэш ссылки на run>",
+"proposed": false,
+"card": {
+"what": "Зафиксированный дефект плана по неудачной попытке needs_plan: вопрос для исследования, ссылка на улику (патч и результаты проверок) и на отложенного кандидата.",
+"where": "Таблица revisions · вид «plan-defect» · id plan-defect:<хэш ссылки на run>",
+"when": "Один раз при подготовке ремонта плана прежнего маршрута, сразу после парковки кандидата.",
+"why": "Превращает сбой исполнения в вопрос к ремонту карты, а не в повтор того же задания.",
+"expects": "Run — точная неудачная попытка needs_plan этого проекта; улика не изменялась; карта не менялась с момента сбоя (repair_graph_changed иначе).",
+"risks": "Прежний маршрут: для нового OM ремонт закрыт (legacy_route_closed), записи не создаются. Потребителя planDefect для исправления L3 в новом OM нет (PR1).",
+"size": "В HX5 и в рабочей базе записей этого вида нет.",
+"note": "Чтение списка дефектов для исследования ремонта (graph/plan-defects.ts: planDefects) идёт через стадии R1/R2 — на узел run.* не отнесено (вывод)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "run",
+"type": "Ref",
+"iface": true,
+"what": "Точная версия неудачной попытки needs_plan.",
+"writer": "Подготовка ремонта (run.s.repair).",
+"readers": "Проверка результата ремонта и освобождение операции (run.s.repair).",
+"expects": "Состояние run — needs_plan, проект тот же.",
+"risks": "Чужой run — repair_run_foreign."
+},
+{
+"path": "plan",
+"type": "Ref",
+"iface": false,
+"what": "План, в котором возник дефект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "node",
+"type": "string",
+"iface": false,
+"what": "Узел карты, чей результат не удалось подтвердить",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "question",
+"type": "string",
+"iface": false,
+"what": "Вопрос ремонту: что мешает получить результат узла (текст находок ревью или ошибки)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "source",
+"type": "Ref",
+"iface": true,
+"what": "Улика сбоя: источник с патчем, проверками и находками.",
+"writer": "Подготовка ремонта (run.s.repair): запись source:<проект>:failure-….",
+"readers": "Исследование ремонта получает её как вход (вывод).",
+"expects": "Не меняется после записи; другое содержимое под тем же id — repair_evidence_changed.",
+"risks": "Улика заменена — ремонт останавливается."
+},
+{
+"path": "parked",
+"type": "Ref",
+"iface": false,
+"what": "Отложенный кандидат этой попытки (запись parked-candidate)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:115 (PlanRepairs.#prepare)",
+"when": "Ремонт прежнего маршрута: после парковки кандидата записывается дефект с вопросом, уликой и ссылкой на парковку",
+"fields": [
+"projectId",
+"run",
+"plan",
+"node",
+"question",
+"source",
+"parked"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:73 (PlanRepairs.#prepare); src/product/stage-checks.ts:520 (checkedLegacyResult)",
+"fields": [
+"projectId",
+"run",
+"plan",
+"parked"
+],
+"expects": "Уже выполненный ремонт проверяет дефект: id от run, проект, run, план и парковка совпадают",
+"sure": false
+}
+]
+},
+{
+"kind": "plan-repair",
+"group": "run",
+"idPattern": "plan-repair:<хэш ссылки на run>",
+"proposed": false,
+"card": {
+"what": "Ход ремонта плана прежнего маршрута: с какой неудачной попытки он начат, какой дефект и какая парковка, уровень карты, фаза, черновик и итоговый новый план.",
+"where": "Таблица revisions · вид «plan-repair» · id plan-repair:<хэш ссылки на run>",
+"when": "Создаётся при подготовке ремонта; новая версия при каждой смене фазы (research, design, compile, reissued) или паузе с причиной.",
+"why": "Позволяет продолжить ремонт после остановки и доказать, какой новый план исправил какой дефект.",
+"expects": "Одна запись на неудачную попытку; фаза reissued несёт план, не несёт ошибки и относится к уровню 2.",
+"risks": "Прежний маршрут: для нового OM ремонт закрыт (legacy_route_closed), записи не создаются.",
+"size": "В HX5 и в рабочей базе записей этого вида нет.",
+"note": ""
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "run",
+"type": "Ref",
+"iface": false,
+"what": "Неудачная попытка, с которой начат ремонт",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "defect",
+"type": "Ref",
+"iface": false,
+"what": "Дефект плана (запись plan-defect)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "parked",
+"type": "Ref",
+"iface": false,
+"what": "Отложенный кандидат (запись parked-candidate)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "level",
+"type": "1 | 2",
+"iface": false,
+"what": "Уровень карты, который ремонтируется: 1 или 2",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "phase",
+"type": "\"research\" | \"design\" | \"compile\" | \"reissued\"",
+"iface": true,
+"what": "Фаза ремонта.",
+"writer": "Каждый шаг ремонта (run.s.repair).",
+"readers": "Продолжение ремонта и проверка результата при освобождении операции (run.s.repair).",
+"expects": "reissued только с уровнем 2, новым планом и без ошибки.",
+"risks": "Пауза хранит причину в error; ремонт можно продолжить с той же фазы."
+},
+{
+"path": "draftId",
+"type": "string",
+"iface": false,
+"what": "Черновик исследования или проектирования, который сейчас ведёт ремонт",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "plan",
+"type": "Ref | null",
+"iface": true,
+"what": "Новый принятый план; заполнен только в фазе reissued",
+"writer": "Последняя фаза ремонта (run.s.repair).",
+"readers": "Новый запуск execute-plan по этому плану.",
+"expects": "Принятая compilation, проект тот же.",
+"risks": "Чужой проект — legacy_operation_invalid."
+},
+{
+"path": "error",
+"type": "string | null",
+"iface": false,
+"what": "причина паузы ремонта; null — работа идёт",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:122 (PlanRepairs.#prepare); src/product/repairs.ts:137 (PlanRepairs.#run); src/product/repairs.ts:187 (PlanRepairs.#run)",
+"when": "Ремонт прежнего маршрута: запись создаётся после парковки, затем обновляется по фазам и закрывается фазой reissued вместе с новым планом",
+"fields": [
+"projectId",
+"run",
+"defect",
+"parked",
+"level",
+"phase",
+"draftId",
+"plan",
+"error"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:39 (PlanRepairs.#withOperation); src/product/repairs.ts:67 (PlanRepairs.#prepare); src/product/stage-checks.ts:513 (checkedLegacyResult)",
+"fields": [
+"projectId",
+"run",
+"defect",
+"parked",
+"level",
+"phase",
+"plan",
+"error"
+],
+"expects": "Завершённый ремонт возвращается как есть; освобождение операции сверяет форму и фазу с результатом",
+"sure": false
+}
+]
+},
+{
+"kind": "plan-reissue",
+"group": "run",
+"idPattern": "plan-reissue:<хэш (проект, дефект, план)>",
+"proposed": false,
+"card": {
+"what": "Итог ремонта плана прежнего маршрута: связь «закрытый дефект → новый принятый план».",
+"where": "Таблица revisions · вид «plan-reissue» · id plan-reissue:<хэш (проект, дефект, план)>",
+"when": "Один раз, вместе с переходом ремонта в фазу reissued, одной транзакцией.",
+"why": "Отличает закрытые дефекты от открытых: исследование не поднимает снова то, что уже исправлено.",
+"expects": "Дефект и план совпадают с записью ремонта; новая compilation принята.",
+"risks": "Прежний маршрут: для нового OM ремонт закрыт (legacy_route_closed), записи не создаются.",
+"size": "В HX5 и в рабочей базе записей этого вида нет.",
+"note": ""
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "defect",
+"type": "Ref",
+"iface": true,
+"what": "Закрытый дефект",
+"writer": "Завершение ремонта (run.s.repair).",
+"readers": "Список открытых дефектов исключает закрытые (graph/plan-defects.ts).",
+"expects": "Ссылка с тем же хэшем, что у записи дефекта.",
+"risks": "Нет такой записи — дефект считается открытым."
+},
+{
+"path": "plan",
+"type": "Ref",
+"iface": false,
+"what": "Новый принятый план, исправивший дефект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:188 (PlanRepairs.#run)",
+"when": "Завершение ремонта: запись пишется вместе с фазой reissued",
+"fields": [
+"projectId",
+"defect",
+"plan"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:72 (PlanRepairs.#prepare); src/graph/plan-defects.ts:10 (planDefects)",
+"fields": [
+"defect",
+"plan"
+],
+"expects": "Завершённый ремонт сверяет запись с дефектом и планом; открытые дефекты отсеиваются по закрытым",
+"sure": false
+}
+]
+},
+{
+"kind": "legacy-operation",
+"group": "run",
+"idPattern": "legacy-operation:<проект>",
+"proposed": false,
+"card": {
+"what": "Охрана прежних операций подготовки и ремонта плана: кто (pid, время старта) владеет проектом, на какой основе и чем операция закончилась.",
+"where": "Таблица revisions · вид «legacy-operation» · id legacy-operation:<проект>",
+"when": "Версия при начале операции (active) и при освобождении (released) с доказательством.",
+"why": "Не даёт вести подготовку и ремонт одновременно и не теряет вызовы модели и парковку при падении процесса.",
+"expects": "Освобождение — только из активной записи и тем же владельцем; все вызовы модели проекта завершены, парковка не в состоянии preparing.",
+"risks": "Для ремонта нового OM она не нужна (маршрут закрыт), но первый вход OM проверяет, что активной операции нет.",
+"size": "В HX5 и в рабочей базе записей этого вида нет.",
+"note": "Запись общая для подготовки (prepare) и ремонта (repair); подготовка на узел run.* не отнесена (вывод)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "string",
+"iface": false,
+"what": "метка формата legacy-operation/v1",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект-владелец",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "operation",
+"type": "\"prepare\" | \"repair\"",
+"iface": false,
+"what": "Какая прежняя операция владеет проектом.",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "token",
+"type": "string",
+"iface": false,
+"what": "токен владения; освобождает только его обладатель",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "basis",
+"type": "Ref",
+"iface": true,
+"what": "Основание операции: preparation-run для подготовки, неудачный task-run для ремонта",
+"writer": "Начало операции (run.s.repair).",
+"readers": "Проверка результата при освобождении (run.s.repair).",
+"expects": "Для ремонта — точная попытка needs_plan этого проекта.",
+"risks": "Чужое основание — legacy_operation_invalid."
+},
+{
+"path": "owner",
+"type": "{ pid, started }",
+"iface": true,
+"what": "Процесс-владелец операции (pid и время старта)",
+"writer": "Начало операции (run.s.repair).",
+"readers": "Восстановление: операцию завершают, только когда владелец доказанно ушёл (run.s.repair).",
+"expects": "Идентифицируем; живой владелец не вытесняется.",
+"risks": "Нельзя определить — legacy_operation_invalid."
+},
+{
+"path": "state",
+"type": "\"active\" | \"released\"",
+"iface": true,
+"what": "Идёт операция или освобождена",
+"writer": "Начало (active) и освобождение (released) (run.s.repair).",
+"readers": "Первый вход OM (om-input) не начинается, пока операция активна (legacy_operation_active).",
+"expects": "Освобождение возможно только из active и только владельцем.",
+"risks": "Незавершённые вызовы модели или парковка preparing не отпускают операцию (legacy_operation_pending)."
+},
+{
+"path": "previous",
+"type": "Ref | null",
+"iface": false,
+"what": "Предыдущая версия операции",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "release",
+"type": "null | { from, reason, result, error, dispatch, calls, parking }",
+"iface": false,
+"what": "Доказательство освобождения: исход, счётчик диспетчера, вызовы модели и парковка",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "run.s.repair",
+"code": "src/product/preparation-run.ts:44 (beginLegacyOperation); src/product/preparation-run.ts:87 (releaseLegacyOperation)",
+"when": "Начало ремонта пишет активную запись под охраной основания; завершение — запись released с доказательством",
+"fields": [
+"contract",
+"projectId",
+"operation",
+"token",
+"basis",
+"owner",
+"state",
+"previous",
+"release"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "run.s.repair",
+"code": "src/product/preparation-run.ts:32 (beginLegacyOperation); src/product/stage-checks.ts:584 (readLegacyOperation)",
+"fields": [
+"contract",
+"projectId",
+"operation",
+"state",
+"owner",
+"previous",
+"release"
+],
+"expects": "Активная операция уже владеет проектом (legacy_operation_active); читается вся цепочка доказательств",
+"sure": false
+}
+]
+}
+],
+"extend": [
+{
+"kind": "project",
+"writers": [],
+"readers": [
+{
+"node": "run.a.start",
+"code": "src/product/engine.ts:298 (ProductEngine.execute); src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"вид записи",
+"id"
+],
+"expects": "Перед запуском проверяется, что проект существует и это project (project_missing иначе)",
+"sure": true
+},
+{
+"node": "run.s.stop",
+"code": "src/product/engine.ts:299 (ProductEngine.execute); src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"вид записи",
+"id"
+],
+"expects": "Команда stop-execution сначала проверяет проект; сама ничего не пишет в базу, а прерывает только исполнение своего процесса (вывод)",
+"sure": false
+},
+{
+"node": "run.s.recover",
+"code": "src/product/engine.ts:300 (ProductEngine.execute); src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"вид записи",
+"id"
+],
+"expects": "Команда recover-execution сначала проверяет проект",
+"sure": true
+}
+]
+},
+{
+"kind": "workspace",
+"writers": [],
+"readers": [
+{
+"node": "run.a.root",
+"code": "src/execution/worktree.ts:54 (ensureWorktree)",
+"fields": [
+"path"
+],
+"expects": "Корень исполнения ссылается на точную версию записи workspace (её пишет configure вместе с окружением)",
+"sure": true
+}
+]
+},
+{
+"kind": "environment",
+"writers": [],
+"readers": [
+{
+"node": "run.a.root",
+"code": "src/execution/worktree.ts:47 (ensureWorktree)",
+"fields": [
+"workspace"
+],
+"expects": "Корень принадлежит выбранному репозиторию: sourceRoot равен workspace окружения (worktree_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.t.adapter",
+"code": "src/execution/runner.ts:381 (Executor.run); src/execution/protocol.ts:138 (callAgent)",
+"fields": [
+"implementer",
+"reviewer",
+"workspace",
+"timeoutMs"
+],
+"expects": "Роли, команды и предел времени берутся из окружения, на котором принят план; процесс стартует в рабочей копии, а не в папке проекта",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/om/capacity.ts:34 (readCapacity); src/execution/runner.ts:459 (Executor.run)",
+"fields": [
+"requestCapacityChars"
+],
+"expects": "Вместимость запроса берётся из окружения точного плана и должна совпасть с maxContextChars команды (capacity_mismatch); нехватка — отказ, не обрезка",
+"sure": true
+},
+{
+"node": "run.k.cmds",
+"code": "src/execution/commit.ts:15 (checkCommands)",
+"fields": [
+"fullCheck"
+],
+"expects": "fullCheck входит в набор команд задачи; сохранённый список в task-run держит порядок, который читают все ворота",
+"sure": true
+},
+{
+"node": "run.k.exec",
+"code": "src/execution/runner.ts:570 (Executor.run)",
+"fields": [
+"workspace",
+"timeoutMs"
+],
+"expects": "Каждая команда проверки идёт в рабочей копии с пределом времени окружения",
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:22 (recoverCommits)",
+"fields": [
+"projectId",
+"fullCheck"
+],
+"expects": "Среда намерения та же, что принята планом (recovery_basis_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:22 (recoverCommits)",
+"fields": [
+"projectId",
+"fullCheck"
+],
+"expects": "Среда намерения та же, что принята планом (recovery_basis_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.f.gate",
+"code": "src/execution/result.ts:16 (resultGate)",
+"fields": [
+"fullCheck"
+],
+"expects": "Ворота результата заново проверяют полный набор команд на среде плана (execution_environment_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.phase.send",
+"code": "src/execution/runner.ts:381 (Executor.run); src/execution/protocol.ts:138 (callAgent)",
+"fields": [
+"implementer",
+"reviewer",
+"workspace",
+"timeoutMs"
+],
+"expects": "Роли, команды и предел времени берутся из окружения, на котором принят план; процесс стартует в рабочей копии, а не в папке проекта",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/om/capacity.ts:34 (readCapacity); src/execution/runner.ts:459 (Executor.run)",
+"fields": [
+"requestCapacityChars"
+],
+"expects": "Вместимость запроса берётся из окружения точного плана и должна совпасть с maxContextChars команды (capacity_mismatch); нехватка — отказ, не обрезка",
+"sure": true
+},
+{
+"node": "run.phase.checks",
+"code": "src/execution/runner.ts:570 (Executor.run)",
+"fields": [
+"workspace",
+"timeoutMs"
+],
+"expects": "Каждая команда проверки идёт в рабочей копии с пределом времени окружения",
+"sure": true
+}
+]
+},
+{
+"kind": "om-run-control",
+"writers": [
+{
+"node": "run.a.lock",
+"code": "src/om/run-control.ts:284 (acquireRunExecution); src/om/run-control.ts:296 (releaseRunExecution)",
+"when": "Допущенный execute-plan берёт общий run-control проекта (токен исполнителя и поколение допуска) и отпускает его в конце; живой чужой исполнитель не вытесняется (run_busy)",
+"fields": [
+"execution"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "run.a.lock",
+"code": "src/om/run-control.ts:273 (acquireRunExecution)",
+"fields": [
+"stop",
+"execution",
+"generation"
+],
+"expects": "Стоп запрещает допуск; запись, занятая живым или неопределимым исполнителем, не вытесняется (run_busy)",
+"sure": false
+},
+{
+"node": "run.s.stop",
+"code": "src/om/run-control.ts:180 (RunControlGate.watch); src/execution/runner.ts:368 (Executor.run)",
+"fields": [
+"stop",
+"generation",
+"execution"
+],
+"expects": "Стоп из любого процесса (om-stop) виден живому исполнению: наблюдение каждые 200 мс прерывает идущий вызов и проверки; команда stop-execution прерывает только свой процесс",
+"sure": false
+}
+]
+},
+{
+"kind": "reader-pilot",
+"writers": [],
+"readers": [
+{
+"node": "run.a.params",
+"code": "src/discovery/reader-pilot.ts:154 (assertPilotBoundary); src/discovery/reader-pilot.ts:139 (readerPilot)",
+"fields": [
+"execution",
+"active",
+"experimental"
+],
+"expects": "За границей compilation исполнение идёт только по допуску владельца на этот точный план: число запусков ролей, мягкий предел входных токенов, резервы ролей и лимит исправлений (pilot_boundary_reached, execution_corrections_exceeded иначе)",
+"sure": true
+},
+{
+"node": "run.t.stage",
+"code": "src/execution/runner.ts:225 (correctionLimit)",
+"fields": [
+"execution"
+],
+"expects": "Лимит исправлений задачи — меньшее из лимита команды и значения допуска (адресного для задачи или общего)",
+"sure": false
+},
+{
+"node": "run.t.ctx",
+"code": "src/execution/runner.ts:292 (clarificationOf)",
+"fields": [
+"execution"
+],
+"expects": "Разъяснение владельца к контракту точной задачи входит в запрос исполнителя",
+"sure": false
+},
+{
+"node": "run.r.give",
+"code": "src/execution/runner.ts:81 (requireExecutionBudget); src/execution/runner.ts:292 (clarificationOf)",
+"fields": [
+"execution"
+],
+"expects": "Перед ревью проверяется бюджет допуска; разъяснение владельца идёт и в запрос ревьюера",
+"sure": false
+},
+{
+"node": "run.phase.ctx",
+"code": "src/execution/runner.ts:292 (clarificationOf)",
+"fields": [
+"execution"
+],
+"expects": "Разъяснение владельца к контракту точной задачи входит в запрос исполнителя",
+"sure": false
+},
+{
+"node": "run.phase.review",
+"code": "src/execution/runner.ts:81 (requireExecutionBudget); src/execution/runner.ts:292 (clarificationOf)",
+"fields": [
+"execution"
+],
+"expects": "Перед ревью проверяется бюджет допуска; разъяснение владельца идёт и в запрос ревьюера",
+"sure": false
+}
+]
+},
+{
+"kind": "phase-policy",
+"writers": [],
+"readers": [
+{
+"node": "run.a.params",
+"code": "src/discovery/reader-pilot.ts:153 (assertPilotBoundary)",
+"fields": [
+"stopAfter"
+],
+"expects": "Исполнение за границей compilation разрешено только политикой, которая останавливает ровно на compilation, и допуском на точный план",
+"sure": true
+}
+]
+},
+{
+"kind": "stage",
+"writers": [],
+"readers": [
+{
+"node": "run.a.plan",
+"code": "src/execution/runner.ts:375 (Executor.run); src/compiler/basis.ts:13 (requireBasis)",
+"fields": [
+"projectId",
+"stage",
+"status",
+"content",
+"proofs"
+],
+"expects": "Исполняется только принятая compilation именно с этим планом (plan_not_accepted); основание плана — принятая стадия om-g2 (plan_basis_foreign)",
+"sure": true
+},
+{
+"node": "run.f.stage",
+"code": "src/execution/runner.ts:636 (Executor.run)",
+"fields": [
+"content"
+],
+"expects": "Стадия execution пишется заново только если хэш результата изменился",
+"sure": true
+},
+{
+"node": "run.f.gate",
+"code": "src/pipeline/pipeline.ts:67 (Pipeline.#inspectValue)",
+"fields": [
+"status",
+"content",
+"inputs",
+"proofs"
+],
+"expects": "Принятая стадия execution проверяется против запечатанной версии compilation: коммиты исполнения не делают историю R3 устаревшей",
+"sure": false
+}
+]
+},
+{
+"kind": "graph",
+"writers": [],
+"readers": [
+{
+"node": "run.a.plan",
+"code": "src/execution/task-obligations.ts:33 (requirePlanTaskObligations)",
+"fields": [
+"вся запись"
+],
+"expects": "Граф плана равен снимку графа в плане; из него выводятся обязательства задач (task_obligation_plan_foreign иначе)",
+"sure": true
+}
+]
+},
+{
+"kind": "source",
+"writers": [
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:113 (PlanRepairs.#prepare)",
+"when": "Ремонт прежнего маршрута: улика сбоя (патч, проверки, находки) сохраняется источником source:<проект>:failure-…; уже сохранённая не заменяется (repair_evidence_changed)",
+"fields": [
+"projectId",
+"origin",
+"content",
+"mediaType",
+"sha256"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "run.t.inputs",
+"code": "src/execution/inputs.ts:17 (executionInputs); src/compiler/inputs.ts:70 (resolveExternalSource)",
+"fields": [
+"projectId",
+"origin",
+"content",
+"mediaType",
+"sha256"
+],
+"expects": "Внешний вход — сохранённый источник, а не квитанция исполнения: тот же id и хэш, содержимое соответствует договору (external_input_missing, artifact_contract_mismatch иначе)",
+"sure": true
+},
+{
+"node": "run.t.tstart",
+"code": "src/graph/obligation-readiness.ts:57 (findObligationConfirmation); src/execution/task-obligations.ts:47 (taskStartProofs)",
+"fields": [
+"projectId",
+"provenance"
+],
+"expects": "Подтверждение среды ищется среди источников этого проекта с происхождением runtime-observation",
+"sure": true
+},
+{
+"node": "run.c.proof",
+"code": "src/graph/obligation-readiness.ts:57 (findObligationConfirmation); src/execution/task-obligations.ts:83 (taskResultProofs)",
+"fields": [
+"projectId",
+"provenance"
+],
+"expects": "Подтверждение task-result ищется там же; для коммита нужно настоящее, а не устаревшее наблюдение",
+"sure": true
+},
+{
+"node": "run.phase.inputs",
+"code": "src/execution/inputs.ts:17 (executionInputs); src/compiler/inputs.ts:70 (resolveExternalSource)",
+"fields": [
+"projectId",
+"origin",
+"content",
+"mediaType",
+"sha256"
+],
+"expects": "Внешний вход — сохранённый источник, а не квитанция исполнения: тот же id и хэш, содержимое соответствует договору (external_input_missing, artifact_contract_mismatch иначе)",
+"sure": true
+},
+{
+"node": "run.phase.tstart",
+"code": "src/graph/obligation-readiness.ts:57 (findObligationConfirmation); src/execution/task-obligations.ts:47 (taskStartProofs)",
+"fields": [
+"projectId",
+"provenance"
+],
+"expects": "Подтверждение среды ищется среди источников этого проекта с происхождением runtime-observation",
+"sure": true
+},
+{
+"node": "run.phase.tresult",
+"code": "src/graph/obligation-readiness.ts:57 (findObligationConfirmation); src/execution/task-obligations.ts:83 (taskResultProofs)",
+"fields": [
+"projectId",
+"provenance"
+],
+"expects": "Подтверждение task-result ищется там же; для коммита нужно настоящее, а не устаревшее наблюдение",
+"sure": true
+}
+]
+},
+{
+"kind": "project-dispatch",
+"writers": [],
+"readers": [
+{
+"node": "run.t.tstart",
+"code": "src/graph/obligation-readiness.ts:56 (findObligationConfirmation)",
+"fields": [
+"serial"
+],
+"expects": "Счётчик вызовов проекта фиксируется до перечисления источников: новое наблюдение не подменит его более новой охраной",
+"sure": true
+},
+{
+"node": "run.c.proof",
+"code": "src/graph/obligation-readiness.ts:56 (findObligationConfirmation)",
+"fields": [
+"serial"
+],
+"expects": "То же для подтверждения task-result",
+"sure": true
+},
+{
+"node": "run.phase.tstart",
+"code": "src/graph/obligation-readiness.ts:56 (findObligationConfirmation)",
+"fields": [
+"serial"
+],
+"expects": "Счётчик вызовов проекта фиксируется до перечисления источников: новое наблюдение не подменит его более новой охраной",
+"sure": true
+},
+{
+"node": "run.phase.tresult",
+"code": "src/graph/obligation-readiness.ts:56 (findObligationConfirmation)",
+"fields": [
+"serial"
+],
+"expects": "То же для подтверждения task-result",
+"sure": true
+}
+]
+},
+{
+"kind": "process-stop",
+"writers": [
+{
+"node": "run.s.end",
+"code": "src/execution/runner.ts:612 (Executor.run)",
+"when": "Отказ остановить процесс исполнителя или неподтверждённая остановка: свидетельство пишется по адресу точной версии попытки; запись попытки хранит прежнюю идентичность процесса",
+"fields": [
+"protocol",
+"subject",
+"child",
+"outcome",
+"stage",
+"target",
+"errno",
+"cause",
+"physical"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "run.t.group",
+"code": "src/execution/runner.ts:411 (Executor.run)",
+"fields": [
+"subject",
+"child",
+"pid",
+"end"
+],
+"expects": "Доказанный конец остаётся доказанным даже при повторном использовании pid; живой или непроверяемый процесс блокирует следующий запуск (executor_still_running, process_identity_unavailable)",
+"sure": true
+},
+{
+"node": "run.s.end",
+"code": "src/execution/runner.ts:411 (Executor.run)",
+"fields": [
+"subject",
+"child",
+"pid",
+"end"
+],
+"expects": "Неопределённость не выдаётся за освобождение: без доказательства конца работа не продолжается",
+"sure": true
+}
+]
+},
+{
+"kind": "plan",
+"writers": [],
+"readers": [
+{
+"node": "run.a.plan",
+"code": "src/execution/runner.ts:371 (Executor.run); src/execution/runner.ts:35 (planCurrentGuards); src/compiler/compiler.ts:89 (Compiler.read)",
+"fields": [
+"вся запись"
+],
+"expects": "Точная версия плана (id, версия, хэш) и его основание перечитываются при каждом запуске (plan_foreign, plan_stale)",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:124 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Контекст собирается из точной сохранённой версии плана; расхождение с переданным — отказ",
+"sure": true
+},
+{
+"node": "run.c.gates",
+"code": "src/execution/task-obligations.ts:104 (requireTaskObligationProofs)",
+"fields": [
+"вся запись"
+],
+"expects": "Доказательства обязательств принадлежат точному плану, проекту и названной задаче (task_obligation_plan_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.f.gate",
+"code": "src/execution/result.ts:13 (resultGate)",
+"fields": [
+"вся запись"
+],
+"expects": "Результат привязан к плану по хэшу; число запусков равно числу задач (execution_plan_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.a.pending",
+"code": "src/execution/recovery.ts:16 (recoverCommits)",
+"fields": [
+"вся запись"
+],
+"expects": "Восстановление использует точный план намерения (recovery_basis_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:16 (recoverCommits)",
+"fields": [
+"вся запись"
+],
+"expects": "Восстановление использует точный план намерения (recovery_basis_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.s.park",
+"code": "src/execution/park.ts:29 (parkCandidate)",
+"fields": [
+"вся запись"
+],
+"expects": "Кандидату нужен его точный исходный план (repair_plan_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:124 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Контекст собирается из точной сохранённой версии плана; расхождение с переданным — отказ",
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/task-obligations.ts:104 (requireTaskObligationProofs)",
+"fields": [
+"вся запись"
+],
+"expects": "Доказательства обязательств принадлежат точному плану, проекту и названной задаче (task_obligation_plan_foreign иначе)",
+"sure": true
+}
+]
+},
+{
+"kind": "feasibility",
+"writers": [],
+"readers": [
+{
+"node": "run.a.plan",
+"code": "src/execution/basis.ts:25 (omExecutionRoot); src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
+"fields": [
+"вся запись"
+],
+"expects": "План опирается на готовую оценку M8 эры om-m8/v2; обязательства задач выводятся из её переданного списка (plan_stale, task_obligation_plan_foreign иначе)",
+"sure": true
+},
+{
+"node": "run.c.gates",
+"code": "src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
+"fields": [
+"вся запись"
+],
+"expects": "Перед принятием проверяется, что задача не потеряла и не подменила обязательства из своей оценки",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:132 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Контекст берёт кандидата, слой и кадр из сохранённой оценки; она должна быть ready и ссылаться на тот же граф и среду",
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
+"fields": [
+"вся запись"
+],
+"expects": "Перед принятием проверяется, что задача не потеряла и не подменила обязательства из своей оценки",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:132 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Контекст берёт кандидата, слой и кадр из сохранённой оценки; она должна быть ready и ссылаться на тот же граф и среду",
+"sure": true
+}
+]
+},
+{
+"kind": "frame-candidate",
+"writers": [],
+"readers": [
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:159 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Работы и границы читаются из точной сохранённой версии works-кандидата; граф кандидата равен снимку графа плана",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:159 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Работы и границы читаются из точной сохранённой версии works-кандидата; граф кандидата равен снимку графа плана",
+"sure": true
+}
+]
+},
+{
+"kind": "connection-frame",
+"writers": [],
+"readers": [
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:162 (loadTaskContextSources); src/compiler/context.ts:164 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Кадр работ и кадр операций читаются по точным ссылкам и входят в контекст задачи",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:162 (loadTaskContextSources); src/compiler/context.ts:164 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Кадр работ и кадр операций читаются по точным ссылкам и входят в контекст задачи",
+"sure": true
+}
+]
+},
+{
+"kind": "runtime-observation",
+"writers": [],
+"readers": [
+{
+"node": "run.t.tstart",
+"code": "src/graph/obligation-readiness.ts:38 (confirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "Подтверждение среды — наблюдение с кодом 0 по этому обязательству; более позднее неудачное или неоконченное наблюдение отменяет старое",
+"sure": true
+},
+{
+"node": "run.c.proof",
+"code": "src/graph/obligation-readiness.ts:72 (frozenObligationConfirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "Подтверждение task-result принимается как историческое: замороженная запись, а не текущая голова",
+"sure": true
+},
+{
+"node": "run.phase.tstart",
+"code": "src/graph/obligation-readiness.ts:38 (confirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "Подтверждение среды — наблюдение с кодом 0 по этому обязательству; более позднее неудачное или неоконченное наблюдение отменяет старое",
+"sure": true
+},
+{
+"node": "run.phase.tresult",
+"code": "src/graph/obligation-readiness.ts:72 (frozenObligationConfirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "Подтверждение task-result принимается как историческое: замороженная запись, а не текущая голова",
+"sure": true
+}
+]
+}
+]
+}
