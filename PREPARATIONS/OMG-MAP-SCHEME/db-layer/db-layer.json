@@ -1,5 +1,5 @@
 {
-"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2+om-r2+om-l3+om-m8+om-c",
+"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2+om-r2+om-l3+om-m8+om-c+om-s",
 "generatedFrom": "om/module d8028bf; kinds-early.json; db-census.json",
 "tables": [
 {
@@ -1044,6 +1044,30 @@
 "вся запись"
 ],
 "sure": false
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:154 (deriveIntent)",
+"fields": [
+"implementer",
+"reviewer",
+"projectId"
+],
+"expects": "Разбор остановки берёт среду, на которую указывает запрос, и требует названных исполнителя и ревьюера как разных участников: одинаковые отвергаются как assessor_not_independent; чужой проект или неполная среда — analysis_invalid",
+"sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/model-call.ts:4600 (completionPrerequisites); src/om/model-call.ts:4623 (readReplacement)",
+"fields": [
+"workspace",
+"implementer",
+"reviewer",
+"timeoutMs",
+"requestCapacityChars"
+],
+"expects": "Остановка шага доказывает, что среда вызова заменена и новая несовместима с назначением (другие роли, модель, усилие, рабочее место, время, вместимость); совместимая замена причиной не считается (completion_cause_invalid)",
+"sure": false
 }
 ]
 },
@@ -1328,6 +1352,15 @@
 ],
 "expects": "Запуск берёт технический контракт вызова из выбранного адаптера (record_missing, если адаптер не настроен); его охрана едет в транзакциях нового прохода.",
 "sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/model-call.ts:4586 (completionPrerequisites); src/om/model-call.ts:4618 (readReplacement)",
+"fields": [
+"protocol"
+],
+"expects": "Остановка шага читает адаптер вызова и его замену: замена должна быть точной более поздней версией того же адаптера и без дополнительного доказательства",
+"sure": false
 }
 ]
 },
@@ -1448,6 +1481,27 @@
 "stop"
 ],
 "sure": true
+},
+{
+"node": "om.s",
+"code": "src/om/run-control.ts:365 (stopRun)",
+"when": "Долговременная остановка прохода: stopRun пишет stop с токеном и текущим исполнителем",
+"fields": [
+"stop"
+],
+"sure": true
+},
+{
+"node": "om.s.apply",
+"code": "src/om/run-control.ts:396 (resumeStoppedRun)",
+"when": "Снятие названной остановки: новая генерация с stop=null и resumed=<токен>; более поздняя остановка не снимается",
+"fields": [
+"generation",
+"stop",
+"execution",
+"resumed"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -1542,6 +1596,28 @@
 ],
 "expects": "Цикл и вызов берут допуск под текущим управлением при первой новой работе (запись, доставка, следующий пакет, диспатч): остановка или смена владельца — потеря управления, ничего не записывается",
 "sure": false
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:401 (runStopAnalysis)",
+"fields": [
+"stop",
+"generation",
+"execution"
+],
+"expects": "Новая работа разбора (намерение, запись вызова, физический обмен) допускается только под действующим управлением прохода: сохранённая остановка отказывает (run_stopped), смена версии управления — run_control_changed",
+"sure": true
+},
+{
+"node": "om.s.apply",
+"code": "src/om/run-control.ts:385 (resumeStoppedRun)",
+"when": "Цикл CAS читает голову управления: снять можно только точный стоящий stop после доказанного конца исполнения",
+"fields": [
+"stop",
+"resumed",
+"generation"
+],
+"sure": true
 }
 ]
 },
@@ -3926,6 +4002,17 @@
 "fields": [
 "вся запись"
 ],
+"sure": false
+},
+{
+"node": "om.s.close",
+"code": "src/om/model-call.ts:4562 (completionPrerequisites); src/om/model-call.ts:4631 (readReplacement)",
+"fields": [
+"content",
+"origin",
+"mediaType"
+],
+"expects": "Остановка шага перечисляет источники, обязательные для назначения, и принимает замену источника, только если новая версия имеет собственное непустое содержимое и разбирается как цитата",
 "sure": false
 }
 ]
@@ -10707,6 +10794,15 @@
 "serial"
 ],
 "sure": false
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:406 (runStopAnalysis)",
+"when": "Каждая физическая отправка ревьюеру увеличивает счётчик отправок проекта в той же сделке, что и запись вызова",
+"fields": [
+"serial"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -14572,6 +14668,34 @@
 "error"
 ],
 "sure": true
+},
+{
+"node": "om.s.recover",
+"code": "src/om/model-call.ts:2481 (recoverOmModelCall)",
+"when": "Восстановление потерянного вызова: запись вызова получает вид «recovered» (процесс потерян, ответ и расход неизвестны) вместе с завершением попытки",
+"fields": [
+"recovery",
+"status",
+"error",
+"finishedAt"
+],
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:406 (runStopAnalysis)",
+"when": "Разбор остановки отправляет пакет ревьюеру через общий транспорт: физическая запись вызова ревьюера (идентичность «A6:<ключ>») пишется отдельно от записи вызова E1",
+"fields": [
+"purpose",
+"requestId",
+"packet",
+"request",
+"response",
+"usage",
+"status",
+"error"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -14789,6 +14913,70 @@
 "response"
 ],
 "expects": "G4b узнаёт вид вызова (обычный E4 или транспорт оценщика) и проверяет его состояние: незавершённый MC1-вызов — не ответ (mc1-unfinished), транспорт оценщика доказывается своим читателем и принадлежностью оценке факта (transport-foreign, assessment-legacy-transport)",
+"sure": true
+},
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:1465 (continueAttempt)",
+"fields": [
+"вся запись"
+],
+"expects": "Выбор шага проверяет, есть ли у пакета физический вызов (запись model-call по номеру запроса): тогда пакет доводит E4, а проход его не обрывает",
+"sure": false
+},
+{
+"node": "om.s.recover",
+"code": "src/om/model-call.ts:2424 (recoverOmModelCall)",
+"fields": [
+"recovery",
+"status",
+"request"
+],
+"expects": "Восстановление читает голову записи вызова: уже восстановленный вызов повторно не восстанавливается, а только доучитывается",
+"sure": true
+},
+{
+"node": "om.s.saved",
+"code": "src/om/model-call.ts:2739 (completionGraph)",
+"fields": [
+"status",
+"response",
+"request"
+],
+"expects": "Реестр работы попытки (G7) читает состояние вызова, чтобы вывести его логическое назначение и признать вызов готовым продуктом",
+"sure": false
+},
+{
+"node": "om.s.owner",
+"code": "src/om/capacity-delivery.ts:429 (permitOmLimitedCallRetry)",
+"fields": [
+"status",
+"error",
+"response"
+],
+"expects": "Команда владельца permit-limited-call-retry проверяет, что названный вызов — текущий терминал проекта, провалился из-за process_output_limit и принадлежит назначению OM",
+"sure": false
+},
+{
+"node": "om.s.close",
+"code": "src/om/series.ts:1011 (prepareComplete)",
+"fields": [
+"status",
+"recovery"
+],
+"expects": "Закрытие попытки по терминальному свидетелю читает завершённый вызов (состояние application-refused или recovered) и его свидетельство om.terminal: серия, попытка и цель равны оригинальной открытой попытке, причина — только interrupted, результатов и отмен нет; иначе outcome_invalid",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:407 (runStopAnalysis)",
+"fields": [
+"response",
+"usage",
+"status",
+"error"
+],
+"expects": "Результат разбора строится из физической записи: ответ ревьюера разбирается по форме omg-stop-analysis/v1, любой отказ транспорта становится state=failed",
 "sure": true
 }
 ]
@@ -15504,6 +15692,21 @@
 "proof"
 ],
 "sure": true
+},
+{
+"node": "om.s.recover",
+"code": "src/om/model-call.ts:2481 (recoverOmModelCall)",
+"when": "Восстановление вызова OM: свидетельство потери пишется одной сделкой с переходом записи вызова в «recovered» и с завершением попытки",
+"fields": [
+"version",
+"projectId",
+"call",
+"reason",
+"usageKnown",
+"execution",
+"proof"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -15528,6 +15731,17 @@
 ],
 "expects": "Вызов OM читает источники, окружение и записи восстановления по точным ссылкам",
 "sure": false
+},
+{
+"node": "om.s.recover",
+"code": "src/om/model-call.ts:2426 (recoverOmModelCall)",
+"fields": [
+"version",
+"call",
+"proof"
+],
+"expects": "Повтор восстановления читает сохранённое свидетельство: названный вызов должен быть исходной потерей или её итогом, иначе model_call_foreign",
+"sure": true
 }
 ]
 },
@@ -15627,6 +15841,20 @@
 "node": "om.r1.store",
 "code": "src/om/model-call.ts:2499 (preserveLateTransport)",
 "when": "Поздний ответ процесса, который успел вернуться после восстановления: сохраняется как квитанция, а не как ответ применённого вызова",
+"fields": [
+"version",
+"projectId",
+"dispatch",
+"recovered",
+"incident",
+"evidence"
+],
+"sure": false
+},
+{
+"node": "om.s.recover",
+"code": "src/om/model-call.ts:2481 (recoverOmModelCall)",
+"when": "Восстановление вызова: если расход потерянного вызова известен, квитанция строится заново над итоговой записью и пишется в той же сделке",
 "fields": [
 "version",
 "projectId",
@@ -22772,6 +23000,20 @@
 "вся запись"
 ],
 "sure": false
+},
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:1169 (readDefinitions)",
+"fields": [
+"nodes",
+"artifacts",
+"contracts",
+"connectors",
+"joins",
+"tests"
+],
+"expects": "Классификация отказа по источнику читает определения принятого базового графа (через кадр): есть ли предмет отказа среди узлов, договоров, связей",
+"sure": false
 }
 ]
 },
@@ -23306,6 +23548,16 @@
 ],
 "expects": "D7 принимает узлы принятых кадров уровня 2 и 3 (через основу кадра): только их узлы допустимы как ответственные и потребители",
 "sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:1169 (readDefinitions)",
+"fields": [
+"projection",
+"acceptance"
+],
+"expects": "Классификация отказа по источнику читает принятый слой как базу: определения берутся из его проекции, а принадлежность слоя проверяется по принятию",
+"sure": false
 }
 ]
 },
@@ -28811,6 +29063,16 @@
 "gap.deferral"
 ],
 "sure": false
+},
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:1973 (answersRequest)",
+"fields": [
+"gap",
+"sources"
+],
+"expects": "Выбор следующего шага ищет неотвеченные разрывы",
+"sure": true
 }
 ]
 },
@@ -36219,12 +36481,13 @@
 "code": "src/om/series.ts:739 (applied)",
 "when": "Порог серии: при записи любой версии код заново проходит всю историю (walk): третья подряд попытка окна без нового результата сохраняет остановку и поднимает ступень, новый принятый результат возвращает лестницу в начало",
 "fields": [
-"withoutProgress",
+"attempts",
+"continuations",
 "ladder",
 "stop",
-"attempts"
+"withoutProgress"
 ],
-"sure": true
+"sure": false
 },
 {
 "node": "om.s.cont",
@@ -36366,13 +36629,13 @@
 },
 {
 "node": "om.s.stop",
-"code": "src/om/series.ts:708 (stopHistoryOf)",
+"code": "src/om/series.ts:708 (stopHistoryOf); src/om/series.ts:955 (prepareBeginInner)",
 "fields": [
 "attempts",
 "continuations",
 "escalations",
-"stop",
 "ladder",
+"stop",
 "withoutProgress"
 ],
 "expects": "История остановок выводится тем же проходом по попыткам, что и сам порог; запись, у которой сохранённый счёт или остановка не следуют из попыток, отвергается",
@@ -43322,6 +43585,2689 @@
 "sure": true
 }
 ]
+},
+{
+"kind": "om-analysis-admission",
+"group": "om",
+"idPattern": "om-analysis-admission:<проект>:<хэш ссылки на намерение>",
+"proposed": false,
+"card": {
+"what": "Неизменяемое доказательство допуска независимого разбора: на каком указателе серий и какой активации стоял блок, когда разбор его остановки был допущен. Сделано, чтобы вывод разбора не зависел от сегодняшнего положения серии.",
+"where": "Таблица revisions · вид «om-analysis-admission» · id om-analysis-admission:<проект>:<хэш ссылки на намерение>",
+"when": "Пишется вместе с намерением разбора (версия 1, одна запись на намерение), только для блока серии управляемой эры (seriesRequiresAdmissionProof). Вид есть в коде (stop-analysis.ts); в рабочей базе записей нет.",
+"why": "Остановку блока разбирает независимый ревьюер, но результат может примениться к серии только пока блок остаётся на той же линии и в активном участии. Фиксированный допуск даёт исторически точное доказательство, не читая сегодняшние головы.",
+"expects": "Точно семь ключей (contract, project, intent, series, pointer, activation, owner); contract om-analysis-admission/v1; intent равен точной ссылке на намерение (ревизия 1); owner — блок серии; общий исторический допуск серии подтверждает именно эту активацию.",
+"risks": "Нет допуска у серии эры — analysis_invalid («series era requires the immutable admission of its analysis intent»); любое расхождение ключей, намерения, серии, владельца или активации — analysis_invalid; допуск механизма не бывает — analysis_invalid.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Только блок: у механизма M5 допуск лежит в самой записи вызова. Вид перечислен среди «рождённых от B1» в stage-checks."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-analysis-admission/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "intent",
+"type": "Ref",
+"iface": true,
+"what": "Точная ссылка на намерение разбора (id, ревизия 1, хэш), к которому относится допуск.",
+"writer": "Разбор остановки (om.s.analyze): ссылка берётся по хэшу записанного намерения.",
+"readers": "Разбор остановки (om.s.analyze) при повторе проверяет, что допуск назван именно для этого намерения.",
+"expects": "intent равен ссылке на намерение с ревизией 1; id допуска — хэш этой ссылки.",
+"risks": "Другое намерение — analysis_invalid."
+},
+{
+"path": "series",
+"type": "Ref",
+"iface": true,
+"what": "Версия серии, на которую стоит разбор.",
+"writer": "Разбор остановки (om.s.analyze): копируется из запроса.",
+"readers": "Разбор остановки (om.s.analyze): сверка с серией запроса и общим допуском.",
+"expects": "Равна request.series намерения; серия — блока.",
+"risks": "Другая серия — analysis_invalid."
+},
+{
+"path": "pointer",
+"type": "Ref",
+"iface": true,
+"what": "Указатель серий, на котором блок был допущен.",
+"writer": "Разбор остановки (om.s.analyze): из текущего допуска линии серии.",
+"readers": "Разбор остановки (om.s.analyze) строит из него общий исторический допуск (readSeriesWorkAdmission).",
+"expects": "Указатель существует и допускает эту серию.",
+"risks": "Нет указателя или активации — analysis_invalid («Managed work requires its proved pointer and activation»)."
+},
+{
+"path": "activation",
+"type": "Ref",
+"iface": true,
+"what": "Активация серии, которую подтверждает общий исторический допуск.",
+"writer": "Разбор остановки (om.s.analyze).",
+"readers": "Разбор остановки (om.s.analyze): допуск, посчитанный заново, обязан дать ту же активацию; защитные ссылки записи входят в запись разбора.",
+"expects": "Активация равна выведенной из указателя общим допуском.",
+"risks": "Расхождение — analysis_invalid («common historical admission must prove this activation»)."
+},
+{
+"path": "owner",
+"type": "{kind: \"block\", block}",
+"iface": false,
+"what": "владелец — блок серии",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:223 (prepareStopAnalysis); src/om/stop-analysis.ts:401 (runStopAnalysis)",
+"when": "Шаг analyze для блока управляемой эры: допуск пишется одной сделкой с намерением, до вызова ревьюера",
+"fields": [
+"contract",
+"project",
+"intent",
+"series",
+"pointer",
+"activation",
+"owner"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:188 (originalGuards)",
+"fields": [
+"вся запись"
+],
+"expects": "Охранные ссылки повторного запуска: допуск обязан быть и точно называть намерение, серию, владельца и активацию; иначе повтор отказывает",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"activation",
+"intent",
+"pointer",
+"series"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1: её адрес входит в перечень производителей B1",
+"sure": false
+}
+]
+},
+{
+"kind": "om-analysis-intent",
+"group": "om",
+"idPattern": "om-analysis-intent:<проект>:<хэш причины разбора>",
+"proposed": false,
+"card": {
+"what": "Намерение независимого разбора остановки (A6): точный запрос (серия, остановка или удержание, адаптер и конфигурация), отчёт об остановке, из которого собрано задание, пакет для ревьюера и запись его вызова. Записывается до обращения к модели.",
+"where": "Таблица revisions · вид «om-analysis-intent» · id om-analysis-intent:<проект>:<хэш причины разбора>",
+"when": "Один раз на причину разбора (остановка серии или удержание «происхождение неизвестно»), версия 1; пишется шагом analyze при первом запуске, до записи вызова и до обращения к ревьюеру. В рабочей базе 3 записи, очень крупные: около 544 КБ, до 313 КБ на запись (внутри полный отчёт и пакет). Две — остановки блока, одна — механизма M5.",
+"why": "Остановка серии без прогресса сама не продолжается: независимый ревьюер (другой актёр, не исполнитель) разбирает причину и предлагает изменение. Фиксация намерения до вызова не даёт ни заплатить за разбор дважды, ни подменить запрос: повтор находит тот же разбор по той же причине.",
+"expects": "Повторный запрос равен записанному (иначе analysis_conflict). Отчёт стоит на точной серии и содержит нужный контекст: для остановки — первая ступень и сохранённая остановка, для удержания — само удержание в списке. В среде разные актёры у исполнителя и ревьюера; весь запрос ревьюера помещается в сохранённую вместимость. Для блока управляемой эры есть неизменяемый допуск.",
+"risks": "analysis_request_invalid (неверная форма запроса); analysis_invalid (отчёт не той серии, нет остановки или удержания, нет целей, нет допуска эры); analysis_conflict (другой запрос по той же причине); assessor_not_independent (ревьюер совпадает с исполнителем); context_too_large (запрос больше вместимости).",
+"size": "HX5: записей нет · рабочая база: 3 записи, 531 КБ, до 306 КБ на версию",
+"note": "Запись содержит заготовку всего разбора. Контракт v2 (om-stop-analysis/v2) наследуется от отчёта новой эры. Результат разбора пишется в другие виды: om-stop-review (остановка), om-origin-analysis (удержание) или om-stop-analysis-failure (отказ)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-stop-analysis/v1\" | \"om-stop-analysis/v2\"",
+"iface": false,
+"what": "метка формата; версия берётся у отчёта",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request",
+"type": "{project, series, hold, dispatch}",
+"iface": true,
+"what": "Точный запрос разбора: проект, версия серии, удержание (или null для остановки) и адаптер с конфигурацией среды.",
+"writer": "Разбор остановки (om.s.analyze): запрос приходит от прохода; hold называет удержание, null — остановку серии.",
+"readers": "Разбор остановки (om.s.analyze) на повторе сверяет запрос с записанным; Решение владельца (om.s.owner) ищет сохранённый шаг analyze по тому же основанию.",
+"expects": "Точный набор ключей; project без двоеточия; series, dispatch.adapter и dispatch.config — точные ссылки; идентичность — хэш (проект, удержание) либо (проект, исходная серия, номер остановки).",
+"risks": "Неверная форма — analysis_request_invalid; другой запрос по той же причине — analysis_conflict."
+},
+{
+"path": "report",
+"type": "AnyStopReport",
+"iface": true,
+"what": "Отчёт об остановке или удержании, на котором стоит разбор: контекст, препятствия, средства, свидетельства окна, предложение.",
+"writer": "Разбор остановки (om.s.analyze): отчёт строит stop-report по серии, журналу и удержаниям (stopReportOfNewEra).",
+"readers": "Разбор остановки (om.s.analyze): ответ ревьюера принимается, только если все ссылки в нём взяты из объявленных источников отчёта.",
+"expects": "report.series равен id серии запроса; report.guards содержит серию; для остановки rung=1 и есть context.stop, для удержания удержание есть в context.holds; цели непусты.",
+"risks": "Отчёт не той серии или нет остановки — analysis_invalid («Only a saved first-rung stop admits its independent review»)."
+},
+{
+"path": "packet",
+"type": "Json",
+"iface": true,
+"what": "Пакет для ревьюера: контракт, назначение, основание, цель, отчёт, перечень разрешённых источников и описание формы ответа.",
+"writer": "Разбор остановки (om.s.analyze): собирается из отчёта и объявленных источников.",
+"readers": "Разбор остановки (om.s.analyze): физическая отправка ревьюеру берёт именно этот пакет; ответ проверяется по его форме.",
+"expects": "Весь запрос помещается в сохранённую вместимость; форма ответа описывает точный объект Ref.",
+"risks": "Запрос больше вместимости — context_too_large."
+},
+{
+"path": "call",
+"type": "AnyRecordCallRequest",
+"iface": true,
+"what": "Запись вызова ревьюера (E1): имя «A6:<ключ>», назначение, основание (stop серии или hold), цель, адаптер, пакет; у механизма M5 — владелец и допуск.",
+"writer": "Разбор остановки (om.s.analyze).",
+"readers": "Разбор остановки (om.s.analyze) заводит запись вызова (call-record) и отправляет её ревьюеру.",
+"expects": "Целей непусто; у блока потребитель «A6:stop-analysis», у механизма — владелец и допуск попытки.",
+"risks": "У механизма нет допуска попытки — analysis_invalid."
+},
+{
+"path": "sources",
+"type": "{series, journal, holds[]}",
+"iface": false,
+"what": "точные версии источников отчёта: серия, журнал отказов, удержания",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "sources.series",
+"type": "Ref",
+"iface": false,
+"what": "версия серии",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "sources.journal",
+"type": "Ref | null",
+"iface": false,
+"what": "версия журнала отказов (или null)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "sources.holds",
+"type": "Ref[]",
+"iface": false,
+"what": "удержания «происхождение неизвестно»",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.series",
+"type": "Ref",
+"iface": false,
+"what": "точная версия серии, о которой разбор",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.hold",
+"type": "Ref | null",
+"iface": false,
+"what": "удержание (null — разбор остановки)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.dispatch",
+"type": "{adapter, config}",
+"iface": false,
+"what": "адаптер и конфигурация среды для вызова ревьюера",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.series",
+"type": "string",
+"iface": false,
+"what": "id серии отчёта",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.block",
+"type": "string",
+"iface": false,
+"what": "блок серии (у механизма вместо него report.owner)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.owner",
+"type": "{kind, mechanism}",
+"iface": false,
+"what": "владелец-механизм M5 (у блока вместо него report.block)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.project",
+"type": "string",
+"iface": false,
+"what": "проект отчёта",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.rung",
+"type": "number",
+"iface": false,
+"what": "ступень лестницы разбора (для остановки 1)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.line",
+"type": "number",
+"iface": false,
+"what": "номер строки отчёта",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.audience",
+"type": "\"reviewer\"",
+"iface": false,
+"what": "кому адресован отчёт",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.context",
+"type": "object",
+"iface": false,
+"what": "контекст остановки: цели, остановка, удержания, лестница",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.finding",
+"type": "object",
+"iface": false,
+"what": "вывод отчёта о ситуации",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.guards",
+"type": "Ref[]",
+"iface": false,
+"what": "точные записи, на которых стоит отчёт",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.lines",
+"type": "object[]",
+"iface": false,
+"what": "строки отчёта",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.obstacles",
+"type": "object[]",
+"iface": false,
+"what": "препятствия: источник и происхождение",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.proposed",
+"type": "object[]",
+"iface": false,
+"what": "предложенные средства",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "report.remedies",
+"type": "object[]",
+"iface": false,
+"what": "средства с записями",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "packet.contract",
+"type": "string",
+"iface": false,
+"what": "контракт пакета (совпадает с контрактом намерения)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "packet.purpose",
+"type": "\"stop-analysis\"",
+"iface": false,
+"what": "назначение пакета",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "packet.basis",
+"type": "object",
+"iface": false,
+"what": "основание вызова: серия и номер остановки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "packet.goal",
+"type": "object",
+"iface": false,
+"what": "цель вызова «A6:<ключ>»",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "packet.report",
+"type": "object",
+"iface": false,
+"what": "отчёт внутри пакета",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "packet.sources",
+"type": "Ref[]",
+"iface": false,
+"what": "объявленные источники отчёта",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "packet.form",
+"type": "object",
+"iface": false,
+"what": "форма ответа ревьюера",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.call",
+"type": "string",
+"iface": false,
+"what": "имя вызова «A6:<хэш>»",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.purpose",
+"type": "\"stop-analysis\"",
+"iface": false,
+"what": "назначение вызова",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.attempt",
+"type": "number",
+"iface": false,
+"what": "номер остановленной попытки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.basis",
+"type": "object",
+"iface": false,
+"what": "основание вызова (series-stop)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.goal",
+"type": "object",
+"iface": false,
+"what": "цель вызова",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.gaps",
+"type": "object[]",
+"iface": false,
+"what": "условные разрывы вызова",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.series",
+"type": "Ref",
+"iface": false,
+"what": "серия вызова",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.dispatch",
+"type": "{adapter, config}",
+"iface": false,
+"what": "адаптер и конфигурация",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.packet",
+"type": "Json",
+"iface": false,
+"what": "пакет вызова",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.block",
+"type": "string",
+"iface": false,
+"what": "блок вызова (у механизма вместо него call.owner)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.owner",
+"type": "object",
+"iface": false,
+"what": "механизм M5 (только у механизма)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call.admission",
+"type": "Ref",
+"iface": false,
+"what": "допуск попытки механизма (только у механизма)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:215 (prepareStopAnalysis); src/om/stop-analysis.ts:401 (runStopAnalysis)",
+"when": "Шаг analyze: намерение выводится из отчёта и пишется до записи вызова; при блоке управляемой эры рядом пишется допуск. Повтор находит записанное и ничего не пишет",
+"fields": [
+"contract",
+"request",
+"sources",
+"report",
+"packet",
+"call"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:208 (prepareStopAnalysis); src/om/stop-analysis.ts:311 (recoverableAnswer); src/om/stop-analysis.ts:402 (runStopAnalysis)",
+"fields": [
+"вся запись"
+],
+"expects": "Повторный запуск находит намерение и сверяет запрос; восстановление ответа старой обёртки адаптера читает записанные запрос и вызов; сохранённое намерение читается точной ссылкой",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"call",
+"report.guards",
+"request.hold",
+"request.series",
+"sources"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам series, hold, journal, holds, guards и адресам вызова, а также по владельцу M5",
+"sure": false
+}
+]
+},
+{
+"kind": "om-capacity-recovery",
+"group": "om",
+"idPattern": "om-capacity-recovery:<проект>:<хэш ссылки на пакет>",
+"proposed": false,
+"card": {
+"what": "Запись о восстановлении вместимости: заблокированный пакет (не поместился в предел запроса) и его преемник — пакет с порционной выдачей больших оригиналов. Связывает старый пакет с новым.",
+"where": "Таблица revisions · вид «om-capacity-recovery» · id om-capacity-recovery:<проект>:<хэш ссылки на пакет>",
+"when": "По команде recover-om-capacity (владелец или оператор), когда пакет заблокирован из-за вместимости (packet_too_large, node_unexpandable, context_budget_exceeded, needs_owner), проход не завершён и нет живого вызова. Пишется в одной сделке с пакетом-преемником. В рабочей базе записей нет.",
+"why": "Проход сам не меняет способ подачи материала: вместимость — решение владельца. Запись ставит новый пакет на место заблокированного и снимает ожидание «нужен владелец» для этой попытки.",
+"expects": "contract om-capacity-recovery/v1; blockedPacket — точная ссылка на blocked пакет этого проекта; successorPacket — пакет с capacityDelivery; actor и recoveredAt; одна запись на пакет (id — хэш ссылки на заблокированный пакет); повтор команды возвращает уже сохранённую запись.",
+"risks": "capacity_recovery_invalid — пакет не заблокирован, чужой или проход завершён; capacity_recovery_unsupported — отказ не из перечня capacity; capacity_recovery_busy — идёт живой вызов; needs_owner — даже порционная выдача не вмещает неделимое ядро.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Если выведенный преемник сам заблокирован, команда возвращает needs_owner до формирования записей (capacity-delivery.ts:356) — записи заблокированного преемника она не создаёт. Команда доступна через ProductEngine (product/engine.ts), не через шаг прохода."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-capacity-recovery/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "blockedPacket",
+"type": "Ref",
+"iface": true,
+"what": "Заблокированный пакет (question-packet со state blocked), который не удалось отправить.",
+"writer": "Команда восстановления вместимости (om.s.recover).",
+"readers": "Выбор шага находит по нему преемника (om.s.resume); учёт ожиданий владельца считает такую причину снятой (om.s.owner).",
+"expects": "Пакет существует, принадлежит проекту, state blocked и refusal.code из перечня capacity.",
+"risks": "capacity_recovery_invalid, capacity_recovery_unsupported."
+},
+{
+"path": "successorPacket",
+"type": "Ref",
+"iface": true,
+"what": "Пакет-преемник той же партии с порционной выдачей больших оригиналов (capacityDelivery) — тот, что дальше уходит в цикл модели.",
+"writer": "Команда восстановления вместимости (om.s.recover) — пакет и запись в одной сделке.",
+"readers": "Выбор шага берёт его вместо заблокированного (om.s.resume); драйвер считает проход переоткрываемым (om.b1.start).",
+"expects": "Преемник готов (state ready); если он снова blocked — команда отказывает needs_owner и ничего не пишет.",
+"risks": "needs_owner — «неделимое ядро превышает вместимость»."
+},
+{
+"path": "actor",
+"type": "string",
+"iface": false,
+"what": "кто восстановил",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "recoveredAt",
+"type": "number",
+"iface": false,
+"what": "время, мс",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.recover",
+"code": "src/om/capacity-delivery.ts:394 (recoverOmCapacity)",
+"when": "Команда recover-om-capacity: преемник и запись восстановления пишутся одной сделкой (вывод: ближайший узел схемы — восстановление)",
+"fields": [
+"contract",
+"project",
+"blockedPacket",
+"successorPacket",
+"actor",
+"recoveredAt"
+],
+"sure": false
+},
+{
+"node": "om.s.owner",
+"code": "src/om/capacity-delivery.ts:394 (recoverOmCapacity)",
+"when": "Решение владельца по остановке из-за вместимости (вывод: команда отдельного входа владельца, не шаг прохода)",
+"fields": [
+"blockedPacket",
+"successorPacket",
+"actor"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:1345 (recoveredSuccessorPacket); src/om/run.ts:1896 (packetPlace); src/om/run.ts:1915 (misplacedCycle)",
+"fields": [
+"blockedPacket",
+"successorPacket"
+],
+"expects": "Выбор шага заменяет заблокированный пакет преемником (по цепочке), пускает пакет-восстановление и не считает цикл заблокированного пакета неуместным",
+"sure": false
+},
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1119 (owedBy)",
+"fields": [
+"blockedPacket"
+],
+"expects": "При подсчёте ожиданий владельца у закрытой попытки такая причина снимается, если для её пакета есть восстановление",
+"sure": false
+},
+{
+"node": "om.b1.start",
+"code": "src/om/run-driver.ts:115 (reopens)",
+"fields": [
+"project"
+],
+"expects": "Драйвер при старте решает, переоткрывается ли остановленный («unable») проход: наличие восстановления проекта достаточно",
+"sure": false
+},
+{
+"node": "om.s.recover",
+"code": "src/om/capacity-delivery.ts:346 (recoverOmCapacity)",
+"fields": [
+"contract"
+],
+"expects": "Повтор команды находит уже сохранённую запись и возвращает её, не создавая второго преемника",
+"sure": true
+},
+{
+"node": "om.b1.hold",
+"code": "src/om/run-driver.ts:115 (reopens)",
+"fields": [
+"project"
+],
+"expects": "Проход в состоянии unable продолжается, если для проекта есть запись восстановления ёмкости.",
+"sure": false
+}
+]
+},
+{
+"kind": "om-completion-close",
+"group": "om",
+"idPattern": "om-completion-close:<проект>:<хэш id владельца>",
+"proposed": false,
+"card": {
+"what": "Доказательство закрытия управляемой попытки: на какой версии реестра работы и каком срезе журнала отказов она закрыта, что заявлено (принимаемые и отменяемые результаты, отказы), какой исход из этого выведен и какие ответы ждут владельца.",
+"where": "Таблица revisions · вид «om-completion-close» · id om-completion-close:<проект>:<хэш id владельца>",
+"when": "Одна запись на попытку, версия 1; пишется в одной сделке с исходом попытки в серии (A3), итоговым журналом отказов, последней версией реестра (closed) и при необходимости с остановками «происхождение неизвестно». В рабочей базе 44 записи (около 94 КБ): 31 с прогрессом (контракт v2) и 13 прежней формы v1 (по доле outcome.progress, вывод).",
+"why": "Серия принимает исход управляемой попытки только по этому доказательству: исход обязан равняться выведенному из полной композиции работы. Без записи закрыть управляемую попытку нельзя.",
+"expects": "Одна формула для всех закрытий: из реестра с добавлениями, журнала и среза вызовов выводятся причина, достигнутые и отменённые результаты; заявка вызывающего (claim) обязана с ними совпасть. Контракт v2 несёт progress (административный конец), v1 читается буквально. Повторное закрытие с той же заявкой ничего не пишет.",
+"risks": "Причина не следует из композиции — completion_reason_invalid; незавершённая композиция — completion_incomplete; физическая работа без среза вызовов — completion_invalid; строка G4b как отказ — completion_refusal_uncounted; иная заявка у уже закрытой попытки — outcome_conflict; закрытие не через G7 — completion_required.",
+"size": "HX5: записей нет · рабочая база: 44 записи, 92 КБ, до 4,0 КБ на версию",
+"note": "Закрытие читается и при пересчёте окна для разбора остановки: прошлые попытки оцениваются по их точным закрытиям, а не по сегодняшним головам. Без этого видом нельзя доказать «административный конец» попытки."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-completion-close/v1\" | \"om-completion-close/v2\"",
+"iface": false,
+"what": "метка формата; v2 — закрытие блока новой эры с progress",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "binding",
+"type": "Ref",
+"iface": false,
+"what": "владелец закрытой попытки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "work",
+"type": "Ref",
+"iface": true,
+"what": "Точная версия реестра работы непосредственно перед закрытием; от неё считается вся композиция.",
+"writer": "Закрыть попытку (om.s.close): берётся голова реестра на момент закрытия.",
+"readers": "Закрыть попытку (om.s.close) повторно выводит композицию от неё; Форма · сборка (om.l3.form) находит по ней источник повтора; разбор остановки (om.s.analyze) читает свидетельства окна.",
+"expects": "Реестр открыт и полон; закрытая версия реестра выводится от неё же той же формулой.",
+"risks": "Неполная композиция — completion_incomplete; закрыть уже закрытую работу иначе, чем точным повтором, — completion_closed."
+},
+{
+"path": "additions",
+"type": "Ref[]",
+"iface": false,
+"what": "продукты, которые закрытие вносит в реестр при закрытии (в обычном закрытии пусто)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "series",
+"type": "Ref",
+"iface": false,
+"what": "серия попытки на момент закрытия",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "ledger",
+"type": "Ref | null",
+"iface": false,
+"what": "срез сводки вызовов (E1), по которому проверена физическая работа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "journal",
+"type": "Ref",
+"iface": true,
+"what": "Итоговый журнал отказов: строки продуктов-отказов и классы закрытия записаны одной версией.",
+"writer": "Закрыть попытку (om.s.close): одна итоговая запись журнала в той же сделке.",
+"readers": "Серия при закрытии (om.s.close) и разбор остановки (om.s.analyze) проверяют строки отказов по журналу.",
+"expects": "Журнал — равен срезу реестра или его более поздней версии; в нём лежат ровно выведенные классы закрытия.",
+"risks": "Журнал не равен срезу — completion_invalid; классы не совпадают с выведенными — completion_invalid."
+},
+{
+"path": "claim",
+"type": "{reason, accepting[], cancelling[], refusals[]}",
+"iface": true,
+"what": "Заявка закрытия: причина, принимаемые и отменяемые результаты, отказы с номерами строк журнала.",
+"writer": "Закрыть попытку (om.s.close): заявку собирает движок из реестра плюс результаты шагов (принятая рамка, линия разрывов).",
+"readers": "Закрыть попытку (om.s.close) выводит исход заново и сверяет с заявкой; повторное закрытие находит заявку в записи.",
+"expects": "claim.reason равен причине, выведенной из композиции; accepting и refusals без повторов, в каноническом порядке.",
+"risks": "Заявка расходится с выводом — completion_reason_invalid; повтор с иной заявкой — outcome_conflict."
+},
+{
+"path": "outcome",
+"type": "{reason, achieved[], cancelled[], refusals[], progress?}",
+"iface": true,
+"what": "Исход закрытия, как он записывается в серии: причина (result, refused, interrupted, off-form, awaiting-owner), достигнутые и отменённые результаты, отказы и (v2) прогресс.",
+"writer": "Закрыть попытку (om.s.close): выводится из полной композиции.",
+"readers": "Серия (om.s.close, A3) принимает исход только равным этому; разбор остановки (om.s.analyze) и ожидание владельца (om.s.owner) читают причину и ожидающие ответы.",
+"expects": "Исход серии (после упорядочивания) равен outcome записи; у блока новой эры есть progress.",
+"risks": "Исход серии иной — completion_invalid; progress у механизма — completion_invalid."
+},
+{
+"path": "waiting",
+"type": "Ref[]",
+"iface": true,
+"what": "Диагностики, на которых попытка ждёт владельца.",
+"writer": "Закрыть попытку (om.s.close): собираются из реестра.",
+"readers": "Решение владельца (om.s.owner) берёт непогашенные ожидания всех закрытых попыток линии.",
+"expects": "Каждая ссылка — диагностика вызова той же попытки с причиной awaiting-owner.",
+"risks": "Ссылка на чужую диагностику — completion_foreign."
+}
+],
+"writers": [
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:2404 (managedCloseBundle); src/om/repeat-gate.ts:487 (closeAttempt); src/om/answers-gate.ts:1424 (writeAnswersEvaluation)",
+"when": "Закрытие управляемой попытки: запись пишется вместе с исходом серии (A3), итоговым журналом, последней версией реестра и возможными остановками; связанное закрытие вместе с оцениванием G4b пишется одной сделкой; повтор того же закрытия ничего не пишет",
+"fields": [
+"contract",
+"project",
+"binding",
+"work",
+"additions",
+"series",
+"ledger",
+"journal",
+"claim",
+"outcome",
+"waiting"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.s.close",
+"code": "src/om/series.ts:999 (prepareComplete); src/om/repeat-gate.ts:2234 (prepareManagedGateClose)",
+"fields": [
+"binding",
+"series",
+"outcome",
+"claim"
+],
+"expects": "Исход серии принимается, только если близкая запись закрытия выведена от того же владельца и серии, а её исход равен записанному; повторное закрытие находит запись и сверяет заявку",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/repeat-gate.ts:2046 (readAttempt)",
+"fields": [
+"work",
+"additions",
+"journal",
+"outcome",
+"claim"
+],
+"expects": "Для каждой закрытой попытки окна свидетельства (результаты, остановки, исход) выводятся заново по точному закрытию, а не по сегодняшним головам",
+"sure": false
+},
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1115 (owedBy)",
+"fields": [
+"waiting"
+],
+"expects": "Проход собирает непогашенные ожидания владельца из закрытий всех попыток линии; без записи закрытия — record_missing",
+"sure": false
+},
+{
+"node": "om.l3.form",
+"code": "src/om/model-call.ts:4316 (reuseValue); src/om/model-call.ts:4403 (reuseCandidates)",
+"fields": [
+"binding",
+"claim",
+"work"
+],
+"expects": "Повтор оплаченной сборки берёт источник только из закрытия, чья причина передаёт результаты (замена B1 области или отказ G5 группы); закрытие обязано стоять на своей работе",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"binding",
+"claim",
+"journal",
+"ledger",
+"series",
+"waiting",
+"work"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам binding, work, series, ledger, journal, claim, waiting",
+"sure": false
+}
+]
+},
+{
+"kind": "om-input-fix",
+"group": "om",
+"idPattern": "om-input-fix:<проект>:<id записи>",
+"proposed": false,
+"card": {
+"what": "Подтверждение исправленного входа: повторная адресная проверка отказа, на котором останавливались попытки, прошла на более поздней ревизии входа, чем та, с которой попытки работали. Это одно из трёх оснований продолжить серию на первой ступени.",
+"where": "Таблица revisions · вид «om-input-fix» · id om-input-fix:<проект>:<id записи>",
+"when": "API сохраняет проверенное переданное основание атомарно: locate создаёт Write (series.ts:1310), оно включается в продолжение (:1123) и пишется общей сделкой (:739). Отдельная продуктовая команда, формирующая содержание такого подтверждения, не установлена; по комментарию серии записать её должны B1 и A4 после повторной проверки. В рабочей базе записей нет.",
+"why": "Остановка из-за отказа входа не должна лечиться словами «входное исправлено»: нужна запись, что тот же отказ на новой ревизии входа не повторился, и эту ревизию можно найти и сравнить.",
+"expects": "Подтверждение называет строку журнала отказов, который попытки встретили, и точную ревизию входа: того же id, строго более поздней, чем ревизия, на которой стоял отказ, с другим хэшем и реально существующую в хранилище.",
+"risks": "input_unfixed (подтверждение про другой отказ, про другой id, про не более позднюю ревизию, про ревизию с теми же данными, про несуществующую), refusal_unlinked (строки нет в журнале проекта), record_foreign (запись вне пространства om-input-fix:<проект>: или другого вида), revision_conflict (id занят другой записью).",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Вид прочитан из кода; команда, формирующая содержание записи, в этой версии не найдена — связь писателя помечена как предположение. В карте стадий вид учитывается по полю input (stage-checks.ts)."
+},
+"fields": [
+{
+"path": "refusal",
+"type": "string",
+"iface": true,
+"what": "Строка журнала отказов (A2), которую повторная проверка подтвердила как исправленную.",
+"writer": "Запись подтверждения (om.s.cont): вместе с продолжением, пока отдельного производителя в коде нет.",
+"readers": "Продолжить серию сверяет, что попытки остановки действительно встретили эту строку (om.s.cont).",
+"expects": "Строка есть в журнале проекта и совпадает с refusal продолжения.",
+"risks": "input_unfixed, refusal_unlinked."
+},
+{
+"path": "input",
+"type": "Ref",
+"iface": true,
+"what": "Точная ревизия входа, на которой отказ больше не повторяется: тот же id, но позже той, что стояла за отказом, с другим содержимым.",
+"writer": "Запись подтверждения (om.s.cont).",
+"readers": "Продолжить серию читает ревизию и сравнивает с входом, на котором попытки работали (om.s.cont); проверка эры видит в ссылке адрес B1 (om.c.accept).",
+"expects": "revision больше ревизии входа попыток, hash отличается, запись реально стоит по этой ссылке.",
+"risks": "input_unfixed на каждом из условий."
+}
+],
+"writers": [
+{
+"node": "om.s.cont",
+"code": "src/om/series.ts:1310 (locate); src/om/series.ts:739 (applied)",
+"when": "Продолжить серию на основании inputs-fixed: проверенная переданная запись, если её ещё нет, становится Write и пишется той же сделкой, что и продолжение; команду, формирующую её содержание, в src не нашли — предполагается API владельца",
+"fields": [
+"refusal",
+"input"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.s.cont",
+"code": "src/om/series.ts:1273 (groundOf)",
+"fields": [
+"refusal",
+"input"
+],
+"expects": "Продолжение на основании inputs-fixed читает подтверждение (по ссылке или вместе с ним) и взвешивает: отказ встречен попытками остановки, вход именно этот, ревизия позже и отличается",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"input"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её ссылка input указывает на адрес B1",
+"sure": false
+}
+]
+},
+{
+"kind": "om-l3-release",
+"group": "om",
+"idPattern": "om-l3-release:<проект>",
+"proposed": false,
+"card": {
+"what": "Освобождение политик переоткрытия (RL3, №4218): явное решение владельца om-continue --release, что политики, о которых переоткрытие спросило, больше не ждут его ответа H2 и отдаются обычному выбору модели (OWN1).",
+"where": "Таблица revisions · вид «om-l3-release» · id om-l3-release:<проект>",
+"when": "Пишется командой владельца om-continue с release = regate_owner_policy, когда проход ждёт (wait.code = regate_owner_policy) этих политик; одна запись на проект, идёт в одной сделке с охраной ожидающего прохода и переоткрытия. Повтор находит запись. В рабочей базе записей нет (вид есть в коде).",
+"why": "Без освобождения проход ждёт ответа владельца на каждую политику; освобождение — осознанный отказ от этого права, чтобы проход пошёл дальше без постоянного участия владельца.",
+"expects": "Ровно пять полей: contract = om-l3-release/v1, project, reopen и run (точные ссылки), decision = {owner, om-continue, regate_owner_policy}; запись относится ровно к стоящему переоткрытию; проход ждёт именно эту причину.",
+"risks": "record_missing (проход не ждёт политик переоткрытия или переоткрытия нет); run_record_invalid (запись потеряла поле или хранит чужое); run_request_invalid. Освобождение чужого переоткрытия ничего не освобождает.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Вид рождён от решения владельца, а не от шагов машины: запись пишется не шагом прохода (perform), а командой engine.execute (product/engine.ts: om-continue → releaseRegateWait) до продолжения. В списке B1_PRODUCERS (product/stage-checks.ts) этого вида нет (вывод: пропуск либо намеренно)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-l3-release/v1\"",
+"iface": false,
+"what": "метка формата",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "reopen",
+"type": "Ref",
+"iface": true,
+"what": "Переоткрытие, чьи политики освобождены.",
+"writer": "Команда владельца om-continue (om.s.owner).",
+"readers": "Проход не ждёт политик, пока освобождено именно это переоткрытие (om.s.owner, om.s.resume); другое или никакое не освобождает ничего.",
+"expects": "Точная ссылка на om-l3-reopen:<проект>, голову на кадре работ.",
+"risks": "Освобождение прежнего переоткрытия не снимает ожидание нового (запись не равна стоящей ссылке)."
+},
+{
+"path": "run",
+"type": "Ref",
+"iface": true,
+"what": "Версия ожидающего прохода, при которой владелец дал освобождение.",
+"writer": "Команда владельца om-continue (om.s.owner).",
+"readers": "Служит охраной сделки: проход мог измениться — запись тогда не пишется (om.s.owner).",
+"expects": "Проход в фазе waiting с кодом regate_owner_policy.",
+"risks": "record_missing (проход не ждёт этих политик)."
+},
+{
+"path": "decision",
+"type": "{actor: owner, command: om-continue, release: regate_owner_policy}",
+"iface": false,
+"what": "кто и чем решил",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1081 (releaseRegateWait)",
+"when": "Команда om-continue с release: решение владельца пишется до продолжения прохода, с охраной ожидающего прохода и стоящего переоткрытия",
+"fields": [
+"вся запись"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1054 (regateRelease); src/om/run.ts:1074 (releaseRegateWait)",
+"fields": [
+"вся запись",
+"reopen"
+],
+"expects": "Запись читается целиком и обязана иметь ровно пять полей; освобождение именно стоящего переоткрытия возвращается как есть, чужое не освобождает",
+"sure": false
+},
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:1040 (regatePolicyWait)",
+"fields": [
+"reopen"
+],
+"expects": "Выбор следующего шага: ожидание regate_owner_policy не ставится, если политики переоткрытия освобождены",
+"sure": false
+}
+]
+},
+{
+"kind": "om-limited-call-retry-permit",
+"group": "om",
+"idPattern": "om-limited-call-retry-permit:<проект>:<хэш ссылки на вызов>",
+"proposed": false,
+"card": {
+"what": "Разрешение владельца на один повтор физического вызова OM, который упёрся в предел вывода (process_output_limit): ссылка на провалившийся вызов и его терминальную запись.",
+"where": "Таблица revisions · вид «om-limited-call-retry-permit» · id om-limited-call-retry-permit:<проект>:<хэш ссылки на вызов>",
+"when": "По команде permit-limited-call-retry (владелец или оператор), когда запись вызова model-call имеет статус failed из-за process_output_limit (в записи, в отказе применения или в launchError обмена), вызов принадлежит попытке OM, проход не завершён и нет живого вызова. В рабочей базе записей нет.",
+"why": "Повтор платного вызова после предела вывода — расход, поэтому нужна явная отметка владельца; она снимает ожидание «нужен владелец» и позволяет проходу продолжить.",
+"expects": "contract om-limited-call-retry-permit/v1; call — точная ссылка на текущий терминал model-call проекта; callRecord — допущенный вызов (om.call) либо тот же ref; terminal равен call; actor и permittedAt; id — хэш ссылки на call; повтор команды возвращает уже сохранённое разрешение.",
+"risks": "limited_call_retry_invalid — нет доказательства предела вывода, вызов не из OM или проход завершён; limited_call_retry_stale — названный вызов не текущий терминал; limited_call_retry_busy — на вопросе идёт живой вызов.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "НЕ путать с limited-call-retry-permit раннего Discovery (id limited-call-retry-permit:<вызов>, поля projectId, consumer): это другой вид с другим владельцем. Команда ProductEngine выбирает вид по форме записи вызова (om в value — этот вид)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-limited-call-retry-permit/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call",
+"type": "Ref",
+"iface": true,
+"what": "Терминальная запись физического вызова model-call, который упёрся в предел вывода.",
+"writer": "Команда разрешения повтора (om.s.owner).",
+"readers": "Подсчёт ожиданий владельца снимает причину для этого вызова (om.s.owner); драйвер считает проход переоткрываемым (om.b1.start).",
+"expects": "Запись вызова — текущий терминал проекта со статусом failed и кодом process_output_limit.",
+"risks": "limited_call_retry_stale, limited_call_retry_invalid."
+},
+{
+"path": "callRecord",
+"type": "Ref",
+"iface": true,
+"what": "Допущенный вызов E1 (call-record) того же физического вызова; разрешение находится и по нему.",
+"writer": "Команда разрешения повтора (om.s.owner).",
+"readers": "Читатель разрешения находит запись по любой из трёх ссылок: терминал, запись вызова или допущенный вызов (om.s.owner).",
+"expects": "Совпадает с om.call записи вызова; иначе берётся сам call.",
+"risks": "Нет — разрешение не находится по этой ссылке."
+},
+{
+"path": "terminal",
+"type": "Ref",
+"iface": false,
+"what": "терминал — то же, что call",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "actor",
+"type": "string",
+"iface": false,
+"what": "кто разрешил",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "permittedAt",
+"type": "number",
+"iface": false,
+"what": "время, мс",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.owner",
+"code": "src/om/capacity-delivery.ts:472 (permitOmLimitedCallRetry)",
+"when": "Команда permit-limited-call-retry: проверяет предел вывода по записи вызова, отказу или обмену и пишет разрешение (вывод: команда отдельного входа владельца, не шаг прохода)",
+"fields": [
+"contract",
+"project",
+"call",
+"callRecord",
+"terminal",
+"actor",
+"permittedAt"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1120 (owedBy); src/om/capacity-delivery.ts:455 (permitOmLimitedCallRetry)",
+"fields": [
+"call",
+"callRecord"
+],
+"expects": "Подсчёт ожиданий владельца у закрытой попытки снимает причину, если для вызова есть разрешение; повтор команды находит уже сохранённое разрешение",
+"sure": false
+},
+{
+"node": "om.b1.start",
+"code": "src/om/run-driver.ts:116 (reopens)",
+"fields": [
+"project"
+],
+"expects": "Драйвер при старте решает, переоткрывается ли остановленный проход: наличие разрешения проекта достаточно",
+"sure": false
+},
+{
+"node": "om.b1.hold",
+"code": "src/om/run-driver.ts:116 (reopens)",
+"fields": [
+"project"
+],
+"expects": "Проход в состоянии unable продолжается, если для проекта есть разрешение повторить вызов с лимитом.",
+"sure": false
+}
+]
+},
+{
+"kind": "om-origin-analysis",
+"group": "om",
+"idPattern": "om-origin-analysis:<проект>:<хэш (проект, удержание)>",
+"proposed": false,
+"card": {
+"what": "Результат независимого разбора (A6) удержания по отказу неизвестного источника: какой класс (предложение, готовность, вход, вывод, условия) ревьюер установил и на каких точных записях, либо что источник не установлен. Только установленный и доказанный класс снимает удержание.",
+"where": "Таблица revisions · вид «om-origin-analysis» · id om-origin-analysis:<проект>:<хэш (проект, удержание)>",
+"when": "Один раз (ревизия 1) по адресу из хэша удержания, когда ревьюер ответил по форме. При установленном классе в той же сделке удержание снимается новой ревизией. Ответ с ошибкой формы или сбой вызова эту запись не создают — пишется отдельная запись сбоя. В рабочей базе записей нет.",
+"why": "Источник отказа нельзя назначить по догадке и нельзя вручную подправить в журнале: его можно только доказать теми же записями, по которым класс определяют обычные ворота. Разбор — единственный автоматический путь снять удержание.",
+"expects": "Запись о том же проекте, блоке (или механизме), попытке и строке журнала, что и удержание; class допускает unknown — такая запись сохраняется со state=origin-unestablished (stop-analysis.ts:271). Непустое доказанное основание и установленный класс требуются для снятия удержания, а не для любой записи этого вида. Ворота не верят заявленному классу: они взвешивают основания той же функцией, что и обычную классификацию отказа, и сравнивают с ним.",
+"risks": "lift_unusable (запись о другой серии, попытке или строке; класс не установлен или unknown; основание пусто, не из ролей ворот или не даёт заявленного класса; основания достаточно лишь для unknown), analysis_response_invalid (ответ не по форме — тогда запись не создаётся), analysis_conflict.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Форма записи общая с om-stop-review (тот же AnalysisRecord), но здесь заполнены row, class и basis, а state — origin-established или origin-unestablished. Сбои разбора пишутся в om-stop-analysis-failure."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-stop-analysis/v1\" | \"om-stop-analysis/v2\"",
+"iface": false,
+"what": "метка формата записи; v2 — отчёт нового образца (LP6)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "block",
+"type": "string",
+"iface": false,
+"what": "блок, чья серия удержана; у серии механизма вместо него owner",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner",
+"type": "{kind, mechanism}",
+"iface": false,
+"what": "владелец серии механизма (M5:addressing)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "state",
+"type": "\"origin-established\" | \"origin-unestablished\"",
+"iface": true,
+"what": "Исход: источник установлен (класс известен и не unknown) или не установлен.",
+"writer": "Разбор остановки (om.s.analyze).",
+"readers": "Лестница прохода выбирает шаг: при «не установлен» проход заканчивается основанием «источник не установлен», удержание стоит (om.s.owner).",
+"expects": "origin-established ⇔ class известен и не unknown; удержание снимается только при origin-established.",
+"risks": "Ярлык не заменяет проверки: ворота всё равно взвешивают основание (lift_unusable)."
+},
+{
+"path": "row",
+"type": "string",
+"iface": false,
+"what": "строка журнала, о которой разбор; должна равняться row удержания",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "attempt",
+"type": "number",
+"iface": false,
+"what": "номер попытки удержания, к которой относится разбор; ворота требуют равенства с attempt удержания",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "stop",
+"type": "number",
+"iface": false,
+"what": "номер остановки серии, если она стоит, иначе номер попытки удержания",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "goals",
+"type": "string[]",
+"iface": false,
+"what": "цели удержанной серии в одном порядке",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "class",
+"type": "\"proposal\" | \"readiness\" | \"input\" | \"derivation\" | \"conditions\" | \"unknown\" | null",
+"iface": true,
+"what": "Класс, который ревьюер установил для отказа: чья ошибка (предложения, готовности, входа, вывода, среды); unknown — не удалось установить; null — origin=null, источник не установлен.",
+"writer": "Разбор остановки (om.s.analyze) из ответа ревьюера.",
+"readers": "Ворота повторов сверяют его с тем, что дают основания (om.r1.attempt); от класса зависит маршрут отказа дальше.",
+"expects": "Из закрытого списка классов, включая unknown (запись с ним сохраняется со state=origin-unestablished); для снятия удержания — установленный класс, равный выводу ворот из оснований.",
+"risks": "lift_unusable «The grounds of an analysis establish X, not the Y it claims»."
+},
+{
+"path": "basis",
+"type": "OriginSource[]",
+"iface": true,
+"what": "Точные источники, на которых установлен класс: роль (proposal, base, derived, environment), ссылка и контекст, достаточный, чтобы перечитать определения.",
+"writer": "Разбор остановки (om.s.analyze): ревьюер называет только записи, которые есть в отчёте.",
+"readers": "Ворота повторов заново читают определения и взвешивают класс (om.r1.attempt); снятое удержание хранит их копию (om.s.close).",
+"expects": "Непустой список (для класса, не равного unknown); роли из закрытого списка; источник среды называет именно среду этой отправки.",
+"risks": "lift_unusable (нет основания или ссылка/контекст неполные)."
+},
+{
+"path": "cause",
+"type": "{kind, text, sources} | null",
+"iface": false,
+"what": "причина по версии ревьюера (как у разбора остановки)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "change",
+"type": "{text, addresses} | null",
+"iface": false,
+"what": "предложенное изменение по версии ревьюера",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "intent",
+"type": "Ref",
+"iface": false,
+"what": "точная запись намерения разбора (om-analysis-intent)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "transport",
+"type": "Ref",
+"iface": false,
+"what": "точная запись физического обмена с ревьюером",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "error",
+"type": "Refusal | null",
+"iface": false,
+"what": "для записи разбора null",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "recovery",
+"type": "{failure: Ref, exchange: Ref}",
+"iface": false,
+"what": "только при принятии ответа, который прежний адаптер ошибочно отверг (LP8)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:419 (runStopAnalysis); src/om/stop-analysis.ts:379 (writeStopAnalysisRecovery)",
+"when": "Разбор источника по удержанию: результат пишется по адресу из хэша удержания; при установленном классе той же сделкой снимается удержание",
+"fields": [
+"contract",
+"projectId",
+"block",
+"owner",
+"state",
+"row",
+"attempt",
+"stop",
+"goals",
+"class",
+"basis",
+"cause",
+"change",
+"intent",
+"transport",
+"error",
+"recovery"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.r1.attempt",
+"code": "src/om/repeat-gate.ts:1320 (checkHold)",
+"fields": [
+"attempt",
+"basis",
+"block",
+"class",
+"owner",
+"projectId",
+"row"
+],
+"expects": "Снятое удержание читается вместе с записью-основанием и взвешивается заново: запись относится к этому удержанию, класс установлен, основания перечитаны той же функцией; иначе hold_invalid и открытие попыток закрыто",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:291 (readStopAnalysis)",
+"fields": [
+"projectId",
+"block",
+"owner",
+"state",
+"row",
+"class",
+"basis"
+],
+"expects": "Чтение результата разбора проверяет, что адрес принадлежит проекту и записи нужного вида, и отдаёт запись проходу",
+"sure": true
+},
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1157 (ladder)",
+"fields": [
+"state",
+"class"
+],
+"expects": "Лестница читает результат разбора удержания: установлен — удержание снято и проход идёт дальше, не установлен — основание конца прохода; сбой разбора — отдельное основание",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"basis",
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её основания указывают на источники B1 или владелец — механизм M5:addressing",
+"sure": false
+}
+]
+},
+{
+"kind": "om-origin-decision",
+"group": "om",
+"idPattern": "om-origin-decision:<проект>:<id записи>",
+"proposed": false,
+"card": {
+"what": "Решение владельца по удержанию неизвестного источника: запись, что владелец решил продолжить, несмотря на неустановленный источник отказа. Единственная альтернатива разбору источника; класс отказа она не устанавливает.",
+"where": "Таблица revisions · вид «om-origin-decision» · id om-origin-decision:<проект>:<id записи>",
+"when": "API сохраняет проверенное переданное решение атомарно: ворота выбирают вид по основанию (repeat-gate.ts:1382), locate создаёт Write (:1622), оно включается вместе со снятием удержания (:1413) и сохраняется (:513). Отдельная продуктовая команда, формирующая содержание такого решения, не установлена. В рабочей базе записей нет.",
+"why": "Если источник доказать нельзя, дальше может идти только владелец: решение записано, привязано к этому удержанию и не подменяет разбор. Слово «разрешил», сказанное вызывающим кодом, ничего не снимает.",
+"expects": "Запись о том же проекте, блоке (или механизме), попытке и строке журнала, что и удержание, и с непустым полем decided. Ничего, что запись сообщает о себе («от владельца», «независимо»), не читается — только эти поля.",
+"risks": "lift_unusable с маршрутом «владелец» (запись о другой серии, попытке или отказе; пустое decided), lift_conflict (удержание уже снято другим основанием), record_foreign (запись вне пространства om-origin-decision:<проект>: или другого вида), revision_conflict (id занят другой записью).",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Писатель переданной записи — ворота повторов; команда, формирующая её содержание, не найдена. Лёгкая ошибка карты: узел схемы «Решение владельца» (om.s.owner) относится к решению по остановке серии, а не по удержанию; связь писателя помечена как предположение. Рядом: om-owner-decision (по остановке)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "block",
+"type": "string",
+"iface": false,
+"what": "блок удержанной серии; у серии механизма вместо него owner",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner",
+"type": "{kind, mechanism}",
+"iface": false,
+"what": "владелец серии механизма (M5:addressing)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "attempt",
+"type": "number",
+"iface": false,
+"what": "номер попытки удержания",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "row",
+"type": "string",
+"iface": true,
+"what": "Строка журнала отказов, по удержанию которой принято решение.",
+"writer": "Командный API владельца (H2); в src производителя нет (om.s.owner).",
+"readers": "Ворота повторов сверяют строку с удержанием, прежде чем считать его снятым (om.r1.attempt).",
+"expects": "Равна row удержания; запись о том же блоке и попытке.",
+"risks": "lift_unusable «This record is about another refusal»."
+},
+{
+"path": "decided",
+"type": "string",
+"iface": true,
+"what": "Текст решения владельца — что он решил, непустой.",
+"writer": "Командный API владельца (H2); в src производителя нет (om.s.owner).",
+"readers": "Ворота повторов требуют непустой текст (om.r1.attempt); снятое удержание хранит ссылку на эту запись (om.s.close).",
+"expects": "Непустая строка.",
+"risks": "lift_unusable «says nothing the owner decided»."
+}
+],
+"writers": [
+{
+"node": "om.s.owner",
+"code": "src/om/repeat-gate.ts:1622 (locate); src/om/repeat-gate.ts:513 (liftOriginHold)",
+"when": "Снятие по решению владельца: проверенная переданная запись, если её ещё нет, становится Write и пишется той же сделкой, что и снятие; команду, формирующую её содержание, в src не нашли — предполагается API владельца (H2)",
+"fields": [
+"projectId",
+"block",
+"owner",
+"attempt",
+"row",
+"decided"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.r1.attempt",
+"code": "src/om/repeat-gate.ts:1320 (checkHold); src/om/repeat-gate.ts:1443 (weighLift)",
+"fields": [
+"attempt",
+"block",
+"decided",
+"owner",
+"projectId",
+"row"
+],
+"expects": "Снятое по решению владельца удержание читается вместе с записью и взвешивается заново: та же серия, попытка и строка, непустое decided; иначе открытие попыток остаётся закрытым",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing",
+"sure": false
+}
+]
+},
+{
+"kind": "om-origin-hold",
+"group": "om",
+"idPattern": "om-origin-hold:<проект>:<хэш (блок или владелец, попытка, строка журнала)>",
+"proposed": false,
+"card": {
+"what": "Удержание серии из-за отказа неизвестного источника: ворота повторов не смогли по доказательствам сказать, чья это ошибка (предложения, входа, вывода или среды), поэтому не гадают, а держат серию. Пока удержание стоит, новые попытки серии не открываются; снимает его только разбор источника (om-origin-analysis) или решение владельца (om-origin-decision).",
+"where": "Таблица revisions · вид «om-origin-hold» · id om-origin-hold:<проект>:<хэш (блок или владелец, попытка, строка журнала)>",
+"when": "Пишется в той же сделке, что закрывает попытку (G7) с отказом, который журнал классифицировал как unknown: по одной записи на (блок или владелец, попытка, строка журнала). Снятие — новая ревизия той же записи в сделке с записью-основанием. В рабочей базе записей нет.",
+"why": "Отказ неизвестного источника не должен ни уходить модели «на угад», ни ждать, пока лестница набьёт три попытки: у него прямой путь — разбор источника или решение владельца. Удержание делает этот путь обязательным.",
+"expects": "Запись стоит по адресу, который выводится из её же содержимого, и ссылается на точную ревизию серии блока, где попытка встретила именно этот отказ; журнал держит эту строку как unknown с тем же адресатом. Снятая запись несёт точную ссылку на основание и маршрут, который оно установило, и взвешивается заново при каждом чтении; снятие «рукой» отвергается.",
+"risks": "origin_held (попытка открывается при стоящем удержании, либо удержание ещё не поднято — закрыть цикл через ворота повторно), hold_invalid (запись не на своём адресе, серия не записывает эту встречу, журнал не держит отказ как unknown, снятие подделано), lift_unusable (основание о другой записи или не доказывает класс), lift_conflict (уже снято на другом основании).",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Удержания касаются и серии механизма M5:addressing (поле owner вместо block). Запись сама ничего не решает: она переключает только открытие попыток своей серии, и снятие переключает тоже только это."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "block",
+"type": "string",
+"iface": false,
+"what": "блок, чья серия удержана; у серии механизма вместо него owner",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner",
+"type": "{kind, mechanism}",
+"iface": false,
+"what": "владелец серии механизма (M5:addressing)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "series",
+"type": "Ref",
+"iface": true,
+"what": "Точная ревизия серии, которая записала закрытие попытки с этим отказом; без неё удержание нельзя сверить с историей.",
+"writer": "Закрыть попытку (om.s.close): ссылка известна до записи — это следующая ревизия серии с хэшем содержимого.",
+"readers": "Ворота повторов при чтении сверяют, что серия записывает эту встречу (om.r1.attempt); разбор остановки и вызов ревьюера называют удержание вместе с серией (om.s.analyze, om.r1.store).",
+"expects": "Серия этого же блока (или механизма); в ней есть попытка с этим номером, а в исходе — отказ с этой строкой журнала.",
+"risks": "hold_invalid «The series a hold names does not record that attempt running into that refusal»."
+},
+{
+"path": "attempt",
+"type": "number",
+"iface": false,
+"what": "номер попытки, которая встретила отказ",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "row",
+"type": "string",
+"iface": true,
+"what": "Строка журнала отказов (A2), класс которой unknown.",
+"writer": "Закрыть попытку (om.s.close): строка берётся из исхода закрытой попытки.",
+"readers": "Ворота повторов находят удержание по строке (om.r1.attempt); разбор остановки записывает её в результат (om.s.analyze); лестница прохода выбирает по нему шаг анализа (om.s.owner).",
+"expects": "Строка есть в журнале проекта, классифицирована как unknown, а адрес записи совпадает с хэшем (блок, попытка, строка).",
+"risks": "hold_invalid «The journal does not hold that refusal as one of unknown origin»."
+},
+{
+"path": "address",
+"type": "string",
+"iface": true,
+"what": "Адресат разбора, который журнал назвал для неопределённого источника (вид и цель, например «unknown:<серия>»).",
+"writer": "Закрыть попытку (om.s.close).",
+"readers": "Разбор остановки показывает адресата ревьюеру (om.s.analyze); вызов ревьюера проверяет, что называет именно это удержание (om.r1.store).",
+"expects": "Равен адресату классификации этой строки в журнале.",
+"risks": "hold_invalid при расхождении с журналом."
+},
+{
+"path": "lift",
+"type": "{ground, record: Ref, class, addressee, basis[]} | null",
+"iface": true,
+"what": "Снятие: null, пока удержание стоит; иначе основание (origin-analysis или owner-decision), точная запись-основание и маршрут, который она установила (класс, адресат, доказательства) — у решения владельца они пусты.",
+"writer": "Разбор остановки (om.s.analyze) снимает удержание в одной сделке со своей записью; решение владельца снимает его так же (om.s.owner).",
+"readers": "Ворота повторов при каждом чтении заново взвешивают запись-основание и пропускают открытие попыток только после этого (om.r1.attempt); лестница прохода берёт из контекста только стоящие удержания (om.s.owner).",
+"expects": "ground ∈ {origin-analysis, owner-decision}; запись-основание относится к этому же блоку, попытке и строке; у анализа класс установлен и не unknown, а его доказательства по тому же весу дают тот же класс.",
+"risks": "lift_unusable (основание не про это удержание, класс не доказан), lift_conflict (удержание уже снято другим основанием)."
+}
+],
+"writers": [
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:487 (closeAttempt)",
+"when": "Закрыть попытку: каждый отказ неизвестного источника поднимает своё удержание в той же сделке, что и исход попытки и классы отказов в журнале (так же при закрытии через G4b, E5 и E4)",
+"fields": [
+"projectId",
+"block",
+"owner",
+"series",
+"attempt",
+"row",
+"address",
+"lift"
+],
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:419 (runStopAnalysis); src/om/stop-analysis.ts:379 (writeStopAnalysisRecovery)",
+"when": "Разбор источника: когда ревьюер установил класс и доказательства, удержание снимается новой ревизией в той же сделке, что и запись om-origin-analysis; так же пишется принятие ранее отвергнутого ответа (LP8)",
+"fields": [
+"lift"
+],
+"sure": true
+},
+{
+"node": "om.s.owner",
+"code": "src/om/repeat-gate.ts:513 (liftOriginHold)",
+"when": "Снятие по решению владельца: новая ревизия с lift.ground = owner-decision и записью решения, если её ещё нет; вызывающего в src нет — предполагается командный API владельца (H2), поэтому связь не подтверждена",
+"fields": [
+"lift"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.r1.attempt",
+"code": "src/om/repeat-gate.ts:1259 (holdsOf); src/om/repeat-gate.ts:1262 (holdsOf)",
+"fields": [
+"address",
+"attempt",
+"lift",
+"row",
+"series"
+],
+"expects": "Перед каждым открытием попытки ворота выводят удержания из серии и журнала и читают каждое: стоящее — отказ origin_held, снятое — заново взвешенное основание; отсутствующее для отказа unknown — тот же отказ, пока цикл не закрыт повторно",
+"sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:909 (raise)",
+"fields": [
+"projectId",
+"block",
+"owner",
+"series",
+"attempt",
+"row",
+"address",
+"lift"
+],
+"expects": "Повторное закрытие находит своё удержание по адресу, берёт его как есть (снятое или стоящее) и не пересоздаёт; чужое на этом адресе — hold_invalid",
+"sure": true
+},
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1145 (ladder)",
+"fields": [
+"row",
+"attempt",
+"address",
+"lift"
+],
+"expects": "Лестница после остановки получает из контекста только стоящие удержания и для каждого просит разбор источника; снять удержание может лишь его основание, проход решений не принимает",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-report.ts:397 (assemble)",
+"fields": [
+"series",
+"attempt",
+"row",
+"address",
+"lift"
+],
+"expects": "Отчёт об остановке читает контекст ворот: удержания в нём — предмет разбора источника, и все они (снятые и стоящие) входят в охрану отчёта",
+"sure": true
+},
+{
+"node": "om.r1.store",
+"code": "src/om/call-record.ts:932 (resolveMechanismSeries); src/om/call-record.ts:846 (resolveSeries)",
+"fields": [
+"attempt",
+"lift",
+"row",
+"series"
+],
+"expects": "Запись вызова ревьюера по удержанию требует точное стоящее удержание той же попытки и (для механизма) того же владельца, иначе call_basis_unresolved",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"lift",
+"series"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если ссылки series или lift.record указывают на адреса B1",
+"sure": false
+}
+]
+},
+{
+"kind": "om-owner-decision",
+"group": "om",
+"idPattern": "om-owner-decision:<проект>:<id записи>",
+"proposed": false,
+"card": {
+"what": "Решение владельца по остановке серии: запись, что владелец решил продолжить остановленную работу, с текстом решения. Единственное основание продолжить остановку на второй ступени лестницы (первая потрачена) и допустимое на первой.",
+"where": "Таблица revisions · вид «om-owner-decision» · id om-owner-decision:<проект>:<id записи>",
+"when": "API сохраняет проверенное переданное решение атомарно: locate создаёт Write (series.ts:1310), оно включается в продолжение (:1123) и пишется общей сделкой (:739). Отдельная продуктовая команда, формирующая содержание такого решения владельца, не установлена. В рабочей базе записей нет.",
+"why": "Слово «владелец разрешил» от кода, который может вызвать resume, не принимается: остановку снимает запись, а то, кто и как решил, подтверждает командный слой владельца, а не серия.",
+"expects": "Запись относится к тому же проекту, блоку (или механизму), номеру остановки и тому же множеству целей, что остановка серии, и имеет непустое поле decided. Поле о самом себе («от владельца», «снимает остановку») не читается.",
+"risks": "decision_unusable с маршрутом «владелец» (чужой блок, чужая остановка, чужие цели, нет decided), continuation_conflict (остановка уже продолжена другим основанием), owner_required (для не-владельческих оснований), stop_absent, record_foreign.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Командный слой, формирующий содержание записи, в этой версии не найден — команда om-continue с resumeStop снимает остановку прохода (om-run-control), а не остановку серии. Связь писателя помечена как предположение. Рядом: om-origin-decision (решение владельца по удержанию неизвестного источника)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "block",
+"type": "string",
+"iface": false,
+"what": "блок, чья остановка продолжена; у серии механизма вместо него owner",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner",
+"type": "{kind, mechanism}",
+"iface": false,
+"what": "владелец серии механизма; только у решения по серии механизма",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "stop",
+"type": "number",
+"iface": true,
+"what": "Номер попытки, после которой сохранена остановка, которую владелец решил продолжить.",
+"writer": "Командный API владельца (H2) пишет запись; в этой версии src его нет, роль берёт вызывающий resume (om.s.owner).",
+"readers": "Продолжить серию сверяет номер и цели с остановкой серии (om.s.cont).",
+"expects": "Совпадает с номером стоящей остановки; цели goals, отсортированные, равны целям остановки.",
+"risks": "decision_unusable «is about another stop / another goal»."
+},
+{
+"path": "goals",
+"type": "string[]",
+"iface": false,
+"what": "цели остановки в одном порядке; сравниваются с целями остановки серии как множество",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "decided",
+"type": "string",
+"iface": true,
+"what": "Текст решения: что владелец решил, непустой.",
+"writer": "Командный API владельца (H2); роль в src берёт вызывающий resume (om.s.owner).",
+"readers": "Продолжить серию требует непустой текст и пишет его в продолжение (om.s.cont); отчёт об остановке показывает его владельцу как уже принятое (om.s.analyze).",
+"expects": "Непустая строка.",
+"risks": "decision_unusable «says nothing the owner decided»."
+}
+],
+"writers": [
+{
+"node": "om.s.owner",
+"code": "src/om/series.ts:1310 (locate); src/om/series.ts:739 (applied)",
+"when": "Продолжить серию на основании owner-decision: проверенная переданная запись, если её ещё нет, становится Write и пишется той же сделкой, что и продолжение; команду, формирующую её содержание, в src не нашли — предполагается API владельца (H2)",
+"fields": [
+"projectId",
+"block",
+"owner",
+"stop",
+"goals",
+"decided"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.s.cont",
+"code": "src/om/series.ts:1275 (groundOf)",
+"fields": [
+"projectId",
+"block",
+"owner",
+"stop",
+"goals",
+"decided"
+],
+"expects": "Продолжение на основании owner-decision читает запись по ссылке или вместе с ним: та же остановка, те же цели, непустое decided; допустимо на любой ступени",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing",
+"sure": false
+}
+]
+},
+{
+"kind": "om-series-progress-transition",
+"group": "om",
+"idPattern": "om-series-progress-transition:<проект>:<хэш серии и остановки>",
+"proposed": false,
+"card": {
+"what": "Доказательство примирения остановки (LP6): каждая попытка окна остановки по правилам новой эры либо принесла свежий результат поля входа, либо закончилась чисто административно. С ним остановка снимается без ревью и без решения владельца, историю результатов дополняют ключи этих попыток.",
+"where": "Таблица revisions · вид «om-series-progress-transition» · id om-series-progress-transition:<проект>:<хэш серии и остановки>",
+"when": "Один раз (ревизия 1) вместе с новой версией серии, когда ворота повторов видят остановку блока и код доказывает, что все её попытки без реальных сбоев. Адрес — хэш (ревизия серии, номер остановки). В рабочей базе 2 записи по одной версии, в каждой по 3 строки окна.",
+"why": "Не заставлять владельца и ревьюера разбирать остановку, которую правила новой эры уже признают ложной: проход продолжается новым окном с нулевым счётом.",
+"expects": "Запись равна единственному выводу из своей сохранённой версии серии (остановка и окно, прочитанные историческим способом, а не по голове B1); для каждой попытки окна есть точная запись закрытия, результат (input-field или administrative), ключи и источники.",
+"risks": "progress_unproved (в окне есть реальный сбой, конфликт, повтор известного результата или попытка без управляемого закрытия — остаются старые правила лестницы), stop_absent (на этой ревизии остановки нет), series_invalid (запись подменена или не следует из серии).",
+"size": "HX5: записей нет · рабочая база: 2 записи, 13 КБ, до 9,6 КБ на версию",
+"note": "В списках B1_PRODUCERS и B1_SHARED_ORIGINS (stage-checks.ts) этого вида нет — возможное расхождение карты эры с кодом (вывод)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-series-progress-transition/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "series",
+"type": "Ref",
+"iface": true,
+"what": "Точная ревизия серии блока, на которой стояла остановка.",
+"writer": "Продолжить серию (om.s.cont): reconcile выводит запись из головы серии.",
+"readers": "Повтор примирения находит свою запись по адресу (om.s.cont).",
+"expects": "Адрес записи — хэш этой ссылки и номера остановки; остановка на этой ревизии действительно стоит.",
+"risks": "stop_absent, если остановки на ревизии нет."
+},
+{
+"path": "stop",
+"type": "number",
+"iface": false,
+"what": "номер попытки, после которой сохранена остановка",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "rows",
+"type": "{ordinal, goal, close: Ref, result, achieved[], sources[]}[]",
+"iface": true,
+"what": "Строки окна: попытка, её цель, точная запись закрытия, итог (input-field или administrative), ключи результатов и источники.",
+"writer": "Продолжить серию (om.s.cont): строки выводит общий разбор окна из ворот повторов.",
+"readers": "Повторный reconcile сверяет сохранённую запись с новым выводом (om.s.cont); ключи входят в историю серии (reconciliations.achieved).",
+"expects": "Для каждой попытки остановки ровно одна строка; результат — свежее поле входа (новое относительно известных полей линии) или чисто административный конец.",
+"risks": "progress_unproved для окна, где хоть одна попытка не годится."
+}
+],
+"writers": [
+{
+"node": "om.s.cont",
+"code": "src/om/series.ts:739 (applied)",
+"when": "Продолжить серию (reconcile): запись пишется той же сделкой, что и новая версия серии с примиренной остановкой, окном с нулевым счётом и ключами результатов",
+"fields": [
+"contract",
+"project",
+"series",
+"stop",
+"rows"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.s.cont",
+"code": "src/om/series.ts:1234 (prepareReconcile)",
+"fields": [
+"series",
+"stop",
+"rows"
+],
+"expects": "Повторный reconcile находит запись примирения этой остановки и сверяет её с единственным выводом; расхождение — отказ, а не молчаливое «готово»",
+"sure": true
+}
+]
+},
+{
+"kind": "om-stop-analysis-failure",
+"group": "om",
+"idPattern": "om-stop-analysis-failure:<проект>:<хэш причины разбора>",
+"proposed": false,
+"card": {
+"what": "Результат независимого разбора остановки, закончившегося без решения: вызов ревьюера отказал или вернул ответ неверной формы. Хранит типизированный отказ, ссылку на намерение и физический обмен.",
+"where": "Таблица revisions · вид «om-stop-analysis-failure» · id om-stop-analysis-failure:<проект>:<хэш причины разбора>",
+"when": "Пишется шагом analyze один раз на причину (версия 1), когда ответ ревьюера не прошёл разбор (state=failed). Позже ответ может быть принят шагом recover-analysis — тогда рядом, по адресу обычного разбора, записывается новый результат со ссылкой на отказ и обмен. В рабочей базе 2 записи (около 2 КБ); в примере код model_adapter_response_invalid (адаптер не отличил подтверждённые настройки от неизвестных).",
+"why": "Отказ разбора — основание конца прохода («автоматически ничего не продолжает»); запись нужна, чтобы при повторном чтении не платить за разбор заново. Но если ответ получен и отвергнут лишь из-за обёртки старого адаптера, его можно принять без нового вызова.",
+"expects": "Контракт om-stop-analysis/v1 (или v2); state равен failed; error — типизированный отказ (код, сообщение, место, маршрут); cause, change и class равны null; row — строка удержания при сбое его разбора (:277), иначе null; ссылки на намерение и физический обмен точные. Восстановление допускает только отказ model_adapter_response_invalid с полем confirmed/usage/envelope, и далее проверяет точные ссылки, signal=null и форму ответа — одних exitCode=0 и совпадения requestId недостаточно (LP8, :310).",
+"risks": "analysis_response_invalid — ответ не JSON или неверной формы; model_adapter_response_invalid — адаптер не разделил подтверждённые настройки и неизвестные; recovery отказывает на пустом, прерванном, чужом или искажённом ответе; потеря держателя управления — запись не пишется.",
+"size": "HX5: записей нет · рабочая база: 2 записи, 1,9 КБ, до 1,0 КБ на версию",
+"note": "Для успешного разбора остановки пишется om-stop-review, для разбора удержания — om-origin-analysis; их id лежат в других пространствах. Вид отсутствует в перечне «рождённых от B1» stage-checks (вывод: связь с B1 идёт через намерение)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-stop-analysis/v1\" | \"om-stop-analysis/v2\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "state",
+"type": "\"failed\"",
+"iface": true,
+"what": "Состояние результата: failed — разбор не дал решения.",
+"writer": "Разбор остановки (om.s.analyze).",
+"readers": "Решение владельца (om.s.owner): состояние failed — основание конца прохода «разбор не дал результата»; восстановление (om.s.analyze) допустимо только для failed.",
+"expects": "Для этого вида всегда failed; прочие состояния лежат в других видах.",
+"risks": "Ответ с состоянием не failed по адресу отказа — analysis_invalid."
+},
+{
+"path": "error",
+"type": "{code, message, route, at}",
+"iface": true,
+"what": "Типизированный отказ: код, сообщение, маршрут и место.",
+"writer": "Разбор остановки (om.s.analyze): берётся из отказа транспорта или разбора ответа.",
+"readers": "Восстановление (om.s.analyze) смотрит на код model_adapter_response_invalid и поле (confirmed, usage, envelope); Решение владельца (om.s.owner) называет отказ в причине конца.",
+"expects": "Восстановимыми считаются только model_adapter_response_invalid с полем-оберткой адаптера.",
+"risks": "Иной отказ не восстанавливается: остаётся причиной конца прохода."
+},
+{
+"path": "intent",
+"type": "Ref",
+"iface": true,
+"what": "Точная ссылка на намерение разбора, из которого получен отказ.",
+"writer": "Разбор остановки (om.s.analyze).",
+"readers": "Восстановление (om.s.analyze) перечитывает намерение, чтобы заново разобрать сохранённый ответ по его форме.",
+"expects": "Ссылка на запись om-analysis-intent этого проекта.",
+"risks": "Нет намерения — analysis_invalid."
+},
+{
+"path": "transport",
+"type": "Ref",
+"iface": true,
+"what": "Точная ссылка на физическую запись вызова ревьюера (обмен с адаптером).",
+"writer": "Разбор остановки (om.s.analyze).",
+"readers": "Восстановление (om.s.analyze) читает по ней обмен: код выхода 0, requestId и исследовательскую нагрузку.",
+"expects": "Хэш записи равен ссылке; в обмене есть процесс с кодом 0 и stdout-протокол omg-agent/v1.",
+"risks": "Иной обмен — восстановление отказывает, отказ остаётся."
+},
+{
+"path": "stop",
+"type": "number",
+"iface": false,
+"what": "номер остановленной попытки (или попытки удержания)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "attempt",
+"type": "number",
+"iface": false,
+"what": "номер попытки вызова",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "goals",
+"type": "string[]",
+"iface": false,
+"what": "ключи целей остановки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "basis",
+"type": "OriginSource[]",
+"iface": false,
+"what": "основания происхождения (у отказа пусто)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause",
+"type": "null",
+"iface": false,
+"what": "причина (у отказа null)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "change",
+"type": "null",
+"iface": false,
+"what": "изменение (у отказа null)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "class",
+"type": "null",
+"iface": false,
+"what": "класс происхождения (у отказа null)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "row",
+"type": "string | null",
+"iface": false,
+"what": "строка журнала (у отказа остановки null)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "block",
+"type": "string",
+"iface": false,
+"what": "блок серии (у механизма вместо него owner)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner",
+"type": "{kind, mechanism}",
+"iface": false,
+"what": "механизм M5 (у блока вместо него block)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner.kind",
+"type": "string",
+"iface": false,
+"what": "mechanism",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner.mechanism",
+"type": "string",
+"iface": false,
+"what": "имя механизма (M5:addressing)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "error.code",
+"type": "string",
+"iface": false,
+"what": "код отказа (в примере базы model_adapter_response_invalid)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "error.message",
+"type": "string",
+"iface": false,
+"what": "сообщение отказа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "error.route",
+"type": "string",
+"iface": false,
+"what": "маршрут отказа (producer, owner, ...)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "error.at",
+"type": "object",
+"iface": false,
+"what": "место отказа: единица, цель, поле",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:419 (runStopAnalysis)",
+"when": "Шаг analyze: разбор закончился без ответа или с неверным ответом; по адресу отказа пишется запись, серия не меняется",
+"fields": [
+"contract",
+"projectId",
+"state",
+"error",
+"intent",
+"transport",
+"stop",
+"attempt",
+"goals",
+"basis",
+"cause",
+"change",
+"class",
+"row",
+"block",
+"owner"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:307 (recoverableAnswer); src/om/stop-analysis.ts:331 (readRecoveredStopAnalysis); src/om/stop-analysis.ts:399 (runStopAnalysis)",
+"fields": [
+"вся запись"
+],
+"expects": "Восстановление читает отказ и решает, пригоден ли сохранённый ответ; повторный запуск разбора возвращает записанный результат, не платя заново",
+"sure": true
+},
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1157 (ladder); src/om/run.ts:1209 (ladder)",
+"fields": [
+"state",
+"error",
+"intent"
+],
+"expects": "Проход читает результат разбора по адресу; failed без восстановления — основание конца прохода (stop-analysis-failed / hold-analysis-failed), recoverable — шаг recover-analysis",
+"sure": false
+}
+]
+},
+{
+"kind": "om-stop-review",
+"group": "om",
+"idPattern": "om-stop-review:<проект>:<хэш (проект, серия-источник, остановка)>",
+"proposed": false,
+"card": {
+"what": "Результат независимого разбора (A6) сохранённой остановки серии: причина (доказанная или гипотеза) и предложенное изменение, каждая часть либо сказана, либо явно null. Это одновременно основание продолжить серию (причина и изменение сказаны) или отправить остановку владельцу (одна из частей null).",
+"where": "Таблица revisions · вид «om-stop-review» · id om-stop-review:<проект>:<хэш (проект, серия-источник, остановка)>",
+"when": "Один раз (ревизия 1), когда ревьюер ответил по форме, вместе с тем, что из ответа следует: при «не решено» — вместе с отправкой остановки владельцу (escalation) в серии. Адрес — хэш (проект, исходная серия, номер остановки), поэтому остановка, перенесённая преемником, имеет одно ревью. В рабочей базе 2 записи по одной версии, оба разбора «decided».",
+"why": "Остановка не снимается словами: продолжить серию на первой ступени можно только записью ревью, которую написал не исполнитель. Эту же запись читают владелец (как объяснение остановки) и проход (как исход ступени).",
+"expects": "Серия читает не ярлык state, а сказанное: cause и change либо оба сказаны (ревью решило — основание продолжить), либо хотя бы один явно null (не решило — основание отправить владельцу). Запись относится к тому же проекту, блоку (или владельцу-механизму), номеру остановки и точно тому же множеству целей, что и остановка серии; пропущенная часть или пустой текст — сломанная запись.",
+"risks": "review_unusable (ревью чужого блока, чужой остановки, чужих целей, с пропущенной частью, или решившее ревью там, где нужна отправка владельцу, и наоборот), analysis_unreadable / analysis_invalid в отчёте об остановке (запись не читается на ссылке серии или противоречит её месту), analysis_conflict (для этой остановки уже сохранён запрос разбора с другим содержанием). Сбой вызова или ответ не по форме записи ревью не создают — пишется отдельная запись сбоя (om-stop-analysis-failure).",
+"size": "HX5: записей нет · рабочая база: 2 записи, 5,7 КБ, до 3,2 КБ на версию",
+"note": "Запись с тем же содержанием, но для удержания «неизвестный источник», лежит в соседнем пространстве om-origin-analysis; сбои разбора — в om-stop-analysis-failure (в списке вида не значится). Поле state — ярлык проекта-A6, серия на него не опирается."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-stop-analysis/v1\" | \"om-stop-analysis/v2\"",
+"iface": false,
+"what": "метка формата записи; v2 — разбор нового отчёта об остановке (LP6)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "block",
+"type": "string",
+"iface": false,
+"what": "блок, чья остановка разобрана; у разбора серии механизма вместо него owner",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner",
+"type": "{kind, mechanism}",
+"iface": false,
+"what": "владелец серии механизма (kind = mechanism, mechanism = M5:addressing); у 1 из 2 записей рабочей базы",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "state",
+"type": "\"decided\" | \"undecided\"",
+"iface": true,
+"what": "Ярлык исхода разбора: решено (причина и изменение сказаны) или не решено.",
+"writer": "Разбор остановки (om.s.analyze) выводит его из ответа ревьюера.",
+"readers": "Лестница после остановки выбирает шаг: при decided — продолжить серию записью ревью, при undecided — ждать второй ступени (om.s.owner).",
+"expects": "Ярлык согласован с содержанием: decided ⇔ cause и change не null. Сама серия ярлык не читает, а пересчитывает исход по cause и change.",
+"risks": "Расхождение ярлыка и содержания даёт review_unusable в серии и analysis_invalid в отчёте."
+},
+{
+"path": "cause",
+"type": "{kind: evidence | hypothesis, text, sources: Ref[]} | null",
+"iface": true,
+"what": "Причина остановки: доказанная ссылками (evidence) или названная гипотеза с текстом; null — ревьюер не смог назвать причину.",
+"writer": "Разбор остановки (om.s.analyze): из ответа ревьюера по форме omg-stop-analysis/v1.",
+"readers": "Продолжить серию проверяет, что сказано (om.s.cont); отчёт об остановке несёт причину как версию с точной записью, а не как факт (om.s.analyze).",
+"expects": "Либо null, либо непустой текст; evidence обязан иметь источники; пропущенный ключ или пустая структура — сломанная запись.",
+"risks": "review_unusable (пропущена или пуста часть); для механизмов и блоков причина не заменяет доказательств отказа."
+},
+{
+"path": "change",
+"type": "{text, addresses: {ref, field}[]} | null",
+"iface": true,
+"what": "Предложенное изменение: текст и адреса записей и полей, которые нужно поправить; null — полезного изменения ревью не нашло. Само предложение ничего не меняет в графе, входе и готовности.",
+"writer": "Разбор остановки (om.s.analyze).",
+"readers": "Продолжить серию (om.s.cont); отчёт показывает изменение владельцу и ревьюеру вместе с причиной (om.s.analyze).",
+"expects": "Либо null, либо непустая структура; решение «ждать владельца» выражается именно null в одной из частей.",
+"risks": "review_unusable при пропущенной или пустой части; если обе части сказаны, а запись выбрана для отправки владельцу — тоже review_unusable."
+},
+{
+"path": "stop",
+"type": "number",
+"iface": true,
+"what": "Номер попытки, после которой сохранена остановка, к которой относится разбор; вместе с goals однозначно называет остановку.",
+"writer": "Разбор остановки (om.s.analyze): из отчёта об остановке.",
+"readers": "Продолжить серию и отправка владельцу сверяют номер с остановкой серии (om.s.cont); отчёт сверяет с историей остановок (om.s.analyze).",
+"expects": "Равен номеру остановки, которая стоит в серии (или отвечена на этой линии); goals, отсортированные, равны целям остановки.",
+"risks": "review_unusable «about another stop / another goal»."
+},
+{
+"path": "goals",
+"type": "string[]",
+"iface": false,
+"what": "цели остановки в одном порядке; сравниваются с целями остановки серии как множество",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "intent",
+"type": "Ref",
+"iface": false,
+"what": "точная запись намерения разбора (om-analysis-intent) с отчётом, запросом и диспетчером",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "transport",
+"type": "Ref",
+"iface": false,
+"what": "точная запись физического обмена с ревьюером",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "error",
+"type": "Refusal | null",
+"iface": false,
+"what": "для записи ревью null (сбой пишется отдельной записью)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "attempt",
+"type": "number",
+"iface": false,
+"what": "номер попытки, к которой относится разбор (у ревью остановки — попытка, после которой она сохранена); совпадает с stop",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "row",
+"type": "string | null",
+"iface": false,
+"what": "для ревью остановки null (строка журнала задана только у разбора удержания)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "class",
+"type": "string | null",
+"iface": false,
+"what": "для ревью остановки null",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "basis",
+"type": "OriginSource[]",
+"iface": false,
+"what": "для ревью остановки пусто",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "recovery",
+"type": "{failure: Ref, exchange: Ref}",
+"iface": false,
+"what": "только при принятии ответа, который прежний адаптер ошибочно отверг (LP8): ссылки на отказ и обмен; у 1 из 2 записей",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-analysis.ts:419 (runStopAnalysis); src/om/stop-analysis.ts:379 (writeStopAnalysisRecovery)",
+"when": "Разбор остановки: после ответа ревьюера результат пишется по адресу ревью; при «не решено» той же сделкой серия получает отправку владельцу; повторно принятый ответ (LP8) пишется тем же способом",
+"fields": [
+"contract",
+"projectId",
+"block",
+"owner",
+"state",
+"cause",
+"change",
+"stop",
+"goals",
+"intent",
+"transport",
+"error",
+"attempt",
+"row",
+"class",
+"basis",
+"recovery"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.s.cont",
+"code": "src/om/series.ts:1270 (groundOf)",
+"fields": [
+"cause",
+"change",
+"stop",
+"goals",
+"projectId",
+"block",
+"owner"
+],
+"expects": "Продолжение на первой ступени берёт запись по точной ссылке или ту, что пишется вместе с ним, и требует: это ревью той же остановки, и оно решило (cause и change сказаны)",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/series.ts:1142 (prepareEscalate); src/om/stop-report.ts:418 (assemble); src/om/stop-analysis.ts:291 (readStopAnalysis)",
+"fields": [
+"cause",
+"change",
+"stop",
+"goals",
+"projectId",
+"block",
+"owner",
+"state"
+],
+"expects": "Отправка владельцу требует ревью без решения; отчёт об остановке читает ревью, на которых серия продолжена или отправлена, как версии с точной записью; чтение результата разбора проверяет адрес и вид записи",
+"sure": true
+},
+{
+"node": "om.s.owner",
+"code": "src/om/run.ts:1157 (ladder)",
+"fields": [
+"state",
+"cause",
+"change"
+],
+"expects": "Лестница после остановки читает результат разбора по ссылке из сохранённого шага: решено — продолжить серию этой записью, не решено — ждать второй ступени, сбой — основание конца прохода",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing",
+"sure": false
+}
+]
 }
 ],
 "pending": [
@@ -43346,36 +46292,6 @@
 ],
 "expects": "M6 читает опись и добавляет отказ inventory_format_unsupported: контракт описи ещё не поставлен.",
 "sure": true
-}
-]
-},
-{
-"kind": "om-capacity-recovery",
-"writers": [],
-"readers": [
-{
-"node": "om.b1.hold",
-"code": "src/om/run-driver.ts:115 (reopens)",
-"fields": [
-"project"
-],
-"expects": "Проход в состоянии unable продолжается, если для проекта есть запись восстановления ёмкости.",
-"sure": false
-}
-]
-},
-{
-"kind": "om-limited-call-retry-permit",
-"writers": [],
-"readers": [
-{
-"node": "om.b1.hold",
-"code": "src/om/run-driver.ts:116 (reopens)",
-"fields": [
-"project"
-],
-"expects": "Проход в состоянии unable продолжается, если для проекта есть разрешение повторить вызов с лимитом.",
-"sure": false
 }
 ]
 },
@@ -43442,78 +46358,6 @@
 ]
 },
 {
-"kind": "om-origin-analysis",
-"writers": [],
-"readers": [
-{
-"node": "om.r1.attempt",
-"code": "src/om/repeat-gate.ts:1320 (checkHold)",
-"fields": [
-"projectId",
-"block",
-"owner",
-"attempt",
-"row",
-"class",
-"basis"
-],
-"expects": "Снятое удержание читается вместе с записью-основанием и взвешивается заново: запись относится к этому удержанию, класс установлен, основания перечитаны той же функцией; иначе hold_invalid и открытие попыток закрыто",
-"sure": true
-}
-]
-},
-{
-"kind": "om-origin-decision",
-"writers": [],
-"readers": [
-{
-"node": "om.r1.attempt",
-"code": "src/om/repeat-gate.ts:1320 (checkHold); src/om/repeat-gate.ts:1443 (weighLift)",
-"fields": [
-"projectId",
-"block",
-"owner",
-"attempt",
-"row",
-"decided"
-],
-"expects": "Снятое по решению владельца удержание читается вместе с записью и взвешивается заново: та же серия, попытка и строка, непустое decided; иначе открытие попыток остаётся закрытым",
-"sure": true
-}
-]
-},
-{
-"kind": "om-origin-hold",
-"writers": [],
-"readers": [
-{
-"node": "om.r1.attempt",
-"code": "src/om/repeat-gate.ts:1259 (holdsOf); src/om/repeat-gate.ts:1262 (holdsOf)",
-"fields": [
-"series",
-"attempt",
-"row",
-"address",
-"lift"
-],
-"expects": "Перед каждым открытием попытки ворота выводят удержания из серии и журнала и читают каждое: стоящее — отказ origin_held, снятое — заново взвешенное основание; отсутствующее для отказа unknown — тот же отказ, пока цикл не закрыт повторно",
-"sure": true
-},
-{
-"node": "om.r1.store",
-"code": "src/om/call-record.ts:932 (resolveMechanismSeries); src/om/call-record.ts:846 (resolveSeries)",
-"fields": [
-"series",
-"attempt",
-"row",
-"lift"
-],
-"expects": "Запись вызова ревьюера по удержанию требует точное стоящее удержание той же попытки и (для механизма) того же владельца, иначе call_basis_unresolved",
-"sure": true
-}
-]
-},
-{
 "kind": "om-series-applied",
 "writers": [],
 "readers": [
@@ -43557,158 +46401,6 @@
 ]
 },
 {
-"kind": "om-completion-close",
-"writers": [],
-"readers": [
-{
-"node": "om.l3.form",
-"code": "src/om/model-call.ts:4316 (reuseValue); src/om/model-call.ts:4403 (reuseCandidates)",
-"fields": [
-"binding",
-"work",
-"claim"
-],
-"expects": "Повтор оплаченной сборки берёт источник только из закрытия, чья причина передаёт результаты (замена B1 области или отказ G5 группы); закрытие обязано стоять на своей работе",
-"sure": false
-}
-]
-},
-{
-"kind": "om-analysis-admission",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"intent",
-"series",
-"pointer",
-"activation"
-],
-"expects": "Приёмка компиляции признаёт запись рождённой от B1: её адрес входит в перечень производителей B1 (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
-"kind": "om-analysis-intent",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"request.series",
-"request.hold",
-"sources",
-"report.guards",
-"call"
-],
-"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам series, hold, journal, holds, guards и адресам вызова, а также по владельцу M5 (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
-"kind": "om-completion-close",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"binding",
-"work",
-"series",
-"ledger",
-"journal",
-"claim",
-"waiting"
-],
-"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам binding, work, series, ledger, journal, claim, waiting (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
-"kind": "om-input-fix",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"input"
-],
-"expects": "Проверка эры считает запись рождённой от B1, если её ссылка input указывает на адрес B1 (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
-"kind": "om-origin-analysis",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"basis",
-"owner"
-],
-"expects": "Проверка эры считает запись рождённой от B1, если её основания указывают на источники B1 или владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
-"kind": "om-origin-decision",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"owner"
-],
-"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
-"kind": "om-origin-hold",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"series",
-"lift"
-],
-"expects": "Проверка эры считает запись рождённой от B1, если ссылки series или lift.record указывают на адреса B1 (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
-"kind": "om-owner-decision",
-"writers": [],
-"readers": [
-{
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
-"fields": [
-"owner"
-],
-"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
-}
-]
-},
-{
 "kind": "om-series-applied",
 "writers": [],
 "readers": [
@@ -43739,17 +46431,57 @@
 ]
 },
 {
-"kind": "om-stop-review",
+"kind": "om-series-applied",
 "writers": [],
 "readers": [
 {
-"node": "om.c.accept",
-"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"node": "om.s.close",
+"code": "src/om/model-call.ts:3458 (readCompletionCause); src/om/model-call.ts:3597 (prepareCompletionCause)",
 "fields": [
-"owner"
+"decisions",
+"prepared",
+"previous"
 ],
-"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
-"sure": false
+"expects": "Прекращение управляемой работы (причина «допуск серии изменился») читает применение и доказывает, что оригинальный допуск линии снят именно доказанным применением после него",
+"sure": true
+},
+{
+"node": "om.s.recover",
+"code": "src/om/model-call.ts:1440 (prepareModelTerminalWitness)",
+"fields": [
+"decisions",
+"previous"
+],
+"expects": "Восстановление потерянного вызова ищет терминального свидетеля: применение, следующее за оригинальным допуском попытки, по которому вызов можно закрыть как прерванный",
+"sure": true
+}
+]
+},
+{
+"kind": "om-series-current",
+"writers": [],
+"readers": [
+{
+"node": "om.s.close",
+"code": "src/om/model-call.ts:3460 (readCompletionCause); src/om/model-call.ts:3592 (prepareCompletionCause)",
+"fields": [
+"applied",
+"previous",
+"series"
+],
+"expects": "Прекращение управляемой работы читает указатель: строка блока должна показывать другую линию или участие не active, иначе причина «допуск серии изменился» отвергается",
+"sure": true
+},
+{
+"node": "om.s.recover",
+"code": "src/om/model-call.ts:1440 (prepareModelTerminalWitness)",
+"fields": [
+"applied",
+"previous",
+"series"
+],
+"expects": "Восстановление потерянного вызова берёт голову указателя как «текущее» применение и сравнивает с оригинальным допуском",
+"sure": true
 }
 ]
 }
