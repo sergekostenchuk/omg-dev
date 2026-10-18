@@ -1,5 +1,5 @@
 {
-"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1",
+"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0",
 "generatedFrom": "om/module d8028bf; kinds-early.json; db-census.json",
 "tables": [
 {
@@ -398,8 +398,8 @@
 "fields": [
 "запись (поля не уточнены)"
 ],
-"expects": "Старт уточнения читает папку проекта",
-"sure": true
+"expects": "Старт уточнения читает папку проекта (сверка R0 18.10: для R0 begin возвращается раньше, finish читает workspace только при level ≠ R0 — путь не R0)",
+"sure": false
 },
 {
 "node": "om.r0.finish",
@@ -407,8 +407,8 @@
 "fields": [
 "запись (поля не уточнены)"
 ],
-"expects": "Завершение уточнения читает черновик и папку",
-"sure": true
+"expects": "Завершение уточнения читает черновик и папку (сверка R0 18.10: для R0 begin возвращается раньше, finish читает workspace только при level ≠ R0 — путь не R0)",
+"sure": false
 },
 {
 "node": "run.a.wt",
@@ -5227,6 +5227,39 @@
 ],
 "expects": "Драфт стадии принадлежит этой стадии, его поля равны принятым, версия контракта известна, вопросы и входы заданы явно.",
 "sure": false
+},
+{
+"node": "om.r0.draft",
+"code": "src/discovery/derived-draft.ts:31 (derivedDraft)",
+"fields": [
+"вся запись"
+],
+"expects": "Если derived-research:<проект>:R0 уже есть и совпадает с новым содержимым (без createdAt), возвращается он же без новой записи; иначе новая версия пишется поверх прочитанной (expected = её версия)",
+"sure": true
+},
+{
+"node": "om.b1.horizon",
+"code": "src/om/horizon.ts:235 (exactClosure); src/om/horizon.ts:313 (readRefinement)",
+"fields": [
+"projectId",
+"stage",
+"level",
+"consumer",
+"contractVersion"
+],
+"expects": "Черновик из цепочки доказательств прежнего L2 читается по точной версии и хэшу. Для фазы R0 это именно derived-research:<проект>:R0, стадия om-g2, уровень R0, потребитель compilation, версия контракта 2 (horizon_refinement_unproven иначе)",
+"sure": true
+},
+{
+"node": "om.r0.begin",
+"code": "src/product/stage-checks.ts:256 (StageChecks.validateStage)",
+"fields": [
+"projectId",
+"stage",
+"fields"
+],
+"expects": "Проверка фич при старте R0 (pipeline.inspect) читает для каждой из пяти ранних стадий её черновик Discovery: стадия и проект те же, поля равны полям стадии (discovery_foreign иначе). Это чтение черновиков ранних стадий, а не производного черновика R0",
+"sure": false
 }
 ]
 },
@@ -9789,6 +9822,40 @@
 ],
 "expects": "Принятая стадия execution проверяется против запечатанной версии compilation: коммиты исполнения не делают историю R3 устаревшей",
 "sure": false
+},
+{
+"node": "om.r0.read",
+"code": "src/graph/refinement.ts:62 (Refinement.#r0Entries); src/graph/refinement.ts:63 (Refinement.#r0Entries)",
+"fields": [
+"content.fields",
+"версия и хэш"
+],
+"expects": "Обе стадии, discovery и concept, существуют (r0_inputs_missing иначе). Берутся поля content.fields.preparation.actors / outcomes / journeys / externalSystems стадии discovery и content.fields.conceptSections стадии concept; принятость проверяется следом, в deriveFields",
+"sure": true
+},
+{
+"node": "om.r0.draft",
+"code": "src/discovery/derived-draft.ts:16 (deriveFields)",
+"fields": [
+"status",
+"content.fields",
+"версия и хэш"
+],
+"expects": "Источник — стадия этого проекта, принятая, с той же версией и хэшем, что в ссылке (derivation_stale иначе); путь поля есть в content (derivation_field_missing иначе); значение копируется в черновик каноническим JSON",
+"sure": true
+},
+{
+"node": "om.r0.finish",
+"code": "src/graph/refinement.ts:45 (Refinement.#inputs); src/graph/refinement.ts:62 (Refinement.#r0Entries); src/discovery/derived-draft.ts:16 (deriveFields)",
+"fields": [
+"status",
+"inputs",
+"proofs",
+"content.fields",
+"версия и хэш"
+],
+"expects": "Фичи приняты и актуальны вместе со всей цепочкой стадий (features_not_ready иначе); значения черновика равны заново выведенным из принятых discovery и concept (research_contract_mismatch, derivation_stale иначе)",
+"sure": true
 }
 ]
 },
@@ -17782,6 +17849,26 @@
 ],
 "expects": "Перед ревью проверяется бюджет допуска; разъяснение владельца идёт и в запрос ревьюера",
 "sure": false
+},
+{
+"node": "om.r0.begin",
+"code": "src/discovery/reader-pilot.ts:154 (assertPilotBoundary); src/discovery/reader-pilot.ts:139 (readerPilot); src/discovery/reader-pilot.ts:155 (assertPilotBoundary)",
+"fields": [
+"active",
+"вся запись"
+],
+"expects": "Если запись есть, она своего проекта и проходит схему (reader_pilot_invalid иначе); при политике, остановка которой не L2, нужен действующий пилот (phase_protections_missing)",
+"sure": true
+},
+{
+"node": "om.r0.finish",
+"code": "src/discovery/reader-pilot.ts:154 (assertPilotBoundary); src/discovery/reader-pilot.ts:139 (readerPilot); src/discovery/reader-pilot.ts:155 (assertPilotBoundary)",
+"fields": [
+"active",
+"вся запись"
+],
+"expects": "То же, что при старте R0: запись пилота читается снова перед сохранением отметки",
+"sure": true
 }
 ]
 },
@@ -17911,6 +17998,24 @@
 "stopAfter"
 ],
 "expects": "Исполнение за границей compilation разрешено только политикой, которая останавливает ровно на compilation, и допуском на точный план",
+"sure": true
+},
+{
+"node": "om.r0.begin",
+"code": "src/discovery/reader-pilot.ts:153 (assertPilotBoundary); src/discovery/phase-policy.ts:19 (phasePolicy)",
+"fields": [
+"stopAfter"
+],
+"expects": "Граница продолжения проверяется до любой работы. R0 в перечни запрещённых фаз не входит, но политика с остановкой не на L2 требует действующего reader-pilot (phase_protections_missing); неполная или чужая запись — phase_policy_invalid",
+"sure": true
+},
+{
+"node": "om.r0.finish",
+"code": "src/discovery/reader-pilot.ts:153 (assertPilotBoundary); src/discovery/phase-policy.ts:19 (phasePolicy)",
+"fields": [
+"stopAfter"
+],
+"expects": "То же, что при старте: граница читается снова перед сохранением отметки (R0 не запрещён ни одной политикой)",
 "sure": true
 }
 ]
@@ -21303,6 +21408,24 @@
 ],
 "expects": "Граф плана равен снимку графа в плане; из него выводятся обязательства задач (task_obligation_plan_foreign иначе)",
 "sure": true
+},
+{
+"node": "om.r0.finish",
+"code": "src/graph/refinement.ts:104 (Refinement.finishResearch); src/graph/refinement.ts:132 (Refinement.finishResearch)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Голова графа читается в начале завершения и входит охраной в запись отметки: если граф изменился до записи — input_stale. Если графа нет, охраны нет",
+"sure": true
+},
+{
+"node": "om.r0.begin",
+"code": "src/graph/repository.ts:130 (GraphRepository.layerGate)",
+"fields": [
+"вся запись"
+],
+"expects": "Проверка фич при старте R0 сверяет печати слоя graph-layer:1 с графом: проекция графа на уровень слоя должна давать записанный в печати хэш (graph_layer_unproven иначе)",
+"sure": false
 }
 ]
 },
@@ -21699,6 +21822,30 @@
 "layerProofs"
 ],
 "expects": "Карта привязана к L1 (graph-layer:<проект>:1): поля узлов равны хэшам обязательств, печать L1 равна хэшу проекции, входы покрывают доказательства.",
+"sure": false
+},
+{
+"node": "om.r0.begin",
+"code": "src/product/stage-checks.ts:354 (StageChecks.validateStage); src/graph/repository.ts:125 (GraphRepository.layerGate)",
+"fields": [
+"projection",
+"inputs",
+"obligations",
+"layerProofs"
+],
+"expects": "Проверка стадии features при старте R0 читает graph-layer:<проект>:1: слой есть (иначе feature_binding_missing / graph_layer_stale), его проекция содержит результаты, названные фичами (feature_outcome_missing иначе), а печати, обязательства и входы слоя ещё верны",
+"sure": false
+},
+{
+"node": "om.r0.finish",
+"code": "src/product/stage-checks.ts:354 (StageChecks.validateStage); src/graph/repository.ts:125 (GraphRepository.layerGate)",
+"fields": [
+"projection",
+"inputs",
+"obligations",
+"layerProofs"
+],
+"expects": "То же при завершении R0: проверка фич снова читает graph-layer:<проект>:1 и все его печати",
 "sure": false
 }
 ]
@@ -28013,6 +28160,204 @@
 "sure": false
 }
 ]
+},
+{
+"kind": "phase",
+"group": "om",
+"idPattern": "phase:<проект>:<фаза> (R0, L1, R1, L2, R2, L3)",
+"proposed": false,
+"card": {
+"what": "Отметка («печать») о том, что фаза прежнего маршрута уточнения завершена. В ней записано, какой результат фазы принят (производный или исследовательский черновик у R0, R1, R2; слой графа у L1, L2, L3) и полный список записей-оснований с точными версиями и хэшами. Здесь главным образом описана первая отметка, phase:<проект>:R0 — итог подблока «Продуктовая основа».",
+"where": "Таблица revisions · вид «phase» · id phase:<проект>:<фаза> (R0, L1, R1, L2, R2, L3)",
+"when": "Один раз на фазу и проект. R0 пишет команда finish-research уровня R0 после begin-research R0: движок проверяет, что фичи приняты, производный черновик актуален, его значения равны заново выведенным, а входы не изменились, и сохраняет отметку с версией контракта 2, ссылкой на черновик derived-research:<проект>:R0 и пустым слоем. Точный повтор (та же ожидаемая версия, те же значения) возвращает прежнюю версию без новой записи. Остальные фазы пишет тот же код (finish-research для R1 и R2, seal-layer для L1–L3), но отдельных узлов у них на схеме нет. В рабочей базе записаны R0, L1, R1 и L2, по одной версии каждая.",
+"why": "Это запись «фаза принята». Следующий шаг прежнего маршрута (печать L1) и проверки OM читают её, чтобы убедиться, что предыдущая фаза есть и ни одно её основание не изменилось. Когда горизонт OM опирается на прежнее уточнение L2, он читает всю цепочку R0, L1, R1, L2 как доказательство (вывод по horizon.ts).",
+"expects": "Читатели ждут: id = phase:<проект>:<фаза> и тот же projectId; phase из набора R0, L1, R1, L2 (горизонт OM другие не принимает); contractVersion равна 2 (записи без версии — только историческое чтение); inputs — список точных ссылок (id, версия, хэш), каждая из которых совпадает с текущей головой записи. У R0 и R1 задан draft и пуст layer, у L1 и L2 наоборот.",
+"risks": "Нет записи — phase_missing. Любое основание изменилось — phase_stale (target — id изменившейся записи). Основание изменилось прямо при записи — input_stale; запись не по текущей версии — revision_conflict. Следующая фаза не стартует, если предшественник записан без версии контракта 2 (refinement_upgrade_required), отсутствует или устарел (phase_not_ready). Горизонт OM при неверной форме или цепочке отказывает кодом horizon_refinement_unproven.",
+"size": "HX5: записей нет · рабочая база: 4 записи, 70 КБ, до 24 КБ на версию · R0 — одна запись на проект",
+"note": "Из шести фаз на схеме есть только R0 (узел om.r0.phase). R1, L1, L2, R2, L3 пишет тот же код (finishResearch, sealLayer) без своих узлов; их читатели (research-scope.ts, obligation-handoff.ts, task-obligations.ts, research-context.ts, preparation-run.ts) к R0 не относятся и здесь не размечены. В новом проходе (om-start) отметка R0 не создаётся; её читают проекция проекта и — только когда горизонт опирается на прежнее уточнение L2 — горизонт OM (вывод по run-bases.ts upperBasis и horizon.ts readRefinement)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "id проекта; горизонт OM сверяет его с проектом запроса",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "phase",
+"type": "string",
+"iface": false,
+"what": "R0, L1, R1, L2, R2 или L3; равна последней части id записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "contractVersion",
+"type": "number",
+"iface": true,
+"what": "Версия контракта уточнения. Сейчас 2 (REFINEMENT_CONTRACT_VERSION); у записей без неё — историческое чтение.",
+"writer": "Сохранить phase:<p>:R0 (om.r0.phase): всегда пишет 2.",
+"readers": "Печать следующей фазы (Refinement.#inputs; для R0 это печать L1 — om.l1) и горизонт OM (om.b1.horizon).",
+"expects": "Равна 2. Если у фазы 2, то и у каждой предыдущей фазы цепочки 2.",
+"risks": "Нет версии или другое число: новая фаза не стартует (refinement_upgrade_required); горизонт принимает отсутствие версии, но не иное число (horizon_refinement_unproven)."
+},
+{
+"path": "draft",
+"type": "Ref | null",
+"iface": true,
+"what": "Ссылка (id, версия, хэш) на результат исследования фазы. У R0 это производный черновик derived-research:<проект>:R0; у R1 и R2 — черновик с ответами модели; у L-фаз null.",
+"writer": "Сохранить phase:<p>:R0 (om.r0.phase): берёт ссылку на черновик, который проверило «finish-research» (om.r0.finish).",
+"readers": "Горизонт OM (om.b1.horizon): проверяет, что черновик входит в inputs и устроен как положено; проверка фазы Refinement.gate держит его в списке оснований.",
+"expects": "Ссылка на точную версию и хэш; черновик есть среди inputs; у R0 его id именно derived-research:<проект>:R0, стадия om-g2, уровень R0, потребитель compilation, версия контракта 2.",
+"risks": "Нет ссылки или черновик другой — horizon_refinement_unproven (поле draft). Черновик изменился после записи — phase_stale при ближайшей проверке."
+},
+{
+"path": "layer",
+"type": "Ref | null",
+"iface": true,
+"what": "Ссылка на слой графа, запечатанный фазой L1, L2 или L3. У R0 и R1 всегда null.",
+"writer": "Сохранить phase:<p>:R0 (om.r0.phase) пишет null; слои запечатывает seal-layer (отдельного узла на схеме нет).",
+"readers": "Горизонт OM (om.b1.horizon) для L1 и L2; основания прохода (om.b1.save) для L2 и L3.",
+"expects": "У R0 и R1 — null; у L-фаз — ссылка, которая входит и в inputs.",
+"risks": "layer не пуст у R0 или пуст у L1/L2 — horizon_refinement_unproven. L3 называет не текущую голову graph-layer:3 — run_bases_basis_stale."
+},
+{
+"path": "inputs",
+"type": "Ref[]",
+"iface": true,
+"what": "Полный список точных ссылок на все записи, на которых держится фаза. У R0: цепочка стадий features … discovery и их доказательства, производный черновик R0 и принятые discovery и concept, из которых он выведен (вывод по finishResearch и pipeline.inspect).",
+"writer": "Сохранить phase:<p>:R0 (om.r0.phase): сохраняет список из охран фич и охран проверки черновика, собранный в «finish-research» (om.r0.finish).",
+"readers": "Проверка фазы Refinement.gate (om.l1, om.l2.obl, run.s.repair, in.a.a6); горизонт OM (om.b1.horizon) собирает по этому списку замкнутую цепочку доказательств.",
+"expects": "Каждая ссылка совпадает с текущей головой записи (id, версия, хэш); записи вида source ещё актуальны; каждая читается по своей версии.",
+"risks": "Любая запись изменилась — phase_stale. При самой записи устаревший вход даёт input_stale. В горизонте нет записи или другой хэш — horizon_refinement_unproven."
+},
+{
+"path": "carried",
+"type": "CarriedObligation[]",
+"iface": false,
+"what": "Переносимые обязательства R2; пишется только у R2 с политикой обязательств, у R0 нет",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "carriedContract",
+"type": "string",
+"iface": false,
+"what": "Всегда «r3-v1»; бывает только вместе с carried",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "taskObligationContract",
+"type": "string",
+"iface": false,
+"what": "Только у L3, когда обязательства передаются задачам",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.r0.phase",
+"code": "src/graph/refinement.ts:42 (Refinement.#milestone); src/graph/refinement.ts:129 (Refinement.finishResearch)",
+"when": "finish-research уровня R0 — после проверок черновика, равенства производных значений и актуальности входов. Точный повтор той же отметки (ожидаемая версия равна текущей и значение то же) новую версию не пишет; иначе версия +1 с охранами на все входы и на голову графа",
+"fields": [
+"projectId",
+"phase",
+"contractVersion",
+"inputs",
+"draft",
+"layer"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.r0.phase",
+"code": "src/graph/refinement.ts:37 (Refinement.#milestone)",
+"fields": [
+"вся запись"
+],
+"expects": "Перед записью читается предыдущая версия: если ожидаемая версия равна её версии и значение совпало — возвращается она же; иначе пишется следующая (revision_conflict, если версия чужая)",
+"sure": true
+},
+{
+"node": "om.b1.horizon",
+"code": "src/om/horizon.ts:235 (exactClosure); src/om/horizon.ts:265 (readRefinement); src/om/queue.ts:277 (refinementGuards)",
+"fields": [
+"contractVersion",
+"draft",
+"inputs",
+"layer",
+"phase",
+"projectId"
+],
+"expects": "Прежнее уточнение L2 читается с полной цепочкой R0, L1, R1, L2. В каждой фазе: тот же проект, id = phase:<проект>:<фаза>, версия контракта 2 или нет; у фаз после R0 с версией 2 ровно один предшественник в inputs, тоже версии 2; у R0 и R1 есть черновик и пуст layer (у R0 черновик именно derived-research:<проект>:R0); у L1 и L2 есть слой с той же проекцией. Нарушение — horizon_refinement_unproven",
+"sure": true
+},
+{
+"node": "om.b1.save",
+"code": "src/om/run-bases.ts:190 (upperBasis); src/om/run-bases.ts:260 (worksLayer3)",
+"fields": [
+"layer"
+],
+"expects": "Если L2 не принят новым маршрутом, верхняя основа берёт прежнюю фазу L2; фаза L3 обязана называть текущую голову graph-layer:3 (run_bases_basis_stale иначе)",
+"sure": true
+},
+{
+"node": "in.a.a6",
+"code": "src/product/engine.ts:147 (ProductEngine.projection)",
+"fields": [
+"вся запись"
+],
+"expects": "Проекция проекта отдаёт каждую фазу кроме R3: запись (или пусто) и результат Refinement.gate; отказа нет — находки показываются в ответе",
+"sure": true
+},
+{
+"node": "om.l2.obl",
+"code": "src/om/frame-obligations.ts:905 (prepareLayerAcceptance); src/om/frame-obligations.ts:949 (prepareFrame); src/graph/refinement.ts:177 (Refinement.gate)",
+"fields": [
+"phase",
+"inputs"
+],
+"expects": "Приём кадра при прежнем L2 (и слоёв, созданных исследованием) требует, чтобы Refinement.gate не нашёл расхождений во всей цепочке R0 … L2; находка превращается в frame_basis_unproven",
+"sure": false
+},
+{
+"node": "run.s.repair",
+"code": "src/product/repairs.ts:120 (PlanRepairs.#prepare); src/graph/refinement.ts:177 (Refinement.gate)",
+"fields": [
+"phase",
+"inputs"
+],
+"expects": "Ремонт плана выбирает глубину: если Refinement.gate(L2) (с цепочкой R0 … L2) нашёл расхождения — начинает с R1, иначе с R2. Для OM-проектов путь закрыт (legacy_route_closed, repairs.ts:88)",
+"sure": false
+},
+{
+"node": "om.l1",
+"code": "src/graph/refinement.ts:53 (Refinement.#inputs); src/graph/refinement.ts:177 (Refinement.gate)",
+"fields": [
+"contractVersion",
+"phase",
+"inputs"
+],
+"expects": "Печать L1 прежнего маршрута (seal-layer L1) требует, чтобы R0 был, был актуален (phase_not_ready иначе) и записан с версией контракта 2 (refinement_upgrade_required иначе). Отдельного узла у этого шага на схеме нет — отнесён к карте L1, где его описывает схема",
+"sure": false
+}
+]
 }
 ],
 "pending": [
@@ -28240,32 +28585,6 @@
 "вся запись"
 ],
 "expects": "Подтверждение task-result принимается как историческое: замороженная запись, а не текущая голова",
-"sure": true
-}
-]
-},
-{
-"kind": "phase",
-"writers": [],
-"readers": [
-{
-"node": "om.b1.horizon",
-"code": "src/om/horizon.ts:265 (readRefinement)",
-"fields": [
-"layer",
-"draft",
-"inputs"
-],
-"expects": "Прежнее уточнение L2 (phase:<проект>:L2) читается с полной цепочкой доказательств R0, L1, R1, L2.",
-"sure": true
-},
-{
-"node": "om.b1.save",
-"code": "src/om/run-bases.ts:190 (upperBasis); src/om/run-bases.ts:260 (worksLayer3)",
-"fields": [
-"layer"
-],
-"expects": "Если L2 не принят новым маршрутом, верхняя основа берёт прежнюю фазу L2; фаза L3 обязана называть текущую голову graph-layer:3.",
 "sure": true
 }
 ]

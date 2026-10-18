@@ -43,3 +43,7 @@
 - om.b1.save: writeRunBases run-bases.ts:454 (на карте 423 = chain()); своей записи у узла нет — пишет om-input, om-run, horizon, gap общих производителей.
 - om.b1.gaps: управляемые основания — managedStage в run-bases.ts (модуль узла save); в рабочей базе не исполнялся (legacy).
 - Сдвиги строк: startRun run.ts:374, buildOmInput input.ts:163, selectMachinePath queue.ts:204.
+- om.r0.read: «читает accepted» — #r0Entries проверяет только наличие стадий (r0_inputs_missing); принятость — deriveFields (derivation_stale) в узле draft.
+- om.r0.begin: перед работой читает ещё phase-policy и reader-pilot — на карте нет.
+- begin-research / finish-research (engine.ts:337–338) не проверяют legacy_route_closed: R0 можно записать после первого OM-ввода (вывод).
+- om.r0.finish: ссылка на строку — refinement.ts:102.
