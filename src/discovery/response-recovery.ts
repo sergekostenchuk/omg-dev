@@ -1,4 +1,5 @@
 import { prepareResearchEnvelope } from './research-protocol.js';
+import { readRequestWire } from './request-parts.js';
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, deliveredConceptSections,
   EARLY_RESEARCH_OUTCOME, requireEscalationReply, researchCapacityInput, declareResultCapacity,
@@ -2247,6 +2248,36 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
       || canonical(reference(claim)) !== canonical(intent.value.call))
       consumerInvalid(intent.id, 'The no-response terminal does not follow its exact physical claim');
     const requestRef = call.value.request.record, archiveRef = call.value.packet?.archive;
+    if (isRef(requestRef) && requestRef.id.startsWith("request-manifest:")) {
+      let provenRequest: ReturnType<typeof readRequestWire>;
+      try {
+        provenRequest = readRequestWire(store, requestRef, {
+          projectId,
+          draftId: intent.value.draft.id,
+          requestId: call.value.requestId,
+        });
+      } catch {
+        consumerInvalid(intent.id, 'The no-response terminal lost its exact request or archive');
+      }
+      const archive = isRef(archiveRef) ? store.get<Record<string, any>>(archiveRef.id, archiveRef.revision) : null;
+      if (!archive || archive.kind !== 'research-context'
+        || canonical(requestRef) !== canonical(intent.value.request)
+        || canonical(reference(archive)) !== canonical(intent.value.archive))
+        consumerInvalid(intent.id, 'The no-response terminal lost its exact request or archive');
+      if (digest(provenRequest.text) !== call.value.request.hash
+        || provenRequest.text.length !== call.value.request.chars
+        || Buffer.byteLength(provenRequest.text) !== call.value.request.bytes)
+        consumerInvalid(intent.id, 'The no-response terminal request bytes differ from physical record');
+      let envelope: any;
+      try { envelope = JSON.parse(provenRequest.text); } catch { consumerInvalid(intent.id, 'The original request envelope is invalid'); }
+      if (!object(envelope) || envelope.protocol !== 'omg-agent/v1' || envelope.mode !== 'research'
+        || envelope.requestId !== call.value.requestId || !object(envelope.subject)
+        || canonical(envelope.subject.working?.archive ?? null) !== canonical(archiveRef))
+        consumerInvalid(intent.id, 'The no-response terminal belongs to another request');
+      return { kind: 'terminal', code: call.value.error!, intent, call, request: requestRef,
+        response: null, archive: archiveRef!, subject: envelope.subject, prompt: envelope.prompt,
+        guards: uniqueTransactionGuards([reference(intent), reference(call), requestRef, archiveRef!, ...provenRequest.partGuards, ...intent.value.guards]) };
+    }
     const request = isRef(requestRef) ? store.get<{projectId:string;draftId:string;text:string}>(requestRef.id, requestRef.revision) : null;
     const archive = isRef(archiveRef) ? store.get<Record<string,any>>(archiveRef.id, archiveRef.revision) : null;
     if (!request || !archive || request.kind !== 'model-request' || archive.kind !== 'research-context'
@@ -2269,26 +2300,53 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
   if (!isRef(requestRef) || !isRef(responseRef) || !isRef(archiveRef)
     || canonical(requestRef) !== canonical(intent.value.request) || canonical(archiveRef) !== canonical(intent.value.archive))
     consumerInvalid(intent.id, 'The paid request, response or original context archive is missing');
-  const request = store.get<{projectId:string;draftId:string;text:string}>(requestRef.id, requestRef.revision);
-  const response = store.get<Record<string, any>>(responseRef.id, responseRef.revision);
-  const archive = store.get<Record<string, any>>(archiveRef.id, archiveRef.revision);
-  if (!request || request.kind !== 'model-request' || canonical(reference(request)) !== canonical(requestRef)
-    || !response || response.kind !== 'model-response' || canonical(reference(response)) !== canonical(responseRef)
+  let requestText: string;
+  let partGuards: Ref[] = [];
+  let response: Revision<Record<string, any>> | null;
+  let archive: Revision<Record<string, any>> | null;
+  if (requestRef.id.startsWith("request-manifest:")) {
+    let provenRequest: ReturnType<typeof readRequestWire>;
+    try {
+      provenRequest = readRequestWire(store, requestRef, {
+        projectId,
+        draftId: intent.value.draft.id,
+        requestId: call.value.requestId,
+      });
+    } catch {
+      consumerInvalid(intent.id, 'The exact saved wire records or archive are missing or foreign');
+    }
+    response = store.get<Record<string, any>>(responseRef.id, responseRef.revision);
+    archive = store.get<Record<string, any>>(archiveRef.id, archiveRef.revision);
+    requestText = provenRequest.text;
+    partGuards = provenRequest.partGuards;
+  } else {
+    const request = store.get<{projectId:string;draftId:string;text:string}>(requestRef.id, requestRef.revision);
+    response = store.get<Record<string, any>>(responseRef.id, responseRef.revision);
+    archive = store.get<Record<string, any>>(archiveRef.id, archiveRef.revision);
+    if (!request || request.kind !== 'model-request' || canonical(reference(request)) !== canonical(requestRef)
+      || hashJson(request.value) !== request.hash
+      || request.value.projectId !== projectId
+      || request.value.draftId !== intent.value.draft.id
+      || typeof request.value.text !== 'string')
+      consumerInvalid(intent.id, 'The exact saved wire records or archive are missing or foreign');
+    requestText = request.value.text;
+  }
+  if (!response || response.kind !== 'model-response' || canonical(reference(response)) !== canonical(responseRef)
     || !archive || archive.kind !== 'research-context' || canonical(reference(archive)) !== canonical(archiveRef)
-    || hashJson(request.value) !== request.hash || hashJson(response.value) !== response.hash || hashJson(archive.value) !== archive.hash
-    || request.value.projectId !== projectId || response.value.projectId !== projectId
-    || request.value.draftId !== intent.value.draft.id || response.value.draftId !== intent.value.draft.id
+    || hashJson(response.value) !== response.hash || hashJson(archive.value) !== archive.hash
+    || response.value.projectId !== projectId
+    || response.value.draftId !== intent.value.draft.id
     || !object(archive.value) || !object(archive.value.body) || !isRef(archive.value.draft) || !isRef(archive.value.question)
     || canonical(archive.value.draft) !== canonical(intent.value.draft)
     || canonical(archive.value.question) !== canonical(intent.value.question)
-    || typeof request.value.text !== 'string' || typeof response.value.text !== 'string')
+    || typeof response.value.text !== 'string')
     consumerInvalid(intent.id, 'The exact saved wire records or archive are missing or foreign');
-  if (digest(request.value.text) !== call.value.request.hash || request.value.text.length !== call.value.request.chars
-    || Buffer.byteLength(request.value.text) !== call.value.request.bytes
+  if (digest(requestText) !== call.value.request.hash || requestText.length !== call.value.request.chars
+    || Buffer.byteLength(requestText) !== call.value.request.bytes
     || response.value.text.length !== call.value.response!.chars || Buffer.byteLength(response.value.text) !== call.value.response!.bytes)
     consumerInvalid(intent.id, 'The paid request or response bytes differ from their physical record');
   let envelope: unknown;
-  try { envelope = JSON.parse(request.value.text); }
+  try { envelope = JSON.parse(requestText); }
   catch { consumerInvalid(intent.id, 'The exact saved request envelope is invalid'); }
   if (!object(envelope) || !object(envelope.subject) || typeof envelope.prompt !== 'string'
     || envelope.protocol !== 'omg-agent/v1' || envelope.mode !== 'research' || envelope.requestId !== call.value.requestId
@@ -2321,7 +2379,7 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     consumerInvalid(intent.id, 'The paid reader request belongs to another source selection');
   physicalExecution(store, call, response.value, 'consumerExecution', 'consumerIntent', 'research-consumer-execution/v1');
   const guards = uniqueTransactionGuards([reference(intent), reference(call), requestRef, responseRef, archiveRef,
-    ...intent.value.guards]);
+    ...partGuards, ...intent.value.guards]);
   const base = { intent, call, request: requestRef, response: responseRef, archive: archiveRef,
     subject: envelope.subject, prompt: envelope.prompt, guards };
   if (call.value.status === 'failed') {
@@ -2885,10 +2943,21 @@ function researchExecution(store: Store, project: string, callRef: Ref,
       && record.value.draftId === draft.id && typeof record.value.text === 'string', 'response_recovery_wire_invalid', 'A saved wire identity is missing or foreign');
     return record.value;
   };
-  const requestValue = read(requestRef, 'model-request'),
-    responseValue = controlTerminal ? null : read(responseRef!, 'model-response');
-  const requestText = requestValue.text as string,
-    responseText = responseValue ? responseValue.text as string : null;
+  let requestText: string;
+  if (requestRef.id.startsWith("request-manifest:")) {
+    const requestWire = readRequestWire(store, requestRef, {
+      projectId: project,
+      draftId: draft.id,
+      requestId: call.value.requestId,
+      errorCode: 'response_recovery_wire_invalid',
+    });
+    requestText = requestWire.text;
+  } else {
+    const requestValue = read(requestRef, 'model-request');
+    requestText = requestValue.text as string;
+  }
+  const responseValue = controlTerminal ? null : read(responseRef!, 'model-response');
+  const responseText = responseValue ? responseValue.text as string : null;
   requireCondition(digest(requestText) === call.value.request.hash && requestText.length === call.value.request.chars
     && Buffer.byteLength(requestText) === call.value.request.bytes
     && (controlTerminal || responseText !== null && responseText.length === call.value.response!.chars

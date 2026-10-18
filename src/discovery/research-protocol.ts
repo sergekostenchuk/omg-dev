@@ -37,16 +37,18 @@ import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply } from './research-consumer-transition.js';
 import { earlyResearchStage, requireResultCapacity, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS } from './early-research-outcome.js';
 import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite } from '../om/run-control.js';
+import { REQUEST_MANIFEST_CONTRACT, prepareRequestPartsAndManifest, partitionResearchWire } from './request-parts.js';
 
 export { researchAction } from './research-consumer-transition.js';
 
-interface ResearchCallAudit {
+export interface ResearchCallAudit {
   store: Store; draftId: string; purpose: string; questionId?: string; pilot?: Revision<ReaderPilot>;
   session?: Ref; onContext?: (context: Record<string, any>) => void;
   application?: Ref; prepareCall?: (call: Write) => { writes: Write[]; guards: TransactionGuard[] };
   consumerIntent?: Ref;
   /** Virtual producer only inside the no-dispatch preview scope. */
   previewIntent?: Revision<ResearchConsumerIntent>;
+  requestContract?: string;
 }
 type AssessmentReservation = { kind: 'replay-only' } | {
   kind: 'application'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
@@ -152,7 +154,8 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
  * Preflight may save a content-addressed archive, never a call or usage. */
 export function prepareResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
   context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot'>,
-  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000') {
+  capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
+  requestContract?: string) {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
   const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
     audit.questionId, audit.purpose, role.actor) : null;
@@ -182,7 +185,12 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   let subject = subjectFor(subjectLimit);
   const physicalLimit = Math.min(requestLimit, audit?.pilot?.value.physicalLimits?.maxRequestChars ?? requestLimit);
   if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
-  let input = JSON.stringify({ ...envelope, subject });
+  const canonicalWire = JSON.stringify({ ...envelope, subject });
+  let input = canonicalWire;
+  if (requestContract === REQUEST_MANIFEST_CONTRACT) {
+    requireCondition(partitionResearchWire(envelope, subject).join('') === canonicalWire,
+      'request_manifest_invalid', 'The wire manifest parts must match the canonical envelope');
+  }
   // Keep RD2b's measured transport adjustment in the single real builder used
   // by both preflight and dispatch; the result marker is already in subject.
   for (let attempt = 0; packetState && input.length > physicalLimit && attempt < 4; attempt += 1) {
@@ -190,6 +198,10 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
     subject = subjectFor(subjectLimit);
     if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
     input = JSON.stringify({ ...envelope, subject });
+    if (requestContract === REQUEST_MANIFEST_CONTRACT) {
+      requireCondition(partitionResearchWire(envelope, subject).join('') === input,
+        'request_manifest_invalid', 'The wire manifest parts must match the canonical envelope');
+    }
   }
   if (capacity !== undefined) requireCondition(recordValue(subject) && Object.hasOwn(subject, 'resultCapacity')
     && canonical(subject.resultCapacity) === canonical(capacity),
@@ -253,6 +265,20 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       'research_consumer_intent_invalid', 'The unsent intent must preserve its exact original prompt and consumer context');
     }
   }
+  const requestContract = audit?.requestContract;
+  if (requestContract !== undefined) {
+    requireCondition(
+      requestContract === REQUEST_MANIFEST_CONTRACT,
+      'request_contract_invalid',
+      `Unsupported or unknown request contract: ${String(requestContract)}`
+    );
+    requireCondition(
+      consumerIntent !== null && consumerIntent.value.kind === 'analyst',
+      'request_contract_unsupported',
+      'The wire manifest contract is only supported for analyst consumer intents'
+    );
+  }
+  const useWireManifest = requestContract === REQUEST_MANIFEST_CONTRACT;
   const assessment = assessmentReservation(audit, role, environment, context);
   // Direct callers may pass the saved base prompt. A new admission still sends
   // the same complete assessor instructions declared by the producer.
@@ -291,7 +317,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   if (consumerIntent?.value.cursor.resultCapacityContract !== undefined)
     requireResultCapacity(capacity, consumerResultCapacity(audit!.store, consumerIntent.value), audit!.store);
   const { packetState, subject, envelope, input, requestLimit } = prepareResearchEnvelope(role, environment,
-    prompt, context, audit, capacity, requestId);
+    prompt, context, audit, capacity, requestId, requestContract);
   if (capacity !== undefined) requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,
     'research_capacity_invalid', 'The actual role prompt differs from its predeclared result admission');
   audit?.onContext?.(subject as Record<string, any>);
@@ -345,6 +371,20 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     if(projectCounter)reservation.guards.push(reference(projectCounter));
     if(policy)reservation.guards.push(reference(policy));
   }
+  let manifestReservationResult: ReturnType<typeof prepareRequestPartsAndManifest> | null = null;
+  if (useWireManifest) {
+    manifestReservationResult = prepareRequestPartsAndManifest({
+      store: audit!.store,
+      projectId: environment.projectId,
+      draftId: audit!.draftId,
+      requestId,
+      envelope,
+      subject,
+      ...(consumerIntent ? { intentRef: reference(consumerIntent) } : {}),
+    });
+    reservation.writes.push(...manifestReservationResult.writes);
+    reservation.guards.push(...manifestReservationResult.guards);
+  }
   if (packetState) {
     const questionCounterId=`question-dispatch:${hashJson(audit!.questionId!)}`;
     const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number}>(questionCounterId);
@@ -357,8 +397,10 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     if(audit!.session) reservation.guards.push(audit!.session);
     const dispatch = continuationDispatch(packetState, callId);
     reservation.writes.push(...dispatch.writes); reservation.guards.push(...dispatch.guards,...(progress?.guards??[]));
-    reservation.writes.push({id:`model-request:${requestId}`,kind:"model-request",expected:0,
-      value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
+    if (!useWireManifest) {
+      reservation.writes.push({id:`model-request:${requestId}`,kind:"model-request",expected:0,
+        value:{projectId:environment.projectId,draftId:audit!.draftId,text:input}});
+    }
   }
   const ownership = audit ? physicalClaim() : null;
   const callWrite: Write = { id: callId, kind: "model-call", expected: 0,
@@ -372,8 +414,11 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       questionId: audit?.questionId ?? null,
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
       ...(runtime ? { runtime } : {}),
-      confirmed: { model: null, effort: null, speed: null }, request: { chars: input.length, bytes: Buffer.byteLength(input), hash: digest(input), ...(packetState ? {record:{id:`model-request:${requestId}`,revision:1,
-        hash:hashJson({projectId:environment.projectId,draftId:audit!.draftId,text:input})}} : {}) },
+      confirmed: { model: null, effort: null, speed: null }, request: { chars: input.length, bytes: Buffer.byteLength(input), hash: digest(input), ...(useWireManifest
+        ? { record: manifestReservationResult!.manifestRef }
+        : packetState
+          ? { record: { id: `model-request:${requestId}`, revision: 1, hash: hashJson({ projectId: environment.projectId, draftId: audit!.draftId, text: input }) } }
+          : {}) },
       ...(packetState ? {packet:{archive:(subject as any).working.archive,kind:packetState.initial?"initial":"continuation",maxChars:requestLimit}} : {}),
       response: null, usage: null, usageSource: "unavailable", error: null } };
   const originalCall = assessment ? canonical(callWrite) : '';

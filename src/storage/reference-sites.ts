@@ -172,6 +172,8 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "om-read-delivery", contract: null, data: [["data", "value"], ["data", "text"]] },
   { kind: "om-capacity-recovery", contract: "om-capacity-recovery/v1", data: [["delivery", "value"], ["delivery", "text"]] },
   { kind: "om-limited-call-retry-permit", contract: "om-limited-call-retry-permit/v1", data: [] },
+  { kind: "request-manifest", contract: "request-manifest/v1", data: [["wire"]], refs: [["parts", INDEX], ["intent"], ["call"]] },
+  { kind: "request-part", contract: "request-part/v1", data: [["text"]], refs: [] },
 ];
 
 const object = (value: unknown): value is Record<string, unknown> =>
