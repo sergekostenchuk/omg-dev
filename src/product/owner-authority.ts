@@ -48,7 +48,8 @@ export const OWNER_AUTHORITY_REFUSAL_CODES = Object.freeze([
   'owner_session_state_invalid', 'owner_authority_invalid', 'owner_authority_foreign',
 ] as const);
 export type OwnerAuthorityRefusalCode = typeof OWNER_AUTHORITY_REFUSAL_CODES[number];
-type DiscoveryChoiceAuthorityRefusalCode = OwnerAuthorityRefusalCode | 'discovery_choice_invalid';
+type DiscoveryChoiceAuthorityRefusalCode = OwnerAuthorityRefusalCode | 'discovery_choice_invalid'
+  | 'project_mode_invalid' | 'project_mode_stale';
 
 export interface OwnerSessionGrant {
   contract: typeof OWNER_GRANT_CONTRACT; id: string; database: string; project: string;
@@ -85,8 +86,9 @@ export function discoveryChoiceSessionId(grant: Ref): string {
 }
 
 class AuthorityFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
-function deny(code: DiscoveryChoiceAuthorityRefusalCode, target: string, field: string, message: string): never {
-  const result = refused(code, message, { unit: 'H2', target, field }, 'owner');
+function deny(code: DiscoveryChoiceAuthorityRefusalCode, target: string, field: string, message: string,
+  unit = 'H2'): never {
+  const result = refused(code, message, { unit, target, field }, 'owner');
   if (!result.ok) throw new AuthorityFailure(result.refusal);
   throw new EngineError('owner_authority_internal', 'Refusal unexpectedly produced a value');
 }
@@ -221,9 +223,9 @@ const OWNER_AUTHORITY_EXERCISE = OwnerAuthority.prototype.exercise;
  */
 export function requireOwnerAuthority(candidate: unknown, request: { store: Store; project: string; action: string }):
   OmResult<Sealed<{ session: Ref }>> {
-  if (candidate instanceof DiscoveryChoiceAuthority)
+  if (candidate instanceof DiscoveryChoiceAuthority || candidate instanceof ProjectModeAuthority)
     return refused('owner_authority_foreign',
-      'Discovery choice authority cannot authorize an owner-result action',
+      'A scoped owner authority cannot authorize an owner-result action',
       { unit: 'H2', target: 'authority', field: 'action' }, 'owner');
   if (!(candidate instanceof OwnerAuthority) || !AUTHORITIES.has(candidate))
     return refused('owner_authority_invalid',
@@ -317,7 +319,7 @@ export class OwnerSessions {
 const DISCOVERY_MINT = Symbol('discovery-choice-authority-mint');
 const DISCOVERY_AUTHORITIES = new WeakSet<DiscoveryChoiceAuthority>();
 
-const sameScope = (left: DiscoveryChoiceScope, right: DiscoveryChoiceScope): boolean =>
+const sameScope = (left: unknown, right: unknown): boolean =>
   hashJson(left) === hashJson(right);
 
 function requireDiscoveryScope(value: unknown, target = 'discovery-choice',
@@ -435,8 +437,8 @@ const DISCOVERY_AUTHORITY_EXERCISE = DiscoveryChoiceAuthority.prototype.exercise
 
 export function requireDiscoveryChoiceAuthority(candidate: unknown,
   request: { store: Store; action: string; scope: DiscoveryChoiceScope }): OmResult<Sealed<{ session: Ref }>> {
-  if (candidate instanceof OwnerAuthority)
-    return refused('owner_authority_foreign', 'Owner-result authority cannot authorize a Discovery choice',
+  if (candidate instanceof OwnerAuthority || candidate instanceof ProjectModeAuthority)
+    return refused('owner_authority_foreign', 'Another owner authority cannot authorize a Discovery choice',
       { unit: 'OC1', target: 'authority', field: 'action' }, 'owner');
   if (!(candidate instanceof DiscoveryChoiceAuthority) || !DISCOVERY_AUTHORITIES.has(candidate))
     return refused('owner_authority_invalid',
@@ -506,6 +508,247 @@ export class DiscoveryChoiceSessions {
       const closed: DiscoveryChoiceSession = { ...head.value, state: 'closed', closedAt: Date.now() };
       const written = take(writeGuarded<DiscoveryChoiceSession>(this.#store, { unit: 'OC1', target: head.id,
         writes: [{ id: head.id, kind: DISCOVERY_CHOICE_SESSION_KIND, expected: head.revision, value: closed }],
+        guards: [exactRef(reference(head))] }));
+      return { session: exactRef(reference(written[0]!)) };
+    });
+  }
+}
+
+/** DR1a: a separate authority branch for the owner project-mode decision — its own action, contracts and scope. */
+export const PROJECT_MODE_ACTION = 'project-mode';
+export const PROJECT_MODE_GRANT_CONTRACT = 'owner-session-grant/v3';
+export const PROJECT_MODE_SESSION_CONTRACT = 'owner-session/v3';
+export const PROJECT_MODE_GRANT_PREFIX = 'owner-project-mode-grant:';
+export const PROJECT_MODE_SESSION_PREFIX = 'owner-project-mode-session:';
+export const PROJECT_MODE_GRANT_KIND = 'owner-session-grant';
+export const PROJECT_MODE_SESSION_KIND = 'owner-session';
+export type ProjectMode = 'questions' | 'bypass';
+export interface ProjectModeScope { project: string; mode: ProjectMode; previous: Ref | null }
+export interface ProjectModeSessionGrant {
+  contract: typeof PROJECT_MODE_GRANT_CONTRACT; id: string; database: string;
+  action: typeof PROJECT_MODE_ACTION; method: typeof OWNER_PAIRING_METHOD; scope: ProjectModeScope;
+  issuedAt: number; expiresAt: number; proof: string;
+}
+export interface ProjectModeSession {
+  contract: typeof PROJECT_MODE_SESSION_CONTRACT; grant: Ref; database: string;
+  action: typeof PROJECT_MODE_ACTION; method: typeof OWNER_PAIRING_METHOD; scope: ProjectModeScope;
+  session: string; openedAt: number; expiresAt: number; state: 'open' | 'closed'; closedAt?: number;
+}
+
+export function projectModeSessionId(grant: Ref): string {
+  return `${PROJECT_MODE_SESSION_PREFIX}${hashJson({ id: grant.id, revision: grant.revision, hash: grant.hash })}`;
+}
+
+function denyMode(code: DiscoveryChoiceAuthorityRefusalCode, target: string, field: string,
+  message: string): never {
+  deny(code, target, field, message, 'DR1a');
+}
+
+function requireProjectModeScope(value: unknown, target = 'owner-project-mode',
+  code: DiscoveryChoiceAuthorityRefusalCode = 'project_mode_invalid'): ProjectModeScope {
+  if (!shape(value) || !isText(value.project)
+    || (value.mode !== 'questions' && value.mode !== 'bypass')
+    || (value.previous !== null && !isRef(value.previous))
+    || Object.keys(value).some(key => !['project', 'mode', 'previous'].includes(key)))
+    denyMode(code, target, 'scope',
+      'A project-mode scope names project, mode questions|bypass and the exact previous record or null only');
+  return { project: value.project as string, mode: value.mode as ProjectMode,
+    previous: value.previous === null ? null : exactRef(value.previous as Ref) };
+}
+
+function provenProjectModeGrant(record: Revision<ProjectModeSessionGrant>): Revision<ProjectModeSessionGrant> {
+  const value = record.value;
+  if (!shape(value) || value.contract !== PROJECT_MODE_GRANT_CONTRACT || !isText(value.id)
+    || record.id !== `${PROJECT_MODE_GRANT_PREFIX}${value.id}` || !isText(value.database)
+    || value.action !== PROJECT_MODE_ACTION || value.method !== OWNER_PAIRING_METHOD
+    || !Number.isSafeInteger(value.issuedAt) || !Number.isSafeInteger(value.expiresAt)
+    || value.expiresAt - value.issuedAt !== OWNER_GRANT_LIFETIME_MS
+    || typeof value.proof !== 'string' || !/^[a-f0-9]{64}$/.test(value.proof)
+    || !shape(value.scope) || Object.keys(value).some(key => !['contract', 'id', 'database', 'action', 'method',
+      'scope', 'issuedAt', 'expiresAt', 'proof'].includes(key)))
+    denyMode('owner_invitation_invalid', record.id, 'contract', 'A project-mode invitation keeps its complete v3 provenance');
+  requireProjectModeScope(value.scope, record.id, 'owner_invitation_invalid');
+  return record;
+}
+
+function provenProjectModeSession(record: Revision<ProjectModeSession>): Revision<ProjectModeSession> {
+  const value = record.value;
+  if (!shape(value) || value.contract !== PROJECT_MODE_SESSION_CONTRACT || !isRef(value.grant)
+    || record.id !== projectModeSessionId(value.grant) || !isText(value.database)
+    || value.action !== PROJECT_MODE_ACTION || value.method !== OWNER_PAIRING_METHOD || !isText(value.session)
+    || !Number.isSafeInteger(value.openedAt) || !Number.isSafeInteger(value.expiresAt)
+    || value.expiresAt - value.openedAt !== OWNER_SESSION_LIFETIME_MS
+    || (value.state !== 'open' && value.state !== 'closed')
+    || (value.state === 'closed' && !Number.isSafeInteger(value.closedAt))
+    || (value.state === 'open' && Object.hasOwn(value, 'closedAt')) || !shape(value.scope)
+    || Object.keys(value).some(key => !['contract', 'grant', 'database', 'action', 'method', 'scope', 'session',
+      'openedAt', 'expiresAt', 'state', 'closedAt'].includes(key)))
+    denyMode('owner_session_state_invalid', record.id, 'contract', 'A project-mode owner session keeps its complete v3 provenance');
+  requireProjectModeScope(value.scope, record.id, 'owner_session_state_invalid');
+  return record;
+}
+
+export function readProjectModeSessionGrant(store: Store, record: unknown):
+  OmResult<Sealed<Revision<ProjectModeSessionGrant>>> {
+  return run(() => provenProjectModeGrant(take(readRecord<ProjectModeSessionGrant>(store, record,
+    { unit: 'DR1a', target: isRef(record) ? record.id : 'grant', idPrefix: PROJECT_MODE_GRANT_PREFIX,
+      kind: PROJECT_MODE_GRANT_KIND }))));
+}
+
+export function readProjectModeSession(store: Store, record: unknown):
+  OmResult<Sealed<Revision<ProjectModeSession>>> {
+  return run(() => provenProjectModeSession(take(readRecord<ProjectModeSession>(store, record,
+    { unit: 'DR1a', target: isRef(record) ? record.id : 'session', idPrefix: PROJECT_MODE_SESSION_PREFIX,
+      kind: PROJECT_MODE_SESSION_KIND }))));
+}
+
+export function issueProjectModeInvitation(store: Store, request: unknown):
+  OmResult<Sealed<{ invitation: string; grant: Ref; expiresAt: number }>> {
+  return run(() => {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'A project-mode invitation needs a Store');
+    const scope = requireProjectModeScope(request);
+    const project = store.get(`project:${scope.project}`);
+    if (!project) denyMode('owner_project_missing', scope.project, 'project',
+      'A project-mode invitation is issued for an existing project only');
+    // A previous naming nothing stored would persist a dangling reference inside the grant.
+    const previous = scope.previous === null ? null : store.get(scope.previous.id, scope.previous.revision);
+    if (scope.previous !== null && (!previous || previous.hash !== scope.previous.hash))
+      denyMode('project_mode_stale', scope.project, 'previous', 'The named previous mode record is not stored');
+    const secret = randomBytes(32).toString('hex'), id = randomBytes(16).toString('hex'), issuedAt = Date.now();
+    const grant: ProjectModeSessionGrant = { contract: PROJECT_MODE_GRANT_CONTRACT, id,
+      database: store.databaseId, action: PROJECT_MODE_ACTION, method: OWNER_PAIRING_METHOD, scope,
+      issuedAt, expiresAt: issuedAt + OWNER_GRANT_LIFETIME_MS, proof: digest(secret) };
+    const written = take(writeGuarded<ProjectModeSessionGrant>(store, { unit: 'DR1a',
+      target: `${PROJECT_MODE_GRANT_PREFIX}${id}`,
+      writes: [{ id: `${PROJECT_MODE_GRANT_PREFIX}${id}`, kind: PROJECT_MODE_GRANT_KIND, expected: 0, value: grant }],
+      guards: [exactRef(reference(project))] }));
+    return { invitation: `${id}.${secret}`, grant: exactRef(reference(written[0]!)), expiresAt: grant.expiresAt };
+  });
+}
+
+const PROJECT_MODE_MINT = Symbol('project-mode-authority-mint');
+const PROJECT_MODE_AUTHORITIES = new WeakSet<ProjectModeAuthority>();
+
+export class ProjectModeAuthority {
+  readonly #sessions: ProjectModeSessions; readonly #store: Store; readonly #digest: string;
+  readonly #sessionId: string; readonly #scope: ProjectModeScope;
+  constructor(token: symbol, sessions: ProjectModeSessions, store: Store, bearerDigest: string,
+    sessionId: string, scope: ProjectModeScope) {
+    requireCondition(token === PROJECT_MODE_MINT, 'owner_authority_invalid',
+      'Project-mode authority is minted by its scoped session exchange only');
+    this.#sessions = sessions; this.#store = store; this.#digest = bearerDigest;
+    this.#sessionId = sessionId; this.#scope = scope; PROJECT_MODE_AUTHORITIES.add(this);
+  }
+  exercise(request: { store: Store; action: string; scope: ProjectModeScope }):
+    OmResult<Sealed<{ session: Ref; at: number }>> {
+    return run(() => {
+      if (!PROJECT_MODE_AUTHORITIES.has(this)) denyMode('owner_authority_invalid', 'authority', 'authority',
+        'Project-mode authority is an object of the closed scoped registry');
+      if (request.store !== this.#store || request.action !== PROJECT_MODE_ACTION
+        || !sameScope(request.scope, this.#scope))
+        denyMode('owner_authority_foreign', this.#sessionId, 'scope',
+          'Project-mode authority is bound to one Store and one exact mode decision');
+      const found = this.#store.get<ProjectModeSession>(this.#sessionId);
+      if (!found) denyMode('owner_session_missing', this.#sessionId, 'session', 'The project-mode owner session record is absent');
+      const session = provenProjectModeSession(found);
+      if (session.value.state !== 'open') denyMode('owner_session_revoked', this.#sessionId, 'session',
+        'The project-mode owner session is revoked');
+      if (this.#sessions.sessionOf(this.#digest) !== this.#sessionId)
+        denyMode('owner_session_missing', this.#sessionId, 'session', 'The project-mode owner session is not live in this process');
+      // The single checked instant of authorization — the decision record saves exactly this moment; it must lie
+      // inside the saved session window on both sides, so a clock behind openedAt writes nothing.
+      const now = Date.now();
+      if (now < session.value.openedAt) denyMode('owner_session_expired', this.#sessionId, 'session',
+        'The project-mode owner session is not yet open at this time');
+      if (session.value.expiresAt <= now) denyMode('owner_session_expired', this.#sessionId, 'session',
+        'The project-mode owner session has expired');
+      if (session.value.database !== this.#store.databaseId || !sameScope(session.value.scope, this.#scope))
+        denyMode('owner_authority_foreign', this.#sessionId, 'scope',
+          'The project-mode owner session is bound to another database or decision');
+      return { session: exactRef(reference(session)), at: now };
+    });
+  }
+}
+const PROJECT_MODE_AUTHORITY_EXERCISE = ProjectModeAuthority.prototype.exercise;
+
+export function requireProjectModeAuthority(candidate: unknown,
+  request: { store: Store; action: string; scope: ProjectModeScope }): OmResult<Sealed<{ session: Ref; at: number }>> {
+  if (candidate instanceof OwnerAuthority || candidate instanceof DiscoveryChoiceAuthority)
+    return refused('owner_authority_foreign', 'Another owner authority cannot authorize a project-mode decision',
+      { unit: 'DR1a', target: 'authority', field: 'action' }, 'owner');
+  if (!(candidate instanceof ProjectModeAuthority) || !PROJECT_MODE_AUTHORITIES.has(candidate))
+    return refused('owner_authority_invalid',
+      'Use the trusted owner-project-mode CLI for this exact mode decision',
+      { unit: 'DR1a', target: 'authority', field: 'authority' }, 'owner');
+  return PROJECT_MODE_AUTHORITY_EXERCISE.call(candidate, request);
+}
+
+export class ProjectModeSessions {
+  readonly #store: Store;
+  readonly #live = new Map<string, { session: string; authority: ProjectModeAuthority }>();
+  constructor(store: Store) {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'The project-mode session registry needs a Store');
+    this.#store = store;
+  }
+  sessionOf(bearerDigest: string): string | null { return this.#live.get(bearerDigest)?.session ?? null; }
+  exchange(request: unknown): OmResult<Sealed<{ bearer: string; session: Ref; expiresAt: number }>> {
+    return run(() => {
+      if (!shape(request) || !isText(request.project) || !isText(request.invitation)
+        || Object.keys(request).some(key => !['project', 'invitation'].includes(key)))
+        denyMode('owner_invitation_invalid', 'project-mode-session', 'request',
+          'A project-mode session exchange needs a project and invitation');
+      const project = request.project as string, parts = (request.invitation as string).split('.');
+      if (parts.length !== 2 || !/^[a-f0-9]{32}$/.test(parts[0]!) || !/^[a-f0-9]{64}$/.test(parts[1]!))
+        denyMode('owner_invitation_invalid', project, 'invitation', 'An invitation is <grant-id>.<secret>');
+      const found = this.#store.get<ProjectModeSessionGrant>(`${PROJECT_MODE_GRANT_PREFIX}${parts[0]}`);
+      if (!found) denyMode('owner_invitation_invalid', project, 'invitation', 'Unknown project-mode invitation');
+      const grant = provenProjectModeGrant(found);
+      if (!timingSafeEqual(Buffer.from(digest(parts[1]!), 'hex'), Buffer.from(grant.value.proof, 'hex')))
+        denyMode('owner_invitation_invalid', project, 'invitation', 'The invitation secret does not verify');
+      if (grant.value.database !== this.#store.databaseId || grant.value.scope.project !== project
+        || grant.value.action !== PROJECT_MODE_ACTION)
+        denyMode('owner_invitation_foreign', project, 'invitation',
+          'The invitation belongs to another database, project or action');
+      const now = Date.now();
+      // The exchange moment must lie inside the saved grant window: a clock behind issuedAt would write a session
+      // whose own reader later refuses the chain.
+      if (now < grant.value.issuedAt) denyMode('owner_invitation_invalid', project, 'invitation',
+        'The project-mode invitation is not yet issued at this time');
+      if (grant.value.expiresAt <= now) denyMode('owner_invitation_expired', project, 'invitation',
+        'The project-mode invitation has expired');
+      const grantRef = exactRef(reference(grant)), sessionId = projectModeSessionId(grantRef);
+      if (this.#store.get(sessionId)) denyMode('owner_invitation_spent', project, 'invitation',
+        'The project-mode invitation is already exchanged');
+      const session: ProjectModeSession = { contract: PROJECT_MODE_SESSION_CONTRACT, grant: grantRef,
+        database: grant.value.database, action: PROJECT_MODE_ACTION, method: OWNER_PAIRING_METHOD,
+        scope: grant.value.scope, session: randomBytes(16).toString('hex'), openedAt: now,
+        expiresAt: now + OWNER_SESSION_LIFETIME_MS, state: 'open' };
+      const written = take(writeGuarded<ProjectModeSession>(this.#store, { unit: 'DR1a', target: sessionId,
+        writes: [{ id: sessionId, kind: PROJECT_MODE_SESSION_KIND, expected: 0, value: session }],
+        guards: [grantRef] }));
+      const bearer = randomBytes(32).toString('hex'), key = digest(bearer);
+      this.#live.set(key, { session: sessionId,
+        authority: new ProjectModeAuthority(PROJECT_MODE_MINT, this, this.#store, key, sessionId, grant.value.scope) });
+      return { bearer, session: exactRef(reference(written[0]!)), expiresAt: session.expiresAt };
+    });
+  }
+  authority(bearer: unknown): ProjectModeAuthority | null {
+    return typeof bearer === 'string' && /^[a-f0-9]{64}$/.test(bearer)
+      ? this.#live.get(digest(bearer))?.authority ?? null : null;
+  }
+  revoke(bearer: unknown): OmResult<Sealed<{ session: Ref }>> {
+    return run(() => {
+      const key = typeof bearer === 'string' ? digest(bearer) : null;
+      const live = key ? this.#live.get(key) : undefined;
+      if (!live) denyMode('owner_session_missing', 'project-mode-session', 'bearer',
+        'No live project-mode session carries this bearer');
+      this.#live.delete(key!);
+      const head = this.#store.get<ProjectModeSession>(live!.session);
+      if (!head) denyMode('owner_session_missing', live!.session, 'session', 'The project-mode session record is absent');
+      if (head.value.state === 'closed') return { session: exactRef(reference(head)) };
+      const closed: ProjectModeSession = { ...head.value, state: 'closed', closedAt: Date.now() };
+      const written = take(writeGuarded<ProjectModeSession>(this.#store, { unit: 'DR1a', target: head.id,
+        writes: [{ id: head.id, kind: PROJECT_MODE_SESSION_KIND, expected: head.revision, value: closed }],
         guards: [exactRef(reference(head))] }));
       return { session: exactRef(reference(written[0]!)) };
     });

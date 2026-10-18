@@ -5,9 +5,11 @@ import { EngineError } from "./errors.js";
 import { readFileSync } from "node:fs";
 import { ProductEngine } from "./product/engine.js";
 import { createProductServer } from "./server.js";
-import { DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation, issueOwnerInvitation } from "./product/owner-authority.js";
+import { DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation, issueOwnerInvitation,
+  issueProjectModeInvitation, ProjectModeSessions } from "./product/owner-authority.js";
 import { probeCommand } from "./om/probe.js";
 import { answerDiscoveryCondition, validateDiscoveryConditionRequest } from "./discovery/discovery-decision.js";
+import { setProjectMode, validateProjectModeRequest } from "./product/project-mode.js";
 import { reference } from "./pipeline/contracts.js";
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
@@ -62,8 +64,35 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
     }
     return;
   }
+  // DR1a: the trusted local project-mode command owns the whole scoped invitation/session lifecycle exactly like
+  // OC1 — no secret or bearer crosses stdin/stdout, so the general command/HTTP route has no credential to replay.
+  if (command === "owner-project-mode") {
+    const store = new Store(resolve(database)); const sessions = new ProjectModeSessions(store);
+    let bearer: string | null = null;
+    try {
+      let request: unknown;
+      try { request = JSON.parse(readFileSync(0, "utf8")); }
+      catch { throw new EngineError("project_mode_invalid", "owner-project-mode reads one JSON request from stdin",
+        { door: "owner-project-mode" }); }
+      const scoped = validateProjectModeRequest(store, request);
+      const issued = issueProjectModeInvitation(store, scoped);
+      if (!issued.ok) throw new EngineError(issued.refusal.code, issued.refusal.message, issued.refusal.at);
+      const exchanged = sessions.exchange({ project: scoped.project, invitation: issued.value.invitation });
+      if (!exchanged.ok) throw new EngineError(exchanged.refusal.code, exchanged.refusal.message, exchanged.refusal.at);
+      bearer = exchanged.value.bearer;
+      const authority = sessions.authority(bearer);
+      if (!authority) throw new EngineError("owner_session_missing", "The scoped local session was not established");
+      const outcome = setProjectMode(store, scoped, authority);
+      console.log(JSON.stringify({ record: reference(outcome.record), mode: outcome.record.value.mode,
+        repeated: outcome.repeated }));
+    } finally {
+      if (bearer && sessions.authority(bearer)) sessions.revoke(bearer);
+      store.close();
+    }
+    return;
+  }
   if (!["init", "inspect", "backup", "command"].includes(command ?? "")) {
-    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|command [database] [backup-directory]; choice/command read JSON from stdin; probe --help");
+    throw new EngineError("invalid_command", "Usage: npm start -- init|inspect|backup|restore|owner-invite|owner-discovery-choice|owner-project-mode|command [database] [backup-directory]; choice/mode/command read JSON from stdin; probe --help");
   }
   const store = new Store(resolve(database));
   try {
@@ -76,10 +105,10 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
 main().catch(error => {
   const details = error instanceof EngineError && error.details && typeof error.details === "object"
     ? error.details as { door?: unknown } : undefined;
-  const discoveryChoiceError = process.argv[2] === "owner-discovery-choice"
-    || details?.door === "owner-discovery-choice";
+  const scopedOwnerError = ["owner-discovery-choice", "owner-project-mode"].includes(process.argv[2] ?? "")
+    || details?.door === "owner-discovery-choice" || details?.door === "owner-project-mode";
   console.error(JSON.stringify({ error: error instanceof EngineError ? error.code : "internal_error", message: error.message,
-    ...(error instanceof EngineError && discoveryChoiceError ? { details: error.details,
-      door: details?.door ?? "stage-summary" } : {}) }));
+    ...(error instanceof EngineError && scopedOwnerError ? { details: error.details,
+      door: details?.door ?? (process.argv[2] === "owner-project-mode" ? "owner-project-mode" : "stage-summary") } : {}) }));
   process.exitCode = 1;
 });
