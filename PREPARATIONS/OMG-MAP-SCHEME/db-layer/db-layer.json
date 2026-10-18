@@ -1,5 +1,5 @@
 {
-"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2",
+"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2+om-r2",
 "generatedFrom": "om/module d8028bf; kinds-early.json; db-census.json",
 "tables": [
 {
@@ -3841,6 +3841,19 @@
 ],
 "expects": "Оценка проверяет, не изменились ли файлы-источники, нужные факту и уже применённым фактам B1: текущие байты файла сравниваются с сохранённым источником; неизменённый файл прекращением приложения не считается (assessment_cause_unproved)",
 "sure": true
+},
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:229 (projectAssignment)",
+"fields": [
+"projectId",
+"content",
+"sha256",
+"mediaType",
+"origin"
+],
+"expects": "Проверка среды в назначении владельца: скрипт и зависимости — точные Source проекта; содержимое равно хэшу, скрипт — .mjs-файл репозитория или самодостаточный документ владельца",
+"sure": true
 }
 ]
 },
@@ -4271,6 +4284,21 @@
 "inputs"
 ],
 "sure": true
+},
+{
+"node": "om.r2",
+"code": "src/graph/refinement.ts:99 (Refinement.begin); src/graph/refinement.ts:165 (Refinement.prepareLayer)",
+"when": "Прежний маршрут: начало исследования R1/R2 и проект слоя создают черновик вопросов; в проходе OM не используется (вывод)",
+"fields": [
+"projectId",
+"stage",
+"level",
+"consumer",
+"questions",
+"inputs",
+"contractVersion"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -22538,6 +22566,17 @@
 ],
 "expects": "Подтверждение закрытия строки D2 допустимо, пока принятые кадр и граф цели остаются головами; смена графа — основание завершения подтверждения (readConfirmationGround)",
 "sure": false
+},
+{
+"node": "om.r2.apply",
+"code": "src/om/addressing.ts:250 (deriveInputDecisions)",
+"fields": [
+"nodes",
+"actors",
+"contracts"
+],
+"expects": "Применение решений поля читает граф с принятой картой L1: узлы потребителя решения и участники границ должны существовать и быть блоками; иначе addressing_invalid",
+"sure": true
 }
 ]
 },
@@ -23061,6 +23100,17 @@
 ],
 "expects": "D2 восстанавливает принятый кадр вместе со слоем: слой должен ссылаться назад на этот кадр",
 "sure": false
+},
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:144 (context)",
+"fields": [
+"projection",
+"acceptance",
+"layerProofs"
+],
+"expects": "D7 принимает узлы принятых кадров уровня 2 и 3 (через основу кадра): только их узлы допустимы как ответственные и потребители",
+"sure": true
 }
 ]
 },
@@ -38567,6 +38617,1520 @@
 "sure": true
 }
 ]
+},
+{
+"kind": "om-obligation-basis",
+"group": "om",
+"idPattern": "om-obligation-basis:<проект>:<хэш содержимого>",
+"proposed": false,
+"card": {
+"what": "Основание (producer) D7: запись, по которой потребители входят в журнал обязательств — несёт тот же запрос и ссылку на точный ledger. Именно producer выбирает эпоху обязательств.",
+"where": "Таблица revisions · вид «om-obligation-basis» · id om-obligation-basis:<проект>:<хэш содержимого>",
+"when": "Пара producer + ledger пишется одной сделкой на шаге obligations (перед пакетами работ N3) и ещё раз при приёмке финальных работ G5 (тот же журнал, пересчитанный на финальном наборе разрывов D1). Адрес — хэш содержимого, поэтому равный запрос находит старую запись, а изменённый даёт новую. В рабочей базе записи неизменяемые: по одной версии на запись. 11 записей.",
+"why": "Потребителям нужен один адрес, из которого видна вся эпоха обязательств: кто и из чего их вывел. Пара producer+ledger в входах потребителя выбирает «эпоху OM» вместо прежнего маршрута R2/L3.",
+"expects": "Контракт om-obligations/v1; ledger — точная ссылка на запись om-obligations, выведенную из того же request; потребитель обязан нести ровно один producer и ровно один ledger, и ledger равен ссылке producer.",
+"risks": "Нет producer — obligation_basis_missing; нет ledger — obligation_ledger_missing; вместе с фазами R2/L3 прежнего маршрута — obligation_era_conflict; ledger не равен выводу — obligation_record_invalid.",
+"size": "HX5: записей нет · рабочая база: 11 записей, 360 КБ, до 35 КБ на версию",
+"note": "Размер почти равен размеру ledger: запрос дублируется в обеих записях (так producer проверяется без чтения ledger). Загрузка и проверка идут через регистрируемый читатель graph/om-obligation-readers.ts."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-obligations/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "ledger",
+"type": "Ref {id, revision, hash}",
+"iface": true,
+"what": "Точная ссылка на журнал обязательств, выведенный из этого запроса.",
+"writer": "D7 — переносы (om.r2.d7), одной сделкой с самим журналом.",
+"readers": "Все потребители входят по producer и выходят на ledger: пакет N3 (om.l3.assign), works-кандидат (om.l3.cand), G5 (om.l3.g5), M8 (om.m8.read, om.m8.obl); M8 сохраняет эту пару (om.m8.rec).",
+"expects": "Ledger существует, принадлежит проекту и равен выводу из request; хэш ссылки совпадает с хэшем записи.",
+"risks": "Ссылка на чужой или изменённый журнал — obligation_record_invalid; потребитель без явного ledger — obligation_ledger_missing."
+},
+{
+"path": "request",
+"type": "{project, gaps:{sources, records}, lines, assignments}",
+"iface": true,
+"what": "Тот же точный запрос, что в журнале: по нему producer выводится заново, не читая ledger.",
+"writer": "D7 — переносы (om.r2.d7).",
+"readers": "Выбор шага и пакет работы сверяют набор разрывов (om.r2.ton3, om.l3.assign); G5 сверяет «один исходный запрос» для всех финальных предложений (om.l3.g5).",
+"expects": "Равен request ledger; assignments содержат только ссылки на команды.",
+"risks": "Расхождение с ledger — obligation_record_invalid."
+},
+{
+"path": "request.project",
+"type": "string",
+"iface": false,
+"what": "проект запроса",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.gaps",
+"type": "{sources, records:Ref[]}",
+"iface": false,
+"what": "источники D1 и записи разрывов",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.lines",
+"type": "Ref",
+"iface": false,
+"what": "версия истории линий D2",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.assignments",
+"type": "({record:Ref}|{pending})[]",
+"iface": false,
+"what": "ссылки на команды назначения",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:532 (writeOmObligations); src/om/run.ts:606 (perform)",
+"when": "Шаг obligations: producer пишется той же сделкой, что и ledger",
+"fields": [
+"вся запись"
+],
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/atomic-gate.ts:768 (worksCandidate); src/om/atomic-gate.ts:812 (writeWorksAcceptance)",
+"when": "Приёмка финальных работ: новая пара producer+ledger на финальном D1 пишется вместе с кандидатом и исходом C5",
+"fields": [
+"вся запись"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.r2.ton3",
+"code": "src/om/run.ts:1502 (continueAttempt)",
+"fields": [
+"ledger",
+"request"
+],
+"expects": "Выбор шага перед пакетом работы: готовая пара producer+ledger передаётся в пакет",
+"sure": true
+},
+{
+"node": "om.l3.assign",
+"code": "src/om/question-packet.ts:700 (worksTaskBasis)",
+"fields": [
+"ledger",
+"request"
+],
+"expects": "Пакет работы читает producer по точной ссылке и сверяет набор разрывов с пакетом",
+"sure": false
+},
+{
+"node": "om.l3.form",
+"code": "src/om/model-call.ts:4299 (reuseValue)",
+"fields": [
+"ledger",
+"request"
+],
+"expects": "Повторное использование: producer берётся по точной ссылке работы",
+"sure": true
+},
+{
+"node": "om.l3.cand",
+"code": "src/om/frame-candidate.ts:375 (checkedWorksBasis)",
+"fields": [
+"ledger",
+"request"
+],
+"expects": "works-кандидат называет producer; запрос равен запросу кандидата",
+"sure": false
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:273 (modelSources); src/om/atomic-gate.ts:329 (proveBindingTransfer); src/om/atomic-gate.ts:395 (candidateTasks)",
+"fields": [
+"ledger",
+"request"
+],
+"expects": "G5 требует тот же запрос у всех финальных предложений и переносит привязки с исходного producer",
+"sure": true
+},
+{
+"node": "om.m8.read",
+"code": "src/om/feasibility.ts:135 (sources)",
+"fields": [
+"ledger",
+"request"
+],
+"expects": "M8 читает producer кандидата работ и сверяет ссылку на ledger",
+"sure": true
+},
+{
+"node": "om.m8.obl",
+"code": "src/om/feasibility.ts:354 (prepareFeasibility); src/graph/runtime-evidence.ts:144 (projectRuntimeCandidate)",
+"fields": [
+"ledger"
+],
+"expects": "Обязательства к R3 берутся по паре producer+ledger; подтверждение среды сверяет ledger по ссылке наблюдения",
+"sure": true
+},
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:451 (loadRecord)",
+"fields": [
+"ledger",
+"request"
+],
+"expects": "D7 читает собственный producer при проверке истории",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Адрес om-obligation-basis относится к записям, рождённым от B1",
+"sure": false
+}
+]
+},
+{
+"kind": "om-obligation-transfer",
+"group": "om",
+"idPattern": "om-obligation-transfer:<проект>:<хэш содержимого>",
+"proposed": false,
+"card": {
+"what": "Перенос назначения (F5): производная от исходной команды владельца запись — то же назначение обязательства, но привязанное к новому полному набору разрывов D1 после того, как финальные работы изменили набор. Полномочие даёт только исходная команда H2.",
+"where": "Таблица revisions · вид «om-obligation-transfer» · id om-obligation-transfer:<проект>:<хэш содержимого>",
+"when": "Пишется при приёмке финальных работ G5 (одной сделкой с новым D7): по одному переносу на каждое сохранённое назначение исходного журнала. В рабочей базе записей нет — вид есть в коде (obligations.ts).",
+"why": "Когда G5 пересобирает D1/D2/D7 над финальными предложениями, назначения владельца должны пройти без потери и без повторного вопроса: перенос доказывает, что разрыв остался тем же (с теми же доказательствами, потребителями и отсрочкой).",
+"expects": "Контракт om-obligation-transfer/v1; from — точные producer, ledger и назначение прежней эпохи, в которых это назначение действительно содержится; меняются только проверенные предложения работ, а вход, граф, горизонт и кадры те же; разрыв сохранён целиком; запись выводится заново и равна себе.",
+"risks": "Разрыв исчез из финального набора — obligation_assignment_invalid (gap); перенос меняет не только работы — obligation_assignment_invalid (context); адрес уже занят иным содержимым — obligation_assignment_invalid (transfer); история переносов имеет цикл — obligation_assignment_invalid.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Перенос не новая воля владельца: owner в записи ссылается на исходную команду. Поэтому читатель повторяет всю проверку исходной команды (чтение не слабее записи)."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-obligation-transfer/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "from",
+"type": "{producer:Ref, ledger:Ref, assignment:Ref}",
+"iface": true,
+"what": "Откуда перенос: точные producer и ledger прежней эпохи и назначение в них.",
+"writer": "Приёмка финальных работ (om.l3.c5), вызывающая D7 (om.r2.d7).",
+"readers": "D7 при следующем выводе журнала (om.r2.d7) и G5 при проверке переноса привязок (om.l3.g5).",
+"expects": "Назначение принадлежит этому ledger и состоит в запросе его producer.",
+"risks": "Назначение не из этого журнала — obligation_assignment_invalid (from)."
+},
+{
+"path": "context",
+"type": "{gaps:{sources, records}, lines}",
+"iface": true,
+"what": "Новый контекст: полный набор разрывов и история линий D2 финального набора.",
+"writer": "Приёмка финальных работ (om.l3.c5).",
+"readers": "D7 сверяет контекст при выводе нового журнала (om.r2.d7); G5 сверяет «только работы изменились» (om.l3.g5).",
+"expects": "Равен контексту нового журнала; вход, граф, горизонт и кадры прежнего контекста те же, меняются лишь предложения работ.",
+"risks": "Иной контекст — obligation_assignment_invalid (context)."
+},
+{
+"path": "gap",
+"type": "Ref",
+"iface": true,
+"what": "Запись разрыва в новом наборе D1, которую переносимое назначение закрывает.",
+"writer": "Приёмка финальных работ (om.l3.c5).",
+"readers": "D7 проверяет разрыв при выводе журнала (om.r2.d7).",
+"expects": "Разрыв позднего момента (не om-pass), целиком равен прежнему: доказательства, потребители, отсрочка.",
+"risks": "Разрыв изменился или пропал — obligation_assignment_invalid (gap)."
+},
+{
+"path": "owner",
+"type": "Ref",
+"iface": true,
+"what": "Исходная команда владельца H2, которая и даёт полномочие.",
+"writer": "Приёмка финальных работ (om.l3.c5).",
+"readers": "D7 проверяет полномочие (om.r2.d7).",
+"expects": "Ссылка на точную исходную команду (или на её перенос в цепи).",
+"risks": "Подмена полномочия — obligation_assignment_invalid."
+},
+{
+"path": "assignments",
+"type": "OwnerGapAssignment['assignments']",
+"iface": false,
+"what": "переносимые назначения (ответственный узел, потребитель, причина, условие возврата, wake, runtimeCheck)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:356 (prepareObligationTransfer)",
+"when": "Подготовка переноса: запись формируется из исходной команды и нового контекста; записывается только если адрес свободен",
+"fields": [
+"вся запись"
+],
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/atomic-gate.ts:766 (worksCandidate); src/om/atomic-gate.ts:812 (writeWorksAcceptance)",
+"when": "Приёмка финальных работ: переносы добавляются в общую сделку и пишутся вместе с новым D7, кандидатом и исходом C5",
+"fields": [
+"вся запись"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:286 (assignmentRecord); src/om/obligations.ts:320 (loadTransfer)",
+"fields": [
+"вся запись"
+],
+"expects": "При выводе журнала ссылка на перенос читается как назначение: проверяется вся цепь до исходной команды владельца",
+"sure": true
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:348 (proveBindingTransfer)",
+"fields": [
+"from",
+"owner"
+],
+"expects": "G5 проверяет, что сохранённые переносы идут именно от producer и ledger ответа, из которого привязки перенесены",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Адрес om-obligation-transfer относится к записям, рождённым от B1",
+"sure": false
+}
+]
+},
+{
+"kind": "om-obligations",
+"group": "om",
+"idPattern": "om-obligations:<проект>:<хэш содержимого>",
+"proposed": false,
+"card": {
+"what": "Журнал обязательств D7 (ledger): полный список «поздних» вопросов, которые не решаются сейчас, а переносятся ответственному блоку-потребителю с условием возврата; по строке-назначению на каждое обязательство.",
+"where": "Таблица revisions · вид «om-obligations» · id om-obligations:<проект>:<хэш содержимого>",
+"when": "Пишется D7 вместе с парой om-obligation-basis: на шаге obligations прохода и при приёмке финальных работ G5. 11 записей по одной версии в рабочей базе; адрес — хэш содержимого, поэтому равный запрос находит старую запись.",
+"why": "Чтобы вопрос, на который нельзя ответить в проходе OM (подтверждение среды, доказательство после реализации, решение владельца), не терялся: M8, компилятор и исполнение получают его готовым — кто отвечает, когда, какое условие возврата и какая проверка его подтверждает.",
+"expects": "Контракт om-obligations/v1; хэш содержимого равен хвосту адреса; журнал выводится заново из request (полный набор разрывов D1 + история линий D2 + команды назначения) и совпадает побайтно; каждый поздний разрыв (момент не om-pass) получает назначение — от владельца (H2) или от движка в обходе OWN1 (только для доказуемых: тесты работы после реализации либо проверка среды, подтверждающая всё условие); остальные поздние вопросы остаются открытыми в B1 и работы не связывают; ответственный узел и потребитель — принятые узлы одного уточнения.",
+"risks": "Другой набор разрывов или линий — obligation_context_mismatch; поздний доказуемый разрыв без принятых потребителей и без назначения владельца — obligation_assignment_unresolved (проход ждёт владельца); недопустимое назначение — obligation_assignment_invalid; журнал не равен выводу — obligation_record_invalid; без явной пары producer+ledger потребитель получает obligation_basis_missing / obligation_ledger_missing.",
+"size": "HX5: записей нет · рабочая база: 11 записей, 362 КБ, до 35 КБ на версию",
+"note": "Производитель и журнал разведены: потребители входят по ссылке на producer (om-obligation-basis) и обязаны вернуть ссылку на ровно этот ledger. Запись может быть пустым журналом — пустота доказана, а не отсутствует. Диагностика (om/spend-report.ts) журнал только читает и блоком схемы не считается."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-obligations/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request",
+"type": "{project, gaps:{sources, records}, lines, assignments}",
+"iface": true,
+"what": "Точный запрос, из которого выведен журнал: проект, полный набор разрывов D1 (источники и записи), история линий D2 и ссылки на команды назначения.",
+"writer": "D7 — переносы (om.r2.d7) и приёмка финальных работ (om.l3.c5), когда пересчитывает журнал на финальном D1.",
+"readers": "Передать N3 (om.r2.ton3) и пакет работы (om.l3.assign) сверяют набор разрывов пакета; G5 (om.l3.g5) и works-кандидат (om.l3.cand) требуют тот же D1; M8 (om.m8.read) требует, чтобы кандидат работ назвал именно этот ledger.",
+"expects": "gaps.sources.project равен проекту; записи разрывов — полный набор того же D1; lines — история D2 того же набора (читается readGapLines); assignments отсортированы.",
+"risks": "Не тот проект или не тот набор — obligation_context_mismatch; неполный запрос — obligation_request_invalid."
+},
+{
+"path": "assignments",
+"type": "CarriedObligation(без scope)[]",
+"iface": true,
+"what": "Назначения: по строке на обязательство — какой разрыв (obligation), откуда он (original), род знания (kind), момент (moment), ответственный узел и потребитель, причина, условие возврата, пробуждение (wake), проверка среды (runtimeCheck).",
+"writer": "D7 — переносы (om.r2.d7): из команд владельца и из обхода OWN1; при приёмке G5 — перенос на финальный набор (om.l3.c5).",
+"readers": "G5 привязывает работы к обязательствам (om.l3.g5); M8 берёт обязательства к R3 (om.m8.obl); компилятор и исполнение получают их в handoff M8 (om.c.derive, run.t.tstart, run.c.proof).",
+"expects": "У разрыва не больше одного полного назначения от владельца (H2); поздние разрывы без него получают назначение движка только если доказуемы (тесты работы после реализации либо проверка среды, подтверждающая всё условие); узел и потребитель принадлежат одному уточнению.",
+"risks": "Два назначения на один разрыв или недопустимое — obligation_assignment_invalid; доказуемый поздний разрыв без принятых потребителей — obligation_assignment_unresolved; недоказуемый (ни tests, ни runtime) остаётся открытым в B1 и работу не связывает."
+},
+{
+"path": "request.project",
+"type": "string",
+"iface": false,
+"what": "проект запроса",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.gaps",
+"type": "{sources, records:Ref[]}",
+"iface": false,
+"what": "источники D1 (вход, граф, горизонт, операции, работы) и точные ссылки на записи разрывов",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.lines",
+"type": "Ref",
+"iface": false,
+"what": "точная версия истории линий D2 (om-gap-lines)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.assignments",
+"type": "({record:Ref}|{pending})[]",
+"iface": false,
+"what": "ссылки на команды назначения: решение владельца или перенос; сохранённая запись содержит только ссылки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:532 (writeOmObligations); src/om/run.ts:606 (perform)",
+"when": "Шаг obligations: журнал выводится из запроса и пишется одной сделкой с парой om-obligation-basis; повтор находит равную запись и ничего не пишет",
+"fields": [
+"вся запись"
+],
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/atomic-gate.ts:768 (worksCandidate); src/om/atomic-gate.ts:812 (writeWorksAcceptance)",
+"when": "Приёмка финальных работ: в той же сделке пересчитывается D7 на финальном D1 (переносы + новый журнал) и пишется вместе с кандидатом, G5 и исходом C5",
+"fields": [
+"вся запись"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.r2.ton3",
+"code": "src/om/run.ts:1502 (continueAttempt)",
+"fields": [
+"request",
+"assignments"
+],
+"expects": "Выбор шага перед пакетом работы: D7 готовится на текущих линиях D2; если записывать нечего — пакету передаётся готовая пара producer+ledger, иначе выбирается шаг obligations",
+"sure": true
+},
+{
+"node": "om.l3.assign",
+"code": "src/om/question-packet.ts:700 (worksTaskBasis)",
+"fields": [
+"request",
+"assignments"
+],
+"expects": "Пакет работы N3 строится на точной паре producer+ledger; набор разрывов и линий должен совпадать с пакетом",
+"sure": false
+},
+{
+"node": "om.l3.form",
+"code": "src/om/model-call.ts:4299 (reuseValue); src/om/model-call.ts:4304 (reuseValue)",
+"fields": [
+"request",
+"assignments"
+],
+"expects": "Повторное использование ответа: журнал берётся по точному producer и ledger, набор D1 должен быть тем же, что у плана; текущий D7 уже обязан быть сохранён",
+"sure": true
+},
+{
+"node": "om.l3.cand",
+"code": "src/om/frame-candidate.ts:375 (checkedWorksBasis)",
+"fields": [
+"request",
+"assignments"
+],
+"expects": "works-кандидат называет полный ledger своего producer; контекст D1 равен запросу кандидата",
+"sure": false
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:273 (modelSources); src/om/atomic-gate.ts:329 (proveBindingTransfer); src/om/atomic-gate.ts:395 (candidateTasks)",
+"fields": [
+"request",
+"assignments"
+],
+"expects": "G5 читает исходный D7 ответов, сверяет, что все финальные предложения от одного исходного набора, переносит привязки и связывает работы с обязательствами",
+"sure": true
+},
+{
+"node": "om.m8.read",
+"code": "src/om/feasibility.ts:135 (sources)",
+"fields": [
+"request"
+],
+"expects": "M8 берёт D7 кандидата работ и требует, чтобы кандидат назвал именно этот ledger",
+"sure": true
+},
+{
+"node": "om.m8.obl",
+"code": "src/om/feasibility.ts:354 (prepareFeasibility); src/graph/runtime-evidence.ts:144 (projectRuntimeCandidate)",
+"fields": [
+"assignments"
+],
+"expects": "Обязательства к R3: из пары producer+ledger выводятся наступившие обязательства; подтверждение среды проверяется против объявления в ledger (совпадение проверки и области); результат сохраняется в записи M8",
+"sure": true
+},
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:451 (loadRecord); src/om/obligations.ts:468 (readOmObligationLedger)",
+"fields": [
+"вся запись"
+],
+"expects": "D7 читает собственную сохранённую пару: проверка истории, повтор и чтение по перенесённому scope",
+"sure": true
+},
+{
+"node": "run.t.tstart",
+"code": "src/runtime/runtime-observation.ts:32 (omRuntimeDeclaration)",
+"fields": [
+"assignments"
+],
+"expects": "Наблюдение среды читает ledger как объявление проверки: нужны проект и точный адрес om-obligations",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Адрес om-obligations относится к записям, рождённым от B1: стадии компиляции нужны только записи нового маршрута",
+"sure": false
+}
+]
+},
+{
+"kind": "om-owner-gap-assignment",
+"group": "om",
+"idPattern": "om-owner-gap-assignment:<проект>:<хэш содержимого>",
+"proposed": false,
+"card": {
+"what": "Команда владельца H2 о назначении позднего вопроса: для разрыва указывает, какой узел и потребитель отвечают за него, причину, условие возврата, пробуждение и (для среды) проверку.",
+"where": "Таблица revisions · вид «om-owner-gap-assignment» · id om-owner-gap-assignment:<проект>:<хэш содержимого>",
+"when": "Пишется не отдельным блоком, а внешним вызывающим как «ожидающая запись» (pending) и сохраняется той же сделкой, что и журнал D7. В рабочей базе записей нет — вид есть в коде (obligations.ts).",
+"why": "Поздний вопрос не может быть решён в проходе, и без назначения проход встанет на ожидании: это единственный способ владельцу осмысленно перенести его потребителю (вместо обхода OWN1).",
+"expects": "Контракт om-owner-gap-assignment/v1; контекст — тот же полный D1 и линии D2; gap — точная запись позднего разрыва (не om-pass); назначения покрывают каждого потребителя разрыва ровно по разу, без слияния; узел и потребитель принятые и из одного уточнения; запись равна своему канону.",
+"risks": "Назначение не покрывает потребителей, узлы не принятые или разные уточнения, чужой проект — obligation_assignment_invalid; запись неполная — obligation_assignment_invalid (assignment); для среды без корректной проверки (скрипт, зависимости, источники) — obligation_assignment_invalid (runtimeCheck).",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Производителя этой записи в коде движка нет: контракт нормализуется функцией normalizeOwnerGapAssignment, а запись приходит как pending-запись извне и сохраняется переданной. Комментарий obligations.ts:166 предусматривает аутентификацию H2; её реализация для этого вида в проверенном пути не установлена. Поэтому писатель в карте — только D7, который сохраняет пришедшую запись."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-owner-gap-assignment/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "context",
+"type": "{gaps:{sources, records:Ref[]}, lines:Ref}",
+"iface": true,
+"what": "Контекст, на котором владелец назначал: полный набор D1 и версия линий D2.",
+"writer": "Вызывающий (владелец через H2) как pending-запись; сохраняет D7 (om.r2.d7).",
+"readers": "D7 при выводе журнала сверяет контекст с запросом (om.r2.d7).",
+"expects": "Равен контексту запроса журнала.",
+"risks": "Иной контекст — obligation_assignment_invalid (context)."
+},
+{
+"path": "gap",
+"type": "Ref",
+"iface": true,
+"what": "Запись разрыва D1, которое владелец назначает.",
+"writer": "Вызывающий (владелец через H2).",
+"readers": "D7 ищет разрыв в полном наборе (om.r2.d7).",
+"expects": "Разрыв есть в наборе и его момент не om-pass («текущий вопрос OM назначением не откладывается»).",
+"risks": "Разрыв не найден или текущий — obligation_assignment_invalid (gap)."
+},
+{
+"path": "assignments",
+"type": "{responsibleNode, responsibleConsumer, reason, returnCondition, wake, runtimeCheck?}[]",
+"iface": true,
+"what": "Решение владельца: за кого и при каком условии вопрос возвращается; wake — какие узлы и пути его будят; runtimeCheck — проверка среды, подтверждающая всё условие.",
+"writer": "Вызывающий (владелец через H2).",
+"readers": "D7 превращает их в назначения журнала (om.r2.d7).",
+"expects": "Ровно одно назначение на каждого потребителя разрыва; узлы принятые; для runtimeCheck: род разрыва — подтверждение среды, satisfies равно условию возврата, скрипт и зависимости — точные Source проекта.",
+"risks": "Лишнее поле или повторный потребитель — obligation_assignment_invalid."
+}
+],
+"writers": [
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:502 (prepareOmObligations)",
+"when": "Если вызывающий передал назначение как pending-запись, она сохраняется той же сделкой, что журнал D7 (адрес свободен или равен); занятый адрес с иным содержимым — отказ",
+"fields": [
+"вся запись"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:192 (ownerRecord)",
+"fields": [
+"вся запись"
+],
+"expects": "D7 читает команду точной ссылкой, заново нормализует и сверяет с каноном, контекстом и принятыми узлами; чтение не слабее записи",
+"sure": true
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:764 (worksCandidate)",
+"fields": [
+"вся запись"
+],
+"expects": "При приёмке финальных работ G5 строит переносы от исходных команд (читает их через D7)",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Адрес om-owner-gap-assignment относится к записям, рождённым от B1",
+"sure": false
+}
+]
+},
+{
+"kind": "om-owner-result",
+"group": "om",
+"idPattern": "om-owner-result:<проект>:<хэш ссылки на квитанцию>",
+"proposed": false,
+"card": {
+"what": "Результат выбора владельца (H2): ответ владельца на вопрос-решение (owner-decision) — нормализованное значение и основание, привязанные к точной квитанции-команде.",
+"where": "Таблица revisions · вид «om-owner-result» · id om-owner-result:<проект>:<хэш ссылки на квитанцию>",
+"when": "Пишется H2 (writeOwnerResult) одной сделкой с квитанцией owner-command, когда владелец с живой сессией отвечает на вопрос. Один результат на квитанцию, адрес — хэш ссылки на неё. 12 записей по одной версии. Точный повтор возвращает прежний результат без записи, даже из новой сессии.",
+"why": "Ответ владельца выше ответа модели: вопрос, на который владелец ответил, больше не уходит в модель, а его значение получают потребители (форма ответа, G4b, применение к B1). Результат переживает выход и истечение сессии — это история.",
+"expects": "Контракт om-owner-result/v1; command — ссылка на owner-command того же проекта; результат побайтно повторяет квитанцию (значение, основание, адрес вопроса); вопрос заново выводится из точных B1, D1 и M6; цепочка квитанция → сессия → грант не нарушает проект, действие и базу; адрес результата выведен из квитанции.",
+"risks": "Запрос неполный — owner_request_invalid; вопрос не выводится из B1/D1/M6 или это не owner-решение — owner_question_invalid; квитанция неполна — owner_command_invalid; результат не повторяет квитанцию или чужая база/сессия — owner_result_invalid. Результат под другим B1, D1 или M6 для G4b чужой.",
+"size": "HX5: записей нет · рабочая база: 12 записей, 21 КБ, до 1,9 КБ на версию",
+"note": "Роль владельца в проходе единственная, где ответ приходит не от модели; значение в рабочей базе — текст (12 из 12). Список вопросов для окна владельца (listOwnerQuestions) и проекция продукта (product/engine.ts) — служебное чтение, блоком схемы не считается."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-owner-result/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "command",
+"type": "Ref {id, revision, hash}",
+"iface": true,
+"what": "Точная ссылка на квитанцию owner-command, на которой стоит результат.",
+"writer": "Выбор владельца (om.r2.owner), в той же сделке с квитанцией.",
+"readers": "Применить к B1 (om.r2.apply) идёт по ней к вопросу владельца; читатель H2 (om.r2.owner) проверяет цепочку до сессии и гранта.",
+"expects": "Существует, принадлежит проекту (id начинается с owner-command:<проект>:), хэш верен; результат лежит по адресу, выведенному из неё.",
+"risks": "Нет квитанции или чужая база — owner_result_invalid."
+},
+{
+"path": "question",
+"type": "string «om-owner-question:<проект>:<хэш>»",
+"iface": true,
+"what": "Адрес вопроса, на который отвечено: хэш точного вопроса с привязкой к B1, D1 и M6.",
+"writer": "Выбор владельца (om.r2.owner).",
+"readers": "G4b сопоставляет результат с разрывом (om.l2.g4b); вопрос заново выводится из своих источников (om.r2.owner).",
+"expects": "Равен адресу вопроса в квитанции; вопрос выводится из B1/D1/M6 заново и совпадает.",
+"risks": "Расхождение — owner_result_invalid (command/question)."
+},
+{
+"path": "value",
+"type": "Json (в рабочей базе — string)",
+"iface": true,
+"what": "Решение владельца — нормализованное значение.",
+"writer": "Выбор владельца (om.r2.owner).",
+"readers": "G4b принимает его ответом разрыва (om.l2.g4b); Применить к B1 переносит в решение поля входа (om.r2.apply); форма ответа исключает вопрос из спроса к модели (om.r1.model); выбор шага отдаёт ответ владельца на применение (om.s.resume).",
+"expects": "Конечный ациклический JSON; побайтно равен значению квитанции; два разных ответа на один вопрос не применяются вовсе (решает владелец).",
+"risks": "Нефинитное значение — owner_request_invalid; расхождение с квитанцией — owner_result_invalid."
+},
+{
+"path": "basis",
+"type": "string",
+"iface": true,
+"what": "Основание решения — текст владельца.",
+"writer": "Выбор владельца (om.r2.owner).",
+"readers": "Решение поля входа хранит его вместе со ссылкой на результат (om.r2.apply).",
+"expects": "Непустая строка, равна основанию квитанции.",
+"risks": "Пустое основание — owner_request_invalid."
+}
+],
+"writers": [
+{
+"node": "om.r2.owner",
+"code": "src/om/owner-result.ts:222 (writeOwnerResult); src/product/engine.ts:176 (ProductEngine.ownerDecision)",
+"when": "Ответ владельца: authority проверяется дважды, затем результат и квитанция пишутся одной сделкой с защитой живой сессии и точных B1, D1, M6",
+"fields": [
+"вся запись"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:285 (proveOfferedRecord); src/om/answers-gate.ts:426 (proveResult); src/om/answers-gate.ts:702 (admitOwnerResults)",
+"fields": [
+"command",
+"question",
+"value"
+],
+"expects": "G4b принимает результат только если его вопрос привязан к этому разрыву, этим M6 и этому B1 и перепрошёл общий читатель; результат чужого вопроса чужой, непрочитанный — не результат",
+"sure": true
+},
+{
+"node": "om.r2.apply",
+"code": "src/om/addressing.ts:266 (deriveInputDecisions)",
+"fields": [
+"command",
+"value",
+"project"
+],
+"expects": "Решение поля входа от владельца стоит только на точном результате H2 этого же вопроса и с тем же значением",
+"sure": true
+},
+{
+"node": "om.r1.model",
+"code": "src/om/answer-form.ts:196 (fieldForm)",
+"fields": [
+"question",
+"value"
+],
+"expects": "Форма ответа поля входа не задаёт модели вопросы, на которые владелец уже ответил",
+"sure": true
+},
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:912 (ownerAnswersBypassed)",
+"fields": [
+"question",
+"value"
+],
+"expects": "Выбор шага: ответы владельца на вопросы, которые обход отправил модели, применяются одним переходом B1 прежде нового вызова",
+"sure": false
+},
+{
+"node": "om.r2.owner",
+"code": "src/om/owner-result.ts:208 (writeOwnerResult); src/om/owner-result.ts:253 (readOwnerResult); src/om/owner-result.ts:293 (listOwnerQuestions)",
+"fields": [
+"вся запись"
+],
+"expects": "Общий читатель: точный повтор находит сохранённый результат, чтение выводит всю цепочку заново, список вопросов отмечает отвеченные",
+"sure": true
+},
+{
+"node": "om.b1.input",
+"code": "src/om/addressing.ts:265 (deriveInputDecisions)",
+"fields": [
+"project",
+"command",
+"value"
+],
+"expects": "Решение владельца стоит на точном результате H2 этого вопроса с тем же значением.",
+"sure": true
+}
+]
+},
+{
+"kind": "owner-command",
+"group": "om",
+"idPattern": "owner-command:<проект>:<хэш команды без сессии>",
+"proposed": false,
+"card": {
+"what": "Квитанция команды владельца (H2): какой вопрос, какое значение и основание владелец дал, под какой живой сессией и в какой базе.",
+"where": "Таблица revisions · вид «owner-command» · id owner-command:<проект>:<хэш команды без сессии>",
+"when": "Пишется H2 одной сделкой с om-owner-result. Адрес — хэш нормализованной команды без сессии, поэтому повтор под новой сессией находит прежнюю. 12 записей по одной версии.",
+"why": "Квитанция доказывает полномочие: результат нельзя получить подменой строки или полем «owner: true» — нужна живая сессия с закреплённой ревизией и вопрос, заново выводимый из B1, D1, M6.",
+"expects": "Контракт owner-command/v1; action = owner-result; database равна базе хранилища; session — точная живая ревизия сессии; address равен хэшу встроенного вопроса om-owner-question/v1; id равен хэшу команды без сессии.",
+"risks": "Квитанция неполна, адрес или id не выводятся из содержимого — owner_command_invalid; квитанция без своего результата (нарушена атомарность) — owner_result_invalid; вопрос больше не выводится — owner_result_invalid (question).",
+"size": "HX5: записей нет · рабочая база: 12 записей, 37 КБ, до 3,3 КБ на версию",
+"note": "Квитанции пишет только H2 прохода OM; сессия и грант — отдельные виды owner-session и owner-session-grant. Вложенный вопрос om-owner-question/v1 отдельной записью не хранится — он встроен в квитанцию."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"owner-command/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "database",
+"type": "string (uuid)",
+"iface": false,
+"what": "база, в которой дана команда",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "action",
+"type": "\"owner-result\"",
+"iface": false,
+"what": "действие, на которое выдана сессия",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "session",
+"type": "Ref {id, revision, hash}",
+"iface": true,
+"what": "Точная ревизия живой сессии владельца на момент записи.",
+"writer": "Выбор владельца (om.r2.owner): authority проверяется ещё раз перед записью.",
+"readers": "Читатель H2 идёт от квитанции к сессии и гранту (om.r2.owner).",
+"expects": "Сессия того же проекта, действия и базы; грант тоже; живость сессии при чтении не проверяется (история переживает выход).",
+"risks": "Цепочка нарушена — owner_result_invalid (session / grant)."
+},
+{
+"path": "address",
+"type": "string «om-owner-question:<проект>:<хэш>»",
+"iface": true,
+"what": "Адрес вопроса — хэш встроенного объекта вопроса.",
+"writer": "Выбор владельца (om.r2.owner).",
+"readers": "Результат повторяет его в поле question (om.r2.owner); G4b сопоставляет (om.l2.g4b).",
+"expects": "Равен хэшу своего вопроса.",
+"risks": "Иной хэш — owner_command_invalid (address)."
+},
+{
+"path": "question",
+"type": "{contract, project, question:{id,text,consumer,kind,moment,blocks}, gap, input, routes, route:{gap,target,field}}",
+"iface": true,
+"what": "Встроенный вопрос om-owner-question/v1: точный B1-вопрос владельца с привязкой к записи разрыва D1, B1 и M6.",
+"writer": "Выбор владельца (om.r2.owner): формулировка, потребитель, момент берутся из записей, а не от вызывающего.",
+"readers": "Применить к B1 сверяет цель и поле маршрута с решением (om.r2.apply); G4b сверяет разрыв, маршруты и вход (om.l2.g4b).",
+"expects": "Выводится заново из точных B1, D1, M6 и совпадает; маршрут — строка owner-routed (или design при обходе OWN1) с родом owner-decision.",
+"risks": "Вопрос не выводится или это не owner-решение — owner_question_invalid."
+},
+{
+"path": "value",
+"type": "Json (в рабочей базе — string)",
+"iface": false,
+"what": "значение решения",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "basis",
+"type": "string",
+"iface": false,
+"what": "основание решения",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.r2.owner",
+"code": "src/om/owner-result.ts:222 (writeOwnerResult)",
+"when": "Ответ владельца: квитанция пишется в одной сделке с результатом под защитой живой сессии, разрыва D1, маршрутов M6 и входа B1",
+"fields": [
+"вся запись"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.r2.owner",
+"code": "src/om/owner-result.ts:204 (writeOwnerResult); src/om/owner-result.ts:255 (readOwnerResult)",
+"fields": [
+"вся запись"
+],
+"expects": "Повтор находит квитанцию по хэшу команды; читатель проверяет контракт, базу, адрес, id и цепочку сессии",
+"sure": true
+},
+{
+"node": "om.r2.apply",
+"code": "src/om/addressing.ts:267 (deriveInputDecisions)",
+"fields": [
+"question",
+"value"
+],
+"expects": "Решение поля входа от владельца требует, чтобы цель и поле маршрута квитанции совпали с целью решения (поле answer)",
+"sure": true
+},
+{
+"node": "om.b1.input",
+"code": "src/om/addressing.ts:267 (deriveInputDecisions)",
+"fields": [
+"question"
+],
+"expects": "Ответ владельца принимается решением, если команда называет этот вопрос и поле answer.",
+"sure": true
+}
+]
+},
+{
+"kind": "research-scope",
+"group": "om",
+"idPattern": "research-scope:<проект>:R2",
+"proposed": false,
+"card": {
+"what": "Область исследования R2 прежнего маршрута: ближайший результат, узлы, границы и расширения, исходные разрывы R1 как обязательства (активные или отложенные с условием пробуждения) и, после политики владельца, назначения обязательств.",
+"where": "Таблица revisions · вид «research-scope» · id research-scope:<проект>:R2",
+"when": "Пишется прежним маршрутом: configureResearchScope при настройке области (в src вызывается из expandResearchScope, research-scope.ts:103) и expandResearchScope при расширении; политику владельца добавляет команда apply-obligation-policy (одной сделкой со счётчиком project-dispatch). В рабочей базе одна запись в 2 версиях (вывод: настройка и применение политики владельца).",
+"why": "Показывает, какие разрывы R1 нужно решить сейчас (active), а какие можно отложить с возвратом (deferred), и кому передать отложенное — основа обязательств прежнего маршрута R2→R3.",
+"expects": "Слой — текущая голова graph-layer:<проект>:2, r1 — текущая принятая веха R1; каждый исходный разрыв R1 сохранён с точным составом; отложить можно только разрыв «нужен для следующего» с условием возврата; политика обязана описывать все обязательства одним целым (объяснение, срок, потребитель, условие возврата); исполнитель проверки среды — точные источники проекта.",
+"risks": "Чужие L2/R1 — scope_basis_foreign; неверная область — scope_invalid; потерян исходный разрыв — scope_gap_missing; плохое откладывание — scope_deferral_invalid; нет политики при обновлении — obligation_policy_missing; политика неполная или чужая — obligation_policy_invalid / obligation_policy_incomplete; параллельный вызов — obligation_application_busy.",
+"size": "HX5: записей нет · рабочая база: 1 запись (2 версии), 112 КБ, до 74 КБ на версию",
+"note": "В проходе OM запись не читается и не пишется: роль политики владельца выполняют D7 (om-obligations) и H2. Её читают прежний маршрут, исследование и наблюдение среды по явной ссылке. Схема OM отдельного узла для области не содержит; связи привязаны к узлам группы R2 по смыслу (вывод)."
+},
+"fields": [
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "layer",
+"type": "Ref",
+"iface": true,
+"what": "Точная ссылка на слой 2, на котором область построена.",
+"writer": "Настройка области (om.r2): должна быть текущей головой graph-layer:<проект>:2.",
+"readers": "Чтение области проверяет, что она принадлежит именно этому слою 2 (om.r2.cons).",
+"expects": "Слой — голова graph-layer:<проект>:2; узлы области принадлежат его проекции.",
+"risks": "Иной слой — scope_basis_foreign."
+},
+{
+"path": "r1",
+"type": "Ref",
+"iface": true,
+"what": "Точная ссылка на принятую веху R1, чей отчёт даёт исходные разрывы.",
+"writer": "Настройка области (om.r2).",
+"readers": "Чтение области и ворота R2 (om.r2.cons).",
+"expects": "Равна текущей голове phase:<проект>:R1.",
+"risks": "Иная веха — scope_basis_foreign; нет отчёта R1 — scope_basis_missing."
+},
+{
+"path": "obligations",
+"type": "{gap, state:active|deferred, reason, wake}[]",
+"iface": true,
+"what": "Исходные разрывы R1 как обязательства: состояние, причина и условие пробуждения.",
+"writer": "Настройка области (om.r2).",
+"readers": "Определение отложенного против текущего (om.r2.cons); вопросы R2 строятся по активным (om.r2).",
+"expects": "Каждый исходный разрыв R1 ровно по разу, точно; отложенный — «нужен для следующего», с причиной и проверяемым условием (узлы, пути или UI).",
+"risks": "Потеряно или изменено — scope_gap_missing; отложено без условия — scope_deferral_invalid."
+},
+{
+"path": "policy",
+"type": "{version, sourceScope:Ref, assignments[]}",
+"iface": true,
+"what": "Политика владельца: для каждого обязательства — вид знания, срок (R2, R3, task-start, task-result), ответственные узел и потребитель, причина, условие возврата, проверка среды.",
+"writer": "Команда apply-obligation-policy (om.r2): новая версия области.",
+"readers": "Отложенное определяется назначением (om.r2.cons); вехи R2 и L3 переносят назначения дальше (phase).",
+"expects": "Одно целое для всех обязательств; sourceScope — исходная версия области; всё нужное для R2 остаётся «сейчас»; проверка среды — точные скрипт и зависимости проекта.",
+"risks": "Неполная или чужая политика — obligation_policy_invalid / obligation_policy_incomplete / obligation_origin_invalid; изменение при работающем вызове — obligation_application_busy."
+},
+{
+"path": "outcome",
+"type": "string",
+"iface": false,
+"what": "ближайший исход, ради которого область",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "nodes",
+"type": "string[]",
+"iface": false,
+"what": "узлы детальной области",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "boundaries",
+"type": "{node, reason}[]",
+"iface": false,
+"what": "внешние договоры (границы)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "expansions",
+"type": "{node, reason}[]",
+"iface": false,
+"what": "расширения области",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "changedPaths",
+"type": "string[]",
+"iface": false,
+"what": "изменяемые пути (для пробуждения отложенного)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "uiRequired",
+"type": "boolean",
+"iface": false,
+"what": "нужен ли интерфейс",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "policy.version",
+"type": "number",
+"iface": false,
+"what": "версия политики",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "policy.sourceScope",
+"type": "Ref",
+"iface": false,
+"what": "исходная версия области, к которой применена политика",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "policy.assignments",
+"type": "ObligationAssignment[]",
+"iface": false,
+"what": "назначения по обязательствам",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.r2",
+"code": "src/graph/research-scope.ts:58 (configureResearchScope); src/graph/obligation-application.ts:40 (applyObligationPolicy)",
+"when": "Настройка или расширение области; применение политики владельца — новая версия области вместе со счётчиком project-dispatch (прежний маршрут)",
+"fields": [
+"вся запись"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.r2.cons",
+"code": "src/graph/research-scope.ts:87 (scopeDefersGap); src/graph/research-scope.ts:92 (researchGapDeferred)",
+"fields": [
+"obligations",
+"policy",
+"layer",
+"r1"
+],
+"expects": "Решение «отложено ли обязательство» в прежнем маршруте: область проверяется (слой и R1 текущие), политика сверяется",
+"sure": false
+},
+{
+"node": "om.r2",
+"code": "src/graph/refinement.ts:94 (Refinement.begin); src/graph/refinement.ts:105 (Refinement.finishResearch); src/graph/refinement.ts:163 (Refinement.prepareLayer)",
+"fields": [
+"вся запись"
+],
+"expects": "Исследование R2 строит вопросы по активным обязательствам области, переносит политику в веху и вход слоя 3",
+"sure": false
+},
+{
+"node": "run.t.tstart",
+"code": "src/runtime/runtime-observation.ts:79 (observationDeclaration)",
+"fields": [
+"policy"
+],
+"expects": "Наблюдение среды по области прежнего маршрута сверяет объявленную проверку с политикой (в OM-эпохе объявление берётся из D7)",
+"sure": false
+}
+]
+},
+{
+"kind": "runtime-observation",
+"group": "om",
+"idPattern": "runtime-observation:<хэш [проект, ключ операции]>",
+"proposed": false,
+"card": {
+"what": "Наблюдение среды: запись о запуске объявленной в назначении проверки (скрипт .mjs с подтверждением всего условия возврата) — кто запускал, на каком коде и бинарниках, чем кончилось. Нулевой код выхода превращает его в подтверждение обязательства среды.",
+"where": "Таблица revisions · вид «runtime-observation» · id runtime-observation:<хэш [проект, ключ операции]>",
+"when": "Пишется только явной командой оператора observe-runtime (модель программу выбрать не может): сначала запись running вместе со счётчиком project-dispatch, затем версии с моментом запуска и идентичностью дочернего процесса, в конце — версия observed вместе с порождённым Source (одной сделкой) либо failed / stale; recover-runtime-observation закрывает брошенный запуск как failed. В рабочей базе записей нет.",
+"why": "Обязательство среды (подтверждение окружения) нельзя закрыть словом: M8 и исполнение требуют фактический запуск объявленной проверки на точных байтах кода и бинарниках, с неизменившейся средой. Запись хранит эти доказательства.",
+"expects": "Версия 1; scope — точный ledger OM (om-obligations) этого проекта или область прежнего маршрута; check равна объявленной в назначении; код проверки — точные Source проекта, неизменившиеся за время запуска; бинарники и субъекты проверены хэшем и идентичностью файла; успех — exitCode 0 без сигнала и status observed; Source, порождённый наблюдением, пересобирается из записи побайтно.",
+"risks": "Проверка не объявлена владельцем — runtime_check_not_declared; код проверки чужой или вне рабочего пространства — runtime_check_source_invalid; код или бинарник изменился за время запуска — runtime_observation_stale; параллельный вызов — runtime_observation_busy; ключ уже принадлежит другому наблюдению — runtime_observation_conflict; прерванный запуск — runtime_observation_interrupted; неизвестный процесс — process_identity_unavailable.",
+"size": "HX5: записей нет · рабочая база: записей нет (вид есть в коде)",
+"note": "Более поздний запуск той же проверки (в том числе провалившийся или идущий) отменяет старый успех: старое подтверждение не «воскресает». Наблюдение не вердикт: релевантность и достаточность оценивает потребитель. Приёмка стадий относит пространство runtime-observation к кандидатам на «рождённые от B1» записи (product/stage-checks.ts); по каталогу кода вид принадлежит runtime/, не om/."
+},
+"fields": [
+{
+"path": "version",
+"type": "1",
+"iface": false,
+"what": "версия формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "key",
+"type": "string",
+"iface": false,
+"what": "устойчивый ключ операции; из него и проекта выводится адрес",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "scope",
+"type": "Ref",
+"iface": true,
+"what": "Точная ссылка на объявление проверки: ledger OM (om-obligations) либо область R2 прежнего маршрута.",
+"writer": "Команда observe-runtime (оператор); пишет наблюдение (om.r2.check).",
+"readers": "Обязательства к R3 сверяют объявление с наблюдением (om.m8.obl); подтверждение при старте задачи и на результате перечитывает объявление заново (run.t.tstart, run.c.proof).",
+"expects": "Для OM — id начинается с om-obligations:<проект>:, объявление выводится из ledger заново; назначение равно объявленному.",
+"risks": "Другая область или объявление — наблюдение исключается (another-declaration-scope / declaration-differs); объявление не читается — runtime_check_not_declared."
+},
+{
+"path": "requestedFor",
+"type": "string",
+"iface": true,
+"what": "Адрес обязательства, для которого запрошена проверка (идентификатор привязки задачи).",
+"writer": "Команда observe-runtime (om.r2.check).",
+"readers": "Подтверждение ищется по этому адресу (om.m8.obl, run.t.tstart, run.c.proof).",
+"expects": "Равен адресу обязательства из назначения (runtimeObligationId); наблюдений с тем же адресом и проверкой позже по времени нет.",
+"risks": "Чужой адрес — подтверждение не засчитывается; более позднее наблюдение — старый успех отменён."
+},
+{
+"path": "check",
+"type": "RuntimeCheck {script, dependencies, subjects, executables, args, timeoutMs, purpose, satisfies}",
+"iface": true,
+"what": "Копия проверки из назначения: скрипт, зависимости, субъекты, бинарники, аргументы, предел времени и условие, которое проверка подтверждает целиком.",
+"writer": "Команда observe-runtime (om.r2.check): берёт только то, что объявлено владельцем.",
+"readers": "Готовность к R3 и исполнение сравнивают её с проверкой назначения (om.m8.obl, run.t.tstart).",
+"expects": "Равна runtimeCheck назначения; satisfies равно условию возврата.",
+"risks": "Иная проверка — наблюдение исключается (another-check)."
+},
+{
+"path": "status",
+"type": "\"running\"|\"observed\"|\"failed\"|\"stale\"",
+"iface": true,
+"what": "Состояние запуска: идёт, выполнен (в том числе с ненулевым кодом), провалился или устарел (основание изменилось).",
+"writer": "Команда observe-runtime и recover-runtime-observation (om.r2.check).",
+"readers": "Подтверждение засчитывается только при observed; идущий запуск блокирует применение политики владельца (om.r2), а подтверждение читается только у observed (om.m8.obl).",
+"expects": "observed только вместе с записью Source; running обязательно несёт идентичность наблюдателя и (после запуска) дочернего процесса.",
+"risks": "running без проверяемой идентичности — runtime_observation_identity_missing; невозможность доказать остановку — process_stop_*."
+},
+{
+"path": "result",
+"type": "{exitCode, signal, stdout, stderr} | null",
+"iface": true,
+"what": "Результат процесса: код выхода, сигнал и вывод.",
+"writer": "Команда observe-runtime (om.r2.check).",
+"readers": "Подтверждение — только exitCode 0 без сигнала (om.m8.obl, run.c.proof).",
+"expects": "Для observed — завершённый процесс без сигнала.",
+"risks": "Код не ноль — наблюдение есть, подтверждения нет."
+},
+{
+"path": "context",
+"type": "Ref[]",
+"iface": false,
+"what": "охранные ссылки: объявление, среда, код проверки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "environment",
+"type": "Ref",
+"iface": false,
+"what": "точная среда запуска",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "root",
+"type": "string",
+"iface": false,
+"what": "корень запуска",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "codeRoot",
+"type": "string | null",
+"iface": false,
+"what": "корень кода проверки; null — самодостаточный модуль оператора",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "runtimeBinding",
+"type": "Json",
+"iface": false,
+"what": "привязка среды запуска: среда, личность процесса, окружение, читатель",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "platform",
+"type": "{os, release, arch, node}",
+"iface": false,
+"what": "платформа и версия Node",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "executable",
+"type": "{path, hash, identity}",
+"iface": false,
+"what": "бинарник Node: путь, хэш, идентичность файла",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "subjects",
+"type": "{requested, kind, path, hash, identity}[]",
+"iface": false,
+"what": "проверяемые субъекты: файлы и бинарники, объявленные в проверке",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "snapshot",
+"type": "string | null",
+"iface": false,
+"what": "временный каталог со снимком кода проверки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "invocation",
+"type": "Command | null",
+"iface": false,
+"what": "точная команда запуска",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "owner",
+"type": "{pid, started}",
+"iface": false,
+"what": "идентичность наблюдателя",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "child",
+"type": "{pid, started} | null",
+"iface": false,
+"what": "идентичность дочернего процесса",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "startedAt",
+"type": "number",
+"iface": false,
+"what": "время начала",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "finishedAt",
+"type": "number | null",
+"iface": false,
+"what": "время конца",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "error",
+"type": "string | null",
+"iface": false,
+"what": "код и сообщение сбоя",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.r2.check",
+"code": "src/runtime/runtime-observation.ts:222 (observeRuntime); src/runtime/runtime-observation.ts:277 (observeRuntime); src/runtime/runtime-observation.ts:296 (observeRuntime)",
+"when": "Явная команда оператора: сначала запись running (с увеличением project-dispatch), затем наблюдение observed вместе с порождённым Source либо failed / stale; брошенный запуск закрывает recover-runtime-observation",
+"fields": [
+"вся запись"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.m8.obl",
+"code": "src/graph/obligation-readiness.ts:38 (confirmation); src/graph/runtime-evidence.ts:122 (projectRuntimeCandidate); src/graph/obligation-readiness.ts:162 (readinessObligations)",
+"fields": [
+"scope",
+"requestedFor",
+"check",
+"status",
+"result"
+],
+"expects": "Готовность к R3 ищет подтверждение: наблюдение observed с кодом 0, тем же адресом и проверкой; более позднее наблюдение этой же проверки отменяет успех",
+"sure": true
+},
+{
+"node": "run.t.tstart",
+"code": "src/graph/obligation-readiness.ts:72 (frozenObligationConfirmation); src/graph/obligation-readiness.ts:38 (confirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "Перед отправкой задачи подтверждение замораживается: наблюдение и Source перечитываются по точным ссылкам, объявление выводится заново",
+"sure": false
+},
+{
+"node": "run.c.proof",
+"code": "src/graph/obligation-readiness.ts:72 (frozenObligationConfirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "На результате задачи подтверждение перечитывается по точным ссылкам; без него задача ждёт (awaiting_obligation)",
+"sure": false
+},
+{
+"node": "om.r2.check",
+"code": "src/runtime/runtime-observation.ts:187 (observeRuntime); src/runtime/runtime-observation.ts:230 (observeRuntime); src/runtime/runtime-observation.ts:305 (recoverRuntimeObservation)",
+"fields": [
+"key",
+"scope",
+"requestedFor",
+"status",
+"owner",
+"child"
+],
+"expects": "Повтор с тем же ключом находит запись; конкурирующий запуск возвращает её; восстановление читает идентичность процессов",
+"sure": false
+},
+{
+"node": "om.r2",
+"code": "src/graph/obligation-application.ts:37 (applyObligationPolicy)",
+"fields": [
+"status"
+],
+"expects": "Применение политики владельца отказывает, пока идёт запуск проверки (obligation_application_busy)",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Пространство runtime-observation относится к записям, рождённым от B1, и проверяется по проекту",
+"sure": false
+},
+{
+"node": "run.phase.tstart",
+"code": "src/graph/obligation-readiness.ts:38 (confirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "Подтверждение среды — наблюдение с кодом 0 по этому обязательству; более позднее неудачное или неоконченное наблюдение отменяет старое",
+"sure": true
+},
+{
+"node": "run.phase.tresult",
+"code": "src/graph/obligation-readiness.ts:72 (frozenObligationConfirmation)",
+"fields": [
+"вся запись"
+],
+"expects": "Подтверждение task-result принимается как историческое: замороженная запись, а не текущая голова",
+"sure": true
+}
+]
 }
 ],
 "pending": [
@@ -38709,48 +40273,6 @@
 ]
 },
 {
-"kind": "runtime-observation",
-"writers": [],
-"readers": [
-{
-"node": "run.t.tstart",
-"code": "src/graph/obligation-readiness.ts:38 (confirmation)",
-"fields": [
-"вся запись"
-],
-"expects": "Подтверждение среды — наблюдение с кодом 0 по этому обязательству; более позднее неудачное или неоконченное наблюдение отменяет старое",
-"sure": true
-},
-{
-"node": "run.c.proof",
-"code": "src/graph/obligation-readiness.ts:72 (frozenObligationConfirmation)",
-"fields": [
-"вся запись"
-],
-"expects": "Подтверждение task-result принимается как историческое: замороженная запись, а не текущая голова",
-"sure": true
-},
-{
-"node": "run.phase.tstart",
-"code": "src/graph/obligation-readiness.ts:38 (confirmation)",
-"fields": [
-"вся запись"
-],
-"expects": "Подтверждение среды — наблюдение с кодом 0 по этому обязательству; более позднее неудачное или неоконченное наблюдение отменяет старое",
-"sure": true
-},
-{
-"node": "run.phase.tresult",
-"code": "src/graph/obligation-readiness.ts:72 (frozenObligationConfirmation)",
-"fields": [
-"вся запись"
-],
-"expects": "Подтверждение task-result принимается как историческое: замороженная запись, а не текущая голова",
-"sure": true
-}
-]
-},
-{
 "kind": "repo-inventory",
 "writers": [],
 "readers": [
@@ -38801,38 +40323,6 @@
 ],
 "expects": "Проход в состоянии unable продолжается, если для проекта есть разрешение повторить вызов с лимитом.",
 "sure": false
-}
-]
-},
-{
-"kind": "owner-command",
-"writers": [],
-"readers": [
-{
-"node": "om.b1.input",
-"code": "src/om/addressing.ts:267 (deriveInputDecisions)",
-"fields": [
-"question"
-],
-"expects": "Ответ владельца принимается решением, если команда называет этот вопрос и поле answer.",
-"sure": true
-}
-]
-},
-{
-"kind": "om-owner-result",
-"writers": [],
-"readers": [
-{
-"node": "om.b1.input",
-"code": "src/om/addressing.ts:265 (deriveInputDecisions)",
-"fields": [
-"project",
-"command",
-"value"
-],
-"expects": "Решение владельца стоит на точном результате H2 этого вопроса с тем же значением.",
-"sure": true
 }
 ]
 },
@@ -39032,22 +40522,6 @@
 ]
 },
 {
-"kind": "om-owner-result",
-"writers": [],
-"readers": [
-{
-"node": "om.r1.model",
-"code": "src/om/answer-form.ts:196 (fieldForm)",
-"fields": [
-"question",
-"value"
-],
-"expects": "Форма ответа поля входа не задаёт модели вопросы, на которые владелец уже ответил",
-"sure": true
-}
-]
-},
-{
 "kind": "om-series-applied",
 "writers": [],
 "readers": [
@@ -39122,23 +40596,6 @@
 "root"
 ],
 "expects": "G4b принимает повтор как результат, только если его партия равна сегодняшней, а предложение заполняет обязательства сегодняшней рамки works",
-"sure": true
-}
-]
-},
-{
-"kind": "om-owner-result",
-"writers": [],
-"readers": [
-{
-"node": "om.l2.g4b",
-"code": "src/om/answers-gate.ts:285 (proveOfferedRecord); src/om/answers-gate.ts:426 (proveResult); src/om/answers-gate.ts:702 (admitOwnerResults)",
-"fields": [
-"command",
-"question",
-"value"
-],
-"expects": "G4b принимает результат только если его вопрос привязан к этому разрыву, этим M6 и этому B1 и перепрошёл общий читатель; результат чужого вопроса чужой, непрочитанный — не результат",
 "sure": true
 }
 ]
