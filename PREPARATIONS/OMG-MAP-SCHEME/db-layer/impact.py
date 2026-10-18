@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--paths", nargs="*", default=[], help="пути задачи (src/… и test/…)")
     ap.add_argument("--kinds", nargs="*", default=[], help="виды записей явно")
     ap.add_argument("--repo", default=str(DEFAULT_REPO), help="рабочее дерево движка для поиска тестов")
+    ap.add_argument("--compact", action="store_true", help="по каждому виду — файлы кода читателей с числом узлов, без построчной таблицы")
     a = ap.parse_args()
     layer = json.loads((HERE / "db-layer.json").read_text())
     nodes = {n["key"]: n for n in json.loads((HERE / "map-nodes.json").read_text())}
@@ -91,6 +92,15 @@ def main():
         readers = [r for r in k.get("readers") or [] if not (code_files(r) <= paths and code_files(r))]
         if not readers:
             print("Читателей вне путей задачи нет.\n")
+            continue
+        if a.compact:
+            files = {}
+            for r in readers:
+                reader_files |= code_files(r)
+                unsure += r.get("sure") is False
+                for f in code_files(r) or {"(без места кода)"}:
+                    files.setdefault(f, set()).add(r["node"].split(".")[0])
+            print(f"Читателей: {len(readers)}. Файлы кода (стадии карты): " + "; ".join(f"`{f}` ({', '.join(sorted(st))})" for f, st in sorted(files.items())) + "\n")
             continue
         print("| Читатель (узел схемы) | Место кода | Поля | Ожидает | Проверено |")
         print("|---|---|---|---|---|")
