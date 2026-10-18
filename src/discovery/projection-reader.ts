@@ -26,9 +26,9 @@ import type { Observation } from "../evidence/evidence.js";
 import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { QUESTION_MOMENT_CONTRACT_VERSION } from "./preparation-contracts.js";
 import {
-  LEGACY_REQUIREMENTS, REQUIREMENTS, RESEARCH_CONTRACT_VERSION, selectResearchRequirements,
-  VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS,
-  VERSION6_REQUIREMENTS, type UpstreamStage,
+  LEGACY_REQUIREMENTS, producerContractEra, REQUIREMENTS, RESEARCH_CONTRACT_VERSION,
+  selectResearchRequirements, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS,
+  VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, type ProducerPolicy, type UpstreamStage,
 } from "./requirements.js";
 import { readAcceptedResearchAnswer } from "./discovery.js";
 import type { Decision, DiscoveryDraft, Fact, FieldSpec, Question } from "./discovery.js";
@@ -46,7 +46,7 @@ export {
   type DiscoveryChoice, type DiscoveryConditionDecision, type DiscoveryOutcome,
 } from "./discovery-outcome.js";
 export type { ResearchRun } from "./research-model.js";
-export { REQUIREMENTS, selectResearchRequirements, UPSTREAM_STAGES, type UpstreamStage } from "./requirements.js";
+export { REQUIREMENTS, selectResearchRequirements, UPSTREAM_STAGES, type ProducerPolicy, type UpstreamStage } from "./requirements.js";
 
 // ---------------------------------------------------------------------------
 // Эры контракта. Единственное место, где внешний потребитель узнаёт,
@@ -57,7 +57,8 @@ export { REQUIREMENTS, selectResearchRequirements, UPSTREAM_STAGES, type Upstrea
 export const SUPPORTED_CONTRACT_ERAS: readonly number[] = Object.freeze([1, 2, 3, 4, 5, 6]);
 /** Эры, для которых вообще существует допуск к новому выполнению. */
 export const ADMISSION_CONTRACT_ERAS: readonly number[] = Object.freeze([4, 5, 6]);
-/** Текущая эра нового контракта. */
+/** Эра текущей таблицы контракта (v6). Эру нового производителя по стадии
+ * выбирает producerContractEra — при включённом производителе v7 она выше. */
 export const CURRENT_CONTRACT_ERA: number = RESEARCH_CONTRACT_VERSION;
 /** С этой эры у контракта есть researchPlan/researchReport/verdict/preparation. */
 export const PREPARATION_CONTRACT_ERA = 5;
@@ -100,9 +101,10 @@ export function expectedRequirements(stage: UpstreamStage, version: number, save
 
 /** Допуск и таблица требований по сохранённой эре — прежний stageResearchContract
  * из product/stage-checks, перенесённый за границу без изменения семантики. */
-export function researchContract(stage: UpstreamStage, version: number, accepted: boolean) {
+export function researchContract(stage: UpstreamStage, version: number, accepted: boolean,
+  policy?: ProducerPolicy) {
   const requirements = requirementsForEra(version);
-  return { supported: !!requirements && (accepted || version === CURRENT_CONTRACT_ERA),
+  return { supported: !!requirements && (accepted || version === producerContractEra(stage, policy)),
     requirements: structuredClone((requirements ?? REQUIREMENTS)[stage] as FieldSpec[]),
     checkMapDesign: [3, 4, 5, 6].includes(version) };
 }
@@ -122,9 +124,11 @@ export function isAdmissionEra(version: number | null | undefined): boolean {
   return typeof version === "number" && ADMISSION_CONTRACT_ERAS.includes(version);
 }
 
-/** Эра — текущее издание контракта. */
-export function isCurrentEra(version: number | null | undefined): boolean {
-  return version === CURRENT_CONTRACT_ERA;
+/** Эра — текущее производимое издание контракта этой стадии по политике
+ * производителя (бесстадийного «текущего» нет: у каждой стадии свой производитель). */
+export function isCurrentEra(stage: UpstreamStage, version: number | null | undefined,
+  policy?: ProducerPolicy): boolean {
+  return version === producerContractEra(stage, policy);
 }
 
 /** Эра самой ранней формы (v1, включая отсутствующую contractVersion после contractEraOf). */
@@ -704,15 +708,16 @@ export interface ExecutionAdmission {
  * после допуска; для остальных назначений по-прежнему ничего не читает —
  * чтение сохранённого прогона остаётся на прежнем месте вызова (readResearchRun). */
 export function executionAdmission(store: Store, draft: Revision<DiscoveryDraft>,
-  purpose: AdmissionPurpose): ExecutionAdmission {
+  purpose: AdmissionPurpose, policy?: ProducerPolicy): ExecutionAdmission {
   const era = contractEraOf(draft.value), explicitEra = explicitContractEraOf(draft.value).version;
+  const producerEra = producerContractEra(draft.value.stage as UpstreamStage, policy);
   const admitted = purpose === "early-drive" ? ADMISSION_CONTRACT_ERAS.includes(era)
-    : era === CURRENT_CONTRACT_ERA;
+    : era === producerEra;
   const paused = purpose === "new-research" && ADMISSION_CONTRACT_ERAS.includes(era) && !admitted;
   const message = admitted || !ADMISSION_CONTRACT_ERAS.includes(era) ? null
     : era === PAID_RESTORE_CONTRACT_ERA
     ? `Paid v${era} work is retained; prepare Discovery v5 before new research or acceptance`
-    : `Paid v${era} work is retained; prepare Discovery v${CURRENT_CONTRACT_ERA} before new research or acceptance`;
+    : `Paid v${era} work is retained; prepare Discovery v${producerEra} before new research or acceptance`;
   let form: ExecutionAdmission["form"] = null;
   if (admitted && purpose === "early-drive") {
     if (!Array.isArray(draft.value.questions)) form = "lost";

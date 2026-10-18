@@ -2,7 +2,7 @@ import { isResearchPreview } from './research-preview.js';
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
-import { RESEARCH_CONTRACT_VERSION } from './requirements.js';
+import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
 import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
@@ -106,17 +106,19 @@ function dispatchModeAfterRecovery(turns: Revision<ResearchTurn>[], question: Re
 
 export class Researcher {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly environments: Environments) {}
-  async run(project: string, draftId: string, limit: number, signal?: AbortSignal, options: { restoreOnly?: boolean } = {}): Promise<Revision<ResearchRun>> {
+  async run(project: string, draftId: string, limit: number, signal?: AbortSignal,
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy } = {}): Promise<Revision<ResearchRun>> {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
     const early = earlyResearchStage(draft.value.stage);
+    const producerEra = producerContractEra(draft.value.stage as UpstreamStage, options.producerPolicy);
     const formerEarlyContract = early && typeof draft.value.contractVersion === 'number'
-      && draft.value.contractVersion >= 4 && draft.value.contractVersion < RESEARCH_CONTRACT_VERSION;
+      && draft.value.contractVersion >= 4 && draft.value.contractVersion < producerEra;
     const restoreOnly = options.restoreOnly === true || formerEarlyContract;
     requireCondition(!restoreOnly || early, 'research_restore_invalid', 'Restore-only applies only to early-stage paid work');
     const restoreComplete = formerEarlyContract
-      ? { code: 'research_contract_upgrade_required', message: `[${draftId}] Previous paid work is settled; prepare Discovery v${RESEARCH_CONTRACT_VERSION} before new work` }
+      ? { code: 'research_contract_upgrade_required', message: `[${draftId}] Previous paid work is settled; prepare Discovery v${producerEra} before new work` }
       : { code: 'research_restore_complete', message: `[${draftId}] Saved paid work is settled; restoration cannot begin a new action` };
     const id = `research-run:${hashJson([project, draftId])}`;
     // №2000-8: the prologue's first duty is restoring a PROVEN paid terminal —

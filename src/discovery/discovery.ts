@@ -6,7 +6,7 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
-import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, type UpstreamStage } from "./requirements.js";
+import { REQUIREMENTS, producerContractEra, producerRequirements, type ProducerPolicy, type UpstreamStage } from "./requirements.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 import { deriveFields, type Derivation } from "./derived-draft.js";
 import { resolveResearchBasis } from '../graph/research-basis.js';
@@ -54,9 +54,11 @@ const ajv = new Ajv({ strict: true, allowUnionTypes: true });
 export class Discovery {
   readonly evidence: Evidence;
   constructor(private readonly store: Store) { this.evidence = new Evidence(store); }
-  forStage(projectId: string, stage: UpstreamStage, consumer: string, inputs: Ref[] = []): Revision<DiscoveryDraft> {
+  forStage(projectId: string, stage: UpstreamStage, consumer: string, inputs: Ref[] = [],
+    policy?: ProducerPolicy): Revision<DiscoveryDraft> {
     requireCondition(Object.hasOwn(REQUIREMENTS, stage), "stage_contract_missing", "No research contract for this stage");
-    return this.create(projectId, stage, "R0", consumer, REQUIREMENTS[stage], inputs, RESEARCH_CONTRACT_VERSION);
+    return this.create(projectId, stage, "R0", consumer, producerRequirements(stage, policy), inputs,
+      producerContractEra(stage, policy));
   }
   create(projectId: string, stage: Stage, level: ResearchLevel, consumer: string, specs: FieldSpec[], inputs: Ref[] = [], contractVersion?: number): Revision<DiscoveryDraft> {
     requireCondition(STAGES.includes(stage) && ["R0", "R1", "R2", "R3"].includes(level) && typeof consumer === "string"

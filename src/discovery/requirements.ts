@@ -1,4 +1,5 @@
 import { sealed } from "../om/refusal.js";
+import { EngineError } from "../errors.js";
 import type { FieldSpec } from "./discovery.js";
 import { UPSTREAM_DETAILS, UPSTREAM_MOMENT_DETAILS, DISCOVERY_RESEARCH_FIELDS, DISCOVERY_PREPARATION, VERSION6_UPSTREAM_DETAILS, DISCOVERY_ANALOGUES_PROMPTS } from "./preparation-contracts.js";
 import { mapDesignSchema } from "../graph/builder.js";
@@ -76,4 +77,44 @@ export function selectResearchRequirements(stage: UpstreamStage, version: number
     if (expected && canonical(expected) === saved) return sealed(expected) as unknown as FieldSpec[];
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Выбор эры производителя по стадии. Только новая подготовка читает это
+// правило; эры сохранённых записей читаются таблицами выше и политикой
+// производителя не переоцениваются.
+// ---------------------------------------------------------------------------
+
+/** Эра следующего исследовательского контракта; её таблица требований
+ * появляется в DR2, поэтому включённый производитель отказывает до записи. */
+export const NEXT_CONTRACT_ERA = 7;
+
+/** Кодовый выключатель производителя v7 по стадиям: последняя правка
+ * программы (DR9) перечисляет здесь стадии с новым производителем. Тестовая
+ * подмена идёт только явным параметром ProducerPolicy вызывающего пути —
+ * обычная команда или ответ модели политику не переключают. */
+const PRODUCER_V7_STAGES: readonly UpstreamStage[] = Object.freeze([]);
+
+/** Политика производителя: какую эру новая подготовка пишет по стадии.
+ * Стадия без записи — текущая RESEARCH_CONTRACT_VERSION. */
+export type ProducerPolicy = Readonly<Partial<Record<UpstreamStage, number>>>;
+
+const CODE_PRODUCER_POLICY: ProducerPolicy = Object.freeze(
+  Object.fromEntries(PRODUCER_V7_STAGES.map(stage => [stage, NEXT_CONTRACT_ERA])));
+
+/** Эра, которую сейчас производит новая подготовка этой стадии. */
+export function producerContractEra(stage: UpstreamStage, policy?: ProducerPolicy): number {
+  return (policy ?? CODE_PRODUCER_POLICY)[stage] ?? RESEARCH_CONTRACT_VERSION;
+}
+
+/** Таблица требований новой подготовки стадии по политике производителя.
+ * Выбранная эра без своей таблицы (v7 до DR2) — типизированный отказ
+ * discovery_v7_producer_not_ready, а не драфт с чужим набором вопросов. */
+export function producerRequirements(stage: UpstreamStage, policy?: ProducerPolicy): FieldSpec[] {
+  const era = producerContractEra(stage, policy);
+  if (era !== RESEARCH_CONTRACT_VERSION)
+    throw new EngineError("discovery_v7_producer_not_ready",
+      `The v${era} research producer for stage "${stage}" is not ready: its requirements table does not exist yet`,
+      { stage, era });
+  return REQUIREMENTS[stage];
 }
