@@ -249,7 +249,7 @@ ul.plain b{color:var(--ink);font-weight:500}
     <div class="l">
       <div class="eyebrow">OMG · проход продукта · 14.10.2026 · Discovery — Codex-omg №4585 · Концепция — №4587 · Карта L1 — №4589 · Спецификация — №4591 · Фичи — №4594 · OM — №4595 · Исполнение — №4597 · Вход — №4600 · Discovery D1–D7 — №4602 · L1 M1–M7 — №4604 · спецификация P1–P7 — №4605 · фичи F1–F7 — №4607 · концепция C1–C7 — №4609 · + оркестратор</div>
       <h1>Проход продукта: <b>от идеи до задачи</b></h1>
-      <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки. <strong>Переключатель «Discovery · текущий / New Discovery»</strong> меняет первую стадию: текущая реализация в движке или предложенное устройство (досье реального мира по 12 осям) — вместе с её связями к концепции, карте, спецификации, фичам и OM.</p>
+      <p class="def">Каждая стадия — карточка. <strong>Клик по карточке разворачивает её</strong> в подробную карту: шаги, записи, проверки. Связи соседних стадий заходят прямо во внутренние узлы — видно, что, чем и куда передаётся. Развернуть можно одну, несколько или все; свернуть — кнопкой в заголовке рамки. <strong>Переключатель «Discovery / OLD Discovery»</strong> меняет первую стадию: Discovery — новое устройство (досье реального мира по 12 осям, предложение), OLD Discovery — прежняя реализация в движке — вместе с её связями к концепции, карте, спецификации, фичам и OM.</p>
     </div>
     <div class="legend" aria-label="Обозначения">
       <span class="pill ok">есть</span><span class="pill acc">в DS1</span><span class="pill warn">частично</span><span class="pill bad">нет</span><span class="pill">макет</span>
@@ -265,8 +265,8 @@ ul.plain b{color:var(--ink);font-weight:500}
     <select class="chip" id="doneDate" aria-label="Сделано за дату"><option value="">все даты</option></select>
     <span class="sep" aria-hidden="true"></span>
     <span class="seg" role="group" aria-label="Какой Discovery показать">
-      <button class="chip" data-disc="old" aria-pressed="true">Discovery · текущий</button>
-      <button class="chip" data-disc="new" aria-pressed="false">New Discovery</button>
+      <button class="chip" data-disc="old" aria-pressed="false">OLD Discovery</button>
+      <button class="chip" data-disc="new" aria-pressed="true">Discovery</button>
     </span>
     <span class="sep" aria-hidden="true"></span>
     <button class="chip" id="dbT" aria-pressed="false" hidden>База</button>
@@ -306,8 +306,8 @@ ul.plain b{color:var(--ink);font-weight:500}
 
   <nav class="nav" aria-label="Разделы">
     <span>Вход</span><a href="#i-what">Что это</a><a href="#i-when">Когда что</a><a href="#i-secrets">Секреты</a><a href="#i-owner">Владелец</a><a href="#i-gaps">Пробелы</a>
-    <span>Discovery</span><a href="#d-subs">Подблоки</a><a href="#d-actions">Действия модели</a><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
-    <span>New Discovery</span><a href="#nd-intro">Определение</a><a href="#nd-v2">Редакция 2</a><a href="#nd-dossier">Досье</a><a href="#nd-axes">12 осей</a><a href="#nd-steps">Шаги</a><a href="#nd-transitions">Исходы</a><a href="#nd-handoff">Передача</a><a href="#nd-research">Исследование</a><a href="#nd-checks">Проверки</a><a href="#nd-keeper">Хранитель</a><a href="#nd-era">Эра</a><a href="#nd-ui">UI</a><a href="#nd-storage">Хранение</a><a href="#nd-gap">Разрыв</a><a href="#nd-decide">Решения</a>
+    <span>OLD Discovery</span><a href="#d-subs">Подблоки</a><a href="#d-actions">Действия модели</a><a href="#d-consumers">Потребители</a><a href="#d-chain">Цепочка</a><a href="#d-outcomes">Исходы</a><a href="#d-owner">Вход</a><a href="#d-records">Записи</a><a href="#d-state">Что есть</a><a href="#d-missed">Упускали</a>
+    <span>Discovery</span><a href="#nd-intro">Определение</a><a href="#nd-v2">Редакция 2</a><a href="#nd-dossier">Досье</a><a href="#nd-axes">12 осей</a><a href="#nd-steps">Шаги</a><a href="#nd-transitions">Исходы</a><a href="#nd-handoff">Передача</a><a href="#nd-research">Исследование</a><a href="#nd-checks">Проверки</a><a href="#nd-keeper">Хранитель</a><a href="#nd-era">Эра</a><a href="#nd-ui">UI</a><a href="#nd-storage">Хранение</a><a href="#nd-gap">Разрыв</a><a href="#nd-decide">Решения</a>
     <span>Концепция</span><a href="#c-subs">Подблоки</a><a href="#c-what">Что это</a><a href="#c-input">Вход</a><a href="#c-process">Обработка</a><a href="#c-output">Выход</a><a href="#c-records">Записи</a><a href="#c-doors">Двери</a><a href="#c-gaps">Пробелы</a><a href="#c-missed">Упускали</a>
     <span>Карта L1</span><a href="#m-subs">Подблоки</a><a href="#m-what">Что это</a><a href="#m-input">Вход</a><a href="#m-process">Обработка</a><a href="#m-output">Выход</a><a href="#m-records">Записи</a><a href="#m-doors">Двери</a><a href="#m-gaps">Пробелы</a><a href="#m-missed">Упускали</a>
     <span>Спецификация</span><a href="#s-subs">Подблоки</a><a href="#s-what">Что это</a><a href="#s-input">Вход</a><a href="#s-process">Обработка</a><a href="#s-output">Выход</a><a href="#s-records">Записи</a><a href="#s-doors">Двери</a><a href="#s-gaps">Пробелы</a><a href="#s-missed">Упускали</a>
@@ -410,7 +410,7 @@ research-stage(project, draftId, maxTurns)
 
   <!-- ===================== DISCOVERY ===================== -->
   <div class="block" id="b-discovery">
-    <div class="bh2"><h2>Стадия 1 · <b>Discovery</b></h2><small>что, кому, как · сведено с Codex-omg №4585</small></div>
+    <div class="bh2"><h2>Стадия 1 · <b>OLD Discovery</b></h2><small>что, кому, как · сведено с Codex-omg №4585</small></div>
     <div class="grid">
       <section class="sec wide" id="d-consumers">
         <h3>Кому что нужно от Discovery <small>потребители выхода</small></h3>
@@ -552,7 +552,7 @@ research-stage(project, draftId, maxTurns)
 
   <!-- ===================== NEW DISCOVERY ===================== -->
   <div class="block" id="b-ndiscovery">
-    <div class="bh2"><h2>Стадия 1 · <b>New Discovery</b></h2><small>редакция 2 · 18.10.2026 · по ревью Codex-omg (7/10: 1 P1, 11 P2, 3 P3) · на схеме — переключатель «New Discovery»</small></div>
+    <div class="bh2"><h2>Стадия 1 · <b>Discovery</b></h2><small>редакция 2 · 18.10.2026 · по ревью Codex-omg (7/10: 1 P1, 11 P2, 3 P3) · на схеме — переключатель «Discovery / OLD Discovery»; прежняя реализация называется OLD Discovery</small></div>
     <div class="grid">
       <section class="sec wide key" id="nd-intro">
         <h3>Discovery — досье реального мира цифрового продукта <small>определение</small></h3>
@@ -578,7 +578,7 @@ research-stage(project, draftId, maxTurns)
             <tr><td>ND-11 · P3</td><td>Ровно 2–3 варианта порождают выдумки</td><td>Допустим один обоснованный вариант с явными границами поиска; можно отклонить все. Вариант — ценность, пользователь, границы продукта; технические способы — основания, а не проект вместо L1</td><td>D4</td></tr>
             <tr><td>ND-12 · P3</td><td>Сравнение частично устарело; номера действий повторяются</td><td>«Сейчас» обновлено по коду: externalSystems уже идут в L1, неизвестные — во все четыре ранние стадии, наследование и выбранные полные договоры есть, драйвер продолжает цепочку сам. Номера действий выровнены по шагам</td><td>#nd-gap, схема</td></tr>
             <tr><td>ND-13 · P2</td><td>Ссылка на целый пакет не убирает повторы; нужна точная проверка wire</td><td>Раздельно: неизменяемая подготовка вызова, малое состояние исполнения, манифест запроса с хэшем полного отправленного wire; общие неизменяемые части один раз; долговечное хранилище отдельно от кэша доказательств</td><td>#nd-storage</td></tr>
-            <tr><td>ND-14 · P2</td><td>Формы записей и атомарность проекций для правил кода не определены</td><td>Таблица записей семейства New Discovery; манифест досье; проекции обновляются в той же транзакции или с меткой применённых событий; историческое решение проверяется по своему точному набору</td><td>#nd-storage</td></tr>
+            <tr><td>ND-14 · P2</td><td>Формы записей и атомарность проекций для правил кода не определены</td><td>Таблица записей семейства Discovery; манифест досье; проекции обновляются в той же транзакции или с меткой применённых событий; историческое решение проверяется по своему точному набору</td><td>#nd-storage</td></tr>
             <tr><td>ND-15 · P3</td><td>«Гигабайты» без числа вызовов; единицы замера</td><td>Замер подписан (HX5: 467,6 МБ файла, 99,05 % JSON — три вида пакетов); объём — формулой U + N × (новые байты + метаданные) с явными предположениями</td><td>#nd-storage</td></tr>
           </tbody>
         </table></div>
@@ -781,7 +781,7 @@ research-stage(project, draftId, maxTurns)
       <section class="sec wide" id="nd-storage">
         <h3>Хранение и данные <small>ND-13…15 · замер HX5 18.10, только чтение</small></h3>
         <p><b>Факты:</b> файл <code>state.sqlite</code> HX5 — 467,6 МБ; JSON-тела — 464,7 МБ; три вида с пакетами модели (<code>research-context</code> 239,8 МБ, <code>research-consumer-intent</code> 179,9 МБ, <code>model-request</code> 40,5 МБ) — 99,05 % JSON-тел. Дедупликация целых тел сэкономила бы 10 486 байт: архивы уже адресуются по хэшу, но меняются каждый ход. Индексов по содержимому JSON нет; <code>Store.list(kind)</code> разбирает все тела вида.</p>
-        <h4>Записи семейства New Discovery (append-only revisions/heads/events; принятый потребитель — по точному Ref)</h4>
+        <h4>Записи семейства Discovery (append-only revisions/heads/events; принятый потребитель — по точному Ref)</h4>
         <div class="tw"><table>
           <thead><tr><th>Запись</th><th>Что хранит</th></tr></thead>
           <tbody>
@@ -1844,7 +1844,7 @@ research-stage(project, draftId, maxTurns)
       {f:"d.d8",t:"e.e3",l:"первый вопрос",lc:"D → E"},
       {f:"c.c6",t:"f.f4",l:"перед OM / M8",k:"alt",route:"below",depth:40}
      ]},
-    {id:"disc",n:"Стадия 1",st:"ds1",g:1,t:"Discovery",io:["идея","stage:discovery"],top:30,
+    {id:"disc",n:"Стадия 1 · OLD",st:"ds1",g:1,t:"OLD Discovery",io:["идея","stage:discovery"],top:30,
      sum:"Понимание и план → исследование наружу → отчёт с цитатами → вердикт → двери не-go → анкета → приёмка и итог. S — общий цикл хода.",
      d:[["Что делает","Превращает поручение в обоснованное решение: что нужно, кому и зачем, какой вариант, в каких рамках, что неизвестно — или обоснованный останов. Закрывает внешние вопросы, от которых зависит допустимость продукта."],["Два выхода","go + принятая preparation → stage:discovery accepted, вход концепции. Поддержанный no_go → полезный отрицательный итог, без accepted stage, разрешающего концепцию; окончательность — для текущего поручения, варианта и оснований."],["Три уровня","assessment supported — ответ обоснован; verdict.outcome — продуктовый вывод; research-run status — техника. Не сводить к одной отметке «принято»."],["Пробелы","Нет поиска моделью на базе (WB1); двери не-go (DS1.1); перенос в анкету (DS1.2); итог владельцу (DS1.3); понимание с авторством (IN1).",GAP],["Задачи","DS1 · WB1 + WB1b · IN1 · DS1.1 · DS1.2 · DS1.3 · DRY5FIX · UNK1",TASK]],
      subs:[
@@ -1983,9 +1983,9 @@ research-stage(project, draftId, maxTurns)
       {f:"d5.n9",t:"d7.n6",l:"отрицательный итог",k:"alt",route:"below",depth:46},
       {f:"s",t:"d1",l:"S обслуживает каждый ход D1–D6",k:"tie",route:"below",depth:92}
      ]},
-    {id:"ndisc",n:"Стадия 1 · New",st:"no",g:1,t:"New Discovery",io:["идея","досье реального мира"],top:30,
+    {id:"ndisc",n:"Стадия 1",st:"no",g:1,t:"Discovery",io:["идея","досье реального мира"],top:30,
      sum:"Приём → рамка → план по 12 осям с блокирующими вопросами → широкий проход → варианты и выбор владельца → глубокий проход по выбранному → досье → итог и вердикт → проекции потребителям. Хранитель держит конституцию.",
-     d:[["Что делает","Разбирается в куске реального мира, которому служит цифровой продукт: отрасль, люди, правила, рынок, деньги, данные, масштаб, последствия, реализуемость, первый результат. Выдаёт досье, на котором строят все следующие стадии."],["Подпродукт","Досье: каждое утверждение помечено — факт с источником, вывод, гипотеза, неизвестное (кто и когда закроет), решение владельца. Плюс 2–3 варианта, итог, вердикт и конституция проекта."],["Отличие от текущего","Текущий Discovery исследует один продукт и выносит go/no_go; домен — свободная строка модели, оси не названы, вариант один, широту никто не проверяет."],["Описание","Раздел «Стадия 1 · New Discovery» ниже на этой странице (#nd-intro): определение, досье, 12 осей, шаги D0–D8, исследование, проверки, замечания, потребители, UI, разрыв, решения. Предложение на утверждение владельца 17.10.2026.",GAP]],
+     d:[["Что делает","Разбирается в куске реального мира, которому служит цифровой продукт: отрасль, люди, правила, рынок, деньги, данные, масштаб, последствия, реализуемость, первый результат. Выдаёт досье, на котором строят все следующие стадии."],["Подпродукт","Досье: каждое утверждение помечено — факт с источником, вывод, гипотеза, неизвестное (кто и когда закроет), решение владельца. Плюс 2–3 варианта, итог, вердикт и конституция проекта."],["Отличие от текущего","Текущий Discovery исследует один продукт и выносит go/no_go; домен — свободная строка модели, оси не названы, вариант один, широту никто не проверяет."],["Описание","Раздел «Стадия 1 · Discovery» ниже на этой странице (#nd-intro): определение, досье, 12 осей, шаги D0–D8, исследование, проверки, замечания, потребители, UI, разрыв, решения. Предложение на утверждение владельца 17.10.2026.",GAP]],
      subs:[
       {id:"d0",n:"D0",st:"yes",g:0,t:"Приём поручения",io:["слова и материалы владельца","поручение дословно"],
        sum:"Код сохраняет поручение и материалы владельца без трактовки — как сейчас.",
@@ -3080,7 +3080,7 @@ research-stage(project, draftId, maxTurns)
     {f:"disc.d7.n4",t:"map.m4",l:"preparation → actors · outcomes · journeys",route:"below",depth:154,ff:.22},
     {f:"disc.d7.n4",t:"om.b1.read",l:"actors · unknowns · externalSystems",route:"below",depth:176,ff:.55},
     {f:"disc.d2.n6",t:"om.r1.packet",l:"каталог Source",k:"tie",route:"below",depth:220,ff:.6},
-    {f:"in.e.e9",t:"ndisc.d0.n1",l:"идея → приём поручения",lc:"идея → New Discovery"},
+    {f:"in.e.e9",t:"ndisc.d0.n1",l:"идея → приём поручения",lc:"идея → Discovery"},
     {f:"ndisc.d8.n1",t:"in.b.b1",l:"сводка владельцу",route:"above",depth:40},
     {f:"ndisc.d4.n4",t:"in.b.b1",l:"выбор варианта",k:"alt",route:"above",depth:70,ff:.5},
     {f:"ndisc.d8.n2",t:"con.c1.n1",l:"досье: люди · ценность · первый результат · не-цели",lc:"досье → концепция"},
@@ -3113,8 +3113,8 @@ research-stage(project, draftId, maxTurns)
   var NSV="http://www.w3.org/2000/svg";
 
   /* ---------- per-viewer state ---------- */
-  var KEY="omg-pass-map-v3",exp={},off={},soff={},DISC="old";
-  try{var saved=JSON.parse(localStorage.getItem(KEY)||"null");if(saved){exp=saved.exp||{};off=saved.off||{};soff=saved.soff||{};DISC=saved.disc==="new"?"new":"old";}}catch(_){}
+  var KEY="omg-pass-map-v3",exp={},off={},soff={},DISC="new";
+  try{var saved=JSON.parse(localStorage.getItem(KEY)||"null");if(saved){exp=saved.exp||{};off=saved.off||{};soff=saved.soff||{};DISC=saved.disc==="old"?"old":"new";}}catch(_){}
   if(location.hash==="#new-discovery")DISC="new";
   function save(){try{localStorage.setItem(KEY,JSON.stringify({exp:exp,off:off,soff:soff,disc:DISC}));}catch(_){}}
   /* two Discovery variants share one slot of the pipeline: only the selected one is laid out and linked */
