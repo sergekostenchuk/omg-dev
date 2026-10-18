@@ -53,3 +53,6 @@
 - om.l1 (старый seal-layer): sealLayer требует принятую features (refinement.ts:45, features_not_ready) и границу phase-policy/reader-pilot.
 - Слой: in.d.d1 → early-stage-driver.ts:498 подписано #entryFailure, а строка в #currentStage.
 - Нет узлов: save-graph, refine-graph, set-map-status.
+- om.r1 (Devin, 18.10, ревью Codex-omg): источник отказа и строка журнала в сохранённом пути E5 пишутся двумя сделками (assessment.ts:746–747, затем recordRefusal на :1178), не одной; работа завершения входит в транзакцию результата только при наличии связывания попытки (assessment.ts:656 пустая пачка).
+- layer-proposal: писатель om.r1.store — question-packet.ts:2205 (partSource) и :2268 (preparePartResult), применяет applyReceivedModelCall (model-call.ts:1773); читатель om.r1.store — checkedPart (question-packet.ts:2218).
+- om-completion-close пишет closeAttempt (run.ts:653 → repeat-gate.ts managedCloseBundle) — по разметке это om.s.close; om-completion-finalization/-reuse пишут writeCompletionFinalization/writeCompletionReuse (model-call.ts:4123/4449, run.ts finalize/reuse) — om.l3.form.
