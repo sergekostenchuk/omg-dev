@@ -47,6 +47,11 @@ export interface ProcessStopReport {
    * ('ESRCH' proved the absence), null when the group still answered, or the probe's own error.
    * The sweep's original EPERM/EACCES stays in `errno` — the probe result never replaces it. */
   groupProbe?: string | null;
+  /** PROC1 diagnostics of the executed re-probe: how many signal-0 probes were actually sent and
+   * the elapsed wall-clock milliseconds. Present only when the refused sweep was re-probed;
+   * reports written without a re-probe simply lack them. */
+  attempts?: number;
+  elapsedMs?: number;
   /** Present only when the sender was child.kill and it returned false. */
   signalReturned?: boolean;
 }

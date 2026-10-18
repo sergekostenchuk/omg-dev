@@ -12,21 +12,35 @@ import { performance } from "node:perf_hooks";
 // D8.5.1 (№2433): a transient EPERM/EACCES of the group sweep — a member of the group caught in its
 // exit/reparent window answers EPERM for a few milliseconds — is not a denial until the same PGID is
 // re-probed with signal 0: only ESRCH proves the addressed group is gone (row 14 of №1500).
-const GROUP_PROBE_BUDGET = 6, GROUP_PROBE_INTERVAL_MS = 20, GROUP_PROBE_DEADLINE_MS = 100;
+// PROC1: extend the bounded re-observation window beyond the old flat 100 ms; whether that window
+// caused the observed load failures has not been established. The probe keeps the same attempt
+// count, the first at once, then doubling waits 20/40/80/160/320 ms — the last probe lands about
+// 620 ms in — inside a monotonic 1 s deadline. Each wait is bounded by the time left to the
+// deadline; a wait resuming past it sends no probe at all.
+const GROUP_PROBE_BUDGET = 6, GROUP_PROBE_FIRST_WAIT_MS = 20, GROUP_PROBE_DEADLINE_MS = 1000;
 
-/** Re-probe the group after a refused sweep: first probe at once, the rest about 20 ms apart, never
- * past the common 100 ms deadline, never a second signal. Returns 'ESRCH' (absence proven), null
- * (the group still answers), or the probe's own errno — an observation error is never an absence. */
-async function probeGroupUntilAbsent(pid: number, probe: (pid: number) => string | null | void): Promise<string | null> {
+/** Re-probe the group after a refused sweep: first probe at once, the rest at doubling intervals,
+ * each wait bounded by what remains of the common 1 s deadline — never past it, never a second
+ * signal, always the same verified PGID. Returns the last observation ('ESRCH' proves absence,
+ * null or another errno does not — an observation error is never an absence) plus the number of
+ * probes actually sent and the elapsed wall-clock time for the stop report. */
+async function probeGroupUntilAbsent(pid: number, probe: (pid: number) => string | null | void): Promise<{ result: string | null; attempts: number; elapsedMs: number }> {
   const startedAt = performance.now();
-  let last: string | null = null;
+  let last: string | null = null, attempts = 0, wait = GROUP_PROBE_FIRST_WAIT_MS;
+  const done = () => ({ result: last, attempts, elapsedMs: Math.round(performance.now() - startedAt) });
   for (let attempt = 0; attempt < GROUP_PROBE_BUDGET; attempt++) {
-    if (attempt > 0) await new Promise(resolve => setTimeout(resolve, GROUP_PROBE_INTERVAL_MS));
-    if (performance.now() - startedAt >= GROUP_PROBE_DEADLINE_MS) break;
-    try { last = probe(pid) ?? null; } catch (error) { return (error as NodeJS.ErrnoException)?.code ?? "unknown"; }
-    if (last === "ESRCH") return last;
+    if (attempt > 0) {
+      const remaining = GROUP_PROBE_DEADLINE_MS - (performance.now() - startedAt);
+      if (remaining <= 0) break;
+      await new Promise(resolve => setTimeout(resolve, Math.min(wait, remaining)));
+      if (performance.now() - startedAt >= GROUP_PROBE_DEADLINE_MS) break;
+      wait *= 2;
+    }
+    attempts++;
+    try { last = probe(pid) ?? null; } catch (error) { last = (error as NodeJS.ErrnoException)?.code ?? "unknown"; return done(); }
+    if (last === "ESRCH") return done();
   }
-  return last;
+  return done();
 }
 
 // The strict identity observation and the stop classifier live in
@@ -97,9 +111,10 @@ export function runProcess(command: Command, cwd: string, input: string, timeout
         if (ownGroup && process.platform !== "win32" && (errno === "EPERM" || errno === "EACCES") && pid > 0) {
           const report: ProcessStopReport = { ...base, outcome: "denied", observedStarted: null, errno };
           const probe = stopHooks?.probeGroup ?? probeGroupAbsence;
-          sweepProbe = probeGroupUntilAbsent(pid, probe).then(result => {
-            stop = result === "ESRCH" ? { ...report, outcome: "absent", groupProbe: "ESRCH" }
-              : { ...report, groupProbe: result };
+          sweepProbe = probeGroupUntilAbsent(pid, probe).then(observation => {
+            const { result, attempts, elapsedMs } = observation;
+            stop = result === "ESRCH" ? { ...report, outcome: "absent", groupProbe: "ESRCH", attempts, elapsedMs }
+              : { ...report, groupProbe: result, attempts, elapsedMs };
             if (failure) refuse(failure);
           });
           return null;

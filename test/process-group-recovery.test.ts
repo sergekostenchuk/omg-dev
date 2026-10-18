@@ -390,6 +390,77 @@ for (const reason of ['abort', 'timeout'] as const) for (const finalProbe of ['E
   });
 }
 
+// PROC1 (D8.5.1 rework): the re-probe schedule is exercised under a controlled monotonic clock —
+// performance.now advances only through the waits the probe asked for (plus an injected overshoot
+// for the overdue-timer case), so the asserted schedule is exact, not sampled. The run's own
+// millisecond timeout stays on the real clock.
+function probeClock(t: test.TestContext, overshoot = 0) {
+  const realNow = performance.now.bind(performance);
+  const realTimeout = globalThis.setTimeout;
+  const waits: number[] = [];
+  let now = 0;
+  (performance as unknown as { now: () => number }).now = () => now;
+  globalThis.setTimeout = (((callback: (...args: never[]) => void, delay = 0, ...args: never[]) => {
+    if (delay < 2000) { waits.push(delay); return realTimeout(() => { now += delay + overshoot; callback(...args); }, 0); }
+    return realTimeout(callback, delay, ...args);
+  }) as unknown) as typeof setTimeout;
+  t.after(() => { (performance as unknown as { now: () => number }).now = realNow; globalThis.setTimeout = realTimeout; });
+  return { waits, advance: (ms: number) => { now += ms; } };
+}
+
+test('row 19k: an absence arriving after the old 100 ms is still proven — first probe at once, waits double to 320 ms', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const clock = probeClock(t);
+  let signals = 0; const probePids: number[] = [];
+  const result = await runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('late-absent')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => { signals++; return 'EPERM'; },
+      probeGroup: pid => { probePids.push(pid); return probePids.length < 6 ? 'EPERM' : 'ESRCH'; } });
+  assert.equal(result.stdout, 'late-absent'); assert.equal(result.exitCode, 0);
+  assert.equal(signals, 1, 'exactly one signal — the probe never signals again');
+  assert.equal(probePids.length, 6); assert.ok(probePids.every(pid => pid === probePids[0] && pid > 0), 'the same verified PGID, never 0/-1');
+  assert.deepEqual(clock.waits, [20, 40, 80, 160, 320], 'first probe at once, then doubling waits — the sixth lands at ~620 ms, past the old 100 ms deadline');
+});
+
+test('row 19l: a group that never proves absent is denied after the last probe — the report carries attempts and elapsedMs', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const clock = probeClock(t);
+  let probes = 0;
+  const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('x')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EPERM', probeGroup: () => { probes++; return 'EPERM'; } }));
+  assert.equal(error.code, 'process_stop_denied');
+  const details = error.details as { outcome: string; errno: string; groupProbe?: string | null; attempts?: number; elapsedMs?: number; cause: null };
+  assert.equal(details.outcome, 'denied'); assert.equal(details.errno, 'EPERM'); assert.equal(details.groupProbe, 'EPERM');
+  assert.equal(probes, 6); assert.equal(details.attempts, 6); assert.equal(details.elapsedMs, 620);
+  assert.deepEqual(clock.waits, [20, 40, 80, 160, 320]);
+  assert.equal(processStopPhysical(error)?.complete, true);
+});
+
+test('row 19m: a wait resuming past the deadline sends no probe — the budget ends by time, not attempts', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const clock = probeClock(t, 2000);
+  let probes = 0;
+  const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('x')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EPERM', probeGroup: () => { probes++; return null; } }));
+  assert.equal(error.code, 'process_stop_denied');
+  const details = error.details as { outcome: string; groupProbe?: string | null; attempts?: number; elapsedMs?: number };
+  assert.equal(details.outcome, 'denied'); assert.equal(details.groupProbe, null);
+  assert.equal(probes, 1); assert.equal(details.attempts, 1); assert.equal(details.elapsedMs, 2020);
+  assert.deepEqual(clock.waits, [20], 'one overdue wake — and no further probe is sent');
+});
+
+test('row 19n: each wait is bounded by the time left to the deadline — probing ends at it, never past it', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'omg-pgr-')); t.after(() => rmSync(root, { recursive: true, force: true }));
+  const clock = probeClock(t);
+  let probes = 0;
+  const error = await rejected(runProcess({ executable: process.execPath, args: ['-e', "process.stdout.write('x')"] }, root, '', 4000, undefined, true,
+    undefined, { signal: () => 'EPERM', probeGroup: () => { probes++; clock.advance(100); return 'EPERM'; } }));
+  assert.equal(error.code, 'process_stop_denied');
+  const details = error.details as { outcome: string; attempts?: number; elapsedMs?: number };
+  assert.equal(details.outcome, 'denied');
+  assert.equal(probes, 5); assert.equal(details.attempts, 5); assert.equal(details.elapsedMs, 1000);
+  assert.deepEqual(clock.waits, [20, 40, 80, 160, 200], 'the fifth wait is cut to the 200 ms remaining');
+});
+
 test('row 23: a finished record replays its own state without touching any process', t => {
   const store = storeFixture(t);
   const record = runningRecord(store, { status: 'failed', child: null, finishedAt: 2 });
