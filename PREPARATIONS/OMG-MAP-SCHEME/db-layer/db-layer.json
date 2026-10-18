@@ -20987,17 +20987,6 @@
 "sure": true
 },
 {
-"node": "ndisc.d8.n6",
-"code": "(предложение: код ещё не написан)",
-"fields": [
-"kind",
-"closer",
-"axis"
-],
-"expects": "Проекция для OM: API, лимиты, лицензии, моменты закрытия.",
-"sure": false
-},
-{
 "node": "ndisc.k.n2",
 "code": "(предложение: код ещё не написан)",
 "fields": [
@@ -21006,6 +20995,19 @@
 ],
 "expects": "Хранитель сверяет шаг стадии с целью и не-целями, опираясь на утверждения.",
 "sure": false
+},
+{
+"node": "ndisc.d7.n7",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"kind",
+"basis",
+"axis",
+"variant",
+"closer"
+],
+"expects": "Принятые утверждения выбранного варианта — основания участников, ограничений, внешних систем и неизвестных проекции.",
+"sure": true
 }
 ]
 },
@@ -21651,23 +21653,15 @@
 "sure": true
 },
 {
-"node": "ndisc.d8.n2",
+"node": "ndisc.d7.n7",
 "code": "(предложение: код ещё не написан)",
 "fields": [
 "title",
-"essence"
-],
-"expects": "Проекция для концепции: выбранный вариант и границы.",
-"sure": false
-},
-{
-"node": "ndisc.d8.n5",
-"code": "(предложение: код ещё не написан)",
-"fields": [
+"essence",
 "criteria"
 ],
-"expects": "Проекция для фич: ценность, кто платит, первый выпуск.",
-"sure": false
+"expects": "Выбранная редакция варианта — рамка проекции.",
+"sure": true
 }
 ]
 },
@@ -21866,7 +21860,7 @@
 "iface": true,
 "what": "Не-цели проекта.",
 "writer": "Итог (ndisc.d7.n1).",
-"readers": "Проекция для концепции (ndisc.d8.n2); хранитель (ndisc.k.n1).",
+"readers": "Проекция (ndisc.d7.n7); хранитель (ndisc.k.n1).",
 "expects": "Заполнены.",
 "risks": "Без не-целей хранитель не поймает дрейф."
 },
@@ -21876,7 +21870,7 @@
 "iface": true,
 "what": "Вердикт Discovery.",
 "writer": "Вердикт (ndisc.d7.n2).",
-"readers": "Сводка владельцу (ndisc.d8.n1); проекции потребителям (ndisc.d8).",
+"readers": "Сводка владельцу (ndisc.d8.n1); оценка (ndisc.d7.n5); единый читатель проекции (ndisc.d8.n7).",
 "expects": "go — без условий.",
 "risks": "Вердикт без оснований не принимается."
 },
@@ -21970,56 +21964,6 @@
 "sure": true
 },
 {
-"node": "ndisc.d8.n2",
-"code": "(предложение: код ещё не написан)",
-"fields": [
-"forWhom",
-"firstResult",
-"nonGoals"
-],
-"expects": "Проекция для концепции: люди, ценность, первый результат, не-цели.",
-"sure": true
-},
-{
-"node": "ndisc.d8.n3",
-"code": "(предложение: код ещё не написан)",
-"fields": [
-"forWhom",
-"basis"
-],
-"expects": "Проекция для карты L1: процессы, участники, внешние системы.",
-"sure": false
-},
-{
-"node": "ndisc.d8.n4",
-"code": "(предложение: код ещё не написан)",
-"fields": [
-"basis"
-],
-"expects": "Проекция для спецификации: правила, словарь, условия использования.",
-"sure": false
-},
-{
-"node": "ndisc.d8.n5",
-"code": "(предложение: код ещё не написан)",
-"fields": [
-"firstResult",
-"successCriterion"
-],
-"expects": "Проекция для фич: ценность, кто платит, первый выпуск.",
-"sure": false
-},
-{
-"node": "ndisc.d8.n6",
-"code": "(предложение: код ещё не написан)",
-"fields": [
-"unknowns",
-"basis"
-],
-"expects": "Проекция для OM: внешние факты, лимиты, моменты закрытия.",
-"sure": false
-},
-{
 "node": "ndisc.k.n1",
 "code": "(предложение: код ещё не написан)",
 "fields": [
@@ -22029,6 +21973,37 @@
 ],
 "expects": "Конституция берёт цель, потребителей, не-цели и критерий успеха из итога.",
 "sure": false
+},
+{
+"node": "ndisc.d7.n7",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"whatWeBuild",
+"forWhom",
+"firstResult"
+],
+"expects": "Итог — рамка проекции.",
+"sure": true
+},
+{
+"node": "ndisc.d7.n5",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"verdict",
+"conditions"
+],
+"expects": "Оценка комплекта: вердикт обоснован досье.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n7",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"verdict",
+"conditions"
+],
+"expects": "Разрешающий исход: go или conditional после разрешения условий; иначе выдачи нет.",
+"sure": true
 }
 ]
 },
@@ -22187,6 +22162,26 @@
 "successCriterion"
 ],
 "expects": "Проверка дрейфа: служит ли шаг цели и первому результату, не нарушены ли не-цели.",
+"sure": true
+},
+{
+"node": "ndisc.d7.n5",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"goal",
+"nonGoals"
+],
+"expects": "Оценка комплекта: конституция верно отражает досье.",
+"sure": true
+},
+{
+"node": "ndisc.d7.n6",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"goal",
+"nonGoals"
+],
+"expects": "Владелец принимает точную редакцию.",
 "sure": true
 }
 ]
@@ -46376,6 +46371,297 @@
 ],
 "expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing",
 "sure": false
+}
+]
+},
+{
+"kind": "product-projection",
+"group": "ndisc",
+"idPattern": "product-projection:<проект>",
+"proposed": true,
+"card": {
+"what": "Проекция выбранного продукта: участники, результаты и пути с ID, ограничения с Ref утверждений, внешние системы, риски, неизвестные (форма ND-02). Единственное, что Discovery отдаёт потребителям.",
+"where": "Таблица revisions · вид «product-projection» · id product-projection:<проект> (предложение).",
+"when": "Формируется моделью в D7 после итога; новая версия — при возврате оценщика или поправке владельца; после принятия не меняется.",
+"why": "Граница модуля: потребители читают только принятую проекцию через единый читатель с версией, не внутренности досье.",
+"expects": "Форма preparation (actors · outcomes · journeys); каждое ограничение с Ref утверждения; неизвестные в форме ND-02.",
+"risks": "Ограничение без Ref — основание «на слово»; код D8, дописывающий смысл, — второй производитель; прямое чтение досье потребителем ломает модульность.",
+"size": "Записей пока нет (вид предлагается).",
+"note": "Предложение по ревью №5824 (R2-01, R2-03): вида в движке нет; форма — договор проекции в разделе «Структурная передача»."
+},
+"fields": [
+{
+"path": "actors",
+"type": "[]",
+"iface": true,
+"what": "участники: id · роль · каналы · выгода",
+"writer": "Проекция (ndisc.d7.n7).",
+"readers": "Выдача карте L1 (ndisc.d8.n3), концепции (ndisc.d8.n2).",
+"expects": "",
+"risks": ""
+},
+{
+"path": "outcomes",
+"type": "[]",
+"iface": true,
+"what": "результаты с ID",
+"writer": "Проекция (ndisc.d7.n7).",
+"readers": "Концепция, карта L1.",
+"expects": "",
+"risks": ""
+},
+{
+"path": "journeys",
+"type": "[]",
+"iface": true,
+"what": "пути: успех · отказ · восстановление",
+"writer": "Проекция (ndisc.d7.n7).",
+"readers": "Карта L1 (ndisc.d8.n3).",
+"expects": "",
+"risks": ""
+},
+{
+"path": "constraints",
+"type": "[]",
+"iface": true,
+"what": "правило · Ref утверждения · область",
+"writer": "Проекция (ndisc.d7.n7).",
+"readers": "Концепция через каталог v7 (ndisc.d8.n2), спецификация (ndisc.d8.n4).",
+"expects": "",
+"risks": ""
+},
+{
+"path": "externalSystems",
+"type": "[]",
+"iface": true,
+"what": "участник · интерфейс · Ref документов · потребности среды",
+"writer": "Проекция (ndisc.d7.n7).",
+"readers": "Карта L1, спецификация.",
+"expects": "",
+"risks": ""
+},
+{
+"path": "risks",
+"type": "[]",
+"iface": true,
+"what": "риск · Ref · последствие",
+"writer": "Проекция (ndisc.d7.n7).",
+"readers": "Концепция, фичи (ndisc.d8.n5).",
+"expects": "",
+"risks": ""
+},
+{
+"path": "unknowns",
+"type": "[]",
+"iface": true,
+"what": "неизвестные в форме ND-02",
+"writer": "Проекция (ndisc.d7.n7).",
+"readers": "Выдача OM (ndisc.d8.n6), фичи.",
+"expects": "",
+"risks": ""
+},
+{
+"path": "contractVersion",
+"type": "string",
+"iface": true,
+"what": "версия договора проекции",
+"writer": "Манифест (ndisc.d7.n4).",
+"readers": "Единый читатель (ndisc.d8.n7).",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "ndisc.d7.n7",
+"code": "(предложение: код ещё не написан)",
+"when": "Модель собирает проекцию из итога, выбранного варианта и принятых утверждений.",
+"fields": [
+"actors",
+"outcomes",
+"journeys",
+"constraints",
+"externalSystems",
+"risks",
+"unknowns"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "ndisc.d7.n3",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"actors",
+"outcomes"
+],
+"expects": "Конституция опирается на проекцию.",
+"sure": true
+},
+{
+"node": "ndisc.d7.n2",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"constraints",
+"unknowns"
+],
+"expects": "Вердикт по итогу и проекции.",
+"sure": true
+},
+{
+"node": "ndisc.d7.n5",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"actors",
+"constraints",
+"unknowns"
+],
+"expects": "Проекция верно отражает досье; у ограничений есть Ref.",
+"sure": true
+},
+{
+"node": "ndisc.d7.n6",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"actors",
+"outcomes",
+"constraints"
+],
+"expects": "Владелец принимает точную редакцию.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n7",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"contractVersion"
+],
+"expects": "Только принятая проекция с известной версией договора.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n2",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"constraints",
+"actors",
+"outcomes"
+],
+"expects": "Каталог оснований v7 → basis-application/v1.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n3",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"actors",
+"outcomes",
+"journeys",
+"externalSystems"
+],
+"expects": "Форма preparation для builder, те же ID.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n4",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"constraints",
+"externalSystems"
+],
+"expects": "Основания для applications договоров.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n5",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"risks",
+"unknowns"
+],
+"expects": "Основания первого выпуска.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n6",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"unknowns"
+],
+"expects": "Адаптер B1: прежние поля вопроса + Ref исходного неизвестного.",
+"sure": true
+}
+]
+},
+{
+"kind": "discovery-acceptance",
+"group": "ndisc",
+"idPattern": "discovery-acceptance:<проект>",
+"proposed": true,
+"card": {
+"what": "Акт принятия владельцем точного комплекта Discovery: Ref итога, проекции, конституции и вердикта.",
+"where": "Таблица revisions · вид «discovery-acceptance» (предложение); полномочная запись владельца.",
+"when": "Один раз, когда владелец нажимает «принять» или вносит поправку (тогда — новая версия комплекта и новый акт).",
+"why": "Владелец принимает именно то, что передаётся дальше; без точных Ref принятие ничего не связывает.",
+"expects": "Все четыре Ref точные (запись + хэш); автор — владелец.",
+"risks": "Принятие без Ref проекции — потребители получат непринятые данные; обязательность принятия — решение владельца 3.",
+"size": "Записей пока нет (вид предлагается).",
+"note": "Предложение по ревью №5824 (R2-01, R2-03): вида в движке нет; форма — договор проекции в разделе «Структурная передача»."
+},
+"fields": [
+{
+"path": "refs",
+"type": "{outcome,projection,constitution,verdict}",
+"iface": true,
+"what": "точные Ref комплекта",
+"writer": "Принятие (ndisc.d7.n6).",
+"readers": "Манифест (ndisc.d7.n4), единый читатель (ndisc.d8.n7).",
+"expects": "",
+"risks": ""
+},
+{
+"path": "decision",
+"type": "accept | amend",
+"iface": true,
+"what": "решение владельца",
+"writer": "Принятие (ndisc.d7.n6).",
+"readers": "Манифест (ndisc.d7.n4).",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "ndisc.d7.n6",
+"code": "(предложение: код ещё не написан)",
+"when": "Владелец принимает комплект или вносит поправку.",
+"fields": [
+"refs",
+"decision"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "ndisc.d7.n4",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"refs",
+"decision"
+],
+"expects": "Полномочия и точные Ref перед манифестом.",
+"sure": true
+},
+{
+"node": "ndisc.d8.n7",
+"code": "(предложение: код ещё не написан)",
+"fields": [
+"refs"
+],
+"expects": "Выдавать только принятую редакцию проекции.",
+"sure": true
 }
 ]
 }
