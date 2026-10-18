@@ -4,6 +4,7 @@ import type { SpecificationBases, TaskSpecification, TaskSpecificationSelection 
 import { isRef, stageId, type Ref } from '../pipeline/contracts.js';
 import { resolveBasisApplications } from '../discovery/basis-application.js';
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
+import { hasBasisApplications } from '../discovery/projection-reader.js';
 
 /**
  * SP1 (№4714 §3): the accepted specification a consumer is given whole — the original behavior contracts, the feature
@@ -13,13 +14,9 @@ import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 export const SELECTED_SPECIFICATION_CONTRACT = 'selected-specification/v1' as const;
 export const BASIS_SPECIFICATION_CONTRACT = 'selected-specification/v2' as const;
 export type SpecificationContract = typeof SELECTED_SPECIFICATION_CONTRACT | typeof BASIS_SPECIFICATION_CONTRACT;
-/** Only the declared producers of the catalogue and application-bearing stages choose this era. */
-export function hasBasisApplications(sources: readonly { stage: string; contractVersion?: number | null }[]): boolean {
-  return ['discovery', 'concept', 'specification'].every(stage => {
-    const rows = sources.filter(source => source.stage === stage);
-    return rows.length === 1 && rows[0]!.contractVersion === 6;
-  });
-}
+/** Only the declared producers of the catalogue and application-bearing stages choose this era.
+ * The era rule itself lives behind the Discovery boundary (projection-reader.hasBasisApplications). */
+export { hasBasisApplications };
 export const SELECTED_SPECIFICATION_CODES = Object.freeze(['selected_specification_basis_invalid', 'selected_specification_unresolved'] as const);
 
 export interface AcceptedStageFields { stage: string; ref: Ref; fields: Record<string, Json> }

@@ -1,4 +1,9 @@
-import { discoveryBasisCatalogue, discoveryOutcome } from '../discovery/discovery-outcome.js';
+import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
+import {
+  artifactFields, contractEraOf, discoveryOutcome, expectedRequirements,
+  isBasisApplicationEra, isLegacyEra, orderedSpecs, readDraft, readExact, readStageArtifact, researchContract,
+  stageFields, type UpstreamStage, UPSTREAM_STAGES,
+} from "../discovery/projection-reader.js";
 import { readOmInput } from '../om/input.js';
 import { isPlainObject } from '../om/refusal.js';
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
@@ -6,8 +11,7 @@ import { provenStore } from "../storage/store-view.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
   type GateContext, type GateResult, type Ref, type Finding } from "../pipeline/contracts.js";
-import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, LEGACY_REQUIREMENTS, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, selectResearchRequirements, type UpstreamStage } from "../discovery/requirements.js";
+import { Discovery } from "../discovery/discovery.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -31,12 +35,7 @@ import { readModelCallRecovery } from "../discovery/model-call-recovery.js";
  */
 /** Admission and reconstruction dispatch on the saved producer, independently of the next producer. */
 export function stageResearchContract(stage: UpstreamStage, version: number, accepted: boolean) {
-  const contracts = { 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS,
-    4: VERSION4_REQUIREMENTS, 5: VERSION5_REQUIREMENTS, 6: VERSION6_REQUIREMENTS };
-  const requirements = Object.hasOwn(contracts, version) ? contracts[version as keyof typeof contracts] : null;
-  return { supported: !!requirements && (accepted || version === RESEARCH_CONTRACT_VERSION),
-    requirements: structuredClone((requirements ?? REQUIREMENTS)[stage]),
-    checkMapDesign: [3, 4, 5, 6].includes(version) };
+  return researchContract(stage, version, accepted);
 }
 
 export interface Project { id: string; title: string }
@@ -253,7 +252,7 @@ export class StageChecks {
     const content = context.content as unknown as StageContent;
     if (!content || typeof content !== "object" || !isRef(content.draft) || !content.fields
       || !Object.hasOwn(content, "graph") || Object.keys(content).sort().join(",") !== "draft,fields,graph") return rejected("stage_content_invalid", "Stage content must bind a discovery result and its fields");
-    const draft = this.store.get<DiscoveryDraft>(content.draft.id);
+    const draft = readDraft(this.store, content.draft.id);
     if (!draft || draft.value.stage !== stage || draft.value.projectId !== context.projectId
       || canonical(draft.value.fields) !== canonical(content.fields)) return rejected("discovery_foreign", "Research does not belong to this stage or its fields changed");
     let outcome: ReturnType<typeof discoveryOutcome>;
@@ -264,29 +263,28 @@ export class StageChecks {
     }
     const result = this.discovery.gate(context.projectId, content.draft);
     result.findings.push(...outcome.findings); result.guards.push(...outcome.guards);
-    const version = draft.value.contractVersion ?? 1;
-    const legacy = version === 1;
-    const contract = stageResearchContract(stage as UpstreamStage, version, context.accepted === true);
+    const version = contractEraOf(draft.value);
+    const legacy = isLegacyEra(version);
+    const contract = researchContract(stage as UpstreamStage, version, context.accepted === true);
     if (!contract.supported)
       result.findings.push({ code: "research_contract_upgrade_required", target: stage, message: "New stage acceptance requires the enriched research contract; legacy history remains readable" });
-    const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
-    const expected = selectResearchRequirements(stage as UpstreamStage, version, specs);
+    const specs = orderedSpecs(this.store, draft.value);
+    const expected = expectedRequirements(stage as UpstreamStage, version, specs);
     if (!expected || canonical(specs) !== canonical(expected)) result.findings.push({ code: "research_contract_mismatch", target: stage, message: "Research questions do not match the stage's required fields" });
     if (!legacy && result.findings.length === 0) {
       const outcomes = this.store.get<{ projection: { artifacts: Graph['artifacts'] } }>(`graph-layer:${context.projectId}:1`);
-      result.findings.push(...preparationFindings(stage, content.fields, name => {
-        const source = this.store.get<StageArtifact>(stageId(context.projectId, name));
-        return (source?.value.content as unknown as StageContent | undefined)?.fields ?? null;
-      }, outcomes?.value.projection.artifacts.map(artifact => artifact.id) ?? []));
+      result.findings.push(...preparationFindings(stage, content.fields,
+        name => stageFields(this.store, context.projectId, name),
+        outcomes?.value.projection.artifacts.map(artifact => artifact.id) ?? []));
     }
-    if (stage === 'concept' && version === 6) {
+    if (stage === 'concept' && isBasisApplicationEra(version)) {
       const source = context.inputs[0];
       try {
         requireCondition(source?.value.stage === 'discovery' && source.value.status === 'accepted',
           'basis_application_material_invalid',
           `[${stageId(context.projectId, 'discovery')}] The concept needs its exact accepted Discovery source`);
-        const fields = (source.value.content as unknown as StageContent)?.fields;
-        requireCondition(fields && typeof fields === 'object' && !Array.isArray(fields),
+        const fields = artifactFields(source);
+        requireCondition(fields !== null,
           'basis_application_material_invalid', `[${source.id}] Accepted Discovery fields are missing`);
         const catalogue = discoveryBasisCatalogue({ ref: reference(source), fields });
         result.findings.push(...conceptApplicationFindings(content.fields['conceptSections'] ?? null, catalogue));
@@ -297,14 +295,14 @@ export class StageChecks {
           field: 'conceptSections', message: error.message });
       }
     }
-    if (stage === 'specification' && version === 6) {
+    if (stage === 'specification' && isBasisApplicationEra(version)) {
       const operation = context.inputs[0];
       try {
         const conceptRef = operation?.value.inputs[0];
         requireCondition(operation?.value.stage === 'operation-map' && isRef(conceptRef)
           && conceptRef.id === stageId(context.projectId, 'concept'),
           'basis_application_material_invalid', '[concept] Specification needs its exact accepted concept');
-        const concept = this.store.get<StageArtifact>(conceptRef.id, conceptRef.revision);
+        const concept = readStageArtifact<StageArtifact>(this.store, conceptRef.id, conceptRef.revision);
         requireCondition(concept?.kind === 'stage' && canonical(reference(concept)) === canonical(conceptRef)
           && concept.value.projectId === context.projectId && concept.value.stage === 'concept'
           && concept.value.status === 'accepted', 'basis_application_material_invalid',
@@ -313,15 +311,13 @@ export class StageChecks {
         requireCondition(concept.value.inputs.length === 1 && isRef(discoveryRef)
           && discoveryRef.id === stageId(context.projectId, 'discovery'),
           'basis_application_material_invalid', `[${concept.id}] Concept needs its exact Discovery source`);
-        const discovery = this.store.get<StageArtifact>(discoveryRef.id, discoveryRef.revision);
+        const discovery = readStageArtifact<StageArtifact>(this.store, discoveryRef.id, discoveryRef.revision);
         requireCondition(discovery?.kind === 'stage' && canonical(reference(discovery)) === canonical(discoveryRef)
           && discovery.value.projectId === context.projectId && discovery.value.stage === 'discovery'
           && discovery.value.status === 'accepted', 'basis_application_material_invalid',
           `[${discoveryRef.id}] Specification lost its accepted Discovery source`);
-        const discoveryFields = (discovery.value.content as unknown as StageContent)?.fields;
-        const conceptFields = (concept.value.content as unknown as StageContent)?.fields;
-        requireCondition(discoveryFields && conceptFields && typeof discoveryFields === 'object'
-          && typeof conceptFields === 'object' && !Array.isArray(discoveryFields) && !Array.isArray(conceptFields),
+        const discoveryFields = artifactFields(discovery), conceptFields = artifactFields(concept);
+        requireCondition(discoveryFields !== null && conceptFields !== null,
           'basis_application_material_invalid', '[behaviorContracts] Accepted source fields are missing');
         const catalogue = discoveryBasisCatalogue({ ref: reference(discovery), fields: discoveryFields });
         result.findings.push(...specificationApplicationFindings(content.fields['behaviorContracts'] ?? null,
@@ -340,10 +336,10 @@ export class StageChecks {
       else { const graphResult = this.graphs.layerGate(context.projectId, 1, content.graph); result.findings.push(...graphResult.findings); result.guards.push(...graphResult.guards); }
       if (contract.checkMapDesign && result.findings.length === 0) {
         const graph = this.store.get<Graph>(`graph:${context.projectId}`)!;
-        const initial = this.store.get<StageArtifact>(stageId(context.projectId, "discovery"))!.value.content as unknown as StageContent;
-        const concept = this.store.get<StageArtifact>(stageId(context.projectId, "concept"))!.value.content as unknown as StageContent;
+        const initial = artifactFields(readStageArtifact<StageArtifact>(this.store, stageId(context.projectId, "discovery"))!);
+        const concept = artifactFields(readStageArtifact<StageArtifact>(this.store, stageId(context.projectId, "concept"))!);
         try {
-          const proposed = buildL1(graph.value.id, graph.value.title, content.fields['mapDesign'], initial.fields, concept.fields);
+          const proposed = buildL1(graph.value.id, graph.value.title, content.fields['mapDesign'], initial!, concept!);
           if (canonical(projectGraph(graph.value, 1)) !== canonical(projectGraph(proposed, 1))) result.findings.push({ code: "map_design_drift", target: graph.id, message: "Stored L1 must match the researched design and accepted concept" });
         } catch (error) { result.findings.push({ code: "map_design_invalid", target: stage, message: error instanceof Error ? error.message : "Invalid researched map" }); }
       }
@@ -470,7 +466,7 @@ export function legacyFailure(project:string,code:string,message:string):never{
 }
 export function legacyExact(store:Store,project:string,ref:Ref,kind?:string):Revision<any>{
  if(!isRef(ref))legacyFailure(project,'legacy_operation_invalid','An exact operation source is required');
- const record=store.get(ref.id,ref.revision);
+ const record=readExact(store,ref);
  if(!record||!legacyObject(record.value)||!legacySame(reference(record),ref)||hashJson(record.value)!==ref.hash||(kind&&record.kind!==kind))
   legacyFailure(project,'legacy_operation_invalid','An exact operation source is unavailable');
  return record;

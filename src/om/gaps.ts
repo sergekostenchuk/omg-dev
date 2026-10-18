@@ -1,6 +1,7 @@
 import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
-import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from '../discovery/preparation-contracts.js';
+import { QUESTION_MOMENTS } from '../discovery/projection-reader.js';
+import { isSupportedEra, questionMomentRequired } from '../discovery/projection-reader.js';
 import { EngineError } from '../errors.js';
 import type { Graph } from '../graph/model.js';
 import { RefinementRelations } from '../graph/relations.js';
@@ -287,10 +288,10 @@ export function collectGaps(sources: GapSources): Sealed<GapCollection> {
       && source.id === question.source.id && source.revision === question.source.revision && source.hash === question.source.hash) : [];
     if (producer.length !== 1 || !['discovery', 'features'].includes(producer[0]!.stage)
       || !Object.hasOwn(producer[0]!, 'contractVersion')
-      || (producer[0]!.contractVersion !== null && ![1, 2, 3, 4, 5, 6].includes(producer[0]!.contractVersion!))) {
+      || (producer[0]!.contractVersion !== null && !isSupportedEra(producer[0]!.contractVersion))) {
       fail('gap_source_missing', question.id, 'source', 'A question must identify its exact stage producer and contract era'); continue;
     }
-    if ((producer[0]!.contractVersion ?? 0) >= QUESTION_MOMENT_CONTRACT_VERSION && !Object.hasOwn(question, 'moment')) {
+    if (questionMomentRequired(producer[0]!.contractVersion) && !Object.hasOwn(question, 'moment')) {
       fail('gap_moment_unknown', question.id, 'moment', 'This producer contract requires its explicit question moment'); continue;
     }
     if (question.kind !== null && !isKind(question.kind)) { fail('gap_kind_unknown', question.id, 'kind', 'The assigned knowledge kind is unknown'); continue; }

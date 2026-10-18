@@ -1,15 +1,17 @@
-import { Ajv, type AnySchema } from "ajv";
 import { isWebDocumentSource } from '../evidence/evidence.js';
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
-import { LEGACY_REQUIREMENTS, UPSTREAM_STAGES, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS, VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, selectResearchRequirements, type UpstreamStage } from "../discovery/requirements.js";
-import { QUESTION_MOMENTS, QUESTION_MOMENT_CONTRACT_VERSION } from "../discovery/preparation-contracts.js";
+import {
+  acceptedIssuance, contractEraAtLeast, contractEraOf, explicitContractEraOf,
+  isBasisApplicationEra, isLegacyEra, proveIssuedAnswer, questionMomentRequired,
+  requiresMapDesignReconstruction, requirementsForEra,
+  UPSTREAM_STAGES, type DiscoveryDraft, type RecordView, type UpstreamStage,
+} from "../discovery/projection-reader.js";
+import { QUESTION_MOMENTS } from "../discovery/projection-reader.js";
 import { conceptApplicationFindings, preparationFindings, specificationApplicationFindings } from "../discovery/preparation-validation.js";
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
-import { readAcceptedResearchAnswer } from "../discovery/discovery.js";
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
-import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { readLegacyOperation, StageChecks } from "../product/stage-checks.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
@@ -183,7 +185,7 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
   if (refusals.length) return finish(null);
   // Check the new mandatory field before JSON normalization, including explicit undefined.
   for (const stage of ["discovery", "features"] as const) {
-    if ((stages[stage].contractVersion ?? 0) < QUESTION_MOMENT_CONTRACT_VERSION) continue;
+    if (!questionMomentRequired(stages[stage].contractVersion)) continue;
     const fields = stages[stage].fields;
     const lists = stage === "discovery"
       ? [{ rows: object(fields.preparation) ? (fields.preparation as Row).unknowns : undefined, field: "preparation.unknowns" }]
@@ -214,7 +216,7 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
   const newEra = (stage: UpstreamStage) => {
     const version = stages[stage].contractVersion;
     if (threshold !== null && version === null) fail("stage_contract_version_unknown", stage, "contractVersion", "The active era threshold needs the exact draft version");
-    return threshold !== null && version !== null && version >= threshold;
+    return threshold !== null && contractEraAtLeast(version, threshold);
   };
   const newContracts = newEra("specification"), newCriteria = newEra("concept");
   const preparation: unknown = stages.discovery.fields['preparation'];
@@ -296,7 +298,7 @@ export function buildOmInput(stages: InputStages, options: InputOptions = {}): S
     if (typeof raw.blocksCurrentStage !== "boolean") fail("input_field_missing", stage, `${id}.blocksCurrentStage`, "The producer must specify whether the question blocks its stage");
     questions.push({ id, question: wording, consumer: raw.consumer, kind: Object.hasOwn(raw, "kind") ? raw.kind : null,
       blocks: raw.blocksCurrentStage === true, source: stages[stage].ref,
-      ...((stages[stage].contractVersion ?? 0) >= QUESTION_MOMENT_CONTRACT_VERSION ? { moment: raw.moment } : {}) });
+      ...(questionMomentRequired(stages[stage].contractVersion) ? { moment: raw.moment } : {}) });
   };
   for (const [index, raw] of unknowns.entries()) question(raw, `discovery:${requiredText(raw.id, "discovery", `unknowns[${index}].id`)}`, "discovery");
   const features: OmInput['features'] = [];
@@ -336,12 +338,10 @@ export function gateInput(result: InputBuildResult): Sealed<{ passed: boolean; c
   return sealed({ passed, codes: [...new Set(result.refusals.map(item => item.code))].sort(order) });
 }
 
-const contractsByVersion = sealed({ 1: LEGACY_REQUIREMENTS, 2: VERSION2_REQUIREMENTS, 3: VERSION3_REQUIREMENTS, 4: VERSION4_REQUIREMENTS, 5: VERSION5_REQUIREMENTS, 6: VERSION6_REQUIREMENTS });
 /** Version-only historical lookup; exact B1 proof questions select their known edition below. */
-export function inputResearchRequirements(version: number | null) {
-  return contractsByVersion[(version ?? 1) as keyof typeof contractsByVersion] ?? null;
+export function inputResearchRequirements(version: number | null | undefined) {
+  return requirementsForEra(version);
 }
-const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 
 function requireInputRequest(store: Store, request: InputRequest): void {
   if (!(store instanceof Store)) invalid("store");
@@ -406,17 +406,19 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
       const draftRecord = proof(content.draft, "discovery-draft"), draft = draftRecord.value;
       check(draftRecord.id.startsWith(`discovery:${request.project}:`) && draft.projectId === request.project && draft.stage === stage
         && object(draft.fields) && canonical(draft.fields) === canonical(content.fields), "content.draft", "The exact draft must belong to this stage and preserve its fields");
-      const version = Object.hasOwn(draft, "contractVersion") ? draft.contractVersion : null;
-      check(version === null || Number.isSafeInteger(version) && version > 0, "contractVersion", "The exact draft version is malformed");
+      const eraInfo = explicitContractEraOf(draft);
+      const version = eraInfo.present ? eraInfo.version : null;
+      check(version === null || typeof version === "number" && Number.isSafeInteger(version) && version > 0, "contractVersion", "The exact draft version is malformed");
       check(inputResearchRequirements(version), "contractVersion", "The draft uses an unknown historical contract");
       check(Array.isArray(draft.questions) && draft.questions.every(text) && Array.isArray(draft.inputs) && draft.inputs.every(isRef),
         "content.draft", "The research question and input sets must be explicit");
       for (const input of draft.inputs) proof(input);
       check(!predecessor || draft.inputs.some((ref: Ref) => canonical(ref) === canonical(reference(predecessor))), "inputs", "Research must bind its accepted predecessor");
-      const questions = draft.questions.map((id: string) => byId(id, "question"));
-      const savedSpecs = questions.map((question: Revision<Row>) => question.value.spec);
-      const specs = selectResearchRequirements(stage, version ?? 1, savedSpecs);
-      check(specs && canonical(savedSpecs) === canonical(specs), "questions", "The complete question set must match the saved contract era");
+      const questionView: RecordView = { get: (id: string) => byId(id, "question") as Revision<never> };
+      const issuance = acceptedIssuance(questionView, draftRecord as Revision<DiscoveryDraft>);
+      check(issuance.issued, "questions", issuance.issued ? ""
+        : issuance.failure === "contract" ? "The complete question set must match the saved contract era"
+        : "Every research question must have its own saved answer");
       const observation = (raw: unknown): Json => {
         check(object(raw) && raw.projectId === request.project && isRef(raw.source) && object(raw.selector), "observation", "Observation needs its project, exact source and selector");
         const sourceRecord = proof(raw.source, "source"), source = sourceRecord.value;
@@ -446,40 +448,35 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         check(canonical(extracted) === canonical(raw.value), "observation.value", "Observation must be derived from its saved source");
         return extracted;
       };
-      for (const [index, question] of (questions as Revision<Row>[]).entries()) {
-        const q = question.value;
-        check(question.id.startsWith(`question:${request.project}:`) && q.projectId === request.project && q.stage === stage
-          && q.draftId === draftRecord.id && q.status === "answered" && isRef(q.answer), "questions", "Every research question must have its own saved answer");
-        const answerRecord = proof(q.answer), answer = answerRecord.value;
-        check(answer.projectId === request.project && answer.question === question.id && answerRecord.id.startsWith(`${answerRecord.kind}:${request.project}:`)
-          && (answerRecord.kind === q.spec.kind || answerRecord.kind === "research-answer"), "answers", "The answer belongs to another question, project or kind");
-        let answered: Json;
-        if (answerRecord.kind === "fact") answered = observation(answer.observation);
-        else if (answerRecord.kind === "research-answer") {
-          // D8.4.2 (№2230): provenance through the common reader — a managed answer proves its own
-          // turn's K (the transitive reads join this B1 trail through the traced store); the exact
-          // K must already sit in the stage's saved proofs (it lands there from gate's guards).
-          const accepted = readAcceptedResearchAnswer(store, request.project, q.answer);
-          if (accepted.binding) proof(reference(accepted.binding), "research-acceptance-binding");
-          const assessment = proof(answer.assessment, "research-assessment").value;
-          check(assessment.projectId === request.project && assessment.verdict === "supported" && text(assessment.researcher)
-            && text(assessment.assessor) && assessment.researcher !== assessment.assessor && isRef(assessment.question), "assessment", "Research needs an independent supported assessment");
-          const issued = store.get<Row>(assessment.question.id, assessment.question.revision);
-          check(issued?.kind === "question" && issued.id === question.id && issued.hash === assessment.question.hash
-            && object(issued.value) && canonical(issued.value.spec) === canonical(q.spec), "assessment.question", "Assessment must bind the issued question contract");
-          check(Array.isArray(assessment.observations) && assessment.observations.length > 0, "assessment.observations", "Supported research needs saved observations");
-          for (const raw of assessment.observations) observation(raw);
-          for (const dependency of runtimeEvidenceDependencies(assessment.runtimeProofs ?? [])) proof(dependency);
-          check(canonical(assessment.value) === canonical(answer.value), "assessment.value", "The assessment must support this answer value");
-          answered = answer.value;
-        } else {
-          check(text(answer.actor), "answer.actor", "A saved decision names its owner");
-          answered = answer.value;
-        }
-        // The full ordered specs were checked against this era above. Reuse their stable schema objects:
-        // Ajv retains freshly decoded schemas by identity, so compiling each historical copy leaks validators.
-        check(canonical(answered) === canonical(draft.fields[q.spec.field]) && schemas.compile(specs[index]!.schema as AnySchema)(answered),
-          `fields.${q.spec.field}`, "Fields must match the answered value and historical schema");
+      for (const entry of issuance.entries) {
+        check(!entry.foreign && entry.staged && entry.namespaced && entry.answered,
+          "questions", "Every research question must have its own saved answer");
+        const answerRecord = proof(entry.answerRef!);
+        // Прежний приоритет: пространство имён и вид записи проверяются до
+        // читателя цепочки принятия внутри proveIssuedAnswer.
+        check(answerRecord.id.startsWith(`${answerRecord.kind}:${request.project}:`)
+          && (answerRecord.kind === entry.specKind || answerRecord.kind === "research-answer"),
+          "answers", "The answer belongs to another question, project or kind");
+        // D8.4.2 (№2230): provenance through the common reader inside the boundary — a managed
+        // answer proves its own turn's K (the transitive reads join this B1 trail through the
+        // traced store); the exact K must already sit in the stage's saved proofs (it lands
+        // there from gate's guards).
+        const issued = proveIssuedAnswer(store, draftRecord as Revision<DiscoveryDraft>, entry, answerRecord,
+          { verifyIssuedQuestion: true });
+        check(issued.ok, "answers", "The answer belongs to another question, project or kind");
+        const proven = issued.proof, prov = proven.provenance;
+        if (prov.kind === "fact") observation(prov.observation);
+        else if (prov.kind === "research-answer") {
+          if (prov.binding) proof(reference(prov.binding), "research-acceptance-binding");
+          proof(prov.assessmentRef!, "research-assessment");
+          check(prov.wellFormed && prov.independent && prov.supported, "assessment", "Research needs an independent supported assessment");
+          check(prov.bindsQuestion === true, "assessment.question", "Assessment must bind the issued question contract");
+          check(prov.hasObservations, "assessment.observations", "Supported research needs saved observations");
+          for (const raw of prov.observations) observation(raw);
+          for (const dependency of prov.runtimeDependencies) proof(dependency);
+          check(prov.valueMatches, "assessment.value", "The assessment must support this answer value");
+        } else check(prov.hasAuthor, "answer.actor", "A saved decision names its owner");
+        check(proven.reproduces, `fields.${entry.field}`, "Fields must match the answered value and historical schema");
       }
       if (stage === "operation-map") {
         check(isRef(content.graph) && content.graph.id === `graph-layer:${request.project}:1`, "content.graph", "The map must bind its exact L1 projection");
@@ -504,13 +501,13 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         const unique = (refs: Ref[]) => sorted([...new Map(refs.map(ref => [canonical(ref), ref])).values()]);
         check(canonical(unique(dependencies)) === canonical(sorted(layer.inputs)), "content.graph.inputs", "Layer inputs must cover all field and layer evidence");
         for (const input of layer.inputs) proof(input);
-        if (version === 3 || version === 4) {
+        if (requiresMapDesignReconstruction(version)) {
           const initial = sources.discovery!.fields, concept = sources.concept!.fields;
           const proposed = buildL1(projection.id, projection.title, content.fields.mapDesign, initial, concept);
           check(canonical(projectGraph(proposed, 1)) === canonical(projection), "content.graph", "The exact map must derive from its saved stage fields");
         }
       } else check(content.graph === null, "content.graph", "Only the operation map binds its own L1 projection");
-      sources[stage] = { ref: reference(record), contractVersion: version, fields: content.fields as Record<string, Json> };
+      sources[stage] = { ref: reference(record), contractVersion: version ?? null, fields: content.fields as Record<string, Json> };
     } catch (error) {
       return refuse("stage_not_accepted", error instanceof Error ? error.message : "Saved acceptance proof is invalid",
         error instanceof EngineError && error.code === "stage_not_accepted" ? error.details as ReturnType<typeof at>
@@ -524,7 +521,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
     if (covered.size !== behaviors.length || [...covered].some(value => !Number.isSafeInteger(value) || Number(value) < 0 || Number(value) >= behaviors.length))
       return refuse("stage_not_accepted", "Prepared features must cover every specified behavior", at(result.features.ref.id, "features.requirements", result.features.ref), "producer");
   }
-  if (result.concept.contractVersion === 6) {
+  if (isBasisApplicationEra(result.concept.contractVersion)) {
     try {
       const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
       const applications = conceptApplicationFindings(result.concept.fields['conceptSections'] ?? null, catalogue);
@@ -537,7 +534,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
         at(result.discovery.ref.id, 'content.fields', result.discovery.ref), 'producer');
     }
   }
-  if (result.specification.contractVersion === 6) {
+  if (isBasisApplicationEra(result.specification.contractVersion)) {
     try {
       const catalogue = discoveryBasisCatalogue({ ref: result.discovery.ref, fields: result.discovery.fields });
       const applications = specificationApplicationFindings(result.specification.fields['behaviorContracts'] ?? null,
@@ -553,7 +550,7 @@ function loadSources(store: Store, request: InputRequest): InputResult<Sealed<In
   }
   const outcomes = (result['operation-map'].fields['mapDesign'] as Row)?.artifacts;
   if (Array.isArray(outcomes)) for (const stage of INPUT_STAGES) {
-    if ((result[stage].contractVersion ?? 1) === 1) continue;
+    if (isLegacyEra(contractEraOf(result[stage]))) continue;
     const findings = preparationFindings(stage, result[stage].fields, name => result[name as UpstreamStage]?.fields ?? null,
       outcomes.map((artifact: Row) => artifact.id));
     if (findings.length) return refuse("stage_not_accepted", findings[0]!.message,

@@ -2,8 +2,9 @@ import { researchGapDeferred } from "./research-scope.js";
 import { realpathSync } from "node:fs";
 import { isAbsolute, normalize } from "node:path";
 import { Store, type TransactionGuard } from "../storage/store.js";
-import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { STAGES, reference, stageId, type StageArtifact, type Finding } from "../pipeline/contracts.js";
+import { Discovery, type DiscoveryDraft } from "../discovery/discovery.js";
+import { discoveryActors, orderedQuestions, readAnswer, readDraft, readQuestion } from "../discovery/projection-reader.js";
+import { STAGES, reference, type Finding } from "../pipeline/contracts.js";
 import type { Source, Observation } from "../evidence/evidence.js";
 import { workspacePath, uniqueTransactionGuards } from "../runtime/environment.js";
 import { requireCondition } from '../errors.js';
@@ -25,8 +26,7 @@ export interface TechnicalProposalOptions {
 }
 
 export function researchConsumerIds(store: Store, project: string, graph: Pick<Graph, "nodes">): string[] {
-  const initial = store.get<StageArtifact>(stageId(project, "discovery"));
-  const actors = (initial?.value.content as unknown as { fields?: { preparation?: { actors?: { id: string }[] } } })?.fields?.preparation?.actors ?? [];
+  const actors = discoveryActors(store, project);
   return [...new Set([...STAGES, ...graph.nodes.map(node => node.id), ...actors.map(actor => actor.id)])];
 }
 
@@ -50,8 +50,7 @@ export function technicalProposalFindings(store: Store, project: string, level: 
   }
   const findings: Finding[] = [];
   const fail = (code: string, target: string, message: string) => findings.push({ code, target, message, field });
-  const initial = store.get<StageArtifact>(stageId(project, "discovery"));
-  const actors = (initial?.value.content as unknown as { fields?: { preparation?: { actors?: { id: string }[] } } })?.fields?.preparation?.actors ?? [];
+  const actors = discoveryActors(store, project);
   const consumers = new Set(researchConsumerIds(store, project, graph));
   const files = observations.flatMap(observation => {
     // Evidence.observe reads the Source head (and, in a captured assessment
@@ -68,8 +67,8 @@ export function technicalProposalFindings(store: Store, project: string, level: 
     }
     return source.value.origin.kind === 'file' ? [source] : [];
   });
-  const question = store.get<Question>(questionId);
-  const draft = question?.value.draftId ? store.get<DiscoveryDraft>(question.value.draftId) : null;
+  const question = readQuestion(store, questionId);
+  const draft = question?.value.draftId ? readDraft(store, question.value.draftId) : null;
   if (mode === 'historical' && (!question || !draft))
     fail('research_context_read_proof_invalid', questionId, 'Historical precheck lost its original question or draft');
   const typed = question?.value.spec.basisContract === 'typed-v1';
@@ -140,14 +139,13 @@ export function technicalProposalFindings(store: Store, project: string, level: 
 }
 
 export function technicalResearchFindings(store: Store, discovery: Discovery, draft: DiscoveryDraft, graph: Graph, root: string, admissionGuards:TransactionGuard[]=[]): Finding[] {
-  return draft.questions.flatMap(questionId => {
-    const question = store.get<Question>(questionId)!;
-    const field = question.value.spec.field;
-    const answer = question.value.answer ? store.get(question.value.answer.id) : null;
+  return orderedQuestions(store, draft).flatMap(question => {
+    const questionId = question!.id, field = question!.value.spec.field;
+    const answer = question!.value.answer ? readAnswer(store, question!.value.answer.id) : null;
     if (answer?.kind !== "research-answer") return [{ code: "research_assessment_required", target: questionId, field,
       message: "Technical research requires an evidence-assessed report; a manual declaration is insufficient" }];
     const report=draft.fields[field] as unknown as TechnicalReport,observations=discovery.observations(questionId);
-    const runtime=collectRuntimeEvidence(store,draft.projectId,question.value.spec,report,observations);
+    const runtime=collectRuntimeEvidence(store,draft.projectId,question!.value.spec,report,observations);
     admissionGuards.push(...uniqueTransactionGuards([...runtime.guards, ...runtime.admissionGuards]));
     return technicalProposalFindings(store, draft.projectId, draft.level, questionId, field,report,observations,graph,root,runtime);
   });

@@ -1,6 +1,8 @@
 import { researchScope, scopedQuestions, researchGapDeferred, type ResearchScope } from "./research-scope.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
-import { Discovery, type DiscoveryDraft, type ResearchLevel, type FieldSpec, type Question } from "../discovery/discovery.js";
+import { Discovery, type ResearchLevel } from "../discovery/discovery.js";
+import { orderedSpecs, readDraft, type DiscoveryDraft, type FieldSpec }
+  from "../discovery/projection-reader.js";
 import { GraphRepository } from "./repository.js";
 import { Environments, inspectRepository, uniqueTransactionGuards, transactionGuardsCurrent, type RepositoryState } from "../runtime/environment.js";
 import { Pipeline } from "../pipeline/pipeline.js";
@@ -68,7 +70,7 @@ export class Refinement {
   #gaps(project: string): TechnicalGap[] {
     const phase = this.store.get<Milestone>(`phase:${project}:R1`);
     if (!phase?.value.draft) return [];
-    const draft = this.store.get<DiscoveryDraft>(phase.value.draft.id, phase.value.draft.revision);
+    const draft = readDraft(this.store, phase.value.draft.id, phase.value.draft.revision);
     requireCondition(draft && draft.hash === phase.value.draft.hash, "research_foreign", "R1 report is unavailable");
     const graph = this.store.get<Graph>(`graph:${project}`);
     return Object.values(draft.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)
@@ -106,11 +108,11 @@ export class Refinement {
     const admissionGuards: TransactionGuard[] = [];
     const inputs = uniqueRefs([...this.#inputs(project, level, admissionGuards), ...(scope ? [reference(scope)] : []), ...(level === "R0" ? [] : defectInputs(this.store, project))]); const checked = this.discovery.gate(project, draftRef);
     requireCondition(checked.findings.length === 0, "research_unresolved", "Research is unresolved or stale");
-    const draft = this.store.get<DiscoveryDraft>(draftRef.id)!;
+    const draft = readDraft(this.store, draftRef.id)!;
     requireCondition(draft.value.level === level && draft.value.stage === "om-g2" && draft.value.consumer === "compilation", "research_foreign", "Research belongs to a different refinement phase");
     requireCondition(draft.value.contractVersion === REFINEMENT_CONTRACT_VERSION,
       "research_contract_upgrade_required", "New research completion requires the enriched contract");
-    const specs = draft.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
+    const specs = orderedSpecs(this.store, draft.value);
     requireCondition((level === "R0" ? specs.length === 0 && canonical(draft.value.derivations) === canonical(this.#r0Entries(project))
       : this.#matchesQuestions(project, level, specs, draft.value.inputs, draft.value.basisContract === 'typed-v1', draft.value.obligationContract === 'evidence-v1'))
       && inputs.every(input => draft.value.inputs.some(ref => ref.id === input.id && ref.revision === input.revision && ref.hash === input.hash)),
@@ -168,7 +170,7 @@ export class Refinement {
   buildLayer(project: string, level: 2 | 3, draft: Ref, expected: number, actor: string): Revision<Graph> {
     assertPilotBoundary(this.store, project, `L${level}`);
     const inputs = this.#inputs(project, `L${level}`);
-    const record = this.store.get<DiscoveryDraft>(draft.id);
+    const record = readDraft(this.store, draft.id);
     requireCondition(record && inputs.every(input => record.value.inputs.some(ref => canonical(ref) === canonical(input))),
       "layer_research_foreign", "Layer design must use all current refinement prerequisites");
     return this.graphs.deriveLayer(project, level, expected, draft, actor, inputs);
@@ -192,14 +194,14 @@ export class Refinement {
         if (prior.admissionGuards?.length) result.admissionGuards = uniqueTransactionGuards(prior.admissionGuards);
       }
       if (phase === "R2" && milestone.value.draft) {
-        const draft = this.store.get<DiscoveryDraft>(milestone.value.draft.id, milestone.value.draft.revision);
+        const draft = readDraft(this.store, milestone.value.draft.id, milestone.value.draft.revision);
         const policyRef = draft?.value.inputs.find(ref => ref.id === `research-scope:${project}:R2`);
         const policyScope = policyRef ? this.store.get<ResearchScope>(policyRef.id, policyRef.revision) : null;
         if (policyScope?.hash === policyRef?.hash && policyScope?.value.policy
           && (!Array.isArray(milestone.value.carried) || canonical(milestone.value.carried) !== canonical(carriedObligations(policyScope))))
           result.findings.push({ code: 'research_obligation_handoff_invalid', target: 'R2',
             message: 'R2 must retain every exact carried obligation from its own scope revision, including its owner and deadline' });
-        const specs = draft?.value.questions.map(id => this.store.get<Question>(id)?.value.spec);
+        const specs = draft ? orderedSpecs(this.store, draft.value) : undefined;
         if (!draft || !this.#matchesQuestions(project, "R2", specs, draft.value.inputs, draft.value.basisContract === 'typed-v1', draft.value.obligationContract === 'evidence-v1')) result.findings.push({
           code: "research_horizon_changed", target: "R2", message: "Current horizon requires research obligations absent from the accepted R2 result" });
         const graph = this.store.get<Graph>(`graph:${project}`);

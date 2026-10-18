@@ -4,12 +4,13 @@ import { EngineError } from '../errors.js';
 import { resolveBasisApplications, type BasisAddress, type BasisApplicationOwner } from './basis-application.js';
 import type { DiscoveryBasisCatalogue } from './discovery-outcome.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
+import { BASIS_APPLICATION_CONTRACT_ERA, contractEraOf } from './projection-reader.js';
 
 type Row = Record<string, any>;
 export const requiresConceptApplications = (draft: DiscoveryDraft, question: Question): boolean =>
-  draft.contractVersion === 6 && draft.stage === 'concept' && question.spec.field === 'conceptSections';
+  contractEraOf(draft) === BASIS_APPLICATION_CONTRACT_ERA && draft.stage === 'concept' && question.spec.field === 'conceptSections';
 export const requiresSpecificationApplications = (draft: DiscoveryDraft, question: Question): boolean =>
-  draft.contractVersion === 6 && draft.stage === 'specification' && question.spec.field === 'behaviorContracts';
+  contractEraOf(draft) === BASIS_APPLICATION_CONTRACT_ERA && draft.stage === 'specification' && question.spec.field === 'behaviorContracts';
 /** The feature's selected contracts, rather than another model field, determine its requirement set. */
 export function selectedFeatureRequirements(contracts: { id: string; requirements: string[] }[], selected: string[]): string[] {
   return [...new Set(contracts.filter(contract => selected.includes(contract.id)).flatMap(contract => contract.requirements))];

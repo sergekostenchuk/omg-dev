@@ -1,6 +1,7 @@
 import type { Revision, Store } from "../storage/store.js";
 import { STAGES, isRef, reference, stageId, type StageArtifact } from "../pipeline/contracts.js";
-import type { DiscoveryDraft, Question } from "./discovery.js";
+import type { DiscoveryDraft } from "./discovery.js";
+import { readAnswer, readDraft, readQuestion, readStageArtifact } from "./projection-reader.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import type { Graph } from "../graph/model.js";
@@ -33,7 +34,7 @@ export function readDiscoveryBasisMaterial(store: Store, draft: DiscoveryDraft):
   if (refs.length !== 1) return fail('inputs', 'The draft needs exactly one accepted Discovery source');
   const ref = refs[0]!;
   if (!isRef(ref)) return fail('inputs', 'The Discovery source needs its full historical reference');
-  const record = store.get<StageArtifact>(ref.id, ref.revision);
+  const record = readStageArtifact<StageArtifact>(store, ref.id, ref.revision);
   if (!record || record.kind !== 'stage' || record.hash !== ref.hash || hashJson(record.value) !== record.hash
     || record.value.projectId !== project || record.value.stage !== 'discovery'
     || record.value.status !== 'accepted')
@@ -64,7 +65,7 @@ function operationMapMaterial(store: Store, draft: DiscoveryDraft, proposal?: In
   const accepted = (stage: "discovery" | "concept") => {
     const id = stageId(draft.projectId, stage), refs = draft.inputs.filter(ref => ref.id === id);
     if (refs.length !== 1) return fail(id, "inputs", "Map material needs exactly one accepted stage reference in its draft inputs");
-    const ref = refs[0]!, record = store.get<StageArtifact>(ref.id, ref.revision);
+    const ref = refs[0]!, record = readStageArtifact<StageArtifact>(store, ref.id, ref.revision);
     if (!record || record.kind !== "stage" || record.hash !== ref.hash || record.value.projectId !== draft.projectId
       || record.value.stage !== stage || record.value.status !== "accepted")
       return fail(id, "inputs", "Map material needs the exact accepted stage of this project");
@@ -140,7 +141,7 @@ function acceptedDraftField(store: Store, draft: DiscoveryDraft, field: string):
   let pending = false;
   let draftId: string | null = null;
   for (const id of draft.questions) {
-    const question = store.get<Question>(id);
+    const question = readQuestion(store, id);
     if (!question || question.kind !== 'question' || question.value.projectId !== draft.projectId
       || question.value.stage !== draft.stage || !question.value.spec?.field
       || (draftId !== null && question.value.draftId !== draftId))
@@ -148,8 +149,8 @@ function acceptedDraftField(store: Store, draft: DiscoveryDraft, field: string):
     draftId = question.value.draftId;
     if (pending || question.value.status !== 'answered') { pending = true; continue; }
     const ref = question.value.answer;
-    const answer = isRef(ref) ? store.get<{ projectId: string; question: string;
-      value?: Json; observation?: { value: Json } }>(ref.id, ref.revision) : null;
+    const answer = isRef(ref) ? readAnswer<{ projectId: string; question: string;
+      value?: Json; observation?: { value: Json } }>(store, ref) : null;
     const value = answer?.kind === 'fact' ? answer.value.observation?.value : answer?.value.value;
     if (!answer || !isRef(ref) || answer.hash !== ref.hash
       || (answer.kind !== question.value.spec.kind && answer.kind !== 'research-answer')
@@ -246,7 +247,7 @@ function featureBasisMaterial(store: Store, draft: DiscoveryDraft, proposal?: In
   const read = (stage: 'discovery' | 'concept' | 'operation-map' | 'specification') => {
     const id = stageId(draft.projectId, stage), refs = draft.inputs.filter(ref => ref.id === id);
     if (refs.length !== 1 || !isRef(refs[0])) return inheritanceFailure(stage, '/inputs', `Features need one exact accepted ${stage} source`);
-    const ref = refs[0]!, record = store.get<StageArtifact>(ref.id, ref.revision);
+    const ref = refs[0]!, record = readStageArtifact<StageArtifact>(store, ref.id, ref.revision);
     if (!record || record.kind !== 'stage' || record.hash !== ref.hash || hashJson(record.value) !== record.hash
       || record.value.projectId !== draft.projectId || record.value.stage !== stage || record.value.status !== 'accepted')
       return inheritanceFailure(stage, '/inputs', `Features lost their exact accepted ${stage} source`);
@@ -351,7 +352,7 @@ function discoveryUnknowns(record: Revision<StageArtifact>) {
  * supply identities needed for traceability, without duplicating every report. */
 export function researchPrerequisites(store: Store, draft: DiscoveryDraft, proposal?: InheritanceProposal) {
   const stages = draft.inputs.flatMap(ref => {
-    const record = store.get<StageArtifact>(ref.id, ref.revision);
+    const record = readStageArtifact<StageArtifact>(store, ref.id, ref.revision);
     return record?.kind === "stage" && record.hash === ref.hash ? [record] : [];
   }).sort((left, right) => STAGES.indexOf(right.value.stage) - STAGES.indexOf(left.value.stage));
   const latest = stages[0];
@@ -389,7 +390,7 @@ export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
   if (!layer || !draft.inputs.some(ref => ref.id === layer.id && ref.revision === layer.revision && ref.hash === layer.hash)) return null;
   const graph = store.get<Graph>(`graph:${draft.projectId}`);
   const previous = draft.level === "R2" ? store.get<{ draft: Ref | null }>(`phase:${draft.projectId}:R2`) : null;
-  const earlier = previous?.value.draft ? store.get<DiscoveryDraft>(previous.value.draft.id, previous.value.draft.revision) : null;
+  const earlier = previous?.value.draft ? readDraft(store, previous.value.draft.id, previous.value.draft.revision) : null;
   const openGaps = earlier?.value.contractVersion === REFINEMENT_CONTRACT_VERSION ? Object.values(earlier.value.fields).flatMap(value => (value as unknown as TechnicalReport).gaps)
     .map(gap => ({ ...gap, deferred: Boolean(graph && researchGapDeferred(store, draft.projectId, graph.value, gap)) })) : [];
   const currentHorizon = graph?.value.nodes.filter(node => graph.value.horizon.includes(node.id))
@@ -397,7 +398,7 @@ export function researchGraphContext(store: Store, draft: DiscoveryDraft) {
   const research = draft.inputs.flatMap(ref => {
     const phase = store.get<{ draft: Ref | null }>(ref.id, ref.revision);
     if (phase?.kind !== "phase" || phase.hash !== ref.hash || !phase.value.draft) return [];
-    const report = store.get<DiscoveryDraft>(phase.value.draft.id, phase.value.draft.revision);
+    const report = readDraft(store, phase.value.draft.id, phase.value.draft.revision);
     return report?.hash === phase.value.draft.hash && report.value.level === draft.level
       ? [{ ref: reference(report), fields: report.value.fields }] : [];
   });

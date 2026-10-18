@@ -28,12 +28,15 @@ import { observeRuntime, recoverRuntimeObservation } from '../runtime/runtime-ob
 import { continuePreparation, recoverLegacyOperation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
-import { StageChecks, type Project, type StageContent } from "./stage-checks.js";
+import { StageChecks, type Project } from "./stage-checks.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGES, predecessor, reference, isRef, stageId, type Stage, type StageArtifact,
   type GateContext, type GateResult, type Ref } from "../pipeline/contracts.js";
-import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { REQUIREMENTS, RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES, type UpstreamStage } from "../discovery/requirements.js";
+import { Discovery } from "../discovery/discovery.js";
+import {
+  executionAdmission, listDrafts, listQuestions, listRuns, orderedQuestions, readDraft, readQuestion,
+  REQUIREMENTS, stageFields, type DiscoveryDraft, type UpstreamStage, UPSTREAM_STAGES,
+} from "../discovery/projection-reader.js";
 import { GraphRepository } from "../graph/repository.js";
 import { canonical, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -49,7 +52,6 @@ import { Executor, planCurrentGuards } from "../execution/runner.js";
 import type { TaskRun } from "../execution/model.js";
 import type { ExecutionRoot } from "../runtime/environment.js";
 import { Researcher } from "../discovery/research-runner.js";
-import type { ResearchRun } from "../discovery/research-model.js";
 import { PlanRepairs } from "./repairs.js";
 import { StageResearch } from "./stage-research.js";
 import { EarlyStageDriver } from "./early-stage-driver.js";
@@ -116,10 +118,10 @@ export class ProductEngine {
   }
   draft(project: string, stage: UpstreamStage, draftId: string, expected: number): Revision<StageArtifact> {
     this.#project(project);
-    const draft = this.store.get<DiscoveryDraft>(draftId);
+    const draft = readDraft(this.store, draftId);
     requireCondition(draft && draft.kind === "discovery-draft" && draft.value.stage === stage && draft.value.projectId === project,
       "discovery_foreign", "Research must belong to this project and stage");
-    requireCondition(draft.value.contractVersion === RESEARCH_CONTRACT_VERSION, "research_contract_upgrade_required",
+    requireCondition(executionAdmission(this.store, draft, 'stage-result').admitted, "research_contract_upgrade_required",
       "Prepare enriched research before creating a new stage result; previous accepted versions remain historical");
     const layer = stage === "operation-map" ? this.store.get(`graph-layer:${project}:1`) : null;
     const content = { draft: reference(draft), fields: draft.value.fields, graph: layer ? reference(layer) : null };
@@ -130,9 +132,9 @@ export class ProductEngine {
     const om = this.#omProject(project);
     const feasibilityId = `${om ? 'om-feasibility' : 'feasibility'}:${project}`;
     const feasibility = this.store.get<Feasibility>(feasibilityId);
-    const drafts = this.store.list<DiscoveryDraft>("discovery-draft").filter(item => item.value.projectId === project);
+    const drafts = listDrafts(this.store, project);
     const research = new Map(drafts.map(draft => [draft.id, this.discovery.gate(project, reference(draft))]));
-    const questions = this.store.list<Question>("question").filter(item => item.value.projectId === project).map(question => {
+    const questions = listQuestions(this.store, project).map(question => {
       const findings = (research.get(question.value.draftId)?.findings ?? []).filter(finding => finding.target === question.id
         || ["discovery_stale", "research_context_stale"].includes(finding.code));
       return { ...question, assessment: { state: question.value.status === "answered" && findings.length ? "stale" : question.value.status, findings } };
@@ -153,7 +155,7 @@ export class ProductEngine {
       executionRoot: this.store.get<ExecutionRoot>(`execution-root:${project}`),
       executionRunning: this.executor.isRunning(project),
       preparationRun: this.store.get(`preparation-run:${project}`),
-      researchRuns: this.store.list<ResearchRun>("research-run").filter(item => item.value.projectId === project),
+      researchRuns: listRuns(this.store, project),
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
       // H2.0 (№2719-7): the owner-question detail for the UI — om-state names the wait, this projection names the
       // exact questions and their answered state. Listing proves nothing and grants nothing. The key exists only
@@ -287,8 +289,8 @@ export class ProductEngine {
         plan => planCurrentGuards(this.store, this.compiler, plan));
       case "configure-saved-synthesis": {
         this.#project(command.project);
-        const question = this.store.get<Question>(command.question);
-        const draft = question && this.store.get<DiscoveryDraft>(question.value.draftId);
+        const question = readQuestion(this.store, command.question);
+        const draft = question && readDraft(this.store, question.value.draftId);
         requireCondition(question?.kind === "question" && question.value.projectId === command.project
           && draft?.kind === "discovery-draft" && draft.value.projectId === command.project && draft.value.questions.includes(question.id),
           "research_question_foreign", "Saved synthesis must target a question and draft of this project");
@@ -368,21 +370,22 @@ export class ProductEngine {
       case "reopen-question": return this.discovery.reopen(command.question, command.expected);
       case "save-graph": this.#project(command.project); return this.graphs.save(command.project, command.graph, command.expected, this.actor);
       case "build-map": {
-        const project = this.#project(command.project); const draft = this.store.get<DiscoveryDraft>(command.draftId);
+        const project = this.#project(command.project); const draft = readDraft(this.store, command.draftId);
         requireCondition(draft && draft.kind === "discovery-draft" && draft.value.stage === "operation-map"
           && draft.value.projectId === command.project, "discovery_foreign", "Map construction needs this project's map-stage research");
         requireCondition(this.discovery.gate(command.project, reference(draft)).findings.length === 0,
           "research_unresolved", "Resolve the map-stage questions first");
         const prerequisite = this.pipeline.inspect(command.project, "concept");
         requireCondition(prerequisite.state === "accepted" && prerequisite.artifact
-          && draft.value.contractVersion === RESEARCH_CONTRACT_VERSION
+          && executionAdmission(this.store, draft, 'stage-result').admitted
           && draft.value.inputs.some(ref => canonical(ref) === canonical(reference(prerequisite.artifact!)))
-          && canonical(draft.value.questions.map(id => this.store.get<Question>(id)!.value.spec)) === canonical(REQUIREMENTS['operation-map']),
+          && canonical(orderedQuestions(this.store, draft.value).map(question => question!.value.spec))
+            === canonical(REQUIREMENTS['operation-map']),
         "research_context_stale", "Map construction must use the current accepted concept and complete research contract");
-        const initial = this.store.get<StageArtifact>(stageId(command.project, "discovery"))!.value.content as unknown as StageContent;
-        const concept = this.store.get<StageArtifact>(stageId(command.project, "concept"))!.value.content as unknown as StageContent;
+        const initial = stageFields(this.store, command.project, "discovery")!;
+        const concept = stageFields(this.store, command.project, "concept")!;
         const existing = this.store.get<Graph>(`graph:${command.project}`);
-        const graph = buildL1(existing?.value.id ?? `${command.project}:map`, project.value.title, draft.value.fields['mapDesign'], initial.fields, concept.fields);
+        const graph = buildL1(existing?.value.id ?? `${command.project}:map`, project.value.title, draft.value.fields['mapDesign'], initial, concept);
         return this.graphs.saveDerived(command.project, graph, command.expected, this.actor, reference(draft));
       }
       case "refine-graph": this.#project(command.project); return this.graphs.refine(command.project, command.expected, command.draft, this.actor);

@@ -1,13 +1,15 @@
-import { Ajv } from "ajv";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
-import { discoveryConstraintBindings, discoveryContext, discoveryDecisionId, discoveryOutcome,
-  readDiscoveryConditionDecision, type DiscoveryChoice, type DiscoveryConditionDecision } from "../discovery/discovery-outcome.js";
-import { readAcceptedResearchAnswer, type Decision, type DiscoveryDraft, type Fact, type Question } from "../discovery/discovery.js";
-import { UPSTREAM_STAGES, selectResearchRequirements, type UpstreamStage } from "../discovery/requirements.js";
-import type { ResearchAssessment, ResearchRun } from "../discovery/research-model.js";
+import { discoveryConstraintBindings, discoveryDecisionId } from "../discovery/discovery-outcome.js";
+import {
+  acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome,
+  isAdmissionEra, isPreparationEra, isSupportedEra, issuedEntry, issuedForm,
+  listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft,
+  readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions,
+  type DiscoveryChoice, type DiscoveryDraft, type FormEntry, type IssuedAnswerProof,
+  type IssuedProjection, type Question, type RecordView, type ResearchRun, type UpstreamStage,
+} from "../discovery/projection-reader.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Observation, Selector, Source } from "../evidence/evidence.js";
-import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { isRef, predecessor, reference, STAGES, stageId, uniqueRefs, type Ref, type Stage, type StageArtifact } from "../pipeline/contracts.js";
 import { type StageContent } from "./stage-checks.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
@@ -116,16 +118,13 @@ interface EarlyStageInput {
   contract: "early-stage-input/v1"; projectId: string; project: Ref; source: Ref; brief: Selector;
   objective: { kind: "brief" } | { kind: "source"; selector: Selector }; actor: "driver:verbatim";
 }
-interface FieldRead { summary: SummaryField; record: Revision<Decision | Fact | { projectId: string; question: string; assessment: Ref; value: Json }>;
-  assessment: Revision<ResearchAssessment> | null }
+interface FieldRead { summary: SummaryField; proof: IssuedAnswerProof }
 interface ExactProofReader { require<T>(ref: Ref, role: string): Revision<T> }
-
-const ajv = new Ajv({ strict: true, allowUnionTypes: true });
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
 const same = (left: unknown, right: unknown): boolean => canonical(left) === canonical(right);
 const exact = <T>(store: Store, ref: Ref, code = "stage_summary_dependency_missing"): Revision<T> => {
-  const record = store.get<T>(ref.id, ref.revision);
-  requireCondition(record && record.hash === ref.hash, code, `[${ref.id}@${ref.revision}] The exact saved dependency is unavailable`);
+  const record = readExact<T>(store, ref);
+  requireCondition(record, code, `[${ref.id}@${ref.revision}] The exact saved dependency is unavailable`);
   return record;
 };
 const address = (record: Ref, pointer: string): SummaryAddress => ({ record, pointer });
@@ -214,16 +213,18 @@ function currentProofs(store: Store): ExactProofReader {
   return { require<T>(ref: Ref): Revision<T> { return exact<T>(store, ref); } };
 }
 
-function candidateFailure(error: unknown, questions: Revision<Question>[]): SummaryFailure {
+function candidateFailure(error: unknown, questions: readonly { id: string; ref: Ref | null }[]): SummaryFailure {
   if (!(error instanceof EngineError)) throw error;
   const target = /^\[([^\]]+)\]/.exec(error.message)?.[1];
   const question = target ? questions.find(item => item.id === target) : undefined;
-  return { code: error.code, message: error.message, question: question ? reference(question) : null };
+  return { code: error.code, message: error.message, question: question?.ref ?? null };
 }
 
 function researchReportSummary(proofs: ExactProofReader, project: string, plan: FieldRead,
   reportRead: FieldRead): SummaryResearchReport {
-  requireCondition(plan.assessment && reportRead.assessment,
+  const planProv = plan.proof.provenance, reportProv = reportRead.proof.provenance;
+  requireCondition(planProv.kind === "research-answer" && reportProv.kind === "research-answer"
+    && planProv.assessment !== null && reportProv.assessment !== null,
     "stage_summary_assessment_invalid", "A saved Discovery report needs exact supported plan and report assessments");
   const reportValue = reportRead.summary.value as unknown as { researchPlan: Ref;
     results: { id: string; question: string; conclusion: string; citations: number[]; limits: string[] }[];
@@ -234,7 +235,7 @@ function researchReportSummary(proofs: ExactProofReader, project: string, plan: 
     conclusion: result.conclusion, limits: result.limits,
     address: address(reportRead.summary.answer, `/value/results/${index}`),
     citations: result.citations.map(citation => {
-      const observation = reportRead.assessment!.value.observations[citation];
+      const observation = reportProv.observations[citation];
       requireCondition(observation, "stage_summary_citation_invalid",
         `[${result.id}] Citation ${citation} is absent from the saved assessment`);
       return { index: citation, value: observation.value, ...sourceSummary(proofs, project, observation) };
@@ -249,7 +250,9 @@ function researchReportSummary(proofs: ExactProofReader, project: string, plan: 
 
 function researchVerdictSummary(reportRead: FieldRead, verdictRead: FieldRead,
   accepted: boolean): SummaryResearchVerdict {
-  requireCondition(reportRead.assessment && verdictRead.assessment,
+  const reportProv = reportRead.proof.provenance, verdictProv = verdictRead.proof.provenance;
+  requireCondition(reportProv.kind === "research-answer" && verdictProv.kind === "research-answer"
+    && reportProv.assessment !== null && verdictProv.assessment !== null,
     "stage_summary_assessment_invalid", "A saved Discovery verdict needs exact supported report and verdict assessments");
   const reportValue = reportRead.summary.value as unknown as { results: { id: string }[]; openQuestions: Json[] };
   const verdictValue = verdictRead.summary.value as unknown as { researchReport: Ref;
@@ -272,55 +275,49 @@ function researchVerdictSummary(reportRead: FieldRead, verdictRead: FieldRead,
       ({ value, address: address(verdictRead.summary.answer, `/value/conditions/${index}`) })) };
 }
 
-function readAcceptedField(proofs: AcceptedProofs, artifact: Revision<StageArtifact>, draft: Revision<DiscoveryDraft>, field: string): FieldRead {
-  const matches = draft.value.questions.map(id => proofs.head<Question>(id, `${field} question`))
-    .filter(question => question.value.spec.field === field);
+function readAcceptedField(proofs: AcceptedProofs, artifact: Revision<StageArtifact>, draft: Revision<DiscoveryDraft>,
+  issuance: IssuedProjection, field: string): FieldRead {
+  const matches = issuance.entries.filter(entry => entry.field === field);
   requireCondition(matches.length === 1, "stage_summary_question_invalid",
     `[${draft.id}] ${draft.value.stage} needs exactly one ${field} question`);
-  const question = matches[0]!;
-  requireCondition(question.kind === "question" && question.value.projectId === draft.value.projectId
-    && question.value.draftId === draft.id && question.value.status === "answered" && isRef(question.value.answer),
-  "stage_summary_question_invalid", `[${question.id}] The accepted ${field} question is incomplete or foreign`);
-  const answerRef = question.value.answer;
-  const record = proofs.require<Decision | Fact | { projectId: string; question: string; assessment: Ref; value: Json }>(answerRef, `${field} answer`);
-  requireCondition(record.value.projectId === draft.value.projectId && record.value.question === question.id,
-    "stage_summary_answer_invalid", `[${record.id}] The accepted ${field} answer belongs to another question`);
-  let value: Json, origin: SummaryOrigin, assessment: Revision<ResearchAssessment> | null = null;
-  if (record.kind === "fact") {
-    const fact = record.value as Fact;
-    const source = sourceSummary(proofs, draft.value.projectId, fact.observation);
-    value = fact.observation.value;
-    origin = { label: "Факт источника", record: reference(record), author: null, assessment: null, binding: null, source };
-  } else if (record.kind === "research-answer") {
-    const research = record.value as { projectId: string; question: string; assessment: Ref; value: Json };
-    const accepted = readAcceptedResearchAnswer(proofs.view, draft.value.projectId, answerRef);
-    assessment = accepted.assessment;
-    requireCondition(assessment?.kind === "research-assessment" && assessment.value.verdict === "supported"
-      && same(assessment.value.value, research.value), "stage_summary_assessment_invalid",
+  const entry = matches[0]!;
+  requireCondition(entry.valid, "stage_summary_question_invalid",
+    `[${entry.question?.id}] The accepted ${field} question is incomplete or foreign`);
+  const answerRef = entry.answerRef!;
+  const record = proofs.require<Record<string, unknown>>(answerRef, `${field} answer`);
+  const issued = proveIssuedAnswer(proofs.view, draft, entry, record);
+  requireCondition(issued.ok, "stage_summary_answer_invalid",
+    `[${record.id}] The accepted ${field} answer belongs to another question`);
+  const proof = issued.proof, prov = proof.provenance;
+  let value: Json, origin: SummaryOrigin;
+  if (prov.kind === "fact") {
+    const source = sourceSummary(proofs, draft.value.projectId, prov.observation);
+    value = prov.observation.value;
+    origin = { label: "Факт источника", record: reference(proof.record), author: null, assessment: null, binding: null, source };
+  } else if (prov.kind === "research-answer") {
+    requireCondition(prov.assessment !== null && prov.assessment.kind === "research-assessment"
+      && prov.supported && prov.valueMatches, "stage_summary_assessment_invalid",
     `[${record.id}] The accepted model proposal has no exact supported assessment`);
-    proofs.require(reference(assessment), `${field} assessment`);
-    if (accepted.binding) proofs.require(reference(accepted.binding), `${field} acceptance binding`);
-    for (const dependency of runtimeEvidenceDependencies(assessment.value.runtimeProofs ?? []))
+    proofs.require(reference(prov.assessment), `${field} assessment`);
+    if (prov.binding) proofs.require(reference(prov.binding), `${field} acceptance binding`);
+    for (const dependency of prov.runtimeDependencies)
       proofs.require(dependency, `${field} runtime evidence dependency`);
-    for (const observation of assessment.value.observations) sourceSummary(proofs, draft.value.projectId, observation);
-    value = research.value;
-    origin = { label: "Предложение модели, принято по оценке", record: reference(record), author: assessment.value.researcher,
-      assessment: reference(assessment), binding: accepted.binding ? reference(accepted.binding) : null, source: null };
+    for (const observation of prov.observations) sourceSummary(proofs, draft.value.projectId, observation);
+    value = proof.value;
+    origin = { label: "Предложение модели, принято по оценке", record: reference(proof.record), author: prov.researcher,
+      assessment: prov.assessmentRef, binding: prov.binding ? reference(prov.binding) : null, source: null };
   } else {
-    requireCondition(record.kind === question.value.spec.kind && (record.kind === "decision" || record.kind === "design"),
+    requireCondition(proof.matchesSpec && (prov.kind === "decision" || prov.kind === "design"),
       "stage_summary_answer_invalid", `[${record.id}] The accepted ${field} answer has the wrong kind`);
-    const decision = record.value as Decision;
-    requireCondition(typeof decision.actor === "string" && decision.actor.trim().length > 0,
-      "stage_summary_answer_invalid", `[${record.id}] The accepted ${field} decision has no author`);
-    value = decision.value;
-    origin = { label: record.kind === "design" ? "Проектное предложение" : "Решение вызывающего",
-      record: reference(record), author: decision.actor, assessment: null, binding: null, source: null };
+    requireCondition(prov.hasAuthor, "stage_summary_answer_invalid", `[${record.id}] The accepted ${field} decision has no author`);
+    value = proof.value;
+    origin = { label: prov.kind === "design" ? "Проектное предложение" : "Решение вызывающего",
+      record: reference(proof.record), author: prov.actor, assessment: null, binding: null, source: null };
   }
-  const validator = ajv.compile(question.value.spec.schema as object);
-  requireCondition(validator(value) && same(value, draft.value.fields[field]), "stage_summary_answer_invalid",
+  requireCondition(proof.reproduces, "stage_summary_answer_invalid",
     `[${record.id}] The accepted ${field} value cannot be reproduced from its answer`);
   return { summary: { field, value, address: address(reference(artifact), `/content/fields/${field}`),
-    question: reference(question), answer: answerRef, origin }, record, assessment };
+    question: entry.ref!, answer: answerRef, origin }, proof };
 }
 
 function applyVerbatimOrigin(proofs: AcceptedProofs, draft: Revision<DiscoveryDraft>, fields: Map<string, FieldRead>): void {
@@ -345,13 +342,14 @@ function applyVerbatimOrigin(proofs: AcceptedProofs, draft: Revision<DiscoveryDr
     const field = fields.get(name);
     requireCondition(field && same(field.summary.value, selected), "instruction_answer_stale",
       `[${binding.id}] The accepted ${name} differs from its exact instruction selector`);
+    const prov = field.proof.provenance;
     if (name === "brief") {
-      requireCondition(field.record.kind === "fact" && same((field.record.value as Fact).observation,
+      requireCondition(prov.kind === "fact" && same(prov.observation,
         { projectId: draft.value.projectId, source: value.source, selector, value: selected }),
-      "instruction_answer_stale", `[${field.record.id}] The accepted brief is not the exact instruction observation`);
-    } else requireCondition(field.record.kind === "decision" && (field.record.value as Decision).actor === "driver:verbatim"
-      && same((field.record.value as Decision).value, selected), "instruction_answer_stale",
-    `[${field.record.id}] The accepted objective was not copied by the input driver`);
+      "instruction_answer_stale", `[${field.proof.record.id}] The accepted brief is not the exact instruction observation`);
+    } else requireCondition(prov.kind === "decision" && prov.actor === "driver:verbatim"
+      && same(field.proof.value, selected), "instruction_answer_stale",
+    `[${field.proof.record.id}] The accepted objective was not copied by the input driver`);
     field.summary.origin = { label: "Слова поручения (дословно)", record: field.summary.answer,
       author: "driver:verbatim", assessment: null, binding: reference(binding),
       source: { ref: reference(source), kind: source.value.origin.kind, location: source.value.origin.location, selector,
@@ -371,23 +369,27 @@ function readAccepted(store: Store, artifact: Revision<StageArtifact>, current: 
   `[${artifact.id}] The accepted Discovery content has an invalid shape`);
   const proofs = new AcceptedProofs(store, artifact);
   const draft = proofs.require<DiscoveryDraft>(content.draft, "Discovery draft");
-  const version = draft.value.contractVersion ?? 1;
+  const version = contractEraOf(draft.value);
   requireCondition(draft.kind === "discovery-draft" && draft.value.projectId === artifact.value.projectId
-    && draft.value.stage === "discovery" && draft.value.level === "R0" && [1, 2, 3, 4, 5, 6].includes(version)
+    && draft.value.stage === "discovery" && draft.value.level === "R0" && isSupportedEra(version)
     && same(draft.value.fields, content.fields), "stage_summary_draft_invalid",
   `[${draft.id}] The accepted Discovery draft is malformed, foreign or differs from the stage`);
-  const specs = draft.value.questions.map(id => proofs.head<Question>(id, "Discovery question").value.spec);
-  const expected = selectResearchRequirements("discovery", version, specs);
-  requireCondition(expected && same(specs, expected), "stage_summary_contract_invalid",
-    `[${draft.id}] The accepted Discovery questions do not match contract version ${version}`);
+  const questionView: RecordView = { get: (id: string) => proofs.head<Question>(id, "Discovery question") as Revision<never> };
+  const issuance = acceptedIssuance(questionView, draft);
+  if (!issuance.issued) {
+    if (issuance.failure === "contract") requireCondition(false, "stage_summary_contract_invalid",
+      `[${draft.id}] The accepted Discovery questions do not match contract version ${version}`);
+    requireCondition(false, "stage_summary_question_invalid",
+      `[${issuance.question}] The accepted ${issuance.field ?? "Discovery"} question is incomplete or foreign`);
+  }
   const fields = new Map<string, FieldRead>();
-  for (const spec of expected) fields.set(spec.field, readAcceptedField(proofs, artifact, draft, spec.field));
+  for (const name of issuance.fields) fields.set(name, readAcceptedField(proofs, artifact, draft, issuance, name));
   applyVerbatimOrigin(proofs, draft, fields);
   const brief = fields.get("brief")!, objective = fields.get("objective")!;
   const limitations: string[] = [];
   let researchPlan: SummaryField | null = null, report: SummaryAccepted["report"] = null;
   let verdict: SummaryAccepted["verdict"] = null, preparation: SummaryField | null = fields.get("preparation")?.summary ?? null;
-  if (version < 5) {
+  if (!issuance.prepared) {
     limitations.push(`researchPlan отсутствует в contractVersion ${version}`,
       `researchReport отсутствует в contractVersion ${version}`, `verdict отсутствует в contractVersion ${version}`);
   } else {
@@ -410,57 +412,56 @@ function readAccepted(store: Store, artifact: Revision<StageArtifact>, current: 
 }
 
 function readCandidateResearchField(store: Store, draft: Revision<DiscoveryDraft>,
-  question: Revision<Question>): FieldRead {
-  const answerRef = question.value.answer;
-  requireCondition(question.value.status === "answered" && isRef(answerRef),
-    "stage_summary_question_invalid", `[${question.id}] The saved research question is incomplete`);
-  const accepted = readAcceptedResearchAnswer(store, draft.value.projectId, answerRef);
-  const record = accepted.answer;
-  const assessment = accepted.assessment;
-  requireCondition(record.kind === "research-answer" && record.value.projectId === draft.value.projectId
-    && record.value.question === question.id && assessment?.kind === "research-assessment"
-    && assessment.value.verdict === "supported" && same(assessment.value.value, record.value.value),
-  "stage_summary_assessment_invalid", `[${question.id}] The saved research answer has no exact supported assessment`);
+  entry: FormEntry): FieldRead {
+  const issued = proveIssuedAnswer(store, draft, entry);
+  if (!issued.ok) requireCondition(false,
+    issued.failure === "question" ? "stage_summary_question_invalid" : "stage_summary_assessment_invalid",
+    issued.failure === "question" ? `[${entry.id}] The saved research question is incomplete`
+      : `[${entry.id}] The saved research answer has no exact supported assessment`);
+  const proof = issued.proof, prov = proof.provenance;
+  requireCondition(prov.kind === "research-answer" && prov.assessment !== null
+    && prov.assessment.kind === "research-assessment" && prov.supported && prov.valueMatches,
+  "stage_summary_assessment_invalid", `[${entry.id}] The saved research answer has no exact supported assessment`);
   const proofs = currentProofs(store);
-  if (accepted.binding) proofs.require(reference(accepted.binding), `${question.value.spec.field} acceptance binding`);
-  for (const dependency of runtimeEvidenceDependencies(assessment.value.runtimeProofs ?? []))
-    proofs.require(dependency, `${question.value.spec.field} runtime evidence dependency`);
-  for (const observation of assessment.value.observations)
+  if (prov.binding) proofs.require(reference(prov.binding), `${entry.field} acceptance binding`);
+  for (const dependency of prov.runtimeDependencies)
+    proofs.require(dependency, `${entry.field} runtime evidence dependency`);
+  for (const observation of prov.observations)
     sourceSummary(proofs, draft.value.projectId, observation);
-  const validator = ajv.compile(question.value.spec.schema as object);
-  requireCondition(validator(record.value.value) && same(record.value.value, draft.value.fields[question.value.spec.field]),
-    "stage_summary_answer_invalid", `[${question.id}] The saved research answer cannot reproduce its candidate field`);
-  return { summary: { field: question.value.spec.field, value: record.value.value,
-    address: address(answerRef, "/value"), question: reference(question), answer: answerRef,
+  requireCondition(proof.reproduces,
+    "stage_summary_answer_invalid", `[${entry.id}] The saved research answer cannot reproduce its candidate field`);
+  const answerRef = entry.answerRef!;
+  return { summary: { field: entry.field!, value: proof.value,
+    address: address(answerRef, "/value"), question: entry.ref!, answer: answerRef,
     origin: { label: "Предложение модели, принято по оценке", record: answerRef,
-      author: assessment.value.researcher, assessment: reference(assessment),
-      binding: accepted.binding ? reference(accepted.binding) : null, source: null } },
-  record, assessment };
+      author: prov.researcher, assessment: prov.assessmentRef,
+      binding: prov.binding ? reference(prov.binding) : null, source: null } },
+  proof };
 }
 
 function candidateResearch(store: Store, project: string, draft: Revision<DiscoveryDraft>,
-  records: Revision<Question>[]): { researchPlan: SummaryField | null; report: SummaryResearchReport | null;
+  records: readonly FormEntry[]): { researchPlan: SummaryField | null; report: SummaryResearchReport | null;
     verdict: SummaryResearchVerdict | null; failure: SummaryFailure | null } {
   let researchPlan: SummaryField | null = null, report: SummaryResearchReport | null = null;
   let verdict: SummaryResearchVerdict | null = null, failure: SummaryFailure | null = null;
-  if ((draft.value.contractVersion ?? 1) < 5) return { researchPlan, report, verdict, failure };
-  const readable = (field: string): Revision<Question> | null => {
-    const index = records.findIndex(question => question.value.spec.field === field);
-    if (index < 0 || !records.slice(0, index + 1).every(question => question.value.status === "answered")) return null;
+  if (!isPreparationEra(contractEraOf(draft.value))) return { researchPlan, report, verdict, failure };
+  const readable = (field: string): FormEntry | null => {
+    const index = records.findIndex(entry => entry.field === field);
+    if (index < 0 || !records.slice(0, index + 1).every(entry => entry.status === "answered")) return null;
     return records[index]!;
   };
   try {
-    const planQuestion = readable("researchPlan");
-    if (!planQuestion) return { researchPlan, report, verdict, failure };
-    const planRead = readCandidateResearchField(store, draft, planQuestion);
+    const planEntry = readable("researchPlan");
+    if (!planEntry) return { researchPlan, report, verdict, failure };
+    const planRead = readCandidateResearchField(store, draft, planEntry);
     researchPlan = planRead.summary;
-    const reportQuestion = readable("researchReport");
-    if (!reportQuestion) return { researchPlan, report, verdict, failure };
-    const reportRead = readCandidateResearchField(store, draft, reportQuestion);
+    const reportEntry = readable("researchReport");
+    if (!reportEntry) return { researchPlan, report, verdict, failure };
+    const reportRead = readCandidateResearchField(store, draft, reportEntry);
     report = researchReportSummary(currentProofs(store), project, planRead, reportRead);
-    const verdictQuestion = readable("verdict");
-    if (!verdictQuestion) return { researchPlan, report, verdict, failure };
-    const verdictRead = readCandidateResearchField(store, draft, verdictQuestion);
+    const verdictEntry = readable("verdict");
+    if (!verdictEntry) return { researchPlan, report, verdict, failure };
+    const verdictRead = readCandidateResearchField(store, draft, verdictEntry);
     verdict = researchVerdictSummary(reportRead, verdictRead, false);
   } catch (error) { failure = candidateFailure(error, records); }
   return { researchPlan, report, verdict, failure };
@@ -593,18 +594,22 @@ function readStructuredAccepted(store: Store, artifact: Revision<StageArtifact>,
   requireCondition(prerequisite.kind === "stage" && prerequisite.value.projectId === artifact.value.projectId
     && prerequisite.value.stage === prior && prerequisite.value.status === "accepted", "stage_summary_input_invalid",
   `[${input.id}@${input.revision}] The accepted ${stage} prerequisite is not an accepted ${prior} stage`);
-  const draft = proofs.require<DiscoveryDraft>(content.draft, `${stage} draft`), version = draft.value.contractVersion ?? 1;
+  const draft = proofs.require<DiscoveryDraft>(content.draft, `${stage} draft`), version = contractEraOf(draft.value);
   const consumer = STAGES[STAGES.indexOf(stage) + 1];
   requireCondition(draft.kind === "discovery-draft" && draft.value.projectId === artifact.value.projectId
     && draft.value.stage === stage && draft.value.level === "R0" && draft.value.consumer === consumer
-    && [1, 2, 3, 4, 5, 6].includes(version) && same(draft.value.fields, content.fields)
+    && isSupportedEra(version) && same(draft.value.fields, content.fields)
     && draft.value.inputs.some(ref => same(ref, input)), "stage_summary_draft_invalid",
   `[${draft.id}] The accepted ${stage} draft is malformed, foreign or differs from the stage`);
-  const specs = draft.value.questions.map(id => proofs.head<Question>(id, `${stage} question`).value.spec);
-  const expected = selectResearchRequirements(stage, version, specs);
-  requireCondition(expected && same(specs, expected), "stage_summary_contract_invalid",
-    `[${draft.id}] The accepted ${stage} questions do not match contract version ${version}`);
-  const fields = new Map(expected.map(spec => [spec.field, readAcceptedField(proofs, artifact, draft, spec.field)]));
+  const questionView: RecordView = { get: (id: string) => proofs.head<Question>(id, `${stage} question`) as Revision<never> };
+  const issuance = acceptedIssuance(questionView, draft);
+  if (!issuance.issued) {
+    if (issuance.failure === "contract") requireCondition(false, "stage_summary_contract_invalid",
+      `[${draft.id}] The accepted ${stage} questions do not match contract version ${version}`);
+    requireCondition(false, "stage_summary_question_invalid",
+      `[${issuance.question}] The accepted ${issuance.field ?? stage} question is incomplete or foreign`);
+  }
+  const fields = new Map(issuance.fields.map(name => [name, readAcceptedField(proofs, artifact, draft, issuance, name)]));
   const limitations: string[] = [];
   if (stage === "concept" && !fields.has("conceptSections")) limitations.push(`conceptSections отсутствует в contractVersion ${version}`);
   if (stage === "operation-map") {
@@ -620,8 +625,9 @@ function readStructuredAccepted(store: Store, artifact: Revision<StageArtifact>,
     fields: [...fields.values()].map(item => item.summary), material: stageMaterial(stage, fields, layer), limitations };
 }
 
-function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDraft>): SummaryRun | null {
-  const run = store.get<ResearchRun>(`research-run:${hashJson([project, draft.id])}`);
+function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDraft>,
+  savedRun?: Revision<ResearchRun> | null): SummaryRun | null {
+  const run = savedRun === undefined ? readResearchRun(store, project, draft.id) : savedRun;
   if (!run) return null;
   requireCondition(run.kind === "research-run" && run.value.projectId === project && run.value.draftId === draft.id,
     "stage_summary_run_invalid", `[${run.id}] The linked research run is foreign or malformed`);
@@ -631,12 +637,11 @@ function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDr
   let door: string | null = run.value.status === "paused" ? "research-stage" : null;
   let questionRef: Ref | null = null;
   if (run.value.status === "needs_owner" && owner) {
-    const question = store.get<Question>(owner.question);
-    requireCondition(question?.kind === "question" && question.value.projectId === project
-      && question.value.draftId === draft.id && draft.value.questions.includes(question.id),
-    "stage_summary_run_invalid", `[${run.id}] The owner pause names no question of this draft`);
-    door = question.value.spec.kind === "fact" ? "answer-fact" : "answer-decision";
-    questionRef = reference(question);
+    const entry = issuedEntry(store, draft, owner.question);
+    requireCondition(entry !== null && !entry.foreign, "stage_summary_run_invalid",
+      `[${run.id}] The owner pause names no question of this draft`);
+    door = entry.door;
+    questionRef = entry.ref;
   }
   const missing = owner ? [owner.reason] : run.value.error ? [run.value.error] : [];
   return { ref: reference(run), status: run.value.status, pauseCode: run.value.pauseCode ?? null,
@@ -644,25 +649,20 @@ function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDr
 }
 
 function readCandidate(store: Store, project: string, draft: Revision<DiscoveryDraft>): SummaryCandidate {
-  const records: Revision<Question>[] = [];
-  let questionFailure: SummaryFailure | null = null;
-  for (const id of draft.value.questions) {
-    try {
-      const question = store.get<Question>(id);
-      requireCondition(question?.kind === "question" && question.value.projectId === project && question.value.draftId === draft.id,
-        "stage_summary_question_invalid", `[${id}] The candidate question is missing or foreign`);
-      records.push(question);
-    } catch (error) { questionFailure = candidateFailure(error, records); break; }
-  }
-  const questions = records.map(question =>
-    ({ ref: reference(question), field: question.value.spec.field, status: question.value.status }));
-  if (questionFailure) return { draft: reference(draft), contractVersion: draft.value.contractVersion ?? 1,
+  const form = issuedForm(store, draft), records = form.entries;
+  const questionFailure: SummaryFailure | null = form.defect === null ? null
+    : candidateFailure(new EngineError("stage_summary_question_invalid",
+      `[${form.defect.id}] The candidate question is missing or foreign`), records);
+  const questions = records.map(entry =>
+    ({ ref: entry.ref!, field: entry.field!, status: entry.status! }));
+  if (questionFailure) return { draft: reference(draft), contractVersion: contractEraOf(draft.value),
     state: "researching", researchPlan: null, report: null, verdict: null,
     questionFailure, admission: null, outcomeFailure: null, researchFailure: null, choiceHistoryFailure: null,
     runFailure: null, reason: null, reasonAddress: null, conditions: [], ownerChoices: [], decisions: [],
     questions, run: null, door: null };
   let outcome: ReturnType<typeof discoveryOutcome> | null = null, admission: SummaryFailure | null = null;
-  try { outcome = discoveryOutcome(store, draft); }
+  let summary: ReturnType<typeof outcomeSummary> | null = null;
+  try { summary = outcomeSummary(store, draft, form); outcome = summary.outcome; }
   catch (error) { admission = candidateFailure(error, records); }
   const research = candidateResearch(store, project, draft, records);
   const conditions: SummaryLocated[] = [], ownerChoices: SummaryOwnerChoice[] = [], decisions: SummaryChoiceDecision[] = [];
@@ -670,13 +670,12 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
   let reasonAddress: SummaryAddress | null = null;
   if (outcome?.verdict) {
     try {
-      const verdictQuestion = records.find(question => question.value.spec.field === "verdict");
-      const verdict = exact<{ projectId: string; question: string; value: Json }>(store, outcome.verdict);
-      requireCondition(verdict.kind === "research-answer" && verdictQuestion
-        && verdict.value.projectId === project && verdict.value.question === verdictQuestion.id
-        && object(verdict.value.value) && Array.isArray(verdict.value.value.conditions),
+      const verdictEntry = records.find(entry => entry.field === "verdict");
+      const verdict = exact<Record<string, unknown>>(store, outcome.verdict);
+      const proven = verdictEntry ? verdictConditions(verdict, { project, question: verdictEntry.id }) : null;
+      requireCondition(proven !== null,
       "stage_summary_outcome_invalid", `[${outcome.verdict.id}] The current verdict is missing, foreign or malformed`);
-      const raw = verdict.value.value.conditions as Json[];
+      const raw = proven;
       const locate = (value: Json): { value: Json; address: SummaryAddress } => {
         const matching = raw.map((item, index) => same(item, value) ? index : -1).filter(index => index >= 0);
         requireCondition(matching.length === 1, "stage_summary_outcome_invalid",
@@ -694,7 +693,7 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
       for (const condition of raw) {
         if (!object(condition) || condition.kind !== "owner_choice" || typeof condition.id !== "string"
           || !Array.isArray(condition.options)) continue;
-        const saved = store.get<DiscoveryConditionDecision>(discoveryDecisionId(project, draft.id, outcome.verdict, condition.id));
+        const saved = readConditionDecision(store, discoveryDecisionId(project, draft.id, outcome.verdict, condition.id));
         if (!saved) continue;
         requireCondition(outcome.report, "stage_summary_choice_invalid", `[${saved.id}] The current choice lost its report`);
         const proved = readDiscoveryConditionDecision(store, { project, draft: draft.id, verdictRef: outcome.verdict,
@@ -711,12 +710,12 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
       outcomeFailure = candidateFailure(error, records);
     }
   }
-  const verdictQuestion = records.find(question => question.value.spec.field === "verdict");
-  if ((draft.value.contractVersion ?? 1) >= 5 && verdictQuestion) {
-    const before = records.slice(0, records.indexOf(verdictQuestion));
-    if (before.every(question => question.value.status === "answered")) {
+  const verdictEntry = records.find(entry => entry.field === "verdict");
+  if (isPreparationEra(contractEraOf(draft.value)) && verdictEntry) {
+    const before = records.slice(0, verdictEntry.index);
+    if (before.every(entry => entry.status === "answered")) {
       try {
-        const history = discoveryContext(store, draft, verdictQuestion).context?.ownerDecisions ?? [];
+        const history = discoveryContext(store, draft, verdictEntry.question!).context?.ownerDecisions ?? [];
         for (const round of history) for (const item of round.decisions) {
           const proved = readDiscoveryConditionDecision(store, { project, draft: draft.id,
             verdictRef: round.verdict.ref, reportRef: round.report,
@@ -734,12 +733,12 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
     }
   }
   let run: SummaryRun | null = null, runFailure: SummaryFailure | null = null;
-  try { run = candidateRun(store, project, draft); }
+  try { run = candidateRun(store, project, draft, summary?.run); }
   catch (error) { runFailure = candidateFailure(error, records); }
   const door = ownerChoices.length ? "owner-discovery-choice"
-    : verdictQuestion?.value.status === "open" && decisions.length ? "research-stage"
+    : verdictEntry?.status === "open" && decisions.length ? "research-stage"
     : run?.door ?? (admission || outcome?.state === "researching" ? "research-stage" : null);
-  return { draft: reference(draft), contractVersion: draft.value.contractVersion ?? 1,
+  return { draft: reference(draft), contractVersion: contractEraOf(draft.value),
     state: outcome?.state ?? "researching", researchPlan: research.researchPlan,
     report: research.report, verdict: research.verdict, questionFailure, admission, outcomeFailure,
     researchFailure: research.failure, choiceHistoryFailure, runFailure,
@@ -762,10 +761,7 @@ function acceptedQuestionsMoved(store: Store, artifact: Revision<StageArtifact>,
   const content = artifact.value.content as unknown as StageContent;
   if (!isRef(content.draft) || !same(content.draft, reference(draft))) return false;
   const proofs = new Map(artifact.value.proofs.map(ref => [ref.id, ref]));
-  return draft.value.questions.some(id => {
-    const saved = proofs.get(id), current = store.get<Question>(id);
-    return !saved || !current || !same(saved, reference(current));
-  });
+  return savedQuestionsMoved(store, draft, id => proofs.get(id));
 }
 
 function selectDiscoveryCandidate(store: Store, project: string, explicit: string | undefined,
@@ -773,10 +769,10 @@ function selectDiscoveryCandidate(store: Store, project: string, explicit: strin
   const entryRefs = currentEntryRefs(store, project);
   const valid = (draft: Revision<DiscoveryDraft> | null): draft is Revision<DiscoveryDraft> => Boolean(draft
     && draft.kind === "discovery-draft" && draft.value.projectId === project && draft.value.stage === "discovery"
-    && draft.value.level === "R0" && draft.value.consumer === "concept" && [4, 5, 6].includes(draft.value.contractVersion ?? 1)
+    && draft.value.level === "R0" && draft.value.consumer === "concept" && isAdmissionEra(contractEraOf(draft.value))
     && same(draft.value.inputs, entryRefs));
   if (explicit !== undefined) {
-    const draft = store.get<DiscoveryDraft>(explicit);
+    const draft = readDraft(store, explicit);
     requireCondition(valid(draft), "stage_summary_draft_foreign", `[${explicit}] The selected candidate is missing or belongs to another project or stage`);
     return { selected: draft, candidates: [] };
   }
@@ -786,7 +782,7 @@ function selectDiscoveryCandidate(store: Store, project: string, explicit: strin
     if (valid(draft)) return { selected: draft, candidates: [] };
   }
   const bound = history.map(item => (item.value.content as unknown as { draft?: unknown }).draft).filter(isRef);
-  const drafts = store.list<DiscoveryDraft>("discovery-draft").filter(valid).filter(draft => {
+  const drafts = listDrafts(store, project).filter(valid).filter(draft => {
     if (accepted && draft.id === (accepted.value.content as unknown as StageContent).draft.id
       && (!same(reference(draft), (accepted.value.content as unknown as StageContent).draft)
         || acceptedQuestionsMoved(store, accepted, draft))) return true;
@@ -798,16 +794,10 @@ function selectDiscoveryCandidate(store: Store, project: string, explicit: strin
 
 function readStructuredCandidate(store: Store, project: string, stage: SummaryStructuredStage,
   draft: Revision<DiscoveryDraft>, current: Revision<StageArtifact> | null): SummaryStructuredCandidate {
-  const records: Revision<Question>[] = [];
-  let questionFailure: SummaryFailure | null = null;
-  for (const id of draft.value.questions) {
-    try {
-      const question = store.get<Question>(id);
-      requireCondition(question?.kind === "question" && question.value.projectId === project && question.value.draftId === draft.id,
-        "stage_summary_question_invalid", `[${id}] The candidate question is missing or foreign`);
-      records.push(question);
-    } catch (error) { questionFailure = candidateFailure(error, records); break; }
-  }
+  const form = issuedForm(store, draft), records = form.entries;
+  let questionFailure: SummaryFailure | null = form.defect === null ? null
+    : candidateFailure(new EngineError("stage_summary_question_invalid",
+      `[${form.defect.id}] The candidate question is missing or foreign`), records);
   let upstreamFailure: SummaryFailure | null = null;
   try {
     const prior = predecessor(stage), expectedId = prior ? stageId(project, prior) : null;
@@ -838,11 +828,11 @@ function readStructuredCandidate(store: Store, project: string, stage: SummarySt
   try { run = candidateRun(store, project, draft); }
   catch (error) { runFailure = candidateFailure(error, records); }
   const draftRef = reference(draft);
-  return { draft: draftRef, contractVersion: draft.value.contractVersion ?? 1, state: run?.status ?? "ready",
+  return { draft: draftRef, contractVersion: contractEraOf(draft.value), state: run?.status ?? "ready",
     fields: Object.entries(draft.value.fields).map(([field, value]) =>
       ({ field, ...located(draftRef, `/fields/${pointerToken(field)}`, value) })),
-    questions: records.map(question =>
-      ({ ref: reference(question), field: question.value.spec.field, status: question.value.status })),
+    questions: records.map(entry =>
+      ({ ref: entry.ref!, field: entry.field!, status: entry.status! })),
     upstreamFailure, questionFailure, graphFailure, run, runFailure,
     door: run?.door ?? (runFailure ? null : "research-stage") };
 }
@@ -853,22 +843,22 @@ function selectStructuredCandidate(store: Store, project: string, stage: Summary
   const consumer = STAGES[STAGES.indexOf(stage) + 1], prior = predecessor(stage), priorId = prior ? stageId(project, prior) : null;
   const valid = (draft: Revision<DiscoveryDraft> | null): draft is Revision<DiscoveryDraft> => Boolean(draft
     && draft.kind === "discovery-draft" && draft.value.projectId === project && draft.value.stage === stage
-    && draft.value.level === "R0" && draft.value.consumer === consumer && [1, 2, 3, 4, 5, 6].includes(draft.value.contractVersion ?? 1)
+    && draft.value.level === "R0" && draft.value.consumer === consumer && isSupportedEra(contractEraOf(draft.value))
     && priorId !== null && Array.isArray(draft.value.inputs)
     && draft.value.inputs.some(ref => isRef(ref) && ref.id === priorId));
   if (explicit !== undefined) {
-    const draft = store.get<DiscoveryDraft>(explicit);
+    const draft = readDraft(store, explicit);
     requireCondition(valid(draft), "stage_summary_draft_foreign",
       `[${explicit}] The selected candidate is missing or belongs to another project or stage`);
     return { selected: draft, candidates: [] };
   }
   const currentContent = current?.value.status === "draft" ? current.value.content as unknown as StageContent : null;
   if (currentContent && isRef(currentContent.draft)) {
-    const draft = store.get<DiscoveryDraft>(currentContent.draft.id, currentContent.draft.revision);
+    const draft = readDraft(store, currentContent.draft.id, currentContent.draft.revision);
     if (draft?.hash === currentContent.draft.hash && valid(draft)) return { selected: draft, candidates: [] };
   }
   const bound = history.map(item => (item.value.content as unknown as { draft?: unknown }).draft).filter(isRef);
-  const drafts = store.list<DiscoveryDraft>("discovery-draft").filter(valid).filter(draft => {
+  const drafts = listDrafts(store, project).filter(valid).filter(draft => {
     if (accepted && draft.id === (accepted.value.content as unknown as StageContent).draft.id
       && (!same(reference(draft), (accepted.value.content as unknown as StageContent).draft)
         || acceptedQuestionsMoved(store, accepted, draft))) return true;

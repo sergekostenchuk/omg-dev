@@ -1,7 +1,11 @@
 import { canonical, digest, type Json } from "../canonical.js";
-import { Discovery, type Decision, type DiscoveryDraft, type Fact, type Question } from "../discovery/discovery.js";
+import { Discovery } from "../discovery/discovery.js";
+import {
+  executionAdmission, listDrafts, orderedQuestions, readAnswer, readDraft,
+  readQuestion, readStageArtifact, type Decision, type DiscoveryDraft, type Fact,
+  type UpstreamStage, UPSTREAM_STAGES,
+} from "../discovery/projection-reader.js";
 import { withInvocationAllowanceReport } from "../discovery/invocation-progress.js";
-import { UPSTREAM_STAGES, selectResearchRequirements, type UpstreamStage } from "../discovery/requirements.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Selector, Source } from "../evidence/evidence.js";
 import { isRef, predecessor, reference, stageId, STAGES, uniqueRefs, type Ref, type StageArtifact } from "../pipeline/contracts.js";
@@ -221,9 +225,8 @@ export class EarlyStageDriver {
   }
 
   #legacyDiscovery(project: string): boolean {
-    return this.engine.store.get(`stage:${project}:discovery`) !== null
-      || this.engine.store.list<DiscoveryDraft>("discovery-draft")
-        .some(draft => draft.value.projectId === project && draft.value.stage === "discovery");
+    return readStageArtifact(this.engine.store, `stage:${project}:discovery`) !== null
+      || listDrafts(this.engine.store, project, "discovery").length > 0;
   }
 
   #inputRefs(project: string): Ref[] {
@@ -386,12 +389,12 @@ export class EarlyStageDriver {
     if (explicit && boundDraft && explicit !== boundDraft.id) return { draft: null, candidates: [] };
     const named = explicit ?? boundDraft?.id;
     if (named) {
-      const draft = this.engine.store.get<DiscoveryDraft>(named);
+      const draft = readDraft(this.engine.store, named);
       return !this.#draftRefusal(project, stage, draft, entryRefs) ? { draft: draft!, candidates: [] }
         : { draft: null, candidates: [] };
     }
-    const valid = this.engine.store.list<DiscoveryDraft>("discovery-draft")
-      .filter(draft => draft.value.projectId === project && draft.value.stage === stage && draft.value.level === "R0"
+    const valid = listDrafts(this.engine.store, project, stage)
+      .filter(draft => draft.value.level === "R0"
         && !this.#draftRefusal(project, stage, draft, entryRefs));
     return valid.length === 1 ? { draft: valid[0]!, candidates: [] }
       : { draft: null, candidates: valid.map(reference) };
@@ -442,11 +445,11 @@ export class EarlyStageDriver {
     const store = this.engine.store, gate = new RunControlGate(store, selected.value.projectId, execution.hold);
     const discovery = new Discovery(gate.view());
     const answer = (field: "brief" | "objective"): void => {
-      const draft = store.get<DiscoveryDraft>(selected.id);
+      const draft = readDraft(store, selected.id);
       requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === input.binding.value.projectId
         && canonical(draft.value.inputs) === canonical(input.refs),
       "instruction_stale", "The Discovery draft moved away from its exact instruction basis");
-      const matches = draft.value.questions.map(id => store.get<Question>(id))
+      const matches = orderedQuestions(store, draft.value)
         .filter(question => question?.kind === "question" && question.value.spec.field === field);
       requireCondition(matches.length === 1, "instruction_binding_invalid",
         `The Discovery input needs exactly one ${field} question`);
@@ -456,10 +459,10 @@ export class EarlyStageDriver {
         else discovery.decision(question.id, question.revision, DRIVER_ACTOR, input.objective);
       } else requireCondition(question.value.status === "answered", "instruction_answer_stale",
         `The ${field} question is not open or answered`);
-      const currentDraft = store.get<DiscoveryDraft>(draft.id)!, currentQuestion = store.get<Question>(question.id)!;
+      const currentDraft = readDraft(store, draft.id)!, currentQuestion = readQuestion(store, question.id)!;
       requireCondition(currentQuestion.value.status === "answered" && isRef(currentQuestion.value.answer),
         "instruction_answer_stale", `The ${field} answer was not saved`);
-      const saved = store.get<Decision | Fact>(currentQuestion.value.answer.id, currentQuestion.value.answer.revision);
+      const saved = readAnswer<Decision | Fact>(store, currentQuestion.value.answer);
       requireCondition(saved && canonical(reference(saved)) === canonical(currentQuestion.value.answer)
         && saved.value.projectId === input.binding.value.projectId && saved.value.question === currentQuestion.id,
       "instruction_answer_stale", `The ${field} answer belongs to another input`);
@@ -519,15 +522,15 @@ export class EarlyStageDriver {
         reason("early_draft_conflict", explicit, "The stage already names another saved draft", "draftId")), turnsUsed: 0, handoff: false } };
     const named = explicit ?? boundDraft?.id;
     if (named) {
-      const draft = this.engine.store.get<DiscoveryDraft>(named);
+      const draft = readDraft(this.engine.store, named);
       const invalid = this.#draftRefusal(project, stage, draft, entryRefs);
       return invalid
         ? { outcome: { ...this.#base(project, "blocked", stage, draft ? reference(draft) : null, [], null, invalid), turnsUsed: 0, handoff: false } }
         : { draft: draft! };
     }
 
-    const rows = this.engine.store.list<DiscoveryDraft>("discovery-draft")
-      .filter(row => row.value.projectId === project && row.value.stage === stage && row.value.level === "R0");
+    const rows = listDrafts(this.engine.store, project, stage)
+      .filter(row => row.value.level === "R0");
     const valid: Revision<DiscoveryDraft>[] = [], invalid: EarlyStageReason[] = [];
     for (const draft of rows) {
       const refusal = this.#draftRefusal(project, stage, draft, entryRefs);
@@ -554,7 +557,7 @@ export class EarlyStageDriver {
     const content = artifact?.value.content as unknown as Partial<StageContent> | undefined;
     const recorded = isRef(content?.draft) ? content.draft : null;
     if (!recorded || stage !== "discovery") return recorded;
-    const draft = this.engine.store.get<DiscoveryDraft>(recorded.id);
+    const draft = readDraft(this.engine.store, recorded.id);
     return draft && this.#supersededInputDraft(project, entryRefs, draft) ? null : recorded;
   }
 
@@ -585,15 +588,12 @@ export class EarlyStageDriver {
     const required = prior ? this.engine.pipeline.inspect(project, prior).guards : entryRefs;
     if (canonical(draft.value.inputs) !== canonical(required))
       return reason("early_draft_stale", draft.id, "The saved draft does not name the current prerequisite basis", "inputs");
-    if (![4, 5, 6].includes(draft.value.contractVersion ?? 1))
+    const admission = executionAdmission(this.engine.store, draft, 'early-drive');
+    if (!admission.admitted)
       return reason("research_contract_upgrade_required", draft.id, "This unfinished draft has no supported research contract", "contractVersion");
-    if (!Array.isArray(draft.value.questions))
+    if (admission.form === "lost")
       return reason("early_draft_invalid", draft.id, "The saved draft lost its complete question set", "questions");
-    const questions = draft.value.questions.map(id => this.engine.store.get<Question>(id));
-    const specs = selectResearchRequirements(stage, draft.value.contractVersion!, questions.map(question => question?.value.spec));
-    if (!specs || !questions.every((question, index) => question?.kind === "question" && question.value.projectId === project
-      && question.value.draftId === draft.id && question.value.stage === stage && question.value.level === "R0"
-      && question.value.consumer === draft.value.consumer && canonical(question.value.spec) === canonical(specs[index])))
+    if (admission.form === "mismatch")
       return reason("early_draft_invalid", draft.id, "The saved draft questions do not match their stage contract", "questions");
     return null;
   }
