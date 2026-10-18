@@ -588,7 +588,7 @@
     },
     {
      "node": "disc.d2.n2",
-     "code": "src/discovery/research-runner.ts:1045 (Researcher.run); src/discovery/web-research.ts:401 (settingsOf); src/discovery/web-research.ts:519 (assertWebEnvironment)",
+     "code": "src/discovery/research-runner.ts:1045 (Researcher.run); src/discovery/web-research.ts:519 (assertWebEnvironment)",
      "fields": [
       "webResearch",
       "версия и хэш",
@@ -619,7 +619,7 @@
     },
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/discovery.ts:212 (Discovery.#acceptSupported); src/discovery/research-runner.ts:1450 (Researcher.applyActionIntent)",
+     "code": "src/discovery/research-runner.ts:1450 (Researcher.applyActionIntent)",
      "fields": [
       "версия и хэш"
      ],
@@ -628,7 +628,7 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/context-recovery.ts:46 (recoverContextSession); src/discovery/context-recovery.ts:51 (recoverContextSession)",
+     "code": "src/discovery/context-recovery.ts:46 (recoverContextSession)",
      "fields": [
       "вид записи",
       "projectId"
@@ -1456,7 +1456,7 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/response-recovery.ts:1945 (cancelledCallRetryable); src/om/run-control.ts:92 (currentControl); src/om/run-control.ts:113 (admitRunControl)",
+     "code": "src/discovery/response-recovery.ts:1945 (cancelledCallRetryable); src/om/run-control.ts:92 (currentControl); src/om/run-control.ts:117 (admitRunControl)",
      "fields": [
       "вся запись",
       "stop",
@@ -1658,10 +1658,10 @@
    "card": {
     "what": "Выбор владельца: какой из предложенных вариантов принят по одному условию условного вердикта Discovery.",
     "where": "Таблица revisions · вид «discovery-condition-decision» · id discovery-condition-decision:<хэш (проект, черновик, вердикт, условие)>",
-    "when": "Один раз на условие, через доверенную дверь owner-discovery-choice; повтор возвращает то же решение.",
-    "why": "Условный вердикт нельзя продолжить без настоящего выбора владельца; решение привязано к точному вердикту, отчёту и сессии.",
-    "expects": "Вердикт — ответ research-answer с исходом conditional и тем же отчётом; условие вида owner_choice; сессия открыта и совпадает по области и сроку (v2).",
-    "risks": "Нет приглашения или сессия закрыта — выбор невозможен; не-go вердикт без выбора останавливает машину. В HX5 и рабочей базе записей нет — путь ни разу не проходил на живых данных (вывод).",
+    "when": "Один раз на условие, через доверенную дверь owner-discovery-choice; повтор возвращает то же решение при допустимом запросе и действующем полномочии.",
+    "why": "Фиксирует настоящий выбор по условию owner_choice точного условного вердикта; условия evidence и другие не-go исходы не заменяются выбором владельца.",
+    "expects": "Новый выбор требует действующего полномочия на точные verdict/report/condition/option. Читатель v2 доказывает сохранённую открытую ревизию сессии и её приглашение; позднее закрытие или истечение не отменяет записанное решение.",
+    "risks": "Новый вызов без действующего полномочия либо по устаревшему вердикту отвергается. Повреждённые точные основания делают сохранённое решение недоказанным. Отсутствие записей в переписи не доказывает, что путь никогда не исполнялся.",
     "size": "В HX5 и в рабочей базе записей этого вида нет.",
     "note": ""
    },
@@ -1711,10 +1711,10 @@
      "type": "Ref",
      "iface": true,
      "what": "Точный вердикт, по которому выбирают.",
-     "writer": "Discovery · дверь не-go (disc.d5.n5): команда answer-decision.",
+     "writer": "Discovery · дверь не-go (disc.d5.n5): команда owner-discovery-choice.",
      "readers": "Исход (disc.d4.n7); сводка стадии (disc.d7.n6).",
      "expects": "Ответ вердикта conditional, тот же отчёт.",
-     "risks": "Вердикт переписан — discovery_choice_stale."
+     "risks": "Новый выбор по устаревшему вердикту — discovery_choice_stale; история ранее сохранённого решения остаётся привязана к прежнему точному вердикту."
     },
     {
      "path": "reportRef",
@@ -1763,8 +1763,8 @@
      "what": "Открытая сессия владельца, под которой сделан выбор.",
      "writer": "Discovery · дверь не-go (disc.d5.n5).",
      "readers": "Читатель решения (disc.d5.n5).",
-     "expects": "Сессия открыта, область и срок совпадают.",
-     "risks": "Сессия закрыта или просрочена — решение недействительно."
+     "expects": "Для нового действия — текущая открытая и непросроченная сессия; читатель v2 доказывает сохранённую открытую ревизию сессии и её приглашение.",
+     "risks": "Повреждённая ссылка сессии делает выбор недоказанным; позднее закрытие или истечение не отменяет записанное решение."
     }
    ],
    "writers": [
@@ -1800,21 +1800,21 @@
     },
     {
      "node": "disc.d5.n4",
-     "code": "src/discovery/discovery-decision.ts:71 (prepareChoice); src/discovery/discovery-outcome.ts:70 (readDiscoveryConditionDecision); src/discovery/discovery-outcome.ts:142 (choiceHistory)",
+     "code": "src/discovery/discovery-decision.ts:71 (prepareChoice); src/discovery/discovery-outcome.ts:84 (readDiscoveryConditionDecision); src/discovery/discovery-outcome.ts:142 (choiceHistory)",
      "fields": [
       "вся запись",
       "версия и хэш"
      ],
-     "expects": "Решение, сессия владельца и её право должны совпасть по области, базе и сроку (версия v2); решения раунда выбора заново доказываются по каждой ревизии вопроса вердикта",
+     "expects": "Решение, сессия и право доказываются по сохранённым ревизиям и согласованным временам; новая авторизация отдельно проверяет текущий срок; решения раунда заново доказываются по каждой ревизии вопроса вердикта",
      "sure": true
     },
     {
      "node": "disc.d5.n5",
-     "code": "src/discovery/discovery-outcome.ts:70 (readDiscoveryConditionDecision); src/discovery/discovery-decision.ts:71 (prepareChoice); src/discovery/discovery-decision.ts:146 (answerDiscoveryCondition)",
+     "code": "src/discovery/discovery-outcome.ts:84 (readDiscoveryConditionDecision); src/discovery/discovery-decision.ts:71 (prepareChoice); src/discovery/discovery-decision.ts:146 (answerDiscoveryCondition)",
      "fields": [
       "вся запись"
      ],
-     "expects": "Решение, сессия владельца и её право должны совпасть по области, базе и сроку (версия v2); вердикт и его ответ должны совпасть с предложенным владельцу (иначе discovery_choice_stale)",
+     "expects": "Решение, сессия и право доказываются по сохранённым ревизиям и согласованным временам; вердикт и его ответ должны совпасть с предложенным владельцу (иначе discovery_choice_stale)",
      "sure": true
     },
     {
@@ -1920,8 +1920,8 @@
      "what": "Переоткрытая версия вопроса вердикта.",
      "writer": "Discovery · переоткрыть зависимые (disc.d5.n6).",
      "readers": "Подготовка выбора (disc.d5.n4): отличить повторное рассмотрение.",
-     "expects": "Вопрос открыт и равен этой версии.",
-     "risks": "Не совпала — discovery_choice_stale."
+     "expects": "При повторе команды текущий открытый вопрос должен совпадать с reopened; в истории раунда хранится точная прежняя версия.",
+     "risks": "Несовпадение текущего вопроса блокирует повтор команды, а не стирает завершённый раунд."
     },
     {
      "path": "decisions",
@@ -1930,7 +1930,7 @@
      "what": "Решения по условиям раунда.",
      "writer": "Discovery · переоткрыть зависимые (disc.d5.n6).",
      "readers": "История выбора (disc.d4.n7).",
-     "expects": "Ровно по одному решению на условие.",
+     "expects": "Ровно по одному решению на каждое условие owner_choice данного вердикта.",
      "risks": "Нехватка решения — раунд не закрыт."
     }
    ],
@@ -1949,7 +1949,7 @@
       "reopened",
       "decisions"
      ],
-     "sure": false
+     "sure": true
     }
    ],
    "readers": [
@@ -2117,7 +2117,6 @@
       "contract",
       "id",
       "database",
-      "project",
       "scope",
       "action",
       "method",
@@ -2149,21 +2148,21 @@
    "readers": [
     {
      "node": "disc.d5.n4",
-     "code": "src/product/owner-authority.ts:365 (readDiscoveryChoiceSessionGrant); src/product/owner-authority.ts:465 (DiscoveryChoiceSessions.exchange); src/discovery/discovery-outcome.ts:70 (readDiscoveryConditionDecision)",
+     "code": "src/product/owner-authority.ts:365 (readDiscoveryChoiceSessionGrant); src/product/owner-authority.ts:465 (DiscoveryChoiceSessions.exchange); src/discovery/discovery-outcome.ts:109 (readDiscoveryConditionDecision)",
      "fields": [
       "вся запись",
       "scope"
      ],
-     "expects": "Приглашение доказано: область, срок и хэш секрета; приглашение читается по id, секрет сверяется с хэшем, срок не вышел",
+     "expects": "При обмене секрет сверяется с хэшем и проверяется текущий срок приглашения; чтение решения доказывает согласованность сохранённых времён и области",
      "sure": true
     },
     {
      "node": "disc.d5.n5",
-     "code": "src/discovery/discovery-outcome.ts:70 (readDiscoveryConditionDecision)",
+     "code": "src/discovery/discovery-outcome.ts:109 (readDiscoveryConditionDecision)",
      "fields": [
       "scope"
      ],
-     "expects": "Решение, сессия владельца и её право должны совпасть по области, базе и сроку (версия v2)",
+     "expects": "Чтение решения доказывает согласованность сохранённых времён, базы и области приглашения v2",
      "sure": true
     },
     {
@@ -2179,6 +2178,24 @@
      ],
      "expects": "Приглашение доказано; приглашение читается по id, секрет сверяется с хэшем, срок не вышел",
      "sure": true
+    },
+    {
+     "node": "disc.d7.n6",
+     "code": "src/discovery/discovery-outcome.ts:109 (readDiscoveryConditionDecision)",
+     "fields": [
+      "вся запись"
+     ],
+     "expects": "Сводка readCandidate вызывает доказательство сохранённого решения, а не только читает его тело",
+     "sure": true
+    },
+    {
+     "node": "disc.d7.n7",
+     "code": "src/discovery/discovery-outcome.ts:109 (readDiscoveryConditionDecision)",
+     "fields": [
+      "вся запись"
+     ],
+     "expects": "Сводка readCandidate вызывает доказательство сохранённого решения, а не только читает его тело",
+     "sure": true
     }
    ]
   },
@@ -2193,7 +2210,7 @@
     "when": "Один раз при обмене приглашения; ещё одна версия при выходе (state closed).",
     "why": "Показать, что выбор сделан доверенным владельцем в открытой, не просроченной сессии.",
     "expects": "Читатель доказывает форму сессии; полномочие требует открытую и не просроченную; решение v2 — те же область, база, действие и срок.",
-    "risks": "Сессия закрыта или просрочена — owner_session_*; чужая — отказ.",
+    "risks": "Новый обмен или действие при закрытой/просроченной сессии — owner_session_*; чужая — отказ; закрытие или истечение после записи решения его не отменяет.",
     "size": "HX5: записей нет · рабочая база: 1 запись (2 версии), 871 Б",
     "note": "Версия v1 — для результата OM, v2 — для выбора в Discovery."
    },
@@ -2305,8 +2322,8 @@
      "what": "Открыта или закрыта сессия.",
      "writer": "Discovery · выбор по условию (disc.d5.n4): обмен и выход.",
      "readers": "Читатель решения (disc.d5.n5); полномочие владельца OM (om.r2.owner).",
-     "expects": "Открыта.",
-     "risks": "Закрыта — решение недействительно."
+     "expects": "Новое действие требует открытую и непросроченную сессию; читатель Discovery v2 доказывает сохранённую открытую ревизию.",
+     "risks": "Закрытие или истечение после записи не делает сохранённое решение недействительным."
     },
     {
      "path": "closedAt",
@@ -2328,7 +2345,6 @@
       "contract",
       "grant",
       "database",
-      "project",
       "scope",
       "action",
       "method",
@@ -2364,25 +2380,23 @@
    "readers": [
     {
      "node": "disc.d5.n4",
-     "code": "src/product/owner-authority.ts:372 (readDiscoveryChoiceSession); src/discovery/discovery-outcome.ts:70 (readDiscoveryConditionDecision)",
+     "code": "src/product/owner-authority.ts:372 (readDiscoveryChoiceSession); src/discovery/discovery-outcome.ts:106 (readDiscoveryConditionDecision); src/product/owner-authority.ts:418 (DiscoveryChoiceAuthority.exercise)",
      "fields": [
       "вся запись",
       "state",
       "scope",
       "grant"
      ],
-     "expects": "Сессия доказана: идентификатор из приглашения, состояние согласовано; решение, сессия владельца и её право должны совпасть по области, базе и сроку (версия v2)",
+     "expects": "Новая авторизация проверяет текущую открытую непросроченную сессию и её срок; чтение сохранённого решения доказывает согласованность сохранённых времён, области, базы и действия",
      "sure": true
     },
     {
      "node": "disc.d5.n5",
-     "code": "src/discovery/discovery-outcome.ts:70 (readDiscoveryConditionDecision)",
+     "code": "src/discovery/discovery-outcome.ts:106 (readDiscoveryConditionDecision); src/product/owner-authority.ts:418 (DiscoveryChoiceAuthority.exercise)",
      "fields": [
-      "state",
-      "scope",
-      "grant"
+      "вся запись"
      ],
-     "expects": "Решение, сессия владельца и её право должны совпасть по области, базе и сроку (версия v2)",
+     "expects": "Чтение сохранённого решения доказывает согласованность сохранённых времён и области v2; новая авторизация проверяет текущий срок",
      "sure": true
     },
     {
@@ -2394,6 +2408,24 @@
       "expiresAt"
      ],
      "expects": "Сессия доказана; сессия должна быть открыта и не просрочена",
+     "sure": true
+    },
+    {
+     "node": "disc.d7.n6",
+     "code": "src/discovery/discovery-outcome.ts:106 (readDiscoveryConditionDecision)",
+     "fields": [
+      "вся запись"
+     ],
+     "expects": "Сводка readCandidate вызывает доказательство сохранённого решения, а не только читает его тело",
+     "sure": true
+    },
+    {
+     "node": "disc.d7.n7",
+     "code": "src/discovery/discovery-outcome.ts:106 (readDiscoveryConditionDecision)",
+     "fields": [
+      "вся запись"
+     ],
+     "expects": "Сводка readCandidate вызывает доказательство сохранённого решения, а не только читает его тело",
      "sure": true
     }
    ]
@@ -2848,7 +2880,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:310 (readAcceptedField)",
+     "code": "src/product/stage-summary.ts:285 (readAcceptedField)",
      "fields": [
       "вид записи",
       "actor",
@@ -2859,7 +2891,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:310 (readAcceptedField)",
+     "code": "src/product/stage-summary.ts:285 (readAcceptedField)",
      "fields": [
       "вид записи",
       "actor",
@@ -3230,7 +3262,7 @@
     },
     {
      "node": "disc.d3.n6",
-     "code": "src/evidence/evidence.ts:283 (Evidence.observe); src/evidence/evidence.ts:311 (Evidence.readSource); src/evidence/evidence.ts:318 (Evidence.verifyReading)",
+     "code": "src/evidence/evidence.ts:283 (Evidence.observe); src/evidence/evidence.ts:311 (Evidence.readSource); src/evidence/evidence.ts:325 (Evidence.verifyReading)",
      "fields": [
       "projectId",
       "версия и хэш",
@@ -3244,7 +3276,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:168 (selectSaved); src/product/stage-summary.ts:198 (sourceSummary); src/product/stage-summary.ts:339 (applyVerbatimOrigin)",
+     "code": "src/product/stage-summary.ts:198 (sourceSummary); src/product/stage-summary.ts:339 (applyVerbatimOrigin)",
      "fields": [
       "content",
       "sha256",
@@ -3257,7 +3289,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:168 (selectSaved); src/product/stage-summary.ts:198 (sourceSummary)",
+     "code": "src/product/stage-summary.ts:198 (sourceSummary)",
      "fields": [
       "content",
       "sha256",
@@ -3270,7 +3302,7 @@
     },
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/response-recovery.ts:1156 (readResearchConsumerTurn); src/discovery/response-recovery.ts:1161 (readResearchConsumerTurn); src/discovery/response-recovery.ts:983 (historicalTurnTransitionProof)",
+     "code": "src/discovery/response-recovery.ts:1156 (readResearchConsumerTurn); src/discovery/response-recovery.ts:983 (historicalTurnTransitionProof)",
      "fields": [
       "content",
       "sha256",
@@ -3302,7 +3334,7 @@
     },
     {
      "node": "disc.s.n6",
-     "code": "src/evidence/evidence.ts:283 (Evidence.observe); src/evidence/evidence.ts:311 (Evidence.readSource); src/evidence/evidence.ts:318 (Evidence.verifyReading)",
+     "code": "src/evidence/evidence.ts:283 (Evidence.observe); src/evidence/evidence.ts:311 (Evidence.readSource); src/evidence/evidence.ts:325 (Evidence.verifyReading)",
      "fields": [
       "projectId",
       "версия и хэш",
@@ -3317,7 +3349,7 @@
     },
     {
      "node": "disc.s.n7",
-     "code": "src/discovery/response-recovery.ts:1675 (assessmentReadView)",
+     "code": "src/discovery/response-recovery.ts:1630 (assessmentReadView.get); src/discovery/response-recovery.ts:1642 (assessmentReadView.get)",
      "fields": [
       "origin.kind",
       "content",
@@ -4141,7 +4173,7 @@
      "fields": [
       "fields.verdict"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d6.n8",
@@ -4490,15 +4522,6 @@
      "sure": true
     },
     {
-     "node": "disc.d1.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
-     "fields": [
-      "questions"
-     ],
-     "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": true
-    },
-    {
      "node": "disc.d2.n2",
      "code": "src/discovery/response-recovery.ts:2368 (intentWebCapability)",
      "fields": [
@@ -4508,26 +4531,8 @@
      "sure": false
     },
     {
-     "node": "disc.d3.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
-     "fields": [
-      "questions"
-     ],
-     "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": false
-    },
-    {
-     "node": "disc.d4.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
-     "fields": [
-      "questions"
-     ],
-     "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": true
-    },
-    {
      "node": "disc.d5.n4",
-     "code": "src/discovery/discovery-decision.ts:57 (prepareChoice); src/discovery/discovery-decision.ts:66 (prepareChoice)",
+     "code": "src/discovery/discovery-decision.ts:57 (prepareChoice)",
      "fields": [
       "projectId",
       "questions.spec.field"
@@ -4537,7 +4542,7 @@
     },
     {
      "node": "disc.d5.n5",
-     "code": "src/discovery/discovery-decision.ts:57 (prepareChoice); src/discovery/discovery-decision.ts:66 (prepareChoice)",
+     "code": "src/discovery/discovery-decision.ts:57 (prepareChoice)",
      "fields": [
       "projectId",
       "questions.spec.field"
@@ -4552,15 +4557,6 @@
       "fields"
      ],
      "expects": "Вопрос переоткрывается (команда reopen-question, выбор владельца, замечание проверки): прежние ответы остаются историей",
-     "sure": true
-    },
-    {
-     "node": "disc.d6.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
-     "fields": [
-      "questions"
-     ],
-     "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
      "sure": true
     },
     {
@@ -4597,7 +4593,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:375 (readAccepted); src/product/stage-summary.ts:775 (selectDiscoveryCandidate); src/product/stage-summary.ts:855 (selectStructuredCandidate)",
+     "code": "src/product/stage-summary.ts:375 (readAccepted); src/product/stage-summary.ts:779 (selectDiscoveryCandidate)",
      "fields": [
       "projectId",
       "stage",
@@ -4612,7 +4608,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:375 (readAccepted); src/product/stage-summary.ts:775 (selectDiscoveryCandidate); src/product/stage-summary.ts:789 (selectDiscoveryCandidate)",
+     "code": "src/product/stage-summary.ts:375 (readAccepted); src/product/stage-summary.ts:779 (selectDiscoveryCandidate); src/product/stage-summary.ts:789 (selectDiscoveryCandidate)",
      "fields": [
       "projectId",
       "stage",
@@ -6214,7 +6210,7 @@
     },
     {
      "node": "disc.d1.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix); src/discovery/discovery-outcome.ts:247 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
      "fields": [
       "spec.field",
       "status",
@@ -6225,18 +6221,18 @@
     },
     {
      "node": "disc.d3.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix); src/discovery/discovery-outcome.ts:247 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
      "fields": [
       "spec.field",
       "status",
       "answer"
      ],
      "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d4.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix); src/discovery/discovery-outcome.ts:247 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
      "fields": [
       "spec.field",
       "status",
@@ -6285,7 +6281,7 @@
     },
     {
      "node": "disc.d6.n1",
-     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix); src/discovery/discovery-outcome.ts:247 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:229 (acceptedPrefix)",
      "fields": [
       "spec.field",
       "status",
@@ -6318,7 +6314,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:281 (readAcceptedField); src/product/stage-summary.ts:634 (candidateRun); src/product/stage-summary.ts:651 (readCandidate)",
+     "code": "src/product/stage-summary.ts:276 (readAcceptedField); src/product/stage-summary.ts:634 (candidateRun); src/product/stage-summary.ts:651 (readCandidate)",
      "fields": [
       "projectId",
       "draftId",
@@ -6329,7 +6325,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:281 (readAcceptedField); src/product/stage-summary.ts:634 (candidateRun); src/product/stage-summary.ts:651 (readCandidate)",
+     "code": "src/product/stage-summary.ts:276 (readAcceptedField); src/product/stage-summary.ts:634 (candidateRun); src/product/stage-summary.ts:651 (readCandidate)",
      "fields": [
       "projectId",
       "draftId",
@@ -6353,7 +6349,7 @@
     },
     {
      "node": "disc.s.n2",
-     "code": "src/discovery/continuation-packet.ts:23 (continuationState); src/discovery/working-context.ts:101 (workingContext); src/discovery/continuation-packet.ts:102 (selectedQuestion)",
+     "code": "src/discovery/continuation-packet.ts:23 (continuationState); src/discovery/working-context.ts:101 (workingContext)",
      "fields": [
       "projectId",
       "draftId"
@@ -6363,11 +6359,13 @@
     },
     {
      "node": "disc.s.n3",
-     "code": "src/discovery/research-protocol.ts:273 (researchCall)",
+     "code": "src/discovery/continuation-packet.ts:23 (continuationState)",
      "fields": [
-      "версия и хэш"
+      "projectId",
+      "draftId",
+      "вся запись"
      ],
-     "expects": "Аудируемый вызов читает счётчики, политику фаз, пилот, прошлые неудачные вызовы того же пакета и намерение",
+     "expects": "Перед отправкой доказываются вопрос и черновик текущего проекта",
      "sure": true
     },
     {
@@ -7165,7 +7163,7 @@
     },
     {
      "node": "disc.d1.n1",
-     "code": "src/discovery/discovery-outcome.ts:263 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "observation.value"
      ],
@@ -7174,16 +7172,16 @@
     },
     {
      "node": "disc.d3.n1",
-     "code": "src/discovery/discovery-outcome.ts:263 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "observation.value"
      ],
      "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d4.n1",
-     "code": "src/discovery/discovery-outcome.ts:263 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "observation.value"
      ],
@@ -7192,7 +7190,7 @@
     },
     {
      "node": "disc.d6.n1",
-     "code": "src/discovery/discovery-outcome.ts:263 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "observation.value"
      ],
@@ -7201,7 +7199,7 @@
     },
     {
      "node": "disc.d7.n3",
-     "code": "src/discovery/discovery.ts:366 (Discovery.gate); src/discovery/discovery.ts:405 (Discovery.gate)",
+     "code": "src/discovery/discovery.ts:366 (Discovery.gate)",
      "fields": [
       "projectId",
       "question",
@@ -7212,7 +7210,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:289 (readAcceptedField); src/product/stage-summary.ts:349 (applyVerbatimOrigin)",
+     "code": "src/product/stage-summary.ts:285 (readAcceptedField)",
      "fields": [
       "observation"
      ],
@@ -7221,7 +7219,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:289 (readAcceptedField)",
+     "code": "src/product/stage-summary.ts:285 (readAcceptedField)",
      "fields": [
       "observation"
      ],
@@ -7275,6 +7273,17 @@
       "observation.value"
      ],
      "expects": "Оценка ответа взвешивает соседние принятые наблюдения той же стадии",
+     "sure": true
+    },
+    {
+     "node": "disc.s.n7",
+     "code": "src/discovery/stage-neighbors.ts:60 (stageNeighbors)",
+     "fields": [
+      "projectId",
+      "question",
+      "observation"
+     ],
+     "expects": "Точный принятый ответ предыдущего вопроса той же стадии; пара question/answer и значение черновика совпадают",
      "sure": true
     }
    ]
@@ -7372,7 +7381,7 @@
     },
     {
      "node": "disc.d1.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "value"
      ],
@@ -7381,16 +7390,16 @@
     },
     {
      "node": "disc.d3.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "value"
      ],
      "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d4.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "value"
      ],
@@ -7399,7 +7408,7 @@
     },
     {
      "node": "disc.d6.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "value"
      ],
@@ -7420,7 +7429,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:310 (readAcceptedField); src/product/stage-summary.ts:352 (applyVerbatimOrigin)",
+     "code": "src/product/stage-summary.ts:285 (readAcceptedField)",
      "fields": [
       "actor",
       "value"
@@ -7430,7 +7439,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:310 (readAcceptedField)",
+     "code": "src/product/stage-summary.ts:285 (readAcceptedField)",
      "fields": [
       "actor",
       "value"
@@ -7487,6 +7496,17 @@
       "value"
      ],
      "expects": "Оценка ответа взвешивает соседние принятые решения той же стадии",
+     "sure": true
+    },
+    {
+     "node": "disc.s.n7",
+     "code": "src/discovery/stage-neighbors.ts:60 (stageNeighbors)",
+     "fields": [
+      "projectId",
+      "question",
+      "value"
+     ],
+     "expects": "Точный принятый ответ предыдущего вопроса той же стадии; пара question/answer и значение черновика совпадают",
      "sure": true
     }
    ]
@@ -7574,7 +7594,7 @@
      "fields": [
       "value"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d6.n8",
@@ -7754,7 +7774,7 @@
     },
     {
      "node": "disc.d1.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix); src/discovery/discovery-outcome.ts:270 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -7763,16 +7783,16 @@
     },
     {
      "node": "disc.d3.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix); src/discovery/discovery-outcome.ts:270 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "запись (поля не уточнены)"
      ],
      "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d4.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix); src/discovery/discovery-outcome.ts:270 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -7799,7 +7819,7 @@
     },
     {
      "node": "disc.d6.n1",
-     "code": "src/discovery/discovery-outcome.ts:261 (acceptedPrefix); src/discovery/discovery-outcome.ts:270 (acceptedPrefix)",
+     "code": "src/discovery/discovery-outcome.ts:258 (acceptedPrefix)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -7808,7 +7828,7 @@
     },
     {
      "node": "disc.d7.n3",
-     "code": "src/discovery/discovery.ts:371 (Discovery.gate)",
+     "code": "src/discovery/discovery.ts:377 (Discovery.gate)",
      "fields": [
       "assessment",
       "value"
@@ -7818,7 +7838,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:294 (readAcceptedField); src/product/stage-summary.ts:420 (readCandidateResearchField); src/product/stage-summary.ts:675 (readCandidate)",
+     "code": "src/product/stage-summary.ts:294 (readAcceptedField); src/product/stage-summary.ts:417 (readCandidateResearchField); src/product/stage-summary.ts:675 (readCandidate)",
      "fields": [
       "assessment",
       "value"
@@ -7828,7 +7848,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:294 (readAcceptedField); src/product/stage-summary.ts:420 (readCandidateResearchField); src/product/stage-summary.ts:675 (readCandidate)",
+     "code": "src/product/stage-summary.ts:294 (readAcceptedField); src/product/stage-summary.ts:417 (readCandidateResearchField); src/product/stage-summary.ts:675 (readCandidate)",
      "fields": [
       "assessment",
       "value"
@@ -7857,7 +7877,7 @@
     },
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/response-recovery.ts:2510 (readResearchAcceptanceBinding); src/discovery/research-consumer-transition.ts:1357 (projectAcceptanceBinding); src/discovery/discovery.ts:127 (Discovery.#answer)",
+     "code": "src/discovery/response-recovery.ts:2510 (readResearchAcceptanceBinding)",
      "fields": [
       "projectId",
       "assessment",
@@ -8186,6 +8206,17 @@
      ],
      "expects": "Оценка ответа читает соседний принятый ответ по точной ссылке",
      "sure": true
+    },
+    {
+     "node": "disc.s.n7",
+     "code": "src/discovery/stage-neighbors.ts:60 (stageNeighbors)",
+     "fields": [
+      "projectId",
+      "question",
+      "value"
+     ],
+     "expects": "Точный принятый ответ предыдущего вопроса той же стадии; пара question/answer и значение черновика совпадают",
+     "sure": true
     }
    ]
   },
@@ -8387,15 +8418,6 @@
      "sure": true
     },
     {
-     "node": "disc.d2.n6",
-     "code": "src/discovery/web-research.ts:417 (apply)",
-     "fields": [
-      "вся запись"
-     ],
-     "expects": "Снимок применяется к ожидающему ходу; отказ не создаёт Source",
-     "sure": true
-    },
-    {
      "node": "disc.s.n1",
      "code": "src/discovery/response-recovery.ts:975 (historicalTurnTransitionProof)",
      "fields": [
@@ -8403,16 +8425,6 @@
      ],
      "expects": "Доказательство перехода хода перечитывает все зависимые записи по ссылкам",
      "sure": false
-    },
-    {
-     "node": "disc.s.n8",
-     "code": "src/discovery/research-consumer-transition.ts:1750 (projectResearchTurnRevision)",
-     "fields": [
-      "вид записи",
-      "версия и хэш"
-     ],
-     "expects": "Ход завершается по доказательству: связка приёмки, оценка, веб-снимок и намерение читаются по ссылкам",
-     "sure": true
     },
     {
      "node": "in.e.e9",
@@ -8613,7 +8625,7 @@
     },
     {
      "node": "disc.d2.n3",
-     "code": "src/discovery/web-research.ts:455 (materialBudgetBase); src/discovery/web-research.ts:237 (requireMaterialBudget); src/discovery/web-research.ts:492 (readWebCaptureBudget)",
+     "code": "src/discovery/web-research.ts:555 (executeMaterialWebTurn); src/discovery/web-research.ts:237 (requireMaterialBudget); src/discovery/web-research.ts:492 (readWebCaptureBudget)",
      "fields": [
       "contract",
       "projectId",
@@ -8926,7 +8938,7 @@
    "readers": [
     {
      "node": "disc.s.n5",
-     "code": "src/discovery/response-recovery.ts:472 (readManagedSearchCompletion); src/discovery/research-consumer-transition.ts:1178 (projectResearchSearchCapture)",
+     "code": "src/discovery/response-recovery.ts:472 (readManagedSearchCompletion)",
      "fields": [
       "вид записи",
       "вся запись",
@@ -9066,7 +9078,7 @@
     },
     {
      "node": "disc.d7.n4",
-     "code": "src/pipeline/pipeline.ts:117 (Pipeline.accept); src/product/early-stage-driver.ts:98 (EarlyStageDriver.reviseInput)",
+     "code": "src/pipeline/pipeline.ts:117 (Pipeline.accept)",
      "when": "Приёмка: стадия получает статус accepted и список опор (proofs); записывается только при отсутствии замечаний; принятая Discovery возвращается в draft (proofs пусты) в той же транзакции, что и новая редакция поручения",
      "fields": [
       "status",
@@ -9273,7 +9285,7 @@
     },
     {
      "node": "disc.d7.n3",
-     "code": "src/pipeline/pipeline.ts:43 (Pipeline.inspect); src/pipeline/pipeline.ts:68 (Pipeline.#inspectValue); src/pipeline/pipeline.ts:80 (Pipeline.#inspectValue)",
+     "code": "src/pipeline/pipeline.ts:43 (Pipeline.inspect)",
      "fields": [
       "вся запись",
       "status",
@@ -9285,20 +9297,8 @@
      "sure": true
     },
     {
-     "node": "disc.d7.n4",
-     "code": "src/product/early-stage-driver.ts:91 (EarlyStageDriver.reviseInput)",
-     "fields": [
-      "вид записи",
-      "projectId",
-      "stage",
-      "status"
-     ],
-     "expects": "Запись стадии Discovery проверяется перед возвратом в черновик",
-     "sure": false
-    },
-    {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:364 (readAccepted); src/product/stage-summary.ts:891 (stageSummary); src/product/stage-summary.ts:578 (readStructuredAccepted)",
+     "code": "src/product/stage-summary.ts:891 (stageSummary)",
      "fields": [
       "projectId",
       "stage",
@@ -9311,7 +9311,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:364 (readAccepted); src/product/stage-summary.ts:891 (stageSummary); src/product/engine.ts:241 (ProductEngine.exportStage)",
+     "code": "src/product/stage-summary.ts:891 (stageSummary); src/product/engine.ts:241 (ProductEngine.exportStage)",
      "fields": [
       "content",
       "projectId",
@@ -9320,15 +9320,6 @@
       "inputs"
      ],
      "expects": "Экспорт стадии берёт ссылку из сводки и отдаёт содержимое как JSON; читаемая сводка стадии: записи читаются по точным ссылкам, хэши и проект сверяются",
-     "sure": true
-    },
-    {
-     "node": "disc.s.n8",
-     "code": "src/discovery/research-consumer-transition.ts:1776 (projectResearchTurnRevision)",
-     "fields": [
-      "запись (поля не уточнены)"
-     ],
-     "expects": "Ход завершается по доказательству: связка приёмки, оценка, веб-снимок и намерение читаются по ссылкам",
      "sure": true
     },
     {
@@ -11357,13 +11348,12 @@
     },
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/research-runner.ts:494 (Researcher.run); src/discovery/research-runner.ts:529 (Researcher.run); src/discovery/research-runner.ts:556 (Researcher.run)",
-     "when": "Восстановление: прогон снова running при продолжении чтеца или при уже принятом ответе; восстановление старых ходов планировщика и повтор ответа с лимитом (пилотная эра)",
+     "code": "src/discovery/research-runner.ts:366 (Researcher.run); src/discovery/research-runner.ts:529 (Researcher.run); src/discovery/research-runner.ts:556 (Researcher.run)",
+     "when": "Создание/повторный захват прогона; восстановление уже принятого ответа или переоткрытого вопроса",
      "fields": [
-      "status",
-      "turns"
+      "вся запись"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.s.n4",
@@ -11541,7 +11531,7 @@
     },
     {
      "node": "disc.d7.n5",
-     "code": "src/discovery/consumer-research.ts:26 (researchForConsumer)",
+     "code": "src/discovery/consumer-research.ts:29 (researchForConsumer)",
      "fields": [
       "turns"
      ],
@@ -11572,7 +11562,7 @@
     },
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/response-recovery.ts:1160 (readResearchConsumerTurn)",
+     "code": "src/discovery/response-recovery.ts:1157 (readResearchConsumerTurn)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -11581,7 +11571,7 @@
     },
     {
      "node": "disc.s.n3",
-     "code": "src/discovery/response-recovery.ts:1496 (prepareResearchConsumerReservation)",
+     "code": "src/discovery/response-recovery.ts:1493 (prepareResearchConsumerReservation)",
      "fields": [
       "projectId",
       "draftId",
@@ -11593,7 +11583,7 @@
     },
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/research-runner.ts:1395 (Researcher.completeAcceptedTurn); src/discovery/response-recovery.ts:2706 (validateConsumerApplicationWrites); src/discovery/response-recovery.ts:2745 (validateRunnerApplicationWrites)",
+     "code": "src/discovery/research-runner.ts:1395 (Researcher.completeAcceptedTurn); src/discovery/response-recovery.ts:2745 (validateRunnerApplicationWrites)",
      "fields": [
       "status",
       "owner",
@@ -12033,14 +12023,14 @@
     },
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/research-runner.ts:725 (Researcher.run); src/discovery/research-runner.ts:738 (Researcher.run); src/discovery/research-runner.ts:801 (Researcher.run)",
-     "when": "Старый ход воспроизводится новым ожидающим (replayedFrom): пилотная эра; ожидающий ход завершается проекцией восстановления: принятый ответ, переоткрытый вопрос или продолжение чтеца",
+     "code": "src/discovery/research-runner.ts:532 (Researcher.run); src/discovery/research-runner.ts:559 (Researcher.run)",
+     "when": "Восстановление ожидающего оплаченного хода: при доказанном принятом ответе либо переоткрытии вопроса сохраняет завершённую проекцию хода вместе с обновлением research-run",
      "fields": [
       "status",
-      "replayedFrom",
-      "observation"
+      "observation",
+      "error"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.s.n4",
@@ -12300,15 +12290,6 @@
      "sure": true
     },
     {
-     "node": "disc.d2.n2",
-     "code": "src/discovery/web-research.ts:411 (requirePendingTurn)",
-     "fields": [
-      "status"
-     ],
-     "expects": "Веб-действие применяется только к ожидающему ходу прогона этого проекта",
-     "sure": false
-    },
-    {
      "node": "disc.d2.n3",
      "code": "src/discovery/web-research.ts:783 (executeLegacyWebTurn)",
      "fields": [
@@ -12328,7 +12309,7 @@
     },
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/research-runner.ts:132 (Researcher.run); src/discovery/research-runner.ts:311 (Researcher.run); src/discovery/research-runner.ts:470 (Researcher.run)",
+     "code": "src/discovery/research-runner.ts:132 (Researcher.run); src/discovery/research-runner.ts:311 (Researcher.run)",
      "fields": [
       "run",
       "status",
@@ -12343,7 +12324,7 @@
     },
     {
      "node": "disc.s.n5",
-     "code": "src/discovery/response-recovery.ts:448 (managedSearchParent); src/discovery/research-consumer-transition.ts:958 (projectAddressedWorkspace); src/discovery/research-consumer-transition.ts:999 (projectRepeatedContextRead)",
+     "code": "src/discovery/response-recovery.ts:448 (managedSearchParent)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -12857,7 +12838,7 @@
     },
     {
      "node": "disc.s.n3",
-     "code": "src/discovery/research-protocol.ts:216 (researchCall); src/discovery/research-protocol.ts:225 (researchCall); src/discovery/research-protocol.ts:232 (researchCall)",
+     "code": "src/discovery/research-protocol.ts:216 (researchCall); src/discovery/research-protocol.ts:232 (researchCall)",
      "fields": [
       "state",
       "cursor",
@@ -12879,7 +12860,7 @@
     },
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/response-recovery.ts:2696 (validateConsumerApplicationWrites); src/discovery/research-runner.ts:1429 (Researcher.applyActionIntent); src/discovery/research-consumer-transition.ts:1761 (projectResearchTurnRevision)",
+     "code": "src/discovery/response-recovery.ts:2696 (validateConsumerApplicationWrites); src/discovery/research-runner.ts:1429 (Researcher.applyActionIntent)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -13082,7 +13063,7 @@
     },
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/response-recovery.ts:2252 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2277 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2302 (readResearchConsumerExecutionFromIntent)",
+     "code": "src/discovery/response-recovery.ts:2252 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2274 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2302 (readResearchConsumerExecutionFromIntent)",
      "fields": [
       "вид записи",
       "body"
@@ -13105,7 +13086,7 @@
     },
     {
      "node": "disc.s.n5",
-     "code": "src/discovery/response-recovery.ts:3221 (readResearchContextRecordAt); src/discovery/pilot-context.ts:76 (readPilotContext); src/discovery/research-consumer-transition.ts:429 (exactContextLookup)",
+     "code": "src/discovery/research-consumer-transition.ts:411 (exactContextLookup); src/discovery/response-recovery.ts:3221 (readResearchContextRecordAt); src/discovery/pilot-context.ts:76 (readPilotContext)",
      "fields": [
       "версия и хэш",
       "body.contextReadContract",
@@ -13324,7 +13305,7 @@
     },
     {
      "node": "disc.s.n5",
-     "code": "src/discovery/research-consumer-transition.ts:423 (exactContextLookup); src/discovery/pilot-context.ts:65 (readPilotContext); src/discovery/response-recovery.ts:3231 (readResearchContextRecordAt)",
+     "code": "src/discovery/research-consumer-transition.ts:411 (exactContextLookup); src/discovery/pilot-context.ts:65 (readPilotContext); src/discovery/response-recovery.ts:3223 (readResearchContextRecordAt)",
      "fields": [
       "вид записи"
      ],
@@ -13333,7 +13314,7 @@
     },
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/response-recovery.ts:2680 (validateConsumerApplicationWrites); src/discovery/response-recovery.ts:2685 (validateConsumerApplicationWrites)",
+     "code": "src/discovery/response-recovery.ts:2685 (validateConsumerApplicationWrites)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -13342,7 +13323,7 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/context-recovery.ts:101 (recoverContextSession); src/discovery/context-recovery.ts:171 (recoverContextSessionV2); src/discovery/context-recovery.ts:202 (recoverContextSessionV2)",
+     "code": "src/discovery/context-recovery.ts:84 (recoverContextSession); src/discovery/context-recovery.ts:164 (recoverContextSessionV2)",
      "fields": [
       "observations"
      ],
@@ -13365,6 +13346,15 @@
       "вся запись"
      ],
      "expects": "Существующая точка переиспользуется, новой записи нет",
+     "sure": true
+    },
+    {
+     "node": "disc.d2.n8",
+     "code": "src/discovery/research-continuation.ts:43 (prepareCheckpoint)",
+     "fields": [
+      "вся запись"
+     ],
+     "expects": "Существующий точный checkpoint переиспользуется без повторной записи",
      "sure": true
     }
    ]
@@ -13573,7 +13563,7 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/response-recovery.ts:2024 (readLimitedCallRetryPermit); src/discovery/response-recovery.ts:1927 (retryableResearchConsumerRefusal); src/discovery/response-recovery.ts:2034 (readLimitedCallRetryPermit)",
+     "code": "src/discovery/response-recovery.ts:2029 (readLimitedCallRetryPermit); src/discovery/response-recovery.ts:1927 (retryableResearchConsumerRefusal)",
      "fields": [
       "вся запись",
       "наличие записи"
@@ -14819,7 +14809,7 @@
     },
     {
      "node": "disc.s.n3",
-     "code": "src/discovery/research-protocol.ts:303 (researchCall); src/discovery/response-recovery.ts:1412 (prepareResearchConsumerIntent); src/discovery/response-recovery.ts:1478 (prepareResearchConsumerReservation)",
+     "code": "src/discovery/research-protocol.ts:303 (researchCall); src/discovery/response-recovery.ts:1412 (prepareResearchConsumerIntent)",
      "fields": [
       "execution",
       "status",
@@ -15260,7 +15250,7 @@
    "readers": [
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/response-recovery.ts:2252 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2275 (readResearchConsumerExecutionFromIntent)",
+     "code": "src/discovery/response-recovery.ts:2252 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2272 (readResearchConsumerExecutionFromIntent)",
      "fields": [
       "вид записи",
       "версия и хэш"
@@ -15537,7 +15527,7 @@
    "readers": [
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/response-recovery.ts:2191 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2276 (readResearchConsumerExecutionFromIntent); src/discovery/planning-recovery.ts:47 (recoverableReadingPlan)",
+     "code": "src/discovery/response-recovery.ts:2191 (readResearchConsumerExecutionFromIntent); src/discovery/response-recovery.ts:2273 (readResearchConsumerExecutionFromIntent)",
      "fields": [
       "вид записи",
       "consumerExecution",
@@ -15911,7 +15901,7 @@
    "readers": [
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/model-call-recovery.ts:249 (readLateModelReceipt); src/discovery/model-call-recovery.ts:240 (checkedLateModelReceipt)",
+     "code": "src/discovery/model-call-recovery.ts:249 (readLateModelReceipt)",
      "fields": [
       "вся запись"
      ],
@@ -16052,7 +16042,7 @@
     },
     {
      "node": "disc.s.n2",
-     "code": "src/discovery/continuation-packet.ts:34 (continuationState)",
+     "code": "src/discovery/continuation-packet.ts:28 (continuationState)",
      "fields": [
       "question",
       "projectId",
@@ -16287,7 +16277,7 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/model-call-recovery.ts:114 (prepareModelCallRecovery); src/runtime/process-identity.ts:200 (processStopWitnesses); src/runtime/process-identity.ts:263 (evaluateProcessStopWitnesses)",
+     "code": "src/discovery/model-call-recovery.ts:114 (prepareModelCallRecovery); src/runtime/process-identity.ts:209 (processStopWitnesses); src/runtime/process-identity.ts:281 (evaluateProcessStopWitnesses)",
      "fields": [
       "вид записи",
       "protocol",
@@ -16487,7 +16477,7 @@
      "fields": [
       "verdict"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d3.n7",
@@ -16496,7 +16486,7 @@
      "fields": [
       "verdict"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d4.n5",
@@ -16505,7 +16495,7 @@
      "fields": [
       "verdict"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d6.n7",
@@ -16514,7 +16504,7 @@
      "fields": [
       "verdict"
      ],
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.s.n7",
@@ -16674,7 +16664,7 @@
       "verdict"
      ],
      "expects": "Принятый префикс: ответы закрытых полей (поддержанная оценка) образуют основу следующего шага",
-     "sure": false
+     "sure": true
     },
     {
      "node": "disc.d4.n1",
@@ -16696,7 +16686,7 @@
     },
     {
      "node": "disc.d7.n3",
-     "code": "src/discovery/discovery.ts:386 (Discovery.gate)",
+     "code": "src/discovery/discovery.ts:377 (Discovery.gate)",
      "fields": [
       "версия и хэш",
       "verdict",
@@ -16709,7 +16699,7 @@
     },
     {
      "node": "disc.d7.n6",
-     "code": "src/product/stage-summary.ts:298 (readAcceptedField); src/product/stage-summary.ts:421 (readCandidateResearchField)",
+     "code": "src/product/stage-summary.ts:298 (readAcceptedField); src/product/stage-summary.ts:417 (readCandidateResearchField)",
      "fields": [
       "verdict",
       "value"
@@ -16719,7 +16709,7 @@
     },
     {
      "node": "disc.d7.n7",
-     "code": "src/product/stage-summary.ts:298 (readAcceptedField); src/product/stage-summary.ts:421 (readCandidateResearchField)",
+     "code": "src/product/stage-summary.ts:298 (readAcceptedField); src/product/stage-summary.ts:417 (readCandidateResearchField)",
      "fields": [
       "verdict",
       "value"
@@ -16751,7 +16741,7 @@
     },
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/discovery.ts:200 (Discovery.#acceptSupported); src/discovery/research-consumer-transition.ts:1361 (projectAcceptanceBinding); src/discovery/research-consumer-transition.ts:1678 (projectResearchTurnRevision)",
+     "code": "src/discovery/discovery.ts:200 (Discovery.#acceptSupported)",
      "fields": [
       "verdict",
       "projectId",
@@ -17765,7 +17755,7 @@
     },
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/discovery.ts:253 (Discovery.#winningAcceptance); src/discovery/response-recovery.ts:2437 (readResearchAcceptanceBinding); src/discovery/research-consumer-transition.ts:1731 (projectResearchTurnRevision)",
+     "code": "src/discovery/discovery.ts:253 (Discovery.#winningAcceptance); src/discovery/response-recovery.ts:2451 (readResearchAcceptanceBinding)",
      "fields": [
       "pending",
       "assessment",
@@ -18102,8 +18092,8 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/context-recovery.ts:215 (recoverContextSessionV2); src/discovery/context-recovery.ts:113 (recoverContextSession)",
-     "when": "Команда recover-context-session: к сессии дописывается выбранный оператором материал; проект, вопрос, черновик и источники должны совпасть и быть актуальными",
+     "code": "src/discovery/context-recovery.ts:113 (recoverContextSession)",
+     "when": "Команда recover-context-session: историческая неманaged-сессия; assessment-session:v2 этой дверью отвергается (:37–39), восстанавливается по paid origin; к сессии дописывается выбранный оператором материал",
      "fields": [
       "projectId",
       "offset",
@@ -18161,7 +18151,7 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/response-recovery.ts:3085 (recoverResearchResponse); src/discovery/response-recovery.ts:3093 (recoverResearchResponse); src/discovery/context-recovery.ts:21 (-)",
+     "code": "src/discovery/response-recovery.ts:3085 (recoverResearchResponse); src/discovery/context-recovery.ts:31 (recoverContextSession)",
      "fields": [
       "binding",
       "offset",
@@ -18459,7 +18449,7 @@
     },
     {
      "node": "disc.s.n7",
-     "code": "src/discovery/assessment-session.ts:355 (readApplication); src/discovery/assessment-session.ts:1068 (assessmentSessionInternal); src/discovery/assessment-session.ts:1347 (proveAppliedAssessment)",
+     "code": "src/discovery/assessment-session.ts:355 (readApplication); src/discovery/assessment-session.ts:1068 (assessmentSessionInternal)",
      "fields": [
       "вся запись",
       "state",
@@ -18863,7 +18853,7 @@
    "readers": [
     {
      "node": "disc.s.n7",
-     "code": "src/discovery/assessment-session.ts:559 (barrierGuard); src/discovery/assessment-session.ts:564 (readBarrier); src/discovery/assessment-session.ts:603 (permitsAssessmentCorrection)",
+     "code": "src/discovery/assessment-session.ts:564 (readBarrier)",
      "fields": [
       "вся запись",
       "completion"
@@ -19115,25 +19105,25 @@
    "readers": [
     {
      "node": "disc.s.n1",
-     "code": "src/discovery/research-runner.ts:224 (Researcher.run); src/discovery/research-runner.ts:200 (Researcher.run); src/discovery/response-recovery.ts:884 (historicalTurnTransitionProof)",
+     "code": "src/discovery/research-runner.ts:200 (Researcher.run); src/discovery/response-recovery.ts:884 (historicalTurnTransitionProof)",
      "fields": [
       "вся запись",
       "версия и хэш"
      ],
-     "expects": "Пролог прогона: незавершённая оплаченная операция проверяется и восстанавливается раньше новой; доказательство перехода хода перечитывает все зависимые записи по ссылкам",
-     "sure": true
+     "expects": "Условное чтение profile из сохранённого происхождения; в обычном Discovery пилота нет",
+     "sure": false
     },
     {
      "node": "disc.s.n3",
-     "code": "src/discovery/reader-pilot.ts:139 (readerPilot); src/discovery/research-protocol.ts:270 (researchCall); src/discovery/response-recovery.ts:1439 (prepareResearchConsumerIntent)",
+     "code": "src/discovery/response-recovery.ts:1439 (prepareResearchConsumerIntent)",
      "fields": [
       "projectId",
       "active",
       "вся запись",
       "версия и хэш"
      ],
-     "expects": "Пилот читается при каждом вызове: валидная схема, тот же проект, активность; аудируемый вызов читает счётчики, политику фаз, пилот, прошлые неудачные вызовы того же пакета и намерение",
-     "sure": true
+     "expects": "Точный profile читается только если он указан в сохраняемом намерении; обычный путь Discovery передаёт null",
+     "sure": false
     },
     {
      "node": "disc.s.n7",
@@ -19141,7 +19131,7 @@
      "fields": [
       "версия и хэш"
      ],
-     "expects": "Оценочная сессия: все записи читаются по точным ссылкам, хэш совпадает, эра и происхождение доказаны; перед вызовом оценщика проверяется, что сессия, приложение и привязки точные и в текущей эре",
+     "expects": "currentAdmission:739 читает configured-голову reader-pilot; :343/:107 читают profile только при наличии сохранённого в записи; обязательного активного пилота в обычном Discovery нет",
      "sure": true
     },
     {
@@ -19385,7 +19375,7 @@
       "stopAfter",
       "budgetSegment"
      ],
-     "expects": "Политика читается перед каждым вызовом; сегмент бюджета нужен только для стадии выше L2; аудируемый вызов читает счётчики, политику фаз, пилот, прошлые неудачные вызовы того же пакета и намерение",
+     "expects": "Политика читается для аудируемого вызова; ветвь использования её budgetSegment здесь действует только для OM R2",
      "sure": true
     },
     {
@@ -19545,15 +19535,6 @@
     }
    ],
    "readers": [
-    {
-     "node": "disc.s.n3",
-     "code": "src/discovery/research-protocol.ts:280 (researchCall)",
-     "fields": [
-      "запись (поля не уточнены)"
-     ],
-     "expects": "Аудируемый вызов читает счётчики, политику фаз, пилот, прошлые неудачные вызовы того же пакета и намерение",
-     "sure": true
-    },
     {
      "node": "om.r2",
      "code": "src/runtime/research-budget.ts:30 (budgetSegment); src/discovery/research-trial.ts:30 (allocatedTrial); src/runtime/research-budget.ts:39 (segmentOwnerCeiling)",
@@ -20044,13 +20025,14 @@
    ],
    "readers": [
     {
-     "node": "disc.s.n9",
+     "node": "disc.s.n3",
      "code": "src/discovery/invocation-progress.ts:24 (invocationProgress)",
      "fields": [
-      "запись (поля не уточнены)"
+      "question",
+      "версия и хэш"
      ],
-     "expects": "Считает вызовы и подтверждения по вопросу и ключу прогресса, чтобы не крутиться впустую",
-     "sure": false
+     "expects": "При обычном контексте без synthesis/assessment/reader состояния перечисляются сохранённые свидетельства для ключа прогресса; отсутствие результатов допустимо",
+     "sure": true
     }
    ]
   },
@@ -20245,7 +20227,7 @@
     },
     {
      "node": "disc.s.n5",
-     "code": "src/discovery/research-consumer-transition.ts:416 (exactContextLookup); src/discovery/pilot-context.ts:47 (readPilotContext); src/discovery/response-recovery.ts:3226 (readResearchContextRecordAt)",
+     "code": "src/discovery/research-consumer-transition.ts:411 (exactContextLookup); src/discovery/pilot-context.ts:47 (readPilotContext); src/discovery/response-recovery.ts:3226 (readResearchContextRecordAt)",
      "fields": [
       "вид записи"
      ],
@@ -20253,21 +20235,12 @@
      "sure": true
     },
     {
-     "node": "disc.s.n8",
-     "code": "src/discovery/response-recovery.ts:2726 (validateConsumerApplicationWrites)",
-     "fields": [
-      "запись (поля не уточнены)"
-     ],
-     "expects": "Применение результата — ровно ожидаемая форма записей: прогон и ход, прежний хэш",
-     "sure": true
-    },
-    {
      "node": "disc.s.n9",
-     "code": "src/discovery/invocation-progress.ts:24 (invocationProgress); src/discovery/context-recovery.ts:170 (recoverContextSessionV2)",
+     "code": "src/discovery/context-recovery.ts:170 (recoverContextSessionV2)",
      "fields": [
       "запись (поля не уточнены)"
      ],
-     "expects": "Считает вызовы и подтверждения по вопросу и ключу прогресса, чтобы не крутиться впустую",
+     "expects": "Восстановление сессии v2 читает сохранённый reader-result по точной ссылке",
      "sure": false
     },
     {
@@ -20300,6 +20273,16 @@
      ],
      "expects": "Чтец (read_bundle): намерение, источники и результат связаны точными ссылками; наблюдения заново выводятся из источников",
      "sure": false
+    },
+    {
+     "node": "disc.s.n3",
+     "code": "src/discovery/invocation-progress.ts:24 (invocationProgress)",
+     "fields": [
+      "question",
+      "версия и хэш"
+     ],
+     "expects": "При обычном контексте без synthesis/assessment/reader состояния перечисляются сохранённые свидетельства для ключа прогресса; отсутствие результатов допустимо",
+     "sure": true
     }
    ]
   },
@@ -20515,7 +20498,7 @@
    "readers": [
     {
      "node": "disc.s.n8",
-     "code": "src/discovery/response-recovery.ts:2660 (validateConsumerApplicationWrites); src/discovery/response-recovery.ts:2666 (validateConsumerApplicationWrites)",
+     "code": "src/discovery/response-recovery.ts:2666 (validateConsumerApplicationWrites)",
      "fields": [
       "запись (поля не уточнены)"
      ],
@@ -20524,7 +20507,7 @@
     },
     {
      "node": "disc.s.n9",
-     "code": "src/discovery/response-recovery.ts:3086 (recoverResearchResponse); src/discovery/response-recovery.ts:3133 (recoverResearchResponse); src/discovery/context-recovery.ts:32 (recoverContextSession)",
+     "code": "src/discovery/response-recovery.ts:3086 (recoverResearchResponse); src/discovery/context-recovery.ts:32 (recoverContextSession)",
      "fields": [
       "вид записи"
      ],
@@ -40763,6 +40746,16 @@
       "status"
      ],
      "expects": "Работающий наблюдатель запрещает новую оплату",
+     "sure": true
+    },
+    {
+     "node": "disc.s.n3",
+     "code": "src/discovery/research-protocol.ts:338 (researchCall)",
+     "fields": [
+      "projectId",
+      "status"
+     ],
+     "expects": "Перед оплатой отсутствие running runtime-observation этого проекта; иначе runtime_observation_busy",
      "sure": true
     }
    ]
