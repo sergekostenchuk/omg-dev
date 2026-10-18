@@ -47,3 +47,9 @@
 - om.r0.begin: перед работой читает ещё phase-policy и reader-pilot — на карте нет.
 - begin-research / finish-research (engine.ts:337–338) не проверяют legacy_route_closed: R0 можно записать после первого OM-ввода (вывод).
 - om.r0.finish: ссылка на строку — refinement.ts:102.
+- om.l1.om: horizon.ts:328 → чтение L1 в deriveHorizon (horizon.ts:341, 349–355); 328 — readRefinement (старый L2).
+- om.l1.model: три вопроса — journey, operationRequirements, mapDesign.
+- om.l1.gate: validateStage (stage-checks.ts:275–281, 338–349).
+- om.l1 (старый seal-layer): sealLayer требует принятую features (refinement.ts:45, features_not_ready) и границу phase-policy/reader-pilot.
+- Слой: in.d.d1 → early-stage-driver.ts:498 подписано #entryFailure, а строка в #currentStage.
+- Нет узлов: save-graph, refine-graph, set-map-status.

@@ -1,5 +1,5 @@
 {
-"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0",
+"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1",
 "generatedFrom": "om/module d8028bf; kinds-early.json; db-census.json",
 "tables": [
 {
@@ -322,6 +322,15 @@
 "id"
 ],
 "expects": "Команда recover-execution сначала проверяет проект",
+"sure": true
+},
+{
+"node": "om.l1.in",
+"code": "src/product/engine.ts:103 (ProductEngine.#prepare); src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"id"
+],
+"expects": "Прежде чем готовить стадию operation-map, проект должен существовать (project_missing иначе).",
 "sure": true
 }
 ]
@@ -953,6 +962,27 @@
 "requestCapacityChars"
 ],
 "expects": "Новый проход стартует, только если условия среды наблюдаются сейчас: среда, исполнители research, репозиторий (root, HEAD, tree), capacity, dispatch; иначе environment_not_ready до любой записи.",
+"sure": true
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-runner.ts:223 (Researcher.run)",
+"fields": [
+"workspace",
+"implementer",
+"reviewer"
+],
+"expects": "Запрос автору уходит исполнителю research из действующей среды проекта и в её рабочей папке; среду берёт Researcher.run для нового запроса.",
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:232 (assessAnswer)",
+"fields": [
+"implementer",
+"reviewer"
+],
+"expects": "Оценщик обязан быть другим исполнителем, чем автор: иначе assessor_not_independent.",
 "sure": true
 }
 ]
@@ -2420,6 +2450,18 @@
 "findings"
 ],
 "sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/discovery/consumer-feedback.ts:22 (rejectResearch)",
+"when": "Если приёмка стадии отвергла предложение автора, но указала поле (например mapDesign), движок сохраняет сам отказ — находки и названные вопросы — и в той же транзакции переоткрывает эти вопросы. Находка без поля стадию только блокирует. Отдельного узла для отказа на схеме нет — отнесено к приёмке (вывод).",
+"fields": [
+"projectId",
+"draft",
+"questions",
+"findings"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -2548,6 +2590,26 @@
 "findings"
 ],
 "expects": "Оценщик видит те же замечания, что и исследователь",
+"sure": true
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/consumer-feedback.ts:32 (consumerFeedback); src/discovery/research-runner.ts:664 (Researcher.run)",
+"fields": [
+"findings",
+"questions"
+],
+"expects": "Автору подаются сохранённые находки приёмки только по переоткрытым вопросам этой версии (вопрос открыт и ревизия на один выше записанной) — чтобы он исправил именно отвергнутое.",
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:324 (assessAnswer)",
+"fields": [
+"findings",
+"questions"
+],
+"expects": "Оценщику подаются те же находки приёмки: оценивается, исправил ли автор названное, а не оценка с нуля.",
 "sure": true
 }
 ]
@@ -2780,6 +2842,15 @@
 "value"
 ],
 "expects": "Ворота приёмки: ответ вызывающего должен называть автора, а значение — равняться полю черновика (вывод)",
+"sure": false
+},
+{
+"node": "om.l1.gate",
+"code": "src/graph/repository.ts:138 (GraphRepository.layerGate)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Если вопрос карты был закрыт решением владельца (вид design), эта запись — опора слоя: она должна быть равна голове (graph_evidence_stale иначе). Для вопросов, закрытых моделью, это не используется.",
 "sure": false
 }
 ]
@@ -3197,8 +3268,11 @@
 },
 {
 "node": "om.l1.graph",
-"code": "src/graph/repository.ts:140 (GraphRepository.layerGate)",
+"code": "src/graph/repository.ts:140 (GraphRepository.layerGate); src/discovery/discovery.ts:390 (Discovery.gate)",
 "fields": [
+"content",
+"origin",
+"sha256",
 "запись (поля не уточнены)"
 ],
 "expects": "Ворота слоя читают источники",
@@ -3679,6 +3753,37 @@
 ],
 "expects": "Наблюдение ответа выводится из сохранённого источника: содержимое, дайджест и происхождение целы.",
 "sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-sources.ts:15 (ResearchSources.list)",
+"fields": [
+"вся запись"
+],
+"expects": "Автору подаётся перечень актуальных источников проекта: у каждого проверяется контракт чтения и актуальность (sourceIsCurrent) — устаревшие в перечень не попадают.",
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:231 (assessAnswer); src/discovery/discovery.ts:205 (Discovery.#acceptSupported)",
+"fields": [
+"origin",
+"sha256",
+"content"
+],
+"expects": "Оценщик наблюдает цитаты автора в источниках проекта; при принятии каждое наблюдение проверяется заново (research_not_supported, если источник изменился).",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/graph/repository.ts:138 (GraphRepository.layerGate); src/graph/repository.ts:140 (GraphRepository.layerGate)",
+"fields": [
+"origin",
+"sha256",
+"content"
+],
+"expects": "Источник — одна из опор слоя: он должен быть равен голове и актуален (sourceIsCurrent), иначе graph_evidence_stale.",
+"sure": true
 }
 ]
 },
@@ -4085,6 +4190,15 @@
 "fields.featurePreparation"
 ],
 "sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/discovery.ts:116 (Discovery.#answer)",
+"when": "Когда оценка с вердиктом supported принята, принятое значение вписывается в поле черновика (по порядку: journey, operationRequirements, mapDesign) — в одной транзакции с ответом и вопросом. Отдельного узла для принятия на схеме нет — отнесено к оценке (вывод).",
+"fields": [
+"fields"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -4523,8 +4637,15 @@
 },
 {
 "node": "om.l1.graph",
-"code": "src/graph/repository.ts:93 (GraphRepository.deriveLayer)",
+"code": "src/graph/repository.ts:93 (GraphRepository.deriveLayer); src/graph/repository.ts:61 (GraphRepository.saveDerived); src/discovery/discovery.ts:343 (Discovery.gate)",
 "fields": [
+"consumer",
+"contractVersion",
+"fields",
+"inputs",
+"level",
+"questions",
+"stage",
 "запись (поля не уточнены)"
 ],
 "expects": "Слой графа выводится из черновика, вопросов и ответов",
@@ -5260,6 +5381,69 @@
 ],
 "expects": "Проверка фич при старте R0 (pipeline.inspect) читает для каждой из пяти ранних стадий её черновик Discovery: стадия и проект те же, поля равны полям стадии (discovery_foreign иначе). Это чтение черновиков ранних стадий, а не производного черновика R0",
 "sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-runner.ts:111 (Researcher.run); src/discovery/research-runner.ts:661 (Researcher.run)",
+"fields": [
+"stage",
+"level",
+"consumer",
+"fields",
+"questions",
+"inputs"
+],
+"expects": "Из черновика стадии берутся стадия, потребитель, уже принятые поля и открытые вопросы — из них собирается запрос автору карты.",
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:216 (assessAnswer); src/discovery/stage-neighbors.ts:37 (stageNeighbors); src/discovery/discovery.ts:206 (Discovery.#acceptSupported)",
+"fields": [
+"stage",
+"fields",
+"questions",
+"inputs",
+"basisContract"
+],
+"expects": "Оценщик читает черновик, к которому относится вопрос; соседние вопросы берутся строго по порядку черновика (stage_neighbors_binding_invalid); при принятии контракт основания вопроса должен быть тем же, что у черновика (research_contract_mismatch).",
+"sure": true
+},
+{
+"node": "om.l1.build",
+"code": "src/product/engine.ts:371 (ProductEngine.execute); src/product/engine.ts:385 (ProductEngine.execute)",
+"fields": [
+"stage",
+"contractVersion",
+"inputs",
+"fields",
+"questions"
+],
+"expects": "Сборка идёт только по черновику стадии operation-map этого проекта (discovery_foreign иначе); из поля mapDesign берётся проект графа.",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/product/stage-checks.ts:256 (StageChecks.validateStage); src/graph/repository.ts:138 (GraphRepository.layerGate)",
+"fields": [
+"stage",
+"fields",
+"projectId"
+],
+"expects": "Содержимое стадии ссылается на черновик этого проекта и стадии, а его поля равны полям черновика (discovery_foreign иначе); черновик — одна из опор слоя, и слой проверяет, что она ещё равна голове (graph_evidence_stale).",
+"sure": true
+},
+{
+"node": "om.l1.stage",
+"code": "src/product/engine.ts:119 (ProductEngine.draft)",
+"fields": [
+"stage",
+"projectId",
+"contractVersion",
+"fields"
+],
+"expects": "Черновик стадии строится из черновика исследования того же проекта и стадии (discovery_foreign иначе), записанного по действующему контракту (research_contract_upgrade_required).",
+"sure": true
 }
 ]
 },
@@ -5703,6 +5887,28 @@
 "beforeHash"
 ],
 "sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/discovery.ts:118 (Discovery.#answer)",
+"when": "Когда оценка вердиктом supported принята, вопрос закрывается: статус answered и ссылка на ответ. Отдельного узла для принятия ответа на схеме нет — отнесено к оценке (вывод).",
+"fields": [
+"status",
+"answer",
+"beforeHash"
+],
+"sure": false
+},
+{
+"node": "om.l1.gate",
+"code": "src/discovery/consumer-feedback.ts:23 (rejectResearch)",
+"when": "Если приёмка стадии отвергла конкретное поле (находка с field), именно эти вопросы переоткрываются: статус open, ответ пуст. Находка без поля вопросов не трогает — стадия блокируется.",
+"fields": [
+"status",
+"answer",
+"beforeHash"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -6061,8 +6267,11 @@
 },
 {
 "node": "om.l1.graph",
-"code": "src/graph/repository.ts:104 (GraphRepository.deriveLayer)",
+"code": "src/graph/repository.ts:104 (GraphRepository.deriveLayer); src/discovery/discovery.ts:362 (Discovery.gate); src/discovery/discovery.ts:385 (Discovery.gate)",
 "fields": [
+"answer",
+"spec",
+"status",
 "запись (поля не уточнены)"
 ],
 "expects": "Слой графа выводится из черновика, вопросов и ответов",
@@ -6574,6 +6783,47 @@
 ],
 "expects": "Каждый вопрос драфта отвечен и принадлежит его стадии; набор вопросов равен набору своей эры контракта.",
 "sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-runner.ts:574 (Researcher.run)",
+"fields": [
+"status",
+"spec"
+],
+"expects": "Для запроса берётся первый вопрос без принятого ответа (по порядку: путь journey, операционные обязанности operationRequirements, проект графа mapDesign); если открытых вопросов нет — research_answers_stale (нужно точечное переоткрытие).",
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/stage-neighbors.ts:37 (stageNeighbors); src/discovery/stage-neighbors.ts:45 (stageNeighbors); src/discovery/discovery.ts:93 (Discovery.#question)",
+"fields": [
+"status",
+"answer",
+"spec"
+],
+"expects": "Оценщик читает вопрос и предыдущие принятые вопросы того же черновика (соседи); принятие требует открытый вопрос в ожидаемой ревизии (question_stale, question_already_answered).",
+"sure": true
+},
+{
+"node": "om.l1.build",
+"code": "src/product/engine.ts:380 (ProductEngine.execute)",
+"fields": [
+"spec"
+],
+"expects": "Вопросы черновика обязаны равняться эталону REQUIREMENTS['operation-map'] действующей эры (research_context_stale иначе).",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/product/stage-checks.ts:272 (StageChecks.validateStage); src/graph/repository.ts:138 (GraphRepository.layerGate)",
+"fields": [
+"spec",
+"status",
+"answer"
+],
+"expects": "Вопросы черновика равны эталону действующей эры (research_contract_mismatch); каждый отвечен (question_unresolved); вопрос — опора слоя и должен быть равен голове.",
+"sure": true
 }
 ]
 },
@@ -7234,6 +7484,17 @@
 "value"
 ],
 "sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/discovery.ts:117 (Discovery.#answer)",
+"when": "Принятый ответ автора карты: после вердикта supported пишется research-answer со ссылкой на оценку и значением поля. Отдельного узла для принятия на схеме нет — отнесено к оценке (вывод).",
+"fields": [
+"question",
+"assessment",
+"value"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -7381,8 +7642,11 @@
 },
 {
 "node": "om.l1.graph",
-"code": "src/graph/repository.ts:104 (GraphRepository.deriveLayer)",
+"code": "src/graph/repository.ts:104 (GraphRepository.deriveLayer); src/discovery/discovery.ts:366 (Discovery.gate); src/discovery/discovery.ts:377 (Discovery.gate)",
 "fields": [
+"assessment",
+"question",
+"value",
 "запись (поля не уточнены)"
 ],
 "expects": "Слой графа выводится из черновика, вопросов и ответов",
@@ -7637,6 +7901,37 @@
 ],
 "expects": "Ответ исследования несёт независимую оценку supported и совпадает с значением поля стадии.",
 "sure": false
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/stage-neighbors.ts:60 (stageNeighbors)",
+"fields": [
+"value",
+"question"
+],
+"expects": "Оценщик видит уже принятые ответы предыдущих вопросов черновика (соседей): ответ должен быть тем же вопросом, его ссылка — точной (stage_neighbors_binding_invalid иначе).",
+"sure": true
+},
+{
+"node": "om.l1.build",
+"code": "src/discovery/discovery.ts:366 (Discovery.gate); src/discovery/discovery.ts:377 (Discovery.gate)",
+"fields": [
+"question",
+"assessment",
+"value"
+],
+"expects": "Сборка по build-map требует закрытого исследования (research_unresolved): каждый ответ называет свой вопрос, а его значение равно полю черновика (answer_foreign, answer_target_mismatch).",
+"sure": false
+},
+{
+"node": "om.l1.gate",
+"code": "src/discovery/discovery.ts:366 (Discovery.gate); src/graph/repository.ts:138 (GraphRepository.layerGate)",
+"fields": [
+"версия и хэш",
+"value"
+],
+"expects": "Приёмка стадии заново проверяет все ответы (Discovery.gate), а слой — что каждый ответ-опора ещё равен голове (graph_evidence_stale).",
+"sure": true
 }
 ]
 },
@@ -8590,6 +8885,20 @@
 "proofs"
 ],
 "sure": true
+},
+{
+"node": "om.l1.stage",
+"code": "src/pipeline/pipeline.ts:23 (Pipeline.draft); src/pipeline/pipeline.ts:116 (Pipeline.accept); src/product/stage-research.ts:118 (StageResearch.run)",
+"when": "Черновик стадии operation-map пишется после сборки карты: в нём точная ссылка на черновик исследования, его поля и Ref среза graph-layer:<проект>:1 (content.graph). Принятие переписывает ту же запись со статусом accepted и списком опор (proofs). Эти два шага делает исследование стадии, когда оценка и сборка графа прошли без находок (те же шаги доступны отдельными командами draft-stage и accept-stage).",
+"fields": [
+"status",
+"content.draft",
+"content.fields",
+"content.graph",
+"inputs",
+"proofs"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -8921,8 +9230,9 @@
 },
 {
 "node": "om.l1.om",
-"code": "src/om/horizon.ts:350 (deriveHorizon)",
+"code": "src/om/horizon.ts:350 (deriveHorizon); src/om/queue.ts:172 (horizonUpper)",
 "fields": [
+"content.graph",
 "запись (поля не уточнены)"
 ],
 "expects": "Горизонт и границы выводятся из принятой карты",
@@ -9856,6 +10166,116 @@
 ],
 "expects": "Фичи приняты и актуальны вместе со всей цепочкой стадий (features_not_ready иначе); значения черновика равны заново выведенным из принятых discovery и concept (research_contract_mismatch, derivation_stale иначе)",
 "sure": true
+},
+{
+"node": "om.l1.in",
+"code": "src/product/engine.ts:105 (ProductEngine.#prepare); src/pipeline/pipeline.ts:43 (Pipeline.inspect); src/product/early-stage-driver.ts:406 (EarlyStageDriver.#driveEarly)",
+"fields": [
+"status",
+"content.fields",
+"inputs",
+"proofs"
+],
+"expects": "Вход стадии operation-map: концепция должна быть принята и актуальна, а через её вход — принятый Discovery (иначе predecessor_not_ready; при изменении основания input_stale или proof_stale). Драйвер ранних стадий берёт первую непринятую из пяти, поэтому operation-map становится текущей, когда приняты Discovery и концепция.",
+"sure": true
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-context.ts:67 (operationMapMaterial); src/discovery/research-context.ts:354 (researchPrerequisites)",
+"fields": [
+"status",
+"content.fields"
+],
+"expects": "Автору карты подаются поля принятых стадий Discovery и концепции: в черновике ровно одна ссылка на каждую, запись принята и совпадает по хэшу (иначе operation_map_material_invalid). Последняя стадия подаётся целиком, предыдущие — только идентификаторами.",
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:321 (assessAnswer)",
+"fields": [
+"status",
+"content.fields"
+],
+"expects": "Оценщик видит те же принятые стадии, что и автор (researchPrerequisites по черновику), чтобы судить ответ по основаниям, а не по памяти.",
+"sure": true
+},
+{
+"node": "om.l1.build",
+"code": "src/product/engine.ts:376 (ProductEngine.execute); src/product/engine.ts:382 (ProductEngine.execute); src/product/engine.ts:383 (ProductEngine.execute)",
+"fields": [
+"status",
+"content.fields",
+"inputs"
+],
+"expects": "Сборка по команде build-map требует принятую концепцию, на которую сослался черновик (иначе research_context_stale). Из полей Discovery и концепции buildL1 подставляет актёров и требования (их нельзя переопределять в проекте карты — derived_field_conflict) и проверяет, что у каждого исхода есть успешный путь (outcome_uncovered), а применимые варианты путей покрыты (journey_uncovered).",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/product/stage-checks.ts:278 (StageChecks.validateStage); src/product/stage-checks.ts:343 (StageChecks.validateStage); src/product/stage-checks.ts:344 (StageChecks.validateStage)",
+"fields": [
+"content.fields"
+],
+"expects": "Для проверки покрытия берутся поля принятых Discovery и концепции: каждый исход и каждое требование концепции покрыты (outcome_uncovered, requirement_uncovered, concept_coverage_foreign, map_outcome_missing); пересборка buildL1 из них даёт ту же проекцию L1, что хранится (иначе map_design_drift или map_design_invalid).",
+"sure": true
+},
+{
+"node": "om.l1.stage",
+"code": "src/pipeline/pipeline.ts:31 (Pipeline.#prepareDraft); src/pipeline/pipeline.ts:111 (Pipeline.accept)",
+"fields": [
+"status",
+"content",
+"inputs",
+"proofs"
+],
+"expects": "Черновик стадии пишется только на принятой концепции (predecessor_not_ready иначе); принятие перечитывает стадию и требует ту же ревизию (revision_conflict), отсутствие находок (gate_rejected иначе) и состояние draft (stage_not_ready).",
+"sure": true
+},
+{
+"node": "om.l2.obl",
+"code": "src/om/frame-obligations.ts:716 (horizonBasisSources)",
+"fields": [
+"content.graph",
+"status"
+],
+"expects": "Обязательства уровня 2 берут принятую стадию operation-map по ссылке из входа OM и читают из неё точный слой L1; без ссылки на слой — frame_basis_unproven. Затем слой L1 сверяется с проекцией графа (frame_upper_drift).",
+"sure": true
+},
+{
+"node": "om.r1.apply",
+"code": "src/om/addressing.ts:246 (deriveInputDecisions)",
+"fields": [
+"content.graph"
+],
+"expects": "Адресация (F5.3) при пересчёте входа читает принятую стадию operation-map из текущего входа и требует, чтобы она называла свой слой L1 (addressing_source_invalid иначе); общий код для применения принятых ответов и решений владельца (вывод по вызывающим: prepareAddressing, writeApplyAnswer).",
+"sure": false
+},
+{
+"node": "om.r2.apply",
+"code": "src/om/addressing.ts:246 (deriveInputDecisions)",
+"fields": [
+"content.graph"
+],
+"expects": "То же чтение стадии operation-map при применении решений владельца и модели к входу (writeOwnerDecision, prepareAddressing).",
+"sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/discovery/discovery.ts:357 (Discovery.gate)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Перед записью карты проверяется, что каждая опора черновика (среди них принятая концепция) ещё равна голове; иначе research_context_stale и карта не пишется.",
+"sure": true
+},
+{
+"node": "om.l1",
+"code": "src/graph/refinement.ts:45 (Refinement.#inputs)",
+"fields": [
+"status"
+],
+"expects": "Старый путь, seal-layer L1: перед печатью обязана быть принята стадия features (features_not_ready иначе) — как для любой фазы уточнения. Отдельного узла у шага на схеме нет — отнесён к подблоку.",
+"sure": false
 }
 ]
 },
@@ -10623,6 +11043,23 @@
 "limit",
 "inputs",
 "owner"
+],
+"sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-runner.ts:366 (Researcher.run)",
+"when": "Запуск исследования черновика стадии operation-map занимает прогон: запись research-run с владельцем-процессом, счётчиком ходов и пределом. Общая запись для всех ранних стадий; здесь показана со стороны модели карты (вывод).",
+"fields": [
+"projectId",
+"draftId",
+"environment",
+"status",
+"turns",
+"limit",
+"inputs",
+"owner",
+"requestChars"
 ],
 "sure": false
 }
@@ -11393,6 +11830,32 @@
 "question"
 ],
 "sure": true
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-runner.ts:1443 (Researcher.applyActionIntent)",
+"when": "Платный ответ модели автору карты сохраняется как ход в состоянии pending вместе с увеличением счётчика прогона (ответ-предложение, ссылка на вопрос и на намерение вызова).",
+"fields": [
+"run",
+"number",
+"action",
+"status",
+"question",
+"consumerIntent"
+],
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-runner.ts:1402 (Researcher.completeAcceptedTurn)",
+"when": "После принятия поддержанного ответа ход закрывается: оценка и наблюдение вписываются в него, ссылка на связку принятия сохраняется. Отдельного узла для принятия на схеме нет — отнесено к оценке (вывод).",
+"fields": [
+"status",
+"assessment",
+"observation",
+"acceptanceBinding"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -11913,6 +12376,25 @@
 "state"
 ],
 "sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/response-recovery.ts:1471 (prepareResearchConsumerIntent)",
+"when": "До платного вызова автору карты сохраняется намерение вызова — точный запрос, роль, окружение и охраны, — чтобы ответ можно было принять после сбоя, не платя заново. Общая запись для всех ранних стадий; здесь показана со стороны модели карты (вывод).",
+"fields": [
+"contract",
+"projectId",
+"kind",
+"key",
+"draft",
+"question",
+"role",
+"dispatch",
+"cursor",
+"state",
+"guards"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -12126,6 +12608,17 @@
 "body"
 ],
 "sure": true
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/working-context.ts:154 (workingContext)",
+"when": "Пакет автору: перед каждым запросом движок собирает рабочий контекст (поля, схемы, принятые стадии, операционная карта, источники, чтения, история) и сохраняет его неизменной записью research-context:<хэш> с привязкой к черновику и вопросу.",
+"fields": [
+"draft",
+"question",
+"body"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -13695,6 +14188,40 @@
 "assessmentApplication"
 ],
 "sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-protocol.ts:364 (researchCall)",
+"when": "Перед платным вызовом автору карты (по порядку вопросов: путь journey, операционные обязанности operationRequirements, проект графа mapDesign) записывается вызов в состоянии «идёт» вместе с резервом бюджета; по окончании та же запись переписывается итогом и расходом.",
+"fields": [
+"projectId",
+"draftId",
+"purpose",
+"requestId",
+"questionId",
+"status",
+"request",
+"response",
+"usage"
+],
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-protocol.ts:364 (researchCall)",
+"when": "Оценщик вызывается тем же платным вызовом researchCall, но с ролью оценки (другой исполнитель, чем у автора): запись вызова «идёт», затем итог и расход.",
+"fields": [
+"projectId",
+"draftId",
+"purpose",
+"requestId",
+"questionId",
+"status",
+"request",
+"response",
+"usage"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -14102,6 +14629,28 @@
 "text"
 ],
 "sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-protocol.ts:360 (researchCall)",
+"when": "В пакетном режиме запроса полный текст запроса автору карты сохраняется отдельной записью вместе с резервом вызова.",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-protocol.ts:360 (researchCall)",
+"when": "В пакетном режиме запроса полный текст запроса оценщику сохраняется так же, как запрос автору.",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -14357,6 +14906,28 @@
 "text"
 ],
 "sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-protocol.ts:464 (researchCall)",
+"when": "Сырой ответ модели автору карты сохраняется записью, на которую ссылается вызов; без него ответ нельзя восстановить после сбоя.",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-protocol.ts:464 (researchCall)",
+"when": "Сырой ответ оценщика (вердикт и причины) сохраняется записью, на которую ссылается вызов.",
+"fields": [
+"projectId",
+"draftId",
+"text"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -15387,6 +15958,22 @@
 "environment"
 ],
 "sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:378 (assessAnswer); src/discovery/research-assessment.ts:400 (assessAnswer)",
+"when": "Независимый оценщик (другой исполнитель, чем автор) судит ответ по наблюдениям из источников: вердикт supported, insufficient или conflicting. Запись одна на содержимое (адрес — хэш); при оплаченном ходе её пишут вместе со связкой оценки.",
+"fields": [
+"question",
+"value",
+"observations",
+"verdict",
+"reasons",
+"researcher",
+"assessor",
+"environment"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -15800,6 +16387,56 @@
 ],
 "expects": "Оценка независима (исследователь не равен оценщику), verdict supported, наблюдения сохранены, значение равно ответу.",
 "sure": false
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/discovery.ts:200 (Discovery.#acceptSupported)",
+"fields": [
+"verdict",
+"question",
+"observations",
+"researcher",
+"assessor",
+"value"
+],
+"expects": "Принять ответ можно только по точной оценке: вердикт supported, оценщик не автор, наблюдения не пусты и проверяются сейчас (research_not_supported иначе).",
+"sure": false
+},
+{
+"node": "om.l1.build",
+"code": "src/discovery/discovery.ts:377 (Discovery.gate); src/discovery/discovery.ts:386 (Discovery.gate)",
+"fields": [
+"verdict",
+"question",
+"observations",
+"value"
+],
+"expects": "Сборка требует, чтобы оценка каждого ответа была поддержанной и принадлежала тому же вопросу (research_evidence_stale иначе).",
+"sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/discovery/discovery.ts:377 (Discovery.gate); src/discovery/discovery.ts:386 (Discovery.gate)",
+"fields": [
+"verdict",
+"question",
+"observations",
+"value"
+],
+"expects": "При записи карты оценка каждого ответа заново проверяется: вердикт supported, независимый оценщик, непустые и актуальные наблюдения, значение равно ответу (research_evidence_stale).",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/discovery/discovery.ts:386 (Discovery.gate); src/graph/repository.ts:138 (GraphRepository.layerGate)",
+"fields": [
+"verdict",
+"question",
+"observations",
+"value"
+],
+"expects": "Приёмка стадии заново проверяет оценки ответов, а слой — что оценка-опора ещё равна голове (graph_evidence_stale).",
+"sure": true
 }
 ]
 },
@@ -16014,6 +16651,20 @@
 "reads"
 ],
 "sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:401 (assessAnswer)",
+"when": "Для оплаченного хода оценка сразу связывается с ним: ссылка на оценку, ход, ожидающую ревизию, черновик, вопрос, среду и чтения оценщика. Связка пишется один раз; другая оценка на тот же ход — research_assessment_binding_invalid.",
+"fields": [
+"assessment",
+"turn",
+"pending",
+"draft",
+"question",
+"environment"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -16096,6 +16747,16 @@
 ],
 "expects": "Управляемое принятие: оценка привязана к цепочке версий ожидающего хода; иначе research_assessment_binding_invalid",
 "sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/discovery.ts:293 (Discovery.#managedAcceptance)",
+"fields": [
+"assessment",
+"pending"
+],
+"expects": "Принимая оплаченный ответ, движок проверяет, что оценка стоит на законной цепочке ожидающих ревизий этого хода (research_assessment_binding_invalid иначе).",
+"sure": false
 }
 ]
 },
@@ -16366,6 +17027,18 @@
 "assessment"
 ],
 "sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/discovery.ts:140 (Discovery.#answer)",
+"when": "Для оплаченного хода принятие ответа записывается и отдельной связкой: черновик, вопрос и ответ до и после, оценка и её доказательство — в той же транзакции, что ответ (адрес — по ходу).",
+"fields": [
+"answer",
+"assessmentProof",
+"turn",
+"pending"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -16547,6 +17220,35 @@
 ],
 "expects": "Управляемый ответ доказывает свой ход через привязку приёмки, которая обязана быть среди доказательств стадии.",
 "sure": false
+},
+{
+"node": "om.l1.build",
+"code": "src/discovery/discovery.ts:377 (Discovery.gate)",
+"fields": [
+"answer"
+],
+"expects": "Если ответ принят оплаченным ходом, его связка принятия — часть опор исследования: повреждённая или недостающая связка — находка, а не молчаливый пропуск.",
+"sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/discovery/discovery.ts:377 (Discovery.gate); src/discovery/discovery.ts:403 (Discovery.gate)",
+"fields": [
+"answer",
+"assessmentProof"
+],
+"expects": "Связка принятия входит в опоры карты (стала бы опорой слоя через guards Discovery.gate); повреждена — research_acceptance_binding_invalid как находка.",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/discovery/discovery.ts:377 (Discovery.gate); src/graph/repository.ts:138 (GraphRepository.layerGate)",
+"fields": [
+"answer",
+"assessmentProof"
+],
+"expects": "Связка принятия проверяется и при приёмке стадии, и как опора слоя: она должна быть равна голове (graph_evidence_stale иначе).",
+"sure": true
 }
 ]
 },
@@ -17869,6 +18571,16 @@
 ],
 "expects": "То же, что при старте R0: запись пилота читается снова перед сохранением отметки",
 "sure": true
+},
+{
+"node": "om.l1",
+"code": "src/discovery/reader-pilot.ts:154 (assertPilotBoundary); src/discovery/reader-pilot.ts:155 (assertPilotBoundary)",
+"fields": [
+"active",
+"вся запись"
+],
+"expects": "Старый путь: перед печатью L1 читается профиль пилота; при политике с остановкой не на L2 нужен действующий (phase_protections_missing).",
+"sure": false
 }
 ]
 },
@@ -18017,6 +18729,15 @@
 ],
 "expects": "То же, что при старте: граница читается снова перед сохранением отметки (R0 не запрещён ни одной политикой)",
 "sure": true
+},
+{
+"node": "om.l1",
+"code": "src/discovery/reader-pilot.ts:153 (assertPilotBoundary); src/discovery/phase-policy.ts:19 (phasePolicy)",
+"fields": [
+"stopAfter"
+],
+"expects": "Старый путь: граница продолжения проверяется до любой работы seal-layer. L1 в перечни запрещённых фаз не входит, но политика с остановкой не на L2 требует действующий reader-pilot (phase_protections_missing); неполная или чужая запись — phase_policy_invalid.",
+"sure": false
 }
 ]
 },
@@ -21068,6 +21789,24 @@
 "horizon"
 ],
 "sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/graph/repository.ts:36 (GraphRepository.#write); src/graph/repository.ts:67 (GraphRepository.saveDerived); src/product/engine.ts:386 (ProductEngine.execute)",
+"when": "Команда build-map: buildL1 собрал граф версии 2 из проекта карты, актёров и требований; saveDerived записывает его вместе с привязкой и срезами. Если граф, его привязка и печати те же, что уже хранятся (та же ожидаемая ревизия), новой версии нет — возвращается прежняя. Запись идёт под охраной опор исследования (изменилась опора — input_stale; чужая правка графа — revision_conflict). Тот же #write вызывают ручное сохранение графа (save-graph), refine и deriveLayer старого маршрута — в эту цепочку они не входят.",
+"fields": [
+"actors",
+"requirements",
+"nodes",
+"artifacts",
+"contracts",
+"connectors",
+"edges",
+"journeys",
+"joins",
+"horizon"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -21279,13 +22018,13 @@
 },
 {
 "node": "om.l1.om",
-"code": "src/om/horizon.ts:344 (deriveHorizon)",
+"code": "src/om/horizon.ts:344 (deriveHorizon); src/om/queue.ts:298 (prepareBlockQueue)",
 "fields": [
-"version",
-"nodes",
-"connectors",
 "artifacts",
-"journeys"
+"connectors",
+"journeys",
+"nodes",
+"version"
 ],
 "expects": "Граф имеет допустимую форму, а его проекция L1 равна принятому слою L1 из входа OM (иначе horizon_unclosed); по нему выводится горизонт",
 "sure": true
@@ -21317,12 +22056,13 @@
 },
 {
 "node": "om.b1.save",
-"code": "src/om/run-bases.ts:191 (upperBasis); src/om/run.ts:874 (rootIds)",
+"code": "src/om/run-bases.ts:191 (upperBasis); src/om/run.ts:874 (rootIds); src/om/run-bases.ts:395 (standingOf)",
 "fields": [
+"nodes",
 "версия и хэш"
 ],
 "expects": "Основания прохода зависят от головы графа: новая версия графа — новое основание того же намерения, а не повтор без эффекта",
-"sure": true
+"sure": false
 },
 {
 "node": "om.l2.obl",
@@ -21425,6 +22165,140 @@
 "вся запись"
 ],
 "expects": "Проверка фич при старте R0 сверяет печати слоя graph-layer:1 с графом: проекция графа на уровень слоя должна давать записанный в печати хэш (graph_layer_unproven иначе)",
+"sure": false
+},
+{
+"node": "om.l1.model",
+"code": "src/discovery/research-context.ts:382 (researchGraphContext)",
+"fields": [
+"nodes",
+"artifacts",
+"connectors",
+"journeys"
+],
+"expects": "Автору подаётся проекция L1 текущего графа (если карта уже собиралась), чтобы доработка шла от последней сборки; графа ещё нет — контекст пуст.",
+"sure": true
+},
+{
+"node": "om.l1.assess",
+"code": "src/discovery/research-assessment.ts:323 (assessAnswer)",
+"fields": [
+"nodes",
+"artifacts",
+"connectors",
+"journeys"
+],
+"expects": "Оценщик видит ту же проекцию L1 текущего графа, что и автор.",
+"sure": true
+},
+{
+"node": "om.l1.build",
+"code": "src/product/engine.ts:384 (ProductEngine.execute)",
+"fields": [
+"id"
+],
+"expects": "При пересборке идентификатор графа сохраняется (existing.value.id): карта остаётся той же, меняется только её содержимое.",
+"sure": true
+},
+{
+"node": "om.l1.graph",
+"code": "src/graph/repository.ts:26 (GraphRepository.#write); src/graph/repository.ts:29 (GraphRepository.#write)",
+"fields": [
+"id",
+"version",
+"connectors",
+"anchors"
+],
+"expects": "Новая сборка не меняет идентичность карты (graph_identity_changed), не понижает уже обогащённый граф версии 2 (graph_downgrade) и не теряет прежние коннекторы и якоря (graph_semantic_drift).",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/graph/repository.ts:130 (GraphRepository.layerGate); src/product/stage-checks.ts:342 (StageChecks.validateStage)",
+"fields": [
+"nodes",
+"artifacts",
+"connectors",
+"journeys",
+"title",
+"id"
+],
+"expects": "Печать слоя сверяется с хэшем проекции текущего графа (graph_layer_unproven), а пересборка buildL1 — с проекцией L1 сохранённого графа (map_design_drift).",
+"sure": true
+},
+{
+"node": "om.l1",
+"code": "src/graph/refinement.ts:136 (Refinement.sealLayer); src/graph/refinement.ts:143 (Refinement.sealLayer)",
+"fields": [
+"version",
+"horizon"
+],
+"expects": "Старый путь, seal-layer L1: граф читается дважды — в начале (его ревизия охраняет запись отметки) и при проверке; для L1 пустого горизонта требовать не нужно (horizon_empty только для L3). Отдельного узла у шага на схеме нет — отнесён к подблоку.",
+"sure": false
+},
+{
+"node": "om.r1.packet",
+"code": "src/om/question-packet.ts:1482 (derivePacketOnce)",
+"fields": [
+"nodes",
+"connectors"
+],
+"expects": "Пакет вопроса (E2) читает граф, названный источниками разрывов: его содержимое входит в основание краткого описания (brief), а ссылка — в список контекстов пакета; нет записи или другая ревизия — отказ чтения.",
+"sure": true
+},
+{
+"node": "om.r1.model",
+"code": "src/om/answer-form.ts:149 (fieldForm)",
+"fields": [
+"nodes"
+],
+"expects": "Ответ модели на недостающее поле входа (адрес, узлы, состояние) сопоставляется с узлами графа: по уровню узла определяется, какой принятый нижний слой нужен; если в источнике маршрута такого слоя нет — answer_form_task_invalid.",
+"sure": true
+},
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:140 (context)",
+"fields": [
+"nodes"
+],
+"expects": "Переносимые обязательства (D7) читают граф по ссылке из источников разрывов и проецируют его на принятый уровень: учитываются только принятые узлы и связи, непринятая нижняя связь не может заменить мост между принятыми верхними узлами.",
+"sure": true
+},
+{
+"node": "om.l2.c5",
+"code": "src/om/frame-accept.ts:93 (readAcceptedFrame)",
+"fields": [
+"вся запись"
+],
+"expects": "Историческое чтение принятого кадра: граф берётся по точной ссылке события и должен совпасть с графом, названным в приёмке (frame_acceptance_invalid иначе).",
+"sure": false
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/frame-accept.ts:93 (readAcceptedFrame)",
+"fields": [
+"вся запись"
+],
+"expects": "То же историческое чтение принятого кадра для уровня 3.",
+"sure": false
+},
+{
+"node": "om.r1.gaps",
+"code": "src/om/series.ts:2149 (deriveMechanismProjection)",
+"fields": [
+"nodes"
+],
+"expects": "Механизм адресации проверяет: если потребитель вопроса уже есть узлом графа, он обязан быть и в каталоге принятых узлов — непринятый узел графа потребителем быть не может (mechanism-проверка consumer).",
+"sure": false
+},
+{
+"node": "om.r1.store",
+"code": "src/om/model-call.ts:4214 (learnedSince)",
+"fields": [
+"nodes",
+"edges"
+],
+"expects": "Чтобы выяснить, узнало ли OM с тех пор что-то о данном узле, граф нужен для отношений «блок — операция — работа»: принятый факт относится к узлу, если его потребитель — сам узел, вышестоящий блок или узел ниже.",
 "sure": false
 }
 ]
@@ -21555,6 +22429,18 @@
 "layerProofs"
 ],
 "sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/graph/repository.ts:49 (GraphRepository.#write); src/graph/repository.ts:47 (GraphRepository.#write); src/product/engine.ts:386 (ProductEngine.execute)",
+"when": "Сразу три среза (1, 2, 3), но новая версия пишется только у изменившихся. Срез 1 — предмет приёмки стадии; срезы 2 и 3 на этом шаге — заготовки без операций и работ, готовности уровня они не доказывают.",
+"fields": [
+"projection",
+"inputs",
+"obligations",
+"layerProofs"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -21631,7 +22517,7 @@
 },
 {
 "node": "om.l1.om",
-"code": "src/om/horizon.ts:353 (deriveHorizon); src/om/horizon.ts:355 (deriveHorizon)",
+"code": "src/om/horizon.ts:353 (deriveHorizon); src/om/horizon.ts:355 (deriveHorizon); src/om/queue.ts:178 (horizonUpper)",
 "fields": [
 "projection"
 ],
@@ -21847,6 +22733,75 @@
 ],
 "expects": "То же при завершении R0: проверка фич снова читает graph-layer:<проект>:1 и все его печати",
 "sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/graph/repository.ts:41 (GraphRepository.#write)",
+"fields": [
+"projection",
+"inputs",
+"obligations",
+"layerProofs"
+],
+"expects": "Новое значение каждого среза сравнивается по хэшу с сохранённым; совпало — новой версии нет.",
+"sure": true
+},
+{
+"node": "om.l1.gate",
+"code": "src/graph/repository.ts:125 (GraphRepository.layerGate); src/product/stage-checks.ts:276 (StageChecks.validateStage)",
+"fields": [
+"projection",
+"layerProofs",
+"obligations",
+"inputs"
+],
+"expects": "Ссылка стадии равна голове среза (graph_layer_stale); печать совпадает с проекцией графа (graph_layer_unproven); хэш каждого помеченного поля сохраняется (graph_field_unproven); каждая опора из inputs ещё равна голове (graph_evidence_stale). Исходы L1 из среза нужны проверке покрытия; если стадия вовсе не называет слой — graph_missing.",
+"sure": true
+},
+{
+"node": "om.l1.stage",
+"code": "src/product/engine.ts:124 (ProductEngine.draft)",
+"fields": [
+"версия и хэш"
+],
+"expects": "Черновик стадии operation-map хранит точную ссылку на срез graph-layer:<проект>:1; без среза content.graph пусто, и приёмка отвергает стадию (graph_missing).",
+"sure": true
+},
+{
+"node": "om.l1",
+"code": "src/graph/refinement.ts:149 (Refinement.sealLayer); src/graph/repository.ts:125 (GraphRepository.layerGate)",
+"fields": [
+"projection",
+"layerProofs",
+"obligations",
+"inputs"
+],
+"expects": "Старый путь, seal-layer L1: слой L1 должен быть, быть актуальным и доказанным (layer_not_ready); отметка phase:<проект>:L1 ссылается на его точную версию. Отдельного узла у шага на схеме нет — отнесён к подблоку.",
+"sure": false
+},
+{
+"node": "om.r1.apply",
+"code": "src/om/addressing.ts:250 (deriveInputDecisions)",
+"fields": [
+"projection",
+"layerProofs",
+"obligations",
+"inputs"
+],
+"expects": "Адресация читает слой L1 по ссылке из принятой стадии operation-map вместе с графом: сохранённый слой равен проекции графа, печати и хэши полей узлов сходятся, входы покрывают все доказательства (layer_basis_unproven иначе).",
+"sure": false
+},
+{
+"node": "om.r2.apply",
+"code": "src/om/addressing.ts:250 (deriveInputDecisions)",
+"fields": [
+"projection",
+"layerProofs",
+"obligations",
+"inputs"
+],
+"expects": "То же чтение слоя L1 при применении решений владельца и модели.",
+"sure": false
 }
 ]
 },
@@ -21953,6 +22908,19 @@
 "layerProofs"
 ],
 "sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/graph/repository.ts:37 (GraphRepository.#write); src/graph/repository.ts:67 (GraphRepository.saveDerived); src/product/engine.ts:386 (ProductEngine.execute)",
+"when": "Вместе с графом пишется привязка: ссылка на граф, автор (actor), все опоры исследования, обязательства по title, outcome и ports каждого узла и печать слоя L1 (для графа версии 2). Это доказательство производности L1: что карта выведена из принятого исследования.",
+"fields": [
+"graph",
+"actor",
+"inputs",
+"obligations",
+"layerProofs"
+],
+"sure": true
 }
 ],
 "readers": [
@@ -21999,6 +22967,17 @@
 ],
 "expects": "Прежний маршрут OM-G2: build-layer переносит обязательства и печати нижних уровней из прежней привязки; оценка R3 проверяет ворота графа",
 "sure": false
+},
+{
+"node": "om.l1.graph",
+"code": "src/graph/repository.ts:25 (GraphRepository.#write)",
+"fields": [
+"actor",
+"obligations",
+"layerProofs"
+],
+"expects": "Прежняя привязка нужна для точного повтора: тот же граф, автор, обязательства и печати — запись не создаётся, возвращается прежняя версия.",
+"sure": true
 }
 ]
 },
@@ -26097,6 +27076,16 @@
 ],
 "expects": "Контекст задачи исполнения несёт значения договоров B1 с указателями /contracts/<i>; читается через читатели OM, установленные в компилятор (вывод).",
 "sure": false
+},
+{
+"node": "om.l1.om",
+"code": "src/om/horizon.ts:342 (deriveHorizon); src/om/queue.ts:169 (horizonUpper)",
+"fields": [
+"input.sources",
+"input.features"
+],
+"expects": "Принятая карта берётся не из головы стадии, а из точного входа OM: в его источниках ровно одна стадия operation-map (иначе queue_source_invalid), а выбранные результаты горизонта должны быть среди фич входа (horizon_feature_unknown).",
+"sure": true
 }
 ]
 },
@@ -28282,6 +29271,20 @@
 "layer"
 ],
 "sure": true
+},
+{
+"node": "om.l1",
+"code": "src/graph/refinement.ts:42 (Refinement.#milestone); src/graph/refinement.ts:151 (Refinement.sealLayer)",
+"when": "Старый путь: команда seal-layer для уровня 1 после R0 записывает phase:<проект>:L1 — ссылку на уже имеющийся слой graph-layer:<проект>:1 со списком опор и версией контракта 2 (draft пуст). Точный повтор возвращает прежнюю версию без новой записи. Новый проход (om-start) отметку L1 не создаёт: он принимает L1 из стадии operation-map. Отдельного узла у шага на схеме нет — отнесён к подблоку.",
+"fields": [
+"projectId",
+"phase",
+"contractVersion",
+"inputs",
+"layer",
+"draft"
+],
+"sure": false
 }
 ],
 "readers": [
