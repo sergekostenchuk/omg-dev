@@ -46544,7 +46544,7 @@
 "path": "risks",
 "type": "{id, risk, basis: Ref {id, revision, hash}, consequence, affectedOutcome: outcome id | Ref неизвестного, mitigation: string | Ref неизвестного}[]",
 "iface": true,
-"what": "риски: затронутый результат и меру снижения производит модель; адаптер только копирует («unknown:<id>» для неизвестного)",
+"what": "риски: затронутый результат и меру снижения производит модель. В preparation-совместимой выдаче affectedOutcome — только ID существующего outcome; Ref неизвестного не превращается в фиктивный ID: адресуется принятому outcome в новой редакции комплекта или закрывается доказательством, иначе — исправимый отказ по risk.id и возврат в D7. mitigation-неизвестное отображается «unknown:<id>» с происхождением",
 "writer": "Проекция (ndisc.d7.n7).",
 "readers": "Концепция, фичи (ndisc.d8.n5).",
 "expects": "",
@@ -46681,7 +46681,7 @@
 "risks",
 "unknowns"
 ],
-"expects": "Основания первого выпуска.",
+"expects": "Основания первого выпуска; риск с affectedOutcome = существующий outcome.id, иначе исправимый отказ по risk.id.",
 "sure": true
 },
 {
@@ -47619,10 +47619,10 @@
 },
 {
 "path": "assessment",
-"type": "Ref {id, revision, hash} | pending",
+"type": "производная связь (поиск discovery-assessment по subject), не хранится",
 "iface": false,
-"what": "оценка новизны (по subject в discovery-assessment)",
-"writer": "—",
+"what": "Оценка попытки — отдельная запись с этой попыткой в subject; в точную попытку не дописывается",
+"writer": "— (не пишется)",
 "readers": "Достаточность (ndisc.d3.n5); D5.n3.",
 "expects": "",
 "risks": ""
