@@ -1,5 +1,5 @@
 {
-"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1",
+"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2",
 "generatedFrom": "om/module d8028bf; kinds-early.json; db-census.json",
 "tables": [
 {
@@ -14584,6 +14584,18 @@
 ],
 "expects": "Принятый ответ E5 хранит вызов оценщика и берёт из него идентификатор вызова в журнале: запись должна читаться как вызов оценщика этого проекта",
 "sure": true
+},
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:265 (modelCallKind); src/om/answers-gate.ts:280 (proveOfferedRecord); src/om/answers-gate.ts:356 (negativeFact)",
+"fields": [
+"requestId",
+"status",
+"request",
+"response"
+],
+"expects": "G4b узнаёт вид вызова (обычный E4 или транспорт оценщика) и проверяет его состояние: незавершённый MC1-вызов — не ответ (mc1-unfinished), транспорт оценщика доказывается своим читателем и принадлежностью оценке факта (transport-foreign, assessment-legacy-transport)",
+"sure": true
 }
 ]
 },
@@ -22505,6 +22517,27 @@
 ],
 "expects": "Срез адресации для серии механизма берёт сырой граф: потребитель уже поставленного вопроса должен быть узлом принятого слоя, а не только узлом непринятого графа",
 "sure": true
+},
+{
+"node": "om.l2.c4",
+"code": "src/om/frame-candidate.ts:795 (prepareCandidate)",
+"fields": [
+"nodes",
+"connectors",
+"horizon",
+"version"
+],
+"expects": "Кандидат собирается поверх принятого графа: основание берётся из головы graph:<проект>, читают его C2-читатели, которых зовёт C4 (prepareFrameProposals)",
+"sure": false
+},
+{
+"node": "om.l2.close",
+"code": "src/om/model-call.ts:4000 (readConfirmationGround)",
+"fields": [
+"вся запись"
+],
+"expects": "Подтверждение закрытия строки D2 допустимо, пока принятые кадр и граф цели остаются головами; смена графа — основание завершения подтверждения (readConfirmationGround)",
+"sure": false
 }
 ]
 },
@@ -23006,6 +23039,27 @@
 "inputs"
 ],
 "expects": "То же чтение слоя L1 при применении решений владельца и модели.",
+"sure": false
+},
+{
+"node": "om.l2.c4",
+"code": "src/om/frame-candidate.ts:795 (prepareCandidate)",
+"fields": [
+"projection",
+"layerProofs",
+"acceptance"
+],
+"expects": "Кандидат опирается на принятый нижний слой и верхнее основание, которые проверяет C2 (frameReadLayer); без принятого слоя при уже принятом кадре — frame_basis_unproven",
+"sure": false
+},
+{
+"node": "om.l2.close",
+"code": "src/om/gap-lines.ts:320 (confirmClosure)",
+"fields": [
+"projection",
+"acceptance"
+],
+"expects": "D2 восстанавливает принятый кадр вместе со слоем: слой должен ссылаться назад на этот кадр",
 "sure": false
 }
 ]
@@ -36207,6 +36261,2312 @@
 "sure": false
 }
 ]
+},
+{
+"kind": "connection-frame",
+"group": "om",
+"idPattern": "om-frame:<проект>:<уровень>",
+"proposed": false,
+"card": {
+"what": "Принятый кадр соединений уровня 2 или 3: для каждого обязательства верхнего слоя записано, каким узлом нижнего слоя оно заполнено, и каким кандидатом и воротами (G3 или G5) это принято.",
+"where": "Таблица revisions · вид «connection-frame» · id om-frame:<проект>:<уровень>",
+"when": "Пишется приёмкой C5 в одной сделке с новым графом, слоем и статусами предложений; новая версия на каждое следующее принятие того же уровня. В рабочей базе одна запись (уровень 3, 1 версия).",
+"why": "Кадр — «чек» принятия: по нему следующие шаги находят, что чем заполнено, и могут доказать, что слой нижнего уровня принят именно OM, а не прежним маршрутом.",
+"expects": "acceptance.producer = om; кандидат — первая версия с совпадающими хэшами; ворота прошли без находок (для L3 — G5 с ссылкой basis на сохранённый G5); новый граф — следующая версия после основания; слой лежит по acceptance.layer.",
+"risks": "Отказы приёмки (FRAME_ACCEPT_CODES): candidate_level_unsupported, candidate_missing, candidate_graph_mismatch, gate_outcome_mismatch, input_stale, frame_acceptance_invalid. Читатели кадра: frame_basis_unproven, frame_upper_drift, frame_layer_drift, layer_basis_unproven.",
+"size": "HX5: записей нет · рабочая база: 1 запись, 42 КБ",
+"note": "Тот же вид пишет «перенос» (rebase): новая версия кадра уровня 3 без поля acceptance, с rebase/rebasedFrom/retired (frame-accept.ts prepareRebaseFrame); вызовов rebase вне самих модулей в src нет (вывод: путь есть, но не используется проходом). Поля acceptance.layer и acceptance.binding есть только у нового контракта om-frame-acceptance/v1."
+},
+"fields": [
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "level",
+"type": "2 | 3",
+"iface": false,
+"what": "уровень принятого кадра",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "worksContract",
+"type": "\"works-frame/v1\"",
+"iface": false,
+"what": "метка эры работ; только у уровня 3",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "candidateHash",
+"type": "string",
+"iface": false,
+"what": "хэш принятого графа (равен graphHash кандидата)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "layerHash",
+"type": "string",
+"iface": false,
+"what": "хэш слоя принятого уровня",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "upperHash",
+"type": "string",
+"iface": false,
+"what": "хэш верхнего слоя в принятом графе",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "lowerHash",
+"type": "string",
+"iface": false,
+"what": "хэш собственного содержимого нижнего слоя (без унаследованного верхнего)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "fills",
+"type": "{obligation, node, port?, codeRef?, source, basis}[]",
+"iface": true,
+"what": "Принятое соответствие «обязательство верхнего уровня → узел и порт нижнего»; source — accepted или identity.",
+"writer": "Приёмка уровня 2 / работ (om.l2.c5, om.l3.c5).",
+"readers": "Следующий кадр и кандидаты берут уже принятые заполнения как основание (om.l2.obl, om.l2.c4); D2 проверяет, что строка заполнена принятыми определениями (om.l2.close); G4b читает принятые заполнения при проверке ответов (om.l2.g4b).",
+"expects": "Каждое заполнение несёт ссылку basis на предложение или кадр, из которого оно принято; у представителя source = identity.",
+"risks": "frame_record_invalid (заполнение без обязательства или с неверным источником); accepted_binding_ambiguous."
+},
+{
+"path": "acceptance.candidate",
+"type": "Ref",
+"iface": true,
+"what": "Точная ссылка на кандидата, который принят этим кадром.",
+"writer": "Приёмка уровня 2 / работ (om.l2.c5, om.l3.c5).",
+"readers": "D2 и G7 восстанавливают по ней кадр и результат (om.l2.close, om.s.close); M8 берёт кандидата и D7 (om.m8.read); G5 сверяет свой результат с принятым (om.l3.g5).",
+"expects": "Кандидат — первая версия с id om-candidate:<проект>:…; хэш записи равен хэшу содержимого; gate.candidate равен этой ссылке.",
+"risks": "candidate_missing, candidate_graph_mismatch."
+},
+{
+"path": "acceptance.gate",
+"type": "{name, passed, candidate, graphHash, findings, codes?, basis?}",
+"iface": true,
+"what": "Ворота, прошедшие принятие: G3 для уровня 2, G5 (с basis — ссылкой на запись om-atomic-gate) для уровня 3.",
+"writer": "Приёмка работ (om.l3.c5) по результату G5 (om.l3.g5); приёмка уровня 2 (om.l2.c5) по результату G3 (om.l2.g3).",
+"readers": "M8 по basis проверяет, что план выдаётся на том дереве, на котором G5 проверял влияние (om.m8.tree); компилятор по basis выбирает эру контекста задачи (om.c.compiler, run.t.ctx).",
+"expects": "passed = true, findings пуст; для L3 name = G5, codes пуст и basis — ссылка на сохранённый G5 того же кандидата.",
+"risks": "gate_outcome_mismatch; atomic_gate_record_forged (G5 не воспроизвёл сохранённую запись)."
+},
+{
+"path": "acceptance.binding",
+"type": "{series, ordinal, obligations} | null",
+"iface": true,
+"what": "Попытка, чью цель закрывает это принятие: серия, номер попытки и обязательства, заполненные настоящими определениями.",
+"writer": "Приёмка C5 по шагу accept/works попытки (om.l2.c5, om.l3.c5).",
+"readers": "G7 подтверждает достижение цели по результату обязательства (om.s.close); D2 закрывает строку (om.l2.close); повторное принятие того же кандидата для другой попытки запрещено (om.l3.c5).",
+"expects": "Серия — точная версия; попытка идёт и её цель объявляет те же заполнения; ни одно обязательство не заполнено представителем.",
+"risks": "frame_acceptance_invalid (чужая попытка или набор обязательств)."
+},
+{
+"path": "acceptance.graph",
+"type": "Ref",
+"iface": true,
+"what": "Точная версия графа, записанная этим принятием.",
+"writer": "Приёмка уровня 2 / работ (om.l2.c5, om.l3.c5).",
+"readers": "Читатели принятого кадра восстанавливают по ней результат и сверяют слой (om.l3.g5, om.m8.read, om.s.close); основания прохода строят новые разрывы на этом графе (om.b1.save).",
+"expects": "id graph:<проект>; хэш равен candidateHash; ревизия на единицу выше основания кандидата.",
+"risks": "frame_acceptance_invalid (граф не тот, что назван событием)."
+},
+{
+"path": "acceptance.layer",
+"type": "{id, revision}",
+"iface": true,
+"what": "Где лежит слой этого принятия: id graph-layer:<проект>:<уровень> и точная ревизия.",
+"writer": "Приёмка уровня 2 / работ (om.l2.c5, om.l3.c5).",
+"readers": "Чтение принятого кадра берёт ровно эту ревизию слоя, а не «подходящую» из истории (om.l3.g5, om.m8.read, om.s.close).",
+"expects": "Ревизия слоя существует и ссылается назад на этот кадр (layer.acceptance.frame).",
+"risks": "layer_basis_unproven (слой не найден или не ссылается на кадр)."
+},
+{
+"path": "acceptance.contract",
+"type": "\"om-frame-acceptance/v1\"",
+"iface": false,
+"what": "контракт нового формата принятия; есть вместе с binding и layer",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "acceptance.producer",
+"type": "\"om\"",
+"iface": false,
+"what": "производитель принятия — всегда om",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "acceptance.upper",
+"type": "Ref",
+"iface": false,
+"what": "верхний слой, на котором принят кадр",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.l2.c5",
+"code": "src/om/frame-accept.ts:354 (prepareSettleCandidate); src/om/frame-accept.ts:372 (settleCandidate); src/om/run.ts:2154 (acceptFrame)",
+"when": "Уровень 2: шаг accept — G4b и приёмка в одной сделке: новый граф, слой, кадр и статусы предложений",
+"fields": [
+"вся запись"
+],
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/frame-accept.ts:354 (prepareSettleCandidate); src/om/run.ts:2170 (acceptWorks)",
+"when": "Уровень 3: шаг works — приёмка работ после G5 в одной сделке с кандидатом, соседями, G5 и записью om-works-acceptance",
+"fields": [
+"вся запись"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.l2.obl",
+"code": "src/om/frame-obligations.ts:707 (frameReadConnection); src/om/frame-obligations.ts:811 (frameSources); src/om/frame-obligations.ts:928 (prepareFrame)",
+"fields": [
+"fills",
+"level",
+"candidateHash"
+],
+"expects": "Кадр строится по принятому нижнему слою и его кадру: кадр без принятого слоя — frame_basis_unproven, существующий кадр нельзя пропустить в запросе — input_stale",
+"sure": true
+},
+{
+"node": "om.l2.c4",
+"code": "src/om/frame-candidate.ts:795 (prepareCandidate); src/om/frame-candidate.ts:770 (observeCandidate)",
+"fields": [
+"fills",
+"level"
+],
+"expects": "Кандидат собирается поверх уже принятых заполнений: они остаются, а изменение принятого требует явной замены (кадр читают C2-читатели prepareFrame/readFrame, которые зовёт C4)",
+"sure": false
+},
+{
+"node": "om.l2.c5",
+"code": "src/om/frame-accept.ts:334 (prepareSettleCandidate); src/om/frame-accept.ts:108 (priorAcceptance)",
+"fields": [
+"level",
+"acceptance.candidate",
+"acceptance.binding"
+],
+"expects": "Приёмка сверяет голову кадра с base.frame кандидата (input_stale) и ищет уже сделанную приёмку этого кандидата — повторная находится, а не делается заново",
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/frame-accept.ts:334 (prepareSettleCandidate); src/om/frame-accept.ts:108 (priorAcceptance); src/om/run.ts:2179 (acceptedFrame)",
+"fields": [
+"level",
+"acceptance.candidate",
+"acceptance.binding"
+],
+"expects": "Приёмка работ сверяет голову кадра с base.frame кандидата и ищет уже сделанную приёмку этого кандидата; другая привязка к попытке — frame_acceptance_invalid; проход по тому же признаку узнаёт, что цель уже принята",
+"sure": true
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:717 (readWorksAcceptance)",
+"fields": [
+"acceptance.gate",
+"acceptance.candidate",
+"acceptance.binding",
+"acceptance.layer"
+],
+"expects": "Запись приёмки работ обязана воспроизводить сохранённый G5: gate.name = G5, basis и binding совпадают с результатом (иначе atomic_gate_record_forged)",
+"sure": true
+},
+{
+"node": "om.b1.hold",
+"code": "src/om/run.ts:525 (regateRun); src/om/run.ts:534 (regateRun)",
+"fields": [
+"acceptance.graph",
+"acceptance.layer"
+],
+"expects": "Команда владельца om-regate читает принятый кадр работ завершённого прохода и его граф со слоем; кадра нет — record_missing",
+"sure": false
+},
+{
+"node": "om.m8.read",
+"code": "src/om/feasibility.ts:129 (sources); src/om/run.ts:2280 (completion)",
+"fields": [
+"acceptance.candidate",
+"acceptance.graph",
+"acceptance.layer",
+"acceptance.gate"
+],
+"expects": "M8 требует точный принятый слой работ (feasibility_record_invalid); проход завершается только на принятом кадре работ",
+"sure": true
+},
+{
+"node": "om.m8.tree",
+"code": "src/om/feasibility.ts:115 (sameSnapshot)",
+"fields": [
+"acceptance.gate"
+],
+"expects": "План выдаётся на том дереве, на котором G5 проверял влияние: берётся basis ворот из кадра (feasibility_stale / feasibility_not_ready)",
+"sure": false
+},
+{
+"node": "om.l2.close",
+"code": "src/om/gap-lines.ts:320 (confirmClosure); src/om/result-identity.ts:553 (deriveIdentityHistory)",
+"fields": [
+"fills",
+"acceptance.candidate",
+"acceptance.graph",
+"acceptance.layer"
+],
+"expects": "D2 подтверждает закрытие строки: обязательство заполнено принятыми определениями, а не представителями",
+"sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/achievements.ts:526 (confirmAcceptedFrameResult); src/om/model-call.ts:3974 (completionAcceptance); src/om/model-call.ts:4061 (finalizationValue)",
+"fields": [
+"acceptance.binding",
+"acceptance.graph",
+"acceptance.layer",
+"acceptance.candidate"
+],
+"expects": "G7 подтверждает достижение цели по принятому кадру: принятие привязано к этой попытке и серии; иначе achievement_unconfirmed",
+"sure": true
+},
+{
+"node": "om.b1.save",
+"code": "src/om/run-bases.ts:176 (accepted); src/om/run.ts:879 (rootGuards); src/om/run-bases.ts:174 (accepted)",
+"fields": [
+"вся запись"
+],
+"expects": "Основания прохода читают принятые кадры уровней 2 и 3 как корни (guards): изменившийся кадр делает шаг новым, а не повтором",
+"sure": true
+},
+{
+"node": "om.c.compiler",
+"code": "src/om/compiler-readers.ts:26 (readTaskContextBasis)",
+"fields": [
+"acceptance.gate",
+"acceptance.candidate"
+],
+"expects": "Читатель OM для компилятора берёт ворота принятого кадра, чтобы выбрать эру контекста задачи (omg-task-context/v1…v3)",
+"sure": false
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:146 (loadTaskContextSources); src/compiler/context.ts:162 (loadTaskContextSources); src/compiler/context.ts:164 (loadTaskContextSources)",
+"fields": [
+"acceptance.candidate",
+"acceptance.gate",
+"вся запись"
+],
+"expects": "Контекст задачи исполнения проверяет, что ворота принятого кадра — G5 с basis",
+"sure": false
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:162 (loadTaskContextSources); src/compiler/context.ts:164 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Кадр работ и кадр операций читаются по точным ссылкам и входят в контекст задачи",
+"sure": true
+},
+{
+"node": "om.b1.horizon",
+"code": "src/om/horizon.ts:260 (readRefinement)",
+"fields": [
+"fills"
+],
+"expects": "Уточнение через принятый L2 читает его кадр и считает блоки с реальными операциями.",
+"sure": false
+}
+]
+},
+{
+"kind": "frame-candidate",
+"group": "om",
+"idPattern": "om-candidate:<проект>:<хэш содержимого>",
+"proposed": false,
+"card": {
+"what": "C4 — общий кандидат кадра: полный граф, который получается, если принять все предложения (части/сборки) участников разом; плюс соответствие «обязательство верхнего уровня → узел нижнего».",
+"where": "Таблица revisions · вид «frame-candidate» · id om-candidate:<проект>:<хэш содержимого>",
+"when": "Пишется один раз (всегда версия 1) шагом candidate (уровень 2) либо внутри одной сделки с приёмкой работ (уровень 3). Id — хэш уровня, графа, основания и предложений, поэтому тот же состав даёт ту же запись. В рабочей базе одна запись (уровень 3).",
+"why": "Общий кандидат — единственное место, где предложения разных блоков сводятся в один граф и проверяются вместе; приёмка (C5) принимает именно его, а не отдельные предложения.",
+"expects": "Граф проходит родной валидатор и разбор слоя; все обязательства горизонта закрыты; хэши graphHash/layerHash/upperHash пересчитываются из graph; id совпадает с хэшем содержимого; запись хранит полный исходный запрос request.",
+"risks": "Сбои сборки (CANDIDATE_REFUSAL_CODES): candidate_level_unsupported, candidate_graph_mismatch, graph_invalid, derived_field_conflict, slot_fill_conflict, replacement_leaves_dangling, operation_port_unbound, works_upper_drift, works_code_missing/foreign, works_obligations_invalid, sleeping_wake_test_missing, sleeping_anchor_underivable; общий порядок записи файла — write_order_choice_missing/invalid, ownership_order_cycle. Открытые обязательства — не отказ, а «gaps»: кандидата нет (run.ts: candidate_gaps).",
+"size": "HX5: записей нет · рабочая база: 1 запись, 566 КБ",
+"note": "Для уровня 2 запись пишет шаг candidate; для уровня 3 кандидат собирается как часть шага works (G5 и C5 в одной сделке), отдельного шага candidate для работ нет. Узлы схемы L3 не различают «собрать кандидата» и «принять» — привязка по смыслу (вывод). Читатели repeat-gate и компилятора связаны с вариантом по id (om-candidate:) и по ссылке acceptance.candidate принятого кадра."
+},
+"fields": [
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "level",
+"type": "2 | 3",
+"iface": false,
+"what": "уровень кадра: 2 — операции блоков, 3 — работы",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "joinAssembly",
+"type": "\"identity-joins/v1\"",
+"iface": false,
+"what": "метка эры сборки соединений; есть только у новых кандидатов уровня 3",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "proposals",
+"type": "Ref[]",
+"iface": true,
+"what": "Точные версии предложений (частей и сборок), из которых собран кандидат.",
+"writer": "Общий кандидат (om.l2.c4); для работ — works-кандидат (om.l3.cand).",
+"readers": "Приёмка C5 ставит этим предложениям статус «принято» (om.l2.c5, om.l3.c5); G4b проверяет, что кандидат несёт нужное предложение (om.l2.g4b).",
+"expects": "Каждая ссылка — первая версия предложения со статусом proposed и всё ещё его голова; набор равен request.proposals.",
+"risks": "Предложение изменилось — input_stale; предложение другого основания — proposal_base_stale; не proposed — proposal_not_proposed."
+},
+{
+"path": "graph",
+"type": "Graph",
+"iface": true,
+"what": "Полный граф проекта после принятия всех предложений: старое принятое содержимое плюс новые определения.",
+"writer": "Общий кандидат (om.l2.c4) / works-кандидат (om.l3.cand).",
+"readers": "G3 берёт его хэш (om.l2.g3); C5 записывает как graph:<проект> (om.l2.c5, om.l3.c5); G5, соседи и M8 читают граф работ (om.l3.g5, om.l3.neighbors, om.m8.read); компилятор берёт его для задач (om.c.compiler).",
+"expects": "Граф проходит валидатор; верхний слой не изменён (L3: тот же срез L2); у каждого входа операции есть связь; хэш равен graphHash.",
+"risks": "graph_invalid, works_upper_drift, derived_field_conflict, operation_port_unbound, replacement_leaves_dangling."
+},
+{
+"path": "fills",
+"type": "{obligation, node, port?, codeRef?, wakeTest?, source, basis}[]",
+"iface": true,
+"what": "Соответствие «обязательство верхнего уровня → узел и порт нижнего»; source — proposed, accepted или identity.",
+"writer": "Общий кандидат (om.l2.c4) / works-кандидат (om.l3.cand).",
+"readers": "C5 переносит их в принятый кадр, меняя proposed на accepted (om.l2.c5, om.l3.c5); соседи берут их как карту соответствия (om.l3.neighbors); D2 сверяет заполнение строки (om.l2.close).",
+"expects": "Для уровня 3 у каждого реального конца связи есть точный codeRef работы; у «представителя» (identity) codeRef нет.",
+"risks": "works_code_missing, works_code_foreign, slot_fill_conflict."
+},
+{
+"path": "works",
+"type": "{contract, producer, ledger, bindings}",
+"iface": true,
+"what": "Уровень 3: обязательства переноса D7 — ссылка на производителя и полный леджер и привязки задач.",
+"writer": "works-кандидат (om.l3.cand) по результату D7 (om.r2.d7).",
+"readers": "G5 доказывает, что привязки — полный перенос проверенных ответов (om.l3.g5); M8 читает леджер D7 (om.m8.read).",
+"expects": "Контракт works-frame/v1; producer и ledger — точные ссылки полного леджера именно этого запроса D1; bindings без потерь.",
+"risks": "works_contract_invalid, works_obligations_invalid; в G5 — atomic_gate_bindings_unproven."
+},
+{
+"path": "base",
+"type": "{graph: Ref, frame: Ref | null}",
+"iface": true,
+"what": "Основание сборки: граф и (если уже был принят) кадр того же уровня, к которым применены предложения.",
+"writer": "Общий кандидат (om.l2.c4) / works-кандидат (om.l3.cand).",
+"readers": "C5 перед записью проверяет, что основание всё ещё текущее (om.l2.c5, om.l3.c5).",
+"expects": "base.graph — голова graph:<проект>, base.frame — голова om-frame:<проект>:<уровень> (или null, пока кадра нет).",
+"risks": "Принятый кадр изменился после сборки — input_stale (base.frame)."
+},
+{
+"path": "request",
+"type": "{frame, proposals, joinAssembly?, works?, wakes?}",
+"iface": true,
+"what": "Полный исходный запрос, по которому кандидат пересчитывается: кадр, предложения, эра соединений, работы и выбранные wake-тесты.",
+"writer": "Общий кандидат (om.l2.c4) / works-кандидат (om.l3.cand).",
+"readers": "C5 пересчитывает кандидата заново (om.l2.c5); соседи, M8 и D2 берут из него запрос кадра (om.l3.neighbors, om.m8.read, om.l2.close).",
+"expects": "request.proposals равен proposals; request.frame.level равен level; base равен {graph, frame} запроса; для уровня 3 — works и (если были) wakes.",
+"risks": "candidate_graph_mismatch (неполный или чужой запрос)."
+},
+{
+"path": "graphHash",
+"type": "string",
+"iface": false,
+"what": "хэш графа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "layerHash",
+"type": "string",
+"iface": false,
+"what": "хэш своего слоя графа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "upperHash",
+"type": "string",
+"iface": false,
+"what": "хэш верхнего слоя графа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "works.contract",
+"type": "\"works-frame/v1\"",
+"iface": false,
+"what": "метка контракта работ",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "works.producer",
+"type": "Ref",
+"iface": false,
+"what": "производитель D7 для этого запроса",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "works.ledger",
+"type": "Ref",
+"iface": false,
+"what": "полный леджер D7",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "works.bindings",
+"type": "TaskObligationBinding[]",
+"iface": false,
+"what": "привязки задач к работам-потребителям",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "graph.horizon",
+"type": "string[]",
+"iface": false,
+"what": "горизонт: работы, которые идут в исполнение (у L3 пересчитывается кандидатом)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "graph.nodes",
+"type": "Node[]",
+"iface": false,
+"what": "узлы графа, включая принятые и новые",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "graph.connectors",
+"type": "Connector[]",
+"iface": false,
+"what": "связи; у L3 с привязками и якорями спящих потребителей",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "graph.researchObligations",
+"type": "TaskObligationBinding[]",
+"iface": false,
+"what": "у L3 — копия works.bindings",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "base.graph",
+"type": "Ref",
+"iface": false,
+"what": "граф-основание",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "base.frame",
+"type": "Ref | null",
+"iface": false,
+"what": "кадр-основание или null",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.frame",
+"type": "FrameRequest",
+"iface": false,
+"what": "запрос кадра: проект, уровень, граф, горизонт, слой, кадр, верхнее основание",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.proposals",
+"type": "Ref[]",
+"iface": false,
+"what": "предложения запроса (отсортированы)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.works",
+"type": "{contract, producer, ledger, bindings}",
+"iface": false,
+"what": "работы запроса (уровень 3)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.wakes",
+"type": "{proposal, choice, work, connector, test}[]",
+"iface": false,
+"what": "выбранные wake-тесты (G5.1): есть, если у производителя несколько покрывающих тестов",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.joinAssembly",
+"type": "string",
+"iface": false,
+"what": "эра соединений запроса",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.l2.c4",
+"code": "src/om/frame-candidate.ts:829 (prepareCandidate); src/om/frame-candidate.ts:836 (writeCandidate); src/om/run.ts:608 (perform)",
+"when": "Уровень 2: шаг candidate после пересчёта предложений; существующий кандидат с тем же id не пишется повторно, а находится",
+"fields": [
+"вся запись"
+],
+"sure": true
+},
+{
+"node": "om.l3.cand",
+"code": "src/om/atomic-gate.ts:776 (worksCandidate)",
+"when": "Уровень 3: works-кандидат готовится в предварительном просмотре сделки шага works; в базу уходит вместе с G5 и приёмкой",
+"fields": [
+"вся запись"
+],
+"sure": false
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/run.ts:2170 (acceptWorks)",
+"when": "Уровень 3: шаг works пишет в одной сделке кандидата, соседей, G5, приёмку, граф, слой, кадр и статусы предложений",
+"fields": [
+"вся запись"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.l2.c4",
+"code": "src/om/frame-candidate.ts:822 (prepareCandidate); src/om/frame-candidate.ts:814 (prepareCandidate); src/om/run.ts:1593 (continueAttempt)",
+"fields": [
+"вся запись",
+"graphHash"
+],
+"expects": "Перед записью ищется уже существующий кандидат с тем же id; он обязан дать тот же результат, иначе candidate_graph_mismatch",
+"sure": true
+},
+{
+"node": "om.l2.g3",
+"code": "src/om/frame-candidate.ts:846 (gateCandidate); src/om/run.ts:1599 (continueAttempt)",
+"fields": [
+"level",
+"graphHash"
+],
+"expects": "G3 читает только граф из записи кандидата (чужой граф в запросе — отказ) и только уровень 2; для работ G3 не годится — нужен G5",
+"sure": true
+},
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:555 (proveResult); src/om/answers-gate.ts:556 (proveResult); src/om/answers-gate.ts:569 (proveResult)",
+"fields": [
+"level",
+"graphHash",
+"request.proposals"
+],
+"expects": "G4b проверяет, что кандидат — именно с этим предложением операций, G3 его подтвердил и хэш графа тот же, а текущий кадр его допускает (иначе delta_stale / input_stale)",
+"sure": true
+},
+{
+"node": "om.l2.c5",
+"code": "src/om/frame-accept.ts:302 (prepareSettleCandidate); src/om/frame-accept.ts:337 (prepareSettleCandidate)",
+"fields": [
+"вся запись",
+"base",
+"request"
+],
+"expects": "Приёмка уровня 2 читает точную запись и заново пересчитывает кандидата из его запроса: результат обязан совпасть, иначе candidate_graph_mismatch",
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/frame-accept.ts:194 (readRejectedCandidate); src/om/layer-basis.ts:170 (readFrameAttemptBinding)",
+"fields": [
+"вся запись",
+"proposals",
+"level"
+],
+"expects": "Приёмка работ читает кандидата для отказа G5 (какие предложения отклонить) и для доказательства привязки к попытке",
+"sure": true
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:612 (deriveGate); src/om/atomic-gate.ts:823 (neededSources)",
+"fields": [
+"graph",
+"graphHash",
+"works",
+"request.frame",
+"proposals"
+],
+"expects": "G5 берёт граф работ и D7-привязки; кандидат должен быть уровня 3 с контрактом works-frame/v1",
+"sure": true
+},
+{
+"node": "om.l3.neighbors",
+"code": "src/om/neighbors.ts:294 (deriveCollection); src/om/deliveries.ts:241 (checked)",
+"fields": [
+"graph",
+"fills",
+"request.frame"
+],
+"expects": "Соседи и поставки строятся по графу работ и соответствию fills из этой записи",
+"sure": true
+},
+{
+"node": "om.m8.read",
+"code": "src/om/feasibility.ts:132 (sources)",
+"fields": [
+"works",
+"request.frame"
+],
+"expects": "M8 читает кандидата принятого кадра и его D7-леджер; без works — feasibility_record_invalid",
+"sure": true
+},
+{
+"node": "om.l2.close",
+"code": "src/om/gap-lines.ts:322 (confirmClosure); src/om/result-identity.ts:556 (deriveIdentityHistory)",
+"fields": [
+"request.frame",
+"proposals"
+],
+"expects": "D2 восстанавливает кадр принявшего кандидата и проверяет, что обязательство заполнено принятыми определениями",
+"sure": true
+},
+{
+"node": "om.l3.next",
+"code": "src/om/input.ts:1047 (readinessQuestions)",
+"fields": [
+"graph"
+],
+"expects": "Вопросы готовности берутся по графу работ кандидата, который проверял сохранённый G5",
+"sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:1147 (readDefinitions); src/om/model-call.ts:3972 (completionAcceptance)",
+"fields": [
+"request.proposals",
+"graph"
+],
+"expects": "G7: при разборе отказа читается, какие определения держит кандидат; при поиске общей приёмки — какие предложения он несёт",
+"sure": false
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:159 (loadTaskContextSources)",
+"fields": [
+"graph",
+"request.frame",
+"вся запись"
+],
+"expects": "Контекст задачи исполнения читает кандидата принятого плана и пересобирает кадры (вывод)",
+"sure": false
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:159 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Работы и границы читаются из точной сохранённой версии works-кандидата; граф кандидата равен снимку графа плана",
+"sure": true
+},
+{
+"node": "om.b1.input",
+"code": "src/om/input.ts:1047 (readinessQuestions)",
+"fields": [
+"graph"
+],
+"expects": "Работы кандидата G5 нужны, чтобы найти принятый блок или операцию над ними и задать вопрос готовности.",
+"sure": true
+}
+]
+},
+{
+"kind": "gap-line",
+"group": "om",
+"idPattern": "om-gap-lines:<проект>:history",
+"proposed": false,
+"card": {
+"what": "История линий пробелов (D2, F5.2): для каждого пробела D1 ведётся линия — когда он впервые появился, в скольких проходах присутствовал, сколько раз открывался заново, открыт ли, отложен или закрыт и чем закрыт (заполнен принятым кадром или принятым ответом).",
+"where": "Таблица revisions · вид «gap-line» · id om-gap-lines:<проект>:history",
+"when": "Единственная запись на проект с историей версий: новая версия на каждый проход D2 (шаг «lines» или подтверждение «confirm»), а при приёмке работ уровня 3 — снимок над итоговыми предложениями. Каждая версия хранит предыдущую, набор разрывов прохода и подтверждённые закрытия. В рабочей базе 1 запись, 16 версий.",
+"why": "Результат попытки (кадр или ответ) должен быть привязан к линии, которую попытка называла в своей цели. История линий это доказывает: закрыть можно только существующую линию, исчезнувшую из текущего D1, точным основанием, названным в цели открытой попытки.",
+"expects": "Проход растёт строго по номеру; линии пересчитываются из предыдущего состояния и текущего набора D1; закрытие «filled» подтверждается либо принятым кадром (обязательство заполнено принятыми определениями, а не тождествами) либо принятым ответом на тот же пробел; закрыть можно только пробел, исчезнувший из D1; запись детерминированно пересобирается из предыдущей.",
+"risks": "Дубль линии — gap_line_duplicate; счётчики не сходятся — gap_line_invalid; проход назад или в другом состоянии — pass_out_of_order, pass_conflict; закрытие несуществующей или присутствующей линии — closure_invalid; цель попытки не называла линию или основание иное — closure_unconfirmed; «cancelled» без владельца — closure_unsupported; подделка истории — gap_line_forged; устаревшая голова — input_stale.",
+"size": "HX5: записей нет · рабочая база: 1 запись (16 версий), 1,19 МБ, до 81 КБ на версию",
+"note": "id вида om-gap-line:<проект>:<id разрыва> (gapLineKey) — не запись, а адрес цели: им называются вопросы в goal.questions попытки. В базе хранится только om-gap-lines:<проект>:history."
+},
+"fields": [
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "lines",
+"type": "GapLine[]",
+"iface": true,
+"what": "Линии: на каждый разрыв id (хэш цели и поля), цель, поле, первый, последний и учтённый проходы, число проходов и переоткрытий, статус (open, deferred, closed), для закрытой — проход, причина (filled, cancelled) и точное основание.",
+"writer": "Шаг «lines»/«confirm» (om.l2.close) и приёмка работ (om.l3.c5).",
+"readers": "Обязательства D7 берут линии как основу своих назначений (om.r2.d7); достижение попытки подтверждается закрытой линией (om.s.close); приёмка работ строит из них следующий проход (om.l3.c5).",
+"expects": "Состояние линии вытекает из предыдущей записи, набора разрывов и закрытий; закрытая линия имеет основание.",
+"risks": "Линия не сходится с историей — gap_line_invalid, gap_line_forged."
+},
+{
+"path": "request.closures",
+"type": "{id, reason, basis, acceptance, attempt, answer?}[]",
+"iface": true,
+"what": "Закрытия, поданные в этом проходе: линия, причина filled, основание (принятый кадр или принятый ответ), попытка, закрывшая линию.",
+"writer": "Шаг «confirm» (om.l2.close): после приёмки или принятого ответа.",
+"readers": "Закрытие попытки сверяет, что линия подтверждена именно этой попыткой и её полной целью (om.s.close); проход ищет событие D2, подтвердившее цель попытки (om.l2.close).",
+"expects": "Линия существовала и исчезла из D1; основание — точный принятый кадр для обязательства уровня или принятый ответ для факта; попытка называла эту линию в цели.",
+"risks": "Не подтверждено — closure_unconfirmed; причина cancelled — closure_unsupported."
+},
+{
+"path": "request.gaps",
+"type": "{sources, records[]}",
+"iface": true,
+"what": "Набор разрывов D1, над которым сделан проход; по нему отличают снимок «этой области» от других.",
+"writer": "Шаг «lines»/«confirm» (om.l2.close).",
+"readers": "Проход выбирает снимок D2 именно этой области (om.l2.close); D7 сверяет контекст (om.r2.d7).",
+"expects": "Полный D1 проекта, источники совпадают с заявкой.",
+"risks": "Другая область — obligation_context_mismatch (D7), input_stale."
+},
+{
+"path": "request.previous",
+"type": "Ref | null",
+"iface": true,
+"what": "Версия истории, поверх которой сделан проход; цепочка образует всю историю линий.",
+"writer": "Шаг «lines»/«confirm» (om.l2.close).",
+"readers": "Чтение истории разворачивает цепочку назад и перевыводит подтверждённые закрытия (om.l2.close, om.s.close).",
+"expects": "Равна голове записи на момент прохода; у первого прохода null.",
+"risks": "Другая предыдущая — input_stale; цикл — gap_line_forged."
+},
+{
+"path": "request.pass",
+"type": "number",
+"iface": true,
+"what": "Номер прохода D2: растёт на 1 с каждым снимком.",
+"writer": "Шаг «lines»/«confirm» (om.l2.close).",
+"readers": "Проход берёт latest.pass+1 для нового снимка (om.l2.close).",
+"expects": "Строго больше предыдущего; один проход — одна запись.",
+"risks": "Старый проход — pass_out_of_order; другой по содержимому — pass_conflict."
+}
+],
+"writers": [
+{
+"node": "om.l2.close",
+"code": "src/om/gap-lines.ts:413 (writeGapLines); src/om/run.ts:605 (perform)",
+"when": "Шаги «lines» и «confirm» прохода: снимок линий над D1 области; подтверждение закрытия записывается вместе с ожидающим принятым ответом, если он ещё не записан",
+"fields": [
+"project",
+"lines",
+"request.closures",
+"request.gaps",
+"request.previous",
+"request.pass"
+],
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/atomic-gate.ts:749 (worksCandidate)",
+"when": "Приёмка работ уровня 3: итоговый полный снимок D2 над окончательными предложениями готовится в той же транзакции, что кандидат работ и обязательства D7 (подготовка, запись делает шаг works)",
+"fields": [
+"project",
+"lines",
+"request.gaps",
+"request.previous",
+"request.pass"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.l2.close",
+"code": "src/om/run.ts:2205 (linesStep); src/om/run.ts:2196 (linesOf); src/om/run.ts:2211 (confirmationOf)",
+"fields": [
+"lines",
+"request.gaps",
+"request.pass",
+"request.closures"
+],
+"expects": "Проход решает, нужен ли снимок D2 этой области (если был — нет) и какое событие D2 подтвердило цель попытки; новая линия — следующий номер прохода",
+"sure": true
+},
+{
+"node": "om.r2.d7",
+"code": "src/om/obligations.ts:133 (context)",
+"fields": [
+"lines",
+"request.gaps"
+],
+"expects": "Обязательства D7 читают историю линий по точной ссылке и требуют, чтобы набор разрывов и источники истории совпадали с контекстом: иначе obligation_context_mismatch",
+"sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/achievements.ts:210 (confirmed); src/om/model-call.ts:4022 (confirmationOfAttempt)",
+"fields": [
+"lines",
+"request.closures"
+],
+"expects": "Закрытие попытки подтверждает достижение закрытой линией только если закрытие названо в полном предыдущем плане именно этой попытки и её блоку; работа завершения ищет событие D2, подтвердившее цель (вывод: функции completion* отнесены к закрытию попытки по смыслу)",
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/atomic-gate.ts:748 (worksCandidate)",
+"fields": [
+"lines",
+"request.pass",
+"request.gaps"
+],
+"expects": "Приёмка работ берёт существующую историю линий (должна сохраняться), берёт номер прохода + 1 и готовит новый полный снимок над итоговыми предложениями; нет истории — atomic_gate_basis_unproven",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Пространство id вида входит в закрытый перечень записей, рождённых от B1 (B1_PRODUCERS): если такая запись есть, а первой версии B1 нет, проект не считается проектом старого маршрута, и omProject отказывает record_missing «OM provenance requires the exact first B1 input» (вывод: узел назначен по аналогии с om-run)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-answers-evaluation",
+"group": "om",
+"idPattern": "om-answers-gate:<проект>:evaluation:<хэш (назначение, проверка)>",
+"proposed": false,
+"card": {
+"what": "Одна оценка проверки G4b для зарегистрированной попытки: на какой версии работы, какой полной проверкой G4b и в какой области (какие разрывы D1 относятся к попытке) она сделана; следующая оценка продолжает цепочку.",
+"where": "Таблица revisions · вид «om-answers-evaluation» · id om-answers-gate:<проект>:evaluation:<хэш (назначение, проверка)>",
+"when": "Пишется шагом оценки (evaluate) прохода, когда проверка зарегистрирована, ещё не решена (оценки нет или остались барьерные находки) и работа открыта; вместе с самой проверкой (om-answers-gate), доказательствами находок и источниками отказов для журнала и новой версией реестра работы. Каждая следующая оценка ссылается на предыдущую. В рабочей базе 35 записей. Доказательства находок, источники отказов и журнал входят в ту же транзакцию только при deliver=all и непустых группах находок (answers-gate.ts:1378); при deliver=none оценка сохраняется без этой доставки.",
+"why": "Попытка должна знать, чего ждёт от неё проверка: какие находки относятся к её области и какие из них ждут работы, представления или производителя. Оценка превращает общую проверку в дело конкретной попытки.",
+"expects": "Контракт om-answers-evaluation/v1; стоит на открытой работе и на регистрации; предыдущая оценка — последняя в цепочке; область выведена из исходного плана привязки, полной цели и D1 проверки; на уже решённую проверку (барьерных групп нет) новая оценка не пишется.",
+"risks": "Работа закрыта — completion_closed; проверка уже решена — completion_resolved; цепочка не продолжает последнюю оценку — completion_conflict; привязка не блок — answers_evaluation_owner_unsupported; оценка не по форме или область неверна — answers_evaluation_invalid.",
+"size": "HX5: записей нет · рабочая база: 35 записей, 242 КБ, до 10 КБ на версию",
+"note": "Группы находок в запись не входят: они выводятся из трассы проверки при чтении, а их доказательства (om-answers-finding) пишутся лишь когда доставлены."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-answers-evaluation/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "gate",
+"type": "Ref",
+"iface": true,
+"what": "Полная проверка G4b (om-answers-gate), на которой сделана оценка.",
+"writer": "Оценка проверки (om.l2.g4b): ссылка на проверку, выведенную в той же сделке.",
+"readers": "Проход читает по ней, прошла ли проверка и какова её заявка (om.l2.g4b); повторное чтение оценки заново выводит группы из трассы этой проверки (om.l2.g4b).",
+"expects": "Проверка записана вместе с оценкой или раньше; её заявка равна заявке оценки.",
+"risks": "Подмена проверки — answers_evaluation_invalid."
+},
+{
+"path": "scope",
+"type": "{items[], absent[]}",
+"iface": true,
+"what": "Область попытки: разрывы D1, которые она закрывает (с исходными пунктами плана), и исходные пункты, чей разрыв исчез.",
+"writer": "Оценка проверки (om.l2.g4b): выводится из плана привязки, цели и текущего D1.",
+"readers": "Группировка находок относит находку к области попытки или оставляет её только в полной проверке (om.l2.g4b).",
+"expects": "Каждый пункт плана — в items или в absent; разрыв входит, если строка цели, вид и момент совпадают и блок среди потребителей.",
+"risks": "Пункт плана без маршрута — answers_evaluation_invalid."
+},
+{
+"path": "previous",
+"type": "Ref | null",
+"iface": true,
+"what": "Предыдущая оценка той же проверки; цепочка образует историю повторных проверок.",
+"writer": "Оценка проверки (om.l2.g4b): голова цепочки на момент оценки.",
+"readers": "Работа завершения берёт последнюю оценку цепочки (om.s.close).",
+"expects": "Указывает на последнюю оценку работы, а у первой — null.",
+"risks": "Другая предыдущая оценка — completion_conflict."
+},
+{
+"path": "work",
+"type": "Ref",
+"iface": true,
+"what": "Версия реестра работы, на которой стоит оценка; следующая версия реестра принимает оценку непосредственно после неё.",
+"writer": "Оценка проверки (om.l2.g4b).",
+"readers": "Переход реестра работы проверяет, что оценка пишется ровно после этой версии (om.s.close).",
+"expects": "Работа открыта и является головой.",
+"risks": "Закрытая работа — completion_closed."
+},
+{
+"path": "binding",
+"type": "Ref",
+"iface": false,
+"what": "привязка попытки блока",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "assignment",
+"type": "Ref",
+"iface": false,
+"what": "назначение проверки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "registration",
+"type": "Ref",
+"iface": false,
+"what": "регистрация проверки (om-answers-registration)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "series",
+"type": "Ref",
+"iface": false,
+"what": "серия попытки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "ordinal",
+"type": "number",
+"iface": false,
+"what": "номер попытки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "goal",
+"type": "{key, result, questions[]}",
+"iface": false,
+"what": "полная цель попытки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:1424 (writeAnswersEvaluation)",
+"when": "Шаг оценки (evaluate): проверка выводится на текущем D1/M6, область попытки вычисляется, запись пишется одной сделкой с проверкой, доказательствами находок, источниками отказов, строками журнала и новой версией реестра работы (при закрывающей заявке — вместе с закрытием попытки G7)",
+"fields": [
+"contract",
+"project",
+"gate",
+"scope",
+"previous",
+"work",
+"binding",
+"assignment",
+"registration",
+"series",
+"ordinal",
+"goal"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/run.ts:2055 (passedGate); src/om/answers-gate.ts:1351 (prepareEvaluation); src/om/answers-gate.ts:1297 (readFinding)",
+"fields": [
+"gate",
+"scope",
+"previous",
+"work"
+],
+"expects": "Проход определяет по последней оценке, прошла ли проверка; повторная оценка того же дела находит уже записанную и возвращает её как историческое повторение; доказательство находки перечитывает свою оценку",
+"sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/model-call.ts:3019 (deriveCompletionSnapshot); src/om/repeat-gate.ts:2165 (deriveManagedOutcome)",
+"fields": [
+"gate",
+"previous",
+"work"
+],
+"expects": "Работа завершения выбирает последнюю оценку цепочки и считает проверку полной, когда нет барьерных находок; закрытие попытки узнаёт оценку среди продуктов работы по виду записи (вывод: функции completion* отнесены к закрытию попытки по смыслу)",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Пространство id вида входит в закрытый перечень записей, рождённых от B1 (B1_PRODUCERS): если такая запись есть, а первой версии B1 нет, проект не считается проектом старого маршрута, и omProject отказывает record_missing «OM provenance requires the exact first B1 input» (вывод: узел назначен по аналогии с om-run)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-answers-finding",
+"group": "om",
+"idPattern": "om-answers-gate:<проект>:finding:<хэш (оценка, находка, причина, область)>",
+"proposed": false,
+"card": {
+"what": "Доказательство одной группы находок G4b: сама находка (код, сообщение, адрес, маршрут), точная причина (точка выпуска, разрыв, маршрут, источники, детали), область группы и вклад — «только в журнал» или «указывает на уже существующую причину»: итог оценки, диагностику вызова или прекращение.",
+"where": "Таблица revisions · вид «om-answers-finding» · id om-answers-gate:<проект>:finding:<хэш (оценка, находка, причина, область)>",
+"when": "Пишется при доставке группы находок оценки: либо вместе с оценкой (если deliver=all), либо позже отдельной доставкой; каждая запись рождает источник A2 (om-unit-refusal, ворота G4b), на который строка журнала ссылается. Не меняется. В рабочей базе 55 записей.",
+"why": "Находка G4b — наблюдение, а не отказ для модели: оно должно быть доказуемо точными записями и должно сказать, ждёт ли попытка работы, представления или производителя, или уже стоит на существующей причине. Для журнала это источник, из которого запись выводится заново.",
+"expects": "Контракт om-answers-finding/v1; оценка — точная; вклад выбран таблицей по точке выпуска (cause.emission) и по принадлежности основания собственным продуктам попытки; для существующей причины основания — ссылки на продукты этой попытки; источник A2 и его id выводятся из этой записи.",
+"risks": "Неподдерживаемая точка выпуска — answers_evaluation_invalid (candidate-gate-negative недостижима); основание не среди продуктов этой попытки — вклад не «существующий», а «только журнал» с ожиданием submission; запись оценки не найдена — answers_evaluation_invalid.",
+"size": "HX5: записей нет · рабочая база: 55 записей, 196 КБ, до 4,8 КБ на версию",
+"note": "Всех точек выпуска (emission) 61; в рабочей базе 3: assessment-interrupted, assessment-off-form и mc2-terminal; вклад существует у E4-terminal и E5-T. Список ролей источников (ANSWERS_GATE_SOURCE_ROLES, 37 ролей) закрыт."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-answers-finding/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "evaluation",
+"type": "Ref",
+"iface": true,
+"what": "Оценка проверки, группу которой доказывает запись.",
+"writer": "Оценка и доставка G4b (om.l2.g4b).",
+"readers": "Источник A2 выводится от неё и от привязки попытки (om.l2.g4b); проверка выдачи группы убеждается, что доставляется только последняя оценка (om.s.close).",
+"expects": "Точная версия оценки; её группы содержат эту находку.",
+"risks": "Оценка не последняя — completion_conflict."
+},
+{
+"path": "finding",
+"type": "{code, message, at, route}",
+"iface": true,
+"what": "Сама находка в том виде, в каком её выдал G4b: код (например answer_missing_for_blocking_gap), сообщение, адрес и маршрут возврата.",
+"writer": "G4b при выводе проверки (om.l2.g4b).",
+"readers": "Источник A2 копирует код и сообщение как отказ в журнале (om.l2.g4b); закрытие попытки различает наблюдения проверки среди причин (om.s.close).",
+"expects": "Код из списка G4b; адрес указывает на разрыв или результат.",
+"risks": "Неизвестный код — запись не принимается."
+},
+{
+"path": "cause",
+"type": "{emission, gap, occurrences, route, sources, detail}",
+"iface": true,
+"what": "Точная причина: в какой точке G4b вышла находка (например assessment-off-form), на каком разрыве, по какому маршруту и по каким точным записям она доказана.",
+"writer": "G4b при выводе проверки (om.l2.g4b).",
+"readers": "Вклад выбирается по emission (om.l2.g4b); проход читает по ней, что ждёт попытка (om.l2.g4b); закрытие попытки считает находку не отказом (om.s.close).",
+"expects": "emission — из закрытого списка; sources содержат только роли G4b и точные ссылки.",
+"risks": "Ссылка на запись, которой нет, — находка не доказана."
+},
+{
+"path": "contribution",
+"type": "{kind, producer?, basis[]} | {kind:'journal-only', wait, barrier}",
+"iface": true,
+"what": "Вклад группы: «существующая» причина с основанием (E5-N, E5-T, E4-T, E4-terminal, cessation) либо «только журнал» с ожиданием (work, submission, producer) и признаком барьера.",
+"writer": "Доставка группы (om.l2.g4b).",
+"readers": "Работа завершения считает попытку ждущей, пока есть барьерные группы только-журнала (om.s.close); существующие основания указывают на продукты самой попытки (om.s.close).",
+"expects": "Существующий вклад — только на собственные продукты этой попытки; барьер — для блокирующего разрыва в области.",
+"risks": "Чужой продукт — вклад становится «только журнал» и ждёт."
+},
+{
+"path": "scope",
+"type": "{kind, gap, line}",
+"iface": false,
+"what": "область группы: gap (разрыв и его строка) или submission (результат не относится к разрыву)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "occurrences",
+"type": "number[]",
+"iface": false,
+"what": "номера строк трассы проверки, которые входят в группу",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:1424 (writeAnswersEvaluation); src/om/answers-gate.ts:1474 (writeAnswersDelivery)",
+"when": "Доставка групп: доказательство каждой группы пишется вместе с источником A2 и строкой журнала в одной сделке, а реестр работы получает источники; повторная доставка группы ничего не пишет",
+"fields": [
+"contract",
+"project",
+"evaluation",
+"finding",
+"cause",
+"contribution",
+"scope",
+"occurrences"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:1778 (refuseAnswersClaim)",
+"fields": [
+"finding",
+"cause",
+"contribution",
+"evaluation"
+],
+"expects": "Закрытие попытки узнаёт строку G4b по четырём меткам и доказывает её через источник → находку → оценку; наблюдение проверки никогда не считается отказом попытки (completion_refusal_uncounted)",
+"sure": true
+},
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:1295 (readFinding); src/om/answers-gate.ts:1308 (readGateRefusal)",
+"fields": [
+"evaluation",
+"finding",
+"cause",
+"contribution"
+],
+"expects": "Собственный читатель G4b: находка → её оценка → привязка; из находки заново выводится источник A2, и он должен совпасть с записью; вклад читается как записан",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/stop-report.ts:465 (obstaclesOf)",
+"fields": [
+"finding",
+"cause"
+],
+"expects": "Объяснение остановки читает содержимое строк журнала (в т. ч. наблюдений G4b), о которые споткнулись попытки; доказательство находки — основание, которое объяснение может процитировать (вывод)",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Пространство id вида входит в закрытый перечень записей, рождённых от B1 (B1_PRODUCERS): если такая запись есть, а первой версии B1 нет, проект не считается проектом старого маршрута, и omProject отказывает record_missing «OM provenance requires the exact first B1 input» (вывод: узел назначен по аналогии с om-run)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-answers-gate",
+"group": "om",
+"idPattern": "om-answers-gate:<проект>:<хэш запроса>",
+"proposed": false,
+"card": {
+"what": "Итог G4b — проверки всего набора ответов общей области: какие разрывы D1 и какой маршрут M6 проверены, какие результаты по каждому разрыву предъявлены, прошла ли проверка и какие находки (отказы с кодом) она выдала.",
+"where": "Таблица revisions · вид «om-answers-gate» · id om-answers-gate:<проект>:<хэш запроса>",
+"when": "Создаётся одной версией на каждую уникальную заявку, когда проверка вычисляется для записи: вместе с оценкой проверки попытки (шаг evaluate) либо вместе с приёмкой общей части (C5 уровня 2 или 3), которой нужна проверка «прошла». Не меняется; другая заявка — другой id. В рабочей базе 35 записей.",
+"why": "Приёмка уровня 2 и 3 допускается только по проверке, которая прошла на текущем D1, текущем M6 и текущих результатах. Запись фиксирует именно эту проверку, а её доказательство (находки по причинам) выводится заново из сохранённой заявки.",
+"expects": "Контракт om-answers-gate/v1; заявка — полный D1 того же проекта, прошедший свои ворота, M6, выведенный из тех же разрывов, и результаты не более одного на разрыв; итог выводится из заявки заново — те же источники дают тот же passed, codes и findings; принятые результаты владельца (H2) входят в заявку и в её id.",
+"risks": "Разрыв вне набора D1 — answer_gap_unknown; результат на устаревшую версию разрыва — answer_version_stale; маршрут не для этого вида знания — answer_route_foreign; два результата на один разрыв — answer_duplicate; блокирующий разрыв без результата — answer_missing_for_blocking_gap; отложенный блокирующий — deferral_not_permitted; M6 не из этого D1 — input_stale; подделанный хэш разрыва — record_forged; итог другой для той же заявки — answer_version_stale (один id — один итог).",
+"size": "HX5: записей нет · рабочая база: 35 записей, 1,64 МБ, до 59 КБ на версию",
+"note": "Положительное (owner-answered) в трассе проверки доказывает ответ владельца и не считается находкой: полностью отвеченная проверка проходит. В записи лежит только итог; причина каждой находки (трасса) в запись не входит и вычисляется при чтении."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-answers-gate/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.gaps",
+"type": "{sources, records[]}",
+"iface": true,
+"what": "Какой именно набор разрывов D1 проверяется: источники (вход, горизонт, граф, операции, работы) и точные версии записей разрывов.",
+"writer": "Проход собирает заявку проверки по D1 области попытки (om.l2.g4b).",
+"readers": "Читатели G4b сверяют разрывы с сохранённым набором (om.l2.g4b).",
+"expects": "Набор полный и прошёл ворота D1; принадлежит тому же проекту.",
+"risks": "Чужой или неполный набор — gap_source_missing; сдвинувшаяся версия — input_stale."
+},
+{
+"path": "request.routes",
+"type": "Ref",
+"iface": true,
+"what": "Маршрут M6, по которому проверяются результаты: кто решает каждый разрыв и какое задание у фактов.",
+"writer": "Проход берёт текущий M6 области попытки (om.l2.g4b).",
+"readers": "G4b проверяет, что маршрут выведен из того же D1 и что каждый разрыв в нём назван (om.l2.g4b).",
+"expects": "M6 выведен из тех же разрывов и источников и остаётся текущим для области.",
+"risks": "Другой M6 — input_stale; разрыв без строки в маршруте — answer_route_foreign."
+},
+{
+"path": "request.results",
+"type": "{gap, result, candidate, deferral?}[]",
+"iface": true,
+"what": "Предъявленные результаты по разрывам: для фактов — итог оценки E5 или принятый ответ D5, для проектных вопросов — ответ владельца H2 или итог сборки, для узлов — кандидат.",
+"writer": "Проход собирает по всем попыткам области: принятые ответы, итоги оценки, сборки и ответы владельца (om.l2.g4b).",
+"readers": "G4b доказывает каждый результат своим читателем и выдаёт находку или признаёт ответ (om.l2.g4b).",
+"expects": "Не более одного результата на разрыв; id результата соответствует виду знания разрыва; блокирующий разрыв имеет результат.",
+"risks": "Дубль — answer_duplicate; результат вне маршрута — answer_route_foreign; подмена хэша — record_forged."
+},
+{
+"path": "result.passed",
+"type": "boolean",
+"iface": true,
+"what": "Прошла ли проверка: true только когда находок нет (ответы владельца H2 находкой не считаются).",
+"writer": "G4b при выводе итога (om.l2.g4b).",
+"readers": "Проход решает по сохранённой оценке, прошла ли проверка попытки (om.l2.g4b); приёмка общей части допускается только по passed текущей проверки (om.l2.c5, om.l3.c5).",
+"expects": "passed равно «находок нет»; codes — уникальные коды находок.",
+"risks": "Приёмка при passed=false — answers_not_passed (проход не принимает)."
+},
+{
+"path": "result.findings",
+"type": "Refusal[]",
+"iface": true,
+"what": "Находки проверки: код, сообщение, адрес (узел, поле, ссылка) и маршрут возврата (readiness, producer, owner).",
+"writer": "G4b при выводе итога (om.l2.g4b).",
+"readers": "Из каждой находки получаются группы доказательств (om-answers-finding) и отказы для журнала (om.l2.g4b); проход ищет в них «неотвечаемые» вопросы (om.l2.g4b).",
+"expects": "Каждая находка имеет код из закрытого списка G4b и адрес на разрыв или результат.",
+"risks": "Неизвестный код — запись не читается как итог G4b."
+},
+{
+"path": "result.codes",
+"type": "string[]",
+"iface": false,
+"what": "уникальные коды находок в порядке сортировки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "request.project",
+"type": "string",
+"iface": false,
+"what": "проект заявки; совпадает с проектом записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:870 (writeAnswersGate); src/om/answers-gate.ts:1424 (writeAnswersEvaluation)",
+"when": "Проверка набора ответов: заявка выводится заново на текущих источниках, итог записывается вместе с записями, которые потребовались для его допуска (маршрут M6, задания, указатель), либо вместе с оценкой проверки попытки",
+"fields": [
+"contract",
+"project",
+"request.gaps",
+"request.routes",
+"request.results",
+"result.passed",
+"result.findings",
+"result.codes",
+"request.project"
+],
+"sure": true
+},
+{
+"node": "om.l2.c5",
+"code": "src/om/run.ts:2154 (acceptFrame)",
+"when": "Приёмка общей части уровня 2 (шаг accept): текущий G4b допускается по passed; если такой проверки ещё нет (обычно её уже записала оценка), она пишется в той же сделке, что граф, слой, кадр и статусы предложений",
+"fields": [
+"вся запись"
+],
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/run.ts:2170 (acceptWorks)",
+"when": "Приёмка работ уровня 3 (шаг works): текущий G4b допускается по passed; если такой проверки ещё нет, она пишется в той же сделке, что кадр работ и статусы",
+"fields": [
+"вся запись"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/run.ts:2057 (passedGate); src/om/run.ts:2051 (technicalAssessmentFailure); src/om/answers-gate.ts:1288 (readEvaluation)",
+"fields": [
+"result.passed",
+"result.findings",
+"request.gaps",
+"request.routes",
+"request.results"
+],
+"expects": "Проход читает сохранённый итог последней оценки: прошла ли проверка, какова её заявка и были ли находки по техническим итогам оценки собственной попытки; оценка (evaluation) заново читает свою проверку по точной ссылке",
+"sure": true
+},
+{
+"node": "om.l2.c5",
+"code": "src/om/run.ts:2148 (acceptFrame)",
+"fields": [
+"result.passed",
+"request.gaps",
+"request.routes",
+"request.results"
+],
+"expects": "Приёмка уровня 2 заново выводит проверку по текущим источникам и, если запись с таким id уже есть (её записала оценка), сверяет с ней; при passed=false приёмка не допускается (answers_not_passed)",
+"sure": true
+},
+{
+"node": "om.l3.c5",
+"code": "src/om/run.ts:2166 (acceptWorks)",
+"fields": [
+"result.passed",
+"request.gaps",
+"request.routes",
+"request.results"
+],
+"expects": "Приёмка работ уровня 3 так же заново выводит текущую проверку и сверяет с уже записанной; при passed=false работы не принимаются (answers_not_passed)",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Пространство id вида входит в закрытый перечень записей, рождённых от B1 (B1_PRODUCERS): если такая запись есть, а первой версии B1 нет, проект не считается проектом старого маршрута, и omProject отказывает record_missing «OM provenance requires the exact first B1 input» (вывод: узел назначен по аналогии с om-run)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-completion-cessation",
+"group": "om",
+"idPattern": "om-completion-cessation:<проект>:<хэш пары (владелец, назначение)>",
+"proposed": false,
+"card": {
+"what": "Доказанная остановка одного назначения: какое назначение прекращено, по какой причине (например, заменена обязательная запись), как прекращено (не отправлено, ветка прекращена, проверка прекращена) и что от него осталось.",
+"where": "Таблица revisions · вид «om-completion-cessation» · id om-completion-cessation:<проект>:<хэш пары (владелец, назначение)>",
+"when": "Одна запись на назначение, версия 1. Физическое назначение прекращает шаг cease, а проверку ответов — шаг cease-check; запись идёт вместе со следующей версией реестра. В рабочей базе 20 записей (около 27 КБ); пять из них (25%) — вариант area-input/v1: проверка прекращена заменой B1 своей области (по доле variant).",
+"why": "Когда обязательное условие шага законно изменилось (заменён B1 области, снят допуск линии), остальную работу нужно закончить доказанным продуктом, а не молчаливо бросить и не платить за неё. Остановка позволяет попытке закрыться.",
+"expects": "Причина доказана заново по точным ссылкам: заменённая запись действительно обязательна для шага, замена существует. Для шага без заявки: не отправлен, заявки E1 и физического вызова нет; поля call, physical, exchange, rejection заполняются только для своих режимов. Запись стоит на непосредственно предшествующей версии реестра (work).",
+"risks": "Причина не доказана — completion_cause_unproved; причина не того вида — completion_cause_invalid; уже есть физическая заявка — completion_claim_exists; шаг уже решён — completion_resolved; работа закрыта — completion_closed; рассинхрон сводки вызовов — input_stale.",
+"size": "HX5: записей нет · рабочая база: 20 записей, 26 КБ, до 1,7 КБ на версию",
+"note": "Прекращённый шаг после записи запрещает следующие действия своей ветки: цикл, применение, материализацию, заявку вызова (completion_ceased). Остановка не является исходом: сама по себе причина — «interrupted»."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-completion-cessation/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "binding",
+"type": "Ref",
+"iface": false,
+"what": "владелец попытки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "assignment",
+"type": "Ref",
+"iface": true,
+"what": "Какое назначение прекращено: физический шаг или назначение «проверка ответов».",
+"writer": "Прекратить шаг (cease) и прекратить проверку (cease-check) (om.s.close).",
+"readers": "Вызов (om.r1.store), Ответ модели (om.r1.model), Маршруты (om.r1.route), оценка факта (om.r1.e5): каждое действие в ветке этого назначения отклоняется.",
+"expects": "Назначение принадлежит открытой работе владельца; у проверки ответов это назначение answers-gate.",
+"risks": "Действие в ветке прекращённого шага — completion_ceased."
+},
+{
+"path": "cause",
+"type": "{kind, prerequisite, replacement, proof}",
+"iface": true,
+"what": "Закрытый вид причины: заменена обязательная запись (required-record-replaced), изменён допуск серии, окончилось отсутствие, наблюдение файла или остановка шага цикла.",
+"writer": "Прекратить шаг (om.s.close): причину доказывает общий производитель, по изменившимся условиям.",
+"readers": "Закрыть попытку (om.s.close) отличает чистый конец (замена B1 своей области) от иного; E4 и повтор (om.r1.model, om.l3.form) читают причину как доказанную.",
+"expects": "Причина перечитывается по точным ссылкам: заменённая запись обязательна именно для этого назначения, замена существует; для проверки допустимы только изменение допуска и замена B1 области.",
+"risks": "Не доказана — completion_cause_unproved; ссылки подменены — completion_cause_invalid."
+},
+{
+"path": "disposition",
+"type": "\"not-dispatched\" | \"branch-ceased\" | \"check-ceased\"",
+"iface": true,
+"what": "Судьба шага: не отправлялся, ветка прекращена или проверка прекращена.",
+"writer": "Прекратить шаг (om.s.close).",
+"readers": "Закрыть попытку (om.s.close) и сводка работы: check-ceased считается решением проверки, остальные — технической остановкой; Форма · сборка (om.l3.form) ищет конец по области.",
+"expects": "not-dispatched требует заявленного адреса вызова и отсутствия физической заявки; branch-ceased — экземпляр без вызова либо принятый, но не применённый ответ.",
+"risks": "Физическая заявка есть — completion_claim_exists."
+},
+{
+"path": "remainder",
+"type": "\"expansion\" | \"continuation\" | \"assembly\" | \"application\" | \"answers-gate\" | null",
+"iface": true,
+"what": "Что осталось от шага: расширение, продолжение, сборка, применение ответа или проверка ответов.",
+"writer": "Прекратить шаг (om.s.close).",
+"readers": "Остановка запрещает действия своей ветки по остатку (om.r1.model, om.r1.store, om.r1.route); сводка работы считает ли корень решённым (om.s.resume).",
+"expects": "Остаток согласуется с видом назначения: корень — expansion или assembly, часть или продолжение — continuation или expansion, проверка — answers-gate.",
+"risks": "Остаток не определяется из работы — completion_invalid («remaining branch needs its exact prior response»)."
+},
+{
+"path": "work",
+"type": "Ref",
+"iface": true,
+"what": "Версия реестра, на которой стоит остановка; запись должна войти в непосредственно следующую версию.",
+"writer": "Прекратить шаг (om.s.close).",
+"readers": "Проверка перехода реестра (om.r1.store, om.s.close) требует, чтобы work остановки равнялся предыдущей версии реестра.",
+"expects": "Реестр открыт и принадлежит тому же владельцу.",
+"risks": "Не последняя версия — completion_invalid («atomic with its immediately succeeding registry»)."
+},
+{
+"path": "packet",
+"type": "Ref | null",
+"iface": false,
+"what": "пакет шага, если он уже был материализован",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "callId",
+"type": "string | null",
+"iface": false,
+"what": "id записи вызова E1 шага (у не отправленного)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "physicalId",
+"type": "string | null",
+"iface": false,
+"what": "id физической записи модели шага",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "call",
+"type": "Ref | null",
+"iface": false,
+"what": "запись вызова E1, если она была",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "ledger",
+"type": "Ref | null",
+"iface": false,
+"what": "срез сводки вызовов, по которому проверено отсутствие заявки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "physical",
+"type": "Ref | null",
+"iface": false,
+"what": "полученный, но не применённый ответ (branch-ceased/application)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "exchange",
+"type": "Ref | null",
+"iface": false,
+"what": "обмен с моделью этого ответа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "rejection",
+"type": "Ref | null",
+"iface": false,
+"what": "отказ применения ответа, если был",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "variant",
+"type": "\"area-input/v1\"",
+"iface": false,
+"what": "вариант: проверка прекращена заменой B1 своей области; у прежних записей поля нет",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.kind",
+"type": "string",
+"iface": false,
+"what": "вид причины (в живой базе только required-record-replaced)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.prerequisite",
+"type": "object",
+"iface": false,
+"what": "заменённая обязательная запись",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.replacement",
+"type": "Ref",
+"iface": false,
+"what": "запись, которая её заменила",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.proof",
+"type": "Ref | null",
+"iface": false,
+"what": "дополнительное доказательство замены",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.s.close",
+"code": "src/om/model-call.ts:3915 (writeCompletionCessation); src/om/answers-gate.ts:1665 (writeAnswersCheckCessation)",
+"when": "Шаг cease: остановка физического назначения; шаг cease-check: остановка проверки ответов. Запись идёт в одной сделке с новой версией реестра; повтор находит записанную",
+"fields": [
+"contract",
+"project",
+"binding",
+"assignment",
+"work",
+"cause",
+"disposition",
+"remainder",
+"packet",
+"callId",
+"physicalId",
+"call",
+"ledger",
+"physical",
+"exchange",
+"rejection",
+"variant"
+],
+"sure": true
+},
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:1644 (prepareCheckCessation)",
+"when": "Остановка проверки ответов (check-ceased) выводится G4b-производителем из изменения допуска линии или замены B1 области",
+"fields": [
+"disposition",
+"remainder",
+"variant",
+"cause",
+"assignment"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.r1.route",
+"code": "src/om/routes.ts:365 (prepareManagedRouteBatch)",
+"fields": [
+"assignment",
+"disposition"
+],
+"expects": "Материализация партии отклоняется, если в её ветке есть остановка (completion_ceased)",
+"sure": true
+},
+{
+"node": "om.r1.model",
+"code": "src/om/model-call.ts:1168 (runModelCycle); src/om/model-call.ts:1721 (applyReceivedModelCall)",
+"fields": [
+"assignment",
+"disposition",
+"remainder"
+],
+"expects": "Цикл и применение ответа отклоняются в ветке остановки (completion_ceased); сохранённый цикл повторяется исторически",
+"sure": true
+},
+{
+"node": "om.r1.store",
+"code": "src/om/model-call.ts:3194 (prepareCompletionCall); src/om/model-call.ts:3119 (prepareManagedEnvironment)",
+"fields": [
+"assignment",
+"disposition"
+],
+"expects": "Заявка вызова E1 и подготовка среды вызова для факта отклоняются, если шаг прекращён",
+"sure": false
+},
+{
+"node": "om.r1.e5",
+"code": "src/om/assessment.ts:1216 (assessUnderControl)",
+"fields": [
+"assignment",
+"disposition"
+],
+"expects": "Оценка факта отказывается (completion_ceased), если обязательный оценщик прекращён: нового намерения и вызова не создаётся",
+"sure": true
+},
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:1504 (readAnswersParticipant); src/om/answers-gate.ts:1529 (checkAnswersTransition)",
+"fields": [
+"assignment",
+"disposition"
+],
+"expects": "Участник проверки ответов узнаёт о прекращённой проверке; проверка либо прекращается, либо берёт следующее оценивание, но не оба сразу",
+"sure": true
+},
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:1951 (technicalEnds); src/om/repeat-gate.ts:2166 (deriveManagedOutcome)",
+"fields": [
+"disposition",
+"remainder",
+"variant",
+"cause",
+"call",
+"ledger",
+"physical"
+],
+"expects": "Административный конец блока и закрытие без среза вызовов допустимы только для чистых концов по замене B1 области; остановка с вызовом, срезом или физическим ответом требует срез",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/repeat-gate.ts:2054 (readAttempt)",
+"fields": [
+"cause",
+"disposition",
+"remainder"
+],
+"expects": "Свидетельства окна для разбора показывают технические концы попыток (остановки как факты, а не как отказы)",
+"sure": false
+},
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:1936 (ceasedCycle)",
+"fields": [
+"assignment",
+"disposition"
+],
+"expects": "Проход не выполняет сохранённый цикл шага, чей корень остановлен, а завершает остаток своим продуктом",
+"sure": false
+},
+{
+"node": "om.l3.form",
+"code": "src/om/model-call.ts:4226 (rootStarted); src/om/model-call.ts:4257 (endedByArea)",
+"fields": [
+"assignment",
+"disposition",
+"variant"
+],
+"expects": "Корень, остановленный раньше, считается начатым (повтор невозможен); попытка закрыта по замене B1 области, если её проверка прекращена вариантом area-input",
+"sure": false
+},
+{
+"node": "om.l3.neighbors",
+"code": "src/om/model-call.ts:2586 (readNeighbourResults)",
+"fields": [
+"assignment"
+],
+"expects": "Остановленные корни исключаются из соседей кистевого корня",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:447 (StageChecks.omProject)",
+"fields": [
+"binding",
+"assignment",
+"work",
+"packet",
+"call",
+"ledger",
+"physical",
+"exchange",
+"rejection",
+"cause"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам binding, assignment, work, packet, call, ledger, physical, exchange, rejection, cause",
+"sure": false
+}
+]
+},
+{
+"kind": "om-completion-finalization",
+"group": "om",
+"idPattern": "om-completion-finalization:<проект>:<хэш пары (владелец, фаза)>",
+"proposed": false,
+"card": {
+"what": "Доказанный конец оставшейся не физической части полной попытки: общей приёмки (C5), которой ждала её законченная проверка, либо подтверждения D2 уже принятой цели. Нужен, когда у области попытки заменили B1 или группа отклонена G5.",
+"where": "Таблица revisions · вид «om-completion-finalization» · id om-completion-finalization:<проект>:<хэш пары (владелец, фаза)>",
+"when": "Пишется шагом finalize, по одной записи на пару (попытка, фаза), версия 1, вместе со следующей версией реестра. В рабочей базе 19 записей (около 21 КБ): все фаза acceptance, причина — замена B1 области; в примере уровень 3 (по переписи).",
+"why": "Проверка попытки закончена, но общая приёмка группы уже невозможна из-за изменившегося входа. Без этого продукта попытка висела бы, а закрыться «как результат» она не может: завершённые корни и оплаченные сборки сохраняют смысл, а конец приёмки — это причина прерывания.",
+"expects": "Работа открыта; все физические корни разрешены; проверка полна, оценена и не прекращена; у попытки есть своя общая приёмка (узловое расширение 2 или 3 уровня). Причина — замена B1 своей области либо сохранённый отказ G5 группы (только для acceptance). Для фазы confirmation названы принятая рамка и основание: рамка или граф заменены, подтверждения D2 ещё не было.",
+"risks": "Приёмка своих результатов уже есть — completion_resolved; причина не доказана — completion_cause_unproved; фаза или поля несогласованы — completion_invalid; причина не того вида — completion_cause_invalid; работа закрыта — completion_closed.",
+"size": "HX5: записей нет · рабочая база: 19 записей, 21 КБ, до 1,1 КБ на версию",
+"note": "Это не оценка и не остановка проверки: оценка, завершённые корни и платные продукты сохраняют смысл. Для закрытия запись считается чистым техническим концом."
+},
+"fields": [
+{
+"path": "contract",
+"type": "\"om-completion-finalization/v1\"",
+"iface": false,
+"what": "метка формата записи",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "binding",
+"type": "Ref",
+"iface": false,
+"what": "владелец (только блок)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "phase",
+"type": "\"acceptance\" | \"confirmation\"",
+"iface": true,
+"what": "Какая оставшаяся часть закончена: общая приёмка (acceptance) или подтверждение D2 (confirmation).",
+"writer": "Конец оставшейся части (om.l3.form, om.l2.form): фаза выбирается проходом по состоянию попытки.",
+"readers": "Закрыть попытку (om.s.close) принимает чистым концом только acceptance; проход (om.s.resume) считает, что у попытки оставшаяся часть закончена.",
+"expects": "acceptance — без accepted и basis; confirmation — с accepted и basis.",
+"risks": "Не согласовано — completion_invalid («names no accepted frame and no ground of a confirmation»)."
+},
+{
+"path": "cause",
+"type": "{kind, ...}",
+"iface": true,
+"what": "Почему конец: заменён B1 своей области (required-record-replaced с проверенной заменой) либо группа отклонена сохранённым отказом G5 (group-rejected).",
+"writer": "Конец оставшейся части (om.l3.form, om.l2.form): причина берётся из сегодняшней замены B1 или из отказа группы.",
+"readers": "Закрыть попытку (om.s.close) решает, чистый ли это конец (замена своего B1 только для acceptance); Форма · сборка (om.l3.form) решает, передаёт ли попытка свои результаты (отказ группы).",
+"expects": "Замена B1 доказана по точным ссылкам (proof null); отказ G5 принадлежит группе этой области.",
+"risks": "Не доказана — completion_cause_unproved; ссылки не те — completion_cause_invalid."
+},
+{
+"path": "evaluation",
+"type": "Ref",
+"iface": true,
+"what": "Последнее оценивание проверки ответов, на котором конец стоит.",
+"writer": "Конец оставшейся части (om.l3.form).",
+"readers": "Закрыть попытку (om.s.close) и сводка работы (om.s.resume) считают проверку законченной.",
+"expects": "Проверка зарегистрирована, полна, оценена и не прекращена.",
+"risks": "Проверка не полна или прекращена — completion_invalid."
+},
+{
+"path": "work",
+"type": "Ref",
+"iface": true,
+"what": "Версия реестра, на которой стоит конец; запись входит в непосредственно следующую версию.",
+"writer": "Конец оставшейся части (om.l3.form).",
+"readers": "Проверка перехода реестра (om.s.close) сверяет work с предыдущей версией реестра.",
+"expects": "Работа открыта; все корни и ответвления решены.",
+"risks": "Не последняя версия — completion_invalid; закрытая работа — completion_closed."
+},
+{
+"path": "level",
+"type": "2 | 3",
+"iface": false,
+"what": "уровень общей приёмки попытки",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "outcome",
+"type": "\"ceased\"",
+"iface": false,
+"what": "исход фазы: приёмка или подтверждение прекращены",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "accepted",
+"type": "Ref | null",
+"iface": false,
+"what": "принятая рамка (только в фазе confirmation)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "basis",
+"type": "{frame, graph} | null",
+"iface": false,
+"what": "основание, почему подтверждение невозможно: рамка или граф заменены (только в confirmation)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.kind",
+"type": "string",
+"iface": false,
+"what": "вид причины (в живой базе только required-record-replaced)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.prerequisite",
+"type": "object",
+"iface": false,
+"what": "заменённый B1 области",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.replacement",
+"type": "Ref",
+"iface": false,
+"what": "запись, которая его заменила",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "cause.proof",
+"type": "Ref | null",
+"iface": false,
+"what": "дополнительное доказательство (в живой базе null)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.l3.form",
+"code": "src/om/model-call.ts:4134 (writeCompletionFinalization)",
+"when": "Шаг finalize: конец оставшейся приёмки или подтверждения (при замене B1 области или отказе G5 группы); запись идёт вместе со следующей версией реестра",
+"fields": [
+"contract",
+"project",
+"binding",
+"work",
+"phase",
+"cause",
+"level",
+"evaluation",
+"accepted",
+"basis",
+"outcome"
+],
+"sure": false
+},
+{
+"node": "om.l2.form",
+"code": "src/om/model-call.ts:4134 (writeCompletionFinalization)",
+"when": "То же для общей приёмки уровня 2 (узловое расширение 2 уровня); запись одна и та же (вывод: узел схемы выбран по подсказке задания)",
+"fields": [
+"phase",
+"cause",
+"level",
+"evaluation"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.s.close",
+"code": "src/om/repeat-gate.ts:1957 (technicalEnds); src/om/repeat-gate.ts:2164 (deriveManagedOutcome)",
+"fields": [
+"phase",
+"cause",
+"level"
+],
+"expects": "Закрытие считает финализацию чистым техническим концом (причина — «interrupted»); закрытие без среза вызовов допускает её среди продуктов без E1",
+"sure": true
+},
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:1569 (continueAttempt)",
+"fields": [
+"phase",
+"cause"
+],
+"expects": "Проход не возвращается к проверке, кандидату или рамке закончившейся фазы: конец найден среди продуктов работы",
+"sure": true
+},
+{
+"node": "om.l3.form",
+"code": "src/om/model-call.ts:4246 (endedByGroupRejection); src/om/model-call.ts:4254 (endedByArea)",
+"fields": [
+"cause",
+"phase"
+],
+"expects": "Повтор оплаченной сборки: попытка передаёт свои результаты, если она закрыта по замене B1 области или по отказу G5 группы",
+"sure": true
+},
+{
+"node": "om.s.analyze",
+"code": "src/om/repeat-gate.ts:2054 (readAttempt)",
+"fields": [
+"cause",
+"phase"
+],
+"expects": "Свидетельства окна для разбора показывают конец оставшейся приёмки как технический конец попытки",
+"sure": false
+}
+]
+},
+{
+"kind": "om-part-assembly",
+"group": "om",
+"idPattern": "om-part-assembly:<проект>:<хэш списка результатов>",
+"proposed": false,
+"card": {
+"what": "Сборка частей: все результаты частей одного узла, собранные в одно предложение слоя (layer-proposal) — полное разложение узла на уровне 2 или 3.",
+"where": "Таблица revisions · вид «om-part-assembly» · id om-part-assembly:<проект>:<хэш списка результатов>",
+"when": "Когда цикл модели закончил последнюю назначенную часть (terminal assembled), цикл вызывает сборку; она пишется одной сделкой вместе с предложением слоя. Повторный вызов находит уже готовую сборку. 13 записей по одной версии, 868 Б каждая; в рабочей базе все — works.",
+"why": "Только полная сборка — ответ на разрыв «обязательство открыто»: G4b принимает сборку, а не часть; уровни 2 и 3 дальше собирают кандидата из сборок.",
+"expects": "Все части назначены ровно один раз, не пересекаются и закрывают все назначенные обязательства; определения одного id не противоречат; у works-узла — одна ведомость D7 во всех частях.",
+"risks": "Части противоречат — model_parts_conflict; пропуск, перекрытие или чужая цепочка — model_parts_invalid; сборка оставила обязательство открытым — model_parts_invalid (поле coverage).",
+"size": "HX5: записей нет · рабочая база: 13 записей, 11 КБ",
+"note": "Сборка не переписывается: у неё один адрес — хэш списка результатов. Результат сборки может переиспользоваться другой попыткой (om-completion-reuse) без нового платного вызова."
+},
+"fields": [
+{
+"path": "project",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "results",
+"type": "Ref[]",
+"iface": true,
+"what": "Результаты частей, собранные в порядке цепочки.",
+"writer": "Сборка частей (om.l2.form для уровня 2, om.l3.form для уровня 3).",
+"readers": "G4b и G5 проверяют цепочку частей (om.l2.g4b, om.l3.g5); цикл подтверждает, что сборка использует именно его результаты (om.r1.store).",
+"expects": "Число результатов равно числу назначений плана; все результаты разные и идут подряд по плану.",
+"risks": "model_parts_invalid — результат лишний, пропущен или повторён."
+},
+{
+"path": "proposal",
+"type": "Ref",
+"iface": true,
+"what": "Собранное предложение слоя: объединение узлов, портов, связей, тестов и заполнений всех частей.",
+"writer": "Сборка частей (om.l2.form, om.l3.form).",
+"readers": "Выбор шага берёт ссылки на предложения сборок в запрос кандидата кадра (om.s.resume, затем om.l2.c4); G4b проверяет полноту (om.l2.g4b); G5 — влияние и атомарность (om.l3.g5); пакеты соседних узлов используют его как готовое разложение (om.r1.packet).",
+"expects": "Предложение записано в той же сделке и равно собранному заново; обязательства, назначенные частям, закрыты.",
+"risks": "model_parts_conflict, model_parts_invalid при расхождении."
+},
+{
+"path": "works",
+"type": "{contract, producer, ledger, bindings[]}",
+"iface": true,
+"what": "Ведомость D7 и привязки последней части (только works).",
+"writer": "Сборка частей (om.l3.form).",
+"readers": "G5 проверяет привязки (om.l3.g5); повторное использование (om.l3.form).",
+"expects": "Совпадает с works последней части; во всех частях один producer и ledger.",
+"risks": "model_parts_invalid — привязки не из последней части."
+}
+],
+"writers": [
+{
+"node": "om.l3.form",
+"code": "src/om/model-call.ts:684 (assembleModelParts)",
+"when": "Сборка частей работы уровня 3: сборка и предложение слоя пишутся одной сделкой; повторный вызов находит готовую и лишь регистрирует её в реестре попытки",
+"fields": [
+"project",
+"results",
+"proposal",
+"works"
+],
+"sure": true
+},
+{
+"node": "om.l2.form",
+"code": "src/om/model-call.ts:684 (assembleModelParts)",
+"when": "Сборка частей операций уровня 2 (вывод: по уровню предложения; в рабочей базе таких записей нет)",
+"fields": [
+"project",
+"results",
+"proposal"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:249 (matchPart); src/om/answers-gate.ts:277 (proveOfferedRecord)",
+"fields": [
+"results",
+"proposal"
+],
+"expects": "G4b принимает сборку как ответ на разрыв: берёт предложение и пакет первой части и сверяет, что назначение включает этот разрыв",
+"sure": true
+},
+{
+"node": "om.l3.g5",
+"code": "src/om/atomic-gate.ts:257 (modelSources); src/om/atomic-gate.ts:599 (resultsSnapshot)",
+"fields": [
+"results",
+"proposal",
+"works"
+],
+"expects": "G5 читает сборку как источник модели и пересчитывает снимок репозитория по частям",
+"sure": true
+},
+{
+"node": "om.s.resume",
+"code": "src/om/run.ts:2029 (assembliesOf)",
+"fields": [
+"proposal",
+"results"
+],
+"expects": "Выбор шага находит сборки корней попытки и уровень их предложений, чтобы решить: собирать кандидата, проверять G4b или закрывать",
+"sure": false
+},
+{
+"node": "om.r1.packet",
+"code": "src/om/model-call.ts:2600 (readNeighbourResults); src/om/model-call.ts:2616 (readNeighbourResults)",
+"fields": [
+"proposal",
+"results"
+],
+"expects": "Пакет корня нового образца включает «соседей» (MP2): готовые разложения других узлов того же уровня этой попытки читаются через сборки — узлы, порты и пути записи; позднего соседа в выпущенный пакет не добавляют",
+"sure": true
+},
+{
+"node": "om.r1.store",
+"code": "src/om/model-call.ts:1039 (cycleSources)",
+"fields": [
+"proposal",
+"results"
+],
+"expects": "Чтение цикла (readModelCycle) проверяет, что сборка использует ровно результаты этого цикла",
+"sure": true
+}
+]
 }
 ],
 "pending": [
@@ -36349,54 +38709,6 @@
 ]
 },
 {
-"kind": "frame-candidate",
-"writers": [],
-"readers": [
-{
-"node": "run.t.ctx",
-"code": "src/compiler/context.ts:159 (loadTaskContextSources)",
-"fields": [
-"вся запись"
-],
-"expects": "Работы и границы читаются из точной сохранённой версии works-кандидата; граф кандидата равен снимку графа плана",
-"sure": true
-},
-{
-"node": "run.phase.ctx",
-"code": "src/compiler/context.ts:159 (loadTaskContextSources)",
-"fields": [
-"вся запись"
-],
-"expects": "Работы и границы читаются из точной сохранённой версии works-кандидата; граф кандидата равен снимку графа плана",
-"sure": true
-}
-]
-},
-{
-"kind": "connection-frame",
-"writers": [],
-"readers": [
-{
-"node": "run.t.ctx",
-"code": "src/compiler/context.ts:162 (loadTaskContextSources); src/compiler/context.ts:164 (loadTaskContextSources)",
-"fields": [
-"вся запись"
-],
-"expects": "Кадр работ и кадр операций читаются по точным ссылкам и входят в контекст задачи",
-"sure": true
-},
-{
-"node": "run.phase.ctx",
-"code": "src/compiler/context.ts:162 (loadTaskContextSources); src/compiler/context.ts:164 (loadTaskContextSources)",
-"fields": [
-"вся запись"
-],
-"expects": "Кадр работ и кадр операций читаются по точным ссылкам и входят в контекст задачи",
-"sure": true
-}
-]
-},
-{
 "kind": "runtime-observation",
 "writers": [],
 "readers": [
@@ -36435,30 +38747,6 @@
 ],
 "expects": "Подтверждение task-result принимается как историческое: замороженная запись, а не текущая голова",
 "sure": true
-}
-]
-},
-{
-"kind": "connection-frame",
-"writers": [],
-"readers": [
-{
-"node": "om.b1.save",
-"code": "src/om/run-bases.ts:174 (accepted); src/om/run.ts:879 (rootGuards)",
-"fields": [
-"вся запись"
-],
-"expects": "Принятые кадры om-frame:<проект>:2 и :3 определяют верхнюю основу горизонта и разрывов и входят в охрану выбора.",
-"sure": true
-},
-{
-"node": "om.b1.horizon",
-"code": "src/om/horizon.ts:260 (readRefinement)",
-"fields": [
-"fills"
-],
-"expects": "Уточнение через принятый L2 читает его кадр и считает блоки с реальными операциями.",
-"sure": false
 }
 ]
 },
@@ -36559,21 +38847,6 @@
 "вся запись"
 ],
 "expects": "Вопросы готовности берутся из сохранённых находок G5 эры impact (om-atomic-gate/v2); G5 прежней эры вопросов не задаёт.",
-"sure": true
-}
-]
-},
-{
-"kind": "frame-candidate",
-"writers": [],
-"readers": [
-{
-"node": "om.b1.input",
-"code": "src/om/input.ts:1047 (readinessQuestions)",
-"fields": [
-"graph"
-],
-"expects": "Работы кандидата G5 нужны, чтобы найти принятый блок или операцию над ними и задать вопрос готовности.",
 "sure": true
 }
 ]
@@ -36687,53 +38960,6 @@
 ]
 },
 {
-"kind": "om-completion-cessation",
-"writers": [],
-"readers": [
-{
-"node": "om.r1.route",
-"code": "src/om/routes.ts:365 (prepareManagedRouteBatch)",
-"fields": [
-"assignment",
-"disposition"
-],
-"expects": "Материализация партии отклоняется, если в её ветке есть остановка (completion_ceased)",
-"sure": true
-},
-{
-"node": "om.r1.model",
-"code": "src/om/model-call.ts:1168 (runModelCycle); src/om/model-call.ts:1721 (applyReceivedModelCall)",
-"fields": [
-"assignment",
-"disposition",
-"remainder"
-],
-"expects": "Цикл и применение ответа отклоняются в ветке остановки (completion_ceased); сохранённый цикл повторяется исторически",
-"sure": true
-},
-{
-"node": "om.r1.store",
-"code": "src/om/model-call.ts:3194 (prepareCompletionCall); src/om/model-call.ts:3119 (prepareManagedEnvironment)",
-"fields": [
-"assignment",
-"disposition"
-],
-"expects": "Заявка вызова E1 и подготовка среды вызова для факта отклоняются, если шаг прекращён",
-"sure": false
-},
-{
-"node": "om.r1.e5",
-"code": "src/om/assessment.ts:1216 (assessUnderControl)",
-"fields": [
-"assignment",
-"disposition"
-],
-"expects": "Оценка факта отказывается (completion_ceased), если обязательный оценщик прекращён: нового намерения и вызова не создаётся",
-"sure": true
-}
-]
-},
-{
 "kind": "om-origin-analysis",
 "writers": [],
 "readers": [
@@ -36822,32 +39048,6 @@
 ]
 },
 {
-"kind": "om-part-assembly",
-"writers": [],
-"readers": [
-{
-"node": "om.r1.packet",
-"code": "src/om/model-call.ts:2600 (readNeighbourResults); src/om/model-call.ts:2616 (readNeighbourResults)",
-"fields": [
-"proposal",
-"results"
-],
-"expects": "Пакет корня нового образца включает «соседей» (MP2): готовые разложения других узлов того же уровня этой попытки читаются через сборки — узлы, порты и пути записи; позднего соседа в выпущенный пакет не добавляют",
-"sure": true
-},
-{
-"node": "om.r1.store",
-"code": "src/om/model-call.ts:1039 (cycleSources)",
-"fields": [
-"results",
-"proposal"
-],
-"expects": "Чтение цикла (readModelCycle) проверяет, что сборка использует ровно результаты этого цикла",
-"sure": true
-}
-]
-},
-{
 "kind": "om-series-applied",
 "writers": [],
 "readers": [
@@ -36905,6 +39105,41 @@
 ],
 "expects": "Запись вызова E1 с основанием wake-choice обязана воспроизвести сохранённое намерение целиком — имя, основание, платящую попытку, цель и пакет (иначе call_basis_unresolved)",
 "sure": false
+}
+]
+},
+{
+"kind": "om-completion-reuse",
+"writers": [],
+"readers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:612 (reusedResult)",
+"fields": [
+"batch",
+"routes",
+"origin",
+"root"
+],
+"expects": "G4b принимает повтор как результат, только если его партия равна сегодняшней, а предложение заполняет обязательства сегодняшней рамки works",
+"sure": true
+}
+]
+},
+{
+"kind": "om-owner-result",
+"writers": [],
+"readers": [
+{
+"node": "om.l2.g4b",
+"code": "src/om/answers-gate.ts:285 (proveOfferedRecord); src/om/answers-gate.ts:426 (proveResult); src/om/answers-gate.ts:702 (admitOwnerResults)",
+"fields": [
+"command",
+"question",
+"value"
+],
+"expects": "G4b принимает результат только если его вопрос привязан к этому разрыву, этим M6 и этому B1 и перепрошёл общий читатель; результат чужого вопроса чужой, непрочитанный — не результат",
+"sure": true
 }
 ]
 }
