@@ -1,5 +1,5 @@
 {
-"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2+om-r2+om-l3",
+"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2+om-r2+om-l3+om-m8",
 "generatedFrom": "om/module d8028bf; kinds-early.json; db-census.json",
 "tables": [
 {
@@ -3886,6 +3886,18 @@
 "projectId"
 ],
 "expects": "G5 проверяет внешние входы задач: каждый нужен точной версией source:<проект>:<артефакт>, совпадающей с хэшем и контрактом артефакта; источник без записи — atomic_gate_basis_unproven",
+"sure": true
+},
+{
+"node": "om.m8.deliv",
+"code": "src/om/feasibility.ts:286 (deliveryInputs)",
+"fields": [
+"origin",
+"content",
+"mediaType",
+"sha256"
+],
+"expects": "Поставки: вход задачи закрывается внешним Source или квитанцией производителя; решение сохраняется в записи M8",
 "sure": true
 }
 ]
@@ -10456,6 +10468,16 @@
 "status"
 ],
 "expects": "Старый путь, seal-layer L1: перед печатью обязана быть принята стадия features (features_not_ready иначе) — как для любой фазы уточнения. Отдельного узла у шага на схеме нет — отнесён к подблоку.",
+"sure": false
+},
+{
+"node": "om.m8.next",
+"code": "src/om/run.ts:2294 (completion)",
+"fields": [
+"status",
+"content"
+],
+"expects": "Конец прохода: стадия om-g2 принята и называет именно этот M8 — иначе выбирается шаг handoff",
 "sure": false
 }
 ]
@@ -29794,6 +29816,16 @@
 ],
 "expects": "Печать L1 прежнего маршрута (seal-layer L1) требует, чтобы R0 был, был актуален (phase_not_ready иначе) и записан с версией контракта 2 (refinement_upgrade_required иначе). Отдельного узла у этого шага на схеме нет — отнесён к карте L1, где его описывает схема",
 "sure": false
+},
+{
+"node": "om.m8.obl",
+"code": "src/graph/obligation-handoff.ts:33 (obligationHandoff); src/graph/obligation-handoff.ts:41 (obligationHandoff)",
+"fields": [
+"inputs",
+"draft"
+],
+"expects": "Обязательства прежнего маршрута: веха L3 указывает предшественника R2, веха R2 — перенесённые обязательства; для OM-эпохи не используется (вывод)",
+"sure": false
 }
 ]
 },
@@ -42293,6 +42325,439 @@
 "sure": false
 }
 ]
+},
+{
+"kind": "feasibility",
+"group": "om",
+"idPattern": "om-feasibility:<проект> (прежний маршрут: feasibility:<проект>)",
+"proposed": false,
+"card": {
+"what": "Готовность к плану (M8): доказательство, что принятый горизонт работ можно передать компилятору на текущих физических основаниях — репозиторий, среда, обязательства к R3, входы и квитанции производителей. Содержит ready, находки и всё, из чего они получены.",
+"where": "Таблица revisions · вид «feasibility» · id om-feasibility:<проект> (прежний маршрут: feasibility:<проект>)",
+"when": "Пишется M8 (writeFeasibility) на шаге feasibility прохода и командой assess продукта, когда принят слой работ; новая версия появляется, если изменились основания (находки исправлены или появились новые), повтор на тех же основаниях ничего не пишет. В рабочей базе одна запись в одной версии (ready = истина).",
+"why": "Это граница между проектированием и исполнением: M9, компилятор и исполнение опираются на то, что репозиторий, среда, поставки и обязательства проверены на конкретном дереве и не разошлись с принятыми работами.",
+"expects": "Контракт M8/v2 (producer.contract = om-m8/v2); запись выводится заново из принятого слоя работ, кандидата с D7, горизонта, среды, репозитория и поставок и равна себе; ready = истина только при пустых находках; дерево репозитория равно дереву, на котором G5 проверил влияние (если в G5 есть снимок).",
+"risks": "Запись не равна выводу — feasibility_record_invalid; контракт M8/v1 заменён — feasibility_contract_superseded; репозиторий ушёл от дерева G5 — feasibility_stale; не готово — feasibility_not_ready; источник изменился во время подготовки — input_stale; находки репозитория, обязательств и поставок передаются как отказы.",
+"size": "HX5: записей нет · рабочая база: 1 запись, 27 КБ",
+"note": "В прежнем маршруте тот же вид пишется как feasibility:<проект> без блока producer (graph/refinement.ts, Refinement.assess); в рабочей базе OMG такой записи нет. Диагностика и проекция продукта (product/engine.ts, projection) запись только читают и блоком схемы не считаются."
+},
+"fields": [
+{
+"path": "contractVersion",
+"type": "number (2)",
+"iface": false,
+"what": "версия контракта уточнения (REFINEMENT_CONTRACT_VERSION)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "ready",
+"type": "boolean",
+"iface": true,
+"what": "Готов ли горизонт к плану: истина только при пустых находках.",
+"writer": "Готовность к плану (om.m8.rec) по итогам осмотра репозитория, обязательств и поставок.",
+"readers": "Шаг после M8 решает: идти к M9 или ждать причину (om.m8.next); передача требует ready (om.c.m9); компилятор — чистый допуск (om.c.compiler); исполнение — опору плана (run.a.plan).",
+"expects": "ready = истина тогда и только тогда, когда findings пусты; repository не пуст.",
+"risks": "Не готов — feasibility_not_ready (проход ждёт причину); ложное ready не выводится заново — feasibility_record_invalid."
+},
+{
+"path": "findings",
+"type": "{code, target, message}[]",
+"iface": true,
+"what": "Находки: что мешает плану — осмотр репозитория, обязательства к R3, поставки.",
+"writer": "Репозиторий · среда (om.m8.repo), Обязательства к R3 (om.m8.obl), Поставки · входы (om.m8.deliv), собирает запись (om.m8.rec).",
+"readers": "Шаг после M8 превращает находки в адресное ожидание (om.m8.next).",
+"expects": "Каждая находка — код, цель и сообщение, без лишних полей; порядок: осмотр, обязательства, поставки.",
+"risks": "Находка другой формы — feasibility_record_invalid."
+},
+{
+"path": "graph",
+"type": "Ref",
+"iface": false,
+"what": "точная версия графа, на которой построена готовность",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "environment",
+"type": "Ref",
+"iface": false,
+"what": "точная версия среды (environment:<проект>)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "repository",
+"type": "{root, head, tree, files}|null",
+"iface": true,
+"what": "Снимок репозитория на момент M8: корень, коммит, дерево и файлы с хэшами.",
+"writer": "Репозиторий · среда (om.m8.repo): осмотр рабочей копии или корня исполнения.",
+"readers": "Компилятор берёт его базой плана (om.c.compiler, om.c.derive); исполнение сверяет базу (run.a.plan).",
+"expects": "Дерево совпадает с деревом G5 (если у G5 есть снимок); null допустим только вместе с находкой осмотра (репозитория нет) и пустыми поставками.",
+"risks": "Дерево ушло — feasibility_stale; репозитория нет, а находок нет — feasibility_record_invalid."
+},
+{
+"path": "repository.root",
+"type": "string",
+"iface": false,
+"what": "корень репозитория",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "repository.head",
+"type": "string",
+"iface": false,
+"what": "коммит (hex 40)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "repository.tree",
+"type": "string",
+"iface": false,
+"what": "дерево (hex 40)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "repository.files",
+"type": "{path, hash}[]",
+"iface": false,
+"what": "файлы с хэшами",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "inputs",
+"type": "Ref[]",
+"iface": true,
+"what": "Точные записи, на которых стоит готовность: граф, слой, кадр, среда, кандидат, горизонт, пара D7, корень исполнения, поставки.",
+"writer": "Готовность к плану (om.m8.rec).",
+"readers": "Передача сверяет доказательства (om.c.m9); компилятор кладёт их среди охранных ссылок плана (om.c.compiler); подробности контекста берутся из них (run.t.ctx).",
+"expects": "Уникальные точные Ref; в них входят producer и ledger D7.",
+"risks": "Неточная ссылка — input_stale / feasibility_record_invalid."
+},
+{
+"path": "obligations",
+"type": "{handoff, confirmations}",
+"iface": true,
+"what": "Обязательства к R3, перенесённые в план: полный handoff D7 и сохранённые подтверждения среды; та же копия лежит в producer.readiness.",
+"writer": "Обязательства к R3 (om.m8.obl): readinessObligations над парой producer+ledger D7.",
+"readers": "Компилятор выводит из handoff обязательства задач (om.c.derive); исполнение проверяет, что у каждой задачи ровно выведенные обязательства (run.a.plan, run.t.tstart).",
+"expects": "Равен producer.readiness; handoff — именно пара D7 из producer.obligations; подтверждения ссылаются на Source и наблюдение.",
+"risks": "Расхождение — feasibility_record_invalid (obligations); недоказанные обязательства — находки environment_confirmation_* и obligation_*."
+},
+{
+"path": "obligations.handoff",
+"type": "{era, producer, scope, obligations[]}",
+"iface": false,
+"what": "handoff D7 как его получают потребители",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "obligations.confirmations",
+"type": "{obligation, source, observation}[]",
+"iface": false,
+"what": "сохранённые подтверждения обязательств среды",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.contract",
+"type": "\"om-m8/v2\"",
+"iface": false,
+"what": "контракт производителя",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.project",
+"type": "string",
+"iface": false,
+"what": "проект производителя",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.layer",
+"type": "Ref",
+"iface": false,
+"what": "принятый слой 3",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.frame",
+"type": "Ref",
+"iface": false,
+"what": "принятый кадр слоя 3",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.candidate",
+"type": "Ref",
+"iface": false,
+"what": "кандидат работ с привязкой к D7",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.horizon",
+"type": "Ref",
+"iface": false,
+"what": "горизонт, по которому M9 доходит до B1",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.obligations",
+"type": "{producer:Ref, ledger:Ref}",
+"iface": false,
+"what": "пара D7, на которой стоит готовность",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.readiness",
+"type": "ReadinessObligations",
+"iface": false,
+"what": "копия обязательств к R3",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.inspection",
+"type": "{graph, layer, environment, root, executionRoot, workspace, result}",
+"iface": false,
+"what": "осмотр репозитория: корень, корень исполнения, рабочее пространство, результат",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "producer.deliveries",
+"type": "{ownership:{root, indexes}|null, resolved[], inputs[]}",
+"iface": true,
+"what": "Поставки: кто последним писал каждый путь записи (индексы) и какой источник или квитанция закрывает каждый вход задачи.",
+"writer": "Поставки · входы (om.m8.deliv): индексы писателей по путям записи и решения входов тем же выводом задач.",
+"readers": "Компилятор при чтении плана выводит задачи заново по этим решениям и индексам писателей (om.c.compiler, om.c.derive).",
+"expects": "Для репозитория — индекс на каждый путь записи горизонта, привязанный к корню исполнения; на каждую пару (производитель, артефакт) ровно одно решение.",
+"risks": "Нет индекса или решение неоднозначно — feasibility_record_invalid (deliveries); вход не закрыт — находки external_input_missing, producer_not_ready."
+}
+],
+"writers": [
+{
+"node": "om.m8.rec",
+"code": "src/om/feasibility.ts:390 (writeFeasibility); src/om/run.ts:615 (perform); src/product/engine.ts:223 (ProductEngine.#assess)",
+"when": "Шаг feasibility прохода и команда assess продукта: запись готовности пишется одной сделкой с охраной всех текущих голов; точный повтор ничего не пишет",
+"fields": [
+"вся запись"
+],
+"sure": true
+},
+{
+"node": "om.m8",
+"code": "src/graph/refinement.ts:227 (Refinement.assess)",
+"when": "Прежний маршрут: Refinement.assess пишет feasibility:<проект> без блока producer (вывод: в новом проходе OM не используется)",
+"fields": [
+"contractVersion",
+"projectId",
+"ready",
+"graph",
+"environment",
+"repository",
+"inputs",
+"findings",
+"obligations"
+],
+"sure": false
+}
+],
+"readers": [
+{
+"node": "om.m8.rec",
+"code": "src/om/feasibility.ts:367 (prepareFeasibility); src/om/feasibility.ts:401 (readFeasibility)",
+"fields": [
+"вся запись"
+],
+"expects": "M8 сверяет предыдущую версию с новым результатом (равный повтор не пишется) и заново выводит сохранённую запись из своих источников",
+"sure": true
+},
+{
+"node": "om.m8.next",
+"code": "src/om/run.ts:2282 (completion); src/om/run.ts:2291 (completion)",
+"fields": [
+"ready",
+"findings"
+],
+"expects": "Конец прохода: сохранённая запись читается исторически; при ready = ложь проход ждёт с адресными находками, при истине идёт к M9; изменившееся основание — новый шаг feasibility",
+"sure": true
+},
+{
+"node": "om.c.m9",
+"code": "src/om/handoff.ts:96 (readHandoff)",
+"fields": [
+"ready",
+"producer.horizon",
+"graph",
+"environment"
+],
+"expects": "Передача читает M8 и требует ready; от горизонта M8 доходит до B1 и принятых фич — их вход должен быть предшественником стадии",
+"sure": true
+},
+{
+"node": "om.c.stage",
+"code": "src/product/stage-checks.ts:240 (StageChecks.validateStage)",
+"fields": [
+"вся запись"
+],
+"expects": "Приёмка стадии om-g2: ссылка из содержимого стадии проходит ворота M8 — полный новый осмотр должен совпасть с сохранённым",
+"sure": false
+},
+{
+"node": "om.c.compiler",
+"code": "src/compiler/compiler.ts:33 (Compiler.compile); src/compiler/compiler.ts:34 (Compiler.compile); src/compiler/compiler.ts:36 (Compiler.compile)",
+"fields": [
+"ready",
+"repository",
+"inputs",
+"producer"
+],
+"expects": "Компилятор требует принятую стадию, чистые ворота и сохранённый repository; контракт контекста задач берётся из G5 через M8",
+"sure": true
+},
+{
+"node": "om.c.derive",
+"code": "src/compiler/compiler.ts:42 (Compiler.compile); src/compiler/compiler.ts:92 (Compiler.read)",
+"fields": [
+"obligations",
+"repository",
+"producer.deliveries"
+],
+"expects": "Обязательства задач выводятся из handoff, сохранённого в записи M8; база плана — её repository; при чтении плана задачи выводятся заново по сохранённым решениям поставок",
+"sure": true
+},
+{
+"node": "run.a.plan",
+"code": "src/execution/basis.ts:25 (omExecutionRoot); src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
+"fields": [
+"obligations",
+"producer.contract",
+"ready",
+"repository",
+"вся запись"
+],
+"expects": "Исполнение сверяет базу плана с доказанным M8/v2 и требует, чтобы у каждой задачи было ровно выведенное из него множество обязательств",
+"sure": true
+},
+{
+"node": "run.t.ctx",
+"code": "src/compiler/context.ts:132 (loadTaskContextSources); src/compiler/compiler.ts:211 (Compiler.detail)",
+"fields": [
+"inputs",
+"producer",
+"вся запись"
+],
+"expects": "Контекст задачи и детали берутся из доказанной записи M8: её источники и охраняемые записи",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Адрес om-feasibility относится к записям, рождённым от B1: стадии компиляции нужны только записи нового маршрута",
+"sure": false
+},
+{
+"node": "om.m8",
+"code": "src/graph/refinement.ts:244 (Refinement.feasibilityGate)",
+"fields": [
+"ready",
+"inputs",
+"obligations",
+"repository"
+],
+"expects": "Прежний маршрут: ворота читают feasibility:<проект> и сверяют входы и состояние репозитория (вывод: к проходу OM не относится)",
+"sure": false
+},
+{
+"node": "run.c.gates",
+"code": "src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
+"fields": [
+"вся запись"
+],
+"expects": "Перед принятием проверяется, что задача не потеряла и не подменила обязательства из своей оценки",
+"sure": true
+},
+{
+"node": "run.phase.commit",
+"code": "src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
+"fields": [
+"вся запись"
+],
+"expects": "Перед принятием проверяется, что задача не потеряла и не подменила обязательства из своей оценки",
+"sure": true
+},
+{
+"node": "run.phase.ctx",
+"code": "src/compiler/context.ts:132 (loadTaskContextSources)",
+"fields": [
+"вся запись"
+],
+"expects": "Контекст берёт кандидата, слой и кадр из сохранённой оценки; она должна быть ready и ссылаться на тот же граф и среду",
+"sure": true
+}
+]
 }
 ],
 "pending": [
@@ -42379,57 +42844,6 @@
 "вся запись"
 ],
 "expects": "Доказательства обязательств принадлежат точному плану, проекту и названной задаче (task_obligation_plan_foreign иначе)",
-"sure": true
-}
-]
-},
-{
-"kind": "feasibility",
-"writers": [],
-"readers": [
-{
-"node": "run.a.plan",
-"code": "src/execution/basis.ts:25 (omExecutionRoot); src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
-"fields": [
-"вся запись"
-],
-"expects": "План опирается на готовую оценку M8 эры om-m8/v2; обязательства задач выводятся из её переданного списка (plan_stale, task_obligation_plan_foreign иначе)",
-"sure": true
-},
-{
-"node": "run.c.gates",
-"code": "src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
-"fields": [
-"вся запись"
-],
-"expects": "Перед принятием проверяется, что задача не потеряла и не подменила обязательства из своей оценки",
-"sure": true
-},
-{
-"node": "run.t.ctx",
-"code": "src/compiler/context.ts:132 (loadTaskContextSources)",
-"fields": [
-"вся запись"
-],
-"expects": "Контекст берёт кандидата, слой и кадр из сохранённой оценки; она должна быть ready и ссылаться на тот же граф и среду",
-"sure": true
-},
-{
-"node": "run.phase.commit",
-"code": "src/execution/task-obligations.ts:23 (requirePlanTaskObligations)",
-"fields": [
-"вся запись"
-],
-"expects": "Перед принятием проверяется, что задача не потеряла и не подменила обязательства из своей оценки",
-"sure": true
-},
-{
-"node": "run.phase.ctx",
-"code": "src/compiler/context.ts:132 (loadTaskContextSources)",
-"fields": [
-"вся запись"
-],
-"expects": "Контекст берёт кандидата, слой и кадр из сохранённой оценки; она должна быть ready и ссылаться на тот же граф и среду",
 "sure": true
 }
 ]
