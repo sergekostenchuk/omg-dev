@@ -1,5 +1,5 @@
 {
-"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2+om-r2+om-l3+om-m8",
+"version": "early-1+map-1+spec-1+feat-1+run-1+om-b1+om-r0+om-l1+om-r1+om-l2+om-r2+om-l3+om-m8+om-c",
 "generatedFrom": "om/module d8028bf; kinds-early.json; db-census.json",
 "tables": [
 {
@@ -332,6 +332,15 @@
 ],
 "expects": "Прежде чем готовить стадию operation-map, проект должен существовать (project_missing иначе).",
 "sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:372 (StageChecks.project)",
+"fields": [
+"id"
+],
+"expects": "Компиляция начинается только для существующего проекта: перед планом проверяется запись проекта (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
 }
 ]
 },
@@ -725,8 +734,9 @@
 },
 {
 "node": "om.c.compiler",
-"code": "src/compiler/compiler.ts:40 (Compiler.compile)",
+"code": "src/compiler/compiler.ts:40 (Compiler.compile); src/runtime/environment.ts:281 (Environments.get)",
 "fields": [
+"вся запись",
 "запись (поля не уточнены)"
 ],
 "expects": "Компиляция читает окружение и источники",
@@ -1025,6 +1035,15 @@
 ],
 "expects": "Выбор wake-теста или порядка записи отправляется исполнителю из среды (actor, model, effort); без исполнителя — wake_request_invalid",
 "sure": true
+},
+{
+"node": "om.c.m9",
+"code": "src/om/handoff.ts:79 (exactSource)",
+"when": "Среда из доказательств передачи читается по точной ссылке",
+"fields": [
+"вся запись"
+],
+"sure": false
 }
 ]
 },
@@ -3899,6 +3918,15 @@
 ],
 "expects": "Поставки: вход задачи закрывается внешним Source или квитанцией производителя; решение сохраняется в записи M8",
 "sure": true
+},
+{
+"node": "om.c.m9",
+"code": "src/om/handoff.ts:79 (exactSource)",
+"when": "exactSource — общий читатель записей из proofs передачи: читаются точные Source, включённые в proofs (например, основания M8); обязательный элемент features — запись stage, не source",
+"fields": [
+"вся запись"
+],
+"sure": false
 }
 ]
 },
@@ -8976,15 +9004,16 @@
 },
 {
 "node": "om.c.m9",
-"code": "src/pipeline/pipeline.ts:106 (Pipeline.prepareAccepted)",
+"code": "src/pipeline/pipeline.ts:106 (Pipeline.prepareAccepted); src/om/handoff.ts:161 (writeHandoff)",
 "when": "Передача OM и поздние стадии собирают пару «черновик и приёмка» в памяти",
 "fields": [
-"projectId",
-"stage",
-"status",
 "content",
 "inputs",
-"proofs"
+"projectId",
+"proofs",
+"stage",
+"status",
+"вся запись"
 ],
 "sure": false
 },
@@ -9092,6 +9121,29 @@
 "proofs"
 ],
 "sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/compiler/compiler.ts:182 (Compiler.publish); src/product/stage-checks.ts:419 (StageChecks.compile)",
+"when": "Компиляция: после записи плана стадия compilation создаётся черновиком с {plan: ссылка} и принимается; приём меняет статус на accepted и проходит ворота компилятора",
+"fields": [
+"projectId",
+"stage",
+"status",
+"content",
+"inputs",
+"proofs"
+],
+"sure": true
+},
+{
+"node": "om.c",
+"code": "src/product/repairs.ts:183 (PlanRepairs.#run)",
+"when": "Старый маршрут ремонта договора: publish+accept стадии compilation (legacy-путь, атрибуция по коду)",
+"fields": [
+"вся запись"
+],
+"sure": false
 }
 ],
 "readers": [
@@ -9397,6 +9449,8 @@
 "node": "om.c.compiler",
 "code": "src/compiler/basis.ts:13 (requireBasis); src/product/stage-checks.ts:408 (StageChecks.compile); src/product/stage-checks.ts:416 (StageChecks.compile)",
 "fields": [
+"content",
+"status",
 "запись (поля не уточнены)"
 ],
 "expects": "Компиляция требует принятых оснований; компиляция читает принятые стадии",
@@ -9404,8 +9458,12 @@
 },
 {
 "node": "om.c.m9",
-"code": "src/om/handoff.ts:87 (readHandoff); src/om/handoff.ts:100 (readHandoff)",
+"code": "src/om/handoff.ts:87 (readHandoff); src/om/handoff.ts:100 (readHandoff); src/om/handoff.ts:88 (readHandoff)",
 "fields": [
+"content",
+"inputs",
+"proofs",
+"status",
 "версия и хэш",
 "запись (поля не уточнены)"
 ],
@@ -9414,9 +9472,11 @@
 },
 {
 "node": "om.c.stage",
-"code": "src/product/engine.ts:396 (ProductEngine.execute); src/product/engine.ts:382 (ProductEngine.execute)",
+"code": "src/product/engine.ts:396 (ProductEngine.execute); src/product/engine.ts:382 (ProductEngine.execute); src/product/stage-checks.ts:408 (StageChecks.compile)",
 "fields": [
-"content.feasibility"
+"content",
+"content.feasibility",
+"status"
 ],
 "expects": "Приёмка стадий OM и компиляции",
 "sure": false
@@ -10479,6 +10539,26 @@
 ],
 "expects": "Конец прохода: стадия om-g2 принята и называет именно этот M8 — иначе выбирается шаг handoff",
 "sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/om/run.ts:2294 (completion); src/om/run.ts:2298 (completion)",
+"fields": [
+"status",
+"content"
+],
+"expects": "Проход завершается, только если стадия compilation принята и её план называет тот же M8; иначе шаг compile",
+"sure": true
+},
+{
+"node": "om.c",
+"code": "src/om/run.ts:623 (perform)",
+"when": "После StageChecks.compile шаг compile читает обратно принятую stage:compilation и возвращает её ссылку",
+"fields": [
+"status",
+"content"
+],
+"sure": true
 }
 ]
 },
@@ -22411,13 +22491,14 @@
 },
 {
 "node": "om.c.compiler",
-"code": "src/compiler/compiler.ts:39 (Compiler.compile); src/compiler/compiler.ts:103 (Compiler.read)",
+"code": "src/compiler/compiler.ts:39 (Compiler.compile); src/compiler/compiler.ts:103 (Compiler.read); src/compiler/compiler.ts:40 (Compiler.compile)",
 "fields": [
-"nodes",
-"horizon",
-"tests",
 "connectors",
-"researchObligations"
+"horizon",
+"nodes",
+"researchObligations",
+"tests",
+"вся запись"
 ],
 "expects": "Компилятор читает граф и запечатывает его снимок в план; при проверке плана граф по точной версии должен быть равен снимку (plan_foreign иначе)",
 "sure": true
@@ -22682,6 +22763,15 @@
 ],
 "expects": "Вопросы готовности спрашиваются у ближайшего принятого блока или операции над работой: места берутся из принятого графа, который читала дверь",
 "sure": true
+},
+{
+"node": "om.c.m9",
+"code": "src/om/handoff.ts:79 (exactSource)",
+"when": "Граф из доказательств передачи читается по точной ссылке",
+"fields": [
+"вся запись"
+],
+"sure": false
 }
 ]
 },
@@ -27453,7 +27543,7 @@
 },
 {
 "node": "om.c.m9",
-"code": "src/om/handoff.ts:99 (readHandoff)",
+"code": "src/om/handoff.ts:99 (readHandoff); src/om/handoff.ts:100 (readHandoff)",
 "fields": [
 "input.sources"
 ],
@@ -28161,7 +28251,7 @@
 },
 {
 "node": "om.c.m9",
-"code": "src/om/handoff.ts:98 (readHandoff)",
+"code": "src/om/handoff.ts:98 (readHandoff); src/om/handoff.ts:99 (readHandoff)",
 "fields": [
 "horizon"
 ],
@@ -28712,6 +28802,15 @@
 ],
 "expects": "G5 не принимает работы, пока блокирующие разрывы открыты.",
 "sure": true
+},
+{
+"node": "om.c.derive",
+"code": "src/graph/task-obligations.ts:87 (bindingContext)",
+"when": "Проверка наступления обязательства читает точный original.record и поле gap.deferral",
+"fields": [
+"gap.deferral"
+],
+"sure": false
 }
 ]
 },
@@ -29082,6 +29181,15 @@
 ],
 "expects": "G4b читает задачу маршрута при проверке отрицательного факта и применимости ответа.",
 "sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Пространство id вида входит в закрытый перечень записей, рождённых от B1 (B1_PRODUCERS): если такая запись есть, а первой версии B1 нет, проект не считается проектом старого маршрута, и omProject отказывает record_missing «OM provenance requires the exact first B1 input» (вывод: узел назначен по аналогии с om-run) (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
 }
 ]
 },
@@ -29219,6 +29327,15 @@
 ],
 "expects": "M6 для каждого факт-задания читает указатель цели (текущий — через prepare, историческая запись маршрута — по точной ссылке searches.index) и проверяет все ответы указателя; указатель чужой цели — route_record_invalid",
 "sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"вся запись"
+],
+"expects": "Пространство id вида входит в закрытый перечень записей, рождённых от B1 (B1_PRODUCERS): если такая запись есть, а первой версии B1 нет, проект не считается проектом старого маршрута, и omProject отказывает record_missing «OM provenance requires the exact first B1 input» (вывод: узел назначен по аналогии с om-run) (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
 }
 ]
 },
@@ -29825,6 +29942,16 @@
 "draft"
 ],
 "expects": "Обязательства прежнего маршрута: веха L3 указывает предшественника R2, веха R2 — перенесённые обязательства; для OM-эпохи не используется (вывод)",
+"sure": false
+},
+{
+"node": "om.c.derive",
+"code": "src/graph/task-obligations.ts:33 (taskObligationHandoff)",
+"when": "Прежний маршрут: OM-ветвь handoff возвращается раньше (:28–29); здесь читается веха L3 и проверяются projectId/taskObligationContract",
+"fields": [
+"projectId",
+"taskObligationContract"
+],
 "sure": false
 }
 ]
@@ -33221,6 +33348,17 @@
 "packet"
 ],
 "expects": "Учёт обязательного исправления находит пакет-исправление среди продуктов; закрытие считает регистрацию неплатной продукцией (для неё книга вызовов не нужна)",
+"sure": false
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"binding",
+"root",
+"packet"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам binding, root, packet (поиск происхождения B1 при отсутствии om-input:1)",
 "sure": false
 }
 ]
@@ -38938,6 +39076,16 @@
 ],
 "expects": "Адрес om-obligation-basis относится к записям, рождённым от B1",
 "sure": false
+},
+{
+"node": "om.c.derive",
+"code": "src/om/obligations.ts:451 (loadRecord)",
+"when": "Вывод задач: сохранённый handoff сверяется с оригиналами — читается производитель обязательств (om-ветвь через omObligationHandoff → loadRecord)",
+"fields": [
+"ledger",
+"request"
+],
+"sure": false
 }
 ]
 },
@@ -39290,6 +39438,15 @@
 "вся запись"
 ],
 "expects": "Адрес om-obligations относится к записям, рождённым от B1: стадии компиляции нужны только записи нового маршрута",
+"sure": false
+},
+{
+"node": "om.c.derive",
+"code": "src/om/obligations.ts:453 (loadRecord)",
+"when": "По producer.value.ledger читается реестр обязательств — источник handoff и входов",
+"fields": [
+"вся запись"
+],
 "sure": false
 }
 ]
@@ -39901,6 +40058,16 @@
 "policy"
 ],
 "expects": "Наблюдение среды по области прежнего маршрута сверяет объявленную проверку с политикой (в OM-эпохе объявление берётся из D7)",
+"sure": false
+},
+{
+"node": "om.c.derive",
+"code": "src/graph/task-obligations.ts:66 (verifiedScope)",
+"when": "Прежняя эра: чтение выполняется в ветви handoff с r2 — срез обязательств сверяется с сохранённым research-scope вехи",
+"fields": [
+"projectId",
+"obligations"
+],
 "sure": false
 }
 ]
@@ -42756,32 +42923,288 @@
 ],
 "expects": "Контекст берёт кандидата, слой и кадр из сохранённой оценки; она должна быть ready и ссылаться на тот же граф и среду",
 "sure": true
+},
+{
+"node": "om.c.read",
+"code": "src/om/handoff.ts:96 (readHandoff)",
+"when": "M9 читает сохранённый M8 и требует ready — текущий допуск передачи",
+"fields": [
+"ready",
+"producer"
+],
+"sure": true
 }
 ]
-}
-],
-"pending": [
+},
 {
 "kind": "plan",
-"writers": [],
-"readers": [
+"group": "om",
+"idPattern": "plan:<проект>:external-inputs-v1:<хэш тела> (прежний вид: plan:<проект>:<хэш тела>)",
+"proposed": false,
+"card": {
+"what": "Машинный план — результат компиляции: неизменяемый список задач (что писать, что читать, какие тесты, какие входы-квитанции, какие обязательства), привязанный к точным графу, среде, стадии OM-G2 и записи M8, плюс снимок графа и базу репозитория.",
+"where": "Таблица revisions · вид «plan» · id plan:<проект>:external-inputs-v1:<хэш тела> (прежний вид: plan:<проект>:<хэш тела>)",
+"when": "Пишется компилятором (Compiler.compile) на шаге compile прохода вместе с указателем current-plan одной сделкой; адрес — хэш тела, поэтому те же основания находят существующий план и не пишут нового. Для нового формата обязательны version=2 и derivation=external-inputs/v1; в исторических записях derivation может отсутствовать. Повторное использование старого адреса допускается только для точного результата без внешних входов (Compiler.compile:62–78). В рабочей базе одна запись (731 680 байт, примерно 715 КиБ).",
+"why": "Исполнение не должно переизобретать работу: всё, что нужно задаче, выведено детерминированно из принятого OM, а любое расхождение (основание изменилось, задачи правили вручную) обнаруживается пересчётом.",
+"expects": "Версия 2; derivation = external-inputs/v1 для адреса нового вида; хэш равен хэшу тела, адрес выведен из него; стадия om-g2 принята и её содержимое равно {feasibility}; M8 готов, репозиторий, граф и среда равны запечатанным; задачи при чтении выводятся заново и равны сохранённым; граф при чтении равен снимку.",
+"risks": "OM-G2 не принята — om_not_ready; M8 не готов — feasibility_not_ready; основание изменилось при компиляции — plan_stale; контрольная сумма не сходится — plan_corrupt; граф чужой — plan_foreign; задачи правили — plan_derivation_mismatch; неполное основание — plan_basis_foreign / plan_basis_incomplete / plan_invalid; чужой контекст задач — context_source_invalid; новый допуск версии 1 — plan_version_upgrade_required.",
+"size": "HX5: записей нет · рабочая база: 1 запись, 731 680 байт (примерно 715 КиБ)",
+"note": "Размер определяется графом: он копируется в запись целиком (graphSnapshot). Починка плана (plan-defect, plan-repair) — отдельная задача."
+},
+"fields": [
 {
-"node": "run.a.plan",
-"code": "src/execution/runner.ts:371 (Executor.run); src/execution/runner.ts:35 (planCurrentGuards); src/compiler/compiler.ts:89 (Compiler.read)",
+"path": "projectId",
+"type": "string",
+"iface": false,
+"what": "проект",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "version",
+"type": "1|2",
+"iface": false,
+"what": "версия правил записи (OM — только 2)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "derivation",
+"type": "\"external-inputs/v1\"",
+"iface": false,
+"what": "правило вывода (внешние входы); задаёт форму адреса плана",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "taskContextContract",
+"type": "\"omg-task-context/v2\"|\"omg-task-context/v3\" (необязательно)",
+"iface": false,
+"what": "версия контекста задачи, измеренная в G5 и перенесённая через M8; в рабочей базе не встречается",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "feasibility",
+"type": "Ref",
+"iface": true,
+"what": "Точная запись M8, на которой стоит план.",
+"writer": "Компилятор (om.c.compiler): берёт ссылку из принятой стадии OM-G2.",
+"readers": "Приёмка компиляции (om.c.accept) сверяет с M8 при завершении прохода; исполнение (run.a.plan) читает M8 по ней и проверяет основание; контекст задач (run.t.ctx) берёт источники.",
+"expects": "Ссылка из содержимого принятой стадии om-g2 и точной записи om-feasibility:<проект>; готовность и репозиторий в ней равны базе плана.",
+"risks": "Расхождение — plan_basis_foreign; без M8-ссылки план не создаётся (om_not_ready)."
+},
+{
+"path": "stage",
+"type": "Ref",
+"iface": true,
+"what": "Принятая стадия OM-G2, на которой стоит план.",
+"writer": "Компилятор (om.c.compiler): ссылка на stage:<проект>:om-g2.",
+"readers": "Проверка основания при чтении плана (om.c.compiler); допуск исполнения (run.a.plan).",
+"expects": "Стадия принята, проект тот же, содержимое равно {feasibility: ссылка плана}.",
+"risks": "Иная или не принятая стадия — plan_basis_foreign."
+},
+{
+"path": "base",
+"type": "{root, head, tree, files}",
+"iface": true,
+"what": "База репозитория, на которой план составлен: коммит и дерево, с которых начнётся исполнение.",
+"writer": "Компилятор (om.c.compiler): копирует repository из M8.",
+"readers": "Рабочая копия исполнения создаётся на этом коммите (run.a.wt); родитель первой задачи — head (run.f.next).",
+"expects": "Равна repository записи M8 и плану; head доступен в репозитории.",
+"risks": "Иная база — plan_basis_foreign; рабочая копия не на базе — worktree-отказы исполнения."
+},
+{
+"path": "tasks",
+"type": "CompiledTask[]",
+"iface": true,
+"what": "Задачи плана в топологическом порядке: узел, исход, пути записи и чтения, тесты, входы-квитанции, обязательства, права записи.",
+"writer": "Развёртка работ в задачи (om.c.derive).",
+"readers": "Run задачи берёт следующий элемент (run.t.run); входы и права считаются по ним (run.t.inputs); контекст задачи собирается из задачи и графа (run.t.ctx); исполнение проверяет обязательства задач (run.a.plan).",
+"expects": "Задачи при каждом чтении выводятся заново из графа, M8 и правил и равны сохранённым; у задач с обязательствами — ровно выведенное из handoff M8 множество.",
+"risks": "Ручная правка или иной вывод — plan_derivation_mismatch; вход не закрыт — plan_input_invalid."
+},
+{
+"path": "guards",
+"type": "Ref[]",
+"iface": true,
+"what": "Охранные ссылки: всё, от чего план зависит и что изменится — при изменении план устаревает.",
+"writer": "Компилятор (om.c.compiler): стадия, М8, граф, среда и доказательства вывода.",
+"readers": "Ворота компиляции (om.c.accept): любая изменившаяся запись — plan_stale; исполнение сверяет прогресс по тем же ссылкам (run.a.plan).",
+"expects": "Содержат стадию, M8, граф, среду, доказательства стадии; каждая ссылка в голове совпадает с хэшем.",
+"risks": "Изменившаяся запись — plan_stale (исполнение останавливается до пересборки)."
+},
+{
+"path": "graphSnapshot",
+"type": "Graph",
+"iface": true,
+"what": "Копия графа (узлы, артефакты, договоры, связи, тесты, joins, anchors, обязательства) на момент компиляции.",
+"writer": "Компилятор (om.c.compiler).",
+"readers": "Контекст задачи и подробности читают из неё (run.t.ctx); перепроверка вывода при чтении плана (om.c.compiler).",
+"expects": "Равна графу, на который ссылается plan.graph (хэш и содержимое).",
+"risks": "Иной граф — plan_foreign."
+},
+{
+"path": "graph",
+"type": "Ref",
+"iface": false,
+"what": "точная версия графа",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "environment",
+"type": "Ref",
+"iface": false,
+"what": "точная версия среды (полная проверка, ёмкость запроса)",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+},
+{
+"path": "hash",
+"type": "string",
+"iface": false,
+"what": "хэш тела плана; входит в адрес",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.c.plan",
+"code": "src/compiler/compiler.ts:83 (Compiler.compile)",
+"when": "Компиляция: план и указатель current-plan пишутся одной сделкой, если такого плана ещё нет; точный повтор находит старый",
 "fields": [
 "вся запись"
 ],
-"expects": "Точная версия плана (id, версия, хэш) и его основание перечитываются при каждом запуске (plan_foreign, plan_stale)",
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.c.compiler",
+"code": "src/compiler/compiler.ts:57 (Compiler.compile); src/compiler/compiler.ts:89 (Compiler.read)",
+"fields": [
+"вся запись"
+],
+"expects": "Повторная компиляция находит существующий план; чтение плана проверяет основание, хэш, граф и пересчёт задач",
+"sure": true
+},
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:245 (StageChecks.validateStage); src/compiler/compiler.ts:150 (Compiler.gate); src/om/run.ts:2299 (completion)",
+"fields": [
+"feasibility",
+"guards",
+"tasks"
+],
+"expects": "Приёмка стадии compilation: ворота читают план и сверяют основание и охранные записи; конец прохода сверяет, что план стоит на этом M8",
+"sure": true
+},
+{
+"node": "run.a.start",
+"code": "src/execution/runner.ts:371 (Executor.run)",
+"fields": [
+"вся запись"
+],
+"expects": "Исполнение берёт план по явной ссылке команды, проверяет проект, хэш и ревизию и принятую стадию compilation",
+"sure": true
+},
+{
+"node": "run.a.plan",
+"code": "src/execution/runner.ts:35 (planCurrentGuards); src/execution/runner.ts:371 (Executor.run); src/compiler/compiler.ts:89 (Compiler.read)",
+"fields": [
+"base",
+"feasibility",
+"guards",
+"вся запись"
+],
+"expects": "Актуальность основания плана: до корня исполнения — ворота компилятора, после — прогресс собственных коммитов; изменившаяся запись — plan_stale",
+"sure": true
+},
+{
+"node": "run.a.wt",
+"code": "src/execution/runner.ts:380 (Executor.run)",
+"fields": [
+"base",
+"environment"
+],
+"expects": "Рабочая копия создаётся на базе плана; родитель первой задачи — head базы",
+"sure": true
+},
+{
+"node": "run.t.run",
+"code": "src/execution/runner.ts:384 (Executor.run)",
+"fields": [
+"tasks",
+"hash"
+],
+"expects": "Цикл идёт по задачам плана в топологическом порядке; уже принятые run считаются звеньями точной цепи",
+"sure": true
+},
+{
+"node": "run.t.inputs",
+"code": "src/compiler/inputs.ts:148 (resolveArtifact)",
+"fields": [
+"вся запись"
+],
+"expects": "Квитанция входа должна быть выдана задачей того же плана: план находится по ссылке квитанции",
 "sure": true
 },
 {
 "node": "run.t.ctx",
-"code": "src/compiler/context.ts:124 (loadTaskContextSources)",
+"code": "src/compiler/context.ts:124 (loadTaskContextSources); src/compiler/compiler.ts:188 (Compiler.#contextPlan)",
+"fields": [
+"environment",
+"graphSnapshot",
+"taskContextContract",
+"tasks",
+"вся запись"
+],
+"expects": "Контекст задачи собирается из задачи плана и снимка графа; нужна принадлежность задачи плану и точная среда",
+"sure": true
+},
+{
+"node": "run.s.recover",
+"code": "src/execution/recovery.ts:16 (recoverCommits)",
 "fields": [
 "вся запись"
 ],
-"expects": "Контекст собирается из точной сохранённой версии плана; расхождение с переданным — отказ",
+"expects": "Восстановление коммитов читает план, к которому относится run, прежде чем довести commit_pending",
 "sure": true
+},
+{
+"node": "run.s.park",
+"code": "src/execution/park.ts:29 (parkCandidate)",
+"fields": [
+"вся запись"
+],
+"expects": "Парковка кандидата читает план своего run",
+"sure": true
+},
+{
+"node": "run",
+"code": "src/ownership/writer-index.ts:54 (writerSource); src/ownership/owners.ts:28 (writerSource)",
+"fields": [
+"tasks",
+"feasibility"
+],
+"expects": "Индекс писателей путей доказывает, что писавший run принадлежит задаче этого плана и что эпоха плана выбирает формат индекса (вывод: через слой владения)",
+"sure": false
 },
 {
 "node": "run.c.gates",
@@ -42811,24 +43234,6 @@
 "sure": true
 },
 {
-"node": "run.s.recover",
-"code": "src/execution/recovery.ts:16 (recoverCommits)",
-"fields": [
-"вся запись"
-],
-"expects": "Восстановление использует точный план намерения (recovery_basis_foreign иначе)",
-"sure": true
-},
-{
-"node": "run.s.park",
-"code": "src/execution/park.ts:29 (parkCandidate)",
-"fields": [
-"вся запись"
-],
-"expects": "Кандидату нужен его точный исходный план (repair_plan_foreign иначе)",
-"sure": true
-},
-{
 "node": "run.phase.ctx",
 "code": "src/compiler/context.ts:124 (loadTaskContextSources)",
 "fields": [
@@ -42848,6 +43253,78 @@
 }
 ]
 },
+{
+"kind": "current-plan",
+"group": "om",
+"idPattern": "current-plan:<проект>",
+"proposed": false,
+"card": {
+"what": "Указатель на актуальный машинный план проекта: ссылка {id, revision, hash} на последнюю запись plan.",
+"where": "Таблица revisions · вид «current-plan» · id current-plan:<проект>",
+"when": "Пишется компилятором в той же сделке, что и новый план: новая ревизия указателя с проверкой предыдущей; если план не изменился, указатель не пишется. В рабочей базе одна запись (193 Б).",
+"why": "Окну продукта и повторной компиляции нужен ответ «какой план текущий» без перебора планов.",
+"expects": "id и hash указывают на существующий план того же проекта; ревизия указателя совпадает с ожиданием (сравнение с головой при записи).",
+"risks": "Кто-то записал указатель раньше — конфликт ревизий в сделке (plan_stale при перепроверке допуска). Исполнение указатель не читает: оно берёт план по явной ссылке команды.",
+"size": "HX5: записей нет · рабочая база: 1 запись, 193 Б",
+"note": "Единственный читатель в блоках схемы — сам компилятор; проекция продукта (product/engine.ts, projection) показывает указатель окну и блоком не считается."
+},
+"fields": [
+{
+"path": "id",
+"type": "string «plan:<проект>:external-inputs-v1:<хэш>»",
+"iface": true,
+"what": "Адрес плана, на который указывает указатель.",
+"writer": "Компиляция (om.c.plan): в одной сделке с самим планом.",
+"readers": "Повторная компиляция берёт текущую ревизию указателя как ожидаемую для следующей записи (om.c.plan).",
+"expects": "Равен адресу плана, записанного той же сделкой.",
+"risks": "Указатель на несуществующий план — нарушение атомарности записи."
+},
+{
+"path": "hash",
+"type": "string (hex 64)",
+"iface": true,
+"what": "Хэш записи плана; вместе с id и revision образует точную ссылку.",
+"writer": "Компиляция (om.c.plan).",
+"readers": "Окно продукта показывает текущий план и результат его ворот (проекция); повторная компиляция сверяет (om.c.plan).",
+"expects": "Равен хэшу записи плана.",
+"risks": "Расхождение с планом — указатель не принимается как текущий."
+},
+{
+"path": "revision",
+"type": "number",
+"iface": false,
+"what": "ревизия записи плана, обычно 1",
+"writer": "",
+"readers": "",
+"expects": "",
+"risks": ""
+}
+],
+"writers": [
+{
+"node": "om.c.plan",
+"code": "src/compiler/compiler.ts:84 (Compiler.compile)",
+"when": "Компиляция: указатель пишется одной сделкой с планом; ожидаемая ревизия — голова указателя",
+"fields": [
+"вся запись"
+],
+"sure": true
+}
+],
+"readers": [
+{
+"node": "om.c.plan",
+"code": "src/compiler/compiler.ts:81 (Compiler.compile)",
+"fields": [
+"вся запись"
+],
+"expects": "Компилятор читает голову указателя, чтобы записать новую ревизию с проверкой",
+"sure": true
+}
+]
+}
+],
+"pending": [
 {
 "kind": "repo-inventory",
 "writers": [],
@@ -43092,6 +43569,186 @@
 "claim"
 ],
 "expects": "Повтор оплаченной сборки берёт источник только из закрытия, чья причина передаёт результаты (замена B1 области или отказ G5 группы); закрытие обязано стоять на своей работе",
+"sure": false
+}
+]
+},
+{
+"kind": "om-analysis-admission",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"intent",
+"series",
+"pointer",
+"activation"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1: её адрес входит в перечень производителей B1 (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-analysis-intent",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"request.series",
+"request.hold",
+"sources",
+"report.guards",
+"call"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам series, hold, journal, holds, guards и адресам вызова, а также по владельцу M5 (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-completion-close",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"binding",
+"work",
+"series",
+"ledger",
+"journal",
+"claim",
+"waiting"
+],
+"expects": "Приёмка компиляции признаёт запись рождённой от B1 по ссылкам binding, work, series, ledger, journal, claim, waiting (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-input-fix",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"input"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её ссылка input указывает на адрес B1 (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-origin-analysis",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"basis",
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её основания указывают на источники B1 или владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-origin-decision",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-origin-hold",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"series",
+"lift"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если ссылки series или lift.record указывают на адреса B1 (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-owner-decision",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-series-applied",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"project"
+],
+"expects": "Проверка эры считает пространство om-series-applied рождённым от B1: стадии нового маршрута принимают его, а не старые записи (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-series-current",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"project"
+],
+"expects": "Адрес om-series-current:<проект> — фиксированный адрес «рождённого от B1»: стадии нового маршрута принимают проект, у которого он есть (поиск происхождения B1 при отсутствии om-input:1)",
+"sure": false
+}
+]
+},
+{
+"kind": "om-stop-review",
+"writers": [],
+"readers": [
+{
+"node": "om.c.accept",
+"code": "src/product/stage-checks.ts:443 (StageChecks.omProject); src/product/stage-checks.ts:448 (StageChecks.omProject)",
+"fields": [
+"owner"
+],
+"expects": "Проверка эры считает запись рождённой от B1, если её владелец — механизм M5:addressing (поиск происхождения B1 при отсутствии om-input:1)",
 "sure": false
 }
 ]
