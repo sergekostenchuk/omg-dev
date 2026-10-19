@@ -14,7 +14,7 @@ import { probeProcessIdentity } from "../src/runtime/process-identity.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../src/storage/store.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { configureDispatch } from "../src/om/dispatch.js";
-import { writeOmInput } from "../src/om/input.js";
+import { writeOmInput, type OmInputRecord } from "../src/om/input.js";
 import type { OmModelCall } from "../src/om/model-call.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
@@ -26,10 +26,9 @@ import { acquireRunExecution, readRunControl, releaseRunExecution, runControlId,
   type RunExecution } from "../src/om/run-control.js";
 import { continuePass, readPass, resumeStoppedPass, startPass, stopPass, type PassOutcome } from "../src/om/run-driver.js";
 import { advanceRun, readRun, runId, startRun, type RunRecord, type RunRequest } from "../src/om/run.js";
-import { gardenGraph } from "./om-fixture.js";
+import { gardenGraph, prepareOmFixtureStages, prepareNativeLayers } from "./om-fixture.js";
 import { omStartReadiness, readEnvironmentReadiness } from "../src/om/environment-readiness.js";
 import { Environments, type Environment } from "../src/runtime/environment.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
 const project = "garden";
@@ -46,7 +45,7 @@ function refusal<T>(result: OmResult<T>): Refusal { if (result.ok) assert.fail("
 const snapshot = (store: Store): Ref[] => store.list().map(reference);
 
 /**
- * A real OM project as the pass meets it: prepared stages with one open addressing question, refined layers, an
+ * A real OM project as the pass meets it: prepared stages with one open addressing question, optional accepted OM layers, an
  * environment whose roles run the scripted adapter, and the dispatch configured by E4.1. A cold project has no OM
  * record at all; otherwise B1 exists with every other decision addressed.
  */
@@ -64,7 +63,8 @@ function driverFixture(t: TestContext, cold = false, questions = ["encoding"], r
   if (mode === "git" || mode === "nested") commitAll(repository);
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  preparedFeatures(engine, project, gardenGraph(), field => {
+  const desired = gardenGraph();
+  prepareOmFixtureStages(engine, project, desired, field => {
     const value = preparedField(project, field);
     if (field === "preparation" && questions.length) (value as Record<string, Json>).unknowns = questions.map(id => ({ id, question: `Which ${id} is supported?`,
       consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false, resolution: "Address this question during OM" }));
@@ -77,10 +77,14 @@ function driverFixture(t: TestContext, cold = false, questions = ["encoding"], r
     reviewer: { actor: "run-reviewer", model: "fixture-reviewer", effort: "medium", command },
     fullCheck: env.fullCheck ?? { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000,
     ...(env.capacity === false ? {} : { requestCapacityChars: 100_000 }) }, 0);
-  if (refine) refinedLayers(engine, project);
+  // Cold/readiness scenarios must retain a genuinely absent B1 and the actual incomplete environment.
+  // A warm ready project has both OM layers accepted, so its open M5 is the only remaining model work.
+  if (refine && !cold && mode === "git" && env.capacity !== false && env.dispatch !== false)
+    prepareNativeLayers(engine, project, desired, "executed");
   if (!cold) {
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-    const graph = reference(store.get(`graph:${project}`)!), base = ok(writeOmInput(store, { project, expected: 0, stages }));
+    const graph = reference(store.get(`graph:${project}`)!), base = store.get<OmInputRecord>(`om-input:${project}`)
+      ?? ok(writeOmInput(store, { project, expected: 0, stages }));
     const decisions = base.value.gaps.filter(gap => gap.code !== "inventory_missing" && gap.code !== "question_unaddressed").map(gap => {
       const field = gap.code === "contract_node_unbound" ? "nodes" : gap.code === "acceptance_kind_missing" ? "checkKind" : "state";
       const value: Json = field === "nodes" ? ["garden-produce-block", "garden-consume-block"] : field === "checkKind" ? "test"
@@ -468,7 +472,7 @@ test(`ENV1 a ${repo} workspace: the research runners stand, the status names the
   assert.equal(f.sent().length, 0, "Nothing is sent");
   if (repo === "none") { git(f.repository, ["init", "-b", "main"]); commitAll(f.repository); }
   else if (repo === "no-head") commitAll(f.repository);
-  // Selecting another folder would invalidate the refined layers made on this workspace; the operator makes it a root.
+  // Repair this same workspace into a real root; do not substitute a different prepared repository.
   else { git(f.workspace, ["init", "-b", "main"]); commitAll(f.workspace); }
   assert.equal(conditionOf(f.store, "repository").state, "available");
   assert.equal((await heldStart(f, "fixed")).end, "stopped");

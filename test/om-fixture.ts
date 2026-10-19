@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
-import { canonical, hashJson, type Json } from "../src/canonical.js";
+import { canonical, canonicalSorted, hashJson, type Json } from "../src/canonical.js";
 import { receiptId, type ArtifactReceipt, type MachinePlan } from "../src/compiler/model.js";
 import { EngineError } from "../src/errors.js";
 import type { Graph, Node } from "../src/graph/model.js";
@@ -316,7 +316,7 @@ export function acceptNativeWorks(engine: ProductEngine, project: string, operat
   const store = engine.store;
   const gaps = take(writeGaps(store, { project, input: reference(store.get(`om-input:${project}`)!),
     graph: works.frame.graph, horizon: works.frame.horizon, operations, works: obligations ? { ...works, proposals: [] } : works }));
-  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: canonicalSorted(gaps.records.map(reference)) };
   const previous = store.get<GapLinesRecord>(gapLinesId(project));
   const lines = take(writeGapLines(store, { project, previous: previous ? reference(previous) : null,
     pass: (previous?.value.request.pass ?? 0) + 1, gaps: gapRead, closures: [] }));
