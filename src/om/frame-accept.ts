@@ -92,6 +92,7 @@ export function readAcceptedFrame(store: Store, request: AcceptedFrameRequest): 
     const frame = exact<OmAcceptedFrame>(store, request.frame, `om-frame:${request.project}:${request.level}`, 'connection-frame');
     if (!object(frame.value.acceptance) || !isRef(frame.value.acceptance.candidate))
       fail('frame_acceptance_invalid', request.frame.id, 'acceptance', 'A rebase cannot substitute for an actual candidate acceptance');
+    requireCurrentAcceptance(frame);
     const graph = exact<Graph>(store, request.graph, `graph:${request.project}`, 'graph');
     const layer = exact<LayerBasis>(store, request.layer, `graph-layer:${request.project}:${request.level}`, 'graph-layer');
     if (!same(request.graph, frame.value.acceptance.graph))
@@ -106,13 +107,24 @@ function acceptedSettlement(store: Store, found: { graph: Revision<Graph>; layer
   const proposals = candidate.value.proposals.map(ref => store.get<LayerProposal>(ref.id, ref.revision + 1)!);
   return { state: 'accepted', graph, layer, frame, proposals };
 }
+function requireSavedBinding(value: Record<string, unknown>, target: string, field: string): void {
+  if (!Object.hasOwn(value, 'binding') || value.binding !== null && !isFrameAttemptBinding(value.binding))
+    fail('frame_acceptance_invalid', target, field, 'The saved event requires an explicit null or exact attempt binding');
+}
+function requireCurrentAcceptance(frame: Revision<OmAcceptedFrame>): void {
+  const acceptance = frame.value.acceptance;
+  if (!object(acceptance) || acceptance.contract !== FRAME_ACCEPTANCE_CONTRACT)
+    fail('frame_acceptance_invalid', frame.id, 'acceptance.contract', 'The accepting event requires the current acceptance contract');
+  requireSavedBinding(acceptance, frame.id, 'acceptance.binding');
+}
 function priorAcceptance(store: Store, request: SettleCandidateRequest): Settlement | null {
   for (const row of store.history<OmAcceptedFrame>(`om-frame:${request.project}:${request.level}`)) {
     if (!object(row.value) || !object(row.value.acceptance) || !same(row.value.acceptance.candidate ?? null, request.candidate)) continue;
+    requireCurrentAcceptance(row);
     if (!isRef(row.value.acceptance.graph))
       fail('frame_acceptance_invalid', row.id, 'acceptance.graph', 'The accepting event must name its exact result graph');
     const found = take(readAcceptedFrameLayer(store, { project: request.project, level: request.level, frame: reference(row) }));
-    if (!same(found.frame.value.acceptance.binding ?? null, request.binding ?? null))
+    if (!same(found.frame.value.acceptance.binding, request.binding ?? null))
       fail('frame_acceptance_invalid', row.id, 'acceptance.binding', 'An accepted candidate cannot be assigned to a different attempt or obligation set');
     return acceptedSettlement(store, found as unknown as Parameters<typeof acceptedSettlement>[1]);
   }
@@ -202,6 +214,7 @@ export function readRejectedCandidate(store: Store, request: SettleCandidateRequ
       || !isRef(row.value.journal) || row.value.journal.id !== journalId(request.project)
       || row.value.previousJournal !== null && (!isRef(row.value.previousJournal) || row.value.previousJournal.id !== journalId(request.project)))
       fail('frame_acceptance_invalid', id, 'rejection', 'The failed gate needs its exact complete rejection event');
+    requireSavedBinding(row.value as unknown as Record<string, unknown>, row.id, 'binding');
     const diagnostic = exact<UnitRefusalRecord>(store, reference(derived.diagnostic), derived.diagnostic.id, UNIT_REFUSAL_KIND);
     if (!same(diagnostic, derived.diagnostic)) fail('frame_acceptance_invalid', diagnostic.id, 'refusals', 'Diagnostics must retain every original G5 finding');
     const proposals = derived.proposalWrites.map(write => {
@@ -217,7 +230,7 @@ export function readRejectedCandidate(store: Store, request: SettleCandidateRequ
     const expectedJournal = journalWrite ? proposedRevision<RefusalJournal>(journalWrite) : previous;
     // The accepting binding is an input of the settlement: a reader that names one must meet it; one that does not reads
     // the saved one, which the rest of the event still has to reproduce.
-    const binding = request.binding === undefined ? (row.value.binding ?? null) : request.binding ?? null;
+    const binding = request.binding === undefined ? row.value.binding : request.binding ?? null;
     if (!same(journal, expectedJournal) || !same(row.value, rejectionBody({ ...request, binding }, reference(diagnostic),
       previous ? reference(previous) : null, reference(journal), proposals.map(reference))))
       fail('frame_acceptance_invalid', row.id, 'journal', 'The rejection must retain its complete journalled finding set and proposal transitions');
@@ -244,6 +257,7 @@ export function readWorkRejectionAt(store: Store, request: { project: string; re
     const saved = exact<WorkRejectionRecord>(store, request.record, request.record.id, 'om-work-rejection');
     if (!object(saved.value) || !isRef(saved.value.candidate) || !isRef(saved.value.gate))
       fail('frame_acceptance_invalid', saved.id, 'rejection', 'A work rejection names its exact candidate and G5 gate');
+    requireSavedBinding(saved.value as unknown as Record<string, unknown>, saved.id, 'binding');
     const read = rejectionOf(store, request.project, saved.value.candidate, saved.value.gate);
     if (!same(read.record, request.record)) fail('frame_acceptance_invalid', saved.id, 'rejection', 'The rejection is the one of its candidate and gate');
     return read;
@@ -255,7 +269,7 @@ function rejectionOf(store: Store, project: string, candidate: Ref, gateRef: Ref
   const rejected = take(readRejectedCandidate(store, settle));
   const row = store.get<WorkRejectionRecord>(workRejectionId(normalizeOutcome(settle)), 1)!;
   return { record: reference(row), diagnostic: row.value.diagnostic, journal: row.value.journal, proposals: rejected.proposals.map(reference),
-    binding: row.value.binding ?? null, results: (gate.value.request as unknown as { results: { kind: string; record: Ref }[] }).results };
+    binding: row.value.binding, results: (gate.value.request as unknown as { results: { kind: string; record: Ref }[] }).results };
 }
 function requireAtomicOutcome(request: SettleCandidateRequest, candidate: Revision<FrameCandidateRecord>, atomic: Revision<AtomicGateRecord>): void {
   if (candidate.value.works?.contract !== WORKS_FRAME_CONTRACT || candidate.value.level !== 3
@@ -482,7 +496,7 @@ export function prepareRejectProposals(store: Store, request: ProposalRequest): 
       && row.value.verdict.kind === 'assembly-refusal' && !object(row.value.verdict.request))
       fail('proposal_rejection_invalid', row.id, 'verdict.request', 'The recorded refusal must retain its complete source request');
     if (previous.some(row => object(row?.value) && object(row.value.verdict)
-      && row.value.verdict.kind === 'assembly-refusal' && same(row.value.verdict.request ?? null, request))) {
+      && row.value.verdict.kind === 'assembly-refusal' && same(row.value.verdict.request, request))) {
       if (previous.some(row => !row)) fail('proposal_rejection_invalid', 'proposals', 'set', 'A prior rejection lost part of its atomic source set');
       const replay = take(readRejectedProposals(store, { request, proposals: previous.map(row => reference(row!)) }));
       return { result: { ...replay, state: 'unchanged' }, writes: [], guards: [] };
@@ -544,11 +558,12 @@ export function prepareRebaseFrame(store: Store, request: RebaseFrameRequest): O
     if (from.project !== to.project || !from.frame || !from.layer || to.frame !== null || to.layer !== null)
       fail('frame_acceptance_invalid', from.project, 'rebase', 'Rebase needs one exact old work frame and a fresh upper-basis request');
     const saved = store.get<OmRebasedFrame>(from.frame.id, from.frame.revision + 1);
-    // A completed transition is compared in its recorded era before normalizing any new work.
-    const replay = saved && object(saved.value) && object(saved.value.rebase)
-      && object(saved.value.rebase.to) && Object.hasOwn(saved.value.rebase.to, 'workZoneContract')
-      ? { from, to: currentFrameRequest(to) } : request;
-    if (saved && object(saved.value) && same(saved.value.rebase ?? null, replay)) {
+    to = currentFrameRequest(to);
+    request = { from, to };
+    if (saved && object(saved.value) && object(saved.value.rebase)
+      && (!object(saved.value.rebase.to) || saved.value.rebase.to.workZoneContract !== 'accepted-l2-v1'))
+      fail('frame_acceptance_invalid', saved.id, 'rebase.to.workZoneContract', 'A saved rebase must name the accepted operation work zone');
+    if (saved && object(saved.value) && same(saved.value.rebase ?? null, request)) {
       const layer = store.get<LayerBasis>(from.layer.id, from.layer.revision + 1);
       if (!layer || !object(layer.value) || !object(layer.value.acceptance) || !isRef(layer.value.acceptance.frame)
         || !same(layer.value.acceptance.frame, reference(saved)))
@@ -556,8 +571,6 @@ export function prepareRebaseFrame(store: Store, request: RebaseFrameRequest): O
       take(readLayerAcceptance(store, { project: from.project, level: 3, graph: to.graph, layer: reference(layer) }));
       return { result: rebaseResult(saved, layer, 'unchanged'), writes: [], guards: [] };
     }
-    to = currentFrameRequest(to);
-    request = { from, to };
     const basis = take(prepareRebaseBasis(store, request));
     for (const ref of [to.graph, to.horizon, from.layer, from.frame, ...basis.currentReferences]) current(store, ref);
     const guards: TransactionGuard[] = [...basis.currentReferences, to.graph, to.horizon, from.layer, from.frame];

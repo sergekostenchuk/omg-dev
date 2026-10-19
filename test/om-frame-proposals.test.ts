@@ -80,6 +80,13 @@ function proposalFor(frame: FrameRead, graph: Graph, id = "one"): ProposalObserv
     tests: clone(projected.tests), edges: clone(projected.edges ?? []), journeys: clone(projected.journeys ?? []),
     packets: clone(projected.packets ?? []), transfers: clone(projected.transfers ?? []), anchors: clone(projected.anchors),
     removes: [], replaces: [], redefines: [] };
+  if (level === 3) {
+    value.worksContract = WORKS_FRAME_CONTRACT;
+    for (const node of value.nodes) if (node.ports.length && !node.code.length)
+      node.code = [{ path: `${node.id}.ts`, access: "write", status: "planned" }];
+    for (const fill of value.fills) if (fill.port !== undefined)
+      fill.codeRef = clone(value.nodes.find(node => node.id === fill.node)!.code[0]!);
+  }
   return observe(value, id);
 }
 function observe(value: LayerProposal, id = "one"): ProposalObservation {
@@ -87,18 +94,20 @@ function observe(value: LayerProposal, id = "one"): ProposalObservation {
 }
 function emptyProposal(frame: FrameRead, id = "empty"): ProposalObservation {
   return observe({ base: { graph: frame.request.graph, frame: frame.request.frame }, level: frame.request.level,
+    ...(frame.request.level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}),
     source: "input", status: "proposed", nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [],
     joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] }, id);
 }
 function acceptedHorizon(store: Store, refinement: Ref | null) {
-  const input = delivered(writeOmInput(store, { project: "garden", expected: 0,
+  const input = delivered(writeOmInput(store, { project: "garden", expected: store.get("om-input:garden")?.revision ?? 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:garden:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   return delivered(writeHorizon(store, { project: "garden", input: reference(input), graph: reference(store.get("graph:garden")!),
     refinement, choice: { choiceVersion: "proposal-choice", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} }));
 }
 function acceptedRequest(f: OmFixture, horizon: Ref, level: FrameLevel): FrameRequest {
   return { project: f.project, level, horizon, graph: reference(f.graphRevision), layer: reference(f.layers[level]),
-    frame: null, upper: level === 2 ? null : { horizon, frame: null } };
+    frame: reference(f.store.get(`om-frame:garden:${level}`)!),
+    upper: level === 2 ? null : { horizon, frame: reference(f.store.get("om-frame:garden:2")!) } };
 }
 function put(store: Store, proposal: ProposalObservation): Ref {
   return reference(store.write({ id: proposal.reference.id, kind: "layer-proposal", expected: 0, value: proposal.value }));
@@ -295,9 +304,10 @@ test("works-frame proposals refuse missing, foreign or inexact code and code on 
 });
 
 test("work proposal contracts reject unknown, null and own-undefined markers and are forbidden on L2", () => {
-  for (const marker of ["works-frame/v2", null, undefined]) {
+  for (const marker of ["absent", "works-frame/v2", null, undefined]) {
     const { frame, proposal } = workProposal(), observation = observe(proposal);
-    (observation.value as unknown as Record<string, unknown>)['worksContract'] = marker;
+    if (marker === 'absent') delete observation.value.worksContract;
+    else (observation.value as unknown as Record<string, unknown>)['worksContract'] = marker;
     assert.equal(refusedAs(applyProposals(frame, [observation]), "proposal_invalid").at.field, "worksContract");
   }
   const graph = gardenGraph(), frame = pureFrame(graph, 2), proposal = proposalFor(frame, graph).value;
@@ -305,8 +315,8 @@ test("work proposal contracts reject unknown, null and own-undefined markers and
   assert.equal(refusedAs(applyProposals(frame, [observe(proposal)]), "proposal_invalid").at.field, "worksContract");
 });
 
-test("legacy proposal outputs remain unchanged and never acquire endpoint code references", () => {
-  for (const level of levels) {
+test("L2 proposal outputs remain unchanged and never acquire work endpoint code references", () => {
+  for (const level of [2] as const) {
     const graph = gardenGraph("cross"), frame = pureFrame(graph, level), proposal = proposalFor(frame, graph);
     const first = delivered(applyProposals(frame, [proposal])), before = hashJson(first);
     assert.ok(first.fills.every(fill => !Object.hasOwn(fill, "codeRef")));
@@ -450,7 +460,8 @@ test("replacing one accepted consumer retains every other consumer and every flo
     proposal.value.removes = [oldId];
     const replaced = frame.result.fills.filter(fill => fill.node === oldId);
     proposal.value.fills = replaced.map(fill => ({ obligation: fill.obligation, node: newId,
-      ...(fill.port === undefined ? {} : { port: fill.port }) }));
+      ...(fill.port === undefined ? {} : { port: fill.port,
+        ...(level === 3 ? { codeRef: clone(proposal.value.nodes[0]!.code[0]!) } : {}) }) }));
     proposal.value.replaces = proposal.value.fills.map(fill => ({ obligation: fill.obligation,
       base: { node: oldId, graph: frame.request.graph }, with: { node: fill.node, port: fill.port ?? null }, basis: "Explicit consumer refinement" }));
     const observed = observe(proposal.value, "replacement"), result = delivered(applyProposals(frame, [observed]));
@@ -486,9 +497,11 @@ test("consumer multiplicity is legal but a proposal cannot borrow a node defined
     const obligation = frame.result.obligations.find(item => item.role === "consumer" && item.upper.node.includes("consume"))!;
     const node = graph.nodes.find(item => LEVEL[item.kind] === level && item.parent === obligation.upper.node)!;
     const left = emptyProposal(frame, "a"), right = emptyProposal(frame, "z");
-    left.value.nodes = [clone(node)]; left.value.fills = [{ obligation: obligation.id, node: node.id, port: obligation.upper.port! }];
+    left.value.nodes = [clone(node)]; left.value.fills = [{ obligation: obligation.id, node: node.id, port: obligation.upper.port!,
+      ...(level === 3 ? { codeRef: clone(node.code[0]!) } : {}) }];
     right.value.nodes = [{ ...clone(node), id: `${node.id}-second` }];
-    right.value.fills = [{ obligation: obligation.id, node: right.value.nodes[0]!.id, port: obligation.upper.port! }];
+    right.value.fills = [{ obligation: obligation.id, node: right.value.nodes[0]!.id, port: obligation.upper.port!,
+      ...(level === 3 ? { codeRef: clone(node.code[0]!) } : {}) }];
     const observations = [observe(left.value, "a"), observe(right.value, "z")];
     const result = delivered(applyProposals(frame, observations));
     assert.equal(result.fills.filter(fill => fill.obligation === obligation.id).length, 2);
@@ -554,7 +567,7 @@ test("the first stored assembly returns proposals, gaps and frame-zero CAS witho
 });
 
 test("stored current preparation rejects proposal head drift while exact history and complete snapshots survive reopen", async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const requests: ProposalRequest[] = [];
   const histories = [];
   for (const level of levels) {
@@ -566,7 +579,7 @@ test("stored current preparation rejects proposal head drift while exact history
     histories.push(historical);
     assert.deepEqual(current.result, historical.result);
     assert.deepEqual(current.gaps, []);
-    assert.ok(current.result.fills.every(fill => fill.source === "accepted"));
+    assert.deepEqual(current.result.fills, frame.result.fills);
     assert.deepEqual(current.proposals[0]!.reference, proposalRef);
     assert.deepEqual(revisions(f.store), before);
     const rejected = { ...proposal.value, status: "rejected" as const };
@@ -590,7 +603,7 @@ test("stored current preparation rejects proposal head drift while exact history
 });
 
 test("proposal preparation passes complete guards to one neighbor transaction with no partial candidate or statuses", async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const request = acceptedRequest(f, reference(horizon.gate), 2), frame = clone(delivered(readFrame(f.store, request))) as FrameRead;
   const proposal = emptyProposal(frame, "guarded"), proposalRef = put(f.store, proposal), complete = { frame: request, proposals: [proposalRef] };
   const prepared = delivered(prepareFrameProposals(f.store, complete));
@@ -618,7 +631,7 @@ test("proposal preparation passes complete guards to one neighbor transaction wi
 });
 
 test("stored proposals reject foreign, forged, absent and malformed records and preserve unexpected store failures", async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const frameRequest = acceptedRequest(f, reference(horizon.gate), 2), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
   const proposal = emptyProposal(frame), proposalRef = put(f.store, proposal), request = { frame: frameRequest, proposals: [proposalRef] };
   const malformedValue = clone(proposal.value) as Partial<LayerProposal>; delete malformedValue.joins;

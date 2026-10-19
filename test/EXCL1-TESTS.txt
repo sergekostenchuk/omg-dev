@@ -44,8 +44,6 @@ om-compiler-readers.test.ts :: R3+R4 on a saved legal base the slot reproduces t
 om-feasibility-boundary.test.ts :: G1.1 complete 3e495b1 producer preserves legacy feasibility and plans while M8 v1 is explicitly superseded without rewriting history # вид 1: эра 3e495b1
 om-feasibility-projection.test.ts :: G1.2 the complete 177d0c5 producer retains native projection and assess bytes after restart # вид 1: эра 177d0c5
 om-feasibility.test.ts :: G1 reads unchanged feasibility stages and plan from the complete 2f2721d producer after restart and preserves positive writeGuarded results # вид 1: эра 2f2721d
-om-frame-accept.test.ts :: C5 and layer-basis preserve real 41fcb54 research L3 and rebase producer bytes after restart # вид 1: эра 41fcb54, 41fcb547
-om-frame-accept.test.ts :: C5.1 genuine eb90700 N2/N3 history survives restart while new F5 acceptance binds only its declared work attempt # вид 1: эра eb90700, eb907005
 om-frame-candidate.test.ts :: FJ1 rows 4/9/10/13: b595c7b produces accepted and pending legacy C4, designed identity joins and rebase in a separate process # вид 1: эра b595c7b, b595c7b5
 om-gap-lines.test.ts :: D2, structural identity and G7 preserve real 41fcb54 L2 producer history after restart # вид 1: эра 41fcb54, 41fcb547
 om-gaps.test.ts :: B1.1 the complete 1189043 producer retains v3 stages questions defaults and gap bytes after restart # вид 1: эра 1189043, 1189043f

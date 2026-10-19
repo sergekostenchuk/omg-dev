@@ -32,7 +32,7 @@ export interface FrameObligation {
 export interface NeighborFill {
   obligation: string; node: string; port?: string; codeRef?: CodeRef; source: "accepted" | "identity" | "proposed";
 }
-export interface NeighborFrame { obligations: FrameObligation[]; fills: NeighborFill[] | null }
+export interface NeighborFrame { obligations: FrameObligation[]; fills: NeighborFill[] }
 export interface NeighborSources {
   identity: string[]; receipts: Record<string, Ref>;
   frames: { operations: NeighborFrame; works: NeighborFrame };

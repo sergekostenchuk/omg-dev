@@ -11,7 +11,7 @@ import { Store, type Write } from '../src/storage/store.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { writeCandidate, type CandidateReadRequest, type CandidateRequest } from '../src/om/frame-candidate.js';
 import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.js';
-import { writeGapLines } from '../src/om/gap-lines.js';
+import { gapLinesId, writeGapLines, type GapLinesRecord } from '../src/om/gap-lines.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeOmInput } from '../src/om/input.js';
@@ -33,7 +33,7 @@ import { buildPackets, neighborsOf, prepareNeighbors, readNeighbors, writeNeighb
 import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
-import { createOmFixture } from './om-fixture.js';
+import { createOmFixture, gardenGraph } from './om-fixture.js';
 
 const producer = 'garden-produce-work', consumer = 'garden-consume-work';
 const producerOp = 'garden-produce-operation', consumerOp = 'garden-consume-operation';
@@ -162,10 +162,11 @@ test('accepted correspondence preserves every operation and block address of one
   assert.deepEqual(packet.neighbors.map(row => [row.neighbor.operation.id, row.neighbor.block.id]).sort(),
     [[consumerOp, consumerBlock], [consumerOp, extraBlock], [extraOp, consumerBlock], [extraOp, extraBlock]].sort());
   assert.ok(packet.neighbors.every(row => row.neighbor.work.id === consumer));
-  const missingWorks = clone(options); missingWorks.frames.works.fills = null;
-  denied(neighborsOf(graph, producer, missingWorks), 'neighbor_chain_ambiguous');
-  const missingOperations = clone(options); missingOperations.frames.operations.fills = null;
-  denied(neighborsOf(graph, producer, missingOperations), 'neighbor_chain_ambiguous');
+  for (const name of ['works', 'operations'] as const) {
+    const incomplete = clone(options); Object.assign(incomplete.frames[name], { fills: null });
+    assert.throws(() => neighborsOf(graph, producer, incomplete), (error: unknown) => error instanceof EngineError
+      && error.code === 'neighbor_request_invalid' && (error.details as { field: string }).field === `frames.${name}.fills`);
+  }
 });
 
 test('correspondence cannot claim an upper endpoint which the lower endpoint does not refine', () => {
@@ -675,27 +676,29 @@ test('the data self-pair exception cannot silently erase requires or ownership d
 
 /** Controls are proposed only for the future consumer; the producer's real committed signature stays exact. */
 async function persistedAvailableControls(t: TestContext) {
-  const f = await createOmFixture(t), { store } = f;
-  const input = ok(writeOmInput(store, { project: 'garden', expected: 0,
+  const f = await createOmFixture(t, 'standard', 'garden', { mode: 'executed' }), { store } = f;
+  const input = ok(writeOmInput(store, { project: 'garden', expected: store.get('om-input:garden')!.revision,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
   const receipt = f.receipts['garden-data']!, path = node(f.graph, producer).code.find(code => code.access === 'write')!.path;
   const horizon = ok(writeHorizon(store, { project: 'garden', input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(store.get('phase:garden:L2')!), available: { [producerBlock]: { 'garden-data': reference(receipt) } },
+    refinement: reference(f.layers[2]), available: { [producerBlock]: { 'garden-data': reference(receipt) } },
     choice: { choiceVersion: 'neighbors-controls', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const frame: FrameRequest = { project: 'garden', level: 3, graph: reference(f.graphRevision), horizon: reference(horizon.gate),
-    layer: reference(f.layers[3]), frame: null, upper: { horizon: reference(horizon.gate), frame: null } };
+    layer: reference(f.layers[3]), frame: reference(store.get('om-frame:garden:3')!),
+    upper: { horizon: reference(horizon.gate), frame: reference(store.get('om-frame:garden:2')!) } };
   const current = ok(prepareFrame(store, frame));
-  const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 3, worksContract: 'works-frame/v1',
+  const proposal: LayerProposal = { base: { graph: frame.graph, frame: frame.frame }, level: 3, worksContract: 'works-frame/v1',
     source: 'decision', status: 'proposed', nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [], joins: [],
     tests: [], edges: [{ id: 'neighbors-ready-result', relation: 'requires', source: consumer, target: producer,
       condition: 'Reuse the accepted producer outcome' }], journeys: [], packets: [],
     transfers: [{ id: 'neighbors-ready-writer', from: producer, to: consumer, path, condition: 'producer_committed' }],
     anchors: [], removes: [], replaces: [], redefines: [] };
   const replacement = clone(node(f.graph, consumer)); replacement.code.push(clone(node(f.graph, producer).code[0]!));
-  const outside = clone(node(f.graph, 'w-garden-later-operation'));
+  const outside = clone(node(gardenGraph(), 'w-garden-later-operation'));
   outside.code = [{ path: 'future/garden-later.ts', access: 'write', status: 'planned', symbol: 'consume' }];
   for (const item of [replacement, outside]) {
-    proposal.nodes.push(item); proposal.removes.push(item.id);
+    proposal.nodes.push(item);
+    if (f.graph.nodes.some(existing => existing.id === item.id)) proposal.removes.push(item.id);
     for (const fill of current.result.fills.filter(fill => fill.node === item.id)) {
       proposal.fills.push({ obligation: fill.obligation, node: item.id,
         ...(fill.port === undefined ? {} : { port: fill.port, codeRef: clone(item.code[0]!) }) });
@@ -706,9 +709,11 @@ async function persistedAvailableControls(t: TestContext) {
   const proposed = reference(store.write({ id: 'om-proposal:garden:neighbors-controls', kind: 'layer-proposal', expected: 0, value: proposal }));
   const works: ProposalRequest = { frame: current.request as FrameRequest, proposals: [proposed] };
   const gaps = ok(writeGaps(store, { project: 'garden', input: reference(input), graph: frame.graph, horizon: frame.horizon,
-    operations: { frame: { ...frame, level: 2, layer: reference(f.layers[2]), upper: null }, proposals: [] }, works }));
+    operations: { frame: { ...frame, level: 2, layer: reference(f.layers[2]), frame: frame.upper!.frame, upper: null }, proposals: [] }, works }));
   const gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
-  const lines = ok(writeGapLines(store, { project: 'garden', previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const previousLines = store.get<GapLinesRecord>(gapLinesId('garden'))!;
+  const lines = ok(writeGapLines(store, { project: 'garden', previous: reference(previousLines),
+    pass: previousLines.value.request.pass + 1, gaps: gapRead, closures: [] }));
   const obligations = ok(writeOmObligations(store, { project: 'garden', gaps: gapRead, lines: reference(lines), assignments: [] }));
   const candidate = ok(writeWorksFrame(store, { ...works, works: { contract: 'works-frame/v1',
     producer: reference(obligations.producer), ledger: reference(obligations.record), bindings: [] } }));
@@ -909,8 +914,14 @@ test('flow-specific recorded code references stay distinct for the same consumer
   for (const row of incoming) {
     assert.ok(row.direction === 'reads'); assert.deepEqual(row.codeRef, expectedCode(row.neighbor.port));
   }
-  const historical = clone(options); historical.frames.operations.fills = null;
-  assert.deepEqual(ok(buildPackets(graph, historical)), ok(buildPackets(graph, options)));
+  for (const name of ['operations', 'works'] as const) for (const value of [null, undefined, 'absent']) {
+    const incomplete = clone(options) as unknown as { frames: Record<string, Record<string, unknown>> };
+    if (value === 'absent') delete incomplete.frames[name]!.fills; else incomplete.frames[name]!.fills = value;
+    for (const action of [() => buildPackets(graph, incomplete as unknown as NeighborSources),
+      () => neighborsOf(graph, consumer, incomplete as unknown as NeighborSources)])
+      assert.throws(action, (error: unknown) => error instanceof EngineError && error.code === 'neighbor_request_invalid'
+        && (error.details as { field: string }).field === `frames.${name}.fills`);
+  }
   assert.equal(canonical({ graph, source }), before);
 });
 

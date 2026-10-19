@@ -256,9 +256,9 @@ function requireObservations(value: unknown): asserts value is ProposalObservati
   for (const observation of value) if (!object(observation) || !isRef(observation['reference']) || !Object.hasOwn(observation, 'value')) invalid('proposals.reference');
 }
 function checkWorksContract(proposal: unknown, target: string): void {
-  if (object(proposal) && Object.hasOwn(proposal, 'worksContract')
-    && (proposal['level'] !== 3 || proposal['worksContract'] !== WORKS_FRAME_CONTRACT))
-    reject('proposal_invalid', target, 'worksContract', 'The work proposal contract must be known and apply to L3');
+  if (object(proposal) && (proposal['level'] === 3
+    ? proposal['worksContract'] !== WORKS_FRAME_CONTRACT : Object.hasOwn(proposal, 'worksContract')))
+    reject('proposal_invalid', target, 'worksContract', 'L3 requires the current work proposal contract; L2 carries none');
 }
 function checkProposal(observation: ProposalObservation, frame: FrameRead): void {
   const { reference: ref, value: proposal } = observation;
@@ -281,9 +281,9 @@ function checkProposal(observation: ProposalObservation, frame: FrameRead): void
   }
   const fillShape = (row: unknown) => object(row) && text(row['obligation']) && text(row['node'])
     && (row['port'] === undefined || text(row['port']))
-    && (!Object.hasOwn(row, 'codeRef') || proposal.worksContract === WORKS_FRAME_CONTRACT && proposalShapes().codeShape(row['codeRef']))
-    && (!Object.hasOwn(row, WAKE_TEST.field) || proposal.worksContract === WORKS_FRAME_CONTRACT && text(row[WAKE_TEST.field]))
-    && Object.keys(row).every(key => ['obligation', 'node', 'port', ...(proposal.worksContract === WORKS_FRAME_CONTRACT ? ['codeRef', WAKE_TEST.field] : [])].includes(key));
+    && (!Object.hasOwn(row, 'codeRef') || proposal.level === 3 && proposalShapes().codeShape(row['codeRef']))
+    && (!Object.hasOwn(row, WAKE_TEST.field) || proposal.level === 3 && text(row[WAKE_TEST.field]))
+    && Object.keys(row).every(key => ['obligation', 'node', 'port', ...(proposal.level === 3 ? ['codeRef', WAKE_TEST.field] : [])].includes(key));
   if (!Array.isArray(proposal.fills) || !proposal.fills.every(fillShape)) reject('proposal_invalid', ref.id, 'fills', 'Fills must be explicit complete endpoints');
   for (const field of ['removes', 'redefines'] as const)
     if (!Array.isArray(proposal[field]) || !proposal[field].every(text) || new Set(proposal[field]).size !== proposal[field].length)
@@ -354,7 +354,7 @@ function derive(frame: FrameRead, observations: ProposalObservation[], base: Fil
       if ((!own && !frame.accepted?.graph.nodes.some(item => item.id === row.node))
         || !obligation || !fits(node, row, obligation, frame, relations) || (removed.has(row.node) && !own))
         reject('slot_fill_foreign', row.obligation, 'fill', 'The endpoint must be accepted or defined in this proposal and refine the named upper end');
-      if (proposal.worksContract === WORKS_FRAME_CONTRACT && (obligation.kind === 'connection-end'
+      if (proposal.level === 3 && (obligation.kind === 'connection-end'
         ? !Object.hasOwn(row, 'codeRef') || !node!.code.some(code => same(code, row.codeRef))
         : Object.hasOwn(row, 'codeRef')))
         reject('slot_fill_foreign', row.obligation, 'codeRef', 'A real connection end needs one exact declared code reference; outcome fills carry none');

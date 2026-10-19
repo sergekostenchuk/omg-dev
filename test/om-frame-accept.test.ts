@@ -1,109 +1,58 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import ts from 'typescript';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import { canonical, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
-import type { Question } from '../src/discovery/discovery.js';
-import type { ResearchAssessment } from '../src/discovery/research-model.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { reference, type Ref, type StageArtifact } from '../src/pipeline/contracts.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { Store, type Revision, type Write } from '../src/storage/store.js';
-import { git } from '../src/runtime/environment.js';
-import { withHistoricalReads, writeOmInput } from '../src/om/input.js';
+import { Store, type Write } from '../src/storage/store.js';
+import { writeOmInput } from '../src/om/input.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { WORKS_FRAME_CONTRACT, flowKey, workAnchorId, fillObligations, prepareFrame, readFrame, type ConnectionFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
+import { WORKS_FRAME_CONTRACT, fillObligations, prepareFrame, readFrame, type ConnectionFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import { prepareFrameProposals, readFrameProposals, type LayerProposal, type ProposalRequest } from '../src/om/frame-proposals.js';
 import { prepareCandidate, writeCandidate } from '../src/om/frame-candidate.js';
-import { prepareSettleCandidate, settleCandidate, readAcceptedFrame, readRejectedCandidate, prepareRejectProposals, rejectProposals, readRejectedProposals, type SettleCandidateRequest, type RejectedLayerProposal, type AcceptedFrameRequest, type Settlement } from '../src/om/frame-accept.js';
+import { prepareSettleCandidate, settleCandidate, readAcceptedFrame, readRejectedCandidate, readWorkRejectionAt, prepareRejectProposals, rejectProposals, readRejectedProposals, type SettleCandidateRequest, type RejectedLayerProposal } from '../src/om/frame-accept.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { gardenGraph, createOmFixture, refusedWith, sameButReferences, thrownWith } from './om-fixture.js';
 import { prepareRebaseFrame, rebaseFrame } from '../src/om/frame-accept.js';
-import { buildRebasedLayer, readRebaseBasis, readLayerAcceptance, readAcceptedFrameLayer, type LayerBasis, type OmRebasedFrame } from '../src/om/layer-basis.js';
+import { buildRebasedLayer, readLayerAcceptance, readAcceptedFrameLayer, type LayerBasis, type OmRebasedFrame } from '../src/om/layer-basis.js';
 import { prepareGaps, writeGaps, readGaps, type GapRequest } from '../src/om/gaps.js';
-import { preparedFeatures, refinedLayers } from './product-fixture.js';
+import { preparedFeatures } from './product-fixture.js';
 import { writeAddressing, inputDecisionWrite, type InputDecisionProposal } from '../src/om/addressing.js';
-import { gapLineKey, writeGapLines } from '../src/om/gap-lines.js';
+import { gapLineKey, gapLinesId, writeGapLines, type GapLinesRecord } from '../src/om/gap-lines.js';
 import { writeOmObligations } from '../src/om/obligations.js';
 import { writeNeighbors } from '../src/om/neighbors.js';
 import { prepareWorksAcceptance, writeWorksAcceptance, writeAtomicGate, type WorksAcceptanceRequest } from '../src/om/atomic-gate.js';
 import { readResultIdentity } from '../src/om/result-identity.js';
 import { beginAttempt, completeAttempt, openSeries, readSeries, seriesId, type AttemptGoal } from '../src/om/series.js';
 
-function markedNativeFixture(t: TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-marked-rebase-')), database = join(root, 'state.sqlite'), workspace = join(root, 'workspace');
-  let store = new Store(database);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  mkdirSync(workspace);
-  writeFileSync(join(workspace, 'README.md'), 'A deterministic garden product fixture.\n');
-  git(workspace, ['init', '-b', 'main']);
-  git(workspace, ['add', 'README.md']);
-  git(workspace, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'fixture baseline']);
-  const graph = gardenGraph(), flow = graph.connectors.find(item => item.id === 'garden-flow')!;
-  const sleeping = flow.bindings.find(item => item.level === 3 && item.anchor !== null)!;
-  const anchor = graph.anchors.find(item => item.id === sleeping.anchor)!;
-  anchor.id = workAnchorId(flow.id, flowKey(flow.bindings.find(item => item.level === 2)!), sleeping.producer);
-  sleeping.anchor = anchor.id;
-  const engine = new ProductEngine(store);
-  preparedFeatures(engine, 'garden', graph);
-  const command = { executable: process.execPath, args: ['--version'] };
-  engine.environments.configure('garden', { workspace,
-    implementer: { actor: 'fixture-implementer', model: 'fixture', effort: 'high', command },
-    reviewer: { actor: 'fixture-reviewer', model: 'fixture', effort: 'high', command },
-    fullCheck: command, timeoutMs: 10_000 }, 0);
-  refinedLayers(engine, 'garden');
-  const graphRevision = store.get<Graph>('graph:garden')!;
-  return { root, graph: graphRevision.value, graphRevision,
-    layers: { 2: store.get<LayerBasis>('graph-layer:garden:2')!, 3: store.get<LayerBasis>('graph-layer:garden:3')! },
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, store.get<StageArtifact>(`stage:garden:${stage}`)!])) as Record<UpstreamStage, Revision<StageArtifact>>,
-    get store() { return store; }, reopen() { store.close(); store = new Store(database); } };
-}
-
-async function rebaseFixture(t: TestContext, change: 'port' | 'outcome' = 'port', marked = false) {
-  const f = marked ? markedNativeFixture(t) : await createOmFixture(t), store = f.store;
-  const input = ok(writeOmInput(store, { project: 'garden', expected: 0,
+async function rebaseFixture(t: TestContext, change: 'port' | 'outcome' = 'port') {
+  const f = await createOmFixture(t, 'standard', 'garden', { mode: 'executed' }), store = f.store;
+  const input = ok(writeOmInput(store, { project: 'garden', expected: store.get('om-input:garden')!.revision,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
   const choice = { choiceVersion: 'rebase-test', features: [{ outcome: 'garden-result' }], excluded: [] };
   const horizon = ok(writeHorizon(store, { project: 'garden', input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(store.get('phase:garden:L2')!), choice, available: {} }));
+    refinement: reference(f.layers[2]), choice, available: {} }));
   const operations: FrameRequest = { project: 'garden', level: 2, graph: reference(f.graphRevision),
-    horizon: reference(horizon.gate), layer: reference(f.layers[2]), frame: null, upper: null };
-  const from: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]),
-    upper: { horizon: reference(horizon.gate), frame: null } };
+    horizon: reference(horizon.gate), layer: reference(f.layers[2]), frame: reference(store.get('om-frame:garden:2')!), upper: null };
+  const from: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]), frame: reference(store.get('om-frame:garden:3')!),
+    upper: { horizon: reference(horizon.gate), frame: operations.frame } };
   const original = ok(readFrame(store, from));
-  const oldFrame: ConnectionFrame = { project: 'garden', level: 3, candidateHash: hashJson(f.graph),
-    layerHash: hashJson(projectGraph(f.graph, 3)), fills: structuredClone(original.result.fills) as ConnectionFrame['fills'] };
-  if (marked) {
-    oldFrame.worksContract = WORKS_FRAME_CONTRACT;
-    for (const fill of oldFrame.fills) {
-      const node = f.graph.nodes.find(item => item.id === fill.node)!;
-      if (node.id === 'w-garden-later-operation' || node.id === 'w-garden-refusal-operation') {
-        assert.equal(node.code.length, 0); assert.ok(!f.graph.horizon.includes(node.id));
-        fill.source = 'identity'; fill.basis = original.upperRef;
-      } else if (fill.port !== undefined) {
-        const endpoint = f.graph.connectors.flatMap(item => item.bindings.filter(binding => binding.level === 3))
-          .flatMap(binding => [binding.producer, ...binding.consumers]).find(end => end.node === fill.node && end.port === fill.port)!;
-        assert.ok(endpoint.codeRef); fill.codeRef = structuredClone(endpoint.codeRef);
-      }
-    }
-    oldFrame.fills.sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
-  }
-  from.frame = reference(store.write({ id: 'om-frame:garden:3', kind: 'connection-frame', expected: 0, value: oldFrame }));
+  const oldFrame = store.get<ConnectionFrame>(from.frame!.id, from.frame!.revision)!.value;
   const before = ok(readFrame(store, operations)), connector = structuredClone(f.graph.connectors.find(item => item.id === 'garden-prep-flow')!);
   const binding = connector.bindings.find(item => item.level === 2)!, node = structuredClone(f.graph.nodes.find(item => item.id === binding.producer.node)!);
   const oldPort = binding.producer.port, newPort = change === 'port' ? `${oldPort}-renamed` : oldPort;
   node.ports.find(port => port.id === oldPort)!.id = newPort; binding.producer.port = newPort;
   if (change === 'outcome') node.outcome = 'garden-data';
   const rows = before.result.fills.filter(fill => fill.node === node.id);
-  const proposal: LayerProposal = { base: { graph: operations.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
+  const proposal: LayerProposal = { base: { graph: operations.graph, frame: operations.frame }, level: 2, source: 'decision', status: 'proposed',
     nodes: [node], localConnectors: [connector], artifacts: [], contracts: [], joins: [], tests: [], edges: [], journeys: [],
     packets: [], transfers: [], anchors: [], removes: [node.id], redefines: [connector.id],
     fills: rows.map(fill => ({ obligation: fill.obligation, node: node.id,
@@ -142,7 +91,8 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
     const result = ok(read(f.store, current));
     assert.ok(result.result.open.length > 0);
     assert.ok(result.result.open.every(obligation => !moved.frame.value.fills.some(fill => fill.obligation === obligation.id)));
-    assert.equal(result.result.fills.filter(fill => fill.source === 'accepted').length, moved.carried);
+    assert.equal(result.result.fills.filter(fill => fill.source === 'accepted').length,
+      moved.frame.value.fills.filter(fill => fill.source === 'accepted').length);
   }
   assert.equal(ok(readLayerAcceptance(f.store, { project: 'garden', level: 3, graph: f.to.graph, layer: reference(moved.layer) })).producer, 'om');
   const works = { frame: current, proposals: [] };
@@ -193,7 +143,7 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
 });
 
 test('C5 rebase preserves the explicit works contract and every carried or retired code address after restart', async t => {
-  const f = await rebaseFixture(t, 'port', true), before = snapshot(f.store);
+  const f = await rebaseFixture(t, 'port'), before = snapshot(f.store);
   const prepared = ok(prepareRebaseFrame(f.store, f.request));
   assert.deepEqual(snapshot(f.store), before);
   const moved = ok(rebaseFrame(f.store, f.request));
@@ -698,187 +648,9 @@ test('C5 rejection retains G3 nested findings and distinguishes forbidden N2 pay
 });
 
 
-test('C5 preserves unmarked rebase history and late replay in its saved era', async t => {
-  const f = await rebaseFixture(t), basis = ok(readRebaseBasis(f.store, f.request));
-  assert.ok(!Object.hasOwn(basis.frame.rebase.to, 'workZoneContract'));
-  const frameRef = { id: f.from.frame!.id, revision: f.from.frame!.revision + 1, hash: hashJson(basis.frame) };
-  const layer = buildRebasedLayer({ frame: basis.frame as OmRebasedFrame, reference: frameRef,
-    graph: f.accepted.graph!.value as Graph, upper: f.accepted.layer! as Parameters<typeof buildRebasedLayer>[0]['upper'],
-    previous: f.store.get<LayerBasis>(f.from.layer!.id)! });
-  const written = f.store.writeMany([
-    { id: frameRef.id, kind: 'connection-frame', expected: f.from.frame!.revision, value: basis.frame },
-    { id: f.from.layer!.id, kind: 'graph-layer', expected: f.from.layer!.revision, value: layer },
-  ]);
-  const accepted = { project: 'garden', level: 3 as const, graph: f.to.graph, layer: reference(written[1]!) };
-  assert.equal(ok(readLayerAcceptance(f.store, accepted)).producer, 'om');
-  const graphHead = f.store.get<Graph>('graph:garden')!;
-  f.store.write({ id: graphHead.id, kind: graphHead.kind, expected: graphHead.revision, value: graphHead.value });
-  for (let restart = 0; restart < 2; restart++) {
-    if (restart) f.f.reopen();
-    const store = f.f.store, before = snapshot(store), repeated = ok(rebaseFrame(store, f.request));
-    assert.equal(repeated.state, 'unchanged');
-    assert.deepEqual(repeated.frame.value.rebase, f.request);
-    assert.equal(ok(readLayerAcceptance(store, accepted)).producer, 'om');
-    assert.deepEqual(snapshot(store), before);
-  }
-});
-
-async function producePreF5AcceptanceHistory() {
-  const { createOmFixture } = await import('./om-fixture.js');
-  const { canonical, hashJson } = await import('../src/canonical.js');
-  const { projectGraph } = await import('../src/graph/project.js');
-  const { reference } = await import('../src/pipeline/contracts.js');
-  const { UPSTREAM_STAGES } = await import('../src/discovery/requirements.js');
-  const { writeOmInput } = await import('../src/om/input.js');
-  const { writeHorizon } = await import('../src/om/horizon.js');
-  const { readFrame } = await import('../src/om/frame-obligations.js');
-  const { writeCandidate } = await import('../src/om/frame-candidate.js');
-  const { settleCandidate, readAcceptedFrame, rebaseFrame } = await import('../src/om/frame-accept.js');
-  const { readLayerAcceptance, readRebaseBasis } = await import('../src/om/layer-basis.js');
-  const { rmSync } = await import('node:fs');
-  const take = <T>(result: OmResult<T>): T => {
-    if (!result.ok) throw new Error(`${result.refusal.code}: ${result.refusal.message}`);
-    return result.value;
-  };
-  const f = await createOmFixture({ after() {} } as unknown as TestContext);
-  let complete = false;
-  try {
-    const store = f.store, project = f.project;
-    const input = take(writeOmInput(store, { project, expected: 0,
-      stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
-    const choice = { choiceVersion: 'pre-f5-native', features: [{ outcome: 'garden-result' }], excluded: [] };
-    const horizon = take(writeHorizon(store, { project, input: reference(input), graph: reference(f.graphRevision),
-      refinement: reference(store.get('phase:garden:L2')!), choice, available: {} }));
-    const operations: FrameRequest = { project, level: 2, graph: reference(f.graphRevision), layer: reference(f.layers[2]),
-      horizon: reference(horizon.gate), frame: null, upper: null };
-    const researchFrame: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]),
-      upper: { horizon: reference(horizon.gate), frame: null } };
-    const research = { project, level: 3 as const, graph: reference(f.graphRevision), layer: reference(f.layers[3]) };
-    const researchBytes = canonical(take(readLayerAcceptance(store, research))), mapped = take(readFrame(store, researchFrame));
-    const researchFrameBytes = canonical(mapped);
-    const oldFrame = store.write({ id: `om-frame:${project}:3`, kind: 'connection-frame', expected: 0, value: {
-      project, level: 3, candidateHash: f.graphRevision.hash, layerHash: hashJson(projectGraph(f.graph, 3)), fills: mapped.result.fills,
-    } });
-    const from = { ...researchFrame, frame: reference(oldFrame) };
-    const written = take(writeCandidate(store, { frame: operations, proposals: [] }));
-    if (written.state !== 'candidate') throw new Error('The old native frame did not yield its operation candidate');
-    const candidate = reference(written.record);
-    const settled = take(settleCandidate(store, { project, level: 2, candidate,
-      outcome: { gate: 'G3', candidate, graphHash: written.record.value.graphHash, passed: true, codes: [] } }));
-    if (!settled.graph || !settled.layer || !settled.frame) throw new Error('The old G3 did not accept its candidate');
-    const accepted = { project, level: 2 as const, graph: reference(settled.graph), layer: reference(settled.layer), frame: reference(settled.frame) };
-    const acceptedBytes = canonical(take(readAcceptedFrame(store, accepted)));
-    const next = take(writeHorizon(store, { project, input: reference(input), graph: accepted.graph, refinement: accepted.layer,
-      choice: { ...choice, choiceVersion: 'pre-f5-rebase' }, available: {} }));
-    const to: FrameRequest = { project, level: 3, graph: accepted.graph, horizon: reference(next.gate), layer: null,
-      frame: null, upper: { horizon: reference(next.gate), frame: accepted.frame } };
-    const request = { from, to }, moved = take(rebaseFrame(store, request));
-    const rebased = { project, level: 3 as const, graph: to.graph, layer: reference(moved.layer) };
-    const rebasedBytes = canonical(take(readLayerAcceptance(store, rebased)));
-    const rebaseBasisBytes = canonical(take(readRebaseBasis(store, moved.frame.value.rebase as { from: FrameRequest; to: FrameRequest })));
-    const rows = [f.graphRevision, f.layers[3], oldFrame, settled.graph, settled.layer, settled.frame, moved.frame, moved.layer]
-      .map(row => ({ reference: reference(row), bytes: canonical(row) }));
-    for (const id of [`graph:${project}`, `source:${project}:brief`, `environment:${project}`]) {
-      const head = store.get(id)!; store.write({ id, kind: head.kind, expected: head.revision, value: head.value });
-    }
-    complete = true;
-    return { root: f.root, database: f.database, research, researchBytes, researchFrame, researchFrameBytes,
-      accepted, acceptedBytes, request, rebased, rebasedBytes, rebaseBasisBytes, frame: moved.frame, layer: moved.layer, rows };
-  } finally {
-    f.store.close();
-    if (!complete) rmSync(f.root, { recursive: true, force: true });
-  }
-}
-
-test('C5 and layer-basis preserve real 41fcb54 research L3 and rebase producer bytes after restart', t => {
-  const root = mkdtempSync(join(tmpdir(), 'omg-c5-era-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(root, 'pre-f5-loader.mjs'), typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', '41fcb54739d861d10b7d7324f77f5978db8d30d8:' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}
-`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const producer = producePreF5AcceptanceHistory.toString()
-    .replace(/import\((["'])\.\.\/src\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
-      `import(${JSON.stringify(new URL(`dist/src/${name}`, repositoryUrl).href)})`)
-    .replace(/import\((["'])\.\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
-      `import(${JSON.stringify(new URL(`dist/test/${name}`, repositoryUrl).href)})`);
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
-    '--input-type=module', '--eval', `process.stdout.write(JSON.stringify(await (${producer})()));`],
-  { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 });
-  const history = JSON.parse(output) as Awaited<ReturnType<typeof producePreF5AcceptanceHistory>>;
-  t.after(() => rmSync(history.root, { recursive: true, force: true }));
-  assert.ok(!Object.hasOwn(history.frame.value, 'worksContract'));
-  for (let restart = 0; restart < 2; restart++) {
-    const store = new Store(history.database);
-    try {
-      const before = snapshot(store);
-      sameButReferences(ok(readLayerAcceptance(store, history.research)), history.researchBytes);
-      sameButReferences(ok(readFrame(store, history.researchFrame)), history.researchFrameBytes);
-      sameButReferences(ok(readAcceptedFrame(store, history.accepted)), history.acceptedBytes);
-      const nativeLayer = store.get<LayerBasis>(history.research.layer.id, history.research.layer.revision)!;
-      const operationProof = nativeLayer.value.layerProofs!.find(proof => proof.level === 2)!;
-      assert.ok(operationProof);
-      const nativeGraph = store.get<Graph>(history.research.graph.id, history.research.graph.revision)!;
-      const product = nativeGraph.value.nodes.find(node => node.kind === 'product')!;
-      const designQuestions = operationProof.inputs.filter(ref => ref.id.startsWith('question:'))
-        .map(ref => store.get<Question>(ref.id, ref.revision)!)
-        .filter(row => row.value.stage === 'om-g2' && row.value.level === 'R1' && row.value.consumer === product.id);
-      assert.equal(designQuestions.length, 1);
-      const assessments = operationProof.inputs.filter(ref => ref.id.startsWith('research-assessment:'))
-        .map(ref => store.get<ResearchAssessment>(ref.id, ref.revision)!)
-        .filter(row => row.value.question.id === designQuestions[0]!.id);
-      assert.equal(assessments.length, 1);
-      const issuedQuestion = assessments[0]!.value.question;
-      assert.equal(issuedQuestion.revision, 1);
-      assert.deepEqual(reference(store.get(issuedQuestion.id, issuedQuestion.revision)!), issuedQuestion);
-      // S1 restores the one dependency omitted by the old cache; all other DTO fields and saved rows stay exact.
-      const completeReferences = (bytes: string): string => {
-        const expected = JSON.parse(bytes) as { references: Ref[] };
-        assert.ok(!expected.references.some(ref => canonical(ref) === canonical(issuedQuestion)));
-        expected.references = [...expected.references, issuedQuestion]
-          .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
-        return canonical(expected);
-      };
-      const expectedRebased = completeReferences(history.rebasedBytes);
-      withHistoricalReads(() => {
-        for (let read = 0; read < 2; read++)
-          sameButReferences(ok(readLayerAcceptance(store, history.rebased)), expectedRebased);
-      });
-      const expectedRebaseBasis = completeReferences(history.rebaseBasisBytes);
-      withHistoricalReads(() => {
-        for (let read = 0; read < 2; read++)
-          sameButReferences(ok(readRebaseBasis(store, history.frame.value.rebase as { from: FrameRequest; to: FrameRequest })), expectedRebaseBasis);
-      });
-      const replay = ok(rebaseFrame(store, history.request));
-      assert.equal(replay.state, 'unchanged');
-      assert.equal(canonical(replay.frame), canonical(history.frame));
-      assert.equal(canonical(replay.layer), canonical(history.layer));
-      for (const row of history.rows)
-        assert.equal(canonical(store.get(row.reference.id, row.reference.revision)), row.bytes);
-      assert.deepEqual(snapshot(store), before);
-    } finally { store.close(); }
-  }
-});
-
-test('G5 result identity traverses a proved rebase to native L3 fills without treating rebase as acceptance', t => {
-  const f = markedNativeFixture(t), project = 'garden', store = f.store, engine = new ProductEngine(store);
-  const initial = ok(writeOmInput(store, { project, expected: 0,
+test('G5 result identity traverses a proved rebase to native L3 fills without treating rebase as acceptance', async t => {
+  const f = await createOmFixture(t, 'standard', 'garden', { mode: 'executed' }), project = 'garden', store = f.store, engine = new ProductEngine(store);
+  const initial = ok(writeOmInput(store, { project, expected: store.get('om-input:garden')!.revision,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
   const decisions: InputDecisionProposal['decision'][] = [
     { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] },
@@ -890,22 +662,13 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
       graph: reference(f.graphRevision), layers: [], decision }) })) }));
   const choice = { choiceVersion: 'identity-native', features: [{ outcome: 'garden-result' }], excluded: [] };
   const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(store.get('phase:garden:L2')!), choice, available: {} }));
+    refinement: reference(f.layers[2]), choice, available: {} }));
   const operations: FrameRequest = { project, level: 2, graph: reference(f.graphRevision), horizon: reference(horizon.gate),
-    layer: reference(f.layers[2]), frame: null, upper: null };
-  const nativeRequest: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]),
-    upper: { horizon: reference(horizon.gate), frame: null } };
-  const native = ok(readFrame(store, nativeRequest));
-  const nativeFills = structuredClone(native.result.fills) as ConnectionFrame['fills'];
-  for (const fill of nativeFills) if (['w-garden-later-operation', 'w-garden-refusal-operation'].includes(fill.node)) {
-    assert.ok(!f.graph.horizon.includes(fill.node));
-    fill.source = 'identity'; fill.basis = native.upperRef;
-  }
-  nativeFills.sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
-  assert.ok(nativeFills.some(fill => fill.source === 'accepted' && fill.port !== undefined));
-  assert.ok(nativeFills.every(fill => !Object.hasOwn(fill, 'codeRef')));
-  const nativeFrame = store.write<ConnectionFrame>({ id: 'om-frame:garden:3', kind: 'connection-frame', expected: 0,
-    value: { project, level: 3, candidateHash: f.graphRevision.hash, layerHash: hashJson(projectGraph(f.graph, 3)), fills: nativeFills } });
+    layer: reference(f.layers[2]), frame: reference(store.get('om-frame:garden:2')!), upper: null };
+  const nativeRequest: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]), frame: reference(store.get('om-frame:garden:3')!),
+    upper: { horizon: reference(horizon.gate), frame: operations.frame } };
+  const nativeFrame = store.get<ConnectionFrame>(nativeRequest.frame!.id, nativeRequest.frame!.revision)!;
+  assert.equal(nativeFrame.value.worksContract, WORKS_FRAME_CONTRACT);
   const from = { ...nativeRequest, frame: reference(nativeFrame) };
   ok(readFrame(store, from));
   const upperCandidate = ok(writeCandidate(store, { frame: operations, proposals: [] }));
@@ -918,7 +681,7 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
     frame: null, upper: { horizon: reference(next.gate), frame: reference(upper.frame!) } };
   const rebased = ok(rebaseFrame(store, { from, to }));
   assert.ok(rebased.carried > 0); assert.equal(rebased.retired, 0);
-  assert.ok(!Object.hasOwn(rebased.frame.value, 'worksContract'));
+  assert.equal(rebased.frame.value.worksContract, WORKS_FRAME_CONTRACT);
   const prepared = ok(prepareFrame(store, { ...to, layer: reference(rebased.layer), frame: reference(rebased.frame) }));
   const works: ProposalRequest = { frame: structuredClone(prepared.request) as FrameRequest, proposals: [] };
   const obligation = prepared.result.obligations.find(item => item.kind === 'connection-end' && item.role === 'producer'
@@ -932,7 +695,9 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
   const gaps = ok(writeGaps(store, { project, input: reference(input), graph: to.graph, horizon: to.horizon,
     operations: { frame: { ...operations, graph: to.graph, horizon: to.horizon, layer: reference(upper.layer!), frame: reference(upper.frame!) }, proposals: [] }, works }));
   const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
-  const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const previousLines = store.get<GapLinesRecord>(gapLinesId(project))!;
+  const lines = ok(writeGapLines(store, { project, previous: reference(previousLines),
+    pass: previousLines.value.request.pass + 1, gaps: gapRead, closures: [] }));
   const handoff = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
   assert.deepEqual(handoff.handoff.obligations, []);
   if ('state' in gapRead.sources.works) throw new Error('The rebased native layer must supply the works frame');
@@ -1173,105 +938,43 @@ test('C5.1 the frame-to-layer reader rejects absent or malformed public argument
   } finally { f.store.get = original; }
 });
 
-interface C51ProducerHistory {
-  root: string; database: string; historyDatabase: string; trace: string; traceBytes: string;
+interface CurrentF5Fixture {
+  root: string; database: string; trace: string; traceBytes: string; graph: Ref;
   request: WorksAcceptanceRequest; goal: { block: string; ordinal: number; series: Ref; goal: AttemptGoal };
   obligations: string[]; foreignObligations: string[]; realizedObligations: string[];
-  history: { request: AcceptedFrameRequest; result: Settlement }[];
-  rows: { ref: Ref; bytes: string }[];
 }
-function c51ProducerHistory(t: TestContext): C51ProducerHistory {
-  const directory = mkdtempSync(join(tmpdir(), 'omg-c51-base-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), repositoryUrl = pathToFileURL(repository).href;
-  const loader = join(directory, 'c51-base-loader.mjs'), typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (!url.startsWith(prefix) || !/\\.js$/.test(url)) return next(url, context);
-  const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
-  const body = execFileSync('git', ['show', 'eb90700587b23375012a98217dc80010031ab8b8:' + relative],
-    { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-  let source = ts.transpileModule(body, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText;
-  if (relative === 'test/om-atomic-gate.test.ts') {
-    const tree = ts.createSourceFile(relative, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-    const registrations = new Set();
-    source = tree.statements.filter(statement => {
-      if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return true;
-      const name = statement.expression.expression.getText(tree);
-      if (name === 'test' || name === 'after') { registrations.add(name); return false; }
-      return true;
-    }).map(statement => source.slice(statement.pos, statement.end)).join('\\n');
-    if (!registrations.has('test') || !registrations.has('after')) throw new Error('The real base fixture registrations were not found');
-    source += '\\nexport { produceAtomicSeed };\\n';
-  }
-  return { format: 'module', shortCircuit: true, source };
-}
-`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const script = `
-import { copyFileSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-const root = ${JSON.stringify(new URL('dist/', repositoryUrl).href)};
-const { produceAtomicSeed } = await import(root + 'test/om-atomic-gate.test.js');
-const { Store } = await import(root + 'src/storage/store.js');
-const { canonical } = await import(root + 'src/canonical.js');
-const { reference } = await import(root + 'src/pipeline/contracts.js');
-const { readAcceptedFrame } = await import(root + 'src/om/frame-accept.js');
-const { readFrame } = await import(root + 'src/om/frame-obligations.js');
-const { writeWorksAcceptance } = await import(root + 'src/om/atomic-gate.js');
-const { gapLineKey } = await import(root + 'src/om/gap-lines.js');
-function ok(result) { if (!result.ok) throw new Error(result.refusal.code + ': ' + result.refusal.message); return result.value; }
-const seed = await produceAtomicSeed(), f = seed.data, historyDatabase = join(seed.root, 'accepted-history.sqlite');
-copyFileSync(seed.database, historyDatabase);
-const store = new Store(historyDatabase);
-try {
-  const upper = { project: f.project, level: 2, graph: f.graph, layer: f.layer2, frame: f.upperFrame };
-  const accepted = ok(writeWorksAcceptance(store, f.request));
-  if (!accepted.acceptance) throw new Error('The genuine base producer did not accept its L3 candidate');
-  const history = [upper, accepted.acceptance].map(request => ({ request, result: ok(readAcceptedFrame(store, request)) }));
-  const all = f.gaps.records.map(record => record.value.gap).filter(gap => gap.code === 'obligation_open'
+async function currentF5Fixture(t: TestContext): Promise<CurrentF5Fixture> {
+  // Reuse the current native N2/E4 producer, without importing its test registrations or loading a Git era.
+  const url = new URL('./om-atomic-gate.test.js', import.meta.url), source = readFileSync(url, 'utf8');
+  const tree = ts.createSourceFile(url.pathname, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  const statements = tree.statements.filter(statement => ts.isImportDeclaration(statement)
+    || ts.isFunctionDeclaration(statement) || ts.isVariableStatement(statement));
+  const module = new URL(`./.lg11-f5-${process.pid}.mjs`, import.meta.url);
+  writeFileSync(module, statements.map(statement => source.slice(statement.pos, statement.end)).join('\n')
+    + '\nexport { produceAtomicSeed };\n');
+  t.after(() => rmSync(module, { force: true }));
+  const { produceAtomicSeed } = await import(module.href);
+  const seed = await produceAtomicSeed();
+  t.after(() => rmSync(seed.root, { recursive: true, force: true }));
+  const f = seed.data as { request: WorksAcceptanceRequest; openGoal: CurrentF5Fixture['goal'];
+    gaps: import('../src/om/gaps.js').GapRecords; gapRead: import('../src/om/gaps.js').GapReadRequest; graph: Ref };
+  const all = f.gaps.records.map(row => row.value.gap).filter(gap => gap.code === 'obligation_open'
     && gap.evidence.some(evidence => evidence.origin === 'works'));
-  const owned = gap => f.openGoal.goal.questions.includes(gapLineKey(f.project, gap.target, gap.field));
-  const works = ok(readFrame(store, f.gapRead.sources.works.frame));
-  const realizedObligations = works.result.obligations.filter(item => item.upper.node === 'garden-produce-operation').map(item => item.id).sort();
-  const rows = history.flatMap(item => [item.result.graph, item.result.layer, item.result.frame])
-    .map(row => ({ ref: reference(row), bytes: canonical(row) }));
-  process.stdout.write(JSON.stringify({ root: seed.root, database: seed.database, historyDatabase, trace: seed.trace,
-    traceBytes: readFileSync(seed.trace, 'utf8'), request: f.request, goal: f.openGoal,
-    obligations: all.filter(owned).map(gap => gap.target).sort(), foreignObligations: all.filter(gap => !owned(gap)).map(gap => gap.target).sort(),
-    realizedObligations, history, rows }));
-} finally { store.close(); }
-`;
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
-    '--input-type=module', '--eval', script], { cwd: repository, encoding: 'utf8', maxBuffer: 20_000_000 });
-  const history = JSON.parse(output) as C51ProducerHistory;
-  t.after(() => rmSync(history.root, { recursive: true, force: true }));
-  return history;
+  const owned = (gap: (typeof all)[number]) => f.openGoal.goal.questions.includes(gapLineKey('garden', gap.target, gap.field));
+  const store = new Store(seed.database);
+  try {
+    if ('state' in f.gapRead.sources.works) throw new Error('Expected the native pending work frame');
+    const works = ok(readFrame(store, f.gapRead.sources.works.frame));
+    return { root: seed.root, database: seed.database, trace: seed.trace, traceBytes: seed.traceBytes, graph: f.graph,
+      request: f.request, goal: f.openGoal, obligations: all.filter(owned).map(gap => gap.target).sort(),
+      foreignObligations: all.filter(gap => !owned(gap)).map(gap => gap.target).sort(),
+      realizedObligations: works.result.obligations.filter(item => item.upper.node === 'garden-produce-operation').map(item => item.id).sort() };
+  } finally { store.close(); }
 }
 
-test('C5.1 genuine eb90700 N2/N3 history survives restart while new F5 acceptance binds only its declared work attempt', t => {
-  const f = c51ProducerHistory(t);
+test('C5.1 current F5 acceptance preserves null and exact work bindings, series guards and restart replay', async t => {
+  const f = await currentF5Fixture(t);
   assert.ok(f.obligations.length > 1 && f.foreignObligations.length > 0);
-  for (let restart = 0; restart < 2; restart++) {
-    const historical = new Store(f.historyDatabase);
-    try {
-      const before = snapshot(historical);
-      for (const old of f.history) {
-        assert.ok(!Object.hasOwn(old.result.frame!.value.acceptance, 'contract'));
-        assert.deepEqual(ok(readAcceptedFrame(historical, old.request)), old.result);
-        const restored = ok(readAcceptedFrameLayer(historical, { project: 'garden', level: old.request.level, frame: old.request.frame }));
-        assert.deepEqual(restored.graph, old.result.graph); assert.deepEqual(restored.layer, old.result.layer);
-        assert.deepEqual(restored.frame, old.result.frame);
-      }
-      for (const row of f.rows) assert.equal(canonical(historical.get(row.ref.id, row.ref.revision)), row.bytes);
-      assert.deepEqual(snapshot(historical), before);
-    } finally { historical.close(); }
-  }
   for (const explicitFirst of [false, true]) {
     const path = join(f.root, `unbound-${explicitFirst}.sqlite`); copyFileSync(f.database, path);
     const unbound = new Store(path);
@@ -1292,7 +995,7 @@ test('C5.1 genuine eb90700 N2/N3 history survives restart while new F5 acceptanc
   try {
     const address = { project: 'garden', block: f.goal.block, line: 1 };
     assert.equal(address.block, 'garden-consume-block'); assert.ok(f.realizedObligations.length > 1);
-    const graph = realized.get<Graph>(f.history[0]!.request.graph.id, f.history[0]!.request.graph.revision)!.value;
+    const graph = realized.get<Graph>(f.graph.id, f.graph.revision)!.value;
     assert.notEqual(graph.nodes.find(node => node.id === 'garden-produce-operation')!.parent, address.block);
     assert.ok(graph.edges!.some(edge => edge.relation === 'realizes' && edge.source === 'garden-produce-operation' && edge.target === address.block));
     ok(completeAttempt(realized, { ...address, attempt: f.goal.ordinal,
@@ -1328,11 +1031,7 @@ test('C5.1 genuine eb90700 N2/N3 history survives restart while new F5 acceptanc
     assert.ok(saved.frame.value.fills.some(fill => f.foreignObligations.includes(fill.obligation)));
     const identity = f.obligations.map(obligation => ok(readResultIdentity(store,
       { acceptance: accepted.acceptance!, obligation })).key);
-    const old = new Store(f.historyDatabase);
-    try {
-      assert.deepEqual(identity, f.obligations.map(obligation => ok(readResultIdentity(old,
-        { acceptance: f.history[1]!.request, obligation })).key));
-    } finally { old.close(); }
+    assert.equal(new Set(identity).size, identity.length);
     store.close(); store = new Store(f.database);
     const savedHeads = snapshot(store);
     assert.deepEqual(ok(readAcceptedFrameLayer(store, exact)), saved);
@@ -1342,4 +1041,56 @@ test('C5.1 genuine eb90700 N2/N3 history survives restart while new F5 acceptanc
     assert.deepEqual(snapshot(store), savedHeads);
     assert.equal(readFileSync(f.trace, 'utf8'), f.traceBytes);
   } finally { store.close(); }
+});
+
+// LG11: required saved fields cannot fall back to an older acceptance/replay contract.
+test('LG11 C5 reads and repeat settlement reject missing acceptance contract or binding without writes', t => {
+  const f = fixture(t), accepted = ok(settleCandidate(f.store, f.request));
+  assert.ok(accepted.graph && accepted.layer && accepted.frame);
+  const exact = { project: 'garden', level: 2 as const, graph: reference(accepted.graph),
+    layer: reference(accepted.layer), frame: reference(accepted.frame) };
+  for (const field of ['contract', 'binding'] as const) for (const value of ['absent', 'unknown', {}]) {
+    const row = structuredClone(accepted.frame), acceptance = row.value.acceptance as unknown as Record<string, unknown>;
+    if (value === 'absent') delete acceptance[field]; else acceptance[field] = value;
+    const view = new Proxy(f.store, { get(target, key) {
+      if (key === 'get') return (id: string, revision?: number) => id === row.id && (revision === undefined || revision === row.revision)
+        ? row : target.get(id, revision);
+      if (key === 'history') return (id: string) => target.history(id).map(saved => id === row.id && saved.revision === row.revision ? row : saved);
+      const member = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    const before = snapshot(f.store);
+    for (const result of [readAcceptedFrame(view, exact), prepareSettleCandidate(view, f.request), settleCandidate(view, f.request)])
+      refusedWith(result, 'frame_acceptance_invalid');
+    assert.deepEqual(snapshot(f.store), before);
+  }
+});
+
+test('LG11 an exact work rejection refuses absent or malformed saved binding before following its references', t => {
+  const f = fixture(t);
+  for (const binding of ['absent', {}, 0]) {
+    const value = { contract: 'om-work-rejection/v1', candidate: f.request.candidate, gate: f.request.candidate,
+      ...(binding === 'absent' ? {} : { binding }) };
+    const row = f.store.write({ id: `om-work-rejection:garden:missing-${String(binding)}`, kind: 'om-work-rejection', expected: 0, value });
+    const result = readWorkRejectionAt(f.store, { project: 'garden', record: reference(row) });
+    refusedWith(result, 'frame_acceptance_invalid');
+    if (!result.ok) assert.equal(result.refusal.at.field, 'binding');
+  }
+});
+
+test('LG11 repeat rebase refuses a saved transition without its current work-zone contract', async t => {
+  const f = await rebaseFixture(t), moved = ok(rebaseFrame(f.store, f.request));
+  for (const marker of ['absent', 'unknown', null]) {
+    const row = structuredClone(moved.frame), to = row.value.rebase.to as unknown as Record<string, unknown>;
+    if (marker === 'absent') delete to.workZoneContract; else to.workZoneContract = marker;
+    const view = new Proxy(f.store, { get(target, key) {
+      if (key === 'get') return (id: string, revision?: number) => id === row.id && revision === row.revision ? row : target.get(id, revision);
+      const member = Reflect.get(target, key, target); return typeof member === 'function' ? member.bind(target) : member;
+    } });
+    const before = snapshot(f.store);
+    for (const action of [prepareRebaseFrame, rebaseFrame]) {
+      const result = action(view, f.request); refusedWith(result, 'frame_acceptance_invalid');
+      if (!result.ok) assert.equal(result.refusal.at.field, 'rebase.to.workZoneContract');
+    }
+    assert.deepEqual(snapshot(f.store), before);
+  }
 });

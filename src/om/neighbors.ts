@@ -22,7 +22,7 @@ export const NEIGHBOR_CONTRACT = 'neighbor-packets/v1' as const;
 export interface NeighborFill {
   obligation: string; node: string; port?: string; codeRef?: CodeRef; source: 'accepted' | 'identity' | 'proposed';
 }
-export interface NeighborFrame { obligations: FrameObligation[]; fills: NeighborFill[] | null }
+export interface NeighborFrame { obligations: FrameObligation[]; fills: NeighborFill[] }
 export interface NeighborSources {
   identity: string[]; receipts: Record<string, Ref>;
   frames: { operations: NeighborFrame; works: NeighborFrame };
@@ -93,9 +93,9 @@ function requireSources(graph: unknown, sources: unknown): asserts sources is Ne
       && text(o['artifact']) && ['horizon', 'outside'].includes(o['zone'] as string)
       && (o['kind'] !== 'connection-end' || (text(o['connector']) && ['producer', 'consumer'].includes(o['role'] as string)
         && text(o['flow']) && text(o['upper']['port']))))) invalid(`frames.${name}.obligations`);
-    if (frame['fills'] !== null && (!Array.isArray(frame['fills']) || !frame['fills'].every(fill => object(fill)
+    if (!Array.isArray(frame['fills']) || !frame['fills'].every(fill => object(fill)
       && text(fill['obligation']) && text(fill['node']) && ['accepted', 'identity', 'proposed'].includes(fill['source'] as string)
-      && (!Object.hasOwn(fill, 'port') || text(fill['port'])) && (!Object.hasOwn(fill, 'codeRef') || neighborShapes().codeShape(fill['codeRef'])))))
+      && (!Object.hasOwn(fill, 'port') || text(fill['port'])) && (!Object.hasOwn(fill, 'codeRef') || neighborShapes().codeShape(fill['codeRef']))))
       invalid(`frames.${name}.fills`);
   }
 }
@@ -118,7 +118,7 @@ function context(graph: Graph, sources: NeighborSources): Context {
   for (const frame of [sources.frames.operations, sources.frames.works]) {
     checkIds(frame.obligations, 'obligations');
     const fills = new Set<string>();
-    for (const fill of frame.fills ?? []) {
+    for (const fill of frame.fills) {
       const key = canonical([fill.obligation, fill.node, fill.port ?? null]);
       if (fills.has(key)) reject('neighbor_chain_ambiguous', fill.node, 'fills', 'Duplicate correspondence is not another address');
       fills.add(key);
@@ -164,7 +164,7 @@ function upperAddresses(ctx: Context, connector: Connector, binding: Binding, en
   let flow = ctx.flows.get(key);
   if (!flow) {
     const read = readFrameFlow(ctx.graph, ctx.graph, { obligations: frame.obligations,
-      fills: frame.fills?.map(fill => ({ ...fill, source: fill.source === 'identity' ? 'identity' : 'accepted' })) ?? null,
+      fills: frame.fills.map(fill => ({ ...fill, source: fill.source === 'identity' ? 'identity' : 'accepted' })),
       ...(level === 3 ? { worksContract: 'works-frame/v1' as const } : {}) }, connector.id, binding);
     if (!read.ok) reject(read.refusal.code === 'accepted_binding_ambiguous' ? 'neighbor_chain_ambiguous' : 'neighbor_chain_broken',
       connector.id, `flow:${level}`, read.refusal.message);
@@ -173,8 +173,6 @@ function upperAddresses(ctx: Context, connector: Connector, binding: Binding, en
   const selected = flow.ends.filter(item => item.role === role && same(item.lower, end))
     .map(item => ({ endpoint: item.upper as Endpoint, binding: flow!.upper as Binding }));
   if (!selected.length) reject('neighbor_chain_broken', end.node, connector.id, 'The whole flow does not address this exact endpoint');
-  if (frame.fills === null && selected.length !== 1)
-    reject('neighbor_chain_ambiguous', end.node, connector.id, 'Several upper addresses require recorded correspondence');
   return selected;
 }
 function localParent(ctx: Context, connector: Connector, binding: Binding, kind: 'operation' | 'block'): string {
@@ -301,8 +299,9 @@ function deriveCollection(store: Store, delivery: Sealed<DeliveryRead>): { value
   if (!request.upper) reject('neighbor_chain_broken', delivery.request.candidate.id, 'upper', 'The works candidate requires its exact operation frame');
   const operations = unwrap(readFrame(store, { project: request.project, level: 2, graph: request.graph,
     horizon: request.horizon, layer: works.upperRef, frame: request.upper.frame, upper: null }));
-  const fills2 = operations.accepted?.frame?.value.fills ?? null;
-  const sources: NeighborSources = copy({ identity: [...new Set([...candidate.value.fills, ...(fills2 ?? [])]
+  const fills2 = operations.accepted?.frame?.value.fills;
+  if (!Array.isArray(fills2)) reject('neighbor_chain_broken', request.project, 'frames.operations.fills', 'The accepted operations require their recorded correspondence');
+  const sources: NeighborSources = copy({ identity: [...new Set([...candidate.value.fills, ...fills2]
     .filter(f => f.source === 'identity').map(f => f.node))].sort(order), receipts: delivery.receipts,
     frames: { operations: { obligations: operations.result.obligations, fills: fills2 },
       works: { obligations: works.result.obligations, fills: candidate.value.fills } } }) as unknown as NeighborSources;

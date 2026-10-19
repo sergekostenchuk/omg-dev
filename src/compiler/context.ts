@@ -166,7 +166,8 @@ export function loadTaskContextSources(store: Store, plan: Revision<MachinePlan>
     const delivery = take(readDeliveries(source, { project, candidate: candidateRef, ownership }));
     const finding = delivery.findings[0];
     if (finding) throw new EngineError(finding.code, finding.message, { unit: "G3", target: finding.target, field: "delivery" });
-    const fills = operations.accepted?.frame?.value.fills ?? null;
+    const fills = operations.accepted?.frame?.value.fills;
+    if (!Array.isArray(fills)) invalid("neighbors.frames.operations.fills", frame.id);
     references.push(plan.value.graph, plan.value.environment, plan.value.feasibility, candidateRef, layer, frame,
       ...works.references, ...operations.references, ...delivery.references);
     const specification = plan.value.taskContextContract ? (() => {
@@ -176,7 +177,7 @@ export function loadTaskContextSources(store: Store, plan: Revision<MachinePlan>
         loadTaskSpecification(source, project, basis.input, plan.value.graphSnapshot, task, readTaskSpecification, basis.contract)])) };
     })() : undefined;
     return sealed({ ...(specification ? { specification } : {}), plan: reference(plan), graph: plan.value.graph, candidate: candidateRef, references: uniqueRefs(references),
-      neighbors: { identity: [...new Set([...candidate.value.fills, ...(fills ?? [])]
+      neighbors: { identity: [...new Set([...candidate.value.fills, ...fills]
         .filter(fill => fill.source === "identity").map(fill => fill.node))].sort(), receipts: delivery.receipts,
       frames: { operations: { obligations: operations.result.obligations, fills },
         works: { obligations: works.result.obligations, fills: candidate.value.fills } } },
