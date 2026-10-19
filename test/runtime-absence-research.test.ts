@@ -617,9 +617,14 @@ try {
         assert.equal(hashJson(row.value), row.hash);
         assert.deepEqual(store.get(row.id, row.revision), row, 'Exact values, hashes, timestamps, identities and revision order stay unchanged');
       }
-      const gates = { answer: engine.discovery.gate('p', reference(old.answered)), features: engine.pipeline.inspect('p', 'features'),
-        phases: (['L2', 'R1', 'R2'] as const).map(name => ({ name, gate: engine.refinement.gate('p', name) })),
-        layer: engine.graphs.layerGate('p', 2) };
+      const { closure: _featuresClosure, ...featuresGate } = engine.pipeline.inspect('p', 'features');
+      const { closure: _layerClosure, ...layerGate } = engine.graphs.layerGate('p', 2);
+      const gates = { answer: engine.discovery.gate('p', reference(old.answered)), features: featuresGate,
+        phases: (['L2', 'R1', 'R2'] as const).map(name => {
+          const { closure: _phaseClosure, ...gate } = engine.refinement.gate('p', name);
+          return { name, gate };
+        }),
+        layer: layerGate };
       assert.deepEqual(gates, old.gates, 'The historical feature, answer, phase and layer gates keep the exact old DTOs');
       const runtime = collectRuntimeEvidence(store, 'p', old.spec, old.proposed.report, [old.proposed.observation]);
       assert.deepEqual(runtime.proofs, old.runtime.proofs);
@@ -650,12 +655,13 @@ try {
   }
 });
 
-test('D8.2 genuine feature L2 R1 R2 and layer gates preserve positive-only OM acceptance sources with runtime dependencies absent', async t => {
+test('D8.2 genuine gates preserve positive acceptance sources and new OM preparation guards exact frame absence', async t => {
   const { UPSTREAM_STAGES } = await import('../src/discovery/requirements.js');
   const { writeOmInput, prepareOmInput } = await import('../src/om/input.js');
   const { writeHorizon, prepareHorizon } = await import('../src/om/horizon.js');
   const { prepareFrame, prepareLayerAcceptance } = await import('../src/om/frame-obligations.js');
   const { readLayerAcceptance } = await import('../src/om/layer-basis.js');
+  const { writeGuarded } = await import('../src/om/refs.js');
   const { obligationHandoff } = await import('../src/graph/obligation-handoff.js');
   const { canonical } = await import('../src/canonical.js');
   const f = await d82MilestoneFixture(t);
@@ -699,7 +705,12 @@ test('D8.2 genuine feature L2 R1 R2 and layer gates preserve positive-only OM ac
   const before = canonical(f.store.list().flatMap(head => f.store.history(head.id)));
   const prepared = [value(prepareOmInput(f.store, inputRequest)), value(prepareHorizon(f.store, horizonRequest)),
     value(prepareLayerAcceptance(f.store, layerRequest)), value(prepareFrame(f.store, frameRequest))];
-  for (const item of prepared) assert.ok(item.guards.every(isRef), 'A native OM producer consumes exact positive acceptance sources');
+  const frameAbsence = [{ id: 'om-frame:p:2', absent: true }, { id: 'om-frame:p:3', absent: true }];
+  for (const [index, item] of prepared.entries()) {
+    assert.deepEqual(item.guards.filter(guard => !isRef(guard)), index === 3 ? frameAbsence : []);
+    const positive = item.guards.filter(isRef);
+    for (const guard of positive) assert.deepEqual(guard, reference(f.store.get(guard.id, guard.revision)!));
+  }
   const currentLayer = value(prepareLayerAcceptance(f.store, layerRequest));
   const historicalLayer = value(readLayerAcceptance(f.store, layerRequest));
   const { guards: _guards, ...historicalBody } = currentLayer;
@@ -708,4 +719,21 @@ test('D8.2 genuine feature L2 R1 R2 and layer gates preserve positive-only OM ac
   assert.equal(canonical(f.store.list().flatMap(head => f.store.history(head.id))), before, 'Preparing all four real OM entrances is read-only');
   assert.equal(f.store.get('reader-pilot:p'), null);
   assert.equal(f.store.get('execution-root:p'), null);
+  for (const absent of frameAbsence) {
+    const saved = await f.store.snapshot(join(f.root, `frame-absence-${absent.id.split(':').at(-1)}`));
+    const competing = new Store(saved.path);
+    try {
+      competing.write({ id: absent.id, kind: 'connection-frame', expected: 0, value: {} });
+      const beforeRace = canonical(competing.list().flatMap(head => competing.history(head.id)));
+      const result = writeGuarded(competing, { unit: 'C4', target: 'p', guards: prepared[3]!.guards,
+        writes: [{ id: 'fix-c:frame-result', kind: 'frame-result', expected: 0, value: {} },
+          { id: 'fix-c:neighbor', kind: 'neighbor', expected: 0, value: {} }] });
+      assert.equal(result.ok, false);
+      assert.equal(result.refusal.code, 'input_stale');
+      assert.equal(result.refusal.at.target, absent.id);
+      assert.equal(competing.get('fix-c:frame-result'), null);
+      assert.equal(competing.get('fix-c:neighbor'), null);
+      assert.equal(canonical(competing.list().flatMap(head => competing.history(head.id))), beforeRace);
+    } finally { competing.close(); }
+  }
 });

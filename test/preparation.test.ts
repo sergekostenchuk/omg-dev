@@ -222,7 +222,8 @@ test("B1.1 real version 3 producer preserves schemas, accepted stage history and
     const store = new Store(prior.database), engine = new ProductEngine(store);
     try {
       for (const item of prior.stages) {
-        assert.deepEqual(engine.pipeline.inspect("legacy", item.stage), item.inspection);
+        const { closure: _closure, ...inspection } = engine.pipeline.inspect("legacy", item.stage);
+        assert.deepEqual(inspection, item.inspection);
         assert.deepEqual(await engine.stageResearch.run("legacy", item.draft, 1), item.replay);
       }
       assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), prior.bytes);

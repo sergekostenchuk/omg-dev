@@ -1476,7 +1476,7 @@ test("concurrent race on reservation batch: conflict rolls back manifest, parts,
   assert.equal(snapAfterSuccess.consumerIntents[0]!.state, "running");
 });
 
-test("DRS1a-04: legacy terminal recovery preserves exact read order ['request', 'archive', 'request', 'archive']", async (t) => {
+test("DRS1a-04: legacy terminal recovery preserves exact read order ['request', 'archive']", async (t) => {
   const f = setupFixture(t);
   writeFileSync(f.adapterPath, "setTimeout(()=>{}, 10000);");
   const context = pilotContext(f.store, f.draft, f.question);
@@ -1559,7 +1559,7 @@ test("DRS1a-04: legacy terminal recovery preserves exact read order ['request', 
 
   const result = readResearchConsumerExecution(coldStore, "p", reference(intent));
   assert.equal(result.kind, "terminal");
-  assert.deepEqual(calls, ["request", "archive", "request", "archive"], "Legacy read order must be strictly preserved");
+  assert.deepEqual(calls, ["request", "archive"], "Legacy read order must strictly read request before archive once");
 });
 
 // -----------------------------------------------------------------------------

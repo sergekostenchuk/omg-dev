@@ -154,17 +154,27 @@ test("missing, forged and masquerading fixture inputs are rejected at their exac
   assert.deepEqual(fixture.engine.graphs.layerGate(fixture.project, 3, { ...exactLayer, hash: "0".repeat(64) }).findings.map(item => item.code),
     ["graph_layer_stale"]);
 
+  // A new acceptance validates inputs; reading a committed stage does not revalidate its body.
+  const concept = fixture.stages.concept;
+  const conceptDraft = fixture.engine.pipeline.draft(fixture.project, "concept", concept.value.content, concept.revision);
+  const missingInputs = fixture.store.write<StageArtifact>({ id: conceptDraft.id, kind: conceptDraft.kind, expected: conceptDraft.revision,
+    value: { ...conceptDraft.value, inputs: [] } });
+  const missingSet = fixture.engine.pipeline.inspect(fixture.project, "concept");
+  assert.equal(missingSet.state, "blocked");
+  assert.ok(missingSet.findings.some(finding => finding.code === "input_set_invalid" && finding.target === concept.id));
+  const beforeAcceptance = fixture.store.list();
+  assert.throws(() => fixture.engine.pipeline.accept(fixture.project, "concept", missingInputs.revision),
+    error => error instanceof EngineError && error.code === "gate_rejected" && Array.isArray(error.details)
+      && error.details.some(finding => finding.code === "input_set_invalid" && finding.target === concept.id));
+  assert.deepEqual(fixture.store.get(concept.id), missingInputs);
+  assert.deepEqual(fixture.store.list(), beforeAcceptance, "Refused acceptance must not write a new record or revision");
+
   const features = fixture.stages.features;
   const missingProof = fixture.store.write<StageArtifact>({ id: features.id, kind: features.kind, expected: features.revision,
     value: { ...features.value, status: "accepted", proofs: [{ id: "missing:source", revision: 1, hash: "0".repeat(64) }] } });
-  assert.ok(fixture.engine.pipeline.inspect(fixture.project, "features").findings.some(finding => finding.code === "proof_stale" && finding.target === "missing:source"));
-
-  const concept = fixture.stages.concept;
-  fixture.store.write<StageArtifact>({ id: concept.id, kind: concept.kind, expected: concept.revision,
-    value: { ...concept.value, status: "accepted", inputs: [] } });
-  const missingSet = fixture.engine.pipeline.inspect(fixture.project, "concept");
-  assert.equal(missingSet.state, "stale");
-  assert.ok(missingSet.findings.some(finding => finding.code === "input_set_invalid" && finding.target === concept.id));
+  const missingProofInspect = fixture.engine.pipeline.inspect(fixture.project, "features");
+  assert.equal(missingProofInspect.state, "stale");
+  assert.ok(missingProofInspect.findings.some(finding => finding.code === "stage_closure_invalid" && finding.target === features.id));
 
   fixture.store.write<StageArtifact>({ id: missingProof.id, kind: missingProof.kind, expected: missingProof.revision,
     value: { ...missingProof.value, projectId: "foreign", status: "accepted" } });

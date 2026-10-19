@@ -956,7 +956,10 @@ store.close();process.stdout.write(JSON.stringify(result));`);
         assert.ok(input.value.input.questions.every((q: object) => !Object.hasOwn(q, 'moment')));
       }
       assert.deepEqual(delivered(readGaps(store, previous.readRequest)), previous.historical);
-      assert.deepEqual(UPSTREAM_STAGES.map(stage => engine.pipeline.inspect('garden', stage)), previous.gates);
+      assert.deepEqual(UPSTREAM_STAGES.map(stage => {
+        const { closure: _closure, ...rest } = engine.pipeline.inspect('garden', stage);
+        return rest;
+      }), previous.gates);
       const rows = store.list().flatMap(row => store.history(row.id));
       assert.equal(canonical(rows), previous.bytes); assert.deepEqual(rows, previous.rows);
       for (const row of rows) assert.equal(hashJson(row.value), row.hash);
@@ -1014,7 +1017,7 @@ ${body}
   return output;
 }
 
-test("PF3.1 rows 35, 39: a D1 set the base code 259d7a8c wrote, read and prepared reads and prepares the same with the new code — cold, warm and after reopen", async t => {
+test("PF3.1 rows 35, 39: a D1 set from 259d7a8c preserves exact history and positive admission with new frame absence guards — cold, warm and after reopen", async t => {
   const f = await createOmFixture(t, undefined, undefined, PF31_BASE), request = nativeRequest(f);
   const root = mkdtempSync(join(tmpdir(), "omg-pf31-era-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -1022,16 +1025,39 @@ test("PF3.1 rows 35, 39: a D1 set the base code 259d7a8c wrote, read and prepare
 const written = take(writeGaps(store, ${JSON.stringify(request)}));
 const read = { sources: written.sources, records: written.records.map(row => ({ id: row.id, revision: row.revision, hash: row.hash })) };
 out({ read, historical: take(readGaps(store, read)), current: take(prepareCurrentGaps(store, read)) });`) as { read: GapReadRequest; historical: Json; current: Json };
+  const frameAbsence = [{ id: 'om-frame:garden:2', absent: true }, { id: 'om-frame:garden:3', absent: true }];
   const check = (store: Store, label: string) => {
     for (const round of ["cold", "warm"]) withHistoricalReads(() => {
       sameButReferences(delivered(readGaps(store, old.read)), old.historical, `${label} ${round}: historical`);
-      sameButReferences(delivered(prepareCurrentGaps(store, old.read)), old.current, `${label} ${round}: current admission`);
+      const current = delivered(prepareCurrentGaps(store, old.read));
+      const added = current.guards.filter(guard => frameAbsence.some(absent => canonical(guard) === canonical(absent)));
+      assert.deepEqual(added, frameAbsence);
+      sameButReferences({ ...current, guards: current.guards.filter(guard =>
+        !frameAbsence.some(absent => canonical(guard) === canonical(absent))) }, old.current, `${label} ${round}: current admission`);
     });
   };
   check(f.store, "open");
   const reopened = new Store(f.database);
   t.after(() => reopened.close());
   check(reopened, "reopened");
+  const current = delivered(prepareCurrentGaps(reopened, old.read));
+  for (const absent of frameAbsence) {
+    const saved = await reopened.snapshot(join(root, `frame-absence-${absent.id.split(':').at(-1)}`));
+    const competing = new Store(saved.path);
+    try {
+      competing.write({ id: absent.id, kind: 'connection-frame', expected: 0, value: {} });
+      const beforeRace = revisions(competing);
+      const result = writeGuarded(competing, { unit: 'M5-neighbor', target: 'garden', guards: current.guards,
+        writes: [{ id: 'fix-c:gap-result', kind: 'gap-result', expected: 0, value: {} },
+          { id: 'fix-c:neighbor', kind: 'neighbor', expected: 0, value: {} }] });
+      assert.equal(result.ok, false);
+      assert.equal(result.refusal.code, 'input_stale');
+      assert.equal(result.refusal.at.target, absent.id);
+      assert.equal(competing.get('fix-c:gap-result'), null);
+      assert.equal(competing.get('fix-c:neighbor'), null);
+      assert.deepEqual(revisions(competing), beforeRace);
+    } finally { competing.close(); }
+  }
 });
 
 // ---- AT1 door (№4105 п.1, п.3): a readiness question names its saved G5 and is addressed to an accepted place ----
