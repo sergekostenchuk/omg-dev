@@ -694,18 +694,21 @@ test('D8.2 genuine gates preserve positive acceptance sources and new OM prepara
   const input = value(writeOmInput(f.store, inputRequest));
   inputRequest.expected = input.revision;
   const graph = reference(f.store.get('graph:p')!);
+  // The current route: before any real N2 acceptance the operations horizon names no refinement —
+  // the stage-only window where both operations frames are honestly absent.
   const horizonRequest: import('../src/om/horizon.js').HorizonRequest = { project: 'p', graph, input: reference(input),
-    refinement: reference(f.store.get('phase:p:L2')!), choice: { choiceVersion: 'd82-historical-gates',
+    refinement: null, choice: { choiceVersion: 'd82-historical-gates',
       features: [{ outcome: 'p-result' }], excluded: [] }, available: {} };
   const horizon = value(writeHorizon(f.store, horizonRequest)), horizonRef = reference(horizon.gate);
   const layerRequest = { project: 'p', graph, level: 2 as const, layer: reference(f.store.get('graph-layer:p:2')!) };
-  const frameRequest: import('../src/om/frame-obligations.js').FrameRequest = { project: 'p', graph, level: 3,
-    layer: reference(f.store.get('graph-layer:p:3')!), horizon: horizonRef, frame: null,
-    upper: { horizon: horizonRef, frame: null } };
+  // Before any real N2 the only honest frame request is the L2 one: an L3 request needs an upper
+  // witness proving an accepted L2, which does not exist yet in the stage-only window.
+  const frameRequest: import('../src/om/frame-obligations.js').FrameRequest = { project: 'p', graph, level: 2,
+    layer: reference(f.store.get('graph-layer:p:2')!), horizon: horizonRef, frame: null, upper: null };
   const before = canonical(f.store.list().flatMap(head => f.store.history(head.id)));
   const prepared = [value(prepareOmInput(f.store, inputRequest)), value(prepareHorizon(f.store, horizonRequest)),
     value(prepareLayerAcceptance(f.store, layerRequest)), value(prepareFrame(f.store, frameRequest))];
-  const frameAbsence = [{ id: 'om-frame:p:2', absent: true }, { id: 'om-frame:p:3', absent: true }];
+  const frameAbsence = [{ id: 'om-frame:p:2', absent: true }];
   for (const [index, item] of prepared.entries()) {
     assert.deepEqual(item.guards.filter(guard => !isRef(guard)), index === 3 ? frameAbsence : []);
     const positive = item.guards.filter(isRef);
@@ -736,4 +739,34 @@ test('D8.2 genuine gates preserve positive acceptance sources and new OM prepara
       assert.equal(canonical(competing.list().flatMap(head => competing.history(head.id))), beforeRace);
     } finally { competing.close(); }
   }
+  // The second honest window runs on a real post-N2 store: fixture mode 'n2' performs the actual
+  // N2 producers, so om-frame:p:2 exists and om-frame:p:3 is the frame that does not exist yet.
+  const { createOmFixture } = await import('./om-fixture.js');
+  const n2 = await createOmFixture(t, 'standard', 'p', { mode: 'n2' });
+  const graphN = reference(n2.graphRevision), layerN = reference(n2.layers[2]);
+  const frameN = reference(n2.store.get('om-frame:p:2')!);
+  const worksRequest: import('../src/om/horizon.js').HorizonRequest = { project: 'p', graph: graphN,
+    input: reference(n2.store.get('om-input:p')!), refinement: layerN, choice: { choiceVersion: 'd82-works',
+      features: [{ outcome: 'p-result' }], excluded: [] }, available: {} };
+  const works = value(writeHorizon(n2.store, worksRequest)), worksRef = reference(works.gate);
+  const frame3Request: import('../src/om/frame-obligations.js').FrameRequest = { project: 'p', graph: graphN,
+    level: 3, layer: null, horizon: worksRef, frame: null, upper: { horizon: worksRef, frame: frameN } };
+  const admission3 = value(prepareFrame(n2.store, frame3Request)).guards;
+  assert.deepEqual(admission3.filter(guard => !isRef(guard)), [{ id: 'om-frame:p:3', absent: true }],
+    'After real N2 the still-absent frame is om-frame:p:3');
+  const saved3 = await n2.store.snapshot(join(n2.root, 'frame-absence-3'));
+  const competing3 = new Store(saved3.path);
+  try {
+    competing3.write({ id: 'om-frame:p:3', kind: 'connection-frame', expected: 0, value: {} });
+    const beforeRace = canonical(competing3.list().flatMap(head => competing3.history(head.id)));
+    const result = writeGuarded(competing3, { unit: 'C4', target: 'p', guards: [...admission3],
+      writes: [{ id: 'fix-c:frame-result-3', kind: 'frame-result', expected: 0, value: {} },
+        { id: 'fix-c:neighbor-3', kind: 'neighbor', expected: 0, value: {} }] });
+    assert.equal(result.ok, false);
+    assert.equal(result.refusal.code, 'input_stale');
+    assert.equal(result.refusal.at.target, 'om-frame:p:3');
+    assert.equal(competing3.get('fix-c:frame-result-3'), null);
+    assert.equal(competing3.get('fix-c:neighbor-3'), null);
+    assert.equal(canonical(competing3.list().flatMap(head => competing3.history(head.id))), beforeRace);
+  } finally { competing3.close(); }
 });
