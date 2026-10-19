@@ -530,14 +530,12 @@ test("input policy keeps all five sources when the upstream module array is muta
   const f = await createOmFixture(t);
   const stageData = sources(f), req = request(f);
   const expected = buildOmInput(stageData);
-  delivered(prepareOmInput(f.store, req));
+  const prepared = delivered(prepareOmInput(f.store, req));
   const stages = UPSTREAM_STAGES as unknown as UpstreamStage[];
   const before = [...stages];
   try {
     stages.splice(0, stages.length, "features");
-    assert.deepEqual(buildOmInput(stageData), expected);
-    // Pure policy is isolated; current admission must still follow the real engine when its contract changes.
-    refusal(prepareOmInput(f.store, req), "stage_not_accepted");
+    assert.deepEqual(buildOmInput(stageData), expected, "Pure policy is isolated from the mutated module array");
     const incomplete = clone(stageData);
     delete (incomplete as Partial<InputStages>).discovery;
     const result = buildOmInput(incomplete);
@@ -549,6 +547,19 @@ test("input policy keeps all five sources when the upstream module array is muta
   } finally {
     stages.splice(0, stages.length, ...before);
   }
+  // The five sources stay bound to the accepted commits: the features head is an exact guard of the successful
+  // preparation, its four predecessors are exact proofs of its closure, and a producer move of one of them refuses.
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(req.stages.features)),
+    "The accepted features head is an exact guard of the prepared input");
+  const closure = f.store.get<StageArtifact>(f.stages.features.id)!.value.closure!;
+  for (const stage of UPSTREAM_STAGES.filter(name => name !== "features"))
+    assert.ok(closure.proofs.some(ref => canonical(ref) === canonical(req.stages[stage])), `${stage} is a proof of the features commit`);
+  const concept = f.store.get<StageArtifact>(f.stages.concept.id)!;
+  f.engine.pipeline.draft(f.project, "concept", concept.value.content as Json, concept.revision);
+  assert.deepEqual(f.engine.pipeline.inspect(f.project, "features").findings.map(finding => [finding.code, finding.target]),
+    [["proof_stale", f.stages.concept.id]]);
+  refusal(prepareOmInput(f.store, req), "input_stale");
+  assert.equal(refusal(prepareOmInput(f.store, currentRequest(f)), "stage_not_accepted").at.field, "status");
   assert.ok(Object.isFrozen(INPUT_REFUSAL_CODES));
   assert.throws(() => { (INPUT_REFUSAL_CODES as unknown as string[]).push("forged_code"); }, TypeError);
 });
@@ -568,30 +579,31 @@ test("accepted status and exact references cannot hide a forged map layer obliga
   assert.equal(f.store.get("om-input:garden"), null);
 });
 
-test("complete exact source closures still refuse behavior with no feature coverage", async t => {
+// Replaced: the former scenario bypassed the producers. The uncovered behavior now comes through them — a new
+// specification acceptance stales the features commit, and the features re-acceptance refuses it.
+test("a specification accepted through its producer with an uncovered behavior stales features, whose re-acceptance refuses requirement_uncovered", async t => {
   const f = await createOmFixture(t);
-  const stage = f.stages.specification;
-  const draftRef = (stage.value.content as Row).draft as Ref;
-  const draft = f.store.get<Row>(draftRef.id, draftRef.revision)!;
-  const question = stage.value.proofs.map(proof => f.store.get<Row>(proof.id, proof.revision)!)
-    .find(proof => proof.kind === "question" && proof.value.spec.field === "behavior")!;
-  const answerRef = question.value.answer as Ref;
-  const answer = f.store.get<Row>(answerRef.id, answerRef.revision)!;
-  const changes = new Map<string, Ref>();
-  const update = (row: Revision<unknown>, value: unknown) => {
-    const written = f.store.write({ id: row.id, kind: row.kind, expected: f.store.get(row.id)!.revision, value });
-    changes.set(canonical(reference(row)), reference(written));
+  const answered = (stage: UpstreamStage, value: (field: string) => Json) => {
+    const draft = f.engine.prepare(f.project, stage);
+    for (const id of draft.value.questions) {
+      const question = f.store.get<Question>(id)!;
+      assert.notEqual(question.value.spec.kind, "fact", `${stage} asks only decisions`);
+      f.engine.discovery.decision(id, question.revision, "owner", value(question.value.spec.field));
+    }
+    return f.engine.draft(f.project, stage, draft.id, f.store.get(f.stages[stage].id)!.revision);
   };
-  update(answer, { ...clone(answer.value), value: [...answer.value.value, "Uncovered behavior"] });
-  const draftValue = clone(draft.value);
-  draftValue.fields.behavior.push("Uncovered behavior");
-  update(draft, draftValue);
-  const stageValue = clone(stage.value);
-  (stageValue.content as Row).fields.behavior.push("Uncovered behavior");
-  update(stage, stageValue);
-  rebindDependents(f.store, changes, new Set());
+  const specification = (f.stages.specification.value.content as Row).fields as Row;
+  const features = (f.stages.features.value.content as Row).fields as Row;
+  const spec = answered("specification", field => field === "behavior" ? [...specification.behavior, "Uncovered behavior"] : specification[field]);
+  f.engine.pipeline.accept(f.project, "specification", spec.revision);
+  assert.deepEqual(f.engine.pipeline.inspect(f.project, "features").findings.map(finding => [finding.code, finding.target]),
+    [["proof_stale", f.stages.specification.id]], "the features commit proves the specification it was accepted on");
+  const candidate = answered("features", field => features[field]);
   assert.ok(f.engine.pipeline.inspect(f.project, "features").findings.some(finding => finding.code === "requirement_uncovered"));
-  assert.equal(refusal(prepareOmInput(f.store, currentRequest(f)), "stage_not_accepted").at.field, "features.requirements");
+  assert.throws(() => f.engine.pipeline.accept(f.project, "features", candidate.revision),
+    (error: unknown) => error instanceof EngineError && error.code === "gate_rejected"
+      && (error.details as { code: string }[]).some(finding => finding.code === "requirement_uncovered"));
+  assert.equal(refusal(prepareOmInput(f.store, currentRequest(f)), "stage_not_accepted").at.field, "status");
   refusal(writeOmInput(f.store, currentRequest(f)), "stage_not_accepted");
   assert.equal(f.store.get("om-input:garden"), null);
 });
