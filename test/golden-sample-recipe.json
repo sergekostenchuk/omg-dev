@@ -1,0 +1,1179 @@
+{
+  "version": 1,
+  "project": "golden",
+  "fields": {
+    "brief": "brief for golden",
+    "objective": "objective for golden",
+    "researchPlan": {
+      "domain": "Local stateless transformation",
+      "roles": [
+        {
+          "role": "CLI product engineer",
+          "side": "Transformation and validation",
+          "why": "Bound the requested observable result"
+        }
+      ],
+      "startingQuestions": [
+        {
+          "id": "scope",
+          "question": "Which local result is needed?",
+          "why": "Define the promised behavior"
+        }
+      ],
+      "sources": [
+        {
+          "id": "request",
+          "kind": "provided document",
+          "what": "The explicit fixture request",
+          "why": "Establish the chosen scope"
+        }
+      ],
+      "feasibilityQuestions": [
+        {
+          "id": "feasibility",
+          "question": "Can the local transformation be bounded and validated?",
+          "why": "Check the proposed delivery constraints"
+        }
+      ],
+      "deliverable": "A supported local CLI design and its constraints"
+    },
+    "researchReport": {
+      "researchPlan": {
+        "id": "fixture-plan",
+        "revision": 1,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "results": [
+        {
+          "id": "bounded",
+          "question": "feasibility",
+          "conclusion": "The fixture explicitly proposes a bounded local transformation",
+          "citations": [
+            0
+          ],
+          "limits": [
+            "Controlled fixture data; no live research claimed"
+          ]
+        }
+      ],
+      "openQuestions": [],
+      "variant": "Local stateless transformation",
+      "constraints": [
+        "Local inputs and outputs only"
+      ]
+    },
+    "verdict": {
+      "researchReport": {
+        "id": "fixture-report",
+        "revision": 1,
+        "hash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "outcome": "go",
+      "reason": "The fixture scope has a bounded implementation",
+      "variant": "Local stateless transformation",
+      "bases": [
+        {
+          "result": "bounded",
+          "reason": "The supplied fixture supports its proposed scope"
+        }
+      ],
+      "conditions": []
+    },
+    "preparation": {
+      "problem": "The user needs a local transformation result",
+      "existingSituation": "A new stateless CLI product is being designed",
+      "actors": [
+        {
+          "id": "golden-user",
+          "role": "CLI user",
+          "benefit": "Receive a validated transformation result",
+          "channels": [
+            "CLI"
+          ]
+        }
+      ],
+      "outcomes": [
+        {
+          "id": "golden-result",
+          "beneficiary": "golden-user",
+          "result": "A validated transformation output",
+          "success": [
+            "The output matches the requested input transformation"
+          ]
+        }
+      ],
+      "journeys": {
+        "success": {
+          "applicability": "applicable",
+          "reason": "The CLI accepts repeated valid and invalid requests",
+          "scenarios": [
+            {
+              "actor": "golden-user",
+              "outcome": "golden-result",
+              "entry": "CLI invocation",
+              "steps": [
+                "Read input",
+                "Validate input",
+                "Produce output"
+              ],
+              "success": [
+                "Return the requested result"
+              ],
+              "failure": [
+                "Reject invalid input without publishing a result"
+              ],
+              "recovery": []
+            }
+          ]
+        },
+        "first_use": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no first_use workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "repeated_use": {
+          "applicability": "applicable",
+          "reason": "The CLI accepts repeated valid and invalid requests",
+          "scenarios": [
+            {
+              "actor": "golden-user",
+              "outcome": "golden-result",
+              "entry": "CLI invocation",
+              "steps": [
+                "Read input",
+                "Validate input",
+                "Produce output"
+              ],
+              "success": [
+                "Return the requested result"
+              ],
+              "failure": [
+                "Reject invalid input without publishing a result"
+              ],
+              "recovery": []
+            }
+          ]
+        },
+        "reload_restart_resume": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no reload_restart_resume workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "cancel_stop_retry": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no cancel_stop_retry workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "invalid_incomplete_input": {
+          "applicability": "applicable",
+          "reason": "The CLI accepts repeated valid and invalid requests",
+          "scenarios": [
+            {
+              "actor": "golden-user",
+              "outcome": "golden-result",
+              "entry": "CLI invocation",
+              "steps": [
+                "Read input",
+                "Validate input",
+                "Produce output"
+              ],
+              "success": [
+                "Return the requested result"
+              ],
+              "failure": [
+                "Reject invalid input without publishing a result"
+              ],
+              "recovery": []
+            }
+          ]
+        },
+        "partial_success": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no partial_success workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "dependency_unavailable": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no dependency_unavailable workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "safe_failure": {
+          "applicability": "applicable",
+          "reason": "The CLI accepts repeated valid and invalid requests",
+          "scenarios": [
+            {
+              "actor": "golden-user",
+              "outcome": "golden-result",
+              "entry": "CLI invocation",
+              "steps": [
+                "Read input",
+                "Validate input",
+                "Produce output"
+              ],
+              "success": [
+                "Return the requested result"
+              ],
+              "failure": [
+                "Reject invalid input without publishing a result"
+              ],
+              "recovery": []
+            }
+          ]
+        },
+        "crash_recovery": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no crash_recovery workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "unauthorized_adversarial": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no unauthorized_adversarial workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "operator_admin": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no operator_admin workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "cli_api_agent": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no cli_api_agent workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "migration_compatibility": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no migration_compatibility workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "concurrent_replayed": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no concurrent_replayed workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "export_retention_deletion": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no export_retention_deletion workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        },
+        "accessibility": {
+          "applicability": "not_applicable",
+          "reason": "This explicitly scoped stateless CLI fixture has no accessibility workflow; no existing service or retained user state is being migrated",
+          "scenarios": []
+        }
+      },
+      "constraints": [
+        {
+          "id": "golden-local",
+          "rule": "Use local input and output only",
+          "basis": "Accepted fixture scope"
+        }
+      ],
+      "externalSystems": [],
+      "risks": [
+        {
+          "id": "golden-invalid",
+          "consequence": "Incorrect output",
+          "affectedOutcome": "golden-result",
+          "mitigation": "Validate before publishing"
+        }
+      ],
+      "unknowns": []
+    },
+    "audience": "audience for golden",
+    "outcome": "outcome for golden",
+    "acceptance": [
+      "acceptance for golden"
+    ],
+    "conceptSections": [
+      {
+        "id": "golden-concept",
+        "title": "Local transformation",
+        "requirements": [
+          {
+            "id": "golden-R1",
+            "statement": "Transform valid input and reject invalid input",
+            "benefit": "Reliable local result",
+            "beneficiary": "golden-user",
+            "outcome": "golden-result",
+            "acceptance": [
+              "Invalid input produces no result"
+            ]
+          }
+        ]
+      }
+    ],
+    "journey": [
+      "journey for golden"
+    ],
+    "operationRequirements": {
+      "outcomes": [
+        {
+          "outcome": "golden-result",
+          "producerResponsibility": "Transform and validate input",
+          "consumers": [
+            "golden-user"
+          ],
+          "prerequisites": [
+            "Input is available"
+          ],
+          "success": [
+            "Valid result is published"
+          ],
+          "failure": [
+            "Invalid input is rejected"
+          ],
+          "recoveryResponsibility": "CLI caller can retry with corrected input"
+        }
+      ],
+      "conceptCoverage": [
+        {
+          "requirement": "golden-R1",
+          "outcome": "golden-result"
+        }
+      ]
+    },
+    "mapDesign": {
+      "nodes": [
+        {
+          "id": "golden-product",
+          "kind": "product",
+          "parent": null,
+          "title": "golden",
+          "outcome": "golden-result",
+          "boundary": {
+            "authority": "project-owner",
+            "writer": "engine",
+            "rollback": "revision",
+            "state": "transient",
+            "provider": false
+          },
+          "ports": [],
+          "code": [],
+          "tests": [],
+          "purpose": "Own the golden part of the transformation",
+          "benefit": "Deliver validated local output",
+          "beneficiary": "golden-user",
+          "implements": [
+            "golden-R1"
+          ]
+        },
+        {
+          "id": "golden-produce-block",
+          "parent": "golden-product",
+          "kind": "block",
+          "title": "produce block",
+          "boundary": {
+            "authority": "project-owner",
+            "writer": "engine",
+            "rollback": "revision",
+            "state": "transient",
+            "provider": false
+          },
+          "outcome": "golden-data",
+          "ports": [
+            {
+              "id": "out",
+              "direction": "out",
+              "contract": "golden-contract"
+            }
+          ],
+          "code": [],
+          "tests": [],
+          "purpose": "Own the produce block part of the transformation",
+          "benefit": "Deliver validated local output",
+          "beneficiary": "golden-user",
+          "implements": [
+            "golden-R1"
+          ]
+        },
+        {
+          "id": "golden-consume-block",
+          "parent": "golden-product",
+          "kind": "block",
+          "title": "consume block",
+          "boundary": {
+            "authority": "project-owner",
+            "writer": "engine",
+            "rollback": "revision",
+            "state": "transient",
+            "provider": false
+          },
+          "outcome": "golden-result",
+          "ports": [
+            {
+              "id": "in",
+              "direction": "in",
+              "contract": "golden-contract"
+            }
+          ],
+          "code": [],
+          "tests": [],
+          "purpose": "Own the consume block part of the transformation",
+          "benefit": "Deliver validated local output",
+          "beneficiary": "golden-user",
+          "implements": [
+            "golden-R1"
+          ]
+        },
+        {
+          "id": "golden-refusal-block",
+          "parent": "golden-product",
+          "kind": "block",
+          "title": "Reject invalid input",
+          "outcome": "golden-refusal",
+          "boundary": {
+            "authority": "project-owner",
+            "writer": "engine",
+            "rollback": "revision",
+            "state": "transient",
+            "provider": false
+          },
+          "code": [],
+          "tests": [],
+          "ports": [],
+          "purpose": "Handle invalid requests safely",
+          "benefit": "Avoid an incorrect result",
+          "beneficiary": "golden-user",
+          "implements": [
+            "golden-R1"
+          ]
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "golden-data",
+          "contract": "golden-contract",
+          "external": false,
+          "terminal": false,
+          "kind": "intermediate",
+          "purpose": "Carry golden-data",
+          "durability": "reconstructible",
+          "sensitivity": "project_internal"
+        },
+        {
+          "id": "golden-result",
+          "contract": "golden-contract",
+          "external": false,
+          "terminal": true,
+          "kind": "result",
+          "purpose": "Carry golden-result",
+          "durability": "reconstructible",
+          "sensitivity": "project_internal"
+        },
+        {
+          "id": "golden-refusal",
+          "contract": "golden-contract",
+          "external": false,
+          "terminal": true,
+          "kind": "error",
+          "purpose": "Return a safe refusal without publishing invalid output",
+          "durability": "reconstructible",
+          "sensitivity": "project_internal"
+        }
+      ],
+      "connectors": [
+        {
+          "id": "golden-flow",
+          "artifact": "golden-data",
+          "returnsTo": "golden-produce-block",
+          "wakeTest": null,
+          "bindings": [
+            {
+              "level": 1,
+              "producer": {
+                "node": "golden-produce-block",
+                "port": "out"
+              },
+              "consumers": [
+                {
+                  "node": "golden-consume-block",
+                  "port": "in"
+                }
+              ],
+              "anchor": null
+            }
+          ]
+        }
+      ],
+      "contracts": [
+        {
+          "id": "golden-contract",
+          "schema": {
+            "type": "number"
+          }
+        }
+      ],
+      "anchors": [],
+      "joins": [],
+      "tests": [],
+      "horizon": [],
+      "edges": [
+        {
+          "id": "golden-invalid-transition",
+          "relation": "on_failure",
+          "source": "golden-produce-block",
+          "target": "golden-refusal-block",
+          "condition": "Input validation fails"
+        }
+      ],
+      "journeys": [
+        {
+          "id": "golden-journey-success-0",
+          "actor": "golden-user",
+          "variant": "success",
+          "entry": "golden-produce-block",
+          "path": [
+            "golden-produce-block",
+            "golden-consume-block"
+          ],
+          "outcome": "golden-result",
+          "terminal": "success"
+        },
+        {
+          "id": "golden-journey-repeated_use-0",
+          "actor": "golden-user",
+          "variant": "repeated_use",
+          "entry": "golden-produce-block",
+          "path": [
+            "golden-produce-block",
+            "golden-consume-block"
+          ],
+          "outcome": "golden-result",
+          "terminal": "success"
+        },
+        {
+          "id": "golden-journey-invalid_incomplete_input-0",
+          "actor": "golden-user",
+          "variant": "invalid_incomplete_input",
+          "entry": "golden-produce-block",
+          "path": [
+            "golden-produce-block",
+            "golden-refusal-block"
+          ],
+          "outcome": "golden-refusal",
+          "terminal": "safe_failure"
+        },
+        {
+          "id": "golden-journey-safe_failure-0",
+          "actor": "golden-user",
+          "variant": "safe_failure",
+          "entry": "golden-produce-block",
+          "path": [
+            "golden-produce-block",
+            "golden-refusal-block"
+          ],
+          "outcome": "golden-refusal",
+          "terminal": "safe_failure"
+        }
+      ],
+      "transfers": [],
+      "packets": []
+    },
+    "behavior": [
+      "behavior for golden"
+    ],
+    "constraints": [
+      "constraints for golden"
+    ],
+    "behaviorContracts": [
+      {
+        "id": "golden-B1",
+        "requirements": [
+          "golden-R1"
+        ],
+        "actor": "golden-user",
+        "entry": "CLI invocation",
+        "inputs": [
+          "Local input"
+        ],
+        "outcome": "golden-result",
+        "success": [
+          "Requested output is returned"
+        ],
+        "failures": [
+          "Invalid input is rejected"
+        ],
+        "forbiddenEffects": [
+          "Publishing invalid output"
+        ],
+        "state": {
+          "durability": "none",
+          "writer": "transformation service",
+          "authority": "CLI caller",
+          "rollback": "Do not publish invalid output",
+          "restart": "Start a new stateless invocation",
+          "replay": "Same input returns the same output"
+        },
+        "compatibility": "New standalone CLI",
+        "proof": "Invoke CLI with valid and invalid input"
+      }
+    ],
+    "features": [
+      {
+        "title": "Deliver result",
+        "outcome": "golden-result",
+        "requirements": [
+          0
+        ]
+      }
+    ],
+    "featurePreparation": [
+      {
+        "featureTitle": "Deliver result",
+        "outcome": "golden-result",
+        "requirements": [
+          "golden-R1"
+        ],
+        "behaviorContracts": [
+          "golden-B1"
+        ],
+        "beneficiary": "golden-user",
+        "benefit": "Obtain a validated result",
+        "success": [
+          "Valid result is returned"
+        ],
+        "failures": [
+          "Invalid input produces no result"
+        ],
+        "interactions": [],
+        "remainingQuestions": []
+      }
+    ]
+  },
+  "desired": {
+    "version": 2,
+    "id": "golden:map",
+    "title": "golden",
+    "horizon": [
+      "golden-produce-work",
+      "golden-consume-work"
+    ],
+    "contracts": [
+      {
+        "id": "golden-contract",
+        "schema": {
+          "type": "number"
+        }
+      }
+    ],
+    "nodes": [
+      {
+        "id": "golden-product",
+        "kind": "product",
+        "parent": null,
+        "title": "golden",
+        "outcome": "golden-result",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "ports": [],
+        "code": [],
+        "tests": [],
+        "purpose": "Own the golden part of the transformation",
+        "benefit": "Deliver validated local output",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-produce-block",
+        "parent": "golden-product",
+        "kind": "block",
+        "title": "produce block",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "outcome": "golden-data",
+        "ports": [
+          {
+            "id": "out",
+            "direction": "out",
+            "contract": "golden-contract"
+          }
+        ],
+        "code": [],
+        "tests": [],
+        "purpose": "Own the produce block part of the transformation",
+        "benefit": "Deliver validated local output",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-produce-operation",
+        "parent": "golden-produce-block",
+        "kind": "operation",
+        "title": "produce operation",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "outcome": "golden-data",
+        "ports": [
+          {
+            "id": "out",
+            "direction": "out",
+            "contract": "golden-contract"
+          }
+        ],
+        "code": [],
+        "tests": [],
+        "purpose": "Own the produce operation part of the transformation",
+        "benefit": "Deliver validated local output",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-produce-work",
+        "parent": "golden-produce-operation",
+        "kind": "work",
+        "title": "produce work",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "outcome": "golden-data",
+        "ports": [
+          {
+            "id": "out",
+            "direction": "out",
+            "contract": "golden-contract"
+          }
+        ],
+        "code": [
+          {
+            "path": "produce.mjs",
+            "access": "write",
+            "status": "planned"
+          }
+        ],
+        "tests": [
+          "golden-produce-work-test"
+        ],
+        "purpose": "Own the produce work part of the transformation",
+        "benefit": "Deliver validated local output",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-consume-block",
+        "parent": "golden-product",
+        "kind": "block",
+        "title": "consume block",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "outcome": "golden-result",
+        "ports": [
+          {
+            "id": "in",
+            "direction": "in",
+            "contract": "golden-contract"
+          }
+        ],
+        "code": [],
+        "tests": [],
+        "purpose": "Own the consume block part of the transformation",
+        "benefit": "Deliver validated local output",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-consume-operation",
+        "parent": "golden-consume-block",
+        "kind": "operation",
+        "title": "consume operation",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "outcome": "golden-result",
+        "ports": [
+          {
+            "id": "in",
+            "direction": "in",
+            "contract": "golden-contract"
+          }
+        ],
+        "code": [],
+        "tests": [],
+        "purpose": "Own the consume operation part of the transformation",
+        "benefit": "Deliver validated local output",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-consume-work",
+        "parent": "golden-consume-operation",
+        "kind": "work",
+        "title": "consume work",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "outcome": "golden-result",
+        "ports": [
+          {
+            "id": "in",
+            "direction": "in",
+            "contract": "golden-contract"
+          }
+        ],
+        "code": [
+          {
+            "path": "consume.mjs",
+            "access": "write",
+            "status": "planned"
+          }
+        ],
+        "tests": [
+          "golden-consume-work-test"
+        ],
+        "purpose": "Own the consume work part of the transformation",
+        "benefit": "Deliver validated local output",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-refusal-block",
+        "parent": "golden-product",
+        "kind": "block",
+        "title": "Reject invalid input",
+        "outcome": "golden-refusal",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "code": [],
+        "tests": [],
+        "ports": [],
+        "purpose": "Handle invalid requests safely",
+        "benefit": "Avoid an incorrect result",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      },
+      {
+        "id": "golden-refusal-operation",
+        "parent": "golden-refusal-block",
+        "kind": "operation",
+        "title": "Reject invalid input",
+        "outcome": "golden-refusal",
+        "boundary": {
+          "authority": "project-owner",
+          "writer": "engine",
+          "rollback": "revision",
+          "state": "transient",
+          "provider": false
+        },
+        "code": [],
+        "tests": [],
+        "ports": [],
+        "purpose": "Handle invalid requests safely",
+        "benefit": "Avoid an incorrect result",
+        "beneficiary": "golden-user",
+        "implements": [
+          "golden-R1"
+        ]
+      }
+    ],
+    "artifacts": [
+      {
+        "id": "golden-data",
+        "contract": "golden-contract",
+        "external": false,
+        "terminal": false,
+        "kind": "intermediate",
+        "purpose": "Carry golden-data",
+        "durability": "reconstructible",
+        "sensitivity": "project_internal"
+      },
+      {
+        "id": "golden-result",
+        "contract": "golden-contract",
+        "external": false,
+        "terminal": true,
+        "kind": "result",
+        "purpose": "Carry golden-result",
+        "durability": "reconstructible",
+        "sensitivity": "project_internal"
+      },
+      {
+        "id": "golden-refusal",
+        "contract": "golden-contract",
+        "external": false,
+        "terminal": true,
+        "kind": "error",
+        "purpose": "Return a safe refusal without publishing invalid output",
+        "durability": "reconstructible",
+        "sensitivity": "project_internal"
+      }
+    ],
+    "connectors": [
+      {
+        "id": "golden-flow",
+        "artifact": "golden-data",
+        "returnsTo": "golden-produce-block",
+        "wakeTest": null,
+        "bindings": [
+          {
+            "level": 1,
+            "producer": {
+              "node": "golden-produce-block",
+              "port": "out"
+            },
+            "consumers": [
+              {
+                "node": "golden-consume-block",
+                "port": "in"
+              }
+            ],
+            "anchor": null
+          },
+          {
+            "level": 2,
+            "producer": {
+              "node": "golden-produce-operation",
+              "port": "out"
+            },
+            "consumers": [
+              {
+                "node": "golden-consume-operation",
+                "port": "in"
+              }
+            ],
+            "anchor": null
+          },
+          {
+            "level": 3,
+            "producer": {
+              "node": "golden-produce-work",
+              "port": "out",
+              "codeRef": {
+                "path": "produce.txt",
+                "access": "write",
+                "status": "planned"
+              }
+            },
+            "consumers": [
+              {
+                "node": "golden-consume-work",
+                "port": "in",
+                "codeRef": {
+                  "path": "consume.txt",
+                  "access": "write",
+                  "status": "planned"
+                }
+              }
+            ],
+            "anchor": null
+          }
+        ]
+      }
+    ],
+    "anchors": [],
+    "joins": [],
+    "tests": [
+      {
+        "id": "golden-produce-work-test",
+        "node": "golden-produce-work",
+        "command": {
+          "executable": "node",
+          "args": [
+            "check.mjs",
+            "produce"
+          ]
+        },
+        "covers": [
+          "golden-flow"
+        ],
+        "contract": {
+          "given": [
+            "Local input supplied by the caller"
+          ],
+          "when": "Invoke the transformation",
+          "then": [
+            "Return validated output"
+          ],
+          "forbiddenEffects": [
+            "Publish invalid output"
+          ],
+          "entrypoint": {
+            "kind": "cli",
+            "path": "produce.mjs",
+            "symbol": null,
+            "status": "planned"
+          },
+          "counterfactuals": [
+            {
+              "connector": "golden-flow",
+              "mutation": "remove",
+              "expectedFailure": "input_missing",
+              "command": {
+                "executable": "node",
+                "args": [
+                  "check.mjs",
+                  "missing"
+                ]
+              }
+            }
+          ],
+          "resourceClass": "pure",
+          "resources": []
+        }
+      },
+      {
+        "id": "golden-consume-work-test",
+        "node": "golden-consume-work",
+        "command": {
+          "executable": "node",
+          "args": [
+            "check.mjs",
+            "consume"
+          ]
+        },
+        "covers": [],
+        "contract": {
+          "given": [
+            "Local input supplied by the caller"
+          ],
+          "when": "Invoke the transformation",
+          "then": [
+            "Return validated output"
+          ],
+          "forbiddenEffects": [
+            "Publish invalid output"
+          ],
+          "entrypoint": {
+            "kind": "cli",
+            "path": "consume.mjs",
+            "symbol": null,
+            "status": "planned"
+          },
+          "counterfactuals": [],
+          "resourceClass": "pure",
+          "resources": []
+        }
+      }
+    ],
+    "actors": [
+      {
+        "id": "golden-user",
+        "role": "CLI user",
+        "channels": [
+          "CLI"
+        ]
+      }
+    ],
+    "requirements": [
+      {
+        "id": "golden-R1",
+        "section": "golden-concept",
+        "outcome": "golden-result",
+        "beneficiary": "golden-user",
+        "statement": "Transform valid input and reject invalid input"
+      }
+    ],
+    "edges": [
+      {
+        "id": "golden-invalid-transition",
+        "relation": "on_failure",
+        "source": "golden-produce-block",
+        "target": "golden-refusal-block",
+        "condition": "Input validation fails"
+      }
+    ],
+    "journeys": [
+      {
+        "id": "golden-journey-success-0",
+        "actor": "golden-user",
+        "variant": "success",
+        "entry": "golden-produce-block",
+        "path": [
+          "golden-produce-block",
+          "golden-consume-block"
+        ],
+        "outcome": "golden-result",
+        "terminal": "success"
+      },
+      {
+        "id": "golden-journey-repeated_use-0",
+        "actor": "golden-user",
+        "variant": "repeated_use",
+        "entry": "golden-produce-block",
+        "path": [
+          "golden-produce-block",
+          "golden-consume-block"
+        ],
+        "outcome": "golden-result",
+        "terminal": "success"
+      },
+      {
+        "id": "golden-journey-invalid_incomplete_input-0",
+        "actor": "golden-user",
+        "variant": "invalid_incomplete_input",
+        "entry": "golden-produce-block",
+        "path": [
+          "golden-produce-block",
+          "golden-refusal-block"
+        ],
+        "outcome": "golden-refusal",
+        "terminal": "safe_failure"
+      },
+      {
+        "id": "golden-journey-safe_failure-0",
+        "actor": "golden-user",
+        "variant": "safe_failure",
+        "entry": "golden-produce-block",
+        "path": [
+          "golden-produce-block",
+          "golden-refusal-block"
+        ],
+        "outcome": "golden-refusal",
+        "terminal": "safe_failure"
+      }
+    ],
+    "transfers": [],
+    "packets": []
+  }
+}

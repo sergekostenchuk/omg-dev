@@ -12,7 +12,8 @@
     "check": "npm run build && npm test",
     "check:backend": "node scripts/check-backend.mjs",
     "start": "node dist/src/cli.js",
-    "dev": "npm run build && node dist/src/cli.js serve"
+    "dev": "npm run build && node dist/src/cli.js serve",
+    "sample:generate": "node scripts/golden-sample.mjs"
   },
   "devDependencies": {
     "@types/node": "22.20.1",

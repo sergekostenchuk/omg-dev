@@ -8,7 +8,6 @@ import { createRequire } from 'node:module';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { type Json } from '../src/canonical.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -130,7 +129,7 @@ function gatePrefix(store: Store, kind: QuestionKind, addressQuestion: boolean, 
         moment: 'om-pass', blocksCurrentStage: false, resolution: 'Resolve the named decision before assembling work' }] : []),
     ];
     return value;
-  }, kind === 'owner-decision' && addressQuestion ? undefined : LP7_BASE);
+  });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
     reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const first = ok(writeOmInput(store, { project, expected: 0, stages }));
@@ -159,14 +158,10 @@ function gatePrefix(store: Store, kind: QuestionKind, addressQuestion: boolean, 
     gap: reference(other), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) : null;
   const tasks = [task, otherTask].filter((entry): entry is NonNullable<typeof task> => entry !== null)
     .map(entry => entry.writes.length ? { pending: clone(entry.writes[0]!) as Write } : { record: reference(entry.record) });
-  // LP7 (№3393 §6 F2): the legacy producers of this suite read this route, so it is the base code's own record, written in
-  // its own process — the split route of that era, which today's code keeps current — never a route joined by today's code.
-  // OWN1 (№3713): an owner question of the pass is routed to the model since; that era's route of it is history, and
-  // its question is routed by today's code.
+  // Every variant is created by the current producers. A completed golden project cannot stand in for
+  // this deliberately open input/frame, and no earlier route grouping is manufactured for the test.
   const routeRequest = { project, gaps: gapRead, tasks, catalog: { paths: [], records: [] }, previous: null };
-  const route = kind === 'owner-decision' && addressQuestion ? ok(writeRoutes(store, clone(routeRequest) as never)) as Revision<RoutesRecord>
-    : atCommit({ root: dirname(store.path), path: store.path }, LP7_BASE, 'gate-route', `const { writeRoutes } = await import(src('om/routes.js'));
-out(take(writeRoutes(store, args)));`, routeRequest) as Revision<RoutesRecord>;
+  const route = ok(writeRoutes(store, clone(routeRequest) as never)) as Revision<RoutesRecord>;
   const request: AnswersGateRequest = { project, gaps: gapRead, routes: reference(route), results: [] };
   return { project, target, block, input, graph, horizon, gaps, blocking, route, request, task };
 }
@@ -1299,7 +1294,6 @@ const canonicalOrder = <T>(values: readonly T[]): T[] => [...values].sort((a, b)
  * each module it serves from Git and refuses an engine module outside the checkout, so a missed prefix cannot fall
  * back to the current build and let an era test pass vacuously.
  */
-const LP7_BASE = '7c7d3cccb88d0a6c17b21051069f0244d98248f9';
 function atCommit(f: { root: string; path: string }, commit: string, name: string, body: string, input: unknown): unknown {
   const repository = fileURLToPath(new URL('../../', import.meta.url));
   const loader = join(f.root, `${name}-loader.mjs`), producer = join(f.root, `${name}-producer.mjs`);
@@ -2732,11 +2726,11 @@ test('14 H1.0c E5 T, E4 T and an H1.0b root cessation stay their own grounds, ne
 });
 
 /** One D3 decision applied to the current B1 (none: B1 stands) and the whole D1/M6 derived again from that input. */
-function redrive(f: ReturnType<typeof fixture>, decision: { target: string; field: string; value: Json } | null, choice: string) {
+function redrive(f: ReturnType<typeof fixture>, decision: { target: string; field: string; value: Json } | { target: string; field: string; value: Json }[] | null, choice: string) {
   const head = f.store.get(f.input.id)!;
   const input = !decision ? head : ok(writeAddressing(f.store, { project: f.project, input: reference(head), graph: reference(f.graph),
-    decisions: [{ pending: clone(inputDecisionWrite({ project: f.project, input: reference(head), graph: reference(f.graph), layers: [],
-      decision: decision as never })) as Write }] }));
+    decisions: (Array.isArray(decision) ? decision : [decision]).map(item => ({ pending: clone(inputDecisionWrite({ project: f.project, input: reference(head), graph: reference(f.graph), layers: [],
+      decision: item as Parameters<typeof inputDecisionWrite>[0]['decision'] })) as Write })) }));
   const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(input), graph: reference(f.graph), refinement: null,
     available: {}, choice: { choiceVersion: `answers-gate-${choice}`, features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const old = f.request.gaps.sources;
@@ -2804,13 +2798,15 @@ test('20 26 27 H1.0c after D3 the vanished gap needs no answer; an old submissio
   const m = managedOn(f, 'garden-consume-block', [batch.id], 1, 'row20');
   const planned = f.gaps.records.find(row => row.value.gap.target === 'garden-B1' && row.value.gap.field === 'nodes')!;
   const foreign: Ref = { id: `${planned.id.slice(0, planned.id.lastIndexOf(':'))}:${'f'.repeat(64)}`, revision: 1, hash: 'f'.repeat(64) };
-  const next = redrive(f, { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] }, 'row20');
+  // Current routes join the complete input of a block: resolve the whole planned batch, not just its nodes member.
+  const next = redrive(f, batch.items.map(item => ({ target: item.target, field: item.field, value: currentInputValue(item.field) })), 'row20');
   assert.equal(next.gaps.records.some(row => row.value.gap.target === 'garden-B1' && row.value.gap.field === 'nodes'), false);
   const old = { gap: reference(planned), result: null, candidate: null };
   const saved = ok(evaluate(f, m, [], { request: { ...next.request, results: [old, old,
     { gap: foreign, result: null, candidate: null }] } }));
   assert.deepEqual(saved.evaluation.value.scope.items, [], 'The vanished gap is no longer an obligation');
-  assert.deepEqual(saved.evaluation.value.scope.absent.map(item => item.record), [reference(planned)]);
+  assert.deepEqual(canonicalOrder(saved.evaluation.value.scope.absent.map(item => item.record)), canonicalOrder(batch.items.map(item => item.record)),
+    'Every member of the current joined batch disappeared by its own D3 decision');
   const read = ok(readAnswersEvaluationAt(f.store, f.project, reference(saved.evaluation)));
   assert.deepEqual(read.gate.value.result.codes.includes('answer_gap_unknown'), true);
   assert.deepEqual(read.groups.map(group => [group.proof.value.scope, group.proof.value.occurrences.length, group.proof.value.contribution]),
@@ -4375,6 +4371,13 @@ test('LP5 (№3278 row 12) a proved subject refusal stays the outcome beside the
 import { writeApplyAnswer, writeReopenAnswers } from '../src/om/addressing.js';
 import type { OmInputRecord } from '../src/om/input.js';
 import type { CompletionCause } from '../src/om/model-call.js';
+/** Values of the complete native block-input batch; an unknown field is a fixture error. */
+function currentInputValue(field: string): Json {
+  if (field === 'nodes') return ['garden-produce-block', 'garden-consume-block'];
+  if (field === 'checkKind') return 'test';
+  if (field === 'state') return { writer: 'garden-produce-block', authority: 'garden-user', rollback: 'garden-produce-block' };
+  assert.fail(`Unexpected input field ${field}`);
+}
 /** Row 25 (E4): a managed attempt on the garden-B1 nodes batch whose own E4 answer applies its D3 decision — the live n-research case. */
 async function lp5OwnDecision(t: TestContext, slice: string) {
   const f = fixture(t, 'repository-fact', true, false, { block: 'garden-consume-block', later: true }), batch = fieldBatch(f, 'garden-B1', 'nodes');
@@ -4399,7 +4402,7 @@ async function lp5OwnDecision(t: TestContext, slice: string) {
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
   writeFileSync(scenario, JSON.stringify({ database: f.path, steps: [{ research: { protocol: '$answerProtocol', requestId: '$requestId',
     action: 'answer', results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
-      value: ['garden-produce-block', 'garden-consume-block'] })) }, usage: traceUsage }] }));
+      value: currentInputValue(item.field) })) }, usage: traceUsage }] }));
   const sent = ok(await runModelCall(f.store, { project: f.project, packet: reference(packet),
     dispatch: { adapter: reference(adapter), config: reference(config) }, role: 'implementer' }));
   assert.equal(sent.outcome?.kind, 'input-decisions');
