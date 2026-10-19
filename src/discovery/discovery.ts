@@ -1,6 +1,7 @@
 import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
-import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { Store, storeObserved, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
@@ -759,11 +760,13 @@ export class Discovery {
     // The managed proofs' pinned exact revisions are immutable rows — verified once when the
     // closure was written and audited by om-fsck, not re-verified row by row here (№6348 G4a-01):
     // the batch cost stays C+ceil(D/chunk) whatever the accepted prefix's size.
+    const physical = provenStore(this.store);
+    const memoRef = physical !== null && !storeObserved(physical);
     for (const check of value.external) {
       if (check.kind !== "source") return invalid("The recorded prefix closure declares an unsupported check");
       const source = this.store.get<Source>(check.ref.id);
       if (source?.kind !== "source" || source.revision !== check.ref.revision || source.hash !== check.ref.hash
-        || !sourceIsCurrent(source.value)) return null;
+        || !sourceIsCurrent(source.value, memoRef ? check.ref : undefined)) return null;
     }
     const findings: Finding[] = [];
     const output: Ref[] = [reference(draft), ...value.derivations, ...value.inputs];

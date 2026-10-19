@@ -11,7 +11,8 @@ import { discoveryAcceptanceActId } from "../src/discovery/v7-contracts.js";
 import { NEXT_CONTRACT_ERA } from "../src/discovery/requirements.js";
 import { EngineError } from "../src/errors.js";
 import { reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
-import type { Source } from "../src/evidence/evidence.js";
+import { withSourceMemo, type Source } from "../src/evidence/evidence.js";
+import { storeView } from "../src/storage/store-view.js";
 import { hashJson } from "../src/canonical.js";
 import { historicalRead, withHistoricalReads } from "../src/history/proofs.js";
 import { referenceSites } from "../src/storage/reference-sites.js";
@@ -500,3 +501,27 @@ test("a lost or damaged K, B or M misses the managed closure and falls back to t
     assert.deepEqual(f.engine.discovery.gate("p", reference(head)).findings, [], `${id} restored`);
   }
 });
+
+test("negative: opaque store view does not borrow a physical source memo in a mixed scope", t => {
+  const root = mkdtempSync(join(tmpdir(), "fixb-source-"));
+  const store = new Store(join(root, "state.sqlite"));
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  writeFileSync(join(root, "source.json"), "{}");
+  const discovery = new Discovery(store);
+  const source = discovery.evidence.file("p", "source", root, "source.json", "application/json", 0);
+  const draft = discovery.create("p", "discovery", "R0", "concept", [{ field: "data", kind: "fact", prompt: "data?", risk: "wrong", schema: { type: "object" } }]);
+  const accepted = discovery.fact(draft.value.questions[0]!, 1, reference(source), { kind: "json-pointer", pointer: "" });
+  const altered = { ...source, value: { ...source.value, origin: { ...source.value.origin, location: join(root, "missing.json") } } };
+  const view = storeView(store, { get: id => id === source.id ? (altered as unknown as Revision) : undefined, write: () => assert.fail("read only") });
+  const projected = new Discovery(view);
+  const isolated = projected.gate("p", reference(accepted));
+  assert.ok(isolated.findings.some(f => f.code === "evidence_stale"));
+  const together = withSourceMemo(() => {
+    const physical = discovery.gate("p", reference(accepted));
+    assert.deepEqual(physical.findings, []);
+    return projected.gate("p", reference(accepted));
+  });
+  assert.ok(together.findings.some(f => f.code === "evidence_stale"), "opaque view with missing file refuses even if physical source was memoized");
+  assert.equal(together.prefix, undefined, "no prefix snapshot on stale view refusal");
+});
+

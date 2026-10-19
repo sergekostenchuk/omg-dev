@@ -1,6 +1,7 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { relative, resolve, isAbsolute } from "node:path";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, storeObserved, type Revision } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import { digest, canonical, hashJson, type Json } from "../canonical.js";
 import { buildSourceStructure, verifySourceStructure, type SourceStructure } from "./source-structure.js";
 import { selectStructuredRead, requireNavigationStructure, STRUCTURED_READ_CONTRACT, type StructuredReadSelection } from './source-navigation.js';
@@ -270,7 +271,9 @@ export const sourceExternalHandler: ExternalCheckHandler<"source"> = (check, con
     if (!source || source.kind !== "source" || source.hash !== check.ref.hash) {
       return { code: "external_source_changed", target: check.ref.id, message: "The declared external source changed" };
     }
-    if (!sourceIsCurrent(source.value, check.ref)) {
+    const physical = provenStore(context.store);
+    const memoRef = physical !== null && !storeObserved(physical);
+    if (!sourceIsCurrent(source.value, memoRef ? check.ref : undefined)) {
       return { code: "external_source_changed", target: check.ref.id, message: "The declared external source file changed or disappeared" };
     }
     return null;
@@ -323,7 +326,9 @@ export class Evidence {
       "source_missing", "A real source from this project is required");
     requireCondition(source.revision === sourceRef.revision && source.hash === sourceRef.hash,
       "source_stale", "Evidence must reference the current source version");
-    requireCondition(sourceIsCurrent(source.value, sourceRef), "source_stale", "The captured source file has changed or disappeared");
+    const physical = provenStore(this.store);
+    const memoRef = physical !== null && !storeObserved(physical);
+    requireCondition(sourceIsCurrent(source.value, memoRef ? sourceRef : undefined), "source_stale", "The captured source file has changed or disappeared");
     let value: unknown;
     if (selector.kind === "json-pointer") {
       requireCondition(source.value.mediaType === "application/json", "selector_invalid", "JSON selection requires a JSON source");
@@ -349,7 +354,9 @@ export class Evidence {
     const source = this.store.get<Source>(sourceRef.id);
     requireCondition(source?.kind === 'source' && source.value.projectId === projectId,
       'source_missing', 'A real source from this project is required');
-    requireCondition(canonical(reference(source)) === canonical(sourceRef) && sourceIsCurrent(source.value, sourceRef),
+    const physical = provenStore(this.store);
+    const memoRef = physical !== null && !storeObserved(physical);
+    requireCondition(canonical(reference(source)) === canonical(sourceRef) && sourceIsCurrent(source.value, memoRef ? sourceRef : undefined),
       'source_stale', 'The requested source has changed or disappeared');
     return projectSourceReading(projectId, sourceRef, source.value, requested, contract);
   }
