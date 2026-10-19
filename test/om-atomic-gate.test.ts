@@ -725,21 +725,38 @@ test('F5 every returned head guard and expected-zero prerequisite protects the o
   assert.ok(prepared.guards.some(guard => guard.id === f.input.id));
   assert.ok(prepared.guards.some(guard => guard.id === f.layer2.id));
   assert.ok(prepared.guards.some(guard => guard.id === f.lines.id));
+  assert.deepEqual(prepared.guards.filter(guard => guard.id === 'om-frame:garden:3'),
+    [{ id: 'om-frame:garden:3', absent: true }]);
   f.restart();
   for (const [index, guard] of prepared.guards.entries()) {
     const database = join(f.root, `guard-${index}.sqlite`); copyFileSync(f.database, database);
     const main = new Store(database), other = new Store(database);
     try {
-      const old = other.get(guard.id)!; assert.ok(old, guard.id);
-      other.write({ id: old.id, kind: old.kind, expected: old.revision, value: old.value });
-      const afterRace = heads(main);
-      denied(writeGuarded(main, { unit: 'G5', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }), 'input_stale');
+      if ('absent' in guard) {
+        assert.equal(other.get(guard.id), null, guard.id);
+        const pending = prepared.writes.find(write => write.id === guard.id);
+        if (pending) assert.equal(pending.expected, 0);
+        other.write(pending ?? { id: guard.id, kind: 'fixture', expected: 0, value: {} });
+      } else {
+        const old = other.get(guard.id)!; assert.ok(old, guard.id);
+        other.write({ id: old.id, kind: old.kind, expected: old.revision, value: old.value });
+      }
+      const afterRace = heads(main), concurrent = other.get(guard.id);
+      const refused = writeGuarded(main, { unit: 'G5', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards });
+      assert.equal(refused.ok, false);
+      if (refused.ok) assert.fail('A changed transaction guard must refuse the entire acceptance');
+      assert.equal(refused.refusal.code, 'input_stale');
+      assert.equal(refused.refusal.at.target, guard.id);
+      assert.equal(refused.refusal.route, 'producer');
       assert.deepEqual(heads(main), afterRace, guard.id);
-      assert.equal(main.get(prepared.record.id), null); assert.equal(main.get('om-frame:garden:3'), null);
+      assert.deepEqual(main.get(guard.id), concurrent, 'The refusal retains the concurrent record');
+      assert.equal(main.get(prepared.record.id), null);
     } finally { other.close(); main.close(); }
   }
   const pending = prepared.writes.find(write => write.kind === 'writer-index' && write.expected === 0);
   assert.ok(pending, 'The first-writer index also uses the same acceptance CAS');
+  assert.equal(prepared.guards.some(guard => guard.id === pending.id && 'absent' in guard), false,
+    'This expected-zero conflict is separate from the complete returned absence guards');
   const database = join(f.root, 'index-race.sqlite'); copyFileSync(f.database, database);
   const main = new Store(database), other = new Store(database);
   try {

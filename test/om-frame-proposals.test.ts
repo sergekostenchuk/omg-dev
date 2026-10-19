@@ -537,10 +537,17 @@ test("the first stored assembly returns proposals, gaps and frame-zero CAS witho
     layerHash: hashJson(projectGraph(graph, 2)), fills: [] };
   store.write({ id: "om-frame:garden:2", kind: "connection-frame", expected: 0, value: frameValue });
   const beforeConflict = revisions(store);
-  refusedAs(writeGuarded(store, { unit: "C5-neighbor", target: "candidate:garden", guards: first.guards,
+  assert.deepEqual(first.guards.filter(guard => guard.id === "om-frame:garden:2"),
+    [{ id: "om-frame:garden:2", absent: true }]);
+  const refused = writeGuarded(store, { unit: "C5-neighbor", target: "candidate:garden", guards: first.guards,
     writes: [{ id: "candidate:garden", kind: "candidate", expected: 0, value: { proposals: first.proposals } },
       { id: "om-frame:garden:2", kind: "connection-frame", expected: first.expected.frame, value: frameValue },
-      { id: proposalRef.id, kind: "layer-proposal", expected: proposalRef.revision, value: { ...proposal.value, status: "accepted" } }] }), "revision_conflict");
+      { id: proposalRef.id, kind: "layer-proposal", expected: proposalRef.revision, value: { ...proposal.value, status: "accepted" } }] });
+  assert.equal(refused.ok, false);
+  if (refused.ok) assert.fail("The concurrent frame must invalidate its absence guard");
+  assert.equal(refused.refusal.code, "input_stale");
+  assert.equal(refused.refusal.at.target, "om-frame:garden:2");
+  assert.equal(refused.refusal.route, "producer");
   assert.equal(store.get("candidate:garden"), null);
   assert.equal(store.get<LayerProposal>(proposalRef.id)!.value.status, "proposed");
   assert.deepEqual(revisions(store), beforeConflict);

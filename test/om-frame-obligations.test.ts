@@ -829,7 +829,12 @@ test("the first frame assembly uses accepted L1 and open obligations without cre
     writes: [{ id: "candidate:garden", kind: "candidate", expected: 0, value: candidate },
       { id: concurrent.id, kind: concurrent.kind, expected: prepared.expected.frame, value: frameValue },
       { id: "candidate-status:garden", kind: "candidate-status", expected: 0, value: { state: "accepted" } }] });
-  refusedAs(transaction, "revision_conflict");
+  assert.deepEqual(prepared.guards.filter(guard => guard.id === concurrent.id), [{ id: concurrent.id, absent: true }]);
+  assert.equal(transaction.ok, false);
+  if (transaction.ok) assert.fail("The concurrent frame must invalidate its absence guard");
+  assert.equal(transaction.refusal.code, "input_stale");
+  assert.equal(transaction.refusal.at.target, concurrent.id);
+  assert.equal(transaction.refusal.route, "producer");
   assert.equal(store.get("candidate:garden"), null);
   assert.equal(store.get("candidate-status:garden"), null);
   assert.deepEqual(revisions(store), beforeConflict);

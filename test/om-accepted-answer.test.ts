@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -15,7 +15,7 @@ import { answerContractFingerprint, mc1FieldSpec, prepareMc1Question, readMc1Que
   checkAnswerInputBody, readAnswerForInput, answerSourceGuards,
   prepareAnswerInvalidation, readAnswerInvalidation, type AnswerInvalidation,
   prepareAnswerTask, writeAnswerTask, readAnswerTask, readAnswerTaskBasis, applicableAnswerTask, type AnswerTaskRequest,
-  prepareAnswerSearch, readAnswerSearch, answerIndexId, prepareAcceptedAnswers, ANSWER_INDEX_KIND, type AnswerIndex,
+  prepareAnswerSearch, readAnswerSearch, answerIndexId, prepareAcceptedAnswers, ANSWER_INDEX_KIND, type AnswerIndex, type OmAnswerClosure,
   readAnswerCitations, prepareAnswerCitations, ANSWER_GROUNDS_ERA,
   confirmAcceptedAnswerResult, ANSWER_REFUSAL_CODES, type AnswerQuestionContract, type Mc1QuestionRequest, type AnswerRequest } from '../src/om/accepted-answer.js';
 import { Evidence, type Selector, type Source } from '../src/evidence/evidence.js';
@@ -427,7 +427,35 @@ test('D5 accepts a native D3-addressed MC1 fact, rederives history and issues a 
   const f = factFixture(t), a = await f.answer(), before = f.store.list().map(reference);
   const prepared = ok(prepareAcceptedAnswer(f.store, a.request));
   assert.deepEqual(f.store.list().map(reference), before);
-  assert.equal(prepared.writes.length, 2); assert.deepEqual(prepared.writes.map(write => write.kind), ['accepted-answer', ANSWER_INDEX_KIND]); assert.ok('pending' in prepared.closure.answer);
+  assert.equal(prepared.writes.length, 3);
+  assert.deepEqual(prepared.writes.map(write => write.kind), ['accepted-answer', ANSWER_INDEX_KIND, 'om-answer-closure']);
+  assert.ok('pending' in prepared.closure.answer);
+  const closure = prepared.writes[2]! as Write & { value: OmAnswerClosure };
+  const answer = reference(prepared.record), source = reference(f.source);
+  const references = [answer, reference(a.question), reference(f.input), ...f.gaps.records,
+    reference(a.issued), reference(a.draft), a.request.answer, reference(a.answered), reference(a.answeredDraft),
+    reference(a.assessment), reference(f.environment), source];
+  assert.deepEqual({ ...closure, value: { ...closure.value,
+    guards: closure.value.guards.map(canonical).sort(), references: closure.value.references.map(canonical).sort() } }, {
+    id: `om-answer-closure:${prepared.record.id}`, kind: 'om-answer-closure', expected: 0,
+    value: { contract: 'om-answer-closure/v1', answer, guards: [answer, source].map(canonical).sort(),
+      external: [{ kind: 'source', ref: source }], references: [...new Set(references.map(canonical))].sort() },
+  });
+  // The new closure belongs to the same transaction as the answer and its index.
+  f.restart();
+  for (const [index, write] of prepared.writes.entries()) {
+    const database = join(f.root, `acceptance-race-${index}.sqlite`);
+    copyFileSync(join(f.root, 'state.sqlite'), database);
+    const branch = new Store(database), other = new Store(database);
+    try {
+      const concurrent = other.write(write), afterRace = branch.list().map(reference);
+      rejected(writeGuarded(branch, { unit: 'D5-test', target: prepared.record.id,
+        writes: prepared.writes, guards: prepared.guards }), 'revision_conflict');
+      assert.deepEqual(branch.list().map(reference), afterRace);
+      for (const member of prepared.writes)
+        assert.deepEqual(branch.get(member.id), member.id === concurrent.id ? concurrent : null);
+    } finally { other.close(); branch.close(); }
+  }
   const lineRequest: GapLinesRequest = { project: f.project, pass: 1, previous: null,
     gaps: { sources: f.gaps.sources, records: f.gaps.records }, closures: [] };
   const line = ok(writeGapLines(f.store, lineRequest));
