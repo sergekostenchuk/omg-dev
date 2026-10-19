@@ -14,7 +14,7 @@ import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { gardenGraph } from "./om-fixture.js";
 import { resumeStoppedPass, stopPass } from "../src/om/run-driver.js";
-import { reference, uniqueRefs } from "../src/pipeline/contracts.js";
+import { isRef, reference, uniqueRefs } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { parseCommand } from "../src/product/commands.js";
 import type { EarlyStageInstruction, EarlyStageOutcome } from "../src/product/early-stage-driver.js";
@@ -1204,10 +1204,35 @@ test("DRY6-02 A: a stop after the analyst received its stdin cancels it; repeats
   assert.deepEqual([fresh.value.draft, fresh.value.question.id], [intent.value.draft, intent.value.question.id], "The same draft and question");
   assert.equal(restarted.get<any>(cancelled.id)!.value.error, "process_cancelled", "The earlier attempt keeps its record and possible cost");
 
-  const again = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 100 }) as EarlyStageOutcome;
+  const callsBefore = new Set(restarted.list<any>("model-call").map(row => row.id));
+  const again = await new ProductEngine(restarted).execute({ type: "early-stage-run", project: "p", maxTurns: 100, maxCalls: 2 }) as EarlyStageOutcome;
   assert.equal(restarted.list<any>("research-consumer-intent").filter(row => row.value.kind === intent.value.kind
     && row.value.key === intent.value.key).length, 2, "The permission is not spent twice");
   assert.notEqual(again.reason?.code, "process_cancelled", JSON.stringify(again.reason));
+  // A third generation would be minted inside the run, before any send (prepareResearchConsumerIntent); the
+  // check above only stays meaningful if the run still pays at least one physical call of the same work —
+  // a new model-call whose saved grounds name this draft and the question of the admitted generation: the
+  // analyst's own consumer intent (same run and question) or the child assessor's application session.
+  const sameWork = (call: any): boolean => {
+    if (callsBefore.has(call.id) || call.value.projectId !== "p" || call.value.draftId !== fresh.value.draft.id) return false;
+    // A reserved model-call alone is not a paid result: the call succeeded and its exact saved response is readable.
+    const response = call.value.status === "succeeded" && isRef(call.value.response?.record) ? call.value.response.record : null;
+    const saved = response ? restarted.get<any>(response.id, response.revision) : null;
+    if (!response || !saved || saved.hash !== response.hash) return false;
+    if (isRef(call.value.consumerIntent)) {
+      const producer = restarted.get<any>(call.value.consumerIntent.id);
+      return producer?.kind === "research-consumer-intent" && producer.value.question?.id === fresh.value.question.id
+        && producer.value.cursor?.run === fresh.value.cursor.run;
+    }
+    if (isRef(call.value.assessmentApplication)) {
+      const application = restarted.get<any>(call.value.assessmentApplication.id);
+      const session = application?.kind === "assessment-application" && isRef(application.value.session)
+        ? restarted.get<any>(application.value.session.id) : null;
+      return session?.kind === "assessment-session" && session.value.binding?.question?.id === fresh.value.question.id;
+    }
+    return false;
+  };
+  assert.ok(restarted.list<any>("model-call").some(sameWork), "again sent at least one new physical call of the same work");
 });
 
 for (const role of ["assess-answer", "assess-escalation"] as const)
