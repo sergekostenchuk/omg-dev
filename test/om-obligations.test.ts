@@ -16,7 +16,7 @@ import { bindTaskObligations, taskObligationHandoff, taskBindingId } from "../sr
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Write } from "../src/storage/store.js";
-import { writeOmInput } from "../src/om/input.js";
+import { writeOmInput, type OmInputRecord } from "../src/om/input.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
@@ -29,11 +29,9 @@ import { OM_OBLIGATION_CONTRACT, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNME
   type ObligationTransferRequest, type ObligationTransferRecord, type OmObligations } from "../src/om/obligations.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { gardenGraph, refusedWith, thrownWith } from "./om-fixture.js";
+import { gardenGraph, prepareNativeLayers, refusedWith, thrownWith } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
-import { answerTechnicalFixture } from "./technical-research-fixture.js";
-import { answerLayerFixture } from "./layer-design-fixture.js";
 
 const clone = structuredClone;
 const sameRef = (a: Ref, b: Ref): boolean => canonical(a) === canonical(b);
@@ -81,13 +79,9 @@ function fixture(t: TestContext, kinds: Array<"environment-confirmation" | "post
     engine.environments.configure(project, { workspace: root,
       implementer: { actor: "assignment-researcher", model: "fixture", effort: "high", command },
       reviewer: { actor: "assignment-reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 10_000 }, 0);
-    const r0 = engine.refinement.begin(project, "R0");
-    engine.refinement.finishResearch(project, "R0", reference(r0), 0); engine.refinement.sealLayer(project, 1, 0);
-    const r1 = engine.refinement.begin(project, "R1"); answerTechnicalFixture(engine, project, r1);
-    engine.refinement.finishResearch(project, "R1", reference(store.get(r1.id)!), 0);
-    const design = engine.refinement.prepareLayer(project, 2), answered = answerLayerFixture(engine, project, design, 2, desired);
-    engine.refinement.buildLayer(project, 2, reference(answered), store.get(`graph:${project}`)!.revision, "assignment-researcher");
-    engine.refinement.sealLayer(project, 2, 0);
+    // LG13-pre2 (№7640 п.2): the two consumers stand on a real accepted OM N2 of this changed graph — the exact
+    // graph-layer:2 and om-frame:2 the L3 reads name as their upper witness — never on Refinement phases.
+    prepareNativeLayers(engine, project, desired, "n2");
   }
   if (unacceptedBridge) {
     const original = store.get<Graph>(`graph:${project}`)!, graph = clone(original.value);
@@ -98,18 +92,20 @@ function fixture(t: TestContext, kinds: Array<"environment-confirmation" | "post
     const layer = store.get<{ projection: unknown }>(`graph-layer:${project}:2`)!;
     store.write({ id: layer.id, kind: layer.kind, expected: layer.revision, value: { ...layer.value, projection: projectGraph(graph, 2) } });
   }
-  let input = ok(writeOmInput(store, { project, expected: 0,
+  // The N2 producer wrote B1 itself; the single-consumer pass stays before N2 and writes its first B1 here.
+  let input = multipleConsumers ? store.get<OmInputRecord>(`om-input:${project}`)! : ok(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   const graph = store.get<Graph>(`graph:${project}`)!, upper = store.get(`graph-layer:${project}:2`)!;
+  const upperFrame = multipleConsumers ? reference(store.get(`om-frame:${project}:2`)!) : null;
   if (kinds.length) input = ok(writeAddressing(store, { project, input: reference(input), graph: reference(graph),
     decisions: kinds.map((kind, index) => ({ pending: inputDecisionWrite({ project, input: reference(input), graph: reference(graph), layers: multipleConsumers ? [reference(upper)] : [],
       decision: { target: `discovery:late-${index}`, field: "address", value: { consumer: lateConsumer, kind } } }) as Write })) }));
-  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: multipleConsumers ? reference(store.get(`phase:${project}:L2`)!) : null,
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: multipleConsumers ? reference(upper) : null,
     available: {}, choice: { choiceVersion: "obligation-first-pass", features: [{ outcome: "garden-result" }], excluded: [] } }));
   const source: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
-    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: multipleConsumers ? reference(upper) : null, frame: null, upper: null } },
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: multipleConsumers ? reference(upper) : null, frame: upperFrame, upper: null } },
     works: multipleConsumers ? { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } : { state: "upper-not-accepted", layer: reference(upper) } };
+      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame } } } : { state: "upper-not-accepted", layer: reference(upper) } };
   const gaps = ok(writeGaps(store, source));
   const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));

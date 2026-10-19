@@ -16,8 +16,8 @@ import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requiremen
 import { projectGraph } from '../src/graph/project.js';
 import type { Graph } from '../src/graph/model.js';
 import { git } from '../src/runtime/environment.js';
-import { gardenGraph } from './om-fixture.js';
-import { preparedFeatures, refinedLayers } from './product-fixture.js';
+import { gardenGraph, prepareOmFixtureStages } from './om-fixture.js';
+import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { writeOmInput } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
@@ -382,7 +382,8 @@ const passed = () => once('run', async (): Promise<RunData> => {
   git(workspace, ['add', 'README.md']); git(workspace, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'initial']);
   const store = new Store(database), engine = new ProductEngine(store);
   try {
-    preparedFeatures(engine, project, gardenGraph(), field => {
+    // LG13-pre2: current upstream stages only (L1, era ''); the pass's next cycle is its B1 input field, no layer is prebuilt.
+    prepareOmFixtureStages(engine, project, gardenGraph(), field => {
       const value = preparedField(project, field);
       if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding', question: 'Which encoding is supported?',
         consumer: 'garden-consume-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Address this question during OM' }];
@@ -394,7 +395,6 @@ const passed = () => once('run', async (): Promise<RunData> => {
     engine.environments.configure(project, { workspace, implementer: { actor: 'run-implementer', model: 'fixture', effort: 'high', command },
       reviewer: { actor: 'run-reviewer', model: 'fixture-reviewer', effort: 'medium', command }, fullCheck: { executable: process.execPath, args: ['--version'] },
       timeoutMs: 10_000, requestCapacityChars: 100_000 }, 0);
-    refinedLayers(engine, project);
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
     const graph = reference(store.get(`graph:${project}`)!);
     const base = ok(writeOmInput(store, { project, expected: 0, stages }));

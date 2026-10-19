@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Json } from "../src/canonical.js";
-import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { Evidence } from "../src/evidence/evidence.js";
 import type { Graph } from "../src/graph/model.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -14,7 +13,6 @@ import { git } from "../src/runtime/environment.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../src/storage/store.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import type { OmDispatch } from "../src/om/dispatch.js";
-import { writeOmInput } from "../src/om/input.js";
 import type { OmModelCall } from "../src/om/model-call.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
@@ -24,8 +22,7 @@ import { runControlId, type RunControlRecord, type RunControlStatus } from "../s
 import { readPass, startPass, type PassOutcome } from "../src/om/run-driver.js";
 import { advanceRun, regateRun, releaseRegateWait, runId, type RunRecord, type RunRequest } from "../src/om/run.js";
 import { spendReport, type SpendReport } from "../src/om/spend-report.js";
-import { gardenGraph } from "./om-fixture.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { gardenGraph, prepareNativeLayers, prepareOmFixtureStages } from "./om-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
 /**
@@ -57,8 +54,8 @@ const stepOf = (run: Revision<RunRecord> | null) => (run?.value.state as { step?
 
 /**
  * A real OM project reached by the operator's commands: prepared stages with one open question, the environment
- * configured through execute with its request capacity, refined layers and the dispatch of configure-om-dispatch.
- * A cold project has no OM record; otherwise B1 exists with every other decision addressed.
+ * configured through execute with its request capacity and the dispatch of configure-om-dispatch; no OM layer is
+ * prebuilt. A cold project has no OM record; otherwise B1 exists with every other decision addressed.
  */
 function commandFixture(t: TestContext, cold: boolean) {
   const root = mkdtempSync(join(tmpdir(), "omg-h2-commands-")), database = join(root, "state.sqlite"), workspace = join(root, "repo");
@@ -66,7 +63,8 @@ function commandFixture(t: TestContext, cold: boolean) {
   git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  preparedFeatures(engine, project, gardenGraph(), field => {
+  // LG13-pre2: current upstream stages only (L1, era ""); the OM layers are the pass's own work, never Refinement phases.
+  prepareOmFixtureStages(engine, project, gardenGraph(), field => {
     const value = preparedField(project, field);
     if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "encoding", question: "Which encoding is supported?",
       consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false, resolution: "Address this question during OM" }];
@@ -78,10 +76,11 @@ function commandFixture(t: TestContext, cold: boolean) {
     implementer: { actor: "h2-implementer", model: "fixture", effort: "high", speed: "fast", command },
     reviewer: { actor: "h2-reviewer", model: "fixture-reviewer", effort: "medium", command },
     fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: 100_000 } });
-  refinedLayers(engine, project);
   if (!cold) {
-    const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-    const graph = reference(store.get(`graph:${project}`)!), base = ok<Revision<{ gaps: { code: string; target: string }[] }>>(writeOmInput(store, { project, expected: 0, stages }));
+    // LG13-pre2: the warm pass stands on the current accepted layers (as the warm om-run parts): the native producers
+    // write B1, N2 and L3; the remaining B1 decisions are addressed over that existing B1, never a second expected:0.
+    prepareNativeLayers(engine, project, gardenGraph(), "executed");
+    const graph = reference(store.get(`graph:${project}`)!), base = store.get(`om-input:${project}`) as Revision<{ gaps: { code: string; target: string }[] }>;
     const decisions = base.value.gaps.filter(gap => gap.code !== "inventory_missing" && gap.code !== "question_unaddressed").map(gap => {
       const field = gap.code === "contract_node_unbound" ? "nodes" : gap.code === "acceptance_kind_missing" ? "checkKind" : "state";
       const value: Json = field === "nodes" ? ["garden-produce-block", "garden-consume-block"] : field === "checkKind" ? "test"

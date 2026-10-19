@@ -923,7 +923,8 @@ test("RD3: a recovered blocked root executes its exact successor once, including
   registerSuccessorDeriver({ deriveCapacitySuccessorPacket });
   // Reuse the real managed-pass fixture without registering the neighbouring suite's tests.
   const { runFixture, addressAll } = await import("./om-run-fixture.js");
-  const f = runFixture(t, ["encoding"]);
+  // LG13-pre2: the warm pass on current producers (accepted N2/L3), as the om-run parts — not the Refinement default.
+  const f = runFixture(t, ["encoding"], "executed");
   const bases = f.bases();
   f.environment(5_000);
   f.steps([addressAll(f, bases.routes)]);

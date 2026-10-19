@@ -27,7 +27,7 @@ import { runtimeContext, type RuntimeObservationResult } from '../src/runtime/ru
 import { Environments, git, uniqueTransactionGuards, transactionGuardsCurrent, type ExecutionRoot } from '../src/runtime/environment.js';
 import { ensureWorktree } from '../src/execution/worktree.js';
 import { runtimeSource, type RuntimeObservation } from '../src/runtime/runtime-observation-model.js';
-import { writeOmInput, readOmInput } from '../src/om/input.js';
+import { writeOmInput, readOmInput, type OmInputRecord } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, readGaps, type GapRequest, type GapMoment } from '../src/om/gaps.js';
@@ -45,11 +45,9 @@ import type { ProcessResult } from '../src/runtime/process.js';
 import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment,
   writeOmObligations, readOmObligationLedger, type OwnerGapAssignment, type ObligationRequest, type OmObligationHandoff, type OmObligationRecord } from '../src/om/obligations.js';
 import type { OmResult } from '../src/om/refusal.js';
-import { gardenGraph } from './om-fixture.js';
+import { gardenGraph, prepareNativeLayers } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
-import { answerTechnicalFixture } from './technical-research-fixture.js';
-import { answerLayerFixture } from './layer-design-fixture.js';
 import { taskObligationExecutionFixture } from './execution-fixture.js';
 
 const clone = structuredClone;
@@ -101,31 +99,27 @@ function fixture(t: TestContext, options: { count?: number; multipleConsumers?: 
   const environment = engine.environments.configure(project, { workspace: root,
     implementer: { actor: 'worker', model: 'fixture', effort: 'high', command },
     reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 3000 }, 0);
-  if (multiple) {
-    const r0 = engine.refinement.begin(project, 'R0');
-    engine.refinement.finishResearch(project, 'R0', reference(r0), 0); engine.refinement.sealLayer(project, 1, 0);
-    const r1 = engine.refinement.begin(project, 'R1'); answerTechnicalFixture(engine, project, r1);
-    engine.refinement.finishResearch(project, 'R1', reference(store.get(r1.id)!), 0);
-    const design = engine.refinement.prepareLayer(project, 2), answered = answerLayerFixture(engine, project, design, 2, desired);
-    engine.refinement.buildLayer(project, 2, reference(answered), store.get(`graph:${project}`)!.revision, 'worker');
-    engine.refinement.sealLayer(project, 2, 0);
-  }
-  let input = ok(writeOmInput(store, { project, expected: 0,
+  // LG13-pre2 (№7640 п.2): the two consumers stand on a real accepted OM N2 of this changed graph — the exact
+  // graph-layer:2 and om-frame:2 the L3 reads name as their upper witness — never on Refinement phases. The N2
+  // producer writes B1 itself; the single-consumer pass stays before N2 and writes its first B1 here.
+  if (multiple) prepareNativeLayers(engine, project, desired, 'n2');
+  let input = multiple ? store.get<OmInputRecord>(`om-input:${project}`)! : ok(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   const unaddressed = input;
   const graph = store.get<Graph>(`graph:${project}`)!, upper = store.get(`graph-layer:${project}:2`)!;
+  const upperFrame = multiple ? reference(store.get(`om-frame:${project}:2`)!) : null;
   input = ok(writeAddressing(store, { project, input: reference(input), graph: reference(graph),
     decisions: input.value.input.questions.map(question => ({ pending: inputDecisionWrite({ project, input: reference(input), graph: reference(graph),
       layers: multiple ? [reference(upper)] : [], decision: { target: question.id, field: 'address',
         value: { consumer, kind: 'environment-confirmation' } } }) as Write })) }));
   const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph),
-    refinement: multiple ? reference(store.get(`phase:${project}:L2`)!) : null, available: {},
+    refinement: multiple ? reference(upper) : null, available: {},
     choice: { choiceVersion: 'runtime-first-pass', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
     operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: multiple ? reference(upper) : null, frame: null, upper: null } },
+      layer: multiple ? reference(upper) : null, frame: upperFrame, upper: null } },
     works: multiple ? { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } : { state: 'upper-not-accepted', layer: reference(upper) } };
+      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame } } } : { state: 'upper-not-accepted', layer: reference(upper) } };
   const gaps = ok(writeGaps(store, sources)), gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
   const marker = join(root, 'invocations.log'), condition = join(root, 'condition.txt'); writeFileSync(condition, 'ready');

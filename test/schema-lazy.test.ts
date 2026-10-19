@@ -45,6 +45,14 @@ const { applyProposals } = await import(D + '/om/frame-proposals.js');
 const { normalizePartAnswer, packetReadPath } = await import(D + '/om/question-packet.js');
 const { researchAction, projectReaderSelection, responseAction } = await import(D + '/discovery/research-consumer-transition.js');
 call('horizon', () => closeHorizon({}, {}));
+// LG13-pre2 (№7640 п.3): an empty request keeps its early typed refusal; a version-2 graph reaches the lazy graph
+// shape, and its repeat proves the cache by an unchanged compile count.
+const horizonCompiles = () => compiles().filter(c => c.at === 'om/horizon').length;
+log({ phase: 'horizon-empty', count: horizonCompiles() });
+call('horizonShape', () => closeHorizon({ version: 2 }, {}));
+log({ phase: 'horizon-first', count: horizonCompiles() });
+call('horizonShapeAgain', () => closeHorizon({ version: 2 }, {}));
+log({ phase: 'horizon-again', count: horizonCompiles() });
 call('workZone', () => workZone({}, { nodes: [] }, []));
 call('neighbors', () => neighborsOf({}, 'w', {}));
 call('frameProposals', () => applyProposals({ request: { project: 'p', level: 2, graph: ref('g'), horizon: ref('h'), layer: null, frame: null, upper: null },
@@ -63,7 +71,7 @@ const SIX = ['om/horizon', 'om/work-zone', 'om/neighbors', 'om/frame-proposals',
   'om/question-packet', 'discovery/research-consumer-transition'];
 
 interface Out { phase?: string; at?: string[]; name?: string; ok?: boolean;
-  code?: string; details?: number | null; value?: boolean }
+  code?: string; details?: number | null; value?: boolean; count?: number }
 function run(t: test.TestContext): Out[] {
   const dir = mkdtempSync(join(resolve('.'), '.schema-lazy-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -96,7 +104,8 @@ test('IMPORT2c each lazy validator compiles on first call and keeps refusals exa
   const out = run(t);
   const byName = new Map(out.filter(row => row.name).map(row => [row.name!, row]));
   const codes = {
-    horizon: 'horizon_request_invalid', workZone: 'work_zone_request_invalid',
+    horizon: 'horizon_request_invalid', horizonShape: 'horizon_request_invalid', horizonShapeAgain: 'horizon_request_invalid',
+    workZone: 'work_zone_request_invalid',
     neighbors: 'neighbor_request_invalid', frameProposals: 'proposal_request_invalid',
     partBody: 'part_answer_invalid', researchBad: 'research_response_invalid',
     researchBadAgain: 'research_response_invalid', readerBad: 'reader_response_invalid',
@@ -128,4 +137,9 @@ test('IMPORT2c each lazy validator is compiled once and reused', t => {
     `question-packet must compile only the two used validators: ${used.join(',')}`);
   for (const module of SIX)
     assert.ok(used.includes(module), `${module} validator was never compiled`);
+  // om/horizon: the first version-2 request compiles its graph shape, the repeat compiles nothing more.
+  const count = (phase: string) => out.find(row => row.phase === phase)!.count!;
+  assert.ok(count('horizon-first') > 0, 'a version-2 request reaches the lazy horizon graph shape');
+  assert.ok(count('horizon-empty') <= count('horizon-first'));
+  assert.equal(count('horizon-again'), count('horizon-first'), 'the horizon graph shape is compiled once and reused');
 });

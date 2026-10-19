@@ -12,7 +12,7 @@ import { EngineError } from "../src/errors.js";
 import { designOf } from "../src/graph/builder.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
-import { gardenGraph } from "./om-fixture.js";
+import { gardenGraph, prepareOmFixtureStages } from "./om-fixture.js";
 import { resumeStoppedPass, stopPass } from "../src/om/run-driver.js";
 import { isRef, reference, uniqueRefs } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
@@ -560,9 +560,9 @@ test("DRV1 one entry uses StageResearch for five stages, builds the real L1 and 
 
 test("DRV1 reads accepted features without a second accept or payment and hands their exact heads to coldStart", async t => {
   const f = fixture(t), project = "garden";
-  preparedFeatures(f.engine, project, gardenGraph());
+  // LG13-pre2: the cold OM hand-off stands on current upstream stages only — no B1, N2 or om-frame before coldStart.
+  prepareOmFixtureStages(f.engine, project, gardenGraph());
   const { trace, omPause } = f.configure(project);
-  refinedLayers(f.engine, project);
   const stageHeads = UPSTREAM_STAGES.map(stage => reference(f.store.get(`stage:${project}:${stage}`)!));
   const restartedStore = new Store(f.database); t.after(() => restartedStore.close());
   const driving = new ProductEngine(restartedStore).execute({ type: "early-stage-run", project, maxTurns: 10,
