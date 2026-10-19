@@ -5231,30 +5231,7 @@ test('LP5 (№3278 rows 17, 19) a reuse carries a non-empty D7 to today\'s hando
   assert.deepEqual(gate.ok ? 'accepted' : [gate.refusal.code, gate.refusal.at.field], ['work_blocking_gap_open', 'candidate']);
 });
 
-test('LP7 row 21: an input packet the base code 7c7d3ccc issued on its split route before the release is answered after it — managed and unmanaged, the exact route stays current and the paid answer applies, with no era refusal', async t => {
-  for (const managed of [true, false]) await t.test(managed ? 'managed' : 'unmanaged', async t => {
-    const f = e4Fixture(t, 'field', 100_000, 0, 5000, managed, false);
-    // The base code wrote this route split; on this very D1 today's birth rule joins the input fields of garden-consume-block.
-    assert.equal(f.routes.value.grouping, 'consumer-set-v1');
-    const split = f.routes.value.batches.filter(batch => batch.task === 'input-field'
-      && batch.items.every(item => ['nodes', 'state', 'checkKind'].includes(item.field) && item.consumers.includes('garden-consume-block')));
-    assert.ok(split.length > 1, 'The split era keeps one batch per field');
-    const issued = h15AtCommit(f, LP7_BASE, `lp7-issued-${managed}`, `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-out(reference(take(writeQuestionPacket(store, args)).record));`, f.packetRequest) as Ref;
-    // Today's admission keeps the exact route and finds the very packet the base code issued.
-    const admitted = valueOf(prepareQuestionPacket(f.store, f.packetRequest));
-    assert.deepEqual([admitted.existing, reference(admitted.record)], [true, issued]);
-    f.steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
-      results: f.batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
-        value: { consumer: 'garden-consume-block', kind: 'repository-fact' } })) }, usage }]);
-    const head = f.store.get(f.input.id)!, sent = valueOf(await runModelCall(f.store, { ...f.request, packet: issued }));
-    assert.equal(sent.outcome?.kind, 'input-decisions');
-    assert.equal(f.store.get(f.input.id)!.revision, head.revision + 1, 'The paid answer applies as one new B1 revision');
-    assert.equal(f.sent().length, 1);
-    f.restart();
-    assert.deepEqual(valueOf(readModelCall(f.store, { project: f.project, record: reference(sent.record) })).record, sent.record);
-  });
-});
+
 
 // ---- PF3.1 (№3459): completion-effective under the proof mechanism; a kept historical E4 refusal ----
 import { readCompletionEffectiveAt } from '../src/om/model-call.js';

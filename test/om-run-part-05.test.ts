@@ -12,11 +12,10 @@ import type { Node } from "../src/graph/model.js";
 import { beginAttempt, openSeries, ownerDecisionNamespace, OWNER_DECISION_KIND, readCompletionBinding, resumeSeries, seriesRequestOf } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
-import { readRoutes, type RoutesRecord } from "../src/om/routes.js";
+import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
 import { closeAttempt } from "../src/om/repeat-gate.js";
-import { runModelCall } from "../src/om/model-call.js";
 import { writeQuestionPacket } from "../src/om/question-packet.js";
 import { gapLineKey } from "../src/om/gap-lines.js";
 import { readRun, startRun, runId, type RunRecord, type RunStep, type RunWait } from "../src/om/run.js";
@@ -32,9 +31,8 @@ import { runWakeChoice, WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wak
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { completionCloseId } from "../src/om/series.js";
 import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
-import { prepareRoutes } from "../src/om/routes.js";
 import { prepareRunBases as lp81PrepareRunBases } from "../src/om/run-bases.js";
-import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Lp5State, lp5Pass, lp6Line, LP7_VALUES, LP7_BASE, type Reopened, wrapperUnable } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Lp5State, lp5Pass, type Reopened, wrapperUnable } from "./om-run-fixture.js";
 
 
 test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is proved by the common recovery the failed review ends the pass, and nothing is sent twice", async t => {
@@ -652,24 +650,7 @@ test("LP5 (№3278 rows 8, 9, 10, 11, 15, 19, 22, 23, 24; §3; return №3294 п
       assert.ok(lp4Sent(f, reference(packet)) <= 1, "A paid answer is never sent again");
   });
 });
-test("LP7 row 21 (run): a field packet the base code 7c7d3ccc issued on its split route before the release is answered by today's code — the exact route stays current and the paid answer applies once", async t => {
-  const f = lp6Line(t, LP7_BASE);
-  f.old("lp7-issued", [{ op: "round", ordinal: 1, answers: [{ field: "nodes", unsent: true }] }], LP7_BASE);
-  const packet = f.store.list<QuestionPacketRecord>("question-packet")[0]!;
-  const routes = ok(readRoutes(f.store, { project, record: packet.value.request.routes })).record as unknown as Revision<RoutesRecord>;
-  assert.equal(routes.value.grouping, "consumer-set-v1", "The base code's own split route");
-  // Split by field: today's birth rule joins exactly these (row 30 on the same line); the saved route stays current by its own algorithm.
-  assert.equal(routes.value.batches.filter(row => row.task === "input-field" && row.items.every(item => item.consumers.includes(f.block))).length, 3);
-  const saved = routes.value.request, again = ok(prepareRoutes(f.store, { project, gaps: saved.gaps as never, tasks: saved.tasks.map(record => ({ record })),
-    catalog: { paths: [...saved.catalog.paths], records: [...saved.catalog.records] }, previous: saved.previous }));
-  assert.deepEqual([again.existing, again.writes.length, reference(again.record)], [true, 0, reference(routes)]);
-  const batch = routes.value.batches.find(row => row.id === packet.value.request.batch)!;
-  writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
-    results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: LP7_VALUES[item.field]! })) }, usage }] }));
-  const before = f.store.get(`om-input:${project}`)!.revision;
-  const sent = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
-  assert.deepEqual([sent.outcome?.kind, f.store.get(`om-input:${project}`)!.revision, f.sent().length], ["input-decisions", before + 1, 1]);
-});
+
 
 test("LP8.1 a reopened record names the exact unable revision, its grounds and exactly one new ground; absence or excess is refused on reading; bases are read as of a live pass only while it weighs its grounds again", async t => {
   const { f, unable } = await wrapperUnable(t);

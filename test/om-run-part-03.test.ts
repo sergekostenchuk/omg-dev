@@ -16,9 +16,8 @@ import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
 import { beginAttempt, openSeries } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
-import { readRoutes, type RoutesRecord } from "../src/om/routes.js";
+import { type RoutesRecord } from "../src/om/routes.js";
 import type { RepairSeries } from "../src/om/series.js";
-import { readQuestionPacket } from "../src/om/question-packet.js";
 import { readRun, startRun, runId, type RunRequest, type RunStep } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 import { regateRun } from "../src/om/run.js";
@@ -30,7 +29,7 @@ import { decidedFieldsBefore, prepareReconcileSeries, readSeries, readStopHistor
 import { prepareCloseAttempt as lp6PrepareClose } from "../src/om/repeat-gate.js";
 import { readStopAnalysis, prepareStopAnalysis as lp6PrepareAnalysis } from "../src/om/stop-analysis.js";
 import { readStopReport, stopReportOfNewEra, STOP_REPORT_CONTRACT_V2 } from "../src/om/stop-report.js";
-import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, drive, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, lp6Line, lp6Close, LP7_VALUES, LP7_BASE, policyDoor } from "./om-run-fixture.js";
+import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, drive, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, lp6Line, lp6Close, policyDoor } from "./om-run-fixture.js";
 
 
 test("26 1 C07 R4 H1.1 the pass runs the project mechanism M5 through G7, then builds the bases of the new B1 itself and goes on; a restart repeats nothing", async t => {
@@ -599,19 +598,5 @@ test("LP6 rows 1, 21, 23, 26, 27, 28, 29, 30, 32: a stop e7db0ba8 saved over fre
   assert.deepEqual(decidedFieldsBefore(successor as never, 4), decidedFieldsBefore(series as never, 4));
 });
 
-test("LP7 row 22 (run): the routes, packets, paid applied answer and close the base code 7c7d3ccc wrote are read by today's code after a reopen exactly as written — nothing is executed again to read them", async t => {
-  const f = lp6Line(t, LP7_BASE);
-  f.old("lp7-history", [{ op: "round", ordinal: 1, answers: [{ field: "nodes", value: LP7_VALUES.nodes! }, { field: "checkKind", unsent: true }] },
-    { op: "cease", ordinal: 1 }, { op: "close", ordinal: 1 }], LP7_BASE);
-  f.restart();
-  const before = f.store.list().map(reference), calls = f.sent().length;
-  const routes = f.store.list<RoutesRecord>("route-result");
-  assert.ok(routes.length > 0 && routes.every(row => row.value.grouping === "consumer-set-v1"), "The base code's own split routes");
-  for (const row of routes) assert.deepEqual(ok(readRoutes(f.store, { project, record: reference(row) })).record, row);
-  for (const row of f.store.list<QuestionPacketRecord>("question-packet")) assert.deepEqual(ok(readQuestionPacket(f.store, { project, record: reference(row) })), row);
-  const close = lp6Close(f, 1);
-  assert.deepEqual([close.contract, close.outcome.reason, close.outcome.achieved.length], ["om-completion-close/v2", "result", 1]);
-  assert.equal(ok(readSeries(f.store, f.address as never)).value.withoutProgress, 0);
-  assert.deepEqual([f.store.list().map(reference), f.sent().length, calls], [before, calls, 1], "Reading wrote nothing and paid nothing again");
-});
+
 test("AT1 policy: the owner's H2 answer decides the producer's state policy; the model is never asked, and the works pass G5", async t => policyDoor(t, true));
