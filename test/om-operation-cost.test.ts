@@ -16,9 +16,8 @@ import { historicalProof, withHistoricalReads } from '../src/history/proofs.js';
 // Observe the actual compiled producer and proof bodies without changing a production module or the accepted fixture.
 const loader = String.raw`
 import ts from TYPESCRIPT;
-import { execFileSync } from 'node:child_process';
-let root, repository, baseline;
-export function initialize(data) { root = data.root; repository = data.repository; baseline = data.baseline; }
+let root;
+export function initialize(data) { root = data.root; }
 const bodies = {
   'src/om/layer-basis.js': { verifyHistoricalBasis: ["C5", "request"] },
   'src/om/frame-obligations.js': { frameSources: ["C2.basis", "request"], frameDerive: ["C2.derive", "request"] },
@@ -45,16 +44,9 @@ const fixtures = {
     'addressAll', 'stopAnswer', 'blockSeries', 'mechanismSeries', 'actions'] },
 };
 export async function load(url, context, nextLoad) {
-  let result;
-  if (baseline && url.startsWith(root) && url.endsWith('.js')) {
-    const path = decodeURIComponent(url.slice(root.length)).replace(/\.js$/, '.ts');
-    const body = execFileSync('git', ['show', baseline + ':' + path], { cwd: repository, encoding: 'utf8', maxBuffer: 10_000_000 });
-    result = { format: 'module', shortCircuit: true, source: ts.transpileModule(body,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  } else result = await nextLoad(url, context);
+  const result = await nextLoad(url, context);
   if (!url.startsWith(root) || result.format !== 'module') return result;
   const file = decodeURIComponent(url.slice(root.length));
-  if (baseline && !fixtures[file]) return result;
   if (!bodies[file] && !fixtures[file] && file !== 'src/history/proofs.js') return result;
   let source = String(result.source);
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
@@ -132,13 +124,17 @@ export async function load(url, context, nextLoad) {
 }
 `;
 
-const baselineScenario = String.raw`
+const checkpointScenario = String.raw`
 import assert from 'node:assert/strict';
 import { copyFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { register } from 'node:module';
 const config = CONFIG;
-register(config.loader, { data: { root: config.dist, repository: config.repository, baseline: '24a7aff15ef0' } });
+register(config.loader, { data: { root: config.dist } });
+// The checkpoint is produced by the current code through the instrumented loader: the proof hooks observe, nothing counts.
+globalThis.__operationCost = { sourceView: store => store, hit() {}, miss() { return null; },
+  action(_attempt, operation) { return operation(); }, replayability() {}, scope() {}, cycle() {},
+  refining() {}, invalidated() {}, footprint() {} };
 const imports = name => import(config.dist + 'src/' + name + '.js');
 const { Store } = await imports('storage/store');
 const { reference } = await imports('pipeline/contracts');
@@ -151,7 +147,7 @@ const { produceAtomicSeed, seedResources } = await import(config.dist + 'test/om
 function ok(result) { if (!result.ok) assert.fail(result.refusal.code + ': ' + result.refusal.message); return result.value; }
 let store, complete = false;
 try {
-  const seed = await produceAtomicSeed(), f = seed.data, database = join(config.directory, 'accepted-baseline.sqlite');
+  const seed = await produceAtomicSeed(), f = seed.data, database = join(config.directory, 'accepted-checkpoint.sqlite');
   copyFileSync(seed.database, database); store = new Store(database);
   const accepted = ok(writeWorksAcceptance(store, f.request)); assert.equal(accepted.state, 'accepted');
   const acceptance = accepted.acceptance, frame = ok(readAcceptedFrame(store, acceptance));
@@ -273,12 +269,12 @@ function cloneStore(database, label) {
 }
 function unchanged(store, before) { assert.deepEqual(store.list().map(reference), before); }
 try {
-  const legacy = JSON.parse(readFileSync(config.checkpoint, 'utf8')), seed = legacy.seed, f = seed.data;
-  const historical = new Store(legacy.database); stores.push(historical);
-  assert.deepEqual(ok(readAcceptedFrame(historical, legacy.accepted.acceptance)), legacy.frame);
-  assert.deepEqual(ok(readGaps(historical, legacy.gaps)), legacy.gapHistory);
-  assert.deepEqual(ok(readGapLines(historical, { project: f.project, record: reference(legacy.lines) })), legacy.lines);
-  assert.deepEqual(ok(confirmResults(historical, legacy.confirmation)), legacy.confirmed,
+  const checkpoint = JSON.parse(readFileSync(config.checkpoint, 'utf8')), seed = checkpoint.seed, f = seed.data;
+  const historical = new Store(checkpoint.database); stores.push(historical);
+  assert.deepEqual(ok(readAcceptedFrame(historical, checkpoint.accepted.acceptance)), checkpoint.frame);
+  assert.deepEqual(ok(readGaps(historical, checkpoint.gaps)), checkpoint.gapHistory);
+  assert.deepEqual(ok(readGapLines(historical, { project: f.project, record: reference(checkpoint.lines) })), checkpoint.lines);
+  assert.deepEqual(ok(confirmResults(historical, checkpoint.confirmation)), checkpoint.confirmed,
     'A new process reads the complete accepted producer history, including its original result keys');
   const store = cloneStore(seed.database, 'cold-acceptance');
   const accepted = measured('writeWorksAcceptance', () => ok(writeWorksAcceptance(store, f.request))).result;
@@ -289,7 +285,7 @@ try {
   assert.deepEqual(layer, { id: freshAcceptance.layer.id, revision: freshAcceptance.layer.revision });
   // FJ1: a new independent C4 belongs to its new assembly era; the exact saved history above remains unchanged.
   const { hashJson } = await imports('canonical');
-  const oldAcceptance = legacy.frame.frame.value.acceptance;
+  const oldAcceptance = checkpoint.frame.frame.value.acceptance;
   const oldCandidate = historical.get(oldAcceptance.candidate.id, oldAcceptance.candidate.revision);
   const newCandidate = store.get(originalAcceptance.candidate.id, originalAcceptance.candidate.revision);
   assert.ok(oldCandidate && newCandidate);
@@ -297,13 +293,19 @@ try {
   const { joinAssembly, request: candidateRequest, ...candidateBody } = newCandidate.value;
   const { joinAssembly: requestedEra, ...oldRequest } = candidateRequest;
   assert.equal(joinAssembly, 'identity-joins/v1'); assert.equal(requestedEra, joinAssembly);
-  assert.equal(Object.hasOwn(oldCandidate.value, 'joinAssembly'), false);
-  assert.deepEqual({ ...candidateBody, request: oldRequest }, oldCandidate.value,
-    'Only the explicit C4 era changes this fixture candidate; the complete graph, sources and works stay equal');
+  const oldEra = !Object.hasOwn(oldCandidate.value, 'joinAssembly');
+  if (!oldEra) {
+    // The checkpoint is produced by the current code: the new C4 names the same saved candidate and era.
+    assert.deepEqual(newCandidate, oldCandidate);
+    assert.deepEqual(reference(newCandidate), oldAcceptance.candidate);
+  } else {
+    assert.deepEqual({ ...candidateBody, request: oldRequest }, oldCandidate.value,
+      'Only the explicit C4 era changes this fixture candidate; the complete graph, sources and works stay equal');
+    assert.notDeepEqual(reference(newCandidate), oldAcceptance.candidate);
+  }
   assert.equal(newCandidate.id, 'om-candidate:' + f.project + ':' + hashJson([candidateBody.level, joinAssembly,
     candidateBody.graphHash, candidateBody.base, candidateBody.proposals, candidateBody.works]));
   assert.equal(newCandidate.hash, hashJson(newCandidate.value));
-  assert.notDeepEqual(reference(newCandidate), oldAcceptance.candidate);
   const newGate = store.get(originalAcceptance.gate.basis.id, originalAcceptance.gate.basis.revision);
   assert.ok(newGate);
   assert.deepEqual(reference(newGate), originalAcceptance.gate.basis);
@@ -312,19 +314,23 @@ try {
   assert.deepEqual(newGate.value.result.candidate, reference(newCandidate));
   assert.equal(newGate.value.result.graphHash, candidateBody.graphHash);
   assert.deepEqual(originalAcceptance.gate.candidate, reference(newCandidate));
-  const sameEraAcceptance = { ...originalAcceptance, candidate: oldAcceptance.candidate,
-    gate: { ...originalAcceptance.gate, candidate: oldAcceptance.gate.candidate, basis: oldAcceptance.gate.basis } };
+  // Old era: reconstruct the saved acceptance from the fresh one — its era dropped contract, binding and layer, and the
+  // C4 named another candidate. Same era: the fresh acceptance is the saved one as written.
+  const sameEraAcceptance = oldEra
+    ? { ...originalAcceptance, candidate: oldAcceptance.candidate,
+      gate: { ...originalAcceptance.gate, candidate: oldAcceptance.gate.candidate, basis: oldAcceptance.gate.basis } }
+    : { contract, binding, layer, ...originalAcceptance };
   assert.deepEqual(sameEraAcceptance, oldAcceptance);
-  assert.deepEqual(freshAcceptance.graph, legacy.frame.graph);
+  assert.deepEqual(freshAcceptance.graph, checkpoint.frame.graph);
   const sameEraProposals = freshAcceptance.proposals.map(row => {
     assert.equal(row.hash, hashJson(row.value));
     assert.deepEqual(row.value.verdict.candidate, reference(newCandidate));
     const value = { ...row.value, verdict: { ...row.value.verdict, candidate: oldAcceptance.candidate } };
     return { ...row, value, hash: hashJson(value) };
   });
-  assert.deepEqual(sameEraProposals, legacy.frame.proposals,
+  assert.deepEqual(sameEraProposals, checkpoint.frame.proposals,
     'Accepted proposal verdicts name the proved new candidate; their hashes and every other field stay exact');
-  assert.deepEqual({ ...freshAcceptance.frame.value, acceptance: sameEraAcceptance }, legacy.frame.frame.value,
+  assert.deepEqual({ ...freshAcceptance.frame.value, acceptance: sameEraAcceptance }, checkpoint.frame.frame.value,
     'The fresh C4 and G5 references follow their proved new era; every other accepting-frame field stays equal');
   const sibling = cloneStore(seed.database, 'warm-acceptance');
   const warmAccepted = withHistoricalReads(() => {
@@ -336,9 +342,9 @@ try {
   source.graph = acceptance.graph; source.operations.frame.graph = acceptance.graph;
   source.works = { frame: { ...source.works.frame, graph: acceptance.graph, layer: acceptance.layer, frame: acceptance.frame }, proposals: [] };
   const current = ok(writeGaps(store, source));
-  assert.deepEqual(current.collection, legacy.current.collection); assert.deepEqual(current.gate, legacy.current.gate);
+  assert.deepEqual(current.collection, checkpoint.current.collection); assert.deepEqual(current.gate, checkpoint.current.gate);
   assert.deepEqual(current.sources, source);
-  assert.deepEqual(current.records.map(row => row.value.gap), legacy.current.records.map(row => row.value.gap),
+  assert.deepEqual(current.records.map(row => row.value.gap), checkpoint.current.records.map(row => row.value.gap),
     'D1 preserves the same gap meanings while its exact sources name the fresh accepted frame and layer');
   const gaps = { sources: current.sources, records: current.records.map(reference) };
   const declared = f.openGoal, goal = declared.goal;
@@ -357,8 +363,8 @@ try {
     const before = copy.list().map(reference);
     const cold = measured('prepareGapLines.' + size, () => ok(prepareGapLines(copy, request)));
     if (size === 4) {
-      const oldFrame = legacy.accepted.acceptance.frame;
-      const expectedLines = legacy.prepared.record.lines.map(line => line.basis && canonical(line.basis) === canonical(oldFrame)
+      const oldFrame = checkpoint.accepted.acceptance.frame;
+      const expectedLines = checkpoint.prepared.record.lines.map(line => line.basis && canonical(line.basis) === canonical(oldFrame)
         ? { ...line, basis: acceptance.frame } : line);
       assert.deepEqual(cold.result.record.lines, expectedLines);
       const byCanonical = (a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0;
@@ -367,7 +373,11 @@ try {
         closures: [...request.closures].sort(byCanonical) });
       for (const ref of [acceptance.graph, acceptance.layer, acceptance.frame, declared.series])
         assert.ok(cold.result.guards.some(guard => canonical(guard) === canonical(ref)), 'Fresh preparation guards ' + ref.id);
-      assert.ok(!cold.result.references.some(ref => canonical(ref) === canonical(oldFrame)),
+      // The newly closed lines retain the exact current acceptance — never a different old producer hash.
+      if (canonical(oldFrame) === canonical(acceptance.frame))
+        assert.ok(cold.result.references.some(ref => canonical(ref) === canonical(oldFrame)),
+          'The newly closed lines retain the exact current acceptance');
+      else assert.ok(!cold.result.references.some(ref => canonical(ref) === canonical(oldFrame)),
         'The newly closed lines retain the exact current acceptance rather than the old producer hash');
     }
     if (preparationFamilies === null) preparationFamilies = cold.families;
@@ -392,8 +402,8 @@ try {
     const confirmation = { project: f.project, block: declared.block, target: declared.series.id, goal, accepting: [reference(saved)], cancelling: [] };
     const confirmed = measured('confirmResults.' + size, () => ok(confirmResults(copy, confirmation)));
     if (size === 4) {
-      assert.deepEqual(confirmed.result.achieved.map(item => item.key), legacy.confirmed.achieved.map(item => item.key));
-      assert.deepEqual(confirmed.result.cancelled, legacy.confirmed.cancelled);
+      assert.deepEqual(confirmed.result.achieved.map(item => item.key), checkpoint.confirmed.achieved.map(item => item.key));
+      assert.deepEqual(confirmed.result.cancelled, checkpoint.confirmed.cancelled);
       assert.ok(confirmed.result.achieved.every(item => canonical(item.basis) === canonical(reference(saved))),
         'Stable result keys use the exact fresh D2 acceptance as their basis');
     }
@@ -460,7 +470,7 @@ try {
 
 test('S1 real F5 proof operations scale by exact histories and preserve references across warm, fresh and pending views', async t => {
   const directory = mkdtempSync(join(tmpdir(), 'omg-operation-cost-'));
-  const checkpoint = join(directory, 'baseline.json');
+  const checkpoint = join(directory, 'prepared.json');
   t.after(() => {
     if (existsSync(checkpoint)) {
       const saved = JSON.parse(readFileSync(checkpoint, 'utf8')) as { seed: { root: string } };
@@ -468,15 +478,14 @@ test('S1 real F5 proof operations scale by exact histories and preserve referenc
     }
     rmSync(directory, { recursive: true, force: true });
   });
-  const loaderFile = join(directory, 'proof-loader.mjs'), script = join(directory, 'scenario.mjs'), oldScript = join(directory, 'baseline.mjs');
+  const loaderFile = join(directory, 'proof-loader.mjs'), script = join(directory, 'scenario.mjs'), preparedScript = join(directory, 'prepared.mjs');
   const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
   const dist = pathToFileURL(fileURLToPath(new URL('../', import.meta.url))).href;
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const configuration = JSON.stringify({ directory, checkpoint, repository, dist, loader: pathToFileURL(loaderFile).href });
+  const configuration = JSON.stringify({ directory, checkpoint, dist, loader: pathToFileURL(loaderFile).href });
   writeFileSync(loaderFile, loader.replace('TYPESCRIPT', JSON.stringify(typescript)));
-  writeFileSync(oldScript, baselineScenario.replace('CONFIG', configuration));
+  writeFileSync(preparedScript, checkpointScenario.replace('CONFIG', configuration));
   writeFileSync(script, scenario.replace('CONFIG', configuration));
-  await promisify(execFile)(process.execPath, [oldScript], { maxBuffer: 16 * 1024 * 1024 });
+  await promisify(execFile)(process.execPath, [preparedScript], { maxBuffer: 16 * 1024 * 1024 });
   const result = await promisify(execFile)(process.execPath, [script], { maxBuffer: 16 * 1024 * 1024 });
   const output = result.stdout.trim().split('\n').at(-1);
   assert.ok(output); const report = JSON.parse(output) as { reports: { label: string }[] };

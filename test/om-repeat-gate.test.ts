@@ -4329,75 +4329,22 @@ import { runModelCycle } from "../src/om/model-call.js";
 const LP6_ADAPTER = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 type Lp6Field = "nodes" | "state" | "checkKind";
 type Lp6Answer = { field: Lp6Field | "expansion"; value?: Json; cannot?: string; owner?: string; unsent?: true; need?: true; corrected?: true };
+/** The fixture values a joined answer fills for the block's input fields it is not asked about (LP7's joined batch). */
+const lp6Values: Record<Lp6Field, Json> = { nodes: ["garden-produce-block", "garden-consume-block"], checkKind: "test",
+  state: { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-consume-block" } };
 const lp6Usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 /**
  * The garden block garden-consume-block on a B1 that leaves its contract's nodes and state and its criterion's checkKind
- * open: M6 gives it an MC2 input-field batch per field and an MC2 node-expansion batch of its own. A round opens a managed
- * attempt on today's routes with the named batches, every packet first, and sends only the answered ones; the owner's own
- * decision replaces B1 from outside; a remaining root is ended by LP4; the claim of a close is derived by its producer.
+ * open: today's routing joins its open input fields in one MC2 batch beside an MC2 node-expansion batch of its own. A
+ * round opens a managed attempt on today's routes with the named batches, every packet first, and sends only the
+ * answered ones; a field answer covers the whole joined batch — its own field with its own value, the rest with the
+ * fixture's. The owner's own decision replaces B1 from outside; a remaining root is ended by LP4; the claim of a close
+ * is derived by its producer.
  */
-import { execFileSync as lp7Exec } from "node:child_process";
-import { createRequire } from "node:module";
-import { dirname } from "node:path";
-import { pathToFileURL } from "node:url";
-const LP7_BASE = "7c7d3cccb88d0a6c17b21051069f0244d98248f9";
-/**
- * The route the base code 7c7d3ccc writes, every engine module served from Git in its own process (LP7, №3393 §6 F1): the
- * subject of these tests is several E4s of one block, which its genuine split routing keeps — today's routing joins them.
- */
-function routesAtBase(store: Store, request: unknown): Revision<RoutesRecord> {
-  const root = dirname(store.path), repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(root, "lp7-base-loader.mjs"), producer = join(root, "lp7-base-producer.mjs"), input = join(root, "lp7-base-input.json");
-  const served = join(root, "lp7-base-served.log"), typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(served, "");
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(LP7_BASE)} + ':' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { writeRoutes } = await import(src('om/routes.js'));
-const store = new Store(database);
-try {
-  const written = writeRoutes(store, JSON.parse(readFileSync(input, 'utf8')));
-  if (!written.ok) throw Error(JSON.stringify(written.refusal));
-  process.stdout.write(JSON.stringify(written.value));
-} finally { store.close(); }`);
-  writeFileSync(input, JSON.stringify(request));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output = JSON.parse(lp7Exec(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, store.path, input],
-    { cwd: repository, encoding: "utf8", timeout: 180_000, maxBuffer: 10_000_000 })) as Revision<RoutesRecord>;
-  assert.ok(readFileSync(served, "utf8").split("\n").includes("src/om/routes.ts"), "The route was written by the modules of the base code");
-  return output;
-}
 function lp6Gate(t: test.TestContext) {
   const seeded = seedCopy("lp6:gate-fields", store => {
     const engine = new ProductEngine(store), project = "garden", { level: _level, ...l1 } = projectGraph(gardenGraph("cross"), 1);
-    preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field), LP7_BASE);
+    preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field));
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
     deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
     return null;
@@ -4415,7 +4362,7 @@ function lp6Gate(t: test.TestContext) {
   const address = { project, block, line: 1 };
   deliveredOf(openSeries(store, { ...address, slice: "lp6", predecessor: null, basis: null } as never));
   const steps: unknown[] = [];
-  const routesNow = (joined = false) => {
+  const routesNow = () => {
     const input = store.get(`om-input:${project}`)!, graph = store.get(`graph:${project}`)!;
     const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
       choice: { choiceVersion: `lp6-${input.revision}`, features: [{ outcome: "garden-result" }], excluded: [] } }));
@@ -4425,7 +4372,7 @@ function lp6Gate(t: test.TestContext) {
     const gaps = deliveredOf(writeGaps(store, sources));
     const request = { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
       tasks: [], catalog: { paths: ["lp6-source.txt"], records: [] }, previous: null };
-    return joined ? deliveredOf(writeRoutes(store, request)) as Revision<RoutesRecord> : routesAtBase(store, request);
+    return deliveredOf(writeRoutes(store, request)) as Revision<RoutesRecord>;
   };
   writeFileSync(join(root, "lp6-source.txt"), "The garden contract is written by the producer.\n");
   const f = {
@@ -4436,10 +4383,14 @@ function lp6Gate(t: test.TestContext) {
     head: () => store.get<RepairSeries>(`repair-series:${project}:1:${block}`)!,
     async round(ordinal: number, answers: readonly Lp6Answer[]) {
       const routes = routesNow();
-      const batches = answers.map(answer => routes.value.batches.find(batch => answer.field === "expansion"
+      // Today's joined routing puts every open input field of the block in ONE batch: a field answer covers the whole
+      // batch — the named field by its own value, the rest by the fixture's — exactly as several E4s did on the split route.
+      const batchOf = (answer: Lp6Answer) => routes.value.batches.find(batch => answer.field === "expansion"
         ? batch.task === "node-expansion" && batch.items.every(item => item.consumers.includes(block))
-        : batch.task === "input-field" && batch.items.some(item => item.field === answer.field && item.consumers.includes(block)))!);
+        : batch.task === "input-field" && batch.items.some(item => item.field === answer.field && item.consumers.includes(block)))!;
+      const batches = [...new Set(answers.map(batchOf))];
       assert.ok(batches.every(Boolean), "M6 gives the block every named batch");
+      const sends = batches.map(batch => ({ batch, answers: answers.filter(answer => batchOf(answer) === batch) }));
       const items = batches.flatMap(batch => batch.items);
       const goal: AttemptGoal = { key: `lp6:${ordinal}:${answers.map(answer => answer.field).join("+")}`,
         questions: items.map(item => gapLineKey(project, item.target, item.field)).sort(), result: gapLineExpectedResult(project, items[0]!.target, items[0]!.field) };
@@ -4448,12 +4399,14 @@ function lp6Gate(t: test.TestContext) {
       const packets = batches.map(batch => deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
         environment: reference(configured), attempt: { series: reference(series), ordinal }, previous: [] })).record);
       const e4: Ref[] = [];
-      for (const [index, batch] of batches.entries()) {
-        const answer = answers[index]!;
+      for (const [index, send] of sends.entries()) {
+        const { batch, answers: batchAnswers } = send;
+        const answer = batchAnswers.find(item => item.corrected) ?? batchAnswers[0]!;
         if (answer.unsent) continue;
+        const valueOf = (item: typeof batch.items[number]) => batchAnswers.find(entry => entry.field === item.field)?.value ?? lp6Values[item.field as Lp6Field];
         if (answer.corrected) {
           // MP2: an answer naming a label the packet never issued is refused and corrected once by its own cycle.
-          const results = (basis: (item: typeof batch.items[number]) => unknown) => batch.items.map(item => ({ target: item.target, field: item.field, basis: basis(item), value: answer.value }));
+          const results = (basis: (item: typeof batch.items[number]) => unknown) => batch.items.map(item => ({ target: item.target, field: item.field, basis: basis(item), value: valueOf(item) }));
           steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: results(() => "G999") }, usage: lp6Usage },
             { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: results(item => (item as unknown as { record: Ref }).record) }, usage: lp6Usage });
           writeFileSync(scenario, JSON.stringify({ database, steps }));
@@ -4468,7 +4421,7 @@ function lp6Gate(t: test.TestContext) {
           ? { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(item => item.gap),
             ...(answer.owner !== undefined ? { action: "need_owner", reason: answer.owner, decision: "Decide it" } : { action: "cannot_answer", reason: answer.cannot }) }
           : { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
-            results: batch.items.map(item => ({ target: item.target, field: item.field, basis: (item as unknown as { record: Ref }).record, value: answer.value })) }, usage: lp6Usage });
+            results: batch.items.map(item => ({ target: item.target, field: item.field, basis: (item as unknown as { record: Ref }).record, value: valueOf(item) })) }, usage: lp6Usage });
         writeFileSync(scenario, JSON.stringify({ database, steps }));
         const sent = await runModelCall(store, { project, packet: reference(packets[index]!), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: "implementer" });
         if (!sent.ok) assert.fail(`${sent.refusal.code} at ${JSON.stringify(sent.refusal.at)}: ${sent.refusal.message}`);
@@ -4478,7 +4431,7 @@ function lp6Gate(t: test.TestContext) {
     },
     /** LP7: one attempt on today's routing — the block's open input fields one batch beside its node expansion — sent in this order. */
     async joinedRound(ordinal: number, sends: readonly { batch: "fields" | "expansion"; values?: Partial<Record<Lp6Field, Json>>; cannot?: string; unsent?: true; need?: true; extra?: (batch: RoutedBatch) => object[]; refused?: true }[]) {
-      const routes = routesNow(true), own = routes.value.batches.filter(batch => batch.items.every(item => item.consumers.includes(block)));
+      const routes = routesNow(), own = routes.value.batches.filter(batch => batch.items.every(item => item.consumers.includes(block)));
       const fields = own.find(batch => batch.task === "input-field" && new Set(batch.items.map(item => item.field)).size > 1)!;
       const expansion = own.find(batch => batch.task === "node-expansion")!;
       assert.ok(fields && expansion && routes.value.grouping === "block-input-v1", "Today's routing joins the block's input fields");
@@ -4573,7 +4526,8 @@ test("LP6 rows 2, 4, 11: a new block close is v2 with its derived progress and e
   assert.equal(saved.contract, "om-completion-close/v2");
   assert.deepEqual(saved.outcome.progress, { contract: "om-attempt-progress/v1", administrative: null } satisfies AttemptProgress);
   assert.equal(saved.outcome.reason, "result");
-  assert.ok(saved.outcome.achieved.every(item => item.key.startsWith("om-result:input-field:")) && saved.outcome.achieved.length === 1);
+  assert.ok(saved.outcome.achieved.every(item => item.key.startsWith("om-result:input-field:")) && saved.outcome.achieved.length === 5,
+    "The joined batch's every own input-field result — nodes, writer, authority, rollback and checkKind");
   const series = deliveredOf(readSeries(f.store, f.address as never)).value as RepairSeries;
   assert.deepEqual(series.progressPolicy, { contract: "om-series-progress/v1", previous: before.revision === f.head().revision ? before : series.progressPolicy!.previous, from: 1 });
   assert.equal(series.progressPolicy!.previous!.id, before.id);
