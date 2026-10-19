@@ -21,7 +21,8 @@ import { Ajv, type AnySchema, type ValidateFunction } from "ajv";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { sealed } from "../om/refusal.js";
 import { isRef, reference, stageId, type Ref, type Stage, type StageArtifact } from "../pipeline/contracts.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, storeObserved, type Revision } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import type { Observation } from "../evidence/evidence.js";
 import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { QUESTION_MOMENT_CONTRACT_VERSION } from "./preparation-contracts.js";
@@ -47,7 +48,7 @@ export {
 } from "./discovery.js";
 export type { ResearchAnswer } from "./research-model.js";
 export {
-  discoveryContext, discoveryOutcome, readDiscoveryConditionDecision,
+  discoveryContext, discoveryOutcome, discoveryInspection, readDiscoveryConditionDecision,
   type DiscoveryChoice, type DiscoveryConditionDecision, type DiscoveryOutcome,
 } from "./discovery-outcome.js";
 export type { ResearchRun } from "./research-model.js";
@@ -221,7 +222,12 @@ export function readQuestionExact(view: RecordView, ref: Ref): Revision<Question
 }
 
 export function listQuestions(store: Store, projectId: string): Revision<Question>[] {
-  return store.list<Question>("question").filter(question => question.value.projectId === projectId);
+  const physical = provenStore(store);
+  if (!physical || storeObserved(physical))
+    return store.list<Question>('question').filter(question => question.value.projectId === projectId);
+  return physical.identities('prefix', `question:${projectId}:`).filter(row => row.kind === 'question')
+    .map(row => physical.get<Question>(row.id, row.revision)!)
+    .filter(question => question?.kind === 'question' && question.value.projectId === projectId);
 }
 
 /** Вопросы драфта в его сохранённом порядке; отсутствующие — null на месте.

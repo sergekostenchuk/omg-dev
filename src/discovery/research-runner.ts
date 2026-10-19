@@ -3,7 +3,7 @@ import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGH
 import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deliveredConceptSections, RESULT_CAPACITY_REFUSAL,
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
-import { discoveryContext, discoveryOutcome } from './discovery-outcome.js';
+import { discoveryContext, discoveryInspection, type DiscoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion } from "./research-routing.js";
@@ -331,8 +331,8 @@ export class Researcher {
         && outstanding.value.cursor.run === id && outstanding.value.cursor.turn === run.value.turns
         && admittedResearchAction(pendingTurn.value.action).action === "need_owner") {
         readResearchConsumerTurn(this.store, reference(pendingTurn));
-        const gate = this.discovery.gate(project, reference(draft));
-        if (gate.findings.length === 0) {
+        const { outcome, gate } = discoveryInspection(this.store, draft);
+        if (gate.findings.length === 0 && outcome.findings.length === 0) {
           if (run.value.status === "completed" && run.value.ownerQuestion === null) return run;
           return this.save(run, { status: "completed", ownerQuestion: null, error: null, pauseCode: null },
             uniqueRefs([reference(outstanding), reference(pendingTurn), reference(question),
@@ -348,18 +348,23 @@ export class Researcher {
         "research_owner_question_invalid", "The saved owner decision has no question in this draft");
       if (question.value.status !== "answered") return run;
     }
-    let admitted: ReturnType<typeof discoveryOutcome> | null = null;
-    if (!outstanding && !forcedPendingTurn && !restoreOnly) {
-      try { admitted = discoveryOutcome(this.store, draft); }
+    let admitted: DiscoveryOutcome | null = null;
+    const inspection: { gate: ReturnType<Discovery['gate']> | null } = { gate: null };
+    if (!outstanding && !forcedPendingTurn && (!restoreOnly || run?.value.status === "completed")) {
+      const requested = reference(draft);
+      try { admitted = discoveryInspection(this.store, draft, () => {
+        inspection.gate = this.discovery.gate(project, requested);
+        return inspection.gate;
+      }).outcome; }
       catch (error) {
         // Source movement follows the existing refresh path. Broken accepted
         // pairs must refuse before that path can reopen them and pay again.
         if (!(error instanceof EngineError && ['research_evidence_stale', 'evidence_stale'].includes(error.code))) throw error;
       }
     }
-    const checked = outstanding || forcedPendingTurn || restoreOnly && run?.value.status !== "completed" ? null : this.discovery.gate(project, reference(draft));
+    const checked = inspection.gate;
     if (run?.value.status === "completed" && checked?.findings.length === 0
-      && discoveryOutcome(this.store,draft).findings.length===0) return run;
+      && admitted?.findings.length===0) return run;
     if (restoreOnly && !outstanding && !forcedPendingTurn)
       throw new EngineError(restoreComplete.code, restoreComplete.message);
     requireCondition(!checked?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed; prepare a current draft");
@@ -507,10 +512,11 @@ export class Researcher {
           continue;
         }
         draft = this.store.get<DiscoveryDraft>(draftId)!;
-        const outcome = forcedPendingTurn ? null : discoveryOutcome(this.store, draft);
+        const inspection = forcedPendingTurn ? null : discoveryInspection(this.store, draft);
+        const outcome = inspection?.outcome;
         if (outcome?.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
           error: outcome.reason, pauseCode: outcome.findings[0]!.code }, outcome.guards);
-        const gate = forcedPendingTurn ? null : this.discovery.gate(project, reference(draft));
+        const gate = inspection?.gate ?? null;
         if (gate?.findings.length === 0) return this.save(run, { status: "completed" });
         requireCondition(!gate?.findings.some(item => item.code === "research_context_stale"), "research_context_stale", "Research prerequisites changed during the run");
         const forcedQuestionRef = forcedPendingTurn?.value.question;
@@ -1267,10 +1273,10 @@ export class Researcher {
       if (restoreOnly) return this.save(run, { status: "paused", ownerQuestion: null,
         error: restoreComplete.message, pauseCode: restoreComplete.code });
       draft = this.store.get<DiscoveryDraft>(draftId)!;
-      const outcome = discoveryOutcome(this.store, draft);
+      const { outcome, gate } = discoveryInspection(this.store, draft);
       if (outcome.findings.length) return this.save(run, { status: 'paused', ownerQuestion: null,
         error: outcome.reason, pauseCode: outcome.findings[0]!.code }, outcome.guards);
-      return this.save(run, this.discovery.gate(project, reference(draft)).findings.length === 0 ? { status: "completed" }
+      return this.save(run, gate.findings.length === 0 ? { status: "completed" }
         : { status: "paused", ...(early ? { pauseCode: "research_turns_exhausted" } : {}),
           error: "Research turn allowance reached; evidence and answers are preserved for continuation" });
     } catch (error) {

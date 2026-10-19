@@ -4,8 +4,8 @@ import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import type { BasisCatalogueEntry } from './basis-application.js';
 import type { Store, Revision } from '../storage/store.js';
-import { reference, uniqueRefs, isRef, type Ref, type Finding } from '../pipeline/contracts.js';
-import { Discovery, type DiscoveryDraft, type Question } from './discovery.js';
+import { reference, uniqueRefs, isRef, type Ref, type Finding, type GateResult } from '../pipeline/contracts.js';
+import { Discovery, type DiscoveryDraft, type Question, type AcceptedPrefixSnapshot } from './discovery.js';
 import { DISCOVERY_RESEARCH_FIELDS } from './preparation-contracts.js';
 import { DISCOVERY_CHOICE_ACTION, OWNER_GRANT_LIFETIME_MS, OWNER_SESSION_LIFETIME_MS,
   readDiscoveryChoiceSession, readDiscoveryChoiceSessionGrant,
@@ -13,6 +13,7 @@ import { DISCOVERY_CHOICE_ACTION, OWNER_GRANT_LIFETIME_MS, OWNER_SESSION_LIFETIM
 
 const fields = ['brief', 'objective', 'researchPlan', 'researchReport', 'verdict', 'preparation'] as const;
 type Field = typeof fields[number];
+type OutcomeGate = GateResult & { prefix?: AcceptedPrefixSnapshot };
 export type DiscoveryVerdict = 'go' | 'conditional' | 'no_go' | 'insufficient_evidence';
 export interface AcceptedField { question: Ref; answer: Ref; value: Json }
 export interface DiscoveryContext {
@@ -214,18 +215,56 @@ const schema = new Ajv({ strict: true, allowUnionTypes: true });
 const same = (a: unknown, b: unknown) => a !== undefined && b !== undefined && canonical(a) === canonical(b);
 const object = (value: unknown) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const researchSchemas = new Map(DISCOVERY_RESEARCH_FIELDS.map(spec => [spec.field, schema.compile(spec.schema as object)]));
+const questionSchemas = new Map<string, ReturnType<typeof schema.compile>>();
+function questionSchema(value: Json) {
+  const key = canonical(value);
+  let validator = questionSchemas.get(key);
+  if (!validator) {
+    validator = new Ajv({ strict: true, allowUnionTypes: true }).compile(value as object);
+    questionSchemas.set(key, validator);
+  }
+  return validator;
+}
 // The v5 research gate is also the explicit subject route of v6. Keep the exported name for its consumers.
 export const isDiscoveryV5 = (draft: DiscoveryDraft) => draft.stage === 'discovery'
   && (draft.contractVersion === 5 || draft.contractVersion === 6);
 
 /** Read the accepted prefix in question order. A reopened question stops the
  * prefix even though the draft deliberately retains its previous field value. */
-function acceptedPrefix(store: Store, draft: Revision<DiscoveryDraft>, before: Field, prove = false) {
+function acceptedPrefix(store: Store, draft: Revision<DiscoveryDraft>, before: Field, gate?: OutcomeGate) {
   const selected: Partial<Record<Field, AcceptedField>> = {};
   const guards = [reference(draft)];
   requireCondition(Array.isArray(draft.value.questions) && draft.value.questions.every(id => typeof id === 'string') && object(draft.value.fields),
     'discovery_research_invalid', `[${draft.id}] Discovery lost its questions or fields`);
   const required = fields.slice(0, fields.indexOf(before));
+  if (gate?.prefix) {
+    const prefix = gate.prefix;
+    requireCondition(prefix.contract === 'discovery-prefix/v1' && same(prefix.draft, reference(draft)),
+      'discovery_stale', `[${draft.id}] The accepted prefix belongs to another draft revision`);
+    guards.push(...gate.guards, prefix.closure);
+    for (const field of required) {
+      const matches = prefix.entries.filter(entry => entry.field === field);
+      requireCondition(matches.length <= 1, 'discovery_research_invalid', `[${draft.id}] Discovery v5 needs one ${field} question`);
+      const entry = matches[0];
+      if (!entry) {
+        // Only unfinished questions need bodies. Accepted questions and their answers stay in the proven snapshot.
+        const answered = new Set(prefix.entries.map(item => item.question.id));
+        const pending = draft.value.questions.filter(id => !answered.has(id)).map(id => store.get<Question>(id))
+          .filter(q => q?.kind === 'question' && q.value.spec.field === field);
+        requireCondition(pending.length === 1 && pending[0]!.value.status === 'open',
+          'discovery_research_invalid', `[${draft.id}] Discovery v5 needs one ${field} question`);
+        guards.push(reference(pending[0]!));
+        return { context: selected, guards: uniqueRefs(guards), pending: pending[0]!.id };
+      }
+      if (['researchPlan', 'researchReport', 'verdict'].includes(field)) {
+        requireCondition(entry.kind === 'research-answer' && isRef(entry.assessment) && entry.observations > 0,
+          'discovery_research_required', `[${entry.question.id}] The delivered answer needs its exact supported assessment`);
+        validateField(field, entry.value, selected, entry.observations, entry.question.id);
+      }
+      selected[field] = { question: entry.question, answer: entry.answer, value: entry.value };
+    }
+    return { context: selected, guards: uniqueRefs(guards), pending: null };
+  }
   const questions = draft.value.questions.map(id => store.get<Question>(id));
   requireCondition(questions.every(q=>q?.kind==='question' && object(q.value)
     && object(q.value.spec) && typeof q.value.spec.field==='string'),
@@ -234,8 +273,7 @@ function acceptedPrefix(store: Store, draft: Revision<DiscoveryDraft>, before: F
     requireCondition(false, code, `[${question}] ${reason}`);
   };
   const finish = (pending: string | null) => {
-    if (prove) {
-      const gate = new Discovery(store).gate(draft.value.projectId, reference(draft));
+    if (gate) {
       const selectedIds = new Set(Object.values(selected).map(item=>item.question.id));
       const refused = gate.findings.find(f=>selectedIds.has(f.target)||f.target===draft.id||f.code==='research_context_stale');
       if(refused) fail(refused.target,refused.message,refused.code);
@@ -263,7 +301,7 @@ function acceptedPrefix(store: Store, draft: Revision<DiscoveryDraft>, before: F
     const value = record.kind==='fact' ? record.value.observation?.value : record.value.value;
     requireCondition(value !== undefined && same(value,draft.value.fields[field]),
       'discovery_research_invalid', `[${q.id}] The accepted pair differs from the delivered value`);
-    const validator = new Ajv({ strict: true, allowUnionTypes: true }).compile(q.value.spec.schema as object);
+    const validator = questionSchema(q.value.spec.schema);
     requireCondition(validator(value), 'discovery_research_invalid',
       `[${q.id}] Accepted value does not satisfy its question`);
     if (['researchPlan', 'researchReport', 'verdict'].includes(field)) {
@@ -356,12 +394,35 @@ export function discoveryContext(store: Store, draft: Revision<DiscoveryDraft>, 
     guards: uniqueRefs([...read.guards, ...history.guards]) };
 }
 
-/** One product outcome for new dispatch, stage results and the concept gate.
- * All four supported verdicts are results; only go permits preparation. */
+/** Public business result. Internal admission evidence never enters this value. */
 export function discoveryOutcome(store: Store, draft: Revision<DiscoveryDraft>): DiscoveryOutcome {
+  return discoveryInspection(store, draft).outcome;
+}
+
+/** Share one gate within a synchronous consumer, separately from the public outcome. */
+export function discoveryInspection(store: Store, draft: Revision<DiscoveryDraft>,
+  readGate: () => OutcomeGate = () => new Discovery(store).gate(draft.value.projectId, reference(draft))): { outcome: DiscoveryOutcome; gate: OutcomeGate } {
+  // Evaluate once in this synchronous operation. The stage reader supplies its requested Ref, not a cached result.
+  if (isDiscoveryV5(draft.value)) requireCondition(Array.isArray(draft.value.questions)
+    && draft.value.questions.every(id => typeof id === 'string') && object(draft.value.fields),
+    'discovery_research_invalid', `[${draft.id}] Discovery lost its questions or fields`);
+  let gate: OutcomeGate;
+  try { gate = readGate(); }
+  catch (error) {
+    // Before closures, the exact-pair reader diagnosed missing values before gate could access them.
+    // Preserve that addressed refusal on old/corrupt records; an unrelated gate failure still propagates.
+    if (isDiscoveryV5(draft.value)) acceptedPrefix(store, draft, 'preparation');
+    throw error;
+  }
+  const invalidPrefix = gate.findings.find(finding => finding.code === 'discovery_prefix_closure_invalid');
+  if (invalidPrefix) throw new EngineError(invalidPrefix.code, `[${invalidPrefix.target}] ${invalidPrefix.message}`);
+  return { outcome: outcomeFromGate(store, draft, gate), gate };
+}
+
+function outcomeFromGate(store: Store, draft: Revision<DiscoveryDraft>, gate: OutcomeGate): DiscoveryOutcome {
   const empty = { verdict: null, report: null, conditions: [], ownerChoices: [], reason: null, guards: [], findings: [] };
   if (!isDiscoveryV5(draft.value)) return { ...empty, state: 'legacy' };
-  const read = acceptedPrefix(store, draft, 'preparation', true);
+  const read = acceptedPrefix(store, draft, 'preparation', gate);
   if (read.pending) return { ...empty, state: 'researching', guards: read.guards };
   const verdict = read.context.verdict!, answer = verdict.value as any;
   const state = answer.outcome as DiscoveryVerdict;
@@ -381,8 +442,11 @@ export function discoveryOutcome(store: Store, draft: Revision<DiscoveryDraft>):
       conditionId: condition.id, condition: condition.condition, criterion: condition.criterion, options: condition.options });
     return true;
   });
-  const preparation = draft.value.questions.map(id => store.get<Question>(id)).find(q => q?.value.spec.field === 'preparation');
-  if (state === 'go' && preparation?.value.status === 'answered') requirePreparation(draft.value.fields.preparation!, read.context, preparation.id);
+  const preparation = gate.prefix
+    ? gate.prefix.entries.find(entry => entry.field === 'preparation')?.question.id
+    : draft.value.questions.map(id => store.get<Question>(id))
+      .find(q => q?.value.spec.field === 'preparation' && q.value.status === 'answered')?.id;
+  if (state === 'go' && preparation) requirePreparation(draft.value.fields.preparation!, read.context, preparation);
   return { state, verdict: verdict.answer, report: read.context.researchReport!.answer,
     conditions, ownerChoices, reason: answer.reason, guards: read.guards, findings };
 }

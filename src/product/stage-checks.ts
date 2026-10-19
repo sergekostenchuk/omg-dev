@@ -1,6 +1,6 @@
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 import {
-  artifactFields, contractEraOf, discoveryOutcome, expectedRequirements,
+  artifactFields, contractEraOf, discoveryInspection, expectedRequirements,
   isBasisApplicationEra, isLegacyEra, orderedSpecs, readDraft, readExact, readStageArtifact, researchContract,
   stageFields, type UpstreamStage, UPSTREAM_STAGES,
 } from "../discovery/projection-reader.js";
@@ -92,13 +92,13 @@ export class StageChecks {
     const draft = readDraft(this.store, content.draft.id);
     if (!draft || draft.value.stage !== stage || draft.value.projectId !== context.projectId
       || canonical(draft.value.fields) !== canonical(content.fields)) return rejected("discovery_foreign", "Research does not belong to this stage or its fields changed");
-    let outcome: ReturnType<typeof discoveryOutcome>;
-    try { outcome = discoveryOutcome(this.store, draft); }
+    let inspection: ReturnType<typeof discoveryInspection>;
+    try { inspection = discoveryInspection(this.store, draft, () => this.discovery.gate(context.projectId, content.draft)); }
     catch (error) {
       if (!(error instanceof EngineError)) throw error;
       return rejected(error.code, error.message);
     }
-    const result = this.discovery.gate(context.projectId, content.draft);
+    const { outcome, gate: result } = inspection;
     result.findings.push(...outcome.findings); result.guards.push(...outcome.guards);
     const version = contractEraOf(draft.value);
     const legacy = isLegacyEra(version);
