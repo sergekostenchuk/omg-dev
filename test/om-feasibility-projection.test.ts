@@ -26,6 +26,9 @@ import { readCall, recordCall } from '../src/om/call-record.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { executionFixture } from './execution-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
+import { answerTechnicalFixture } from './technical-research-fixture.js';
+import { deriveLayerFixture } from './layer-design-fixture.js';
+import { writeHorizon } from '../src/om/horizon.js';
 
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message} ${canonical(result.refusal.at)}`);
@@ -63,53 +66,74 @@ function worksFixture(t: TestContext): Promise<WorksFixture> {
   })();
   return worksModule.then(module => module.acceptedWorksFixture(t));
 }
-interface MixedWorksFixture extends WorksFixture { readonly legacy: Revision<Feasibility> }
-let mixedWorksModule: Promise<{ acceptedWorksFixture(t: TestContext): MixedWorksFixture }> | undefined;
-function mixedWorksFixture(t: TestContext): Promise<MixedWorksFixture> {
-  mixedWorksModule ??= (async () => {
+interface MixedLayerHead { readonly acceptance?: { readonly producer: string }; readonly layerProofs?: readonly { readonly level: number }[] }
+interface MixedNativeFixture {
+  readonly store: Store; readonly engine: ProductEngine; readonly project: string; readonly workspace: string;
+  readonly legacy: Revision<Feasibility>;
+  readonly basis: OmResult<unknown>;
+  readonly omLayer: Revision<MixedLayerHead>;
+  readonly beforeRefusal: string;
+  readonly attempt: (store: Store) => OmResult<unknown>;
+  restart(): void;
+}
+let mixedModule: Promise<{ acceptedOperationsFixture(t: TestContext): unknown }> | undefined;
+async function mixedNativeFixture(t: TestContext): Promise<MixedNativeFixture> {
+  mixedModule ??= (async () => {
     const url = new URL('./om-feasibility.test.js', import.meta.url), source = readFileSync(url, 'utf8');
     const boundary = source.indexOf('const heads ='); assert.ok(boundary > 0);
     let prefix = source.slice(0, boundary);
     const once = (before: string, after: string) => {
-      assert.equal(prefix.split(before).length - 1, 1, `One native-to-OM fixture seam: ${before}`);
+      assert.equal(prefix.split(before).length - 1, 1, `One native-to-OM fixture seam: ${before.slice(0, 60)}`);
       prefix = prefix.replace(before, after);
     };
     once("import { preparedFeatures } from './product-fixture.js';", "import { preparedFeatures, refinedLayers } from './product-fixture.js';");
     once('preparedFeatures(engine, project, l1, field => {', "desired.horizon = ['garden-consume-work']; preparedFeatures(engine, project, desired, field => {");
-    const input = '    let input = ok(writeOmInput(store, { project, expected: 0,';
+    const input = '  let input = ok(writeOmInput(store, { project, expected: 0,';
     once(input, `    const nativeCommand = { executable: process.execPath, args: ['--version'] };
     engine.environments.configure(project, { workspace,
       implementer: { actor: 'external-producer', model: 'fixture', effort: 'high', command: nativeCommand },
       reviewer: { actor: 'external-reviewer', model: 'fixture', effort: 'high', command: nativeCommand },
-      fullCheck: nativeCommand, timeoutMs: 5_000, requestCapacityChars: 200_000 }, 0);
+      fullCheck: nativeCommand, timeoutMs: 5_000, requestCapacityChars: 200000 }, 0);
     refinedLayers(engine, project);
     const legacy = engine.execute({ type: 'assess', project, expected: 0 });
     assert.equal(legacy.id, 'feasibility:' + project); assert.equal(legacy.value.ready, true);
+    assert.deepEqual(engine.refinement.feasibilityGate(project, reference(legacy), true).findings, []);
+    for (const inputRef of legacy.value.inputs) { const rec = store.get(inputRef.id, inputRef.revision); assert.ok(rec, 'native input missing: ' + inputRef.id); assert.deepEqual(reference(rec), inputRef); }
 ${input}`);
-    once('timeoutMs: 5000, requestCapacityChars: 200_000 }, 0);',
-      'timeoutMs: 5000, requestCapacityChars: 200_000 }, store.get(`environment:${project}`).revision);');
-    once('layer: null, frame: null, upper: null };', 'layer: reference(store.get(`graph-layer:${project}:2`)), frame: null, upper: null };');
-    once('horizon: reference(horizon.gate), layer: null, frame: null,',
-      'horizon: reference(horizon.gate), layer: reference(store.get(`graph-layer:${project}:3`)), frame: null,');
-    const acceptance = /    const proposal2 = proposal[\s\S]*?    const graph = reference\(accepted.graph\), layer = reference\(accepted.layer\), upperFrame = reference\(accepted.frame\);/;
-    assert.equal([...prefix.matchAll(new RegExp(acceptance.source, 'g'))].length, 1);
-    prefix = prefix.replace(acceptance, '    const graph = reference(store.get(`graph:${project}`)), layer = reference(store.get(`graph-layer:${project}:2`)), upperFrame = null;');
-    once('graph, refinement: layer,', 'graph, refinement: reference(store.get(`phase:${project}:L2`)),');
+    // The complete native history stays in this database; the OM N2 candidate names its exact research basis.
+    once('    layer: null, frame: null, upper: null };',
+      '    layer: reference(store.get(`graph-layer:${project}:2`)), frame: null, upper: null };');
+    // The next works-basis step is where the contract refuses: keep the refusal instead of throwing it.
+    once('const basis = ok(prepareFrame(', 'const basis = prepareFrame(');
+    once('frame: upperFrame } }));', 'frame: upperFrame } });');
     const proposal = '        return reference(store.write({ id: `om-proposal:garden:external-${level}`';
     once(proposal, `        value.replaces = value.fills.flatMap(fill => frame.result.fills
           .filter(old => old.obligation === fill.obligation && old.source === 'accepted')
           .map(old => ({ obligation: fill.obligation, base: { node: old.node, graph: frame.request.graph },
-            with: { node: fill.node, port: fill.port ?? null }, basis: 'Preserve the exact native fill in the OM contract' })));
+            with: { node: fill.node, port: fill.port ?? null }, basis: 'Preserve the exact accepted fill in the OM contract' })));
 ${proposal}`);
     once('return { root, workspace, database, project, desired, basis, frame2, graph, layer, upperFrame, input, horizon, proposal,',
       'return { root, workspace, database, project, desired, basis, frame2, graph, layer, upperFrame, input, horizon, proposal, legacy,');
-    once('get store() { return base.store; }, restart: base.restart };', 'legacy: base.legacy, get store() { return base.store; }, restart: base.restart };');
     prefix = prefix.replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g,
       (_match, _quote: string, path: string) => `from ${JSON.stringify(new URL(path, url).href)}`);
     assert.ok(!/\btest\(/.test(prefix), 'The mixed native producer does not import the original test registrations');
-    return import(`data:text/javascript;base64,${Buffer.from(`${prefix}\nexport { acceptedWorksFixture };`).toString('base64')}`);
+    return import(`data:text/javascript;base64,${Buffer.from(`${prefix}\nexport { acceptedOperationsFixture };`).toString('base64')}`);
   })();
-  return mixedWorksModule.then(module => module.acceptedWorksFixture(t));
+  const base = (await mixedModule).acceptedOperationsFixture(t) as Omit<MixedNativeFixture, 'basis'> & { basis: OmResult<unknown> };
+  const { store, engine, project } = base;
+  const omLayer = store.get<MixedLayerHead>(`graph-layer:${project}:2`)!;
+  // The one remaining continuation rebuilds the research work layer over the OM basis by the real producers.
+  engine.refinement.sealLayer(project, 2, 1);
+  const rebuiltR2 = engine.refinement.begin(project, 'R2');
+  answerTechnicalFixture(engine, project, rebuiltR2);
+  engine.refinement.finishResearch(project, 'R2', reference(store.get(rebuiltR2.id)!), 1);
+  deriveLayerFixture(engine, project, 3);
+  const beforeRefusal = history(store);
+  const attempt = (s: Store) => writeHorizon(s, { project, input: reference(s.get(`om-input:${project}`)!),
+    graph: reference(s.get(`graph:${project}`)!), refinement: reference(omLayer), available: {},
+    choice: { choiceVersion: 'mixed-works-retry', features: [{ outcome: 'garden-result' }], excluded: [] } });
+  return { ...base, omLayer, basis: base.basis, beforeRefusal, attempt,
+    get store() { return base.store; }, get engine() { return base.engine; }, restart: () => base.restart() };
 }
 function missingM8(engine: ProductEngine, project: string) {
   const view = engine.projection(project);
@@ -271,41 +295,75 @@ test('G1.2 a first assess command creates M8 while the public projection initial
   assert.equal(saved.value.ready, true);
   assert.deepEqual(engine.projection(f.project).feasibility, saved);
   assert.equal(f.store.get(`feasibility:${f.project}`), null);
-});
-
-test('G1.2 a genuine mixed project preserves native R3 while assess uses only the current M8 revision', async t => {
-  const f = await mixedWorksFixture(t), engine = new ProductEngine(f.store), legacyBytes = canonical(f.legacy);
-  assert.equal(f.legacy.id, `feasibility:${f.project}`); assert.equal(f.legacy.revision, 1);
-  assert.equal(f.store.get(`om-feasibility:${f.project}`), null);
-  missingM8(engine, f.project);
-  const first = engine.execute({ type: 'assess', project: f.project, expected: 0 }) as Revision<OmFeasibility>;
-  assert.equal(first.id, `om-feasibility:${f.project}`); assert.equal(first.revision, f.legacy.revision);
-  assert.equal(first.value.ready, true);
-  assert.equal(canonical(f.store.get(f.legacy.id)), legacyBytes);
-  assert.deepEqual(engine.execute({ type: 'assess', project: f.project, expected: f.legacy.revision }), first,
-    'Matching revision numbers are valid when the expected value names the current M8 head');
-  assert.deepEqual(engine.projection(f.project).feasibility, first);
-  const environment = engine.environments.get(f.project), { projectId: _project, ...settings } = environment.value;
+  assert.deepEqual(engine.execute({ type: 'assess', project: f.project, expected: saved.revision }), saved,
+    'An exact repeat of the current M8 revision is the idempotent result');
+  const environment = engine.environments.get(f.project), { projectId: _projectId, ...settings } = environment.value;
   engine.environments.configure(f.project, { ...settings, timeoutMs: settings.timeoutMs + 1 }, environment.revision);
-  const second = engine.execute({ type: 'assess', project: f.project, expected: first.revision }) as Revision<OmFeasibility>;
-  assert.equal(second.id, first.id); assert.equal(second.revision, 2);
-  assert.notDeepEqual(second.value.environment, first.value.environment);
-  assert.equal(canonical(f.store.get(f.legacy.id)), legacyBytes);
+  const second = engine.execute({ type: 'assess', project: f.project, expected: saved.revision }) as Revision<OmFeasibility>;
+  assert.equal(second.id, saved.id); assert.equal(second.revision, 2);
+  assert.notDeepEqual(second.value.environment, saved.value.environment);
   f.restart();
-  const reopened = new ProductEngine(f.store), before = history(f.store);
+  const reopened = new ProductEngine(f.store);
   assert.deepEqual(reopened.projection(f.project).feasibility, second);
-  assert.deepEqual(ok(readFeasibility(f.store, { project: f.project, record: reference(first) })), first);
+  assert.deepEqual(ok(readFeasibility(f.store, { project: f.project, record: reference(saved) })), saved);
   assert.deepEqual(ok(readFeasibility(f.store, { project: f.project, record: reference(second) })), second);
-  assert.equal(canonical(f.store.get(f.legacy.id, f.legacy.revision)), legacyBytes);
-  const legacyGate = reopened.refinement.feasibilityGate(f.project, reference(f.legacy), true);
-  assert.ok(legacyGate.findings.some(finding => finding.code === 'feasibility_stale'),
-    'Native R3 still checks its original environment and graph against the current heads');
-  assert.ok(!legacyGate.findings.some(finding => finding.code === 'feasibility_contract_superseded'),
-    'An explicit native reference retains its own producer contract in a mixed project');
-  assert.throws(() => reopened.execute({ type: 'assess', project: f.project, expected: f.legacy.revision }),
+  const before = history(f.store);
+  assert.throws(() => reopened.execute({ type: 'assess', project: f.project, expected: saved.revision }),
     (error: unknown) => error instanceof EngineError && error.code === 'revision_conflict'
       && (error.details as { target: string }).target === second.id);
-  assert.equal(history(f.store), before, 'A native revision cannot be interpreted as permission to replay a newer M8');
+  assert.equal(history(f.store), before, 'A stale M8 expected revision writes nothing');
+});
+
+test('G1.2 a genuine mixed project preserves native R3 while the OM continuation stops at the exact incompatible step', async t => {
+  const f = await mixedNativeFixture(t), engine = f.engine, legacyBytes = canonical(f.legacy);
+  // The complete native history lives in this database: R3 is revision 1 and every exact input still resolves.
+  assert.equal(f.legacy.id, `feasibility:${f.project}`); assert.equal(f.legacy.revision, 1);
+  for (const input of f.legacy.value.inputs)
+    assert.deepEqual(reference(f.store.get(input.id, input.revision)!), input);
+  // The first B1 already selected the OM space: the projection reports the missing M8, never the saved R3.
+  missingM8(engine, f.project);
+  const beforeAssess = history(f.store);
+  assert.throws(() => engine.execute({ type: 'assess', project: f.project, expected: f.legacy.revision }),
+    (error: unknown) => addressed(error) && (error as EngineError).code === 'revision_conflict'
+      && ((error as EngineError).details as { target: string }).target === `om-feasibility:${f.project}`);
+  assert.equal(history(f.store), beforeAssess, 'A native revision is not an expected revision of the M8 record');
+  // The real OM N2 acceptance happened on the exact research basis inside the fixture.
+  assert.equal(f.omLayer.value.acceptance?.producer, 'om');
+  // The next continuation step is refused at its exact contract point: the works frame cannot omit
+  // the saved research L3 (its head carries level-3 proofs).
+  assert.equal(f.basis.ok, false);
+  if (!f.basis.ok) {
+    assert.equal(f.basis.refusal.code, 'frame_basis_unproven');
+    assert.deepEqual(f.basis.refusal.at, { unit: 'F4', target: `graph-layer:${f.project}:3`, field: 'layer' });
+  }
+  // The remaining bridge — a fresh research L3 derived over the OM L2 by real producers — also cannot
+  // proceed: its graph write supersedes the accepted L2 head, so the works horizon names a non-head.
+  const refused = f.attempt(f.store);
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.refusal.code, 'input_stale');
+    assert.deepEqual(refused.refusal.at, { unit: 'G2', target: `graph-layer:${f.project}:2`, field: 'head', ref: reference(f.omLayer) });
+  }
+  assert.equal(history(f.store), f.beforeRefusal, 'The refused step writes nothing');
+  const repeat = f.attempt(f.store);
+  assert.equal(repeat.ok, false);
+  if (!repeat.ok) assert.equal(repeat.refusal.code, 'input_stale');
+  assert.equal(history(f.store), f.beforeRefusal, 'A repeat of the refused step writes nothing');
+  // After the OM N2 acceptance the native gate names the superseded L2 input; the record itself is untouched.
+  const stale = engine.refinement.feasibilityGate(f.project, reference(f.legacy), true);
+  assert.ok(stale.findings.some(finding => finding.code === 'feasibility_stale' && finding.target === `graph-layer:${f.project}:2`),
+    'The native gate addresses the exact layer revision the OM acceptance superseded');
+  assert.ok(!stale.findings.some(finding => finding.code === 'feasibility_contract_superseded'),
+    'An explicit native reference retains its own producer contract in a mixed project');
+  assert.equal(canonical(f.store.get(f.legacy.id)), legacyBytes);
+  f.restart();
+  assert.equal(canonical(f.store.get(f.legacy.id, f.legacy.revision)), legacyBytes);
+  for (const input of f.legacy.value.inputs)
+    assert.deepEqual(reference(f.store.get(input.id, input.revision)!), input);
+  const cold = f.attempt(f.store);
+  assert.equal(cold.ok, false);
+  if (!cold.ok) assert.equal(cold.refusal.code, 'input_stale');
+  assert.equal(history(f.store), f.beforeRefusal, 'A cold repeat of the refused step adds no records');
 });
 
 test('G1.2 B1 revision one remains mandatory with a derived head and retained M8 references', async t => {
