@@ -1,7 +1,8 @@
 import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { checkTransactionGuards, Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { checkTransactionGuards, storeObserved, Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { digest, hashJson } from "../canonical.js";
 import type { Command, Graph } from "../graph/model.js";
@@ -84,7 +85,13 @@ export function uniqueTransactionGuards(values: readonly TransactionGuard[]): Tr
 export function transactionGuardsCurrent(store: Store, guards: readonly TransactionGuard[]): boolean {
   requireCondition(store !== null && typeof store === "object" && typeof store.get === "function",
     "invalid_guard", "Current guard validation needs a readable Store");
-  return uniqueTransactionGuards(guards).every(guard => {
+  const checked = uniqueTransactionGuards(guards);
+  // G1 (№6174 п.3): on a proved Store with no capture actively observing, heads are compared in one
+  // snapshot without decoding bodies; every other store or view, and every read a proof is capturing,
+  // keeps the per-guard observable get so the recorded journal stays the same.
+  const source = provenStore(store);
+  if (source !== null && !storeObserved(source)) return source.headsMatch(checked).ok;
+  return checked.every(guard => {
     const current = store.get(guard.id);
     return 'absent' in guard ? current === null : current !== null && current.revision === guard.revision && current.hash === guard.hash;
   });

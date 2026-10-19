@@ -61,6 +61,14 @@ export interface StoreObserver {
 let observer: StoreObserver | null = null;
 /** Installs the observer and returns the previous one, so a test can put it back. */
 export function observeStore(next: StoreObserver | null): StoreObserver | null { const previous = observer; observer = next; return previous; }
+/** G1 (№6174 п.3): whether a capture actively observes this Store's reads right now — asked through the
+ * same begin protocol the reads use, so an installed-but-idle observer (proofs.ts sets it permanently)
+ * does not disable the snapshot paths. A returned token is dropped, never ended: nothing was read and
+ * nothing is accounted; the store may be marked for the proof in progress exactly as its first observed
+ * read would mark it. */
+export function storeObserved(store: Store): boolean {
+  return observer?.begin(store) !== undefined;
+}
 /** A write attempt that a view's policy may refuse before it reaches any Store is still an attempt (№2302-2). */
 export function noteWriteAttempt(store: Store): void { observer?.write(store); }
 /** A read projection, capture or other opaque view may answer without reaching any Store: the reading proof is incomplete. */
@@ -118,6 +126,22 @@ function keepBody(area: Map<string, CachedBody>, key: string, body: string): voi
 }
 function releaseArea(area: Map<string, CachedBody>): void { for (const entry of [...area.values()]) forgetBody(entry); }
 const IDENTITY_COLUMNS = "r.entity_id, r.revision, r.kind, r.sha256";
+
+/** G1 (пул K ред.3 п.2, №6174 п.3): one id a batch head comparison could not satisfy. `expected` lists
+ * every guard that named the id — more than one is a `guard_conflict`; `actual` is the head identity the
+ * single snapshot found, or none. */
+export interface HeadsMatchMismatch {
+  id: string;
+  expected: TransactionGuard[];
+  actual: RevisionIdentity | null;
+}
+/** The result of one snapshot head comparison: `ok` exactly when every guard held; `conflict` marks at
+ * least one id required by contradictory guards — reported, never silently folded into a stale answer. */
+export interface HeadsMatch {
+  ok: boolean;
+  conflict: boolean;
+  mismatches: HeadsMatchMismatch[];
+}
 
 /** PF4 (№3499 §3.1): one committed product event without its body — what a write changed, never what it wrote. */
 export interface StoreEvent { sequence: number; id: string; revision: number; kind: string }
@@ -186,6 +210,70 @@ export class Store {
     const found = rows.map(row => ({ id: String(row!['entity_id']), kind: String(row!['kind']), revision: Number(row!['revision']), hash: String(row!['sha256']) }));
     if (token) observer!.end(token, this, 'identities', method, id, revision, found);
     return found;
+  }
+  /**
+   * G1 (пул K ред.3 п.2, №6174 п.3): compares a set of transaction guards against current heads in ONE
+   * committed snapshot — all chunks inside a single deferred read transaction (inside an already-open
+   * write transaction, within it), no body ever decoded. Covers TransactionGuard wholly: a present
+   * requirement (exact revision and sha256), an absent one (no head may exist), the empty set (true),
+   * and contradictory requirements for one id, which are reported as a conflict instead of passing or
+   * failing silently. Every executed SELECT chunk is a counted physical read — the batch cost follows
+   * C+ceil(D/chunk), never one flat read however large the guard set (№6232 G1-02). While a proof
+   * actively captures this Store's reads, the same snapshot is read instead by the point identities
+   * get of each distinct id (№6262 G1-02): the journal then records exactly the ids selected — each
+   * found head and each absent id — counted and observed once per read, so a write of any other id
+   * leaves the proof reusable and a moved or newly present selected id re-derives it. A chunk is never
+   * described as a whole-Store list. The empty guard set runs no SELECT at all and reports no observation.
+   */
+  headsMatch(guards: readonly TransactionGuard[]): HeadsMatch {
+    requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    const checked = checkTransactionGuards([...guards]);
+    const byId = new Map<string, TransactionGuard[]>();
+    for (const guard of checked) {
+      const group = byId.get(guard.id);
+      if (group) group.push(guard); else byId.set(guard.id, [guard]);
+    }
+    const heads = new Map<string, RevisionIdentity>();
+    const ids = [...byId.keys()];
+    const read = () => {
+      if (storeObserved(this)) {
+        // A capturing proof records each selected id by the point read its journal already replays.
+        for (const id of ids) for (const identity of this.identities('get', id)) heads.set(identity.id, identity);
+        return;
+      }
+      for (let index = 0; index < ids.length; index += 999) {
+        physicalReads++;
+        const chunk = ids.slice(index, index + 999);
+        const rows = this.#db.prepare(`SELECT ${IDENTITY_COLUMNS} FROM heads h
+          JOIN revisions r USING(entity_id, revision) WHERE h.entity_id IN (${chunk.map(() => "?").join(",")})`)
+          .all(...chunk);
+        for (const row of rows) heads.set(String(row!['entity_id']), { id: String(row!['entity_id']), kind: String(row!['kind']),
+          revision: Number(row!['revision']), hash: String(row!['sha256']) });
+      }
+    };
+    if (ids.length) {
+      if (this.#writing) read();
+      else {
+        this.#db.exec("BEGIN DEFERRED");
+        try { read(); } finally { this.#db.exec("COMMIT"); }
+      }
+    }
+    const mismatches: HeadsMatchMismatch[] = [];
+    let conflict = false;
+    for (const [id, group] of byId) {
+      const actual = heads.get(id) ?? null;
+      const variants = new Set(group.map(guard => 'absent' in guard ? "absent" : `${guard.revision}:${guard.hash}`));
+      if (variants.size > 1) {
+        conflict = true;
+        mismatches.push({ id, expected: group, actual });
+        continue;
+      }
+      const guard = group[0]!;
+      const ok = 'absent' in guard ? actual === null
+        : actual !== null && actual.revision === guard.revision && actual.hash === guard.hash;
+      if (!ok) mismatches.push({ id, expected: group, actual });
+    }
+    return { ok: mismatches.length === 0, conflict, mismatches };
   }
   get databaseId(): string { return String(this.#db.prepare("SELECT database_id FROM identity WHERE id=1").get()!['database_id']); }
   get<T = Json>(id: string, revision?: number): Revision<T> | null {

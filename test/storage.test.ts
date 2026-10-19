@@ -13,7 +13,7 @@ import { reference } from "../src/pipeline/contracts.js";
 import { captureView, storeView } from "../src/storage/store-view.js";
 import { isRef } from "../src/pipeline/contracts.js";
 import { HASH_PATTERN, HASH_RE } from "../src/canonical.js";
-import { uniqueTransactionGuards } from "../src/runtime/environment.js";
+import { uniqueTransactionGuards, transactionGuardsCurrent } from "../src/runtime/environment.js";
 import { readOmAdmissionGuards } from "../src/om/input.js";
 import { restoreSnapshot, inspectSnapshot } from "../src/storage/snapshots.js";
 import { assertSchema, removeProofCache } from "../src/storage/schema.js";
@@ -671,4 +671,137 @@ test("PF4 rows 34-36: the proof cache is written in one transaction of its own �
   assert.equal(Number(raw.prepare("SELECT count(*) AS n FROM proof_links l LEFT JOIN proof_nodes n ON l.node = n.hash WHERE n.hash IS NULL").get()!['n']), 0);
   assert.throws(() => store.proofCacheWrite([record("h", ["absent"])], [], limits), code("proof_cache_incomplete"));
   assert.equal(store.proofCacheRead("h"), null, "Nothing of an incomplete result is written");
+});
+
+test("headsMatch compares positive, absent and contradictory guards in one counted snapshot without decoding a body", t => {
+  const { store } = fixture(t);
+  const a = store.write({ id: "hm:a", kind: "k", expected: 0, value: { n: 1 } });
+  const b = store.write({ id: "hm:b", kind: "k", expected: 0, value: { n: 1 } });
+  const ghost: AbsentGuard = { id: "hm:ghost", absent: true };
+  const before = storeReads();
+  const first = store.headsMatch([reference(a), reference(b), ghost]);
+  assert.deepEqual([first.ok, first.conflict, first.mismatches], [true, false, []]);
+  assert.equal(storeReads() - before, 1, "one physical read for the whole guard set");
+  assert.equal(store.headsMatch([]).ok, true, "the empty guard set holds");
+  store.write({ id: "hm:b", kind: "k", expected: 1, value: { n: 2 } });
+  const moved = store.headsMatch([reference(a), reference(b), ghost]);
+  assert.equal(moved.ok, false); assert.equal(moved.conflict, false);
+  assert.equal(moved.mismatches.length, 1);
+  assert.equal(moved.mismatches[0]!.id, "hm:b");
+  assert.equal(moved.mismatches[0]!.actual?.revision, 2);
+  store.write({ id: "hm:ghost", kind: "k", expected: 0, value: {} });
+  const present = store.headsMatch([ghost]);
+  assert.equal(present.ok, false); assert.equal(present.mismatches[0]!.id, "hm:ghost");
+  const conflict = store.headsMatch([reference(a), { id: "hm:a", absent: true }]);
+  assert.equal(conflict.ok, false); assert.equal(conflict.conflict, true,
+    "contradictory requirements on one id are a conflict, never a silent pass");
+  const bulk: TransactionGuard[] = [];
+  for (let index = 0; index < 1001; index++)
+    bulk.push(reference(store.write({ id: `hm:bulk:${index}`, kind: "k", expected: 0, value: { index } })));
+  const bulkBefore = storeReads();
+  assert.equal(store.headsMatch(bulk).ok, true, "chunks share the one snapshot");
+  assert.equal(storeReads() - bulkBefore, Math.ceil(bulk.length / 999),
+    "every executed SELECT chunk is a counted read, not one flat read for the whole set");
+  assert.throws(() => store.headsMatch([{ id: "x", absent: false } as unknown as TransactionGuard]),
+    code("invalid_guard"), "guards are checked with the single form every caller shares");
+});
+
+test("headsMatch under a capture journals exactly the selected ids — reused unchanged and after a foreign write, re-derived when a selected head moves or appears", t => {
+  const { store } = fixture(t);
+  // №6262 G1-02: inside an active capture each distinct id is one point identities get of the same
+  // snapshot — present or absent — so the journal depends on those ids only, never on the whole Store.
+  for (const count of [2, 1001]) {
+    const refs = store.writeMany(Array.from({ length: count }, (_value, index) =>
+      ({ id: `hm:pf4:${count}:${index}`, kind: "k", expected: 0, value: { index } }))).map(reference);
+    const ghost: AbsentGuard = { id: `hm:pf4:${count}:ghost`, absent: true };
+    let derived = 0;
+    const run = (guards: TransactionGuard[]) => withHistoricalReads(() => historicalRead(store,
+      { reader: "M6.route-result", project: "garden", ref: refs[0]! },
+      () => { derived++; return { ok: store.headsMatch(guards).ok }; },
+      () => { throw new Error("cycle"); }));
+    const guards: TransactionGuard[] = [...refs, ghost];
+    assert.deepEqual(run(guards), { ok: true }); assert.deepEqual(run(guards), { ok: true });
+    assert.equal(derived, 1, `${count} dependencies: the second operation replays the saved proof`);
+    store.write({ id: `unrelated:another-project:${count}`, kind: "noise", expected: 0, value: {} });
+    assert.deepEqual(run(guards), { ok: true });
+    assert.equal(derived, 1, `${count} dependencies: a write of an unselected id leaves the proof reusable`);
+    const last = refs.at(-1)!;
+    store.write({ id: last.id, kind: "k", expected: last.revision, value: { moved: true } });
+    assert.deepEqual(run(guards), { ok: false });
+    assert.equal(derived, 2, `${count} dependencies: a moved selected head re-derives`);
+    const current = [...refs.slice(0, -1), reference(store.get(last.id)!), ghost];
+    assert.deepEqual(run(current), { ok: true });
+    assert.equal(derived, 3);
+    store.write({ id: ghost.id, kind: "k", expected: 0, value: {} });
+    assert.deepEqual(run(current), { ok: false });
+    assert.equal(derived, 4, `${count} dependencies: a selected absent id that appears re-derives`);
+  }
+});
+
+test("headsMatch reports to an observing observer one point read per distinct id — physical and observed counts agree for 0, 2 and 1001 ids", t => {
+  const { store } = fixture(t);
+  const seen: { method: string; mode: string; id: string | undefined; rows: number }[] = [];
+  const previous = observeStore({ begin: () => ({}),
+    end: (_token, _store, method, mode, id, _revision, rows) => { seen.push({ method, mode, id, rows: rows.length }); },
+    write: () => {}, untraced: () => {} });
+  try {
+    for (const count of [0, 2, 1001]) {
+      const refs = count ? store.writeMany(Array.from({ length: count }, (_value, index) =>
+        ({ id: `hm:obs:${count}:${index}`, kind: "k", expected: 0, value: { index } }))).map(reference) : [];
+      const guards: TransactionGuard[] = count ? [...refs, refs[0]!, { id: `hm:obs:${count}:ghost`, absent: true }] : [];
+      seen.length = 0;
+      const before = storeReads();
+      assert.equal(store.headsMatch(guards).ok, true);
+      const physical = storeReads() - before;
+      const distinct = count ? count + 1 : 0;
+      assert.equal(physical, distinct, `${count}: one physical read per distinct id, the repeated guard read once`);
+      assert.equal(seen.length, physical, `${count}: every physical read is observed exactly once`);
+      assert.ok(seen.every(event => event.method === "identities" && event.mode === "get" && event.id !== undefined),
+        `${count}: never a whole-Store list`);
+      if (count) assert.deepEqual(seen.at(-1), { method: "identities", mode: "get", id: `hm:obs:${count}:ghost`, rows: 0 },
+        `${count}: the absent id is recorded as selected and found absent`);
+    }
+  } finally { observeStore(previous); }
+  // Outside any capture the same comparison stays the chunked snapshot.
+  const bulk = store.list().filter(row => row.id.startsWith("hm:obs:1001:")).map(reference);
+  const before = storeReads();
+  assert.equal(store.headsMatch(bulk).ok, true);
+  assert.equal(storeReads() - before, Math.ceil(bulk.length / 999), "unobserved: one counted read per SELECT chunk");
+});
+
+test("transactionGuardsCurrent takes the heads snapshot only on a genuine unobserved Store, else the observable gets", t => {
+  const { store } = fixture(t);
+  const a = store.write({ id: "tg:a", kind: "k", expected: 0, value: { n: 1 } });
+  const ghost: AbsentGuard = { id: "tg:ghost", absent: true };
+  const guards: TransactionGuard[] = [reference(a), ghost];
+  const count = (action: () => boolean): [boolean, number] => {
+    const before = storeReads(); const result = action(); return [result, storeReads() - before];
+  };
+  assert.deepEqual(count(() => transactionGuardsCurrent(store, guards)), [true, 1],
+    "one snapshot read on a genuine Store");
+  assert.equal(transactionGuardsCurrent(store, [reference(a), { id: "tg:a", absent: true }]), false,
+    "contradictory guards refuse exactly as the per-guard walk did");
+  // An opaque view never takes the snapshot: the observable per-guard gets stay.
+  const opaque = { get: (id: string, revision?: number) => store.get(id, revision) } as Store;
+  assert.deepEqual(count(() => transactionGuardsCurrent(opaque, guards)), [true, 2],
+    "a view it cannot prove keeps the two observable gets");
+  // A capture whose reads are observed keeps the same gets — the snapshot would hide them.
+  const inside = withHistoricalReads(() => historicalRead(store,
+    { reader: "M6.route-result", project: "garden", ref: reference(a) },
+    () => count(() => transactionGuardsCurrent(store, guards)), () => { throw new Error("cycle"); }));
+  assert.deepEqual(inside, [true, 2], "inside an active capture the heads are read one by one");
+  assert.deepEqual(count(() => transactionGuardsCurrent(store, guards)), [true, 1],
+    "and the snapshot returns outside it");
+  // An installed observer that answers begin() is itself an active capture: the gets stay observable.
+  const seen: string[] = [];
+  const previous = observeStore({ begin: () => ({}),
+    end: (_token, _store, method) => { seen.push(method); }, write: () => {}, untraced: () => {} });
+  try {
+    assert.equal(transactionGuardsCurrent(store, guards), true);
+    assert.deepEqual(seen, ["get", "get"], "an observing observer keeps the per-guard reads");
+    seen.length = 0;
+    assert.equal(store.headsMatch(guards).ok, true);
+    assert.deepEqual(seen, ["identities", "identities"],
+      "under an observing observer headsMatch reads each selected id by a point identities get (№6262)");
+  } finally { observeStore(previous); }
 });
