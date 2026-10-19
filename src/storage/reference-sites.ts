@@ -124,6 +124,21 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "question", contract: null, data: [["spec", "schema"]] },
   { kind: "stage", contract: null, data: [["content", "fields"]] },
   { kind: "research-answer", contract: null, data: [["value"]] },
+  // DR2: a v7 answer declares its typed references — the accepted assessment
+  // and every claim basis of the discriminated dossier form: a fact basis
+  // names basis.source.ref, an inference basis names basis.from[*].container
+  // (a single ClaimAddress or an array of them), an owner-decision basis
+  // names basis.authority. Free payload content keeps no site even where an
+  // object resembles a Ref; old answers without the root marker stay on the
+  // contract:null rule above.
+  { kind: "research-answer", contract: "discovery-claims/v7", data: [], refs: [
+    ["assessment"],
+    ["value", "claims", INDEX, "basis", "source", "ref"],
+    ["value", "claims", INDEX, "basis", "from", "container"],
+    ["value", "claims", INDEX, "basis", "from", INDEX, "container"],
+    ["value", "claims", INDEX, "basis", "authority"],
+    ["value", "claims", INDEX, "basis", "authority", "ref"],
+  ] },
   { kind: "research-assessment", contract: null, data: [["value"], ["observations", INDEX, "value"]] },
   { kind: "research-checkpoint", contract: null, data: [["proposal"], ["observations", INDEX, "value"]] },
   { kind: "research-context", contract: null, data: contextData(["body"]) },
@@ -174,6 +189,8 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "om-limited-call-retry-permit", contract: "om-limited-call-retry-permit/v1", data: [] },
   { kind: "request-manifest", contract: "request-manifest/v1", data: [["wire"]], refs: [["parts", INDEX], ["intent"], ["call"]] },
   { kind: "request-part", contract: "request-part/v1", data: [["text"]], refs: [] },
+  { kind: "discovery-acceptance-act", contract: "discovery-acceptance-act/v1", data: [],
+    refs: [["draftBefore"], ["draftAfter"], ["questionBefore"], ["questionAfter"], ["answer"], ["assessment"], ["binding"]] },
 ];
 
 const object = (value: unknown): value is Record<string, unknown> =>

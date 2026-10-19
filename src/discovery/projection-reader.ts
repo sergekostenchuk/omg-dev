@@ -26,13 +26,18 @@ import type { Observation } from "../evidence/evidence.js";
 import { runtimeEvidenceDependencies } from "../graph/runtime-evidence.js";
 import { QUESTION_MOMENT_CONTRACT_VERSION } from "./preparation-contracts.js";
 import {
-  LEGACY_REQUIREMENTS, producerContractEra, REQUIREMENTS, RESEARCH_CONTRACT_VERSION,
+  LEGACY_REQUIREMENTS, NEXT_CONTRACT_ERA, producerContractEra, REQUIREMENTS, RESEARCH_CONTRACT_VERSION,
   selectResearchRequirements, VERSION2_REQUIREMENTS, VERSION3_REQUIREMENTS, VERSION4_REQUIREMENTS,
   VERSION5_REQUIREMENTS, VERSION6_REQUIREMENTS, type ProducerPolicy, type UpstreamStage,
 } from "./requirements.js";
+import {
+  DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT,
+  discoveryAcceptanceActId, type DiscoveryAcceptanceAct,
+} from "./v7-contracts.js";
 import { readAcceptedResearchAnswer } from "./discovery.js";
 import type { Decision, DiscoveryDraft, Fact, FieldSpec, Question } from "./discovery.js";
-import type { ResearchAcceptanceBinding } from "./research-consumer-transition.js";
+import { managedAnswerTurn, type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
+import { readResearchAcceptanceBinding } from "./response-recovery.js";
 import type { ResearchAnswer, ResearchAssessment, ResearchRun } from "./research-model.js";
 import { discoveryOutcome, type DiscoveryConditionDecision, type DiscoveryOutcome } from "./discovery-outcome.js";
 
@@ -549,6 +554,200 @@ export function proveIssuedAnswer(view: Store, draft: Revision<DiscoveryDraft>,
     && schemaValidator(spec.schema)(fieldValue) && same(fieldValue, draft.value.fields[entry.field]);
   return { ok: true, proof: { record: row, ref: entry.answerRef, kind, namespaced: row.id.startsWith(`${kind}:${projectId}:`),
     matchesSpec: kind === spec?.kind, value: fieldValue, reproduces, provenance } };
+}
+
+/** spec.schema вопроса над интерпретированным значением поля — форма ответа
+ * без обращения к текущей голове драфта (proof.reproduces читает голову). */
+export function issuedAnswerSchemaHolds(question: Revision<Question>, value: Json): boolean {
+  const spec = object(question.value.spec) ? question.value.spec : null;
+  return spec !== null && schemaValidator(spec.schema)(value);
+}
+
+/** Сохранённый акт принятия exact Ref: доказывает связанный переход одного акта
+ * принятия:
+ *   1. Для managed-пути: K несёт exact after-ревизии вопроса и драфта.
+ *   2. Для обычного пути: переход вопроса beforeQ -> afterQ (где afterQ отвечен
+ *      именно ref); для research-answer assessment.question обязана совпадать
+ *      с exact Ref вопроса до именно этого принятия (reference(beforeQ));
+ *      связанный переход драфта beforeDraft -> afterDraft, где beforeDraft
+ *      согласован с beforeQ.beforeHash, а afterDraft получен установкой поля.
+ * Читается только сохранённая история: текущая голова может быть open после
+ * reopen или держать следующий ответ — это не отменяет прошлого принятия.
+ * Свойства оценки/цепочки доказываются отдельно (proveIssuedAnswer); факт
+ * принятия — только здесь, по сохранённым ревизиям, а не по флагу вызывающего. */
+export function savedAcceptanceAct(view: RecordView, draft: Revision<DiscoveryDraft>,
+  question: Revision<Question>, field: string, ref: Ref, value: Json): boolean {
+  if (draft.kind !== "discovery-draft" || question.kind !== "question") return false;
+  if (question.value.draftId !== draft.id || question.value.spec.field !== field) return false;
+
+  // Для черновиков v7: проверка неизменяемой записи discovery-acceptance-act (DR2, №6009/6010)
+  if (draft.value.contractVersion === NEXT_CONTRACT_ERA) {
+    const actId = discoveryAcceptanceActId(draft.value.projectId, draft.id, field, ref);
+    const act = view.get<DiscoveryAcceptanceAct>(actId);
+    if (!act || act.kind !== DISCOVERY_ACCEPTANCE_ACT_KIND || act.revision !== 1
+      || typeof act.value !== "object" || act.value === null
+      || hashJson(act.value) !== act.hash) {
+      return false;
+    }
+    const a = act.value;
+    if (a.contract !== DISCOVERY_ACCEPTANCE_ACT_CONTRACT
+      || a.projectId !== draft.value.projectId
+      || a.draftId !== draft.id
+      || a.field !== field
+      || !isRef(a.answer) || canonical(a.answer) !== canonical(ref)
+      || !isRef(a.draftBefore) || a.draftBefore.id !== draft.id
+      || !isRef(a.draftAfter) || a.draftAfter.id !== draft.id
+      || a.draftAfter.revision !== a.draftBefore.revision + 1
+      || !isRef(a.questionBefore) || a.questionBefore.id !== question.id
+      || !isRef(a.questionAfter) || a.questionAfter.id !== question.id
+      || a.questionAfter.revision !== a.questionBefore.revision + 1) {
+      return false;
+    }
+
+    // Загружаем связанные ревизии через view.get (существующая поверхность чтения Store view)
+    const qBefore = view.get<Question>(a.questionBefore.id, a.questionBefore.revision);
+    const qAfter = view.get<Question>(a.questionAfter.id, a.questionAfter.revision);
+    const dBefore = view.get<DiscoveryDraft>(a.draftBefore.id, a.draftBefore.revision);
+    const dAfter = view.get<DiscoveryDraft>(a.draftAfter.id, a.draftAfter.revision);
+
+    if (!qBefore || qBefore.kind !== "question" || qBefore.hash !== a.questionBefore.hash
+      || !qAfter || qAfter.kind !== "question" || qAfter.hash !== a.questionAfter.hash
+      || !dBefore || dBefore.kind !== "discovery-draft" || dBefore.hash !== a.draftBefore.hash
+      || !dAfter || dAfter.kind !== "discovery-draft" || dAfter.hash !== a.draftAfter.hash) {
+      return false;
+    }
+
+    // Вопрос принадлежит draft и его field; questionBefore — open или unresolved (как у производителя), не answered; questionAfter — answered с exact answer
+    if (qBefore.value.draftId !== draft.id || qBefore.value.spec.field !== field
+      || (qBefore.value.status !== "open" && qBefore.value.status !== "unresolved")
+      || qAfter.value.draftId !== draft.id || qAfter.value.spec.field !== field
+      || qAfter.value.status !== "answered" || canonical(qAfter.value.answer) !== canonical(ref)) {
+      return false;
+    }
+
+    // draftAfter.fields[field] равно интерпретированному значению ответа
+    if (!same(dAfter.value.fields[field], value)) {
+      return false;
+    }
+
+    // Пары before/after воспроизводят переход производителя
+    if (hashJson(dBefore.value.fields[field]) !== qBefore.value.beforeHash) {
+      return false;
+    }
+    const expectedDraftAfter = {
+      ...dBefore.value,
+      fields: { ...dBefore.value.fields, [field]: value },
+    };
+    if (canonical(expectedDraftAfter) !== canonical(dAfter.value)) {
+      return false;
+    }
+    const expectedQAfter = {
+      ...qBefore.value,
+      status: "answered" as const,
+      answer: ref,
+    };
+    if (canonical(expectedQAfter) !== canonical(qAfter.value)) {
+      return false;
+    }
+
+    // Оценка (assessment)
+    if (a.assessment !== null) {
+      if (!isRef(a.assessment)) return false;
+      const assessment = view.get<ResearchAssessment>(a.assessment.id, a.assessment.revision);
+      if (!assessment || assessment.kind !== "research-assessment" || assessment.hash !== a.assessment.hash) {
+        return false;
+      }
+      if (assessment.value.projectId !== draft.value.projectId
+        || assessment.value.verdict !== "supported"
+        || canonical(assessment.value.question) !== canonical(a.questionBefore)
+        || !same(assessment.value.value, value)
+        || assessment.value.researcher === assessment.value.assessor
+        || !Array.isArray(assessment.value.observations) || assessment.value.observations.length === 0) {
+        return false;
+      }
+      const ansRec = view.get<ResearchAnswer>(ref.id, ref.revision);
+      if (!ansRec || ansRec.kind !== "research-answer" || canonical(ansRec.value.assessment) !== canonical(a.assessment)) {
+        return false;
+      }
+    } else {
+      // Для brief/fact и objective/decision: assessment равен null
+      // План и ClaimAddress по-прежнему требуют исследовательское доказательство (assessment)
+      if (question.value.spec.proof === "assessment") {
+        return false;
+      }
+      const ansRec = view.get<Fact | Decision | ResearchAnswer>(ref.id, ref.revision);
+      if (!ansRec || ansRec.kind === "research-answer") {
+        return false;
+      }
+      if (ansRec.kind === "fact") {
+        if (!same((ansRec.value as Fact).observation.value, value)) return false;
+      } else if (ansRec.kind === "decision" || ansRec.kind === "design") {
+        if (!same((ansRec.value as Decision).value, value)) return false;
+      } else {
+        return false;
+      }
+    }
+
+    // Managed binding
+    let turnId: string | null = null;
+    try {
+      turnId = managedAnswerTurn(ref.id, draft.value.projectId);
+    } catch {
+      return false;
+    }
+    if (turnId !== null) {
+      if (!a.binding || !isRef(a.binding)) return false;
+      const bindingRecord = view.get<ResearchAcceptanceBinding>(a.binding.id, a.binding.revision);
+      if (!bindingRecord || bindingRecord.kind !== "research-acceptance-binding"
+        || bindingRecord.hash !== a.binding.hash
+        || hashJson(bindingRecord.value) !== bindingRecord.hash) {
+        return false;
+      }
+      const b = bindingRecord.value;
+      if (canonical(b.draftBefore) !== canonical(a.draftBefore)
+        || canonical(b.draftAfter) !== canonical(a.draftAfter)
+        || canonical(b.questionBefore) !== canonical(a.questionBefore)
+        || canonical(b.questionAfter) !== canonical(a.questionAfter)
+        || canonical(b.answer) !== canonical(a.answer)
+        || canonical(b.assessment) !== canonical(a.assessment)) {
+        return false;
+      }
+    } else {
+      if (a.binding !== null && a.binding !== undefined) return false;
+    }
+
+    return true;
+  }
+
+  // Для старых эр (не v7): managed-путь через readResearchAcceptanceBinding
+  let turnId: string | null = null;
+  try {
+    turnId = managedAnswerTurn(ref.id, draft.value.projectId);
+  } catch {
+    return false;
+  }
+  if (turnId !== null) {
+    const proven = readResearchAcceptanceBinding(view as unknown as Store, draft.value.projectId, turnId);
+    if (proven !== null) {
+      const b = proven.binding.value;
+      if (canonical(b.answer) === canonical(ref)
+        && b.questionBefore.id === question.id
+        && b.questionAfter.id === question.id
+        && b.questionAfter.revision === b.questionBefore.revision + 1
+        && b.draftBefore.id === draft.id
+        && b.draftAfter.id === draft.id
+        && b.draftAfter.revision === b.draftBefore.revision + 1) {
+        const dAfter = view.get<DiscoveryDraft>(draft.id, b.draftAfter.revision);
+        if (dAfter !== null && dAfter.kind === "discovery-draft"
+          && same(dAfter.value.fields[field], value)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  return false;
 }
 
 // ---------------------------------------------------------------------------

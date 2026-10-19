@@ -6,7 +6,10 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
-import { REQUIREMENTS, producerContractEra, producerRequirements, type ProducerPolicy, type UpstreamStage } from "./requirements.js";
+import { NEXT_CONTRACT_ERA, REQUIREMENTS, producerContractEra, producerRequirements, type ProducerPolicy, type UpstreamStage } from "./requirements.js";
+import { checkV7FieldAnswer, DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from "./v7-contracts.js";
+import { provenAcceptance } from "./claim-address.js";
+import { proveIssuedAnswer, savedAcceptanceAct } from "./projection-reader.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 import { deriveFields, type Derivation } from "./derived-draft.js";
 import { resolveResearchBasis } from '../graph/research-basis.js';
@@ -107,6 +110,23 @@ export class Discovery {
       "target_stale", "The target field changed since this question was issued");
     const validate = ajv.compile(q.spec.schema as object);
     requireCondition(validate(value), "answer_invalid", "The answer does not satisfy the field contract");
+    if (draft.value.contractVersion === NEXT_CONTRACT_ERA)
+      checkV7FieldAnswer(draft.value, q.spec, value, (field, ref) => {
+        const target = draft.value.questions.map(questionId => this.store.get<Question>(questionId))
+          .find(item => item !== null && item.value.spec.field === field);
+        if (target === undefined || target === null) return null;
+        try {
+          const proven = proveIssuedAnswer(this.store, draft,
+            { question: target, foreign: false, answered: true, answerRef: ref,
+              field: target.value.spec.field }, undefined, { verifyIssuedQuestion: true });
+          return proven.ok && provenAcceptance(proven.proof.provenance)
+            && savedAcceptanceAct(this.store, draft, target, field, ref, proven.proof.value)
+            ? proven.proof : null;
+        } catch (error) {
+          if (error instanceof EngineError && error.code === "invalid_json") return null;
+          throw error;
+        }
+      });
     // D8.4.2 (№2230-1): a managed acceptance writes its answer at the address of its own paid
     // turn — consumers without a saved turn learn the provenance from the record itself; every
     // other acceptance keeps the random UUID address of its era.
@@ -120,6 +140,7 @@ export class Discovery {
       { id: question.id, kind: question.kind, expected: question.revision, value: questionAfter },
     ];
     const bindingGuards: TransactionGuard[] = [];
+    let bindingRef: Ref | null = null;
     if (managed) {
       // D8.4e: K is derived from the PREPARED writes by the shared projection
       // — the future draft, answer and question revisions are named before
@@ -139,12 +160,34 @@ export class Discovery {
         ...(managed.expandedProposal !== undefined ? { expandedProposal: managed.expandedProposal } : {}) };
       const binding = projectAcceptanceBinding(inputs, { turn: managed.turn, pending: managed.pending,
         intent: managed.intent, assessmentProof: managed.assessmentProof });
-      writes.push({ id: acceptanceBindingId(q.projectId, managed.turn.id), kind: "research-acceptance-binding",
+      const bId = acceptanceBindingId(q.projectId, managed.turn.id);
+      bindingRef = { id: bId, revision: 1, hash: hashJson(binding) };
+      writes.push({ id: bId, kind: "research-acceptance-binding",
         expected: 0, value: binding });
       // O@1 and I are proven immutable revisions (their heads lawfully move
       // on); the current-state guards are P, B and R plus the CAS of the
       // three records and the absence of K.
       bindingGuards.push(managed.pending, managed.assessmentProof, reference(managed.assessment));
+    }
+    if (draft.value.contractVersion === NEXT_CONTRACT_ERA) {
+      const actId = discoveryAcceptanceActId(q.projectId, draft.id, q.spec.field, answerRef);
+      const assessmentRef = kind === "research-answer" && isRef((answer as ResearchAnswer).assessment)
+        ? (answer as ResearchAnswer).assessment
+        : null;
+      const actValue: DiscoveryAcceptanceAct = {
+        contract: DISCOVERY_ACCEPTANCE_ACT_CONTRACT,
+        projectId: q.projectId,
+        draftId: draft.id,
+        field: q.spec.field,
+        draftBefore: reference(draft),
+        draftAfter: { id: draft.id, revision: draft.revision + 1, hash: hashJson(draftAfter) },
+        questionBefore: reference(question),
+        questionAfter: { id: question.id, revision: question.revision + 1, hash: hashJson(questionAfter) },
+        answer: answerRef,
+        assessment: assessmentRef,
+        binding: bindingRef,
+      };
+      writes.push({ id: actId, kind: DISCOVERY_ACCEPTANCE_ACT_KIND, expected: 0, value: actValue });
     }
     return this.store.writeMany<DiscoveryDraft>(writes,
       uniqueTransactionGuards([...guards, ...draft.value.inputs, reference(question), reference(draft), ...bindingGuards]))[0]!;
@@ -152,6 +195,11 @@ export class Discovery {
   decision(id: string, expected: number, actor: string, value: Json): Revision<DiscoveryDraft> {
     const question = this.#question(id, expected);
     requireCondition(question.value.spec.kind === "decision" || question.value.spec.kind === "design", "fact_requires_evidence", "An owner's choice cannot confirm a factual question");
+    if (question.value.spec.proof === "assessment") {
+      const draft = this.store.get<DiscoveryDraft>(question.value.draftId);
+      requireCondition(draft?.value.contractVersion !== NEXT_CONTRACT_ERA, "research_assessment_required",
+        "This v7 question needs research and an assessment, not an owner's choice");
+    }
     requireCondition(typeof actor === "string" && actor.trim(), "actor_missing", "Decision needs an owner identity");
     return this.#answer(question, value, { projectId: question.value.projectId, actor, question: id, value }, question.value.spec.kind, []);
   }

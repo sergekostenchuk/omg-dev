@@ -4,6 +4,7 @@ import type { FieldSpec } from "./discovery.js";
 import { UPSTREAM_DETAILS, UPSTREAM_MOMENT_DETAILS, DISCOVERY_RESEARCH_FIELDS, DISCOVERY_PREPARATION, VERSION6_UPSTREAM_DETAILS, DISCOVERY_ANALOGUES_PROMPTS } from "./preparation-contracts.js";
 import { mapDesignSchema } from "../graph/builder.js";
 import { canonical, type Json } from "../canonical.js";
+import { V7_CONTRACT_ERA, V7_REQUIREMENTS } from "./v7-contracts.js";
 
 const text = { type: "string", minLength: 1 };
 const texts = { type: "array", minItems: 1, uniqueItems: true, items: text };
@@ -86,8 +87,9 @@ export function selectResearchRequirements(stage: UpstreamStage, version: number
 // ---------------------------------------------------------------------------
 
 /** Эра следующего исследовательского контракта; её таблица требований
- * появляется в DR2, поэтому включённый производитель отказывает до записи. */
-export const NEXT_CONTRACT_ERA = 7;
+ * появилась в DR2, но частична (D1–D2 стадии discovery), поэтому включённый
+ * производитель по-прежнему отказывает до записи. */
+export const NEXT_CONTRACT_ERA = V7_CONTRACT_ERA;
 
 /** Кодовый выключатель производителя v7 по стадиям: последняя правка
  * программы (DR9) перечисляет здесь стадии с новым производителем. Тестовая
@@ -108,13 +110,20 @@ export function producerContractEra(stage: UpstreamStage, policy?: ProducerPolic
 }
 
 /** Таблица требований новой подготовки стадии по политике производителя.
- * Выбранная эра без своей таблицы (v7 до DR2) — типизированный отказ
- * discovery_v7_producer_not_ready, а не драфт с чужим набором вопросов. */
+ * Выбранная эра без своей ПОЛНОЙ таблицы — типизированный отказ
+ * discovery_v7_producer_not_ready, а не драфт с чужим набором вопросов.
+ * Частичная таблица v7 (DR2: D1–D2 стадии discovery) производства не открывает:
+ * готовность выводится из покрытия всех стадий, не из наличия записей. */
 export function producerRequirements(stage: UpstreamStage, policy?: ProducerPolicy): FieldSpec[] {
   const era = producerContractEra(stage, policy);
-  if (era !== RESEARCH_CONTRACT_VERSION)
-    throw new EngineError("discovery_v7_producer_not_ready",
-      `The v${era} research producer for stage "${stage}" is not ready: its requirements table does not exist yet`,
-      { stage, era });
+  if (era !== RESEARCH_CONTRACT_VERSION) {
+    const table = era === NEXT_CONTRACT_ERA && V7_REQUIREMENTS.complete[stage] === true
+      ? V7_REQUIREMENTS.fields[stage] : undefined;
+    if (!table)
+      throw new EngineError("discovery_v7_producer_not_ready",
+        `The v${era} research producer for stage "${stage}" is not ready: its requirements table is incomplete`,
+        { stage, era });
+    return [...table] as FieldSpec[];
+  }
   return REQUIREMENTS[stage];
 }
