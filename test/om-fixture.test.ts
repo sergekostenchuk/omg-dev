@@ -15,6 +15,12 @@ import { projectGraph } from "../src/graph/project.js";
 import { validateGraph } from "../src/graph/validate.js";
 import { reference, type StageArtifact } from "../src/pipeline/contracts.js";
 import { delivered, refused, type OmResult } from "../src/om/refusal.js";
+import { readAcceptedFrame } from "../src/om/frame-accept.js";
+import type { OmAcceptedFrame, LayerBasis } from "../src/om/layer-basis.js";
+import { readHandoff } from "../src/om/handoff.js";
+import type { OmFeasibility } from "../src/om/feasibility.js";
+import { withHistoricalUpstream } from "./product-fixture.js";
+import type { OmPreparedFixture } from "./om-fixture.js";
 import { Store } from "../src/storage/store.js";
 import { createCrossOmFixture, createOmFixture, gardenGraph, OM_FIXTURE_ERROR, refusedWith, thrownWith } from "./om-fixture.js";
 
@@ -198,12 +204,13 @@ test("an interrupted execution cannot return a completed garden fixture", async 
   t.mock.method(Executor.prototype, "run", function (this: Executor, ...args: Parameters<Executor["run"]>) {
     return run.call(this, args[0], args[1], args[2], AbortSignal.abort());
   });
-  await assert.rejects(createOmFixture(t), error => {
-    assert.ok(error instanceof EngineError);
-    assert.equal(error.code, OM_FIXTURE_ERROR);
-    assert.deepEqual(error.details, { target: "/runs" });
-    return true;
-  });
+  for (const create of [() => createOmFixture(t), () => createOmFixture(t, "standard", "garden", { mode: "executed" })])
+    await assert.rejects(create(), error => {
+      assert.ok(error instanceof EngineError);
+      assert.equal(error.code, OM_FIXTURE_ERROR);
+      assert.deepEqual(error.details, { target: "/runs" });
+      return true;
+    });
 });
 
 test("a missing committed receipt rejects fixture creation at the exact record", async t => {
@@ -219,14 +226,115 @@ test("a missing committed receipt rejects fixture creation at the exact record",
   t.mock.method(Store.prototype, "get", function (this: Store, ...args: Parameters<Store["get"]>) {
     return completed && args[0] === missing ? null : get.apply(this, args);
   });
-  await assert.rejects(createOmFixture(t), error => {
-    assert.ok(error instanceof EngineError);
-    assert.equal(error.code, OM_FIXTURE_ERROR);
-    assert.deepEqual(error.details, { target: missing });
-    return true;
-  });
+  for (const create of [() => createOmFixture(t), () => createOmFixture(t, "standard", "garden", { mode: "executed" })]) {
+    completed = false;
+    await assert.rejects(create(), error => {
+      assert.ok(error instanceof EngineError);
+      assert.equal(error.code, OM_FIXTURE_ERROR);
+      assert.deepEqual(error.details, { target: missing });
+      return true;
+    });
+  }
 });
 
+
+function assertCurrentStages(fixture: OmPreparedFixture): void {
+  for (const [index, stage] of UPSTREAM_STAGES.entries()) {
+    const artifact = fixture.stages[stage];
+    assert.equal(artifact.value.status, "accepted");
+    assert.equal(fixture.engine.pipeline.inspect(fixture.project, stage).state, "accepted");
+    assert.deepEqual(artifact.value.inputs, index === 0 ? [] : [reference(fixture.stages[UPSTREAM_STAGES[index - 1]!])]);
+  }
+  assert.equal(fixture.store.list().some(row => row.id.startsWith("phase:")), false);
+  assert.equal(fixture.store.get(`feasibility:${fixture.project}`), null);
+}
+
+function assertNativeAcceptance(fixture: OmPreparedFixture, level: 2 | 3): void {
+  const layer = fixture.store.get<LayerBasis>(`graph-layer:${fixture.project}:${level}`)!;
+  const frame = fixture.store.get<OmAcceptedFrame>(`om-frame:${fixture.project}:${level}`)!;
+  assert.ok(layer && frame);
+  assert.equal(layer.value.acceptance?.producer, "om");
+  assert.equal(readAcceptedFrame(fixture.store, { project: fixture.project, level,
+    graph: frame.value.acceptance.graph, layer: reference(layer), frame: reference(frame) }).ok, true);
+}
+
+test("LG01a stages uses current producers even inside an inherited historical scope", async t => {
+  for (const variant of ["standard", "cross"] as const) {
+    const fixture = await withHistoricalUpstream("must-never-load-this-era", () => variant === "cross"
+      ? createCrossOmFixture(t, "sprout", { mode: "stages" })
+      : createOmFixture(t, variant, "sprout", { mode: "stages" }));
+    assertCurrentStages(fixture);
+    for (const id of ["om-input:sprout", "om-frame:sprout:2", "om-frame:sprout:3", "om-feasibility:sprout", "stage:sprout:om-g2", "stage:sprout:compilation"])
+      assert.equal(fixture.store.get(id), null, id);
+    for (const level of [1, 2, 3] as const)
+      assert.deepEqual(fixture.layers[level].value.projection, projectGraph(fixture.graph, level));
+    assert.equal("plan" in fixture, false);
+    assert.equal("runs" in fixture, false);
+    const before = fixture.store.list();
+    fixture.reopen();
+    assert.deepEqual(fixture.store.list(), before);
+    assert.equal(fixture.engine.store, fixture.store);
+  }
+});
+
+test("LG01a n2 accepts the operations frame through G3 for standard and cross gardens", async t => {
+  for (const variant of ["standard", "cross"] as const) {
+    const fixture = variant === "cross" ? await createCrossOmFixture(t, "sprout", { mode: "n2" })
+      : await createOmFixture(t, variant, "sprout", { mode: "n2" });
+    assertCurrentStages(fixture);
+    assertNativeAcceptance(fixture, 2);
+    assert.equal(fixture.store.get("om-frame:sprout:3"), null);
+    assert.equal(fixture.store.get("om-feasibility:sprout"), null);
+    assert.equal(fixture.store.get("stage:sprout:om-g2"), null);
+    assert.equal("plan" in fixture, false);
+    const flow = fixture.graph.connectors.find(connector => connector.id === "sprout-flow")!;
+    assert.equal(flow.bindings.filter(binding => binding.level === 2).length, variant === "cross" ? 2 : 1);
+    assert.deepEqual(validateGraph(fixture.graph).findings, []);
+  }
+});
+
+test("LG01a executed uses accepted L3 and M8 M9 with real committed runs and receipts", async t => {
+  for (const variant of ["standard", "cross"] as const) {
+    const fixture = variant === "cross" ? await createCrossOmFixture(t, "sprout", { mode: "executed" })
+      : await createOmFixture(t, variant, "sprout", { mode: "executed" });
+    assertCurrentStages(fixture);
+    assertNativeAcceptance(fixture, 3);
+    const m8 = fixture.store.get<OmFeasibility>("om-feasibility:sprout")!;
+    assert.equal(m8.value.producer.contract, "om-m8/v2");
+    assert.equal(m8.value.ready, true);
+    const m9 = fixture.store.get<StageArtifact>("stage:sprout:om-g2")!;
+    assert.equal(m9.value.status, "accepted");
+    assert.deepEqual((m9.value.content as { feasibility: unknown }).feasibility, reference(m8));
+    assert.equal(readHandoff(fixture.store, { project: fixture.project, record: reference(m9) }).ok, true);
+    const compilation = fixture.store.get<StageArtifact>("stage:sprout:compilation")!;
+    assert.equal(compilation.value.status, "accepted");
+    assert.deepEqual((compilation.value.content as { plan: unknown }).plan, reference(fixture.plan));
+    assert.equal(fixture.plan.value.feasibility.id, m8.id);
+    assert.equal(fixture.engine.legacyRoute(fixture.project).om, true);
+    assert.ok(fixture.plan.value.tasks.length > 0);
+    assert.equal(fixture.runs.length, fixture.plan.value.tasks.length);
+    assert.ok(fixture.runs.every(run => run.value.state === "committed"));
+    for (const [artifactId, receipt] of Object.entries(fixture.receipts)) {
+      const producer = fixture.graph.nodes.find(node => node.id === receipt.value.node)!;
+      assert.deepEqual(receipt.value.plan, reference(fixture.plan));
+      assert.ok(fixture.runs.some(run => canonical(reference(run)) === canonical(receipt.value.run)));
+      assert.equal(receipt.value.signature, nodeSignature(fixture.graph, producer));
+      assert.deepEqual(resolveArtifact(fixture.store, fixture.project, fixture.graph, fixture.repository, producer.id, artifactId),
+        { receipt: reference(receipt), source: null });
+    }
+    const flow = fixture.graph.connectors.find(connector => connector.id === "sprout-flow")!;
+    assert.equal(flow.bindings.filter(binding => binding.level === 3 && binding.anchor === null).length, variant === "cross" ? 2 : 1);
+  }
+});
+
+test("LG01a missing and masquerading modes fail before creating a fixture", async t => {
+  for (const options of [null, {}, { mode: null }, { mode: "unknown" }, 1, []]) {
+    const invalid = (error: unknown) => error instanceof EngineError && error.code === OM_FIXTURE_ERROR
+      && canonical(error.details) === canonical({ target: "/mode" });
+    await assert.rejects(createOmFixture(t, "standard", "garden", options as never), invalid);
+    await assert.rejects(createCrossOmFixture(t, "garden", options as never), invalid);
+  }
+});
 
 // Q2.1: a check of a refusal names its code. The two helpers below are the only way the OM suites check one, so these
 // tests pin what they accept and what they refuse to accept.
