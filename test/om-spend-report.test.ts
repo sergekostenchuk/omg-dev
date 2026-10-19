@@ -1410,7 +1410,7 @@ try {
   assert.equal(storageBytes(), before, "Neither historical nor current E6 rewrites the old producer's records");
 });
 
-/** Real ordinary E4/E2 fact assignment, using the same source construction as om-model-call.test.ts. */
+/** Real ordinary E4/E2 fact assignment, using the same source construction as om-model-call-fixture.ts. */
 function ordinarySpendFixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-spend-ordinary-")), database = join(root, "state.sqlite");
   const store = new Store(database), engine = new ProductEngine(store), project = "garden";

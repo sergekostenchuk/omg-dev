@@ -46,6 +46,8 @@ import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.
 import { writeGuarded } from '../src/om/refs.js';
 import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
 import { gardenGraph } from './om-fixture.js';
+// OMMC-SPLIT: the managed-cycle helpers moved to a shared fixture module; importing it registers no tests.
+import { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit } from './om-model-call-fixture.js';
 import { preparedFeatures, refinedLayers, withHistoricalUpstream } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -3499,15 +3501,8 @@ test('MP3 rows 7, 19 (era): packets, deliveries, continuations and parts of the 
 });
 
 const MP11_BASE = 'e88b4ed40d94dd61e242d613d96a87e0bb5e6206';
-// Reuse the actual managed-cycle fixtures; no tests from the neighbouring suite are registered.
-async function mp11CycleFixtures(t: TestContext): Promise<any> {
-  const module = new URL(`./.mp11-cycles-${process.pid}.mjs`, import.meta.url);
-  const source = readFileSync(new URL('./om-model-call.test.js', import.meta.url), 'utf8')
-    .replace(/import test from ["']node:test["'];/, 'const test = () => {};');
-  writeFileSync(module, `${source}\nexport { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit };\n`);
-  t.after(() => rmSync(module, { force: true }));
-  return import(module.href);
-}
+// Reuse the actual managed-cycle fixtures from the shared module; destructuring keeps the historical sites unchecked as before.
+const mp11CycleFixtures: any = { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit };
 function mp11Version(packet: Sealed<Revision<QuestionPacketRecord>>, era: 'om-brief/v1' | 'om-brief/v2') {
   assert.equal(packet.value.briefContract, era === 'om-brief/v2' ? era : undefined);
   if (packet.value.packet) {
@@ -3595,7 +3590,7 @@ test('MP1.1 rows 9,10,19: direct reader and current producer reject unsupported,
 });
 
 test('MP1.1 rows 11–13: genuine E3 and delivered search are case-insensitive literal substrings, including phrases and | . *; empty succeeds and inaccessible refuses', async t => {
-  const { e4Fixture, e4NeedSource } = await mp11CycleFixtures(t);
+  const { e4Fixture, e4NeedSource } = mp11CycleFixtures;
   for (const scope of ['path', 'source'] as const) await t.test(scope, async t => {
     const text = 'Alpha TWO Words\nA\nB\nA|B\nA.B\nA*B\nTwo separate words\n';
     let source!: Revision<any>;
@@ -3634,7 +3629,7 @@ test('MP1.1 rows 11–13: genuine E3 and delivered search are case-insensitive l
 });
 
 test('MP1.1 rows 5–8,20: actual managed correction → continuation → next part inherits v1/v2 and reopens without another send', async t => {
-  const { e4Fixture, e4Node, e4NeedSource, mp2Refused, h15AtCommit } = await mp11CycleFixtures(t);
+  const { e4Fixture, e4Node, e4NeedSource, mp2Refused, h15AtCommit } = mp11CycleFixtures;
   for (const historical of [false, true]) await t.test(historical ? 'e88 root' : 'new root', async t => {
     const f = e4Fixture(t, 'node', 100_000, 0, 5000, true, false);
     const whole = historical ? h15AtCommit(f, MP11_BASE, 'mp11-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
@@ -3667,7 +3662,7 @@ test('MP1.1 rows 5–8,20: actual managed correction → continuation → next p
 });
 
 test('MP1.1 rows 2,4: true legacy empty/no-batch and independent new empty preserve their chosen version and repeat after reopen', async t => {
-  const { h15AtCommit } = await mp11CycleFixtures(t);
+  const { h15AtCommit } = mp11CycleFixtures;
   for (const historical of [false, true]) {
     const f = emptyPacketFixture(t, historical ? MP11_BASE : undefined);
     const packet = historical ? h15AtCommit(f, MP11_BASE, 'mp11-empty', `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
@@ -3686,7 +3681,7 @@ test('MP1.1 rows 2,4: true legacy empty/no-batch and independent new empty prese
 });
 
 test('MP1.1 rows 1,6,8,19: a selected chain through compatible historical environment chooses the same version in temporary proof and current admission', async t => {
-  const { e4Fixture, e4NeedSource, mp2IssuedBy } = await mp11CycleFixtures(t);
+  const { e4Fixture, e4NeedSource, mp2IssuedBy } = mp11CycleFixtures;
   for (const historical of [false, true]) {
     const fixture = historical ? mp2IssuedBy(t, MP11_BASE) : null;
     const f = fixture?.f ?? e4Fixture(t, 'node', 100_000, 0, 5000, true), request = fixture?.request ?? f.request;
@@ -3703,7 +3698,7 @@ test('MP1.1 rows 1,6,8,19: a selected chain through compatible historical enviro
 });
 
 test('MP1.1 row 10: two individually proved parts from different brief versions cannot form one producer request or a saved chain', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const { h15AtCommit } = await mp11CycleFixtures(t), p = expansionFixture(t, 100_000, 1, MP11_BASE), { f } = p;
+  const { h15AtCommit } = mp11CycleFixtures, p = expansionFixture(t, 100_000, 1, MP11_BASE), { f } = p;
   const oldWhole = h15AtCommit(f, MP11_BASE, 'mp11-old-whole', `const { prepareQuestionPacket } = await import(src('om/question-packet.js'));
     out(take(prepareQuestionPacket(store, args)).record);`, p.request);
   const oldEnvironment = p.environment(oldWhole.value.fullChars - 1), oldRequest = { ...p.request, environment: reference(oldEnvironment) };

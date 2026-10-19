@@ -51,29 +51,29 @@ om-gaps.test.ts :: PF3.1 rows 35, 39: a D1 set from 259d7a8c preserves exact his
 om-impact-flow.test.ts :: AT1 era: the research contracts the base accepted through L1–L3 stay accepted for the new code — a work's impact fields never rewrite an accepted authoring schema # вид 1: эра e475bd59
 om-legacy-operation-lock.test.ts :: G1.4 whole f8136c1 history stays exact while new production uses the new plan envelope # вид 1: эра f8136c1
 om-legacy-route-closure.test.ts :: G1.3 complete daa81a530cae history and new plan era preserve native semantics and exact dependent references # вид 1: эра daa81a5
-om-model-call.test.ts :: E4 control and malformed outcomes complete their attempt once, preserve unanswered questions, and replay after restart # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 cycle delivers all addressed read forms then answers once in the same attempt with immutable history # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 direct continuation refuses repeated knowledge atomically before a third dispatch and replays after restart # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 cycle repeated unchanged reads refuse once while exact late replay adds no calls, deliveries or completions # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 cycle saves delivery overflow without a second dispatch or context truncation # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 cycle refuses missing coverage and conflicting definitions without accepting a partial node # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 control completion cannot replace an outcome saved after the control response was received # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 restarts every durable cycle prefix with one physical send and one settlement for content and cannot_answer # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 resumes saved source deliveries and continuation packets before content or cannot_answer without duplicate sources or sends # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 restarts a later node part after receipt or application and assembles or completes cannot_answer once # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 public recovery closes a truly lost pre-spawn owner for products and analysis without sending or inventing usage # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 actual owner and provider loss recover both product calls and analysis purposes through the public command # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 competing public recoveries commit one terminal product transition and one A3 outcome # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 records real local supplier death while its owner survives as one interrupted MC2 attempt # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: E4 failed dispatch authorization preserves a terminal physical outcome without transmitting for both transports # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: 1 H1.0a standalone physical history retains its original completion and never acquires an owner # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: 4 H1.0a an existing standalone opening cannot be adopted even before any physical call # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: C03 H1.0a completion threshold preserves old ordinals and an exact managed opening ignores later M6 heads # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: C06 H1.0a successor inherits original completion proofs but starts its own independent ordinal threshold # вид 1: эра 7c7d3cc
-om-model-call.test.ts :: 16 H1.0b a genuine H1.0a application-refused replays its exact exchange without another settlement # вид 1: эра 7aa19cc, 7c7d3cc
-om-model-call.test.ts :: H1.5 №2166 п.3 ERA a call the base code already paid for is finished and accounted as before, applied or only received, also through a new store: the prohibition asks only for a NEW dispatch # вид 1: эра 479b307, 7c7d3cc
-om-model-call.test.ts :: MP2 (№2968 rows 12, 19; regression 5) the accepted MP1 producer in its own process: its brief root keeps its bytes and no neighbour section; a cycle it ended keeps its era — no policy, no correction, no send; a chain it only began and paid continues under the policy without paying again # вид 1: эра 5ccc463, 7c7d3cc, dd5fc67
-om-model-call.test.ts :: MP3 era: a new MP3 root carries a lawful delivery of the producer before MP3 (MP1+MP2) in the addressed form, while the earlier records keep their bytes and read back unchanged # вид 1: эра 08be75a
+om-model-call-part-06.test.ts :: E4 control and malformed outcomes complete their attempt once, preserve unanswered questions, and replay after restart # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 cycle delivers all addressed read forms then answers once in the same attempt with immutable history # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 direct continuation refuses repeated knowledge atomically before a third dispatch and replays after restart # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 cycle repeated unchanged reads refuse once while exact late replay adds no calls, deliveries or completions # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 cycle saves delivery overflow without a second dispatch or context truncation # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 cycle refuses missing coverage and conflicting definitions without accepting a partial node # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 control completion cannot replace an outcome saved after the control response was received # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 restarts every durable cycle prefix with one physical send and one settlement for content and cannot_answer # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 resumes saved source deliveries and continuation packets before content or cannot_answer without duplicate sources or sends # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 restarts a later node part after receipt or application and assembles or completes cannot_answer once # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 public recovery closes a truly lost pre-spawn owner for products and analysis without sending or inventing usage # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 actual owner and provider loss recover both product calls and analysis purposes through the public command # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 competing public recoveries commit one terminal product transition and one A3 outcome # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 records real local supplier death while its owner survives as one interrupted MC2 attempt # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: E4 failed dispatch authorization preserves a terminal physical outcome without transmitting for both transports # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: 1 H1.0a standalone physical history retains its original completion and never acquires an owner # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: 4 H1.0a an existing standalone opening cannot be adopted even before any physical call # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: C03 H1.0a completion threshold preserves old ordinals and an exact managed opening ignores later M6 heads # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: C06 H1.0a successor inherits original completion proofs but starts its own independent ordinal threshold # вид 1: эра 7c7d3cc
+om-model-call-part-06.test.ts :: 16 H1.0b a genuine H1.0a application-refused replays its exact exchange without another settlement # вид 1: эра 7aa19cc, 7c7d3cc
+om-model-call-part-06.test.ts :: H1.5 №2166 п.3 ERA a call the base code already paid for is finished and accounted as before, applied or only received, also through a new store: the prohibition asks only for a NEW dispatch # вид 1: эра 479b307, 7c7d3cc
+om-model-call-part-06.test.ts :: MP2 (№2968 rows 12, 19; regression 5) the accepted MP1 producer in its own process: its brief root keeps its bytes and no neighbour section; a cycle it ended keeps its era — no policy, no correction, no send; a chain it only began and paid continues under the policy without paying again # вид 1: эра 5ccc463, 7c7d3cc, dd5fc67
+om-model-call-part-06.test.ts :: MP3 era: a new MP3 root carries a lawful delivery of the producer before MP3 (MP1+MP2) in the addressed form, while the earlier records keep their bytes and read back unchanged # вид 1: эра 08be75a
 om-probe.test.ts :: PR1 §7 history: the base b595c7b producer from Git writes in its own process; after reopening the new probe reads every request and wire unchanged # вид 1: эра b595c7b
 om-question-packet.test.ts :: E2 preserves original packet and part-result history strictly in its old answer era after restart # вид 1: эра ff25519
 om-question-packet.test.ts :: E2.1 reads the immutable pre-works L3 producer history byte-for-byte and rejects codeRef in its old answer form # вид 1: эра 30f8d753
@@ -114,4 +114,4 @@ stage-research.test.ts :: DS1-09 exact Git v4 producer: accepted stages retain t
 storage.test.ts :: the complete ee3fd4c Store producer retains records, hashes and history after restart # вид 1: эра ee3fd4c
 storage.test.ts :: PF4 (№3523): the engine before PF4 (3e8aa784) opens and writes a database with the extension and reads snapshots with and without it; a check this engine saved notices what the old engine wrote, and one it did not touch stays # вид 1: эра 3e8aa78, 3e8aa784
 store-view.test.ts :: PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them # вид 1: эра 5929ea25
-om-model-call.test.ts :: LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send # вид 1: старый E3 допускал context Ref в search; только два reads-invalid окна (№6978)
+om-model-call-part-06.test.ts :: LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send # вид 1: старый E3 допускал context Ref в search; только два reads-invalid окна (№6978)
