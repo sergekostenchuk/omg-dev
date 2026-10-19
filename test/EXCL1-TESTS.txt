@@ -31,10 +31,6 @@ om-accepted-answer.test.ts :: PF3 row 24: accepted answers and the index the bas
 om-queue.test.ts :: the whole b1143aa producer retains its pre-B1 projection and saved bytes under the new queue era # вид 1: эра b1143aa
 om-achievements.test.ts :: C5.1b genuine N3 bound work passes G7 and physical E6 history without attributing foreign fillings # вид 1: эра 9c22e4a4
 om-achievements.test.ts :: C5.1b exact old producer D2 and E6 history survives while its unbound frame cannot invent an achievement # вид 1: эра 7c7d3ccc, 9c22e4a4, b1143aa7
-om-answers-gate.test.ts :: G4b reads a genuine saved E5.0 assessor transport by its historical contract # вид 1: эра 3eb5dac3, 7c7d3ccc
-om-answers-gate.test.ts :: 16 H1.0c a legacy E5.0 transport keeps its own traced cause, not an E5 N of the current attempt # вид 1: эра 3eb5dac3, 7c7d3ccc
-om-answers-gate.test.ts :: 16 H1.0c a legacy E5.0 transport of another question or a superseded task keeps its exact foreign cause # вид 1: эра 3eb5dac3, 7c7d3ccc
-om-answers-gate.test.ts :: 16 H1.0c a legacy E5.0 transport of an earlier attempt stays journal-only # вид 1: эра 3eb5dac3, 7c7d3ccc
 om-answers-gate.test.ts :: H1.5 ERA: G4b records written by the code of the base commit are read by the new code with the same result, and the new preparation derives that very record # вид 1: эра 479b307f, 7c7d3ccc
 om-answers-gate.test.ts :: FA1 an E5 intent of the era before the verdict form is admitted and its supported verdict applied by today's E5 as saved, never assessment_source_stale # вид 1: эра 7c7d3ccc, d519a603
 om-answers-gate.test.ts :: PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prepares byte for byte what the base d519a60 prepares in its own process — two new sources in one batch, a late delivery mixing a stored source with a new one, and the evaluation linked with the close — result, writes, guards and their order; the written evaluation and delivery repeat without a write # вид 1: эра 7c7d3ccc, d519a603

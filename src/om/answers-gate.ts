@@ -6,7 +6,7 @@ import { deriveInputDecisions, inputDecisionNamespace, type InputDecisionProposa
 import { applicableAnswerTask, readAnswerTaskBasis, readMc1Question, readAcceptedAnswer,
   type AnswerInvalidation } from './accepted-answer.js';
 import { assessmentRefusalId, readAssessmentIntentAt, readAssessmentTerminalAt, type AssessmentResultRecord } from './assessment.js';
-import { readCall, readFactAssessmentOrigin } from './call-record.js';
+import { readCall } from './call-record.js';
 import { readCandidate, gateCandidate, prepareCandidate, type CandidateRequest } from './frame-candidate.js';
 import { prepareFrameProposals, readFrameProposals } from './frame-proposals.js';
 import { bypassRouteOf, readGaps, prepareCurrentGaps, type GapReadRequest, type Gap, type GapKind, type GapMoment } from './gaps.js';
@@ -65,9 +65,9 @@ export const ANSWERS_GATE_EMISSIONS = sealed([
   'candidate-absent', 'candidate-gate-negative', 'candidate-stale', 'works-candidate', 'works-frame-unavailable',
   'works-obligation-open', 'works-obligation-filled-elsewhere', 'batch-level-foreign',
   'mc1-unfinished', 'mc1-foreign-task', 'mc1-task-foreign-gap', 'mc1-fact-candidates', 'mc1-technical',
-  'transport-foreign', 'legacy-question-foreign', 'assessment-question-foreign', 'assessment-task-foreign',
+  'transport-foreign', 'assessment-question-foreign', 'assessment-task-foreign',
   'assessment-supported', 'assessment-transport-managed', 'assessment-insufficient', 'assessment-conflicting',
-  'assessment-off-form', 'assessment-interrupted', 'assessment-terminated', 'assessment-legacy-transport',
+  'assessment-off-form', 'assessment-interrupted', 'assessment-terminated',
   'mc2-terminal', 'mc2-terminal-foreign',
 ] as const);
 export type AnswersGateEmission = typeof ANSWERS_GATE_EMISSIONS[number];
@@ -81,7 +81,7 @@ export const ANSWERS_GATE_SOURCE_ROLES = sealed([
 export type AnswersGateSourceRole = typeof ANSWERS_GATE_SOURCE_ROLES[number];
 // Every violated condition of a composite emission point, so one emitted finding keeps all of its checked causes.
 export const ANSWERS_GATE_MISMATCHES = sealed([
-  'call-purpose', 'call-basis', 'source-batch-absent', 'current-batch-absent', 'batch-model', 'batch-task',
+  'call-purpose', 'call-basis', 'call-basis-assessment', 'source-batch-absent', 'current-batch-absent', 'batch-model', 'batch-task',
   'batch-changed', 'item-absent', 'route-task-absent', 'gap-unassigned', 'gap-kind', 'question-gap', 'question-task',
   'question-address', 'task-address', 'task-contract', 'graph-hash', 'level', 'proposal',
   'cycle-terminal', 'cycle-binding', 'cycle-candidate',
@@ -334,7 +334,7 @@ function negativeFact(store: Store, request: AnswersGateRequest, row: AnswerRout
         ...(outcome.diagnostic ? [cite('diagnostic', outcome.diagnostic)] : [])],
       { state: state.state, outcome: outcome.outcome?.kind ?? null });
   }
-  let questionRef: Ref, supported = false, managedTransport = false, legacyTransport = false;
+  let questionRef: Ref, supported = false, managedTransport = false;
   let verdict: AssessmentResultRecord['verdict'] | null = null, ceased: ReturnType<typeof cessation> | null = null;
   const chain: AnswersGateSource[] = [];
   if (ref.id.startsWith('om-assessment-result:')) {
@@ -357,39 +357,30 @@ function negativeFact(store: Store, request: AnswersGateRequest, row: AnswerRout
     const call = take(readCall(store, project, transport.call));
     const basis = call.value.basis;
     chain.push(cite('transport', ref), cite('call', transport.call));
-    if (call.value.purpose !== 'fact-assessment' || !basis || basis.kind !== 'fact-assessment')
+    if (call.value.purpose !== 'fact-assessment' || !basis || basis.kind !== 'fact-assessment' || !basis.assessment)
       return traced('transport-foreign', finding('record_foreign', gap.target, 'result',
         'This transport is not a fact assessment', ref), chain, { purpose: call.value.purpose,
         mismatch: violated([['call-purpose', call.value.purpose !== 'fact-assessment'],
-          ['call-basis', !basis || basis.kind !== 'fact-assessment']]) });
-    if (basis.assessment) {
-      const intent = take(readAssessmentIntentAt(store, project, basis.assessment));
-      questionRef = intent.question.record;
-      managedTransport = true;
-      references.push(basis.assessment);
-      chain.push(cite('intent', basis.assessment));
-    } else {
-      const origin = take(readFactAssessmentOrigin(store, project, basis, ref.id));
-      questionRef = basis.question;
-      legacyTransport = true;
-      if (!origin.gaps.some(address => address.id === gap.target && address.field === gap.field))
-        return traced('legacy-question-foreign', finding('answer_version_stale', gap.target, 'result',
-          'The assessed fact belongs to another question', ref), [...chain, cite('model-call', basis.modelCall),
-          cite('packet', basis.packet), cite('response', basis.response), cite('question', basis.question)]);
-    }
+          ['call-basis', !basis || basis.kind !== 'fact-assessment'],
+          ['call-basis-assessment', !!basis && basis.kind === 'fact-assessment' && !basis.assessment]]) });
+    const intent = take(readAssessmentIntentAt(store, project, basis.assessment));
+    questionRef = intent.question.record;
+    managedTransport = true;
+    references.push(basis.assessment);
+    chain.push(cite('intent', basis.assessment));
     references.push(ref, transport.call, basis.modelCall, basis.packet, basis.response, basis.question);
     chain.push(cite('model-call', basis.modelCall), cite('packet', basis.packet), cite('response', basis.response));
   }
   chain.push(cite('question', questionRef));
   const question = take(readMc1Question(store, { project, record: questionRef }));
   if (!route.task || !same(question.record.value.request.gap, row.gap)
-    || (question.record.value.request.task === undefined ? !legacyTransport
+    || (question.record.value.request.task === undefined ? true
       : !same(question.record.value.request.task, route.task))
     || question.gap.target !== gap.target || question.gap.field !== gap.field)
     return traced('assessment-question-foreign', finding('answer_version_stale', gap.target, 'result',
       'The assessed fact does not belong to the exact current M6 question', ref), chain, { mismatch: violated([
       ['route-task-absent', !route.task], ['question-gap', !same(question.record.value.request.gap, row.gap)],
-      ['question-task', question.record.value.request.task === undefined ? !legacyTransport
+      ['question-task', question.record.value.request.task === undefined ? true
         : !same(question.record.value.request.task, route.task)],
       ['question-address', question.gap.target !== gap.target || question.gap.field !== gap.field]]) });
   const task = take(readAnswerTaskBasis(store, { project, task: { record: route.task }, current }));
@@ -408,7 +399,8 @@ function negativeFact(store: Store, request: AnswersGateRequest, row: AnswerRout
     'A managed assessor transport is not its checked E5 terminal result', ref), chain);
   const negative = finding('answer_missing_for_blocking_gap', gap.target, 'result',
     'A checked negative or technical assessment does not accept a D5 fact', ref);
-  if (verdict === null) return traced('assessment-legacy-transport', negative, chain);
+  if (verdict === null) evaluationFail(ref.id, 'verdict',
+    'A non-terminal transport is managed or refused above; only terminal results reach this point', ref);
   return traced(TERMINAL_EMISSIONS[verdict], negative, chain, { verdict, ...ceased?.detail });
 }
 function proveResult(store: Store, request: AnswersGateRequest, row: AnswerRouteResult, route: RoutedGap,
@@ -1086,11 +1078,11 @@ const CONTRIBUTION_RULES: Readonly<Record<AnswersGateEmission, ContributionRule>
   'works-frame-unavailable': 'producer', 'works-obligation-open': 'submission',
   'works-obligation-filled-elsewhere': 'submission', 'batch-level-foreign': 'submission', 'mc1-unfinished': 'work',
   'mc1-foreign-task': 'submission', 'mc1-task-foreign-gap': 'submission', 'mc1-fact-candidates': 'work',
-  'mc1-technical': 'E4-T', 'transport-foreign': 'submission', 'legacy-question-foreign': 'submission',
+  'mc1-technical': 'E4-T', 'transport-foreign': 'submission',
   'assessment-question-foreign': 'submission', 'assessment-task-foreign': 'submission',
   'assessment-supported': 'submission', 'assessment-transport-managed': 'work', 'assessment-insufficient': 'E5-N',
   'assessment-conflicting': 'E5-N', 'assessment-off-form': 'E5-T', 'assessment-interrupted': 'E5-T',
-  'assessment-terminated': 'E5-T', 'assessment-legacy-transport': 'submission',
+  'assessment-terminated': 'E5-T',
   'mc2-terminal': 'E4-terminal', 'mc2-terminal-foreign': 'submission',
   // H2.0: an accepted owner answer is not a finding — positive entries are filtered before grouping, so this rule is
   // structurally unreachable and must stay so.
