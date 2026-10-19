@@ -45,6 +45,8 @@ for (const tag of ["EXCL1", "EXCL2"]) {
 }
 const shared = new Set(allKeys.map(key => JSON.stringify([key.file, key.name]))).size !== allKeys.length;
 if (shared) throw new Error("test/EXCL1-TESTS.txt and test/EXCL2-TESTS.txt share a key");
+// GUARD1 (№6781 п.1, №6784): every process of the test run preloads scripts/guard1.cjs, so no old engine code runs
+// here — no loader but the EXCL hook, no extraction of the engine's own sources from Git; a stop names the test file.
+env.NODE_OPTIONS = `--require ${JSON.stringify(resolve(root, "scripts/guard1.cjs"))} ${process.env.NODE_OPTIONS ?? ""}`.trim();
 run([...(allKeys.length ? ["--import", resolve(root, "scripts/excl1-register.mjs")] : []),
-  "--test", ...(args.length ? [`--test-reporter=${args[1]}`] : []), ...tests], false,
-  allKeys.length ? env : undefined);
+  "--test", ...(args.length ? [`--test-reporter=${args[1]}`] : []), ...tests], false, env);
