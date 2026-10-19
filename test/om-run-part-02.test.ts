@@ -39,7 +39,7 @@ import { lp3Blocked, lp3Pointers, mechanismSeries, project, ok, refusal, runFixt
 
 
 test("H1.2 R4 R1 a block line stopped by three fruitless attempts: the one review is undecided and the second rung ends the pass on the block's exact stop", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const stopped = stoppedBlockLine(f);
   assert.ok(stopped.value.stop, "A3 stopped the line");
   assert.equal(stopped.value.escalations.length, 0, "Nothing reviewed it yet");
@@ -64,7 +64,7 @@ test("H1.2 R4 R1 a block line stopped by three fruitless attempts: the one revie
 });
 
 test("H1.2 R13a R8 an open N2 attempt whose MC1 asked the owner: after the neighbour's work the full G4b proves that exact question, and no close, C5 or D2 is invented", async t => {
-  const f = runFixture(t, ["encoding"], false, true);
+  const f = runFixture(t, ["encoding"], "stages", true);
   const b = f.bases("h12-frame-owner"), request = f.request(b);
   ok(startRun(f.store, { project }));
   const answers: Record<string, unknown>[] = [], answered = new Set<string>();
@@ -93,7 +93,7 @@ test("H1.2 R13a R8 an open N2 attempt whose MC1 asked the owner: after the neigh
   assert.equal(f.sent().length, 3);
 });
 test("OWN1 H1.2 R13 R8 a fact and a design decision of one block are each asked once: the fact is applied, the model's decision with its alternatives stands decided in B1, and the pass ends on neither", async t => {
-  const f = runFixture(t, ["encoding", "spare"]);
+  const f = runFixture(t, ["encoding", "spare"], "executed");
   addressQuestions(f, [["encoding", "repository-fact"], ["spare", "design-decision"]]);
   const request = f.request();
   ok(startRun(f.store, { project }));
@@ -165,7 +165,7 @@ test("FA1 a lawful negative E5 verdict of the attempt's own fact is no technical
 
 
 test("1 24 22 C57 R20 №1860-8 H1.1 a managed project works only on the activation of the pass's own issue: the machine runs B3, a new root works after it, a block outside the intent never", async t => {
-  const f = runFixture(t, ["encoding"], false, true, true);
+  const f = runFixture(t, ["encoding"], "stages", true, true);
   // The project is already transition-managed: another issue activated an independent block's root.
   ok(openSeries(f.store, { project, block: "garden-later-block", line: 1, slice: "h1-other", predecessor: null, basis: null }));
   f.activate("h1-initial", { features: [{ outcome: "garden-later" }], excluded: [] });
@@ -204,7 +204,7 @@ test("1 24 22 C57 R20 №1860-8 H1.1 a managed project works only on the activat
 });
 
 test("5 4 H1 an answer received before a lost process is applied by the same saved step after restart, without a second send", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases("h1-5"), request = f.request(b);
   f.steps([addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -225,7 +225,7 @@ test("5 4 H1 an answer received before a lost process is applied by the same sav
 });
 
 test("25 R20 №1937-1 №1860-5 H1.1 managed N2: while the first participant waits for the frame, the missing one is registered and activated by B3 of the same issue and paid; the first keeps its scope", async t => {
-  const f = runFixture(t, [], false);
+  const f = runFixture(t, [], "stages");
   // The managed era began with an activation of the producing block's root only; the consuming root does not exist yet.
   ok(openSeries(f.store, { project, block: "garden-produce-block", line: 1, slice: "h11-initial", predecessor: null, basis: null }));
   f.activate("h11-initial", { features: [{ outcome: "garden-result" }], excluded: [] });
@@ -248,9 +248,9 @@ test("25 R20 №1937-1 №1860-5 H1.1 managed N2: while the first participant wa
 });
 // Top-level registrations only: S1.1 (om-operation-cost) loads this file as a fixture with its test() calls removed.
 test("OWN1.1 №3722 two owner answers of questions the bypass gives the model are both decisions: the model is never asked, B1 holds both owner values",
-  async t => twoOwnerAnswers(t, false));
+  async t => twoOwnerAnswers(t, false, "executed"));
 test("OWN1 №3719 P2-2 a decision packet asks no owner: no need_owner in its form or examples, every example passes its own check, and a need_owner reply is a correctable refusal", async t => {
-  const f = runFixture(t, ["spare"]);
+  const f = runFixture(t, ["spare"], "executed");
   addressQuestions(f, [["spare", "design-decision"]]);
   const request = f.request();
   ok(startRun(f.store, { project }));
@@ -292,7 +292,7 @@ test("OWN1 №3719 P2-2 a decision packet asks no owner: no need_owner in its fo
 });
 
 test("LP3 current context search labels fail before delivery: one correction per attempt, G7 closes all three, and restart repeats the unable end without payment", async t => {
-  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("lp3-53"), request = f.request(b);
   const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
   f.steps([need, need, need, need, need, need, stopAnswer(f, false)]);
@@ -323,7 +323,7 @@ test("LP3 current context search labels fail before delivery: one correction per
   assert.equal(f.sent().length, 7, "Six answers and the one review; no third correction");
   await sameEnd(f, request, 7);
 
-  const positive = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  const positive = runFixture(t, ["encoding"], "executed");
   const bases = positive.bases("lp3-positive"), req = positive.request(bases);
   ok(startRun(positive.store, { project }));
   const step = await until(positive, req, "cycle");

@@ -22,7 +22,7 @@ import type { OmInputRecord } from "../src/om/input.js";
 import { writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
 import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
-import { gardenGraph } from "./om-fixture.js";
+import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { projectGraph } from "../src/graph/project.js";
 import { fillObligations, prepareFrame, type FrameScope } from "../src/om/frame-obligations.js";
@@ -77,11 +77,12 @@ function ok<T>(result: OmResult<T>): T {
 function refusal<T>(result: OmResult<T>): Refusal { if (result.ok) assert.fail("Expected a refusal"); return result.refusal; }
 
 /**
- * A real OM project up to its first bases: prepared stages with two open addressing questions, refined layers,
- * an environment whose implementer is the scripted adapter, B1 with every other design decision addressed, an
- * accepted horizon, D1, M6 and the owner's M3 queue.
+ * A run with its own graph, questions and adapter. Explicit modes use current upstream producers and native
+ * N2/L3 acceptance; boolean refinement remains for consumers not yet moved off the research route.
+ * A cold run never prebuilds B1 or an OM frame, even if an accepted-layer mode was requested.
  */
-function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refine = true, addressed: boolean | string[] = false, later = false, cold = false,
+type RunFixtureMode = "stages" | "n2" | "executed";
+function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refine: boolean | RunFixtureMode = true, addressed: boolean | string[] = false, later = false, cold = false,
   unknowns: Readonly<Record<string, { consumer?: string; moment?: string }>> = {}, historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), "omg-h1-run-")), database = join(root, "state.sqlite"), workspace = join(root, "repo");
   mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "H1 pass repository\n");
@@ -96,7 +97,9 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
     graphData.requirements!.push({ ...structuredClone(graphData.requirements![0]!), id: "garden-R2", outcome: "garden-later", statement: "Deliver the later result" });
     graphData.nodes.find(node => node.id === "garden-later-block")!.implements!.push("garden-R2");
   }
-  preparedFeatures(engine, project, graphData, field => {
+  const mode = typeof refine === "string" ? refine : undefined;
+  const { level: _currentLevel, ...currentUpper } = projectGraph(graphData, 1);
+  preparedFeatures(engine, project, mode ? currentUpper as Graph : graphData, field => {
     const value = preparedField(project, field);
     if (field === "preparation" && questions.length) (value as Record<string, Json>).unknowns = questions.map(id => ({ id,
       question: `Which ${id} is supported?`, consumer: unknowns[id]?.consumer ?? "garden-consume-block", moment: unknowns[id]?.moment ?? "om-pass", blocksCurrentStage: false,
@@ -125,7 +128,7 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
         ...(field === "featurePreparation" ? { requirements: ["garden-R2"], behaviorContracts: ["garden-B2"] } : {}) });
     }
     return value;
-  }, historicalCommit);
+  }, mode ? "" : historicalCommit);
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
   const environment = (amount = 100_000) => engine.environments.configure(project, { workspace,
@@ -134,13 +137,15 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
     fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: amount },
   store.get(`environment:${project}`)?.revision ?? 0);
   const configured = environment();
-  if (refine) refinedLayers(engine, project);
+  if (mode && mode !== "stages" && !cold) prepareNativeLayers(engine, project, graphData, mode);
+  else if (refine === true) refinedLayers(engine, project);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const graph = reference(store.get(`graph:${project}`)!);
   // A cold project has no OM record at all: its first B1 is written by the machine bases (H1.1).
   const input = cold ? null : fixtureInput();
   function fixtureInput() {
-  const base = ok(writeOmInput(store, { project, expected: 0, stages }));
+  const base = (mode ? store.get<OmInputRecord>(`om-input:${project}`) : null)
+    ?? ok(writeOmInput(store, { project, expected: 0, stages }));
   const decisions = base.value.gaps.filter(gap => gap.code !== "inventory_missing" && gap.code !== "question_unaddressed").map(gap => {
     const field = gap.code === "contract_node_unbound" ? "nodes" : gap.code === "acceptance_kind_missing" ? "checkKind" : "state";
     const value: Json = field === "nodes" ? ["garden-produce-block", "garden-consume-block"] : field === "checkKind" ? "test"
@@ -164,7 +169,8 @@ function runFixture(t: test.TestContext, questions = ["encoding", "spare"], refi
   /** The owner's B3 transition over the current roots: P and G2 on a horizon of this choice, then its application. */
   function activate(choiceVersion: string, choice: { features: { outcome: string }[]; excluded: { block: string; reason: string; returnCondition: string }[] }) {
     const horizon = ok(writeHorizon(store, { project, input: reference(store.get(`om-input:${project}`)!), graph,
-      refinement: null, available: {}, choice: { choiceVersion, ...choice } }));
+      refinement: mode && store.get(`om-frame:${project}:2`) ? reference(store.get(`graph-layer:${project}:2`)!) : null,
+      available: {}, choice: { choiceVersion, ...choice } }));
     assert.equal(horizon.gate.value.state, "accepted", JSON.stringify(horizon.gate.value));
     const roots = store.list<RepairSeries>("repair-series").filter(row => "block" in row.value)
       .filter(row => !store.list<RepairSeries>("repair-series").some(other => other.value.predecessor?.id === row.id)).map(reference);
@@ -301,8 +307,8 @@ function stoppedBlockLine(f: Fixture, block = "garden-consume-block") {
 }
 
 /** Reaches the second rung of the M5 line: three refused attempts, the one undecided review, nothing ended yet. */
-async function secondRung(t: test.TestContext) {
-  const f = runFixture(t, ["encoding"]);
+async function secondRung(t: test.TestContext, mode: boolean | RunFixtureMode = true) {
+  const f = runFixture(t, ["encoding"], mode);
   const b = f.bases("h12-window"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, false), addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -964,8 +970,8 @@ async function ownerAnswers(f: Fixture, ids: readonly string[]) {
       value: `Explicit owner choice for ${id}`, basis: "Explicit choice for this question" }, { routes: readRoutes, input: readOmInput }));
   });
 }
-async function twoOwnerAnswers(t: test.TestContext, moved: boolean) {
-  const f = runFixture(t, ["encoding", "spare"]);
+async function twoOwnerAnswers(t: test.TestContext, moved: boolean, mode: boolean | RunFixtureMode = true) {
+  const f = runFixture(t, ["encoding", "spare"], mode);
   addressQuestions(f, [["encoding", "owner-decision"], ["spare", "owner-decision"]]);
   const request = f.request(), [encoding, spare] = await ownerAnswers(f, ["encoding", "spare"]);
   if (moved) {
@@ -1189,7 +1195,7 @@ async function mp2Works(f: ReturnType<typeof worksFixture>, onStep?: (step: { ac
 }
 
 /** The works answer of worksFixture for an exact saved packet, as research data: the desired work of its operation. */
-function mp2WorkAnswer(f: ReturnType<typeof worksFixture>, saved: Ref) {
+function mp2WorkAnswer(f: Pick<ReturnType<typeof worksFixture>, "store" | "desired">, saved: Ref) {
   const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
   const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
   const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;

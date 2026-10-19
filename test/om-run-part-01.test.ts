@@ -14,10 +14,17 @@ import { readOmInput } from "../src/om/input.js";
 import { readRoutes, type RoutesRecord } from "../src/om/routes.js";
 import type { RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
-import { runModelCall, readModelCall, runModelCycle, type ModelCycleRecord } from "../src/om/model-call.js";
+import { runModelCall, readModelCall, runModelCycle, type ModelCycleRecord, type OmModelCall } from "../src/om/model-call.js";
 import { readQuestionPacket, writeQuestionPacket } from "../src/om/question-packet.js";
-import { cycleStartOf, readRun, startRun, runId, type RunRecord, type RunWait } from "../src/om/run.js";
+import { cycleStartOf, readRun, startRun, runId, type RunRecord, type RunRequest } from "../src/om/run.js";
 import { writeRunBases } from "../src/om/run-bases.js";
+import { gardenGraph } from "./om-fixture.js";
+import { readOmObligations } from "../src/om/obligations.js";
+import type { CarriedObligation } from "../src/graph/om-obligation-readers.js";
+import { taskBindingId } from "../src/graph/task-obligations.js";
+import { readFeasibility, type OmFeasibility } from "../src/om/feasibility.js";
+import { readWorksFrame } from "../src/om/works-frame.js";
+import type { GapRecord } from "../src/om/gaps.js";
 // OWN1 (№3719, return of Codex-omg): the owner's answer is above the model's, and a decision packet asks no owner.
 import { issueOwnerInvitation, OwnerSessions } from "../src/product/owner-authority.js";
 import { writeOwnerResult } from "../src/om/owner-result.js";
@@ -33,8 +40,23 @@ import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "..
 import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, LP3_BASE_COMMIT, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_CONTENTS, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp5ReplaceB1, lp5Pass, g51Pass, LP5_BASE_COMMIT, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
 
 
+test("LG01r1 current fixture modes preserve the run's questions and never prebuild a cold B1", t => {
+  for (const mode of ["stages", "n2", "executed"] as const) {
+    const f = runFixture(t, ["own-question"], mode);
+    assert.deepEqual(f.input!.value.input.questions.map(row => row.id), ["discovery:own-question"]);
+    assert.deepEqual(f.store.list("phase"), [], "Current modes never create research phases");
+    assert.equal(!!f.store.get(`om-frame:${project}:2`), mode !== "stages");
+    assert.equal(!!f.store.get(`om-frame:${project}:3`), mode === "executed");
+    const cold = runFixture(t, ["own-question"], mode, false, false, true);
+    assert.equal(cold.input, null);
+    for (const id of [`om-input:${project}`, `om-frame:${project}:2`, `om-frame:${project}:3`, runId(project)])
+      assert.equal(cold.store.get(id), null, `${mode}: ${id} is created only by the tested operation`);
+    assert.deepEqual(cold.store.list("phase"), []);
+  }
+});
+
 test("H1.2 R10a a second store ending the pass between the builder's derivation and its first write: the lost write reads the pass again and builds no base", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases(), request = f.request();
   f.steps([addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -66,7 +88,7 @@ test("H1.2 R10a a second store ending the pass between the builder's derivation 
 });
 
 test("H1.2 R11 two stores deriving the same end: one write wins, the other reads the winner's pass, and the grounds are the same", async t => {
-  const { f, request } = await secondRung(t);
+  const { f, request } = await secondRung(t, "executed");
   let raced = false;
   class Losing extends Store {
     override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
@@ -92,7 +114,7 @@ test("H1.2 R11 two stores deriving the same end: one write wins, the other reads
 });
 
 test("2 R1 H1.1 cold OM to the first model step: the machine builds B1, the pass and its bases; a pass without built bases builds them first", async t => {
-  const f = runFixture(t, ["encoding"], true, false, false, true);
+  const f = runFixture(t, ["encoding"], "stages", false, false, true);
   assert.equal(f.store.get(`om-input:${project}`), null, "No OM record exists");
   const built = ok(writeRunBases(f.store, { project }));
   f.steps([addressAll(f, built.bases.routes)]);
@@ -102,7 +124,7 @@ test("2 R1 H1.1 cold OM to the first model step: the machine builds B1, the pass
   assert.ok(ok(await advanceRun(f.store, request)).performed?.action === "cycle" && cycling);
   assert.equal(f.sent().length, 1, "The first paid model step");
   // A pass whose bases were never built: its first step is its own saved build, before any series or attempt.
-  const g = runFixture(t, ["encoding"]);
+  const g = runFixture(t, ["encoding"], "stages");
   ok(startRun(g.store, { project }));
   assert.equal(g.store.list("horizon").length, 0);
   const first = ok(await advanceRun(g.store, g.request())).record.value.state;
@@ -113,7 +135,7 @@ test("2 R1 H1.1 cold OM to the first model step: the machine builds B1, the pass
 });
 
 test("13 H1 technical outcomes are closed by G7 with their proved reason; the next attempt opens only after the previous one is closed", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h1-13"), request = f.request(b);
   f.steps([{ research: { invalid: true }, usage }, { rawStdout: "{broken", exitCode: 7 }, addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -125,7 +147,7 @@ test("13 H1 technical outcomes are closed by G7 with their proved reason; the ne
 });
 
 test("25 11 R2 №1770 H1 an N2 root that ended without assembly closes its own attempt through G7: no candidate, C5 or D2, no waiting for the frame", async t => {
-  const f = runFixture(t, [], false);
+  const f = runFixture(t, [], "stages");
   const b = f.bases("h1-negative"), request = f.request(b);
   ok(startRun(f.store, { project }));
   const a1 = await until(f, request, "cycle");
@@ -144,25 +166,104 @@ test("25 11 R2 №1770 H1 an N2 root that ended without assembly closes its own 
 
 
 test("H1.5 №2166 п.4 the moment decides, not the kind: an environment confirmation or a post-implementation proof of the pass is a ground of its end, one of task-start or task-result is no barrier of the pass", async t => {
+  // Native N2 must actually build N3 now; the former research fixture had a full L3 without om-frame:3.
+  async function completeWorks(f: Fixture, request: RunRequest) {
+    const replies: Record<string, unknown>[] = [], packets = new Set<string>(), performed: string[] = [];
+    ok(startRun(f.store, { project }));
+    // Includes N3 registration, D1/D2/D7, paid parts, G4b/G5/G7 and M8/M9/compilation (formerly 12 idle transitions).
+    for (let index = 0; index < 200; index++) {
+      const next = ok(await advanceRun(f.store, request)), state = next.record.value.state;
+      if (next.performed) performed.push(next.performed.action);
+      if (state.phase === "step" && state.step.action === "cycle") {
+        const ref = (state.step.request as unknown as { packet: Ref }).packet;
+        if (!packets.has(ref.id)) {
+          packets.add(ref.id);
+          const packet = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!;
+          const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!;
+          const batch = routes.value.batches.find(row => row.id === packet.value.request.batch)!;
+          assert.deepEqual([batch.task, batch.level], ["node-expansion", 3], "Only real N3 questions are sent");
+          assert.ok(!batch.items.some(item => item.target === "discovery:proof"));
+          const answer = mp2WorkAnswer({ store: f.store, desired: gardenGraph() }, ref);
+          const handoff = ok(readOmObligations(f.store, { project, producer: packet.value.request.works!.producer }));
+          assert.deepEqual(reference(handoff.record), packet.value.request.works!.ledger);
+          const work = answer.research.proposal.nodes[0]!;
+          const assigned = (packet.value.packet as unknown as { works: { assigned: string[] } }).works.assigned;
+          const bindings = handoff.handoff.obligations.filter(item => assigned.includes(taskBindingId(item as CarriedObligation)))
+            .map(item => ({ id: taskBindingId(item as CarriedObligation), scope: item.scope, obligation: item.obligation,
+              consumers: [{ node: work.id, tests: work.tests }] }));
+          replies.push({ ...answer, research: { ...answer.research, bindings }, usage }); f.steps(replies);
+        }
+      }
+      if (["unable", "waiting", "complete"].includes(state.phase)) {
+        const calls = f.store.list<OmModelCall>("model-call").filter(row => row.value.om);
+        assert.equal(calls.length, f.sent().length, `Every physical N3 call is accounted for: ${JSON.stringify({ state, performed, failures: calls.map(row => row.value.om.failure) })}`);
+        assert.equal(calls.length, packets.size, "Each exact packet is paid once, with no correction or hidden review");
+        for (const call of calls) {
+          const ref = call.value.om.request.packet;
+          assert.ok(packets.has(ref.id));
+          const packet = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!;
+          assert.deepEqual(reference(packet), ref);
+          const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!;
+          assert.deepEqual(reference(routes), packet.value.request.routes);
+          const batch = routes.value.batches.find(row => row.id === packet.value.request.batch)!;
+          assert.deepEqual([batch.task, batch.level], ["node-expansion", 3]);
+          assert.ok(!batch.items.some(item => item.target === "discovery:proof"), "The unsupported/late question itself is never paid");
+        }
+        return { state, performed };
+      }
+    }
+    assert.fail(`N3 did not reach its terminal state: ${performed.join(",")}`);
+  }
+  const history = (f: Fixture) => f.store.list().flatMap(row => f.store.history(row.id).map(reference));
   for (const [kind, later] of [["environment-confirmation", "task-start"], ["post-implementation-proof", "task-result"]] as const) {
-    const blocking = runFixture(t, ["proof"]);
+    const blocking = runFixture(t, ["proof"], "n2");
     addressQuestions(blocking, [["proof", kind]]);
-    ok(startRun(blocking.store, { project }));
-    const ended = await ends(blocking, blocking.request(), 12);
-    assert.deepEqual(reasonsOf(ended.state).map(row => [row.kind, row.code, row.target, row.field]), [["unsupported-question", "route_result_unsupported", "discovery:proof", "answer"]], kind);
-    assert.equal(blocking.sent().length, 0, kind);
-    const deferred = runFixture(t, ["proof"], true, false, false, false, { proof: { moment: later } });
-    addressQuestions(deferred, [["proof", kind]]);
-    ok(startRun(deferred.store, { project }));
-    const idle = await ends(deferred, deferred.request(), 12);
-    assert.equal(idle.state.phase, "waiting", `${kind}: ${JSON.stringify(idle.state)}`);
-    assert.equal((idle.state as unknown as { wait: RunWait }).wait.code, "run_idle", `${kind}: nothing to do is a wait for new bases, not the end of the pass`);
-    assert.equal(deferred.sent().length, 0, kind);
-    assert.equal(deferred.store.list("repair-series").length, 0, kind);
+    const request = blocking.request(), ended = await completeWorks(blocking, request);
+    const reasons = reasonsOf(ended.state);
+    assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]),
+      [["unsupported-question", "route_result_unsupported", "discovery:proof", "answer"]], kind);
+    const gap = blocking.store.list<GapRecord>("gap").find(row => row.value.gap.target === "discovery:proof")!;
+    assert.ok(gap);
+    assert.deepEqual(reasons[0]!.basis.find(ref => ref.id === gap.id), reference(gap));
+    assert.ok(blocking.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.some(row => row.id === "discovery:proof"));
+    const before = history(blocking);
+    await sameEnd(blocking, request, blocking.sent().length);
+    assert.deepEqual(history(blocking), before, "Restart writes no revision after the exact unsupported end");
+
+    const deferred = runFixture(t, ["proof"], "n2", false, false, false, { proof: { moment: later } });
+    addressQuestions(deferred, [["proof", kind]]); // Before current D1, D7 and N3, never on a stale accepted horizon.
+    const lateRequest = deferred.request(), finished = await completeWorks(deferred, lateRequest);
+    assert.equal(finished.state.phase, "complete", JSON.stringify(finished));
+    const m8 = deferred.store.get<OmFeasibility>(`om-feasibility:${project}`)!;
+    assert.ok(m8 && m8.value.ready);
+    assert.deepEqual(ok(readFeasibility(deferred.store, { project, record: reference(m8) })), m8);
+    const candidate = ok(readWorksFrame(deferred.store, { project, candidate: m8.value.producer.candidate }));
+    assert.deepEqual({ producer: candidate.value.works!.producer, ledger: candidate.value.works!.ledger }, m8.value.producer.obligations);
+    const d7 = ok(readOmObligations(deferred.store, { project, producer: m8.value.producer.obligations.producer }));
+    assert.deepEqual(reference(d7.record), m8.value.producer.obligations.ledger);
+    const input = deferred.store.get<OmInputRecord>(`om-input:${project}`)!;
+    assert.ok(input.value.input.questions.some(row => row.id === "discovery:proof"), "A carried question remains open in B1");
+    assert.equal(deferred.store.list("om-owner-gap-assignment").length, 0, "No H2 is invented");
+    if (kind === "environment-confirmation") assert.deepEqual(d7.record.value.assignments, [], "No runtime proof: no work assignment");
+    else {
+      assert.equal(d7.record.value.assignments.length, 1);
+      const assignment = d7.record.value.assignments[0]!;
+      const original = deferred.store.get<GapRecord>(assignment.original.record.id, assignment.original.record.revision)!;
+      assert.deepEqual(reference(original), assignment.original.record);
+      assert.deepEqual([assignment.original.pointer, original.value.gap.target, assignment.kind, assignment.moment,
+        assignment.responsibleNode, assignment.responsibleConsumer],
+      ["/gap", "discovery:proof", "post-implementation-proof", "task-result", "garden-consume-block", "garden-consume-block"]);
+      assert.ok(candidate.value.works!.bindings.some(binding => binding.obligation === assignment.obligation
+        && binding.consumers.some(consumer => consumer.node === "garden-consume-work")));
+    }
+    t.diagnostic(`${kind}: ${deferred.sent().length} native N3 calls, ${finished.performed.length} transitions, complete with ready M8`);
+    const lateBefore = history(deferred);
+    await sameEnd(deferred, lateRequest, deferred.sent().length);
+    assert.deepEqual(history(deferred), lateBefore);
   }
 });
 test("OWN1 №3719 P2-1 an owner's H2 answer of a question the bypass gives the model is its decision: the model is never asked, B1 holds the owner's value, om-decisions names the owner", async t => {
-  const f = runFixture(t, ["spare"]);
+  const f = runFixture(t, ["spare"], "executed");
   addressQuestions(f, [["spare", "owner-decision"]]);
   const bases = f.bases(), request = f.request();
   const routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!;
@@ -187,7 +288,7 @@ test("OWN1 №3719 P2-1 an owner's H2 answer of a question the bypass gives the 
 
 // RD2 pages individual values; distinct read addresses must themselves exceed the fixed continuation budget.
 test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold ends its cycle blocked and is never sent: the pass closes each attempt through G7, goes up the ladder and ends by A6 — never waiting on the blocked packet; the start of the root's cycle is chosen by its links in both positions of root and continuation", async t => {
-  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  const f = runFixture(t, ["encoding"], "executed");
   f.environment(80_000);
   const b = f.bases("lp3-52"), request = f.request(b);
   ok(startRun(f.store, { project }));
@@ -230,7 +331,7 @@ test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold end
 });
 
 test("LP3 current packet reads can be temporarily unavailable at selection or a saved cycle: exact waiting is idempotent and the same root resumes with one lawful read and its continuation", async t => {
-  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("lp3-2870"), request = f.request(b);
   const content = "UTF-8 is supported\n";
   writeFileSync(join(f.root, "repo", "encoding.txt"), content);

@@ -33,7 +33,7 @@ import { project, adapterFixture, ok, refusal, runFixture, type Fixture, address
 
 
 test("26 1 C07 R4 H1.1 the pass runs the project mechanism M5 through G7, then builds the bases of the new B1 itself and goes on; a restart repeats nothing", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases(), request = f.request();
   f.steps([addressAll(f, b.routes)]);
   const started = ok(startRun(f.store, { project }));
@@ -72,7 +72,7 @@ test("26 1 C07 R4 H1.1 the pass runs the project mechanism M5 through G7, then b
 });
 
 test("H1.2 R11 C11 an end derived on bases that another store lawfully renews before the write is not saved: the next choice starts from the new B1", async t => {
-  const { f, request } = await secondRung(t);
+  const { f, request } = await secondRung(t, "executed");
   let raced = false;
   class Renewing extends Store {
     override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
@@ -103,7 +103,7 @@ test("H1.2 R11 C11 an end derived on bases that another store lawfully renews be
 });
 
 test("C01 №1852 H1 one pass per project: a repeated start reads it, equal concurrent creations converge to one winner, and the record is B1-born", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const racing = new RacingStore(f.database);
   t.after(() => racing.close());
   racing.target = runId(project); racing.remaining = 1;
@@ -386,7 +386,7 @@ test("FA1 G6 a technical E5 terminal of the attempt's own fact closes the attemp
 });
 
 test("C11 3 H1 a standalone open attempt of the earlier mode is not adopted: the pass waits on it, opens no next ordinal, and works independent owners", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const request = f.request(f.bases("h1-c11"));
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h1-standalone", predecessor: null, basis: null }));
@@ -401,7 +401,7 @@ test("C11 3 H1 a standalone open attempt of the earlier mode is not adopted: the
 });
 
 test("R19 №1937-3 H1.1 a second store opening work between the saved bases step's admission and its write: the step is refused, D1 does not move", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases(), request = f.request();
   f.steps([addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -431,10 +431,10 @@ test("R19 №1937-3 H1.1 a second store opening work between the saved bases ste
   assert.equal(f.store.list("om-horizon").length, horizons);
 });
 test("OWN1.1 №3722 two owner answers stay decisions when the second was given before B1 moved by the first: the model is never asked, B1 holds both owner values",
-  async t => twoOwnerAnswers(t, true));
+  async t => twoOwnerAnswers(t, true, "executed"));
 
 test("MP1 LP3 №53 in the brief era: a search scope naming a context Ref is refused by E2 label decoding during E3 admission; the pass closes all three attempts without waiting or delivering reads — MP2 (№2968): each managed attempt corrects that repairable answer once", async t => {
-  const f = runFixture(t, ["encoding"]), b = f.bases("mp1-lp3-53"), request = f.request(b);
+  const f = runFixture(t, ["encoding"], "executed"), b = f.bases("mp1-lp3-53"), request = f.request(b);
   const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
   // MP2 (№2968 §3): an unissued label in reads is answer content of MP1's closed repairable class (briefAnswerRepairable):
   // each attempt gets its one correction, answered here the same way.
