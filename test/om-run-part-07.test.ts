@@ -25,7 +25,7 @@ import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor
 
 
 test("3 8 25 C23 C17 C27 R5 H1.1 on its own new bases the pass works the block through MC1, E5 and G4b to one G7 close, then applies the accepted facts", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const { m5, second, request } = await blockBases(f);
   f.steps([m5, factsAll(f, second.routes), assessor("supported"), assessor("supported")]);
   const driven = await drive(f, request, 40);
@@ -34,18 +34,21 @@ test("3 8 25 C23 C17 C27 R5 H1.1 on its own new bases the pass works the block t
   const series = blockSeries(f);
   const outcome = series.value.attempts[0]!.outcome!;
   assert.equal(outcome.reason, "result");
-  assert.equal(driven.wait.code, "run_idle");
+  // The saved M8's completion admission names the input before the applied facts moved its head —
+  // the pass stands on that exact stale basis instead of reopening the confirmed feasibility.
+  assert.deepEqual([driven.wait.code, driven.wait.target, driven.wait.field],
+    ["input_stale", `om-input:${project}`, "head"], JSON.stringify(driven.wait));
   assert.equal(f.sent().length, 4, "Every paid call was made once; a new B1 never calls MC1 again");
   // №1860-4: the machine task's result form {answer} runs D5 → MC1 → E5 → the applied B1, read back from the saved input.
   const input = ok(readOmInput(f.store, project, reference(f.store.get(`om-input:${project}`)!)));
   assert.deepEqual(input.value.input.facts!.map(fact => [fact.question.id, fact.value]).sort(),
     [["discovery:encoding", { answer: "UTF-8" }], ["discovery:spare", { answer: "UTF-8" }]]);
   assert.deepEqual(input.value.input.questions, [], "An applied fact leaves the open questions");
-  assert.deepEqual(driven.wait.basis[0], reference(f.store.get(`om-input:${project}`)!), "The idle pass names the bases it stands on");
+  assert.equal(driven.wait.target, `om-input:${project}`, "The standing wait names the moved input head it bases on");
 });
 
 test("H1.2 R1 R3 R4 R10 17 19 20 C33 three attempts without progress stop the M5 series; A6 reviews the exact stop once, an undecided review ends the pass on the second rung, and nothing is written or paid again", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h1-first"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, false), addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -93,7 +96,7 @@ test("H1.2 R1 R3 R4 R10 17 19 20 C33 three attempts without progress stop the M5
 
 test("H1.2 R8 C31 №2045-1 a stopped line of a block outside the horizon of the launch intent stops nothing; of two stopped lines only the one inside the horizon is a ground", async t => {
   // Outside: the intent names garden-result, so the later block is no node of the horizon the pass derived.
-  const f = runFixture(t, []);
+  const f = runFixture(t, [], "executed");
   const stopped = stoppedBlockLine(f, "garden-later-block");
   ok(startRun(f.store, { project, outcomes: ["garden-result"] }));
   const request = f.request(), horizon = f.bases().horizon;
@@ -106,7 +109,7 @@ test("H1.2 R8 C31 №2045-1 a stopped line of a block outside the horizon of the
   assert.notEqual(outside.state.phase, "unable", "The finished history of a block the intent never asked for is another subject's: " + JSON.stringify(outside.state));
   assert.equal(f.sent().length, 1, "Only the operator's review was paid");
   // Both: the same kind of stop on a block of the horizon is the pass's ground, and only it is named.
-  const g = runFixture(t, []);
+  const g = runFixture(t, [], "executed");
   const foreign = stoppedBlockLine(g, "garden-later-block"), own = stoppedBlockLine(g, "garden-produce-block");
   ok(startRun(g.store, { project, outcomes: ["garden-result"] }));
   const asked = g.request();
@@ -121,7 +124,7 @@ test("H1.2 R8 C31 №2045-1 a stopped line of a block outside the horizon of the
 });
 
 test("H1.2 R8 R9 C11 3 a standalone open attempt of another owner defers the end: the proved second rung of M5 does not end a pass that may still change", async t => {
-  const f = runFixture(t, ["encoding", "spare"], true, ["encoding"]);
+  const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
   const b = f.bases("h12-defer"), request = f.request(b), none = cannotAnswer(f, b.routes);
   // The independent block has an attempt of the earlier mode still open: the pass never adopts it and never ends over it.
   const address = { project, block: "garden-consume-block", line: 1 };
@@ -141,7 +144,7 @@ test("H1.2 R8 R9 C11 3 a standalone open attempt of another owner defers the end
 });
 
 test("H1.2 R4 R2 a stop after a spent continuation is on the second rung by that spent window: the first review is not borrowed, no second one is paid", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h12-spent"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, true), none, none, none]);
   ok(startRun(f.store, { project }));
@@ -159,7 +162,7 @@ test("H1.2 R4 R2 a stop after a spent continuation is on the second rung by that
 });
 
 test("H1.2 R6 an origin the review establishes lifts its own hold and the pass goes on; it is no ground of the end", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h12-established", predecessor: null, basis: null }));
   const goal = { key: "h12-established-goal", questions: ["Address one contract"], result: "A supported contract" };
@@ -184,7 +187,7 @@ test("H1.2 R6 an origin the review establishes lifts its own hold and the pass g
 });
 
 test("C41 C43 К7 H1 a product written before the cursor moved is found again by the saved request: no second call, open or close", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases("h1-first"), request = f.request(b);
   f.steps([addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -234,7 +237,7 @@ test("FA1 №3833 an own off-form E5 terminal beside an own insufficient or conf
 });
 
 test("29 H1 a pass record that lost a required saved field is an integrity refusal: nothing is chosen, sent or written", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const request = f.request(f.bases("h1-29"));
   ok(startRun(f.store, { project }));
   await until(f, request, "open-series");
@@ -251,7 +254,7 @@ test("29 H1 a pass record that lost a required saved field is an integrity refus
 });
 
 test("4 9 C21 C22 C25 H1 a lost E4 executor after its claim is recovered by the common recovery; the same saved cycle goes on without a send", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases("h1-lost"), request = f.request(b);
   f.steps([addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -277,7 +280,7 @@ test("4 9 C21 C22 C25 H1 a lost E4 executor after its claim is recovered by the 
 });
 
 test("4 9 C21 H1 a lost assessor after its claim is recovered the same way: the saved assessment reads its recovered transport, no second intent", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const b = f.bases("h1-lost-e5"), request = f.request(b);
   f.steps([factsAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -296,7 +299,7 @@ test("4 9 C21 H1 a lost assessor after its claim is recovered the same way: the 
 });
 
 test("4 9 12 21 C21 №1814 H1 A6 on an origin hold keeps its saved request through a live executor, its loss, a new Environment revision and a restart", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const b = f.bases("h1-a6-hold"), request = f.request(b);
   // Three earlier standalone attempts refused with a refusal of unknown origin: A3 stopped the series, G7 raised holds.
   const address = { project, block: "garden-consume-block", line: 1 };

@@ -32,11 +32,13 @@ import { runWakeChoice, WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wak
 import { completionCloseId } from "../src/om/series.js";
 import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
 import { prepareRunBases as lp81PrepareRunBases } from "../src/om/run-bases.js";
-import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Lp5State, lp5Pass, type Reopened, unavailableReview } from "./om-run-fixture.js";
+import type { OmModelCall } from "../src/om/model-call.js";
+import { gardenGraph } from "./om-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Lp5State, lp5Pass, type Reopened, unavailableReview, sameEnd } from "./om-run-fixture.js";
 
 
 test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is proved by the common recovery the failed review ends the pass, and nothing is sent twice", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h1-a6-lost"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, false)]);
   ok(startRun(f.store, { project }));
@@ -58,7 +60,7 @@ test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is prove
 });
 
 test("H1.2 R11 an end derived on a stop that another store lawfully continues before the write is not saved: the next choice reads the new ladder", async t => {
-  const { f, request } = await secondRung(t);
+  const { f, request } = await secondRung(t, "executed");
   let raced = false;
   class Continuing extends Store {
     override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
@@ -91,24 +93,45 @@ test("H1.2 R11 an end derived on a stop that another store lawfully continues be
 // OWN1 (№3711): an owner question of the pass is the model's since; a confirmation of the environment the pass itself
 // needs (moment om-pass) still has no producer in this product.
 test("H1.2 R13b a blocking question nobody can answer in this product ends the pass on that exact question, with no attempt open and nothing invented", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "n2");
   const input = f.store.get(`om-input:${project}`)!;
   ok(writeAddressing(f.store, { project, input: reference(input), graph: f.graph, decisions: [{ pending: structuredClone(inputDecisionWrite({
     project, input: reference(input), graph: f.graph, layers: [], decision: { target: "discovery:encoding", field: "address",
       value: { consumer: "garden-consume-block", kind: "environment-confirmation" } } })) as Write }] }));
   const request = f.request();
   ok(startRun(f.store, { project }));
-  const end = await ends(f, request, 10);
-  const reasons = reasonsOf(end.state);
+  // Native N2 builds a real N3 now; the unserved question is never a part of any packet — every paid call is a works one.
+  const replies: Record<string, unknown>[] = [], paid = new Set<string>();
+  let end: Awaited<ReturnType<typeof ends>>["state"] | null = null;
+  for (let index = 0; index < 200 && !end; index++) {
+    const state = ok(await advanceRun(f.store, request)).record.value.state;
+    if (state.phase === "step" && state.step.action === "cycle") {
+      const ref = (state.step.request as unknown as { packet: Ref }).packet;
+      if (paid.has(ref.id)) continue;
+      paid.add(ref.id);
+      const packet = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!;
+      const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+      const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
+      assert.ok(!batch.items.some(item => item.target === "discovery:encoding"), "The unsupported question is never paid");
+      replies.push({ ...mp2WorkAnswer({ store: f.store, desired: gardenGraph() }, ref), usage }); f.steps(replies);
+    }
+    if (["unable", "waiting", "complete"].includes(state.phase)) end = state;
+  }
+  assert.ok(end, "The pass reached a terminal state");
+  const reasons = reasonsOf(end);
   assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target]), [["unsupported-question", "route_result_unsupported", "discovery:encoding"]]);
   assert.equal(reasons[0]!.field, "answer");
-  assert.equal(f.store.list("repair-series").length, 0, "No line, no attempt: nobody was asked to answer it");
+  const calls = f.store.list<OmModelCall>("model-call").filter(row => row.value.om);
+  assert.equal(calls.length, paid.size, "Every paid call is an exact N3 packet; none asks the unsupported question");
   assert.equal(f.store.list().filter(row => row.id.startsWith("om-owner-result:")).length, 0, "No owner result is invented");
-  assert.equal(f.sent().length, 0);
+  const history = () => f.store.list().flatMap(row => f.store.history(row.id).map(reference));
+  const before = history();
+  await sameEnd(f, request, calls.length);
+  assert.deepEqual(history(), before, "A restart writes no revision after the exact unsupported end");
 });
 
 test("H1.2 R7 R10a 15 16 C33 need_owner of a goal ends the pass on that goal at any reason of its close; new bases or a restart neither release it nor pay again", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const { m5, second, request } = await blockBases(f);
   const saved = f.store.get<RoutesRecord>(second.routes.id, second.routes.revision)!.value;
   const gap = saved.batches.find(item => item.model === "MC1")!.items[0]!.gap;
@@ -136,7 +159,7 @@ test("H1.2 R7 R10a 15 16 C33 need_owner of a goal ends the pass on that goal at 
 test("RL3 №4218 exits 1 and 3: the reopening's policy is asked in B1 before any work and the pass waits for the owner — a repeat writes nothing; the owner's H2 answer is applied first, never asked of the model, carried decided to the works brief, and closes the policy for every work of the contract", async t => regatePolicy(t, "owner"));
 
 test("6 C54 H1 a lawfully changed required condition of an unfinished assignment is ended by the common cessation producer, never sent", async t => {
-  const f = runFixture(t, ["encoding", "spare"], true, ["encoding"]);
+  const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
   const b = f.bases("h1-cease"), request = f.request(b);
   const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
   const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
@@ -171,7 +194,7 @@ test("6 C54 H1 a lawfully changed required condition of an unfinished assignment
 });
 
 test("H1.2 R6 R7 C32 a standing hold and the goal's own owner-control are both grounds: each is named once with its own records, and nothing else is paid", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const b = f.bases("h12-hold-owed"), request = f.request(b);
   const item = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value.batches.find(row => row.model === "MC1")!.items[0]!;
   const address = { project, block: "garden-consume-block", line: 1 };
@@ -202,7 +225,7 @@ test("H1.2 R6 R7 C32 a standing hold and the goal's own owner-control are both g
 // OWN1 (№3711): the H1.5 tests of a blocking batch no producer serves are gone with it — a design or owner question of the
 // pass is the model's now (above); a question of a later moment keeps its unserved batch and is no ground (below).
 test("H1.5 №2221 a non-blocking unserved batch (a design question of task-start) in a saved plan is not sent and is no ground: the pass waits on the open work instead of ending", async t => {
-  const f = runFixture(t, ["proof"], true, false, false, false, { proof: { moment: "task-start" } });
+  const f = runFixture(t, ["proof"], "executed", false, false, false, { proof: { moment: "task-start" } });
   addressQuestions(f, [["proof", "design-decision"]]);
   const bases = f.bases(), routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value;
   const batch = routes.batches.find(item => item.items.some(row => row.target === "discovery:proof" && row.field === "answer"))!;

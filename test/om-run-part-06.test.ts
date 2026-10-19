@@ -8,16 +8,18 @@ import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { git } from "../src/runtime/environment.js";
 import type { OmInputRecord } from "../src/om/input.js";
+import { readFeasibility, type OmFeasibility } from "../src/om/feasibility.js";
+import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
-import { beginAttempt, openSeries, readCompletionBinding } from "../src/om/series.js";
+import { beginAttempt, openSeries, readCompletionBinding, type CompletionOwner } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
 import type { RepairSeries } from "../src/om/series.js";
 import { closeAttempt, deriveCompletionEvidence } from "../src/om/repeat-gate.js";
-import { modelCallRecordId, prepareCompletionCause, runModelCall } from "../src/om/model-call.js";
+import { modelCallRecordId, prepareCompletionCause, runModelCall, type OmModelCall } from "../src/om/model-call.js";
 import { gapLineKey } from "../src/om/gap-lines.js";
-import { readRun, startRun, runId, type RunRecord, type RunWait } from "../src/om/run.js";
+import { readRun, startRun, runId, type RunRecord } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { prepareReconcileSeries, readSeries, readSeriesProgressTransitionAt, completionCloseId, seriesProgressTransitionId, SERIES_PROGRESS_TRANSITION_KIND } from "../src/om/series.js";
@@ -31,11 +33,11 @@ import { configureDispatch } from "../src/om/dispatch.js";
 // of the snapshot, the answer is applied, and the next works — now deciding the test the transition reaches — pass G5 on
 // the same snapshot. The question is asked once; a repeat of the B1 transition writes nothing.
 import { readinessPending, writeReadinessInput, type ReadinessTransition } from "../src/om/input.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor, sameEnd } from "./om-run-fixture.js";
 
 
 test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep their canonical order without a repeat, and a malformed end is an integrity refusal", async t => {
-  const f = runFixture(t, ["encoding", "spare"], true, ["encoding"]);
+  const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
   const b = f.bases("h12-both"), request = f.request(b);
   const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
   const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
@@ -63,7 +65,7 @@ test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep the
 });
 
 test("H1.2 R2 18 19 H1 a decided first-rung review grounds resumeSeries of that exact stop, the next attempt works on, and the pass does not end", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h1-first"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, true), addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -112,7 +114,7 @@ test("25 7 C61 №1749 H1 works of several blocks: each pays once, the full G4b 
 });
 
 test("H1.2 R7 C25 an owner-control whose question is no longer open holds nothing: the line's work on today's question goes on", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const request = f.request(f.bases("h12-resolved"));
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h12-resolved", predecessor: null, basis: null }));
@@ -127,7 +129,7 @@ test("H1.2 R7 C25 an owner-control whose question is no longer open holds nothin
 });
 
 test("25 R4 №1770 H1 N2 mixed: A's assembly waits open for the frame; B's negative attempt closes by its own G7 meanwhile, nothing is paid twice", async t => {
-  const f = runFixture(t, [], false);
+  const f = runFixture(t, [], "stages");
   const b = f.bases("h1-mixed"), request = f.request(b);
   ok(startRun(f.store, { project }));
   const a1 = await until(f, request, "cycle");
@@ -147,7 +149,7 @@ test("25 R4 №1770 H1 N2 mixed: A's assembly waits open for the frame; B's nega
 });
 
 test("R10 H1.1 a saved step is performed by its own request when the bases have changed meanwhile: no build, cycle or ordinal comes first", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases(), request = f.request();
   f.steps([addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -172,19 +174,65 @@ test("R10 H1.1 a saved step is performed by its own request when the bases have 
 });
 
 test("H1.5 №2166 п.4 a design question of task-start has a batch M6 describes and no producer: it is left out of every plan as well, yet it is no ground of the end", async t => {
-  const f = runFixture(t, ["proof"], true, false, false, false, { proof: { moment: "task-start" } });
-  addressQuestions(f, [["proof", "design-decision"]]);
+  const f = runFixture(t, ["proof"], "n2", false, false, false, { proof: { moment: "task-start" } });
+  addressQuestions(f, [["proof", "design-decision"]]); // Before D1, D7 and N3; no stale accepted horizon.
+  const question = f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.find(row => row.id === "discovery:proof")!;
+  assert.ok(question);
   const bases = f.bases(), routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value;
-  const batch = routes.batches.find(item => item.items.some(row => row.target === "discovery:proof" && row.field === "answer"));
+  const batch = routes.batches.find(item => item.items.some(row => row.target === question.id && row.field === "answer"));
   assert.ok(batch, "M6 makes a batch of every design decision, whatever its moment");
   const read = ok(readRouteProducers(f.store, { project, routes: bases.routes }));
-  assert.deepEqual(read.batches.filter(row => row.unserved.length).map(row => row.batch), [batch!.id], "The batch has no producer, blocking or not");
+  assert.deepEqual(read.batches.filter(row => row.unserved.length).map(row => row.batch), [batch.id]);
+  assert.deepEqual(read.batches.find(row => row.batch === batch.id)!.unserved.map(row => [row.gap, row.target, row.field, row.blocking]),
+    [[batch.items.find(row => row.target === question.id)!.record, question.id, "answer", false]], "Exactly this late question has no producer");
+  const selectedBatch = (routesRef: Ref, id: string | null) => {
+    assert.ok(id, "Every N3 packet names its batch");
+    const saved = f.store.get<RoutesRecord>(routesRef.id, routesRef.revision)!;
+    assert.deepEqual(reference(saved), routesRef);
+    const selected = saved.value.batches.find(row => row.id === id)!;
+    assert.ok(selected);
+    assert.notEqual(selected.id, batch.id);
+    assert.ok(!selected.items.some(row => row.target === question.id), "No version of the late question enters a plan, packet or call");
+    assert.deepEqual([selected.task, selected.level], ["node-expansion", 3]);
+    return selected;
+  };
+  const request = f.request(), replies: Record<string, unknown>[] = [], paid = new Map<string, Ref>(), performed: string[] = [];
   ok(startRun(f.store, { project }));
-  const idle = await ends(f, f.request(), 12);
-  assert.equal(idle.state.phase, "waiting", JSON.stringify(idle.state));
-  assert.equal((idle.state as unknown as { wait: RunWait }).wait.code, "run_idle", "A question of task-start does not end the pass");
-  assert.equal(f.store.list("repair-series").length, 0, "Not planned, not asked");
-  assert.equal(f.sent().length, 0);
+  let state = ok(readRun(f.store, { project }))!.value.state;
+  // №7365/7394: real N3 replaces the old full Refinement L3 without om-frame:3 and its 12 idle transitions.
+  for (let index = 0; index < 200 && !["complete", "unable", "waiting"].includes(state.phase); index++) {
+    const next = ok(await advanceRun(f.store, request)); state = next.record.value.state;
+    if (next.performed) performed.push(next.performed.action);
+    if (state.phase !== "step" || state.step.action !== "cycle") continue;
+    const ref = (state.step.request as unknown as { packet: Ref }).packet;
+    if (paid.has(ref.id)) continue;
+    paid.set(ref.id, ref);
+    const packet = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!;
+    assert.deepEqual(reference(packet), ref);
+    selectedBatch(packet.value.request.routes, packet.value.request.batch);
+    assert.deepEqual((packet.value.packet as unknown as { works: { assigned: string[] } }).works.assigned, [], "No task binding is invented for the late design question");
+    replies.push({ ...mp2WorkAnswer({ store: f.store, desired: gardenGraph() }, ref), usage }); f.steps(replies);
+  }
+  assert.equal(state.phase, "complete", JSON.stringify({ state, performed }));
+  const m8 = f.store.get<OmFeasibility>(`om-feasibility:${project}`)!;
+  assert.ok(m8.value.ready);
+  assert.deepEqual(ok(readFeasibility(f.store, { project, record: reference(m8) })), m8);
+  const owners = f.store.list<CompletionOwner>("om-completion-owner");
+  assert.ok(owners.length > 0, "Real N3 has completion plans");
+  for (const owner of owners) for (const id of owner.value.plan.batches) selectedBatch(owner.value.plan.routes, id);
+  const packets = f.store.list<QuestionPacketRecord>("question-packet"), calls = f.store.list<OmModelCall>("model-call").filter(row => row.value.om);
+  assert.ok(paid.size > 0);
+  assert.deepEqual(packets.map(reference).sort((a, b) => a.id.localeCompare(b.id)), [...paid.values()].sort((a, b) => a.id.localeCompare(b.id)));
+  for (const packet of packets) selectedBatch(packet.value.request.routes, packet.value.request.batch);
+  assert.equal(calls.length, paid.size, "One call per exact N3 packet, no correction or hidden review");
+  assert.equal(f.sent().length, calls.length, "All paid transport is accounted for by N3 calls");
+  for (const call of calls) assert.deepEqual(call.value.om.request.packet, paid.get(call.value.om.request.packet.id));
+  assert.deepEqual(f.store.get<OmInputRecord>(`om-input:${project}`)!.value.input.questions.find(row => row.id === question.id), question);
+  const history = () => f.store.list().flatMap(row => f.store.history(row.id).map(reference));
+  const before = history();
+  await sameEnd(f, request, calls.length);
+  assert.deepEqual(history(), before, "Restart adds neither a record nor a revision");
+  t.diagnostic(`${calls.length} native N3 calls, ${performed.length} transitions; late batch never planned or paid`);
 });
 
 test("LP4 (№2887 rows 1, 4, 9, §6.3, §6.4, §6.6) an addressed file the first or the second root waits for: without another environment the pass waits lawfully and nothing is ceased; once the roles move, the waiting step and then its node are ceased, the other root is worked by its own rules, the first attempt closes by G7 — on a new Store after every transaction, never waiting on completion_ceased and never sending the paid need_source again", async t => {
@@ -377,7 +425,9 @@ test("LP6 return №3371: an accepted field beside a real failure of the same at
 
 
 test("LP7 row 26: one question of a joined batch waiting for the owner holds that whole batch — none of its fields is asked again — while a free batch the wait does not hold is worked on", async t => {
-  const f = runFixture(t, ["encoding"], true, false, false, true);
+  const f = runFixture(t, ["encoding"], "stages", false, false, true);
+  // Accept N2 without addressing B1: its joined input batch must remain open.
+  prepareNativeLayers(f.engine, project, gardenGraph(), "n2");
   const built = ok(writeRunBases(f.store, { project })), request = f.request();
   assert.equal(f.store.get<RoutesRecord>(built.bases.routes.id, built.bases.routes.revision)!.value.grouping, "block-input-v1");
   const source = () => f.store.get<{ content: string }>(`source:${project}:brief`)!;
@@ -386,15 +436,18 @@ test("LP7 row 26: one question of a joined batch waiting for the owner holds tha
   for (let index = 0; index < 80 && !["waiting", "complete", "unable"].includes(state.phase); index++) {
     if (state.phase === "step" && state.step.action === "assess") { steps.push(assessor("supported")); f.steps(steps); }
     if (state.phase === "step" && state.step.action === "cycle") {
-      const packet = f.store.get<QuestionPacketRecord>((state.step.request as unknown as { packet: Ref }).packet.id)!;
+      const ref = (state.step.request as unknown as { packet: Ref }).packet;
+      const packet = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!;
       const routes = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
       const batch = routes.batches.find(row => row.id === packet.value.request.batch)!;
       sent.push([...new Set(batch.items.map(item => item.field))].sort());
-      // M5 addresses the encoding; the block asks the owner one question of its joined batch and answers its fact.
+      // M5 addresses the encoding; the block asks the owner one question of its joined batch, answers its fact
+      // and works the real N3 expansion batches the wait does not hold.
       steps.push(batch.items.every(item => item.field === "address") ? { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
           results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: { consumer: "garden-consume-block", kind: "repository-fact" } })) }, usage }
-        : batch.task === "input-field" ? { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_owner",
+        : batch.items.some(item => item.field === "checkKind") ? { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_owner",
           questionIds: batch.items.filter(item => item.field === "checkKind").map(item => item.gap), reason: "The owner decides the check kind", decision: "Name it" }, usage }
+        : batch.task === "node-expansion" ? { ...mp2WorkAnswer({ store: f.store, desired: gardenGraph() }, ref), usage }
         : { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: batch.items.map(item => ({ questionId: item.gap, value: { answer: "UTF-8" },
           citations: [{ source: reference(source()), selector: { kind: "text-range", start: 0, end: source().value.content.length } }] })) }, usage });
       f.steps(steps);
@@ -402,18 +455,20 @@ test("LP7 row 26: one question of a joined batch waiting for the owner holds tha
     state = ok(await advanceRun(f.store, request)).record.value.state;
   }
   assert.deepEqual(sent[0], ["address"], "Row 6: M5 goes first, and the address keeps its own batch beside the joined one");
-  assert.deepEqual(sent.map(row => row.join("+")).sort(), ["address", "answer", "checkKind+nodes+state"],
-    `Each batch once: M5, the free fact and the joined batch whose one question waits: ${JSON.stringify(sent)}`);
+  assert.deepEqual(sent.map(row => row.join("+")).sort(),
+    ["address", "answer", "checkKind+nodes+state", "fill", "fill", "fill"],
+    `Each batch once: M5, the free fact, the joined batch whose one question waits, and the real N3 fills: ${JSON.stringify(sent)}`);
   assert.ok(actions(f.store).includes("assess"), "The free fact batch is worked on — its answer is assessed — beside the wait");
-  assert.equal(state.phase, "waiting");
+  assert.equal(state.phase, "waiting", JSON.stringify(state));
   // The wait holds the whole joined batch: further steps ask none of its fields again and pay nothing.
-  const calls = f.sent().length;
+  const calls = f.sent().length, attempts = blockSeries(f).value.attempts.length;
   for (let index = 0; index < 3; index++) ok(await advanceRun(f.store, request));
-  assert.deepEqual([f.sent().length, blockSeries(f).value.attempts.length], [calls, 1]);
+  assert.deepEqual([f.sent().length, blockSeries(f).value.attempts.length], [calls, attempts],
+    "The held joined batch is never asked again while the pass waits on its owner");
 });
 
 test("LP8.1 grounds that stay final: an unable pass on a review that never completed stands — advance, start and continue write nothing, take no execution and send nothing, also after a restart", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("lp81-final"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, { rawStdout: "{broken", exitCode: 7, stderr: "intentional reviewer failure" }, addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));

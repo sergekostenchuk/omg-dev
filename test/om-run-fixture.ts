@@ -1673,7 +1673,7 @@ out(state);`, { request, project }) as { phase: string };
 
 /** A genuine current failed review ends unable while only its exact exchange is unreadable. */
 async function unavailableReview(t: test.TestContext) {
-  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("lp81-unavailable"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, { ...stopAnswer(f, true), confirmed: null }, addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));

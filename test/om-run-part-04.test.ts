@@ -39,7 +39,7 @@ import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, fact
 
 
 test("H1.2 R8 R4 C31 a stopped line whose owner has no batch today keeps its barrier: its reviewed stop on the second rung ends the pass, and nothing is paid for that owner", async t => {
-  const f = runFixture(t, []);
+  const f = runFixture(t, [], "executed");
   const stopped = stoppedBlockLine(f);
   const request = f.request(f.bases("h12-idle"));
   f.steps([stopAnswer(f, false)]);
@@ -61,7 +61,7 @@ test("H1.2 R8 R4 C31 a stopped line whose owner has no batch today keeps its bar
 });
 
 test("H1.2 R5 a failed review of the stop ends the pass on that very record: a restart pays no second review", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h1-failed"), request = f.request(b), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, { rawStdout: "{broken", exitCode: 7, stderr: "intentional reviewer failure" }, addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
@@ -86,7 +86,7 @@ test("H1.2 R5 a failed review of the stop ends the pass on that very record: a r
 });
 
 test("H1.2 R5b a review that cannot even be prepared for its saved request ends the pass on that refusal: no failed record, no transport, no new dispatch", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h1-a6-unavailable"), none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, false)]);
   ok(startRun(f.store, { project }));
@@ -116,7 +116,7 @@ test("H1.2 R5b a review that cannot even be prepared for its saved request ends 
 });
 
 test("H1.2 R7 R7a R8 6 C54 M5 asks the owner while the independent block is worked to its end; only then does the pass end, on the goal that stays open, and its grounds keep the canonical order", async t => {
-  const f = runFixture(t, ["encoding", "spare"], true, ["encoding"]);
+  const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
   const b = f.bases("h12-independent"), request = f.request(b);
   const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
   const m5 = saved.batches.find(item => item.model === "MC2" && item.task === "input-field")!;
@@ -141,7 +141,7 @@ test("H1.2 R7 R7a R8 6 C54 M5 asks the owner while the independent block is work
 });
 
 test("К10 C41 H1 two stores choosing the next step at once: the first saved choice wins and the other performs that same step", async t => {
-  const f = runFixture(t);
+  const f = runFixture(t, undefined, "executed");
   const b = f.bases("h1-first"), request = f.request(b);
   ok(startRun(f.store, { project }));
   const racing = new RacingStore(f.database);
@@ -159,7 +159,7 @@ test("К10 C41 H1 two stores choosing the next step at once: the first saved cho
 });
 
 test("25 C61 7 R8 №1749 №1860-12 H1.1 two blocks of one N2 frame: G4b waits for both, one bound C5, machine bases over it, a D2 event per goal and each own G7 across second stores, then L3", async t => {
-  const f = runFixture(t, [], false);
+  const f = runFixture(t, [], "stages");
   const b = f.bases("h1-n2"), request = f.request(b);
   const saved = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value;
   assert.equal(saved.batches.filter(row => row.task === "node-expansion" && row.level === 2).length, 2, "Both blocks expand the one operations frame");
@@ -277,7 +277,7 @@ test("G6 В3 a paid assembly ended by its area's B1 is reused while its area's q
 });
 
 test("H1.2 R6 R6a 12 21 H1 stop and origin holds together: the origin route goes first (A6 on the exact hold), no attempt opens, an unestablished origin ends the pass without paying the other holds or the stop", async t => {
-  const f = runFixture(t, ["encoding"], true, true);
+  const f = runFixture(t, ["encoding"], "executed", true);
   const request = f.request(f.bases("h1-hold"));
   // Three earlier standalone attempts of the block were refused with a refusal of unknown origin: A3 stopped the
   // series and G7 raised a hold for each (the earlier mode, read by its own contract).
@@ -318,7 +318,7 @@ test("H1.2 R6 R6a 12 21 H1 stop and origin holds together: the origin route goes
 });
 
 test("4 9 17 21 C21 №1814 H1 A6 on a stop keeps its saved request through a live executor, its loss, a new Environment revision and a restart", async t => {
-  const f = runFixture(t, ["encoding"]);
+  const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("h1-a6-stop"), request = f.request(b);
   const none = cannotAnswer(f, b.routes);
   f.steps([none, none, none, stopAnswer(f, false)]);
@@ -330,7 +330,7 @@ test("4 9 17 21 C21 №1814 H1 A6 on a stop keeps its saved request through a li
 });
 
 test("25 R8 R20 №1937-2 №1860-8 H1.1 managed N2 after C5: completion bases serve both D2 and G7 through second stores, with no B3 before the group is closed; S1.2 №1961-4 then the common B3 of the new slices and the first L3 step on the joint base, nothing paid again", async t => {
-  const f = runFixture(t, [], false);
+  const f = runFixture(t, [], "stages");
   for (const block of ["garden-produce-block", "garden-consume-block"])
     ok(openSeries(f.store, { project, block, line: 1, slice: "h11-initial", predecessor: null, basis: null }));
   f.activate("h11-initial", { features: [{ outcome: "garden-result" }], excluded: [] });
@@ -430,7 +430,7 @@ test("25 R8 R20 №1937-2 №1860-8 H1.1 managed N2 after C5: completion bases s
 
 // OWN1 (№3711) replaces H1.5 №2164: an owner question of the pass is asked of the model once and decided by it.
 test("OWN1 H1.5 №2164 an owner question of the pass is asked of the model once: its decision stands decided in B1, om-decisions shows it with its alternatives, and the pass does not end on it", async t => {
-  const f = runFixture(t, ["spare"]);
+  const f = runFixture(t, ["spare"], "executed");
   addressQuestions(f, [["spare", "owner-decision"]]);
   const bases = f.bases(), request = f.request();
   assert.ok(answerBatch(f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!.value), "M6 routes the question to the model");
