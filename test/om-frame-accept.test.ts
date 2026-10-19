@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import ts from 'typescript';
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { produceAtomicSeed, type AtomicSeedResources } from './om-atomic-seed.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonical, hashJson } from '../src/canonical.js';
@@ -944,20 +944,14 @@ interface CurrentF5Fixture {
   obligations: string[]; foreignObligations: string[]; realizedObligations: string[];
 }
 async function currentF5Fixture(t: TestContext): Promise<CurrentF5Fixture> {
-  // Reuse the current native N2/E4 producer, without importing its test registrations or loading a Git era.
-  const url = new URL('./om-atomic-gate.test.js', import.meta.url), source = readFileSync(url, 'utf8');
-  const tree = ts.createSourceFile(url.pathname, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
-  const statements = tree.statements.filter(statement => ts.isImportDeclaration(statement)
-    || ts.isFunctionDeclaration(statement) || ts.isVariableStatement(statement));
-  const module = new URL(`./.lg11-f5-${process.pid}.mjs`, import.meta.url);
-  writeFileSync(module, statements.map(statement => source.slice(statement.pos, statement.end)).join('\n')
-    + '\nexport { produceAtomicSeed };\n');
-  t.after(() => rmSync(module, { force: true }));
-  const { produceAtomicSeed } = await import(module.href);
-  const seed = await produceAtomicSeed();
-  t.after(() => rmSync(seed.root, { recursive: true, force: true }));
-  const f = seed.data as { request: WorksAcceptanceRequest; openGoal: CurrentF5Fixture['goal'];
-    gaps: import('../src/om/gaps.js').GapRecords; gapRead: import('../src/om/gaps.js').GapReadRequest; graph: Ref };
+  const seedResources: AtomicSeedResources = [];
+  t.after(() => {
+    for (const resource of seedResources) {
+      resource.store.close(); rmSync(resource.root, { recursive: true, force: true });
+    }
+  });
+  const seed = await produceAtomicSeed(seedResources);
+  const f = seed.data;
   const all = f.gaps.records.map(row => row.value.gap).filter(gap => gap.code === 'obligation_open'
     && gap.evidence.some(evidence => evidence.origin === 'works'));
   const owned = (gap: (typeof all)[number]) => f.openGoal.goal.questions.includes(gapLineKey('garden', gap.target, gap.field));

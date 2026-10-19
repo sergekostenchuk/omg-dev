@@ -34,9 +34,8 @@ const bodies = {
   'src/om/answers-gate.js': { deriveAnswersGroups: ["G4b.groups", "{ id: evaluation.id, revision: evaluation.revision, hash: evaluation.hash }"] },
   'src/om/model-call.js': { deriveCompletionSnapshot: ["G7.snapshot", "{ id: work.id, revision: work.revision, hash: work.hash }"] },
 };
-// Accepted fixtures reached without their own test registrations, exactly as the F5 seed is (S1.1 adds the G4b one).
+// Expose these test-module fixtures without their registrations. F5 imports om-atomic-seed directly.
 const fixtures = {
-  'test/om-atomic-gate.test.js': { registrations: ['test', 'after'], exports: ['produceAtomicSeed', 'seedResources'] },
   // E2.2 (№1801): the real MC2 node root of a block ended by the scripted answer and the G4b evaluation of a managed attempt.
   'test/om-answers-gate.test.js': { registrations: ['test'], exports: ['fixture', 'registered', 'factGap', 'traceUsage', 'nodeTerminal', 'evaluate'] },
   // S1.1 (№1787-3/4): the accepted H1 pass fixture for the mixed N2 and L3 scenarios.
@@ -143,11 +142,12 @@ const { readAcceptedFrame } = await imports('om/frame-accept');
 const { writeGaps, readGaps } = await imports('om/gaps');
 const { gapLineKey, prepareGapLines, writeGapLines } = await imports('om/gap-lines');
 const { confirmResults } = await imports('om/achievements');
-const { produceAtomicSeed, seedResources } = await import(config.dist + 'test/om-atomic-gate.test.js');
+const { produceAtomicSeed } = await import(config.dist + 'test/om-atomic-seed.js');
+const seedResources = [];
 function ok(result) { if (!result.ok) assert.fail(result.refusal.code + ': ' + result.refusal.message); return result.value; }
 let store, complete = false;
 try {
-  const seed = await produceAtomicSeed(), f = seed.data, database = join(config.directory, 'accepted-checkpoint.sqlite');
+  const seed = await produceAtomicSeed(seedResources), f = seed.data, database = join(config.directory, 'accepted-checkpoint.sqlite');
   copyFileSync(seed.database, database); store = new Store(database);
   const accepted = ok(writeWorksAcceptance(store, f.request)); assert.equal(accepted.state, 'accepted');
   const acceptance = accepted.acceptance, frame = ok(readAcceptedFrame(store, acceptance));
@@ -485,7 +485,11 @@ test('S1 real F5 proof operations scale by exact histories and preserve referenc
   writeFileSync(loaderFile, loader.replace('TYPESCRIPT', JSON.stringify(typescript)));
   writeFileSync(preparedScript, checkpointScenario.replace('CONFIG', configuration));
   writeFileSync(script, scenario.replace('CONFIG', configuration));
-  await promisify(execFile)(process.execPath, [preparedScript], { maxBuffer: 16 * 1024 * 1024 });
+  const prepared = await promisify(execFile)(process.execPath, [preparedScript], { maxBuffer: 16 * 1024 * 1024 })
+    .catch((error: Error & { stdout?: string; stderr?: string }) => {
+      throw new Error(`prepared.mjs failed\nstdout:\n${error.stdout ?? ''}\nstderr:\n${error.stderr ?? ''}`, { cause: error });
+    });
+  assert.equal(prepared.stdout, '', 'The checkpoint producer writes only its file and must not register or run tests');
   const result = await promisify(execFile)(process.execPath, [script], { maxBuffer: 16 * 1024 * 1024 });
   const output = result.stdout.trim().split('\n').at(-1);
   assert.ok(output); const report = JSON.parse(output) as { reports: { label: string }[] };
