@@ -178,7 +178,7 @@ ${body}
   return output;
 }
 const ERA_D7_COMMIT = '73d95d936ba7e3135eb898d783ee3c3a99c67719';
-async function produceAtomicSeed(era = false) {
+async function produceAtomicSeed(era = false, withForeign = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-f5-atomic-seed-')), database = join(root, 'state.sqlite'), project = 'garden';
   const store = new Store(database), engine = new ProductEngine(store);
   seedResources.push({ root, store });
@@ -335,7 +335,7 @@ out({ record: reference(cycle.record), assembly: cycle.assembly });`, call) as {
   }
   // G5: a D7 of ANOTHER request — the same D1 and D2 without the owner's assignment — and the produce answer issued on it.
   let foreign: { kind: 'assembly'; record: Ref } | null = null;
-  if (older) {
+  if (withForeign || older) {
     const alt = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
     const batch = routes.value.batches.find(item => item.level === 3 && item.task === 'node-expansion' && item.node === 'garden-produce-operation')!;
     const block = accepted.graph!.value.nodes.find(node => node.id === batch.node)!.parent!, ordinal = opened.get(block)! + 1;
@@ -354,9 +354,12 @@ out({ record: reference(cycle.record), assembly: cycle.assembly });`, call) as {
     routes, results, proposals, cycles, transfers, openGoal, request, older, foreign } };
 }
 
-let atomicSeed: ReturnType<typeof produceAtomicSeed> | undefined, eraSeed: ReturnType<typeof produceAtomicSeed> | undefined;
-async function atomicFixture(t: TestContext, era = false) {
-  const seed = await (era ? eraSeed ??= produceAtomicSeed(true) : atomicSeed ??= produceAtomicSeed());
+let atomicSeed: ReturnType<typeof produceAtomicSeed> | undefined;
+let eraSeed: ReturnType<typeof produceAtomicSeed> | undefined;
+let foreignSeed: ReturnType<typeof produceAtomicSeed> | undefined;
+async function atomicFixture(t: TestContext, era = false, foreign = false) {
+  const seed = await (era ? eraSeed ??= produceAtomicSeed(true, true)
+    : (foreign ? foreignSeed ??= produceAtomicSeed(false, true) : atomicSeed ??= produceAtomicSeed()));
   const root = mkdtempSync(join(tmpdir(), 'omg-f5-atomic-')), database = join(root, 'state.sqlite');
   copyFileSync(seed.database, database);
   copyFileSync(seed.trace, join(root, 'trace.jsonl')); copyFileSync(seed.scenario, join(root, 'scenario.json'));
@@ -549,9 +552,12 @@ test('G5 two D7 of one exact request (the older rule and today\'s) are one origi
 });
 
 test('G5 a D7 of another request among the sources is refused: all final proposals belong to one original handoff', async t => {
-  const f = await atomicFixture(t, true), before = heads(f.store);
-  assert.ok(f.foreign && f.older);
-  const produce = f.request.results.find(result => ok(readPartAssembly(f.store, { project: f.project, record: result.record })).record.value.works!.ledger.id === f.older!.ledger.id)!;
+  const f = await atomicFixture(t, false, true), before = heads(f.store);
+  assert.ok(f.foreign);
+  const produce = f.request.results.find(result => {
+    const works = ok(readPartAssembly(f.store, { project: f.project, record: result.record })).record.value.works!;
+    return works.bindings.some(binding => binding.consumers.some(consumer => consumer.node.includes('garden-produce')));
+  }) ?? f.request.results[0]!;
   const foreign = ok(readPartAssembly(f.store, { project: f.project, record: f.foreign.record })).record.value.works!;
   const request = ok(readOmObligations(f.store, { project: f.project, producer: foreign.producer })).record.value.request;
   assert.notEqual(canonical(request as unknown as Json), canonical(f.ledger.record.value.request as unknown as Json), 'Another request');

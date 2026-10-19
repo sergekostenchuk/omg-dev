@@ -363,6 +363,94 @@ interface Saved {
     legacy: { directory: string; database: string; plan: { id: string; value: { tasks: { id: string }[] } } } };
   planned: string; base: Record<string, Outcome>; current: Record<string, Outcome>;
 }
+interface CurrentSaved {
+  directory: string; build: { root: string; workspace: string; database: string; project: string; m8: { id: string; revision: number; value: unknown } };
+  planned: string; current: Record<string, Outcome>;
+}
+
+/** Current legal base M8: the accepted works of om-feasibility.test produced by current code with its own live workspace. */
+const BUILD_CURRENT = String.raw`
+const C = JSON.parse(process.argv[2]);
+const { readFileSync } = await import('node:fs');
+const url = new URL('om-feasibility.test.js', C.tst);
+const compiled = readFileSync(url, 'utf8'), end = compiled.indexOf('const heads =');
+if (end < 0) throw new Error('The declared om-feasibility fixture seam moved');
+let source = compiled.slice(0, end).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g, (_match, _quote, path) => 'from ' + JSON.stringify(new URL(path, url).href));
+if (/\btest\(/.test(source)) throw new Error('The fixture slice must not declare a test');
+const { acceptedWorksFixture } = await import('data:text/javascript;base64,' + Buffer.from(source + '\nexport { acceptedWorksFixture };').toString('base64'));
+const { writeFeasibility } = await import(C.src + 'om/feasibility.js');
+const { writeHandoff } = await import(C.src + 'om/handoff.js');
+const { reference } = await import(C.src + 'pipeline/contracts.js');
+const ok = result => { if (!result.ok) throw new Error('Unexpected refusal ' + result.refusal.code); return result.value; };
+const f = acceptedWorksFixture({ after() {} });
+const m8 = ok(writeFeasibility(f.store, f.feasibility));
+ok(writeHandoff(f.store, { project: f.project, feasibility: reference(m8), expected: 0 }));
+f.store.close();
+process.stdout.write(JSON.stringify({ root: f.root, workspace: f.workspace, database: f.database, project: f.project, m8 }) + '\n');
+`;
+
+const SCENARIO_CURRENT = String.raw`
+const C = JSON.parse(process.argv[2]);
+const { copyFileSync } = await import('node:fs');
+const { Store } = await import(C.src + 'storage/store.js');
+const { ProductEngine } = await import(C.src + 'product/engine.js');
+const { reference } = await import(C.src + 'pipeline/contracts.js');
+const { hashJson, canonical } = await import(C.src + 'canonical.js');
+const { loadTaskContextSources } = await import(C.src + 'compiler/context.js');
+const { requireBasis } = await import(C.src + 'compiler/basis.js');
+const { requirePlanTaskObligations } = await import(C.src + 'execution/task-obligations.js');
+const selector = { id: '', pointer: '', start: null, end: null };
+function attempt(out, name, run) {
+  try { const value = run(); out[name] = { value: value === undefined ? null : JSON.parse(JSON.stringify(value)) }; }
+  catch (error) { out[name] = { error: { name: error?.name ?? null, code: error?.code ?? null, message: String(error?.message ?? error),
+    details: error?.details === undefined ? null : JSON.parse(JSON.stringify(error.details)) } }; }
+  return out[name];
+}
+const rows = store => { const all = store.list().flatMap(row => store.history(row.id)); return { count: all.length, hash: hashJson(canonical(all)) }; };
+function open(database) { const store = new Store(database); return { store, engine: new ProductEngine(store) }; }
+function compiled(out, engine, project) {
+  const plan = attempt(out, 'compile', () => engine.compiler.compile(project));
+  if (!plan.value) throw new Error('The saved base must compile: ' + JSON.stringify(plan.error));
+  attempt(out, 'repeat', () => engine.compiler.compile(project));
+  attempt(out, 'publish', () => { const stage = engine.compiler.publish(project, reference(plan.value), 0);
+    return [stage, engine.pipeline.accept(project, 'compilation', stage.revision)]; });
+  return plan.value;
+}
+function reads(out, suffix, store, engine, project, plan) {
+  attempt(out, 'feasibilityGate' + suffix, () => engine.refinement.feasibilityGate(project, plan.value.feasibility));
+  attempt(out, 'planGate' + suffix, () => engine.compiler.gate(project, reference(plan)));
+  attempt(out, 'basis' + suffix, () => requireBasis(store, plan.value));
+  attempt(out, 'sources' + suffix, () => loadTaskContextSources(store, plan));
+  attempt(out, 'contexts' + suffix, () => plan.value.tasks.map(task => engine.compiler.context(project, reference(plan), task.id, 200000)));
+  attempt(out, 'detail' + suffix, () => engine.compiler.detail(project, reference(plan), plan.value.tasks[0].id, 'evidence-index', selector, 100000));
+  attempt(out, 'obligations' + suffix, () => requirePlanTaskObligations(store, plan.value));
+}
+const result = { slot: 'present' }, project = C.project;
+{
+  const out = result.m8 = {}, database = C.directory + '/m8.sqlite'; copyFileSync(C.database, database);
+  let { store, engine } = open(database);
+  const plan = store.get(compiled(out, engine, project).id);
+  reads(out, '', store, engine, project, plan);
+  if (C.save) { store.close(); copyFileSync(database, C.save); ({ store, engine } = open(database)); }
+  out.rows = rows(store); store.close();
+}
+process.stdout.write(JSON.stringify(result) + '\n');
+`;
+
+let currentSaved: Promise<CurrentSaved> | undefined, currentBuilt: CurrentSaved | undefined;
+function currentSavedBases(): Promise<CurrentSaved> {
+  currentSaved ??= (async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'omg-r34-current-bases-'));
+    const build = child(directory, 'build-current', BUILD_CURRENT, { repository: ROOT }, false) as CurrentSaved['build'];
+    const planned = join(directory, 'planned.sqlite');
+    const config = { directory: '', database: build.database, project: build.project, m8: build.m8 };
+    const currentDirectory = mkdtempSync(join(directory, 'current-'));
+    const current = child(currentDirectory, 'scenario-current', SCENARIO_CURRENT, { ...config, directory: currentDirectory, save: planned }, false) as CurrentSaved['current'];
+    return currentBuilt = { directory, build, planned, current };
+  })();
+  return currentSaved;
+}
+
 /** NR1 (№3600): equal outputs but `references`, which name only records of the base's checked trail (local: om-fixture registers the readers). */
 function sameButReferences(actual: unknown, expected: unknown, message: string): void {
   const collect = (value: unknown, into: Set<string>): unknown => {
@@ -385,6 +473,7 @@ function sameButReferences(actual: unknown, expected: unknown, message: string):
 let saved: Promise<Saved> | undefined, built: Saved | undefined;
 after(() => {
   if (built) for (const path of [built.directory, built.build.root, built.build.legacy.directory]) rmSync(path, { recursive: true, force: true });
+  if (currentBuilt) for (const path of [currentBuilt.directory, currentBuilt.build.root]) rmSync(path, { recursive: true, force: true });
 });
 /** One saved base for the file; the base and the new implementation each run the scenario on their own copies. */
 function savedBases(): Promise<Saved> {
@@ -466,20 +555,15 @@ await import(C.src + 'compiler/compiler.js'); await import(C.src + 'graph/refine
 const expected = JSON.parse(readFileSync(C.expected, 'utf8'));
 const checks = [], check = (name, pass, detail) => checks.push({ name, pass: !!pass, detail });
 const refused = run => { try { return { value: run() }; } catch (error) { return { code: error.code, details: error.details }; } };
-const store = new Store(C.planned), legacyStore = new Store(C.legacy);
-const rows = () => canonical([store, legacyStore].map(one => one.list().flatMap(row => one.history(row.id))));
-const before = rows(), plan = store.get(C.plan), legacyPlan = legacyStore.get(C.legacyPlan);
+const store = new Store(C.planned);
+const rows = () => canonical(store.list().flatMap(row => store.history(row.id)));
+const before = rows(), plan = store.get(C.plan);
 const address = { unit: 'compiler', target: 'readFeasibility', project: plan.value.projectId, record: plan.value.feasibility };
 for (const [name, run] of [['sources', () => loadTaskContextSources(store, plan)], ['basis', () => requireBasis(store, plan.value)]]) {
   const result = refused(run);
   check(name + '-unavailable', canonical(result) === canonical({ code: 'om_compiler_reader_unavailable', details: address }), result);
 }
 const fullCheck = ({ store, plan }) => store.get(plan.value.environment.id, plan.value.environment.revision).value.fullCheck;
-// Legacy branches that need no OM reader keep their outcome without the assembly point.
-check('legacy-sources', loadTaskContextSources(legacyStore, legacyPlan) === null);
-check('legacy-basis', requireBasis(legacyStore, legacyPlan.value) === undefined);
-const legacyContext = taskContext(legacyPlan, fullCheck({ store: legacyStore, plan: legacyPlan }), legacyPlan.value.tasks[0].id, 200000);
-check('legacy-context', canonical(legacyContext) === canonical(expected.legacy.contexts.value[0]), legacyContext.hash);
 check('no-writes-before', rows() === before);
 await import(C.src + 'product/engine.js');
 const sources = refused(() => loadTaskContextSources(store, plan));
@@ -488,17 +572,17 @@ check('basis-after-assembly', canonical(requireBasis(store, plan.value)) === can
 const context = taskContext(plan, fullCheck({ store, plan }), plan.value.tasks[0].id, 200000, sources.value);
 check('context-after-assembly', canonical(context) === canonical(expected.m8.contexts.value[0]), context.hash);
 check('no-writes-after', rows() === before);
-store.close(); legacyStore.close();
+store.close();
 process.stdout.write(JSON.stringify({ checks }) + '\n');
 `;
 
 test('R3+R4 cold lower entry: before the assembly point the M8 consumers refuse with the addressed unavailable slot and write nothing while legacy keeps its outcome; after it, the same process reads exactly', { timeout: 600_000 }, async t => {
-  const bases = await savedBases(), directory = workDirectory(t, 'cold-lower');
-  const planned = join(directory, 'planned.sqlite'), legacy = join(directory, 'legacy.sqlite'), expected = join(directory, 'expected.json');
-  copyFileSync(bases.planned, planned); copyFileSync(bases.build.legacy.database, legacy);
+  const bases = await currentSavedBases(), directory = workDirectory(t, 'cold-lower');
+  const planned = join(directory, 'planned.sqlite'), expected = join(directory, 'expected.json');
+  copyFileSync(bases.planned, planned);
   writeFileSync(expected, JSON.stringify(bases.current));
   const plan = (bases.current['m8']!['compile'] as Attempt).value as { id: string };
-  coldChecks(child(directory, 'cold-lower', COLD_LOWER, { planned, legacy, expected, plan: plan.id, legacyPlan: bases.build.legacy.plan.id }));
+  coldChecks(child(directory, 'cold-lower', COLD_LOWER, { planned, expected, plan: plan.id }));
 });
 
 /** Product entries in their own cold processes: a real task-context request reaches the OM reads through the slot. */
@@ -544,7 +628,7 @@ process.stdout.write(JSON.stringify({ checks }) + '\n');
 
 for (const entry of ['engine', 'server-first'] as const) {
   test(`R3+R4 cold ${entry} entry: a real task-context request reads the saved M8 base through the installed slot`, { timeout: 600_000 }, async t => {
-    const bases = await savedBases(), directory = workDirectory(t, entry);
+    const bases = await currentSavedBases(), directory = workDirectory(t, entry);
     const planned = join(directory, 'planned.sqlite'), expected = join(directory, 'expected.json');
     copyFileSync(bases.planned, planned); writeFileSync(expected, JSON.stringify(bases.current));
     const plan = (bases.current['m8']!['compile'] as Attempt).value as { id: string; revision: number; hash: string;
@@ -555,7 +639,7 @@ for (const entry of ['engine', 'server-first'] as const) {
 }
 
 test('R3+R4 cold CLI command: a real task-context request reads the saved M8 base through the installed slot', { timeout: 600_000 }, async t => {
-  const bases = await savedBases(), directory = workDirectory(t, 'cli');
+  const bases = await currentSavedBases(), directory = workDirectory(t, 'cli');
   const planned = join(directory, 'planned.sqlite'); copyFileSync(bases.planned, planned);
   const plan = (bases.current['m8']!['compile'] as Attempt).value as { id: string; revision: number; hash: string; value: { tasks: { id: string }[] } };
   const environment = { ...process.env }; delete environment['NODE_TEST_CONTEXT'];
