@@ -58,7 +58,7 @@ function malformed(error: unknown): boolean {
 function sources(): GapSources {
   const graph = gardenGraph("cross");
   const input: OmInput = {
-    sources: UPSTREAM_STAGES.map(stage => ({ ...fakeRef(`stage:garden:${stage}`), stage, contractVersion: 3 })),
+    sources: UPSTREAM_STAGES.map(stage => ({ ...fakeRef(`stage:garden:${stage}`), stage, contractVersion: 6 })),
     inventory: null, requirements: [{ id: "garden-R1", section: "garden-concept" }, { id: "garden-R2", section: "garden-concept" }],
     criteria: [], contracts: [], questions: [], features: [
       { index: 0, title: "Produce", outcome: "garden-data", behaviorIndexes: [0], requirementIds: ["garden-R1"], contracts: [] },
@@ -71,7 +71,9 @@ function sources(): GapSources {
 }
 function stamp(source: GapSources): void { source.inputResult.hash = hashJson(source.inputResult.input); }
 function question(id: string, kind: SourceQuestion["kind"] = "design-decision", consumer = "garden-consume-operation"): SourceQuestion {
-  return { id, question: `Resolve ${id}`, consumer, kind, blocks: false, source: fakeRef("stage:garden:features") };
+  // Current upstream questions carry their deadline; D1 must not recover it from the kind.
+  const moment = kind === "environment-confirmation" ? "task-start" : kind === "post-implementation-proof" ? "task-result" : "om-pass";
+  return { id, question: `Resolve ${id}`, consumer, kind, blocks: false, moment, source: fakeRef("stage:garden:features") };
 }
 function inputGap(code: string, target: string, field: string, consumer: SourceGap["consumer"]): SourceGap {
   return { code, target, field, consumer, message: `Resolve ${target}/${field}`, source: fakeRef("stage:garden:concept") };
@@ -265,8 +267,9 @@ test("inventory consumer uses are mandatory and every malformed form is an addre
   assert.equal(gateGaps(normalized as GapCollection, reordered).passed, true);
 });
 
-test("knowledge moments use defaults only for new questions and preserve an explicit feasibility deadline", () => {
+test("knowledge moments preserve explicit v6 deadlines including an earlier feasibility deadline", () => {
   const source = sources();
+  assert.ok(source.inputResult.input!.sources.every(row => row.contractVersion === 6));
   const cases = [
     ["repository-fact", "om-pass", ["code", "research"]], ["design-decision", "om-pass", ["design"]],
     ["owner-decision", "om-pass", ["owner"]], ["environment-confirmation", "task-start", ["environment"]],
@@ -874,7 +877,10 @@ test('B1.1 D1 uses the exact question producer era and never defaults missing v4
     assert.ok(!result.gaps.some(gap => gap.target === 'environment'));
   }
   const mixed = clone(source), input = mixed.inputResult.input!;
+  // This mixed-era regression remains explicit until its removal in LG25.
+  input.sources.find(item => item.stage === 'discovery')!.contractVersion = 3;
   const prior = { ...question('old-environment', 'environment-confirmation'), source: fakeRef('stage:garden:discovery') };
+  delete prior.moment;
   input.questions.push(prior); stamp(mixed);
   const history = collectGaps(mixed); assert.deepEqual(history.refusals, []);
   assert.equal(history.gaps.find(gap => gap.target === 'old-environment')!.moment, 'task-start');

@@ -620,14 +620,14 @@ test('MP1.1 row 17: each approved test extension is selected by its actual saved
 test('OWN1 a decided question reaches the packets of its own consumer only; the facts of the own database go with a late environment question', t => {
   const f = sample(t), node = f.basis.node!;
   const decision = (consumer: string, id: string) => ({ question: { id, question: `Which policy for ${id}?`, consumer, kind: 'owner-decision',
-    blocks: false, source: { id: 'stage:garden:discovery', revision: 1, hash: '2'.repeat(64) } },
+    blocks: false, moment: 'om-pass', source: { id: 'stage:garden:discovery', revision: 1, hash: '2'.repeat(64) } },
   value: { decision: `Keep the minimal ${id} policy`, rationale: 'It does not duplicate the stage states',
     alternatives: [{ option: 'Wait for the owner', consequences: 'The pass stands at this question' },
       { option: 'Keep everything forever', consequences: 'The database grows without a bound' }] },
   decision: { id: `om-input-decision:garden:${id}`, revision: 1, hash: '3'.repeat(64) } });
-  const sources = [{ stage: 'discovery', id: 'stage:garden:discovery', revision: 2, hash: '4'.repeat(64), contractVersion: 3 }];
+  const sources = [{ stage: 'discovery', id: 'stage:garden:discovery', revision: 2, hash: '4'.repeat(64), contractVersion: 6 }];
   const environment = { id: 'discovery:live-state', question: 'Which stages are recorded?', consumer: node, kind: 'environment-confirmation',
-    blocks: false, source: sources[0] };
+    blocks: false, moment: 'task-start', source: sources[0] };
   for (const late of [false, true]) {
     const input = { ...(f.basis.input as Record<string, Json>), sources, questions: late ? [environment] : [],
       decided: [decision(node, 'retention'), decision('garden-produce-block', 'elsewhere')] };
@@ -756,26 +756,55 @@ test('RB1 (№4343): a decision B1 applied reaches a v3 brief by the works and p
 // ---- SP1a (№4714): the selected specification is a mandatory part of the brief scope, only in the selection era ----
 import { boundedBrief, BRIEF_SELECTION_CONTRACT } from '../src/om/packet-brief.js';
 import { preparedField } from './preparation-fixture.js';
+import { discoveryBasisCatalogue } from '../src/discovery/discovery-outcome.js';
+import { conceptApplicationFindings, specificationApplicationFindings } from '../src/discovery/preparation-validation.js';
 
 function selectionBasis(t: test.TestContext) {
   const f = sample(t);
+  const discovery = { ref: { id: 'stage:garden:discovery', revision: 2, hash: '4'.repeat(64) },
+    fields: { verdict: preparedField('garden', 'verdict'), preparation: preparedField('garden', 'preparation') } };
+  const concept = { id: 'stage:garden:concept', revision: 2, hash: '5'.repeat(64) };
+  const catalogue = discoveryBasisCatalogue(discovery);
+  const grounds = [catalogue.variant, ...catalogue.constraints];
+  const sections = preparedField('garden', 'conceptSections') as { requirements: Record<string, Json>[] }[];
+  for (const [si, section] of sections.entries()) for (const [ri, requirement] of section.requirements.entries())
+    requirement.applications = grounds.map(entry => ({ contract: 'basis-application/v1', basis: { record: { ...entry.address.record }, pointer: entry.address.pointer },
+      appliedAt: [`/${si}/requirements/${ri}/${entry === catalogue.variant ? 'statement' : 'acceptance/0'}`] }));
   const specification = { id: 'stage:garden:specification', revision: 3, hash: '3'.repeat(64) };
   const features = { id: 'stage:garden:features', revision: 2, hash: '2'.repeat(64) };
   const contract = (preparedField('garden', 'behaviorContracts') as Json[])[0] as Record<string, Json>;
+  contract.applications = grounds.map(entry => ({ contract: 'basis-application/v1', basis: { record: { ...entry.address.record }, pointer: entry.address.pointer },
+    appliedAt: [entry === catalogue.variant ? '/0/entry' : '/0/success/0'] }));
   const preparation = (preparedField('garden', 'featurePreparation') as Json[])[0] as Record<string, Json>;
   const basis: BriefBasis = { ...f.basis,
-    contexts: [...f.basis.contexts, specification, features],
-    accepted: [{ stage: 'specification', ref: specification, fields: { behavior: ['Transform valid input'], constraints: ['Local inputs and outputs only'],
+    contexts: [...f.basis.contexts, discovery.ref, concept, specification, features],
+    accepted: [{ stage: 'discovery', ...discovery }, { stage: 'concept', ref: concept, fields: { conceptSections: sections } },
+      { stage: 'specification', ref: specification, fields: { behavior: ['Transform valid input'], constraints: ['Local inputs and outputs only'],
       behaviorContracts: [contract] } }, { stage: 'features', ref: features, fields: { features: [{ title: 'Deliver result', outcome: 'garden-result', requirements: [0] }],
       featurePreparation: [preparation] } }],
     input: { requirements: [], criteria: [], questions: [],
-      sources: [{ ...specification, stage: 'specification', contractVersion: 5 }, { ...features, stage: 'features', contractVersion: 5 }],
+      sources: [{ ...discovery.ref, stage: 'discovery', contractVersion: 6 }, { ...concept, stage: 'concept', contractVersion: 6 },
+        { ...specification, stage: 'specification', contractVersion: 6 }, { ...features, stage: 'features', contractVersion: 6 }],
       contracts: [{ id: 'garden-B1', nodes: ['garden-consume-block'], requirements: ['garden-R1'], outcome: 'garden-result', actor: 'garden-user',
         success: contract.success!, failures: contract.failures!, forbiddenEffects: contract.forbiddenEffects!, state: contract.state!, proof: contract.proof! }],
       features: [{ index: 0, title: 'Deliver result', outcome: 'garden-result', behaviorIndexes: [0], requirementIds: ['garden-R1'], contracts: ['garden-B1'] }] } as Json };
   const scope = (payload: Record<string, any>) => JSON.parse(packetPrompt(payload).split('# Scope and exact context\n')[1]!.split('\n')[0]!).input;
-  return { ...f, basis, contract, preparation, scope };
+  return { ...f, basis, contract, preparation, scope, catalogue, sections };
 }
+
+test('LG03 selected v6 sources carry the exact Discovery grounds through Concept and Specification', t => {
+  const f = selectionBasis(t);
+  assert.deepEqual((f.basis.input as { sources: { contractVersion: number }[] }).sources.map(source => source.contractVersion), [6, 6, 6, 6]);
+  assert.deepEqual(conceptApplicationFindings(f.sections, f.catalogue), []);
+  assert.deepEqual(specificationApplicationFindings([f.contract], f.sections, f.catalogue), []);
+  const missing = structuredClone(f.sections); delete missing[0]!.requirements[0]!.applications;
+  assert.ok(conceptApplicationFindings(missing, f.catalogue).length, 'v6 requires explicit basis applications');
+  const missingContract = structuredClone(f.contract); delete missingContract.applications;
+  assert.ok(specificationApplicationFindings([missingContract], f.sections, f.catalogue).length, 'a v6 contract must inherit its requirement grounds');
+  const foreign = structuredClone(f.catalogue); foreign.source.hash = '0'.repeat(64);
+  foreign.variant.address.record.hash = '0'.repeat(64);
+  assert.ok(specificationApplicationFindings([f.contract], f.sections, foreign).length, 'an application cannot name another Discovery revision');
+});
 
 test('SP1a №4714 §2.1: a basis without the selection declaration shows no section — the brief differs from the selection era by exactly that section', t => {
   const f = selectionBasis(t);

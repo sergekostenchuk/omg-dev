@@ -55,7 +55,7 @@ function malformed(error: unknown): boolean {
 function source(): GapSources {
   const graph = gardenGraph("cross");
   const input: OmInput = {
-    sources: UPSTREAM_STAGES.map(stage => ({ ...ref(`stage:garden:${stage}`), stage, contractVersion: 3 })),
+    sources: UPSTREAM_STAGES.map(stage => ({ ...ref(`stage:garden:${stage}`), stage, contractVersion: 6 })),
     inventory: null, requirements: [{ id: "garden-R1", section: "garden-concept" }, { id: "garden-R2", section: "garden-concept" }],
     criteria: [], contracts: [], questions: [], features: [
       { index: 0, title: "Produce", outcome: "garden-data", behaviorIndexes: [0], requirementIds: ["garden-R1"], contracts: [] },
@@ -66,8 +66,10 @@ function source(): GapSources {
   return { inputResult: { input, hash: hashJson(input), gaps: [], refusals: [] }, graph,
     frameGaps: { operations: [], works: [] }, horizon: { nodes: graph.nodes.filter(node => node.kind === "block").map(node => node.id) } };
 }
-function question(id: string, kind: OmInput["questions"][number]["kind"] = "repository-fact", consumer = "garden-consume-operation") {
-  return { id, question: `Resolve ${id}`, consumer, kind, blocks: false, source: ref("stage:garden:features") };
+function question(id: string, kind: OmInput["questions"][number]["kind"] = "repository-fact", consumer = "garden-consume-operation"): OmInput["questions"][number] {
+  // Current upstream questions carry their deadline; D1 must not recover it from the kind.
+  const moment = kind === "environment-confirmation" ? "task-start" : kind === "post-implementation-proof" ? "task-result" : "om-pass";
+  return { id, question: `Resolve ${id}`, consumer, kind, blocks: false, moment, source: ref("stage:garden:features") };
 }
 function missing(code: string, target: string, field: string, consumer: SourceGap["consumer"]): SourceGap {
   return { code, target, field, consumer, message: `Resolve ${target}/${field}`, source: ref("stage:garden:concept") };
@@ -184,6 +186,7 @@ function routesFixture(t: TestContext, withEncoding = false) {
 // question keeps the owner route and no batch.
 test("D4 retains the source-derived knowledge routes and resolution moments", () => {
   const sources = source();
+  assert.ok(sources.inputResult.input!.sources.every(row => row.contractVersion === 6));
   const cases = [
     ["repository-fact", "research", "om-pass"], ["design-decision", "design", "om-pass"],
     ["owner-decision", "design", "om-pass"], ["environment-confirmation", "environment", "task-start"],
