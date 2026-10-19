@@ -1,7 +1,7 @@
 import { assessmentRolePrompt } from './assessment-session.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
-import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, executionOf } from './model-call-recovery.js';
+import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, readModelCallRecovery, executionOf } from './model-call-recovery.js';
 import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowance } from "./invocation-progress.js";
 import { requireContextDelivery } from "./context-workspace.js";
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
@@ -10,7 +10,7 @@ import { continuationState, continuationDispatch, continuationMetadata, continua
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
 import { phasePolicy } from "./phase-policy.js";
-import { budgetSegment, budgetUsage, budgetGroups, assertQuestionBudget, reserveResearchCall } from "../runtime/research-budget.js";
+import { budgetSegment, budgetUsage, budgetGroups, assertQuestionBudget, reserveResearchCall, type BudgetSegment, type CallEstimate } from "../runtime/research-budget.js";
 import { planningForQuestion } from "./research-routing.js";
 import { researchScope } from "../graph/research-scope.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
@@ -38,6 +38,9 @@ import { projectResearchPhysicalReply } from './research-consumer-transition.js'
 import { earlyResearchStage, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS, RESULT_CAPACITY } from './early-research-outcome.js';
 import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite } from '../om/run-control.js';
 import { REQUEST_MANIFEST_CONTRACT, prepareRequestPartsAndManifest, partitionResearchWire } from './request-parts.js';
+
+import { isDiscoveryV7Draft } from './v7-contracts.js';
+import { stageBudgetPlan, DISCOVERY_V7_STAGE_BUDGET_KEY } from './stage-token-budget.js';
 
 export { researchAction } from './research-consumer-transition.js';
 
@@ -285,6 +288,12 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   if (assessment?.kind === 'application' && assessment.application.value.context.resultCapacityContract !== undefined
     && prompt === assessment.application.value.prompt) prompt = assessmentRolePrompt(prompt);
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
+  // Unbound audit labels belong to the general transport API. A saved question
+  // or a producer's Discovery address must never lose its draft and dispatch free.
+  if (audit && (draft || audit.questionId || audit.draftId.startsWith('discovery:')))
+    requireCondition(draft?.kind === 'discovery-draft' && recordValue(draft.value)
+      && draft.value.projectId === environment.projectId && Array.isArray(draft.value.questions)
+      && Array.isArray(draft.value.inputs), 'discovery_draft_invalid', 'The call needs its saved project draft');
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
   let segment = null;
   let groups: string[] = [];
@@ -345,6 +354,35 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const replay = !consumerIntent && audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
     audit.questionId, audit.purpose, input) : null;
   if (replay) return replay.research;
+  // Budget admission is only for a NEW send: every paid-return path above is free.
+  const originalDraft = audit && draft ? audit.store.get<DiscoveryDraft>(draft.id, 1) : null;
+  const stageV7 = isDiscoveryV7Draft(draft?.value) || isDiscoveryV7Draft(originalDraft?.value);
+  const stagePlan = stageV7 && audit && draft ? stageBudgetPlan(audit.store, draft) : null;
+  let stageSegment: Revision<BudgetSegment> | null = null;
+  let stageEstimate: CallEstimate | null = null;
+  let stageRemaining = 0;
+  const stageFailure = (code: string, message: string): never => {
+    throw new EngineError(code, message, { segment: stageSegment ? reference(stageSegment) : null,
+      class: 'research', remaining: stageRemaining, estimate: stageEstimate });
+  };
+  if (stagePlan && audit && draft) {
+    requireCondition(isDiscoveryV7Draft(draft.value), 'discovery_draft_invalid', 'A v7 draft cannot lose its era');
+    requireCondition(typeof audit.purpose === 'string' && audit.purpose.length > 0 && packetState !== null,
+      'discovery_draft_invalid', 'A v7 send needs its saved question and purpose');
+    stageSegment = 'saved' in stagePlan.target ? stagePlan.target.saved : {
+      id: stagePlan.writes[0]!.id, kind: 'research-budget', revision: 1,
+      value: stagePlan.target.creating, hash: hashJson(stagePlan.target.creating) };
+    const usage = stagePlan.isNew ? { measured: 0, reserved: 0 } : budgetUsage(audit.store, stageSegment);
+    stageRemaining = stageSegment.value.limit - stageSegment.value.completionReserve! - usage.measured - usage.reserved;
+    if (usage.measured > stageSegment.value.limit)
+      stageFailure('discovery_budget_overrun', 'Actual stage usage forbids another paid send');
+    try { stageEstimate = estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length,
+      packetState?.initial === false ? 'continuation' : 'initial'); }
+    catch (error) {
+      if (error instanceof EngineError && error.code === 'budget_estimate_missing') stageFailure(error.code, error.message);
+      throw error;
+    }
+  }
   const control = audit && draft && earlyResearchStage(draft.value.stage)
     ? new RunControlGate(audit.store, environment.projectId) : null;
   try { control?.admit(); }
@@ -355,13 +393,30 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
   const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>):null;
   const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
-  const reservation = !segment && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
+  const reservation = !segment && !stagePlan && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
   const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length, packetState?.initial === false ? "continuation" : "initial") : null;
   if (segment && audit && estimate) {
     requireCondition(input.length <= requestLimit!, "pilot_request_limit", "Complete envelope exceeds its working limit");
     const reserved = reserveResearchCall(audit.store, segment, callId, groups, estimate);
     reservation.writes.push(...reserved.writes);
     reservation.guards.push(...reserved.guards, reference(policy!), reference(audit.pilot!), reference(draft!), reference(protectedQuestion!), ...draft!.value.inputs);
+  }
+  if (stagePlan && stageEstimate && audit && draft) {
+    // The closing-kind whitelist is empty until DR6/DR7. No caller/model field
+    // (role, purpose, finalization mode or attempt end) grants completion funds.
+    try {
+      const reserved = reserveResearchCall(audit.store, stagePlan.target, callId,
+        [DISCOVERY_V7_STAGE_BUDGET_KEY], stageEstimate, 'research');
+      reservation.writes.push(...reserved.writes);
+      reservation.guards.push(...reserved.guards, reference(draft), ...draft.value.inputs);
+    } catch (error) {
+      if (error instanceof EngineError && ['budget_segment_exhausted', 'budget_question_limit', 'budget_owner_group_limit'].includes(error.code)) {
+        const latest = stagePlan.isNew ? { measured: 0, reserved: 0 } : budgetUsage(audit.store, stageSegment!);
+        stageRemaining = stageSegment!.value.limit - stageSegment!.value.completionReserve! - latest.measured - latest.reserved;
+        stageFailure(latest.measured > stageSegment!.value.limit ? 'discovery_budget_overrun' : 'discovery_budget_reserve', error.message);
+      }
+      throw error;
+    }
   }
   if(audit){
     const projectCounterId=`project-dispatch:${hashJson(environment.projectId)}`;
@@ -411,6 +466,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const callWrite: Write = { id: callId, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit?.draftId ?? "", purpose: audit?.purpose ?? "", requestId,
       ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
+      ...(stageSegment && stageEstimate ? { budget: { segment: reference(stageSegment),
+        groups: [DISCOVERY_V7_STAGE_BUDGET_KEY], estimate: stageEstimate } } : {}),
       ...(progress?{progressKey:progress.key}:{}),
       ...(ownership ?? {}),
       ...(audit?.application ? { assessmentApplication: audit.application } : {}),
@@ -527,12 +584,44 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
           ? { runtime: { ...runtime, status: 'unavailable', error: 'call_runtime_finalize_pending' } } : {}) };
         const linked = stopCancel && patch.status === 'failed' && patch.error === 'process_cancelled'
           ? [callStopCancelWrite(environment.projectId, { id: call.id, revision: call.revision + 1, hash: hashJson(terminal) }, stopCancel)] : [];
-        call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision, value: terminal },
-          ...responseWrites, ...linked])[0]!;
+        // A terminal snapshot includes every charged call and the ledger head.
+        // A competing accounting revision only invalidates this snapshot. Keep
+        // the paid bytes until a coherent batch commits; it cannot turn a live
+        // dispatch into process_lost by exhausting an arbitrary retry count.
+        for (;;) {
+          const incident: Write[] = [], guards: TransactionGuard[] = [];
+          if (stageSegment) {
+            const usage = budgetUsage(audit.store, stageSegment);
+            const used = (value: ModelCall) => value.usage ? value.usage.inputTokens + value.usage.outputTokens : 0;
+            const measured = usage.measured - used(call.value) + used(terminal);
+            guards.push(...usage.guards, ...(usage.ledger ? [reference(usage.ledger)] : []));
+            if (measured > stageSegment.value.limit) incident.push({ id: `budget-incident:${requestId}`,
+              kind: 'budget-incident', expected: 0, value: { projectId: environment.projectId,
+                segment: reference(stageSegment), call: { id: call.id, revision: call.revision + 1, hash: hashJson(terminal) },
+                reason: 'Actual stage usage exceeded the budget; subsequent paid sends are forbidden' } });
+          }
+          try {
+            call = audit.store.writeMany<ModelCall>([{ id: call.id, kind: call.kind, expected: call.revision, value: terminal },
+              ...responseWrites, ...linked, ...incident], guards)[0]!;
+            break;
+          } catch (error) {
+            if (!stageSegment || !(error instanceof EngineError) || error.code !== 'input_stale') throw error;
+            const changed = audit.store.headsMatch(guards).mismatches, ownId = call.id;
+            // Only other charged calls / the ledger may move. A changed own
+            // dispatch or segment is a different conflict, never this retry.
+            if (!changed.length || changed.some(item => item.id === ownId || item.id === stageSegment.id)) throw error;
+          }
+        }
       } catch (error) {
         if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code) || !physicalResult) throw error;
         // A recovery may win the runtime CAS. Keep the observed physical bytes
         // under the same authorized dispatch instead of dropping paid evidence.
+        if (stageSegment) {
+          const head = audit.store.get<ModelCall>(call.id);
+          if (head?.value.status !== 'failed' || head.value.error !== 'process_lost' || !head.value.recovery) throw error;
+          const recovered = readModelCallRecovery(audit.store, environment.projectId, reference(head));
+          if (canonical(reference(recovered.original)) !== canonical(reference(call))) throw error;
+        }
         const late = prepareLateModelReceipt(audit.store, environment.projectId, reference(call), { process: physicalResult, launchError: null });
         audit.store.writeMany(late.writes, late.guards);
         throw error;
