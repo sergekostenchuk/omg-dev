@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
@@ -922,12 +922,7 @@ test("RD3: a recovered blocked root executes its exact successor once, including
   // Earlier command tests install a mock deriver; this scenario exercises the real packet producer.
   registerSuccessorDeriver({ deriveCapacitySuccessorPacket });
   // Reuse the real managed-pass fixture without registering the neighbouring suite's tests.
-  const module = new URL(`./.rd3-run-fixture-${process.pid}.mjs`, import.meta.url);
-  const source = readFileSync(new URL("./om-run.test.js", import.meta.url), "utf8")
-    .replace(/import test from ["']node:test["'];/, "const test = () => {};");
-  writeFileSync(module, `${source}\nexport { runFixture, addressAll };\n`);
-  t.after(() => rmSync(module, { force: true }));
-  const { runFixture, addressAll } = await import(module.href);
+  const { runFixture, addressAll } = await import("./om-run-fixture.js");
   const f = runFixture(t, ["encoding"]);
   const bases = f.bases();
   f.environment(5_000);

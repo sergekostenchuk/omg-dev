@@ -1097,7 +1097,7 @@ const { withHistoricalReads } = await imports('om/input');
 const { journalId, readJournalAt } = await imports('om/refusal-journal');
 const { readQuestionPacket } = await imports('om/question-packet');
 const { startRun, advanceRun } = await imports('om/run');
-const h1 = await import(config.dist + 'test/om-run.test.js');
+const h1 = await import(config.dist + 'test/om-run-fixture.js');
 ` + monitorTail + passDriver + String.raw`
 const outcomes = {};
 try {
@@ -1204,7 +1204,7 @@ const { withHistoricalReads } = await imports('om/input');
 const { journalId, readJournalAt } = await imports('om/refusal-journal');
 const { readQuestionPacket } = await imports('om/question-packet');
 const { startRun, advanceRun } = await imports('om/run');
-const h1 = await import(config.dist + 'test/om-run.test.js');
+const h1 = await import(config.dist + 'test/om-run-fixture.js');
 ` + monitorTail + passDriver + String.raw`
 try {
   // ---- R5: L3 produce → consume of the atomic seed with mixed outcomes: the consuming block's first work is refused,
