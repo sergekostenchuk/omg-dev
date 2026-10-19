@@ -3,7 +3,7 @@ import { measureAdapterWire, OM_CAPACITY_DELIVERY_CONTRACT, requireOmCapacityDel
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -45,10 +45,10 @@ import { ONE_ARTIFACT, prepareFrameProposals, readFrameProposals, type LayerProp
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
-import { gardenGraph } from './om-fixture.js';
+import { gardenGraph, prepareOmFixtureStages, prepareNativeLayers } from './om-fixture.js';
 // OMMC-SPLIT: the managed-cycle helpers moved to a shared fixture module; importing it registers no tests.
 import { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit } from './om-model-call-fixture.js';
-import { preparedFeatures, refinedLayers, withHistoricalUpstream } from './product-fixture.js';
+import { preparedFeatures, withHistoricalUpstream } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
 const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => any } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
@@ -1515,35 +1515,31 @@ test('NR1 (№3591) a journal is read as written: the sources its rows name are 
   });
 });
 
-function emptyPacketFixture(t: TestContext, historicalCommit?: string) {
+function emptyPacketFixture(t: TestContext, _historicalCommit?: string) {
   const root = mkdtempSync(join(tmpdir(), 'omg-packet-accepted-')), database = join(root, 'state.sqlite');
+  const workspace = join(root, 'workspace');
+  mkdirSync(workspace);
+  writeFileSync(join(workspace, 'README.md'), 'Current accepted OM layers for empty-packet testing.\n');
+  for (const args of [['init', '-b', 'main'], ['add', 'README.md'],
+    ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'fixture baseline']])
+    execFileSync('git', args, { cwd: workspace, stdio: 'pipe' });
   const store = new Store(database), engine = new ProductEngine(store), project = 'garden';
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  writeFileSync(join(root, 'README.md'), 'Native accepted garden layers for empty-packet testing.\n');
-  preparedFeatures(engine, project, gardenGraph(), undefined, historicalCommit);
+  const desired = gardenGraph();
+  prepareOmFixtureStages(engine, project, desired);
   const command = { executable: process.execPath, args: ['--version'] };
-  const environment = engine.environments.configure(project, { workspace: root,
+  const environment = engine.environments.configure(project, { workspace,
     implementer: { actor: 'accepted-layer-worker', model: 'fixture', effort: 'high', command },
-    reviewer: { actor: 'accepted-layer-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
-  refinedLayers(engine, project);
-  const graph = store.get<Graph>(`graph:${project}`)!;
-  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-  const base = ok(writeOmInput(store, { project, stages, expected: 0 }));
-  const decisions = base.value.gaps.filter(gap => gap.code !== 'inventory_missing').map(gap => {
-    assert.ok(['contract_node_unbound', 'acceptance_kind_missing', 'contract_boundary_prose'].includes(gap.code), gap.code);
-    const field = gap.code === 'contract_node_unbound' ? 'nodes' : gap.code === 'acceptance_kind_missing' ? 'checkKind' : 'state';
-    const value: Json = field === 'nodes' ? ['garden-produce-block', 'garden-consume-block'] : field === 'checkKind' ? 'test'
-      : { writer: 'garden-produce-block', authority: 'garden-user', rollback: 'garden-produce-block' };
-    return { pending: clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
-      decision: { target: gap.target, field, value } })) as Write };
-  });
-  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions }));
+    reviewer: { actor: 'accepted-layer-reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000,
+    requestCapacityChars: 100_000 }, 0);
+  prepareNativeLayers(engine, project, desired, 'executed');
+  const graph = store.get<Graph>(`graph:${project}`)!, input = store.get(`om-input:${project}`)!;
   const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph),
-    refinement: reference(store.get(`phase:${project}:L2`)!), available: {},
+    refinement: reference(store.get(`graph-layer:${project}:2`)!), available: {},
     choice: { choiceVersion: 'all-layers-accepted', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const frame = (level: 2 | 3) => ({ proposals: [], frame: { project, level, graph: reference(graph), horizon: reference(horizon.gate),
-    layer: reference(store.get(`graph-layer:${project}:${level}`)!), frame: null,
-    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: null } } });
+    layer: reference(store.get(`graph-layer:${project}:${level}`)!), frame: reference(store.get(`om-frame:${project}:${level}`)!),
+    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: reference(store.get(`om-frame:${project}:2`)!) } } });
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate), operations: frame(2), works: frame(3) };
   const operations = ok(prepareFrameProposals(store, sources.operations)), works = ok(prepareFrameProposals(store, frame(3)));
   assert.deepEqual(operations.gaps, []); assert.deepEqual(works.gaps, []);
@@ -1760,25 +1756,19 @@ test('E2 admits an MC2 missing input field with a proven block consumer under th
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(blocked) })), blocked);
 });
 
-// Dynamic imports let the same fixture run under the immutable historical producer's complete module graph.
-async function workExpansionFixture(database: string, root: string, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false, historicalCommit?: string) {
+// Prepare current N2 while keeping L3 genuinely open for the packet's producer.
+async function workExpansionFixture(database: string, root: string, late?: 'multiple' | 'overlap' | 'initial-realizes', initialWorks = false, _historicalCommit?: string) {
   const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default;
   const { writeFileSync } = await import('node:fs'), { join } = await import('node:path');
   const { canonical } = await import('../src/canonical.js');
   const { Store } = await import('../src/storage/store.js');
   const { ProductEngine } = await import('../src/product/engine.js');
-  const { projectGraph } = await import('../src/graph/project.js');
   const { reference } = await import('../src/pipeline/contracts.js');
-  const { UPSTREAM_STAGES } = await import('../src/discovery/requirements.js');
-  const { writeOmInput } = await import('../src/om/input.js');
   const { writeHorizon } = await import('../src/om/horizon.js');
   const { writeGaps } = await import('../src/om/gaps.js');
   const { writeRoutes } = await import('../src/om/routes.js');
   const { gapLineKey, gapLineExpectedResult } = await import('../src/om/gap-lines.js');
-  const { gardenGraph } = await import('./om-fixture.js');
-  const { preparedFeatures } = await import('./product-fixture.js');
-  const { answerTechnicalFixture } = await import('./technical-research-fixture.js');
-  const { answerLayerFixture } = await import('./layer-design-fixture.js');
+  const { gardenGraph, prepareOmFixtureStages, prepareNativeLayers } = await import('./om-fixture.js');
   const { preparedField } = await import('./preparation-fixture.js');
   const { inputDecisionWrite, writeAddressing } = await import('../src/om/addressing.js');
   const { prepareFrame } = await import('../src/om/frame-obligations.js');
@@ -1795,30 +1785,24 @@ async function workExpansionFixture(database: string, root: string, late?: 'mult
     if (late && late !== 'initial-realizes') desired.edges!.push({ id: 'e21-shared-consumer', relation: 'realizes',
       source: late === 'multiple' ? 'garden-produce-operation' : 'garden-consume-operation',
       target: late === 'multiple' ? 'garden-consume-block' : 'garden-produce-block', condition: 'The operation also serves this accepted consumer' });
-    const { level: _level, ...l1 } = projectGraph(desired, 1);
     const responsible = late === 'initial-realizes' ? 'garden-consume-operation'
       : late === 'multiple' ? 'garden-produce-operation' : 'garden-produce-block';
-    preparedFeatures(engine, project, l1 as Graph, field => {
+    prepareOmFixtureStages(engine, project, desired, field => {
       const value = preparedField(project, field);
       if (late && field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'work-proof',
         question: 'Which result proof do these work consumers retain?', consumer: responsible,
         moment: 'task-result', blocksCurrentStage: false, resolution: 'Carry this result proof until work execution' }];
       return value;
-    }, historicalCommit);
-    const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-    let input = ok(writeOmInput(store, { project, expected: 0, stages }));
+    });
     const command = { executable: process.execPath, args: ['--version'] };
     const environment = engine.environments.configure(project, { workspace: root,
       implementer: { actor: 'fixture-researcher', model: 'fixture', effort: 'high', command },
       reviewer: { actor: 'fixture-assessor', model: 'fixture', effort: 'high', command },
       fullCheck: command, timeoutMs: 5000, requestCapacityChars: 100_000 }, 0);
-    const r0 = engine.refinement.begin(project, 'R0');
-    engine.refinement.finishResearch(project, 'R0', reference(r0), 0); engine.refinement.sealLayer(project, 1, 0);
-    const r1 = engine.refinement.begin(project, 'R1'); answerTechnicalFixture(engine, project, r1);
-    engine.refinement.finishResearch(project, 'R1', reference(store.get(r1.id)!), 0);
-    const design = engine.refinement.prepareLayer(project, 2), answered = answerLayerFixture(engine, project, design, 2, desired);
-    const graph = engine.refinement.buildLayer(project, 2, reference(answered), store.get(`graph:${project}`)!.revision, 'fixture-researcher');
-    const layer = engine.refinement.sealLayer(project, 2, 0);
+    prepareNativeLayers(engine, project, desired, 'n2');
+    const graph = store.get<Graph>(`graph:${project}`)!, layer = store.get(`graph-layer:${project}:2`)!;
+    const frame2 = reference(store.get(`om-frame:${project}:2`)!);
+    let input: Sealed<Revision<import('../src/om/input.js').OmInputRecord>> = store.get<import('../src/om/input.js').OmInputRecord>(`om-input:${project}`)!;
     if (late) input = ok(writeAddressing(store, { project, input: reference(input), graph: reference(graph),
       decisions: [{ pending: inputDecisionWrite({ project, input: reference(input), graph: reference(graph),
         layers: late !== 'overlap' ? [reference(store.get(`graph-layer:${project}:2`)!)] : [],
@@ -1827,9 +1811,9 @@ async function workExpansionFixture(database: string, root: string, late?: 'mult
       choice: { choiceVersion: 'e2-first-work-pass', features: [{ outcome: 'garden-result' }], excluded: [] } }));
     const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
       operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
-        layer: reference(store.get(`graph-layer:${project}:2`)!), frame: null, upper: null } },
+        layer: reference(store.get(`graph-layer:${project}:2`)!), frame: frame2, upper: null } },
       works: { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
-        layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } };
+        layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: frame2 } } } };
     if (initialWorks) {
       assert.ok(!('state' in sources.works));
       const frame = ok(prepareFrame(store, sources.works.frame));
