@@ -1,6 +1,6 @@
 import { digest } from "../canonical.js";
 import { requireCondition } from "../errors.js";
-import { Store } from "./store.js";
+import { Store, type Revision } from "./store.js";
 import { referenceSites } from "./reference-sites.js";
 
 /**
@@ -14,7 +14,7 @@ import { referenceSites } from "./reference-sites.js";
  */
 export const INTEGRITY_FINDING_CODES = Object.freeze([
   "revision_corrupt", "revision_gap", "head_invalid", "event_missing", "event_duplicate", "event_order",
-  "reference_missing", "reference_forged",
+  "reference_missing", "reference_forged", "record_missing",
 ] as const);
 export type IntegrityFindingCode = typeof INTEGRITY_FINDING_CODES[number];
 export interface IntegrityFinding {
@@ -23,12 +23,18 @@ export interface IntegrityFinding {
 }
 export interface IntegrityReport { lastSequence: number; revisions: number; events: number; references: number; findings: IntegrityFinding[] }
 
-export function checkStoreIntegrity(store: Store): IntegrityReport {
+/** A domain check consumes the same decoded revisions and finishes inside the same snapshot. */
+export interface IntegrityRecordCheck {
+  record(record: Revision<unknown>): void;
+  findings(): IntegrityFinding[];
+}
+
+export function checkStoreIntegrity(store: Store, additional?: IntegrityRecordCheck): IntegrityReport {
   requireCondition(store instanceof Store, "integrity_request_invalid", "The integrity check reads a store");
   // №3674 п.1: one committed snapshot for the whole check — never events of one moment and heads of another.
-  return store.integritySnapshot(() => checkSnapshot(store));
+  return store.integritySnapshot(() => checkSnapshot(store, additional));
 }
-function checkSnapshot(store: Store): IntegrityReport {
+function checkSnapshot(store: Store, additional?: IntegrityRecordCheck): IntegrityReport {
   const findings: IntegrityFinding[] = [];
   const found = (code: IntegrityFindingCode, id: string, revision: number | null, message: string,
     field: string | null = null, ref: IntegrityFinding["ref"] = null) => findings.push({ code, id, revision, field, ref, message });
@@ -70,6 +76,7 @@ function checkSnapshot(store: Store): IntegrityReport {
     if (row.revision > (covered.get(row.id) ?? 0)) continue;
     let body: unknown;
     try { body = JSON.parse(row.body); } catch { continue; }
+    additional?.record({ id: row.id, kind: row.kind, revision: row.revision, hash: row.sha256, value: body });
     for (const { field, ref } of referenceSites(row.kind, body)) {
       references++;
       const target = hashes.get(ref.id)?.[ref.revision - 1];
@@ -79,5 +86,6 @@ function checkSnapshot(store: Store): IntegrityReport {
         field, ref);
     }
   }
+  findings.push(...(additional?.findings() ?? []));
   return { lastSequence, revisions, events: events.length, references, findings };
 }

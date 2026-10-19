@@ -1,3 +1,4 @@
+import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -640,15 +641,18 @@ function provenanceFixture(t: TestContext) {
   return { database, get store() { return store; }, get engine() { return engine; },
     reopen() { store.close(); store = new Store(database); engine = new ProductEngine(store); } };
 }
-/** The refusal of #omProject at the exact first B1 address — through the legacy route and through the projection. */
+/** G7: the same provenance predicate now refuses at the fsck/start boundary. */
 function refusesProvenance(engine: ProductEngine, project = 'p') {
-  const provenance = (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-    && canonical(error.details) === canonical({ unit: 'product', target: `om-input:${project}`, field: 'revision' });
-  assert.throws(() => engine.legacyRoute(project), provenance);
-  assert.throws(() => engine.projection(project), provenance);
+  assert.equal(engine.legacyRoute(project).om, false);
+  const result = runIntegrityCheck(engine.store, { project }); assert.ok(result.ok);
+  assert.ok(result.value.value.findings.some(f => f.code === 'record_missing' && f.id === `om-input:${project}` && f.revision === 1));
+  assert.equal(integrityGate(engine.store, project)?.ok, false);
 }
-const stillLegacy = (engine: ProductEngine, project = 'p') =>
+const stillLegacy = (engine: ProductEngine, project = 'p') => {
   assert.deepEqual(engine.legacyRoute(project), { om: false, guards: [{ id: `om-input:${project}`, absent: true }] });
+  const report = runIntegrityCheck(engine.store, { project }); assert.ok(report.ok);
+  assert.ok(!report.value.value.findings.some(f => f.code === 'record_missing' && f.id === `om-input:${project}`));
+};
 
 /** One record per class of the provenance table (and of its negatives), written without a first B1 of 'p'. */
 const PROVENANCE_ROWS: { name: string; row: { id: string; kind: string; value: unknown }; refused: boolean; refusedQ?: boolean }[] = [

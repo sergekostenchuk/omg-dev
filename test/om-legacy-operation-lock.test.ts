@@ -1,3 +1,4 @@
+import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, watch, writeFileSync } from 'node:fs';
@@ -861,11 +862,14 @@ test('G1.4 persisted repair release requires complete own result, defect and par
 // ---- S1.5 (№2363): the search for saved OM provenance follows the Store it is given ----
 
 const legacyRoute = (engine: ProductEngine) => engine.legacyRoute('p');
-const provenanceRefusal = (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-  && canonical(error.details) === canonical({ unit: 'product', target: 'om-input:p', field: 'revision' });
+const provenanceRefusal = (store: Store) => {
+  const report = runIntegrityCheck(store, { project: 'p' }); assert.ok(report.ok);
+  assert.ok(report.value.value.findings.some(f => f.code === 'record_missing' && f.id === 'om-input:p' && f.revision === 1));
+  assert.equal(integrityGate(store, 'p')?.ok, false);
+};
 const bareLegacy = { om: false, guards: [{ id: 'om-input:p', absent: true }] };
 
-test('S1.5 №2363 a provenance record written by a second Store refuses the next pass of the first Store and of a cold reopening alike', t => {
+test('S1.5 №2363 a provenance record written by a second Store refuses fsck and the integrity gate before and after reopening', t => {
   const directory = mkdtempSync(join(tmpdir(), 'omg-s15-second-')), database = join(directory, 'state.sqlite');
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
@@ -873,12 +877,12 @@ test('S1.5 №2363 a provenance record written by a second Store refuses the nex
   assert.deepEqual(legacyRoute(engine), bareLegacy);
   const other = new Store(database);
   try { other.write({ id: 'om-horizon:p:h1', kind: 'om-horizon', expected: 0, value: {} }); } finally { other.close(); }
-  assert.throws(() => legacyRoute(engine), provenanceRefusal, 'The first Store sees the record the second one wrote');
+  assert.deepEqual(legacyRoute(engine), bareLegacy); provenanceRefusal(store);
   store.close(); store = new Store(database); engine = new ProductEngine(store);
-  assert.throws(() => legacyRoute(engine), provenanceRefusal, 'A cold reopening agrees');
+  assert.deepEqual(legacyRoute(engine), bareLegacy); provenanceRefusal(store);
 });
 
-test('S1.5 №2363 a view that is no proven Store keeps the full walk through its own reads: a subclass serving a provenance record its file lacks refuses, while the genuine Store and a Proxy of it stay legacy', t => {
+test('S1.5 №2363 G7 views read only exact first B1; fsck examines committed records, not a virtual provenance record absent from the file', t => {
   const directory = mkdtempSync(join(tmpdir(), 'omg-s15-view-')), database = join(directory, 'state.sqlite');
   const store = new Store(database);
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
@@ -893,11 +897,11 @@ test('S1.5 №2363 a view that is no proven Store keeps the full walk through it
   }
   const overlay = new Overlay(database);
   try {
-    assert.throws(() => legacyRoute(new ProductEngine(overlay)), provenanceRefusal,
-      'The identities of the file beneath do not describe the view: the reads of the view itself decide');
+    assert.deepEqual(legacyRoute(new ProductEngine(overlay)), bareLegacy);
+    assert.equal(integrityGate(overlay, 'p'), null, 'No committed provenance exists in this database');
   } finally { overlay.close(); }
   assert.deepEqual(legacyRoute(new ProductEngine(store)), bareLegacy, 'The genuine Store holds no provenance');
   // A transparent Proxy, bound to its target the way the engine's own trace views are: no proven Store, the same records.
   const proxied = new Proxy(store, { get(target, key) { const value: unknown = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value; } });
-  assert.deepEqual(legacyRoute(new ProductEngine(proxied)), bareLegacy, 'A Proxy walks the same records through its own reads and agrees');
+  assert.deepEqual(legacyRoute(new ProductEngine(proxied)), bareLegacy, 'A Proxy reads the same exact first B1 and agrees');
 });

@@ -1,3 +1,4 @@
+import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -487,25 +488,17 @@ test('saved queue entry points reject incomplete public sources before reading o
       machinePath: { ...f.request.policy.machinePath, layer } } }), 'queue_policy_invalid');
 });
 
-test('a sole saved queue establishes missing B1 provenance for projection and assess after restart', t => {
+test('a sole saved queue establishes missing B1 provenance for fsck and the integrity gate after restart', t => {
   const f = fixture(t), queue = ok(writeBlockQueue(f.store, f.request));
-  const hidden = (store: Store) => {
-    const all = store.list(), hiddenIds = new Set(all.filter(row => row.id !== queue.id &&
-      (row.id.startsWith('om-') || row.id.startsWith('horizon:') || row.id.startsWith('block-weight:'))).map(row => row.id));
-    return new Proxy(store, { get(target, property) {
-      if (property === 'get') return (id: string, revision?: number) => hiddenIds.has(id) ? null : store.get(id, revision);
-      if (property === 'list') return (kind?: string) => store.list(kind).filter(row => !hiddenIds.has(row.id));
-      if (property === 'history') return (id: string) => hiddenIds.has(id) ? [] : store.history(id);
-      const value: unknown = Reflect.get(target, property, target);
-      return typeof value === 'function' ? value.bind(target) : value;
-    } });
-  };
+  const directory = mkdtempSync(join(tmpdir(), 'omg-g7-queue-'));
+  let alone = new Store(join(directory, 'state.sqlite'));
+  t.after(() => { alone.close(); rmSync(directory, { recursive: true, force: true }); });
+  alone.write({ id: queue.id, kind: queue.kind, expected: 0, value: queue.value });
   for (let attempt = 0; attempt < 2; attempt++) {
-    const engine = new ProductEngine(hidden(f.store));
-    for (const action of [() => engine.projection(project), () => engine.execute({ type: 'assess', project, expected: 0 })])
-      assert.throws(action, (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-        && canonical(error.details).includes(`om-input:${project}`));
-    f.restart();
+    const report = runIntegrityCheck(alone, { project }); assert.ok(report.ok);
+    assert.ok(report.value.value.findings.some(f => f.code === 'record_missing' && f.id === `om-input:${project}` && f.revision === 1));
+    assert.equal(integrityGate(alone, project)?.ok, false);
+    const path = alone.path; alone.close(); alone = new Store(path);
   }
 });
 

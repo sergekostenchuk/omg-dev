@@ -1,3 +1,4 @@
+import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import { openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
 import { readCompletionBinding, completionWorkId } from '../src/om/series.js';
 import { readCompletionWorkAt, writeCompletionCessation, readCompletionCessationAt } from '../src/om/model-call.js';
@@ -466,19 +467,17 @@ test('B3.0b real legacy membership before B1 remains native for projection and a
   }
 });
 
-test('B3.0b lost B1 with only P or G retained including partial envelopes refuses projection and assess', t => {
+test('B3.0b lost B1 with only P or G retained including partial envelopes refuses fsck and the integrity gate', t => {
   const source = fixture(t); source.series(); const pair = transition(source, 'standalone-provenance');
   for (const saved of [pair.prepared, pair.issuance]) for (const partial of [false, true]) {
     const f = emptyProject(t);
     f.store.write({ id: saved.id, kind: saved.kind, expected: 0, value: partial ? {} : saved.value });
     for (const restart of [false, true]) {
       if (restart) f.restart();
-      const engine = new ProductEngine(f.store), before = snapshot(f.store);
-      for (const operation of [() => engine.projection(project), () => engine.execute({ type: 'assess', project, expected: 0 })]) {
-        assert.throws(operation, (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-          && (error.details as { target?: string }).target === `om-input:${project}`);
-        assert.deepEqual(snapshot(f.store), before);
-      }
+      const retained = () => snapshot(f.store).filter(row => !row.head.id.startsWith('om-integrity:'));
+      const before = retained();
+      missingB1AtFsck(f.store);
+      assert.deepEqual(retained(), before);
     }
   }
 });
@@ -1056,6 +1055,12 @@ test('B3.0b common historical work admission restores its original pointer guard
   assert.equal(f.store.get('old-work-proof'), null);
 });
 
+function missingB1AtFsck(store: Store) {
+  const report = runIntegrityCheck(store, { project }); assert.ok(report.ok);
+  assert.ok(report.value.value.findings.some(f => f.code === 'record_missing' && f.id === `om-input:${project}` && f.revision === 1));
+  assert.equal(integrityGate(store, project)?.ok, false);
+}
+
 test('B3.0b managed provenance A C era A6 membership and series reject lost B1 with incomplete links', t => {
   const f = product(fixture(t), true, false), a = analysis(f);
   ok(commit(f.store, ok(prepareStopAnalysis(f.store, a.request))));
@@ -1066,16 +1071,13 @@ test('B3.0b managed provenance A C era A6 membership and series reject lost B1 w
     const value = !partial ? row.value : row.kind === 'om-series-membership' ? { mode: 'transition-managed' }
       : row.kind === 'repair-series' ? { contract: 'om-repair-series/v2' } : {};
     alone.store.write({ id: row.id, kind: row.kind, expected: 0, value });
-    const engine = new ProductEngine(alone.store), before = snapshot(alone.store);
-    for (const operation of [() => engine.projection(project), () => engine.execute({ type: 'assess', project, expected: 0 })]) {
-      assert.throws(operation, (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-        && (error.details as { target?: string }).target === `om-input:${project}`, `${row.kind} partial=${partial}`);
-      assert.deepEqual(snapshot(alone.store), before);
-    }
+    const before = snapshot(alone.store);
+    missingB1AtFsck(alone.store);
+    assert.deepEqual(snapshot(alone.store).filter(row => !row.head.id.startsWith('om-integrity:')), before);
   }
   const onlyActivation = emptyProject(t);
   onlyActivation.store.write({ id: head(f).id, kind: 'repair-series', expected: 0, value: { activation: { contract: 'om-series-activation/v1' } } });
-  assert.throws(() => new ProductEngine(onlyActivation.store).projection(project), (error: unknown) => error instanceof EngineError && error.code === 'record_missing');
+  missingB1AtFsck(onlyActivation.store);
 });
 
 test('B3.0b E1 E4 and A6 carry positive pointer guards through their actual write transactions', async t => {
@@ -1347,12 +1349,9 @@ test('B3 discarded provenance alone detects lost B1 even when its body is incomp
   const f = fixture(t); f.series(); const saved = ok(writeSeriesDiscard(f.store, refusedPair(f).request)).record;
   for (const value of [saved.value, {}]) {
     const alone = emptyProject(t); alone.store.write({ id: saved.id, kind: saved.kind, expected: 0, value });
-    alone.restart(); const before = snapshot(alone.store), engine = new ProductEngine(alone.store);
-    for (const operation of [() => engine.projection(project), () => engine.execute({ type: 'assess', project, expected: 0 })]) {
-      assert.throws(operation, (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-        && (error.details as { target?: string }).target === `om-input:${project}`);
-      assert.deepEqual(snapshot(alone.store), before);
-    }
+    alone.restart(); const before = snapshot(alone.store);
+    missingB1AtFsck(alone.store);
+    assert.deepEqual(snapshot(alone.store).filter(row => !row.head.id.startsWith('om-integrity:')), before);
   }
 });
 

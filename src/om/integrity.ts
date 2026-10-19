@@ -1,7 +1,9 @@
+import { canonical } from "../canonical.js";
+import { b1OriginCheck } from "./b1-origin.js";
 import { reference } from "../pipeline/contracts.js";
 import { Store, type Revision } from "../storage/store.js";
 import { checkStoreIntegrity, type IntegrityFinding, type IntegrityReport } from "../storage/fsck.js";
-import { delivered, isText, refused, type OmResult, type Sealed } from "./refusal.js";
+import { delivered, isPlainObject, isText, refused, type OmResult, type Sealed } from "./refusal.js";
 import { writeGuarded } from "./refs.js";
 import { EngineError } from "../errors.js";
 
@@ -37,15 +39,30 @@ export const integrityAddress = (finding: IntegrityFinding): string =>
 export function runIntegrityCheck(store: Store, request: { project: string }): OmResult<Sealed<Revision<IntegrityRecord>>> {
   if (!(store instanceof Store)) throw new EngineError("integrity_request_invalid", "The integrity check reads a store", { unit: UNIT, target: "om-integrity", field: "store" });
   requireProject(request?.project);
-  return save(store, request.project, checkStoreIntegrity(store));
+  return save(store, request.project, checkStoreIntegrity(store, b1OriginCheck(request.project)));
+}
+
+/** A damaged diagnostic is never evidence that the newly computed report was already saved. */
+function sameFindings(value: unknown, project: string, findings: IntegrityFinding[]): boolean {
+  if (!isPlainObject(value)) return false;
+  const saved = value as Record<string, unknown>;
+  if (saved.contract !== INTEGRITY_CONTRACT || saved.project !== project || !Array.isArray(saved.findings)
+    || ![saved.checkedAt, saved.lastSequence, saved.revisions, saved.events, saved.references]
+      .every(n => typeof n === "number" && Number.isSafeInteger(n) && n >= 0)) return false;
+  try { return canonical(saved.findings) === canonical(findings); }
+  catch (error) {
+    // JSON.parse also accepts numeric overflow. Such a damaged array must not hide the fsck refusal.
+    if (error instanceof EngineError && error.code === "invalid_json") return false;
+    throw error;
+  }
 }
 
 /** At om-start and om-continue: the same check; damage found is saved (once per distinct finding set) and refuses the start. */
 export function integrityGate(store: Store, project: string): OmResult<never> | null {
-  const report = checkStoreIntegrity(store);
+  const report = checkStoreIntegrity(store, b1OriginCheck(project));
   if (!report.findings.length) return null;
-  const head = store.get<IntegrityRecord>(integrityId(project));
-  if (!head || JSON.stringify(head.value.findings) !== JSON.stringify(report.findings)) save(store, project, report);
+  const head = store.get<unknown>(integrityId(project));
+  if (!head || !sameFindings(head.value, project, report.findings)) save(store, project, report);
   const shown = report.findings.slice(0, 5).map(integrityAddress).join("; ");
   return refused("store_damaged", `om-fsck found ${report.findings.length} damaged place(s) in the database: ${shown}`
     + `${report.findings.length > 5 ? "; …" : ""} — the pass does not start; the owner decides`,

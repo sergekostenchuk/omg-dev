@@ -1,3 +1,7 @@
+import { DatabaseSync } from "node:sqlite";
+import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
+import { checkStoreIntegrity } from "../src/storage/fsck.js";
+import { b1OriginCheck } from "../src/om/b1-origin.js";
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -308,10 +312,12 @@ test('G1.2 B1 revision one remains mandatory with a derived head and retained M8
   const f = await worksFixture(t), saved = ok(writeFeasibility(f.store, f.feasibility));
   const input = f.store.get<OmInputRecord>(`om-input:${f.project}`)!;
   assert.ok(input.revision > 1, 'The real fixture records D3 decisions after the first B1');
-  const before = history(f.store), view = hidden(f.store, input.id, 1), engine = new ProductEngine(view);
-  assert.ok(view.get(input.id)); assert.ok(view.get(saved.id));
-  for (const action of [() => engine.projection(f.project), () => engine.execute({ type: 'project', project: f.project }),
-    () => engine.execute({ type: 'assess', project: f.project, expected: saved.revision })]) assert.throws(action, addressed);
+  const before = history(f.store), lost = lostB1Copy(t, f.store, f.project);
+  assert.equal(lost.get(input.id, 1), null);
+  assert.deepEqual(lost.get(input.id), input); assert.deepEqual(lost.get(saved.id), saved);
+  assertMissingB1(lost, f.project);
+  const cold = new Store(lost.path); t.after(() => cold.close());
+  assertMissingB1(cold, f.project);
   assert.equal(history(f.store), before);
   f.restart();
   assert.deepEqual(new ProductEngine(f.store).projection(f.project).feasibility, saved);
@@ -338,16 +344,46 @@ test('G1.2 invalid first B1 refuses projection and assess through the common exa
   }
 });
 
-test('G1.2 a retained OM stage reference without B1 cannot select the native projection', async t => {
+/** The integrity boundary reads committed SQLite rows: make a damaged copy instead of hiding get() through a Proxy. */
+function lostB1Copy(t: TestContext, source: Store, project: string, keep?: string[], alsoMissing: string[] = []) {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-g7-lost-')), path = join(directory, 'state.sqlite');
+  const original = new DatabaseSync(source.path);
+  try { original.exec(`VACUUM INTO '${path.replaceAll("'", "''")}'`); } finally { original.close(); }
+  const raw = new DatabaseSync(path);
+  try {
+    raw.exec('PRAGMA foreign_keys=OFF');
+    for (const name of ['revisions_no_delete', 'events_no_delete']) raw.exec(`DROP TRIGGER IF EXISTS ${name}`);
+    if (keep) for (const table of ['revisions', 'events', 'heads'])
+      raw.prepare(`DELETE FROM ${table} WHERE entity_id NOT IN (${keep.map(() => '?').join(',')})`).run(...keep);
+    const id = `om-input:${project}`;
+    raw.prepare('DELETE FROM revisions WHERE entity_id=? AND revision=1').run(id);
+    raw.prepare('DELETE FROM events WHERE entity_id=? AND revision=1').run(id);
+    raw.prepare('DELETE FROM heads WHERE entity_id=? AND revision=1').run(id);
+    for (const removed of alsoMissing) for (const table of ['revisions', 'events', 'heads'])
+      raw.prepare(`DELETE FROM ${table} WHERE entity_id=?`).run(removed);
+  } finally { raw.close(); }
+  const store = new Store(path);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  return store;
+}
+function assertMissingB1(store: Store, project: string) {
+  const retained = () => canonical(store.list().filter(row => row.id !== `om-integrity:${project}`).flatMap(row => store.history(row.id)));
+  const before = retained();
+  const report = runIntegrityCheck(store, { project }); assert.ok(report.ok);
+  assert.ok(report.value.value.findings.some(f => f.code === 'record_missing' && f.id === `om-input:${project}` && f.revision === 1));
+  assert.equal(integrityGate(store, project)?.ok, false);
+  assert.equal(retained(), before, 'Only the addressed integrity report may be saved');
+}
+
+test('G1.2 a retained OM stage reference without B1 refuses fsck and the integrity gate', async t => {
   const f = await worksFixture(t), saved = ok(writeFeasibility(f.store, f.feasibility)), engine = new ProductEngine(f.store);
   const stage = engine.refinement.publish(f.project, reference(saved), 0);
   engine.pipeline.accept(f.project, 'om-g2', stage.revision);
-  const view = hidden(hidden(f.store, `om-input:${f.project}`), saved.id), observed = new ProductEngine(view);
-  assert.ok(view.get(stage.id)); assert.equal(view.get(`om-input:${f.project}`), null); assert.equal(view.get(saved.id), null);
   const before = history(f.store);
-  assert.throws(() => observed.projection(f.project), addressed);
-  assert.throws(() => observed.execute({ type: 'assess', project: f.project, expected: 0 }), addressed);
-  assert.equal(history(f.store), before);
+  const lost = lostB1Copy(t, f.store, f.project, undefined, [saved.id]);
+  assert.ok(lost.get(stage.id)); assert.equal(lost.get(`om-input:${f.project}`, 1), null); assert.equal(lost.get(saved.id), null);
+  assertMissingB1(lost, f.project);
+  assert.equal(history(f.store), before, 'The intact source fixture is unchanged');
 });
 
 test('G1.2 every retained native B1-dependent record refuses a missing first input independently', async t => {
@@ -361,23 +397,11 @@ test('G1.2 every retained native B1-dependent record refuses a missing first inp
     for (const kind of kinds) await t.test(`${kind}/${phase}`, () => {
       const retained = records.find(row => row.kind === kind);
       assert.ok(retained, `The genuine accepted-works fixture has a ${kind} record`);
-      const removed = new Set(records.filter(row => row.id !== retained.id && row.id !== `project:${f.project}`).map(row => row.id));
-      const get = f.store.get.bind(f.store), list = f.store.list.bind(f.store), historical = f.store.history.bind(f.store);
-      const lostFirst = (id: string, revision?: number) => kind === 'om-input' && id === retained.id && revision === 1;
       if (kind === 'om-input') assert.ok(retained.revision > 1, 'The native D3 producer retained a later B1 revision');
-      const view = new Proxy(f.store, { get(target, property) {
-        if (property === 'get') return (id: string, revision?: number) => removed.has(id) || lostFirst(id, revision) ? null : get(id, revision);
-        if (property === 'list') return (filter?: string) => list(filter).filter(row => !removed.has(row.id));
-        if (property === 'history') return (id: string) => removed.has(id) ? [] : historical(id).filter(row => !lostFirst(row.id, row.revision));
-        const value: unknown = Reflect.get(target, property, target);
-        return typeof value === 'function' ? value.bind(target) : value;
-      } });
-      assert.equal(view.get(`om-input:${f.project}`, 1), null);
-      assert.equal(view.get(`om-feasibility:${f.project}`), null);
-      assert.deepEqual(view.get(retained.id), retained);
-      const engine = new ProductEngine(view), before = history(f.store);
-      for (const action of [() => engine.projection(f.project), () => engine.execute({ type: 'assess', project: f.project, expected: 0 })])
-        assert.throws(action, (error: unknown) => addressed(error) && (error as EngineError).code === 'record_missing');
+      const before = history(f.store), lost = lostB1Copy(t, f.store, f.project, [retained.id, `project:${f.project}`]);
+      assert.equal(lost.get(`om-input:${f.project}`, 1), null);
+      assert.deepEqual(lost.get(retained.id), retained);
+      assertMissingB1(lost, f.project);
       assert.equal(history(f.store), before);
     });
   }
@@ -400,20 +424,19 @@ test('G1.2 pre-B1 refusal journals and document text do not establish an OM era'
   assert.equal(history(store), before);
 });
 
-test('G1.2 a saved call input reference cannot select legacy when both B1 and its call marker are missing', t => {
+test('G1.2 a saved call input reference requires first B1 at fsck when its call marker is missing', t => {
   const f = b1Fixture(t);
   // Deliberately incomplete physical record: this tests the era boundary, never the validity of a call or response.
   const callId = `model-call:${f.project}:om:lost-input`;
   for (const input of [reference(f.input), { id: f.input.id, revision: f.input.revision }]) {
     f.store.write({ id: callId, kind: 'model-call', expected: f.store.get(callId)?.revision ?? 0,
       value: { om: { input } } });
-    const view = hidden(f.store, f.input.id), engine = new ProductEngine(view), before = history(f.store);
-    for (const action of [() => engine.projection(f.project), () => engine.execute({ type: 'assess', project: f.project, expected: 0 })])
-      assert.throws(action, (error: unknown) => addressed(error) && (error as EngineError).code === 'record_missing');
+    const before = history(f.store), lost = lostB1Copy(t, f.store, f.project, [callId, `project:${f.project}`]);
+    assertMissingB1(lost, f.project);
     assert.equal(history(f.store), before);
   }
   f.restart();
-  assert.throws(() => new ProductEngine(hidden(f.store, f.input.id)).projection(f.project), addressed);
+  assertMissingB1(lostB1Copy(t, f.store, f.project, [callId, `project:${f.project}`]), f.project);
 });
 
 test('G1.2 a missing M8 stays an addressed absence even after a genuine M8 was saved', async t => {
@@ -630,6 +653,7 @@ function retainsNativeEra(t: TestContext, envelope: EraBoundaryEnvelope) {
   for (const restarted of [false, true]) {
     if (restarted) f.restart();
     const current = new ProductEngine(f.store);
+    assert.ok(!checkStoreIntegrity(f.store, b1OriginCheck('p')).findings.some(f => f.code === 'record_missing'), envelope.name);
     assert.deepEqual(current.projection('p'), native, envelope.name);
     assert.deepEqual(current.execute({ type: 'project', project: 'p' }), native, envelope.name);
     assert.deepEqual(nativeAssessFailure(current, 'p'), nativeError, envelope.name);
@@ -675,19 +699,12 @@ function requiresFirstB1(t: TestContext, envelope: EraBoundaryEnvelope) {
   f.store.write({ id: envelope.id, kind: envelope.kind, expected: 0, value: envelope.value });
   for (const [index, value] of (envelope.later ?? []).entries())
     f.store.write({ id: envelope.id, kind: envelope.kind, expected: index + 1, value });
-  const before = history(f.store);
+  const retained = () => canonical(f.store.list().filter(row => row.kind !== 'om-integrity').flatMap(row => f.store.history(row.id)));
+  const before = retained();
   for (const restarted of [false, true]) {
     if (restarted) f.restart();
-    const engine = new ProductEngine(f.store);
-    for (const read of [() => engine.projection('p'), () => engine.execute({ type: 'assess', project: 'p', expected: 0 })]) {
-      assert.throws(read, (error: unknown) => {
-        assert.ok(error instanceof EngineError);
-        assert.equal(error.code, 'record_missing', envelope.name);
-        assert.equal((error.details as { target?: unknown }).target, 'om-input:p', envelope.name);
-        return true;
-      });
-      assert.equal(history(f.store), before, 'Missing first B1 refuses without changing the retained envelope or any other record');
-    }
+    assertMissingB1(f.store, 'p');
+    assert.equal(retained(), before, 'The report leaves the retained envelope and its history unchanged');
   }
 }
 

@@ -1,3 +1,4 @@
+import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 const { fixtureAnswer } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 
 import test, { type TestContext } from 'node:test';
@@ -787,7 +788,7 @@ test('G4b rederives a saved negative outcome instead of trusting a self-consiste
   assert.equal(repeated.ok, false, 'A corrupt head cannot become an idempotent exact repeat');
 });
 
-test('a saved G4b outcome, even with an incomplete envelope, proves missing B1 provenance to product projection and assess', t => {
+test('a saved G4b outcome, even with an incomplete envelope, proves missing B1 provenance at fsck and the start/continue integrity gate', t => {
   const f = fixture(t), gate = ok(writeAnswersGate(f.store, f.request));
   for (const value of [gate.value, { project: f.project }]) {
     const root = mkdtempSync(join(tmpdir(), 'omg-answers-gate-origin-'));
@@ -795,11 +796,10 @@ test('a saved G4b outcome, even with an incomplete envelope, proves missing B1 p
     t.after(() => { isolated.close(); rmSync(root, { recursive: true, force: true }); });
     new ProductEngine(isolated).execute({ type: 'create-project', project: f.project, title: 'G4b origin' });
     isolated.write({ id: gate.id, kind: gate.kind, expected: 0, value });
-    const engine = new ProductEngine(isolated);
-    for (const action of [() => engine.projection(f.project),
-      () => engine.execute({ type: 'assess', project: f.project, expected: 0 })])
-      assert.throws(action, (error: unknown) => error instanceof EngineError && error.code === 'record_missing'
-        && JSON.stringify(error.details).includes(`om-input:${f.project}`));
+    const report = runIntegrityCheck(isolated, { project: f.project }); assert.ok(report.ok);
+    assert.ok(report.value.value.findings.some(finding => finding.code === 'record_missing'
+      && finding.id === `om-input:${f.project}` && finding.revision === 1));
+    assert.equal(integrityGate(isolated, f.project)?.ok, false);
   }
 });
 
