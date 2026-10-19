@@ -5,10 +5,19 @@ import { isRef, type Ref } from "../pipeline/contracts.js";
 import type { Revision } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 
+let cachedSelfStart: string | null = null;
+
 export function processStart(pid: number): string {
+  if (pid === process.pid && cachedSelfStart !== null) {
+    return cachedSelfStart;
+  }
   const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 5000 });
   requireCondition(!result.error, "process_identity_unavailable", "Cannot determine process identity for safe recovery");
-  return result.status === 0 ? result.stdout.trim() : "";
+  const started = result.status === 0 ? result.stdout.trim() : "";
+  if (pid === process.pid && started.length > 0) {
+    cachedSelfStart = started;
+  }
+  return started;
 }
 
 /** Three-valued identity observation: an empty `ps` row is not proof of

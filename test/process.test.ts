@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { runProcess } from "../src/runtime/process.js";
+import { processStart } from "../src/runtime/process-identity.js";
 
 test("process adapter preserves split UTF-8 output and refuses an already-cancelled launch", async t => {
   const root = mkdtempSync(join(tmpdir(), "omg-process-")); t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -59,4 +62,115 @@ test('request bytes are transferred only after successful awaited spawn authoriz
   let authorized = false;
   const result = await runProcess({ executable: process.execPath, args: ['-e', "const fs=require('node:fs');process.stdout.write(fs.readFileSync(0,'utf8'))"] }, root, 'authorized-only', 2000, undefined, true, async () => { await Promise.resolve(); authorized = true; });
   assert.equal(authorized, true); assert.equal(result.stdout, 'authorized-only');
+});
+
+// PS1 (№6784, №6781 п.6, №6796): processStart caches self process start time on process lifetime,
+// foreign PIDs and probeProcessIdentity remain fresh, errors and empty output are never cached.
+
+let ps1Ordinal = 0;
+interface PsMockRow {
+  stdout: string;
+  status?: number | null;
+  stderr?: string;
+  error?: Error;
+}
+
+async function runWithPsMocks(
+  results: PsMockRow[],
+  run: (mod: typeof import('../src/runtime/process-identity.js'), getCalls: () => number) => Promise<void> | void
+) {
+  const req = createRequire(import.meta.url);
+  const cp = req('node:child_process');
+  const original = cp.spawnSync;
+  let reads = 0;
+  cp.spawnSync = (command: string, ...args: unknown[]) => {
+    if (command !== 'ps') return original(command, ...args);
+    assert.ok(reads < results.length, 'unexpected extra ps');
+    const r = results[reads++]!;
+    if (r.error) return { error: r.error, status: null, stdout: '', stderr: '' };
+    return { status: r.status ?? 0, stdout: r.stdout, stderr: r.stderr ?? '' };
+  };
+  syncBuiltinESMExports();
+  try {
+    const mod = await import(`../src/runtime/process-identity.js?ps1Case=${ps1Ordinal++}`);
+    await run(mod, () => reads);
+  } finally {
+    cp.spawnSync = original;
+    syncBuiltinESMExports();
+  }
+}
+
+const mockRow = (stdout: string, status = 0, stderr = ''): PsMockRow => ({ status, stdout, stderr });
+
+test('PS1: processStart caches self process start time without repeated ps invocations', async () => {
+  await runWithPsMocks([mockRow('start-A\n')], (m, count) => {
+    assert.deepEqual(
+      [m.processStart(process.pid), m.processStart(process.pid), m.processStart(process.pid)],
+      ['start-A', 'start-A', 'start-A']
+    );
+    assert.equal(count(), 1, 'Exactly one ps call for multiple self processStart calls');
+  });
+});
+
+test('PS1: processStart queries foreign pid with fresh ps invocation each time', async () => {
+  const foreignPid = process.pid + 100000;
+  await runWithPsMocks([mockRow('start-A'), mockRow('start-B')], (m, count) => {
+    assert.equal(m.processStart(foreignPid), 'start-A');
+    assert.equal(m.processStart(foreignPid), 'start-B');
+    assert.equal(count(), 2, 'Foreign PID queries are not cached and observe changed identities');
+  });
+});
+
+test('PS1: processStart retries empty successful self observation without caching', async () => {
+  await runWithPsMocks([mockRow(' \n'), mockRow('start-B')], (m, count) => {
+    assert.equal(m.processStart(process.pid), '');
+    assert.equal(m.processStart(process.pid), 'start-B');
+    assert.equal(m.processStart(process.pid), 'start-B');
+    assert.equal(count(), 2, 'Empty response is retried until non-empty success is observed');
+  });
+});
+
+test('PS1: processStart does not cache nonzero status self output', async () => {
+  await runWithPsMocks([mockRow('ignored', 1), mockRow('start-B')], (m, count) => {
+    assert.equal(m.processStart(process.pid), '');
+    assert.equal(m.processStart(process.pid), 'start-B');
+    assert.equal(count(), 2, 'Nonzero status response is not cached');
+  });
+});
+
+test('PS1: processStart throws on observation error and never caches failed attempts', async () => {
+  const err = Object.assign(new Error('unavailable'), { code: 'ENOENT' });
+  await runWithPsMocks([{ error: err, stdout: '', status: null }, mockRow('start-B')], (m, count) => {
+    assert.throws(() => m.processStart(process.pid), { code: 'process_identity_unavailable' });
+    assert.equal(m.processStart(process.pid), 'start-B');
+    assert.equal(count(), 2, 'Observation error throws typed failure and is not cached');
+  });
+});
+
+test('PS1: probeProcessIdentity remains fresh after warm self cache', async () => {
+  await runWithPsMocks([mockRow('start-A'), mockRow('start-B'), mockRow('', 1)], (m, count) => {
+    assert.equal(m.processStart(process.pid), 'start-A');
+    assert.deepEqual(m.probeProcessIdentity(process.pid), { state: 'present', started: 'start-B' });
+    assert.deepEqual(m.probeProcessIdentity(process.pid), { state: 'absent' });
+    assert.equal(count(), 3, 'probeProcessIdentity always performs fresh probe');
+  });
+});
+
+test('PS1: processStart observes disappearance of a finished process without caching stale identity', async t => {
+  const child = spawn(process.execPath, ['-e', 'process.stdin.resume()'], { stdio: ['pipe', 'ignore', 'ignore'] });
+  t.after(() => {
+    try { child.kill('SIGKILL'); } catch {}
+  });
+  const pid = child.pid!;
+  const started = processStart(pid);
+  assert.ok(started.length > 0, 'child identity must be observed while child is held alive');
+  const exited = new Promise<void>(resolve => child.on('exit', () => resolve()));
+  child.stdin?.end();
+  await exited;
+  let gone = false;
+  for (let i = 0; i < 20; i++) {
+    if (processStart(pid) === '') { gone = true; break; }
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert.equal(gone, true, 'processStart must return empty string once child exits');
 });
