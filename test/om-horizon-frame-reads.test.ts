@@ -20,10 +20,11 @@ import {
   prepareHorizon, writeHorizon, type HorizonRequest,
 } from "../src/om/horizon.js";
 import {
-  prepareFrame, prepareHorizonBasis, fillObligations, type FrameRequest, type FrameLevel, type FrameScope,
+  prepareFrame, prepareHorizonBasis, prepareLayerAcceptance, fillObligations, type FrameRequest, type FrameLevel, type FrameScope,
 } from "../src/om/frame-obligations.js";
 import { createOmFixture, gardenGraph, type OmFixture } from "./om-fixture.js";
 
+import { Refinement } from "../src/graph/refinement.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { projectGraph } from "../src/graph/project.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -49,16 +50,13 @@ function refusedAs<T>(value: OmResult<T>, expected: string) {
 }
 
 async function storedHorizonFixture(t: TestContext) {
-  const f = await createOmFixture(t);
-  const input = delivered(writeOmInput(f.store, {
-    project: f.project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref>,
-  }));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
+  const input = f.store.get("om-input:garden")!;
   const req: HorizonRequest = {
     project: f.project,
     input: reference(input),
     graph: reference(f.graphRevision),
-    refinement: reference(f.store.get("phase:garden:L2")!),
+    refinement: reference(f.layers[2]),
     choice: {
       choiceVersion: "choice-1",
       features: [{ outcome: resultArtifact }],
@@ -98,7 +96,8 @@ function acceptedHorizon(store: Store, refinement: Ref | null) {
 function frameRequestFor(f: OmFixture, horizon: Ref, level: FrameLevel): FrameRequest {
   return {
     project: f.project, level, horizon, graph: reference(f.graphRevision), layer: reference(f.layers[level]),
-    frame: null, upper: level === 2 ? null : { horizon, frame: null },
+    frame: reference(f.store.get(`om-frame:${f.project}:${level}`)!),
+    upper: level === 2 ? null : { horizon, frame: reference(f.store.get(`om-frame:${f.project}:2`)!) },
   };
 }
 
@@ -162,7 +161,7 @@ test("prepareHorizon numerical storeReads budget: O(1) reads with batch headsMat
     assert.equal(prepared.existing, null);
     assert.ok(prepared.guards.length > 0);
   });
-  // Fresh prepareHorizon on research phase path is bounded (includes StageChecks in G1 era)
+  // Fresh prepareHorizon on the accepted OM layer path is bounded (includes StageChecks in G1 era)
   assert.ok(freshReads <= 1000, `Fresh prepareHorizon reads ${freshReads} must be <= 1000`);
 
   // Save the horizon
@@ -188,8 +187,8 @@ test("prepareHorizon fast existing replay budget <= 13 reads on G3a closure", as
 });
 
 test("prepareFrame numerical storeReads budget for level 2 and level 3", async t => {
-  const f = await createOmFixture(t);
-  const horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
+  const horizon = acceptedHorizon(f.store, reference(f.layers[2]));
 
   // Prepare level 2 frame: batch headsMatch checks prerequisites in 1 chunk
   const reqL2 = frameRequestFor(f, reference(horizon.gate), 2);
@@ -219,7 +218,7 @@ test("prepareFrame numerical storeReads budget <= 35 reads on G3a closure", asyn
 
 test("10x noise history invariant: adding 100 unrelated records causes 0 increase in storeReads", async t => {
   const { f, req } = await storedHorizonFixture(t);
-  const horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const reqFrame = frameRequestFor(f, reference(horizon.gate), 2);
 
   // Baseline reads before noise injection (using isolated store instances with warm-up)
@@ -298,14 +297,12 @@ async function withAbsentAdmission(name: string, dependencies: Record<string, st
   const path = new URL(`../src/om/${name}.js`, import.meta.url), require = createRequire(import.meta.url);
   let code = readFileSync(path, 'utf8');
   if (inject) {
-    for (const symbol of ['prepareExistingOmInput', 'readOmAdmissionGuards']) {
-      assert.ok(code.includes(symbol), `${name} imports ${symbol}`);
-      code = code.replace(symbol, `${symbol} as original_${symbol}`);
-      const value = symbol === 'prepareExistingOmInput'
-        ? '{...r.value, guards:[...r.value.guards, {id:"g3b:producer-absence", absent:true}]}'
-        : '[...r.value, {id:"g3b:producer-absence", absent:true}]';
-      code += `\nfunction ${symbol}(...args) { const r=original_${symbol}(...args); return r.ok ? {...r,value:${value}} : r; }`;
-    }
+    // Current OM preparation receives admission through B1, independently of the removed research-phase branch.
+    const symbol = 'prepareExistingOmInput';
+    assert.ok(code.includes(symbol), `${name} imports ${symbol}`);
+    code = code.replace(symbol, `${symbol} as original_${symbol}`);
+    code += `\nfunction ${symbol}(...args) { const r=original_${symbol}(...args); return r.ok
+      ? {...r,value:{...r.value, guards:[...r.value.guards, {id:"g3b:producer-absence", absent:true}]}} : r; }`;
   }
   code = code.replace(/from (["'])([^"']+)\1/g, (_match, _quote, spec: string) => {
     const url = dependencies[spec] ?? (spec.startsWith('.') ? new URL(spec, path).href
@@ -316,7 +313,7 @@ async function withAbsentAdmission(name: string, dependencies: Record<string, st
   return { url, api: await import(url) };
 }
 
-test("absent admission survives horizon, layer, frame and downstream preparation and rolls back the whole batch", async t => {
+test("absent admission survives horizon, frame and downstream preparation and rolls back the whole batch", async t => {
   const { f, req } = await storedHorizonFixture(t);
   const saved = delivered(writeHorizon(f.store, req));
   const frame = frameRequestFor(f, reference(saved.gate), 2);
@@ -329,11 +326,10 @@ test("absent admission survives horizon, layer, frame and downstream preparation
   const sources = [
     ['horizon', h.api.prepareHorizon(f.store, req)],
     ['horizon-basis', b.api.prepareHorizonBasis(f.store, { project:f.project, graph:frame.graph, horizon:frame.horizon })],
-    ['layer', b.api.prepareLayerAcceptance(f.store, { project:f.project, level:2, graph:frame.graph, layer:frame.layer })],
     ['frame', b.api.prepareFrame(f.store, frame)],
     ['proposals', p.api.prepareFrameProposals(f.store, { frame, proposals:[] })],
     ['candidate', c.api.prepareCandidate(f.store, { frame, proposals:[] })],
-    ['work-zone', w.api.prepareWorkZone(f.store, {project:f.project,graph:frame.graph,layer:frame.layer,horizon:frame.horizon,frame:null})],
+    ['work-zone', w.api.prepareWorkZone(f.store, {project:f.project,graph:frame.graph,layer:frame.layer,horizon:frame.horizon,frame:frame.frame})],
     ['gaps', g.api.prepareGaps(f.store, {project:f.project,input:req.input,graph:frame.graph,horizon:frame.horizon,
       operations:{frame,proposals:[]}, works:{frame:frameRequestFor(f,reference(saved.gate),3),proposals:[]}})],
   ] as const;
@@ -369,6 +365,44 @@ test("absent admission survives horizon, layer, frame and downstream preparation
     for (const write of writes) assert.equal(f.store.get(write.id), null, 'no member of the batch was committed');
   }
   assert.equal(f.store.events(0, Number.MAX_SAFE_INTEGER).length, before);
+});
+
+test("OM layer preparation guards its exact producer outputs without a research gate and rolls back a stale batch", async t => {
+  const f = committedFrameFixture(t);
+  const request = { project: "garden", level: 2 as const, graph: f.request.graph, layer: f.request.layer! };
+  const own = [request.graph, request.layer, reference(f.store.get("graph-layer:garden:1")!), f.request.frame!];
+  const gate = Refinement.prototype.gate;
+  let calls = 0;
+  Refinement.prototype.gate = function(...args) { calls++; return gate.apply(this, args); };
+  try {
+    const prepared = delivered(prepareLayerAcceptance(f.store, request));
+    assert.equal(prepared.producer, "om");
+    assert.deepEqual(prepared.guards.map(canonical).sort(), own.map(canonical).sort());
+    assert.equal(calls, 0);
+    const writes = [0, 1].map(i => ({ id: `g3b:layer:${i}`, kind: "test-output", expected: 0, value: { i } }));
+    const snapshot = await f.store.snapshot(join(f.database + "-control"));
+    const path = f.database + "-control.sqlite";
+    copyFileSync(snapshot.path, path);
+    const control = new Store(path);
+    try {
+      delivered(writeGuarded(control, { unit: "F4", target: "garden", writes, guards: prepared.guards }));
+      for (const write of writes) assert.ok(control.get(write.id));
+    } finally { control.close(); }
+    const other = new Store(f.database), dependency = f.request.frame!;
+    try {
+      const current = other.get(dependency.id)!;
+      other.write({ id: current.id, kind: current.kind, expected: current.revision, value: current.value });
+    } finally { other.close(); }
+    const before = f.store.events(0, Number.MAX_SAFE_INTEGER);
+    const transaction = transactionForTests(f.store) as ReturnType<typeof transactionForTests> & { protectedHeads(): TransactionGuard[] };
+    transaction.add({ writes, guards: prepared.guards });
+    const failure = writeGuarded(f.store, { unit: "F4", target: "garden", writes: [...transaction.writes.values()], guards: transaction.protectedHeads() });
+    assert.equal(refusedAs(failure, "input_stale").at.target, dependency.id);
+    for (const write of writes) assert.equal(f.store.get(write.id), null);
+    assert.equal(refusedAs(prepareLayerAcceptance(f.store, request), "input_stale").at.target, dependency.id);
+    assert.deepEqual(f.store.events(0, Number.MAX_SAFE_INTEGER), before);
+    assert.equal(calls, 0);
+  } finally { Refinement.prototype.gate = gate; }
 });
 
 test("horizon and frame head checks use the actual view and active PF4 observations", async t => {
@@ -436,7 +470,7 @@ test("TypeError and record_corrupt exceptions propagate cleanly without being ma
   });
 
   // Also verify for prepareFrame
-  const horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const reqFrame = frameRequestFor(f, reference(horizon.gate), 2);
   assert.throws(() => {
     const brokenStore = new Proxy(f.store, {
@@ -454,25 +488,12 @@ test("TypeError and record_corrupt exceptions propagate cleanly without being ma
   });
 });
 
-test("two acceptance paths: graph-layer with saved acceptance and research phase with StageChecks", async t => {
+test("a graph-layer with real saved OM acceptance proves the horizon and guards its frame", async t => {
   const { f, req } = await storedHorizonFixture(t);
-
-  // Path (b): research phase without closure (phase:garden:L2)
-  assert.equal(req.refinement?.id, "phase:garden:L2");
-  const prepPhase = delivered(prepareHorizon(f.store, req));
-  assert.ok(prepPhase.guards.some(g => !('absent' in g) && g.id === "phase:garden:L2"));
-
-  // Path (a): graph-layer with saved acceptance
-  const layerReq: HorizonRequest = {
-    ...clone(req),
-    refinement: reference(f.layers[2]),
-  };
-  const prepLayer = prepareHorizon(f.store, layerReq);
-  if (!prepLayer.ok) {
-    assert.equal(prepLayer.refusal.code, "horizon_refinement_unproven");
-  } else {
-    assert.ok(prepLayer.value.guards.length > 0);
-  }
+  assert.equal(req.refinement?.id, "graph-layer:garden:2");
+  const prepared = delivered(prepareHorizon(f.store, req));
+  for (const ref of [reference(f.layers[2]), reference(f.store.get("om-frame:garden:2")!)])
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(ref)), ref.id);
 });
 
 

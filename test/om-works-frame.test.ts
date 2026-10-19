@@ -20,7 +20,7 @@ import { assembleCandidate, gateCandidate, prepareCandidate, readCandidate, writ
   type CandidateRequest } from '../src/om/frame-candidate.js';
 import { fillObligations, prepareFrame, type FrameRead, type FrameRequest } from '../src/om/frame-obligations.js';
 import { prepareFrameProposals, type LayerProposal, type ProposalRequest } from '../src/om/frame-proposals.js';
-import { writeGapLines } from '../src/om/gap-lines.js';
+import { writeGapLines, gapLinesId } from '../src/om/gap-lines.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeOmInput } from '../src/om/input.js';
@@ -377,40 +377,33 @@ test('F2 hands D7 and C2 guards to the candidate transaction without publishing 
   }
 });
 
-test('F2 carries an actually accepted research L3 and reads its candidate after source advances and restart', async t => {
-  const f = await createCrossOmFixture(t), store = f.store;
-  const input = ok(writeOmInput(store, { project: 'garden', expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+test('F2 carries an actually accepted OM L3 and reads its candidate after source advances and restart', async t => {
+  const f = await createCrossOmFixture(t, "garden", { mode: "executed" }), store = f.store;
+  const input = store.get("om-input:garden")!;
   const horizon = ok(writeHorizon(store, { project: 'garden', input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(store.get('phase:garden:L2')!), available: {},
+    refinement: reference(f.layers[2]), available: {},
     choice: { choiceVersion: 'accepted-work-carry', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const frame: FrameRequest = { project: 'garden', level: 3, graph: reference(f.graphRevision), horizon: reference(horizon.gate),
-    layer: reference(f.layers[3]), frame: null, upper: { horizon: reference(horizon.gate), frame: null } };
+    layer: reference(f.layers[3]), frame: reference(store.get("om-frame:garden:3")!),
+    upper: { horizon: reference(horizon.gate), frame: reference(store.get("om-frame:garden:2")!) } };
   const current = ok(prepareFrame(store, frame));
-  const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 3, worksContract: 'works-frame/v1', source: 'decision', status: 'proposed',
+  const proposal: LayerProposal = { base: { graph: frame.graph, frame: frame.frame }, level: 3, worksContract: 'works-frame/v1', source: 'decision', status: 'proposed',
     nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [], joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
-  // The historical reader correctly reports this unmarked work as accepted, so the new era
-  // upgrades its missing code explicitly instead of inferring identity from a name.
-  const outside = clone(f.graph.nodes.find(node => node.id === 'w-garden-later-operation')!);
-  outside.code = [{ path: 'future/garden-later.ts', access: 'write', status: 'planned', symbol: 'consume' }];
-  proposal.nodes.push(outside); proposal.removes.push(outside.id);
-  for (const fill of current.result.fills.filter(item => item.node === outside.id)) {
-    proposal.fills.push({ obligation: fill.obligation, node: outside.id, ...(fill.port === undefined ? {} : { port: fill.port, codeRef: clone(outside.code[0]!) }) });
-    proposal.replaces.push({ obligation: fill.obligation, base: { node: outside.id, graph: frame.graph },
-      with: { node: outside.id, port: fill.port ?? null }, basis: 'Retain the accepted consumer with an explicit planned implementation address' });
-  }
+  // Current F5 already saved explicit code/identity fills; an empty proposal carries them unchanged.
   const proposalRef = put(store, 'accepted-work-carry', proposal);
   const readyProducer = ok(writeHorizon(store, { project: 'garden', input: reference(input), graph: frame.graph,
-    refinement: reference(store.get('phase:garden:L2')!),
+    refinement: reference(f.layers[2]),
     available: { 'garden-produce-block': { 'garden-data': reference(f.receipts['garden-data']!) } },
     choice: { choiceVersion: 'ready-producer-work-carry', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const readyFrame = clone(ok(prepareFrame(store, { ...frame, horizon: reference(readyProducer.gate) }))) as unknown as FrameRead;
   assert.ok(!readyFrame.scope.nodes.includes('garden-produce-operation'));
   const works = { frame: current.request as FrameRequest, proposals: [proposalRef] };
   const gaps = ok(writeGaps(store, { project: 'garden', input: reference(input), graph: frame.graph, horizon: frame.horizon,
-    operations: { frame: { ...frame, level: 2, layer: reference(f.layers[2]), upper: null }, proposals: [] }, works }));
+    operations: { frame: { ...frame, level: 2, layer: reference(f.layers[2]), frame: reference(store.get("om-frame:garden:2")!), upper: null }, proposals: [] }, works }));
   const read = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
-  const lines = ok(writeGapLines(store, { project: 'garden', previous: null, pass: 1, gaps: read, closures: [] }));
+  const priorLines = store.get<import('../src/om/gap-lines.js').GapLinesRecord>(gapLinesId('garden'));
+  const lines = ok(writeGapLines(store, { project: 'garden', previous: priorLines ? reference(priorLines) : null,
+    pass: (priorLines?.value.request.pass ?? 0) + 1, gaps: read, closures: [] }));
   const ledger = ok(writeOmObligations(store, { project: 'garden', gaps: read, lines: reference(lines), assignments: [] }));
   const request: CandidateRequest = { ...works, works: { contract: 'works-frame/v1', producer: reference(ledger.producer), ledger: reference(ledger.record), bindings: [] } };
   const ready = ok(assembleCandidate(readyFrame, [{ reference: proposalRef, value: proposal }], request.works));

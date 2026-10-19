@@ -7,23 +7,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
-import type { Source } from "../src/evidence/evidence.js";
+import { Evidence, type Source } from "../src/evidence/evidence.js";
 import type { ResearchAnswer, ResearchAssessment } from "../src/discovery/research-model.js";
-import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
-import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
+import type { Question } from "../src/discovery/discovery.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store } from "../src/storage/store.js";
 import { removeProofCache } from "../src/storage/schema.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { OmResult } from "../src/om/refusal.js";
-import { writeOmInput } from "../src/om/input.js";
 import { readLayerBasis, readLayerEnvelope, readLayerAcceptance, readUnacceptedLayer, readRebaseBasis, buildRebasedLayer, acceptedCandidateFills, lowerLayerHash, omAcceptedFrame, acceptedLayerProof,
   type LayerBasis, type OmAcceptedFrame, type OmRebasedFrame, type RebasedLayerRequest, type LayerEnvelopeRequest } from "../src/om/layer-basis.js";
 import { prepareHorizon, readHorizon, writeHorizon, type HorizonRecord, type HorizonRequest } from "../src/om/horizon.js";
 import { prepareFrame, readFrame, type FrameRequest } from "../src/om/frame-obligations.js";
 import { createOmFixture, type FixtureLayer, type OmFixture } from "./om-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
-import { writeCandidate, gateCandidate, type FrameCandidateRecord, type CandidateGate } from "../src/om/frame-candidate.js";
+import { writeCandidate, gateCandidate, readCandidate as importedReadCandidate, type FrameCandidateRecord, type CandidateGate } from "../src/om/frame-candidate.js";
 import type { Revision, Write } from "../src/storage/store.js";
 import { prepareSettleCandidate, settleCandidate, type SettleCandidateRequest } from "../src/om/frame-accept.js";
 import type { Graph } from "../src/graph/model.js";
@@ -63,67 +61,93 @@ function basisRequest(f: OmFixture, level: 2 | 3): LayerBasisRequest {
 }
 function frameRequest(f: OmFixture, horizon: Ref, level: 2 | 3): FrameRequest {
   return { project: f.project, level, graph: reference(f.graphRevision), layer: reference(f.layers[level]),
-    horizon, frame: null, upper: level === 2 ? null : { horizon, frame: null } };
+    horizon, frame: reference(f.store.get(`om-frame:${f.project}:${level}`)!),
+    upper: level === 2 ? null : { horizon, frame: reference(f.store.get(`om-frame:${f.project}:2`)!) } };
 }
-async function fixture(t: test.TestContext) {
-  const f = await createOmFixture(t);
-  const input = delivered(writeOmInput(f.store, { project: f.project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+async function fixture(t: test.TestContext, fileBrief = false) {
+  // The history scenario needs an actual file source in the upstream accepted proof.
+  // Only source creation is redirected; all stages and both OM layers use real producers.
+  const directory = fileBrief ? mkdtempSync(join(tmpdir(), "omg-layer-file-")) : null;
+  if (directory) t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const document = Evidence.prototype.document;
+  if (directory) Evidence.prototype.document = function(project, id, content, mediaType, expected) {
+    if (project === "garden" && id === "brief") {
+      writeFileSync(join(directory, "brief.md"), content);
+      return this.file(project, id, directory, "brief.md", mediaType, expected);
+    }
+    return document.call(this, project, id, content, mediaType, expected);
+  };
+  let f: OmFixture;
+  try { f = await createOmFixture(t, "standard", "garden", { mode: "executed" }); }
+  finally { Evidence.prototype.document = document; }
+  const input = f.store.get("om-input:garden")!;
   const request: HorizonRequest = { project: f.project, input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(f.store.get("phase:garden:L2")!),
+    refinement: reference(f.layers[2]),
     choice: { choiceVersion: "shared-basis", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} };
   const horizon = delivered(writeHorizon(f.store, request));
   return { f, request, horizon };
 }
 
-test("the shared layer reader validates both native levels, its complete boundary, and unexpected failures without writes", async t => {
+test("the shared acceptance reader validates both OM levels, its complete boundary, and unexpected failures without writes", async t => {
   const { f } = await fixture(t);
   for (const level of levels) {
-    const request = basisRequest(f, level), before = revisions(f.store);
-    const result = delivered(readLayerBasis(f.store, request));
-    for (const ref of [request.graph, request.layer, request.upper])
+    const expectedUpper = basisRequest(f, level).upper;
+    const request = { project: f.project, level, graph: reference(f.graphRevision), layer: reference(f.layers[level]) };
+    const before = revisions(f.store);
+    const result = delivered(readLayerAcceptance(f.store, request));
+    for (const ref of [request.graph, request.layer, expectedUpper])
       assert.ok(result.references.some(item => canonical(item) === canonical(ref)), ref.id);
     assert.equal(new Set(result.references.map(ref => canonical(ref))).size, result.references.length);
-    assert.ok(result.references.some(ref => ref.id.startsWith("research-assessment:")));
+    assert.equal(result.producer, "om");
+    assert.deepEqual(result.upper, expectedUpper);
+    assert.deepEqual(result.frame, reference(f.store.get(`om-frame:garden:${level}`)!));
+    assert.ok(result.currentReferences.some(ref => canonical(ref) === canonical(result.frame)));
     assert.ok(Object.isFrozen(result) && Object.isFrozen(result.references));
     assert.deepEqual(revisions(f.store), before);
     for (const bad of [undefined, null, 0, "request", []]) {
-      assert.throws(() => readLayerBasis(f.store, bad as unknown as LayerBasisRequest), malformed);
-      assert.throws(() => readLayerBasis(bad as unknown as Store, request), malformed);
+      assert.throws(() => readLayerAcceptance(f.store, bad as unknown as LayerBasisRequest), malformed);
+      assert.throws(() => readLayerAcceptance(bad as unknown as Store, request), malformed);
     }
-    for (const field of ["project", "level", "graph", "layer", "upper"] as const) {
-      const missing = clone(request) as Partial<LayerBasisRequest>; delete missing[field];
-      assert.throws(() => readLayerBasis(f.store, missing as LayerBasisRequest), malformed);
+    for (const field of ["project", "level", "graph", "layer"] as const) {
+      const missing = clone(request) as Partial<typeof request>; delete missing[field];
+      assert.throws(() => readLayerAcceptance(f.store, missing as LayerBasisRequest), malformed);
     }
-    for (const field of ["graph", "layer", "upper"] as const) {
+    for (const field of ["graph", "layer"] as const) {
       for (const value of [null, {}, { ...request[field], revision: 0 }, { ...request[field], hash: "bad" }]) {
         const broken = { ...request, [field]: value } as LayerBasisRequest;
-        assert.throws(() => readLayerBasis(f.store, broken), malformed);
+        assert.throws(() => readLayerAcceptance(f.store, broken), malformed);
       }
       const missing = clone(request); missing[field].revision += 1000;
-      refusedAs(readLayerBasis(f.store, missing), "layer_basis_unproven");
+      refusedAs(readLayerAcceptance(f.store, missing), "layer_basis_unproven");
       const forged = clone(request); forged[field].hash = "0".repeat(64);
-      refusedAs(readLayerBasis(f.store, forged), "layer_basis_unproven");
+      refusedAs(readLayerAcceptance(f.store, forged), "layer_basis_unproven");
       const foreign = clone(request); foreign[field].id = field === "graph" ? "graph:other" : `graph-layer:other:${level}`;
-      refusedAs(readLayerBasis(f.store, foreign), "layer_basis_unproven");
+      refusedAs(readLayerAcceptance(f.store, foreign), "layer_basis_unproven");
     }
     for (const bad of ["", "  "])
-      assert.throws(() => readLayerBasis(f.store, { ...request, project: bad }), malformed);
+      assert.throws(() => readLayerAcceptance(f.store, { ...request, project: bad }), malformed);
     for (const bad of [1, 4, "2"])
-      assert.throws(() => readLayerBasis(f.store, { ...request, level: bad } as LayerBasisRequest), malformed);
+      assert.throws(() => readLayerAcceptance(f.store, { ...request, level: bad } as LayerBasisRequest), malformed);
     // NR1 (№3591): the saved layer is read as written; a fault of a record it reads (the graph) reaches the caller, and the
-    // research records named by its proof are not read again.
+    // producer records named by its proof are not read again.
     for (const target of [request.graph.id]) for (const error of [
       new TypeError("injected shared layer failure"), new EngineError("record_corrupt", "injected shared layer corruption", { target }),
     ]) {
       const get = f.store.get.bind(f.store);
       try {
         f.store.get = ((id: string, revision?: number) => { if (id === target) throw error; return get(id, revision); }) as Store["get"];
-        assert.throws(() => readLayerBasis(f.store, request), actual => actual === error);
+        assert.throws(() => readLayerAcceptance(f.store, request), actual => actual === error);
       } finally { f.store.get = get; }
       assert.deepEqual(revisions(f.store), before);
     }
     assert.deepEqual(revisions(f.store), before);
+    const upper = f.store.get(expectedUpper.id)!;
+    f.store.write({ id: upper.id, kind: upper.kind, expected: upper.revision, value: upper.value });
+    const afterAdvance = revisions(f.store);
+    assert.deepEqual(delivered(readLayerAcceptance(f.store, request)), result);
+    f.reopen();
+    assert.deepEqual(delivered(readLayerAcceptance(f.store, request)), result);
+    assert.deepEqual(revisions(f.store), afterAdvance);
   }
 });
 
@@ -232,8 +256,8 @@ test("an unused exact source in a proof is refused consistently by the shared re
   assert.deepEqual(revisions(f.store), beforeRead);
 });
 
-test("all historical layer readers preserve captured research after source heads and files change", async t => {
-  const { f, horizon } = await fixture(t);
+test("all historical layer readers preserve captured OM acceptance after source heads and files change", async t => {
+  const { f, horizon } = await fixture(t, true);
   const basisRequests = levels.map(level => basisRequest(f, level));
   const frameRequests = levels.map(level => frameRequest(f, reference(horizon.gate), level));
   const bases = basisRequests.map(request => delivered(readLayerBasis(f.store, request)));
@@ -243,40 +267,19 @@ test("all historical layer readers preserve captured research after source heads
   try {
     for (const level of levels) {
       const proof = f.layers[level].value.layerProofs!.find(item => item.level === level)!;
-      const product = f.graph.nodes.find(node => node.kind === "product")!;
-      const drafts = proof.inputs.map(ref => f.store.get<DiscoveryDraft>(ref.id, ref.revision)!)
-        .filter(record => record.kind === "discovery-draft" && record.value.stage === "om-g2"
-          && record.value.level === `R${level - 1}` && record.value.consumer === product.id);
-      assert.equal(drafts.length, 1);
-      assert.equal(drafts[0]!.value.questions.length, 1);
-      const questionRefs = proof.inputs.filter(ref => ref.id === drafts[0]!.value.questions[0]);
-      assert.equal(questionRefs.length, 1);
-      const questionRef = questionRefs[0]!, question = f.store.get<Question>(questionRef.id, questionRef.revision)!;
-      assert.equal(question.hash, questionRef.hash);
-      assert.equal(question.value.status, "answered");
-      assert.equal(question.value.spec.field, "layerDesign");
-      assert.ok(question.value.answer);
-      const answer = f.store.get<ResearchAnswer>(question.value.answer.id, question.value.answer.revision)!;
-      assert.equal(answer.kind, "research-answer");
-      assert.equal(answer.hash, question.value.answer.hash);
-      assert.ok(proof.inputs.some(ref => canonical(ref) === canonical(reference(answer))));
-      const assessment = f.store.get<ResearchAssessment>(answer.value.assessment.id, answer.value.assessment.revision)!;
-      assert.equal(assessment.kind, "research-assessment");
-      assert.equal(assessment.hash, answer.value.assessment.hash);
-      assert.ok(proof.inputs.some(ref => canonical(ref) === canonical(reference(assessment))));
-      assert.ok(assessment.value.observations.length > 0);
-      for (const observation of assessment.value.observations) {
-        assert.ok(proof.inputs.some(ref => canonical(ref) === canonical(observation.source)));
-        sources.set(canonical(observation.source), observation.source);
-      }
-      // Native layer designs cite owner documents; inherited research supplies the captured file evidence.
-      for (const ref of proof.inputs) {
-        const record = f.store.get<ResearchAssessment>(ref.id, ref.revision)!;
-        if (record.kind !== "research-assessment") continue;
-        for (const observation of record.value.observations) if (proof.inputs.some(input => canonical(input) === canonical(observation.source)))
-          sources.set(canonical(observation.source), observation.source);
-      }
+      const frame = f.store.get<import('../src/om/layer-basis.js').OmAcceptedFrame>(`om-frame:garden:${level}`)!;
+      assert.equal(frame.value.acceptance.producer, "om");
+      assert.ok(proof.inputs.some(ref => canonical(ref) === canonical(reference(frame))));
+      const candidateRef = frame.value.acceptance.candidate;
+      const candidate = delivered(importedReadCandidate(f.store, { project: f.project, candidate: candidateRef }));
+      assert.equal(candidate.hash, candidateRef.hash);
+      assert.ok(proof.inputs.some(ref => canonical(ref) === canonical(candidateRef)));
     }
+    // Accepted upstream observations supply real captured files; the OM layers retain
+    // their own candidate/frame proofs when those source heads and files later change.
+    for (const assessment of f.store.list<ResearchAssessment>("research-assessment"))
+      for (const observation of assessment.value.observations) sources.set(canonical(observation.source), observation.source);
+    assert.ok(sources.size > 0);
     for (const sourceRef of sources.values()) {
       const source = f.store.get<Source>(sourceRef.id, sourceRef.revision)!;
       assert.equal(source.kind, "source");
@@ -288,7 +291,7 @@ test("all historical layer readers preserve captured research after source heads
       }
       f.store.write({ id: source.id, kind: source.kind, expected: f.store.get(source.id)!.revision, value: source.value });
     }
-    assert.ok(changedFiles.size > 0, "The native L3 fixture supplies a real captured file");
+    assert.ok(changedFiles.size > 0, "The accepted upstream proof supplies a real captured file");
     const before = revisions(f.store);
     for (const reopen of [false, true]) {
       if (reopen) f.reopen();
@@ -460,12 +463,10 @@ test("the OM historical layer reader rederives its exact accepted candidate and 
 async function nativeRebaseFixture(t: test.TestContext, forgedRetired = false) {
   const { f, request: horizonRequest, horizon } = await fixture(t);
   const original = frameRequest(f, reference(horizon.gate), 3);
-  const mapped = delivered(readFrame(f.store, original));
-  const nativeFrame = f.store.write({ id: "om-frame:garden:3", kind: "connection-frame", expected: 0, value: {
-    project: f.project, level: 3, candidateHash: f.graphRevision.hash, layerHash: hashJson(f.layers[3].value.projection),
-    fills: mapped.result.fills, ...(forgedRetired ? { retired: [mapped.result.fills[0]!], rebase: {} } : {}),
-  } });
-  const from = { ...original, frame: reference(nativeFrame) };
+  const nativeFrame = f.store.get<import('../src/om/layer-basis.js').OmAcceptedFrame>(original.frame!.id)!;
+  const frame = forgedRetired ? f.store.write({ id: nativeFrame.id, kind: nativeFrame.kind, expected: nativeFrame.revision,
+    value: { ...nativeFrame.value, retired: [nativeFrame.value.fills[0]!], rebase: {} } }) : nativeFrame;
+  const from = { ...original, frame: reference(frame) };
   delivered(readFrame(f.store, from));
   const written = delivered(writeCandidate(f.store, { frame: frameRequest(f, reference(horizon.gate), 2), proposals: [] }));
   assert.equal(written.state, "candidate"); if (written.state !== "candidate") assert.fail("The native fixture must produce an operation candidate");

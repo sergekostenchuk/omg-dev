@@ -710,7 +710,7 @@ test("frame boundaries reject absent sets, foreign correspondence, reserved iden
 });
 
 function acceptedInput(store: Store) {
-  return delivered(writeOmInput(store, { project: "garden", expected: 0,
+  return store.get("om-input:garden") ?? delivered(writeOmInput(store, { project: "garden", expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:garden:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
 }
 function acceptedHorizon(store: Store, refinement: Ref | null) {
@@ -720,7 +720,8 @@ function acceptedHorizon(store: Store, refinement: Ref | null) {
 }
 function requestFor(f: OmFixture, horizon: Ref, level: FrameLevel): FrameRequest {
   return { project: f.project, level, horizon, graph: reference(f.graphRevision), layer: reference(f.layers[level]),
-    frame: null, upper: level === 2 ? null : { horizon, frame: null } };
+    frame: f.store.get(`om-frame:${f.project}:${level}`) ? reference(f.store.get(`om-frame:${f.project}:${level}`)!) : null,
+    upper: level === 2 ? null : { horizon, frame: f.store.get(`om-frame:${f.project}:2`) ? reference(f.store.get(`om-frame:${f.project}:2`)!) : null } };
 }
 const revisions = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
 function branchStore(f: OmFixture, snapshot: string, name: string): Store {
@@ -733,25 +734,27 @@ function replaceExact(value: unknown, replacements: Map<string, Ref>): unknown {
   return value;
 }
 
-test("C2 reads both accepted garden layers without proof one or a frame and never writes the database", async t => {
-  const f = await createOmFixture(t);
-  const horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+test("C2 reads both accepted garden layers with exact OM frames and never writes the database", async t => {
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
+  const horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   assert.ok(!f.layers[1].value.layerProofs?.some(proof => proof.level === 1));
   for (const level of levels) {
     const request = requestFor(f, reference(horizon.gate), level), before = revisions(f.store);
     const historical = delivered(readFrame(f.store, request));
     const current = delivered(prepareFrame(f.store, request));
     assert.deepEqual(current.result, historical.result);
-    assert.equal(historical.accepted!.frame, null);
+    assert.deepEqual(historical.accepted!.frame, { reference: request.frame, value: f.store.get(`om-frame:garden:${level}`)!.value });
     assert.deepEqual(historical.result.open, []);
-    assert.deepEqual(historical.result.representatives, []);
-    assert.ok(historical.result.fills.every(fill => fill.source === "accepted"));
-    assert.deepEqual(current.expected, { graph: f.graphRevision.revision, layer: f.layers[level].revision, frame: 0 });
+    const identityNodes = new Set(f.store.get<ConnectionFrame>(request.frame!.id)!.value.fills
+      .filter(fill => fill.source === "identity").map(fill => fill.node));
+    assert.deepEqual(historical.result.representatives.map(node => node.id).sort(), [...identityNodes].sort());
+    assert.ok(historical.result.fills.every(fill => fill.source === (identityNodes.has(fill.node) ? "identity" : "accepted")));
+    assert.deepEqual(current.expected, { graph: f.graphRevision.revision, layer: f.layers[level].revision, frame: request.frame!.revision });
     assert.equal(historical.upperRef.id, `graph-layer:garden:${level - 1}`);
     assert.deepEqual(historical.upper, upper(f.graph, level));
     assert.ok(current.guards.some(guard => canonical(guard) === canonical(reference(f.graphRevision))));
     assert.deepEqual(revisions(f.store), before);
-    assert.equal(f.store.list("connection-frame").length, 0);
+    assert.equal(f.store.list("connection-frame").length, 2);
     assert.ok(Object.isFrozen(current.result.fills));
   }
   const request = requestFor(f, reference(horizon.gate), 2);
@@ -766,32 +769,24 @@ test("C2 reads both accepted garden layers without proof one or a frame and neve
   assert.deepEqual(delivered(readFrame(f.store, request)), historical);
 });
 
-test("the work scope excludes recorded operation identities after their blocks enter the horizon", async t => {
-  const f = await createOmFixture(t), initial = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
-  const horizonRequest = clone(initial.horizon.value.request) as HorizonRequest;
-  horizonRequest.choice = { choiceVersion: "frame-identity-entry", features: [{ outcome: "garden-result" }], excluded: [] };
-  const horizon = delivered(writeHorizon(f.store, horizonRequest));
-  assert.ok(horizon.horizon.value.result.horizon.nodes.includes("garden-consume-block"));
-  assert.equal(horizon.horizon.value.result.horizon.execution["garden-consume-block"]!.state, "needed");
-  const request = requestFor(f, reference(horizon.gate), 3);
-  const legacy = delivered(readFrame(f.store, request));
-  assert.ok(legacy.scope.nodes.includes("garden-consume-operation"));
-  assert.ok(legacy.scope.nodes.includes("garden-produce-operation"));
-  assert.ok(legacy.result.fills.some(fill => fill.node === "w-garden-later-operation" && fill.source === "accepted"));
-  const operations = delivered(readFrame(f.store, requestFor(f, reference(horizon.gate), 2)));
-  const fills = operations.result.fills.map(fill => ({ ...fill,
-    source: fill.node === "garden-consume-operation" ? "identity" as const : fill.source }));
-  const frame = f.store.write({ id: "om-frame:garden:2", kind: "connection-frame", expected: 0,
-    value: storedFrame(f.graph, 2, fills) });
-  request.upper = { horizon: reference(horizon.gate), frame: reference(frame) };
-  const before = revisions(f.store);
+test("the work scope excludes recorded operation identities after their blocks enter the horizon", t => {
+  const { store, input, settled, acceptedGraph, acceptedLayer, acceptedFrame, later } = identityOperationFixture(t);
+  const horizon = delivered(writeHorizon(store, { project: "garden", input, graph: acceptedGraph, refinement: acceptedLayer,
+    choice: { choiceVersion: "frame-identity-entry", features: [{ outcome: "garden-result" }, { outcome: "garden-later" }], excluded: [] }, available: {} }));
+  assert.ok(horizon.horizon.value.result.horizon.nodes.includes(later));
+  assert.equal(horizon.horizon.value.result.horizon.execution[later]!.state, "needed");
+  const identity = representativeId(later, 2);
+  assert.ok(settled.frame!.value.fills.some(fill => fill.node === identity && fill.source === "identity"));
+  const request: FrameRequest = { project: "garden", level: 3, graph: acceptedGraph, horizon: reference(horizon.gate),
+    layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: acceptedFrame } };
+  const before = revisions(store);
   for (const action of [readFrame, prepareFrame]) {
-    const current = delivered(action(f.store, request));
-    assert.ok(!current.scope.nodes.includes("garden-consume-operation"));
+    const current = delivered(action(store, request));
+    assert.ok(!current.scope.nodes.includes(identity));
     assert.ok(current.scope.nodes.includes("garden-produce-operation"));
-    assert.ok(current.result.fills.some(fill => fill.node === "w-garden-later-operation" && fill.source === "accepted"));
+    assert.ok(current.result.fills.some(fill => fill.source === "identity"));
   }
-  assert.deepEqual(revisions(f.store), before);
+  assert.deepEqual(revisions(store), before);
 });
 
 test("the first frame assembly uses accepted L1 and open obligations without creating an empty frame", t => {
@@ -841,16 +836,13 @@ test("the first frame assembly uses accepted L1 and open obligations without cre
 });
 
 test("a prepared frame guards every mutable dependency before a neighbor can write any part of its transaction", async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const request = requestFor(f, reference(horizon.gate), 2);
-  const inferred = delivered(readFrame(f.store, request));
-  const record = f.store.write({ id: "om-frame:garden:2", kind: "connection-frame", expected: 0,
-    value: storedFrame(f.graph, 2, inferred.result.fills) });
-  request.frame = reference(record);
+  const record = f.store.get("om-frame:garden:2")!;
   const saved = delivered(readFrame(f.store, request));
   assert.ok(saved.result.fills.every(fill => canonical(fill.basis) === canonical(reference(record))));
   const snapshot = await f.store.snapshot(join(f.root, "frame-guards"));
-  const dependencies = [reference(f.store.get("source:garden:brief")!), request.graph, request.layer!, request.frame];
+  const dependencies = [reference(f.store.get("source:garden:brief")!), request.graph, request.layer!, reference(record)];
   for (const [index, dependency] of dependencies.entries()) {
     const store = branchStore(f, snapshot.path, `frame-guard-${index}`);
     try {
@@ -1060,7 +1052,7 @@ test("self-consistent lower proofs cannot replace saved layer research on either
 });
 
 test("frame storage boundaries reject malformed refs and preserve unexpected engine exceptions without writes", async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const request = requestFor(f, reference(horizon.gate), 2);
   for (const action of [readFrame, prepareFrame]) {
     for (const bad of [undefined, null, 1, "input", []]) {
@@ -1172,7 +1164,7 @@ test("OM acceptance from L1 is consumed by C2, B2 and D1 with historical sources
   assert.deepEqual(delivered(readGaps(store, { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) })), gaps);
 });
 
-test("C2 and F1 share the accepted operation zone across realizes roles, newly selected identities and unaccepted lower bridges", t => {
+function identityOperationFixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-work-zone-c2-")), store = new Store(join(root, "state.sqlite"));
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const graph = gardenGraph(), producer = "garden-produce-block", consumer = "garden-consume-block", later = "garden-later-block";
@@ -1225,13 +1217,19 @@ test("C2 and F1 share the accepted operation zone across realizes roles, newly s
     transfers: clone(design.transfers ?? []), anchors: clone(design.anchors), removes: [], replaces: [], redefines: [] };
   const offered = store.write({ id: "om-proposal:garden:work-zone-c2", kind: "layer-proposal", expected: 0, value: proposal });
   const written = delivered(writeCandidate(store, { frame: original, proposals: [reference(offered)] }));
-  assert.equal(written.state, "candidate"); if (written.state !== "candidate") return;
+  assert.equal(written.state, "candidate"); if (written.state !== "candidate") assert.fail("The identity fixture requires a current N2 candidate");
   const candidate = reference(written.record), gate = delivered(gateCandidate(store, { project: "garden", candidate }));
   assert.equal(gate.passed, true, JSON.stringify(gate));
   const settled = delivered(settleCandidate(store, { project: "garden", level: 2, candidate,
     outcome: { gate: "G3", candidate, graphHash: gate.graphHash, passed: gate.passed, codes: [] } }));
   assert.equal(settled.state, "accepted"); assert.ok(settled.graph && settled.layer && settled.frame);
   const acceptedGraph = reference(settled.graph), acceptedLayer = reference(settled.layer), acceptedFrame = reference(settled.frame);
+  return { store, graph, input, settled, original, producer, consumer, later, outside, acceptedGraph, acceptedLayer, acceptedFrame };
+}
+
+test("C2 and F1 share the accepted operation zone across realizes roles, newly selected identities and unaccepted lower bridges", t => {
+  const { store, graph, input, settled, original, producer, later, outside, acceptedGraph, acceptedLayer, acceptedFrame } = identityOperationFixture(t);
+  assert.ok(settled.graph && settled.frame);
   const identity = representativeId(later, 2);
   assert.ok(settled.frame.value.fills.some(fill => fill.source === "identity" && fill.node === identity));
   const choice = (version: string, outcomes: string[], graphRef: Ref = acceptedGraph) => {
@@ -1279,7 +1277,7 @@ test("C2 and F1 share the accepted operation zone across realizes roles, newly s
 
 
 test("C2 work-zone contracts are explicit in history and unknown contracts never become current work", async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const legacy = requestFor(f, reference(horizon.gate), 3), original = clone(legacy);
   const historical = delivered(readFrame(f.store, legacy));
   assert.ok(!Object.hasOwn(historical.request, "workZoneContract"));

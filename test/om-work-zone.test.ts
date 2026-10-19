@@ -308,20 +308,19 @@ test('F1 does not disguise storage or execution exceptions as missing readiness'
   assert.deepEqual(snapshot(f.store), before);
 });
 
-test('F1 preserves the historical engine era without a frame and excludes ready blocks using real receipts even with an accepted L3', async t => {
-  const f = await createOmFixture(t), store = f.store;
-  const input = ok(writeOmInput(store, { project: f.project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+test('F1 excludes ready blocks using real receipts with accepted OM L2 and L3 across restart', async t => {
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), store = f.store;
+  const input = store.get("om-input:garden")!;
   const horizon = ok(writeHorizon(store, { project: f.project, input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(store.get('phase:garden:L2')!), choice: { choiceVersion: 'zone-ready', features: [{ outcome: 'garden-result' }], excluded: [] },
+    refinement: reference(f.layers[2]), choice: { choiceVersion: 'zone-ready', features: [{ outcome: 'garden-result' }], excluded: [] },
     available: { [consumer]: { 'garden-result': reference(f.receipts['garden-result']!) } } }));
   const request: WorkZoneRequest = { project: f.project, graph: reference(f.graphRevision), layer: reference(f.layers[2]),
-    horizon: reference(horizon.gate), frame: null };
+    horizon: reference(horizon.gate), frame: reference(store.get("om-frame:garden:2")!) };
   const read = ok(readWorkZone(store, request)), prepared = ok(prepareWorkZone(store, request));
   assert.deepEqual(read.operations, [prepOp, produceOp]);
   assert.deepEqual(prepared.operations, read.operations);
   assert.deepEqual(ok(readFrameBasis(store, { project: f.project, level: 3, graph: request.graph, horizon: request.horizon,
-    layer: null, frame: null, upper: { horizon: request.horizon, frame: null } })).scope.nodes, read.operations);
+    layer: null, frame: null, upper: { horizon: request.horizon, frame: request.frame } })).scope.nodes, read.operations);
   assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(f.receipts['garden-result']!))));
   const layer3 = store.get('graph-layer:garden:3')!;
   store.write({ id: layer3.id, kind: layer3.kind, expected: layer3.revision, value: layer3.value });

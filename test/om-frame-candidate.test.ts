@@ -20,9 +20,8 @@ import { writeHorizon } from "../src/om/horizon.js";
 import { historicalTrace, withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
-import { gardenGraph, createOmFixture, type OmFixture } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, prepareNativeLayers, acceptNativeWorks, type OmFixture } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
-import { answerLayerFixture } from "./layer-design-fixture.js";
 
 const clone = structuredClone;
 const fakeRef = (id: string): Ref => ({ id, revision: 1, hash: hashJson(id) });
@@ -88,15 +87,15 @@ function proposalFor(frame: FrameRead, graph: Graph, id = "one"): ProposalObserv
   return observe(value, id);
 }
 function acceptedHorizon(store: Store, refinement: Ref | null) {
-  const input = delivered(writeOmInput(store, { project: "garden", expected: 0,
+  const input = store.get("om-input:garden") ?? delivered(writeOmInput(store, { project: "garden", expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:garden:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   return delivered(writeHorizon(store, { project: "garden", input: reference(input), graph: reference(store.get("graph:garden")!),
     refinement, choice: { choiceVersion: "candidate-choice", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} }));
 }
 function acceptedRequest(f: OmFixture): FrameRequest {
-  const horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const horizon = acceptedHorizon(f.store, reference(f.store.get("graph-layer:garden:2")!));
   return { project: "garden", level: 2, horizon: reference(horizon.gate), graph: reference(f.graphRevision),
-    layer: reference(f.layers[2]), frame: null, upper: null };
+    layer: reference(f.layers[2]), frame: reference(f.store.get("om-frame:garden:2")!), upper: null };
 }
 function put(store: Store, proposal: ProposalObservation): Ref {
   return reference(store.write({ id: proposal.reference.id, kind: "layer-proposal", expected: 0, value: proposal.value }));
@@ -274,7 +273,6 @@ test("open horizon obligations become addressed gaps; explicit empty proposals a
   assert.equal(prepared.state, "gaps"); assert.equal(written.state, "gaps");
   if (prepared.state === "gaps") { assert.deepEqual(prepared.gaps, pure.gaps); assert.deepEqual(prepared.writes, []); }
   assert.deepEqual(revisions(f.store), before);
-  assert.equal(f.store.list("frame-candidate").length, 0);
 });
 
 test("first L1-only pass saves exactly one immutable candidate without a preliminary frame or accepted graph mutation", t => {
@@ -438,12 +436,12 @@ test("C4 historical proofs remain local to their Store and are discarded after a
 });
 
 test("current accepted fixtures preserve their exact bases and return accepted fills without rewriting neighbors", async t => {
-  const f = await createOmFixture(t, "cross"), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
+  const f = await createOmFixture(t, "cross", "garden", { mode: "executed" }), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
   const proposal = emptyProposal(frame, "accepted-base"), proposalRef = put(f.store, proposal), request = { frame: frameRequest, proposals: [proposalRef] };
   const before = revisions(f.store), written = delivered(writeCandidate(f.store, request));
   assert.equal(written.state, "candidate"); if (written.state !== "candidate") return;
   const value = written.record.value;
-  assert.deepEqual(value.base, { graph: frameRequest.graph, frame: null });
+  assert.deepEqual(value.base, { graph: frameRequest.graph, frame: frameRequest.frame });
   assert.ok(value.fills.every(fill => fill.source === "accepted"));
   assert.deepEqual(projectGraph(value.graph as Graph, 2), projectGraph(f.graph, 2));
   assert.deepEqual(revisions(f.store).filter(item => item.head.id !== written.record.id), before);
@@ -759,7 +757,7 @@ function assertAcceptedWorksUnchanged(before: Graph, after: Graph): void {
 }
 
 test("accepted L3 survives real L2 port changes in local and inherited connectors with full or L2-only proposals", async t => {
-  const f = await createOmFixture(t), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
   for (const connectorId of ["garden-prep-flow", "garden-flow"]) for (const includeOtherLevels of [true, false]) {
     const proposal = renameOperationPort(frame, f.graph, connectorId, includeOtherLevels, `preserve-${connectorId}-${includeOtherLevels}`);
     const proposalRef = put(f.store, proposal), request = { frame: frameRequest, proposals: [proposalRef] }, before = revisions(f.store);
@@ -783,7 +781,7 @@ test("accepted L3 survives real L2 port changes in local and inherited connector
 });
 
 test("explicit changes and partial deletion of accepted L3 bindings are refused through candidate prepare and write", async t => {
-  const f = await createOmFixture(t, "cross"), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
+  const f = await createOmFixture(t, "cross", "garden", { mode: "executed" }), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
   const mutations = [
     { id: "local-work-port", connector: "garden-prep-flow", change: (connector: Graph["connectors"][number]) => {
       connector.bindings.find(binding => binding.level === 3)!.producer.port = "changed-work-port";
@@ -811,12 +809,11 @@ test("explicit changes and partial deletion of accepted L3 bindings are refused 
       assert.equal(refusal.at.target, mutation.connector);
     }
     assert.deepEqual(revisions(f.store), before);
-    assert.equal(f.store.list("frame-candidate").length, 0);
   }
 });
 
 test("redefines cannot erase a prior work reference by moving accepted tests or anchors to operations", async t => {
-  const f = await createOmFixture(t), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), frameRequest = acceptedRequest(f), frame = clone(delivered(readFrame(f.store, frameRequest))) as FrameRead;
   const workTest = clone(f.graph.tests.find(item => item.node === "garden-produce-work")!);
   workTest.node = "garden-produce-operation";
   const workAnchor = clone(f.graph.anchors.find(item => item.owner === "garden-produce-work")!);
@@ -833,30 +830,43 @@ test("redefines cannot erase a prior work reference by moving accepted tests or 
       assert.equal(refusal.at.target, id);
     }
     assert.deepEqual(revisions(f.store), before);
-    assert.equal(f.store.list("frame-candidate").length, 0);
   }
 });
 
-function acceptResearchedWorks(f: OmFixture, graph: Graph): { graph: Graph; request: FrameRequest; frame: FrameRead } {
-  const prior = f.store.get<Graph>("graph:garden")!;
-  assert.deepEqual(projectGraph(graph, 2), projectGraph(prior.value, 2));
+function acceptCurrentWorks(f: { store: Store; engine: ProductEngine }, graph: Graph): { graph: Graph; request: FrameRequest; frame: FrameRead } {
   assert.deepEqual(validateGraph(graph).findings, []);
-  const draft = f.engine.refinement.prepareLayer("garden", 3);
-  const answered = answerLayerFixture(f.engine, "garden", draft, 3, graph);
-  const built = f.engine.refinement.buildLayer("garden", 3, reference(answered), prior.revision, "fixture-researcher");
-  f.engine.refinement.sealLayer("garden", 3, f.store.get("phase:garden:L3")!.revision, reference(built));
-  assert.deepEqual(f.engine.refinement.gate("garden", "L3").findings, []);
-  const horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  prepareNativeLayers(f.engine, "garden", graph, "n2");
+  const graph2 = reference(f.store.get("graph:garden")!), layer2 = reference(f.store.get("graph-layer:garden:2")!),
+    frame2 = reference(f.store.get("om-frame:garden:2")!);
+  let input: Ref = reference(f.store.get("om-input:garden")!);
+  const decisions: import('../src/om/addressing.js').InputDecisionProposal['decision'][] = [
+    { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] },
+    { target: 'garden-B1', field: 'state', value: { writer: 'garden-produce-block', authority: 'garden-consume-block', rollback: 'garden-consume-block' } },
+    { target: 'garden-R1#1', field: 'checkKind', value: 'test' },
+  ];
+  input = reference(delivered(writeAddressing(f.store, { project: 'garden', input: input, graph: graph2,
+    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project: 'garden', input: input, graph: graph2, layers: [], decision }) as Write })) })));
+  const first = delivered(writeHorizon(f.store, { project: 'garden', input: input, graph: graph2, refinement: layer2,
+    choice: { choiceVersion: 'current-work-design', features: [{ outcome: 'garden-result' }], excluded: [] }, available: {} }));
+  const works: FrameRequest = { project: 'garden', level: 3, graph: graph2, horizon: reference(first.gate),
+    layer: null, frame: null, upper: { horizon: reference(first.gate), frame: frame2 } };
+  const prepared = clone(delivered(prepareFrame(f.store, works))) as unknown as FrameRead;
+  const proposal = fjPut(f.store, 'current-work-only', fjProposalFor(prepared, graph));
+  acceptNativeWorks(f.engine, 'garden',
+    { frame: { project: 'garden', level: 2, graph: graph2, horizon: works.horizon, layer: layer2, frame: frame2, upper: null }, proposals: [] },
+    { frame: prepared.request, proposals: [proposal] });
+  const built = f.store.get<Graph>("graph:garden")!;
+  const horizon = acceptedHorizon(f.store, reference(f.store.get("graph-layer:garden:2")!));
   const request: FrameRequest = { project: "garden", level: 2, horizon: reference(horizon.gate), graph: reference(built),
-    layer: reference(f.store.get("graph-layer:garden:2")!), frame: null, upper: null };
+    layer: reference(f.store.get("graph-layer:garden:2")!), frame: reference(f.store.get("om-frame:garden:2")!), upper: null };
   return { graph: built.value, request, frame: clone(delivered(readFrame(f.store, request))) as FrameRead };
 }
 
-test("a legally researched L3 work-only port contract cannot be redefined by an N2 proposal", async t => {
-  const f = await createOmFixture(t), desired = clone(f.graph), contractId = "garden-work-only-contract";
+test("a currently accepted L3 work-only port contract cannot be redefined by an N2 proposal", async t => {
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" }), desired = gardenGraph(), contractId = "garden-work-only-contract";
   desired.contracts.push({ id: contractId, schema: { type: "string" } });
   desired.nodes.find(node => node.id === "garden-produce-work")!.ports.push({ id: "aux-work-only", direction: "out", contract: contractId });
-  const accepted = acceptResearchedWorks(f, desired);
+  const accepted = acceptCurrentWorks(f, desired);
   assert.ok(!projectGraph(accepted.graph, 2).contracts.some(contract => contract.id === contractId));
   const proposal = emptyProposal(accepted.frame, "work-only-port-contract");
   proposal.value.contracts = [{ id: contractId, schema: { type: "number" } }]; proposal.value.redefines = [contractId];
@@ -867,12 +877,11 @@ test("a legally researched L3 work-only port contract cannot be redefined by an 
     assert.equal(refusal.at.target, contractId);
   }
   assert.deepEqual(revisions(f.store), before);
-  assert.equal(f.store.list("frame-candidate").length, 0);
   assert.deepEqual(f.store.get<Graph>("graph:garden")!.value.contracts.find(item => item.id === contractId)!.schema, { type: "string" });
 });
 
 test("L3 outcome and connector dependencies remain protected while unrelated typed L2 additions still pass", async t => {
-  const f = await createOmFixture(t), desired = clone(f.graph);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" }), desired = gardenGraph();
   const outcomeContract = "garden-work-outcome-contract", outcomeArtifact = "garden-work-outcome";
   const flowContract = "garden-work-flow-contract", flowArtifact = "garden-work-flow-artifact";
   desired.contracts.push({ id: outcomeContract, schema: { type: "string" } }, { id: flowContract, schema: { type: "string" } });
@@ -880,17 +889,28 @@ test("L3 outcome and connector dependencies remain protected while unrelated typ
   desired.artifacts.push({ ...artifact, id: outcomeArtifact, contract: outcomeContract, purpose: "An outcome belonging only to work" },
     { ...artifact, id: flowArtifact, contract: flowContract, terminal: false, kind: "intermediate", purpose: "An internal work-only flow" });
   const producer = desired.nodes.find(node => node.id === "w-garden-refusal-operation")!;
-  const resultWork = clone(desired.nodes.find(node => node.id === "w-garden-refusal-operation")!);
+  producer.parent = "garden-produce-operation"; producer.outcome = flowArtifact;
+  producer.code = [{ path: "future/work-flow.ts", access: "write", status: "planned", symbol: "flow" }];
+  const flowTest = clone(desired.tests.find(test => test.node === "garden-produce-work")!);
+  flowTest.id = "garden-work-only-flow-test"; flowTest.node = producer.id; flowTest.covers = ["garden-work-only-flow"];
+  flowTest.contract!.entrypoint.path = producer.code[0]!.path; flowTest.contract!.counterfactuals = flowTest.contract!.counterfactuals.map(pair => ({ ...pair, connector: "garden-work-only-flow" }));
+  producer.tests = [flowTest.id]; desired.tests.push(flowTest); desired.horizon.push(producer.id);
+  const resultWork = clone(producer);
   resultWork.id = "garden-work-only-outcome"; resultWork.parent = producer.parent; resultWork.outcome = outcomeArtifact;
   resultWork.ports = [{ id: "in", direction: "in", contract: flowContract }];
-  desired.nodes.push(resultWork);
+  resultWork.code = [{ path: "future/work-outcome.ts", access: "write", status: "planned", symbol: "outcome" }];
+  const resultTest = clone(desired.tests.find(test => test.id === resultWork.tests[0])!);
+  resultTest.id = "garden-work-only-outcome-test"; resultTest.node = resultWork.id;
+  resultTest.covers = []; resultTest.contract!.entrypoint.path = resultWork.code[0]!.path; resultTest.contract!.counterfactuals = []; resultWork.tests = [resultTest.id];
+  desired.tests.push(resultTest);
+  desired.nodes.push(resultWork); desired.horizon.push(resultWork.id);
   producer.ports.push({ id: "work-only-flow", direction: "out", contract: flowContract });
-  desired.connectors.push({ id: "garden-work-only-flow", artifact: flowArtifact, returnsTo: "garden-refusal-operation", wakeTest: null,
-    bindings: [{ level: 3, producer: { node: producer.id, port: "work-only-flow" },
-      consumers: [{ node: resultWork.id, port: "in" }], anchor: null }] });
+  desired.connectors.push({ id: "garden-work-only-flow", artifact: flowArtifact, returnsTo: "garden-produce-operation", wakeTest: null,
+    bindings: [{ level: 3, producer: { node: producer.id, port: "work-only-flow", codeRef: clone(producer.code[0]!) },
+      consumers: [{ node: resultWork.id, port: "in", codeRef: clone(resultWork.code[0]!) }], anchor: null }] });
   const journey = clone(desired.journeys!.find(item => item.terminal === "safe_failure")!);
   desired.journeys!.push({ ...journey, id: "garden-work-only-journey", entry: resultWork.id, path: [resultWork.id], outcome: outcomeArtifact });
-  const accepted = acceptResearchedWorks(f, desired);
+  const accepted = acceptCurrentWorks(f, desired);
   assert.ok(!projectGraph(accepted.graph, 2).artifacts.some(item => [outcomeArtifact, flowArtifact].includes(item.id)));
   assert.ok(!accepted.graph.nodes.some(node => node.ports.some(port => port.contract === outcomeContract)), "Outcome contract is reached through its artifact, not a port");
   for (const [part, id] of [["contracts", outcomeContract], ["artifacts", outcomeArtifact], ["artifacts", flowArtifact]] as const) {
@@ -905,7 +925,6 @@ test("L3 outcome and connector dependencies remain protected while unrelated typ
       assert.equal(refusal.at.target, id);
     }
     assert.deepEqual(revisions(f.store), before);
-    assert.equal(f.store.list("frame-candidate").length, 0);
   }
   const positive = emptyProposal(accepted.frame, "outside-work-closure"), node = clone(accepted.graph.nodes.find(item => item.id === "garden-prep-operation")!);
   const contractId = "garden-operation-only-contract";
@@ -955,11 +974,12 @@ function fjProposalFor(frame: FrameRead, graph: Graph): LayerProposal {
       const upper = frame.upper[part] ?? [], ids = new Set(upper.map(item => item.id));
       Object.assign(graph, { [part]: [...clone(upper), ...(graph[part] ?? []).filter(item => !ids.has(item.id))] });
     }
+    const local = graph.connectors.filter(connector => !frame.upper.connectors.some(upper => upper.id === connector.id));
     graph.connectors = frame.upper.connectors.map(upper => {
       const desired = graph.connectors.find(connector => connector.id === upper.id)!;
       return { ...clone(upper), wakeTest: upper.wakeTest ?? desired.wakeTest,
         bindings: [...clone(upper.bindings), ...desired.bindings.filter(binding => binding.level === 3)] };
-    });
+    }).concat(local);
   }
   const level = frame.request.level, projected = projectGraph(graph, level);
   const mapped = delivered(fillObligations(frame.upper, frame.scope, { graph,
@@ -977,7 +997,7 @@ function fjProposalFor(frame: FrameRead, graph: Graph): LayerProposal {
       return { obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }),
         ...(codeRef ? { codeRef: clone(codeRef) } : {}) };
     }),
-    localConnectors: level === 3 ? [] : projected.connectors.map(connector => ({ ...connector,
+    localConnectors: level === 3 ? projected.connectors.filter(connector => !frame.upper.connectors.some(upper => upper.id === connector.id)) : projected.connectors.map(connector => ({ ...connector,
       bindings: connector.bindings.filter(binding => binding.level === level) })).filter(connector => connector.bindings.length),
     artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins,
     tests: projected.tests.filter(item => level === 2 || selected.has(item.node)),
