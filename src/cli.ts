@@ -3,20 +3,15 @@ import { Store } from "./storage/store.js";
 import { restoreSnapshot } from "./storage/snapshots.js";
 import { EngineError } from "./errors.js";
 import { readFileSync } from "node:fs";
-import { ProductEngine } from "./product/engine.js";
-import { createProductServer } from "./server.js";
-import { DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation, issueOwnerInvitation,
-  issueProjectModeInvitation, ProjectModeSessions } from "./product/owner-authority.js";
-import { probeCommand } from "./om/probe.js";
-import { answerDiscoveryCondition, validateDiscoveryConditionRequest } from "./discovery/discovery-decision.js";
-import { setProjectMode, validateProjectModeRequest } from "./product/project-mode.js";
 import { reference } from "./pipeline/contracts.js";
 
 export async function main(args = process.argv.slice(2)): Promise<void> {
   const [command, database = ".omg/state.sqlite", directory = ".omg/backups"] = args;
   // PR1 (№2943): the probe reads only the frozen snapshot it is given and copies it first; it never opens the default database.
-  if (command === "probe") { process.exitCode = await probeCommand(args.slice(1)); return; }
+  if (command === "probe") { const { probeCommand } = await import("./om/probe.js"); process.exitCode = await probeCommand(args.slice(1)); return; }
   if (command === "serve") {
+    const [{ ProductEngine }, { createProductServer }] = await Promise.all([
+      import("./product/engine.js"), import("./server.js")]);
     const store = new Store(resolve(database)); const server = createProductServer(new ProductEngine(store));
     const port = Number(args[2] ?? 4318);
     server.listen(port, "127.0.0.1", () => console.log(`OMG: http://127.0.0.1:${(server.address() as { port: number }).port}/#token=${server.accessToken}`));
@@ -29,6 +24,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   // H2.0 (№2719): invitation issuance is CLI-only — `serve`, `command` and HTTP can never mint one. The secret reaches
   // the owner's terminal exactly once; the Store keeps only its hash inside the grant.
   if (command === "owner-invite") {
+    const { issueOwnerInvitation } = await import("./product/owner-authority.js");
     const store = new Store(resolve(database));
     try {
       const minted = issueOwnerInvitation(store, { project: args[2] });
@@ -40,6 +36,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   // OC1: this trusted local command owns the whole scoped invitation/session lifecycle. Neither secret nor bearer is
   // accepted as input or printed; the general command/HTTP route therefore has no credential to replay.
   if (command === "owner-discovery-choice") {
+    const [{ DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation }, { answerDiscoveryCondition,
+      validateDiscoveryConditionRequest }] = await Promise.all([
+      import("./product/owner-authority.js"), import("./discovery/discovery-decision.js")]);
     const store = new Store(resolve(database)); const sessions = new DiscoveryChoiceSessions(store);
     let bearer: string | null = null;
     try {
@@ -67,6 +66,9 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   // DR1a: the trusted local project-mode command owns the whole scoped invitation/session lifecycle exactly like
   // OC1 — no secret or bearer crosses stdin/stdout, so the general command/HTTP route has no credential to replay.
   if (command === "owner-project-mode") {
+    const [{ ProjectModeSessions, issueProjectModeInvitation }, { setProjectMode,
+      validateProjectModeRequest }] = await Promise.all([
+      import("./product/owner-authority.js"), import("./product/project-mode.js")]);
     const store = new Store(resolve(database)); const sessions = new ProjectModeSessions(store);
     let bearer: string | null = null;
     try {
@@ -96,9 +98,15 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
   const store = new Store(resolve(database));
   try {
-    console.log(JSON.stringify(command === "command" ? await new ProductEngine(store).execute(JSON.parse(readFileSync(0, "utf8")))
-      : command === "backup" ? await store.snapshot(directory)
-      : { databaseId: store.databaseId, entities: store.list() }));
+    let out: unknown;
+    if (command === "command") {
+      const { ProductEngine } = await import("./product/engine.js");
+      out = await new ProductEngine(store).execute(JSON.parse(readFileSync(0, "utf8")));
+    } else {
+      out = command === "backup" ? await store.snapshot(directory)
+        : { databaseId: store.databaseId, entities: store.list() };
+    }
+    console.log(JSON.stringify(out));
   } finally { store.close(); }
 }
 
