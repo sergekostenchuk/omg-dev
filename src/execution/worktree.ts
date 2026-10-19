@@ -9,10 +9,28 @@ import { digest } from "../canonical.js";
 
 export function requireWorktree(root: ExecutionRoot, expectedHead: string): void {
   const common = (path: string) => realpathSync(resolve(path, git(path, ["rev-parse", "--git-common-dir"])));
-  requireCondition(common(root.path) === common(root.sourceRoot)
-    && realpathSync(git(root.path, ["rev-parse", "--show-toplevel"])) === realpathSync(root.path)
-    && git(root.path, ["symbolic-ref", "HEAD"]) === `refs/heads/${root.branch}`
-    && git(root.path, ["rev-parse", "HEAD"]) === expectedHead, "worktree_changed", "The managed branch, repository or parent changed");
+  // GITSRC1: one joined rev-parse per cwd (common-dir, toplevel, HEAD sha, symbolic name in argument
+  // order). An ambiguous answer, a git failure or a mismatched field reruns the historical separate
+  // sequence, so the old refusal classes stand.
+  const separate = (): void => {
+    requireCondition(common(root.path) === common(root.sourceRoot)
+      && realpathSync(git(root.path, ["rev-parse", "--show-toplevel"])) === realpathSync(root.path)
+      && git(root.path, ["symbolic-ref", "HEAD"]) === `refs/heads/${root.branch}`
+      && git(root.path, ["rev-parse", "HEAD"]) === expectedHead, "worktree_changed", "The managed branch, repository or parent changed");
+  };
+  let same = false;
+  try {
+    const fields = git(root.path, ["rev-parse", "--git-common-dir", "--show-toplevel", "HEAD", "--symbolic-full-name", "HEAD"]).split("\n");
+    // A newline inside a real path adds a line, so only an exactly-four-field answer is unambiguous.
+    same = fields.length === 4
+      && realpathSync(resolve(root.path, fields[0]!)) === common(root.sourceRoot)
+      && realpathSync(fields[1]!) === realpathSync(root.path)
+      && fields[3] === `refs/heads/${root.branch}`
+      && fields[2] === expectedHead;
+  } catch {
+    return separate();
+  }
+  if (!same) return separate();
 }
 export function materializeWorktree(root: ExecutionRoot): void {
   mkdirSync(dirname(root.path), { recursive: true });
