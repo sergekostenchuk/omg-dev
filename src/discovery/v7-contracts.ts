@@ -16,6 +16,13 @@ export type V7AxisDepth = typeof V7_DEPTHS[number];
 export const V7_PRODUCT_TYPES = Object.freeze(["personal", "internal", "commercial", "public"] as const);
 /** P3: tokens, the initial total limit of every paid role of the stage. */
 export const V7_STAGE_TOKEN_CEILING = 20_000_000;
+/** R3-a: completion reserve is a trusted constant of the stage budget (10% of ceiling). */
+export const V7_COMPLETION_RESERVE = 2_000_000;
+export const V7_STAGE_BUDGET_POLICY = Object.freeze({
+  ceiling: V7_STAGE_TOKEN_CEILING,
+  completionReserve: V7_COMPLETION_RESERVE,
+} as const);
+export type V7StageBudgetPolicy = typeof V7_STAGE_BUDGET_POLICY;
 const BLOCKING_DEFAULT_AXES: readonly string[] = ["rules", "feasibility"];
 
 /** Producer stages the era-7 table must cover before production may open. */
@@ -43,7 +50,7 @@ export const V7_FRAME_SCHEMA: Json = object({
     ceiling: { const: V7_STAGE_TOKEN_CEILING },
     axisHints: { type: "object", additionalProperties: false,
       properties: Object.fromEntries(V7_AXES.map(axis => [axis, { type: "integer", minimum: 0 }])) },
-    completionReserve: { type: "integer", minimum: 0 },
+    completionReserve: { const: V7_COMPLETION_RESERVE },
   }),
 });
 
@@ -102,6 +109,18 @@ export function createPartialV7Draft(discovery: Discovery, projectId: string, co
   return discovery.create(projectId, "discovery", "R0", consumer, [...discoveryFields], inputs, V7_CONTRACT_ERA);
 }
 
+export type DiscoveryV7Draft = DiscoveryDraft & {
+  stage: "discovery";
+  contractVersion: typeof V7_CONTRACT_ERA;
+};
+
+/** Predicate checking whether a draft belongs to Discovery era-7. */
+export function isDiscoveryV7Draft(draft: unknown): draft is DiscoveryV7Draft {
+  if (typeof draft !== "object" || draft === null || Array.isArray(draft)) return false;
+  const value = draft as Record<string, unknown>;
+  return value["stage"] === "discovery" && value["contractVersion"] === V7_CONTRACT_ERA;
+}
+
 /** The proof reader of an accepted answer of one field's question in the
  * same draft, injected by the intake so this module never opens a second
  * interpretation of the acceptance chain. It returns the interpreted proof
@@ -146,8 +165,8 @@ function checkV7Frame(value: Json): void {
       if (!(V7_AXES as readonly string[]).includes(key))
         refuse(`frame.budget.axisHints.${key}`, "axis hints exist only for the 12 axes");
   const reserve = budget["completionReserve"];
-  if (reserve !== undefined && (typeof reserve !== "number" || !Number.isSafeInteger(reserve) || reserve < 0))
-    refuse("frame.budget.completionReserve", "the completion reserve is a non-negative token count");
+  if (reserve !== V7_COMPLETION_RESERVE)
+    refuse("frame.budget.completionReserve", `the completion reserve must be ${V7_COMPLETION_RESERVE}`);
 }
 
 /** The fields that make a plan question the same question between editions:
