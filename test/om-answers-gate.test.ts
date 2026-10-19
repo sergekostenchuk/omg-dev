@@ -962,6 +962,223 @@ test('G4b keeps a direct E5 assessor transport distinct from an ordinary MC1 aft
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
 });
 
+test('G4b rejects both permutations of duplicate fact claims without selecting a valid winner', async t => {
+  const f = fixture(t, 'repository-fact'), fact = await acceptedFact(f);
+  const good = { gap: reference(fact.fact), result: reference(fact.accepted), candidate: null };
+  const counterfeit = { ...good, result: reference(f.route) };
+  const request: AnswersGateRequest = { ...f.request, routes: reference(fact.route), results: [good, counterfeit] };
+  const first = ok(writeAnswersGate(f.store, request));
+  const reversed = ok(writeAnswersGate(f.store, { ...request, results: [counterfeit, good] }));
+  assert.deepEqual(first, reversed);
+  assert.ok(first.value.result.codes.includes('answer_duplicate'));
+  assert.deepEqual(first.value.result.findings.filter(finding => finding.at.target === f.target).map(finding => finding.code),
+    ['answer_duplicate'], 'Neither duplicate is evaluated as the chosen answer');
+  f.restart();
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(first) })), first);
+});
+
+test('G4b groups stale and current gap claims before reading any result', t => {
+  const f = fixture(t, 'owner-decision');
+  const gap = f.blocking.find(row => row.value.gap.target === f.target)!;
+  const exact = { gap: reference(gap), result: null, candidate: null };
+  const stale = { ...exact, gap: { ...exact.gap, revision: exact.gap.revision + 1 } };
+  const invalidResult = { ...exact, result: { ...reference(f.route), hash: '0'.repeat(64) } };
+  for (const rows of [[exact, stale], [stale, exact], [stale, stale], [stale, invalidResult]]) {
+    const request: AnswersGateRequest = { ...f.request, results: rows };
+    const saved = ok(writeAnswersGate(f.store, request));
+    const codes = saved.value.result.findings.filter(item => item.at.target === f.target).map(item => item.code);
+    assert.ok(codes.includes('answer_duplicate'), JSON.stringify(codes));
+    assert.ok(codes.includes('answer_version_stale'), JSON.stringify(codes));
+    assert.equal(codes.includes('record_forged'), false, 'Neither result is selected before the duplicate finding');
+    f.restart();
+    assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
+  }
+  const deferred: AnswersGateRequest = { ...f.request, results: [{ ...stale,
+    deferral: { reason: 'outside_horizon', until: 'horizon-entry' } }] };
+  const saved = ok(writeAnswersGate(f.store, deferred));
+  assert.ok(saved.value.result.codes.includes('answer_version_stale'));
+  assert.ok(saved.value.result.codes.includes('deferral_not_permitted'));
+  f.restart();
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
+});
+
+test('G4b requires complete real MC2 assembly and a live G3 candidate for an N2 gap', t => {
+  const f = fixture(t), mc2 = assembledOperation(f), other = assembledOperation(f, 'garden-consume-block');
+  const candidate = ok(writeCandidate(f.store, { frame: f.request.gaps.sources.operations.frame,
+    proposals: [reference(mc2.assembly.proposal), reference(other.assembly.proposal)] }));
+  assert.equal(candidate.state, 'candidate', JSON.stringify(candidate));
+  if (candidate.state !== 'candidate') assert.fail('The two real MC2 proposals must fill the current N2 frame');
+  const admitted = ok(writeAnswersGate(f.store, { ...f.request, results: [{ gap: reference(mc2.gap),
+    result: reference(mc2.assembly.record), candidate: reference(candidate.record) }] }));
+  assert.equal(admitted.value.result.findings.some(finding => finding.at.target === mc2.gap.value.gap.target), false,
+    'The exact G3 candidate proves this MC2 operation for assembly, without C5 acceptance');
+  const complete = ok(writeAnswersGate(f.store, { ...f.request, results: [{ gap: reference(mc2.gap),
+    result: reference(mc2.assembly.record), candidate: null }] }));
+  assert.ok(complete.value.result.codes.includes('delta_not_verified'),
+    'A fully assembled operation still needs its exact successful G3 candidate');
+  const partial = ok(writeAnswersGate(f.store, { ...f.request, results: [{ gap: reference(mc2.gap),
+    result: reference(mc2.part.record), candidate: null }] }));
+  assert.ok(partial.value.result.codes.includes('route_result_missing'),
+    'A part is not a complete node result even when the plan contains just one part');
+  f.restart();
+  for (const saved of [admitted, complete, partial])
+    assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
+});
+
+test('G4b retains a checked MC2 assignment when an unrelated M6 container advances', t => {
+  const f = fixture(t), first = assembledOperation(f), other = assembledOperation(f, 'garden-consume-block');
+  const candidate = ok(writeCandidate(f.store, { frame: f.request.gaps.sources.operations.frame,
+    proposals: [reference(first.assembly.proposal), reference(other.assembly.proposal)] }));
+  assert.equal(candidate.state, 'candidate');
+  if (candidate.state !== 'candidate') assert.fail('Both MC2 proposals must form the current candidate');
+  const results = [{ gap: reference(first.gap), result: reference(first.assembly.record), candidate: reference(candidate.record) }];
+  const firstGate = ok(writeAnswersGate(f.store, { ...f.request, results }));
+  assert.equal(firstGate.value.result.findings.some(item => item.at.target === first.gap.value.gap.target), false);
+  const successor = ok(writeRoutes(f.store, { project: f.project, gaps: f.request.gaps, tasks: [],
+    catalog: { paths: [], records: [] }, previous: reference(f.route) }));
+  // LP7 (№3393 §6 F3): today's successor of the split base route joins the block's input fields; the MC2 assignments stay.
+  const expansions = (batches: readonly { task: string }[]) => batches.filter(batch => batch.task === 'node-expansion');
+  assert.equal(successor.value.grouping, 'block-input-v1');
+  assert.deepEqual(expansions(successor.value.batches), expansions(f.route.value.batches));
+  const request: AnswersGateRequest = { ...f.request, routes: reference(successor), results };
+  const saved = ok(writeAnswersGate(f.store, request));
+  assert.equal(saved.value.result.findings.some(item => item.at.target === first.gap.value.gap.target), false);
+  f.restart();
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
+  assert.deepEqual(ok(writeAnswersGate(f.store, request)), saved);
+});
+
+test('G4b rejects a successful G3 candidate for a different real MC2 proposal as delta_stale', t => {
+  const f = fixture(t), first = assembledOperation(f), other = assembledOperation(f, 'garden-consume-block');
+  ok(completeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1,
+    outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  const replacement = assembledOperation(f, f.block, { attempt: 2, variant: 'replacement' });
+  assert.notDeepEqual(reference(first.assembly.proposal), reference(replacement.assembly.proposal));
+  const candidate = ok(writeCandidate(f.store, { frame: f.request.gaps.sources.operations.frame,
+    proposals: [reference(replacement.assembly.proposal), reference(other.assembly.proposal)] }));
+  assert.equal(candidate.state, 'candidate');
+  if (candidate.state !== 'candidate') assert.fail('The replacement must form a complete real candidate');
+  const gate = ok(gateCandidate(f.store, { project: f.project, candidate: reference(candidate.record) }));
+  assert.equal(gate.passed, true, 'The offered G3 candidate itself is legitimate');
+  const request: AnswersGateRequest = { ...f.request, results: [{ gap: reference(first.gap),
+    result: reference(first.assembly.record), candidate: reference(candidate.record) }] };
+  const saved = ok(writeAnswersGate(f.store, request));
+  const addressed = saved.value.result.findings.filter(finding => finding.at.target === first.gap.value.gap.target);
+  assert.deepEqual(addressed.map(finding => finding.code), ['delta_stale']);
+  f.restart();
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
+});
+
+test('G4b preserves the exact common G3 refusal for a consistently hashed damaged candidate', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
+  const f = fixture(t), first = assembledOperation(f), other = assembledOperation(f, 'garden-consume-block');
+  const candidate = ok(writeCandidate(f.store, { frame: f.request.gaps.sources.operations.frame,
+    proposals: [reference(first.assembly.proposal), reference(other.assembly.proposal)] }));
+  assert.equal(candidate.state, 'candidate');
+  if (candidate.state !== 'candidate') assert.fail('The complete candidate must be produced before damaging its next revision');
+  const broken = f.store.write({ id: candidate.record.id, kind: candidate.record.kind, expected: candidate.record.revision,
+    value: { ...clone(candidate.record.value), graphHash: '0'.repeat(64) } });
+  const direct = gateCandidate(f.store, { project: f.project, candidate: reference(broken) });
+  assert.equal(direct.ok, false);
+  if (direct.ok) assert.fail('The common G3 reader must refuse the damaged exact revision');
+  const before = snapshot(f.store);
+  const result = writeAnswersGate(f.store, { ...f.request, results: [{ gap: reference(first.gap),
+    result: reference(first.assembly.record), candidate: reference(broken) }] });
+  assert.equal(result.ok, false);
+  if (result.ok) assert.fail('G4b must not save a failed G3 candidate as a negative outcome');
+  assert.equal(result.refusal.code, direct.refusal.code);
+  assert.deepEqual(result.refusal.at, direct.refusal.at);
+  assert.deepEqual(snapshot(f.store), before);
+  f.restart();
+  const repeated = writeAnswersGate(f.store, { ...f.request, results: [{ gap: reference(first.gap),
+    result: reference(first.assembly.record), candidate: reference(broken) }] });
+  assert.equal(repeated.ok, false);
+  if (!repeated.ok) assert.deepEqual(repeated.refusal, direct.refusal);
+});
+
+test('G4b discovers an N3 batch only after a real C5 upper-frame acceptance', t => {
+  const f = fixture(t), first = assembledOperation(f), second = assembledOperation(f, 'garden-consume-block');
+  const candidate = ok(writeCandidate(f.store, { frame: f.request.gaps.sources.operations.frame,
+    proposals: [reference(first.assembly.proposal), reference(second.assembly.proposal)] }));
+  assert.equal(candidate.state, 'candidate');
+  if (candidate.state !== 'candidate') assert.fail('The complete upper candidate must be present');
+  const accepted = ok(settleCandidate(f.store, { project: f.project, level: 2, candidate: reference(candidate.record),
+    outcome: { gate: 'G3', candidate: reference(candidate.record), graphHash: candidate.record.value.graphHash,
+      passed: true, codes: [] } }));
+  assert.equal(accepted.state, 'accepted');
+  const graph = reference(accepted.graph!), layer = reference(accepted.layer!), upperFrame = reference(accepted.frame!);
+  const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(f.input), graph,
+    refinement: layer, available: {}, choice: { choiceVersion: 'answers-gate-works',
+      features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const sources: GapRequest = { project: f.project, input: reference(f.input), graph, horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project: f.project, level: 2, graph, horizon: reference(horizon.gate),
+      layer, frame: upperFrame, upper: null } },
+    works: { proposals: [], frame: { project: f.project, level: 3, graph, horizon: reference(horizon.gate),
+      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame } } } };
+  const gaps = ok(writeGaps(f.store, sources));
+  const gapRead: GapReadRequest = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = ok(writeGapLines(f.store, { project: f.project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const handoff = ok(writeOmObligations(f.store, { project: f.project, gaps: gapRead,
+    lines: reference(lines), assignments: [] }));
+  const route = ok(writeRoutes(f.store, { project: f.project, gaps: gapRead, tasks: [],
+    catalog: { paths: [], records: [] }, previous: null }));
+  const batch = route.value.batches.find(item => item.model === 'MC2' && item.level === 3 && item.task === 'node-expansion');
+  assert.ok(batch, 'The accepted upper frame produces an N3 work expansion batch');
+  assert.ok(handoff.producer && handoff.record);
+  assert.deepEqual(handoff.handoff.obligations, []);
+  for (const block of ['garden-produce-block', 'garden-consume-block'])
+    ok(completeAttempt(f.store, { project: f.project, block, line: 1, attempt: 1,
+      outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  const upper = accepted.graph!.value.nodes.find(node => node.id === batch.node)!;
+  assert.ok(upper?.parent);
+  const goal: AttemptGoal = { key: `answers:works:${batch.node}`,
+    questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
+    result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
+  const series = ok(beginAttempt(f.store, { project: f.project, block: upper.parent, line: 1,
+    attempt: 2, goal }));
+  const environment = f.store.get(`environment:${f.project}`)!;
+  const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(route), batch: batch.id,
+    environment: reference(environment), attempt: { series: reference(series), ordinal: 2 }, previous: [],
+    works: { producer: reference(handoff.producer), ledger: reference(handoff.record) } })).record;
+  assert.equal(packet.value.state, 'ready');
+  const packetBody = packet.value.packet as Record<string, Json>, requestId = packetBody.requestId as string;
+  const ids = packet.value.plan!.assignments[packet.value.plan!.position]!.obligations;
+  const framed = ok(prepareFrameProposals(f.store, sources.works as Extract<GapRequest['works'], { frame: unknown }>));
+  const assigned = framed.frame.result.obligations.filter(obligation => ids.includes(obligation.id));
+  assert.equal(assigned.length, ids.length);
+  const work: Node = { ...(clone(upper) as Node), id: 'garden-answers-work', kind: 'work', parent: upper.id,
+    title: 'Work resolving the exact N3 frame', code: [{ path: 'answers-work.ts', access: 'write', status: 'planned' }], tests: [] };
+  const body = { nodes: [work], fills: assigned.map(obligation => ({ obligation: obligation.id, node: work.id,
+    ...(obligation.kind === 'connection-end' ? { port: obligation.upper.port!, codeRef: work.code[0]! } : {}) })),
+    tests: [], localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [],
+    transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
+  const adapter = f.store.write({ id: `adapter:${f.project}:answers:works`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: f.project, protocol: 'fixture' } });
+  const config = f.store.write({ id: `config:${f.project}:answers:works`, kind: 'dispatch-config', expected: 0,
+    value: { projectId: f.project, model: 'fixture' } });
+  const call = ok(recordCall(f.store, f.project, { call: requestId, purpose: 'model-design', basis: null,
+    block: upper.parent, gaps: batch.items.filter(item => ids.includes(item.target)).flatMap(item => item.consumers.map(consumer => ({
+      id: item.target, goal: item.target, field: item.field, consumer }))),
+    series: reference(series), attempt: 2, goal,
+    dispatch: { adapter: reference(adapter), config: reference(config) },
+    packet: clone(packet.value.packet) as Json })).call;
+  const responseWrite: Write = { id: partResponseId(f.project, reference(call)), kind: 'part-response', expected: 0,
+    value: { project: f.project, packet: reference(packet), call: reference(call), requestId,
+      raw: JSON.stringify(fixtureAnswer(packet.value.packet, { protocol: PACKET_ANSWER_PROTOCOL, requestId, action: 'answer', proposal: body, bindings: [] })) } };
+  const prepared = ok(preparePartResult(f.store, { project: f.project, packet: reference(packet), call: reference(call),
+    response: { pending: responseWrite } }));
+  ok(writeGuarded(f.store, { unit: 'G4b-test', target: prepared.record.id, writes: prepared.writes, guards: prepared.guards }));
+  const part = ok(readPartResult(f.store, { project: f.project, record: reference(prepared.record) }));
+  const assembly = ok(assembleModelParts(f.store, { project: f.project, results: [reference(part.record)] }));
+  const gap = gaps.records.find(row => batch.items.some(item => item.gap === row.value.gap.id))!;
+  assert.ok(gap);
+  const request: AnswersGateRequest = { project: f.project, gaps: gapRead, routes: reference(route),
+    results: [{ gap: reference(gap), result: reference(assembly.record), candidate: null }] };
+  const saved = ok(writeAnswersGate(f.store, request));
+  assert.equal(saved.value.result.findings.some(finding => finding.at.target === gap.value.gap.target), false);
+  f.restart();
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
+});
+
 const same = (a: unknown, b: unknown) => canonical(a as Json) === canonical(b as Json);
 const canonicalOrder = <T>(values: readonly T[]): T[] => [...values].sort((a, b) =>
   canonical(a as Json) < canonical(b as Json) ? -1 : canonical(a as Json) > canonical(b as Json) ? 1 : 0);
