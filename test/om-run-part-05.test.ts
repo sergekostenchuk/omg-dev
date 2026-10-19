@@ -32,7 +32,7 @@ import { runWakeChoice, WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wak
 import { completionCloseId } from "../src/om/series.js";
 import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
 import { prepareRunBases as lp81PrepareRunBases } from "../src/om/run-bases.js";
-import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Lp5State, lp5Pass, type Reopened, wrapperUnable } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Lp5State, lp5Pass, type Reopened, unavailableReview } from "./om-run-fixture.js";
 
 
 test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is proved by the common recovery the failed review ends the pass, and nothing is sent twice", async t => {
@@ -653,7 +653,7 @@ test("LP5 (№3278 rows 8, 9, 10, 11, 15, 19, 22, 23, 24; §3; return №3294 п
 
 
 test("LP8.1 a reopened record names the exact unable revision, its grounds and exactly one new ground; absence or excess is refused on reading; bases are read as of a live pass only while it weighs its grounds again", async t => {
-  const { f, unable } = await wrapperUnable(t);
+  const { f, unable, unchanged } = await unavailableReview(t);
   const reasons = (unable.value.state as unknown as Reopened).reasons;
   const step: RunStep = { action: "recover-analysis", request: { project } as unknown as Json, series: null, attempt: null };
   const bad = (state: unknown) => {
@@ -674,4 +674,5 @@ test("LP8.1 a reopened record names the exact unable revision, its grounds and e
   assert.equal(refusal(lp81PrepareRunBases(f.store, { project })).code, "run_bases_terminal", "An unable pass takes no bases");
   assert.throws(() => lp81PrepareRunBases(f.store, { project }, { reweigh: "yes" } as never), (error: unknown) => error instanceof EngineError && error.code === "run_bases_request_invalid");
   assert.ok(ok(lp81PrepareRunBases(f.store, { project }, { reweigh: true })), "Weighing its grounds again, it reads them as a live pass");
+  unchanged();
 });

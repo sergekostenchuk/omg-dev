@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { type OmResult, type Refusal } from "../src/om/refusal.js";
+import { type Sealed, type OmResult, type Refusal } from "../src/om/refusal.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import type { Graph } from "../src/graph/model.js";
 import { ProductEngine } from "../src/product/engine.js";
@@ -19,7 +19,7 @@ import { Evidence } from "../src/evidence/evidence.js";
 import type { FrameRead, FrameRequest } from "../src/om/frame-obligations.js";
 import type { HorizonRecords } from "../src/om/horizon.js";
 import type { OmInputRecord } from "../src/om/input.js";
-import type { QuestionPacketRecord } from "../src/om/question-packet.js";
+import { writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
 import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
 import { gardenGraph } from "./om-fixture.js";
@@ -38,8 +38,8 @@ import { applySeriesActivation, beginAttempt, openSeries, readCompletionBinding 
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { readRoutes, type RouteBatch, type RoutesRecord } from "../src/om/routes.js";
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
-import { closeAttempt, openAttempt } from "../src/om/repeat-gate.js";
-import { modelCallRecordId } from "../src/om/model-call.js";
+import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
+import { type ModelCallOutcome, type ModelCycleRecord, readModelCall, runModelCall, readCompletionWorkAt, writeCompletionCessation } from "../src/om/model-call.js";
 import { gapLineExpectedResult, gapLineKey } from "../src/om/gap-lines.js";
 import { advanceRun as currentAdvanceRun, cycleStartOf, readRun, startRun, runId, type RunRequest, type RunRecord, type RunResult, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases, type RunBases } from "../src/om/run-bases.js";
@@ -57,7 +57,7 @@ import { COMPLETION_REUSE_KIND, prepareCompletionFinalization, type CompletionRe
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { WAKE_CHOICE_KIND, type WakeChoiceRecord, type WakeChoiceRequest } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { completionCloseId } from "../src/om/series.js";
+import { completionCloseId, completionWorkId } from "../src/om/series.js";
 import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
 import { writeGaps as lp7WriteGaps, type GapRequest as Lp7GapRequest } from "../src/om/gaps.js";
 import { writeRoutes as lp7WriteRoutes } from "../src/om/routes.js";
@@ -1065,27 +1065,54 @@ function lp3Order(f: Fixture): "root-first" | "continuation-first" {
   const last = f.store.history<{ products: Ref[] }>(work.id).at(-1)!;
   const packets = last.value.products.map(ref => f.store.get<{ packet?: Ref }>(ref.id, ref.revision)!).filter(row => row.kind === "om-completion-packet")
     .map(row => f.store.get<QuestionPacketRecord>(row.value.packet!.id, row.value.packet!.revision)!.value.request.continuation ? "continuation" : "root");
-  assert.equal(packets.length, 2, "One root packet and its blocked continuation");
+  assert.equal(packets.length, 2, "One root packet and its blocked continuation: " + JSON.stringify(f.store.list<QuestionPacketRecord>("question-packet").map(row => ({ state: row.value.state, correction: !!row.value.request.correction, continuation: !!row.value.request.continuation, refusal: row.value.refusal }))));
   return packets[0] === "root" ? "root-first" : "continuation-first";
 }
-/** Every cycle of the pass ended blocked; nothing but the attempts' own packets and the one review was sent. */
-function lp3Blocked(f: Fixture, sends: number) {
-  const cycles = f.store.list<{ terminal: string; next: Ref | null }>("om-model-cycle");
-  assert.ok(cycles.length > 0 && cycles.every(row => row.value.terminal === "blocked" && row.value.next !== null), "Each cycle ends blocked on its continuation");
+/** Distinct real leaves of one already-addressed context, without adding historical or forged records. */
+function lp3Pointers(value: Json): string[] {
+  const visit = (item: Json, pointer: string): string[] => item !== null && typeof item === "object"
+    ? Object.entries(item).flatMap(([key, child]) => visit(child as Json, `${pointer}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`))
+    : [pointer];
+  return visit(value, "");
+}
+/** Check the exact continuation and real E3 calls; a null blocked payload has no request id. */
+function lp3Blocked(f: { store: Store; sent(): unknown[] }, sends: number, code: string, reads: number, capacity: number) {
+  const cycles = f.store.list<ModelCycleRecord>("om-model-cycle");
+  assert.ok(cycles.length > 0);
+  const calls = f.store.list<{ om?: unknown }>("model-call").filter(row => row.value.om).map(row => ok(readModelCall(f.store, { project, record: reference(row) })));
   for (const cycle of cycles) {
-    const blocked = f.store.get<QuestionPacketRecord>(cycle.value.next!.id, cycle.value.next!.revision)!;
+    assert.equal(cycle.value.terminal, "blocked");
+    assert.ok(cycle.value.next);
+    const blocked = f.store.get<QuestionPacketRecord>(cycle.value.next.id, cycle.value.next.revision)!;
+    assert.deepEqual(reference(blocked), cycle.value.next);
     assert.equal(blocked.value.state, "blocked");
-    assert.equal(f.store.get(modelCallRecordId(project, (blocked.value.packet as { requestId?: string } | null)?.requestId ?? "none")), null,
-      "The blocked continuation was never sent");
+    assert.equal(blocked.value.refusal?.code, code);
+    const origin = blocked.value.request.continuation!;
+    assert.deepEqual(origin.packet, cycle.value.request.packet);
+    assert.equal(origin.deliveries.length, reads, "Every distinct lawful read was delivered");
+    const call = ok(readModelCall(f.store, { project, record: cycle.value.steps[0]!.record }));
+    assert.equal(call.outcome?.kind, "need-source", "E3 admitted the reads, without label correction");
+    assert.equal(cycle.value.steps.length, 1);
+    assert.ok(calls.every(row => canonical(row.record.value.om.request.packet) !== canonical(cycle.value.next)),
+      "No call refers to this exact blocked continuation");
+    const root = f.store.get<QuestionPacketRecord>(origin.packet.id, origin.packet.revision)!;
+    assert.equal(root.value.state, "ready");
+    const requestId = (root.value.packet as { requestId: string }).requestId;
+    assert.equal(f.sent().filter(line => JSON.parse(line as string).requestId === requestId).length, 1);
   }
   assert.equal(f.sent().length, sends);
+  for (const line of f.sent()) assert.ok((line as string).length <= capacity,
+    "The full adapter wire, including its actual model/effort/speed, fits the fixed budget (roots and A6)");
 }
 const LP3_CONTENTS = { "root-first": "UTF-8 ".repeat(40_000) };
 const LP3_UNPROVED: Record<string, string> = {};
 /** A view of the store in which one exact record cannot be read; everything else, writes included, goes to the store. */
-function lp3Hiding(store: Store, id: string): Store {
+function lp3Hiding(store: Store, ref: Ref, intercepted: () => void): Store {
   return new Proxy(store, { get(target, key) {
-    if (key === "get") return (at: string, revision?: number) => at === id ? null : target.get(at, revision);
+    if (key === "get") return (at: string, revision?: number) => {
+      if (at === ref.id && revision === ref.revision) { intercepted(); return null; }
+      return target.get(at, revision);
+    };
     const member: unknown = Reflect.get(target, key, target);
     return typeof member === "function" ? member.bind(target) : member;
   } });
@@ -1229,14 +1256,11 @@ function threeArtifacts(graph: Graph) {
     failures: { missing: "missing", extra: "extra", foreign: "foreign", stale: "stale", duplicate: "duplicate", returnsTo: "garden-consume-block" } } as unknown as Graph["joins"][number]);
 }
 
-// G6.2 (№3869 п.1, п.5, №3885): a G5 finding of one work's own content rejects only the proposal that defines it. The base
-// before G6 (a62940ec) issues the producing root and admits its one work for two artifacts (its E3 knows no such rule); G5
-// refuses it today. Only that proposal is rejected, its attempt closes through G7 on its own rows — placed as the
-// proposal's, no hold, no analysis — and the next attempt of its block answers anew; the consuming block's paid work is
-// kept and nothing stands on input_stale.
+// G6.2: current E3 accepts the work's shape; G5 refuses its missing write scope. Only that proposal is
+// rejected; G7 closes it on its own rows, preserves the sound member and never reuses the rejected assembly.
 const G62_BASE = "a62940ecc6ee43d2b44ef315abf1067b060d4db0";
 async function g62Rejection(t: test.TestContext, chain: boolean, prior = false) {
-  const f = worksFixture(t, false, false, twoArtifacts, G62_BASE), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
+  const f = worksFixture(t, false, false, undefined, ""), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
   const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
   const paid = new Map<string, number>(), count = (node: string) => paid.set(node, (paid.get(node) ?? 0) + 1);
   const consumeAddress = { project, block: "garden-consume-block", line: 1 };
@@ -1250,17 +1274,24 @@ async function g62Rejection(t: test.TestContext, chain: boolean, prior = false) 
   }
   ok(startRun(f.store, { project }));
   for (let round = 0; round < 4; round++) {
-    const issued = atCommit(f, G62_BASE, `g62-issue-${round}`, `const { advanceRun } = await import(src('om/run.js'));
-for (let index = 0; index < 40; index++) {
-  const state = take(await advanceRun(store, args.request)).record.value.state;
-  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
-  if (state.phase === 'waiting') { out(null); break; }
-}`, { request: f.request }) as Ref | null;
-    assert.ok(issued, "The base issues a works packet");
+    let issued: Ref | null = null;
+    for (let index = 0; index < 40; index++) {
+      const state = ok(await advanceRun(f.store, f.request)).record.value.state;
+      if (state.phase === "step" && state.step.action === "cycle") { issued = (state.step.request as unknown as { packet: Ref }).packet; break; }
+      if (state.phase === "waiting") break;
+    }
+    assert.ok(issued, "The current producer issues the works packet");
     const answer = mp2WorkAnswer(f, issued), node = answer.research.proposal.nodes[0]!.parent!;
+    if (node === "garden-produce-operation") {
+      // One artifact is already checked by E3; G5 still checks that the work has an exact write scope.
+      for (const code of answer.research.proposal.nodes[0]!.code) code.access = "read";
+      for (const fill of answer.research.proposal.fills) if (fill.codeRef) fill.codeRef.access = "read";
+    }
     count(node); push(answer.research);
-    assert.equal(atCommit(f, G62_BASE, `g62-cycle-${round}`, `const { advanceRun } = await import(src('om/run.js'));
-out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request }), "cycle");
+    const cycled = ok(await advanceRun(f.store, f.request));
+    assert.equal(cycled.performed?.action, "cycle");
+    assert.ok(f.store.list("layer-proposal").some(row => row.id.startsWith("om-proposal:") && row.id !== "om-proposal:garden:h1-upper"),
+      "The current E3 accepted a real proposal before G5 checks its contents");
     if (node === "garden-produce-operation") break;
   }
   f.restart();
@@ -1302,7 +1333,8 @@ out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { 
   const rejected = f.store.get<LayerProposal>(rejections[0]!.value.proposals[0]!.id)!;
   assert.ok(rejected.value.status === "rejected" && rejected.value.nodes.some(node => node.parent === "garden-produce-operation"), "The producing work's proposal");
   assert.equal(f.store.list("om-origin-hold").length, 0, "No hold, no origin analysis");
-  const journal = f.store.get<{ rows: { id: string; gate: string }[]; classifications: { row: string; class: string; addressee: string }[] }>(`om-refusal-journal:${project}`)!.value;
+  const journal = f.store.get<{ rows: { id: string; gate: string; code: string }[]; classifications: { row: string; class: string; addressee: string }[] }>(`om-refusal-journal:${project}`)!.value;
+  assert.ok(journal.rows.some(row => row.gate === "G5" && row.code === "work_write_scope_unbounded"), "The content finding comes from G5");
   const g5 = new Set(journal.rows.filter(row => row.gate === "G5").map(row => row.id));
   const placed = journal.classifications.filter(row => g5.has(row.row));
   assert.ok(placed.length > 0 && placed.every(row => row.class === "proposal"), `The rows are placed as the proposal's: ${JSON.stringify(placed)}`);
@@ -1557,6 +1589,51 @@ function lp7Routes(f: ReturnType<typeof lp6Line>) {
     tasks: [], catalog: { paths: [], records: [] }, previous: null }));
 }
 
+/** Current joined routes; mixed failures are produced in a distinct expansion batch beside the field answer. */
+async function lp6CurrentRounds(f: ReturnType<typeof lp6Line>, ops: Lp6Op[]) {
+  const steps: unknown[] = [], verdicts: (string | null)[] = [], calls: Sealed<ModelCallOutcome>[] = [];
+  for (const item of ops) {
+    if (item.op === "round") {
+      const routes = lp7Routes(f);
+      const batches = item.answers.map(answer => routes.value.batches.find(batch => answer.field === "expansion"
+        ? batch.task === "node-expansion" && batch.items.every(row => row.consumers.includes(f.block))
+        : batch.task === "input-field" && batch.items.some(row => row.field === answer.field && row.consumers.includes(f.block)))!);
+      assert.equal(new Set(batches.map(batch => batch.id)).size, batches.length, "One reply for each current batch");
+      const items = batches.flatMap(batch => batch.items);
+      const goal = { key: `lp6-current:${item.ordinal}`, questions: items.map(row => gapLineKey(project, row.target, row.field)).sort(),
+        result: gapLineExpectedResult(project, items[0]!.target, items[0]!.field) };
+      const series = ok(openAttempt(f.store, { ...f.address, attempt: item.ordinal, goal,
+        completion: { routes: reference(routes), batches: batches.map(batch => batch.id).sort() } } as never));
+      const packets = batches.map(batch => ok(writeQuestionPacket(f.store, { project, routes: reference(routes), batch: batch.id,
+        environment: f.dispatch.config, attempt: { series: reference(series), ordinal: item.ordinal }, previous: [] })).record);
+      for (const [index, batch] of batches.entries()) {
+        const answer = item.answers[index]!;
+        if (answer.unsent) continue;
+        steps.push(answer.exit !== undefined ? { exitCode: answer.exit } : { research: answer.cannot !== undefined
+          ? { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(row => row.gap), action: "cannot_answer", reason: answer.cannot }
+          : answer.owner !== undefined ? { protocol: "$answerProtocol", requestId: "$requestId", questionIds: batch.items.map(row => row.gap), action: "need_owner", reason: answer.owner, decision: "Decide it" }
+          : { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: batch.items.filter(row => row.field === answer.field)
+            .map(row => ({ target: row.target, field: row.field, basis: row.record, value: answer.value })) }, usage });
+        writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps }));
+        calls.push(ok(await runModelCall(f.store, { project, packet: reference(packets[index]!), dispatch: f.dispatch, role: "implementer" })));
+      }
+    } else if (item.op === "cease") {
+      const binding = ok(readCompletionBinding(f.store, project, reference(f.head()), item.ordinal))!;
+      for (;;) {
+        const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+        const resolved = new Set(work.resolved.map(ref => ref.id));
+        const next = work.assignments.filter(row => !resolved.has(row.id)).sort((a, b) => Number(a.value.kind !== "root") - Number(b.value.kind !== "root"))[0];
+        if (!next) break;
+        ok(writeCompletionCessation(f.store, { project, binding: reference(binding), assignment: reference(next) }));
+      }
+    } else if (item.op === "close") {
+      const claim = ok(prepareManagedClaim(f.store, { ...f.address, attempt: item.ordinal, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never));
+      verdicts.push(ok(closeAttempt(f.store, { ...f.address, attempt: item.ordinal, outcome: claim.outcome } as never)).verdict);
+    } else assert.fail(`Unexpected current-round operation ${item.op}`);
+  }
+  return { verdicts, calls };
+}
+
 const LP7_BASE = "7c7d3cccb88d0a6c17b21051069f0244d98248f9";
 
 const LP81_BASE_COMMIT = "ea207137a7e26a96792f12a3bffd8bc255df59f2";
@@ -1586,6 +1663,48 @@ out(state);`, { request, project }) as { phase: string };
   const unable = ok(readRun(f.store, { project }))!;
   assert.deepEqual(reasonsOf(unable.value.state).map(row => [row.kind, row.code]), [["stop-analysis-failed", "analysis_failed"]]);
   return { f, request, failure: reference(failure), unable };
+}
+
+/** A genuine current failed review ends unable while only its exact exchange is unreadable. */
+async function unavailableReview(t: test.TestContext) {
+  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  const b = f.bases("lp81-unavailable"), request = f.request(b), none = cannotAnswer(f, b.routes);
+  f.steps([none, none, none, { ...stopAnswer(f, true), confirmed: null }, addressAll(f, b.routes)]);
+  ok(startRun(f.store, { project }));
+  await driveTo(f, request, "analyze", 40);
+  const failure = f.store.list<{ transport: Ref }>("om-stop-analysis-failure")[0]!;
+  assert.ok(failure, "The current review producer saved its real wrapper failure");
+  const physical = f.store.get<{ transport: { exchange: Ref } }>(failure.value.transport.id, failure.value.transport.revision)!;
+  const exchangeRef = physical.value.transport.exchange;
+  const exchange = f.store.get(exchangeRef.id, exchangeRef.revision)!;
+  assert.equal(exchange.hash, exchangeRef.hash);
+  let hidden = 0;
+  // Opaque on purpose: a read-changing view must never claim physical-store transparency.
+  const view = new Proxy(f.store, { get(target, key) {
+    if (key === "get") return (id: string, revision?: number) => {
+      if (id === exchangeRef.id && revision === exchangeRef.revision) { hidden++; return null; }
+      return target.get(id, revision);
+    };
+    const member: unknown = Reflect.get(target, key, target);
+    return typeof member === "function" ? member.bind(target) : member;
+  } });
+  for (let index = 0; index < 5; index++) {
+    const state = ok(await advanceRun(view, request)).record.value.state;
+    if (state.phase === "unable") break;
+    assert.notEqual(state.phase, "waiting", JSON.stringify(state));
+  }
+  assert.ok(hidden > 0, "The exact exchange read was actually withheld");
+  const unable = ok(readRun(f.store, { project }))!;
+  assert.equal(unable.value.state.phase, "unable", "The producer persisted unable, visible through the ordinary Store");
+  assert.deepEqual(reasonsOf(unable.value.state).map(row => [row.kind, row.code]), [["stop-analysis-failed", "analysis_failed"]]);
+  const unchanged = () => {
+    assert.deepEqual(f.store.get(failure.id, failure.revision), failure);
+    assert.deepEqual(f.store.get(exchangeRef.id, exchangeRef.revision), exchange);
+    assert.equal(f.store.history(failure.id).length, 1);
+    assert.equal(f.store.history(exchangeRef.id).length, 1);
+  };
+  unchanged(); f.restart();
+  return { f, request, failure: reference(failure), unable, unchanged };
 }
 
 // AT1 (№4117, contract §1.3): the appearance policy of a durable work's state is decided once at its producer. G5 refuses
@@ -1681,5 +1800,5 @@ async function policyDoor(t: test.TestContext, owner: boolean) {
 // always did under the new code — its rejection asks no readiness question and never stands on a refusal of the era.
 const AT1_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
 
-export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, sameEnd, twoOwnerAnswers, LP3_BASE_COMMIT, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Order, lp3Blocked, LP3_CONTENTS, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, lp5Pass, g51AmbiguousAnswer, g51Pass, LP5_BASE_COMMIT, lp6Line, lp6Close, LP7_VALUES, lp7Routes, LP7_BASE, passRows, wrapperUnable, policyDoor, AT1_BASE };
+export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, sameEnd, twoOwnerAnswers, LP3_BASE_COMMIT, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_CONTENTS, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, lp5Pass, g51AmbiguousAnswer, g51Pass, LP5_BASE_COMMIT, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, LP7_BASE, passRows, wrapperUnable, unavailableReview, policyDoor, AT1_BASE };
 export type { Fixture, Verdict, Lp5State, Lp6Op, Reopened };

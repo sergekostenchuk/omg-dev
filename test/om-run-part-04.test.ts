@@ -35,7 +35,7 @@ import { readSeries } from "../src/om/series.js";
 import { readCompletionWorkAt } from "../src/om/model-call.js";
 import { completionWorkId } from "../src/om/series.js";
 import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "../src/om/gap-lines.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, g51Pass, lp6Line, lp6Close, LP7_VALUES, lp7Routes, passRows, wrapperUnable } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, g51Pass, lp6Line, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview } from "./om-run-fixture.js";
 
 
 test("H1.2 R8 R4 C31 a stopped line whose owner has no batch today keeps its barrier: its reviewed stop on the second rung ends the pass, and nothing is paid for that owner", async t => {
@@ -506,7 +506,7 @@ test("G5.1 row 9 a producer end answered in the wake-test era names its wake tes
 });
 
 test("LP7 row 30: one full answer to the joined input fields replaces B1 once; the rest of the attempt ends cleanly by that replacement, the v2 close takes every LP6 key, the line moves on without a false stop, and a reopen reads it all and pays nothing again", async t => {
-  const f = lp6Line(t), scenario = join(f.root, "scenario.json");
+  const f = lp6Line(t, ""), scenario = join(f.root, "scenario.json");
   const routes = lp7Routes(f), byBlock = routes.value.batches.filter(batch => batch.items.every(item => item.consumers.includes(f.block)));
   const joined = byBlock.find(batch => batch.task === "input-field" && new Set(batch.items.map(item => item.field)).size > 1)!;
   const expansion = byBlock.find(batch => batch.task === "node-expansion")!;
@@ -548,7 +548,7 @@ test("LP7 row 30: one full answer to the joined input fields replaces B1 once; t
 });
 
 test("LP8.1 the reopening is guarded by the exact unable revision: another store moving the pass between the weighing and the write leaves its record, nothing is written over it", async t => {
-  const { f, request, unable } = await wrapperUnable(t);
+  const { f, request, unable, unchanged } = await unavailableReview(t);
   let raced = false;
   class Moving extends Store {
     override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
@@ -570,4 +570,5 @@ test("LP8.1 the reopening is guarded by the exact unable revision: another store
   const head = ok(readRun(f.store, { project }))!;
   assert.deepEqual([head.revision, head.value.state.phase], [unable.revision + 1, "ready"], "The other store's record stands");
   assert.deepEqual(passRows(f.store).filter(phase => phase === "reopened"), []);
+  unchanged();
 });

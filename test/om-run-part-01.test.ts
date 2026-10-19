@@ -14,7 +14,7 @@ import { readOmInput } from "../src/om/input.js";
 import { readRoutes, type RoutesRecord } from "../src/om/routes.js";
 import type { RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
-import { runModelCall } from "../src/om/model-call.js";
+import { runModelCall, readModelCall, runModelCycle, type ModelCycleRecord } from "../src/om/model-call.js";
 import { readQuestionPacket, writeQuestionPacket } from "../src/om/question-packet.js";
 import { cycleStartOf, readRun, startRun, runId, type RunRecord, type RunWait } from "../src/om/run.js";
 import { writeRunBases } from "../src/om/run-bases.js";
@@ -30,7 +30,7 @@ import { chosenWakes, WAKE_CHOICE_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { readSeries } from "../src/om/series.js";
 import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "../src/om/gap-lines.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, LP3_BASE_COMMIT, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Order, lp3Blocked, LP3_CONTENTS, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp5ReplaceB1, lp5Pass, g51Pass, LP5_BASE_COMMIT, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, LP3_BASE_COMMIT, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_CONTENTS, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp5ReplaceB1, lp5Pass, g51Pass, LP5_BASE_COMMIT, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
 
 
 test("H1.2 R10a a second store ending the pass between the builder's derivation and its first write: the lost write reads the pass again and builds no base", async t => {
@@ -185,15 +185,24 @@ test("OWN1 №3719 P2-1 an owner's H2 answer of a question the bypass gives the 
     [["discovery:spare", "owner", "Retain every record permanently", reference(owner.result), 0]]);
 });
 
-// OBL1 (№3773): a brief continuation fits what its reads brought; the continuation the capacity cannot hold stays the end of
-// the packet era before the brief — the old packet producer issues these roots.
+// RD2 pages individual values; distinct read addresses must themselves exceed the fixed continuation budget.
 test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold ends its cycle blocked and is never sent: the pass closes each attempt through G7, goes up the ladder and ends by A6 — never waiting on the blocked packet; the start of the root's cycle is chosen by its links in both positions of root and continuation", async t => {
-  const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
+  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  f.environment(80_000);
   const b = f.bases("lp3-52"), request = f.request(b);
-  writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
-  const need = lp3Need(f, b.routes, [{ action: "read", path: "big.txt", media: "text/plain" }]);
-  f.steps([need, need, need, stopAnswer(f, false)]);
   ok(startRun(f.store, { project }));
+  const selected = await until(f, request, "cycle");
+  const rootRef = (selected.request as unknown as { packet: Ref }).packet;
+  const body = f.store.get<QuestionPacketRecord>(rootRef.id, rootRef.revision)!.value.packet as unknown as {
+    brief: { labels: { domain: string; value: Ref }[] }
+  };
+  // Select by stable record identity, not the label order (labels are ordered by hashes).
+  const context = body.brief.labels.find(label => label.domain === "context" && label.value.id === `graph:${project}`)!.value;
+  const pointers = lp3Pointers(f.store.get(context.id, context.revision)!.value).slice(0, 256);
+  assert.equal(pointers.length, 256);
+  const reads = pointers.map(pointer => ({ action: "read_context", record: context, pointer }));
+  const need = lp3Need(f, b.routes, reads);
+  f.steps([need, need, need, stopAnswer(f, false)]);
   const first = await driveTo(f, request, "close", 20);
   assert.deepEqual(first.performed.slice(-2), ["cycle", "close"], `The blocked root is closed by G7, not waited on (products ${lp3Order(f)})`);
   // Both positions of the root packet and its blocked continuation, without relying on the order the hashes gave here.
@@ -213,41 +222,84 @@ test("LP3 (№2817 rows 3, 4, №52) a continuation the capacity cannot hold end
   const end = await ends(f, request, 60);
   assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
   assert.equal(mechanismSeries(f).value.attempts.length, 3, "Three attempts of the ladder");
-  lp3Blocked(f, 4);
+  lp3Blocked(f, 4, "packet_too_large", reads.length, 80_000);
   const roots = f.store.list<QuestionPacketRecord>("question-packet").filter(row => !row.value.request.continuation).map(reference);
   const two = cycleStartOf(f.store, project, roots.slice(0, 2));
   assert.ok(!two.ok && two.refusal.code === "run_record_invalid", "Two starts are an addressed refusal, never a second dispatch");
   await sameEnd(f, request, 4);
 });
 
-test("LP3 (№2870, №2817 row 9) a packet whose record cannot be read is never taken for a continuation: a saved cycle of it is performed as saved and its producer's record_missing stands as the pass's wait — no ready, no new packet, nothing sent; once the record is read again the same saved cycle goes on", { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
-  const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
+test("LP3 current packet reads can be temporarily unavailable at selection or a saved cycle: exact waiting is idempotent and the same root resumes with one lawful read and its continuation", async t => {
+  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
   const b = f.bases("lp3-2870"), request = f.request(b);
-  f.steps([lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }])]);
+  const content = "UTF-8 is supported\n";
+  writeFileSync(join(f.root, "repo", "encoding.txt"), content);
+  f.steps([lp3Need(f, b.routes, [{ action: "read", path: "encoding.txt", media: "text/plain" }]), addressAll(f, b.routes)]);
   ok(startRun(f.store, { project }));
-  // The selection: ready after the packet step, the root's packet unreadable — the pass's addressed refusal, nothing written,
-  // never a second packet.
   let head = ok(readRun(f.store, { project }))!;
   for (let index = 0; index < 20 && !(head.value.state.phase === "ready" && head.value.last?.step.action === "packet"); index++)
     head = ok(await advanceRun(f.store, request)).record;
   assert.equal(head.value.last?.step.action, "packet");
   const packet = head.value.last!.products.find(ref => ref.id.startsWith(`om-question-packet:${project}:`))!;
-  const chosen = await advanceRun(lp3Hiding(f.store, packet.id), request);
-  assert.deepEqual(chosen.ok ? chosen.value.record.value.state : [chosen.refusal.code, chosen.refusal.at.target], ["record_missing", packet.id]);
-  assert.equal(ok(readRun(f.store, { project }))!.revision, head.revision, "Nothing was written");
-  // The saved step: the root's cycle chosen, then its packet unreadable — performed as saved, its refusal stands.
+  const physical = structuredClone(f.store.get(packet.id, packet.revision));
+  let intercepted = 0;
+  const hidden = lp3Hiding(f.store, packet, () => { intercepted++; });
+  const expected = { code: "record_missing", message: "No record exists at this exact reference", target: packet.id,
+    field: "producer", basis: [packet] };
+  const products = () => ["question-packet", "model-call", "om-model-cycle"].map(kind => f.store.list(kind));
+  const beforeProducts = products();
+  const chosen = ok(await advanceRun(hidden, request));
+  assert.ok(intercepted > 0);
+  assert.deepEqual(chosen.record.value.state, { phase: "waiting", wait: expected });
+  assert.equal(chosen.record.revision, head.revision + 1);
+  assert.equal(chosen.performed, null);
+  assert.deepEqual(chosen.record.value.last, head.value.last);
+  assert.deepEqual(products(), beforeProducts);
+  const repeated = ok(await advanceRun(hidden, request));
+  assert.deepEqual(repeated.record, chosen.record, "The same selection wait adds no run revision");
+  assert.equal(repeated.performed, null);
+  assert.equal(f.sent().length, 0);
   const step = await until(f, request, "cycle");
-  assert.ok(isRefOf(step.request, packet), "The saved cycle is the root's own");
-  const before = ok(readRun(f.store, { project }))!.revision;
-  const performed = ok(await advanceRun(lp3Hiding(f.store, packet.id), request));
-  const state = performed.record.value.state;
-  assert.notEqual(state.phase, "ready", JSON.stringify(state));
-  assert.deepEqual([performed.record.revision, performed.performed?.action, performed.record.value.last?.refusal?.code, f.sent().length],
-    [before + 1, "cycle", "record_missing", 0], "The cycle was performed as saved and refused by its producer; nothing was sent");
-  assert.deepEqual(f.store.list("om-model-cycle"), []);
+  assert.ok(isRefOf(step.request, packet));
+  const before = ok(readRun(f.store, { project }))!;
+  intercepted = 0;
+  const performed = ok(await advanceRun(hidden, request));
+  assert.ok(intercepted > 0);
+  assert.deepEqual(performed.record.value.state, { phase: "waiting", wait: expected });
+  assert.equal(performed.record.revision, before.revision + 1);
+  assert.deepEqual(performed.performed, step);
+  assert.deepEqual(performed.record.value.last, { step, products: [], refusal: expected });
+  assert.deepEqual(performed.products, []);
+  assert.deepEqual(products(), beforeProducts);
+  assert.deepEqual(ok(await advanceRun(hidden, request)).record, performed.record);
+  assert.equal(f.sent().length, 0);
+  assert.deepEqual(f.store.get(packet.id, packet.revision), physical);
   const again = ok(await advanceRun(f.store, request));
-  assert.deepEqual([again.performed?.action, f.sent().length], ["cycle", 1], "The same saved cycle goes on once its packet is read");
-  assert.equal(f.store.list<{ terminal: string }>("om-model-cycle")[0]!.value.terminal, "reads-invalid");
+  assert.deepEqual(again.performed, step, "Resume the saved cycle request without substituting a new root");
+  assert.equal(f.sent().length, 2, "One root and one valid completing continuation");
+  const cycle = f.store.list<ModelCycleRecord>("om-model-cycle")[0]!;
+  assert.equal(cycle.value.terminal, "outcome");
+  assert.deepEqual(cycle.value.request.packet, packet);
+  assert.equal(cycle.value.steps.length, 2);
+  assert.deepEqual(cycle.value.steps[0]!.packet, packet);
+  const continuation = f.store.get<QuestionPacketRecord>(cycle.value.steps[1]!.packet.id, cycle.value.steps[1]!.packet.revision)!;
+  assert.deepEqual(continuation.value.request.continuation!.packet, packet);
+  assert.deepEqual(continuation.value.request.continuation!.call, ok(readModelCall(f.store, { project, record: cycle.value.steps[0]!.record })).call);
+  const deliveries = f.store.list<{ data: Json }>("om-read-delivery");
+  assert.equal(deliveries.length, 1);
+  assert.deepEqual(deliveries[0]!.value.data, content);
+  assert.deepEqual(continuation.value.request.continuation!.deliveries, [reference(deliveries[0]!)]);
+  for (const called of cycle.value.steps) {
+    const body = f.store.get<QuestionPacketRecord>(called.packet.id, called.packet.revision)!.value.packet as { requestId: string };
+    assert.equal(f.sent().filter(line => JSON.parse(line as string).requestId === body.requestId).length, 1);
+  }
+  assert.equal(f.store.list<QuestionPacketRecord>("question-packet").filter(row => !row.value.request.continuation).length, 1);
+  const snapshot = f.store.list().map(row => f.store.history(row.id));
+  const resumed = ok(await runModelCycle(f.store, step.request as unknown as Parameters<typeof runModelCycle>[1]));
+  assert.equal(resumed.repeated, true);
+  assert.deepEqual(f.store.list().map(row => f.store.history(row.id)), snapshot);
+  assert.equal(f.sent().length, 2);
+  assert.deepEqual(f.store.get(packet.id, packet.revision), physical);
 });
 test("LP3 (№2876) a cycle start is refused only with the codes of H1 and of E2's reader marked with its source; the refusal keeps the reader's bytes", () => {
   const root = mkdtempSync(join(tmpdir(), "omg-lp3-codes-")), store = new Store(join(root, "state.sqlite"));
@@ -403,7 +455,7 @@ out(trail);`, { request: f.request }) as string[];
 });
 
 test("LP7 rows 14, 24 (run): an answer of some joined fields — part of state included — applies only them; on the new B1 today's routing joins the rest, and its answer completes the subject keys of one full answer", async t => {
-  const f = lp6Line(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], keys: string[] = [];
+  const f = lp6Line(t, ""), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], keys: string[] = [];
   const round = async (ordinal: number, values: Record<string, Json>) => {
     const routes = lp7Routes(f), joined = routes.value.batches.find(batch => batch.task === "input-field" && batch.items.every(item => item.consumers.includes(f.block))
       && new Set(batch.items.map(item => item.field)).size > 1)!;

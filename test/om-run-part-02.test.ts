@@ -16,12 +16,11 @@ import { assessAnswer } from "../src/discovery/research-assessment.js";
 import type { OmInputRecord } from "../src/om/input.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import { writeOmInput } from "../src/om/input.js";
-import { beginAttempt, openSeries, ownerDecisionNamespace, OWNER_DECISION_KIND, resumeSeries } from "../src/om/series.js";
+import { readCompletionBinding, beginAttempt, openSeries, ownerDecisionNamespace, OWNER_DECISION_KIND, resumeSeries } from "../src/om/series.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import type { RepairSeries } from "../src/om/series.js";
 import { closeAttempt } from "../src/om/repeat-gate.js";
-import { prepareCompletionCause, runModelCall, writeCompletionCessation } from "../src/om/model-call.js";
-import { ResearchSources } from "../src/discovery/research-sources.js";
+import { prepareCompletionCause, runModelCall, readModelCall, deliverModelSources, readManagedModelDiagnostic, writeCompletionCessation } from "../src/om/model-call.js";
 import { readRun, startRun, runId, type RunRequest, type RunRecord, type RunStep } from "../src/om/run.js";
 import { prepareRunBases } from "../src/om/run-bases.js";
 // OWN1.2 (№3806): the live pass had derived D7 for this exact request by the older rule (73d95d93 carried the environment
@@ -36,7 +35,7 @@ import { runWakeChoice, type WakeChoiceRecord, type WakeChoiceRequest } from "..
 import { prepareReconcileSeries, readSeries, readStopHistory, readSeriesProgressTransitionAt } from "../src/om/series.js";
 // ---- LP8.1 (№3670): an unable pass weighs its grounds again by today's rules at every entry ----
 import { startPass } from "../src/om/run-driver.js";
-import { project, ok, refusal, runFixture, addressAll, usage, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, stoppedBlockLine, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, twoOwnerAnswers, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Configure, lp4Questions, g51Pass, type Lp6Op, lp6Line } from "./om-run-fixture.js";
+import { lp3Blocked, lp3Pointers, mechanismSeries, project, ok, refusal, runFixture, addressAll, usage, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, stoppedBlockLine, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Configure, lp4Questions, g51Pass, type Lp6Op, lp6Line } from "./om-run-fixture.js";
 
 
 test("H1.2 R4 R1 a block line stopped by three fruitless attempts: the one review is undecided and the second rung ends the pass on the block's exact stop", async t => {
@@ -292,35 +291,77 @@ test("OWN1 №3719 P2-2 a decision packet asks no owner: no need_owner in its fo
   assert.equal(f.sent().length, 2, "The asked owner is one corrected answer, not a wait");
 });
 
-test("LP3 (№2817 row 2, №53) a need_source whose search names a context record as its scope ends the cycle as reads-invalid with its record_foreign: the pass closes the attempt, goes on to the next and never waits on the refusal; a source scope and read_context of the same record still deliver", async t => {
-  const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
+test("LP3 current context search labels fail before delivery: one correction per attempt, G7 closes all three, and restart repeats the unable end without payment", async t => {
+  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
   const b = f.bases("lp3-53"), request = f.request(b);
   const need = lp3Need(f, b.routes, [{ action: "search", within: lp3Context(f), query: "encoding" }]);
-  f.steps([need, need, need, stopAnswer(f, false)]);
+  f.steps([need, need, need, need, need, need, stopAnswer(f, false)]);
   ok(startRun(f.store, { project }));
   const first = await driveTo(f, request, "close", 20);
   assert.deepEqual(first.performed.slice(-2), ["cycle", "close"]);
   const end = await ends(f, request, 60);
   assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
-  const cycles = f.store.list<{ terminal: string; diagnostic: Ref }>("om-model-cycle");
-  assert.equal(cycles.length, 3); assert.ok(cycles.every(row => row.value.terminal === "reads-invalid"));
-  for (const cycle of cycles) assert.equal(f.store.get<{ refusals: { code: string }[] }>(cycle.value.diagnostic.id)!.value.refusals[0]!.code, "record_foreign");
+  const cycles = f.store.list<{ terminal: string; steps: { packet: Ref; record: Ref }[] }>("om-model-cycle");
+  assert.equal(cycles.length, 3);
+  assert.equal(mechanismSeries(f).value.attempts.length, 3);
+  for (const cycle of cycles) {
+    assert.equal(cycle.value.terminal, "outcome");
+    assert.equal(cycle.value.steps.length, 2, "The first answer and exactly one correction");
+    for (const step of cycle.value.steps) {
+      const call = ok(readModelCall(f.store, { project, record: step.record }));
+      assert.deepEqual([call.record.value.om.failure?.code, call.record.value.om.failure?.at.field], ["answer_label_unknown", "reads/0/within"]);
+      assert.ok(call.diagnostic && call.response);
+      const packet = f.store.get<QuestionPacketRecord>(step.packet.id, step.packet.revision)!.value;
+      const attempt = packet.request.attempt!;
+      const binding = ok(readCompletionBinding(f.store, project, attempt.series, attempt.ordinal))!;
+      const diagnostic = ok(readManagedModelDiagnostic(f.store, binding, call.diagnostic));
+      assert.deepEqual([diagnostic.request.packet, diagnostic.request.call, diagnostic.request.response, diagnostic.request.code],
+        [step.packet, call.call, call.response, "answer_label_unknown"]);
+    }
+  }
   assert.deepEqual(f.store.list("om-read-delivery"), [], "Nothing was read");
-  assert.equal(f.sent().length, 4, "Three attempts and the one review");
-  await sameEnd(f, request, 4);
+  assert.equal(f.sent().length, 7, "Six answers and the one review; no third correction");
+  await sameEnd(f, request, 7);
+
+  const positive = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, "");
+  const bases = positive.bases("lp3-positive"), req = positive.request(bases);
+  ok(startRun(positive.store, { project }));
+  const step = await until(positive, req, "cycle");
+  const packetRef = (step.request as unknown as { packet: Ref }).packet;
+  const packet = positive.store.get<QuestionPacketRecord>(packetRef.id, packetRef.revision)!;
+  const labels = (packet.value.packet as unknown as { brief: { labels: { domain: string; value: Ref }[] } }).brief.labels;
+  const source = labels.find(label => label.domain === "source")!.value;
+  const context = labels.find(label => label.domain === "context" && label.value.id.startsWith("om-input:"))!.value;
+  const reads = [{ action: "search", within: source, query: "encoding" }, { action: "read_context", record: context, pointer: "/input/questions/0/question" }];
+  positive.steps([lp3Need(positive, bases.routes, reads)]);
+  const paid = ok(await runModelCall(positive.store, { ...(step.request as object), project } as Parameters<typeof runModelCall>[1]));
+  assert.equal(paid.outcome?.kind, "need-source", "Both reads are lawful under the current label protocol");
+  const delivered = ok(deliverModelSources(positive.store, { project, packet: packetRef, call: paid.call, response: paid.response! }));
+  assert.equal(delivered.deliveries.length, 2);
+  const rows = positive.store.list<{ read: Json; data: Json }>("om-read-delivery");
+  assert.equal(rows.length, 2);
+  const at = (read: object) => rows.find(row => canonical(row.value.read) === canonical(read as Json))!.value.data;
+  assert.deepEqual(at(reads[1]!), { contract: "om-read-result/v1", outcome: "complete", requested: { pointer: "/input/questions/0/question" },
+    value: positive.store.get<OmInputRecord>(context.id, context.revision)!.value.input.questions[0]!.question });
+  const content = positive.store.get<{ content: string }>(source.id, source.revision)!.value.content;
+  assert.deepEqual(at(reads[0]!), content.split(/\r?\n/).flatMap((text, index) => text.toLowerCase().includes("encoding")
+    ? [{ source, line: index + 1, text }] : []));
 });
 
-test("LP3 (№2870, works-v1) an H1 works root whose three lawful read_context reads leave a continuation the capacity cannot hold ends each cycle blocked, never sends the blocked packet and reaches the attempt's close through G7 — also after a restart between steps", async t => {
-  const f = lp3NativePackets(t, worksFixture(t, undefined, undefined, undefined, LP3_PACKET_COMMIT)), capture = new ResearchSources(f.store, project, f.root), reads: unknown[] = [];
-  for (let index = 0; index < 3; index++) {
-    writeFileSync(join(f.root, `context-${index}.txt`), `context ${index} ${"x".repeat(90_000)}`);
-    reads.push({ action: "read_context", record: reference(capture.read(`context-${index}.txt`, "text/plain")), pointer: "/content" });
-  }
+test("LP3 current works-brief roots whose distinct lawful context pointers exceed the continuation capacity ends each cycle blocked, never sends the blocked packet and reaches the attempt's close through G7 — also after a restart between steps", async t => {
+  const f = worksFixture(t, undefined, undefined, undefined, "");
+  const environment = f.store.get<import("../src/runtime/environment.js").Environment>(`environment:${project}`)!;
+  const configured = f.engine.environments.configure(project, { ...environment.value, requestCapacityChars: 100_000 }, environment.revision);
+  const request = { ...f.request, dispatch: { ...f.request.dispatch, config: reference(configured) } };
+  const graph = reference(f.store.get(`graph:${project}`)!);
+  const pointers = lp3Pointers(f.store.get(graph.id, graph.revision)!.value).slice(0, 192);
+  assert.equal(pointers.length, 192);
+  const reads = pointers.map(pointer => ({ action: "read_context", record: graph, pointer }));
   ok(startRun(f.store, { project }));
   const steps: unknown[] = [], performed: string[] = [], answered = new Set<string>();
   let closed = false;
   for (let index = 0; index < 45 && !closed; index++) {
-    const advanced = ok(await advanceRun(f.store, f.request)), state = advanced.record.value.state;
+    const advanced = ok(await advanceRun(f.store, request)), state = advanced.record.value.state;
     if (advanced.performed) performed.push(advanced.performed.action);
     assert.notEqual(state.phase, "waiting", JSON.stringify({ state, performed }));
     if (state.phase === "step" && state.step.action === "cycle") {
@@ -328,23 +369,21 @@ test("LP3 (№2870, works-v1) an H1 works root whose three lawful read_context r
       if (!answered.has(ref.id)) {
         answered.add(ref.id);
         const saved = f.store.get<QuestionPacketRecord>(ref.id, ref.revision)!.value;
-        assert.deepEqual([saved.packetContract, saved.state], ["om-packet/works-v1", "ready"]);
+        assert.deepEqual([saved.packetContract, saved.state], ["om-packet/works-brief-v1", "ready"], JSON.stringify({ refusal: saved.refusal, priorCalls: steps.length }));
         steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "need_source",
           questionIds: (saved.packet as { questions: { id: string }[] }).questions.map(question => question.id),
-          missing: "Read the three supplied context values", reads }, usage });
-        writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ steps }));
+          missing: "Read the distinct addressed context values", reads }, usage });
+        writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps }));
       }
     }
     if (advanced.performed?.action === "cycle") {
-      const cycles = f.store.list<{ terminal: string }>("om-model-cycle");
-      assert.ok(cycles.length > 0 && cycles.every(row => row.value.terminal === "blocked"), JSON.stringify(cycles.map(row => row.value.terminal)));
-      assert.equal(f.sent().length, steps.length, "The blocked continuation is never sent");
+      lp3Blocked(f, steps.length, "node_unexpandable", reads.length, 100_000);
       f.restart();
     }
     closed = advanced.performed?.action === "close";
   }
   assert.ok(closed, performed.join(","));
-  assert.ok(f.store.list("om-read-delivery").length >= 3, "The three lawful reads were delivered");
+  assert.equal(f.store.list("om-read-delivery").length, steps.length * reads.length, "Every root delivered each exact page");
   assert.equal(f.sent().length, steps.length);
 });
 

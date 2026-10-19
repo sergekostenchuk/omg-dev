@@ -1,8 +1,9 @@
+import { readCompletionWorkAt } from "../src/om/model-call.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { Store, type Write } from "../src/storage/store.js";
+import { type Revision, Store, type Write } from "../src/storage/store.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { git } from "../src/runtime/environment.js";
@@ -13,7 +14,7 @@ import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
 import type { RepairSeries } from "../src/om/series.js";
-import { closeAttempt } from "../src/om/repeat-gate.js";
+import { closeAttempt, deriveCompletionEvidence } from "../src/om/repeat-gate.js";
 import { modelCallRecordId, prepareCompletionCause, runModelCall } from "../src/om/model-call.js";
 import { gapLineKey } from "../src/om/gap-lines.js";
 import { readRun, startRun, runId, type RunRecord, type RunWait } from "../src/om/run.js";
@@ -30,7 +31,7 @@ import { configureDispatch } from "../src/om/dispatch.js";
 // of the snapshot, the answer is applied, and the next works — now deciding the test the transition reaches — pass G5 on
 // the same snapshot. The question is asked once; a repeat of the B1 transition writes nothing.
 import { readinessPending, writeReadinessInput, type ReadinessTransition } from "../src/om/input.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, passRows, wrapperUnable, policyDoor } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor } from "./om-run-fixture.js";
 
 
 test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep their canonical order without a repeat, and a malformed end is an integrity refusal", async t => {
@@ -268,6 +269,51 @@ test("MP2 return №3147: through the pass after a restart, a changed environmen
     || f.store.get(modelCallRecordId(project, (row.value.packet as { requestId: string }).requestId))), "The correction is never sent and no correction call exists");
 });
 
+test("LP6 current mixed attempts keep their applied field beside refusal, owner wait or interruption: progress closes preserve failure evidence after restart", async t => {
+  for (const kind of ["refusal", "owner", "interrupted"] as const) await t.test(kind, async t => {
+    const f = lp6Line(t, "");
+    const failed: Lp6Op & { op: "round" } = { op: "round", ordinal: 1, answers: [
+      { field: "expansion", ...(kind === "refusal" ? { cannot: "The expansion is unresolved" } : kind === "owner" ? { owner: "The owner decides the expansion" } : { exit: 1 }) },
+      { field: "nodes", value: ["garden-produce-block", "garden-consume-block"] },
+    ] };
+    const made = await lp6CurrentRounds(f, [failed, { op: "cease", ordinal: 1 }, { op: "close", ordinal: 1 }]);
+    assert.deepEqual(made.verdicts, ["progress"]);
+    assert.equal(made.calls.length, 2);
+    const [failure, accepted] = made.calls;
+    assert.ok(failure!.diagnostic && accepted!.record.value.om.input);
+    const code = kind === "refusal" ? "model_cannot_answer" : kind === "owner" ? "model_need_owner" : "model_adapter_interrupted";
+    const close = lp6Close(f, 1);
+    assert.ok(close.claim.refusals.some(row => row.name === code), JSON.stringify(close.claim.refusals));
+    const binding = ok(readCompletionBinding(f.store, project, reference(f.head()), 1))!;
+    const snapshot = ok(readCompletionWorkAt(f.store, project, close.work));
+    for (const call of made.calls) {
+      const packet = f.store.get<QuestionPacketRecord>(call.packet.id, call.packet.revision)!.value;
+      assert.equal(packet.request.attempt!.ordinal, 1);
+      assert.equal(packet.request.attempt!.series.id, f.head().id);
+      assert.ok(snapshot.assignments.some(row => row.value.batch === packet.request.batch));
+    }
+    assert.deepEqual(close.binding, reference(binding));
+    assert.ok(close.claim.accepting.some(ref => canonical(ref) === canonical(reference(accepted!.record))));
+    assert.equal(f.store.get(`om-input:${project}`)!.revision, 2, "Its own D3 applied the partial field");
+    if (kind === "owner") assert.deepEqual(close.waiting, [failure!.diagnostic]);
+    else assert.deepEqual(close.waiting, []);
+    const evidence = ok(deriveCompletionEvidence(f.store, project, { series: reference(f.head()), ordinals: [1] }));
+    assert.equal(evidence[0]!.effect, "failure");
+    assert.ok(evidence[0]!.results.length > 0);
+    assert.deepEqual(evidence[0]!.decisions.map(row => row.e4), [reference(accepted!.record)]);
+    assert.deepEqual(evidence[0]!.remaining, [
+      ...close.claim.refusals.map(row => `refusal ${row.name} of ${row.goal} (row ${row.row})`),
+      ...close.waiting.map(ref => `waiting for the owner on ${ref.id}@${ref.revision}`),
+      ...(kind === "interrupted" ? [`interrupted of model-call (${failure!.record.id}@${failure!.record.revision})`] : []),
+    ]);
+    const saved = f.store.list(); f.restart();
+    assert.deepEqual(ok(deriveCompletionEvidence(f.store, project, { series: reference(f.head()), ordinals: [1] })), evidence);
+    assert.deepEqual(lp6Close(f, 1), close);
+    assert.deepEqual(f.store.list(), saved);
+    assert.equal(f.sent().length, 2);
+  });
+});
+
 test("LP6 return №3371: an accepted field beside a real failure of the same attempt — a refusal of the model (the reviewer's probe), the owner's wait, an interrupted call — is no reconciled row: the stop stands for the producer, for the reader of a transition and after a reopen, and the facts A6 is shown keep the mixed end", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   // A stop e7db0ba8 saved over three mixed attempts, the producer and the reader of the new era over it.
   const check = (f: ReturnType<typeof lp6Line>, failures: RegExp[]) => {
@@ -387,12 +433,31 @@ test("LP8.1 grounds that stay final: an unable pass on a review that never compl
 });
 
 test("LP8.1 start and continue of an unable pass whose grounds no longer stand drive it: the reopening, the recovery and the next work under one execution", async t => {
-  const { f, failure, unable } = await wrapperUnable(t);
+  const { f, failure, unable, unchanged } = await unavailableReview(t);
   ok(configureDispatch(f.store, { project, protocol: "codex-stdio" }));
   const sends = f.sent().length;
+  let recoveries = 0;
+  class ObservedRecovery extends Store {
+    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
+      if (writes.some(write => write.kind === "om-stop-review" && Object.hasOwn(write.value as object, "recovery"))) {
+        assert.equal(f.sent().length, sends, "The exact paid answer is recovered without another call");
+        recoveries++;
+      }
+      return super.writeMany<T>(writes, guards);
+    }
+  }
+  f.restart(path => new ObservedRecovery(path));
   ok(await continuePass(f.store, { project }));
   const rows = passRows(f.store);
   assert.equal(rows.filter(phase => phase === "reopened").length, 1);
+  const reopened = f.store.history<RunRecord>(runId(project)).find(row => row.value.state.phase === "reopened")!.value.state;
+  assert.ok(reopened.phase === "reopened");
+  assert.deepEqual([reopened.from, reopened.reasons], [reference(unable), reasonsOf(unable.value.state)]);
+  assert.deepEqual(Object.keys(reopened.ground), ["step"]);
+  assert.ok("step" in reopened.ground);
+  assert.equal(reopened.ground.step.action, "recover-analysis");
+  assert.deepEqual((reopened.ground.step.request as unknown as { failure: Ref }).failure, failure);
+  assert.equal(recoveries, 1);
   assert.ok(f.store.history(runId(project)).some(row => row.revision > unable.revision + 1
     && (row.value as unknown as RunRecord).last?.step.action === "resume"), "The continue drove the pass past its old end");
   assert.ok(f.store.list().some(row => row.kind === "om-stop-review" && canonical((row.value as { recovery?: { failure: Ref } }).recovery?.failure as unknown as Json) === canonical(failure as unknown as Json)));
@@ -400,6 +465,7 @@ test("LP8.1 start and continue of an unable pass whose grounds no longer stand d
   // A second start finds the pass live and never reopens it again.
   ok(await startPass(f.store, { project }));
   assert.equal(passRows(f.store).filter(phase => phase === "reopened").length, 1);
+  unchanged();
 });
 test("AT1 door: an unresolved transition refused by G5 is asked in B1 once, researched, applied, and the next works decide what it reaches and pass G5 on the same snapshot", async t => {
   const f = worksFixture(t), work = f.desired.nodes.find(node => node.id === "garden-produce-work")!;
