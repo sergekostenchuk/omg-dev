@@ -12,11 +12,11 @@ import { conceptApplicationFindings, preparationFindings, specificationApplicati
 import { discoveryBasisCatalogue } from '../discovery/discovery-outcome.js';
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
-import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import { isRef, reference, stageId, STAGE_CLOSURE_CONTRACT, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { readLegacyOperation, StageChecks } from "../product/stage-checks.js";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { historicalProof, historicalTrace, pendingSnapshotView, withHistoricalReads } from "../history/proofs.js";
-import { uniqueTransactionGuards } from "../runtime/environment.js";
+import { uniqueTransactionGuards, transactionGuardsCurrent } from "../runtime/environment.js";
 import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, type OmResult, type Refusal, type Sealed, type SourceCodes } from "./refusal.js";
 import { readRecord, writeGuarded } from "./refs.js";
 import { preparationMatches } from "./selected-specification.js";
@@ -124,7 +124,7 @@ export interface ReopenFactInputDerivation { kind: "reopen-facts"; previous: Ref
 export type InputDerivation = DecisionInputDerivation | RefreshInputDerivation | FactInputDerivation | ReopenFactInputDerivation | ReadinessInputDerivation;
 export interface OmInputRecord { projectId: string; input: OmInput; hash: string; gaps: InputGap[]; derivation?: InputDerivation }
 export type DerivedInputRequest = { project: string } & (DecisionInputDerivation | FactInputDerivation | ReopenFactInputDerivation | ReadinessInputDerivation);
-export interface PreparedOmInput<G extends TransactionGuard = Ref> { record: OmInputRecord; writes: Write[]; guards: G[]; existing: Revision<OmInputRecord> | null }
+export interface PreparedOmInput<G extends TransactionGuard = TransactionGuard> { record: OmInputRecord; writes: Write[]; guards: G[]; existing: Revision<OmInputRecord> | null }
 export const INPUT_REFRESH_CONFLICT = "input_refresh_conflict";
 
 type Row = Record<string, any>;
@@ -138,8 +138,8 @@ function copy<T>(value: T): T {
   try { return sealed(value) as T; } catch { return invalid("json"); }
 }
 
-/** Current OM gates may carry positive admission refs; absence needs a different producer contract. */
-export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" | "G2" | "F4"): InputResult<Sealed<Ref[]>> {
+/** Validate the complete admission channel before selecting its producer era. */
+function readTransactionAdmission(value: unknown, gate: string, unit: "G1" | "G2" | "F4"): InputResult<Sealed<TransactionGuard[]>> {
   if (!text(gate) || !["G1", "G2", "F4"].includes(unit))
     raise("om_admission_guard_invalid", "An admission channel needs its named gate and unit",
       { unit: "OM", target: "admissionGuards", field: !text(gate) ? "gate" : "unit" });
@@ -151,8 +151,15 @@ export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" |
         { unit, target: gate, field: "admissionGuards" }, "producer");
     throw error;
   }
+  return delivered(checked);
+}
+
+/** Legacy producers support positive refs only; stage-closure/v1 carries full guards. */
+export function readOmAdmissionGuards(value: unknown, gate: string, unit: "G1" | "G2" | "F4"): InputResult<Sealed<Ref[]>> {
+  const checked = readTransactionAdmission(value, gate, unit);
+  if (!checked.ok) return checked;
   const refs: Ref[] = [];
-  for (const guard of checked) {
+  for (const guard of checked.value) {
     if ('absent' in guard)
       return refuse("om_admission_guard_unsupported", `${gate} declares an absence not supported by this OM producer`,
         { unit, target: guard.id, field: `${gate}.admissionGuards` }, "producer");
@@ -573,43 +580,61 @@ function deriveInputRecord(store: Store, request: InputRequest): InputResult<Sea
   return delivered({ projectId: request.project, input: result.input as OmInput, hash: result.hash, gaps: result.gaps as InputGap[] });
 }
 
+function sourcesMatch(input: { readonly sources?: readonly { readonly stage: string; readonly id: string; readonly revision: number; readonly hash: string }[]; readonly inventory?: Ref | null }, stages: InputRequest['stages'], inventory?: Ref | null): boolean {
+  if (!Array.isArray(input.sources) || input.sources.length !== INPUT_STAGES.length) return false;
+  for (const source of input.sources) {
+    const reqStage = stages[source.stage as UpstreamStage];
+    if (!reqStage || reqStage.id !== source.id || reqStage.revision !== source.revision || reqStage.hash !== source.hash) {
+      return false;
+    }
+  }
+  const currentInv = input.inventory ?? null;
+  const requestedInv = inventory ?? null;
+  if (currentInv === null && requestedInv === null) return true;
+  if (currentInv === null || requestedInv === null) return false;
+  return canonical(currentInv) === canonical(requestedInv);
+}
+
 // Current acceptance reads more heads than Pipeline exposes as guards (notably the full graph).
-// Trace those reads without turning exact historical reads, such as an issued question, into heads.
-function currentAcceptance(store: Store, request: InputRequest): InputResult<Sealed<Ref[]>> {
-  const heads = new Map<string, Ref>();
-  const remember = (ref: Ref) => {
-    const previous = heads.get(ref.id);
-    if (previous && canonical(previous) !== canonical(ref))
-      raise("input_stale", "An acceptance dependency changed during preparation", at(ref.id, "head", previous));
-    heads.set(ref.id, ref);
-  };
-  const traced = new Proxy(store, {
-    get(target, key) {
-      if (key === "get") return <T = Json>(id: string, revision?: number): Revision<T> | null => {
-        const record = target.get<T>(id, revision);
-        if (revision === undefined && record) remember(reference(record));
-        return record;
-      };
-      const member: unknown = Reflect.get(target, key, target);
-      return typeof member === "function" ? member.bind(target) : member;
-    },
-  });
-  try {
-    for (const ref of [...INPUT_STAGES.map(stage => request.stages[stage]), ...(request.inventory ? [request.inventory] : [])]) {
-      const head = traced.get(ref.id);
+// Check requested stages via batch headsMatch/transactionGuardsCurrent, read graph head explicitly, inspect pipeline features, and return deduplicated TransactionGuards.
+function currentAcceptance(store: Store, request: InputRequest): InputResult<Sealed<TransactionGuard[]>> {
+  const requestedSources: Ref[] = [
+    ...INPUT_STAGES.map(stage => request.stages[stage]),
+    ...(request.inventory ? [request.inventory] : []),
+  ];
+  if (!transactionGuardsCurrent(store, requestedSources)) {
+    for (const ref of requestedSources) {
+      const head = store.get(ref.id);
       if (!head || canonical(reference(head)) !== canonical(ref))
         return refuse("input_stale", "The requested input source is no longer current", at(ref.id, "head", ref), "producer");
     }
-    const projection = new StageChecks(traced).pipeline.inspect(request.project, "features");
-    const admission = readOmAdmissionGuards(projection.admissionGuards, "pipeline.features", "G1");
+    return refuse("input_stale", "The requested input source is no longer current", at(requestedSources[0]!.id, "head", requestedSources[0]), "producer");
+  }
+
+  try {
+    // Explicit head read for graph:<project> (required for CAS guard & propagating corrupt errors)
+    const graphRecord = store.get(`graph:${request.project}`);
+    const graphGuard: Ref | null = graphRecord ? reference(graphRecord) : null;
+
+    const projection = new StageChecks(store).pipeline.inspect(request.project, "features");
+    const admission = projection.artifact?.value.closure?.contract === STAGE_CLOSURE_CONTRACT
+      ? readTransactionAdmission(projection.admissionGuards, "pipeline.features", "G1")
+      : readOmAdmissionGuards(projection.admissionGuards, "pipeline.features", "G1");
     if (!admission.ok) return admission;
     if (projection.state !== "accepted") {
       const finding = projection.findings[0];
       return refuse("stage_not_accepted", finding?.message ?? "The current stages are not accepted",
         at(finding?.target ?? request.stages.features.id, finding?.field ?? finding?.code ?? "status", request.stages.features), "producer");
     }
-    for (const ref of [...projection.guards, ...admission.value]) remember(ref);
-    return delivered(sorted([...heads.values()]));
+
+    const allGuards: TransactionGuard[] = [
+      ...requestedSources,
+      ...(graphGuard ? [graphGuard] : []),
+      ...projection.guards,
+      ...admission.value,
+    ];
+
+    return delivered(uniqueTransactionGuards(allGuards));
   } catch (error) {
     if (error instanceof EngineError && error.code === "input_stale")
       return refuse("input_stale", error.message, error.details as ReturnType<typeof at>, "producer");
@@ -618,7 +643,7 @@ function currentAcceptance(store: Store, request: InputRequest): InputResult<Sea
 }
 
 export function prepareOmInput(store: Store, request: InputRequest): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {
-  return withHistoricalReads(() => prepareOmInputInScope(store, request));
+  return prepareOmInputInScope(store, request);
 }
 function prepareOmInputInScope(store: Store, request: InputRequest): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   requireInputRequest(store, request);
@@ -632,11 +657,30 @@ function prepareOmInputInScope(store: Store, request: InputRequest): InputResult
         at(operation.id, "state", reference(operation)), "producer");
     initialGuards.push(operation ? reference(operation) : { id: `legacy-operation:${request.project}`, absent: true });
   }
-  const derived = deriveInputRecord(store, request);
-  if (!derived.ok) return derived;
+
   const checked = current && current.revision === request.expected
     ? readOmInput(store, request.project, reference(current)) : null;
   if (checked && !checked.ok) return checked;
+
+  // Quick-path when the current input's stage sources and inventory already match the request.
+  // This avoids re-deriving the input record and loading/decoding all upstream stage proofs.
+  if (current && checked?.ok && sourcesMatch(checked.value.value.input, request.stages, request.inventory)) {
+    if (Object.hasOwn(checked.value.value, "derivation")) {
+      return prepareExistingOmInput(store, request.project, reference(current));
+    }
+    const acceptance = currentAcceptance(store, request);
+    if (!acceptance.ok) return acceptance;
+    return delivered({
+      record: checked.value.value,
+      existing: current,
+      writes: [],
+      guards: uniqueTransactionGuards([...acceptance.value, reference(current), ...initialGuards]),
+    });
+  }
+
+  const derived = withHistoricalReads(() => deriveInputRecord(store, request));
+  if (!derived.ok) return derived;
+
   // A refreshed independent source must not erase accepted decisions. Both the previous version and
   // the requested root are rebuilt before carrying their checked content into a refresh derivation.
   if (current && checked?.ok && Object.hasOwn(checked.value.value, "derivation")) {
@@ -651,7 +695,7 @@ function prepareOmInputInScope(store: Store, request: InputRequest): InputResult
     if (!facts.ok) return facts;
     return delivered({ record: refreshed.value, existing: null,
       writes: [{ id, kind: "om-input", expected: request.expected, value: refreshed.value }],
-      guards: [...acceptance.value, ...facts.value, reference(current)] });
+      guards: uniqueTransactionGuards([...acceptance.value, ...facts.value, reference(current)]) });
   }
   const acceptance = currentAcceptance(store, request);
   if (!acceptance.ok) return acceptance;
@@ -659,11 +703,11 @@ function prepareOmInputInScope(store: Store, request: InputRequest): InputResult
   const guards = [...acceptance.value];
   const existing = current?.kind === "om-input" && current.revision === request.expected && canonical(current.value) === canonical(record) ? current : null;
   return delivered({ record, existing, writes: existing ? [] : [{ id, kind: "om-input", expected: request.expected, value: record }],
-    guards: [...guards, ...(existing ? [reference(existing)] : []), ...initialGuards] });
+    guards: uniqueTransactionGuards([...guards, ...(existing ? [reference(existing)] : []), ...initialGuards]) });
 }
 
 export function writeOmInput(store: Store, request: InputRequest): InputResult<Sealed<Revision<OmInputRecord>>> {
-  return withHistoricalReads(() => writeOmInputInScope(store, request));
+  return writeOmInputInScope(store, request);
 }
 function writeOmInputInScope(store: Store, request: InputRequest): InputResult<Sealed<Revision<OmInputRecord>>> {
   const prepared = prepareOmInput(store, request);
@@ -895,7 +939,7 @@ function deriveOmInputInScope(store: Store, request: DerivedInputRequest): Input
 
 /** Admit an exact saved version without reconstructing it as a stage-only root or requiring historical heads. */
 export function prepareExistingOmInput(store: Store, project: string, ref: Ref): InputResult<Sealed<PreparedOmInput>> {
-  return withHistoricalReads(() => prepareExistingOmInputInScope(store, project, ref));
+  return prepareExistingOmInputInScope(store, project, ref);
 }
 function prepareExistingOmInputInScope(store: Store, project: string, ref: Ref): InputResult<Sealed<PreparedOmInput>> {
   const read = readOmInput(store, project, ref);
@@ -911,14 +955,14 @@ function prepareExistingOmInputInScope(store: Store, project: string, ref: Ref):
   if (!acceptance.ok) return acceptance;
   const facts = currentFactGuards(store, body as OmInputRecord);
   if (!facts.ok) return facts;
-  return delivered({ record: body, existing: read.value, writes: [], guards: [...acceptance.value, ...facts.value, ref] });
+  return delivered({ record: body, existing: read.value, writes: [], guards: sorted([...new Map([...acceptance.value, ...facts.value, ref].map(r => [canonical(r), r])).values()]) });
 }
 
 /** The only recovery bypass is the stale fact being removed; stage acceptance remains current. */
-export function prepareReopenOmInput(store: Store, request: { project: string; input: Ref }): InputResult<Sealed<PreparedOmInput>> {
+export function prepareReopenOmInput(store: Store, request: { project: string; input: Ref }): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   return withHistoricalReads(() => prepareReopenOmInputInScope(store, request));
 }
-function prepareReopenOmInputInScope(store: Store, request: { project: string; input: Ref }): InputResult<Sealed<PreparedOmInput>> {
+function prepareReopenOmInputInScope(store: Store, request: { project: string; input: Ref }): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   if (!object(request)) invalid("request");
   requireInputRequest(store, { project: request.project, stages: {} as InputRequest['stages'], expected: 0 });
   if (!isRef(request.input)) invalid("input");
@@ -949,7 +993,7 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
     inventory: body.input.inventory, expected: request.input.revision });
   if (!acceptance.ok) return acceptance;
   const invalidations: AnswerInvalidation[] = [], writes = new Map<string, Write>();
-  const guards: Ref[] = [...acceptance.value, request.input];
+  const guards: TransactionGuard[] = [...acceptance.value, request.input];
   for (const fact of body.input.facts ?? []) {
     const prepared = prepareAnswerInvalidation(store, { project: request.project, record: fact.answer });
     if (!prepared.ok) return transfer("accepted-answer", prepared);
@@ -972,17 +1016,18 @@ function prepareReopenOmInputInScope(store: Store, request: { project: string; i
   const facts = currentFactGuards(pendingSource, rebuilt.value as OmInputRecord);
   if (!facts.ok) return facts;
   guards.push(...facts.value);
-  const heads = new Map<string, Ref>();
+  const heads = new Map<string, TransactionGuard>();
   for (const guard of guards) {
     const previous = heads.get(guard.id);
     if (previous && canonical(previous) !== canonical(guard))
-      return refuse("input_stale", "Recovery observed conflicting source heads", at(guard.id, "head", previous), "producer");
+      return refuse("input_stale", "Recovery observed conflicting source heads", at(guard.id, "head", 'revision' in previous ? previous : undefined), "producer");
     heads.set(guard.id, guard);
   }
-  if (!invalidations.length) return delivered({ record: body, existing: read.value, writes: [], guards: sorted([...heads.values()]) });
+  const finalGuards = uniqueTransactionGuards([...heads.values()]);
+  if (!invalidations.length) return delivered({ record: body, existing: read.value, writes: [], guards: finalGuards });
   return delivered({ record: rebuilt.value, existing: null,
     writes: [...writes.values(), { id: request.input.id, kind: "om-input", expected: request.input.revision, value: rebuilt.value }],
-    guards: sorted([...heads.values()]) });
+    guards: finalGuards });
 }
 
 /**
@@ -1160,7 +1205,7 @@ export function readinessPending(store: Store, project: string, gate: Ref): Inpu
 }
 export interface ReadinessInputRequest { project: string; input: Ref; gate: Ref }
 /** The B1 transition that asks a saved G5's readiness questions; a repeat of a written one is delivered as it is. */
-export function prepareReadinessInput(store: Store, request: ReadinessInputRequest): InputResult<Sealed<PreparedOmInput>> {
+export function prepareReadinessInput(store: Store, request: ReadinessInputRequest): InputResult<Sealed<PreparedOmInput<TransactionGuard>>> {
   return withHistoricalReads(() => {
     if (!object(request) || !text(request.project) || !isRef(request.input) || !isRef(request.gate)
       || Object.keys(request).some(key => !["project", "input", "gate"].includes(key))) invalid("readiness");
@@ -1172,7 +1217,7 @@ export function prepareReadinessInput(store: Store, request: ReadinessInputReque
     const wanted: ReadinessInputDerivation = { kind: "readiness", previous: request.input, gate: request.gate };
     for (let cursor = admitted.value.existing as Revision<OmInputRecord>; cursor.value.derivation;) {
       if (canonical(cursor.value.derivation) === canonical(wanted))
-        return delivered({ record: cursor.value, writes: [], guards: admitted.value.guards as Ref[], existing: cursor });
+        return delivered({ record: cursor.value, writes: [], guards: admitted.value.guards, existing: cursor });
       const next = readOmInput(store, request.project, cursor.value.derivation.previous);
       if (!next.ok) return next;
       cursor = next.value as Revision<OmInputRecord>;
@@ -1181,7 +1226,7 @@ export function prepareReadinessInput(store: Store, request: ReadinessInputReque
       return refuse("input_stale", "New readiness questions are asked on the current B1", at(request.input.id, "head", request.input), "producer");
     const derived = deriveOmInput(store, { project: request.project, ...wanted });
     if (!derived.ok) return derived;
-    const guards = [...admitted.value.guards as Ref[], request.gate];
+    const guards = uniqueTransactionGuards([...admitted.value.guards, request.gate]);
     if (canonical(derived.value) === canonical(current.value)) return delivered({ record: current.value, writes: [], guards, existing: current });
     return delivered({ record: derived.value as OmInputRecord, existing: null, guards,
       writes: [{ id: current.id, kind: current.kind, expected: current.revision, value: derived.value as OmInputRecord }] });

@@ -9,8 +9,18 @@ import type { DiscoveryDraft, FieldSpec, Question } from '../discovery/discovery
 import { readAcceptedResearchAnswer } from '../discovery/discovery.js';
 import type { ResearchAnswer, ResearchAssessment } from '../discovery/research-model.js';
 import { Evidence, sourceIsCurrent, isWebDocumentSource, type Observation, type Selector, type Source } from '../evidence/evidence.js';
-import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { isRef, reference, type Ref, type StageExternalCheck } from '../pipeline/contracts.js';
+import { Store, type Revision, type TransactionGuard, type Write, storeObserved } from '../storage/store.js';
+import { uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
+
+export const OM_ANSWER_CLOSURE_CONTRACT = 'om-answer-closure/v1' as const;
+export interface OmAnswerClosure {
+  contract: typeof OM_ANSWER_CLOSURE_CONTRACT;
+  answer: Ref;
+  guards: Ref[];
+  external: StageExternalCheck[];
+  references: Ref[];
+}
 import { captureView, pendingOverlay, provenStore } from '../storage/store-view.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { prepareCurrentGaps, readGaps, type Gap, type GapReadRequest, type GapRecord } from './gaps.js';
@@ -81,7 +91,7 @@ export interface AnswerTaskRecord { project: string; request: AnswerTaskRequest;
 export type AnswerTaskBasis = { record: Ref } | { pending: Write };
 export interface CheckedAnswerTask {
   request: AnswerTaskRequest; record: Revision<AnswerTaskRecord>; contract: AnswerQuestionContract; gap: Gap;
-  references: Ref[]; guards: Ref[]; writes: Write[];
+  references: Ref[]; guards: TransactionGuard[]; writes: Write[];
 }
 export interface Mc1QuestionRecord { project: string; request: Mc1QuestionRequest; fingerprint: string }
 export interface AnswerRequest {
@@ -111,7 +121,7 @@ export interface CheckedAnswer {
   key: string; references: Ref[]; attempt: AnswerAttempt | null;
 }
 export interface PreparedAnswer {
-  record: Revision<AcceptedAnswerRecord>; writes: Write[]; guards: Ref[]; references: Ref[];
+  record: Revision<AcceptedAnswerRecord>; writes: Write[]; guards: TransactionGuard[]; references: Ref[];
   closure: { id: string; reason: 'filled'; basis: Ref; acceptance: null; attempt: GapLineAttempt | null; answer: AnswerBasis };
 }
 export type PreparedNativeAnswer = Omit<PreparedAnswer, 'record'> & { record: Revision<NativeAcceptedAnswerRecord> };
@@ -176,7 +186,28 @@ function requireE5Answer(value: unknown): asserts value is E5AnswerRequest {
     || Object.keys(value).some(key => !['project', 'intent', 'assessor'].includes(key))) requestInvalid('e5-answer');
 }
 function head(store: Store, ref: Ref): void {
-  check(same(store.get(ref.id) ? reference(store.get(ref.id)!) : null, ref), 'input_stale', ref.id, 'reference', 'A current source changed');
+  const current = store.get(ref.id);
+  check(same(current ? reference(current) : null, ref), 'input_stale', ref.id, 'reference', 'A current source changed');
+}
+function checkHeads(store: Store, guards: readonly TransactionGuard[]): void {
+  const checked = uniqueTransactionGuards(guards);
+  if (checked.length === 0) return;
+  const source = provenStore(store);
+  if (source !== null && !storeObserved(source)) {
+    const match = source.headsMatch(checked);
+    if (!match.ok) {
+      const mismatch = match.mismatches[0];
+      const id = mismatch?.id ?? checked[0]!.id;
+      fail('input_stale', id, 'reference', 'A current source changed');
+    }
+    return;
+  }
+  for (const guard of checked) {
+    const current = store.get(guard.id);
+    const ok = 'absent' in guard ? current === null
+      : current !== null && current.revision === guard.revision && current.hash === guard.hash;
+    if (!ok) fail('input_stale', guard.id, 'reference', 'A current source changed');
+  }
 }
 function exact<T>(store: Store, project: string, ref: Ref, kind: string, prefix = `${kind}:${project}:`): Revision<T> {
   return take(readRecord<T>(store, ref, { unit: 'D5', target: ref.id, kind, idPrefix: prefix })) as Revision<T>;
@@ -296,10 +327,10 @@ function questionContext(store: Store, request: Mc1QuestionRequest) {
   const references = unique([...context.references, request.engineQuestion, request.draft, ...(request.task ? [request.task] : [])]);
   return { ...context, engine, draft, references };
 }
-function currentTaskGuards(store: Store, request: AnswerTaskRequest): Ref[] {
+function currentTaskGuards(store: Store, request: AnswerTaskRequest): TransactionGuard[] {
   const prepared = take(prepareCurrentGaps(store, request.gaps));
   const guards = unique([...prepared.guards, request.input, ...request.gaps.records]);
-  for (const guard of guards) head(store, guard);
+  checkHeads(store, guards);
   return guards;
 }
 function currentQuestionContext(store: Store, request: Mc1QuestionRequest, context: ReturnType<typeof questionContext>) {
@@ -399,7 +430,7 @@ export function readAnswerTaskBasis(store: Store, request: { project: string; ta
     return { ...answerTask, guards: unique(guards), writes: basis.writes };
   });
 }
-export function prepareMc1Question(store: Store, request: Mc1QuestionRequest): OmResult<Sealed<{ record: Revision<Mc1QuestionRecord>; writes: Write[]; guards: Ref[] }>> {
+export function prepareMc1Question(store: Store, request: Mc1QuestionRequest): OmResult<Sealed<{ record: Revision<Mc1QuestionRecord>; writes: Write[]; guards: TransactionGuard[] }>> {
   requireStore(store); requireQuestion(request); request = normalizedQuestion(request);
   return result(() => {
     const context = currentQuestionContext(store, request, questionContext(store, request));
@@ -601,7 +632,7 @@ function deriveAnswer(store: Store, request: AnswerRequest, current: boolean, er
   const context = currentQuestionContext(store, question.record.value.request, question.context);
   // Reusing an exact accepted fact does not assign a new result to its historical attempt.
   const guards = historical.guards.filter(ref => currentAttempt || !request.attempt || !same(ref, request.attempt.series));
-  for (const guard of guards) head(store, guard);
+  checkHeads(store, guards);
   for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true, era);
   return { ...historical, guards: unique([...guards, ...context.guards]) };
 }
@@ -647,7 +678,7 @@ function deriveE5AnswerHistory(store: Store, request: E5AnswerRequest) {
     ...grounds.map(ground => ground.observation.source)]), question: q.record, gap, attempt };
 }
 function currentAcceptedAttempt(store: Store, project: string, attempt: AnswerAttempt,
-  accepted?: { ref: Ref; key: string }): Ref[] {
+  accepted?: { ref: Ref; key: string }): readonly TransactionGuard[] {
   const head = store.get<RepairSeries>(attempt.series.id);
   check(head, 'answer_attempt_invalid', attempt.series.id, 'attempt',
     'The original E5 fact attempt needs a current series line');
@@ -673,7 +704,7 @@ function currentAcceptedAttempt(store: Store, project: string, attempt: AnswerAt
     && (accepted === undefined ? running.outcome === null : running.outcome === null || acceptedInOutcome()),
     'answer_attempt_invalid', attempt.series.id, 'attempt',
     'The supported E5 fact must belong to the same full attempt goal and its accepted result');
-  return admission.guards as Ref[];
+  return admission.guards;
 }
 function deriveE5Answer(store: Store, request: E5AnswerRequest, current: boolean, currentAttempt = true) {
   const historical = historicalRead(store, { reader: 'D5.e5-answer-sources', project: request.project, ref: request.assessor,
@@ -683,7 +714,7 @@ function deriveE5Answer(store: Store, request: E5AnswerRequest, current: boolean
   const question = loadMc1Question(store, { project: request.project, record: reference(historical.question) });
   const context = currentQuestionContext(store, question.record.value.request, question.context);
   const guards = historical.guards;
-  for (const guard of guards) head(store, guard);
+  checkHeads(store, guards);
   for (const ground of historical.value.grounds) checkedGround(store, request.project, ground.observation, true, ANSWER_GROUNDS_ERA);
   return { ...historical, guards: unique([...guards, ...context.guards,
     ...(currentAttempt ? currentAcceptedAttempt(store, request.project, historical.attempt) : [])]) };
@@ -850,8 +881,18 @@ export function prepareAcceptedAnswer(store: Store, request: AnswerRequest): OmR
     const checked = deriveAnswer(store, request, true, ANSWER_GROUNDS_ERA, !old);
     const admission = !old && request.attempt ? take(prepareSeriesLineAdmission(store, request.project, request.attempt.series)).guards : [];
     const write: Write = { id: record.id, kind: record.kind, expected: 0, value: record.value };
+    const closureId = `om-answer-closure:${record.id}`;
+    const closureValue: OmAnswerClosure = {
+      contract: OM_ANSWER_CLOSURE_CONTRACT,
+      answer: reference(record),
+      guards: unique([reference(record), ...checked.value.grounds.map((g: { observation: { source: Ref } }) => g.observation.source)]),
+      external: checked.value.grounds.map((g: { observation: { source: Ref } }) => ({ kind: 'source' as const, ref: g.observation.source })),
+      references: unique([reference(record), ...checked.references]),
+    };
+    const closureWrite: Write = { id: closureId, kind: 'om-answer-closure', expected: 0, value: closureValue };
     const search = take(prepareAnswerIndex(store, { project: request.project, target: checked.gap.target, field: checked.gap.field, pending: old ? [] : [write] }));
-    return { record, writes: search.writes as Write[], guards: unique([...checked.guards, ...admission, ...search.guards]), references: unique([...checked.references, ...search.references]),
+    const writes = [...search.writes as Write[], ...(old ? [] : [closureWrite])];
+    return { record, writes, guards: unique([...checked.guards, ...admission, ...search.guards]), references: unique([...checked.references, ...search.references]),
       closure: { id: checked.gap.id, reason: 'filled' as const, basis: reference(record), acceptance: null, attempt: request.attempt,
         answer: old ? { record: reference(record) } : { pending: write } } };
   });
@@ -866,10 +907,20 @@ export function prepareE5AcceptedAnswer(store: Store, request: E5AnswerRequest):
     const disposition = old ? null : take(prepareAssessmentDisposition(store, request.project, request.intent));
     const checked = deriveE5Answer(store, request, true, !old);
     const write: Write = { id: record.id, kind: record.kind, expected: 0, value: record.value };
+    const closureId = `om-answer-closure:${record.id}`;
+    const closureValue: OmAnswerClosure = {
+      contract: OM_ANSWER_CLOSURE_CONTRACT,
+      answer: reference(record),
+      guards: unique([reference(record), ...checked.value.grounds.map((g: { observation: { source: Ref } }) => g.observation.source)]),
+      external: checked.value.grounds.map((g: { observation: { source: Ref } }) => ({ kind: 'source' as const, ref: g.observation.source })),
+      references: unique([reference(record), ...checked.references]),
+    };
+    const closureWrite: Write = { id: closureId, kind: 'om-answer-closure', expected: 0, value: closureValue };
     const search = take(prepareAnswerIndex(store, { project: request.project, target: checked.gap.target,
       field: checked.gap.field, pending: old ? [] : [write] }));
+    const writes = [...search.writes as Write[], ...(old ? [] : [closureWrite])];
     const attempt = { series: checked.attempt.series, attempt: checked.attempt.ordinal };
-    return { record, writes: search.writes as Write[],
+    return { record, writes,
       guards: unique([...checked.guards, ...search.guards, ...(disposition?.guards ?? [])]),
       references: unique([...checked.references, ...search.references]),
       closure: { id: checked.gap.id, reason: 'filled' as const, basis: reference(record),
@@ -878,7 +929,7 @@ export function prepareE5AcceptedAnswer(store: Store, request: E5AnswerRequest):
 }
 /** A neighbour needing several answers takes this whole bundle; one line receives one final index CAS. */
 export function prepareAcceptedAnswers(store: Store, requests: AnswerRequest[]): OmResult<Sealed<{
-  records: Revision<NativeAcceptedAnswerRecord>[]; closures: PreparedAnswer['closure'][]; writes: Write[]; guards: Ref[]; references: Ref[];
+  records: Revision<NativeAcceptedAnswerRecord>[]; closures: PreparedAnswer['closure'][]; writes: Write[]; guards: TransactionGuard[]; references: Ref[];
 }>> {
   requireStore(store);
   if (!Array.isArray(requests) || requests.length === 0) requestInvalid('answers');
@@ -898,8 +949,9 @@ export function prepareAcceptedAnswers(store: Store, requests: AnswerRequest[]):
     const intermediate = new Set(prepared.flatMap(item => item.writes.filter(write => write.kind === ANSWER_INDEX_KIND).map(write =>
       canonical({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }))));
     return { records: prepared.map(item => item.record) as Revision<NativeAcceptedAnswerRecord>[],
-      closures: prepared.map(item => item.closure) as PreparedAnswer['closure'][], writes: searches.flatMap(item => item.writes) as Write[],
-      guards: unique([...prepared.flatMap(item => item.guards), ...searches.flatMap(item => item.guards)]),
+      closures: prepared.map(item => item.closure) as PreparedAnswer['closure'][],
+      writes: [...searches.flatMap(item => item.writes), ...prepared.flatMap(item => item.writes.filter(write => write.kind === 'om-answer-closure'))] as Write[],
+      guards: uniqueTransactionGuards([...prepared.flatMap(item => item.guards), ...searches.flatMap(item => item.guards)]),
       references: unique([...prepared.flatMap(item => item.references).filter(ref => !intermediate.has(canonical(ref))), ...searches.flatMap(item => item.references)]) };
   });
 }
@@ -917,7 +969,7 @@ export function writeAcceptedAnswer(store: Store, request: AnswerRequest): OmRes
 export interface AnswerInputRequest { project: string; record: Ref; question: Ref; input: Ref; current: boolean }
 export interface AnswerRequirementChange { pointer: string; before: Json; after: PointerValue }
 export interface AnswerInputBody {
-  checked: CheckedAnswer; sourceQuestion: OmInput['questions'][number]; applicable: boolean; guards: Ref[]; references: Ref[];
+  checked: CheckedAnswer; sourceQuestion: OmInput['questions'][number]; applicable: boolean; guards: TransactionGuard[]; references: Ref[];
   requirementChanges: AnswerRequirementChange[];
 }
 function answerInputBody(store: Store, request: { project: string; record: Ref; question: Ref; input: OmInputRecord }): AnswerInputBody {
@@ -999,7 +1051,31 @@ function currentAnswerSources(store: Store, project: string, checked: CheckedAns
 /** Current evidence only: B1 already admits its input and must not recurse through that admission here. */
 export function answerSourceGuards(store: Store, request: AnswerReadRequest): OmResult<Sealed<{ applicable: boolean; guards: Ref[]; references: Ref[] }>> {
   requireRefRequest(store, request);
-  return result(() => currentAnswerSources(store, request.project, loadAnswer(store, request)));
+  return result(() => {
+    const closureId = `om-answer-closure:${request.record.id}`;
+    const closure = store.get<OmAnswerClosure>(closureId);
+    if (closure) {
+      check(closure.kind === 'om-answer-closure' && object(closure.value)
+        && closure.value.contract === OM_ANSWER_CLOSURE_CONTRACT
+        && isRef(closure.value.answer) && same(closure.value.answer, request.record)
+        && Array.isArray(closure.value.guards) && closure.value.guards.every(isRef)
+        && Array.isArray(closure.value.external)
+        && closure.value.external.every(e => object(e) && e.kind === 'source' && isRef(e.ref))
+        && Array.isArray(closure.value.references) && closure.value.references.every(isRef),
+        'answer_record_invalid', closureId, 'closure', 'The declared answer closure is malformed');
+      let applicable = transactionGuardsCurrent(store, closure.value.guards);
+      if (applicable) {
+        for (const checkItem of closure.value.external) {
+          if (checkItem.kind === 'source') {
+            const source = exact<Source>(store, request.project, checkItem.ref, 'source');
+            if (!sourceIsCurrent(source.value)) { applicable = false; break; }
+          }
+        }
+      }
+      return { applicable, guards: closure.value.guards, references: closure.value.references };
+    }
+    return currentAnswerSources(store, request.project, loadAnswer(store, request));
+  });
 }
 /** Capture through the native producer while leaving its write for B1's atomic transition. */
 function captureChangedFile(store: Store, project: string, source: Revision<Source>): { record: Revision<Source>; write: Write; guards: Ref[] } {
@@ -1079,7 +1155,7 @@ export interface AnswerTaskApplicationRequest {
 }
 export function applicableAnswerTask(store: Store, request: AnswerTaskApplicationRequest): OmResult<Sealed<{
   applicable: boolean; value: Json; key: string; task: Ref; invalidation: AnswerInvalidation | null;
-  guards: Ref[]; references: Ref[]; writes: Write[];
+  guards: TransactionGuard[]; references: Ref[]; writes: Write[];
 }>> {
   requireRefRequest(store, request);
   if (!object(request.task) || typeof request.current !== 'boolean'
@@ -1091,7 +1167,7 @@ export function applicableAnswerTask(store: Store, request: AnswerTaskApplicatio
     const contractMatches = checked.record.value.target === task.gap.target && checked.record.value.field === task.gap.field
       && same(checked.record.value.contract, task.contract);
     let invalidation: AnswerInvalidation | null;
-    const guards: Ref[] = [...task.guards], references: Ref[] = [...task.references, ...checked.references], writes: Write[] = [...task.writes];
+    const guards: TransactionGuard[] = [...task.guards], references: Ref[] = [...task.references, ...checked.references], writes: Write[] = [...task.writes];
     if (request.current && !contractMatches) {
       head(store, request.record); guards.push(request.record); invalidation = null;
     } else if (request.current) {
@@ -1118,7 +1194,7 @@ export function readAnswerForInput(store: Store, request: AnswerInputRequest): O
   return result(() => {
     const input = take(readOmInput(store, request.project, request.input)) as Revision<OmInputRecord>;
     const body = answerInputBody(store, { ...request, input: input.value });
-    const guards: Ref[] = [];
+    const guards: TransactionGuard[] = [];
     let applicable = body.applicable;
     if (request.current) {
       const admission = take(prepareExistingOmInput(store, request.project, request.input));
@@ -1130,7 +1206,7 @@ export function readAnswerForInput(store: Store, request: AnswerInputRequest): O
     return { ...body, input, applicable, guards: unique(guards), references: unique([...body.references, request.input]) };
   });
 }
-export function applicableAnswer(store: Store, request: { project: string; record: Ref; question: Ref; input?: Ref }): OmResult<Sealed<{ applicable: boolean; guards: Ref[]; references: Ref[] }>> {
+export function applicableAnswer(store: Store, request: { project: string; record: Ref; question: Ref; input?: Ref }): OmResult<Sealed<{ applicable: boolean; guards: TransactionGuard[]; references: Ref[] }>> {
   requireRefRequest(store, request);
   if (!isRef(request.question) || Object.hasOwn(request, 'input') && !isRef(request.input)) requestInvalid('question');
   return result(() => {
@@ -1233,7 +1309,7 @@ function pendingAnswer(store: Store, project: string, row: Revision<AcceptedAnsw
     () => checkAcceptedRecord(store, project, row), () => fail('answer_record_invalid', row.id, 'history', 'A pending answer has cyclic sources'));
 }
 export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureRequest): OmResult<Sealed<{
-  key: string; references: Ref[]; guards: Ref[]; writes: Write[]; attempt: AnswerAttempt | null;
+  key: string; references: Ref[]; guards: TransactionGuard[]; writes: Write[]; attempt: AnswerAttempt | null;
 }>> {
   requireStore(store);
   if (!object(request) || !text(request.project) || !text(request.target) || !text(request.field)
@@ -1266,7 +1342,7 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
       ? { series: checked.attempt.series, attempt: checked.attempt.ordinal } : null),
       'answer_attempt_invalid', request.target, 'closure.attempt',
       'A line may not reattribute a fact to a different attempt');
-    const guards: Ref[] = [];
+    const guards: TransactionGuard[] = [];
     if (request.currentOnly) {
       const prepared = take(prepareCurrentGaps(view.store, request.current));
       guards.push(...prepared.guards, now.sources.input, ...request.current.records);
@@ -1280,7 +1356,8 @@ export function confirmAnswerGapClosure(store: Store, request: AnswerGapClosureR
         const acceptance = 'producer' in checked.record.value
           ? deriveE5Answer(view.store, checked.record.value.request, false)
           : deriveAnswer(view.store, checked.record.value.request, false, checked.record.value.groundsEra ?? 'legacy');
-        for (const guard of acceptance.guards) { head(store, guard); guards.push(guard); }
+        checkHeads(store, acceptance.guards);
+        guards.push(...acceptance.guards);
       }
     }
     const search = request.currentOnly && view.writes.length ? take(prepareAnswerIndex(store, { project: request.project,

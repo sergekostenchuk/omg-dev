@@ -493,7 +493,7 @@ export interface PreparedWrite {
 }
 export interface SeriesTransition {
   readonly writes: readonly PreparedWrite[];
-  readonly guards: readonly Ref[];
+  readonly guards: readonly TransactionGuard[];
   readonly value: RepairSeries;
 }
 
@@ -743,11 +743,11 @@ function applied(store: Store, prepared: SeriesResult<Prepared>): SeriesResult<S
   return delivered(result.value[0]!);
 }
 
-const unchanged = (current: Revision<AnyRepairSeries>, guards: readonly Ref[] = []): SeriesResult<Prepared> =>
+const unchanged = (current: Revision<AnyRepairSeries>, guards: readonly TransactionGuard[] = []): SeriesResult<Prepared> =>
   ({ ok: true, value: { transition: { writes: [], guards, value: current.value }, current } });
 
 function change(
-  address: Address, value: AnyRepairSeries, expected: number, guards: readonly Ref[], current: Revision<AnyRepairSeries> | null,
+  address: Address, value: AnyRepairSeries, expected: number, guards: readonly TransactionGuard[], current: Revision<AnyRepairSeries> | null,
   grounds: readonly PreparedWrite[] = [],
 ): SeriesResult<Prepared> {
   const series: PreparedWrite = { id: address.id, kind: REPAIR_SERIES_KIND, expected, value };
@@ -769,7 +769,7 @@ function prepareOpenInner(store: Store, request: AnyOpenSeriesRequest): SeriesRe
   if (projection?.ok && projection.value.value.questions.length === 0)
     return problem("series_invalid", "An empty addressing slice opens no work and does not erase its lineage", { target: address.id, ref: undefined }, "scope.questions");
   const slice = projection?.ok ? projection.value.slice : (request as OpenSeriesRequest).slice;
-  let sourceGuards: readonly Ref[] = [];
+  let sourceGuards: readonly TransactionGuard[] = [];
   let registrationPointer: Ref | null = null;
 
   // The first line has no predecessor and no ground to stand on; any later line has both. Neither is a default.
@@ -2068,7 +2068,7 @@ export interface MechanismSlice {
   questions: { target: string; field: string; classification: unknown; task: unknown; producer: unknown; protected: unknown; decision?: unknown }[];
   consumers: { id: string; kind: string }[];
 }
-export interface MechanismProjection { slice: string; value: MechanismSlice; guards: Ref[]; references: Ref[] }
+export interface MechanismProjection { slice: string; value: MechanismSlice; guards: TransactionGuard[]; references: Ref[] }
 export interface SeriesAdmissionProof extends MechanismProjection {
   goal: Omit<AttemptGoal, 'key'>; gaps: { id: string; target: string; field: string }[];
 }
@@ -2083,6 +2083,7 @@ function mechanismResult<T>(action: () => T): SeriesResult<Sealed<T>> {
   });
 }
 const mechanismObject = (value: unknown): value is Record<string, any> => isPlainObject(value);
+const guardsUnique = (guards: readonly TransactionGuard[]): TransactionGuard[] => ordered(uniqueTransactionGuards(guards), canonical);
 const refsUnique = (refs: readonly Ref[]): Ref[] => ordered([...new Map(refs.map(ref => [canonical(ref), exactRef(ref)])).values()], canonical);
 function normalizedScope(scope: Sealed<GapReadRequest>): GapReadRequest {
   return sealed({ sources: scope.sources, records: ordered(scope.records, canonical) }) as GapReadRequest;
@@ -2116,10 +2117,10 @@ function mechanismProjection(store: Store, project: string, scope: Sealed<GapRea
   if (!current) return historical;
   const full = mechanismGaps(store, project, scope);
   const prepared = mechanismTake(prepareCurrentGaps(store, { sources: full.sources as GapReadRequest['sources'], records: [...scope.records] }));
-  const guards = refsUnique([...prepared.guards, scope.sources.input, ...scope.records]);
+  const guards = guardsUnique([...prepared.guards, scope.sources.input, ...scope.records]);
   for (const ref of guards) {
     const head = store.get(ref.id);
-    mechanismCheck(head && sameRef(reference(head), ref), ref.id, 'head', 'A current addressing prerequisite has changed');
+    mechanismCheck('absent' in ref ? head === null : head && sameRef(reference(head), ref), ref.id, 'head', 'A current addressing prerequisite has changed');
   }
   return { ...historical, guards, references: refsUnique([...historical.references, ...prepared.references]) };
 }
@@ -2130,7 +2131,7 @@ function deriveMechanismProjection(store: Store, project: string, scope: Sealed<
   const input = mechanismTake(readOmInput(store, project, source.input));
   const operations = mechanismTake(readFrameBasis(store, source.operations.frame));
   const references: Ref[] = [source.input, source.graph, ...scope.records, ...operations.references];
-  const guards: Ref[] = [];
+  const guards: TransactionGuard[] = [];
   const catalog = new Map(operations.upper.nodes.map(node => [node.id, { id: node.id, kind: node.kind }]));
   if (operations.accepted) for (const node of operations.accepted.graph.nodes.filter(node => node.kind === 'operation'))
     catalog.set(node.id, { id: node.id, kind: node.kind });
@@ -2169,7 +2170,7 @@ function deriveMechanismProjection(store: Store, project: string, scope: Sealed<
   }
   const value: MechanismSlice = { contract: 'addressing-slice/v1', owner: { kind: 'mechanism', mechanism: 'M5:addressing' },
     questions: ordered(questions, row => canonical([row.target, row.field])), consumers: ordered([...catalog.values()], canonical) };
-  return { slice: hashJson(value), value, guards: refsUnique(guards), references: refsUnique(references) };
+  return { slice: hashJson(value), value, guards: guardsUnique(guards), references: refsUnique(references) };
 }
 export function projectMechanismSlice(store: Store, project: string, scope: Sealed<GapReadRequest>, current = false): SeriesResult<Sealed<MechanismProjection>> {
   requireStore(store); requireProject(project); requireScope(scope);
@@ -2195,7 +2196,7 @@ function mechanismAdmission(store: Store, request: MechanismSeriesRequest, admis
       catalog: { paths: [...saved.catalog.paths], records: [...saved.catalog.records] }, tasks: saved.tasks.map(record => ({ record })) }));
   mechanismCheck(canonical(reference(prepared.record)) === canonical(admission.routes) && prepared.writes.length === 0,
     admission.routes.id, 'routes', 'New admission requires the saved current route, not an unrecorded replacement');
-  return { ...historical, guards: refsUnique([...scope.guards, ...prepared.guards, admission.routes]),
+  return { ...historical, guards: guardsUnique([...scope.guards, ...prepared.guards, admission.routes]),
     references: refsUnique([...historical.references, ...scope.references, ...prepared.references]) };
 }
 function deriveMechanismAdmission(store: Store, request: MechanismSeriesRequest, admission: MechanismAdmission): SeriesAdmissionProof {
@@ -2219,7 +2220,7 @@ function deriveMechanismAdmission(store: Store, request: MechanismSeriesRequest,
   });
   mechanismCheck(new Set(gaps.map(gap => gap.id)).size === gaps.length, admission.routes.id, 'batch', 'An assignment may occur only once');
   const guards = [...scope.guards], references = [...scope.references, ...routes.references];
-  return { ...scope, guards: refsUnique(guards), references: refsUnique(references), gaps,
+  return { ...scope, guards: guardsUnique(guards), references: refsUnique(references), gaps,
     goal: { questions: ordered(gaps.map(gap => gapLineKey(request.project, gap.target, gap.field)), value => value),
       result: gapLineExpectedResult(request.project, gaps[0]!.target, gaps[0]!.field) } };
 }
@@ -2230,7 +2231,7 @@ export function prepareSeriesAdmission(store: Store, request: MechanismSeriesReq
     const read = mechanismTake(readAnySeries(store, request));
     const line = mechanismTake(prepareSeriesLineAdmission(store, request.project, reference(read)));
     const proof = mechanismAdmission(store, request, admission, true);
-    return { ...proof, guards: refsUnique([...proof.guards, ...line.guards]) };
+    return { ...proof, guards: guardsUnique([...proof.guards, ...line.guards]) };
   });
 }
 interface MechanismAdmissionRequest {
@@ -2269,14 +2270,14 @@ function readMechanismAttemptAdmission(store: Store, request: MechanismAdmission
       const sources = sameSources ? original : mechanismAdmission(store, address, request.admission, request.current);
       return { ...original, series: series as Revision<MechanismRepairSeries>, owner: value.owner, goal: attempt.goal,
         references: refsUnique([...original.references, ...sources.references, request.series]),
-        guards: request.current ? refsUnique([...line!.guards, ...(sameSources ? [] : sources.guards)]) : [] };
+        guards: request.current ? guardsUnique([...line!.guards, ...(sameSources ? [] : sources.guards)]) : [] };
     }
     const proof = mechanismAdmission(store, address, request.admission, request.current, { series: request.series, attempt: request.attempt });
     const original = mechanismProjection(store, request.project, admitted.basis.gaps, false);
     mechanismCheck(proof.slice === original.slice, request.series.id, 'admission.scope', 'A refreshed admission must preserve the exact semantic task and consumer conditions');
     mechanismCheck(canonical(attempt.goal.questions) === canonical(proof.goal.questions) && attempt.goal.result === proof.goal.result,
       request.series.id, 'goal', 'The complete selected task must equal the declared goal');
-    return { ...proof, guards: refsUnique([...proof.guards, ...(line?.guards ?? [])]),
+    return { ...proof, guards: guardsUnique([...proof.guards, ...(line?.guards ?? [])]),
       series: series as Revision<MechanismRepairSeries>, owner: value.owner, goal: attempt.goal };
   });
 }
@@ -2975,7 +2976,7 @@ function completionPlanSources(store: Store, before: Revision<AnyRepairSeries>, 
   const results = [...new Set(selected.flatMap(batch => batch.items.map(item => gapLineExpectedResult(request.project, item.target, item.field))))];
   if (canonical(questions) !== canonical(goal.questions) || results.length !== 1 || results[0] !== goal.result)
     completionFail(before.id, 'goal', 'The initial work must cover exactly the complete recorded question set and result');
-  const guards: Ref[] = [reference(before)];
+  const guards: TransactionGuard[] = [reference(before)];
   if (current) {
     const fresh = completionTake(prepareRoutes(store, JSON.parse(canonical({ ...routes.record.value.request,
       tasks: routes.record.value.request.tasks.map(record => ({ record })) }))));

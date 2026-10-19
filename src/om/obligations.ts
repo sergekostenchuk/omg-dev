@@ -7,7 +7,7 @@ import { projectGraph } from '../graph/project.js';
 import { RefinementRelations } from '../graph/relations.js';
 import type { Source } from '../evidence/evidence.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import { readGapLines, type GapLinesRecord } from './gap-lines.js';
 import { prepareCurrentGaps, readGaps, type GapReadRequest, type GapRecords, type GapRecord } from './gaps.js';
 import { historicalRead, withHistoricalReads } from './input.js';
@@ -50,7 +50,7 @@ export interface ObligationTransferRecord extends ObligationTransferRequest {
 export interface ObligationTransfer {
   record: Revision<ObligationTransferRecord>; owner: Ref; assignments: OwnerGapAssignment['assignments']; inputs: Ref[];
 }
-export interface PreparedObligationTransfer extends ObligationTransfer { writes: Write[]; guards: Ref[] }
+export interface PreparedObligationTransfer extends ObligationTransfer { writes: Write[]; guards: TransactionGuard[] }
 type AssignmentRecord = Revision<OwnerGapAssignment> | Revision<ObligationTransferRecord>;
 export interface OmObligationRecord {
   contract: typeof OM_OBLIGATION_CONTRACT; project: string; request: ObligationRequest;
@@ -63,14 +63,14 @@ export interface OmObligations {
   producer: Revision<OmObligationProducer>; record: Revision<OmObligationRecord>;
   handoff: OmObligationHandoff; inputs: Ref[];
 }
-export interface PreparedOmObligations extends OmObligations { writes: Write[]; guards: Ref[] }
+export interface PreparedOmObligations extends OmObligations { writes: Write[]; guards: TransactionGuard[] }
 export interface ReadOmObligationsRequest { project: string; producer: Ref }
 
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
-const unique = (values: readonly Ref[]): Ref[] => sorted([...new Map(values.map(ref => [canonical(ref), ref])).values()]);
+const unique = <T>(values: readonly T[]): T[] => sorted([...new Map(values.map(ref => [canonical(ref), ref])).values()]);
 function invalid(field: string): never {
   throw new EngineError('obligation_request_invalid', 'OM obligations need explicit source context and exact references',
     { unit: 'D7', target: 'om-obligations', field });
@@ -522,7 +522,7 @@ export function prepareOmObligations(store: Store, request: ObligationRequest): 
       else writes.push({ id: expected.id, kind: expected.kind, expected: 0, value: expected.value });
     }
     return { ...derived, writes, guards: unique(guards), inputs: handoffInputs(request.project,
-      [...derived.inputs, ...fresh.references, ...fresh.guards], derived.record, derived.producer) };
+      [...derived.inputs, ...fresh.references, ...fresh.guards.filter(isRef)], derived.record, derived.producer) };
   });
 }
 export function writeOmObligations(store: Store, request: ObligationRequest): OmResult<Sealed<PreparedOmObligations>> {

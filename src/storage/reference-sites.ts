@@ -209,6 +209,8 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "om-limited-call-retry-permit", contract: "om-limited-call-retry-permit/v1", data: [] },
   { kind: "request-manifest", contract: "request-manifest/v1", data: [["wire"]], refs: [["parts", INDEX], ["intent"], ["call"]] },
   { kind: "request-part", contract: "request-part/v1", data: [["text"]], refs: [] },
+  { kind: "om-answer-closure", contract: "om-answer-closure/v1", data: [],
+    refs: [["answer"], ["guards", INDEX], ["external", INDEX, "ref"], ["references", INDEX]] },
   { kind: "discovery-acceptance-act", contract: "discovery-acceptance-act/v1", data: [],
     refs: [["draftBefore"], ["draftAfter"], ["questionBefore"], ["questionAfter"], ["answer"], ["assessment"], ["binding"]] },
   // G4a: the prefix closure names every head it stands on — the draft, inputs, derivation sources,

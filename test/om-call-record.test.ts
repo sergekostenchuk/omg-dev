@@ -9,7 +9,7 @@ import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
-import { reference, type Ref } from "../src/pipeline/contracts.js";
+import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store, type Revision, type Write, type ReadGuard } from "../src/storage/store.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import {
@@ -1368,7 +1368,7 @@ test("prepareCallDispatch uses current purpose, call and configuration guards wh
   assert.deepEqual(proof.call, admitted.call);
   assert.ok(deeplyFrozen(proof));
   for (const source of [admitted.call, f.series, f.adapter, f.config])
-    assert.ok(proof.guards.some(ref => ref.id === source.id && ref.revision === source.revision && ref.hash === source.hash));
+    assert.ok(proof.guards.some(ref => isRef(ref) && ref.id === source.id && ref.revision === source.revision && ref.hash === source.hash));
   addressed(prepareCallDispatch(f.store, PROJECT, undefined as never), "call_unresolved");
   addressed(prepareCallDispatch(f.store, PROJECT, { ...reference(admitted.call), hash: "f".repeat(64) }), "call_unresolved");
   addressed(prepareCallDispatch(f.store, "beta", reference(admitted.call)), "call_unresolved");

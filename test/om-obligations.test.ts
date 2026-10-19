@@ -338,7 +338,7 @@ test("D7 new and reused preparations guard native sources inside the consumer tr
     const dependencies = [reference(f.graph), reference(f.upper), reference(f.input), reference(f.lines), f.request.gaps.records[0]!];
     if (name === "reused") dependencies.push(reference(saved.producer), reference(saved.record));
     for (const [index, dependency] of dependencies.entries()) {
-      assert.ok(prepared.guards.some(ref => sameRef(ref, dependency)), `${name}: missing guard for ${dependency.id}`);
+      assert.ok(prepared.guards.some(ref => !('absent' in ref) && sameRef(ref, dependency)), `${name}: missing guard for ${dependency.id}`);
       const path = join(f.root, `${name}-${index}.sqlite`); copyFileSync(snapshot.path, path);
       const branch = new Store(path);
       try {
@@ -519,7 +519,7 @@ test("D7 exact runtime declarations keep source guards and explicit satisfies wi
   }
   const request: ObligationRequest = { ...f.request, assignments: [{ pending: ownerWrite(normalized) }] };
   const prepared = ok(prepareOmObligations(f.store, request));
-  assert.ok(prepared.guards.some(ref => sameRef(ref, reference(script))));
+  assert.ok(prepared.guards.some(ref => !('absent' in ref) && sameRef(ref, reference(script))));
   const saved = ok(writeOmObligations(f.store, request));
   assert.deepEqual(saved.handoff.obligations[0]!.runtimeCheck, assignment.runtimeCheck);
   assert.equal(f.store.list("runtime-observation").length, 0);
@@ -548,7 +548,7 @@ test("D7 pending H2 assignments commit with the producer once; competing ownersh
   }
   const saved = ok(writeOmObligations(f.store, request));
   const ownerRecord = f.store.get(owner.id)!;
-  assert.ok(ok(prepareOmObligations(f.store, request)).guards.some(ref => sameRef(ref, reference(ownerRecord))));
+  assert.ok(ok(prepareOmObligations(f.store, request)).guards.some(ref => !('absent' in ref) && sameRef(ref, reference(ownerRecord))));
   const historical = ok(readOwnerGapAssignment(f.store, { project: f.project, record: reference(ownerRecord) }));
   f.store.write({ id: ownerRecord.id, kind: ownerRecord.kind, expected: ownerRecord.revision, value: ownerRecord.value });
   denied(prepareOmObligations(f.store, request), "input_stale");
@@ -684,10 +684,10 @@ test('D7 F5 transfer preserves all H2 consumers through repeated proposal change
   assert.deepEqual(transfer.owner, request.from.assignment);
   assert.equal(transfer.assignments.length, 2);
   assert.deepEqual(transfer.assignments.map(row => row.responsibleConsumer).sort(), ['garden-later-block', 'garden-produce-block']);
-  assert.ok(!transfer.guards.some(ref => sameRef(ref, original.producer.value.request.lines)), 'Old D2 is historical, not required to be current');
-  assert.ok(transfer.guards.some(ref => sameRef(ref, next.lines)));
+  assert.ok(!transfer.guards.some(ref => !('absent' in ref) && sameRef(ref, original.producer.value.request.lines)), 'Old D2 is historical, not required to be current');
+  assert.ok(transfer.guards.some(ref => !('absent' in ref) && sameRef(ref, next.lines)));
   for (const ref of [request.from.assignment, request.from.producer, request.from.ledger])
-    assert.ok(transfer.guards.some(guard => sameRef(guard, ref)));
+    assert.ok(transfer.guards.some(guard => !('absent' in guard) && sameRef(guard, ref)));
   const newRequest: ObligationRequest = { project: f.project, gaps: next.gaps, lines: next.lines,
     assignments: [{ pending: clone(transfer.writes[0]!) as Write }] };
   const prepared = ok(prepareOmObligations(f.store, newRequest));
@@ -695,7 +695,7 @@ test('D7 F5 transfer preserves all H2 consumers through repeated proposal change
   assert.equal(prepared.writes.filter(write => write.kind === OM_OWNER_ASSIGNMENT_KIND).length, 0);
   assert.equal(prepared.writes.filter(write => write.kind === OM_OBLIGATION_TRANSFER_KIND).length, 1);
   for (const ref of [request.from.assignment, request.from.producer, request.from.ledger])
-    assert.ok(prepared.guards.some(guard => sameRef(guard, ref)), 'The outward handoff still guards its original authority');
+    assert.ok(prepared.guards.some(guard => !('absent' in guard) && sameRef(guard, ref)), 'The outward handoff still guards its original authority');
   const saved = ok(writeOmObligations(f.store, newRequest)) as unknown as OmObligations;
   assert.equal(saved.handoff.obligations.length, 2);
   assert.deepEqual(ok(readOmObligationHandoff(f.store, f.project, saved.inputs)), saved.handoff);

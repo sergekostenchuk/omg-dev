@@ -3,7 +3,9 @@ import { EngineError } from '../errors.js';
 import { KNOWLEDGE_KINDS as ENGINE_KINDS } from '../graph/obligation-policy.js';
 import { LEVEL, type Graph } from '../graph/model.js';
 import { isRef, reference, type Ref, type StageArtifact } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type Revision, type TransactionGuard, type Write, storeObserved } from '../storage/store.js';
+import { provenStore } from '../storage/store-view.js';
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { readLayerEnvelope, readLayerAcceptance, type LayerAcceptanceRequest } from './layer-basis.js';
@@ -27,8 +29,8 @@ export interface InputDecisionProposal {
 export const INPUT_DECISION_KIND = 'input-decision';
 export type InputDecisionBasis = { record: Ref } | { pending: Write };
 export interface AddressingRequest { project: string; input: Ref; graph: Ref; decisions: InputDecisionBasis[] }
-export interface PreparedAddressing {
-  record: Revision<OmInputRecord>; writes: Write[]; guards: Ref[]; references: Ref[];
+export interface PreparedAddressing<G extends TransactionGuard = TransactionGuard> {
+  record: Revision<OmInputRecord>; writes: Write[]; guards: G[]; references: Ref[];
 }
 export interface ApplyAnswerRequest { project: string; input: Ref; answer: Ref; question: Ref }
 const object = (value: unknown): value is Record<string, any> => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -52,6 +54,27 @@ function run<T>(action: () => T): OmResult<Sealed<T>> {
     try { return delivered(action()); }
     catch (error) { if (error instanceof AddressingFailure) return { ok: false, refusal: error.refusal }; throw error; }
   });
+}
+function checkHeads(store: Store, guards: readonly TransactionGuard[], code: string, field: string, message: string): void {
+  const checked = uniqueTransactionGuards(guards);
+  if (checked.length === 0) return;
+  const source = provenStore(store);
+  if (source !== null && !storeObserved(source)) {
+    const match = source.headsMatch(checked);
+    if (!match.ok) {
+      const mismatch = match.mismatches[0];
+      check(false, code, mismatch?.id ?? checked[0]!.id, field, message);
+    }
+    return;
+  }
+  for (const guard of checked) {
+    const current = store.get(guard.id);
+    const ok = 'absent' in guard ? current === null
+      : current !== null && current.revision === guard.revision && current.hash === guard.hash;
+    if (!ok) {
+      check(false, code, guard.id, field, message);
+    }
+  }
 }
 function invalid(field: string): never {
   throw new EngineError('addressing_request_invalid', 'Addressing needs explicit well-formed arguments', { unit: 'F5.3', target: 'om-input', field });
@@ -324,18 +347,15 @@ export function prepareAddressing(store: Store, request: AddressingRequest): OmR
     const admitted = take(prepareExistingOmInput(store, request.project, reference(current)));
     let cursor = admitted.existing! as Revision<OmInputRecord>;
     while (cursor.value.derivation) {
-      if (same(cursor.value.derivation, expected)) return { record: cursor, writes: [], guards: admitted.guards as Ref[], references: [reference(cursor)] };
+      if (same(cursor.value.derivation, expected)) return { record: cursor, writes: [], guards: admitted.guards, references: [reference(cursor)] };
       cursor = take(readOmInput(store, request.project, cursor.value.derivation.previous)) as Revision<OmInputRecord>;
     }
     check(same(reference(current), request.input), 'addressing_conflict', request.input.id, 'input', 'A new decision names the current input; only an exact applied delivery may use an old base');
     const record = take(deriveOmInput(view.store, { project: request.project, previous: request.input, graph: request.graph, decisions: view.refs })) as OmInputRecord;
     const derived = take(deriveInputDecisions(view.store, { project: request.project, previous: current, graph: request.graph, decisions: view.refs }));
     const lowerGuards = derived.layers.flatMap(layer => take(prepareLayerAcceptance(store, layer)).guards);
-    const guards = unique([...admitted.guards, ...lowerGuards, request.graph, ...view.refs.filter(ref => !view.writes.some(write => write.id === ref.id))]);
-    for (const guard of guards) {
-      const head = store.get(guard.id);
-      check(head && same(reference(head), guard), 'addressing_source_invalid', guard.id, 'head', 'A decision prerequisite changed before preparation');
-    }
+    const guards = uniqueTransactionGuards([...admitted.guards, ...lowerGuards, request.graph, ...view.refs.filter(ref => !view.writes.some(write => write.id === ref.id))]);
+    checkHeads(store, guards, 'addressing_source_invalid', 'head', 'A decision prerequisite changed before preparation');
     if (same(current.value.input, record.input) && same(current.value.gaps, record.gaps))
       return { record: current, writes: [], guards, references: derived.references as Ref[] };
     const next = { id: current.id, kind: current.kind, revision: current.revision + 1, hash: hashJson(record), value: record };
@@ -379,7 +399,7 @@ export function prepareApplyAnswer(store: Store, request: ApplyAnswerRequest): O
     const derivation = { kind: 'fact' as const, previous: request.input, answer: request.answer, question: request.question };
     let cursor = admitted.existing! as Revision<OmInputRecord>;
     while (cursor.value.derivation) {
-      if (same(cursor.value.derivation, derivation)) return { record: cursor, writes: [], guards: admitted.guards as Ref[],
+      if (same(cursor.value.derivation, derivation)) return { record: cursor, writes: [], guards: admitted.guards,
         references: [reference(cursor), request.input, request.answer, request.question] };
       cursor = take(readOmInput(store, request.project, cursor.value.derivation.previous)) as Revision<OmInputRecord>;
     }
@@ -390,11 +410,8 @@ export function prepareApplyAnswer(store: Store, request: ApplyAnswerRequest): O
     check(applicable.applicable, 'answer_inapplicable', request.input.id, 'answer',
       'The accepted fact must still establish this exact input question under the same contract and sources');
     const record = take(deriveOmInput(store, { project: request.project, ...derivation })) as OmInputRecord;
-    const guards = unique([...admitted.guards, ...applicable.guards]);
-    for (const guard of guards) {
-      const head = store.get(guard.id);
-      check(head && same(reference(head), guard), 'input_stale', guard.id, 'head', 'A fact application prerequisite changed');
-    }
+    const guards = uniqueTransactionGuards([...admitted.guards, ...applicable.guards]);
+    checkHeads(store, guards, 'input_stale', 'head', 'A fact application prerequisite changed');
     if (same(current.value.input, record.input) && same(current.value.gaps, record.gaps))
       return { record: current, writes: [], guards, references: applicable.references as Ref[] };
     const next = { id: current.id, kind: current.kind, revision: current.revision + 1, hash: hashJson(record), value: record };
@@ -429,8 +446,8 @@ export function prepareReopenAnswers(store: Store, request: ReopenAnswersRequest
     const evidence = derivation && 'kind' in derivation && derivation.kind === 'reopen-facts'
       ? [...derivation.invalidations.flatMap(item => [item.record, ...item.sources.flatMap(pair => [pair.before, pair.after])]),
         ...(derivation.dependencies ?? []).flatMap(item => [item.record, item.question, ...item.removed])] : [];
-    return { record, writes: prepared.writes as Write[], guards: prepared.guards as Ref[],
-      references: unique([request.input, reference(record), ...prepared.guards, ...evidence]) };
+    return { record, writes: prepared.writes as Write[], guards: prepared.guards,
+      references: unique([request.input, reference(record), ...prepared.guards.filter(isRef), ...evidence]) };
   });
 }
 export function writeReopenAnswers(store: Store, request: ReopenAnswersRequest): OmResult<Sealed<Revision<OmInputRecord>>> {

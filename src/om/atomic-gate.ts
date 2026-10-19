@@ -14,7 +14,7 @@ import type { TaskObligationBinding } from '../graph/task-obligation-model.js';
 import { safeRelativePath } from '../graph/topology.js';
 import { validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
-import { noteUntracedRead, Store, type Revision, type Write } from '../storage/store.js';
+import { noteUntracedRead, Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import { provenReads, registerSourceOverlay } from '../storage/store-view.js';
 import { readCapacity as readCapacityOf } from './capacity.js';
 import { taskSpecificationReader } from './task-specification.js';
@@ -112,7 +112,7 @@ export interface AtomicGateRecord {
   result: { gate: 'G5'; candidate: Ref; graphHash: string; passed: boolean; codes: string[]; findings: Finding[] };
   impact?: AtomicGateImpact;
 }
-export interface PreparedAtomicGate { record: Revision<AtomicGateRecord>; writes: Write[]; guards: Ref[]; references: Ref[] }
+export interface PreparedAtomicGate { record: Revision<AtomicGateRecord>; writes: Write[]; guards: TransactionGuard[]; references: Ref[] }
 const object = isPlainObject;
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
@@ -174,7 +174,7 @@ function issuedRequest(store: Store, request: AtomicGateRequest): AtomicGateRequ
 /** A preview has the same exact revisions as the one final transaction; it never writes to the store. */
 class Transaction {
   readonly writes = new Map<string, Write>();
-  readonly guards: Ref[] = [];
+  readonly guards: TransactionGuard[] = [];
   readonly view: Store;
   constructor(readonly store: Store) {
     const row = (write: Write): Revision<unknown> => ({ id: write.id, kind: write.kind, revision: write.expected + 1,
@@ -224,7 +224,7 @@ class Transaction {
       return typeof member === 'function' ? member.bind(target) : member;
     } });
   }
-  add(value: { writes: readonly Write[]; guards: readonly Ref[] }): void {
+  add(value: { writes: readonly Write[]; guards: readonly TransactionGuard[] }): void {
     for (const write of value.writes) {
       const old = this.writes.get(write.id);
       if (old && !same(old, write)) fail('atomic_gate_transaction_conflict', write.id, 'writes', 'One acceptance cannot write two different versions of a source');
@@ -239,16 +239,16 @@ class Transaction {
     }
     this.guards.push(...value.guards);
   }
-  protectedHeads(): Ref[] {
+  protectedHeads(): TransactionGuard[] {
     return unique(this.guards.filter(ref => {
       const pending = this.writes.get(ref.id);
-      return !pending || ref.revision !== pending.expected + 1 || ref.hash !== hashJson(pending.value);
+      return 'absent' in ref || !pending || ref.revision !== pending.expected + 1 || ref.hash !== hashJson(pending.value);
     }));
   }
 }
 
 /** Test access only (№1942-4): the preview transaction of one acceptance, for the regressions of its view; not a product API. */
-export const transactionForTests = (store: Store): { view: Store; writes: Map<string, Write>; add(value: { writes: readonly Write[]; guards: readonly Ref[] }): void } => new Transaction(store);
+export const transactionForTests = (store: Store): { view: Store; writes: Map<string, Write>; add(value: { writes: readonly Write[]; guards: readonly TransactionGuard[] }): void } => new Transaction(store);
 
 function modelSources(store: Store, project: string, results: readonly WorkProposalSource[]) {
   const outputs = results.map(source => historicalRead(store, { reader: `G5.model-source.${source.kind}`, project, ref: source.record },
@@ -616,7 +616,7 @@ function deriveGate(store: Store, request: AtomicGateRequest, current: boolean):
   if (request.gaps.sources.project !== request.project || !same(request.gaps.sources.works, {
     frame: candidate.value.request.frame, proposals: candidate.value.request.proposals }))
     fail('atomic_gate_basis_unproven', request.candidate.id, 'gaps', 'The complete D1 set must describe the final proposals');
-  const guards: Ref[] = [], writes: Write[] = [];
+  const guards: TransactionGuard[] = [], writes: Write[] = [];
   if (current) {
     const gaps = take(prepareCurrentGaps(store, request.gaps)); guards.push(...gaps.guards);
     const prepared = take(prepareNeighbors(store, { project: request.project, candidate: request.candidate }));
@@ -680,7 +680,7 @@ export interface WorksAcceptanceRecord {
 }
 export interface PreparedWorksAcceptance {
   state: 'accepted' | 'rejected' | 'unchanged'; record: Revision<WorksAcceptanceRecord>;
-  acceptance: AcceptedFrameRequest | null; writes: Write[]; guards: Ref[];
+  acceptance: AcceptedFrameRequest | null; writes: Write[]; guards: TransactionGuard[];
 }
 function requireAcceptance(store: Store, request: WorksAcceptanceRequest): void {
   if (!(store instanceof Store) || !object(request) || !text(request.project) || !isRef(request.environment)

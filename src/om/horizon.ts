@@ -1,5 +1,5 @@
 import { Ajv } from "ajv";
-import { canonical, hashJson, type Json } from "../canonical.js";
+import { canonical, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { controlPredecessors } from "../graph/dependencies.js";
 import type { Graph } from "../graph/model.js";
@@ -10,7 +10,8 @@ import { receiptId, type ArtifactReceipt } from "../compiler/model.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { StageChecks } from "../product/stage-checks.js";
-import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
+import { Store, storeObserved, type Revision, type TransactionGuard, type Write, type HeadsMatch, type HeadsMatchMismatch } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
 import { readRecord, writeGuarded } from "./refs.js";
@@ -198,7 +199,7 @@ export interface OmHorizonRecord {
 }
 export interface HorizonRecords { horizon: Revision<HorizonRecord>; gate: Revision<OmHorizonRecord> }
 export interface PreparedHorizon {
-  record: HorizonRecord; gate: OmHorizonRecord; writes: Write[]; guards: Ref[]; existing: HorizonRecords | null;
+  record: HorizonRecord; gate: OmHorizonRecord; writes: Write[]; guards: TransactionGuard[]; existing: HorizonRecords | null;
 }
 const address = (target: string, field: string, ref?: Ref) => ({ unit: "G2", target, field, ...(ref ? { ref } : {}) });
 function requireStore(store: Store, project: string): void {
@@ -382,50 +383,61 @@ function deriveHorizon(store: Store, request: HorizonRequest): HorizonResult<Sea
   return delivered({ project: request.project, request, result: { ...result, refusals: sorted([...result.refusals, ...extra]) } });
 }
 
-function currentHorizonSources(store: Store, request: HorizonRequest): HorizonResult<Sealed<Ref[]>> {
-  const heads = new Map<string, Ref>();
-  const remember = (ref: Ref) => {
-    const previous = heads.get(ref.id);
-    if (previous && canonical(previous) !== canonical(ref))
-      raise("input_stale", "A horizon prerequisite changed during preparation", address(ref.id, "head", previous));
-    heads.set(ref.id, ref);
+function currentHorizonSources(store: Store, request: HorizonRequest): HorizonResult<Sealed<TransactionGuard[]>> {
+  const guards = new Map<string, TransactionGuard>();
+  const remember = (guard: TransactionGuard) => {
+    const previous = guards.get(guard.id);
+    if (previous) {
+      if ('absent' in previous !== 'absent' in guard || canonical(previous) !== canonical(guard)) {
+        raise("input_stale", "A horizon prerequisite changed during preparation",
+          address(guard.id, "head", !('absent' in previous) ? previous : undefined));
+      }
+    }
+    guards.set(guard.id, guard);
   };
-  const traced = new Proxy(store, {
-    get(target, key) {
-      if (key === "get") return <T = Json>(id: string, revision?: number): Revision<T> | null => {
-        const value = target.get<T>(id, revision);
-        if (revision === undefined && value) remember(reference(value));
-        return value;
-      };
-      const value: unknown = Reflect.get(target, key, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
+  const matchHeads = (targetStore: Store, candidateGuards: readonly TransactionGuard[]): HeadsMatch => {
+    const physical = provenStore(targetStore);
+    if (physical && !storeObserved(physical)) return physical.headsMatch(candidateGuards);
+    const mismatches: HeadsMatchMismatch[] = [];
+    for (const g of candidateGuards) {
+      const head = targetStore.get(g.id);
+      if ('absent' in g) {
+        if (head !== null) mismatches.push({ id: g.id, expected: [g], actual: head ? { id: head.id, kind: head.kind, revision: head.revision, hash: head.hash } : null });
+      } else {
+        if (!head || head.revision !== g.revision || head.hash !== g.hash) {
+          mismatches.push({ id: g.id, expected: [g], actual: head ? { id: head.id, kind: head.kind, revision: head.revision, hash: head.hash } : null });
+        }
+      }
+    }
+    return { ok: mismatches.length === 0, conflict: false, mismatches };
+  };
   try {
     const refs = [request.input, request.graph, ...(request.refinement ? [request.refinement] : []),
       ...Object.values(request.available).flatMap(basis => Object.values(basis))];
-    for (const ref of refs) {
-      const head = traced.get(ref.id);
-      if (!head || canonical(reference(head)) !== canonical(ref))
-        return refuse("input_stale", "The horizon prerequisite is no longer current", address(ref.id, "head", ref), "producer");
+    const match = matchHeads(store, refs);
+    if (!match.ok) {
+      const failing = refs.find(r => match.mismatches.some(m => m.id === r.id)) ?? refs[0]!;
+      return refuse("input_stale", "The horizon prerequisite is no longer current", address(failing.id, "head", failing), "producer");
     }
-    const prepared = prepareExistingOmInput(traced, request.project, request.input);
+    for (const ref of refs) remember(ref);
+    const prepared = prepareExistingOmInput(store, request.project, request.input);
     if (!prepared.ok) return transfer("input", prepared);
     if (!prepared.value.existing || canonical(reference(prepared.value.existing)) !== canonical(request.input))
       return refuse("input_stale", "Horizon needs the currently admitted input", address(request.input.id, "input", request.input), "producer");
     for (const guard of prepared.value.guards) remember(guard);
     if (request.refinement?.id === `graph-layer:${request.project}:2`) {
-      const basis = readLayerAcceptance(traced, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
+      const basis = readLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
       if (!basis.ok) return refuse("horizon_refinement_unproven", basis.refusal.message,
         address(basis.refusal.at.target, basis.refusal.at.field ?? "acceptance", request.refinement), "producer");
-      for (const ref of basis.value.currentReferences) {
-        const head = traced.get(ref.id);
-        if (!head || canonical(reference(head)) !== canonical(ref))
-          return refuse("input_stale", "The accepted OM refinement is no longer current", address(ref.id, "head", ref), "producer");
+      const layerMatch = matchHeads(store, basis.value.currentReferences);
+      if (!layerMatch.ok) {
+        const failing = basis.value.currentReferences.find(r => layerMatch.mismatches.some(m => m.id === r.id)) ?? basis.value.currentReferences[0]!;
+        return refuse("input_stale", "The accepted OM refinement is no longer current", address(failing.id, "head", failing), "producer");
       }
+      for (const ref of basis.value.currentReferences) remember(ref);
     } else if (request.refinement) {
-      const engine = new StageChecks(traced);
-      const phase = traced.get<SavedPhase>(request.refinement.id, request.refinement.revision)!;
+      const engine = new StageChecks(store);
+      const phase = store.get<SavedPhase>(request.refinement.id, request.refinement.revision)!;
       for (const [name, gate] of [["refinement.L2", engine.refinement.gate(request.project, "L2")],
         ["layer.2", engine.graphs.layerGate(request.project, 2, phase.value.layer!)]] as const) {
         const admission = readOmAdmissionGuards(gate.admissionGuards, name, "G2");
@@ -437,7 +449,7 @@ function currentHorizonSources(store: Store, request: HorizonRequest): HorizonRe
         for (const guard of [...gate.guards, ...admission.value]) remember(guard);
       }
     }
-    return delivered(sorted([...heads.values()]));
+    return delivered(uniqueTransactionGuards([...guards.values()]));
   } catch (error) {
     if (error instanceof EngineError && error.code === "input_stale")
       return refuse("input_stale", error.message, address(request.project, "sources"), "producer");
@@ -478,7 +490,7 @@ export function prepareHorizon(store: Store, request: HorizonRequest): HorizonRe
     { id: horizon.id, kind: "horizon", expected: 0, value: record },
     { id: `om-horizon:${request.project}:${request.choice.choiceVersion}`, kind: "om-horizon", expected: 0, value: gate },
   ];
-  return delivered({ record, gate, writes, guards: sorted([...admission.value,
+  return delivered({ record, gate, writes, guards: uniqueTransactionGuards([...admission.value,
     ...(existing.value ? [reference(existing.value.horizon), reference(existing.value.gate)] : [])]), existing: existing.value });
 }
 export function writeHorizon(store: Store, request: HorizonRequest): HorizonResult<Sealed<HorizonRecords>> {

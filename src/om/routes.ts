@@ -1,7 +1,9 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type Revision, type TransactionGuard, type Write, storeObserved } from '../storage/store.js';
+import { provenStore } from '../storage/store-view.js';
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { readCompletionWorkAt, checkCompletionDisposition } from './model-call.js';
 import { completionWorkId, prepareSeriesLineAdmission, readCompletionBinding } from './series.js';
@@ -39,7 +41,7 @@ export interface RouteSearch {
 }
 export interface RoutesRecord { grouping?: 'consumer-set-v1' | 'block-input-v1'; project: string; request: SavedRoutesRequest; searches: RouteSearch[];
   routes: RoutedGap[]; batches: RoutedBatch[]; refusals: Refusal[] }
-export interface PreparedRoutes { record: Revision<RoutesRecord>; existing: boolean; writes: Write[]; guards: Ref[]; references: Ref[] }
+export interface PreparedRoutes { record: Revision<RoutesRecord>; existing: boolean; writes: Write[]; guards: TransactionGuard[]; references: Ref[] }
 export interface RoutesReadRequest { project: string; record: Ref }
 export const ROUTES_KIND = 'route-result';
 
@@ -91,6 +93,26 @@ function head(store: Store, ref: Ref): void {
   const latest = store.get(ref.id);
   if (!latest || !same(reference(latest), ref)) fail('input_stale', ref.id, 'reference', 'A routing source is no longer current');
 }
+function checkHeads(store: Store, guards: readonly TransactionGuard[]): void {
+  const checked = uniqueTransactionGuards(guards);
+  if (checked.length === 0) return;
+  const source = provenStore(store);
+  if (source !== null && !storeObserved(source)) {
+    const match = source.headsMatch(checked);
+    if (!match.ok) {
+      const mismatch = match.mismatches[0];
+      const id = mismatch?.id ?? checked[0]!.id;
+      fail('input_stale', id, 'reference', 'A routing source is no longer current');
+    }
+    return;
+  }
+  for (const guard of checked) {
+    const current = store.get(guard.id);
+    const ok = 'absent' in guard ? current === null
+      : current !== null && current.revision === guard.revision && current.hash === guard.hash;
+    if (!ok) fail('input_stale', guard.id, 'reference', 'A routing source is no longer current');
+  }
+}
 function normalized(request: RoutesRequest): RoutesRequest {
   return copy({ ...request, tasks: sorted(request.tasks), gaps: { ...request.gaps, records: sorted(request.gaps.records) },
     catalog: { paths: sorted(request.catalog.paths), records: sorted(request.catalog.records) } });
@@ -99,7 +121,7 @@ function routeSources(store: Store, request: RoutesRequest, current: boolean, cu
   const gaps = take(readGaps(store, request.gaps));
   if (gaps.sources.project !== request.project) fail('route_source_invalid', request.project, 'gaps', 'The D1 source belongs to another project');
   const input = take(readOmInput(store, request.project, gaps.sources.input));
-  const guards: Ref[] = [], references: Ref[] = [gaps.sources.input, ...request.gaps.records];
+  const guards: TransactionGuard[] = [], references: Ref[] = [gaps.sources.input, ...request.gaps.records];
   if (current) {
     const prepared = take(prepareCurrentGaps(store, request.gaps));
     guards.push(...prepared.guards, gaps.sources.input, ...request.gaps.records);
@@ -121,7 +143,7 @@ function routeSources(store: Store, request: RoutesRequest, current: boolean, cu
     if (!refusal.ok) refusals.push(refusal.refusal);
     references.push(inventoryRef); if (current) guards.push(inventoryRef);
   }
-  for (const ref of unique(guards)) head(store, ref);
+  checkHeads(store, unique(guards));
   const tasks = new Map<string, ReturnType<typeof checkedTask>>(), writes: Write[] = [];
   function checkedTask(basis: AnswerTaskBasis) {
     const historical = take(readAnswerTaskBasis(store, { project: request.project, task: basis, current: false }));
@@ -259,7 +281,7 @@ function requestForHistory(request: SavedRoutesRequest): RoutesRequest {
 /** The same answer-selection rule serves full M6 production and one already-owned batch. */
 function selectTaskAnswers(store: Store, request: RoutesRequest, tasks: ReturnType<typeof routeSources>['tasks'],
   current: boolean, history?: RouteSearch[]) {
-  const writes: Write[] = [], guards: Ref[] = [], references: Ref[] = [];
+  const writes: Write[] = [], guards: TransactionGuard[] = [], references: Ref[] = [];
   const answers = new Map<string, Ref>(), searches: RouteSearch[] = [];
   if (!current && (!Array.isArray(history) || history.length !== tasks.size))
     fail('route_record_invalid', request.project, 'searches', 'Historical routing must retain every fact search');
@@ -347,7 +369,7 @@ export function readRoutes(store: Store, request: RoutesReadRequest): OmResult<S
  * The owner reader proves the initial complete M6 and full attempt goal; this is never an opening admission. */
 export function prepareManagedRouteBatch(store: Store, request: {
   project: string; series: Ref; attempt: number; routes: Ref; batch: string;
-}): OmResult<Sealed<{ record: Revision<RoutesRecord>; batch: RoutedBatch; writes: Write[]; guards: Ref[]; references: Ref[] }>> {
+}): OmResult<Sealed<{ record: Revision<RoutesRecord>; batch: RoutedBatch; writes: Write[]; guards: TransactionGuard[]; references: Ref[] }>> {
   requireStore(store);
   if (!object(request) || !text(request.project) || !isRef(request.series) || !isRef(request.routes)
     || !Number.isSafeInteger(request.attempt) || request.attempt < 1 || !text(request.batch)) invalid('managed');

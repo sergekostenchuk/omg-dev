@@ -3822,7 +3822,7 @@ try {
   return output;
 }
 
-test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — N+1 derivations at depth N, where each link was derived twice per step — with the exact record, guards, references and writes of the base code 2785fca, a 6th link unwritten included, and its refusal codes for a foreign response or delivery', t => {
+test('PF5 (№4235): a chain of 1–5 continuations prepares each link once — N+1 derivations at depth N, where each link was derived twice per step — with the exact record, guards, references and writes of the base code 2785fca, a 6th link unwritten included, and its refusal codes for a foreign response or delivery', async t => {
   const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, PF5_BASE), { f } = p;
   // Five reads of five different values: each link adds knowledge, so each continuation is a ready packet.
   const question = f.input.value.input.questions[0]! as unknown as Record<string, unknown>;
@@ -3870,7 +3870,15 @@ out(take(writeQuestionPacket(store, args)).record);`, p.request) as Sealed<Revis
   // The base code prepares the same requests on the same database, in its own process: the same existing records, guards,
   // references and writes; the same new record of the sixth link; the same refusals.
   const base = preparedAtCommit(f.store.path, [...requests, sixth, ...refused]);
-  assert.deepEqual(JSON.parse(JSON.stringify([...again.map(row => row.summary), unwritten, ...refusals])), base);
+  const addedAbsence = { id: 'om-frame:garden:2', absent: true };
+  const legacySummary = (summary: PreparedSummary): PreparedSummary => {
+    if ('refusal' in summary) return summary;
+    assert.ok(Array.isArray(summary.guards));
+    const added = summary.guards.filter(guard => canonical(guard) === canonical(addedAbsence));
+    assert.deepEqual(added, [addedAbsence], 'The new preparation keeps the exact frame absence separately from the legacy contract');
+    return { ...summary, guards: summary.guards.filter(guard => canonical(guard) !== canonical(addedAbsence)) };
+  };
+  assert.deepEqual(JSON.parse(JSON.stringify([...again.map(row => legacySummary(row.summary)), legacySummary(unwritten), ...refusals])), base);
   // Before its write, each link's new record was the one the base code finds written: the same id, revision and hash.
   for (const [index, row] of ours.entries()) {
     const written = base[index]!;
@@ -3880,10 +3888,24 @@ out(take(writeQuestionPacket(store, args)).record);`, p.request) as Sealed<Revis
   // №4244: two derivations of one link with a different `current` in one preparation never share a result. The engine's one
   // path that derives a link both ways is its preparation after the environment moved: historically for the environment's
   // proof, then currently on the admitted view — 7 + 7 here, neither served from the other; the outcome is the base code's.
+  const guarded = ok(prepareQuestionPacket(f.store, sixth));
+  const saved = await f.store.snapshot(join(f.root, 'pf5-absent-frame'));
+  const competing = new Store(saved.path);
+  try {
+    competing.write({ id: addedAbsence.id, kind: 'connection-frame', expected: 0, value: {} });
+    const beforeRace = snapshot(competing);
+    const outcome = writeGuarded(competing, { unit: 'M3', target: 'garden', guards: guarded.guards,
+      writes: [...guarded.writes, { id: 'pf5:neighbor', kind: 'neighbor', expected: 0, value: {} }] });
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.refusal.code, 'input_stale');
+    assert.equal(outcome.refusal.at.target, addedAbsence.id);
+    assert.deepEqual(snapshot(competing), beforeRace);
+    assert.equal(competing.get('pf5:neighbor'), null);
+  } finally { competing.close(); }
   p.environment(100_000);
   const from = packetDerivations(), moved = preparedSummary(prepareQuestionPacket(f.store, sixth));
   assert.equal(packetDerivations() - from, 14);
-  assert.deepEqual(JSON.parse(JSON.stringify([moved])), preparedAtCommit(f.store.path, [sixth]));
+  assert.deepEqual(JSON.parse(JSON.stringify([legacySummary(moved)])), preparedAtCommit(f.store.path, [sixth]));
 });
 
 import { mkdirSync as rb1Mkdir, renameSync as rb1Rename } from 'node:fs';

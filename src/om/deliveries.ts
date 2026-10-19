@@ -12,7 +12,7 @@ import { selectWriter, type WriterProof } from '../ownership/owners.js';
 import { prepareWriterIndex, readWriterIndex } from '../ownership/writer-index.js';
 import type { ExecutionRoot } from '../runtime/environment.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import type { CandidateReadRequest, CandidateRequest } from './frame-candidate.js';
 import { readHorizon } from './horizon.js';
 import { withHistoricalReads } from './input.js';
@@ -44,12 +44,12 @@ export interface DeliveryOwnershipBasis {
   contract: 'delivery-ownership/v1'; root: Ref | null; indexes: Record<string, Ref>;
 }
 export interface DeliveryReadRequest extends CandidateReadRequest { ownership: DeliveryOwnershipBasis }
-export interface DeliveryRead extends DeliveryCheck { request: DeliveryReadRequest; writes: Write[] }
+export interface DeliveryRead extends Omit<DeliveryCheck, 'guards'> { request: DeliveryReadRequest; writes: Write[]; guards: TransactionGuard[] }
 const object = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const text = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0;
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-const unique = (refs: readonly Ref[]): Ref[] => [...new Map(refs.map(ref => [canonical(ref), ref])).values()]
+const unique = <T>(refs: readonly T[]): T[] => [...new Map(refs.map(ref => [canonical(ref), ref])).values()]
   .sort((a, b) => order(canonical(a), canonical(b)));
 const ajv = new Ajv({ strict: true, allowUnionTypes: true });
 const shapes = [ajv.compile(sealed(graphSchema)), ajv.compile(sealed(graphV2Schema))];
@@ -239,7 +239,7 @@ function checked(store: Store, request: CandidateReadRequest | DeliveryReadReque
         { unit: 'F7.4', target: request.candidate.id, field: 'ownership' }, 'producer');
   }
   const candidate = readWorksFrame(store, { project: request.project, candidate: request.candidate }); if (!candidate.ok) return candidate;
-  const record = candidate.value, source = record.value, guards: Ref[] = [];
+  const record = candidate.value, source = record.value, guards: TransactionGuard[] = [];
   const horizon = readHorizon(store, request.project, source.request.frame.horizon); if (!horizon.ok) return horizon;
   if (horizon.value.gate.value.state !== 'accepted') return refused('delivery_basis_unproven', 'Delivery bases require an accepted M2 horizon',
     { unit: 'F7.4', target: source.request.frame.horizon.id, field: 'horizon' }, 'readiness');

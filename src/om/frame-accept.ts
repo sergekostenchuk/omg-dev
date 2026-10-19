@@ -2,7 +2,7 @@ import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import type { Graph } from '../graph/model.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import { assembleCandidate, gateCandidate, prepareCandidate, readCandidate, type FrameCandidateRecord } from './frame-candidate.js';
 import type { LayerProposal, ProposalObservation, ProposalRequest } from './frame-proposals.js';
 import { WORKS_FRAME_CONTRACT, currentFrameRequest, prepareFrame, readFrame, type FrameRead, type FrameRequest } from './frame-obligations.js';
@@ -14,6 +14,7 @@ import { prepareAtomicGate, readAtomicGate, type AtomicGateRequest, type AtomicG
 import { journalId, prepareRecordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, REFUSAL_JOURNAL_KIND,
   type RefusalJournal, type UnitRefusalRecord, type OriginSource } from './refusal-journal.js';
 import { readRecord, writeGuarded } from './refs.js';
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { ACCEPTING_ROLE } from './repeat-gate.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { prepareRebaseBasis, buildRebasedLayer, type OmRebasedFrame } from './layer-basis.js';
@@ -29,7 +30,7 @@ export interface Settlement {
   graph: Revision<Graph> | null; layer: Revision<LayerBasis> | null; frame: Revision<OmAcceptedFrame> | null;
   proposals: Revision<LayerProposal>[];
 }
-export interface PreparedSettlement { result: Settlement; writes: Write[]; guards: Ref[]; expected: { graph: number; layer: number; frame: number } | null }
+export interface PreparedSettlement { result: Settlement; writes: Write[]; guards: TransactionGuard[]; expected: { graph: number; layer: number; frame: number } | null }
 export interface AcceptedFrameRequest { project: string; level: 2 | 3; graph: Ref; layer: Ref; frame: Ref }
 interface WorkRejectionRecord {
   contract: 'om-work-rejection/v1'; project: string; candidate: Ref; gate: Ref;
@@ -42,6 +43,7 @@ const text = (value: unknown): value is string => typeof value === 'string' && v
 const hash = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const sorted = <T>(items: readonly T[]): T[] => [...items].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
+const guardsOf = (guards: readonly TransactionGuard[]): TransactionGuard[] => sorted(uniqueTransactionGuards(guards));
 const unique = (refs: readonly Ref[]): Ref[] => sorted([...new Map(refs.map(ref => [canonical(ref), ref])).values()]);
 class AcceptFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }
 function fail(code: string, target: string, field: string, message: string): never {
@@ -265,7 +267,7 @@ function requireAtomicOutcome(request: SettleCandidateRequest, candidate: Revisi
     fail('gate_outcome_mismatch', candidate.id, 'outcome', 'The claimed outcome must equal the complete saved G5 result for this works candidate');
 }
 function prepareWorkRejection(store: Store, request: SettleCandidateRequest, candidate: Revision<FrameCandidateRecord>,
-  gate: Revision<AtomicGateRecord>, guards: Ref[], expected: PreparedSettlement['expected']): PreparedSettlement {
+  gate: Revision<AtomicGateRecord>, guards: TransactionGuard[], expected: PreparedSettlement['expected']): PreparedSettlement {
   const derived = workRejectionSources(store, request, candidate, gate), writes: Write[] = [...derived.proposalWrites];
   const old = store.get(derived.diagnostic.id);
   if (old && !same(old, derived.diagnostic))
@@ -287,7 +289,7 @@ function prepareWorkRejection(store: Store, request: SettleCandidateRequest, can
   writes.push({ id: workRejectionId(request), kind: 'om-work-rejection', expected: 0,
     value: rejectionBody(request, reference(derived.diagnostic), previousJournal, journalRef, proposals.map(reference)) });
   return { result: { state: 'rejected', graph: null, layer: null, frame: null, proposals }, writes,
-    guards: unique([...guards, ...journal.guards, ...(old ? [reference(old)] : [])]
+    guards: guardsOf([...guards, ...journal.guards, ...(old ? [reference(old)] : [])]
       .filter(ref => !writes.some(write => same(reference(proposedRevision(write)), ref)))), expected };
 }
 /** Prepare every write and its guard before any member of the acceptance transaction is visible. */
@@ -314,7 +316,7 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
       return { result: { ...rejected, state: 'unchanged' }, writes: [], guards: [], expected: null };
     }
     let checked: AcceptedFrameGate;
-    const gateGuards: Ref[] = [];
+    const gateGuards: TransactionGuard[] = [];
     if (atomic) {
       const admission = take(prepareAtomicGate(store, atomic.value.request as AtomicGateRequest));
       if (!same(admission.record, atomic))
@@ -338,11 +340,11 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
     if (prepared.state !== 'candidate' || !prepared.existing || !same(reference(prepared.existing), request.candidate))
       fail('candidate_graph_mismatch', candidate.id, 'candidate', 'Current preparation did not reproduce this exact saved candidate');
     if (atomic && !atomic.value.result.passed) return prepareWorkRejection(store, request, candidate,
-      atomic as Revision<AtomicGateRecord>, unique([...prepared.guards, ...gateGuards, request.candidate]), prepared.expected);
+      atomic as Revision<AtomicGateRecord>, guardsOf([...prepared.guards, ...gateGuards, request.candidate]), prepared.expected);
     const binding = take(readFrameAttemptBinding(store, { project: request.project, candidate: request.candidate, binding: request.binding ?? null })).binding;
     const bindingGuards = binding ? take(prepareSeriesLineAdmission(store, request.project, binding.series)).guards : [];
     const upperId = `graph-layer:${request.project}:${request.level - 1}`;
-    const upperCandidates = prepared.guards.filter(ref => ref.id === upperId);
+    const upperCandidates = prepared.guards.filter((ref): ref is Ref => !('absent' in ref) && ref.id === upperId);
     if (upperCandidates.length !== 1) fail('frame_acceptance_invalid', upperId, 'upper', 'The acceptance must retain exactly one admitted upper basis');
     const upperRef = upperCandidates[0]!;
     const upper = exact<LayerBasis>(store, upperRef, upperId, 'graph-layer');
@@ -363,7 +365,7 @@ export function prepareSettleCandidate(store: Store, request: SettleCandidateReq
     });
     const proposals = proposalWrites.map(write => proposedRevision<LayerProposal>(write));
     return { result: { state: 'accepted', graph, layer, frame, proposals },
-      writes: [graphWrite, layerWrite, frameWrite, ...proposalWrites], guards: unique([...prepared.guards, ...gateGuards, ...bindingGuards, request.candidate, upperRef]), expected: prepared.expected };
+      writes: [graphWrite, layerWrite, frameWrite, ...proposalWrites], guards: guardsOf([...prepared.guards, ...gateGuards, ...bindingGuards, request.candidate, upperRef]), expected: prepared.expected };
   });
 }
 export function settleCandidate(store: Store, request: SettleCandidateRequest): OmResult<Sealed<Settlement>> {
@@ -385,7 +387,7 @@ export interface RejectedLayerProposal extends Omit<LayerProposal, 'status' | 'v
 export interface ProposalRejection {
   state: 'rejected' | 'unchanged' | 'obsolete'; proposals: Revision<RejectedLayerProposal>[]; verdict: ProposalRejectionVerdict | null;
 }
-export interface PreparedProposalRejection { result: ProposalRejection; writes: Write[]; guards: Ref[] }
+export interface PreparedProposalRejection { result: ProposalRejection; writes: Write[]; guards: TransactionGuard[] }
 export interface RejectedProposalsRequest { request: ProposalRequest; proposals: Ref[] }
 function requireRejectionRequest(store: Store, value: unknown): asserts value is ProposalRequest {
   if (!(store instanceof Store) || !object(value) || !object(value['frame'])
@@ -497,7 +499,7 @@ export function prepareRejectProposals(store: Store, request: ProposalRequest): 
     const verdict = rejectionVerdict(frame as unknown as FrameRead, sources, request);
     const writes = sources.map(source => ({ id: source.id, kind: 'layer-proposal', expected: source.revision, value: rejectedValue(source, verdict) }));
     return { result: { state: 'rejected', proposals: writes.map(write => proposedRevision<RejectedLayerProposal>(write)), verdict },
-      writes, guards: unique([...frame.guards, ...sources.map(reference)]) };
+      writes, guards: guardsOf([...frame.guards, ...sources.map(reference)]) };
   });
 }
 export function rejectProposals(store: Store, request: ProposalRequest): OmResult<Sealed<ProposalRejection>> {
@@ -514,7 +516,7 @@ export interface FrameRebase {
   state: 'rebased' | 'unchanged'; frame: Revision<OmRebasedFrame>; layer: Revision<LayerBasis>;
   carried: number; retired: number;
 }
-export interface PreparedFrameRebase { result: FrameRebase; writes: Write[]; guards: Ref[] }
+export interface PreparedFrameRebase { result: FrameRebase; writes: Write[]; guards: TransactionGuard[] }
 function requireRebaseRequest(store: Store, request: unknown): asserts request is RebaseFrameRequest {
   if (!(store instanceof Store) || !object(request)) invalid('rebase');
   for (const key of ['from', 'to']) {
@@ -558,7 +560,7 @@ export function prepareRebaseFrame(store: Store, request: RebaseFrameRequest): O
     request = { from, to };
     const basis = take(prepareRebaseBasis(store, request));
     for (const ref of [to.graph, to.horizon, from.layer, from.frame, ...basis.currentReferences]) current(store, ref);
-    const guards: Ref[] = [...basis.currentReferences, to.graph, to.horizon, from.layer, from.frame];
+    const guards: TransactionGuard[] = [...basis.currentReferences, to.graph, to.horizon, from.layer, from.frame];
     // Each horizon can carry different availability sources; admit both, preserving their complete guards.
     for (const horizon of unique([to.horizon, to.upper!.horizon])) {
       const admitted = take(prepareFrame(store, { project: to.project, level: 2, graph: to.graph, horizon,
@@ -573,7 +575,7 @@ export function prepareRebaseFrame(store: Store, request: RebaseFrameRequest): O
     const layerWrite: Write = { id: from.layer.id, kind: 'graph-layer', expected: from.layer.revision,
       value: buildRebasedLayer({ frame: basis.frame as OmRebasedFrame, reference: reference(frame), graph: graph.value, upper, previous }) };
     const layer = proposedRevision<LayerBasis>(layerWrite);
-    return { result: rebaseResult(frame, layer, 'rebased'), writes: [layerWrite, frameWrite], guards: unique(guards) };
+    return { result: rebaseResult(frame, layer, 'rebased'), writes: [layerWrite, frameWrite], guards: guardsOf(guards) };
   });
 }
 export function rebaseFrame(store: Store, request: RebaseFrameRequest): OmResult<Sealed<FrameRebase>> {

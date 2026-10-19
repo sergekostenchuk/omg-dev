@@ -122,7 +122,7 @@ export interface AssessmentIntentRecord {
   contract: typeof INTENT_CONTRACT; project: string; source: SourceBasis; candidates: Candidate[];
   fact: Fact; question: AssessmentQuestion; originalSeries: Ref; series: Ref;
   attempt: number; goal: AttemptGoal; block: string; gaps: AddressedGap[];
-  dispatch: DispatchContract; packet: Json; originalActor: string; originalGuards: Ref[];
+  dispatch: DispatchContract; packet: Json; originalActor: string; originalGuards: TransactionGuard[];
 }
 export interface CheckedAssessmentIntent {
   intent: Ref; record: Revision<AssessmentIntentRecord>; call: string; basis: FactAssessmentBasis;
@@ -251,7 +251,7 @@ function sourceBasis(store: Store, project: string, modelCall: Ref, questionId: 
     response: outcome.response, question: facts[0]!.question, questionId };
 }
 function sourceBody(store: Store, project: string, source: SourceBasis, dispatch: DispatchContract,
-  series: Ref, current: boolean, formed = true): { value: AssessmentIntentRecord; guards: Ref[]; requiredGuards: Ref[] } {
+  series: Ref, current: boolean, formed = true): { value: AssessmentIntentRecord; guards: TransactionGuard[]; requiredGuards: Ref[] } {
   const origin = take(readFactAssessmentOrigin(store, project, source, source.modelCall.id));
   if ('owner' in origin.call.value) fail('assessment_source_invalid', source.call.id, 'owner', 'MC1 fact assessment belongs to a block attempt');
   const state = take(readModelCallState(store, { project, record: source.modelCall }));
@@ -303,7 +303,7 @@ function sourceBody(store: Store, project: string, source: SourceBasis, dispatch
       contract, fingerprint: question.record.value.fingerprint },
     answer: { value: fact.value, grounds: fact.grounds }, ...(formed ? { responseForm: ASSESSMENT_VERDICT_FORM } : {}),
   }) as unknown as Json;
-  const guards = current ? refs([source.modelCall, source.packet, source.response, series,
+  const guards = current ? uniqueTransactionGuards([source.modelCall, source.packet, source.response, series,
     dispatch.adapter, dispatch.config, ...(liveQuestion?.guards ?? []), ...(liveCitations?.guards ?? []),
     ...take(prepareSeriesLineAdmission(store, project, series)).guards]) : [];
   const requiredGuards = refs([source.modelCall, source.packet, source.response, series,
@@ -311,9 +311,10 @@ function sourceBody(store: Store, project: string, source: SourceBasis, dispatch
     ...fact.grounds.map(ground => ground.observation.source)]);
   if (current && requiredGuards.some(required => !guards.some(guard => same(guard, required))))
     fail('assessment_source_invalid', source.question.id, 'guards', 'The admission must guard every exact question and citation source', source.question);
-  if (current) for (const ref of guards) {
-    const head = store.get(ref.id);
-    if (!head || !same(reference(head), ref)) fail('assessment_source_stale', ref.id, 'head', 'The assessment source moved', ref);
+  if (current) for (const guard of guards) {
+    const head = store.get(guard.id);
+    if ('absent' in guard ? head !== null : !head || !same(reference(head), guard))
+      fail('assessment_source_stale', guard.id, 'head', 'The assessment source moved', isRef(guard) ? guard : undefined);
   }
   return { value: { contract: INTENT_CONTRACT, project, source, candidates, fact,
     question: { record: source.question, target: question.gap.target, field: question.gap.field,
@@ -417,7 +418,7 @@ export function prepareAssessmentFileTerminationCause(store: Store, request: { p
   });
 }
 function assessmentSeriesCause(store: Store, project: string, intent: Sealed<CheckedAssessmentIntent>, pointer: Ref) {
-  const originalPointer = intent.record.value.originalGuards.find(ref => ref.id === seriesCurrentId(project)) ?? null;
+  const originalPointer = intent.record.value.originalGuards.find((guard): guard is Ref => isRef(guard) && guard.id === seriesCurrentId(project)) ?? null;
   const change = take(readSeriesAdmissionChange(store, { project, series: intent.series, pointer: originalPointer, currentPointer: pointer }));
   const current = take(readCurrentSeriesPointer(store, { project, record: pointer }));
   const line = current.value.series.find(row => row.block === intent.block);
@@ -448,7 +449,7 @@ export function prepareAssessmentSeriesTerminationCause(store: Store, request: {
   requireIntentRef(store, request.project, request.intent);
   return checked(() => {
     const intent = take(readAssessmentIntentAt(store, request.project, request.intent));
-    const original = intent.record.value.originalGuards.find(ref => ref.id === seriesCurrentId(request.project)) ?? null;
+    const original = intent.record.value.originalGuards.find((guard): guard is Ref => isRef(guard) && guard.id === seriesCurrentId(request.project)) ?? null;
     const head = store.get(seriesCurrentId(request.project));
     if (!head) {
       if (original) fail('assessment_cause_invalid', original.id, 'pointer', 'A lost required pointer is not a proved admission change', original);
@@ -460,13 +461,13 @@ export function prepareAssessmentSeriesTerminationCause(store: Store, request: {
     return derived.cause ? take(readAssessmentSeriesTerminationCause(store, { ...request, cause: derived.cause })) : derived;
   });
 }
-function originalGuardHeads(store: Store, intent: Sealed<CheckedAssessmentIntent>): Ref[] {
+function originalGuardHeads(store: Store, intent: Sealed<CheckedAssessmentIntent>): TransactionGuard[] {
   const original = intent.record.value.originalGuards;
   for (const guard of original) {
     const head = store.get(guard.id);
-    if (!head || !same(reference(head), guard))
+    if ('absent' in guard ? head !== null : !head || !same(reference(head), guard))
       fail('assessment_source_stale', guard.id, 'originalGuards',
-        'The assessor retains every head captured before its original intent was written', guard);
+        'The assessor retains every head captured before its original intent was written', isRef(guard) ? guard : undefined);
   }
   return [...original];
 }

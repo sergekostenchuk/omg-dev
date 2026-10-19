@@ -9,7 +9,7 @@ import { L3_ASSEMBLY, assembleL3 } from '../graph/layer-assembly.js';
 import { projectGraph } from '../graph/project.js';
 import { requireGraph, validateGraph } from '../graph/validate.js';
 import { isRef, reference, type Finding, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import { WORKS_FRAME_CONTRACT, representativeJoinId, workAnchorId, workFillCode, fillObligations, flowKey, readFrame, type ConnectionFrame, type FrameFill, type FrameRead, type PreparedFrame } from './frame-obligations.js';
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, prepareFrameProposals,
   WAKE_TEST, type FrameGap, type ProposalObservation, type ProposalRequest, type ProposalResult } from './frame-proposals.js';
@@ -44,7 +44,7 @@ export interface WorksCandidateInput { contract: typeof WORKS_FRAME_CONTRACT; pr
 /** G5.1 (№3847): the chosen wake tests of producer ends answered before the wake-test era — present only when used. */
 export interface CandidateRequest extends ProposalRequest { works?: WorksCandidateInput; joinAssembly?: typeof JOIN_ASSEMBLY; wakes?: WakeChoiceInput[] }
 export interface FrameCandidateRecord extends FrameCandidate { request: CandidateRequest }
-export type PreparedCandidate = { guards: Ref[]; expected: PreparedFrame['expected']; writes: Write[] } & (
+export type PreparedCandidate = { guards: TransactionGuard[]; expected: PreparedFrame['expected']; writes: Write[] } & (
   { state: 'gaps'; gaps: FrameGap[]; existing: null }
   | { state: 'candidate'; candidate: FrameCandidateRecord; existing: Revision<FrameCandidateRecord> | null });
 export type CandidateWriteResult = { state: 'gaps'; gaps: FrameGap[] }
@@ -378,7 +378,7 @@ function checkedWorksBasis(store: Store, request: CandidateRequest, current: boo
   const works = saved.producer.value.request.gaps.sources.works;
   if ('state' in works || !same(works, { frame: request.frame, proposals: sorted(request.proposals) }))
     reject('works_obligations_invalid', request.works.producer.id, 'context', 'The handoff and candidate must name exactly the same checked D1 works request');
-  if (!current) return { ...saved, guards: [] as Ref[] };
+  if (!current) return { ...saved, guards: [] as TransactionGuard[] };
   const prepared = take(prepareOmObligations(store, saved.producer.value.request as ObligationRequest));
   if (prepared.writes.length || !same(reference(prepared.producer), request.works.producer) || !same(reference(prepared.record), request.works.ledger))
     reject('works_obligations_invalid', request.works.producer.id, 'admission', 'The current handoff must already exist at the exact declared references');
@@ -799,7 +799,7 @@ export function prepareCandidate(store: Store, request: CandidateRequest): Candi
       sharedWritePaths(sources.proposals as ProposalObservation[]))) as WriteOrderInput[] : [];
     const basis = request.frame.level === 3 ? checkedWorksBasis(store, request, true) : null;
     const common = { guards: unique([...sources.guards, ...(basis?.guards ?? []), ...(request.wakes ?? []).map(wake => wake.choice),
-      ...orders.map(order => order.choice)]) as Ref[],
+      ...orders.map(order => order.choice)]),
       expected: sources.expected as PreparedFrame['expected'] };
     const existingResult = (existing: Revision<FrameCandidateRecord>, candidate: FrameCandidate): PreparedCandidate => {
       const { request: _request, ...content } = existing.value;

@@ -229,8 +229,14 @@ test('C5 rebase refuses graph edits outside acceptance and guards its entire tra
     const file = join(f.f.root, `rebase-race-${index}.sqlite`); copyFileSync(saved.path, file);
     const isolated = new Store(file);
     try {
-      const head = isolated.get(guard.id)!;
-      isolated.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
+      const head = isolated.get(guard.id);
+      if ('absent' in guard) {
+        assert.equal(head, null);
+        isolated.write({ id: guard.id, kind: 'race', expected: 0, value: {} });
+      } else {
+        assert.ok(head);
+        isolated.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
+      }
       const changed = snapshot(isolated);
       refusedWith(writeGuarded(isolated, { unit: 'rebase-neighbor', target: 'rebase', guards: prepared.guards, writes: [...prepared.writes,
         { id: 'neighbor:rebase', kind: 'neighbor', expected: 0, value: {} }] }), 'input_stale');
@@ -394,8 +400,14 @@ test('C5 guards every prepared input and frame absence in a common neighbor tran
     const file = join(f.root, `guard-${index}.sqlite`); copyFileSync(saved.path, file);
     const isolated = new Store(file);
     try {
-      const row = isolated.get(guard.id)!;
-      isolated.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+      const row = isolated.get(guard.id);
+      if ('absent' in guard) {
+        assert.equal(row, null);
+        isolated.write({ id: guard.id, kind: 'race', expected: 0, value: {} });
+      } else {
+        assert.ok(row);
+        isolated.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+      }
       const afterChange = snapshot(isolated);
       refusedWith(writeGuarded(isolated, { unit: 'neighbor', target: 'accept', writes: [...prepared.writes,
         { id: 'neighbor:accept', kind: 'neighbor', expected: 0, value: {} }], guards: prepared.guards }), 'input_stale');
@@ -406,7 +418,8 @@ test('C5 guards every prepared input and frame absence in a common neighbor tran
   const other = fixture(t), absent = ok(prepareSettleCandidate(other.store, other.request));
   other.store.write({ id: 'om-frame:garden:2', kind: 'connection-frame', expected: 0, value: { occupied: true } });
   const before = snapshot(other.store);
-  refusedWith(writeGuarded(other.store, { unit: 'neighbor', target: 'accept', writes: absent.writes, guards: absent.guards }), 'revision_conflict');
+  assert.equal(refusedWith(writeGuarded(other.store, { unit: 'neighbor', target: 'accept', writes: absent.writes, guards: absent.guards }),
+    'input_stale').at.target, 'om-frame:garden:2');
   assert.deepEqual(snapshot(other.store), before);
 });
 
@@ -619,8 +632,14 @@ test('C5 rejection guards every current input and all participants without parti
     const file = join(f.root, `rejection-guard-${index}.sqlite`); copyFileSync(saved.path, file);
     const store = new Store(file);
     try {
-      const row = store.get(guard.id)!;
-      store.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+      const row = store.get(guard.id);
+      if ('absent' in guard) {
+        assert.equal(row, null);
+        store.write({ id: guard.id, kind: 'race', expected: 0, value: {} });
+      } else {
+        assert.ok(row);
+        store.write({ id: row.id, kind: row.kind, expected: row.revision, value: row.value });
+      }
       const before = snapshot(store);
       refusedWith(writeGuarded(store, { unit: 'rejection-neighbor', target: 'reject', guards: prepared.guards,
         writes: [...prepared.writes, { id: 'neighbor:reject', kind: 'neighbor', expected: 0, value: {} }] }), 'input_stale');

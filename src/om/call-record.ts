@@ -351,7 +351,7 @@ function readCallInScope(store: Store, project: string, ref: Ref, history?: Call
  */
 export function prepareCallDispatch(
   store: Store, project: string, callRef: Ref,
-): OmResult<Sealed<{ readonly call: Revision<AnyCallRecord>; readonly guards: readonly Ref[] }>> {
+): OmResult<Sealed<{ readonly call: Revision<AnyCallRecord>; readonly guards: readonly TransactionGuard[] }>> {
   return withHistoricalReads(() => {
     const read = readCallInScope(store, project, callRef);
     if (!read.ok) return read;
@@ -362,7 +362,7 @@ export function prepareCallDispatch(
     if (!dispatch.ok) return dispatch;
     const series = resolveSeries(store, project, read.value.value, callRef.id);
     if (!series.ok) return series;
-    return delivered({ call: read.value, guards: uniqueRefs([callRef, ...dispatch.value, ...series.value]) });
+    return delivered({ call: read.value, guards: uniqueTransactionGuards([callRef, ...dispatch.value, ...series.value]) });
   });
 }
 
@@ -455,9 +455,9 @@ function recordCallInScope(store: Store, project: string, request: AnyRecordCall
     projectId: project,
     calls: orderedRows([...(ledger.value?.record.value.calls ?? []), row]),
   };
-  const ledgerGuards = (ledger.value?.guards ?? []) as unknown as readonly Ref[];
-  const dispatchGuards = dispatch.value as unknown as readonly Ref[];
-  const seriesGuards = series.value as unknown as readonly Ref[];
+  const ledgerGuards = ledger.value?.guards ?? [];
+  const dispatchGuards = dispatch.value;
+  const seriesGuards = series.value;
   const written = writeGuarded(store, {
     unit: UNIT, target: id,
     writes: [
@@ -784,7 +784,7 @@ function resolveDispatch(store: Store, dispatch: DispatchContract, target: strin
   return delivered([exactRef(dispatch.adapter), exactRef(dispatch.config)]);
 }
 
-function resolveSeries(store: Store, project: string, request: CheckedRequest, target: string): OmResult<Sealed<readonly Ref[]>> {
+function resolveSeries(store: Store, project: string, request: CheckedRequest, target: string): OmResult<Sealed<readonly TransactionGuard[]>> {
   if ("owner" in request) return resolveMechanismSeries(store, project, request, target, true);
   const admission = prepareSeriesLineAdmission(store, project, request.series);
   if (!admission.ok || "owner" in admission.value.series.value || admission.value.series.value.block !== request.block) {
@@ -825,7 +825,7 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
         target, "attempt", "producer", request.series);
     }
     const proved = wakeCallProved(store, project, request);
-    return proved.ok ? delivered(uniqueRefs([...guards, ...proved.value])) : proved;
+    return proved.ok ? delivered(uniqueTransactionGuards([...guards, ...proved.value])) : proved;
   }
   if (!attempt || attempt.outcome === null) {
     return problem("call_basis_unresolved", "An analysis call belongs to a completed attempt at its saved ground",
@@ -853,7 +853,7 @@ function resolveSeries(store: Store, project: string, request: CheckedRequest, t
     return problem("call_basis_unresolved", "The call names its exact current origin hold and the attempt that raised it",
       target, "basis", "producer", basis.hold);
   }
-  return delivered(uniqueRefs([...guards, ...context.value.reads]));
+  return delivered(uniqueTransactionGuards([...guards, ...context.value.reads]));
 }
 
 /** G5.1: a wake-choice E1 is exactly the call its saved intent derives — name, basis, paying attempt, goal and packet. */
@@ -879,7 +879,7 @@ function wakeCallProved(store: Store, project: string, request: Pick<AnyCallReco
 function resolveMechanismSeries(
   store: Store, project: string, request: Omit<MechanismRecordCallRequest, "packet"> | MechanismCallRecord,
   target: string, current: boolean, history?: CallHistory,
-): OmResult<Sealed<readonly Ref[]>> {
+): OmResult<Sealed<readonly TransactionGuard[]>> {
   if (request.purpose === "fact-assessment") {
     return problem("call_purpose_invalid", "An MC1 fact assessment belongs to its original block attempt",
       target, "purpose", "gap", request.series);
@@ -905,7 +905,7 @@ function resolveMechanismSeries(
     return problem("call_series_unresolved", "The call's mechanism owner and exact task must be proved by its series", target, "admission", "producer", request.series);
   const series = read.value.series.value;
   const attempt = [...series.inherited, ...series.attempts].find(item => item.ordinal === request.attempt);
-  const guards = current ? [request.series, ...read.value.guards] as unknown as readonly Ref[] : [];
+  const guards = current ? [request.series, ...read.value.guards] : [];
   if (ordinary) {
     if (request.purpose !== "model-design")
       return problem("call_purpose_invalid", "M5:addressing admits its MC2 design task", target, "purpose", "gap", request.series);
@@ -916,7 +916,7 @@ function resolveMechanismSeries(
     const gaps = orderedGaps(read.value.gaps.map(gap => ({ id: gap.id, goal: gap.target, field: gap.field, consumer: request.owner })));
     if (hashJson(gaps) !== hashJson(request.gaps))
       return problem("call_question_invalid", "The call addresses every member of the proved mechanism batch exactly once", target, "gaps", "gap", request.series);
-    return delivered(uniqueRefs(guards));
+    return delivered(uniqueTransactionGuards(guards));
   }
   if (!attempt || attempt.outcome === null)
     return problem("call_basis_unresolved", "An analysis call refers to a completed mechanism attempt", target, "attempt", "producer", request.series);
@@ -926,7 +926,7 @@ function resolveMechanismSeries(
       || stop.attempt !== request.attempt || !stop.attempts.includes(request.attempt)
       || !series.ladder.grounds.includes("review-record"))
       return problem("call_basis_unresolved", "A mechanism stop analysis names the saved stop and its review rung", target, "basis", "producer", basis.series);
-    return delivered(uniqueRefs(guards));
+    return delivered(uniqueTransactionGuards(guards));
   }
   const basis = request.basis as OriginHoldBasis;
   const hold = readOriginHoldAt(store, project, basis.hold, history?.journal);
@@ -939,7 +939,7 @@ function resolveMechanismSeries(
   const context = readStopContext(store, seriesRequestOf(JSON.parse(canonical(series))));
   if (!context.ok || !context.value.context.holds.some(item => sameRef(item.hold, basis.hold) && item.attempt === request.attempt))
     return problem("call_basis_unresolved", "A mechanism origin analysis names its current owner hold", target, "basis", "producer", basis.hold);
-  return delivered(uniqueRefs([...guards, ...context.value.reads]));
+  return delivered(uniqueTransactionGuards([...guards, ...context.value.reads]));
 }
 
 function validMechanismOwner(value: unknown): value is MechanismCallOwner {

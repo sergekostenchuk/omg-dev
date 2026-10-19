@@ -65,7 +65,7 @@ export interface QuestionTaskRequest {
 export interface PreparedQuestionTasks {
   tasks: CheckedAnswerTask[];
   writes: Write[];
-  guards: Ref[];
+  guards: TransactionGuard[];
   references: Ref[];
 }
 
@@ -153,7 +153,7 @@ export function writeQuestionTasks(store: Store, request: QuestionTaskRequest): 
   return result(() => {
     const prepared = take(prepareQuestionTasks(store, request));
     if (prepared.writes.length) take(writeGuarded(store, { unit: 'E2', target: request.project,
-      writes: prepared.writes as Write[], guards: prepared.guards as Ref[] }));
+      writes: prepared.writes as Write[], guards: prepared.guards as TransactionGuard[] }));
     return prepared as PreparedQuestionTasks;
   });
 }
@@ -952,7 +952,7 @@ const includedSources = (packet: Json): Ref[] => (briefReadings(packet)?.entries
  * The era is the root's: the caller asks only when the step it follows carries readings.
  */
 function chainStepReadings(store: Store, request: QuestionPacketRequest, prior: Revision<QuestionPacketRecord>, saved: QuestionPacketRecord | undefined,
-  current: boolean, packet: Json, limit: number, fits?: (packet: Json) => boolean): { packet: Json; guards: Ref[] } {
+  current: boolean, packet: Json, limit: number, fits?: (packet: Json) => boolean): { packet: Json; guards: TransactionGuard[] } {
   const savedReadings = saved ? briefReadings(saved.packet) : null;
   if (saved && !savedReadings) fail('packet_record_invalid', prior.id, 'readings', 'A chain step of the readings era keeps its readings');
   const routed = take(readRoutes(store, { project: request.project, record: request.routes })) as unknown as { record: Revision<RoutesRecord> };

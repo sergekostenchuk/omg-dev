@@ -1,3 +1,4 @@
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Ajv } from "ajv";
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
@@ -5,7 +6,7 @@ import { LEVEL, type CodeRef, type Graph, type Node } from "../graph/model.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { Store, type Revision } from "../storage/store.js";
+import { Store, type TransactionGuard, type Revision } from "../storage/store.js";
 import { readRecord } from "./refs.js";
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from "./refusal.js";
 import {
@@ -89,7 +90,7 @@ export interface FrameReopen { record: Ref; works: string[] }
 export interface FrameProposals {
   frame: FrameRead; proposals: ProposalObservation[]; result: ProposalResult; gaps: FrameGap[]; references: Ref[];
 }
-export interface PreparedFrameProposals extends FrameProposals { guards: Ref[]; expected: PreparedFrame['expected'] }
+export interface PreparedFrameProposals extends FrameProposals { guards: TransactionGuard[]; expected: PreparedFrame['expected'] }
 export interface ObserveProposalRequest { project: string; proposal: Ref; request: ProposalRequest }
 export interface ObservedProposal { record: Revision<LayerProposal>; definitions: string[]; references: Ref[]; sources: ProposalRequest }
 
@@ -551,14 +552,14 @@ export function prepareFrameProposals(store: Store, request: ProposalRequest): O
     const frame = withReopen(take(prepareFrame(store, bare(request.frame))) as PreparedFrame, reopen);
     requireReopenFits(frame, reopen);
     const result = bundle(frame, loadProposals(store, request));
-    const guards = new Map(frame.guards.map(ref => [ref.id, ref]));
-    if (guard) guards.set(guard.id, guard);
+    const guards: TransactionGuard[] = [...frame.guards];
+    if (guard) guards.push(guard);
     for (const proposal of result.proposals) {
       const head = store.get(proposal.reference.id);
       if (!head || !same(reference(head), proposal.reference))
         reject('input_stale', proposal.reference.id, 'head', 'A proposal changed after its named revision; use the current proposed record');
-      guards.set(proposal.reference.id, proposal.reference);
+      guards.push(proposal.reference);
     }
-    return { ...result, guards: sorted([...guards.values()]), expected: frame.expected };
+    return { ...result, guards: sorted(uniqueTransactionGuards(guards)), expected: frame.expected };
   });
 }

@@ -5,7 +5,7 @@ import { projectGraph } from '../graph/project.js';
 import { RefinementRelations } from '../graph/relations.js';
 import { graphSchema, graphV2Schema } from '../graph/schema.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
-import { Store } from '../storage/store.js';
+import { Store, type TransactionGuard } from '../storage/store.js';
 import { readFrame, prepareFrame, type FrameRequest } from './frame-obligations.js';
 import { readHorizon, type Horizon } from './horizon.js';
 import { withHistoricalReads } from './input.js';
@@ -58,7 +58,7 @@ export function workZone(graph: Graph, horizon: WorkZoneHorizon, identityOps: re
 
 export interface WorkZoneRequest { project: string; graph: Ref; layer: Ref; horizon: Ref; frame: Ref | null }
 export interface WorkZoneRead { request: WorkZoneRequest; operations: string[]; references: Ref[] }
-export interface PreparedWorkZone extends WorkZoneRead { guards: Ref[] }
+export interface PreparedWorkZone extends WorkZoneRead { guards: TransactionGuard[] }
 
 function requireRequest(store: Store, request: unknown): asserts request is WorkZoneRequest {
   if (!(store instanceof Store)) invalid('store');
@@ -83,7 +83,7 @@ function checkedZone(store: Store, request: WorkZoneRequest, current: boolean): 
   const zone = workZone(accepted.graph as Graph, horizon.value.horizon.value.result.horizon, identities);
   if (!zone.ok) return zone;
   return delivered({ request: source, operations: zone.value, references: frame.value.references,
-    guards: 'guards' in frame.value ? frame.value.guards as Ref[] : [] });
+    guards: 'guards' in frame.value ? frame.value.guards as TransactionGuard[] : [] });
 }
 
 /** Reconstruct a historical zone from exact sources; moving heads does not rewrite history. */

@@ -728,7 +728,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
   claimed.forEach((item, index) => { if (!placed.has(item.row)) placed.set(item.row, index); });
   const routed: RoutedRefusal[] = [];
   const classifications: RefusalClassification[] = [];
-  const guards: Ref[] = [];
+  const guards: TransactionGuard[] = [];
   let independentRefusal = false;
   if (results.guards) assessmentGuards.push(...results.guards);
   const rows = new Map<string, JournalRow>();
@@ -837,7 +837,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
   const writes: GateWrite[] = [...series.value.writes];
   // Guards read through the pending view name revisions this very batch writes; the batch guards their real heads.
   const staged = new Set(preview?.writes.map(write => write.id) ?? []);
-  guards.push(...series.value.guards.filter(guard => !staged.has(guard.id)));
+  guards.push(...series.value.guards.filter(guard => 'absent' in guard || !staged.has(guard.id)));
 
   let decided: readonly RefusalClassification[] = [];
   if (source) {
@@ -887,7 +887,7 @@ function prepareCloseInScope(store: Store, request: AnyCloseAttemptRequest, addr
  * before it is written — the next revision of its id, with the hash of its content — or, when the series holds this
  * outcome already, the head it holds it at, which then guards the transaction like anything else that was read.
  */
-function recordedAt(store: Store, address: Address, written: readonly { readonly expected: number; readonly value: unknown }[], guards: Ref[]): Ref {
+function recordedAt(store: Store, address: Address, written: readonly { readonly expected: number; readonly value: unknown }[], guards: TransactionGuard[]): Ref {
   const own = written[0];
   if (own !== undefined) return { id: address.id, revision: own.expected + 1, hash: hashJson(own.value) };
   const head = reference(store.get(address.id)!);
@@ -1670,9 +1670,14 @@ const compare = (left: string, right: string): number => (left < right ? -1 : le
  * the series both — and a guard named twice at DIFFERENT revisions is exactly the window T7 is about, so both are kept
  * and the stale one fails the transaction.
  */
-function uniqueGuards(guards: readonly Ref[]): Ref[] {
-  const seen = new Map<string, Ref>();
-  for (const guard of guards) seen.set(`${guard.id}\0${guard.revision}\0${guard.hash}`, exactRef(guard));
+function uniqueGuards(guards: readonly Ref[]): Ref[];
+function uniqueGuards(guards: readonly TransactionGuard[]): TransactionGuard[];
+function uniqueGuards(guards: readonly TransactionGuard[]): TransactionGuard[] {
+  const seen = new Map<string, TransactionGuard>();
+  for (const guard of guards) {
+    if ('absent' in guard) seen.set(`${guard.id}\0absent`, { id: guard.id, absent: true });
+    else seen.set(`${guard.id}\0${guard.revision}\0${guard.hash}`, exactRef(guard));
+  }
   return [...seen.values()];
 }
 

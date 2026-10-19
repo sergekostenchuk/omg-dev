@@ -3,7 +3,7 @@ import { EngineError } from '../errors.js';
 import { RefinementRelations } from '../graph/relations.js';
 import type { Graph } from '../graph/model.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import { gapId, prepareCurrentGaps, readGaps, type Gap, type GapReadRequest, type GapRecords } from './gaps.js';
 import { readAcceptedFrame, type AcceptedFrameRequest } from './frame-accept.js';
 import { readCandidate } from './frame-candidate.js';
@@ -42,11 +42,11 @@ export interface GapLinesRequest {
 export interface GapLinesRecord { project: string; request: GapLinesRequest; lines: GapLine[] }
 export interface GapLinesReadRequest { project: string; record: Ref }
 export interface PreparedGapLines {
-  record: GapLinesRecord; existing: Revision<GapLinesRecord> | null; writes: Write[]; guards: Ref[]; references: Ref[];
+  record: GapLinesRecord; existing: Revision<GapLinesRecord> | null; writes: Write[]; guards: TransactionGuard[]; references: Ref[];
 }
 interface ConfirmedClosureBase {
   attempt: { series: Ref; ordinal: number; block: string; goal: AttemptGoal } | null;
-  references: Ref[]; guards: Ref[]; writes: Write[];
+  references: Ref[]; guards: TransactionGuard[]; writes: Write[];
 }
 type ConfirmedGapClosure = ConfirmedClosureBase & (
   { kind: 'frame'; obligation: FrameObligation; acceptance: AcceptedFrameRequest }
@@ -233,8 +233,8 @@ function head(store: Store, ref: Ref): void {
   const row = store.get(ref.id);
   if (!row || !same(reference(row), ref)) fail('input_stale', ref.id, 'reference', 'A current prerequisite has changed');
 }
-function guardsOf(refs: readonly Ref[]): Ref[] {
-  const result = new Map<string, Ref>();
+function guardsOf(refs: readonly TransactionGuard[]): TransactionGuard[] {
+  const result = new Map<string, TransactionGuard>();
   for (const ref of refs) {
     const old = result.get(ref.id);
     if (old && !same(old, ref)) fail('input_stale', ref.id, 'guards', 'The sources name different current revisions');
@@ -393,7 +393,11 @@ export function prepareGapLines(store: Store, request: GapLinesRequest): OmResul
     const record: GapLinesRecord = { project: request.project, request, lines: merged.lines as GapLine[] };
     const guards = guardsOf([...(latest ? [reference(latest)] : []), ...fresh.guards, ...request.gaps.records,
       ...closures.flatMap(item => item.guards)]);
-    for (const ref of guards) head(store, ref);
+    for (const guard of guards) {
+      if ('absent' in guard) {
+        if (store.get(guard.id)) fail('input_stale', guard.id, 'absent', 'A previously absent prerequisite appeared');
+      } else head(store, guard);
+    }
     const pending = new Map<string, Write>();
     for (const write of closures.flatMap(item => item.writes)) {
       const other = pending.get(write.id);

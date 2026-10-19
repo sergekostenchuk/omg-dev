@@ -1,3 +1,4 @@
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Ajv } from 'ajv';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
@@ -6,7 +7,7 @@ import type { Binding, CodeRef, Connector, Endpoint, Graph, Node } from '../grap
 import { RefinementRelations } from '../graph/relations.js';
 import { graphSchema, graphV2Schema } from '../graph/schema.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import { prepareDeliveries, type DeliveryRead, type DeliveryReadRequest } from './deliveries.js';
 import type { CandidateReadRequest } from './frame-candidate.js';
 import { flowKey, readFrame, readFrameFlow, type FrameFlowRead, type FrameObligation, type FrameRequest } from './frame-obligations.js';
@@ -284,7 +285,7 @@ export interface NeighborCollection { contract: typeof NEIGHBOR_CONTRACT; projec
 export interface NeighborReadRequest { project: string; neighbors: Ref }
 export interface PreparedNeighbors {
   record: NeighborCollection; reference: Ref; existing: Revision<NeighborCollection> | null;
-  references: Ref[]; guards: Ref[]; writes: Write[];
+  references: Ref[]; guards: TransactionGuard[]; writes: Write[];
 }
 const collectionId = (value: Pick<NeighborCollection, 'contract' | 'project' | 'source'>) =>
   `om-neighbors:${value.project}:${hashJson({ contract: value.contract, source: value.source })}`;
@@ -330,7 +331,7 @@ export function prepareNeighbors(store: Store, request: CandidateReadRequest): O
     const writes: Write[] = [...delivery.writes] as Write[];
     if (!existing) writes.push({ id, kind: 'om-neighbors', expected: 0, value: derived.value });
     return { record: derived.value, reference: existing ? reference(existing) : { id, revision: 1, hash: hashJson(derived.value) }, existing,
-      references: derived.references, guards: uniqueRefs([...delivery.guards, ...(existing ? [reference(existing)] : [])]), writes };
+      references: derived.references, guards: uniqueTransactionGuards([...delivery.guards, ...(existing ? [reference(existing)] : [])]).sort((a,b) => order(canonical(a),canonical(b))), writes };
   }));
 }
 export function writeNeighbors(store: Store, request: CandidateReadRequest): OmResult<Sealed<Revision<NeighborCollection>>> {

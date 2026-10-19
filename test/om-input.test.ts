@@ -11,7 +11,7 @@ import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requiremen
 import { QUESTION_MOMENTS, preparationMomentSchema, featurePreparationMomentSchema } from "../src/discovery/preparation-contracts.js";
 import { collectGaps, GAP_MOMENTS, type GapSources } from "../src/om/gaps.js";
 import { EngineError } from "../src/errors.js";
-import { isRef, reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
+import { isRef, reference, STAGE_CLOSURE_CONTRACT, type Ref, type Stage, type StageArtifact, type GateContext, type GateResult } from "../src/pipeline/contracts.js";
 import { Store, storeEvents, storeReads, type Revision, type Write } from "../src/storage/store.js";
 import { execFileSync } from "node:child_process";
 import { removeProofCache } from "../src/storage/schema.js";
@@ -34,7 +34,7 @@ import { createOmFixture, gardenGraph, type OmFixture } from "./om-fixture.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { ResearchAssessment } from "../src/discovery/research-model.js";
 import type { Source } from "../src/evidence/evidence.js";
-import { inputDecisionWrite, writeAddressing, type AddressingRequest, type InputDecisionProposal } from "../src/om/addressing.js";
+import { inputDecisionWrite, prepareAddressing, writeAddressing, type AddressingRequest, type InputDecisionProposal } from "../src/om/addressing.js";
 import { projectGraph } from "../src/graph/project.js";
 import type { Graph } from "../src/graph/model.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -3645,3 +3645,111 @@ test("RL3 (№4217): the owner's reopening asks its door's unresolved transition
   const elsewhere = f.store.write({ id: `om-l3-reopen:${project}-other`, kind: "om-l3-reopen", expected: 0, value: body(reference(asked.value), true) as unknown as Json });
   assert.equal(prepareReadinessInput(f.store, { project, input: reference(asked.value), gate: reference(elsewhere) }).ok, false);
 });
+
+test("quick path in prepareOmInput bypasses deriveInputRecord and stage proofs loading when current sources match", async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-quick-path-")), path = join(root, "state.sqlite");
+  const store = new Store(path), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+
+  const project = "garden";
+  const originalValidate = engine.checks.validateStage.bind(engine.checks);
+  engine.checks.validateStage = (stage: Stage, context: GateContext): GateResult => {
+    const res = originalValidate(stage, context);
+    if (res.findings.length === 0) {
+      res.closure = {
+        contract: STAGE_CLOSURE_CONTRACT,
+        external: stage === "discovery" ? [{ kind: "source", ref: reference(store.get(`source:${project}:brief`)!) }] : [],
+      };
+    }
+    return res;
+  };
+
+  const { level: _level, ...l1 } = projectGraph(gardenGraph(), 1);
+  preparedFeatures(engine, project, l1 as Graph);
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const req = { project, stages, expected: 0 };
+  const saved = delivered(writeOmInput(store, req));
+
+  const beforeReads = storeReads();
+  const prepared = delivered(prepareOmInput(store, { ...req, expected: saved.revision }));
+  const reads = storeReads() - beforeReads;
+  assert.equal(prepared.existing !== null, true);
+  assert.equal(prepared.writes.length, 0);
+  assert.ok(reads <= 10, `quick path storeReads (${reads}) exceeded O(1) budget (10)`);
+});
+
+test("absent guard in prepareOmInput rolls back transaction when absent entity becomes present before commit", async t => {
+  const f = await createOmFixture(t);
+  const req = request(f);
+  const prepared = delivered(prepareOmInput(f.store, req));
+  assert.ok(prepared.guards.some(g => 'absent' in g && g.id === `legacy-operation:${f.project}` && g.absent === true),
+    "First OM input must carry an absent guard on legacy-operation");
+  // Simulate concurrent write that creates legacy-operation before the transaction commits
+  f.store.write({ id: `legacy-operation:${f.project}`, kind: "legacy-operation", expected: 0, value: { state: "idle" } });
+  const result = writeGuarded(f.store, {
+    unit: "G1",
+    target: `om-input:${f.project}`,
+    writes: prepared.writes,
+    guards: prepared.guards,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.refusal.code, "input_stale");
+  assert.equal(f.store.get(`om-input:${f.project}`), null, "Transaction rollback must leave om-input empty");
+});
+
+test("G3a a native stage closure carries absence through first, repeated and addressed B1 to an atomic write", async t => {
+  for (const mode of ['first', 'repeat', 'existing', 'addressed'] as const) await t.test(mode, () => {
+    const root = mkdtempSync(join(tmpdir(), 'omg-b1-closure-absence-')), path = join(root, 'state.sqlite');
+    const store = new Store(path), engine = new ProductEngine(store), project = 'garden';
+    try {
+      const absent = { id: 'stage-prerequisite:absent', absent: true as const };
+      const validate = engine.checks.validateStage.bind(engine.checks);
+      engine.checks.validateStage = (stage, context) => {
+        const result = validate(stage, context);
+        if (!result.findings.length) {
+          result.closure = { contract: STAGE_CLOSURE_CONTRACT, external: stage === 'discovery'
+            ? [{ kind: 'source', ref: reference(store.get(`source:${project}:brief`)!) }] : [] };
+          if (stage === 'features') result.admissionGuards = [...(result.admissionGuards ?? []), absent];
+        }
+        return result;
+      };
+      const { level: _level, ...l1 } = projectGraph(gardenGraph(), 1);
+      preparedFeatures(engine, project, l1 as Graph, field => {
+        const value = preparedField(project, field);
+        if (field === 'preparation') (value as Row).unknowns = [{ id: 'output-format', question: 'Which format?',
+          consumer: 'garden-produce-block', moment: 'om-pass', blocksCurrentStage: false, resolution: 'Read repository facts during OM' }];
+        return value;
+      });
+      const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as InputRequest['stages'];
+      const req = { project, stages, expected: 0 };
+      const accepted = engine.checks.pipeline.inspect(project, 'features');
+      assert.equal(accepted.state, 'accepted');
+      assert.ok(accepted.admissionGuards?.some(guard => canonical(guard) === canonical(absent)));
+      const saved = mode === 'first' ? null : delivered(writeOmInput(store, req));
+      const graph = reference(store.get(`graph:${project}`)!);
+      const prepared = mode === 'addressed'
+        ? delivered(prepareAddressing(store, { project, input: reference(saved!), graph, decisions: [{ pending: inputDecisionWrite({
+          project, input: reference(saved!), graph, layers: [], decision: { target: 'discovery:output-format', field: 'address',
+            value: { consumer: 'garden-produce-block', kind: 'repository-fact' } },
+        }) }] }))
+        : mode === 'existing' ? delivered(prepareExistingOmInput(store, project, reference(saved!)))
+        : delivered(prepareOmInput(store, { ...req, expected: saved?.revision ?? 0 }));
+      assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(absent)));
+      if (mode === 'repeat' || mode === 'existing') assert.equal(prepared.writes.length, 0);
+      const second = new Store(path);
+      try { second.write({ id: absent.id, kind: 'prerequisite', expected: 0, value: {} }); }
+      finally { second.close(); }
+      const before = store.list().map(reference), events = storeEvents();
+      const result = writeGuarded(store, { unit: 'G1', target: project, guards: prepared.guards,
+        writes: [...prepared.writes, { id: 'neighbor:one', kind: 'neighbor', expected: 0, value: {} },
+          { id: 'neighbor:two', kind: 'neighbor', expected: 0, value: {} }] });
+      assert.equal(refusal(result, 'input_stale').at.target, absent.id);
+      assert.deepEqual(store.list().map(reference), before);
+      assert.deepEqual(storeEvents(), events);
+      assert.equal(store.get('neighbor:one'), null); assert.equal(store.get('neighbor:two'), null);
+      assert.equal(store.get('om-input:garden')?.revision ?? 0, saved?.revision ?? 0);
+      if (saved) assert.deepEqual(delivered(readOmInput(store, project, reference(saved))), saved);
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+});
+

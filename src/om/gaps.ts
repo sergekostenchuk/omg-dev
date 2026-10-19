@@ -1,3 +1,4 @@
+import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { QUESTION_MOMENTS } from '../discovery/projection-reader.js';
@@ -8,7 +9,7 @@ import { RefinementRelations } from '../graph/relations.js';
 import { graphSchema, graphV2Schema } from '../graph/schema.js';
 import { KNOWLEDGE_KINDS as ENGINE_KINDS, RESOLUTION_MOMENTS as ENGINE_MOMENTS } from '../graph/obligation-policy.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import { Store, type Revision, type Write } from '../storage/store.js';
+import { Store, type TransactionGuard, type Revision, type Write } from '../storage/store.js';
 import { delivered, refused, sealed, type OmResult, type Refusal, type Sealed } from './refusal.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { READINESS_CONTRACT, historicalProof, readOmInput, readinessQuestionId, withHistoricalReads, type InputBuildResult, type InputGap, type OmInput,
@@ -82,7 +83,7 @@ export interface GapRequest {
 export interface GapRecord { project: string; sources: GapRequest; gap: Gap }
 export interface PreparedGaps {
   sources: GapRequest; collection: GapCollection; gate: GapGate; references: Ref[];
-  writes: Write[]; guards: Ref[]; existing: Revision<GapRecord>[];
+  writes: Write[]; guards: TransactionGuard[]; existing: Revision<GapRecord>[];
 }
 export interface GapRecords { sources: GapRequest; records: Revision<GapRecord>[]; collection: GapCollection; gate: GapGate }
 export interface GapReadRequest { sources: GapRequest; records: Ref[] }
@@ -394,7 +395,7 @@ function normalizedRequest(request: GapRequest): GapRequest {
   return copy({ ...request, operations: { ...request.operations, proposals: sorted(request.operations.proposals) },
     works: unavailableWorks(request.works) ? request.works : { ...request.works, proposals: sorted(request.works.proposals) } });
 }
-interface Materialized { request: GapRequest; sources: GapSources; collection: GapCollection; gate: GapGate; references: Ref[]; guards: Ref[] }
+interface Materialized { request: GapRequest; sources: GapSources; collection: GapCollection; gate: GapGate; references: Ref[]; guards: TransactionGuard[] }
 function materialize(store: Store, request: GapRequest, current: boolean): Materialized {
   if (current) return deriveMaterialized(store, request, true);
   return historicalProof(store, { reader: 'D1.materialize', project: request.project, ref: request.input,
@@ -415,7 +416,7 @@ function deriveMaterialized(store: Store, request: GapRequest, current: boolean)
   const graph = take(readRecord<Graph>(store, request.graph, { unit: 'G4', target: request.graph.id, id: `graph:${request.project}`, kind: 'graph' }));
   const read = current ? prepareFrameProposals : readFrameProposals;
   const operations = take(read(store, request.operations));
-  let works: Sealed<{ gaps: FrameGap[]; references: Ref[]; guards?: Ref[] }>;
+  let works: Sealed<{ gaps: FrameGap[]; references: Ref[]; guards?: TransactionGuard[] }>;
   let worksRequest = request.works;
   if (unavailableWorks(request.works)) {
     if (operations.frame.accepted !== null || horizon.horizon.value.request.refinement !== null)
@@ -438,7 +439,7 @@ function deriveMaterialized(store: Store, request: GapRequest, current: boolean)
     frameGaps: { operations: operations.gaps as FrameGap[], works: works.gaps as FrameGap[] } };
   const derived = collectGaps(sources), collection = derived as GapCollection, gate = gateAgainst(collection, derived, sources) as GapGate;
   if (!gate.passed) throw new GapFailure(gate.findings[0]!);
-  const guards = new Map<string, Ref>();
+  const guards = new Map<string, TransactionGuard>();
   if (current) for (const source of [operations, works]) for (const ref of (source as Sealed<PreparedFrameProposals>).guards) {
     const previous = guards.get(ref.id);
     if (previous && !same(previous, ref)) reject('gap_record_forged', ref.id, 'head', 'Sources were prepared from different heads');
@@ -455,16 +456,16 @@ export function prepareGaps(store: Store, request: GapRequest): OmResult<Sealed<
   return outcome(() => {
     const basis = materialize(store, request, true), writes: Write[] = [], existing: Revision<GapRecord>[] = [];
     request = normalizedRequest(basis.request);
-    const guards = new Map(basis.guards.map(ref => [ref.id, ref]));
+    const guards: TransactionGuard[] = [...basis.guards];
     for (const gap of basis.collection.gaps) {
       const id = recordId(request.project, gap), value: GapRecord = { project: request.project, sources: request, gap };
       const head = store.get<GapRecord>(id);
-      if (head) guards.set(head.id, reference(head));
+      if (head) guards.push(reference(head));
       if (head && same(head.value, value)) existing.push(head);
       else writes.push({ id, kind: 'gap', expected: head?.revision ?? 0, value });
     }
     return { sources: request, collection: basis.collection, gate: basis.gate, references: basis.references,
-      writes, guards: sorted([...guards.values()]), existing };
+      writes, guards: sorted(uniqueTransactionGuards(guards)), existing };
   });
 }
 export function writeGaps(store: Store, request: GapRequest): OmResult<Sealed<GapRecords>> {
