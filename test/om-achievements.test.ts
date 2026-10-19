@@ -697,63 +697,8 @@ const LP6_ADAPTER = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", i
 const LP6_BLOCK = "garden-consume-block";
 type Lp6Field = "nodes" | "state" | "checkKind";
 const lp6Usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
-/** The routes of today's B1 of the garden project: horizon, D1 and M6, no catalog. */
-import { dirname } from "node:path";
-const LP7_BASE = "7c7d3cccb88d0a6c17b21051069f0244d98248f9";
-/**
- * The route the base code 7c7d3ccc writes, every engine module served from Git in its own process (LP7, №3393 §6 F1): the
- * subject of these tests is several E4s of one block, which its genuine split routing keeps — today's routing joins them.
- */
-function routesAtBase(store: Store, request: unknown): Revision<RoutesRecord> {
-  const root = dirname(store.path), repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(root, "lp7-base-loader.mjs"), producer = join(root, "lp7-base-producer.mjs"), input = join(root, "lp7-base-input.json");
-  const served = join(root, "lp7-base-served.log"), typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(served, "");
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { appendFileSync, realpathSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root, log, prefixes;
-export function initialize(data) {
-  root = data.root; log = data.log;
-  prefixes = [root, pathToFileURL(realpathSync(fileURLToPath(root)) + '/').href].map(base => new URL('dist/src/', base).href);
-}
-export async function load(url, context, next) {
-  const prefix = prefixes.find(item => url.startsWith(item));
-  if (prefix && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    appendFileSync(log, relative + '\\n');
-    const source = execFileSync('git', ['show', ${JSON.stringify(LP7_BASE)} + ':' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  if (url.startsWith('file:') && url.includes('/dist/src/') && !url.includes('/node_modules/'))
-    throw new Error('An engine module outside the era checkout: ' + url);
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { writeRoutes } = await import(src('om/routes.js'));
-const store = new Store(database);
-try {
-  const written = writeRoutes(store, JSON.parse(readFileSync(input, 'utf8')));
-  if (!written.ok) throw Error(JSON.stringify(written.refusal));
-  process.stdout.write(JSON.stringify(written.value));
-} finally { store.close(); }`);
-  writeFileSync(input, JSON.stringify(request));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)}, log: ${JSON.stringify(served)} } });`;
-  const output = JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, store.path, input],
-    { cwd: repository, encoding: "utf8", timeout: 180_000, maxBuffer: 10_000_000 })) as Revision<RoutesRecord>;
-  assert.ok(readFileSync(served, "utf8").split("\n").includes("src/om/routes.ts"), "The route was written by the modules of the base code");
-  return output;
-}
-function lp6Routes(store: Store, project: string, joined = false): Revision<RoutesRecord> {
+
+function lp6Routes(store: Store, project: string): Revision<RoutesRecord> {
   const input = store.get(`om-input:${project}`)!, graph = store.get(`graph:${project}`)!;
   const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null, available: {},
     choice: { choiceVersion: `lp6-${input.revision}`, features: [{ outcome: "garden-result" }], excluded: [] } }));
@@ -763,17 +708,13 @@ function lp6Routes(store: Store, project: string, joined = false): Revision<Rout
   const gaps = deliveredOf(writeGaps(store, sources));
   const request = { project, gaps: { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
     tasks: [], catalog: { paths: [], records: [] }, previous: null };
-  return joined ? deliveredOf(writeRoutes(store, request)) as Revision<RoutesRecord> : routesAtBase(store, request);
+  return deliveredOf(writeRoutes(store, request)) as Revision<RoutesRecord>;
 }
-/**
- * A block whose B1 leaves its contract's nodes and state and its criterion's checkKind open, so the split routing of the
- * base code gives it one MC2 input-field batch per field. A round opens a managed attempt of its line on the routes of today's B1 with the batches
- * of the named fields, and the scripted model answers each of them: the block's own E4 applies the decisions by D3.
- */
+/** Current B1 leaves nodes, state and checkKind open; each joined answer applies only its named fields. */
 function lp6Fields(t: test.TestContext, block = LP6_BLOCK) {
   const seeded = seedCopy("lp6:block-fields", store => {
     const engine = new ProductEngine(store), project = "garden", { level: _level, ...l1 } = projectGraph(gardenGraph("cross"), 1);
-    preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field), LP7_BASE);
+    preparedFeatures(engine, project, l1 as Graph, field => preparedField(project, field), "");
     const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
     deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
     return null;
@@ -833,20 +774,31 @@ function lp6Fields(t: test.TestContext, block = LP6_BLOCK) {
       return { goal, e4, routes: reference(routes), series: reference(store.get(series.id)!) };
     },
     /** LP7: one managed attempt on today's routing, where the block's open input fields are one batch; the model answers the named ones. */
-    async joined(ordinal: number, values: Partial<Record<Lp6Field, Json>>) {
-      const routes = lp6Routes(store, project, true);
-      const batch = routes.value.batches.find(row => row.task === "input-field" && row.items.some(item => item.consumers.includes(block))
-        && new Set(row.items.map(item => item.field)).size > 1)!;
-      assert.ok(batch, `Today's routing joins the open input fields of ${block}`);
-      const goal: AttemptGoal = { key: `lp7:${ordinal}`, questions: batch.items.map(item => lp6LineKey(project, item.target, item.field)).sort(),
+    async joined(ordinal: number, values: Partial<Record<Lp6Field, Json>>,
+      options: { goalKey?: string; cannot?: string; refused?: string } = {}) {
+      const routes = lp6Routes(store, project);
+      const batches = routes.value.batches.filter(row => row.task === "input-field" && row.items.some(item => item.consumers.includes(block)));
+      assert.equal(routes.value.grouping, "block-input-v1");
+      assert.equal(batches.length, 1, `Today's routing puts all remaining input fields of ${block} in one batch`);
+      const batch = batches[0]!;
+      assert.deepEqual(routes.value.request.gaps.sources.input, reference(store.get(`om-input:${project}`)!));
+      const goal: AttemptGoal = { key: options.goalKey ?? `lp7:${ordinal}`, questions: batch.items.map(item => lp6LineKey(project, item.target, item.field)).sort(),
         result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
       const series = deliveredOf(managedOpenAttempt(store, { ...address, attempt: ordinal, goal, completion: { routes: reference(routes), batches: [batch.id] } } as never));
       const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
         environment: reference(configured), attempt: { series: reference(series), ordinal }, previous: [] })).record;
-      steps.push({ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: batch.items.filter(item => Object.hasOwn(values, item.field))
-        .map(item => ({ target: item.target, field: item.field, basis: (item as unknown as { record: Ref }).record, value: values[item.field as Lp6Field]! })) }, usage: lp6Usage });
+      steps.push({ research: options.cannot !== undefined
+        ? { protocol: "$answerProtocol", requestId: "$requestId", action: "cannot_answer", questionIds: batch.items.map(item => item.gap), reason: options.cannot }
+        : { protocol: "$answerProtocol", requestId: "$requestId", action: "answer", results: batch.items.filter(item => Object.hasOwn(values, item.field))
+          .map(item => ({ target: item.target, field: item.field, basis: (item as unknown as { record: Ref }).record, value: values[item.field as Lp6Field]! })) }, usage: lp6Usage });
       writeFileSync(scenario, JSON.stringify({ database, steps }));
       const sent = await runModelCall(store, { project, packet: reference(packet), dispatch: { adapter: reference(adapter), config: reference(configured) }, role: "implementer" });
+      if (options.refused !== undefined) {
+        assert.equal(sent.ok ? "applied" : sent.refusal.code, options.refused);
+        const call = store.list<{ om?: { request: { packet: Ref } } }>("model-call").find(row => row.value.om?.request.packet.id === packet.id);
+        assert.ok(call, "A refused application still retains its exact E4");
+        return { goal, e4: [reference(call)], routes, batch, outcome: undefined };
+      }
       if (!sent.ok) assert.fail(`${sent.refusal.code} at ${JSON.stringify(sent.refusal.at)}: ${sent.refusal.message}`);
       return { goal, e4: [reference(sent.value.record)], routes, batch, outcome: sent.value.outcome };
     },
@@ -869,7 +821,7 @@ const lp6Keys = (store: Store, e4: Ref, context: Parameters<typeof readInputFiel
 
 test("LP6 rows 4, 5, 7, 9: the block's own applied E4 accepts exactly the fields it filled anew — nodes, state, checkKind — whatever their order, packaging, revision or composite goal; an E3 without its own applied D3 accepts nothing", async t => {
   const f = lp6Fields(t);
-  const nodes = await f.round(1, [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }]);
+  const nodes = await f.joined(1, { nodes: ["garden-produce-block", "garden-consume-block"] });
   const read = lp6Keys(f.store, nodes.e4[0]!, f.context(nodes.goal, 1, nodes.e4));
   assert.deepEqual(read.filled, [{ target: "garden-B1", field: "nodes", component: null, accepted: ["garden-consume-block", "garden-produce-block"] }]);
   assert.equal(read.keys.length, 1); assert.ok(read.keys[0]!.startsWith(INPUT_FIELD_KEY_PREFIX));
@@ -877,10 +829,10 @@ test("LP6 rows 4, 5, 7, 9: the block's own applied E4 accepts exactly the fields
   const confirmed = deliveredOf(confirmResults(f.store, { ...f.context(nodes.goal, 1, nodes.e4), target: f.address.block, cancelling: [] } as never));
   assert.deepEqual(confirmed.achieved.map(item => item.key), read.keys);
   assert.deepEqual(f.close(1).verdict, "progress");
-  const state = await f.round(2, [{ field: "state", value: { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-consume-block" } }]);
+  const state = await f.joined(2, { state: { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-consume-block" } });
   const stateKeys = lp6Keys(f.store, state.e4[0]!, f.context(state.goal, 2, state.e4));
   assert.equal(f.close(2).verdict, "progress");
-  const check = await f.round(3, [{ field: "checkKind", value: "test" }]);
+  const check = await f.joined(3, { checkKind: "test" });
   const checkKeys = lp6Keys(f.store, check.e4[0]!, f.context(check.goal, 3, check.e4));
   // Row 4: three own applied fields in a row are three results — no false stop of the n-research kind.
   assert.equal(f.close(3).verdict, "progress");
@@ -888,36 +840,38 @@ test("LP6 rows 4, 5, 7, 9: the block's own applied E4 accepts exactly the fields
   assert.deepEqual(stateKeys.filled.map(item => item.component), ["authority", "rollback", "writer"], "One key per filled component of state");
   assert.equal(stateKeys.keys.length, 3);
   assert.deepEqual(checkKeys.filled, [{ target: "garden-R1#1", field: "checkKind", component: null, accepted: "test" }]);
-  // Row 5: the same accepted nodes in another order, in another package (two fields asked together under another
-  // composite goal), from another store, revision and E4 id: the same semantic key.
+  // Row 5: the same nodes in another order under another full joined goal, from another Store and E4: the same semantic key.
   const g = lp6Fields(t);
-  const both = await g.round(1, [{ field: "nodes", value: ["garden-consume-block", "garden-produce-block"] }, { field: "checkKind", unsent: true }]);
+  const both = await g.joined(1, { nodes: ["garden-consume-block", "garden-produce-block"] }, { goalKey: "lp6:other-composite-goal" });
   assert.notEqual(both.goal.key, nodes.goal.key); assert.notDeepEqual(both.e4[0], nodes.e4[0]);
   assert.deepEqual(lp6Keys(g.store, both.e4[0]!, g.context(both.goal, 1, both.e4)).keys, read.keys);
   g.restart();
   assert.deepEqual(lp6Keys(g.store, both.e4[0]!, g.context(both.goal, 1, both.e4)).keys, read.keys, "A new Store derives the same key");
   assert.equal(checkKeys.keys.length, 1);
-  // Row 7: a part of the assigned fields is applied — the state E4 of a package that also asked checkKind, whose answer
-  // was refused by the model: only the applied state gives keys, the open checkKind has no achievement.
+  // Row 7: the joined packet asks all open fields; only state/writer is answered and only it gives an achievement.
   const h = lp6Fields(t);
-  const partial = await h.round(1, [{ field: "checkKind", cannot: "The criterion is not decidable here" }, { field: "state", value: { writer: "garden-produce-block" } }]);
-  assert.deepEqual(lp6Keys(h.store, partial.e4[1]!, h.context(partial.goal, 1, partial.e4)).filled.map(item => item.component), ["writer"]);
-  // Row 9: the refused E4 has no applied D3 of its own: it is no result of this kind, and as accepting it is refused.
-  assert.deepEqual(deliveredOf(readInputFieldResult(h.store, partial.e4[0]!, h.context(partial.goal, 1, partial.e4))), { relevant: false });
-  const refused = refusalOf(confirmResults(h.store, { ...h.context(partial.goal, 1, [partial.e4[0]!]), target: h.address.block, cancelling: [] } as never));
+  const partial = await h.joined(1, { state: { writer: "garden-produce-block" } });
+  assert.deepEqual(lp6Keys(h.store, partial.e4[0]!, h.context(partial.goal, 1, partial.e4)).filled.map(item => item.component), ["writer"]);
+  assert.deepEqual(partial.outcome?.unanswered, partial.batch.items.filter(item => item.field !== "state").map(item => item.gap).sort());
+  // Row 9: a separate genuine cannot_answer E4 has no applied D3 and cannot be submitted as an achievement.
+  const unavailable = lp6Fields(t);
+  const declined = await unavailable.joined(1, {}, { cannot: "The input fields are not decidable here" });
+  assert.equal(unavailable.store.get("om-input:garden")!.revision, 1);
+  assert.deepEqual(deliveredOf(readInputFieldResult(unavailable.store, declined.e4[0]!, unavailable.context(declined.goal, 1, declined.e4))), { relevant: false });
+  const refused = refusalOf(confirmResults(unavailable.store, { ...unavailable.context(declined.goal, 1, declined.e4), target: unavailable.address.block, cancelling: [] } as never));
   assert.deepEqual([refused.code, refused.at.field], ["achievement_unconfirmed", "outcome.accepting.0"]);
 });
 
 test("LP6 rows 6, 8: state filled in parts and filled at once give one set of keys; a component known before the E4 is no new key, and an own E4 that filled nothing anew accepts nothing", async t => {
   const parts = lp6Fields(t), whole = lp6Fields(t);
   const all = { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-consume-block" };
-  const once = await whole.round(1, [{ field: "state", value: all }]);
+  const once = await whole.joined(1, { state: all });
   const onceKeys = lp6Keys(whole.store, once.e4[0]!, whole.context(once.goal, 1, once.e4)).keys;
-  const first = await parts.round(1, [{ field: "state", value: { writer: all.writer } }]);
+  const first = await parts.joined(1, { state: { writer: all.writer } });
   const firstKeys = lp6Keys(parts.store, first.e4[0]!, parts.context(first.goal, 1, first.e4)).keys;
   parts.close(1);
   // The writer is known on the new B1: deciding it again with the two others makes keys of the two others only.
-  const second = await parts.round(2, [{ field: "state", value: all }]);
+  const second = await parts.joined(2, { state: all });
   const secondRead = lp6Keys(parts.store, second.e4[0]!, parts.context(second.goal, 2, second.e4));
   assert.deepEqual(secondRead.filled.map(item => item.component), ["authority", "rollback"]);
   assert.deepEqual([...firstKeys, ...secondRead.keys].sort(), [...onceKeys].sort(), "The union does not depend on the packaging");
@@ -926,9 +880,9 @@ test("LP6 rows 6, 8: state filled in parts and filled at once give one set of ke
   // replacement it could hide behind: no applied E4, no key, and as accepting it is refused. (The provider also reads an
   // applied E4 that filled nothing anew as relevant without keys — the no-op the close requires of every own E4.)
   const none = lp6Fields(t);
-  const writer = await none.round(1, [{ field: "state", value: { writer: all.writer, authority: all.authority } }]);
+  const writer = await none.joined(1, { state: { writer: all.writer, authority: all.authority } });
   none.close(1);
-  const again = await none.round(2, [{ field: "state", value: { writer: all.writer }, refused: "record_missing" }]);
+  const again = await none.joined(2, { state: { writer: all.writer } }, { refused: "record_missing" });
   assert.equal(none.store.get("om-input:garden")!.revision, 2, "The answer that filled nothing replaced no B1");
   assert.deepEqual(deliveredOf(readInputFieldResult(none.store, again.e4[0]!, none.context(again.goal, 2, again.e4))), { relevant: false });
   const refused = refusalOf(confirmResults(none.store, { ...none.context(again.goal, 2, again.e4), target: none.address.block, cancelling: [] } as never));
@@ -938,7 +892,7 @@ test("LP6 rows 6, 8: state filled in parts and filled at once give one set of ke
 
 test("LP6 row 10: a genuine applied E4 confirms nothing for another attempt, block, line or full goal, nor under another binding — the whole result is refused at its address", async t => {
   const f = lp6Fields(t);
-  const nodes = await f.round(1, [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }]);
+  const nodes = await f.joined(1, { nodes: ["garden-produce-block", "garden-consume-block"] });
   const own = f.context(nodes.goal, 1, nodes.e4);
   const cases: [string, Record<string, unknown>][] = [
     ["another attempt", { ...own, attempt: { ...own.attempt, ordinal: 2 } }],

@@ -115,3 +115,13 @@ storage.test.ts :: the complete ee3fd4c Store producer retains records, hashes a
 storage.test.ts :: PF4 (№3523): the engine before PF4 (3e8aa784) opens and writes a database with the extension and reads snapshots with and without it; a check this engine saved notices what the old engine wrote, and one it did not touch stays # вид 1: эра 3e8aa78, 3e8aa784
 store-view.test.ts :: PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them # вид 1: эра 5929ea25
 om-model-call-part-06.test.ts :: LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send # вид 1: старый E3 допускал context Ref в search; только два reads-invalid окна (№6978)
+om-achievements.test.ts :: LP7 rows 23, 24: one answer to the joined input fields proves exactly the LP6 keys the split routing proves by parts, state components included; an answer of some proves only theirs, and their rest is joined again on the next B1 # вид 1, найден GUARD1
+om-question-packet.test.ts :: E2 pre-continuation v2 blocked packets preserve their original refusal after restart # вид 1, найден GUARD1
+om-question-packet.test.ts :: MP1.1 rows 2,4: true legacy empty/no-batch and independent new empty preserve their chosen version and repeat after reopen # вид 1, найден GUARD1
+om-question-packet.test.ts :: MP1.1 rows 2–4: independent blocked packets record their version before the null payload; true legacy blocked stays unmarked on repeat # вид 1, найден GUARD1
+om-question-packet.test.ts :: MP1.1 rows 5–8,20: actual managed correction → continuation → next part inherits v1/v2 and reopens without another send # вид 1, найден GUARD1
+om-run-g5-choice.test.ts :: G5.1 rows 3, 5 a choice outside the allowed tests is refused, asked once more showing why, then chosen; twice refused, the wait stands with no third call # вид 1, найден GUARD1
+om-series-transition-prepared.test.ts :: the whole b1143aa producer leaves its stopped legacy series and exact B1 horizon bytes unchanged # вид 1, найден GUARD1
+om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006 producer after restart # вид 1, найден GUARD1
+om-spend-report.test.ts :: E6 replays the exact four-purpose report produced by cf5d56f after restart # вид 1, найден GUARD1
+stage-checks.test.ts :: R2 №2419-5: a compile produced by the code of base 4c2d5b3 in its own process is read by the lower kit as by ProductEngine, and its repeat after a restart writes nothing # вид 1, найден GUARD1
