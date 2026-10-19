@@ -29,7 +29,7 @@ import { readCall, recordCall } from '../src/om/call-record.js';
 import { gateCandidate, writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
-import { writeGaps, type GapReadRequest, type GapRequest } from '../src/om/gaps.js';
+import { writeGaps, type GapReadRequest, type GapRecord, type GapRequest } from '../src/om/gaps.js';
 import { gapLineExpectedResult, gapLineKey, writeGapLines } from '../src/om/gap-lines.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { readOmInput, writeOmInput } from '../src/om/input.js';
@@ -799,55 +799,37 @@ test('a saved G4b outcome, even with an incomplete envelope, proves missing B1 p
 });
 
 test('G4b passes a complete accepted graph with no blocking answer and survives restart', async t => {
-  const f = await createOmFixture(t);
-  const first = ok(writeOmInput(f.store, { project: f.project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
-      reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
-  const sourceFor = (input: Ref, horizon: Ref): GapRequest => ({ project: f.project, input,
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
+  // The executed fixture already carries the addressed input and both accepted frames; its own D1 write
+  // left the earlier era's rows in history, so a superseded gap reference is available honestly.
+  const earlier = f.store.list<GapRecord>('gap');
+  const input = f.store.get(`om-input:${f.project}`)!;
+  const upperFrame = reference(f.store.get(`om-frame:${f.project}:2`)!);
+  const worksFrame = reference(f.store.get(`om-frame:${f.project}:3`)!);
+  const sourceFor = (horizon: Ref): GapRequest => ({ project: f.project, input: reference(input),
     graph: reference(f.graphRevision), horizon,
     operations: { proposals: [], frame: { project: f.project, level: 2, graph: reference(f.graphRevision), horizon,
-      layer: reference(f.layers[2]), frame: null, upper: null } },
+      layer: reference(f.layers[2]), frame: upperFrame, upper: null } },
     works: { proposals: [], frame: { project: f.project, level: 3, graph: reference(f.graphRevision), horizon,
-      layer: reference(f.layers[3]), frame: null, upper: { horizon, frame: null } } } });
-  const priorHorizon = ok(writeHorizon(f.store, { project: f.project, input: reference(first),
-    graph: reference(f.graphRevision), refinement: reference(f.store.get(`phase:${f.project}:L2`)!), available: {},
-    choice: { choiceVersion: 'answers-gate-before-d3', features: [{ outcome: 'garden-result' }], excluded: [] } }));
-  const priorGaps = ok(writeGaps(f.store, sourceFor(reference(first), reference(priorHorizon.gate))));
-  const priorRead: GapReadRequest = { sources: clone(priorGaps.sources) as GapRequest, records: priorGaps.records.map(reference) };
-  assert.deepEqual(priorGaps.records.filter(row => row.value.gap.blocking).map(row => row.value.gap.code).sort(),
-    ['acceptance_kind_missing', 'contract_boundary_prose', 'contract_node_unbound']);
-  const priorRoute = ok(writeRoutes(f.store, { project: f.project, gaps: priorRead, tasks: [],
-    catalog: { paths: [], records: [] }, previous: null }));
-  const priorGate = ok(writeAnswersGate(f.store, { project: f.project, gaps: priorRead,
-    routes: reference(priorRoute), results: [] }));
-  assert.equal(priorGate.value.result.passed, false);
-  const decisions = [
-    { target: 'garden-B1', field: 'nodes', value: ['garden-produce-block', 'garden-consume-block'] },
-    { target: 'garden-B1', field: 'state', value: { writer: 'garden-produce-block', authority: 'garden-consume-block', rollback: 'garden-consume-block' } },
-    { target: 'garden-R1#1', field: 'checkKind', value: 'test' },
-  ] satisfies { target: string; field: 'nodes' | 'state' | 'checkKind'; value: Json }[];
-  const input = ok(writeAddressing(f.store, { project: f.project, input: reference(first), graph: reference(f.graphRevision),
-    decisions: decisions.map(decision => ({ pending: clone(inputDecisionWrite({ project: f.project, input: reference(first),
-      graph: reference(f.graphRevision), layers: [], decision })) as Write })) }));
+      layer: reference(f.layers[3]), frame: worksFrame, upper: { horizon, frame: upperFrame } } } });
   const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(input),
-    graph: reference(f.graphRevision), refinement: reference(f.store.get(`phase:${f.project}:L2`)!), available: {},
+    graph: reference(f.graphRevision), refinement: reference(f.layers[2]), available: {},
     choice: { choiceVersion: 'answers-gate-complete', features: [{ outcome: 'garden-result' }], excluded: [] } }));
-  const gaps = ok(writeGaps(f.store, sourceFor(reference(input), reference(horizon.gate))));
+  const gaps = ok(writeGaps(f.store, sourceFor(reference(horizon.gate))));
   assert.deepEqual(gaps.records.filter(row => row.value.gap.blocking).map(row => `${row.value.gap.target}/${row.value.gap.code}`), []);
-  assert.ok(priorGaps.records.some(row => f.store.get(row.id) !== null), 'The old physical D1 rows remain in history');
+  assert.ok(earlier.some(row => f.store.get(row.id) !== null), 'The old physical D1 rows remain in history');
   const gapRead: GapReadRequest = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const route = ok(writeRoutes(f.store, { project: f.project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
   const request: AnswersGateRequest = { project: f.project, gaps: gapRead, routes: reference(route), results: [] };
   const saved = ok(writeAnswersGate(f.store, request));
   assert.equal(saved.value.result.passed, true);
   assert.deepEqual(saved.value.result.codes, []);
-  const disappeared = priorGaps.records.find(row => row.value.gap.blocking)!;
+  const disappeared = earlier[0]!;
   const oldClaim = ok(writeAnswersGate(f.store, { ...request, results: [{ gap: reference(disappeared),
     result: null, candidate: null }] }));
-  assert.deepEqual(oldClaim.value.result.codes, ['answer_gap_unknown'],
-    'A former D1 gap cannot be offered to the newly complete D1 set after D3');
+  assert.deepEqual(oldClaim.value.result.codes, ['answer_version_stale'],
+    'A gap reference from the superseded D1 set cannot be offered to the current complete set');
   f.reopen();
-  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(priorGate) })), priorGate);
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(oldClaim) })), oldClaim);
   assert.deepEqual(ok(writeAnswersGate(f.store, request)), saved);

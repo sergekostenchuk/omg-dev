@@ -43,11 +43,9 @@ import {
   readCallLedger, readCallLedgerAt, recordCall, settleCall,
   type CallLedger, type RecordCallRequest, type MechanismRecordCallRequest,
 } from "../src/om/call-record.js";
-import { gardenGraph } from "./om-fixture.js";
+import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
-import { answerTechnicalFixture } from "./technical-research-fixture.js";
-import { answerLayerFixture } from "./layer-design-fixture.js";
 
 const PROJECT = "alpha";
 const BLOCK = "block:cart";
@@ -1029,31 +1027,22 @@ test("E6 report: a real D7 package counts one obligation shared by two accepted 
   const environment = engine.environments.configure(project, { workspace: root,
     implementer: { actor: "assignment-researcher", model: "fixture", effort: "high", command },
     reviewer: { actor: "assignment-reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 10_000 }, 0);
-  const r0 = engine.refinement.begin(project, "R0");
-  engine.refinement.finishResearch(project, "R0", reference(r0), 0);
-  engine.refinement.sealLayer(project, 1, 0);
-  const r1 = engine.refinement.begin(project, "R1");
-  answerTechnicalFixture(engine, project, r1);
-  engine.refinement.finishResearch(project, "R1", reference(store.get(r1.id)!), 0);
-  const design = engine.refinement.prepareLayer(project, 2);
-  const answered = answerLayerFixture(engine, project, design, 2, desired);
-  engine.refinement.buildLayer(project, 2, reference(answered), store.get(`graph:${project}`)!.revision, "assignment-researcher");
-  engine.refinement.sealLayer(project, 2, 0);
+  prepareNativeLayers(engine, project, desired, "n2");
   const graph = store.get<Graph>(`graph:${project}`)!, layer = store.get(`graph-layer:${project}:2`)!;
-  const first = deliveredOf(writeOmInput(store, { project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const upperFrame = reference(store.get(`om-frame:${project}:2`)!);
+  const first = store.get(`om-input:${project}`)!;
   const input = deliveredOf(writeAddressing(store, { project, input: reference(first), graph: reference(graph), decisions: [{
     pending: inputDecisionWrite({ project, input: reference(first), graph: reference(graph), layers: [reference(layer)],
       decision: { target: "discovery:late-proof", field: "address", value: { consumer, kind: "post-implementation-proof" } } }) as Write,
   }] }));
   const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph),
-    refinement: reference(store.get(`phase:${project}:L2`)!), available: {},
+    refinement: reference(layer), available: {},
     choice: { choiceVersion: "spend-d7", features: [{ outcome: "garden-result" }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
     operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: reference(layer), frame: null, upper: null } },
+      layer: reference(layer), frame: upperFrame, upper: null } },
     works: { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: null } } } };
+      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame } } } };
   const gaps = deliveredOf(writeGaps(store, sources));
   const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const gap = gaps.records.find(record => record.value.gap.target === "discovery:late-proof")!;
@@ -1410,7 +1399,7 @@ try {
   assert.equal(storageBytes(), before, "Neither historical nor current E6 rewrites the old producer's records");
 });
 
-/** Real ordinary E4/E2 fact assignment, using the same source construction as om-model-call-fixture.ts. */
+/** Real ordinary E4/E2 fact assignment, using the same source construction as om-model-call.test.ts. */
 function ordinarySpendFixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-spend-ordinary-")), database = join(root, "state.sqlite");
   const store = new Store(database), engine = new ProductEngine(store), project = "garden";

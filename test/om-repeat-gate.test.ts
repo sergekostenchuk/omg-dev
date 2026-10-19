@@ -1589,17 +1589,16 @@ test("a hold outlives a successor of the series: one change of the slice does no
 
 test("the table of decision: every tally of roles and holders gets the class its sources suffice for, and no other", async t => {
   // This exhaustive table uses native acceptance once; dedicated integration tests also cover OM acceptance.
-  const native = await createOmFixture(t, "standard", "pool"), template = native.store, root = native.root, path = native.database;
+  const native = await createOmFixture(t, "standard", "pool", { mode: "n2" }), template = native.store, root = native.root, path = native.database;
   const matrixSubject = "pool-prep";
-  const input = deliveredOf(writeOmInput(template, { project: "pool", expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(native.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const input = template.get(`om-input:pool`)!;
   const makeHorizon = (choiceVersion: string, refinement: Ref | null) => deliveredOf(writeHorizon(template,
     { project: "pool", input: reference(input), graph: reference(native.graphRevision), refinement,
       choice: { choiceVersion, features: [{ outcome: "pool-result" }], excluded: [] }, available: {} }));
   const first: FrameRequest = { project: "pool", level: 2, graph: reference(native.graphRevision), horizon: reference(makeHorizon("table-upper", null).gate),
     layer: null, frame: null, upper: null };
-  const accepted: FrameRequest = { ...first, horizon: reference(makeHorizon("table-lower", reference(template.get("phase:pool:L2")!)).gate),
-    layer: reference(native.layers[2]) };
+  const accepted: FrameRequest = { ...first, horizon: reference(makeHorizon("table-lower", reference(native.layers[2])).gate),
+    layer: reference(native.layers[2]), frame: reference(template.get(`om-frame:pool:2`)!) };
   const read = deliveredOf(readFrame(template, first)), upper = structuredClone(read.upper) as Graph;
   const baseAbsent = remember(read.upperRef, { kind: "frame", request: first });
   remember(accepted.graph, { kind: "frame", request: accepted });
@@ -1971,14 +1970,13 @@ test("G7 observes real first-pass and accepted bases of both producers through t
   const back = new Store(path); t.after(() => back.close());
   assert.ok(deliveredOf(readDefinitions(back, { project: PROJECT, source: saved as unknown as OriginSource })).definitions.includes(SUBJECT));
 
-  const native = "native", nativeFixture = await createOmFixture(t, "standard", native);
+  const native = "native", nativeFixture = await createOmFixture(t, "standard", native, { mode: "n2" });
   const nativeStore = nativeFixture.store;
-  const input = deliveredOf(writeOmInput(nativeStore, { project: native, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(nativeStore.get(`stage:${native}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const input = nativeStore.get(`om-input:${native}`)!;
   const horizon = deliveredOf(writeHorizon(nativeStore, { project: native, input: reference(input), graph: reference(nativeStore.get(`graph:${native}`)!),
-    refinement: reference(nativeStore.get(`phase:${native}:L2`)!), choice: { choiceVersion: "origin-native", features: [{ outcome: `${native}-result` }], excluded: [] }, available: {} }));
+    refinement: reference(nativeFixture.layers[2]), choice: { choiceVersion: "origin-native", features: [{ outcome: `${native}-result` }], excluded: [] }, available: {} }));
   const request: FrameRequest = { project: native, level: 2, graph: reference(nativeStore.get(`graph:${native}`)!), horizon: reference(horizon.gate),
-    layer: reference(nativeStore.get(`graph-layer:${native}:2`)!), frame: null, upper: null };
+    layer: reference(nativeFixture.layers[2]), frame: reference(nativeStore.get(`om-frame:${native}:2`)!), upper: null };
   const definitions = deliveredOf(readDefinitions(nativeStore, { project: native, source: { role: "base", ref: request.graph,
     context: { kind: "frame", request } } })).definitions;
   assert.ok(definitions.includes(`${native}-prep-operation`));

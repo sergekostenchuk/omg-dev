@@ -13,11 +13,10 @@ import { projectGraph } from "../src/graph/project.js";
 import { KNOWLEDGE_KINDS, RESOLUTION_MOMENTS } from "../src/graph/obligation-policy.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { Store, type Write } from "../src/storage/store.js";
+import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { READINESS_CONTRACT, readinessQuestionId, withHistoricalReads, writeOmInput, type OmInput, type ReadinessCause } from "../src/om/input.js";
+import { READINESS_CONTRACT, readinessQuestionId, withHistoricalReads, writeOmInput, type OmInput, type OmInputRecord, type ReadinessCause } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { fillObligations, type FrameLevel, type FrameRead, type FrameScope } from "../src/om/frame-obligations.js";
 import { applyProposals, openObligationsToGaps, prepareFrameProposals, type FrameGap, type ProposalRequest } from "../src/om/frame-proposals.js";
 import { writeGuarded } from "../src/om/refs.js";
@@ -98,6 +97,19 @@ function frameGaps(graph: Graph, level: FrameLevel): FrameGap[] {
   const frame = frameOf(graph, level);
   return clone(delivered(openObligationsToGaps(frame, delivered(applyProposals(frame, [])) as Parameters<typeof openObligationsToGaps>[1]))) as FrameGap[];
 }
+/** The same request on the current contract: the fixture's own post-B1 input (revision 1), exact accepted frames. */
+function currentRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
+  const input = f.store.get<OmInputRecord>(`om-input:${f.project}`)!;
+  const upperFrame = reference(f.store.get(`om-frame:${f.project}:2`)!);
+  const horizon = delivered(writeHorizon(f.store, { project: f.project, input: reference(input), graph: reference(f.graphRevision),
+    refinement: reference(f.layers[2]), available: {},
+    choice: { choiceVersion: "gaps-choice", features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const frame = (level: FrameLevel): ProposalRequest => ({ proposals: [], frame: { project: f.project, level,
+    graph: reference(f.graphRevision), horizon: reference(horizon.gate),
+    layer: reference(f.layers[level]!), frame: reference(f.store.get(`om-frame:${f.project}:${level}`)!),
+    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: upperFrame } } });
+  return { project: f.project, input: reference(input), graph: reference(f.graphRevision), horizon: reference(horizon.gate), operations: frame(2), works: frame(3) };
+}
 function nativeRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
   const input = delivered(writeOmInput(f.store, { project: f.project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
@@ -111,7 +123,8 @@ function nativeRequest(f: OmFixture): GapRequest & { works: ProposalRequest } {
 }
 
 test("S1 D1 shares the full historical set only inside one operation and keeps current admission fresh", async t => {
-  const f = await createOmFixture(t), saved = delivered(writeGaps(f.store, nativeRequest(f)));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }),
+    saved = delivered(writeGaps(f.store, currentRequest(f)));
   const request: GapReadRequest = { sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) };
   let gets = 0, recordsRead = 0;
   const gapRecords = new Set(request.records.map(ref => `${ref.id}@${ref.revision}`));
@@ -514,7 +527,8 @@ test("gap policy is an immutable snapshot and addressed source evidence preserve
 });
 
 test("native D1 prepares without writes, persists exact B1 and C3 sources and repeats without extra revisions", async t => {
-  const f = await createOmFixture(t), request = nativeRequest(f), before = revisions(f.store);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }),
+    request = currentRequest(f), before = revisions(f.store);
   const prepared = delivered(prepareGaps(f.store, request));
   assert.equal(prepared.gate.passed, true); assert.deepEqual(prepared.collection.refusals, []);
   assert.ok(prepared.collection.gaps.some(gap => gap.code === "inventory_missing"));
@@ -526,6 +540,7 @@ test("native D1 prepares without writes, persists exact B1 and C3 sources and re
     frame: { ...request.works.frame, workZoneContract: 'accepted-l2-v1' } } });
   assert.equal(Object.hasOwn(request.works.frame, 'workZoneContract'), false);
   assert.deepEqual(revisions(f.store), before);
+  const preExisting = new Set(f.store.list("gap").map(row => row.id));
   const saved = delivered(writeGaps(f.store, request));
   assert.equal(saved.records.length, prepared.collection.gaps.length);
   assert.deepEqual(saved.sources, prepared.sources);
@@ -533,7 +548,7 @@ test("native D1 prepares without writes, persists exact B1 and C3 sources and re
   assert.deepEqual(saved.collection, prepared.collection);
   for (const row of saved.records) {
     assert.equal(row.kind, "gap"); assert.equal(row.id, `om-gap:garden:${row.value.gap.id}`);
-    assert.equal(row.revision, 1); assert.equal(row.value.project, "garden");
+    assert.equal(row.revision, preExisting.has(row.id) ? 2 : 1); assert.equal(row.value.project, "garden");
     assert.deepEqual(row.value.sources, prepared.sources);
     assert.equal(row.hash, hashJson(row.value));
   }
@@ -580,9 +595,9 @@ test("stored gap history survives source and graph heads plus reopen while G4 re
 });
 
 test("new and reused gap preparations guard source, graph, proposals and saved gaps before any neighbor write", async t => {
-  const f = await createOmFixture(t), request = nativeRequest(f);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), request = currentRequest(f);
   const proposal = f.store.write({ id: "om-proposal:garden:gaps", kind: "layer-proposal", expected: 0, value: {
-    base: { graph: request.graph, frame: null }, level: 2, source: "input", status: "proposed", nodes: [], fills: [], localConnectors: [],
+    base: { graph: request.graph, frame: request.operations.frame.frame }, level: 2, source: "input", status: "proposed", nodes: [], fills: [], localConnectors: [],
     artifacts: [], contracts: [], joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [],
   } });
   request.operations.proposals = [reference(proposal)];
@@ -593,7 +608,7 @@ test("new and reused gap preparations guard source, graph, proposals and saved g
     assert.equal(prepared.writes.length === 0, mode === "existing");
     const snapshot = await f.store.snapshot(join(f.root, `gap-${mode}-snapshot`));
     if (mode === "new") newSnapshot = snapshot.path;
-    const dependencies = [request.input, request.graph, request.horizon, request.works.frame.layer!, reference(proposal),
+    const dependencies = [request.input, request.graph, request.horizon, request.operations.frame.layer!, reference(proposal),
       reference(f.store.get("source:garden:brief")!), ...(mode === "existing" ? [reference(prepared.existing[0]!)] : [])];
     for (const [index, dependency] of dependencies.entries()) {
       const path = join(f.root, `gap-${mode}-${index}.sqlite`); copyFileSync(snapshot.path, path);
@@ -803,28 +818,20 @@ test("native first-pass gaps accept an explicit unaccepted work upper, then expo
 });
 
 test("current D1 admission distinguishes eras even when both legitimate derivations contain no gap records", async t => {
-  const f = await createOmFixture(t), graph = reference(f.graphRevision);
-  const inventory = f.store.write({ id: "repo-inventory:garden", kind: "repo-inventory", expected: 0,
-    value: { projectId: f.project, paths: [...new Set(f.graph.nodes.flatMap(node => node.code.map(ref => ref.path)))].sort() } });
-  const base = delivered(writeOmInput(f.store, { project: f.project, expected: 0, inventory: reference(inventory),
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
-  assert.deepEqual(base.value.input.questions, []);
-  const decisions = base.value.gaps.map(gap => {
-    assert.ok(["contract_node_unbound", "acceptance_kind_missing", "contract_boundary_prose"].includes(gap.code), gap.code);
-    const field = gap.code === "contract_node_unbound" ? "nodes" : gap.code === "acceptance_kind_missing" ? "checkKind" : "state";
-    const value: Json = field === "nodes" ? ["garden-produce-block", "garden-consume-block"] : field === "checkKind" ? "test"
-      : { writer: "garden-produce-block", authority: "garden-user", rollback: "garden-produce-block" };
-    return { pending: clone(inputDecisionWrite({ project: f.project, input: reference(base), graph, layers: [],
-      decision: { target: gap.target, field, value } })) as Write };
-  });
-  const input = delivered(writeAddressing(f.store, { project: f.project, input: reference(base), graph, decisions }));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), graph = reference(f.graphRevision);
+  // A fresh current input carrying the repository inventory admits no D1 questions at all.
+  const inventory = f.store.write({ id: `repo-inventory:${f.project}`, kind: "repo-inventory", expected: 0, value: { project: f.project } });
+  const input = delivered(writeOmInput(f.store, { project: f.project, expected: f.store.get(`om-input:${f.project}`)!.revision,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref>,
+    inventory: reference(inventory) }));
   assert.deepEqual(input.value.gaps, []);
+  const upperFrame = reference(f.store.get(`om-frame:${f.project}:2`)!);
   const horizon = delivered(writeHorizon(f.store, { project: f.project, input: reference(input), graph,
-    refinement: reference(f.store.get("phase:garden:L2")!), available: {},
+    refinement: reference(f.layers[2]), available: {},
     choice: { choiceVersion: "empty-d1-era", features: [{ outcome: "garden-result" }], excluded: [] } }));
   const frame = (level: FrameLevel): ProposalRequest => ({ proposals: [], frame: { project: f.project, level, graph,
-    horizon: reference(horizon.gate), layer: reference(f.layers[level]), frame: null,
-    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: null } } });
+    horizon: reference(horizon.gate), layer: reference(f.layers[level]!), frame: reference(f.store.get(`om-frame:${f.project}:${level}`)!),
+    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: upperFrame } } });
   const sources: GapRequest = { project: f.project, input: reference(input), graph, horizon: reference(horizon.gate),
     operations: frame(2), works: frame(3) };
   const saved = delivered(writeGaps(f.store, sources));
@@ -845,7 +852,7 @@ test("current D1 admission distinguishes eras even when both legitimate derivati
   assert.deepEqual(admitted.collection, saved.collection);
   assert.deepEqual(admitted.writes, []);
   assert.deepEqual(admitted.existing, []);
-  for (const ref of [graph, reference(input), reference(horizon.gate), reference(inventory), reference(f.layers[2]), reference(f.layers[3])])
+  for (const ref of [graph, reference(input), reference(horizon.gate), upperFrame, reference(f.layers[2])])
     assert.ok(admitted.guards.some(guard => canonical(guard) === canonical(ref)), ref.id);
   assert.deepEqual(revisions(f.store), before);
 
