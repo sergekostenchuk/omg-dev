@@ -29,9 +29,11 @@ export function capture(root: ExecutionRoot, parent: string, task: CompiledTask)
   // Stage the owned tree, then bind the scope of the actual resulting tree as well.
   git(root.path, ["add", "--all", "--", "."]);
   const tree = git(root.path, ["write-tree"]);
-  const actual = gitBytes(root.path, ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", parent, tree]).toString("utf8").split("\0").filter(Boolean);
+  const actual = gitBytes(root.path, ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", parent, tree])
+    .toString("utf8").split("\0").filter(Boolean);
   requireCondition(actual.every(path => task.writePaths.includes(path)), "write_scope_exceeded", "The captured tree contains a change outside the task's scope");
   requireCandidateBytes(root.path, tree);
-  requireCondition(tree !== git(root.path, ["rev-parse", `${parent}^{tree}`]), "candidate_empty", "The task produced no code change");
+  // The actual diff is also the empty check: it is empty exactly when the captured tree is the parent's.
+  requireCondition(actual.length > 0, "candidate_empty", "The task produced no code change");
   return tree;
 }

@@ -4,7 +4,9 @@ import { resolve } from "node:path";
 import { gitBytes, workspacePath } from "../runtime/environment.js";
 import { requireCondition, EngineError } from "../errors.js";
 
-/** Git filters and line-ending conversion must not substitute different accepted code. */
+/** Git filters and line-ending conversion must not substitute different accepted code.
+ *  The exact ls-tree form goes through the shared Git API — its memo decides reuse and counts every
+ *  logical read; bytes, modes and links on disk are re-verified on every call (GITSRC3). */
 export function requireCandidateBytes(root: string, tree: string): void {
   const entries = gitBytes(root, ["ls-tree", "-r", "-z", tree]).toString("utf8").split("\0").filter(Boolean);
   for (const entry of entries) {
