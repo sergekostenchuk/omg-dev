@@ -3,7 +3,7 @@ import { readRequestWire } from './request-parts.js';
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, deliveredConceptSections,
   EARLY_RESEARCH_OUTCOME, requireEscalationReply, researchCapacityInput, declareResultCapacity,
-  requireResultCapacity, researchResultFailure, researchResultEnvelopeLimit, RESULT_CAPACITY, RESULT_CAPACITY_REFUSAL } from './early-research-outcome.js';
+  researchResultFailure, researchResultEnvelopeLimit, RESULT_CAPACITY, RESULT_CAPACITY_REFUSAL } from './early-research-outcome.js';
 import { consolidationInput, consolidationPage, consolidationFragment,
   CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -189,8 +189,8 @@ function samePreparedSubject(store: Store, a: ResearchConsumerIntent, b: Researc
 function consumerInvalid(id: string, message: string): never {
   throw new EngineError('research_consumer_intent_invalid', `[${id}] ${message}`);
 }
-function synthesisTurnMatches(store: Store, intent: Revision<ResearchConsumerIntent>,
-  session: Revision<RecoverableContextSession>, action: unknown): boolean {
+export function synthesisTurnMatches(store: Store, intent: Revision<ResearchConsumerIntent>,
+  session: Revision<{ result: unknown }>, action: unknown): boolean {
   if (canonical(session.value.result) === canonical(action)) return true;
   // A pause is control flow: the session deliberately retains result:null so
   // a later explicit run may continue. Its one handoff still has to come from
@@ -289,157 +289,20 @@ function requireEscalationNeighbors(store: Store, intent: ResearchConsumerIntent
       || !intent.basis.some(basis => canonical(basis) === canonical(ref))))
     consumerInvalid(id, 'The escalation material does not derive from its exact accepted neighbors');
 }
+/** G5a (№6218/6200): the saved intent is a commit. Its transitions, capacity
+ * and generation chain are proved once by the producer writing each revision
+ * (prepare/reservation/refusal/application, the C23 rebind and the synthesis
+ * delivery append); a substituted byte is om-fsck's finding, not a read check.
+ * The reader therefore trusts the exact saved row: kind, exact Ref, producer
+ * address and field shape — without recomputing hashes, capacity or history. */
 export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<ResearchConsumerIntent> {
   if (!store || typeof store.get !== 'function' || !isRef(ref)) consumerInvalid('research-consumer-intent', 'An exact saved intent is required');
   const saved = store.get<ResearchConsumerIntent>(ref.id, ref.revision);
-  if (!saved || saved.kind !== 'research-consumer-intent' || canonical(reference(saved)) !== canonical(ref)
-    || hashJson(saved.value) !== saved.hash) consumerInvalid(ref.id, 'The exact intent is missing or changed');
+  if (!saved || saved.kind !== 'research-consumer-intent' || canonical(reference(saved)) !== canonical(ref))
+    consumerInvalid(ref.id, 'The exact intent is missing or changed');
   consumerShape(saved.value, saved.id);
   if (saved.id !== researchConsumerIntentId(saved.value.projectId, saved.value.kind, saved.value.key, saved.value.generation))
     consumerInvalid(saved.id, 'The intent address does not match its saved producer');
-  const origin = store.get<ResearchConsumerIntent>(saved.id, 1);
-  if (!origin || origin.kind !== saved.kind || hashJson(origin.value) !== origin.hash) consumerInvalid(saved.id, 'The original prepared intent is missing');
-  consumerShape(origin.value, origin.id);
-  if (origin.value.state !== 'prepared') consumerInvalid(saved.id, 'The original intent was not prepared');
-  requireEscalationNeighbors(store, origin.value, origin.id);
-  if (origin.value.cursor.resultCapacityContract !== undefined || origin.value.cursor.resultCapacity !== undefined) {
-    requireCondition(origin.value.cursor.resultCapacityContract === RESULT_CAPACITY,
-      'research_capacity_invalid', 'The producer lost its capacity era');
-    requireResultCapacity(origin.value.cursor.resultCapacity, consumerResultCapacity(store, origin.value), store);
-  }
-  if (origin.value.generation === 0) {
-    if (origin.value.previous !== null) consumerInvalid(saved.id, 'The first generation cannot claim a predecessor');
-  } else {
-    const prior = origin.value.previous;
-    if (!isRef(prior)
-      || prior.id !== researchConsumerIntentId(origin.value.projectId, origin.value.kind,
-        origin.value.rootKey, origin.value.generation - 1))
-      consumerInvalid(saved.id, 'The next generation lost its exact predecessor address');
-    const predecessor = readResearchConsumerIntent(store, prior);
-    if (!retryableResearchConsumerRefusal(store, predecessor)
-      || !sameLogicalConsumerStep(predecessor.value, origin.value))
-      consumerInvalid(saved.id, 'A new generation needs the proved refused logical step');
-  }
-  let latestPrepared = origin;
-  let previous: Revision<ResearchConsumerIntent> | null = null;
-  for (let revision = 1; revision <= saved.revision; revision += 1) {
-    const step = store.get<ResearchConsumerIntent>(saved.id, revision);
-    if (!step || step.revision !== revision || step.kind !== 'research-consumer-intent'
-      || hashJson(step.value) !== step.hash)
-      consumerInvalid(saved.id, 'A saved consumer state revision is missing or changed');
-    consumerShape(step.value, step.id);
-    if (step.value.cursor.resultCapacityContract !== undefined || step.value.cursor.resultCapacity !== undefined) {
-      requireCondition(step.value.cursor.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The prepared step lost its capacity era');
-      requireResultCapacity(step.value.cursor.resultCapacity, consumerResultCapacity(store, step.value), store);
-    }
-    if (previous?.value.state === 'prepared') {
-      if (step.value.state === 'prepared') {
-        // C23: the only lawful prepared->prepared change is the atomic rebind
-        // of an unclaimed reader to the retried revision of its own child turn.
-        const same = samePreparedSubject(store, previous.value, step.value);
-        if ((!same && !reboundUnclaimedReader(store, previous.value, step.value)) || step.value.call !== null)
-          consumerInvalid(saved.id, 'An unsent reader intent changed its logical source or question');
-        latestPrepared = step;
-      } else if (step.value.state === 'running') {
-        if (canonical({ ...step.value, state: 'prepared', call: null, request: null,
-          archive: null, outputs: null, refusal: null }) !== canonical(previous.value))
-          consumerInvalid(saved.id, 'The physical claim did not follow the latest prepared revision');
-      } else consumerInvalid(saved.id, 'A prepared intent can only be re-prepared or reserve its one physical call');
-    } else if (previous?.value.state === 'running') {
-      if (!['applied', 'refused'].includes(step.value.state)
-        || canonical([step.value.call, step.value.request, step.value.archive])
-          !== canonical([previous.value.call, previous.value.request, previous.value.archive]))
-        consumerInvalid(saved.id, 'The physical binding changed during consumer completion');
-      if (step.value.state === 'applied') {
-        const writes = step.value.outputs!.map(output => {
-          const record = store.get(output.id, output.revision);
-          if (!record || canonical(reference(record)) !== canonical(output) || hashJson(record.value) !== record.hash)
-            consumerInvalid(saved.id, `An exact applied output is missing: ${output.id}`);
-          return { id: record.id, kind: record.kind, expected: record.revision - 1, value: record.value };
-        });
-        validateConsumerApplicationWrites(store, step, writes, undefined, 'historical');
-      } else if (step.value.outputs !== null)
-        consumerInvalid(saved.id, 'A refused consumer cannot claim an applied output');
-    } else if (previous?.value.state === 'applied') {
-      const before = previous.value.outputs, after = step.value.outputs;
-      if (previous.revision !== 3 || !['synthesis', 'consolidation'].includes(step.value.kind)
-        || step.value.state !== 'applied'
-        || canonical([step.value.call, step.value.request, step.value.archive])
-          !== canonical([previous.value.call, previous.value.request, previous.value.archive])
-        || !before || !after || after.length !== before.length + 1
-        || canonical(after.slice(0, before.length)) !== canonical(before))
-        consumerInvalid(saved.id, 'Only the exact synthesis delivery turn may extend an applied intent');
-      const turnRef = after[after.length - 1]!, turn = store.get<Record<string, any>>(turnRef.id, turnRef.revision);
-      const sessionRef = before.find(output => output.id === step.value.owner.id);
-      const session = sessionRef ? store.get<RecoverableContextSession>(sessionRef.id, sessionRef.revision) : null;
-      const delivery = step.value.cursor.delivery;
-      if (!turn || turn.kind !== 'research-turn' || canonical(reference(turn)) !== canonical(turnRef)
-        || hashJson(turn.value) !== turn.hash || turn.revision !== 1 || !object(turn.value)
-        || turn.value.contract !== 'research-consumer-turn/v1'
-        || canonical(turn.value.consumerIntent) !== canonical(reference(origin))
-        || !object(delivery)
-        || turn.value.run !== delivery.run || turn.value.number !== delivery.turn
-        || turn.id !== managedTurnId(turn.value.run, turn.value.number)
-        || !session || canonical(reference(session)) !== canonical(sessionRef)
-        || !synthesisTurnMatches(store, previous, session, turn.value.action))
-        consumerInvalid(saved.id, 'The appended turn is not the exact result of the saved synthesis session');
-    } else if (previous)
-      consumerInvalid(saved.id, 'A completed consumer intent cannot acquire another outcome');
-    previous = step;
-  }
-  for (const source of [saved.value.owner, saved.value.draft, saved.value.question, ...saved.value.basis,
-    ...(saved.value.profile ? [saved.value.profile] : [])]) {
-    const exact = store.get(source.id, source.revision);
-    if (!exact || canonical(reference(exact)) !== canonical(source) || hashJson(exact.value) !== exact.hash)
-      consumerInvalid(saved.id, `An exact original source is missing: ${source.id}`);
-  }
-  if (saved.value.call) {
-    const call = store.get<ModelCall>(saved.value.call.id, saved.value.call.revision);
-    const owner = (call?.value as ModelCall & { consumerIntent?: Ref } | undefined)?.consumerIntent;
-    if (!call || call.kind !== 'model-call' || canonical(reference(call)) !== canonical(saved.value.call)
-      || !isRef(owner) || canonical(owner) !== canonical(reference(latestPrepared)))
-      consumerInvalid(saved.id, 'The running intent is not bound to its exact physical claim');
-  }
-  if (saved.value.outputs) for (const output of saved.value.outputs) {
-    const record = store.get(output.id, output.revision);
-    if (!record || canonical(reference(record)) !== canonical(output)) consumerInvalid(saved.id, 'An applied consumer output is missing');
-  }
-  if (saved.value.state === 'applied'
-    && readResearchConsumerExecutionFromIntent(store, saved.value.projectId, saved).kind !== 'response')
-    consumerInvalid(saved.id, 'The applied outcome has no proven received response');
-  if (saved.value.state === 'refused') {
-    const paid = readResearchConsumerExecutionFromIntent(store, saved.value.projectId, saved);
-    const refusal = saved.value.refusal!;
-    const synthesisFamily = saved.value.kind === 'synthesis' || saved.value.kind === 'consolidation';
-    // RS3: before RS3 a failure that left only its own envelope was saved as its terminal research_provider_failed.
-    const legacy = paid.kind === 'provider-failed' && paid.envelope === true && refusal.kind === 'terminal'
-      && refusal.code === paid.call.value.error;
-    const expectedKind = legacy ? 'terminal' : paid.kind === 'provider-failed' ? 'provider-failed'
-      : paid.kind === 'terminal' ? 'terminal'
-      : saved.value.kind === 'reader' ? 'reader-invalid' : 'consumer-invalid';
-    if (refusal.kind !== expectedKind
-      || refusal.code !== (paid.kind === 'response' ? refusal.code : legacy ? paid.call.value.error : paid.code)
-      || canonical([refusal.call, refusal.request, refusal.response, refusal.archive]) !== canonical([
-        reference(paid.call), paid.request, paid.response, paid.archive]))
-      consumerInvalid(saved.id, 'The terminal refusal lacks its exact no-response physical proof');
-    if (refusal.code === RESULT_CAPACITY_REFUSAL && paid.kind === 'response'
-      && canonical(refusal.capacity) !== canonical(consumerCapacityFailure(store, saved, paid.payload)?.details))
-      consumerInvalid(saved.id, 'The capacity refusal lost its exact declared result measurements');
-    if (paid.kind === 'response' && saved.value.kind === 'reader') {
-      if (readerRefusalCode(saved, paid.payload) !== refusal.code)
-        consumerInvalid(saved.id, 'The refused reader code differs from the original paid selection');
-    }
-    if (paid.kind === 'response' && !synthesisFamily && saved.value.kind !== 'reader') {
-      // C13/C62: the saved refusal code must be the one this exact paid
-      // payload deterministically derives — the check needs no current state.
-      if (actionResponseRefusalCode(store, saved, paid) !== refusal.code)
-        consumerInvalid(saved.id, 'The refused consumer code differs from the exact paid response');
-    }
-    if (paid.kind === 'response' && synthesisFamily) {
-      if (synthesisTransitionRefusalCode(store, saved, paid) !== refusal.code)
-        consumerInvalid(saved.id, 'The refused synthesis step code differs from the exact paid transition');
-    }
-  }
   return saved;
 }
 /** A queued managed plan owns its children even though their old addresses do
@@ -1379,12 +1242,16 @@ export function consumerResultCapacity(store: Store, intent: ResearchConsumerInt
     cursor: Object.fromEntries(['sessionId', 'offset', 'materialOffset', 'run', 'turn', 'pendingTurn', 'delivery',
       'previousProposalRef', 'contextContract'].filter(key => Object.hasOwn(cursor, key)).map(key => [key, cursor[key]])) });
 }
-export function consumerCapacityFailure(store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown) {
+export function consumerCapacityFailure(_store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown) {
   const cursor = intent.value.cursor;
   if (cursor.resultCapacityContract === undefined && cursor.resultCapacity === undefined) return null;
-  requireCondition(cursor.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The new attempt lost its capacity era');
-  const saved = requireResultCapacity(cursor.resultCapacity, consumerResultCapacity(store, intent.value), store);
-  return researchResultFailure(saved, payload);
+  // G5a (возврат 1): the saved admission is the commit — its capacity was
+  // computed and proved once by the producer. A repeated answer check only
+  // measures the NEW payload against that trusted declaration, never
+  // recomputes it from today's rows.
+  requireCondition(cursor.resultCapacityContract === RESULT_CAPACITY && cursor.resultCapacity !== undefined,
+    'research_capacity_invalid', 'The new attempt lost its capacity era');
+  return researchResultFailure(cursor.resultCapacity, payload);
 }
 
 /** One bounded correction, derived from the exact terminal producer and raw reply. */
@@ -1434,6 +1301,20 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
       value.cursor.resultCapacityPrompt = previous.value.cursor.resultCapacityPrompt;
     }
   } else {
+    // G5a (возврат 1): an unchanged prepared admission returns its saved row
+    // before the capacity builder runs — the declaration was proved once when
+    // the producer wrote that revision. The builder below still runs for a
+    // new admission, a retry generation or a lawful change of inputs.
+    const same = !replacing && previous?.value.state === 'prepared' ? previous : null;
+    if (same) {
+      for (const field of ['resultCapacityContract', 'resultCapacity', 'resultCapacityPrompt'] as const)
+        if (same.value.cursor[field] === undefined) delete value.cursor[field];
+        else value.cursor[field] = same.value.cursor[field];
+      if (canonical(same.value) === canonical(value)) return same;
+      delete value.cursor.resultCapacityContract;
+      delete value.cursor.resultCapacity;
+      delete value.cursor.resultCapacityPrompt;
+    }
     const correction = previous ? consumerCapacityCorrection(store, previous) : null;
     if (correction) value.cursor.context = { ...value.cursor.context, failures: [correction] };
     value.cursor.resultCapacityContract = RESULT_CAPACITY;
@@ -2451,39 +2332,6 @@ function actionResponseRefusalCode(store: Store, intent: Revision<ResearchConsum
   }
 }
 
-/** C23 rebind proof: the only lawful prepared->prepared change is an unclaimed
- * reader following the retried revision of its own child turn. Every exact
- * field except the turn reference must stay identical, the new revision must
- * be a pending replay of the bound one, and each intermediate revision must
- * be the recorded failed attempt or an earlier pending retry. */
-function reboundUnclaimedReader(store: Store, a: ResearchConsumerIntent,
-  b: ResearchConsumerIntent): boolean {
-  if (a.kind !== 'reader' || b.kind !== 'reader' || a.state !== 'prepared' || b.state !== 'prepared')
-    return false;
-  const consumerA = a.cursor.consumer, consumerB = b.cursor.consumer;
-  if (!object(consumerA) || !object(consumerB)
-    || !isRef(consumerA.run) || !isRef(consumerA.turn)
-    || !isRef(consumerB.run) || !isRef(consumerB.turn)
-    || canonical(consumerA.run) !== canonical(consumerB.run)
-    || consumerA.turn.id !== consumerB.turn.id
-    || consumerB.turn.revision <= consumerA.turn.revision) return false;
-  const oldTurn = consumerA.turn, newTurn = consumerB.turn;
-  if (canonical(a.owner) !== canonical(oldTurn) || canonical(b.owner) !== canonical(newTurn)) return false;
-  const swap = (value: unknown): unknown => canonical(value) === canonical(oldTurn) ? newTurn
-    : Array.isArray(value) ? value.map(swap)
-      : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value as Record<string, unknown>)
-        .map(([key, item]) => [key, swap(item)])) : value;
-  const projected = swap(a) as ResearchConsumerIntent;
-  if (projected.cursor.resultCapacityContract !== undefined)
-    projected.cursor.resultCapacity = declareResultCapacity(store, consumerResultCapacity(store, projected));
-  if (canonical(projected) !== canonical(b)) return false;
-  // The turn-side chain is the one shared O -> P derivation: the bound pending
-  // ref reaches the new pending revision only through recorded failed attempts
-  // or earlier pending replays of the same turn.
-  const to = store.get<ResearchTurn>(newTurn.id, newTurn.revision);
-  return !!to && queuedChildReached(store, oldTurn, to);
-}
-
 /** D8.4e: the common reader of K. It proves the whole chain from the record's
  * own exact references — O@1 and P through the managed turn reader, R under
  * its managed proof B (which must be the record's assessmentProof), the
@@ -2922,7 +2770,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
   const synthesis = session.kind === 'synthesis-session', purpose = synthesis ? 'analyst' : 'assessor';
   const call = store.get<ModelCall>(callRef.id, callRef.revision);
   requireCondition(call?.kind === 'model-call' && object(call.value) && canonical(reference(call)) === canonical(callRef)
-    && (!onlyResponse || call.value.status === 'succeeded') && hashJson(call.value) === call.hash
+    && (!onlyResponse || call.value.status === 'succeeded')
     && call.value.projectId === project && call.value.draftId === draft.id && call.value.questionId === question.id
     && call.value.purpose === purpose && object(call.value.requested) && canonical(call.value.requested) === canonical(role)
     && canonical(call.value.profile ?? null) === canonical(profile),

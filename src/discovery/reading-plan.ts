@@ -134,14 +134,22 @@ export function retryPlannedRead(store:Store,project:string,ref:Ref){
   requireCondition(!boundReaders.some(intent=>intent.value.state==='running'),
     'reading_plan_recovery_invalid','A claimed reader cannot follow a retried child');
   const unclaimed=boundReaders.filter(intent=>intent.value.state==='prepared');
+  const retriedValue={...child.value,status:'pending' as const,error:null,observation:null,replayedFrom:ref};
+  const retriedRef:Ref={id:child.id,revision:child.revision+1,hash:hashJson(retriedValue)};
+  const retried:Revision<ResearchTurn>={id:child.id,kind:child.kind,revision:child.revision+1,
+    hash:retriedRef.hash,value:retriedValue};
+  // C23 (write-time proof, G5a): the producer proves the rebound step the
+  // reader used to replay — the intent's owner is exactly its bound pending
+  // turn, and that pending revision reaches the retried one only through
+  // recorded failed attempts or earlier pending replays of the same turn.
   requireCondition(unclaimed.every(intent=>{
     const bound=intent.value.cursor.consumer.turn as Ref;
     const target=store.get<ResearchTurn>(bound.id,bound.revision);
     return bound.revision<=child.revision&&target?.kind==='research-turn'&&target.value.status==='pending'
-      &&canonical(bound)===canonical(reference(target));
+      &&canonical(bound)===canonical(reference(target))
+      &&canonical(intent.value.owner)===canonical(bound)
+      &&queuedChildReached(store,bound,retried);
   }),'reading_plan_recovery_invalid','Only an unclaimed reader can follow its retried child');
-  const retriedValue={...child.value,status:'pending' as const,error:null,observation:null,replayedFrom:ref};
-  const retriedRef:Ref={id:child.id,revision:child.revision+1,hash:hashJson(retriedValue)};
   const rebinds=unclaimed.map(intent=>{
     const oldRef=intent.value.cursor.consumer.turn as Ref;
     const swap=(value:unknown):unknown=>canonical(value)===canonical(oldRef)?retriedRef

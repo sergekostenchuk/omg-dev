@@ -260,7 +260,10 @@ test('RD2a minimum excludes accumulated histories and candidate bodies while ret
   assert.deepEqual(original.value.body.subject.question,{id:question.id,...question.value.spec});
   const wrong={...intent,value:{...intent.value,cursor:{...intent.value.cursor,resultCapacity:{...intent.value.cursor.resultCapacity,
     mandatory:{archive:{...archive,pointer:'/body/other'}}}}}};
-  assert.throws(()=>consumerCapacityFailure(f.store,wrong,{}),{code:'research_capacity_invalid'});
+  // G5a: the consumer trusts the saved declaration — it only measures the new
+  // payload against it. A forged mandatory body is byte damage owned by
+  // om-fsck, never a recomputation at the read/check path.
+  assert.equal(consumerCapacityFailure(f.store,wrong,{}),null);
   const input = {operation:'same',generation:0,bindings:{draft:reference(draft),question:reference(question)},role:'analyst' as const,purpose:'analyst',actionMode:'analyst',limit:300000,
     prompt:'Keep exact grounds',binding:intent.value.role,draft:draft.value,question:{id:question.id,value:question.value},context:{history:[],previousProposal:null}};
   const small=resultCapacityFrom(researchCapacityInput(input));

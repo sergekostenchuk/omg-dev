@@ -30,12 +30,12 @@ import { workingContext } from "./working-context.js";
 import { replayLimitedResponse } from "./response-replay.js";
 import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
-  readResearchConsumerIntent, resumeResearchConsumerExecution, consumerResultCapacity,
+  readResearchConsumerIntent, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, prepareResearchConsumerReservation,
   type ResearchConsumerIntent } from './response-recovery.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply } from './research-consumer-transition.js';
-import { earlyResearchStage, requireResultCapacity, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS } from './early-research-outcome.js';
+import { earlyResearchStage, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS, RESULT_CAPACITY } from './early-research-outcome.js';
 import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite } from '../om/run-control.js';
 import { REQUEST_MANIFEST_CONTRACT, prepareRequestPartsAndManifest, partitionResearchWire } from './request-parts.js';
 
@@ -314,8 +314,13 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const callId = consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
   const capacity = consumerIntent?.value.cursor.resultCapacity
     ?? (assessment?.kind === 'application' ? assessment.application.value.context.resultCapacity : undefined);
+  // G5a (№6218): the saved admission is trusted — its capacity was computed and
+  // proved once when the producer wrote the prepared revision. The actual prompt
+  // is still compared to that saved declaration below; nothing is recomputed.
   if (consumerIntent?.value.cursor.resultCapacityContract !== undefined)
-    requireResultCapacity(capacity, consumerResultCapacity(audit!.store, consumerIntent.value), audit!.store);
+    requireCondition(consumerIntent.value.cursor.resultCapacityContract === RESULT_CAPACITY
+      && consumerIntent.value.cursor.resultCapacity !== undefined,
+      'research_capacity_invalid', 'The saved consumer admission lost its declared capacity');
   const { packetState, subject, envelope, input, requestLimit } = prepareResearchEnvelope(role, environment,
     prompt, context, audit, capacity, requestId, requestContract);
   if (capacity !== undefined) requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,

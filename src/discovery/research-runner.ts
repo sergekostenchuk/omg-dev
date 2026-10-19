@@ -24,7 +24,7 @@ import { projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
 import { earlyResearchConsumerFailure, consumerCapacityFailure, captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
   assessmentReadView, prepareResearchConsumerIntent, readResearchConsumerIntent,
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
-  prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt,
+  prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt, synthesisTurnMatches,
   readContextIdentityAt, readContextTurnHistoryAt, projectPaidLayerDesignRefusal,
   PreparedManagedProposalRefusal,
   refuseResearchConsumerIntent, pinnedLayerDeltaStore, readResearchAcceptanceBinding, intentWebCapability, intentResponseAction,
@@ -1528,8 +1528,11 @@ export class Researcher {
   private handoffSynthesis(intent: Revision<ResearchConsumerIntent>, run: Revision<ResearchRun>,
     action: ResearchAction, owner: ResearchRun["owner"], guards: Ref[] = []) {
     const current = this.store.get<ResearchConsumerIntent>(intent.id);
+    // G5a (№6218): the once-only delivery extension is proved here at the write —
+    // only the exact third revision (prepared → running → applied) may grow a
+    // turn output; the reader trusts the saved row without replaying history.
     requireCondition(current && (current.value.kind === "synthesis" || current.value.kind === "consolidation")
-      && current.value.state === "applied" && Array.isArray(current.value.outputs)
+      && current.value.state === "applied" && current.revision === 3 && Array.isArray(current.value.outputs)
       && current.value.cursor.delivery && typeof current.value.cursor.delivery === "object"
       && current.value.cursor.delivery.run === run.id && current.value.cursor.delivery.turn === run.value.turns,
       "research_consumer_intent_invalid", "Only the exact completed synthesis may hand off its turn");
@@ -1539,6 +1542,9 @@ export class Researcher {
     const sessionRef = current.value.outputs.find(ref => ref.id === current.value.owner.id);
     const session = sessionRef
       ? this.store.get<SynthesisSessionState>(sessionRef.id, sessionRef.revision) : null;
+    requireCondition(session && canonical(reference(session)) === canonical(sessionRef)
+      && synthesisTurnMatches(this.store, current, session, action),
+      "research_consumer_intent_invalid", "The appended turn is not the exact result of the saved synthesis session");
     const turnId = paidTurnId(run.id, run.value.turns);
     // D8.4e: the second producer of O uses the shared projection, so the
     // acceptance era marker is fixed identically by both producers.
@@ -1562,8 +1568,8 @@ export class Researcher {
       writes.push(mark.write);
     }
     const saved = this.store.writeMany<ResearchRun | ResearchTurn>(writes,
-      uniqueTransactionGuards([reference(run), reference(current), { id: turnId, absent: true },
-        ...(mark ? mark.guards : []), ...guards]));
+      uniqueTransactionGuards([reference(run), reference(current), ...(session ? [reference(session)] : []),
+        { id: turnId, absent: true }, ...(mark ? mark.guards : []), ...guards]));
     return { run: saved[0]! as Revision<ResearchRun>, turn: saved[1]! as Revision<ResearchTurn> };
   }
   private save(run: Revision<ResearchRun>, patch: Partial<ResearchRun>, guards: Ref[] = []): Revision<ResearchRun> {

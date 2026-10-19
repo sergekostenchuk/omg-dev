@@ -7,7 +7,8 @@ import { join } from "node:path";
 import { canonical, digest } from "../src/canonical.js";
 import { Evidence } from "../src/evidence/evidence.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { git } from "../src/runtime/environment.js";
+import { git, uniqueTransactionGuards } from "../src/runtime/environment.js";
+import { readResearchConsumerIntent, researchConsumerIntentId } from "../src/discovery/response-recovery.js";
 import { configureReaderPilot, pilotEnvironment } from "../src/discovery/reader-pilot.js";
 import { pilotContext, readPilotContext, retainPilotRead } from "../src/discovery/pilot-context.js";
 import { synthesisSession } from "../src/discovery/synthesis-session.js";
@@ -279,6 +280,43 @@ test("om-fsck finds each change of another connection at its address", t => {
   const gone = found(f.store);
   assert.ok(gone.includes(`revision_gap:${f.a.id}@2`), gone.join());
   assert.ok(gone.includes(`reference_missing:${f.b.id}@1`), gone.join());
+});
+
+test("om-fsck owns a forged consumer intent history: the trusted read stays one row", t => {
+  // G5a (№6218): the saved intent is a commit — a substituted byte in its
+  // history is the whole-check's finding, never a re-proving walk on read.
+  const f = fixture(t);
+  const ref = (id: string, revision = 1) => ({ id, revision, hash: digest(`${id}:${revision}`) });
+  const owner = ref("research-run:r"), draft = ref("discovery-draft:d"), question = ref("question:q");
+  const value = { contract: "research-consumer-intent/v1", projectId: PROJECT, kind: "analyst", key: "k",
+    rootKey: "k", generation: 0, previous: null, owner, draft, question,
+    role: { actor: "a", model: "m", effort: "e", command: { executable: "x", args: [] } },
+    dispatch: { projectId: PROJECT }, profile: null,
+    cursor: { run: owner.id, turn: 1, context: {}, prompt: "p" },
+    basis: [], guards: uniqueTransactionGuards([owner, draft, question]),
+    state: "prepared", call: null, request: null, archive: null, outputs: null, refusal: null };
+  const id = researchConsumerIntentId(PROJECT, "analyst", "k", 0);
+  f.store.writeMany([{ id, kind: "research-consumer-intent", expected: 0, value }]);
+  const [head] = f.store.writeMany([{ id, kind: "research-consumer-intent", expected: 1,
+    value: { ...value, state: "running", call: ref("model-call:c"), request: ref("request-manifest:c"),
+      archive: ref("archive:c") } }]);
+  assert.deepEqual(readResearchConsumerIntent(f.store, reference(head!)).value, head!.value);
+  // Raw SQL rewrites an earlier revision leaving its sha256 stale: the intact
+  // head reads as before — the check alone owns history damage.
+  f.foreign("UPDATE revisions SET body=? WHERE entity_id=? AND revision=1", canonical({ ...value, key: "forged" }), id);
+  assert.deepEqual(readResearchConsumerIntent(f.store, reference(head!)).value, head!.value,
+    "the committed row is trusted — the read does not re-walk its revisions");
+  assert.ok(found(f.store).includes(`revision_corrupt:${id}@1`), found(f.store).join());
+  // A self-consistent rewrite of the head moves its sha256, so the exact ref
+  // captured before stops matching — the cheap identity check, still one read.
+  const forgedHead = { ...(head!.value as Record<string, any>),
+    cursor: { ...(head!.value as Record<string, any>).cursor, note: "forged" } };
+  f.foreign("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=2",
+    canonical(forgedHead), digest(canonical(forgedHead)), id);
+  assert.throws(() => readResearchConsumerIntent(f.store, reference(head!)),
+    { code: "research_consumer_intent_invalid" });
+  assert.deepEqual(readResearchConsumerIntent(f.store, reference(f.store.get(id)!)).value, forgedHead,
+    "the new exact ref trusts the self-consistent row — a consistent rewrite is outside the read's threat model");
 });
 
 test("om-fsck finds an event gone and a head moved back", t => {
