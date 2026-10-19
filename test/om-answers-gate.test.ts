@@ -833,6 +833,34 @@ test('G4b passes a complete accepted graph with no blocking answer and survives 
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(oldClaim) })), oldClaim);
   assert.deepEqual(ok(writeAnswersGate(f.store, request)), saved);
+  // A genuinely disappeared gap is a different live branch of the gate: a fresh current input carrying
+  // the repository inventory admits no D1 rows at all, while the old inventory_missing record stays in
+  // history. Offering its exact reference to the current empty set is refused as answer_gap_unknown.
+  const vanished = earlier.find(row => row.value.gap.code === 'inventory_missing')!;
+  assert.ok(vanished);
+  const inventory = f.store.write({ id: `repo-inventory:${f.project}`, kind: 'repo-inventory', expected: 0,
+    value: { projectId: f.project, paths: [...new Set(f.graph.nodes.flatMap(node => node.code.map(ref => ref.path)))].sort() } });
+  const freshInput = ok(writeOmInput(f.store, { project: f.project, expected: f.store.get(`om-input:${f.project}`)!.revision,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref>,
+    inventory: reference(inventory) }));
+  assert.deepEqual(freshInput.value.gaps, []);
+  const freshHorizon = ok(writeHorizon(f.store, { project: f.project, input: reference(freshInput),
+    graph: reference(f.graphRevision), refinement: reference(f.layers[2]), available: {},
+    choice: { choiceVersion: 'answers-gate-vanished-gap', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const emptyGaps = ok(writeGaps(f.store, { ...sourceFor(reference(freshHorizon.gate)), input: reference(freshInput) }));
+  assert.deepEqual(emptyGaps.records, []);
+  assert.deepEqual(f.store.get(vanished.id, vanished.revision), vanished);
+  const emptyRead: GapReadRequest = { sources: clone(emptyGaps.sources) as GapRequest, records: [] };
+  const emptyRoute = ok(writeRoutes(f.store, { project: f.project, gaps: emptyRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const vanishedRequest: AnswersGateRequest = { project: f.project, gaps: emptyRead, routes: reference(emptyRoute),
+    results: [{ gap: reference(vanished), result: null, candidate: null }] };
+  const vanishedClaim = ok(writeAnswersGate(f.store, vanishedRequest));
+  assert.deepEqual(vanishedClaim.value.result.codes, ['answer_gap_unknown']);
+  const ledger = f.store.list().map(reference);
+  f.reopen();
+  assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(vanishedClaim) })), vanishedClaim);
+  assert.deepEqual(ok(writeAnswersGate(f.store, vanishedRequest)), vanishedClaim);
+  assert.deepEqual(f.store.list().map(reference), ledger);
 });
 
 test('G4b proves a real selected D5 fact while other live obligations remain incomplete', async t => {
