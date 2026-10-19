@@ -1,6 +1,7 @@
 import test from 'node:test';
-import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { execFile, execFileSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, realpathSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,7 +17,7 @@ import { packetAnswerSchema, type QuestionPacketRecord } from '../src/om/questio
 import { checkAnswerForm } from '../src/om/answer-form.js';
 import { adapterRequest } from '../src/om/model-call.js';
 import { BRIEF_VERSION, deriveBrief, briefMaterial, briefRules, briefAnswerRepairable, packetPrompt, packetFingerprint,
-  resolveBriefAnswer, type BriefBasis } from '../src/om/packet-brief.js';
+  resolveBriefAnswer, compactSchema, type BriefBasis } from '../src/om/packet-brief.js';
 import { bindingFlowIdentity } from '../src/graph/flow-identity.js';
 import { flowKey } from '../src/om/frame-obligations.js';
 import { GRAPH_VALIDATION_CODES } from '../src/graph/validate.js';
@@ -802,4 +803,130 @@ test('SP1a №4714 §2.1: an unsupported declaration and a basis without the exa
   assert.throws(() => deriveBrief(f.input, { ...f.basis, selection: BRIEF_SELECTION_CONTRACT, accepted: f.basis.accepted.filter(row => row.stage !== 'features') }),
     (error: unknown) => error instanceof EngineError && error.code === 'selected_specification_basis_invalid'
       && (error.details as { target: string }).target === 'stage:garden:features');
+});
+
+// HASH2: the optimized paths are proven by canonical computations, not by time. The counter is a
+// loader hook on the compiled canonical.js — production modules are not touched.
+const hashCountLoader = String.raw`
+let root;
+export function initialize(data) { root = data.root; }
+export async function load(url, context, nextLoad) {
+  const result = await nextLoad(url, context);
+  if (!url.startsWith(root) || result.format !== 'module') return result;
+  if (decodeURIComponent(url.slice(root.length)) !== 'src/canonical.js') return result;
+  let source = String(result.source);
+  const anchor = 'export function canonical(value) {';
+  if (source.split(anchor).length !== 2) throw new Error('The canonical computation was not identified');
+  source = source.replace(anchor, anchor + '\nglobalThis.__canonicalCount = (globalThis.__canonicalCount || 0) + 1;');
+  return { ...result, source };
+}
+`;
+const hashCountScenario = String.raw`
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { register } from 'node:module';
+const config = CONFIG;
+register(config.loader, { data: { root: config.dist } });
+globalThis.__canonicalCount = 0;
+const imports = name => import(config.dist + 'src/' + name + '.js');
+const { Store } = await imports('storage/store');
+const { Evidence } = await imports('evidence/evidence');
+const { deriveBrief, boundedBrief, briefMaterial, packetPrompt, packetFingerprint, compactSchema, BRIEF_VERSION } = await imports('om/packet-brief');
+const { packetAnswerSchema } = await imports('om/question-packet');
+const { reference } = await imports('pipeline/contracts');
+const { gardenGraph } = await import(config.dist + 'test/om-fixture.js');
+const { canonical, hashJson } = await imports('canonical');
+const take = () => { const count = globalThis.__canonicalCount; globalThis.__canonicalCount = 0; return count; };
+const root = mkdtempSync(join(tmpdir(), 'omg-hash2-'));
+const store = new Store(join(root, 'state.sqlite'));
+new Evidence(store).document('garden', 'reference', 'Source text 😀', 'text/plain', 0);
+const context = store.write({ id: 'om-input:garden', kind: 'om-input', expected: 0, value: { known: true } });
+const gap = { id: 'gap:garden:one', revision: 1, hash: '1'.repeat(64) };
+const basis = { project: 'garden', graph: gardenGraph(), node: 'garden-consume-block',
+  gaps: [{ question: 'q-native', target: 'criterion', field: 'checkKind', ref: gap, evidence: [] }],
+  contexts: [reference(context)], accepted: [], input: { requirements: [], criteria: [], contracts: [], questions: [] },
+  material: briefMaterial(store, 'garden', root, false), materialBudget: 45000, codes: [] };
+const input = { version: BRIEF_VERSION, requestId: 'brief-request', task: 'fact', model: 'MC1', purpose: 'model-research',
+  questions: [{ id: 'q-native', target: 'criterion', field: 'answer', contract: { establishes: 'Какова кодировка? 😀', resultForm: { type: 'string' } } }],
+  responseForm: { protocol: 'omg-answer/v3', requestId: 'brief-request', schema: packetAnswerSchema('fact') }, refusals: [] };
+take();
+const packet = deriveBrief(input, basis), out = { derive: take() };
+assert.equal(canonical(deriveBrief(input, basis)), canonical(packet), 'The same payload and basis produce the same packet bytes');
+take();
+const text = packetPrompt(packet);
+out.prompt = take();
+const fingerprint = packetFingerprint(packet);
+out.fingerprint = take();
+assert.deepEqual(fingerprint, { hash: hashJson(packet), chars: text.length, utf8Bytes: Buffer.byteLength(text) });
+const bounded = boundedBrief(input, basis, text.length + 100000, () => true);
+out.bounded = take();
+assert.equal(canonical(bounded), canonical(packet), 'The unbounded candidate wins the whole budget and keeps the same bytes');
+assert.equal(packetPrompt(bounded), text);
+const leaf = { type: 'string', description: 'x'.repeat(200) };
+const shared = { type: 'object', properties: { a: leaf, b: leaf }, required: ['a', 'b'] };
+const compacted = compactSchema({ type: 'object', properties: { one: shared, two: shared, wrap: { type: 'object', properties: { inner: shared } } } });
+out.compact = take();
+const replaced = { type: 'object', properties: { a: { $ref: '#/$defs/s1' }, b: { $ref: '#/$defs/s1' } }, required: ['a', 'b'] };
+assert.deepEqual(compacted, { type: 'object', properties: { one: replaced, two: replaced, wrap: { type: 'object', properties: { inner: replaced } } },
+  $defs: { s1: leaf } });
+console.log(JSON.stringify(out));
+store.close(); rmSync(root, { recursive: true, force: true });
+`;
+
+test('HASH2 one serialization serves prompt and fingerprint; budget candidates reuse the invariant brief; compacted schemas share subtrees once', async t => {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-hash2-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const loaderFile = join(directory, 'loader.mjs'), script = join(directory, 'scenario.mjs');
+  const dist = pathToFileURL(fileURLToPath(new URL('../', import.meta.url))).href;
+  writeFileSync(loaderFile, hashCountLoader);
+  writeFileSync(script, hashCountScenario.replace('CONFIG', JSON.stringify({ dist, loader: pathToFileURL(loaderFile).href })));
+  const { stdout } = await promisify(execFile)(process.execPath, [script], { maxBuffer: 16 * 1024 * 1024 });
+  const counts = JSON.parse(stdout.trim()) as { derive: number; prompt: number; fingerprint: number; bounded: number; compact: number };
+  assert.equal(counts.fingerprint, counts.prompt, 'packetFingerprint reuses the one packet serialization of promptParts');
+  assert.ok(counts.bounded < counts.derive * 4, `Every budget candidate rebuilt the invariant brief: ${counts.bounded} vs ${counts.derive} per derive`);
+  assert.ok(counts.compact <= 8, `Compacted subtrees are serialized once, not once per occurrence and ancestor: ${counts.compact}`);
+});
+
+test('HASH2 compactSchema keeps the exact deduplication contract: post-order s1/s2, threshold 180, scoped refusal, opaque values', () => {
+  const leaf = { type: 'string', description: 'x'.repeat(200) };
+  assert.deepEqual(compactSchema({ type: 'object', properties: { first: leaf, second: leaf } }),
+    { type: 'object', properties: { first: { $ref: '#/$defs/s1' }, second: { $ref: '#/$defs/s1' } },
+      $defs: { s1: { type: 'string', description: 'x'.repeat(200) } } });
+  // A parent whose only repeated child was shared keeps the literal child inside its own $defs entry —
+  // the changed parent key is not deduplicated against the original counts.
+  const inner = { type: 'string', description: 'y'.repeat(200) };
+  const parent = { type: 'object', properties: { child: inner, extra: { type: 'integer', description: 'z'.repeat(150) } } };
+  assert.deepEqual(compactSchema({ type: 'object', properties: { p1: parent, p2: parent } }),
+    { type: 'object', properties: {
+      p1: { type: 'object', properties: { child: { $ref: '#/$defs/s1' }, extra: { $ref: '#/$defs/s2' } } },
+      p2: { type: 'object', properties: { child: { $ref: '#/$defs/s1' }, extra: { $ref: '#/$defs/s2' } } } },
+      $defs: { s1: { type: 'string', description: 'y'.repeat(200) }, s2: { type: 'integer', description: 'z'.repeat(150) } } });
+  // Two distinct repeated subtrees are numbered in post-order of first completion: the leaf first,
+  // and a parent changed by a shared child keeps its literal place.
+  const small = { type: 'string', description: 'w'.repeat(200) };
+  const big = { type: 'object', properties: { only: { type: 'number', description: 'v'.repeat(200) } } };
+  const rebuiltBig = { type: 'object', properties: { only: { $ref: '#/$defs/s2' } } };
+  assert.deepEqual(compactSchema({ type: 'object', properties: { a: small, b: big, c: small, d: big } }),
+    { type: 'object', properties: { a: { $ref: '#/$defs/s1' }, b: rebuiltBig, c: { $ref: '#/$defs/s1' }, d: rebuiltBig },
+      $defs: { s1: { type: 'string', description: 'w'.repeat(200) }, s2: { type: 'number', description: 'v'.repeat(200) } } });
+  // Boundary: a canonical key of 179 stays inline, 180 is shared.
+  const under = { type: 'x', description: 'd'.repeat(150) }, at = { type: 'x', description: 'd'.repeat(151) };
+  assert.equal(canonical(under).length, 179); assert.equal(canonical(at).length, 180);
+  assert.deepEqual(compactSchema({ type: 'object', properties: { a: under, b: under } }), { type: 'object', properties: { a: under, b: under } });
+  assert.deepEqual(compactSchema({ type: 'object', properties: { a: at, b: at } }),
+    { type: 'object', properties: { a: { $ref: '#/$defs/s1' }, b: { $ref: '#/$defs/s1' } }, $defs: { s1: at } });
+  // Scoped schemas are returned as the same object: $id, $ref, $defs, definitions — anywhere.
+  for (const scoped of [{ $id: 'urn:a', type: 'object' }, { type: 'object', properties: { x: { $ref: '#/y' } } },
+    { type: 'object', $defs: { s1: leaf }, properties: { x: leaf, y: leaf } }, { type: 'object', definitions: { s1: leaf }, properties: { x: leaf, y: leaf } }])
+    assert.equal(compactSchema(scoped), scoped);
+  // const, enum and default are opaque values — equal nodes share a def, a differing one stays literal.
+  const same1 = { type: 'string', enum: ['A'.repeat(90), 'B'.repeat(90)], const: 'A'.repeat(90), default: 'B'.repeat(90) };
+  const other = { ...same1, default: 'C'.repeat(90) };
+  assert.deepEqual(compactSchema({ type: 'object', properties: { a: same1, b: same1, c: other } }),
+    { type: 'object', properties: { a: { $ref: '#/$defs/s1' }, b: { $ref: '#/$defs/s1' }, c: other }, $defs: { s1: same1 } });
+  // Non-objects and empty schemas pass through untouched.
+  assert.equal(compactSchema('not a schema'), 'not a schema');
+  assert.deepEqual(compactSchema({}), {});
 });
