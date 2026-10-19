@@ -28,6 +28,7 @@ execution.test.ts :: EX6 era: without a clarification every request is byte for 
 execution.test.ts :: AT3a rows 11, 12: era — the code before AT3a stops a task on a plan finding of strings, and the new code reads it as it wrote it; without admission the requests and outcomes stay as they were # вид 1: старая форма/маршрут
 execution.test.ts :: AT3a return №4141 P2-1: the live form of task 1 — a needs_code the code before AT3a wrote, with its candidate, a failed full check, no review and no correction left — is reviewed once as saved, with no implementation bought and no correction slot opened # вид 1: старая форма/маршрут
 om-accepted-answer.test.ts :: PF3 row 24: accepted answers and the index the base code 5929ea25 wrote prepare and read the same with the new code, warm and after reopen # вид 1: эра 5929ea25
+om-queue.test.ts :: the whole b1143aa producer retains its pre-B1 projection and saved bytes under the new queue era # вид 1: эра b1143aa
 om-achievements.test.ts :: C5.1b genuine N3 bound work passes G7 and physical E6 history without attributing foreign fillings # вид 1: эра 9c22e4a4
 om-achievements.test.ts :: C5.1b exact old producer D2 and E6 history survives while its unbound frame cannot invent an achievement # вид 1: эра 7c7d3ccc, 9c22e4a4, b1143aa7
 om-answers-gate.test.ts :: G4b reads a genuine saved E5.0 assessor transport by its historical contract # вид 1: эра 3eb5dac3, 7c7d3ccc

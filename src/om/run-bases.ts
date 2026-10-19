@@ -6,7 +6,8 @@ import { Store, type Revision, type TransactionGuard, type Write } from "../stor
 import { prepareHorizon, prepareHorizonIssuance, type HorizonRequest } from "./horizon.js";
 import { prepareOmInput, type OmInputRecord } from "./input.js";
 import { prepareGaps, type GapReadRequest, type GapRequest } from "./gaps.js";
-import { readAcceptedFrameLayer } from "./layer-basis.js";
+import { readAcceptedFrameLayer, readUnacceptedLayer, type LayerBasis } from "./layer-basis.js";
+import { prepareLayerAcceptance } from "./frame-obligations.js";
 import { prepareQuestionTasks } from "./question-packet.js";
 import { prepareBlockQueue, prepareMachinePath, QUEUE_POLICY_VERSION, type QueueRequest } from "./queue.js";
 import { prepareSeriesActivation, readAnySeriesAt, readAppliedSeriesTransition, readCurrentSeriesPointer, readSeriesMembership, seriesAddress,
@@ -181,16 +182,19 @@ function layerHead(store: Store, project: string, level: number): Ref | null {
 }
 /**
  * The representation of the upper layer the horizon and D1 stand on (№1844 п.6, №1860 п.2): an accepted OM N2 frame
- * with its exact graph and layer; otherwise no refinement. A candidate or assembly is never taken for an accepted layer.
+ * with its exact graph and layer; otherwise an existing research L2 phase (its own gates admit it or refuse G2);
+ * otherwise no refinement. A candidate or assembly is never taken for an accepted layer.
  */
 function upperBasis(store: Store, project: string) {
   const n2 = accepted(store, project, 2), n3 = n2 ? accepted(store, project, 3) : null;
+  const phase = n2 ? null : store.get(`phase:${project}:L2`);
   const head = store.get(`graph:${project}`);
   if (!head) fail("record_missing", `graph:${project}`, "graph", "The machine bases need the current graph of the project");
   // Every accepted layer lives in the current graph: an accepted N2 or N3 moves the head, and new heads are new bases
   // of the same intent (№1844 п.7); the accepted frames contribute their exact layers and frames.
   const graph = reference(head);
-  return { n2, n3, horizonGraph: graph, gapsGraph: graph, refinement: n2 ? n2.layer : null };
+  return { n2, n3, phase: phase ? reference(phase) : null, horizonGraph: graph, gapsGraph: graph,
+    refinement: n2 ? n2.layer : phase ? reference(phase) : null };
 }
 /**
  * The G2 request of the intent (№1852 п.3): its outcomes as the common features, nothing excluded, closure by M2/G2.
@@ -231,10 +235,44 @@ function gapRequest(store: Store, project: string, input: Ref, horizon: Ref, bas
     return { guards: [], request: { project, input, graph, horizon, operations: { frame: frame(2, basis.n2.layer, basis.n2.frame, null), proposals: [] },
       works: { frame: works, proposals: [] } } as GapRequest };
   }
+  if (basis.phase) {
+    const works3 = worksLayer3(store, project, graph);
+    return { guards: works3.guards, request: { project, input, graph, horizon,
+      operations: { frame: frame(2, layerHead(store, project, 2), null, null), proposals: [] },
+      works: { frame: frame(3, works3.layer, works3.frame, { horizon, frame: null }), proposals: [] } } as GapRequest };
+  }
   const layer = layerHead(store, project, 2);
   if (!layer) fail("record_missing", `graph-layer:${project}:2`, "works.layer", "The unaccepted upper layer of the works must exist before D1");
   return { guards: [], request: { project, input, graph, horizon, operations: { frame: frame(2, null, null, null), proposals: [] },
     works: { state: "upper-not-accepted", layer } } as GapRequest };
+}
+/**
+ * The level-3 slot of the research-phase branch (№2157): an existing graph-layer:3 head is accepted only as proven —
+ * the full common acceptance derivation and the current admission (prepareLayerAcceptance; an own derivation proof is
+ * lawful before sealLayer(3)), a shell with only inherited upper proofs is confirmed unaccepted by the common reader
+ * and the level-3 work stays open, and a published L3 phase names its sealed layer — missing, corrupt or moved head
+ * is an addressed refusal, never a fallback to open work. The exact read heads and significant absences of the choice
+ * are guards of the D1 write, so a competing acceptance between the choice and the write loses the compare-and-set and
+ * the whole chain is derived again.
+ */
+function worksLayer3(store: Store, project: string, graph: Ref): { layer: Ref | null; frame: Ref | null; guards: TransactionGuard[] } {
+  const phaseId = `phase:${project}:L3`;
+  const phase = store.get<{ layer: Ref | null }>(phaseId);
+  const head = store.get<LayerBasis>(`graph-layer:${project}:3`);
+  if (phase) {
+    const named = phase.value.layer;
+    if (!named || !head || !same(named, reference(head)))
+      fail("run_bases_basis_stale", phaseId, "layer", "The accepted L3 phase does not name the current level-3 layer head");
+    const proven = take(prepareLayerAcceptance(store, { project, level: 3, graph, layer: named }));
+    return { layer: named, frame: proven.frame, guards: [...proven.guards, reference(phase)] };
+  }
+  if (!head) return { layer: null, frame: null, guards: [{ id: `graph-layer:${project}:3`, absent: true }, { id: phaseId, absent: true }] };
+  if (head.value.acceptance !== undefined || (head.value.layerProofs ?? []).some(proof => proof.level >= 3)) {
+    const proven = take(prepareLayerAcceptance(store, { project, level: 3, graph, layer: reference(head) }));
+    return { layer: reference(head), frame: proven.frame, guards: [...proven.guards] };
+  }
+  const unaccepted = take(readUnacceptedLayer(store, { project, level: 3, graph, layer: reference(head) }));
+  return { layer: null, frame: null, guards: [...unaccepted.currentReferences, { id: phaseId, absent: true }] };
 }
 /**
  * The requirements of a fact task (№1860 п.3): only the exact contracts of B1 bound to the question's own consumer —

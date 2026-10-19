@@ -4,18 +4,19 @@ import { EngineError } from "../errors.js";
 import { controlPredecessors } from "../graph/dependencies.js";
 import { withGraphRead } from "../graph/repository.js";
 import type { Graph } from "../graph/model.js";
-import { graphV2Schema } from "../graph/schema.js";
+import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { delivered, isPlainObject, localErrors, localRefusals, sealed, transfer, type OmResult, type Refusal, type RefusalRoute, type Sealed, type SourceCodes } from "./refusal.js";
 import { receiptId, type ArtifactReceipt } from "../compiler/model.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
+import { StageChecks } from "../product/stage-checks.js";
 import { Store, storeObserved, type Revision, type TransactionGuard, type Write, type HeadsMatch, type HeadsMatchMismatch } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
-import { prepareExistingOmInput, readOmInput } from "./input.js";
+import { prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
 import { readRecord, writeGuarded } from "./refs.js";
-import { readLayerAcceptance, type LayerBasis } from "./layer-basis.js";
+import { readLayerAcceptance, readLayerBasis, readLayerEnvelope, type LayerBasis } from "./layer-basis.js";
 import { prepareSeriesTransition, readPreparedSeriesTransition } from "./series-transition.js";
 
 export const HORIZON_REFUSAL_CODES = Object.freeze([
@@ -74,8 +75,11 @@ function jsonCopy<T>(value: T): T {
     throw error;
   }
 }
-let graphShape: ReturnType<Ajv['compile']> | undefined;
-const horizonShape = () => graphShape ??= new Ajv({ strict: true, allErrors: false, allowUnionTypes: true }).compile(sealed(graphV2Schema));
+let graphShapes: ReturnType<Ajv['compile']>[] | undefined;
+const horizonShapes = () => graphShapes ??= (() => {
+  const schema = new Ajv({ strict: true, allErrors: false, allowUnionTypes: true });
+  return [schema.compile(sealed(graphSchema)), schema.compile(sealed(graphV2Schema))];
+})();
 function requireChoice(value: unknown): asserts value is HorizonChoice {
   if (!object(value) || !text(value['choiceVersion']) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value['choiceVersion'])) invalid("choiceVersion");
   if (!Array.isArray(value['features']) || !value['features'].every(feature => object(feature) && text(feature['outcome']))) invalid("features");
@@ -88,7 +92,7 @@ function requireOptions(value: unknown): asserts value is HorizonOptions {
 }
 
 export function closeHorizon(upper: Graph, options: HorizonOptions): Sealed<HorizonBuildResult> {
-  if (!object(upper) || upper.version !== 2 || !horizonShape()(upper)) invalid("upper");
+  if (!object(upper) || !horizonShapes()[upper.version === 2 ? 1 : 0]!(upper)) invalid("upper");
   requireOptions(options);
   upper = jsonCopy(upper); options = jsonCopy(options);
   const blocks = new Map(upper.nodes.filter(node => node.kind === "block").map(node => [node.id, node]));
@@ -221,23 +225,123 @@ function receiptShape(value: unknown, project: string, artifact: string): value 
     || !["node", "signature", "contractHash", "commit", "tree"].every(field => text(value[field]))
     || !object(value['value']) || !Array.isArray(value['value']['files'])
     || !value['value']['files'].every(file => object(file) && text(file['path']) && (file['hash'] === null || text(file['hash'])))) return false;
-  return isRef(value['plan']) && isRef(value['run']);
+  return (value['plan'] === undefined || isRef(value['plan'])) && (value['run'] === undefined || isRef(value['run']));
+}
+interface SavedPhase { projectId: string; phase: string; inputs: Ref[]; layer: Ref | null; draft: Ref | null; contractVersion?: number }
+// Resolve the producer's recorded proof closure historically; only current admission below reads heads.
+function exactClosure(store: Store, refs: Ref[]): HorizonResult<Sealed<Revision[]>> {
+  const pending = [...refs], seen = new Set<string>(), records: Revision[] = [];
+  while (pending.length) {
+    const ref = pending.shift()!;
+    if (!isRef(ref)) return refuse("horizon_refinement_unproven", "Refinement has an invalid proof reference", address("refinement", "inputs"), "producer");
+    const key = canonical(ref);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const record = store.get(ref.id, ref.revision);
+    if (!record || record.hash !== ref.hash) return refuse("horizon_refinement_unproven", "Refinement proof is absent or has a different hash", address(ref.id, "inputs", ref), "producer");
+    records.push(record);
+    if ((record.kind === "phase" || record.kind === "graph-layer") && object(record.value)) {
+      if (!Array.isArray(record.value['inputs']) || !record.value['inputs'].every(isRef))
+        return refuse("horizon_refinement_unproven", "Refinement proof needs its explicit input set", address(ref.id, "inputs", ref), "producer");
+      pending.push(...record.value['inputs'] as unknown as Ref[]);
+      if (record.kind === "phase") for (const field of ["draft", "layer"] as const) {
+        const input = record.value[field];
+        if (isRef(input)) pending.push(input);
+        else if (input !== null) return refuse("horizon_refinement_unproven", "Refinement phase has an invalid source", address(ref.id, field, ref), "producer");
+      }
+    }
+  }
+  return delivered(records);
 }
 function readRefinement(store: Store, request: HorizonRequest, graph: Graph): HorizonResult<Sealed<string[]>> {
-  if (request.refinement === null) return delivered([]);
-  if (request.refinement.id !== `graph-layer:${request.project}:2`)
-    return refuse("horizon_refinement_unproven", "Refinement must name an accepted OM N2 layer",
-      address(request.refinement.id, "refinement", request.refinement), "producer");
-  const basis = readLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
-  if (!basis.ok) return refuse("horizon_refinement_unproven", basis.refusal.message,
-    address(basis.refusal.at.target, basis.refusal.at.field ?? "acceptance", request.refinement), "producer");
-  if (basis.value.producer !== "om") return refuse("horizon_refinement_unproven", "Refinement must retain its accepted OM frame",
-    address(request.refinement.id, "producer", request.refinement), "producer");
+  if (!request.refinement) return delivered([]);
+  if (request.refinement.id === `graph-layer:${request.project}:2`) {
+    const basis = readLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: request.refinement });
+    if (!basis.ok) return refuse("horizon_refinement_unproven", basis.refusal.message,
+      address(basis.refusal.at.target, basis.refusal.at.field ?? "acceptance", request.refinement), "producer");
+    if (basis.value.producer !== "om") return refuse("horizon_refinement_unproven", "Research refinement must retain its accepted milestone",
+      address(request.refinement.id, "producer", request.refinement), "producer");
+    const relations = new RefinementRelations(graph);
+    const frame = store.get<{ fills: { node: string; source: string }[] }>(basis.value.frame!.id, basis.value.frame!.revision)!;
+    const identities = new Set(frame.value.fills.filter(fill => fill.source === "identity").map(fill => fill.node));
+    return delivered(graph.nodes.filter(block => block.kind === "block" && graph.nodes.some(operation => operation.kind === "operation"
+      && !identities.has(operation.id) && relations.refines(operation.id, block.id))).map(block => block.id).sort(order));
+  }
+  const read = readRecord<SavedPhase>(store, request.refinement, { unit: "G2", target: request.project,
+    id: `phase:${request.project}:L2`, kind: "phase" });
+  if (!read.ok) return transfer("refs", read);
+  const phase = read.value.value;
+  const reject = (field: string, source: Ref = request.refinement!) => refuse("horizon_refinement_unproven", "Refinement must be an accepted L2 milestone with its exact proof closure",
+    address(source.id, field, source), "producer");
+  if (!object(phase) || phase.projectId !== request.project || phase.phase !== "L2" || phase.draft !== null
+    || !isRef(phase.layer) || !Array.isArray(phase.inputs) || !phase.inputs.every(isRef)
+    || !phase.inputs.some(ref => canonical(ref) === canonical(phase.layer))
+    || !phase.inputs.some(ref => ref.id === `phase:${request.project}:R1`)
+    || (phase.contractVersion !== undefined && phase.contractVersion !== 2)) return reject("inputs");
+  const layerRead = readRecord<LayerBasis>(store, phase.layer, { unit: "G2", target: request.project,
+    id: `graph-layer:${request.project}:2`, kind: "graph-layer" });
+  if (!layerRead.ok) return transfer("refs", layerRead);
+  const layer = layerRead.value.value;
+  if (!object(layer) || !object(layer.projection) || !Array.isArray(layer.inputs) || !layer.inputs.every(isRef)
+    || !Array.isArray(layer.obligations) || (layer.layerProofs !== undefined && !Array.isArray(layer.layerProofs))) return reject("layer");
+  if (graph.version === 2 && !layer.layerProofs?.some(proof => object(proof) && proof.level === 2)) return reject("layerProofs");
+  if (graph.version === 1) {
+    const checked = readLayerEnvelope(store, { project: request.project, level: 2, graph: request.graph, layer: phase.layer });
+    if (!checked.ok) return refuse("horizon_refinement_unproven", checked.refusal.message,
+      address(checked.refusal.at.target, checked.refusal.at.field ?? "inputs", phase.layer), "producer");
+  }
+  const closure = exactClosure(store, [request.refinement, ...layer.inputs]);
+  if (!closure.ok) return closure;
+  const phaseOrder = ["R0", "L1", "R1", "L2"];
+  const byRef = new Map(closure.value.map(record => [canonical(reference(record)), record]));
+  for (const record of closure.value) if (record.kind === "phase") {
+    const value = record.value, source = reference(record);
+    if (!object(value) || value['projectId'] !== request.project || !text(value['phase'])
+      || !phaseOrder.includes(value['phase']) || record.id !== `phase:${request.project}:${value['phase']}`)
+      return reject("projectId", source);
+    if (!Array.isArray(value['inputs']) || !value['inputs'].every(isRef)) return reject("inputs", source);
+    const inputs = value['inputs'] as unknown as Ref[];
+    const has = (ref: Ref) => inputs.some(input => canonical(input) === canonical(ref));
+    const version = value['contractVersion'];
+    if (version !== undefined && version !== 2) return reject("contractVersion", source);
+    if (version === 2 && value['phase'] !== "R0") {
+      const predecessorId = `phase:${request.project}:${phaseOrder[phaseOrder.indexOf(value['phase']) - 1]}`;
+      const predecessors = inputs.filter(ref => ref.id === predecessorId);
+      if (predecessors.length !== 1) return reject("inputs", source);
+      const predecessor = byRef.get(canonical(predecessors[0]));
+      if (predecessor?.kind !== "phase" || !object(predecessor.value) || predecessor.value['contractVersion'] !== 2)
+        return reject("contractVersion", source);
+    }
+    if (value['phase'] === "R0" || value['phase'] === "R1") {
+      if (value['layer'] !== null || !isRef(value['draft']) || !has(value['draft'])) return reject("draft", source);
+      const draft = byRef.get(canonical(value['draft']));
+      if (!draft || draft.kind !== "discovery-draft" || (value['phase'] === "R0"
+        ? draft.id !== `derived-research:${request.project}:R0` : !draft.id.startsWith(`discovery:${request.project}:`))
+        || !object(draft.value) || draft.value['projectId'] !== request.project || draft.value['stage'] !== "om-g2"
+        || draft.value['level'] !== value['phase'] || draft.value['consumer'] !== "compilation"
+        || (version === 2 && draft.value['contractVersion'] !== 2)) return reject("draft", source);
+    } else {
+      if (value['draft'] !== null || !isRef(value['layer']) || !has(value['layer'])) return reject("layer", source);
+      const savedLayer = byRef.get(canonical(value['layer']));
+      const level = value['phase'] === "L1" ? 1 : 2;
+      if (!savedLayer || savedLayer.kind !== "graph-layer" || savedLayer.id !== `graph-layer:${request.project}:${level}`
+        || !object(savedLayer.value) || !object(savedLayer.value['projection'])
+        || canonical(savedLayer.value['projection']) !== canonical(projectGraph(graph, level))) return reject("layer", source);
+    }
+  }
+  if (graph.version === 2) {
+    const upper = phase.inputs.filter(ref => ref.id === `graph-layer:${request.project}:1`);
+    if (upper.length !== 1) return reject("inputs");
+    const checked = readLayerBasis(store, { project: request.project, level: 2, graph: request.graph, layer: phase.layer, upper: upper[0]! });
+    if (!checked.ok) return refuse("horizon_refinement_unproven", checked.refusal.message,
+      address(checked.refusal.at.target, `layerProofs.${checked.refusal.at.field ?? "inputs"}`, phase.layer), "producer");
+    const research = phase.inputs.filter(ref => ref.id === `phase:${request.project}:R1`);
+    const ownProof = layer.layerProofs!.find(proof => proof.level === 2)!;
+    if (research.length !== 1 || !ownProof.inputs.some((ref: Ref) => canonical(ref) === canonical(research[0]))) return reject("inputs");
+  }
   const relations = new RefinementRelations(graph);
-  const frame = store.get<{ fills: { node: string; source: string }[] }>(basis.value.frame!.id, basis.value.frame!.revision)!;
-  const identities = new Set(frame.value.fills.filter(fill => fill.source === "identity").map(fill => fill.node));
   return delivered(graph.nodes.filter(block => block.kind === "block" && graph.nodes.some(operation => operation.kind === "operation"
-    && !identities.has(operation.id) && relations.refines(operation.id, block.id))).map(block => block.id).sort(order));
+    && relations.refines(operation.id, block.id))).map(block => block.id).sort(order));
 }
 function deriveHorizon(store: Store, request: HorizonRequest): HorizonResult<Sealed<HorizonRecord>> {
   const inputRead = readOmInput(store, request.project, request.input);
@@ -245,7 +349,7 @@ function deriveHorizon(store: Store, request: HorizonRequest): HorizonResult<Sea
   const graphRead = readRecord<Graph>(store, request.graph, { unit: "G2", target: request.project, id: `graph:${request.project}`, kind: "graph" });
   if (!graphRead.ok) return transfer("refs", graphRead);
   const graph = graphRead.value.value as Graph;
-  if (!object(graph) || graph.version !== 2 || !horizonShape()(graph))
+  if (!object(graph) || !horizonShapes()[graph.version === 2 ? 1 : 0]!(graph))
     return refuse("horizon_unclosed", "The saved graph has an invalid shape", address(request.graph.id, "graph", request.graph), "producer");
   const map = inputRead.value.value.input.sources.find(source => source.stage === "operation-map")!;
   const stage = readRecord<StageArtifact>(store, map, { unit: "G2", target: request.project, id: `stage:${request.project}:operation-map`, kind: "stage" });
@@ -335,8 +439,18 @@ function currentHorizonSources(store: Store, request: HorizonRequest): HorizonRe
       }
       for (const ref of basis.value.currentReferences) remember(ref);
     } else if (request.refinement) {
-      return refuse("horizon_refinement_unproven", "Refinement must name an accepted OM N2 layer",
-        address(request.refinement.id, "refinement", request.refinement), "producer");
+      const engine = new StageChecks(store);
+      const phase = store.get<SavedPhase>(request.refinement.id, request.refinement.revision)!;
+      for (const [name, gate] of [["refinement.L2", engine.refinement.gate(request.project, "L2")],
+        ["layer.2", engine.graphs.layerGate(request.project, 2, phase.value.layer!)]] as const) {
+        const admission = readOmAdmissionGuards(gate.admissionGuards, name, "G2");
+        if (!admission.ok) return transfer("input", admission);
+        if (gate.findings.length) {
+          const finding = gate.findings[0]!;
+          return refuse("horizon_refinement_unproven", finding.message, address(finding.target, finding.code, request.refinement), "producer");
+        }
+        for (const guard of [...gate.guards, ...admission.value]) remember(guard);
+      }
     }
     return delivered(uniqueTransactionGuards([...guards.values()]));
   } catch (error) {
@@ -407,10 +521,6 @@ export function readHorizon(store: Store, project: string, ref: Ref): HorizonRes
   const horizon = readRecord<HorizonRecord>(store, value.horizon, { unit: "G2", target: project,
     id: `horizon:${project}:${value.choiceVersion}`, kind: "horizon" });
   if (!horizon.ok) return transfer("refs", horizon);
-  const refinement = horizon.value.value.request.refinement;
-  if (refinement !== null && (!isRef(refinement) || refinement.id !== `graph-layer:${project}:2`))
-    return refuse("horizon_refinement_unproven", "Refinement must name an accepted OM N2 layer or be explicitly absent",
-      address(horizon.value.id, "refinement", reference(horizon.value)), "producer");
   return delivered({ horizon: horizon.value, gate: gate.value });
 }
 

@@ -6,8 +6,10 @@ import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
-import { reference, type Ref } from "../src/pipeline/contracts.js";
+import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
+import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { Store, type Revision } from "../src/storage/store.js";
+import { writeOmInput } from "../src/om/input.js";
 import { writeGuarded } from "../src/om/refs.js";
 import { REFUSAL_ROUTES, type Sealed, type OmResult } from "../src/om/refusal.js";
 import {
@@ -263,10 +265,11 @@ function refusedAs<T>(value: OmResult<T>, expected: string) {
   return value.refusal;
 }
 async function storedFixture(t: test.TestContext) {
-  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
-  const input = f.store.get("om-input:garden")!; // Already produced and addressed by the native fixture.
+  const f = await createOmFixture(t);
+  const input = delivered(writeOmInput(f.store, { project: f.project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
   const req: HorizonRequest = {
-    project: f.project, input: reference(input), graph: reference(f.graphRevision), refinement: reference(f.layers[2]),
+    project: f.project, input: reference(input), graph: reference(f.graphRevision), refinement: reference(f.store.get("phase:garden:L2")!),
     choice: { choiceVersion: "choice-1", features: [{ outcome: resultArtifact }], excluded: [] },
     available: { [producer]: { [data]: reference(f.receipts[data]!) } },
   };
@@ -278,6 +281,24 @@ function copyStore(f: OmFixture, snapshot: string, name: string): Store {
   copyFileSync(snapshot, path);
   return new Store(path);
 }
+function rebind(value: Json, from: Ref, to: Ref): Json {
+  if (isRef(value) && canonical(value) === canonical(from)) return to as unknown as Json;
+  if (Array.isArray(value)) return value.map(item => rebind(item, from, to));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, rebind(item, from, to)]));
+  return value;
+}
+function replaceResearch(store: Store, current: HorizonRequest, mutate: (value: Record<string, Json>) => void): void {
+  const r1 = store.get<Record<string, Json>>("phase:garden:R1")!;
+  const value = clone(r1.value); mutate(value);
+  const changed = store.write({ id: r1.id, kind: r1.kind, expected: r1.revision, value });
+  const phase = store.get<{ layer: Ref; inputs: Ref[] }>(current.refinement!.id)!;
+  const layer = store.get(phase.value.layer.id)!;
+  const revisedLayer = store.write({ id: layer.id, kind: layer.kind, expected: layer.revision,
+    value: rebind(layer.value, reference(r1), reference(changed)) });
+  const phaseValue = rebind(rebind(phase.value as unknown as Json, reference(r1), reference(changed)), reference(layer), reference(revisedLayer));
+  current.refinement = reference(store.write({ id: phase.id, kind: phase.kind, expected: phase.revision, value: phaseValue }));
+}
+
 test("stored G2 binds the actual checked horizon and real artifact receipts, with stable historical replay", async t => {
   const { f, req } = await storedFixture(t);
   req.available[consumer] = { [resultArtifact]: reference(f.receipts[resultArtifact]!) };
@@ -351,6 +372,35 @@ test("refused choices persist their conflict while forged namespaces, hashes and
     { code: "record_foreign", change: (_store, current) => { current.graph.id = "graph:other"; } },
     { code: "record_forged", change: (_store, current) => { current.graph.hash = "0".repeat(64); } },
     { code: "record_missing", change: (_store, current) => { current.graph.revision = 99999; } },
+    { code: "horizon_refinement_unproven", change: (store, current) => {
+      const phase = store.get<Record<string, unknown>>(current.refinement!.id)!;
+      current.refinement = reference(store.write({ id: phase.id, kind: phase.kind, expected: phase.revision,
+        value: { ...phase.value, status: "accepted", phase: "R0" } }));
+    } },
+    { code: "horizon_refinement_unproven", field: "layerProofs", change: (store, current) => {
+      const phase = store.get<{ layer: Ref; inputs: Ref[] }>(current.refinement!.id)!;
+      const layer = store.get<Record<string, unknown>>(phase.value.layer.id)!;
+      const r1 = phase.value.inputs.find(ref => ref.id === "phase:garden:R1");
+      assert.ok(r1);
+      const withoutProofs = store.write({ id: layer.id, kind: layer.kind, expected: layer.revision,
+        value: { ...layer.value, layerProofs: [], obligations: [], inputs: [] } });
+      current.refinement = reference(store.write({ id: phase.id, kind: phase.kind, expected: phase.revision,
+        value: { ...phase.value, layer: reference(withoutProofs), inputs: [r1, reference(withoutProofs)] } }));
+    } },
+    { code: "horizon_refinement_unproven", change: (store, current) => {
+      const phase = store.get<{ layer: Ref; inputs: Ref[] }>(current.refinement!.id)!;
+      const layer = store.get<{ projection: Json }>(phase.value.layer.id)!;
+      const hollow = store.write({ id: layer.id, kind: layer.kind, expected: layer.revision, value: { ...layer.value,
+        layerProofs: [{ level: 2, hash: hashJson(layer.value.projection), inputs: [] }], obligations: [], inputs: [] } });
+      current.refinement = reference(store.write({ id: phase.id, kind: phase.kind, expected: phase.revision,
+        value: rebind(phase.value as unknown as Json, reference(layer), reference(hollow)) }));
+    } },
+    { code: "horizon_refinement_unproven", field: "draft", change: (store, current) => {
+      replaceResearch(store, current, value => { value['draft'] = null; });
+    } },
+    { code: "horizon_refinement_unproven", field: "contractVersion", change: (store, current) => {
+      replaceResearch(store, current, value => { delete value['contractVersion']; });
+    } },
     { code: "horizon_available_unproven", change: (store, current) => {
       const ref = current.available[producer]![data]!;
       const proof = store.get<Record<string, unknown>>(ref.id)!;
@@ -364,6 +414,41 @@ test("refused choices persist their conflict while forged namespaces, hashes and
         value: { ...proof.value, accepted: true, artifact: resultArtifact } }));
     } },
   ];
+  for (const role of ["draft", "question", "answer", "assessment", "source", "environment"] as const) cases.push({
+    code: "horizon_refinement_unproven", change: (store, current) => {
+      const phase = store.get<{ layer: Ref; inputs: Ref[] }>(current.refinement!.id)!;
+      const layer = store.get<{ layerProofs: { level: number; inputs: Ref[] }[]; obligations: { inputs: Ref[] }[]; inputs: Ref[] }>(phase.value.layer.id)!;
+      const value = clone(layer.value), proof = value.layerProofs.find(item => item.level === 2)!;
+      const draft = proof.inputs.map(ref => store.get<{ consumer: string; fields: Record<string, Json>; questions: string[] }>(ref.id, ref.revision)!)
+        .find(record => record.kind === "discovery-draft" && record.value.consumer === "garden-product" && record.value.fields['layerDesign'])!;
+      const question = store.get<{ answer: Ref }>(draft.value.questions[0]!)!;
+      const answer = store.get<{ assessment: Ref }>(question.value.answer.id, question.value.answer.revision)!;
+      const assessment = store.get<{ observations: { source: Ref }[]; environment: Ref }>(answer.value.assessment.id, answer.value.assessment.revision)!;
+      if (role === "environment") {
+        const changedAssessment = store.write({ id: assessment.id, kind: assessment.kind, expected: assessment.revision,
+          value: { ...assessment.value, environment: { ...assessment.value.environment, revision: 99999 } } });
+        const changedAnswer = store.write({ id: answer.id, kind: answer.kind, expected: answer.revision,
+          value: { ...answer.value, assessment: reference(changedAssessment) } });
+        const changedQuestion = store.write({ id: question.id, kind: question.kind, expected: question.revision,
+          value: { ...question.value, answer: reference(changedAnswer) } });
+        const replacements = [[assessment, changedAssessment], [answer, changedAnswer], [question, changedQuestion]] as const;
+        const replace = (body: Json) => replacements.reduce((previous, [from, to]) => rebind(previous, reference(from), reference(to)), body);
+        const revised = store.write({ id: layer.id, kind: layer.kind, expected: layer.revision, value: replace(layer.value as unknown as Json) });
+        current.refinement = reference(store.write({ id: phase.id, kind: phase.kind, expected: phase.revision,
+          value: rebind(replace(phase.value as unknown as Json), reference(layer), reference(revised)) }));
+        return;
+      }
+      const removed = { draft: reference(draft), question: reference(question), answer: reference(answer),
+        assessment: reference(assessment), source: assessment.value.observations[0]!.source }[role];
+      assert.ok(proof.inputs.some(ref => canonical(ref) === canonical(removed)), role);
+      proof.inputs = proof.inputs.filter(ref => canonical(ref) !== canonical(removed));
+      value.inputs = [...new Map([...value.layerProofs.flatMap(item => item.inputs), ...value.obligations.flatMap(item => item.inputs)]
+        .map(ref => [canonical(ref), ref])).values()];
+      const revised = store.write({ id: layer.id, kind: layer.kind, expected: layer.revision, value });
+      current.refinement = reference(store.write({ id: phase.id, kind: phase.kind, expected: phase.revision,
+        value: rebind(phase.value as unknown as Json, reference(layer), reference(revised)) }));
+    },
+  });
   for (const [index, entry] of cases.entries()) {
     const store = copyStore(f, snapshot.path, `bad-${index}`);
     try {
@@ -376,8 +461,8 @@ test("refused choices persist their conflict while forged namespaces, hashes and
         assert.equal(writing.at.field, entry.field);
       }
       assert.deepEqual(revisions(store), before);
-      assert.equal(store.get(`horizon:${current.project}:${current.choice.choiceVersion}`), null);
-      assert.equal(store.get(`om-horizon:${current.project}:${current.choice.choiceVersion}`), null);
+      assert.equal(store.list("horizon").length, 0);
+      assert.equal(store.list("om-horizon").length, 0);
     } finally { store.close(); }
   }
 });
@@ -385,7 +470,6 @@ test("refused choices persist their conflict while forged namespaces, hashes and
 test("new and existing horizon preparations guard sources, graph, refinement and receipts without partial neighbor writes", async t => {
   const { f, req } = await storedFixture(t);
   const snapshot = await f.store.snapshot(join(f.root, "guarded-horizon-template"));
-  const initialHorizons = f.store.list("horizon").length, initialGates = f.store.list("om-horizon").length;
   const dependencies = [
     { ref: reference(f.store.get("source:garden:brief")!), code: "stage_not_accepted" },
     { ref: req.graph, code: "input_stale" },
@@ -414,8 +498,8 @@ test("new and existing horizon preparations guard sources, graph, refinement and
         assert.deepEqual(delivered(writeHorizon(store, req)), saved);
         assert.deepEqual(delivered(readHorizon(store, f.project, reference(saved.gate))), saved);
       } else refusedAs(writeHorizon(store, req), dependency.code);
-      assert.equal(store.list("horizon").length, initialHorizons + (mode === "existing" ? 1 : 0));
-      assert.equal(store.list("om-horizon").length, initialGates + (mode === "existing" ? 1 : 0));
+      assert.equal(store.list("horizon").length, mode === "existing" ? 1 : 0);
+      assert.equal(store.list("om-horizon").length, mode === "existing" ? 1 : 0);
     } finally { store.close(); }
   }
 });
@@ -464,52 +548,4 @@ test("stored horizon readers rederive exact sources and all public boundaries pr
       assert.deepEqual(revisions(f.store), before);
     } finally { f.store.get = originalGet; }
   }
-});
-
-
-test("LG13 horizon rejects graph v1 and missing versions at its pure boundary", () => {
-  for (const version of [1, undefined, 3]) {
-    const graph = { ...upper(), version } as Graph;
-    assert.throws(() => closeHorizon(graph, options()), malformed);
-    assert.throws(() => gateHorizon(graph, options(), clone(closeHorizon(upper(), options())) as HorizonBuildResult), malformed);
-  }
-});
-
-test("LG13 stored horizons require OM N2 and complete receipt plan/run references, including replay", async t => {
-  const { f, req } = await storedFixture(t);
-  assert.equal(f.store.get("phase:garden:L2"), null, "the fixture accepts OM N2 without a research phase");
-  const saved = delivered(writeHorizon(f.store, req));
-  const oldRef = { id: "phase:garden:L2", revision: 1, hash: "0".repeat(64) };
-  const oldRequest = { ...req, refinement: oldRef, choice: { ...req.choice, choiceVersion: "removed-refinement" } };
-  for (const action of [prepareHorizon, writeHorizon]) {
-    const before = revisions(f.store);
-    refusedAs<unknown>(action(f.store, oldRequest), "horizon_refinement_unproven");
-    assert.deepEqual(revisions(f.store), before);
-  }
-  // Negative stored-form fixture: a matching address and a self-consistent Ref do not restore the removed route.
-  const badHorizon = f.store.write({ id: "horizon:garden:removed-refinement", kind: "horizon", expected: 0,
-    value: { ...saved.horizon.value, request: oldRequest } });
-  const badGate = f.store.write({ id: "om-horizon:garden:removed-refinement", kind: "om-horizon", expected: 0,
-    value: { ...saved.gate.value, choiceVersion: "removed-refinement", horizon: reference(badHorizon) } });
-  refusedAs(readHorizon(f.store, f.project, reference(badGate)), "horizon_refinement_unproven");
-  refusedAs(prepareHorizon(f.store, oldRequest), "horizon_refinement_unproven");
-  refusedAs(writeHorizon(f.store, oldRequest), "horizon_refinement_unproven");
-  for (const field of ["plan", "run"] as const) for (const value of [undefined, null, { id: "claim" }]) {
-    const source = f.store.get<Record<string, Json>>(f.receipts[data]!.id)!;
-    const body = { ...f.receipts[data]!.value } as unknown as Record<string, Json>;
-    if (value === undefined) delete body[field]; else body[field] = value;
-    const broken = f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: body });
-    const request = { ...req, choice: { ...req.choice, choiceVersion: `receipt-${field}-${source.revision}` },
-      available: { [producer]: { [data]: reference(broken) } } };
-    for (const action of [prepareHorizon, writeHorizon]) {
-      const before = revisions(f.store);
-      refusedAs<unknown>(action(f.store, request), "horizon_available_unproven");
-      assert.deepEqual(revisions(f.store), before);
-    }
-  }
-  const source = f.store.get<Graph>(req.graph.id)!;
-  const graph = f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: { ...source.value, version: 1 } });
-  const request = { ...req, graph: reference(graph), available: {}, choice: { ...req.choice, choiceVersion: "removed-graph" } };
-  refusedAs(prepareHorizon(f.store, request), "horizon_unclosed");
-  refusedAs(writeHorizon(f.store, request), "horizon_unclosed");
 });

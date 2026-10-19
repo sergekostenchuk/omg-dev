@@ -2,9 +2,11 @@ import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
@@ -16,6 +18,7 @@ import { ProductEngine } from '../src/product/engine.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
 import { writeOmInput } from '../src/om/input.js';
 import { writeHorizon } from '../src/om/horizon.js';
+import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeRoutes, type RoutesRecord } from '../src/om/routes.js';
 import { writeGuarded } from '../src/om/refs.js';
@@ -405,15 +408,24 @@ test('question ordering reads real M5 and M6 consumer groups once without multip
 });
 
 test('an explicit empty model batch set from complete M5 and M6 selects no questions without treating missing routes as empty', async t => {
-  const f = await createOmFixture(t, 'standard', project, { mode: 'executed' }), graph = reference(f.graphRevision);
-  const input = f.store.get<{ gaps: { code: string }[] }>(`om-input:${project}`)!;
-  assert.ok(input.value.gaps.every(gap => gap.code === 'inventory_missing'), 'The native fixture already completed M5 addressing');
+  const f = await createOmFixture(t), graph = reference(f.graphRevision);
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref>;
+  const base = ok(writeOmInput(f.store, { project, expected: 0, stages }));
+  const decisions = base.value.gaps.filter(gap => gap.code !== 'inventory_missing').map(gap => {
+    assert.ok(['contract_node_unbound', 'acceptance_kind_missing', 'contract_boundary_prose'].includes(gap.code), gap.code);
+    const field = gap.code === 'contract_node_unbound' ? 'nodes' : gap.code === 'acceptance_kind_missing' ? 'checkKind' : 'state';
+    const value: Json = field === 'nodes' ? [producer,consumer] : field === 'checkKind' ? 'test'
+      : { writer: producer, authority: 'garden-user', rollback: producer };
+    return { pending: clone(inputDecisionWrite({ project, input: reference(base), graph, layers: [],
+      decision: { target: gap.target, field, value } })) as Write };
+  });
+  const input = ok(writeAddressing(f.store, { project, input: reference(base), graph, decisions }));
   const horizon = ok(writeHorizon(f.store, { project, input: reference(input), graph,
-    refinement: reference(f.layers[2]), available: {},
+    refinement: reference(f.store.get('phase:garden:L2')!), available: {},
     choice: { choiceVersion: 'queue-complete-model-work', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const frame = (level: 2 | 3) => ({ proposals: [], frame: { project, level, graph,
-    horizon: reference(horizon.gate), layer: reference(f.layers[level]), frame: reference(f.store.get(`om-frame:${project}:${level}`)!),
-    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: reference(f.store.get(`om-frame:${project}:2`)!) } } });
+    horizon: reference(horizon.gate), layer: reference(f.layers[level]), frame: null,
+    upper: level === 2 ? null : { horizon: reference(horizon.gate), frame: null } } });
   const gaps = ok(writeGaps(f.store, { project, input: reference(input), graph, horizon: reference(horizon.gate),
     operations: frame(2), works: frame(3) }));
   const routes = ok(writeRoutes(f.store, { project, gaps: { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) },
@@ -488,6 +500,50 @@ test('a sole saved queue establishes missing B1 provenance for fsck and the inte
     assert.equal(integrityGate(alone, project)?.ok, false);
     const path = alone.path; alone.close(); alone = new Store(path);
   }
+});
+
+test('the whole b1143aa producer retains its pre-B1 projection and saved bytes under the new queue era', t => {
+  const base = 'b1143aa7343db45896a134ee3cb3a273b211057e', root = mkdtempSync(join(tmpdir(), 'omg-queue-history-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
+  const run = (command: string, args: string[], cwd: string) => {
+    const child = spawnSync(command, args, { cwd, env: environment, encoding: 'utf8', timeout: 90_000, maxBuffer: 20_000_000 });
+    assert.equal(child.error, undefined, child.error?.message);
+    assert.equal(child.status, 0, `${command} ${args.join(' ')}\n${child.stdout}\n${child.stderr}`);
+    return child.stdout;
+  };
+  const repository = run('git', ['rev-parse', '--show-toplevel'], dirname(fileURLToPath(import.meta.url))).trim();
+  const legacy = join(root, 'base'), archive = join(root, 'base.tar'); mkdirSync(legacy);
+  run('git', ['archive', '--format=tar', '--output', archive, base], repository);
+  run('tar', ['-xf', archive, '-C', legacy], root);
+  symlinkSync(join(repository, 'node_modules'), join(legacy, 'node_modules'), 'dir');
+  writeFileSync(join(legacy, 'tsconfig.queue-history.json'), JSON.stringify({ extends: './tsconfig.json',
+    include: ['src/**/*.ts', 'test/om-fixture.ts', 'test/product-fixture.ts'], exclude: [] }));
+  run(process.execPath, [join(legacy, 'node_modules/typescript/bin/tsc'), '-p', 'tsconfig.queue-history.json'], legacy);
+  const path = join(root, 'old.sqlite'), output = join(root, 'old.json'), script = join(legacy, 'old-producer.mjs');
+  writeFileSync(script, `
+import {writeFileSync} from 'node:fs';
+import {Store} from './dist/src/storage/store.js';
+import {ProductEngine} from './dist/src/product/engine.js';
+import {projectGraph} from './dist/src/graph/project.js';
+import {preparedFeatures} from './dist/test/product-fixture.js';
+import {gardenGraph} from './dist/test/om-fixture.js';
+const store=new Store(process.argv[2]),engine=new ProductEngine(store),project='garden';
+const {level,...upper}=projectGraph(gardenGraph(),1);preparedFeatures(engine,project,upper);
+writeFileSync(process.argv[3],JSON.stringify({view:engine.projection(project),rows:store.list().flatMap(row=>store.history(row.id))}));
+store.close();
+`);
+  run(process.execPath, [script, path, output], legacy);
+  const old = JSON.parse(readFileSync(output, 'utf8')) as { view: ReturnType<ProductEngine['projection']>; rows: Revision[] };
+  let store = new Store(path);
+  try {
+    for (let pass = 0; pass < 2; pass++) {
+      assert.equal(store.get(`om-input:${project}`), null);
+      assert.deepEqual(new ProductEngine(store).projection(project), old.view);
+      assert.deepEqual(snapshots(store), old.rows);
+      store.close(); store = new Store(path);
+    }
+  } finally { store.close(); }
 });
 
 test('ordinary project text that resembles a queue address does not establish OM provenance', t => {
@@ -672,6 +728,56 @@ test('late admission cannot replace missing H, B1, policy or required exact upst
   assert.equal(canonical(snapshots(f.store)), before);
 });
 
+test('frame availability and explicit upper checks stay current while only M3 rechecks the main research refinement', async t => {
+  const f = await createOmFixture(t), graph = reference(f.graphRevision);
+  const input = ok(writeOmInput(f.store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const refinement = f.store.get('phase:garden:L2')!, receipt = f.receipts['garden-data']!;
+  const horizon = ok(writeHorizon(f.store, { project, input: reference(input), graph, refinement: reference(refinement),
+    available: { [producer]: { 'garden-data': reference(receipt) } },
+    choice: { choiceVersion: 'queue-available', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const layer = (f.stages['operation-map'].value.content as unknown as { graph: Ref }).graph;
+  const request: QueueRequest = { project, horizon: reference(horizon.gate), policy: policy(f.graph, layer), override: null };
+  const queue = ok(writeBlockQueue(f.store, request));
+  const operations: FrameRequest = { project, level: 2, graph, horizon: reference(horizon.gate),
+    layer: reference(f.layers[2]), frame: null, upper: null };
+  const works: FrameRequest = { project, level: 3, graph, horizon: reference(horizon.gate),
+    layer: reference(f.layers[3]), frame: null, upper: { horizon: reference(horizon.gate), frame: null } };
+  const originalFrame = ok(readFrame(f.store, operations));
+  const originalWorks = ok(readFrame(f.store, { ...works, workZoneContract: 'accepted-l2-v1' }));
+  const currentFrame = ok(prepareFrame(f.store, operations));
+  ok(prepareFrame(f.store, works));
+  const currentQueue = ok(prepareBlockQueue(f.store, { ...request, override: { order: [consumer], reason: 'Single remaining consumer' } }));
+  for (const prepared of [currentFrame, currentQueue])
+    assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(receipt))), 'The declared available receipt is a current dependency');
+  assert.equal(currentFrame.guards.some(guard => canonical(guard) === canonical(reference(refinement))), false,
+    'The main H refinement remains historical unless it is explicitly required as an upper witness');
+  assert.ok(currentQueue.guards.some(guard => canonical(guard) === canonical(reference(refinement))),
+    'M3 retains its own research-refinement freshness requirement');
+  // Advance the exact real fact's head without changing its saved content; no new acceptance is asserted.
+  const other = new Store(f.database);
+  try { other.write({ id: refinement.id, kind: refinement.kind, expected: refinement.revision, value: refinement.value }); }
+  finally { other.close(); }
+  ok(prepareFrame(f.store, operations));
+  const upperFailure = refusedWith(prepareFrame(f.store, works), 'frame_basis_unproven');
+  assert.equal(upperFailure.at.target, refinement.id, 'The current upper-layer gate keeps the original refinement address');
+  refusedWith(prepareBlockQueue(f.store, { ...request, override: { order: [consumer], reason: 'Reordered after refinement changed' } }), 'input_stale');
+  f.reopen();
+  ok(prepareFrame(f.store, operations));
+  const exact = new ExactOnlyStore(f.database);
+  try {
+    assert.deepEqual(ok(readBlockQueue(exact, { project, record: reference(queue) })), queue);
+    assert.deepEqual(ok(readFrame(exact, operations)), originalFrame);
+    assert.deepEqual(ok(readFrame(exact, { ...works, workZoneContract: 'accepted-l2-v1' })), originalWorks);
+  } finally { exact.close(); }
+  const receiptWriter = new Store(f.database);
+  try { receiptWriter.write({ id: receipt.id, kind: receipt.kind, expected: receipt.revision, value: receipt.value }); }
+  finally { receiptWriter.close(); }
+  refusedWith(prepareFrame(f.store, operations), 'input_stale');
+  assert.deepEqual(ok(readFrame(f.store, operations)), originalFrame);
+});
+
+
 test('queue and common horizon admission reject graph-only upper drift while the exact accepted L1, H and B1 stay unchanged', t => {
   const f = fixture(t), saved = ok(writeBlockQueue(f.store, f.request)), changed = clone(f.graph.value);
   changed.nodes.find(node => node.id === producer)!.title += ' differs from the retained accepted upper';
@@ -728,14 +834,4 @@ test('concurrent creation of the same prepared queue preserves its CAS and leave
   assert.equal(f.store.get('queue-target-cas-neighbor'), null);
   assert.deepEqual(f.store.get(prepared.record.id), concurrent);
   assert.deepEqual(ok(writeBlockQueue(f.store, f.request)), concurrent);
-});
-
-
-test('LG13 queue refuses a graph without version 2 instead of interpreting it as the old upper layer', () => {
-  for (const version of [1, undefined, 3]) {
-    const graph = upper();
-    if (version === undefined) delete (graph as Partial<Graph>).version; else graph.version = version as Graph["version"];
-    const rejected = refusedWith(computeBlockWeights(graph, [producer, consumer], policy(upper())), 'queue_source_invalid');
-    assert.equal(rejected.at.field, 'version');
-  }
 });

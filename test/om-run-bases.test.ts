@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { Evidence } from "../src/evidence/evidence.js";
 import { tmpdir } from "node:os";
@@ -10,10 +10,10 @@ import { EngineError } from "../src/errors.js";
 import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { Refinement } from "../src/graph/refinement.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { beginLegacyOperation } from "../src/product/preparation-run.js";
 import { processStart } from "../src/runtime/process-identity.js";
+import { git } from "../src/runtime/environment.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { applySeriesActivation, beginAttempt, openSeries } from "../src/om/series.js";
@@ -25,9 +25,12 @@ import { readBlockQueue } from "../src/om/queue.js";
 import type { RoutesRecord } from "../src/om/routes.js";
 import { readRun, startRun } from "../src/om/run.js";
 import { FACT_RESULT_FORM, RUN_BASES_POLICY, prepareRunBases, writeRunBases, type BuiltRunBases } from "../src/om/run-bases.js";
-import { gardenGraph, createOmFixture } from "./om-fixture.js";
+import { gardenGraph } from "./om-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
+import { deriveLayerFixture } from "./layer-design-fixture.js";
+import { answerTechnicalFixture } from "./technical-research-fixture.js";
+import type { LayerBasis } from "../src/om/layer-basis.js";
 import { prepareAtomicGate, prepareCandidateSources, type AtomicGateRequest } from "../src/om/atomic-gate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
@@ -39,7 +42,7 @@ import { writeOmInput } from "../src/om/input.js";
 import { writeNeighbors } from "../src/om/neighbors.js";
 import { writeOmObligations } from "../src/om/obligations.js";
 import { writeWorksFrame } from "../src/om/works-frame.js";
-import { preparedFeatures } from "./product-fixture.js";
+import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
 const project = "garden";
@@ -56,10 +59,10 @@ const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 
 /**
  * A cold OM project: accepted stages and graph, no OM record yet. `later` adds an independent second outcome with its
- * own successful journey (as in om-series-current).
+ * own successful journey (as in om-series-current); `refine` accepts the research layers up to L2.
  */
-function basesFixture(t: test.TestContext, options: { questions?: string[]; later?: boolean; consumers?: Record<string, string> } = {}) {
-  const { questions = ["encoding"], later = false, consumers = {} } = options;
+function basesFixture(t: test.TestContext, options: { questions?: string[]; refine?: boolean; refineTo?: 2 | 3; later?: boolean; consumers?: Record<string, string> } = {}) {
+  const { questions = ["encoding"], refine = false, refineTo, later = false, consumers = {} } = options;
   const root = mkdtempSync(join(tmpdir(), "omg-h11-bases-")), database = join(root, "state.sqlite");
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -100,6 +103,22 @@ function basesFixture(t: test.TestContext, options: { questions?: string[]; late
     return value;
   };
   preparedFeatures(engine, project, graphData, valueFor);
+  if (refine || refineTo !== undefined) {
+    const command = { executable: process.execPath, args: ["--version"] }, workspace = join(root, "repo");
+    mkdirSync(workspace); git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "H1.1 bases repository\n");
+    git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
+    engine.environments.configure(project, { workspace, implementer: { actor: "bases-implementer", model: "fixture", effort: "high", command },
+      reviewer: { actor: "bases-reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 5000, requestCapacityChars: 100_000 }, 0);
+    if (refineTo === undefined) refinedLayers(engine, project);
+    else for (const [level, layer] of [["R0", 1], ["R1", 2]] as const) {
+      const draft = engine.refinement.begin(project, level);
+      if (level !== "R0") answerTechnicalFixture(engine, project, draft);
+      const current = engine.store.get(draft.id)!;
+      engine.refinement.finishResearch(project, level, reference(current), 0);
+      if (layer !== 1) deriveLayerFixture(engine, project, layer);
+      engine.refinement.sealLayer(project, layer, 0);
+    }
+  }
   return { root, database, valueFor, get store() { return store; }, get engine() { return engine; },
     restart() { store.close(); store = new Store(database); engine = new ProductEngine(store); } };
 }
@@ -264,14 +283,20 @@ test("R21 STALE-1 H1.1 a newly accepted upstream stage under a derived B1 is inp
   assert.equal(built.input.revision, addressed.revision);
 });
 
-test("№1860-2 R6 H1.1 D1 without accepted OM N2 retains the unaccepted upper representation", t => {
+test("№1860-2 R6 H1.1 D1 stands on the lawful upper representation: no refinement, or the accepted research L2", t => {
   const f = basesFixture(t);
   const cold = ok(writeRunBases(f.store, { project }));
   const plain = routesOf(f.store, cold).value.request.gaps.sources;
   assert.deepEqual(plain.works, { state: "upper-not-accepted", layer: reference(f.store.get(`graph-layer:${project}:2`)!) });
   assert.equal((plain.operations.frame as { layer: Ref | null }).layer, null);
   assert.equal(horizonOf(f.store, cold).value.request.refinement, null);
-
+  const g = basesFixture(t, { refine: true });
+  const refined = ok(writeRunBases(g.store, { project }));
+  assert.deepEqual(horizonOf(g.store, refined).value.request.refinement, reference(g.store.get(`phase:${project}:L2`)!));
+  const sources = routesOf(g.store, refined).value.request.gaps.sources as unknown as { operations: { frame: Record<string, unknown> };
+    works: { frame: Record<string, unknown> } };
+  assert.deepEqual(sources.operations.frame.layer, reference(g.store.get(`graph-layer:${project}:2`)!));
+  assert.deepEqual(sources.works.frame.upper, { horizon: refined.bases.horizon, frame: null }, "Works of an accepted research L2 are a level-three frame");
 });
 
 test("R20 H1.1 a legacy project stays legacy: the machine writes no membership, transition, issuance or activation", t => {
@@ -592,33 +617,101 @@ test("R19 №1937-3 H1.1 a second store opening work between the builder's admis
 });
 
 /** An L3 derivation left unsealed on purpose (№2157 line 3): R2 finished, deriveLayer done, no sealLayer(3). */
+function deriveUnsealedL3(engine: ProductEngine, project: string) {
+  const draft = engine.refinement.begin(project, "R2");
+  answerTechnicalFixture(engine, project, draft);
+  engine.refinement.finishResearch(project, "R2", reference(engine.store.get(draft.id)!), 0);
+  deriveLayerFixture(engine, project, 3);
+}
+const worksFrameOf = (store: Store, built: BuiltRunBases) =>
+  (routesOf(store, built).value.request.gaps.sources as unknown as { works: { frame: { level: number; layer: Ref | null; frame: Ref | null; upper: unknown } } }).works.frame;
+const layerProofLevels = (store: Store) =>
+  (store.get<LayerBasis>(`graph-layer:${project}:3`)!.value.layerProofs ?? []).map(proof => proof.level);
 
+test("H1.4 №2157-1 L2 accepted, L3 a shell with inherited proofs only: the build reaches D1/M6/C1 and the level-3 work stays open; repeats and a new store write nothing", t => {
+  const f = basesFixture(t, { refineTo: 2 });
+  assert.deepEqual(layerProofLevels(f.store), [2], "the shell carries only the inherited L2 proof");
+  assert.equal(f.store.get(`phase:${project}:L3`), null);
+  const built = ok(writeRunBases(f.store, { project }));
+  const works = worksFrameOf(f.store, built);
+  assert.equal(works.level, 3);
+  assert.deepEqual([works.layer, works.frame], [null, null], "an unaccepted shell never fills the level-3 slot");
+  assert.deepEqual(works.upper, { horizon: built.bases.horizon, frame: null }, "the accepted L2 horizon stays the upper basis");
+  assert.ok(f.store.get(built.bases.routes.id) && f.store.get(built.bases.queue.id), "D5/M6 and C1 are built");
+  assert.ok(f.store.list("gap").length > 0, "D1 is written with the level-3 work open");
+  const before = heads(f.store);
+  ok(writeRunBases(f.store, { project }));
+  assert.deepEqual(heads(f.store), before, "a repeat on the same bases writes nothing");
+  f.restart();
+  ok(writeRunBases(f.store, { project }));
+  assert.deepEqual(heads(f.store), before, "a new store on the same bases writes nothing");
+});
 
-test("LG13 OM N2/N3 bases use accepted frames, call zero research gates and retain exact replay after restart", async t => {
-  for (const mode of ["n2", "executed"] as const) await t.test(mode, async sub => {
-    const f = await createOmFixture(sub, "standard", project, { mode });
-    assert.equal(f.store.get(`phase:${project}:L2`), null);
-    const original = Refinement.prototype.gate;
-    let calls = 0;
-    Refinement.prototype.gate = function (...args) { calls++; return original.apply(this, args); };
-    sub.after(() => { Refinement.prototype.gate = original; });
-    const built = ok(writeRunBases(f.store, { project }));
-    const horizon = horizonOf(f.store, built);
-    assert.deepEqual(horizon.value.request.refinement, reference(f.layers[2]));
-    const scope = routesOf(f.store, built).value.request.gaps.sources as unknown as {
-      operations: { frame: { layer: Ref; frame: Ref } }; works: { frame: { layer: Ref | null; frame: Ref | null; upper: unknown } } };
-    const n2 = reference(f.store.get(`om-frame:${project}:2`)!);
-    assert.deepEqual(scope.operations.frame.layer, reference(f.layers[2]));
-    assert.deepEqual(scope.operations.frame.frame, n2);
-    assert.deepEqual(scope.works.frame.upper, { horizon: built.bases.horizon, frame: n2 });
-    assert.deepEqual(scope.works.frame.layer, mode === "n2" ? null : reference(f.layers[3]));
-    assert.deepEqual(scope.works.frame.frame, mode === "n2" ? null : reference(f.store.get(`om-frame:${project}:3`)!));
-    const before = heads(f.store);
-    assert.deepEqual(ok(writeRunBases(f.store, { project })), built);
-    assert.deepEqual(heads(f.store), before);
-    f.reopen();
-    assert.deepEqual(ok(writeRunBases(f.store, { project })), built);
-    assert.deepEqual(heads(f.store), before);
-    assert.equal(calls, 0, "horizon, D1 and queue do not call Refinement.gate on the OM path");
-  });
+test("H1.4 №2157-2 L2 and L3 both accepted: the previous accepted layer and the result are preserved", t => {
+  const f = basesFixture(t, { refine: true });
+  const built = ok(writeRunBases(f.store, { project }));
+  const works = worksFrameOf(f.store, built);
+  assert.deepEqual(works.layer, reference(f.store.get(`graph-layer:${project}:3`)!), "the accepted layer keeps the level-3 slot");
+  assert.equal(works.frame, null);
+  assert.deepEqual(works.upper, { horizon: built.bases.horizon, frame: null });
+  const before = heads(f.store);
+  ok(writeRunBases(f.store, { project }));
+  assert.deepEqual(heads(f.store), before, "a repeat writes nothing");
+});
+
+test("H1.4 №2157-3 L3 derived through deriveLayer before phase:L3 is published: the legitimate own proof is not lost", t => {
+  const f = basesFixture(t, { refineTo: 2 });
+  deriveUnsealedL3(f.engine, project);
+  assert.equal(f.store.get(`phase:${project}:L3`), null, "no L3 phase is published yet");
+  assert.ok(layerProofLevels(f.store).includes(3), "the derivation left its own level-3 proof");
+  const built = ok(writeRunBases(f.store, { project }));
+  assert.deepEqual(worksFrameOf(f.store, built).layer, reference(f.store.get(`graph-layer:${project}:3`)!),
+    "the proven layer fills the level-3 slot without a published phase");
+});
+
+test("H1.4 №2157-4 an accepted L3 stale by its own bases is an addressed refusal, never turned into open work", t => {
+  const f = basesFixture(t, { refine: true });
+  const built = ok(writeRunBases(f.store, { project }));
+  assert.deepEqual(worksFrameOf(f.store, built).layer, reference(f.store.get(`graph-layer:${project}:3`)!));
+  const d1 = heads(f.store).filter(ref => ref.id.startsWith("om-gap:"));
+  // The layer's own R2 basis moves through a lawful new research result: the accepted layer goes stale.
+  const draft = f.engine.refinement.begin(project, "R2");
+  answerTechnicalFixture(f.engine, project, draft);
+  f.engine.refinement.finishResearch(project, "R2", reference(f.store.get(draft.id)!), 1);
+  const lost = refusal(writeRunBases(f.store, { project }));
+  assert.deepEqual([lost.code, lost.at.target, lost.at.field], ["frame_basis_unproven", `phase:${project}:R2`, "graph_evidence_stale"],
+    "the common acceptance derivation refuses with the original address");
+  assert.deepEqual(heads(f.store).filter(ref => ref.id.startsWith("om-gap:")), d1, "no open-work D1 is written instead");
+});
+
+test("H1.4 №2157-5 a level-3 derivation between the choice and the D1 write loses the guard; the whole chain is derived again", t => {
+  const f = basesFixture(t, { refineTo: 2 });
+  let raced = false;
+  class Race extends Store {
+    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
+      if (!raced && writes.some(write => write.kind === "gap")) {
+        raced = true;
+        const other = new Store(f.database);
+        try { deriveUnsealedL3(new ProductEngine(other), project); } finally { other.close(); }
+      }
+      return super.writeMany<T>(writes, guards);
+    }
+  }
+  const race = new Race(f.database);
+  t.after(() => race.close());
+  const built = ok(writeRunBases(race, { project }));
+  assert.ok(raced, "the second store derived L3 right before the D1 write");
+  assert.deepEqual(worksFrameOf(race, built).layer, reference(race.get(`graph-layer:${project}:3`)!),
+    "the lost guard re-derived the chain onto the proven layer");
+});
+
+test("H1.4 №2157-3 a sealed L3 whose head moved without a new phase is the addressed run_bases_basis_stale", t => {
+  const f = basesFixture(t, { refine: true });
+  const sealedHead = reference(f.store.get(`graph-layer:${project}:3`)!);
+  assert.ok(f.store.get(`phase:${project}:L3`));
+  // A new derivation moves the level-3 head; the published phase still names the sealed one.
+  deriveLayerFixture(f.engine, project, 3);
+  assert.notDeepEqual(reference(f.store.get(`graph-layer:${project}:3`)!), sealedHead, "the head moved without a new phase");
+  const lost = refusal(writeRunBases(f.store, { project }));
+  assert.deepEqual([lost.code, lost.at.target, lost.at.field], ["run_bases_basis_stale", `phase:${project}:L3`, "layer"]);
 });
