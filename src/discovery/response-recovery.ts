@@ -43,14 +43,15 @@ import { readModelCallRecovery, readLateModelReceipt, recoverModelCall, executio
 import { stopCancelledCall, liftedStop } from '../om/run-control.js';
 import { isResearchPreview } from './research-preview.js';
 import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply,
-  isReservationOnlySessionStep, admittedResearchAction, responseAction, webResearchCapability, earlyUnknownEra, EARLY_UNKNOWN,
+  isReservationOnlySessionStep, turnAction, responseAction, webResearchCapability, earlyUnknownEra, EARLY_UNKNOWN,
   projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
   projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
   projectAddressedWorkspace, projectResearchTurnRevision, projectSourceReadingTurn, isCorrectableLayerDesignFailure,
   managedTurnId, matchAcceptedPaidAnswer, ACTION_RESPONSE_REFUSAL_CODES,
   acceptanceBindingId, acceptanceEraOf, projectAcceptanceBinding,
-  ACCEPTANCE_BINDING_CONTRACT, ACCEPTANCE_BINDING_FIELDS,
+  ACCEPTANCE_BINDING_CONTRACT, ACCEPTANCE_BINDING_FIELDS, attemptEraOf, projectAttemptBinding,
+  type AttemptTurnInputs,
   type SynthesisSessionState, type SynthesisTransitionInput,
   type ManagedResearchTurn, type TurnTransitionProof, type LayerDesignRefusalProof,
   type AcceptedPaidAnswerInputs, type ResearchAcceptanceBinding,
@@ -62,6 +63,10 @@ import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queuedChildReached } from './reading-plan.js';
 import { paidOriginId, paidSessionId, limitedAssessmentRetryScope } from './assessment-session.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
+import { ATTEMPT_BINDING_CONTRACT, ATTEMPT_BINDING_FIELDS, ATTEMPT_BINDING_KIND, addressedQuestionId, attemptBindingId,
+  callAddressesSubject, planSubjectOf, sameSubject, type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
+import { proveAttempt, provePlanQuestions, type V7Attempt } from './v7-plan-questions.js';
+import { V7_CONTRACT_ERA } from './v7-contracts.js';
 
 export interface ResponseRecovery {
   projectId: string; declaredBy: string; call: Ref; request: Ref; response: Ref; archive: Ref;
@@ -170,6 +175,9 @@ function sameLogicalConsumerStep(a: ResearchConsumerIntent, b: ResearchConsumerI
   if (a.projectId !== b.projectId || a.kind !== b.kind || a.rootKey !== b.rootKey
     || a.owner.id !== b.owner.id || a.draft.id !== b.draft.id || a.question.id !== b.question.id)
     return false;
+  // DR3a3-K: one Question at two plan-questions — or one plan-question id in
+  // two plan editions — is two logical steps; the subject is part of the step.
+  if (!sameSubject(cursorSubject(a), cursorSubject(b))) return false;
   if (a.kind === 'reader') return a.cursor.rootKey === b.cursor.rootKey
     && canonical(a.cursor.child) === canonical(b.cursor.child)
     && a.cursor.purpose === b.cursor.purpose;
@@ -189,6 +197,18 @@ function samePreparedSubject(store: Store, a: ResearchConsumerIntent, b: Researc
 function consumerInvalid(id: string, message: string): never {
   throw new EngineError('research_consumer_intent_invalid', `[${id}] ${message}`);
 }
+/** DR3a3-K: the attempt subject a saved intent's cursor declares (null for
+ * the field-question path). The Question basis stays intent.question. */
+function cursorSubject(intent: ResearchConsumerIntent, id = 'research-consumer-intent'): V7PlanSubject | null {
+  try { return planSubjectOf(intent.cursor); }
+  catch (error) {
+    if (error instanceof EngineError) consumerInvalid(id, error.message);
+    throw error;
+  }
+}
+/** The consumers whose application writes an original turn (O@1): the runner
+ * application and the synthesis handoff. Only these may name an attempt subject. */
+const SUBJECT_KINDS: readonly ResearchConsumerKind[] = ['analyst', 'reading-planner', 'synthesis', 'consolidation'];
 export function synthesisTurnMatches(store: Store, intent: Revision<ResearchConsumerIntent>,
   session: Revision<{ result: unknown }>, action: unknown): boolean {
   if (canonical(session.value.result) === canonical(action)) return true;
@@ -254,6 +274,8 @@ function consumerShape(value: unknown, id: string): asserts value is ResearchCon
   } else if (typeof value.cursor.run !== 'string' || value.cursor.run !== value.owner.id
     || !Number.isSafeInteger(value.cursor.turn) || value.cursor.turn <= 0)
     consumerInvalid(id, 'The runner intent lost its exact run and turn');
+  if (cursorSubject(value as ResearchConsumerIntent, id) !== null && !SUBJECT_KINDS.includes(value.kind))
+    consumerInvalid(id, 'Only a consumer that writes an original turn can name an attempt subject');
   const required = uniqueTransactionGuards([value.owner, value.draft, value.question, ...value.basis,
     ...(value.profile ? [value.profile] : [])]);
   if (!required.every(guard => value.guards.some((saved: TransactionGuard) => canonical(saved) === canonical(guard))))
@@ -328,7 +350,7 @@ function managedSearchParent(store: Store, child: Revision<Record<string, any>>)
  * historical input. */
 function readManagedSearchCompletion(store: Store, before: Revision<Record<string, any>>,
   after: Revision<Record<string, any>>, parent = managedSearchParent(store, before)) {
-  const action = admittedResearchAction(before.value.action);
+  const action = turnAction(before.value);
   if (action.action !== 'search' || after.value.status !== 'completed' || after.value.error !== null)
     consumerInvalid(before.id, 'A completed managed search lost its exact pending action');
   const captureRef = after.value.observation?.capture;
@@ -490,7 +512,7 @@ export function pinnedLayerDeltaStore(store: Store, delta: LayerDelta): Store {
 export function projectPaidLayerDesignRefusal(store: Store, producer: Revision<ResearchConsumerIntent>,
   before: Revision<Record<string, any>>, admission: 'current' | 'historical' = 'historical'):
   { proof: LayerDesignRefusalProof; turn: ManagedResearchTurn; failure: EngineError } | null {
-  const action = admittedResearchAction(before.value.action);
+  const action = turnAction(before.value);
   const delivery = producer.value.cursor.delivery;
   if ((action.action !== 'answer' && action.action !== 'answer_delta') || before.kind !== 'research-turn'
     || before.value.status !== 'pending' || hashJson(before.value) !== before.hash
@@ -571,7 +593,7 @@ export function projectPaidLayerDesignRefusal(store: Store, producer: Revision<R
       || (saved.value as ManagedResearchTurn).contract !== 'research-consumer-turn/v1') return null;
     try { readResearchConsumerTurn(store, prior); }
     catch { return null; }
-    const previousAction = admittedResearchAction(saved.value.action);
+    const previousAction = turnAction(saved.value);
     if (previousAction.action !== 'answer_delta'
       || canonical(previousAction.base) !== canonical(graphRef)) return null;
     prior = previousAction.revises;
@@ -643,7 +665,7 @@ export function readManagedProposalRefusalAt(store: Store, projectId: string, tu
     'research_proposal_refusal_invalid', `[${id}] Technical refusal belongs to another assessment`);
   const first = readResearchConsumerTurn(store, value.turn);
   const pending = readResearchConsumerTurn(store, value.pending);
-  const paid = admittedResearchAction(first.value.action);
+  const paid = turnAction(first.value);
   requireCondition(pending.value.status === 'pending' && canonical(reference(pending)) === canonical(value.pending)
     && canonical(pending.value.question) === canonical(value.question)
     && (paid.action === 'answer' || paid.action === 'answer_delta') && paid.question === question.id,
@@ -688,7 +710,7 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
   if (before.value.status !== 'pending')
     consumerInvalid(before.id, 'A completed paid turn cannot acquire another transition');
   let action: ResearchAction;
-  try { action = admittedResearchAction(before.value.action); }
+  try { action = turnAction(before.value); }
   catch { consumerInvalid(before.id, 'The original paid turn action is invalid'); }
   if (after.value.status === 'completed' && after.value.observation?.code === 'research_context_incomplete') {
     const paid = readResearchConsumerExecutionFromIntent(store, producer.value.projectId, producer);
@@ -875,6 +897,28 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
   if ((action.action === 'synthesize' || action.action === 'need_research')
     && after.value.status === 'completed' && after.value.error === null)
     return { kind: 'reading-mode' };
+  // DR3a3-K: a paid answer of the attempt era completes only through its
+  // attempt binding — never through the assessed or accepted answer branches.
+  // A missing or damaged binding is a typed refusal, never a fall-through.
+  if (attemptEraOf(before.value) === 'attempt' && action.action === 'answer'
+    && after.value.status === 'completed' && after.value.error === null) {
+    const link = (after.value as { attemptBinding?: unknown }).attemptBinding;
+    if (!isRef(link))
+      throw new EngineError('research_attempt_binding_invalid',
+        `[${before.id}] The completed attempt turn lost the link to its attempt record`,
+        { ref: { id: attemptBindingId(producer.value.projectId, before.id), revision: 1 }, reason: 'link' });
+    const proven = readResearchAttemptBinding(store, producer.value.projectId, before.id);
+    if (!proven)
+      throw new EngineError('research_attempt_binding_invalid',
+        `[${before.id}] The completed attempt turn names a missing attempt record`, { ref: link, reason: 'missing' });
+    if (canonical(reference(proven.binding)) !== canonical(link)
+      || canonical(reference(proven.pending)) !== canonical(reference(before)))
+      throw new EngineError('research_attempt_binding_invalid',
+        `[${before.id}] The completed attempt turn names another attempt record or pending revision`,
+        { ref: link, reason: 'link' });
+    return { kind: 'attempt-recorded', inputs: proven.inputs,
+      binding: { ref: reference(proven.binding), value: proven.binding.value } };
+  }
   if ((action.action === 'answer' || action.action === 'answer_delta')
     && after.value.status === 'completed') {
     const originalRef = before.value.question;
@@ -1011,7 +1055,8 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
   if (!managed) {
     if (Object.hasOwn(saved.value, 'contract') && saved.value.contract === 'research-consumer-turn/v1'
       || Object.hasOwn(saved.value, 'consumerIntent') || Object.hasOwn(saved.value, 'acceptanceContract')
-      || Object.hasOwn(saved.value, 'acceptanceBinding'))
+      || Object.hasOwn(saved.value, 'acceptanceBinding')
+      || ['attemptContract', 'subject', 'attempt', 'attemptBinding'].some(field => Object.hasOwn(saved.value, field)))
       consumerInvalid(saved.id, 'A legacy turn address cannot claim a new consumer producer');
     if (saved.value.action?.action === 'read_source' && object(saved.value.observation)
       && Object.hasOwn(saved.value.observation, 'contract')) {
@@ -1036,7 +1081,7 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
     }
     if (saved.revision > 1 && saved.value.status === 'completed') {
       const first = store.get<Record<string, any>>(saved.id, 1);
-      if (first && admittedResearchAction(first.value.action).action === 'search') {
+      if (first && turnAction(first.value).action === 'search') {
         // The completion's pending basis is the revision it directly follows —
         // after a lawful retry that is the retried pending revision (P), never
         // the stored original ref (O). Finding the managed parent from P also
@@ -1080,8 +1125,20 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
     consumerInvalid(saved.id, 'The new turn names an unknown acceptance contract');
   if (original.value.status !== 'pending' || original.value.assessment !== null
     || original.value.observation !== null || original.value.error !== null
-    || Object.hasOwn(original.value, 'acceptance') || Object.hasOwn(original.value, 'acceptanceBinding'))
+    || Object.hasOwn(original.value, 'acceptance') || Object.hasOwn(original.value, 'acceptanceBinding')
+    || Object.hasOwn(original.value, 'attempt') || Object.hasOwn(original.value, 'attemptBinding'))
     consumerInvalid(saved.id, 'The original managed turn is not a plain pending paid turn');
+  // DR3a3-K: the attempt era is the producer's own field on O@1, fixed together
+  // with the subject — both present or both absent, only the known contract.
+  // A missing or unknown marker on the new form never selects another branch.
+  if (Object.hasOwn(original.value, 'attemptContract') !== Object.hasOwn(original.value, 'subject')
+    || Object.hasOwn(original.value, 'attemptContract') && original.value.attemptContract !== ATTEMPT_BINDING_CONTRACT)
+    consumerInvalid(saved.id, 'The new turn names an unknown attempt contract or lost its attempt subject');
+  let turnSubject: V7PlanSubject | null = null;
+  if (Object.hasOwn(original.value, 'subject')) {
+    try { turnSubject = planSubjectOf({ subject: original.value.subject }); }
+    catch { consumerInvalid(saved.id, 'The new turn carries a damaged attempt subject'); }
+  }
   const originIntent = readResearchConsumerIntent(store, saved.value.consumerIntent);
   // The original turn is written either in the runner application at @3 or in
   // the synthesis handoff at @4. A later intent HEAD is not evidence for this
@@ -1093,6 +1150,8 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
         canonical(output) === canonical(reference(original))));
   if (candidates.length !== 1) consumerInvalid(saved.id, 'No unique exact applied intent revision produced this turn');
   const intent = readResearchConsumerIntent(store, reference(candidates[0]!));
+  if (!sameSubject(cursorSubject(intent.value, saved.id), turnSubject))
+    consumerInvalid(saved.id, 'The turn attempt subject differs from the subject its producing intent fixed');
   const synthesis = intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation';
   const directOutput = intent.value.outputs?.some(output => canonical(output) === canonical(reference(original))) ?? false;
   const sessionOutput = synthesis && intent.value.outputs?.find(output => output.id === intent.value.owner.id);
@@ -1118,7 +1177,9 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
       consumerIntent: value.consumerIntent, run: value.run, number: value.number,
       question: value.question, action: value.action,
       ...(Object.hasOwn(value, 'dispatchMode') ? { dispatchMode: value.dispatchMode } : {}),
-      ...(Object.hasOwn(value, 'acceptanceContract') ? { acceptanceContract: value.acceptanceContract } : {}) });
+      ...(Object.hasOwn(value, 'acceptanceContract') ? { acceptanceContract: value.acceptanceContract } : {}),
+      ...(Object.hasOwn(value, 'attemptContract') ? { attemptContract: value.attemptContract } : {}),
+      ...(Object.hasOwn(value, 'subject') ? { subject: value.subject } : {}) });
     if (canonical(immutable(after.value)) !== canonical(immutable(original.value)))
       consumerInvalid(saved.id, 'A later turn rewrote its paid action or original binding');
     const proof = historicalTurnTransitionProof(store, intent, before, after);
@@ -1230,7 +1291,9 @@ export function consumerResultCapacity(store: Store, intent: ResearchConsumerInt
   const cursor = intent.cursor, context = cursor.context;
   return researchCapacityInput({ operation: intent.key, generation: intent.generation,
     bindings: { projectId: intent.projectId, draft: intent.draft, question: intent.question,
-      inputsHash: hashJson(draft.value.inputs), basis: intent.basis, owner: intent.owner },
+      inputsHash: hashJson(draft.value.inputs), basis: intent.basis, owner: intent.owner,
+      // DR3a3-K: two plan-questions of one plan Question never share a declaration.
+      ...(cursorSubject(intent) ? { subject: cursorSubject(intent) } : {}) },
     role: ['synthesis', 'consolidation'].includes(intent.kind) ? 'synthesizer'
       : intent.kind === 'escalation-assessor' ? 'assessor' : 'analyst',
     purpose: intent.kind, actionMode: intent.kind === 'consolidation' ? 'consolidation'
@@ -1265,6 +1328,35 @@ export function consumerCapacityCorrection(store: Store, intent: Revision<Resear
     instruction: 'Return a smaller complete result of the same role; preserve sources and unresolved obligations.' };
 }
 
+/** DR3a3-K: the producer proves a declared attempt subject once, before the
+ * intent exists: the Question basis is the real `plan` field Question of a v7
+ * discovery draft at the exact revision answered by the subject's plan answer,
+ * and the plan-question belongs to that proven plan edition. Readers trust the
+ * saved subject afterwards (its form is checked with the intent shape). */
+function requireIntentSubject(store: Store, value: ResearchConsumerIntent, id: string): void {
+  const subject = cursorSubject(value, id);
+  if (!subject) return;
+  if (!SUBJECT_KINDS.includes(value.kind))
+    consumerInvalid(id, 'Only a consumer that writes an original turn can name an attempt subject');
+  const draft = store.get<DiscoveryDraft>(value.draft.id, value.draft.revision);
+  const question = store.get<Question>(value.question.id, value.question.revision);
+  if (!draft || !question || draft.kind !== 'discovery-draft' || question.kind !== 'question'
+    || canonical(reference(draft)) !== canonical(value.draft) || canonical(reference(question)) !== canonical(value.question)
+    || draft.value.projectId !== value.projectId || draft.value.stage !== 'discovery'
+    || draft.value.contractVersion !== V7_CONTRACT_ERA
+    || question.value.draftId !== draft.id || !draft.value.questions.includes(question.id)
+    || question.value.spec.field !== 'plan' || question.value.status !== 'answered' || !isRef(question.value.answer)
+    || canonical(question.value.answer) !== canonical(subject.planAnswer))
+    consumerInvalid(id, 'The attempt subject is not a plan-question of the exact accepted plan its Question basis names');
+  let planned: { planQuestionId: string }[];
+  try { planned = provePlanQuestions(store, draft, subject.planAnswer); }
+  catch (error) {
+    if (error instanceof EngineError) consumerInvalid(id, `The attempt subject's plan edition is not proven: ${error.code}`);
+    throw error;
+  }
+  if (!planned.some(item => item.planQuestionId === subject.planQuestionId))
+    consumerInvalid(id, 'The attempt subject names a plan-question outside its proven plan edition');
+}
 export function prepareResearchConsumerIntent(store: Store, input: ResearchConsumerIntentInput,
   permits: readonly Ref[] = []): Revision<ResearchConsumerIntent> {
   if (!object(input)) consumerInvalid('research-consumer-intent', 'A complete consumer admission is required');
@@ -1291,6 +1383,7 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   const value: ResearchConsumerIntent = { ...input, contract: 'research-consumer-intent/v1',
     rootKey: input.key, generation, previous: replacing ? reference(previous!) : previous?.value.previous ?? null,
     state: 'prepared', call: null, request: null, archive: null, outputs: null, refusal: null };
+  requireIntentSubject(store, value, input.key);
   // Retain an existing attempt's era; a new external generation declares its
   // own admission. An old paid/unsent operation is never reclassified here.
   value.cursor = { ...input.cursor };
@@ -1363,7 +1456,7 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
     || !isRef(call.value.packet.archive) || canonical(call.value.packet.archive) !== canonical(archive)
     || !isRef(call.value.consumerIntent) || canonical(call.value.consumerIntent) !== canonical(reference(intent))
     || call.value.projectId !== intent.value.projectId || call.value.draftId !== intent.value.draft.id
-    || call.value.questionId !== intent.value.question.id
+    || !callAddressesSubject(call.value, intent.value.question, cursorSubject(intent.value, intent.id))
     || canonical(call.value.requested) !== canonical(intent.value.role)
     || canonical(call.value.profile ?? null) !== canonical(intent.value.profile)
     || call.value.purpose !== (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation'
@@ -1739,6 +1832,10 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   if (!earlyResearchStage(draft.value.stage)) return null;
   const paid = readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
   if (paid.kind !== 'response') return null;
+  // DR3a3-K (№7475 п.11): the FieldSpec/early answer checks of the plan field
+  // never apply to an attempt subject — its reply is checked by the subject/end
+  // contract, and a malformed paid end is a refusal without a second payment.
+  if (cursorSubject(intent.value, intent.id)) return consumerCapacityFailure(store, intent, paid.payload);
   return consumerCapacityFailure(store, intent, paid.payload) ?? earlyResearchFailure(draft.value, question.value,
     intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
     intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question),
@@ -1766,7 +1863,7 @@ export function earlyUnknownProof(store: Store, producer: Revision<ResearchConsu
     || canonical(reference(question)) !== canonical(questionRef))
     consumerInvalid(turn.id, 'The early unknown lost its exact original draft or question');
   let action: ResearchAction;
-  try { action = admittedResearchAction(turn.value.action); }
+  try { action = turnAction(turn.value); }
   catch { consumerInvalid(turn.id, 'The early unknown lost its paid action'); }
   if (action.action !== 'need_research') consumerInvalid(turn.id, 'An early unknown completes a paid need_research');
   // The searched material is what each earlier turn's FIRST completed revision saved — the read source (ref), the fetched
@@ -2097,7 +2194,9 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     || call.id !== intent.value.call.id || terminal && canonical(reference(call)) !== canonical(terminal)
     || call.value.projectId !== projectId
     || !bound || !isRef(consumer) || canonical(consumer) !== canonical(reference(bound))
-    || call.value.draftId !== intent.value.draft.id || call.value.questionId !== intent.value.question.id
+    || call.value.draftId !== intent.value.draft.id
+    || !callAddressesSubject(call.value as unknown as Record<string, unknown>, intent.value.question,
+      cursorSubject(intent.value, intent.id))
     || canonical(call.value.requested) !== canonical(intent.value.role)
     || canonical(call.value.profile ?? null) !== canonical(intent.value.profile))
     consumerInvalid(intent.id, 'The terminal model call is missing or belongs to another consumer');
@@ -2312,7 +2411,8 @@ export function intentWebCapability(store: Store, intent: Revision<ResearchConsu
 export function intentResponseAction(store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown): ResearchAction {
   const failure = consumerCapacityFailure(store, intent, payload);
   if (failure) throw failure;
-  return responseAction(payload, intentWebCapability(store, intent), earlyUnknownEra(intent.value.cursor));
+  return responseAction(payload, intentWebCapability(store, intent), earlyUnknownEra(intent.value.cursor),
+    cursorSubject(intent.value, intent.id));
 }
 
 /** The terminal refusal code a paid analyst/planner/escalation payload
@@ -2384,7 +2484,7 @@ export function readResearchAcceptanceBinding(store: Store, projectId: string, t
     lost(value.pending, 'pending-turn');
   const intent = readResearchConsumerIntent(store, value.intent);
   let action: ResearchAction;
-  try { action = admittedResearchAction(pending.value.action); }
+  try { action = turnAction(pending.value); }
   catch { return lost(value.pending, 'action'); }
   if ((action.action !== 'answer' && action.action !== 'answer_delta') || action.question !== value.questionBefore.id)
     lost(value.pending, 'action');
@@ -2432,6 +2532,155 @@ export function readResearchAcceptanceBinding(store: Store, projectId: string, t
   return { binding: saved, turn, pending, intent, assessment, inputs, proof: proof! };
 }
 
+/** DR3a3-K: the paid call of the intent revision that applied this original
+ * turn (O@1) — the call an attempt of that turn must name. */
+function appliedTurnCall(store: Store, intent: Revision<ResearchConsumerIntent>, original: Ref): Ref | null {
+  for (let revision = 2; ; revision += 1) {
+    const step = store.get<ResearchConsumerIntent>(intent.id, revision);
+    if (!step) return null;
+    if (step.value.state === 'applied' && step.value.outputs?.some(output => canonical(output) === canonical(original)))
+      return isRef(step.value.call) ? step.value.call : null;
+  }
+}
+
+/** DR3a3-K: the common reader of the attempt binding. It proves the record
+ * from its own exact references — O@1 and P through the managed turn reader,
+ * I@1 and its paid call, the attempt through the DR3a1 proof — and re-derives
+ * the record with the shared projection. P must be a pending revision BEFORE
+ * the full reader runs (T → binding → T is refused), so the reader always ends
+ * at P. `null` only when no record exists at the address; every damaged or
+ * foreign source is an addressed refusal research_attempt_binding_invalid. */
+export function readResearchAttemptBinding(store: Store, projectId: string, turnId: string): {
+  binding: Revision<ResearchAttemptBinding>; turn: Revision<ManagedResearchTurn>;
+  pending: Revision<ManagedResearchTurn>; intent: Revision<ResearchConsumerIntent>;
+  attempt: Revision<V7Attempt>; inputs: AttemptTurnInputs } | null {
+  requireCondition(store && typeof store.get === 'function' && typeof projectId === 'string' && projectId.trim()
+    && typeof turnId === 'string' && turnId.trim(), 'research_attempt_binding_invalid',
+  'An attempt record needs its exact project and turn');
+  const id = attemptBindingId(projectId, turnId);
+  const lost = (ref: unknown, reason: string): never => {
+    throw new EngineError('research_attempt_binding_invalid',
+      `[${id}] The attempt record or a mandatory exact source is missing, foreign or changed: ${reason}`,
+      { ref, reason });
+  };
+  const saved = store.get<ResearchAttemptBinding>(id);
+  if (!saved) return null;
+  const value = saved.value;
+  if (saved.kind !== ATTEMPT_BINDING_KIND || saved.revision !== 1 || !object(value)
+    || hashJson(value) !== saved.hash
+    || Object.keys(value).sort().join(',') !== [...ATTEMPT_BINDING_FIELDS].sort().join(',')
+    || value.contract !== ATTEMPT_BINDING_CONTRACT || value.projectId !== projectId
+    || !isRef(value.turn) || !isRef(value.pending) || !isRef(value.intent) || !isRef(value.planAnswer)
+    || !isRef(value.attempt) || typeof value.planQuestionId !== 'string' || !value.planQuestionId.trim()
+    || value.turn.id !== turnId || value.turn.revision !== 1 || value.pending.id !== turnId)
+    lost(reference(saved), 'form');
+  const rawPending = store.get<Record<string, any>>(value.pending.id, value.pending.revision);
+  if (!rawPending || rawPending.kind !== 'research-turn' || !object(rawPending.value)
+    || rawPending.value.status !== 'pending' || canonical(reference(rawPending)) !== canonical(value.pending))
+    lost(value.pending, 'pending-turn');
+  const turn = readResearchConsumerTurn(store, value.turn) as Revision<ManagedResearchTurn>;
+  const pending = readResearchConsumerTurn(store, value.pending) as Revision<ManagedResearchTurn>;
+  if (pending.value.status !== 'pending' || attemptEraOf(pending.value) !== 'attempt'
+    || canonical(pending.value.consumerIntent) !== canonical(value.intent)
+    || canonical(turn.value.consumerIntent) !== canonical(value.intent))
+    lost(value.pending, 'pending-turn');
+  const intent = readResearchConsumerIntent(store, value.intent);
+  if (intent.revision !== 1) lost(value.intent, 'intent');
+  const call = appliedTurnCall(store, intent, value.turn);
+  if (!call) lost(value.intent, 'call');
+  let attempt: Revision<V7Attempt>;
+  try { attempt = proveAttempt(store, value.attempt).attempt; }
+  catch (error) {
+    if (error instanceof EngineError) return lost(value.attempt, `attempt:${error.code}`);
+    throw error;
+  }
+  const inputs: AttemptTurnInputs = { projectId, pending, intent, call: call!, attempt };
+  const expected = projectAttemptBinding(inputs, { turn: value.turn });
+  if (canonical(expected) !== canonical(value)) lost(reference(saved), 'derivation');
+  return { binding: saved, turn, pending, intent, attempt, inputs };
+}
+
+/** DR3a3-K: the writes that complete one pending attempt turn — the attempt
+ * binding (expected 0) and the completed turn (expected P.revision) — and the
+ * guards of their one batch: the run head and the attempt (the pending turn
+ * is held by its expected revision; the intent head is already applied and
+ * immutable for this turn). A caller that writes more in the same
+ * transaction merges these. */
+export function prepareResearchAttemptCompletion(store: Store, projectId: string, pendingRef: Ref, attemptRef: Ref):
+  { writes: Write[]; guards: TransactionGuard[]; binding: ResearchAttemptBinding; turn: ManagedResearchTurn } {
+  requireCondition(store && typeof projectId === 'string' && projectId.trim() && isRef(pendingRef) && isRef(attemptRef),
+    'research_attempt_binding_invalid', 'An attempt completion needs its project, pending turn and attempt');
+  const pending = readResearchConsumerTurn(store, pendingRef) as Revision<ManagedResearchTurn>;
+  requireCondition(pending.value.status === 'pending' && attemptEraOf(pending.value) === 'attempt',
+    'research_attempt_binding_invalid',
+    `[${pending.id}] Only a pending paid answer of the attempt era completes through an attempt record`);
+  const original = store.get<ManagedResearchTurn>(pending.id, 1);
+  if (!original) consumerInvalid(pending.id, 'The attempt turn lost its original revision');
+  const intent = readResearchConsumerIntent(store, pending.value.consumerIntent);
+  const call = appliedTurnCall(store, intent, reference(original));
+  requireCondition(isRef(call), 'research_attempt_binding_invalid', `[${pending.id}] The attempt turn lost its paid call`);
+  // The DR3a2 door's own proof; its attempt_invalid is kept as is.
+  const attempt = proveAttempt(store, attemptRef).attempt;
+  const inputs: AttemptTurnInputs = { projectId, pending, intent, call, attempt };
+  const binding = projectAttemptBinding(inputs, { turn: reference(original) });
+  const id = attemptBindingId(projectId, pending.id);
+  const turn = projectResearchTurnRevision(pending.value, { kind: 'attempt-recorded', inputs,
+    binding: { ref: { id, revision: 1, hash: hashJson(binding) }, value: binding } });
+  const run = store.get<ResearchRun>(pending.value.run);
+  requireCondition(run?.kind === 'research-run' && object(run.value) && run.value.projectId === projectId,
+    'research_attempt_binding_invalid', `[${pending.id}] The attempt turn lost its research run`);
+  return { binding, turn,
+    writes: [{ id, kind: ATTEMPT_BINDING_KIND, expected: 0, value: binding },
+      { id: pending.id, kind: 'research-turn', expected: pending.revision, value: turn }],
+    // №7475 п.5: under the pending (expected) and run heads; the attempt is immutable.
+    guards: uniqueTransactionGuards([reference(run), attemptRef]) };
+}
+
+/** DR3a3-K: complete one pending attempt turn in one batch. A concurrent or
+ * repeated completion is answered by the saved records: the same pending
+ * revision completed through this very attempt returns that turn without a
+ * write (after a reopen or a cold Store alike); any other completion refuses.
+ * A conflict leaves neither half — the batch is one transaction. */
+export function completeResearchAttemptTurn(store: Store, projectId: string, pendingRef: Ref, attemptRef: Ref):
+  { turn: Revision<ManagedResearchTurn>; binding: Revision<ResearchAttemptBinding>; repeated: boolean } {
+  const repeat = () => {
+    const head = isRef(pendingRef) ? store.get<ManagedResearchTurn>(pendingRef.id) : null;
+    if (!head || head.revision <= pendingRef.revision) return null;
+    const completed = store.get<ManagedResearchTurn>(pendingRef.id, pendingRef.revision + 1);
+    const proven = readResearchAttemptBinding(store, projectId, pendingRef.id);
+    if (!completed || !proven || canonical(reference(proven.pending)) !== canonical(pendingRef)
+      || canonical(proven.binding.value.attempt) !== canonical(attemptRef)
+      || canonical(completed.value.attemptBinding ?? null) !== canonical(reference(proven.binding)))
+      throw new EngineError('research_attempt_binding_invalid',
+        `[${pendingRef.id}] The turn already moved on without completing through this attempt`,
+        { ref: pendingRef, reason: 'completed' });
+    readResearchConsumerTurn(store, reference(completed));
+    return { turn: completed as Revision<ManagedResearchTurn>, binding: proven.binding, repeated: true };
+  };
+  const earlier = repeat();
+  if (earlier) return earlier;
+  const prepared = prepareResearchAttemptCompletion(store, projectId, pendingRef, attemptRef);
+  if (isResearchPreview()) {
+    const [bindingWrite, turnWrite] = prepared.writes;
+    return { repeated: false,
+      binding: { id: bindingWrite!.id, kind: ATTEMPT_BINDING_KIND, revision: 1, hash: hashJson(prepared.binding),
+        value: prepared.binding },
+      turn: { id: turnWrite!.id, kind: 'research-turn', revision: pendingRef.revision + 1,
+        hash: hashJson(prepared.turn), value: prepared.turn } };
+  }
+  try {
+    const written = store.writeMany<Record<string, any>>(prepared.writes, prepared.guards);
+    return { binding: written[0] as Revision<ResearchAttemptBinding>,
+      turn: written[1] as Revision<ManagedResearchTurn>, repeated: false };
+  } catch (error) {
+    if (error instanceof EngineError && error.code === 'revision_conflict') {
+      const landed = repeat();
+      if (landed) return landed;
+    }
+    throw error;
+  }
+}
+
 /** №1745-2: load the acceptance chain persisted on the completed turn. Every
  * named record must exist exactly as referenced, agree with the pending
  * turn's own question and paid assessment, and still satisfy the shared
@@ -2457,7 +2706,7 @@ function storedAcceptedAnswerInputs(store: Store, before: Revision<Record<string
   if (canonical(reference(questionBefore)) !== canonical(reference(original))
     || canonical(reference(checkedAssessment)) !== canonical(reference(assessment)))
     consumerInvalid(before.id, 'The saved accepted-answer chain names other records');
-  const action = admittedResearchAction(before.value.action);
+  const action = turnAction(before.value);
   let expandedProposal: unknown;
   if (action.action === 'answer_delta')
     expandedProposal = expandLayerDelta(pinnedLayerDeltaStore(store, action), draftBefore, original, action);
@@ -2669,7 +2918,7 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
       || canonical(pending.value.question) !== canonical(intent.value.question))
       consumerInvalid(intent.id, 'Escalation lost its exact pending owner turn');
     let action: ResearchAction;
-    try { action = admittedResearchAction(pending.value.action); }
+    try { action = turnAction(pending.value); }
     catch { consumerInvalid(intent.id, 'The pending owner action is invalid'); }
     const verdict = paid.payload;
     if (action.action !== 'need_owner' || !object(verdict) || typeof verdict.necessary !== 'boolean'
@@ -2690,11 +2939,15 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
     // A paid planner may name a prose or foreign question. Admission preserves
     // that exact action with a null selected question so the ordinary planner
     // records a rejected turn and can recover an audited archive plan later.
-    const selectedQuestion = 'question' in action && action.question !== intent.value.question.id
+    // DR3a3-K: an attempt subject's action addresses its plan-question id; the
+    // selected Question is still the subject's Question basis.
+    const subject = cursorSubject(intent.value, intent.id);
+    const selectedQuestion = 'question' in action
+      && action.question !== addressedQuestionId(intent.value.question, subject)
       ? null : intent.value.question;
     const projected = projectPaidTurnAdmission(priorRun.value as ResearchRun, {
       runId: priorRun.id, intent: reference(origin), response: paid.payload,
-      question: selectedQuestion,
+      question: selectedQuestion, ...(subject ? { subject } : {}),
       owner: runWrite.value.owner as ResearchRun['owner'], limit: runWrite.value.limit,
       context: intent.value.cursor.context, ...(intent.value.cursor.mode ? { mode: intent.value.cursor.mode } : {}),
       ...(intentWebCapability(store, intent) ? { web: true } : {}), ...(earlyUnknownEra(intent.value.cursor) ? { unknown: true } : {}) });
@@ -2703,7 +2956,7 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
     // turn written without the acceptance marker is the earlier era. A live
     // application is always the current producer's full projection.
     const { acceptanceContract: _marker, ...earlierEra } = projected.turn;
-    expectedTurn = mode === 'historical' && object(turnWrite.value)
+    expectedTurn = mode === 'historical' && !subject && object(turnWrite.value)
       && !Object.hasOwn(turnWrite.value, 'acceptanceContract') ? earlierEra : projected.turn;
   }
   if (canonical(runWrite.value) !== canonical(expectedRun)
@@ -3230,7 +3483,7 @@ export function readContextTurnHistoryAt(store: Store, projectId: string,
           && (paid.subject.contextDelivery || paid.subject.contextIndex))
           packet = paid.subject;
       }
-      const action = admittedResearchAction(checked.value.action);
+      const action = turnAction(checked.value);
       if (action.action === 'read_context') {
         const { action: _action, observation: _observation, question: _question, ...source } =
           checkedContextIdentity(store, projectId, draft, question, action, checked.value.observation);

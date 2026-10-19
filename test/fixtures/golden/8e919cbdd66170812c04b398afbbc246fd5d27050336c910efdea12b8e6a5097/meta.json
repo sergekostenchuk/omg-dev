@@ -1,5 +1,5 @@
 {
-  "producerDigest": "82522e369880dac8212e0733f9cd5d9cfd3a15c91b16fdb29a07170f662913f6",
+  "producerDigest": "4d96a7eab5e2d19f7d64bcd998d9413eb3207cf846d572d28a26502bce96156f",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -223,7 +223,7 @@
     },
     {
       "path": "src/discovery/research-consumer-transition.ts",
-      "sha256": "487caa03a82468d4b783def2048dfd87a97e62dae0f4e3a68db393926d46f747"
+      "sha256": "892c86b9ca36334ebc107c1b983d7211f5ca6f064c8160f517aee5ed1cf83676"
     },
     {
       "path": "src/discovery/research-context.ts",
@@ -279,7 +279,7 @@
     },
     {
       "path": "src/discovery/response-recovery.ts",
-      "sha256": "8878f353e7e9836f0ccdc36b4c769f7241abe5be8c5994f6026e163f353d0fdb"
+      "sha256": "eff16811748e9d88a65fbe6ffe8dc4915737adb01f2c6609e81ba763036352ca"
     },
     {
       "path": "src/discovery/response-replay.ts",
@@ -312,6 +312,10 @@
     {
       "path": "src/discovery/v7-contracts.ts",
       "sha256": "621c10cc3cefe0698d54e74587ce9d64cfe105dd66bd34152c2273bb36a7f3bc"
+    },
+    {
+      "path": "src/discovery/v7-managed-attempt.ts",
+      "sha256": "72c3bee2246ef573cbef97783960f79ff112cceef532dd76a3e61ce9b669b71b"
     },
     {
       "path": "src/discovery/v7-plan-questions.ts",
@@ -883,7 +887,7 @@
     },
     {
       "path": "src/storage/reference-sites.ts",
-      "sha256": "8c960067a011a79d32afe9beaa0900e906937c03fcd561f43c6b926a25674d45"
+      "sha256": "b77a032595fd226f11dc7113ad074e3ae36df201f73ac5e7e6c5d8097b118ca1"
     },
     {
       "path": "src/storage/schema.ts",
@@ -939,48 +943,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "608b4fb9774e613dcdef963ed8ec641d821e687e8ac87157559d456bafe366bf"
+      "hash": "fb2841fa23bb257c8e5213bbf70e0801df523e4e602e503a3184571d38e460fc"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "cd847f1f5a2ff6e8aaf72d5e4135bc5e07e85adcfe2934b8cff137171603a5c2"
+      "hash": "962dd23c31fe7a35c66c72216b0210c6964663bd03ccd48d88dcad52e012ab80"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "7f2be6b6abe64b67c60484de70dbb1a6cd675a8aaec3b93be685953fdce70260"
+      "hash": "85c07a31ce5483f8952faaee1ba4603d884c961608e805bc389dab19c2ceca71"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "da9fb0cda963b406b10a685eed4cb2b207ad69395bd9c219a8b70a0153d884c3"
+      "hash": "2797b9246a24de4aaf0017237c786ee88d9ec58127d953d2200b183df03aad36"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "e7581ba69e2153c928a9b963f57e9884961c0c2da3dd8401895c406d4c2af718"
+      "hash": "7e97a4074d54269f91f4fcd050845eba4d4b6916b6780e2194d1fa0af1faf316"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "fbdcdc57197570c581171f55879075a227ae1db7319fa4ec05bc6cf3c4d30ac1"
+      "hash": "c7226d3a7b9bbe5b44ff9bff1c59529273ad2115e90ccf0196a5a582064ddfba"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "60b766d0875343771c2414b9062ec567739c96fcb783477eff858da827e61845"
+      "hash": "bb162b3109fb1199ab8d0195afe36b53563c0bd199096aa058e66b3f4bdf1935"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "6699e0814b63560f75485622984990897b1cae24c215402b1d0d8417fb9b6bb4"
+      "hash": "e1c9f293002ed82f7ad313222b030461bb5431b0e40ae9e4a525c38eca542a0c"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-dr3c-a2b/.golden-build-d6G7p9/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-git-int/.golden-build-VHT7Az/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "a8589044872ce923b3ee9e491bf06443193c4920a36065ea1bde7f8b49461387",
-  "sqliteBytes": 14573568
+  "sqliteFileSha256": "627b4423c1204184cb4b55117ea2674426846f337b0edb6dcc8eb5817d8cffeb",
+  "sqliteBytes": 14561280
 }

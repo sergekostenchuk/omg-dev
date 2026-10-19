@@ -27,6 +27,9 @@ import { addContextLookup, contextLookupKey, contextProgress, contextWorkspace, 
 import { archivedContext, contextPage, contextValue, type ContextPage } from './working-context.js';
 import type { Graph } from '../graph/model.js';
 import type { ResearchConsumerIntent } from './response-recovery.js';
+import type { V7Attempt } from './v7-plan-questions.js';
+import { ATTEMPT_BINDING_CONTRACT, addressedQuestionId, attemptBindingId, attemptEndOfAction, planSubjectOf, sameSubject,
+  type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
 import type { Json } from '../canonical.js';
 
 /* This module is the dependency leaf for paid consumer transitions. Its inputs
@@ -239,9 +242,22 @@ export function webResearchCapability(stage: unknown, role: unknown, dispatch: {
 }
 const isWebPayload = (value: unknown): boolean => value !== null && typeof value === 'object'
   && WEB_ACTIONS.includes((value as { action?: unknown }).action as string);
+/** DR3a3-K: a paid answer of an attempt subject is parsed by the subject/end contract the saved intent
+ * selected (an end of its plan-question; bases live inside the end, so the envelope has no citations) —
+ * never by the uncited-answer rule of the field path. Every other action keeps its own parser. */
+function subjectAnswer(value: unknown, subject: V7PlanSubject | null): ResearchAction | null {
+  if (!subject || value === null || typeof value !== 'object') return null;
+  const kind = (value as { action?: unknown }).action;
+  if (kind !== 'answer' && kind !== 'answer_delta') return null;
+  attemptEndOfAction(value, subject);
+  return value as ResearchAction;
+}
 /** A paid reply classified by its own call: without the capability the shared parser — and its original
  * research_response_invalid — is unchanged; with it a web action is checked by its own contract. */
-export function responseAction(value: unknown, web: boolean, unknown = false): ResearchAction {
+export function responseAction(value: unknown, web: boolean, unknown = false,
+  subject: V7PlanSubject | null = null): ResearchAction {
+  const attempt = subjectAnswer(value, subject);
+  if (attempt) return attempt;
   if (unknown && isNeedResearch(value)) return earlyNeedResearch(value);
   if (!web || !isWebPayload(value)) return researchAction(value);
   try { return webAction(value); }
@@ -251,10 +267,22 @@ export function responseAction(value: unknown, web: boolean, unknown = false): R
   }
 }
 /** The action of a turn that already exists: a web turn exists only after its call was admitted with the capability. */
-export function admittedResearchAction(value: unknown): ResearchAction {
+export function admittedResearchAction(value: unknown, subject: V7PlanSubject | null = null): ResearchAction {
+  const attempt = subjectAnswer(value, subject);
+  if (attempt) return attempt;
   // UNK1: an upstream address exists only in a turn admitted by the unknown era.
   if (isNeedResearch(value) && Object.hasOwn(value as object, 'upstream')) return earlyNeedResearch(value);
   return isWebPayload(value) ? webAction(value) : researchAction(value);
+}
+/** DR3a3-K: the action of a saved turn, read by the turn's own immutable subject (O@1 of the attempt era
+ * carries the subject its producer proved against the intent; a field turn carries none). */
+export function turnAction(turn: { action?: unknown }): ResearchAction {
+  return admittedResearchAction(turn.action, planSubjectOf(turn));
+}
+/** DR3a3-K: the logical question a managed turn addresses — the plan-question id of its attempt subject, the
+ * Question record id of a field turn (turn.question stays the Question basis); null without a selected question. */
+export function turnQuestionId(turn: { question?: unknown }): string | null {
+  return isRef(turn.question) ? addressedQuestionId(turn.question, planSubjectOf(turn)) : null;
 }
 
 export interface PaidReaderResultInput {
@@ -872,11 +900,23 @@ export type ManagedResearchTurn = ResearchTurn & { contract: 'research-consumer-
   acceptanceContract?: typeof ACCEPTANCE_BINDING_CONTRACT;
   acceptance?: AcceptedAnswerChain;
   /** D8.4e: the exact K the completed turn was derived from (new era only). */
-  acceptanceBinding?: Ref };
+  acceptanceBinding?: Ref;
+  /** DR3a3-K: the attempt era of O@1 — fixed by the producer together with the
+   * subject, immutable across revisions like the paid action. */
+  attemptContract?: typeof ATTEMPT_BINDING_CONTRACT;
+  subject?: V7PlanSubject;
+  /** DR3a3-K: the recorded attempt and its binding, on the completed turn only. */
+  attempt?: Ref;
+  attemptBinding?: Ref };
 /** The era of a managed turn, read from its own immutable producer field —
  * never from the presence of K, a completed acceptance chain or a scan. */
 export function acceptanceEraOf(turn: { acceptanceContract?: unknown }): 'binding' | 'legacy' {
   return turn.acceptanceContract === ACCEPTANCE_BINDING_CONTRACT ? 'binding' : 'legacy';
+}
+/** DR3a3-K: the attempt era of a managed turn — its own immutable producer
+ * field. A turn of this era answers a plan-question, never a field question. */
+export function attemptEraOf(turn: { attemptContract?: unknown }): 'attempt' | 'answer' {
+  return turn.attemptContract === ATTEMPT_BINDING_CONTRACT ? 'attempt' : 'answer';
 }
 /** D8.4e: K — the acceptance record written atomically with the draft, the
  * research-answer and the answered question. It names the exact original
@@ -976,7 +1016,7 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
     requireCondition(entry.context,
       'research_consumer_intent_invalid',
       'An earlier addressed read lost its exact checked original');
-    const action = admittedResearchAction(prior.action);
+    const action = turnAction(prior);
     requireCondition(action.action === 'read_context',
       'research_consumer_intent_invalid', 'The original addressed action is invalid');
     const result = prior.observation as ProjectedContextRead;
@@ -991,7 +1031,7 @@ export function projectAddressedWorkspace(before: ManagedResearchTurn,
 export function projectRepeatedContextRead(before: ManagedResearchTurn,
   current: ContextReadIdentityInput,
   history: ContextTurnHistoryProof[]): { previous: Ref; history: Ref[] } | null {
-  const action = admittedResearchAction(before.action);
+  const action = turnAction(before);
   requireCondition(action.action === 'read_context' && isRef(before.question)
     && canonical(action) === canonical(current.action)
     && canonical(before.question) === canonical(current.question)
@@ -1010,7 +1050,7 @@ export function projectRepeatedContextRead(before: ManagedResearchTurn,
   for (const entry of [...history].reverse()) {
     const prior = entry.turn.value;
     if (prior.question?.id !== before.question.id) continue;
-    const priorAction = admittedResearchAction(prior.action);
+    const priorAction = turnAction(prior);
     if (priorAction.action === 'checkpoint' || priorAction.action === 'answer'
       || priorAction.action === 'answer_delta') break;
     if (prior.error || prior.status !== 'completed' || priorAction.action !== 'read_context') continue;
@@ -1130,7 +1170,7 @@ export function projectResearchSearchCapture(input: ResearchSearchCaptureInput):
   { id: string; ref: Ref; value: ResearchSearchCaptureValue } {
   const { projectId, turn, parent, query, workspace, sources, process } = input;
   requireSearchQuery(query);
-  const action = admittedResearchAction(turn.value.action);
+  const action = turnAction(turn.value);
   requireCondition(turn.kind === 'research-turn' && hashJson(turn.value) === turn.hash
     && turn.value.status === 'pending' && action.action === 'search'
     && action.query === query && typeof projectId === 'string' && projectId.length > 0
@@ -1147,7 +1187,7 @@ export function projectResearchSearchCapture(input: ResearchSearchCaptureInput):
   if (isRef(turn.value.plannedBy)) {
     const parentRef = turn.value.plannedBy;
     const original = parent?.original, queued = parent?.queued;
-    const parentAction = original ? admittedResearchAction(original.value.action) : null;
+    const parentAction = original ? turnAction(original.value) : null;
     const rawChildren = queued?.value.observation && typeof queued.value.observation === 'object'
       ? (queued.value.observation as { children?: unknown }).children : null;
     const children: unknown[] | null = Array.isArray(rawChildren) ? rawChildren : null;
@@ -1233,8 +1273,10 @@ type PaidLocalRefusalReason = { kind: PaidLocalRefusalKind; code: string; messag
 function paidLocalRefusalReason(before: ManagedResearchTurn,
   action: ResearchAction, unknown: boolean): PaidLocalRefusalReason | null {
   const mode = before.dispatchMode;
+  // DR3a3-K: the turn's logical question (plan-question id of an attempt subject).
+  const questionId = turnQuestionId(before);
   // UNK1: in the unknown era an early need_research on the current question is the unknown door, not a mode transition.
-  if (unknown && action.action === 'need_research' && isRef(before.question) && action.question === before.question.id) return null;
+  if (unknown && action.action === 'need_research' && questionId !== null && action.question === questionId) return null;
   if (!before.plannedBy && (mode === 'planning' || mode === 'synthesis')) {
     const allowed = mode === 'planning'
       ? ['read_plan', 'synthesize', 'pause']
@@ -1244,13 +1286,13 @@ function paidLocalRefusalReason(before: ManagedResearchTurn,
       message: 'Planning only selects reads; synthesis answers or identifies explicit missing information' };
   }
   if (action.action === 'read_plan' && mode === 'planning'
-    && (!isRef(before.question) || action.question !== before.question.id
+    && (questionId === null || action.question !== questionId
       || new Set(action.reads.map(canonical)).size !== action.reads.length))
     return { kind: 'reading-plan-refusal', code: 'reading_plan_invalid',
       message: 'Reading plan must target this question without duplicate requests' };
   if ((action.action === 'synthesize' || action.action === 'need_research')
     && (mode !== 'planning' && mode !== 'synthesis'
-      || !isRef(before.question) || action.question !== before.question.id))
+      || questionId === null || action.question !== questionId))
     return { kind: 'reading-mode-refusal', code: 'research_question_foreign',
       message: 'Mode transition must target the current question' };
   if (action.action === 'search'
@@ -1263,7 +1305,7 @@ function paidLocalRefusalReason(before: ManagedResearchTurn,
 export function projectPaidLocalRefusal(before: ManagedResearchTurn, unknown = false): {
   proof: { kind: PaidLocalRefusalKind }; turn: ManagedResearchTurn; failure: EngineError;
 } | null {
-  const reason = paidLocalRefusalReason(before, admittedResearchAction(before.action), unknown);
+  const reason = paidLocalRefusalReason(before, turnAction(before), unknown);
   if (!reason) return null;
   const proof = { kind: reason.kind, ...(unknown ? { unknown: true as const } : {}) };
   return { proof, turn: projectResearchTurnRevision(before, proof),
@@ -1278,6 +1320,8 @@ export interface PaidTurnAdmission {
   web?: boolean;
   /** UNK1: the early-actions era of the producing intent, from its saved cursor (earlyUnknownEra). */
   unknown?: boolean;
+  /** DR3a3-K: the attempt subject of the producing intent, from its saved cursor (planSubjectOf). */
+  subject?: V7PlanSubject;
 }
 
 export interface AcceptedPaidAnswerInputs {
@@ -1384,7 +1428,10 @@ export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdm
     && before.turns >= 0 && Number.isSafeInteger(before.requestChars) && before.requestChars >= 0
     && Number.isSafeInteger(input.limit) && input.limit > 0 && input.intent.revision === 1,
   'research_consumer_intent_invalid', 'A paid turn needs its exact prior run and original intent');
-  const action = responseAction(input.response, input.web === true, input.unknown === true);
+  // DR3a3-K: a paid answer of an attempt subject states exactly one attempt
+  // end of its plan-question; anything else is a typed payload refusal before
+  // any turn exists (no attempt, no second payment).
+  const action = responseAction(input.response, input.web === true, input.unknown === true, input.subject ?? null);
   const next = before.turns + 1;
   const run: ResearchRun = { ...before, status: 'running', turns: next,
     limit: input.limit, owner: input.owner,
@@ -1395,7 +1442,8 @@ export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdm
     run: input.runId, number: next,
     action, assessment: null, observation: null, error: null,
     status: 'pending', question: input.question,
-    ...(input.mode ? { dispatchMode: input.mode } : {}) };
+    ...(input.mode ? { dispatchMode: input.mode } : {}),
+    ...(input.subject ? { attemptContract: ATTEMPT_BINDING_CONTRACT, subject: input.subject } : {}) };
   return { run, turn };
 }
 
@@ -1403,14 +1451,87 @@ export function projectPaidTurnAdmission(before: ResearchRun, input: PaidTurnAdm
  * The same immutable fields and the same acceptance era marker as the runner
  * application; the caller supplies only the exact handoff sources. */
 export function projectSynthesisHandoffTurn(input: { intent: Ref; runId: string; number: number;
-  action: unknown; question: Ref | null }): ManagedResearchTurn {
+  action: unknown; question: Ref | null; subject?: V7PlanSubject }): ManagedResearchTurn {
   requireCondition(isRef(input.intent) && input.intent.revision === 1 && typeof input.runId === 'string'
     && !!input.runId && Number.isSafeInteger(input.number) && input.number > 0,
   'research_consumer_intent_invalid', 'A synthesis handoff needs its original intent and exact turn position');
+  // DR3a3-K: the same immutable subject as the runner application (O@1 of
+  // either producer); a handoff answer of a subject is an attempt end.
+  if (input.subject && typeof input.action === 'object' && input.action !== null
+    && ['answer', 'answer_delta'].includes((input.action as { action?: unknown }).action as string))
+    attemptEndOfAction(input.action, input.subject);
   return { contract: 'research-consumer-turn/v1', consumerIntent: input.intent,
     acceptanceContract: ACCEPTANCE_BINDING_CONTRACT, run: input.runId, number: input.number,
     action: input.action, assessment: null, observation: null, error: null,
-    status: 'pending', question: input.question, dispatchMode: 'synthesis' };
+    status: 'pending', question: input.question, dispatchMode: 'synthesis',
+    ...(input.subject ? { attemptContract: ATTEMPT_BINDING_CONTRACT, subject: input.subject } : {}) };
+}
+
+/** DR3a3-K: the exact records one recorded attempt turn derives from. */
+export interface AttemptTurnInputs {
+  projectId: string;
+  /** P — the pending revision the completion consumes. */
+  pending: Revision<ManagedResearchTurn>;
+  /** I@1 — the producing intent's first revision; its cursor names the subject. */
+  intent: Revision<ResearchConsumerIntent>;
+  /** The paid call of that intent — the call its application revision names. */
+  call: Ref;
+  /** The attempt the DR3a2 door recorded, proven by the caller (proveAttempt). */
+  attempt: Revision<V7Attempt>;
+}
+
+/** DR3a3-K: the formula of an attempt turn. It ties the exact paid payload of
+ * P, the producing intent and its paid call, the subject and the end of the
+ * proven attempt: the end must DERIVE from the saved payload by the one
+ * mapping (attemptEndOfAction) — matching call, plan or id alone is not enough.
+ * null when the records do not satisfy it. */
+export function matchAttemptPaidTurn(input: AttemptTurnInputs): { end: Json } | null {
+  const { projectId, pending, intent, call, attempt } = input;
+  if (!pending || pending.kind !== 'research-turn' || !intent || intent.kind !== 'research-consumer-intent'
+    || !attempt || attempt.kind !== 'research-attempt' || !isRef(call)
+    || intent.revision !== 1 || intent.value.projectId !== projectId
+    || pending.value.contract !== 'research-consumer-turn/v1' || pending.value.status !== 'pending'
+    || attemptEraOf(pending.value) !== 'attempt'
+    || canonical(pending.value.consumerIntent) !== canonical(exactRef(intent))) return null;
+  let subject: V7PlanSubject | null, turnSubject: V7PlanSubject | null, end: unknown;
+  try {
+    subject = planSubjectOf(intent.value.cursor);
+    turnSubject = planSubjectOf({ subject: pending.value.subject });
+    end = subject ? attemptEndOfAction(pending.value.action, subject) : null;
+  } catch (error) {
+    if (error instanceof EngineError) return null;
+    throw error;
+  }
+  if (!subject || !sameSubject(subject, turnSubject) || end === null) return null;
+  const value = attempt.value as unknown as Record<string, unknown>;
+  if (value === null || typeof value !== 'object' || value['project'] !== projectId
+    || !isRef(value['planAnswer']) || canonical(value['planAnswer']) !== canonical(subject.planAnswer)
+    || value['planQuestionId'] !== subject.planQuestionId
+    || !isRef(value['call']) || canonical(value['call']) !== canonical(call)
+    || !isRef(value['draft']) || (value['draft'] as Ref).id !== intent.value.draft.id
+    || canonical(value['end'] as Json) !== canonical(end as Json)) return null;
+  return { end: end as Json };
+}
+
+/** DR3a3-K: the one projection of the attempt binding shared by the producer
+ * (on prepared records) and the historical reader (on loaded exact records).
+ * Belonging of O/P/I and the proof of the attempt are the caller's; here the
+ * formula, the exact forms and the links are checked. */
+export function projectAttemptBinding(inputs: AttemptTurnInputs, links: { turn: Ref }): ResearchAttemptBinding {
+  const refuse = (reason: string): never => {
+    throw new EngineError('research_attempt_binding_invalid',
+      `[${links?.turn?.id ?? 'research-turn'}] The attempt record does not derive from its exact sources: ${reason}`,
+      { ref: links?.turn ?? null, reason });
+  };
+  if (!links || !isRef(links.turn) || links.turn.revision !== 1 || !inputs?.pending
+    || links.turn.id !== inputs.pending.id) refuse('links');
+  if (hashJson(inputs.pending.value) !== inputs.pending.hash) refuse('pending-form');
+  if (inputs.attempt?.revision !== 1 || hashJson(inputs.attempt.value) !== inputs.attempt.hash) refuse('attempt-form');
+  if (!matchAttemptPaidTurn(inputs)) refuse('attempt-formula');
+  const subject = planSubjectOf(inputs.intent.value.cursor)!;
+  return { contract: ATTEMPT_BINDING_CONTRACT, projectId: inputs.projectId,
+    turn: links.turn, pending: exactRef(inputs.pending), intent: exactRef(inputs.intent),
+    planAnswer: subject.planAnswer, planQuestionId: subject.planQuestionId, attempt: exactRef(inputs.attempt) };
 }
 
 export type TurnTransitionProof =
@@ -1447,6 +1568,10 @@ export type TurnTransitionProof =
   | { kind: 'accepted-answer'; inputs: AcceptedPaidAnswerInputs;
       /** D8.4e: the proven K; mandatory for a turn of the binding era. */
       binding?: { ref: Ref; value: ResearchAcceptanceBinding } }
+  /** DR3a3-K: a paid answer of the attempt era completes only from the attempt
+   * the DR3a2 door recorded and its binding, written with the completed turn. */
+  | { kind: 'attempt-recorded'; inputs: AttemptTurnInputs;
+      binding: { ref: Ref; value: ResearchAttemptBinding } }
   | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question>;
       producer: Revision<ResearchConsumerIntent>; web?: boolean;
       /** UNK1: the unknown-era admission of the producer (earlyUnknownAdmission); absent in the DRY5FIX era. */
@@ -1461,7 +1586,7 @@ export type TurnTransitionProof =
 /** Includes queued children whose historical addresses predate managed turns. */
 export function projectSourceReadingTurn<T extends ResearchTurn>(before: T, projectId: string,
   source: { ref: Ref; value: Source }, readContract: SourceReadContract = SOURCE_READ_CONTRACT): T {
-  const action = admittedResearchAction(before.action);
+  const action = turnAction(before);
   requireCondition(before.status === 'pending' && before.error === null && before.assessment === null
     && action.action === 'read_source' && canonical(action.source) === canonical(source.ref),
     'research_consumer_intent_invalid', 'Only an exact pending source read can produce this result');
@@ -1478,7 +1603,13 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
   requireCondition(before.status === 'pending' && before.error === null
     && before.contract === 'research-consumer-turn/v1',
   'research_consumer_intent_invalid', 'Only a pending paid turn can be completed');
-  const action = admittedResearchAction(before.action);
+  const action = turnAction(before);
+  // DR3a3-K: a paid answer of the attempt era completes only through its
+  // attempt record — never by a proof of the field path (assessed, accepted,
+  // FieldSpec/early, layer, technical, reopened or context refusals).
+  if (attemptEraOf(before) === 'attempt' && action.action === 'answer')
+    requireCondition(proof.kind === 'attempt-recorded', 'research_consumer_intent_invalid',
+      'A paid answer of the attempt era completes only through its attempt record');
   if (proof.kind === 'context-incomplete') {
     requireCondition(action.action === 'answer' || action.action === 'answer_delta',
       'research_consumer_intent_invalid', 'Only a final paid answer can claim incomplete context');
@@ -1672,6 +1803,32 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
     'The owner verdict needs the paid request and checked reviewer reason');
     return { ...before, status: 'completed', assessment: null,
       observation: proof.verdict, error: null };
+  }
+  if (proof.kind === 'attempt-recorded') {
+    requireCondition(attemptEraOf(before) === 'attempt' && action.action === 'answer',
+      'research_attempt_binding_invalid',
+      `[${before.run}] Only a pending paid answer of the attempt era completes through an attempt record`);
+    const { inputs, binding } = proof;
+    requireCondition(!!inputs?.pending && canonical(inputs.pending.value) === canonical(before),
+      'research_attempt_binding_invalid', `[${before.run}] The attempt record names another pending turn`);
+    // The supplied binding must be the exact record of THIS pending revision:
+    // its address, revision 1, its hash, P = before (by value hash; the
+    // caller's CAS names the revision), I = before.consumerIntent, O = the
+    // first revision of this turn, and a value re-derived from the same inputs.
+    const expected = projectAttemptBinding(inputs, { turn: binding?.value?.turn });
+    requireCondition(isRef(binding.ref) && binding.ref.revision === 1
+      && binding.ref.id === attemptBindingId(binding.value.projectId, binding.value.turn.id)
+      && binding.ref.hash === hashJson(binding.value)
+      && canonical(binding.value) === canonical(expected)
+      && binding.value.turn.revision === 1 && binding.value.turn.id === managedTurnId(before.run, before.number)
+      && binding.value.pending.hash === hashJson(before)
+      && canonical(binding.value.intent) === canonical(before.consumerIntent),
+    'research_attempt_binding_invalid',
+    `[${binding?.value?.turn?.id ?? before.run}] The attempt record names another pending turn, intent or attempt`);
+    const end = (inputs.attempt.value.end as unknown as { type: string }).type;
+    return { ...before, status: 'completed', assessment: null,
+      observation: { attempt: binding.value.attempt, end }, error: null,
+      attempt: binding.value.attempt, attemptBinding: binding.ref };
   }
   if (proof.kind === 'assessed-answer') {
     const assessment = proof.assessment, question = proof.question;
@@ -1870,7 +2027,7 @@ export function assertResearchTurnTransition(before: ManagedResearchTurn,
 /** The paid pause is a terminal turn and a paused run in the same transaction. */
 export function projectPaidPause(beforeRun: ResearchRun, beforeTurn: ManagedResearchTurn):
   { run: ResearchRun; turn: ManagedResearchTurn } {
-  const action = admittedResearchAction(beforeTurn.action);
+  const action = turnAction(beforeTurn);
   requireCondition(action.action === 'pause', 'research_consumer_intent_invalid',
     'Only the exact paid pause can pause its run');
   return { run: { ...beforeRun, status: 'paused', error: action.reason, pauseCode: null },
@@ -1883,17 +2040,20 @@ export function projectPaidOwnerReview(beforeRun: ResearchRun, beforeTurn: Manag
   verdict: { necessary: boolean; reason: string; [key: string]: unknown },
   owner: ResearchRun['owner'], limit: number):
   { run: ResearchRun; turn: ManagedResearchTurn } {
-  const action = admittedResearchAction(beforeTurn.action);
+  const action = turnAction(beforeTurn);
+  // DR3a3-K-01 (№7543): the owner is asked about the turn's logical question —
+  // the plan-question id of an attempt subject, the Question id of a field turn.
+  const questionId = turnQuestionId(beforeTurn);
   requireCondition(action.action === 'need_owner' && typeof verdict.necessary === 'boolean'
     && typeof verdict.reason === 'string' && verdict.reason.trim().length > 0
-    && beforeTurn.question !== null && beforeTurn.question.id === action.question
+    && questionId !== null && questionId === action.question
     && Number.isSafeInteger(limit) && limit > 0,
   'escalation_assessment_invalid', 'An owner review needs the exact paid request and verdict');
   const turn = projectResearchTurnRevision(beforeTurn, { kind: 'owner-review', verdict });
   return { turn, run: { ...beforeRun,
     status: verdict.necessary ? 'needs_owner' : 'running',
     ownerQuestion: verdict.necessary
-      ? { question: beforeTurn.question.id, reason: verdict.reason, searched: action.searched }
+      ? { question: questionId, reason: verdict.reason, searched: action.searched }
       : null,
     limit, owner, error: null, pauseCode: null } };
 }

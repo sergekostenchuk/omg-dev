@@ -159,6 +159,12 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["end", "value", "claims", INDEX, "refutedBy", INDEX, "container"],
     ["end", "value", "claims", INDEX, "supersedes", "container"],
   ] },
+  // DR3a3-K: the attempt binding names exactly the original turn, the pending
+  // revision it completed, the producing intent, the accepted plan answer of
+  // its subject and the recorded attempt — no free data.
+  { kind: "research-attempt-binding", contract: "research-attempt-binding/v1", data: [], refs: [
+    ["turn"], ["pending"], ["intent"], ["planAnswer"], ["attempt"],
+  ] },
   { kind: "research-assessment", contract: null, data: [["value"], ["observations", INDEX, "value"]] },
   { kind: "research-checkpoint", contract: null, data: [["proposal"], ["observations", INDEX, "value"]] },
   { kind: "research-context", contract: null, data: contextData(["body"]) },

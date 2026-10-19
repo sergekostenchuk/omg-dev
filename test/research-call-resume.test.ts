@@ -14,8 +14,10 @@ import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import { readBundle, readReaderResultAt, resumeReadBundleIntent, type ReaderResult } from '../src/discovery/reader.js';
 import { readResearchConsumerIntent, readResearchConsumerExecution, readResearchConsumerTurn,
   prepareResearchConsumerApplication, refuseResearchConsumerIntent, captureResearchConsumerRetryPermits,
-  assessmentReadView, readResearchAcceptanceBinding, readContextTurnHistoryAt,
+  assessmentReadView, readResearchAcceptanceBinding, readContextTurnHistoryAt, prepareResearchConsumerReservation,
   type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { ATTEMPT_BINDING_CONTRACT, V7_PLAN_SUBJECT_CONTRACT, callAddressesSubject,
+  planSubjectOf } from '../src/discovery/v7-managed-attempt.js';
 import { readResearchAssessmentAt, assessmentBindingId } from '../src/discovery/research-assessment.js';
 import { readAssessmentPaidOrigin } from '../src/discovery/assessment-session.js';
 import { processStart } from '../src/runtime/process-identity.js';
@@ -1014,7 +1016,7 @@ test('paid preview recovers only its isolated copy and completed preview does no
 import { synthesisSession, readSynthesisSession } from '../src/discovery/synthesis-session.js';
 import { projectPaidSynthesisTransition } from '../src/discovery/response-recovery.js';
 import { recoverContextSession } from '../src/discovery/context-recovery.js';
-import { CONTEXT_RECOVERY_SUPERSEDE_REASON, acceptanceBindingId, acceptanceEraOf, projectAcceptanceBinding,
+import { CONTEXT_RECOVERY_SUPERSEDE_REASON, acceptanceBindingId, acceptanceEraOf, projectAcceptanceBinding, attemptEraOf,
   projectSynthesisHandoffTurn, ACCEPTANCE_BINDING_CONTRACT,
   type ManagedResearchTurn, type ResearchAcceptanceBinding } from '../src/discovery/research-consumer-transition.js';
 import { pilotContext } from '../src/discovery/pilot-context.js';
@@ -4520,6 +4522,57 @@ else research={action:'pause',reason:'Hold the run'};`);
   assert.deepEqual(original.value, projectSynthesisHandoffTurn({ intent: original.value.consumerIntent,
     runId: original.value.run, number: original.value.number, action: original.value.action, question: original.value.question }));
   readResearchConsumerTurn(f.open(), reference(handoff));
+});
+
+test('DR3a3-K regression: the v6 field path keeps its era — O@1 without attemptContract or subject; a call carrying a plan answer is not the field intent\'s call; an attempt claim on a v6 turn is refused', async t => {
+  const f = acceptanceFixture(t, { neighbor: false, prefix: 'v6-attempt' });
+  const outcomes: string[] = [];
+  const restore = f.hook(f.store, writes => writes.some(write => write.kind === 'model-call' && write.expected === 0
+    && write.id.startsWith('model-call:consumer:v1:')), writes => {
+    const callWrite = writes.find(write => write.kind === 'model-call')!;
+    const call = callWrite.value as Record<string, any>;
+    const intent = readResearchConsumerIntent(f.store, call.consumerIntent);
+    const reserve = (value: Record<string, unknown>) => {
+      try {
+        prepareResearchConsumerReservation(f.store, reference(intent), { ...callWrite, value: value as never },
+          call.request.record, call.packet.archive);
+        return 'accepted';
+      } catch (error) { return error instanceof EngineError ? error.code : 'other'; }
+    };
+    const planAnswer = { id: 'research-answer:p:plan', revision: 1, hash: hashJson('plan') };
+    outcomes.push(String(intent.value.kind), String(planSubjectOf(intent.value.cursor)), reserve(call),
+      reserve({ ...call, planAnswer }), reserve({ ...call, questionId: 'q-industry', planAnswer }));
+  }, 'v6-reservation', 'before');
+  const run = await f.engine.researcher.run('p', f.draft.id, 1);
+  restore();
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  // The real field intent has no subject; its own call reserves; the same call with a plan answer, or
+  // addressed to a plan-question, is not this intent's call.
+  assert.deepEqual(outcomes, ['analyst', 'null', 'accepted', 'research_consumer_intent_invalid',
+    'research_consumer_intent_invalid']);
+  const turn = f.paidTurn(), original = f.store.get<ManagedResearchTurn>(turn.id, 1)!;
+  for (const field of ['attemptContract', 'subject', 'attempt', 'attemptBinding'])
+    assert.equal(Object.hasOwn(managedOf(turn), field) || Object.hasOwn(original.value, field), false, field);
+  assert.equal(attemptEraOf(original.value), 'answer');
+  assert.equal(original.value.acceptanceContract, ACCEPTANCE_BINDING_CONTRACT);
+  assert.ok(f.binding(), 'the v6 answer still completes through its acceptance binding');
+  const paid = f.store.list<ModelCall>('model-call').find(item => canonical((item.value as { consumerIntent?: unknown }).consumerIntent ?? null)
+    === canonical(original.value.consumerIntent))!;
+  assert.equal(Object.hasOwn(paid.value, 'planAnswer'), false, 'a v6 call gets no new fields');
+  assert.equal(callAddressesSubject(paid.value as unknown as Record<string, unknown>, reference(f.question), null), true);
+  // An attempt-era claim on the v6 original (marker and subject the intent never fixed) is refused.
+  const subject = { contract: V7_PLAN_SUBJECT_CONTRACT, planAnswer: { id: 'research-answer:p:plan', revision: 1,
+    hash: hashJson('plan') }, planQuestionId: 'q-industry' };
+  f.rewrite(turn.id, 1, { ...original.value, attemptContract: ATTEMPT_BINDING_CONTRACT, subject });
+  assert.throws(() => readResearchConsumerTurn(f.open(), reference(turn)), { code: 'research_consumer_intent_invalid' });
+  f.rewrite(turn.id, 1, original.value);
+  // A completed v6 turn cannot acquire an attempt link.
+  const linked = { ...managedOf(turn), attemptBinding: reference(f.binding()!) };
+  f.rewrite(turn.id, turn.revision, linked);
+  assert.throws(() => readResearchConsumerTurn(f.open(), { id: turn.id, revision: turn.revision, hash: hashJson(linked) }),
+    { code: 'research_consumer_intent_invalid' });
+  f.rewrite(turn.id, turn.revision, turn.value);
+  readResearchConsumerTurn(f.open(), reference(turn));
 });
 
 test('D8.4e R1: a supported managed answer writes draft, answer, question and K in one transaction and completes the turn from K', async t => {
