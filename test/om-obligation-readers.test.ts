@@ -434,7 +434,7 @@ try {
   const { setTimeout: delay } = await import("node:timers/promises");
   const { Store } = await import(C.src + "storage/store.js");
   const { ProductEngine } = await import(C.src + "product/engine.js");
-  const { preparedFeatures, refinedLayers } = await import(C.tst + "product-fixture.js");
+  const { preparedFeatures } = await import(C.tst + "product-fixture.js");
   const { gardenGraph } = await import(C.tst + "om-fixture.js");
   // The cold public entry is a real ProductEngine over a temporary copy: repository, prepared stages and layers.
   mkdirSync(C.workspace);
@@ -448,7 +448,6 @@ try {
     implementer: { actor: "r1-implementer", model: "fixture", effort: "high", speed: "fast", command },
     reviewer: { actor: "r1-reviewer", model: "fixture-reviewer", effort: "medium", command },
     fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10000, requestCapacityChars: 100000 } });
-  refinedLayers(engine, project);
   engine.execute({ type: "configure-om-dispatch", project, protocol: "codex-stdio" });
   // The stub adapter pauses while holding the pass's first request: the drive is exercised up to its first intended step.
   writeFileSync(C.scenario, JSON.stringify({ steps: [{ research: { held: true }, pauseAfterRequest: C.pause }] }));

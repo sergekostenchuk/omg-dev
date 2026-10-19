@@ -23,7 +23,7 @@ import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
 import { gardenGraph } from "./om-fixture.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { preparedFeatures } from "./product-fixture.js";
 import { git } from "../src/runtime/environment.js";
 
 const clone = structuredClone;
@@ -449,15 +449,41 @@ function identityFixture(t: TestContext, research = false, options: { thirdPort?
     const command = { executable: process.execPath, args: ["--version"] };
     engine.environments.configure("garden", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command },
       reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000 }, 0);
-    refinedLayers(engine, "garden");
   }
   const input = reference(delivered(writeOmInput(store, { project: "garden", expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:garden:${stage}`)!)])) as Record<UpstreamStage, Ref> })));
+  let nativeFrame: Ref | null = null;
+  if (research) {
+    // LG01f: the accepted upper layer is produced by the current OM producers — the legacy refinement chain is gone.
+    const graphRef = reference(store.get("graph:garden")!);
+    const gate = delivered(writeHorizon(store, { project: "garden", input, graph: graphRef, refinement: null,
+      choice: { choiceVersion: "identity-native-l2", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} }));
+    const native: FrameRequest = { project: "garden", level: 2, graph: graphRef, horizon: reference(gate.gate), layer: null, frame: null, upper: null };
+    const prepared = delivered(prepareFrame(store, native));
+    const mapped = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
+      { graph, reference: { ...native.graph, hash: hashJson(graph) }, frame: null }, prepared.upperRef, 2));
+    const projected = projectGraph(graph, 2);
+    const proposal: LayerProposal = { base: { graph: native.graph, frame: null }, level: 2, source: "decision", status: "proposed",
+      nodes: projected.nodes.filter(node => node.kind === "operation"),
+      fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),
+      localConnectors: projected.connectors.map(connector => ({ ...connector, bindings: connector.bindings.filter(binding => binding.level === 2) }))
+        .filter(connector => connector.bindings.length),
+      artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins, anchors: projected.anchors,
+      tests: projected.tests, edges: projected.edges ?? [], journeys: projected.journeys ?? [], packets: projected.packets ?? [],
+      transfers: projected.transfers ?? [], removes: [], replaces: [], redefines: [] };
+    const offered = reference(store.write({ id: "om-proposal:garden:identity-native-l2", kind: "layer-proposal", expected: 0, value: proposal }));
+    const candidate = delivered(writeCandidate(store, { frame: native, proposals: [offered] }));
+    assert.equal(candidate.state, "candidate");
+    const accepted = delivered(settleCandidate(store, { project: "garden", level: 2, candidate: reference(candidate.record),
+      outcome: { gate: "G3", candidate: reference(candidate.record), graphHash: candidate.record.value.graphHash, passed: true, codes: [] } }));
+    assert.ok(accepted.layer, "the native L2 acceptance writes graph-layer:garden:2");
+    nativeFrame = reference(accepted.frame!);
+  }
   const horizon = delivered(writeHorizon(store, { project: "garden", input, graph: reference(store.get("graph:garden")!),
-    refinement: research ? reference(store.get("phase:garden:L2")!) : null,
+    refinement: research ? reference(store.get("graph-layer:garden:2")!) : null,
     choice: { choiceVersion: "identity-initial", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} }));
   let frame: FrameRequest = { project: "garden", level: 2, graph: reference(store.get("graph:garden")!), horizon: reference(horizon.gate),
-    layer: research ? reference(store.get("graph-layer:garden:2")!) : null, frame: null, upper: null };
+    layer: research ? reference(store.get("graph-layer:garden:2")!) : null, frame: research ? nativeFrame : null, upper: null };
   const researchLayer = frame.layer;
   let ordinal = 0;
   const empty = (): LayerProposal => ({ base: { graph: frame.graph, frame: frame.frame }, level: 2, source: "decision", status: "proposed",
