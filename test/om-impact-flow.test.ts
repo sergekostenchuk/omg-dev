@@ -87,9 +87,8 @@ out(${JSON.stringify(stages)}.map(stage => [stage, engine.pipeline.inspect('p', 
 
 // ---- AT1 door (№4105 п.1–3): the readiness questions of a saved G5 rejection as a derivation of B1 ----
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { readOmInput, prepareReadinessInput, writeOmInput, writeReadinessInput, type OmInputRecord, type ReadinessTransition } from "../src/om/input.js";
+import { readOmInput, prepareReadinessInput, writeReadinessInput, type OmInputRecord, type ReadinessTransition } from "../src/om/input.js";
 import type { Graph } from "../src/graph/model.js";
-import type { UpstreamStage } from "../src/discovery/requirements.js";
 import { createOmFixture } from "./om-fixture.js";
 import { declarationUnknown, transitionField } from "../src/om/impact.js";
 
@@ -116,9 +115,8 @@ function refusedGate(store: Store, project: string, input: Ref, graph: Ref, tree
 }
 
 test("AT1 door: a saved G5 rejection asks its unresolved transition in B1 once — for the accepted operation above a work not yet accepted, its source the gate; a repeat writes nothing; another snapshot asks anew; a foreign chain or era is refused", async t => {
-  const f = await createOmFixture(t), project = f.project;
-  const stages = Object.fromEntries(Object.entries(f.stages).map(([stage, row]) => [stage, reference(row)])) as Record<UpstreamStage, Ref>;
-  const root = ok(writeOmInput(f.store, { project, stages, expected: 0 }));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), project = f.project;
+  const root = f.store.get<OmInputRecord>(`om-input:${project}`)!;
   const graph = reference(f.graphRevision);
   const gate = refusedGate(f.store, project, reference(root), graph, "b".repeat(40), "first");
   const asked = ok(writeReadinessInput(f.store, { project, input: reference(root), gate }));
@@ -147,9 +145,8 @@ test("AT1 door: a saved G5 rejection asks its unresolved transition in B1 once �
 });
 
 test("AT1 return №4147: a connection point the parser proves nothing about is asked in B1 as a repository fact about the point itself — its only candidate the point", async t => {
-  const f = await createOmFixture(t), project = f.project;
-  const stages = Object.fromEntries(Object.entries(f.stages).map(([stage, row]) => [stage, reference(row)])) as Record<UpstreamStage, Ref>;
-  const root = ok(writeOmInput(f.store, { project, stages, expected: 0 }));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), project = f.project;
+  const root = f.store.get<OmInputRecord>(`om-input:${project}`)!;
   const unknown = declarationUnknown("src/store.py#commit", "The parser reads JavaScript and TypeScript only");
   const gate = refusedGate(f.store, project, reference(root), reference(f.graphRevision), "b".repeat(40), "declaration", "om-atomic-gate/v2", { ...unknown });
   const asked = ok(writeReadinessInput(f.store, { project, input: reference(root), gate }));
@@ -175,9 +172,8 @@ function policyGate(store: Store, project: string, input: Ref, graph: Ref, needs
   return reference(gate);
 }
 test("AT1 policy: a saved G5 asks each undecided policy once — at the producer the boundary names when it is an accepted node, above the works when no node bears the name — as an owner decision; a repeat asks nothing", async t => {
-  const f = await createOmFixture(t), project = f.project;
-  const stages = Object.fromEntries(Object.entries(f.stages).map(([stage, row]) => [stage, reference(row)])) as Record<UpstreamStage, Ref>;
-  const root = ok(writeOmInput(f.store, { project, stages, expected: 0 }));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), project = f.project;
+  const root = f.store.get<OmInputRecord>(`om-input:${project}`)!;
   const gate = policyGate(f.store, project, reference(root), reference(f.graphRevision),
     [["appearance", `${project}-produce-block`, "state-contract"], ["appearance", `${project}-produce-block`, "other-contract"], ["provider", "owner", "state-contract"]], "policies");
   const asked = ok(writeReadinessInput(f.store, { project, input: reference(root), gate }));
@@ -195,9 +191,8 @@ test("AT1 policy: a saved G5 asks each undecided policy once — at the producer
 });
 
 test("AT1 return №4186 P1, №4188: a transition several works in different blocks need is one question of the snapshot — asked once at their common accepted place, one answer for all", async t => {
-  const f = await createOmFixture(t), project = f.project;
-  const stages = Object.fromEntries(Object.entries(f.stages).map(([stage, row]) => [stage, reference(row)])) as Record<UpstreamStage, Ref>;
-  const root = ok(writeOmInput(f.store, { project, stages, expected: 0 }));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), project = f.project;
+  const root = f.store.get<OmInputRecord>(`om-input:${project}`)!;
   const accepted = f.store.get<Graph>(f.graphRevision.id, f.graphRevision.revision)!.value;
   const template = accepted.nodes.find(node => node.kind === "work")!;
   const works = [{ ...structuredClone(template), id: `${project}-one-work`, parent: `${project}-produce-operation` },

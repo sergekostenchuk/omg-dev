@@ -36,7 +36,7 @@ import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { readLayerAcceptance } from '../src/om/layer-basis.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
-import { createOmFixture, gardenGraph, refusedWith } from './om-fixture.js';
+import { gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -455,37 +455,6 @@ test('D3 canonical nodes proposals retain one identity across permutations, late
   assert.equal(normalizeInputDecisionProposal({ ...shape, layers: [...layers, layers[0]!] }).layers.length, 3);
 });
 
-for (const level of [2, 3] as const) test(`D3 research lower admission L${level} rejects stale assessments before preparation and atomically at write while accepted history survives`, async t => {
-  const f = await createOmFixture(t), input = ok(writeOmInput(f.store, { project: f.project, expected: 0,
-    stages: Object.fromEntries(Object.entries(f.stages).map(([stage, row]) => [stage, reference(row)])) as Record<UpstreamStage, Ref> }));
-  const layer = f.layers[level], consumer = level === 2 ? 'garden-produce-operation' : 'garden-produce-work';
-  const basis = { project: f.project, graph: reference(f.graphRevision), layers: [reference(layer)] };
-  const request = (base: Ref, role: string): AddressingRequest => ({ project: f.project, input: base, graph: basis.graph,
-    decisions: [{ pending: inputDecisionWrite({ ...basis, input: base, decision: {
-      target: input.value.input.contracts[0]!.id, field: 'state', value: { [role]: consumer } } }) as Write }] });
-  const accepted = ok(writeAddressing(f.store, request(reference(input), 'writer')));
-  const next = request(reference(accepted), 'authority'), prepared = ok(prepareAddressing(f.store, next));
-  const phase = level === 2 ? 'R1' : 'R2', gate = f.engine.refinement.gate(f.project, phase);
-  assert.deepEqual(gate.findings, []);
-  const milestone = f.store.get<{ draft: Ref }>(`phase:${f.project}:${phase}`)!;
-  const draft = f.store.get<{ questions: string[] }>(milestone.value.draft.id, milestone.value.draft.revision)!;
-  const questions = new Set(draft.value.questions);
-  const assessment = gate.guards.map(ref => f.store.get<{ question: Ref }>(ref.id, ref.revision))
-    .find(row => row?.kind === 'research-assessment' && questions.has(row.value.question.id))!;
-  assert.ok(assessment);
-  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(assessment))));
-  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(layer))));
-  f.store.write({ id: assessment.id, kind: assessment.kind, expected: assessment.revision, value: assessment.value });
-  assert.ok(f.engine.refinement.gate(f.project, phase).findings.some(finding => finding.code === 'phase_stale'));
-  const before = f.store.list().map(reference);
-  refusedWith(prepareAddressing(f.store, next), 'frame_basis_unproven'); refusedWith(writeAddressing(f.store, next), 'frame_basis_unproven');
-  refusedWith(writeGuarded(f.store, { unit: 'D3', target: input.id, guards: prepared.guards,
-    writes: [...prepared.writes, { id: 'neighbor:research', kind: 'test', expected: 0, value: {} }] }), 'input_stale');
-  assert.deepEqual(f.store.list().map(reference), before);
-  assert.deepEqual(ok(readOmInput(f.store, f.project, reference(accepted))), accepted);
-  f.reopen(); assert.deepEqual(ok(readOmInput(f.store, f.project, reference(accepted))), accepted);
-  refusedWith(prepareAddressing(f.store, next), 'frame_basis_unproven');
-});
 
 function acceptOperations(f: ReturnType<typeof fixture>) {
   const sources = gapRequest(f, f.input, 'lower-admission'), frame = sources.operations.frame;

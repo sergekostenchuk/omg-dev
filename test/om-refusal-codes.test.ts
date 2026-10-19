@@ -215,7 +215,7 @@ test("Q2 input: re-addressed results keep their exact prior code, message, addre
     && error.code === "om_admission_guard_invalid"
     && JSON.stringify(error.details) === JSON.stringify({ unit: "OM", target: "admissionGuards", field: "gate" }));
   // A refusal of refs comes through readOmInput whole: refs' own code, at the caller's unit and target (№2460-3).
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const missing = readOmInput(f.store, f.project, { id: `om-input:${f.project}`, revision: 7, hash: hashJson({ probe: true }) });
   const transferred = failed(missing);
   assert.ok(has(REFS_REFUSAL_CODES, transferred.code), transferred.code);
@@ -251,7 +251,7 @@ test("Q2 horizon: the closing gate's default route, an explicit route, and the s
   }
   // The saved issuance reading: a malformed record is horizon_issuance_record_invalid at its first absent field
   // (the record's own bad(field), №2460-5 correction), never horizon_issuance_request_invalid.
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const id = `${HORIZON_ISSUANCE_KIND}:${f.project}:probe`;
   const written = writeGuarded(f.store, { unit: "G2", target: id,
     writes: [{ id, kind: HORIZON_ISSUANCE_KIND, expected: 0, value: { bogus: true } }], guards: [] });
@@ -399,7 +399,7 @@ const ADAPTER_PINS = [
 ] as const;
 
 test("Q2 pins input: stage acceptance and currentness refusals keep their exact prior results", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const request = (expected = 0): InputRequest => ({ project: f.project, expected,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> });
   type Stage = (typeof f.stages)[UpstreamStage]["value"];
@@ -425,7 +425,7 @@ test("Q2 pins input: stage acceptance and currentness refusals keep their exact 
 });
 
 test("Q2 pins input: a source that moved after the input was saved is refused with its exact prior address", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const request = (expected = 0): InputRequest => ({ project: f.project, expected,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> });
   const saved = writeOmInput(f.store, request());

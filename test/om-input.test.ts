@@ -30,7 +30,7 @@ import {
 } from "../src/om/input.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal, Sealed } from "../src/om/refusal.js";
-import { createOmFixture, gardenGraph, type OmFixture } from "./om-fixture.js";
+import { createOmFixture, gardenGraph, type OmPreparedFixture } from "./om-fixture.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { ResearchAssessment } from "../src/discovery/research-model.js";
 import type { Source } from "../src/evidence/evidence.js";
@@ -63,11 +63,11 @@ function addressedError(error: unknown): boolean {
   assert.ok(typeof details?.target === "string" && details.target.length > 0);
   return true;
 }
-function request(f: OmFixture): InputRequest {
+function request(f: OmPreparedFixture): InputRequest {
   return { project: f.project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> };
 }
-function sources(f: OmFixture): InputStages {
+function sources(f: OmPreparedFixture): InputStages {
   return Object.fromEntries(UPSTREAM_STAGES.map(stage => {
     const content = f.stages[stage].value.content as Row;
     const ref = content.draft as Ref;
@@ -88,7 +88,7 @@ function hasCode(result: Sealed<InputBuildResult>, code: string): Refusal {
   assert.equal(gateInput(result as InputBuildResult).passed, false);
   return found;
 }
-function reviseStage(f: OmFixture, stage: UpstreamStage, change: (value: StageArtifact) => void): Ref {
+function reviseStage(f: OmPreparedFixture, stage: UpstreamStage, change: (value: StageArtifact) => void): Ref {
   const original = f.stages[stage];
   const value = clone(original.value);
   change(value);
@@ -124,13 +124,13 @@ function rebindDependents(store: Store, substitutions: Map<string, Ref>, changed
   }
   assert.fail("Exact reference rebinding failed to reach a fixed point");
 }
-function currentRequest(f: OmFixture): InputRequest {
+function currentRequest(f: OmPreparedFixture): InputRequest {
   return { project: f.project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(f.stages[stage].id)!)])) as InputRequest["stages"] };
 }
 
 test("M1 derives the five exact accepted garden sources and writes only om-input", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const before = f.store.list().map(reference);
   const pure = buildOmInput(sources(f));
   assert.deepEqual(pure.refusals, []);
@@ -171,7 +171,7 @@ test("M1 derives the five exact accepted garden sources and writes only om-input
 });
 
 test("every G1 refusal has an exact producer address and leaves no om-input", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const baseline = sources(f);
   const seen = new Set<string>();
   const cases: [string, (stages: InputStages) => void, InputOptions?][] = [
@@ -203,7 +203,7 @@ test("every G1 refusal has an exact producer address and leaves no om-input", as
 });
 
 test("contract era distinguishes legacy addressed gaps from new-era producer refusals", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const legacy = sources(f);
   fields(legacy, "specification").behaviorContracts[0].proof = "garden-produce-block appears only in prose";
   const old = buildOmInput(legacy);
@@ -240,7 +240,7 @@ test("contract era distinguishes legacy addressed gaps from new-era producer ref
 });
 
 test("feature preparation binds by both title and outcome independently of its array order", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const stages = sources(f);
   const featureFields = fields(stages, "features");
   featureFields.features.push({ title: "Deliver data", outcome: "garden-data", requirements: [0] });
@@ -262,7 +262,7 @@ test("feature preparation binds by both title and outcome independently of its a
 });
 
 test("questions preserve producer knowledge and consumers while inventory absence is a nonblocking gap", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const stages = sources(f);
   const metadata = JSON.parse('{"name":"repository-fact","__proto__":{"source":"producer"}}') as Json;
   fields(stages, "discovery").preparation.unknowns = [{ id: "u1", question: "Which module?", consumer: "garden-produce-block",
@@ -304,7 +304,7 @@ test("questions preserve producer knowledge and consumers while inventory absenc
 });
 
 test("exact references and independently checked acceptance reject forged or masquerading saved stages", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   for (const [change, expected] of [
     [{ id: "stage:other:features" }, "record_foreign"],
     [{ hash: fakeHash }, "record_forged"],
@@ -345,7 +345,7 @@ test("exact references and independently checked acceptance reject forged or mas
 });
 
 test("historical accepted sources keep their exact input and era after draft, stage and evidence heads change", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const original = delivered(prepareOmInput(f.store, request(f)));
   const saved = delivered(writeOmInput(f.store, request(f)));
   const ref = (f.stages.specification.value.content as Row).draft as Ref;
@@ -370,7 +370,7 @@ test("historical accepted sources keep their exact input and era after draft, st
 });
 
 test("historical input reads reuse the same era schema objects after source movement and Store reopen", { todo: "NR1 №3591: записанное не перепроверяется при чтении — проверка была у производителя при записи" }, async t => {
-  const f = await createOmFixture(t, "standard", "input-schema-identities");
+  const f = await createOmFixture(t, "standard", "input-schema-identities", { mode: "stages" });
   const saved = delivered(writeOmInput(f.store, request(f)));
   const expectedSchemas = UPSTREAM_STAGES.flatMap(stage => {
     const accepted = f.stages[stage];
@@ -437,7 +437,7 @@ test("historical input reads reuse the same era schema objects after source move
 });
 
 test("all read source heads are guarded and a neighbor cannot persist a partial prepared input", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const req = request(f);
   const prepared = delivered(prepareOmInput(f.store, req));
   for (const stage of UPSTREAM_STAGES) assert.ok(prepared.guards.some(guard => guard.id === req.stages[stage].id));
@@ -464,7 +464,7 @@ test("all read source heads are guarded and a neighbor cannot persist a partial 
 
 
 test("a neighbor stores prepared input atomically and readers rederive forged payloads from saved sources", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const prepared = delivered(prepareOmInput(f.store, request(f)));
   const writes = delivered(writeGuarded(f.store, { unit: "test-neighbor", target: "neighbor:garden",
     writes: [...prepared.writes, { id: "neighbor:garden", kind: "neighbor", expected: 0, value: { inputHash: prepared.record.hash } }], guards: prepared.guards }));
@@ -483,7 +483,7 @@ test("a neighbor stores prepared input atomically and readers rederive forged pa
 });
 
 test("every exported boundary validates absent or malformed arguments before accessing storage", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const valid = sources(f);
   for (const bad of [undefined, null, 7, "invalid/project", []]) {
     assert.throws(() => buildOmInput(bad as unknown as InputStages), addressedError);
@@ -527,7 +527,7 @@ test("every exported boundary validates absent or malformed arguments before acc
 });
 
 test("input policy keeps all five sources when the upstream module array is mutated after import", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const stageData = sources(f), req = request(f);
   const expected = buildOmInput(stageData);
   const prepared = delivered(prepareOmInput(f.store, req));
@@ -566,7 +566,7 @@ test("input policy keeps all five sources when the upstream module array is muta
 
 
 test("accepted status and exact references cannot hide a forged map layer obligation", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const mapRef = (f.stages["operation-map"].value.content as Row).graph as Ref;
   const original = f.store.get<Row>(mapRef.id, mapRef.revision)!;
   const value = clone(original.value);
@@ -582,7 +582,7 @@ test("accepted status and exact references cannot hide a forged map layer obliga
 // Replaced: the former scenario bypassed the producers. The uncovered behavior now comes through them — a new
 // specification acceptance stales the features commit, and the features re-acceptance refuses it.
 test("a specification accepted through its producer with an uncovered behavior stales features, whose re-acceptance refuses requirement_uncovered", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const answered = (stage: UpstreamStage, value: (field: string) => Json) => {
     const draft = f.engine.prepare(f.project, stage);
     for (const id of draft.value.questions) {
@@ -609,7 +609,7 @@ test("a specification accepted through its producer with an uncovered behavior s
 });
 
 async function assessedInputFixture(t: test.TestContext) {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const draftRef = (f.stages.features.value.content as Row).draft as Ref;
   const draft = f.store.get<DiscoveryDraft>(draftRef.id, draftRef.revision)!;
   const answered = draft.value.questions.map(id => f.store.get<Question>(id)!)
@@ -751,7 +751,7 @@ for (const mode of ["new", "existing"] as const) test(`prepared ${mode} input gu
 });
 
 test("current acceptance preserves engine exceptions on new and existing input without writing", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const graphId = `graph:${f.project}`;
   const originalGet = f.store.get;
   const revisions = () => f.store.list().map(head => ({ head: reference(head), history: f.store.history(head.id).map(reference) }));
@@ -817,7 +817,7 @@ test("current acceptance preserves engine exceptions on new and existing input w
 });
 
 test("B1 existing-version admission guards current dependencies while historical input remains readable", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const saved = delivered(writeOmInput(f.store, request(f)));
   const ref = reference(saved);
   const prepared = delivered(prepareExistingOmInput(f.store, f.project, ref));
@@ -840,7 +840,7 @@ test("B1 existing-version admission guards current dependencies while historical
 });
 
 test("B1 refuses malformed or cyclic derived input lineage before treating its body as stage output", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const saved = delivered(writeOmInput(f.store, request(f)));
   const prior = reference(saved), graph = reference(f.graphRevision);
   const before = f.store.history(saved.id).length;
@@ -862,7 +862,7 @@ test("B1 refuses malformed or cyclic derived input lineage before treating its b
 });
 
 test("B1 derived-input request shape is checked before storage reads", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const ref = reference(f.graphRevision);
   const valid: DerivedInputRequest = { project: f.project, previous: ref, graph: ref, decisions: [] };
   const cases: unknown[] = [undefined, null, {}, { ...valid, previous: null }, { ...valid, graph: null },
@@ -888,7 +888,7 @@ test("B1 derived-input request shape is checked before storage reads", async t =
 });
 
 test("B1 rederives addressed versions and preserves them through reuse, source history and restart", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const base = delivered(writeOmInput(f.store, request(f)));
   const criterion = base.value.input.criteria[0]!;
   assert.equal(criterion.checkKind, null);
@@ -1151,7 +1151,7 @@ test("B1 cannot use a recovery claim to reopen a question with no applied fact",
 });
 
 test("B1 recovery request shape is checked before storage access", async t => {
-  const f = await createOmFixture(t), original = f.store.get;
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" }), original = f.store.get;
   f.store.get = () => { throw new Error("Malformed recovery must not read storage"); };
   try {
     for (const request of [undefined, null, {}, { project: f.project }, { project: f.project, input: null }])
@@ -1186,7 +1186,7 @@ test("B1 historical memo ends with its outer read and never masks later storage 
 });
 
 test("B1 dependent recovery rejects missing evidence and duplicate causes before storage", async t => {
-  const f = await createOmFixture(t), ref = reference(f.graphRevision);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" }), ref = reference(f.graphRevision);
   const invalidations = [{ record: ref, sources: [{ before: ref, after: { ...ref, revision: ref.revision + 1 } }] }];
   const dependency = { record: ref, question: ref, removed: [ref],
     conditions: [{ pointer: "/facts/0/value", before: "JSON", after: { present: false } }] };
@@ -1865,7 +1865,7 @@ test("S1.3 (№2217 г) a complete Store-only proof is kept, and git calls outsi
 });
 
 test('B1.1 both v4 question producers require explicit moments before normalization and preserve per-source eras', async t => {
-  const f = await createOmFixture(t), stages = sources(f);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" }), stages = sources(f);
   const unknown = { id: 'late', question: 'Which environment is needed?', consumer: 'garden-produce-block',
     kind: 'environment-confirmation', blocksCurrentStage: false, resolution: 'Observe the requested moment', moment: 'feasibility' };
   const remaining = { question: 'Which result environment is needed?', consumer: 'garden-consume-block',
@@ -1897,7 +1897,7 @@ test('B1.1 both v4 question producers require explicit moments before normalizat
 });
 
 test('B1.1 deadline policy survives exported-table mutation across producer B1 and D1', async t => {
-  const f = await createOmFixture(t), stages = sources(f);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" }), stages = sources(f);
   fields(stages, 'discovery').preparation.unknowns = [{ id: 'late', question: 'Which environment is required?',
     consumer: 'garden-produce-block', blocksCurrentStage: false, resolution: 'Confirm before feasibility', moment: 'feasibility' }];
   fields(stages, 'features').featurePreparation[0].remainingQuestions = [{ question: 'Which consumer environment is required?',
@@ -1943,7 +1943,7 @@ test('B1.1 deadline policy survives exported-table mutation across producer B1 a
 // ── D8.4.2 (договор №2230): B1 через общий читатель принятого ответа ──
 
 test("D8.4.2 R13: a stage accepted on a managed answer carries K in its proofs; B1 builds and reads historically on the same trail; a lost K refuses", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const draftRef = (f.stages.features.value.content as Row).draft as Ref;
   const draft = f.store.get<DiscoveryDraft>(draftRef.id, draftRef.revision)!;
   const answered = draft.value.questions.map(id => f.store.get<Question>(id)!)
@@ -3612,10 +3612,8 @@ import { transitionField } from "../src/om/impact.js";
  * impact era is: its door's unresolved transitions and undecided policies are asked in B1 before any works packet.
  */
 test("RL3 (№4217): the owner's reopening asks its door's unresolved transition and undecided policy in B1 as a saved G5 does — above the accepted work and at the accepted producer, its source the record; a repeat asks nothing; a reopening without the door's impact, on a B1 of another chain or under another project's address is refused", async t => {
-  const f = await createOmFixture(t), project = f.project;
-  const stages = Object.fromEntries(Object.entries(f.stages).map(([stage, row]) => [stage, reference(row)])) as Record<UpstreamStage, Ref>;
-  const root = writeOmInput(f.store, { project, stages, expected: 0 });
-  assert.ok(root.ok);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), project = f.project;
+  const root = f.store.get<OmInputRecord>(`om-input:${project}`)!;
   const accepted = f.graphRevision.value as Graph, work = accepted.nodes.find(node => node.kind === "work")!;
   const block = accepted.nodes.find(node => node.kind === "block")!.id, snapshot = { commit: "c".repeat(40), tree: "b".repeat(40) };
   const unknown = { file: "test/loader.test.ts", line: 2, kind: "dynamic-import", text: "import(process.env.M!)", site: { start: 60, end: 82, hash: "a".repeat(64) }, candidates: ["src/garden.ts"] };
@@ -3628,15 +3626,15 @@ test("RL3 (№4217): the owner's reopening asks its door's unresolved transition
     ...(impact ? { impact: { snapshot, works: [{ work: work.id, affected: [], entries: [], consumers: [], unknowns: [unknown] }],
       policies: [{ work: work.id, policy: "appearance", producer: block, contract: { id: "state-contract", hash: "state-contract-hash" }, question: null }] } } : {}),
     decision: { actor: "owner", command: "om-regate" } });
-  const reopen = reference(f.store.write({ id: `om-l3-reopen:${project}`, kind: "om-l3-reopen", expected: 0, value: body(reference(root.value), true) as unknown as Json }));
+  const reopen = reference(f.store.write({ id: `om-l3-reopen:${project}`, kind: "om-l3-reopen", expected: 0, value: body(reference(root), true) as unknown as Json }));
   const pending = readinessPending(f.store, project, reopen);
   assert.ok(pending.ok && pending.value);
-  const asked = writeReadinessInput(f.store, { project, input: reference(root.value), gate: reopen });
+  const asked = writeReadinessInput(f.store, { project, input: reference(root), gate: reopen });
   assert.ok(asked.ok);
-  const added = asked.value.value.input.questions.filter(question => !root.value.value.input.questions.some(prior => prior.id === question.id))
+  const added = asked.value.value.input.questions.filter(question => !root.value.input.questions.some(prior => prior.id === question.id))
     .map(question => [question.readiness!.cause, question.consumer, question.kind, question.source, question.readiness!.works]).sort();
   assert.deepEqual(added, [["policy", block, "owner-decision", reopen, [work.id]], ["transition", work.parent, "repository-fact", reopen, [work.id]]].sort());
-  assert.deepEqual(asked.value.value.derivation, { kind: "readiness", previous: reference(root.value), gate: reopen });
+  assert.deepEqual(asked.value.value.derivation, { kind: "readiness", previous: reference(root), gate: reopen });
   const read = readOmInput(f.store, project, reference(asked.value));
   assert.ok(read.ok, "a trusted read of the derived B1");
   // A repeat asks nothing: the same request delivers the written B1, and on it nothing is pending.
@@ -3651,7 +3649,7 @@ test("RL3 (№4217): the owner's reopening asks its door's unresolved transition
   };
   const bare = reference(f.store.write({ id: reopen.id, kind: "om-l3-reopen", expected: 1, value: body(reference(asked.value), false) as unknown as Json }));
   refusedWith(bare, reference(asked.value), "record_forged");
-  const other = f.store.write({ id: `om-input-other:${project}`, kind: "om-input", expected: 0, value: root.value.value as unknown as Json });
+  const other = f.store.write({ id: `om-input-other:${project}`, kind: "om-input", expected: 0, value: root.value as unknown as Json });
   const foreign = reference(f.store.write({ id: reopen.id, kind: "om-l3-reopen", expected: 2, value: body(reference(other), true) as unknown as Json }));
   refusedWith(foreign, reference(asked.value), "record_forged");
   const elsewhere = f.store.write({ id: `om-l3-reopen:${project}-other`, kind: "om-l3-reopen", expected: 0, value: body(reference(asked.value), true) as unknown as Json });
@@ -3691,7 +3689,7 @@ test("quick path in prepareOmInput bypasses deriveInputRecord and stage proofs l
 });
 
 test("absent guard in prepareOmInput rolls back transaction when absent entity becomes present before commit", async t => {
-  const f = await createOmFixture(t);
+  const f = await createOmFixture(t, "standard", "garden", { mode: "stages" });
   const req = request(f);
   const prepared = delivered(prepareOmInput(f.store, req));
   assert.ok(prepared.guards.some(g => 'absent' in g && g.id === `legacy-operation:${f.project}` && g.absent === true),
