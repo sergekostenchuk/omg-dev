@@ -1044,18 +1044,40 @@ test("DRV1 public stopped entry applies a saved web capture without HTTP or anot
 });
 
 // DRY6-01 (contract №4961 (b)): during the assessor B of one concept question a second Store lawfully reopens its answered
-// neighbour; the adapter does it itself, so the change falls inside the real assessment of the public pass.
+// neighbour; the adapter does it itself, so the change falls inside the real assessment of the public pass. The reopen goes
+// through Discovery.reopen — the exact function the 'reopen-question' command delegates to. In the r2 trace the refusal was
+// kind 'call' — the provider call ended without a response (process_timeout/process_cancelled at assessment-session.ts:1148)
+// before the reopen landed; a cold import(engine.js) measures ≈5.7 s here vs the unchanged 4 s provider timeout, consistent
+// with the call exceeding its budget.
 const NEIGHBOR_ADAPTER = ADAPTER.replace("let research;", `let research;
 const order=process.argv[5]+'.neighbor';
 if(c.role==='assess-answer'&&existsSync(order)){const o=JSON.parse(readFileSync(order,'utf8'));
  if(c.question?.field===o.at){(await import('node:fs')).rmSync(order);
   const {Store}=await import(${JSON.stringify(new URL("../src/storage/store.js", import.meta.url).href)});
-  const {ProductEngine}=await import(${JSON.stringify(new URL("../src/product/engine.js", import.meta.url).href)});
+  const {Discovery}=await import(${JSON.stringify(new URL("../src/discovery/discovery.js", import.meta.url).href)});
   const s=new Store(o.db);
   try{const d=s.list('discovery-draft').filter(r=>r.value.projectId===o.project&&r.value.stage===o.stage).at(-1);
    const q=d.value.questions.map(id=>s.get(id)).find(r=>r.value.spec.field===o.reopen);
-   new ProductEngine(s).execute({type:'reopen-question',question:q.id,expected:q.revision});}
+   new Discovery(s).reopen(q.id,q.revision);}
   finally{s.close();}}}`);
+
+test("DRY6-01 the neighbour's in-call reopen has no direct reference to the product engine; cold import cost is diagnostic only", t => {
+  // Direct-route check: the adapter source holds no reference to the product engine — it performs the same lawful
+  // reopen through Discovery.reopen, the function 'reopen-question' delegates to, with the store still closed in
+  // finally. (Transitive imports of discovery.js itself are outside what this text check can prove.)
+  assert.match(NEIGHBOR_ADAPTER, /discovery\/discovery\.js/);
+  assert.match(NEIGHBOR_ADAPTER, /new Discovery\(s\)\.reopen\(q\.id,q\.revision\)/);
+  assert.match(NEIGHBOR_ADAPTER, /finally\{s\.close\(\);\}/);
+  assert.doesNotMatch(NEIGHBOR_ADAPTER, /product\/engine\.js|ProductEngine/);
+  try {
+    const dist = (name: string) => new URL(`../src/${name}`, import.meta.url).href;
+    const coldCost = (specifiers: string[]) => Number(execFileSync(process.execPath, ["--input-type=module", "-e",
+      `const t=performance.now();for(const s of ${JSON.stringify(specifiers)}) await import(s);console.log(Math.round(performance.now()-t));`],
+      { encoding: "utf8" }).trim());
+    t.diagnostic(`cold import — reopen path ${coldCost([dist("storage/store.js"), dist("discovery/discovery.js")])}ms, ` +
+      `engine path ${coldCost([dist("storage/store.js"), dist("product/engine.js")])}ms (diagnostic only, never asserted)`);
+  } catch (cause) { t.diagnostic(`cold-import measurement unavailable: ${cause}`); }
+});
 
 test("DRY6-01 a lawful neighbour reopen during B pauses the public pass with the exact machine door; a restart repeats it without a call; another project keeps its own door; the named command continues the same draft", async t => {
   const f = fixture(t);

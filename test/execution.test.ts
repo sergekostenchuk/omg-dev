@@ -157,6 +157,62 @@ test("file evidence preserves literal Unicode names and explicit deletions", asy
   assert.throws(() => resolveArtifact(f.store, "p", f.plan.value.graphSnapshot, { root: root.path, head: git(root.path, ["rev-parse", "HEAD"]), tree: git(root.path, ["rev-parse", "HEAD^{tree}"]), files: [] }, "p-produce-work", "p-data"), /artifact changed/);
 });
 
+// FLAKY2: the owner's first call needs its whole engine module graph loaded inside the spawned child — a cold
+// `import(engine.js)` alone measures ≈5.7 s here, consistent with the start not fitting the nominal 4 s (200×20 ms)
+// poll under load. The wait keeps a finite monotonic deadline, fails early when the owner exits on its own and
+// reports the observed state (elapsed ms, exit code/signal, calls, the saved child and stderr), so a slow start,
+// an early exit and a hang are distinguished by the failure text instead of a bare counter. The deadline is a
+// test-local bound, never engine timing.
+const OWNER_READY_DEADLINE_MS = 30_000;
+type MonotonicClock = { now(): number; sleep(ms: number): Promise<void> };
+const REAL_CLOCK: MonotonicClock = { now: () => performance.now(), sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) };
+async function awaitOwnerReady(child: { exitCode: number | null; signalCode: NodeJS.Signals | null },
+  ready: () => boolean, diagnostics: () => string, deadlineMs = OWNER_READY_DEADLINE_MS,
+  clock: MonotonicClock = REAL_CLOCK): Promise<void> {
+  const started = clock.now();
+  for (;;) {
+    if (ready()) return;
+    const elapsed = Math.round(clock.now() - started);
+    if (child.exitCode !== null || child.signalCode !== null)
+      assert.fail(`The owner exited before its first call (exitCode=${child.exitCode} signal=${child.signalCode}) after ${elapsed} ms — ${diagnostics()}`);
+    if (elapsed >= deadlineMs)
+      assert.fail(`No first call within ${elapsed} ms and the owner is still running — ${diagnostics()}`);
+    await clock.sleep(20);
+  }
+}
+
+test("the owner-readiness wait distinguishes a controlled slow start, an early exit and an expired deadline", async () => {
+  // Virtual clock — the injected sleep only advances virtual now; no branch can race a real timer, and no real
+  // children are spawned.
+  const child = () => ({ exitCode: null as number | null, signalCode: null as NodeJS.Signals | null });
+  const virtualClock = (): MonotonicClock => {
+    let now = 0;
+    return { now: () => now, sleep: ms => { now += ms; return Promise.resolve(); } };
+  };
+  { // readiness after a bounded number of polls resolves — the real scheduler cannot delay virtual time
+    const clock = virtualClock(); let polls = 0;
+    await awaitOwnerReady(child(), () => ++polls >= 3, () => "unreached", 1000, clock);
+    assert.ok(polls >= 3, `readiness arrived after ${polls} bounded polls`);
+  }
+  { // an exit observed between polls is reported with its code and signal, not mistaken for a deadline
+    const clock = virtualClock(); const leaver = child(); let checks = 0;
+    await assert.rejects(awaitOwnerReady(leaver, () => { if (++checks === 2) leaver.exitCode = 3; return false; },
+      () => "stderr=bye", 1000, clock), /exited before its first call \(exitCode=3 signal=null\).*stderr=bye/);
+  }
+  { // readiness that never arrives is refused by the virtual deadline with the measured duration
+    const clock = virtualClock();
+    await assert.rejects(awaitOwnerReady(child(), () => false, () => "calls=0 saved child=null", 1000, clock),
+      /No first call within 1000 ms and the owner is still running — calls=0 saved child=null/);
+  }
+  { // the r1 counterexample: a timer resumed 1100 ms late — the injected sleep models it by advancing virtual now
+    // past the deadline, so the deadline branch reports the measured elapsed deterministically
+    let now = 0;
+    const clock: MonotonicClock = { now: () => now, sleep: _ms => { now += 1100; return Promise.resolve(); } };
+    await assert.rejects(awaitOwnerReady(child(), () => false, () => "late timer", 1000, clock),
+      /No first call within 1100 ms and the owner is still running — late timer/);
+  }
+});
+
 test("an abruptly killed owner cannot leave its implementation writer alive, and the attempt reopens as interrupted", async t => {
   const f = executionFixture(t, "wait");
   const worker = join(f.directory, "owner.mjs");
@@ -168,7 +224,12 @@ store.close();`);
   const child = spawn(process.execPath, [worker], { stdio: ["ignore", "pipe", "pipe"] });
   t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
   let error = ""; child.stderr.on("data", data => { error += data; });
-  for (let n = 0; n < 200 && f.calls().length === 0 && child.exitCode === null; n++) await new Promise(resolve => setTimeout(resolve, 20));
+  child.once("error", cause => { error += `\nspawn error: ${cause.message}`; });
+  // Readiness is the implementer's real first call plus the attempt's saved child — runProcess commits that record
+  // before the request is sent, and the first call lands only inside the spawned owner.
+  const savedChild = () => f.store.list<TaskRun>("task-run")[0]?.value.child ?? null;
+  await awaitOwnerReady(child, () => f.calls().length >= 1 && savedChild() !== null,
+    () => `calls=${f.calls().length} saved child=${JSON.stringify(savedChild())} stderr=${error.trim() || "(empty)"}`);
   assert.equal(f.calls().length, 1, error);
   const owned = f.store.list<TaskRun>("task-run")[0]!.value.child!;
   assert.ok(owned);
