@@ -6,7 +6,7 @@
 assessment-session-resume.test.ts :: D8.3 reads byte-identical assessment history from the whole b603c2b producer after two restarts without dispatch # вид 1: эра b603c2b
 discovery-v6-era.test.ts :: DS1.2e the released v5 requirement literal and all schema/prompt bytes stay exact # вид 1: старая форма/маршрут
 discovery-v6-era.test.ts :: P3-83 saved v5 accepted replay keeps its public shape and paid bytes after a new Store # вид 1: старая форма/маршрут
-discovery-v6-era.test.ts :: DS2 genuine pre-DS2 v6 keeps unfinished and paid work, accepted summary and B1 exact closure after restart # вид 1: старая форма/маршрут
+discovery-v6-era.test.ts :: DS2 genuine pre-DS2 v6 keeps unfinished and paid work, accepted summary and B1 exact closure after restart # поддерживаемое издание v6 до DS2; исторический Git-производитель, исключён из check:backend
 discovery.test.ts :: D8.4.2-2 P2-1 (№2276-1): a K of the accepted D8.4e producer (c60be08, UUID answer) keeps its full contract; the new producer alone writes the managed address # вид 1: эра c60be08
 early-stage-briefs.test.ts :: RS4 exact Git 8b665772 producer: old completed and paid pending history and reader continuation survive restart unchanged # вид 1: эра 8b665772
 execution-external-input.test.ts :: whole historical Git producer keeps its defective external plan sealed and does not retrofit a Source # вид 1: старая форма/маршрут
