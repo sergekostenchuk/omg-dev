@@ -121,3 +121,4 @@ stage-research.test.ts :: DS1-09 exact Git v4 producer: accepted stages retain t
 storage.test.ts :: the complete ee3fd4c Store producer retains records, hashes and history after restart # вид 1: эра ee3fd4c
 storage.test.ts :: PF4 (№3523): the engine before PF4 (3e8aa784) opens and writes a database with the extension and reads snapshots with and without it; a check this engine saved notices what the old engine wrote, and one it did not touch stays # вид 1: эра 3e8aa78, 3e8aa784
 store-view.test.ts :: PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them # вид 1: эра 5929ea25
+om-model-call.test.ts :: LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send # вид 1: старый E3 допускал context Ref в search; только два reads-invalid окна (№6978)

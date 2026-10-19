@@ -259,7 +259,7 @@ import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { prepareQuestionTasks, prepareQuestionPacket, readQuestionPacket, readPartResult, writeQuestionPacket, type QuestionPacketRequest, type QuestionPacketRecord,
   type PartProposalBody } from '../src/om/question-packet.js';
-import { writeRoutes, type RoutesRecord } from '../src/om/routes.js';
+import { writeRoutes } from '../src/om/routes.js';
 import { openSeries, beginAttempt, seriesRequestOf, readCompletionBinding, completionWorkId } from '../src/om/series.js';
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
@@ -295,7 +295,7 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
         // OWN1 (№3711): a design question of the pass is the model's; the one no producer of the pass serves is a later one.
         moment: kind === 'design' ? 'task-start' : 'om-pass', blocksCurrentStage: false, resolution: 'Address during OM' }] : [])];
     return value;
-  }, LP7_BASE);
+  });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = valueOf(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   // 'design' also addresses the spare question as a design decision of task start: no producer of the pass answers it (H1.5, OWN1).
@@ -315,14 +315,13 @@ function e4Prefix(store: Store, kind: 'fact' | 'node' | 'field' | 'design', extr
     questions: gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
       .map(gap => ({ gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) }));
   const source = store.get<{content: string}>(`source:${project}:brief`)!;
-  // LP7 (№3393 §6 F2): every historical producer of these tests reads this route, so it is the base code's own record,
-  // written in its own process — the split route of its era, which today's code keeps current — never a joined one.
-  const routes = h15AtCommit({ root: dirname(store.path), database: store.path }, LP7_BASE, 'e4-routes', `const { writeRoutes } = await import(src('om/routes.js'));
-out(take(writeRoutes(store, args)));`, { project, gaps: gapRequest, tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
-    catalog: { paths: ['e4-source.txt'], records: [] }, previous: null }) as Revision<RoutesRecord>;
+  // This open prefix is built once per variant by current producers, then copied for each test.
+  // Live workspace, pending calls and race participants are created only after the copy.
+  const routes = valueOf(writeRoutes(store, { project, gaps: gapRequest,
+    tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
+    catalog: { paths: ['e4-source.txt'], records: [] }, previous: null }));
   return { graphData, graph, input, sources, gaps, gapRequest, source, routes };
 }
-const LP7_BASE = '7c7d3cccb88d0a6c17b21051069f0244d98248f9';
 
 function e4Fixture(t: TestContext, kind: 'fact' | 'node' | 'field' | 'design' = 'fact', capacity = 100_000, priorNoProgress = 0, timeoutMs = 1000, managed = false, materialize = true, extraQuestion = false,
   seriesCommit?: string, material?: (store: Store, project: string, root: string) => void, priorRefused = false) {
@@ -3680,62 +3679,113 @@ test('PF1 (№2797-2) pendingCallStore is the common pending overlay: later writ
     (error: unknown) => error instanceof EngineError && error.code === 'invalid_json', 'A value that is no JSON is refused as before: its hash is taken first');
 });
 
-// These regressions exercise the historical permissive E3 form; its genuine producer owns the era.
-test('LP3 (№2817 row 2) a need_source that E3 admits but whose search names a context record as its scope ends the cycle as reads-invalid with the read\'s own record_foreign, before any read: the root is discharged, nothing more is sent, and the cycle reads and repeats the same after restart; a source scope and read_context of that record still deliver', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
+// Current E3 rejects cross-domain labels before delivery; MP2 allows exactly one correction.
+test('LP3 current E3 rejects a context search label before any delivery, repeats one paid call exactly, and settles one failed correction; lawful source search and context reading still deliver', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
   const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' },
     { action: 'search', within: reference(f.input), query: 'question' }]);
-  f.steps([{ research: need, usage }, { research: e4Fact(f), usage }]);
+  f.steps([{ research: need, usage }, { research: need, usage }]);
+  const first = valueOf(await runModelCall(f.store, f.request));
+  assert.ok(first.diagnostic && first.response && first.record.value.om.failure);
+  assert.deepEqual([first.record.value.om.failure.code, first.record.value.om.failure.at.field], ['answer_label_unknown', 'reads/1/within']);
+  const diagnostic = valueOf(readManagedModelDiagnostic(f.store, completionSnapshot(f).binding, first.diagnostic));
+  assert.deepEqual([diagnostic.request.packet, diagnostic.request.call, diagnostic.request.response, diagnostic.request.code],
+    [f.request.packet, first.call, first.response, 'answer_label_unknown']);
+  assert.equal(f.sent().length, 1);
+  assert.deepEqual(f.store.list('om-read-delivery'), [], 'No read was performed, including the lawful read before the bad label');
+  const paid = f.store.list(); f.restart();
+  assert.deepEqual(valueOf(readModelCall(f.store, { project: f.project, record: reference(first.record) })).record, first.record);
+  assert.deepEqual(valueOf(await runModelCall(f.store, f.request)).record, first.record);
+  assert.deepEqual(f.store.list(), paid); assert.equal(f.sent().length, 1, 'Replaying the paid refusal never sends again');
+
   const cycle = valueOf(await runModelCycle(f.store, f.request));
-  assert.equal(cycle.record.value.terminal, 'reads-invalid');
-  assert.equal(f.sent().length, 1, 'One paid call; the unperformable read sends nothing more');
-  assert.deepEqual(f.store.list('om-read-delivery'), [], 'No read was performed — not even the lawful one before it');
-  const diagnostic = f.store.get<{ refusals: { code: string }[] }>(cycle.record.value.diagnostic!.id)!;
-  assert.equal(diagnostic.value.refusals[0]!.code, 'record_foreign', 'The read keeps its own addressed refusal');
-  assert.ok(canonical(diagnostic.value as unknown as Json).includes(f.input.id), 'and its exact record as evidence');
+  assert.equal(cycle.record.value.terminal, 'outcome');
+  assert.equal(cycle.record.value.steps.length, 2);
+  assert.deepEqual(cycle.record.value.steps[0]!.record, reference(first.record));
+  assert.equal(f.sent().length, 2, 'The failed correction is sent once, with no third call');
+  assert.deepEqual([cycle.last.record.value.om.failure?.code, cycle.last.record.value.om.failure?.at.field],
+    ['answer_label_unknown', 'reads/1/within']);
+  assert.ok(cycle.last.diagnostic && cycle.last.response);
+  const secondDiagnostic = valueOf(readManagedModelDiagnostic(f.store, completionSnapshot(f).binding, cycle.last.diagnostic));
+  assert.deepEqual([secondDiagnostic.request.packet, secondDiagnostic.request.call, secondDiagnostic.request.response],
+    [cycle.record.value.steps[1]!.packet, cycle.last.call, cycle.last.response]);
+  assert.deepEqual(f.store.list('om-read-delivery'), []);
   const work = completionSnapshot(f); assert.equal(work.complete, true); assert.ok(work.refusals.length);
   const saved = f.store.list(); f.restart();
   assert.deepEqual(valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) })).record, cycle.record);
-  valueOf(await runModelCycle(f.store, f.request));
-  assert.deepEqual(f.store.list(), saved, 'The repeat writes nothing'); assert.equal(f.sent().length, 1);
-  // Control: the same record read as context, and a captured source as the scope, are performed as before.
-  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
-  g.steps([{ research: e4NeedSource(g, [{ action: 'read_context', record: reference(g.input), pointer: '/input/questions/0/question' },
-    { action: 'search', within: reference(g.source), query: 'UTF' }]), usage }, { research: e4Fact(g), usage }]);
+  assert.deepEqual(valueOf(await runModelCycle(f.store, f.request)).record, cycle.record);
+  assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 2);
+
+  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+  const contextRead = { action: 'read_context', record: reference(g.input), pointer: '/input/questions/0/question' };
+  const sourceRead = { action: 'search', within: reference(g.source), query: 'UTF' };
+  g.steps([{ research: e4NeedSource(g, [contextRead, sourceRead]), usage }, { research: e4Fact(g), usage }]);
   const lawful = valueOf(await runModelCycle(g.store, g.request));
   assert.equal(lawful.record.value.terminal, 'outcome'); assert.equal(g.sent().length, 2);
-  assert.equal(g.store.list('om-read-delivery').length, 2);
+  const deliveries = g.store.list<ReadDeliveryRecord>('om-read-delivery');
+  assert.equal(deliveries.length, 2);
+  const at = (read: object) => deliveries.find(row => canonical(row.value.read as Json) === canonical(read as unknown as Json))!.value.data;
+  assert.deepEqual(at(contextRead), { contract: 'om-read-result/v1', outcome: 'complete',
+    requested: { pointer: contextRead.pointer }, value: g.input.value.input.questions[0]!.question });
+  assert.deepEqual(at(sourceRead), g.source.value.content.split(/\r?\n/).flatMap((text, index) =>
+    text.toLowerCase().includes('utf') ? [{ source: reference(g.source), line: index + 1, text }] : []));
 });
 
-test('LP3 (№2817 п.4, п.7) a cycle stopped between its transactions — after the call, the deliveries, the blocked continuation or its diagnostic; after the call or the diagnostic of an unperformable read — is finished by the same cycle without another send, with the same terminal and diagnostic, and repeats without a write after restart', async t => {
-  const windows = { blocked: ['call', 'deliveries', 'continuation', 'diagnostic'], 'reads-invalid': ['call', 'diagnostic'] } as const;
-  for (const [terminal, stops] of Object.entries(windows)) for (const stop of stops) await t.test(`${terminal} after ${stop}`, async t => {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
-    let request = f.request, packetRequest = f.packetRequest;
-    if (terminal === 'blocked') {
-      const config = f.environment(currentPacketWire(f.packet.value.packet) + 100);
-      packetRequest = { ...f.packetRequest, environment: reference(config) };
-      const packet = h15AtCommit(f, 'b595c7b', 'era-window-packet',
-        `const { writeQuestionPacket } = await import(src('om/question-packet.js'));
-out(take(writeQuestionPacket(store,args)).record);`, packetRequest) as Revision<QuestionPacketRecord>;
-      request = { ...request, packet: reference(packet), dispatch: { ...request.dispatch, config: reference(config) } };
-      writeFileSync(join(f.root, 'e4-source.txt'), 'UTF-8 '.repeat(20_000));
-    }
-    const reads = terminal === 'blocked' ? [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]
-      : [{ action: 'search', within: reference(f.input), query: 'question' }];
+test('LP3 current blocked continuation resumes after call, deliveries, continuation or diagnostic with one paid call and exact replay', async t => {
+  for (const stop of ['call', 'deliveries', 'continuation', 'diagnostic'] as const) await t.test('blocked after ' + stop, async t => {
+    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
+    const config = f.environment(currentPacketWire(f.packet.value.packet) + 100);
+    const packetRequest = { ...f.packetRequest, environment: reference(config) };
+    const packet = valueOf(writeQuestionPacket(f.store, packetRequest)).record;
+    const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
+    writeFileSync(join(f.root, 'e4-source.txt'), 'UTF-8 '.repeat(20_000));
+    const reads = [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }];
     f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4NeedSource(f, reads), usage }]);
     const call = valueOf(await runModelCall(f.store, request));
     const basis = { project: f.project, packet: request.packet, call: call.call, response: call.response! };
-    if (terminal === 'blocked' && stop !== 'call') {
+    let expectedNext: Ref | undefined, expectedDiagnostic: Ref | undefined;
+    if (stop !== 'call') {
       const delivered = valueOf(deliverModelSources(f.store, basis));
       if (stop !== 'deliveries') {
         const next = valueOf(writeQuestionPacket(f.store, { ...packetRequest, previous: [], continuation: { packet: basis.packet, call: basis.call,
           response: basis.response, deliveries: [...delivered.deliveries] } })).record;
         assert.equal(next.value.state, 'blocked');
-        if (stop === 'diagnostic') valueOf(finishModelAttempt(f.store, { ...basis, code: next.value.refusal!.code, message: next.value.refusal!.message,
-          reason: 'refused', evidence: [reference(next)] }));
+        expectedNext = reference(next);
+        if (stop === 'diagnostic') expectedDiagnostic = valueOf(finishModelAttempt(f.store, { ...basis, code: next.value.refusal!.code,
+          message: next.value.refusal!.message, reason: 'refused', evidence: [reference(next)] })).diagnostic;
       }
     }
+    f.restart();
+    const cycle = valueOf(await runModelCycle(f.store, request));
+    assert.equal(cycle.record.value.terminal, 'blocked');
+    assert.equal(f.sent().length, 1, 'The saved call is finished, never sent again');
+    assert.ok(cycle.record.value.next && cycle.record.value.diagnostic);
+    if (expectedNext) assert.deepEqual(cycle.record.value.next, expectedNext);
+    if (expectedDiagnostic) assert.deepEqual(cycle.record.value.diagnostic, expectedDiagnostic);
+    const next = f.store.get<QuestionPacketRecord>(cycle.record.value.next.id)!;
+    assert.deepEqual([next.value.request.continuation!.packet, next.value.request.continuation!.call, next.value.request.continuation!.response],
+      [basis.packet, basis.call, basis.response]);
+    const diagnostic = valueOf(readManagedModelDiagnostic(f.store, completionSnapshot(f).binding, cycle.record.value.diagnostic));
+    assert.deepEqual([diagnostic.request.packet, diagnostic.request.call, diagnostic.request.response, diagnostic.request.evidence],
+      [basis.packet, basis.call, basis.response, [reference(next)]]);
+    assert.equal(completionSnapshot(f).complete, true);
+    const saved = f.store.list(); f.restart();
+    assert.deepEqual(valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) })).record, cycle.record);
+    assert.deepEqual(valueOf(await runModelCycle(f.store, request)).record, cycle.record);
+    assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 1);
+  });
+});
+
+// Type 1: only the old E3 admitted this context Ref as a search scope; excluded independently of the four current windows.
+test('LP3 legacy reads-invalid: a context Ref admitted by the old E3 resumes after call or diagnostic without another send', async t => {
+  const windows = { 'reads-invalid': ['call', 'diagnostic'] } as const;
+  for (const [terminal, stops] of Object.entries(windows)) for (const stop of stops) await t.test(`${terminal} after ${stop}`, async t => {
+    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
+    const request = f.request;
+    const reads = [{ action: 'search', within: reference(f.input), query: 'question' }];
+    f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4NeedSource(f, reads), usage }]);
+    const call = valueOf(await runModelCall(f.store, request));
+    const basis = { project: f.project, packet: request.packet, call: call.call, response: call.response! };
     if (terminal === 'reads-invalid' && stop === 'diagnostic') {
       const scope = reference(f.input), read = readRecord(f.store, scope, { unit: 'E4', target: scope.id, idPrefix: `source:${f.project}:`, kind: 'source' });
       assert.ok(!read.ok && read.refusal.code === 'record_foreign');
@@ -3752,23 +3802,28 @@ out(take(writeQuestionPacket(store,args)).record);`, packetRequest) as Revision<
   });
 });
 
-test('LP3 (№2817 п.3, п.7) the ground of reads-invalid is derived from the exact packet, call and response alone: another record as its evidence, or a response whose reads are performable, cannot close the attempt with that terminal', async t => {
-  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
+test('LP3 current E3 refusal cannot be assigned reads-invalid, and a lawful need-source cannot be closed with a fabricated read refusal', async t => {
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
   f.steps([{ research: e4NeedSource(f, [{ action: 'search', within: reference(f.input), query: 'question' }]), usage }]);
   const call = valueOf(await runModelCall(f.store, f.request));
+  assert.deepEqual([call.record.value.om.failure?.code, call.record.value.om.failure?.at.field], ['answer_label_unknown', 'reads/0/within']);
   const basis = { project: f.project, packet: f.request.packet, call: call.call, response: call.response! };
-  const scope = reference(f.input), read = readRecord(f.store, scope, { unit: 'E4', target: scope.id, idPrefix: `source:${f.project}:`, kind: 'source' });
+  const scope = reference(f.input), read = readRecord(f.store, scope, { unit: 'E4', target: scope.id, idPrefix: 'source:' + f.project + ':', kind: 'source' });
   assert.ok(!read.ok);
   const before = f.store.list();
+  // The early E3 refusal supplies no proof of a later reads-invalid terminal, even with another record as evidence.
   const foreign = finishModelAttempt(f.store, { ...basis, code: read.refusal.code, message: read.refusal.message, reason: 'refused', evidence: [reference(f.source)] });
-  assert.ok(!foreign.ok && foreign.refusal.code === 'completion_invalid', 'Another record is no evidence of this read');
+  assert.ok(!foreign.ok && foreign.refusal.code === 'completion_invalid');
   assert.deepEqual(f.store.list(), before, 'Nothing is written');
-  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, 'b595c7b');
+  const g = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
   g.steps([{ research: e4NeedSource(g, [{ action: 'search', within: reference(g.source), query: 'UTF' }]), usage }]);
   const lawful = valueOf(await runModelCall(g.store, g.request));
+  assert.equal(lawful.outcome?.kind, 'need-source', 'The positive control was genuinely admitted by current E3');
+  const lawfulBefore = g.store.list();
   const claimed = finishModelAttempt(g.store, { project: g.project, packet: g.request.packet, call: lawful.call, response: lawful.response!,
     code: 'record_foreign', message: read.refusal.message, reason: 'refused', evidence: [reference(g.source)] });
   assert.ok(!claimed.ok && claimed.refusal.code === 'completion_invalid', 'A performable read gives no such ground');
+  assert.deepEqual(g.store.list(), lawfulBefore);
 });
 
 // ---- LP4 (№2887): the remaining work of a cycle that a proved cessation of its own step forbids ----
@@ -4456,7 +4511,9 @@ test('MP3 main scenario, rows 1, 2, 3, 5: one need_source of several reads deliv
 
 // OBL1 (№3768): a whole record read by a pointer can exceed what a continuation may carry.
 test('OBL1 №3768 №3773 a large context result is shown as an exact bounded fragment, the delivery stays whole, and a small read is shown whole', async t => {
-  const capacity = 26_000, m = mp3Cycle(t, 'fact', capacity), { f } = m;
+  const measured = mp3Cycle(t), graphChars = canonical(measured.f.graph.value as unknown as Json).length;
+  const capacity = currentPacketWire(measured.f.packet.value.packet) + Math.floor(graphChars / 2);
+  const m = mp3Cycle(t, 'fact', capacity), { f } = m;
   const whole = { action: 'read_context', record: reference(f.graph), pointer: '' }, small = { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' };
   const graph = f.store.get(f.graph.id, f.graph.revision)!.value as Record<string, unknown>;
   assert.ok(canonical(graph as Json).length + currentPacketWire(f.packet.value.packet) > capacity, 'Whole, the graph would not fit beside the packet');
@@ -4481,10 +4538,13 @@ test('OBL1 №3768 №3773 a large context result is shown as an exact bounded f
 });
 
 test('OBL1 №3773 five reads that each fit alone but not together: the continuation shows the largest past what fits as their length and shape, keeps the rest whole, and the answer follows', async t => {
-  const capacity = 30_000, size = 4_000;
-  const f = e4Fixture(t, 'fact', capacity, 0, 5000, false, true, false, undefined, (store, project) => {
+  const size = 4_000;
+  const material = (store: Store, project: string) => {
     new Evidence(store).document(project, 'large-json', JSON.stringify(Object.fromEntries(Array.from({ length: 5 }, (_, i) => [`field${i}`, String(i).repeat(size)]))), 'application/json', 0);
-  });
+  };
+  const measured = e4Fixture(t, 'fact', 100_000, 0, 5000, false, true, false, undefined, material);
+  const capacity = currentPacketWire(measured.packet.value.packet) + 2 * size;
+  const f = e4Fixture(t, 'fact', capacity, 0, 5000, false, true, false, undefined, material);
   const source = f.store.get<Source>(`source:${f.project}:large-json`)!;
   const reads = Array.from({ length: 5 }, (_, i) => ({ action: 'read_source', source: reference(source), selector: { kind: 'json-pointer', pointer: `/field${i}` } }));
   f.steps([{ research: e4NeedSource(f, reads), usage }, { research: e4Fact(f), usage }]);
@@ -4499,7 +4559,9 @@ test('OBL1 №3773 five reads that each fit alone but not together: the continua
 });
 
 test('OBL1 №3780 what is new is judged by what the reader is shown: the same bounded fragment asked again is research-no-progress without another send; a narrower read is progress', async t => {
-  const capacity = 26_000, m = mp3Cycle(t, 'fact', capacity), { f } = m;
+  const measured = mp3Cycle(t), graphChars = canonical(measured.f.graph.value as unknown as Json).length;
+  const capacity = currentPacketWire(measured.f.packet.value.packet) + Math.floor(graphChars / 2);
+  const m = mp3Cycle(t, 'fact', capacity), { f } = m;
   const whole = { action: 'read_context', record: reference(f.graph), pointer: '' };
   f.steps([{ research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: e4Fact(f), usage }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
@@ -5332,19 +5394,19 @@ test('NR1 №3674 п.2: a packet of the previous attempt is not registered in th
 });
 
 // ---- SP1a (№4714 §2.1): a correction of a selection-era root keeps its declaration and its selected material ----
-import { BRIEF_SELECTION_CONTRACT } from '../src/om/packet-brief.js';
+import { BASIS_BRIEF_SELECTION_CONTRACT } from '../src/om/packet-brief.js';
 
 test('SP1a №4714 §2.1: the legal correction of a new managed root — a paid repairable E3 refusal with its diagnostic — keeps briefSelection and the same selected section', async t => {
   const f = mp2Managed(t);
-  assert.equal(f.packet.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'A new root declares the selection era');
+  assert.equal(f.packet.value.briefSelection, BASIS_BRIEF_SELECTION_CONTRACT, 'A new root declares the selection era');
   f.steps([{ research: mp2Refused(f) }, { research: e4Node(f) }]);
   const cycle = valueOf(await mp2Cycle(f.store, f.request));
   const [first, second] = cycle.record.value.steps;
   const rejected = mp2Step(f, first!), corrected = f.store.get<QuestionPacketRecord>(second!.packet.id)!;
   assert.deepEqual(corrected.value.request.correction, { packet: first!.packet, call: rejected.call, response: rejected.response, diagnostic: rejected.diagnostic });
-  assert.equal(corrected.value.briefSelection, BRIEF_SELECTION_CONTRACT, 'The correction keeps its root era');
+  assert.equal(corrected.value.briefSelection, BASIS_BRIEF_SELECTION_CONTRACT, 'The correction keeps its root era');
   const scope = (packet: Json) => JSON.parse(packetPrompt(packet).split('# Scope and exact context\n')[1]!.split('\n')[0]!).input;
   const selected = scope(f.packet.value.packet as Json).selected;
-  assert.ok(selected && selected.contract === 'selected-specification/v1', 'The root shows the selected specification');
+  assert.ok(selected && selected.contract === 'selected-specification/v2', 'The root shows the selected specification');
   assert.deepEqual(scope(corrected.value.packet as Json).selected, selected, 'The correction shows the same selected material');
 });
