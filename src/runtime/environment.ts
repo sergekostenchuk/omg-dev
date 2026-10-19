@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { checkTransactionGuards, storeObserved, Store, type Revision, type TransactionGuard } from "../storage/store.js";
@@ -105,12 +105,124 @@ let gitEntries = 0;
 /** Entries into gitBytes (git goes through it) in this process, whatever their outcome (S1.3, №2217): a historical proof
  * whose action ran git depends on more than its Store and is never kept beyond its operation. */
 export function gitCalls(): number { return gitEntries; }
-export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffer {
-  gitEntries++;
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+const fullOid = (value: string) => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
+const objectPath = (value: string) => value.length > 0 && !value.includes('\0') && !value.startsWith('/')
+  && value.split('/').every(part => part !== '.' && part !== '..');
+/** Closed forms only. In particular: no HEAD, abbreviated OID, revision walk, diff, filters or arbitrary options. */
+function immutableGitRead(args: readonly string[]): boolean {
+  if (args[0] === 'rev-parse' && args.length === 2 && args[1]!.endsWith('^{tree}')) return fullOid(args[1]!.slice(0, -7));
+  if (args[0] === 'cat-file' && args.length === 3 && args[1] === 'blob') return fullOid(args[2]!);
+  if (args[0] === 'show' && args.length === 2) {
+    const colon = args[1]!.indexOf(':');
+    return colon > 0 && fullOid(args[1]!.slice(0, colon)) && objectPath(args[1]!.slice(colon + 1));
+  }
+  if (args[0] === 'ls-tree') return args.length === 4 && args[1] === '-r' && args[2] === '-z' && fullOid(args[3]!)
+    || args.length === 5 && args[1] === '-z' && fullOid(args[2]!) && args[3] === '--' && objectPath(args[4]!);
+  return false;
+}
+const gitMemo = new Map<string, { bytes: Buffer; size: number }>();
+const GIT_MEMO_BYTES = 8 * 1024 * 1024, GIT_MEMO_ENTRIES = 1024;
+let gitMemoBytes = 0;
+function clearGitMemo(): void { gitMemo.clear(); gitMemoBytes = 0; }
+function rememberGit(key: string, bytes: Buffer): void {
+  const size = bytes.length + Buffer.byteLength(key) + 256;
+  if (size > GIT_MEMO_BYTES) return;
+  while (gitMemoBytes + size > GIT_MEMO_BYTES || gitMemo.size >= GIT_MEMO_ENTRIES) {
+    const first = gitMemo.keys().next().value!;
+    gitMemoBytes -= gitMemo.get(first)!.size; gitMemo.delete(first);
+  }
+  gitMemo.set(key, { bytes: Buffer.from(bytes), size }); gitMemoBytes += size;
+}
+function runGit(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv, input?: Uint8Array): Buffer {
   const result = spawnSync("git", ["--literal-pathspecs", "-c", "core.hooksPath=/dev/null", ...args], { cwd, env, input, timeout: 15_000, maxBuffer: 8_000_000 });
   if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", { action: args[0], stderr: result.stderr?.toString("utf8"), error: result.error?.message });
   return result.stdout;
+}
+function gitFileStamp(path: string): string {
+  const s = statSync(path, { bigint: true, throwIfNoEntry: false });
+  return s ? [realpathSync(path), s.dev, s.ino, s.mode, s.size, s.birthtimeNs, s.mtimeNs, s.ctimeNs].join(':') : 'absent';
+}
+function gitDirectoryIdentity(path: string): string {
+  const s = statSync(path, { bigint: true });
+  if (!s.isDirectory()) throw new Error('Git directory expected');
+  return [s.dev, s.ino, s.mode, s.birthtimeNs].join(':');
+}
+function smallGitFile(path: string, limit = 65_536): string {
+  const s = statSync(path, { throwIfNoEntry: false });
+  if (!s) return '';
+  if (!s.isFile() || s.size > limit) throw new Error('Git metadata is outside the memo boundary');
+  return readFileSync(path, 'utf8');
+}
+let gitConfigPaths: { identity: string; paths: string[] } | undefined;
+/** A fresh filesystem observation, not a repository-path cache. Unknown layouts/configuration bypass the memo.
+ * Object names are immutable; directory generations also invalidate after normal loose-object deletion, repack/GC.
+ * Config includes, alternates, reftable, replacements, shallow/grafts and partial clones use Git every time. */
+function gitMemoContext(cwd: string, env: NodeJS.ProcessEnv): string | null {
+  try {
+    // git-var separates global paths with LF, without quoting. Unknown HOME and CR/LF in either
+    // path source cannot prove which files Git will read; let Git handle these legal environments.
+    if (!env.HOME || /[\r\n]/.test(env.HOME) || /[\r\n]/.test(env.XDG_CONFIG_HOME ?? '')) return null;
+    const root = realpathSync(cwd), dot = resolve(root, '.git');
+    const dotStat = lstatSync(dot, { throwIfNoEntry: false });
+    if (!dotStat || dotStat.isSymbolicLink()) return null; // Bare repositories and subdirectories take the ordinary path.
+    const gitFile = dotStat.isFile() ? smallGitFile(dot, 4096) : '';
+    if (gitFile && !/^gitdir: [^\r\n]+\r?\n?$/.test(gitFile)) return null;
+    const dir = realpathSync(gitFile ? resolve(root, gitFile.slice(8).trimEnd()) : dot);
+    const commonFile = smallGitFile(resolve(dir, 'commondir'), 4096);
+    const common = realpathSync(commonFile ? resolve(dir, commonFile.trimEnd()) : dir);
+    const head = smallGitFile(resolve(dir, 'HEAD'), 4096).trimEnd();
+    if (!fullOid(head) && !/^ref: refs\/[^\r\n]+$/.test(head)) return null;
+    if ([resolve(common, 'shallow'), resolve(common, 'info/grafts'), resolve(common, 'objects/info/alternates'),
+      resolve(common, 'objects/info/http-alternates'), resolve(common, 'refs/replace')].some(path => existsSync(path))) return null;
+    const packed = smallGitFile(resolve(common, 'packed-refs'), 1_048_576);
+    if (/(?:^|\n)[^\n]* refs\/replace\//.test(packed)) return null;
+    const executable = executablePath({ executable: 'git', args: [] }, root);
+    const identity = digest(JSON.stringify([env, gitFileStamp(executable)]));
+    if (gitConfigPaths?.identity !== identity) {
+      const system = runGit(root, ['var', 'GIT_CONFIG_SYSTEM'], env).toString('utf8');
+      const global = runGit(root, ['var', 'GIT_CONFIG_GLOBAL'], env).toString('utf8');
+      // The system variable is ONE path. Remove only the output terminator, preserving pathname
+      // whitespace; extra CR/LF is ambiguous even when every fragment looks absolute.
+      if (!system.endsWith('\n') || /[\r\n]/.test(system.slice(0, -1))
+        || !global.endsWith('\n') || global.includes('\r')) return null;
+      const globals = global.slice(0, -1).split('\n');
+      const paths = [system.slice(0, -1), ...globals];
+      if (globals.length > 2 || paths.some(path => !isAbsolute(path))) return null;
+      gitConfigPaths = { identity, paths };
+    }
+    const configs = [...gitConfigPaths.paths, resolve(common, 'config'), resolve(dir, 'config.worktree')]
+      .map(path => [path, gitFileStamp(path), smallGitFile(path)]);
+    if (configs.some(([, , text]) => /include|partialclone|refstorage|alternate/i.test(text!))) return null;
+    const objects = resolve(common, 'objects'), entries = readdirSync(objects).sort();
+    if (entries.length > 260) return null;
+    const objectStamps: string[] = [gitFileStamp(objects)];
+    for (const entry of entries) {
+      if (!/^(?:[a-f0-9]{2}|info|pack)$/.test(entry)) return null;
+      objectStamps.push(entry, gitFileStamp(resolve(objects, entry)));
+      if (entry === 'pack') {
+        const packs = readdirSync(resolve(objects, entry)).sort();
+        if (packs.length > 512) return null;
+        for (const pack of packs) objectStamps.push(pack, gitFileStamp(resolve(objects, entry, pack)));
+      }
+    }
+    return JSON.stringify([root, common, digest(JSON.stringify([identity, gitFile, commonFile, head,
+      gitDirectoryIdentity(dir), gitDirectoryIdentity(common), gitDirectoryIdentity(resolve(common, 'refs')), configs, objectStamps]))]);
+  } catch { return null; } // Metadata/read errors never substitute for the command's original result or refusal.
+}
+export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffer {
+  gitEntries++; // PF4: even a successful memo hit is a Git-dependent read, before lookup.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+  const eligible = input === undefined && immutableGitRead(args) && JSON.stringify(args).length <= 4096;
+  // Unknown commands/options may write. These read-only verbs leave existing immutable entries available.
+  if (!['rev-parse', 'status', 'ls-tree', 'ls-files', 'show', 'cat-file', 'diff', 'diff-tree', 'rev-list', 'merge-base',
+    'for-each-ref', 'check-ignore', 'var'].includes(args[0]!)) clearGitMemo();
+  const context = eligible ? gitMemoContext(cwd, env) : null;
+  const key = context === null ? null : JSON.stringify([context, args]);
+  const saved = key === null ? undefined : gitMemo.get(key);
+  if (saved && key) { gitMemo.delete(key); gitMemo.set(key, saved); return Buffer.from(saved.bytes); }
+  const bytes = runGit(cwd, args, env, input);
+  if (key && gitMemoContext(cwd, env) === context) rememberGit(key, bytes);
+  return bytes;
 }
 function requireCommand(command: Command): void {
   requireCondition(command && typeof command.executable === "string" && command.executable.length > 0
@@ -199,13 +311,34 @@ export function commandModulePath(command: Command, cwd: string): string | null 
   return /^node(\.exe)?$/i.test(basename(command.executable)) && first !== undefined && !first.startsWith("-") && /\.[cm]?js$/.test(first)
     ? resolve(cwd, first) : null;
 }
+function repositoryStatus(root: string): { head: string | null; dirty: boolean } {
+  const records = gitBytes(root, ['status', '--porcelain=v2', '--branch', '-z', '--untracked-files=all']).toString('utf8').split('\0');
+  let head: string | null | undefined, dirty = false;
+  const valid = (condition: unknown) => requireCondition(condition, 'git_failed', 'Git command failed');
+  valid(records.pop() === '');
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index]!;
+    if (record.startsWith('# branch.oid ')) {
+      const oid = record.slice(13);
+      valid(head === undefined && (oid === '(initial)' || fullOid(oid)));
+      head = oid === '(initial)' ? null : oid;
+    } else if (!record.startsWith('# ')) {
+      valid(/^[12u?!] /.test(record)); dirty = true;
+      if (record.startsWith('2 ')) valid(++index < records.length && records[index] !== ''); // origPath is a pathname, never a header.
+    }
+  }
+  valid(head !== undefined);
+  return { head: head!, dirty };
+}
 export function inspectRepository(environment: Environment, graph: Graph): { state: RepositoryState | null; findings: Finding[] } {
   const findings: Finding[] = [];
   try {
     const root = realpathSync(environment.workspace);
     requireCondition(realpathSync(git(root, ["rev-parse", "--show-toplevel"])) === root, "repository_root", "Select the Git repository root");
-    const head = git(root, ["rev-parse", "HEAD"]); const tree = git(root, ["rev-parse", "HEAD^{tree}"]);
-    if (git(root, ["status", "--porcelain", "--untracked-files=all"])) findings.push({ code: "repository_dirty", target: root, message: "Repository has uncommitted changes" });
+    const status = repositoryStatus(root), head = status.head;
+    requireCondition(head !== null, 'git_failed', 'Git command failed');
+    const tree = git(root, ['rev-parse', `${head}^{tree}`]);
+    if (status.dirty) findings.push({ code: "repository_dirty", target: root, message: "Repository has uncommitted changes" });
     for (const [role, binding, mode] of [["implementer", environment.implementer, "implement"], ["reviewer", environment.reviewer, "review"]] as const) {
       try { executablePath(resolveRoleMode(role, binding, mode).command, root); }
       catch (error) { findings.push({ code: error instanceof EngineError && error.code === "role_mode_missing" ? error.code : "executor_unavailable",
