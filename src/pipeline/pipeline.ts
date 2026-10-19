@@ -3,7 +3,7 @@ import { provenStore } from "../storage/store-view.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { canonical, type Json } from "../canonical.js";
 import { uniqueTransactionGuards, transactionGuardsCurrent } from "../runtime/environment.js";
-import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
+import { sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
 import { STAGES, predecessor, reference, stageId, isRef, uniqueRefs, STAGE_CLOSURE_CONTRACT,
   type Stage, type StageArtifact, type StageClosure, type StageExternalCheck, type ExternalCheckHandler,
   type ExternalCheckHandlers, type StageProjection, type StageValidators, type Finding, type Ref } from "./contracts.js";
@@ -100,10 +100,12 @@ export class Pipeline {
     }, guards: uniqueTransactionGuards(guards) };
   }
   inspect(projectId: string, stage: Stage): StageProjection {
-    this.#requireProject(projectId); this.#requireStage(stage);
-    const artifact = this.store.get<StageArtifact>(stageId(projectId, stage));
-    if (!artifact) return { stage, state: "missing", artifact: null, findings: [], guards: [] };
-    return this.#inspectValue(projectId, stage, artifact.value, artifact);
+    return withSourceMemo(() => {
+      this.#requireProject(projectId); this.#requireStage(stage);
+      const artifact = this.store.get<StageArtifact>(stageId(projectId, stage));
+      if (!artifact) return { stage, state: "missing", artifact: null, findings: [], guards: [] };
+      return this.#inspectValue(projectId, stage, artifact.value, artifact);
+    });
   }
   #inspectValue(projectId: string, stage: Stage, value: StageArtifact, artifact: Revision<StageArtifact> | null): StageProjection {
     const id = stageId(projectId, stage);
@@ -326,5 +328,7 @@ export class Pipeline {
       value: this.#acceptedValue(checked.artifact.value, checked, guards),
     }], guards)[0]!;
   }
-  project(projectId: string): StageProjection[] { return STAGES.map(stage => this.inspect(projectId, stage)); }
+  project(projectId: string): StageProjection[] {
+    return withSourceMemo(() => STAGES.map(stage => this.inspect(projectId, stage)));
+  }
 }

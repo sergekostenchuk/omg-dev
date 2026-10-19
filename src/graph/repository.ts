@@ -2,12 +2,13 @@ import { Store, type Revision } from "../storage/store.js";
 import { requireCondition } from "../errors.js";
 import { canonical, hashJson } from "../canonical.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
-import { reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
+import { reference, uniqueRefs, STAGE_CLOSURE_CONTRACT, type Ref, type GateResult,
+  type StageExternalCheck, type ExternalCheckHandler } from "../pipeline/contracts.js";
 import { requireGraph, validateGraph } from "./validate.js";
 import type { Graph } from "./model.js";
 import { LEVEL } from "./model.js";
 import { projectGraph } from "./project.js";
-import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
+import { sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
 import { continuityFindings } from "./semantics.js";
 import { composeLayer, layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
 import { obligationHandoff } from './obligation-handoff.js';
@@ -122,6 +123,9 @@ export class GraphRepository {
     return Boolean(layer?.value.layerProofs?.some(proof => proof.level === level));
   }
   layerGate(projectId: string, level: 1 | 2 | 3, expected?: Ref): GateResult {
+    return withSourceMemo(() => this.#layerGate(projectId, level, expected));
+  }
+  #layerGate(projectId: string, level: 1 | 2 | 3, expected?: Ref): GateResult {
     const layer = this.store.get<Layer>(`graph-layer:${projectId}:${level}`);
     if (!layer || layer.kind !== "graph-layer" || (expected && (expected.id !== layer.id || expected.hash !== layer.hash || expected.revision !== layer.revision))) {
       return { findings: [{ code: "graph_layer_stale", target: `graph-layer:${projectId}:${level}`, message: "This graph layer is missing or changed" }], guards: [] };
@@ -134,15 +138,28 @@ export class GraphRepository {
       const node = layer.value.projection.nodes.find(item => item.id === obligation.node);
       if (!node || hashJson((node as unknown as Record<string, unknown>)[obligation.field]) !== obligation.valueHash) result.findings.push({ code: "graph_field_unproven", target: `${obligation.node}/${obligation.field}`, message: "The field changed without a matching research result" });
     }
+    const sources: StageExternalCheck[] = [];
     for (const input of uniqueRefs(layer.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.hash !== input.hash || current.revision !== input.revision
-        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Research behind this layer has changed" });
-      else result.guards.push(reference(current));
+        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source, input))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Research behind this layer has changed" });
+      else {
+        result.guards.push(reference(current));
+        if (current.kind === "source") sources.push({ kind: "source", ref: input });
+      }
     }
+    const external: StageExternalCheck[] = [];
+    const levelProof = layer.value.layerProofs?.find(p => p.level === level);
+    const projectionHash = levelProof?.hash ?? hashJson(layer.value.projection);
+    external.push({ kind: "graph-projection", level, hash: projectionHash });
+    external.push(...sources);
+    result.closure = { contract: STAGE_CLOSURE_CONTRACT, external };
     return result;
   }
   gate(projectId: string, expected?: Ref): GateResult {
+    return withSourceMemo(() => this.#gate(projectId, expected));
+  }
+  #gate(projectId: string, expected?: Ref): GateResult {
     const graph = this.store.get<Graph>(`graph:${projectId}`);
     const binding = this.store.get<Binding>(`graph-binding:${projectId}`);
     const result: GateResult = { findings: [], guards: [] };
@@ -162,9 +179,25 @@ export class GraphRepository {
     for (const input of uniqueRefs(binding.value.inputs)) {
       const current = this.store.get(input.id);
       if (!current || current.hash !== input.hash || current.revision !== input.revision
-        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Evidence used to refine the graph has changed" });
+        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source, input))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Evidence used to refine the graph has changed" });
       else result.guards.push(reference(current));
     }
     return result;
   }
 }
+
+/** G1/G2: External check handler for graph L1/L2/L3 projection. */
+export const graphProjectionHandler: ExternalCheckHandler<"graph-projection"> = (check, context) => {
+  if (check.level !== 1 && check.level !== 2 && check.level !== 3) {
+    return { code: "graph_layer_unproven", target: `L${check.level}`, message: "Invalid layer level" };
+  }
+  const graph = context.store.get<Graph>(`graph:${context.projectId}`);
+  if (!graph || graph.kind !== "graph") {
+    return { code: "graph_layer_unproven", target: `L${check.level}`, message: "Graph is missing or changed" };
+  }
+  if (hashJson(projectGraph(graph.value, check.level)) !== check.hash) {
+    return { code: "graph_layer_unproven", target: `L${check.level}`, message: "Layer semantics changed without an updated research result" };
+  }
+  return null;
+};
+

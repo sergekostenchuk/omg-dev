@@ -9,10 +9,11 @@ import { isPlainObject } from '../om/refusal.js';
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import { Pipeline } from "../pipeline/pipeline.js";
-import { STAGES, reference, isRef, stageId, type Stage, type StageArtifact, type StageValidators,
-  type GateContext, type GateResult, type Ref, type Finding } from "../pipeline/contracts.js";
+import { STAGES, reference, isRef, stageId, uniqueRefs, STAGE_CLOSURE_CONTRACT, type Stage, type StageArtifact, type StageValidators,
+  type GateContext, type GateResult, type Ref, type Finding, type StageExternalCheck } from "../pipeline/contracts.js";
 import { Discovery } from "../discovery/discovery.js";
-import { GraphRepository } from "../graph/repository.js";
+import { GraphRepository, graphProjectionHandler } from "../graph/repository.js";
+import { sourceExternalHandler, sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Graph } from "../graph/model.js";
@@ -216,6 +217,11 @@ function savedB1Origin(project: string, record: Revision<unknown>): boolean {
       || recordObject(value['activation']) && value['activation']['contract'] === 'om-series-activation/v1')
     || namespace === 'om-series-membership' && value['mode'] === 'transition-managed';
 }
+
+function uniqueExternalChecks(checks: readonly StageExternalCheck[]): StageExternalCheck[] {
+  return [...new Map(checks.map(check => [canonical(check), check])).values()];
+}
+
 export class StageChecks {
   readonly discovery: Discovery;
   readonly graphs: GraphRepository;
@@ -226,12 +232,18 @@ export class StageChecks {
   constructor(readonly store: Store) {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
-    this.pipeline = new Pipeline(store, validators);
+    this.pipeline = new Pipeline(store, validators, {
+      source: sourceExternalHandler,
+      "graph-projection": graphProjectionHandler,
+    });
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
     this.compiler = new Compiler(store, this.pipeline, this.refinement, this.environments);
   }
   validateStage(stage: Stage, context: GateContext): GateResult {
+    return withSourceMemo(() => this.#validateStage(stage, context));
+  }
+  #validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });
     if (stage === "om-g2") {
       const content = context.content as { feasibility?: unknown } | null;
@@ -361,6 +373,28 @@ export class StageChecks {
       }
       if (Array.isArray(behavior) && covered.size !== behavior.length) result.findings.push({ code: "requirement_uncovered", target: stage, field: "features", message: "Every specified behavior needs a feature" });
       const layer = this.graphs.layerGate(context.projectId, 1); result.findings.push(...layer.findings); result.guards.push(...layer.guards);
+    }
+    if (!legacy && result.findings.length === 0) {
+      const external: StageExternalCheck[] = [];
+      for (const ref of uniqueRefs(result.guards)) {
+        const source = this.store.get<Source>(ref.id, ref.revision);
+        if (source?.kind === "source") {
+          if (source.hash !== ref.hash || !sourceIsCurrent(source.value, ref)) {
+            result.findings.push({ code: "external_source_changed", target: ref.id, message: "The declared external source changed or disappeared" });
+          }
+          external.push({ kind: "source", ref });
+        }
+      }
+      if (stage === "operation-map" || stage === "features") {
+        const layerRecord = this.store.get<{ projection?: ReturnType<typeof projectGraph>; layerProofs?: Array<{ level: number; hash: string }> }>(`graph-layer:${context.projectId}:1`);
+        const proof = layerRecord?.value.layerProofs?.find(p => p.level === 1);
+        const hash = proof?.hash ?? (layerRecord?.value.projection ? hashJson(layerRecord.value.projection) : null);
+        if (hash) external.push({ kind: "graph-projection", level: 1, hash });
+      }
+      result.closure = {
+        contract: STAGE_CLOSURE_CONTRACT,
+        external: uniqueExternalChecks(external),
+      };
     }
     return result;
   }

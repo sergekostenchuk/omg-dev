@@ -5,7 +5,7 @@ import { digest, canonical, hashJson, type Json } from "../canonical.js";
 import { buildSourceStructure, verifySourceStructure, type SourceStructure } from "./source-structure.js";
 import { selectStructuredRead, requireNavigationStructure, STRUCTURED_READ_CONTRACT, type StructuredReadSelection } from './source-navigation.js';
 import { EngineError, requireCondition } from "../errors.js";
-import { reference, isRef, type Ref } from "../pipeline/contracts.js";
+import { reference, isRef, type Ref, type ExternalCheckHandler } from "../pipeline/contracts.js";
 import { safeRelativePath } from "../graph/topology.js";
 
 /** A received web page, kept as one immutable snapshot of its capture. HTTP success does not prove the extraction
@@ -225,11 +225,29 @@ export function projectSourceReading(projectId: string, source: Ref, value: Sour
           title: section.title, parentId: section.parentId, headingRange: section.headingRange,
           bodyRange: section.bodyRange })), nextAction: range.nextAction })) as Json : null };
 }
+let sourceCurrentMemo: Map<string, boolean> | null = null;
+
+/** Run a synchronous action within a memoized sourceIsCurrent scope. */
+export function withSourceMemo<T>(action: () => T): T {
+  if (sourceCurrentMemo !== null) return action();
+  sourceCurrentMemo = new Map();
+  try {
+    return action();
+  } finally {
+    sourceCurrentMemo = null;
+  }
+}
+
 /** The captured digest was computed from the captured content when the source was written; only the file on disk is new.
  * A web snapshot is its saved text: citing it never goes back to the network. */
-export function sourceIsCurrent(source: Source): boolean {
+export function sourceIsCurrent(source: Source, ref?: Ref): boolean {
+  let key: string | null = null;
+  if (sourceCurrentMemo !== null) {
+    if (ref) key = canonical(ref);
+    if (key !== null && sourceCurrentMemo.has(key)) return sourceCurrentMemo.get(key)!;
+  }
   try {
-    return source.origin.kind === "owner-document"
+    const result = source.origin.kind === "owner-document"
       || source.origin.kind === "web" && (!('documentContract' in source.origin)
         || source.origin.documentContract === WEB_DOCUMENT_CONTRACT
           && source.mediaType === 'text/markdown' && digest(source.content) === source.sha256
@@ -237,8 +255,28 @@ export function sourceIsCurrent(source: Source): boolean {
           && verifySourceStructure(source.content, source.structure))
       || source.origin.kind === "file" && realpathSync(source.origin.location) === source.origin.location
         && digest(readFileSync(source.origin.location)) === source.sha256;
-  } catch { return false; }
+    if (key !== null && sourceCurrentMemo !== null) sourceCurrentMemo.set(key, result);
+    return result;
+  } catch {
+    if (key !== null && sourceCurrentMemo !== null) sourceCurrentMemo.set(key, false);
+    return false;
+  }
 }
+
+/** G1/G2: External check handler for source dependencies. */
+export const sourceExternalHandler: ExternalCheckHandler<"source"> = (check, context) => {
+  const runCheck = () => {
+    const source = context.store.get<Source>(check.ref.id, check.ref.revision);
+    if (!source || source.kind !== "source" || source.hash !== check.ref.hash) {
+      return { code: "external_source_changed", target: check.ref.id, message: "The declared external source changed" };
+    }
+    if (!sourceIsCurrent(source.value, check.ref)) {
+      return { code: "external_source_changed", target: check.ref.id, message: "The declared external source file changed or disappeared" };
+    }
+    return null;
+  };
+  return withSourceMemo(runCheck);
+};
 
 /** One shared admission check for saved Markdown web documents across documentary consumers. */
 export function isWebDocumentSource(value: unknown): value is Source {
@@ -285,7 +323,7 @@ export class Evidence {
       "source_missing", "A real source from this project is required");
     requireCondition(source.revision === sourceRef.revision && source.hash === sourceRef.hash,
       "source_stale", "Evidence must reference the current source version");
-    requireCondition(sourceIsCurrent(source.value), "source_stale", "The captured source file has changed or disappeared");
+    requireCondition(sourceIsCurrent(source.value, sourceRef), "source_stale", "The captured source file has changed or disappeared");
     let value: unknown;
     if (selector.kind === "json-pointer") {
       requireCondition(source.value.mediaType === "application/json", "selector_invalid", "JSON selection requires a JSON source");
@@ -311,7 +349,7 @@ export class Evidence {
     const source = this.store.get<Source>(sourceRef.id);
     requireCondition(source?.kind === 'source' && source.value.projectId === projectId,
       'source_missing', 'A real source from this project is required');
-    requireCondition(canonical(reference(source)) === canonical(sourceRef) && sourceIsCurrent(source.value),
+    requireCondition(canonical(reference(source)) === canonical(sourceRef) && sourceIsCurrent(source.value, sourceRef),
       'source_stale', 'The requested source has changed or disappeared');
     return projectSourceReading(projectId, sourceRef, source.value, requested, contract);
   }
