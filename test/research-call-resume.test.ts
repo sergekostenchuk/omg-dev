@@ -4533,7 +4533,7 @@ test('D8.4e R1: a supported managed answer writes draft, answer, question and K 
   f.store.writeMany = original;
   assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
   assert.deepEqual(transactions.find(kinds => kinds.includes('research-acceptance-binding')),
-    ['discovery-draft', 'question', 'research-acceptance-binding', 'research-answer']);
+    ['discovery-draft', 'discovery-prefix-closure', 'question', 'research-acceptance-binding', 'research-answer']);
   const turn = f.paidTurn(), k = f.binding()!;
   assert.ok(k); assert.equal(k.revision, 1); assert.equal(k.kind, 'research-acceptance-binding');
   assert.equal(turn.value.status, 'completed'); assert.equal(turn.revision, 2);

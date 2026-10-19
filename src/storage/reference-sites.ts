@@ -211,6 +211,21 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "request-part", contract: "request-part/v1", data: [["text"]], refs: [] },
   { kind: "discovery-acceptance-act", contract: "discovery-acceptance-act/v1", data: [],
     refs: [["draftBefore"], ["draftAfter"], ["questionBefore"], ["questionAfter"], ["answer"], ["assessment"], ["binding"]] },
+  // G4a: the prefix closure names every head it stands on — the draft, inputs, derivation sources,
+  // each question's head and answer chain, every observation source and runtime dependency, and the
+  // declared external checks (a source check names `ref`; the other union kinds name `basis`).
+  // The stored answer `value` is payload snapshot material, not a reference. A managed entry's
+  // saved read set declares the proof's heads and every pinned exact revision — its absent
+  // declarations carry no hash and name nothing to traverse.
+  { kind: "discovery-prefix-closure", contract: "discovery-prefix-closure/v1",
+    data: [["questions", INDEX, "answer", "value"]], refs: [
+    ["draft"], ["inputs", INDEX], ["derivations", INDEX], ["questions", INDEX, "question"],
+    ["questions", INDEX, "answer", "answer"], ["questions", INDEX, "answer", "assessment"],
+    ["questions", INDEX, "answer", "binding"], ["questions", INDEX, "answer", "act"],
+    ["questions", INDEX, "answer", "sources", INDEX], ["questions", INDEX, "answer", "runtimeDependencies", INDEX],
+    ["questions", INDEX, "answer", "managed", "heads", INDEX],
+    ["questions", INDEX, "answer", "managed", "pinned", INDEX],
+    ["external", INDEX, "ref"], ["external", INDEX, "basis"]] },
 ];
 
 const object = (value: unknown): value is Record<string, unknown> =>

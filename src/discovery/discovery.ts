@@ -1,10 +1,11 @@
 import { Ajv } from "ajv";
 import { randomUUID } from "node:crypto";
 import { Store, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
-import { Evidence, type Observation, type Selector } from "../evidence/evidence.js";
+import { Evidence, sourceIsCurrent, type Observation, type Selector, type Source } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
-import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult } from "../pipeline/contracts.js";
+import { reference, STAGES, isRef, uniqueRefs, type Ref, type Stage, type Finding, type GateResult,
+  type StageExternalCheck } from "../pipeline/contracts.js";
 import type { Graph } from "../graph/model.js";
 import { NEXT_CONTRACT_ERA, REQUIREMENTS, producerContractEra, producerRequirements, type ProducerPolicy, type UpstreamStage } from "./requirements.js";
 import { checkV7FieldAnswer, DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from "./v7-contracts.js";
@@ -14,7 +15,7 @@ import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 import { deriveFields, type Derivation } from "./derived-draft.js";
 import { resolveResearchBasis } from '../graph/research-basis.js';
 import type { TechnicalReport } from '../graph/research-contracts.js';
-import { Environments, uniqueTransactionGuards } from '../runtime/environment.js';
+import { Environments, uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
 import { obligationEvidenceFindings } from '../graph/obligation-evidence.js';
 import { collectRuntimeEvidence, runtimeEvidenceDependencies } from '../graph/runtime-evidence.js';
 import { readResearchAssessmentAt, assessmentBindingId, directAssessmentBasis } from './research-assessment.js';
@@ -52,6 +53,113 @@ interface ManagedAcceptance {
   action: unknown; expandedProposal?: unknown;
 }
 export interface Fact { projectId: string; question: string; observation: Observation }
+/** G4a (пул K ред.2, №6215 п.2): the committed closure of one draft revision's accepted prefix —
+ * a separate record written in the same batch as the draft revision it closes (the draft's own bytes
+ * never change), at the deterministic address of `discoveryPrefixClosureId`. It names every head the
+ * gate compares: the draft's inputs, each question's head and its accepted answer chain — the exact
+ * answer, its assessment, the v7 acceptance act — every `observation.source` of every era (web and
+ * owner-document sources included) and the runtime evidence dependencies. File sources are
+ * additionally declared as external `source` checks re-executed on every read — their bytes live
+ * outside the store. Question-only writers (`reopen`, `unresolved`) keep the same closure key: the
+ * saved question head no longer matches, so the read falls back to the full pass — a stale field
+ * never stands for an accepted answer. A managed research answer is closed through the saved read
+ * set of its own K proof: K@1 and every head the proof reads become head guards, every exact
+ * non-head revision it reads (the turn's pending chain, the intent chain, B/M/session and the
+ * replayed read proof) is pinned by presence and hash — a rebound assessment's source chain is
+ * unbounded, so a rebound stays on the full pass by design. */
+export const DISCOVERY_PREFIX_CLOSURE_KIND = "discovery-prefix-closure";
+export const DISCOVERY_PREFIX_CLOSURE_CONTRACT = "discovery-prefix-closure/v1";
+export function discoveryPrefixClosureId(draftId: string, revision: number): string {
+  return `${DISCOVERY_PREFIX_CLOSURE_KIND}:${draftId}:${revision}`;
+}
+/** G4a (№6284): the complete read set the managed K proof performed when the prefix was closed.
+ * `heads`/`absentHeads` — every head read (K@1 included) and every head absence, re-verified as
+ * guards on the closed path: a head the proof stood on moving is the only lawful change that can
+ * alter its outcome. `pinned`/`absentPinned` — the saved manifest of the exact revisions the proof
+ * read and missed (the pending/intent/turn chains, B, M, session, the replayed read proof): exact
+ * revisions are immutable, so the closed path does not re-verify them row by row (№6348 G4a-01) —
+ * each entity an exact read missed is snapshotted into the head requirements instead, and the
+ * physical integrity of immutable rows is the offline checker's (om-fsck) domain. */
+interface ManagedPrefixProof {
+  heads: Ref[]; absentHeads: string[]; pinned: Ref[]; absentPinned: { id: string; revision: number }[];
+}
+interface PrefixClosureAnswer {
+  answer: Ref; assessment: Ref | null; binding: Ref | null; act: Ref | null;
+  sources: Ref[]; runtimeDependencies: Ref[];
+  /** Snapshot entry material (решение №6253): stored at acceptance so the closed read never
+   * decodes old question/answer/assessment bodies to serve the accepted prefix. */
+  field: string; kind: string; value: Json; observations: number;
+  managed?: ManagedPrefixProof;
+}
+interface PrefixClosureQuestion { question: Ref; answer: PrefixClosureAnswer | null }
+/** G4a→G4b (решение оркестратора №6253/6254): the accepted prefix a checked closure proves — one
+ * entry per answered question in draft order, carried in the closure record itself. */
+export interface AcceptedPrefixEntry {
+  question: Ref; field: string; status: "answered"; kind: string; answer: Ref; value: Json;
+  assessment: Ref | null; observations: number;
+}
+export interface AcceptedPrefixSnapshot {
+  contract: "discovery-prefix/v1"; draft: Ref; closure: Ref; entries: AcceptedPrefixEntry[];
+}
+declare module "../pipeline/contracts.js" {
+  interface GateResult { prefix?: AcceptedPrefixSnapshot }
+}
+export interface DiscoveryPrefixClosure {
+  contract: typeof DISCOVERY_PREFIX_CLOSURE_CONTRACT;
+  projectId: string; draftId: string; draft: Ref;
+  inputs: Ref[]; derivations: Ref[];
+  questions: PrefixClosureQuestion[];
+  external: StageExternalCheck[];
+}
+/** Structural form of a saved closure — every field the closed read and the acceptance-time
+ * inheritance trust without decoding the records the entry refs name. `questionIds`, when given,
+ * pins the questions array to the draft's own order. */
+const shapeManagedProof = (managed: unknown): managed is ManagedPrefixProof =>
+  managed !== null && typeof managed === "object" && !Array.isArray(managed)
+  && Array.isArray((managed as ManagedPrefixProof).heads) && (managed as ManagedPrefixProof).heads.every(isRef)
+  && Array.isArray((managed as ManagedPrefixProof).absentHeads)
+  && (managed as ManagedPrefixProof).absentHeads.every(id => typeof id === "string")
+  && Array.isArray((managed as ManagedPrefixProof).pinned) && (managed as ManagedPrefixProof).pinned.every(isRef)
+  && Array.isArray((managed as ManagedPrefixProof).absentPinned)
+  && (managed as ManagedPrefixProof).absentPinned.every(ref => ref !== null && typeof ref === "object"
+    && typeof (ref as { id: unknown }).id === "string"
+    && Number.isSafeInteger((ref as { revision: unknown }).revision));
+const shapeClosureAnswer = (entry: unknown): entry is PrefixClosureAnswer =>
+  entry !== null && typeof entry === "object" && !Array.isArray(entry)
+  && isRef((entry as PrefixClosureAnswer).answer)
+  && ((entry as PrefixClosureAnswer).assessment === null || isRef((entry as PrefixClosureAnswer).assessment))
+  && ((entry as PrefixClosureAnswer).binding === null || isRef((entry as PrefixClosureAnswer).binding))
+  && ((entry as PrefixClosureAnswer).act === null || isRef((entry as PrefixClosureAnswer).act))
+  && Array.isArray((entry as PrefixClosureAnswer).sources) && (entry as PrefixClosureAnswer).sources.every(isRef)
+  && Array.isArray((entry as PrefixClosureAnswer).runtimeDependencies)
+  && (entry as PrefixClosureAnswer).runtimeDependencies.every(isRef)
+  && typeof (entry as PrefixClosureAnswer).field === "string"
+  && typeof (entry as PrefixClosureAnswer).kind === "string"
+  && Number.isSafeInteger((entry as PrefixClosureAnswer).observations)
+  && (entry as PrefixClosureAnswer).observations >= 0
+  && ((entry as PrefixClosureAnswer).managed === undefined || shapeManagedProof((entry as PrefixClosureAnswer).managed));
+const shapeClosure = (value: unknown, projectId: string, draftId: string,
+  questionIds: readonly string[] | null): value is DiscoveryPrefixClosure =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+  && (value as DiscoveryPrefixClosure).contract === DISCOVERY_PREFIX_CLOSURE_CONTRACT
+  && (value as DiscoveryPrefixClosure).projectId === projectId
+  && (value as DiscoveryPrefixClosure).draftId === draftId
+  && isRef((value as DiscoveryPrefixClosure).draft)
+  && Array.isArray((value as DiscoveryPrefixClosure).inputs) && (value as DiscoveryPrefixClosure).inputs.every(isRef)
+  && Array.isArray((value as DiscoveryPrefixClosure).derivations)
+  && (value as DiscoveryPrefixClosure).derivations.every(isRef)
+  && Array.isArray((value as DiscoveryPrefixClosure).questions)
+  && (questionIds === null || (value as DiscoveryPrefixClosure).questions.length === questionIds.length)
+  && (value as DiscoveryPrefixClosure).questions.every((entry, index) =>
+    entry !== null && typeof entry === "object" && !Array.isArray(entry)
+    && isRef((entry as PrefixClosureQuestion).question)
+    && (questionIds === null || (entry as PrefixClosureQuestion).question.id === questionIds[index])
+    && ((entry as PrefixClosureQuestion).answer === null
+      || shapeClosureAnswer((entry as PrefixClosureQuestion).answer)))
+  && Array.isArray((value as DiscoveryPrefixClosure).external)
+  && (value as DiscoveryPrefixClosure).external.every(check => check !== null
+    && typeof check === "object" && !Array.isArray(check)
+    && (check as { kind?: unknown }).kind === "source" && isRef((check as { ref?: unknown }).ref));
 
 const ajv = new Ajv({ strict: true, allowUnionTypes: true });
 export class Discovery {
@@ -89,9 +197,14 @@ export class Discovery {
     const draft: DiscoveryDraft = { projectId, createdAt: Date.now(), stage, level, consumer, inputs: uniqueRefs(inputs), ...(contractVersion === undefined ? {} : { contractVersion }),
       ...(typedBasis ? { basisContract: 'typed-v1' as const } : {}), ...(obligationEvidence ? { obligationContract: 'evidence-v1' as const } : {}),
       fields: Object.fromEntries(specs.map(spec => [spec.field, null])), questions };
-    const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft },
-      ...specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
-        value: { projectId, draftId: id, stage, level, consumer, spec, beforeHash: hashJson(null), status: "open", answer: null } satisfies Question }))];
+    const questionWrites = specs.map((spec, i) => ({ id: questions[i]!, kind: "question", expected: 0,
+      value: { projectId, draftId: id, stage, level, consumer, spec, beforeHash: hashJson(null), status: "open", answer: null } satisfies Question }));
+    const closure: DiscoveryPrefixClosure = { contract: DISCOVERY_PREFIX_CLOSURE_CONTRACT, projectId,
+      draftId: id, draft: { id, revision: 1, hash: hashJson(draft) }, inputs: draft.inputs, derivations: [],
+      questions: questionWrites.map(write => ({ question: { id: write.id, revision: 1, hash: hashJson(write.value) }, answer: null })),
+      external: [] };
+    const writes = [{ id, kind: "discovery-draft", expected: 0, value: draft }, ...questionWrites,
+      { id: discoveryPrefixClosureId(id, 1), kind: DISCOVERY_PREFIX_CLOSURE_KIND, expected: 0, value: closure }];
     return this.store.writeMany<DiscoveryDraft>(writes, inputs)[0]!;
   }
   #question(id: string, expected: number): Revision<Question> {
@@ -139,6 +252,13 @@ export class Discovery {
       { id, kind, expected: 0, value: answer },
       { id: question.id, kind: question.kind, expected: question.revision, value: questionAfter },
     ];
+    // The records of this batch as the committed store will hold them — a managed closure proof
+    // re-runs over this exact post-write state to capture the read set it pins.
+    const pending: Revision<any>[] = [
+      { id: draft.id, kind: draft.kind, revision: draft.revision + 1, hash: hashJson(draftAfter), value: draftAfter },
+      { id, kind, revision: 1, hash: answerRef.hash, value: answer },
+      { id: question.id, kind: question.kind, revision: question.revision + 1, hash: hashJson(questionAfter), value: questionAfter },
+    ];
     const bindingGuards: TransactionGuard[] = [];
     let bindingRef: Ref | null = null;
     if (managed) {
@@ -164,11 +284,13 @@ export class Discovery {
       bindingRef = { id: bId, revision: 1, hash: hashJson(binding) };
       writes.push({ id: bId, kind: "research-acceptance-binding",
         expected: 0, value: binding });
+      pending.push({ id: bId, kind: "research-acceptance-binding", revision: 1, hash: bindingRef.hash, value: binding });
       // O@1 and I are proven immutable revisions (their heads lawfully move
       // on); the current-state guards are P, B and R plus the CAS of the
       // three records and the absence of K.
       bindingGuards.push(managed.pending, managed.assessmentProof, reference(managed.assessment));
     }
+    let actRef: Ref | null = null;
     if (draft.value.contractVersion === NEXT_CONTRACT_ERA) {
       const actId = discoveryAcceptanceActId(q.projectId, draft.id, q.spec.field, answerRef);
       const assessmentRef = kind === "research-answer" && isRef((answer as ResearchAnswer).assessment)
@@ -188,7 +310,51 @@ export class Discovery {
         binding: bindingRef,
       };
       writes.push({ id: actId, kind: DISCOVERY_ACCEPTANCE_ACT_KIND, expected: 0, value: actValue });
+      actRef = { id: actId, revision: 1, hash: hashJson(actValue) };
+      pending.push({ id: actId, kind: DISCOVERY_ACCEPTANCE_ACT_KIND, revision: 1, hash: actRef.hash, value: actValue });
     }
+    // G4a (пул K ред.2, №6215 п.2; managed — №6284): the new revision carries the closure of its
+    // accepted prefix in the same batch — built once by the same checks gate() applies to the whole
+    // prefix, so a draft answered under an earlier era (no closure on the previous revision) gains
+    // its closure here. A managed answer is closed on the captured read set of its own K proof
+    // (heads as guards, exact revisions pinned); a rebound's source chain is unbounded and stays
+    // on the full pass by design (the K itself is still written exactly as before).
+    let closable = true;
+    let closureAssessment: Ref | null = null; let closureSources: Ref[] = []; let closureRuntime: Ref[] = [];
+    let managedReads: ManagedPrefixProof | null = null;
+    if (kind === "research-answer") {
+      closureAssessment = (answer as ResearchAnswer).assessment;
+      const record = managed?.assessment
+        ?? this.store.get<ResearchAssessment>(closureAssessment.id, closureAssessment.revision);
+      requireCondition(record !== null && record.kind === "research-assessment" && record.hash === closureAssessment.hash,
+        "research_acceptance_binding_invalid", `[${closureAssessment.id}] The accepted assessment is unavailable for the prefix closure`);
+      closureSources = record.value.observations.map(item => item.source);
+      closureRuntime = runtimeEvidenceDependencies(record.value.runtimeProofs ?? []);
+      if (record.value.reusedFrom !== undefined) closable = false;
+      if (managed) {
+        const proven = this.#managedProofReads(q.projectId, answerRef, pending);
+        if (proven === null || proven.accepted.binding === null
+          || canonical(reference(proven.accepted.binding)) !== canonical(bindingRef)
+          || proven.accepted.assessment === null
+          || canonical(reference(proven.accepted.assessment)) !== canonical(closureAssessment)) closable = false;
+        else managedReads = proven.reads;
+      }
+    } else if (kind === "fact") closureSources = [(answer as Fact).observation.source];
+    const draftAfterRef: Revision<DiscoveryDraft> = pending[0] as Revision<DiscoveryDraft>;
+    // №6348 G4a-02: the closure of the revision this write replaces lets the new one inherit its
+    // verified prefix instead of re-reading every accepted answer.
+    const previous = closable
+      ? this.store.get<DiscoveryPrefixClosure>(discoveryPrefixClosureId(draft.id, draft.revision)) : null;
+    const closure = closable ? this.#prefixClosure(q.projectId, draftAfterRef, { questionId: question.id,
+      entry: { question: { id: question.id, revision: question.revision + 1, hash: hashJson(questionAfter) },
+        answer: { answer: answerRef, assessment: closureAssessment, binding: bindingRef, act: actRef,
+          sources: closureSources, runtimeDependencies: closureRuntime,
+          field: q.spec.field, kind, value,
+          observations: kind === "fact" ? 1 : closureSources.length,
+          ...(managedReads ? { managed: managedReads } : {}) } } }, pending, previous) : null;
+    if (closure !== null)
+      writes.push({ id: discoveryPrefixClosureId(draft.id, draftAfterRef.revision),
+        kind: DISCOVERY_PREFIX_CLOSURE_KIND, expected: 0, value: closure });
     return this.store.writeMany<DiscoveryDraft>(writes,
       uniqueTransactionGuards([...guards, ...draft.value.inputs, reference(question), reference(draft), ...bindingGuards]))[0]!;
   }
@@ -386,6 +552,240 @@ export class Discovery {
     return this.store.writeMany<Question>([{ id, kind: "question", expected,
       value: { ...q.value, beforeHash: hashJson(draft.value.fields[q.value.spec.field]), status: "open", answer: null } }], [reference(draft)])[0]!;
   }
+  /** G4a (пул K ред.2, №6215 п.2): the closure of a revision's accepted prefix. When the replaced
+   * revision already carries a well-formed closure of the same questions, an ordinary acceptance
+   * verifies only the NEW entry and inherits the saved prefix verbatim — old heads/refs are never
+   * refreshed, their own saved guards catch staleness at read (№6348 G4a-02). A revision with no
+   * earlier closure is the one place the whole prefix is built once by the same checks gate()
+   * applies: every earlier question is then read and verified by #closedEntry. A question this
+   * build cannot cover — a stale head, refused provenance, an unsupported assessment, a missing
+   * act — leaves the whole revision unclosed: a saved closure never certifies an unchecked prefix. */
+  #prefixClosure(projectId: string, draftAfter: Revision<DiscoveryDraft>,
+    fresh: { questionId: string; entry: PrefixClosureQuestion },
+    pending: Revision<any>[] = [],
+    previous: Revision<DiscoveryPrefixClosure> | null = null): DiscoveryPrefixClosure | null {
+    // A draft carrying `derivations` AND questions never matches the gate's derivation check —
+    // an empty list is a derivation_stale, a nonempty one a derivation_conflict — the closure
+    // cannot represent either, so such a draft stays unclosed.
+    if (draftAfter.value.derivations !== undefined && draftAfter.value.questions.length) return null;
+    const ids = draftAfter.value.questions;
+    const inherited = previous !== null && previous.kind === DISCOVERY_PREFIX_CLOSURE_KIND
+      && previous.revision === 1 && shapeClosure(previous.value, projectId, draftAfter.id, ids)
+      && (previous.value.draft as Ref).revision === draftAfter.revision - 1 ? previous.value : null;
+    let questions: PrefixClosureQuestion[];
+    if (inherited !== null)
+      questions = ids.map((id, index) => id === fresh.questionId ? fresh.entry : inherited.questions[index]!);
+    else {
+      questions = [];
+      for (const questionId of ids) {
+        if (questionId === fresh.questionId) { questions.push(fresh.entry); continue; }
+        const head = this.store.get<Question>(questionId);
+        if (!head || head.kind !== "question" || head.value.projectId !== projectId
+          || head.value.draftId !== draftAfter.id) return null;
+        const entry = this.#closedEntry(projectId, draftAfter, head, pending);
+        if (entry === null) return null;
+        questions.push(entry);
+      }
+    }
+    // File sources are external: their bytes live outside the store, so a matching head is not
+    // enough — each one is declared as a `source` check re-executed on every closed read. An
+    // inherited prefix keeps only the checks whose exact Ref the resulting entries still use —
+    // a replaced answer's source is dropped with it, a source shared by another accepted answer
+    // stays (№6403 G4a-03); the fresh entry's sources (or, on a full build, every entry's) are
+    // looked up here.
+    const usedSources = new Set(questions
+      .flatMap(entry => entry.answer?.sources ?? []).map(ref => canonical(ref)));
+    const external = new Map<string, StageExternalCheck>();
+    for (const check of inherited?.external ?? [])
+      if (check.kind === "source" && usedSources.has(canonical(check.ref))) external.set(check.ref.id, check);
+    const sourceRefs = uniqueRefs((inherited === null ? questions : [fresh.entry])
+      .flatMap(entry => entry.answer?.sources ?? []));
+    for (const ref of sourceRefs) {
+      const source = this.store.get<Source>(ref.id);
+      if (!source || source.kind !== "source") return null;
+      if (source.value.origin.kind === 'file') external.set(ref.id, { kind: "source", ref });
+    }
+    return { contract: DISCOVERY_PREFIX_CLOSURE_CONTRACT, projectId, draftId: draftAfter.id,
+      draft: reference(draftAfter), inputs: draftAfter.value.inputs,
+      derivations: (draftAfter.value.derivations ?? []).map(entry => entry.source),
+      questions, external: [...external.values()] };
+  }
+  /** G4a (№6284): the reads the common accepted-answer reader performs for one research answer,
+   * captured through a recording view so a managed prefix can pin them all — head reads as head
+   * requirements (K@1 among them), head-absences, exact reads pinned by presence and hash (the
+   * pending/intent/turn chains, B, M, session, the replayed assessment-read proof), exact misses
+   * by their absence. `pending` serves the records of the not-yet-committed batch (K, the answer,
+   * the new draft/question revisions), so the proof runs over the exact post-write state. Returns
+   * null when the proof refuses or reads anything a closure cannot pin (a non-get read has no
+   * exact form): such an answer keeps the full pass. */
+  #managedProofReads(projectId: string, answerRef: Ref, pending: Revision<any>[]): {
+    accepted: ReturnType<typeof readAcceptedResearchAnswer>; reads: ManagedPrefixProof } | null {
+    const heads: Ref[] = [], absentHeads: string[] = [];
+    const pinned: Ref[] = [], absentPinned: { id: string; revision: number }[] = [];
+    const rows = new Map(pending.map(row => [`${row.id}:${row.revision}`, row]));
+    const pendingHeads = new Map(pending.map(row => [row.id, row]));
+    let unclosable = false;
+    const store = this.store;
+    const view = new Proxy(store, {
+      get(target, key) {
+        if (key === "get") return (id: string, revision?: number) => {
+          const row = revision === undefined ? pendingHeads.get(id) : rows.get(`${id}:${revision}`);
+          const record = row !== undefined ? row : store.get(id, revision);
+          if (revision === undefined) { if (record) heads.push(reference(record)); else absentHeads.push(id); }
+          else if (record !== null) pinned.push({ id, revision, hash: record.hash });
+          else absentPinned.push({ id, revision });
+          return record;
+        };
+        const value = Reflect.get(target, key, target);
+        if (typeof value === "function")
+          return (...args: unknown[]) => { unclosable = true; return (value as (...a: unknown[]) => unknown).apply(target, args); };
+        return value;
+      }
+    });
+    let accepted: ReturnType<typeof readAcceptedResearchAnswer>;
+    try { accepted = readAcceptedResearchAnswer(view, projectId, answerRef); }
+    catch (error) {
+      if (error instanceof EngineError && error.code.startsWith("research_")) return null;
+      throw error;
+    }
+    // A revision the proof found missing can be created lawfully later — snapshot each such
+    // entity's write-time head (or its absence) as an ordinary head requirement: any later
+    // creation moves that head and the closed read falls back (№6348 G4a-01).
+    const headCovered = new Set([...heads.map(ref => ref.id), ...absentHeads]);
+    for (const { id } of absentPinned) if (!headCovered.has(id)) view.get(id);
+    if (unclosable) return null;
+    return { accepted, reads: {
+      heads: uniqueRefs(heads), absentHeads: [...new Set(absentHeads)], pinned: uniqueRefs(pinned),
+      absentPinned: [...new Map(absentPinned.map(row => [`${row.id}:${row.revision}`, row])).values()] } };
+  }
+  /** G4a: the gate's own checks for one already-answered question, run once when its draft revision
+   * is closed — and the exact heads/refs the closed read compares instead. Returns null when the
+   * check the gate would make today does not pass: the prefix then writes no closure at all. */
+  #closedEntry(projectId: string, after: Revision<DiscoveryDraft>, question: Revision<Question>,
+    pending: Revision<any>[] = []): PrefixClosureQuestion | null {
+    const entry: PrefixClosureQuestion = { question: reference(question), answer: null };
+    const q = question.value;
+    if (q.status !== "answered" || !q.answer) return entry;
+    const ref = q.answer;
+    const answer = this.store.get<Decision | Fact | ResearchAnswer>(ref.id);
+    if (!answer || answer.hash !== ref.hash || answer.revision !== ref.revision
+      || answer.value.projectId !== projectId || answer.value.question !== question.id
+      || (answer.kind !== q.spec.kind && answer.kind !== "research-answer")) return null;
+    let act: Ref | null = null;
+    if (after.value.contractVersion === NEXT_CONTRACT_ERA) {
+      const record = this.store.get<DiscoveryAcceptanceAct>(
+        discoveryAcceptanceActId(projectId, after.id, q.spec.field, ref));
+      if (record?.kind !== DISCOVERY_ACCEPTANCE_ACT_KIND || record.revision !== 1
+        || hashJson(record.value) !== record.hash) return null;
+      act = reference(record);
+    }
+    const onTarget = (value: Json): boolean => canonical(value) === canonical(after.value.fields[q.spec.field]);
+    if (answer.kind === "research-answer") {
+      const research = answer.value as ResearchAnswer;
+      const proven = this.#managedProofReads(projectId, ref, pending);
+      if (proven === null) return null;
+      const { accepted, reads } = proven;
+      const assessment = accepted.assessment;
+      // A rebound's source chain is unbounded — it stays on the full pass by design.
+      if (assessment?.value.reusedFrom !== undefined) return null;
+      const issued = assessment ? this.store.get<Question>(assessment.value.question.id, assessment.value.question.revision) : null;
+      if (assessment?.kind !== "research-assessment" || assessment.hash !== research.assessment.hash
+        || assessment.revision !== research.assessment.revision || assessment.value.verdict !== "supported"
+        || issued?.hash !== assessment.value.question.hash || issued.id !== question.id
+        || canonical(issued.value.spec) !== canonical(q.spec) || assessment.value.researcher === assessment.value.assessor
+        || assessment.value.observations.length === 0
+        || !assessment.value.observations.every(item => this.evidence.verify(item))
+        || canonical(assessment.value.value) !== canonical(research.value)
+        || !onTarget(research.value)) return null;
+      entry.answer = { answer: ref, assessment: reference(assessment), binding: accepted.binding ? reference(accepted.binding) : null, act,
+        sources: assessment.value.observations.map(item => item.source),
+        runtimeDependencies: runtimeEvidenceDependencies(assessment.value.runtimeProofs ?? []),
+        field: q.spec.field, kind: answer.kind, value: research.value,
+        observations: assessment.value.observations.length,
+        ...(accepted.binding ? { managed: reads } : {}) };
+      return entry;
+    }
+    if (answer.kind === "fact") {
+      const observation = (answer.value as Fact).observation;
+      if (!this.evidence.verify(observation) || !onTarget(observation.value)) return null;
+      entry.answer = { answer: ref, assessment: null, binding: null, act,
+        sources: [observation.source], runtimeDependencies: [],
+        field: q.spec.field, kind: answer.kind, value: observation.value, observations: 1 };
+      return entry;
+    }
+    const decision = answer.value as Decision;
+    if (!decision.actor?.trim() || !onTarget(decision.value)) return null;
+    entry.answer = { answer: ref, assessment: null, binding: null, act, sources: [], runtimeDependencies: [],
+      field: q.spec.field, kind: answer.kind, value: decision.value, observations: 0 };
+    return entry;
+  }
+  /** G4a: the committed prefix answers the gate — one closure record read at the deterministic
+   * address, every saved head compared in the shared snapshot (or by observable gets on opaque views
+   * and inside an active capture), then each declared external check re-executed. Returns null on a
+   * missing closure or any miss — the caller then takes the previous full pass for the exact finding;
+   * a malformed record is an addressed refusal, never a silent pass. An empty or partial prefix keeps
+   * `question_unresolved` on its unanswered questions (№6215 п.1). The saved body's hash and the
+   * managed proofs' pinned immutable revisions are not re-verified row by row (№6348 G4a-01):
+   * committed bytes are the offline checker's domain, exactly as for the records the full pass
+   * reads without re-hashing them either. */
+  #closedPrefix(projectId: string, draft: Revision<DiscoveryDraft>): GateResult | null {
+    const record = this.store.get<DiscoveryPrefixClosure>(discoveryPrefixClosureId(draft.id, draft.revision));
+    if (record === null) return null;
+    const invalid = (message: string): GateResult => ({ guards: [],
+      findings: [{ code: "discovery_prefix_closure_invalid", target: record.id, message }] });
+    const value = record.value;
+    // The record is trusted by its structural form at the deterministic address — the saved body's
+    // hash is not recomputed here (№6348 G4a-01): byte integrity of committed records is the
+    // offline checker's (om-fsck) domain, exactly as for every record the full pass reads.
+    if (record.kind !== DISCOVERY_PREFIX_CLOSURE_KIND || record.revision !== 1
+      || !shapeClosure(value, projectId, draft.id, draft.value.questions)
+      || canonical(value.draft) !== canonical(reference(draft)))
+      return invalid("The recorded prefix closure is missing, foreign or malformed");
+    const guards: TransactionGuard[] = [...value.inputs, ...value.derivations];
+    for (const entry of value.questions) {
+      guards.push(entry.question);
+      if (entry.answer !== null) {
+        guards.push(entry.answer.answer, ...entry.answer.runtimeDependencies, ...entry.answer.sources);
+        if (entry.answer.assessment) guards.push(entry.answer.assessment);
+        if (entry.answer.binding) guards.push(entry.answer.binding);
+        if (entry.answer.act) guards.push(entry.answer.act);
+        if (entry.answer.managed) {
+          guards.push(...entry.answer.managed.heads);
+          for (const id of entry.answer.managed.absentHeads) guards.push({ id, absent: true });
+        }
+      }
+    }
+    if (!transactionGuardsCurrent(this.store, uniqueTransactionGuards(guards))) return null;
+    // The managed proofs' pinned exact revisions are immutable rows — verified once when the
+    // closure was written and audited by om-fsck, not re-verified row by row here (№6348 G4a-01):
+    // the batch cost stays C+ceil(D/chunk) whatever the accepted prefix's size.
+    for (const check of value.external) {
+      if (check.kind !== "source") return invalid("The recorded prefix closure declares an unsupported check");
+      const source = this.store.get<Source>(check.ref.id);
+      if (source?.kind !== "source" || source.revision !== check.ref.revision || source.hash !== check.ref.hash
+        || !sourceIsCurrent(source.value)) return null;
+    }
+    const findings: Finding[] = [];
+    const output: Ref[] = [reference(draft), ...value.derivations, ...value.inputs];
+    const entries: AcceptedPrefixEntry[] = [];
+    for (const entry of value.questions) {
+      const answer = entry.answer;
+      if (answer === null) {
+        findings.push({ code: "question_unresolved", target: entry.question.id, message: "Question has no accepted answer" });
+        continue;
+      }
+      output.push(entry.question, answer.answer, ...answer.runtimeDependencies,
+        ...(answer.assessment ? [answer.assessment] : []), ...answer.sources,
+        ...(answer.binding ? [answer.binding] : []));
+      entries.push({ question: entry.question, field: answer.field, status: "answered",
+        kind: answer.kind, answer: answer.answer, value: answer.value,
+        assessment: answer.assessment, observations: answer.observations });
+    }
+    // Решение №6253/6254: the snapshot exists only on this checked path — every guard and pinned
+    // revision compared above — never on a fallback or the full pass.
+    return { findings, guards: uniqueRefs(output),
+      prefix: { contract: "discovery-prefix/v1", draft: reference(draft), closure: reference(record), entries } };
+  }
   gate(projectId: string, draftRef: Ref): GateResult {
     requireCondition(isRef(draftRef), "discovery_ref_invalid", "Discovery needs a versioned draft reference");
     const findings: Finding[] = []; const guards: Ref[] = [];
@@ -396,6 +796,10 @@ export class Discovery {
       return { findings: [{ code: "discovery_stale", target: draftRef.id, message: "Discovery draft is missing, foreign or changed" }], guards };
     }
     guards.push(reference(draft));
+    // G4a: a recorded prefix closure answers the whole accepted prefix by saved heads plus the
+    // declared external checks — a missing record or any miss falls through to the full pass below.
+    const closed = this.#closedPrefix(projectId, draft);
+    if (closed !== null) return closed;
     if (draft.value.derivations) {
       try {
         if (draft.value.questions.length || canonical(deriveFields(this.store, projectId, draft.value.derivations)) !== canonical(draft.value.fields))
