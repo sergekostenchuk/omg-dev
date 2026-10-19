@@ -73,8 +73,11 @@ function jsonCopy<T>(value: T): T {
     throw error;
   }
 }
-const schema = new Ajv({ strict: true, allErrors: false, allowUnionTypes: true });
-const graphShapes = [schema.compile(sealed(graphSchema)), schema.compile(sealed(graphV2Schema))];
+let graphShapes: ReturnType<Ajv['compile']>[] | undefined;
+const horizonShapes = () => graphShapes ??= (() => {
+  const schema = new Ajv({ strict: true, allErrors: false, allowUnionTypes: true });
+  return [schema.compile(sealed(graphSchema)), schema.compile(sealed(graphV2Schema))];
+})();
 function requireChoice(value: unknown): asserts value is HorizonChoice {
   if (!object(value) || !text(value['choiceVersion']) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(value['choiceVersion'])) invalid("choiceVersion");
   if (!Array.isArray(value['features']) || !value['features'].every(feature => object(feature) && text(feature['outcome']))) invalid("features");
@@ -87,7 +90,7 @@ function requireOptions(value: unknown): asserts value is HorizonOptions {
 }
 
 export function closeHorizon(upper: Graph, options: HorizonOptions): Sealed<HorizonBuildResult> {
-  if (!object(upper) || !graphShapes[upper.version === 2 ? 1 : 0]!(upper)) invalid("upper");
+  if (!object(upper) || !horizonShapes()[upper.version === 2 ? 1 : 0]!(upper)) invalid("upper");
   requireOptions(options);
   upper = jsonCopy(upper); options = jsonCopy(options);
   const blocks = new Map(upper.nodes.filter(node => node.kind === "block").map(node => [node.id, node]));
@@ -344,7 +347,7 @@ function deriveHorizon(store: Store, request: HorizonRequest): HorizonResult<Sea
   const graphRead = readRecord<Graph>(store, request.graph, { unit: "G2", target: request.project, id: `graph:${request.project}`, kind: "graph" });
   if (!graphRead.ok) return transfer("refs", graphRead);
   const graph = graphRead.value.value as Graph;
-  if (!object(graph) || !graphShapes[graph.version === 2 ? 1 : 0]!(graph))
+  if (!object(graph) || !horizonShapes()[graph.version === 2 ? 1 : 0]!(graph))
     return refuse("horizon_unclosed", "The saved graph has an invalid shape", address(request.graph.id, "graph", request.graph), "producer");
   const map = inputRead.value.value.input.sources.find(source => source.stage === "operation-map")!;
   const stage = readRecord<StageArtifact>(store, map, { unit: "G2", target: request.project, id: `stage:${request.project}:operation-map`, kind: "stage" });

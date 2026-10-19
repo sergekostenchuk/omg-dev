@@ -19,8 +19,11 @@ export type WorkZoneHorizon = Sealed<Pick<Horizon, 'nodes' | 'execution'>>;
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-const schemas = new Ajv({ strict: true, allErrors: false, allowUnionTypes: true });
-const graphShapes = [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
+let graphShapes: ReturnType<Ajv['compile']>[] | undefined;
+const zoneShapes = () => graphShapes ??= (() => {
+  const schemas = new Ajv({ strict: true, allErrors: false, allowUnionTypes: true });
+  return [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
+})();
 function invalid(field: string): never {
   throw new EngineError('work_zone_request_invalid', 'The work zone needs explicit, well-formed sources',
     { unit: 'F7.1', target: 'work-zone', field });
@@ -28,7 +31,7 @@ function invalid(field: string): never {
 
 /** This selects from an accepted L2 projection; persisted callers prove acceptance through C2. */
 export function workZone(graph: Graph, horizon: WorkZoneHorizon, identityOps: readonly string[]): OmResult<Sealed<string[]>> {
-  if (!object(graph) || !graphShapes[graph.version === 2 ? 1 : 0]!(graph)) invalid('graph');
+  if (!object(graph) || !zoneShapes()[graph.version === 2 ? 1 : 0]!(graph)) invalid('graph');
   if (!object(horizon) || !Array.isArray(horizon.nodes) || !Array.from(horizon.nodes).every(text)) invalid('horizon.nodes');
   if (!Array.isArray(identityOps) || !Array.from(identityOps).every(text)) invalid('identityOps');
   const projected = projectGraph(graph, 2);

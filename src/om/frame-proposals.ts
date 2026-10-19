@@ -99,10 +99,14 @@ const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const parts = ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers', 'anchors'] as const;
-const schemas = new Ajv({ strict: true, allowUnionTypes: true });
-const graphShapes = [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
-const codeShape = schemas.compile(sealed(graphV2Schema.properties['nodes'].items.properties.code.items));
-const partShapes = new Map(parts.map(part => [part, schemas.compile(sealed(graphV2Schema.properties[part === 'localConnectors' ? 'connectors' : part].items))]));
+type Validator = ReturnType<Ajv['compile']>;
+let shapes: { graphShapes: Validator[]; codeShape: Validator; partShapes: Map<string, Validator> } | undefined;
+const proposalShapes = () => shapes ??= (() => {
+  const schemas = new Ajv({ strict: true, allowUnionTypes: true });
+  return { graphShapes: [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))],
+    codeShape: schemas.compile(sealed(graphV2Schema.properties['nodes'].items.properties.code.items)),
+    partShapes: new Map(parts.map(part => [part, schemas.compile(sealed(graphV2Schema.properties[part === 'localConnectors' ? 'connectors' : part].items))])) };
+})();
 const graphParts = ['nodes', 'connectors', 'artifacts', 'contracts', 'anchors', 'joins', 'tests'] as const;
 const graphV2Parts = ['actors', 'requirements', 'edges', 'journeys', 'transfers', 'packets'] as const;
 function invalid(field: string, target = 'proposals'): never {
@@ -233,7 +237,7 @@ function requireReopenFits(frame: FrameRead, reopen: FrameReopen | null): void {
 function requireFrame(value: unknown): asserts value is FrameRead {
   if (!object(value)) invalid('frame');
   requireRequest(value['request']);
-  if (!object(value['upper']) || !graphShapes[value['upper']['version'] === 2 ? 1 : 0]!(value['upper'])
+  if (!object(value['upper']) || !proposalShapes().graphShapes[value['upper']['version'] === 2 ? 1 : 0]!(value['upper'])
     || !isRef(value['upperRef']) || !object(value['scope']) || !object(value['result'])
     || !Array.isArray(value['references']) || !value['references'].every(isRef)) invalid('frame');
   const scope = value['scope'];
@@ -242,7 +246,7 @@ function requireFrame(value: unknown): asserts value is FrameRead {
     || typeof scope['hash'] !== 'string' || !/^[a-f0-9]{64}$/.test(scope['hash'])) invalid('frame.scope');
   const accepted = value['accepted'];
   if (accepted !== null && (!object(accepted) || !isRef(accepted['reference']) || !object(accepted['graph'])
-    || !graphShapes[accepted['graph']['version'] === 2 ? 1 : 0]!(accepted['graph'])
+    || !proposalShapes().graphShapes[accepted['graph']['version'] === 2 ? 1 : 0]!(accepted['graph'])
     || (accepted['frame'] !== null && (!object(accepted['frame']) || !isRef(accepted['frame']['reference']) || !object(accepted['frame']['value']))))) invalid('frame.accepted');
   for (const key of ['obligations', 'fills', 'open', 'representatives', 'joins']) if (!Array.isArray(value['result'][key])) invalid(`frame.result.${key}`);
 }
@@ -269,14 +273,14 @@ function checkProposal(observation: ProposalObservation, frame: FrameRead): void
   if (!same(proposal.base.graph, frame.request.graph) || !same(proposal.base.frame, frame.request.frame) || proposal.level !== frame.request.level)
     reject('proposal_base_stale', ref.id, 'base', 'This proposal was offered for another graph, frame or level');
   for (const part of parts) {
-    if (!Array.isArray(proposal[part]) || !proposal[part].every(item => partShapes.get(part)!(item)))
+    if (!Array.isArray(proposal[part]) || !proposal[part].every(item => proposalShapes().partShapes.get(part)!(item)))
       reject('proposal_invalid', ref.id, part, 'Every introduced definition must be complete according to the native graph schema');
     const ids = proposal[part].map(item => item.id);
     if (new Set(ids).size !== ids.length) reject('proposal_invalid', ref.id, part, 'Introduced definitions have distinct IDs');
   }
   const fillShape = (row: unknown) => object(row) && text(row['obligation']) && text(row['node'])
     && (row['port'] === undefined || text(row['port']))
-    && (!Object.hasOwn(row, 'codeRef') || proposal.worksContract === WORKS_FRAME_CONTRACT && codeShape(row['codeRef']))
+    && (!Object.hasOwn(row, 'codeRef') || proposal.worksContract === WORKS_FRAME_CONTRACT && proposalShapes().codeShape(row['codeRef']))
     && (!Object.hasOwn(row, WAKE_TEST.field) || proposal.worksContract === WORKS_FRAME_CONTRACT && text(row[WAKE_TEST.field]))
     && Object.keys(row).every(key => ['obligation', 'node', 'port', ...(proposal.worksContract === WORKS_FRAME_CONTRACT ? ['codeRef', WAKE_TEST.field] : [])].includes(key));
   if (!Array.isArray(proposal.fills) || !proposal.fills.every(fillShape)) reject('proposal_invalid', ref.id, 'fills', 'Fills must be explicit complete endpoints');

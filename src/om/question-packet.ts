@@ -1799,7 +1799,8 @@ const worksBodySchema = (wake = true, impact = true) => ({ ...WORKS_PART_PROPOSA
   ...(impact ? { nodes: { type: 'array', items: structuredClone(graphV2Schema.properties.nodes.items) } } : {}) } });
 let worksBody: ReturnType<Ajv['compile']> | undefined;
 const validateWorksPartBody = (value: unknown) => (worksBody ??= new Ajv({ strict: true, allowUnionTypes: true }).compile(worksBodySchema()))(value);
-const validatePartBody = new Ajv({ strict: true, allowUnionTypes: true }).compile(PART_PROPOSAL_SCHEMA);
+let partBody: ReturnType<Ajv['compile']> | undefined;
+const validatePartBody = (value: unknown) => (partBody ??= new Ajv({ strict: true, allowUnionTypes: true }).compile(PART_PROPOSAL_SCHEMA))(value);
 function requirePart(store: Store, value: unknown): asserts value is PartResultRequest {
   if (!(store instanceof Store) || !object(value) || !text(value.project)
     || ![value.packet, value.call, value.response].every(isRef)
@@ -1811,7 +1812,7 @@ export function normalizePartAnswer(value: unknown, worksContract?: typeof WORKS
     if (worksContract !== undefined && worksContract !== WORKS_FRAME_CONTRACT)
       fail('part_answer_invalid', 'part-answer', 'worksContract', 'The work answer must name its known proposal contract');
     const valid = worksContract === WORKS_FRAME_CONTRACT ? validateWorksPartBody(value) : validatePartBody(value);
-    const errors = worksContract === WORKS_FRAME_CONTRACT ? worksBody?.errors : validatePartBody.errors;
+    const errors = worksContract === WORKS_FRAME_CONTRACT ? worksBody?.errors : partBody?.errors;
     if (!valid)
       fail('part_answer_invalid', 'part-answer', errors?.[0]?.instancePath || 'proposal',
         'A typed part answer must satisfy the exact content schema without service fields');
@@ -1917,10 +1918,11 @@ export function packetAnswerSchema(kind: 'node' | 'fact' | 'field', worksContrac
   const key = protocol === 'omg-answer/v3' && !includePage ? 'omg-answer/v3-nopage' : protocol;
   return answerSchemas[key][worksContract ? 'works' : kind] as Sealed<Json>;
 }
-const answerSchemasAjv = new Ajv({ strict: true, allowUnionTypes: true });
+let answerAjv: Ajv | undefined;
+const answerSchemasAjv = () => answerAjv ??= new Ajv({ strict: true, allowUnionTypes: true });
 const compileAnswers = (family: ReturnType<typeof answerSchemaFamily>) => ({
-  node: answerSchemasAjv.compile(family.node), fact: answerSchemasAjv.compile(family.fact),
-  field: answerSchemasAjv.compile(family.field), works: answerSchemasAjv.compile(family.works),
+  node: answerSchemasAjv().compile(family.node), fact: answerSchemasAjv().compile(family.fact),
+  field: answerSchemasAjv().compile(family.field), works: answerSchemasAjv().compile(family.works),
 });
 /**
  * G5: the protocol check of a works packet of the wake-test era admits the wake test its form asks for. AT1: one of the
@@ -1933,18 +1935,23 @@ function eraWorksValidator(protocol: AnswerProtocol, wake: boolean, impact: bool
   if (!validator) {
     const works = JSON.parse(canonical(answerSchemas[protocol].works as unknown as Json));
     works.oneOf[0].properties.proposal = worksBodySchema(wake, impact);
-    eraWorksValidators.set(key, validator = answerSchemasAjv.compile(works));
+    eraWorksValidators.set(key, validator = answerSchemasAjv().compile(works));
   }
   return validator;
 }
-const answerValidators = { 'omg-answer/v2': compileAnswers(answerSchemas['omg-answer/v2']),
+let answerValidators: Record<'omg-answer/v2' | 'omg-answer/v3', ReturnType<typeof compileAnswers>> | undefined;
+const answerValidatorsFor = () => answerValidators ??= {
+  'omg-answer/v2': compileAnswers(answerSchemas['omg-answer/v2']),
   'omg-answer/v3': compileAnswers(answerSchemas['omg-answer/v3']) };
-const readPathValidator = answerSchemasAjv.compile(readPathShape);
+let readPathValidator: ReturnType<Ajv['compile']> | undefined;
 /** The exact lexical rule used by the v3 schema, with no shared mutable RegExp exposed. */
-export function packetReadPath(value: unknown): value is string { return readPathValidator(value); }
-const legacyResultValidators = {
-  fact: answerSchemasAjv.compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: factResults } }),
-  field: answerSchemasAjv.compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: fieldResults } }),
+export function packetReadPath(value: unknown): value is string {
+  return (readPathValidator ??= answerSchemasAjv().compile(readPathShape))(value) as boolean;
+}
+let legacyResultValidators: { fact: ReturnType<Ajv['compile']>; field: ReturnType<Ajv['compile']> } | undefined;
+const legacyValidators = () => legacyResultValidators ??= {
+  fact: answerSchemasAjv().compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: factResults } }),
+  field: answerSchemasAjv().compile({ type: 'object', additionalProperties: false, required: ['results'], properties: { results: fieldResults } }),
 };
 function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): PacketAnswer {
   const value = packet.value, payload = value.packet;
@@ -1973,7 +1980,7 @@ function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): Packe
       || Object.keys(parsed).some(key => !Object.hasOwn(branch.properties, key)))
       fail('part_answer_invalid', packet.id, 'reply', 'The response envelope must match exactly one declared branch before resolving labels');
     const resolved = take(resolveBriefAnswer(payload, parsed));
-    const validateWire = answerSchemasAjv.compile(form.schema as object);
+    const validateWire = answerSchemasAjv().compile(form.schema as object);
     if (!validateWire(parsed)) fail('part_answer_invalid', packet.id, validateWire.errors?.[0]?.instancePath || 'reply',
       'The reply must use this packet-specific form');
     parsed = resolved;
@@ -1982,7 +1989,7 @@ function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): Packe
   if (value.answerProtocol) {
     const wake = value.wakeTests === true, impact = Object.hasOwn(value, 'briefImpact');
     const validate = packetWorkContract(value) && (wake || impact) ? eraWorksValidator(value.answerProtocol, wake, impact)
-      : answerValidators[value.answerProtocol][packetWorkContract(value) ? 'works' : kind];
+      : answerValidatorsFor()[value.answerProtocol][packetWorkContract(value) ? 'works' : kind];
     if (!validate(parsed)) fail('part_answer_invalid', packet.id, validate.errors?.[0]?.instancePath || 'reply',
       'The reply must use exactly one branch of the declared answer form without service fields');
     if (parsed.requestId !== payload.requestId)
@@ -1998,7 +2005,7 @@ function packetReply(packet: Revision<QuestionPacketRecord>, raw: string): Packe
       || Object.keys(parsed).some(key => !['protocol', 'requestId', 'proposal'].includes(key)))
       fail('part_result_invalid', packet.id, 'requestId', 'The old packet accepts only its original exact node reply envelope');
   } else {
-    const validate = legacyResultValidators[kind];
+    const validate = legacyValidators()[kind];
     if (!validate(parsed)) fail('part_answer_invalid', packet.id, 'results', 'The old packet accepts only its declared results form');
   }
   const { protocol: _protocol, requestId: _requestId, ...body } = parsed;

@@ -1,6 +1,6 @@
 import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME, researchResultFailure,
   type EarlyUnknownAdmission } from './early-research-outcome.js';
-import { Ajv } from 'ajv';
+import { Ajv, type ValidateFunction } from 'ajv';
 import { canonical, digest, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 import { tokenUsage, type ModelCall } from '../runtime/model-usage.js';
@@ -76,7 +76,9 @@ const answerDelta = object({ action: { const: 'answer_delta' }, question: text, 
   citations: { type: 'array', minItems: 1, items: object({ source: ref, selector }) } });
 answerDelta.properties['revises'] = ref;
 answerDelta.properties['horizon'] = { type: 'array', minItems: 1, uniqueItems: true, items: text };
-const validateAction = new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
+let actionValidator: ValidateFunction<ResearchAction> | undefined;
+const validateAction = (value: unknown): value is ResearchAction =>
+  (actionValidator ??= new Ajv({ allErrors: true }).compile<ResearchAction>({ oneOf: [
   ...readSchemas,
   object({ action: { const: 'read_plan' }, question: text,
     reads: { type: 'array', minItems: 1, maxItems: 16, items: { oneOf: readSchemas } } }),
@@ -92,15 +94,17 @@ const validateAction = new Ajv({ allErrors: true }).compile<ResearchAction>({ on
   object({ action: { const: 'need_owner' }, question: text, reason: text,
     searched: { type: 'array', minItems: 1, items: ref } }),
   object({ action: { const: 'pause' }, reason: text })
-] });
+] }))(value);
 
-const validateReaderReply = new Ajv({ allErrors: true }).compile<{
-  selections: ReaderSelection[]; unresolved: string[] }>(object({
-  selections: { type: 'array', items: { oneOf: [
-    object({ source: ref, firstLine: { type: 'integer', minimum: 1 }, lastLine: { type: 'integer', minimum: 1 } }),
-    object({ sourceIndex: { type: 'integer', minimum: 0 },
-      firstLine: { type: 'integer', minimum: 1 }, lastLine: { type: 'integer', minimum: 1 } })] } },
-  unresolved: { type: 'array', items: text } }));
+let readerReplyValidator: ValidateFunction<{ selections: ReaderSelection[]; unresolved: string[] }> | undefined;
+const validateReaderReply = (value: unknown): value is { selections: ReaderSelection[]; unresolved: string[] } =>
+  (readerReplyValidator ??= new Ajv({ allErrors: true }).compile<{
+    selections: ReaderSelection[]; unresolved: string[] }>(object({
+    selections: { type: 'array', items: { oneOf: [
+      object({ source: ref, firstLine: { type: 'integer', minimum: 1 }, lastLine: { type: 'integer', minimum: 1 } }),
+      object({ sourceIndex: { type: 'integer', minimum: 0 },
+        firstLine: { type: 'integer', minimum: 1 }, lastLine: { type: 'integer', minimum: 1 } })] } },
+    unresolved: { type: 'array', items: text } })))(value);
 
 /** A sibling field may advance the draft without changing this reader task. */
 export function readerDraftEquivalent(store: Store, before: Ref, after: Ref, question: Ref): boolean {
@@ -128,7 +132,7 @@ export function readerDraftEquivalent(store: Store, before: Ref, after: Ref, que
 export function projectReaderSelection(sources: readonly { ref: Ref; lines: readonly { line: number }[] }[],
   reply: unknown): { response: { selections: ReaderSelection[]; unresolved: string[] }; sourceIndices: number[] } {
   if (!validateReaderReply(reply)) throw new EngineError('reader_response_invalid',
-    'Reader must return only source/line selections and unresolved questions', validateReaderReply.errors);
+    'Reader must return only source/line selections and unresolved questions', readerReplyValidator?.errors);
   requireCondition(reply.selections.length > 0 || reply.unresolved.length > 0,
     'reader_response_empty', 'An empty reader response does not establish absence of relevant information');
   const sourceIndices = reply.selections.map(selection => {
@@ -194,10 +198,12 @@ export const EARLY_ACTIONS = 'early-research-actions/v2' as const;
 export const EARLY_UNKNOWN = 'early-research-unknown/v1' as const;
 export const earlyUnknownEra = (cursor: unknown): boolean =>
   cursor !== null && typeof cursor === 'object' && (cursor as { earlyActions?: unknown }).earlyActions === EARLY_ACTIONS;
-const validateEarlyNeed = new Ajv({ allErrors: true }).compile<Extract<ResearchAction, { action: 'need_research' }>>({
-  type: 'object', additionalProperties: false, required: ['action', 'question', 'missing'], properties: {
-    action: { const: 'need_research' }, question: text, missing: { type: 'array', minItems: 1, items: text },
-    upstream: object({ stage: ref, field: text }) } });
+let earlyNeedValidator: ValidateFunction<Extract<ResearchAction, { action: 'need_research' }>> | undefined;
+const validateEarlyNeed = (value: unknown): value is Extract<ResearchAction, { action: 'need_research' }> =>
+  (earlyNeedValidator ??= new Ajv({ allErrors: true }).compile<Extract<ResearchAction, { action: 'need_research' }>>({
+    type: 'object', additionalProperties: false, required: ['action', 'question', 'missing'], properties: {
+      action: { const: 'need_research' }, question: text, missing: { type: 'array', minItems: 1, items: text },
+      upstream: object({ stage: ref, field: text }) } }))(value);
 const isNeedResearch = (value: unknown): boolean => value !== null && typeof value === 'object'
   && (value as { action?: unknown }).action === 'need_research';
 /** The early need_research of the unknown era — the global planning schema is not widened after the fact. */
@@ -205,7 +211,7 @@ function earlyNeedResearch(value: unknown): Extract<ResearchAction, { action: 'n
   value = normalizeResearchAction(value);
   if (!validateEarlyNeed(value)) throw new EngineError('research_response_invalid',
     'An early need_research names its question, the missing material and optionally an exact upstream stage and field',
-    validateEarlyNeed.errors);
+    earlyNeedValidator?.errors);
   return value;
 }
 
@@ -213,7 +219,7 @@ function earlyNeedResearch(value: unknown): Extract<ResearchAction, { action: 'n
 export function researchAction(value: unknown): ResearchAction {
   value = normalizeResearchAction(value);
   if (!validateAction(value)) throw new EngineError('research_response_invalid',
-    'Research action has missing or invalid fields', validateAction.errors);
+    'Research action has missing or invalid fields', actionValidator?.errors);
   if (value.action === 'checkpoint' && value.citations.length === 0) {
     const note = value.value;
     const meaningful = typeof note === 'string' ? note.trim().length > 0

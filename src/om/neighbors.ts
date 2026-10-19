@@ -54,9 +54,13 @@ const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const uniqueRefs = (refs: readonly Ref[]): Ref[] => [...new Map(refs.map(ref => [canonical(ref), ref])).values()]
   .sort((a, b) => order(canonical(a), canonical(b)));
-const ajv = new Ajv({ strict: true, allowUnionTypes: true });
-const graphShapes = [ajv.compile(sealed(graphSchema)), ajv.compile(sealed(graphV2Schema))];
-const codeShape = ajv.compile(sealed(graphV2Schema.properties['nodes'].items.properties.code.items));
+type Validator = ReturnType<Ajv['compile']>;
+let shapes: { graphShapes: Validator[]; codeShape: Validator } | undefined;
+const neighborShapes = () => shapes ??= (() => {
+  const ajv = new Ajv({ strict: true, allowUnionTypes: true });
+  return { graphShapes: [ajv.compile(sealed(graphSchema)), ajv.compile(sealed(graphV2Schema))],
+    codeShape: ajv.compile(sealed(graphV2Schema.properties['nodes'].items.properties.code.items)) };
+})();
 function invalid(field: string): never {
   throw new EngineError('neighbor_request_invalid', 'Neighbors require explicit, well-formed sources',
     { unit: 'F7.3', target: 'neighbors', field });
@@ -77,7 +81,7 @@ function copy<T>(value: T): T {
   catch (error) { if (error instanceof EngineError && error.code === 'unsealable_value') invalid('json'); throw error; }
 }
 function requireSources(graph: unknown, sources: unknown): asserts sources is NeighborSources {
-  if (!object(graph) || !graphShapes[graph['version'] === 2 ? 1 : 0]!(graph)) invalid('graph');
+  if (!object(graph) || !neighborShapes().graphShapes[graph['version'] === 2 ? 1 : 0]!(graph)) invalid('graph');
   if (!object(sources) || !Array.isArray(sources['identity']) || !sources['identity'].every(text)
     || !object(sources['receipts']) || !Object.values(sources['receipts']).every(isRef) || !object(sources['frames'])) invalid('sources');
   for (const [name, level] of [['operations', 2], ['works', 3]] as const) {
@@ -90,7 +94,7 @@ function requireSources(graph: unknown, sources: unknown): asserts sources is Ne
         && text(o['flow']) && text(o['upper']['port']))))) invalid(`frames.${name}.obligations`);
     if (frame['fills'] !== null && (!Array.isArray(frame['fills']) || !frame['fills'].every(fill => object(fill)
       && text(fill['obligation']) && text(fill['node']) && ['accepted', 'identity', 'proposed'].includes(fill['source'] as string)
-      && (!Object.hasOwn(fill, 'port') || text(fill['port'])) && (!Object.hasOwn(fill, 'codeRef') || codeShape(fill['codeRef'])))))
+      && (!Object.hasOwn(fill, 'port') || text(fill['port'])) && (!Object.hasOwn(fill, 'codeRef') || neighborShapes().codeShape(fill['codeRef'])))))
       invalid(`frames.${name}.fills`);
   }
 }
