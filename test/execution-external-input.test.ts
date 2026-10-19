@@ -782,7 +782,7 @@ test('a genuine unexecuted legacy v2 without external task inputs repeats after 
 });
 
 test('without an exact legacy v2 record nonexternal compilation creates only the new era', t => {
-  const f = executionFixture(t);
+  const f = executionFixture(t, "normal", { route: "om" });
   const { derivation: _derivation, hash: _hash, ...body } = f.plan.value;
   assert.ok(f.plan.value.tasks.every(task => task.inputs.every(input => !f.plan.value.graphSnapshot.artifacts.find(artifact => artifact.id === input.artifact)!.external)));
   assert.equal(f.plan.value.derivation, 'external-inputs/v1');

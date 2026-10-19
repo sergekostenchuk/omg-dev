@@ -1,16 +1,41 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { TestContext } from "node:test";
 import { Store } from "../src/storage/store.js";
+import assert from "node:assert/strict";
+import { writeFeasibility } from "../src/om/feasibility.js";
+import { writeHandoff } from "../src/om/handoff.js";
 import { EngineError } from "../src/errors.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { git } from "../src/runtime/environment.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
-import { prepareOmFixtureStages, prepareNativeLayers } from "./om-fixture.js";
+import { prepareOmFixtureStages, prepareNativeLayers, type NativeLayerOptions } from "./om-fixture.js";
+import { hashJson, type Json } from "../src/canonical.js";
+import type { CarriedObligation } from "../src/graph/obligation-policy.js";
+import { taskBindingId } from "../src/graph/task-obligations.js";
+import { runtimeObligationId, type RuntimeObservationResult } from "../src/runtime/runtime-observation.js";
+import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment, readOmObligations } from "../src/om/obligations.js";
+import type { OmResult } from "../src/om/refusal.js";
+import type { Ref } from "../src/pipeline/contracts.js";
+import { writeRoutes } from "../src/om/routes.js";
+import { writeQuestionPacket, partResponseId, preparePartResult } from "../src/om/question-packet.js";
+import { writeGuarded } from "../src/om/refs.js";
+import { openSeries, beginAttempt } from "../src/om/series.js";
+import { recordCall } from "../src/om/call-record.js";
+import { gapLineKey, gapLineExpectedResult } from "../src/om/gap-lines.js";
+import { writeWorksAcceptance } from "../src/om/atomic-gate.js";
+import { readAcceptedFrame } from "../src/om/frame-accept.js";
+import { readWorksFrame } from "../src/om/works-frame.js";
+import { preparedField } from "./preparation-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
+
+const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => unknown } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
+const take = <T>(result: OmResult<T>): T => {
+  assert.ok(result.ok, result.ok ? "" : `${result.refusal.code}: ${result.refusal.message}`); return result.value;
+};
 
 // Controlled protocol agents exercise real OS processes, code, gates and Git.
 // They do not prove research or code-generation quality of a language model.
@@ -75,12 +100,15 @@ if(mode==='overflow-consume') {const {consume}=await import('./consume.mjs');ass
 
 export interface CurrentExecutionFixture {
   route: "om";
+  graph?: (graph: import("../src/graph/model.js").Graph) => void;
   beforeRoute?: (engine: ProductEngine) => void;
+  valueFor?: Parameters<typeof preparedFeatures>[3];
+  native?: NativeLayerOptions;
 }
 
 export function executionFixture(t: TestContext, behavior = "normal",
-  route: ((engine: ProductEngine) => void) | CurrentExecutionFixture = engine => refinedLayers(engine, "p")) {
-  const current = typeof route !== "function";
+  route?: CurrentExecutionFixture) {
+  const current = route !== undefined;
   if (current && (!route || typeof route !== "object" || route.route !== "om"
     || (route.beforeRoute !== undefined && typeof route.beforeRoute !== "function")))
     throw new EngineError("execution_fixture_invalid", "The current fixture needs route om and an optional beforeRoute function", { target: "/route" });
@@ -108,18 +136,19 @@ export function executionFixture(t: TestContext, behavior = "normal",
     test.command = { executable: process.execPath, args: ["check.mjs", test.node.includes("produce") ? "produce" : "consume"] };
     for (const mutation of test.contract!.counterfactuals) mutation.command = { executable: process.execPath, args: ["check.mjs", "mutation"] };
   }
-  if (current) prepareOmFixtureStages(engine, "p", graph);
+  if (current) route.graph?.(graph);
+  if (current) prepareOmFixtureStages(engine, "p", graph, route.valueFor);
   else preparedFeatures(engine, "p", graph);
   const command = { executable: process.execPath, args: [agent, journal, behavior] };
   engine.environments.configure("p", { workspace, implementer: { actor: "worker", model: "protocol-fixture", effort: "high", command },
     reviewer: { actor: "reviewer", model: "protocol-fixture", effort: "high", command }, fullCheck: { executable: process.execPath, args: ["check.mjs", "all"] }, timeoutMs: 10_000,
     ...(current ? { requestCapacityChars: 100_000 } : {}) }, 0);
-  if (typeof route === "function") {
-    route(engine); const feasibility = engine.refinement.assess("p", 0);
+  if (!current) {
+    refinedLayers(engine, "p"); const feasibility = engine.refinement.assess("p", 0);
     const stage = engine.refinement.publish("p", reference(feasibility), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
   } else {
     route.beforeRoute?.(engine);
-    prepareNativeLayers(engine, "p", graph, "executed");
+    prepareNativeLayers(engine, "p", graph, "executed", route.native);
   }
   const plan = engine.compiler.compile("p"); const compilation = engine.compiler.publish("p", reference(plan), 0); engine.pipeline.accept("p", "compilation", compilation.revision);
   return { get store() { return store; }, get engine() { return engine; }, directory, workspace, initial, plan,
@@ -127,4 +156,127 @@ export function executionFixture(t: TestContext, behavior = "normal",
     reopen: () => { store.close(); store = new Store(join(directory, "state.sqlite")); engine = new ProductEngine(store); return engine; },
     options: { retry: false, maxContextChars: 100_000, maxCorrections: 0 },
   };
+}
+
+/** Reobserve the accepted native L3 against the current repository and publish its new M8/M9. */
+export function refreshExecutionPlan(engine: ProductEngine, project = "p") {
+  const store = engine.store;
+  const feasibility = writeFeasibility(store, { project, graph: reference(store.get(`graph:${project}`)!),
+    layer: reference(store.get(`graph-layer:${project}:3`)!), frame: reference(store.get(`om-frame:${project}:3`)!),
+    environment: reference(engine.environments.get(project)), expected: store.get(`om-feasibility:${project}`)!.revision });
+  assert.ok(feasibility.ok, feasibility.ok ? "" : feasibility.refusal.message);
+  assert.equal(feasibility.value.value.ready, true);
+  const handoff = writeHandoff(store, { project, feasibility: reference(feasibility.value), expected: store.get(`stage:${project}:om-g2`)!.revision });
+  assert.ok(handoff.ok, handoff.ok ? "" : handoff.refusal.message);
+  return engine.compiler.compile(project);
+}
+
+/** Current D1/D2 -> H2/D7 -> L3 task bindings, with live evidence produced only in the test. */
+export function taskObligationExecutionFixture(t: TestContext) {
+  const labels = ["start", "result", "implementation"] as const;
+  let condition = "", engine: ProductEngine;
+  const obligations = new Map<string, CarriedObligation>();
+  const f = executionFixture(t, "normal", {
+    route: "om",
+    valueFor(field) {
+      const value = preparedField("p", field);
+      if (field === "preparation") (value as { unknowns: unknown }).unknowns = labels.map(id => ({
+        id, question: `Check the actual ${id} of the producer task at its declared moment`,
+        consumer: "p-produce-operation", moment: id === "start" ? "task-start" : "task-result",
+        blocksCurrentStage: false, resolution: `Verify actual ${id} for this producer task`,
+      }));
+      return value;
+    },
+    beforeRoute(current) {
+      engine = current;
+      condition = join(dirname(current.store.path), "condition.txt"); writeFileSync(condition, "ready");
+    },
+    native: {
+      addresses: labels.map(id => ({ target: `discovery:${id}`, field: "address", value: {
+        consumer: "p-produce-operation", kind: id === "implementation" ? "post-implementation-proof" : "environment-confirmation",
+      } })),
+      obligations: {
+        assignments(context, records) {
+          const script = engine.discovery.evidence.document("p", "task-check",
+            "import{readFileSync}from'node:fs';process.exitCode=readFileSync(process.argv.at(-1),'utf8')==='ready'?0:7;", "text/plain", 0);
+          const gaps = records.filter(row => labels.some(id => row.value.gap.target === `discovery:${id}`) && row.value.gap.field === "answer");
+          assert.equal(gaps.length, labels.length);
+          return gaps.map(row => {
+            const label = row.value.gap.target.slice("discovery:".length);
+            const returnCondition = `Verify actual ${label} for this producer task`;
+            const assignment = normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project: "p",
+              context: { gaps: context.gaps, lines: context.lines }, gap: reference(row), assignments: row.value.gap.consumers.map(responsibleConsumer => ({
+                responsibleNode: "p-produce-operation", responsibleConsumer, reason: "The owner requires exact evidence at this task boundary",
+                returnCondition, wake: null, ...(label === "implementation" ? {} : { runtimeCheck: {
+                  script: reference(script), dependencies: [], subjects: [condition], executables: [], args: [condition], timeoutMs: 3000,
+                  purpose: "A controlled local execution fixture", satisfies: returnCondition,
+                } }),
+              })) });
+            return { pending: { id: `om-owner-gap-assignment:p:${hashJson(assignment)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value: assignment } };
+          });
+        },
+        accept(gaps, initial, proposal) {
+          const store = engine.store, project = "p", environment = reference(engine.environments.get(project));
+          const routes = take(writeRoutes(store, { project, gaps, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+          const adapter = store.write({ id: "adapter:p:task-fixture", kind: "dispatch-adapter", expected: 0,
+            value: { projectId: project, protocol: "fixture" } });
+          const results: { kind: "part"; record: Ref }[] = [];
+          for (const batch of routes.value.batches.filter(item => item.level === 3 && item.task === "node-expansion")) {
+            const work = proposal.nodes.find(node => node.parent === batch.node)!; assert.ok(work, batch.node ?? "node");
+            const upper = store.get<import("../src/graph/model.js").Graph>("graph:p")!.value.nodes.find(node => node.id === batch.node)!;
+            const block = upper.parent!;
+            take(openSeries(store, { project, block, line: 1, slice: `fixture:${batch.node}`, predecessor: null, basis: null }));
+            const goal = { key: `fixture:${batch.node}`, questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+              result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+            const series = take(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+            const packet = take(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment,
+              attempt: { series: reference(series), ordinal: 1 }, previous: [],
+              works: { producer: reference(initial.producer), ledger: reference(initial.record) } })).record;
+            assert.equal(packet.value.state, "ready"); assert.equal(packet.value.plan!.mode, "whole");
+            const payload = packet.value.packet as unknown as { requestId: string; questions: { id: string }[];
+              expansion: { assigned: string[] }; works: { assigned: string[] } };
+            const bindings = initial.handoff.obligations.filter(item => payload.works.assigned.includes(taskBindingId(item))).map(item => ({
+              id: taskBindingId(item), scope: item.scope, obligation: item.obligation,
+              consumers: [{ node: work.id, tests: item.kind === "post-implementation-proof" ? [...work.tests] : [] }],
+            }));
+            const body = { nodes: [work], tests: proposal.tests.filter(proof => work.tests.includes(proof.id)),
+              fills: proposal.fills.filter(fill => fill.node === work.id && payload.expansion.assigned.includes(fill.obligation)),
+              localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [],
+              removes: [], replaces: [], redefines: [] };
+            const questions = new Set(payload.questions.map(question => question.id));
+            const call = take(recordCall(store, project, { call: payload.requestId, purpose: "model-design", basis: null, block,
+              gaps: batch.items.filter(item => questions.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
+                id: item.target, goal: item.target, field: item.field, consumer }))), series: reference(series), attempt: 1, goal,
+              dispatch: { adapter: reference(adapter), config: environment }, packet: structuredClone(packet.value.packet) as Json })).call;
+            const response = store.write({ id: partResponseId(project, reference(call)), kind: "part-response", expected: 0,
+              value: { project, packet: reference(packet), call: reference(call), requestId: payload.requestId,
+                raw: JSON.stringify(fixtureAnswer(packet.value.packet, { protocol: packet.value.answerProtocol, requestId: payload.requestId,
+                  action: "answer", proposal: body, bindings })) } });
+            const part = take(preparePartResult(store, { project, packet: reference(packet), call: reference(call), response: reference(response) }));
+            take(writeGuarded(store, { unit: "fixture", target: part.record.id, writes: part.writes, guards: part.guards }));
+            results.push({ kind: "part", record: reference(part.record) });
+          }
+          assert.equal(results.length, 2);
+          const accepted = take(writeWorksAcceptance(store, { project, results, environment, sources: [] }));
+          assert.equal(accepted.state, "accepted"); assert.ok(accepted.acceptance);
+          const settled = take(readAcceptedFrame(store, accepted.acceptance)); assert.ok(settled.frame);
+          const candidate = take(readWorksFrame(store, { project, candidate: settled.frame.value.acceptance.candidate }));
+          const final = take(readOmObligations(store, { project, producer: candidate.value.works!.producer }));
+          assert.equal(final.handoff.obligations.length, labels.length);
+          for (const frozen of final.handoff.obligations) {
+            const item = structuredClone(frozen) as CarriedObligation;
+            const label = labels.find(id => item.returnCondition === `Verify actual ${id} for this producer task`); assert.ok(label);
+            obligations.set(label, item); assert.equal(item.moment, label === "start" ? "task-start" : "task-result");
+          }
+          return structuredClone(accepted.acceptance);
+        },
+      },
+    },
+  });
+  const observe = (label: string, key = label) => {
+    const obligation = obligations.get(label); assert.ok(obligation, `Missing declared obligation ${label}`);
+    return f.engine.execute({ type: "observe-runtime", project: "p", scope: obligation.scope,
+      obligation: runtimeObligationId(obligation), key }) as Promise<RuntimeObservationResult>;
+  };
+  return { ...f, condition, observe };
 }

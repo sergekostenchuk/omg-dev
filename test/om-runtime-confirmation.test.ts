@@ -16,8 +16,7 @@ import { configureReaderPilot, type ReaderPilotSettings } from '../src/discovery
 import type { Source } from '../src/evidence/evidence.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { carriedObligations, type ObligationPolicy, type CarriedObligation, type RuntimeCheck } from '../src/graph/obligation-policy.js';
-import { configureResearchScope } from '../src/graph/research-scope.js';
+import { type CarriedObligation, type RuntimeCheck } from '../src/graph/obligation-policy.js';
 import { findObligationConfirmation, frozenObligationConfirmation, readinessObligations } from '../src/graph/obligation-readiness.js';
 import { runtimeSupport } from '../src/graph/runtime-evidence.js';
 import { bindTaskObligations, taskBindingId } from '../src/graph/task-obligations.js';
@@ -50,8 +49,8 @@ import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { answerTechnicalFixture } from './technical-research-fixture.js';
-import { answerLayerFixture, deriveLayerFixture } from './layer-design-fixture.js';
-import { executionFixture } from './execution-fixture.js';
+import { answerLayerFixture } from './layer-design-fixture.js';
+import { taskObligationExecutionFixture } from './execution-fixture.js';
 
 const clone = structuredClone;
 const selector = (obligation: CarriedObligation) => taskBindingId(obligation);
@@ -1001,41 +1000,10 @@ store.close();
 
 `;
 
-// Task-start/task-result are declared by the existing research-scope contract.
-// This fixture does not manufacture OM task-result authority.
+// Current OM declarations carry exact task-start/task-result authority through M8/M9.
 function d83ScopedExecutionFixture(t: test.TestContext) {
-  let condition = '';
-  const f = executionFixture(t, 'normal', engine => {
-    const store = engine.store;
-    condition = join(dirname(store.path), 'd83-condition.txt'); writeFileSync(condition, 'ready');
-    const r0 = engine.refinement.begin('p', 'R0'); engine.refinement.finishResearch('p', 'R0', reference(r0), 0); engine.refinement.sealLayer('p', 1, 0);
-    const gaps = ['start', 'result', 'implementation'].map(id => ({ id, target: 'p-produce-block', consumer: 'compilation', field: 'tests',
-      requiredFor: 'next' as const, question: `Check the actual ${id} of the producer task at its declared moment` }));
-    const r1 = engine.refinement.begin('p', 'R1'); answerTechnicalFixture(engine, 'p', r1, (field, report) => field === 'runtime' ? { ...report, gaps } : report);
-    const phase = engine.refinement.finishResearch('p', 'R1', reference(store.get(r1.id)!), 0);
-    deriveLayerFixture(engine, 'p', 2); engine.refinement.sealLayer('p', 2, 0);
-    const original = configureResearchScope(store, { projectId: 'p', r1: reference(phase), layer: reference(store.get('graph-layer:p:2')!),
-      outcome: 'Produce and consume numeric results with exact late obligations', nodes: ['p-produce-block'], boundaries: [], expansions: [], changedPaths: [], uiRequired: false,
-      obligations: gaps.map(gap => ({ gap, state: 'active', reason: 'Approved local fixture', wake: null })) }, 0);
-    const script = engine.discovery.evidence.document('p', 'd83-task-check',
-      "import{readFileSync}from'node:fs';process.exitCode=readFileSync(process.argv.at(-1),'utf8')==='ready'?0:7;", 'text/plain', 0);
-    const policy: ObligationPolicy = { version: 1, sourceScope: reference(original), assignments: gaps.map((gap, index) => ({
-      obligation: gap.id, original: { record: reference(original), pointer: `/obligations/${index}/gap` },
-      kind: gap.id === 'implementation' ? 'post-implementation-proof' : 'environment-confirmation',
-      moment: gap.id === 'start' ? 'task-start' : 'task-result', responsibleNode: gap.target, responsibleConsumer: gap.consumer,
-      neededForR2: false, reason: 'The future runtime and implementation do not decide the R2 design', returnCondition: `Verify actual ${gap.id} for this producer task`,
-      ...(gap.id === 'implementation' ? {} : { runtimeCheck: { script: reference(script), dependencies: [], subjects: [condition], executables: [], args: [condition], timeoutMs: 3000,
-        purpose: 'A controlled local execution fixture', satisfies: `Verify actual ${gap.id} for this producer task` } }) })) };
-    const scope = configureResearchScope(store, { ...original.value, policy }, 1);
-    const r2 = engine.refinement.begin('p', 'R2'); answerTechnicalFixture(engine, 'p', r2);
-    engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
-    const graph = store.get<Graph>('graph:p')!;
-    engine.graphs.save('p', { ...graph.value, researchObligations: carriedObligations(scope).map(item => ({ id: taskBindingId(item), scope: item.scope,
-      obligation: item.obligation, consumers: [{ node: 'p-produce-work', tests: item.kind === 'post-implementation-proof' ? ['p-produce-work-test'] : [] }] })) }, graph.revision, 'fixture');
-    deriveLayerFixture(engine, 'p', 3); engine.refinement.sealLayer('p', 3, 0);
-  });
-  const observe = (obligation: string, key = obligation) => f.engine.execute({ type: 'observe-runtime', project: 'p',
-    scope: reference(f.store.get('research-scope:p:R2')!), obligation, key }) as Promise<RuntimeObservationResult>;
+  const f = taskObligationExecutionFixture(t);
+  const { condition, observe } = f;
   const run = (retry = false) => f.engine.executor.run('p', reference(f.plan), { ...f.options, retry, maxCorrections: 3 });
   const prepare = async () => {
     await assert.rejects(run(), { code: 'task_obligation_start_required' });

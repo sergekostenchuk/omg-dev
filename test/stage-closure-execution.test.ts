@@ -12,27 +12,15 @@ import { git } from '../src/runtime/environment.js';
 import type { ExecutionResult } from '../src/execution/model.js';
 import { writeFeasibility, type FeasibilityRequest } from '../src/om/feasibility.js';
 import { ProductEngine } from '../src/product/engine.js';
-import { executionFixture } from './execution-fixture.js';
-import { refinedLayers } from './product-fixture.js';
-import { answerTechnicalFixture } from './technical-research-fixture.js';
-import { deriveLayerFixture } from './layer-design-fixture.js';
+import { executionFixture as baseExecutionFixture, refreshExecutionPlan } from './execution-fixture.js';
+const executionFixture = (t: TestContext) => baseExecutionFixture(t, 'normal', { route: 'om' });
 
 const context = (store: Store, projectId = 'p'): ExternalCheckContext => ({ store, projectId, stage: 'om-g2' });
 const repository = (store: Store, basis: Ref, project = 'p') => REFINEMENT_EXTERNAL_CHECKS.repository!({ kind: 'repository', basis }, context(store, project));
 const environment = (store: Store, basis: Ref, project = 'p') => REFINEMENT_EXTERNAL_CHECKS.environment!({ kind: 'environment', basis }, context(store, project));
 const ancestry = (store: Store, basis: Ref, project = 'p') => EXECUTION_EXTERNAL_CHECKS['git-ancestry']!({ kind: 'git-ancestry', basis }, context(store, project));
 function measured(action: () => void) { const before = storeReads(); action(); return storeReads() - before; }
-function nextPlan(f: ReturnType<typeof executionFixture>) {
-  const research = f.engine.refinement.begin('p', 'R2');
-  answerTechnicalFixture(f.engine, 'p', research);
-  f.engine.refinement.finishResearch('p', 'R2', reference(f.store.get(research.id)!), f.store.get('phase:p:R2')!.revision);
-  deriveLayerFixture(f.engine, 'p', 3);
-  f.engine.refinement.sealLayer('p', 3, f.store.get('phase:p:L3')!.revision);
-  const readiness = f.engine.refinement.assess('p', f.store.get('feasibility:p')!.revision);
-  const om = f.engine.refinement.publish('p', reference(readiness), f.store.get('stage:p:om-g2')!.revision);
-  f.engine.pipeline.accept('p', 'om-g2', om.revision);
-  return f.engine.compiler.compile('p');
-}
+function nextPlan(f: ReturnType<typeof executionFixture>) { return refreshExecutionPlan(f.engine); }
 
 test('G2b the real accepted compilation prefix is closed, cold and independent of unrelated history', t => {
   const f = executionFixture(t);
@@ -122,9 +110,11 @@ test('G2b exact repository/environment handlers have a fixed cold read budget an
   f.reopen();
   assert.equal(measured(check), 5);
   const path = join(f.workspace, 'untracked-basis.txt');
-  writeFileSync(path, 'A dirty repository produces a refused new R3');
-  const next = f.engine.refinement.assess('p', basis.revision);
-  assert.equal(next.value.ready, false);
+  writeFileSync(path, 'A dirty repository produces a refused new M8');
+  const next = writeFeasibility(f.store, { project: 'p', graph: reference(f.store.get('graph:p')!),
+    layer: reference(f.store.get('graph-layer:p:3')!), frame: reference(f.store.get('om-frame:p:3')!),
+    environment: reference(f.engine.environments.get('p')), expected: basis.revision });
+  assert.ok(next.ok); assert.equal(next.value.value.ready, false);
   unlinkSync(path);
   assert.equal(repository(f.store, basis), null, 'An external handler reads its exact saved basis, never the later head');
   assert.equal(f.store.headsMatch([basis]).ok, false, 'The separate head comparison rejects the moved record');
@@ -139,20 +129,19 @@ test('G2b unchanged Store heads do not hide dirty/untracked files, a moved git H
   change('new.txt', 'untracked'); assert.equal(repository(f.store, basis)?.code, 'repository_dirty');
   unlinkSync(join(f.workspace, 'new.txt'));
   git(f.workspace, ['-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-qm', 'later']);
-  assert.equal(repository(f.store, basis)?.code, 'repository_stale');
+  assert.equal(repository(f.store, basis)?.code, 'feasibility_stale');
   assert.equal(f.store.headsMatch([basis]).ok, true);
   git(f.workspace, ['reset', '--hard', f.initial]);
 });
 
 test('G2b a missing executable invalidates the saved repository without any Store change', t => {
   let executable = '';
-  const f = executionFixture(t, 'normal', engine => {
+  const f = baseExecutionFixture(t, 'normal', { route: 'om', beforeRoute(engine) {
     const old = engine.environments.get('p');
     executable = join(old.value.workspace, '..', 'local-check');
     writeFileSync(executable, '#!/bin/sh\nexit 0\n'); chmodSync(executable, 0o755);
     engine.environments.configure('p', { ...old.value, fullCheck: { executable, args: [] } }, old.revision);
-    refinedLayers(engine, 'p');
-  });
+  } });
   assert.equal(repository(f.store, f.plan.value.feasibility), null);
   chmodSync(executable, 0o644);
   assert.equal(repository(f.store, f.plan.value.feasibility)?.code, 'check_unavailable');

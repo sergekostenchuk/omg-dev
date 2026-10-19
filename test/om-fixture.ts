@@ -20,11 +20,11 @@ import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { fillObligations, prepareFrame, type FrameRead, type FrameRequest } from "../src/om/frame-obligations.js";
 import { gateCandidate, writeCandidate } from "../src/om/frame-candidate.js";
-import { settleCandidate } from "../src/om/frame-accept.js";
+import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
-import { writeGaps, type GapRequest } from "../src/om/gaps.js";
+import { writeGaps, type GapRequest, type GapRecords, type GapReadRequest } from "../src/om/gaps.js";
 import { gapLinesId, writeGapLines, type GapLinesRecord } from "../src/om/gap-lines.js";
-import { writeOmObligations } from "../src/om/obligations.js";
+import { writeOmObligations, type ObligationContext, type OwnerAssignmentBasis, type OmObligations } from "../src/om/obligations.js";
 import { writeWorksFrame } from "../src/om/works-frame.js";
 import { writeNeighbors } from "../src/om/neighbors.js";
 import { writeAtomicGate } from "../src/om/atomic-gate.js";
@@ -232,14 +232,23 @@ function take<T>(result: OmResult<T>): T {
 }
 
 /** Prepare only current upstream stages, even when called from an inherited era scope. */
-export function prepareOmFixtureStages(engine: ProductEngine, project: string, graph: Graph): void {
+export function prepareOmFixtureStages(engine: ProductEngine, project: string, graph: Graph, valueFor?: Parameters<typeof preparedFeatures>[3]): void {
   const { level: _level, ...l1 } = projectGraph(graph, 1);
   // Explicit empty era bypasses an inherited historical scope; undefined would select its old producer.
-  preparedFeatures(engine, project, l1 as Graph, undefined, "");
+  preparedFeatures(engine, project, l1 as Graph, valueFor, "");
+}
+
+export interface NativeObligationOptions {
+  assignments(context: ObligationContext, records: GapRecords["records"]): OwnerAssignmentBasis[];
+  accept(gaps: GapReadRequest, handoff: OmObligations, proposal: LayerProposal): AcceptedFrameRequest;
+}
+export interface NativeLayerOptions {
+  addresses?: InputDecisionProposal["decision"][];
+  obligations?: NativeObligationOptions;
 }
 
 /** Build each accepted layer through the current OM producers, without Refinement phases. */
-export function prepareNativeLayers(engine: ProductEngine, project: string, desired: Graph, mode: "n2" | "executed"): void {
+export function prepareNativeLayers(engine: ProductEngine, project: string, desired: Graph, mode: "n2" | "executed", options: NativeLayerOptions = {}): void {
   const store = engine.store;
   let input = take(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
@@ -289,28 +298,43 @@ export function prepareNativeLayers(engine: ProductEngine, project: string, desi
     { target: `${project}-B1`, field: "nodes", value: [`${project}-produce-block`, `${project}-consume-block`] },
     { target: `${project}-B1`, field: "state", value: { writer: `${project}-produce-block`, authority: `${project}-consume-block`, rollback: `${project}-consume-block` } },
     { target: `${project}-R1#1`, field: "checkKind", value: "test" },
+    ...(options.addresses ?? []),
   ];
   input = take(writeAddressing(store, { project, input: reference(input), graph,
-    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input: reference(input), graph, layers: [], decision }) as Write })) }));
+    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input: reference(input), graph, layers: decision.field === "address" ? [layer] : [], decision }) as Write })) }));
   const horizon = take(writeHorizon(store, { project, input: reference(input), graph, refinement: layer, available: {},
     choice: { choiceVersion: "fixture-works", features: [{ outcome: `${project}-result` }], excluded: [] } }));
   const frame3: FrameRequest = { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
     upper: { horizon: reference(horizon.gate), frame: upperFrame } };
   const works: ProposalRequest = { frame: frame3, proposals: [proposal(structuredClone(take(prepareFrame(store, frame3))) as unknown as FrameRead)] };
   acceptNativeWorks(engine, project,
-    { frame: { ...frame2, graph, layer, frame: upperFrame, horizon: reference(horizon.gate) }, proposals: [] }, works);
+    { frame: { ...frame2, graph, layer, frame: upperFrame, horizon: reference(horizon.gate) }, proposals: [] }, works, options.obligations);
 }
 
 /** Accept a fresh works proposal (including an explicit replacement) and publish its M8/M9. */
-export function acceptNativeWorks(engine: ProductEngine, project: string, operations: ProposalRequest, works: ProposalRequest): void {
+export function acceptNativeWorks(engine: ProductEngine, project: string, operations: ProposalRequest, works: ProposalRequest, obligations?: NativeObligationOptions): void {
   const store = engine.store;
   const gaps = take(writeGaps(store, { project, input: reference(store.get(`om-input:${project}`)!),
-    graph: works.frame.graph, horizon: works.frame.horizon, operations, works }));
+    graph: works.frame.graph, horizon: works.frame.horizon, operations, works: obligations ? { ...works, proposals: [] } : works }));
   const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const previous = store.get<GapLinesRecord>(gapLinesId(project));
   const lines = take(writeGapLines(store, { project, previous: previous ? reference(previous) : null,
     pass: (previous?.value.request.pass ?? 0) + 1, gaps: gapRead, closures: [] }));
-  const handoff = take(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
+  const context = { project, gaps: gapRead, lines: reference(lines) };
+  const handoff = take(writeOmObligations(store, { ...context, assignments: obligations?.assignments(context, structuredClone(gaps.records) as GapRecords["records"]) ?? [] }));
+  const finish = (accepted: Pick<AcceptedFrameRequest, "graph" | "layer" | "frame">, environment: Ref) => {
+    const feasibility = take(writeFeasibility(store, { project, ...accepted, environment,
+      expected: store.get(`om-feasibility:${project}`)?.revision ?? 0 }));
+    assert.equal(feasibility.value.ready, true);
+    take(writeHandoff(store, { project, feasibility: reference(feasibility), expected: store.get(`stage:${project}:om-g2`)?.revision ?? 0 }));
+  };
+  if (obligations) {
+    assert.equal(works.proposals.length, 1);
+    const ref = works.proposals[0]!, proposal = store.get<LayerProposal>(ref.id, ref.revision)!;
+    assert.deepEqual(reference(proposal), ref);
+    const accepted = obligations.accept(gapRead, structuredClone(handoff) as unknown as OmObligations, proposal.value);
+    finish({ graph: accepted.graph, layer: accepted.layer, frame: accepted.frame }, reference(engine.environments.get(project))); return;
+  }
   assert.deepEqual(handoff.handoff.obligations, []);
   const candidate3 = take(writeWorksFrame(store, { ...works, works: { contract: "works-frame/v1",
     producer: reference(handoff.producer), ledger: reference(handoff.record), bindings: [] } }));
@@ -324,10 +348,7 @@ export function acceptNativeWorks(engine: ProductEngine, project: string, operat
   const accepted3 = take(settleCandidate(store, { project, level: 3, candidate: reference(candidate3.record),
     outcome: { ...gate3.value.result, codes: [...gate3.value.result.codes], basis: reference(gate3) } }));
   assert.equal(accepted3.state, "accepted"); assert.ok(accepted3.graph && accepted3.layer && accepted3.frame);
-  const feasibility = take(writeFeasibility(store, { project, graph: reference(accepted3.graph), layer: reference(accepted3.layer),
-    frame: reference(accepted3.frame), environment, expected: store.get(`om-feasibility:${project}`)?.revision ?? 0 }));
-  assert.equal(feasibility.value.ready, true);
-  take(writeHandoff(store, { project, feasibility: reference(feasibility), expected: store.get(`stage:${project}:om-g2`)?.revision ?? 0 }));
+  finish({ graph: reference(accepted3.graph), layer: reference(accepted3.layer), frame: reference(accepted3.frame) }, environment);
 }
 
 export function createOmFixture(t: TestContext, variant: GardenVariant, project: string, options: { mode: "executed" }): Promise<OmFixture>;
