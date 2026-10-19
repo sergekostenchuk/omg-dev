@@ -2,7 +2,7 @@ import type { Store } from "../storage/store.js";
 import type { MachinePlan, CompiledTask } from "../compiler/model.js";
 import type { TaskRun } from "../execution/model.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { git, type RepositoryState, type Environment } from "../runtime/environment.js";
+import { git, gitIsAncestor, type RepositoryState, type Environment } from "../runtime/environment.js";
 import { treeFile } from "../runtime/git-files.js";
 import { canonical, digest } from "../canonical.js";
 import { requireCondition } from "../errors.js";
@@ -14,6 +14,7 @@ type Repository = Pick<RepositoryState, "root" | "head">;
 interface WriterSource { run: Ref; value: TaskRun; plan: MachinePlan; task: CompiledTask }
 const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const commitName = (value: string) => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
 function requireContext(store: Store, project: string, repository: Repository, path?: string): void {
   requireCondition(store && typeof store.get === "function" && text(project) && object(repository)
     && text(repository.root) && text(repository.head) && (path === undefined || text(path)),
@@ -58,14 +59,24 @@ function requireGateShape(writer: WriterSource, environment: Environment): void 
   "ownership_proof_foreign", "The accepted writer has malformed gate sources");
 }
 
+function writerReachable(repository: Repository, commit: string): boolean {
+  if (!commitName(commit) || !gitIsAncestor(repository.root, commit, repository.head)) return false;
+  // merge-base peels annotated tags; the former rev-list membership required the commit OID itself.
+  // This bounded, memo-eligible read is also the exact form commitOrigin uses for its parent proof.
+  return git(repository.root, ['rev-list', '--parents', '-n', '1', commit]).split(' ')[0] === commit;
+}
+
 /** Check one immutable writer against a supplied repository slice; never select a current head. */
 export function readWriter(store: Store, project: string, repository: Repository, run: Ref, path: string): WriterProof {
   requireContext(store, project, repository, path);
   requireCondition(text(path), "ownership_proof_foreign", "An accepted writer needs an exact path");
   const writer = writerSource(store, project, run);
-  requireCondition(writer.task.writePaths.includes(path)
-    && new Set(git(repository.root, ["rev-list", repository.head]).split("\n")).has(writer.value.commit!),
+  requireCondition(writer.task.writePaths.includes(path) && writerReachable(repository, writer.value.commit!),
   "ownership_proof_foreign", "The accepted writer does not own this path in the repository slice");
+  return checkedWriter(store, project, repository, writer, path);
+}
+/** Only callers which just proved reachability may enter here; there is no public bypass parameter. */
+function checkedWriter(store: Store, project: string, repository: Repository, writer: WriterSource, path: string): WriterProof {
   requireCondition(writer.value.tree && git(repository.root, ["rev-parse", `${writer.value.commit}^{tree}`]) === writer.value.tree,
     "ownership_proof_foreign", "The accepted writer must bind its exact commit tree");
   requireCondition(isRef(writer.plan.environment), "ownership_proof_foreign", "The accepted writer needs an exact check environment");
@@ -83,45 +94,78 @@ export function readWriter(store: Store, project: string, repository: Repository
     commit: writer.value.commit!, tree: writer.value.tree, hash };
 }
 
-/** The caller proves the set's completeness; selection and acceptance use only these exact revisions. */
-export function selectWriter(store: Store, project: string, repository: Repository, refs: readonly Ref[], path: string): WriterProof | null {
-  requireContext(store, project, repository, path);
-  requireCondition(text(path) && Array.isArray(refs) && refs.every(isRef),
-    "ownership_proof_foreign", "Writer selection needs exact run references and a path");
-  const candidates = refs.map(ref => writerSource(store, project, ref)).filter(writer => writer.task.writePaths.includes(path));
+type Ancestry = ReadonlyMap<string, readonly string[]>;
+function readAncestry(repository: Repository): Ancestry {
+  return new Map(git(repository.root, ['rev-list', '--parents', repository.head]).split('\n').filter(Boolean)
+    .map(line => { const [commit, ...parents] = line.split(' '); return [commit!, parents] as const; }));
+}
+/** The one fresh Git selection already contains all reachable parents, including merge/shallow rules. */
+function isAncestorIn(ancestry: Ancestry, ancestor: string, head: string): boolean {
+  const pending = [head], seen = new Set<string>();
+  while (pending.length) {
+    const commit = pending.pop()!;
+    if (commit === ancestor) return true;
+    if (seen.has(commit)) continue;
+    seen.add(commit);
+    for (const parent of ancestry.get(commit) ?? []) pending.push(parent);
+  }
+  return false;
+}
+function chooseWriter(store: Store, project: string, repository: Repository, candidates: WriterSource[], path: string,
+  ancestry?: Ancestry): WriterProof | null {
   if (!candidates.length) return null;
-  const ancestors = new Set(git(repository.root, ["rev-list", repository.head]).split("\n"));
-  const accepted = candidates.filter(writer => ancestors.has(writer.value.commit!));
+  if (candidates.length === 1 && !ancestry) {
+    const writer = candidates[0]!;
+    return writerReachable(repository, writer.value.commit!)
+      ? checkedWriter(store, project, repository, writer, path) : null;
+  }
+  const graph = ancestry ?? readAncestry(repository);
+  const accepted = candidates.filter(writer => graph.has(writer.value.commit!));
   if (!accepted.length) return null;
   let latest = accepted[0]!;
   for (const candidate of accepted.slice(1)) {
     if (candidate.value.commit === latest.value.commit) {
       requireCondition(canonical(candidate.run) === canonical(latest.run), "ownership_ambiguous", "Different accepted runs claim the same write commit"); continue;
     }
-    try { git(repository.root, ["merge-base", "--is-ancestor", latest.value.commit!, candidate.value.commit!]); latest = candidate; }
-    catch { try { git(repository.root, ["merge-base", "--is-ancestor", candidate.value.commit!, latest.value.commit!]); }
-      catch { requireCondition(false, "ownership_ambiguous", "Parallel writers need an accepted integration before ownership can transfer"); } }
+    if (isAncestorIn(graph, latest.value.commit!, candidate.value.commit!)) latest = candidate;
+    else requireCondition(isAncestorIn(graph, candidate.value.commit!, latest.value.commit!),
+      "ownership_ambiguous", "Parallel writers need an accepted integration before ownership can transfer");
   }
-  return readWriter(store, project, repository, latest.run, path);
+  return checkedWriter(store, project, repository, latest, path);
+}
+
+/** The caller proves the set's completeness; selection and acceptance use only these exact revisions. */
+export function selectWriter(store: Store, project: string, repository: Repository, refs: readonly Ref[], path: string): WriterProof | null {
+  requireContext(store, project, repository, path);
+  requireCondition(text(path) && Array.isArray(refs) && refs.every(isRef),
+    "ownership_proof_foreign", "Writer selection needs exact run references and a path");
+  const candidates = refs.map(ref => writerSource(store, project, ref)).filter(writer => writer.task.writePaths.includes(path));
+  return chooseWriter(store, project, repository, candidates, path);
 }
 
 /** Ownership is a projection of immutable accepted runs, not a second mutable truth. */
 export class Owners {
-  private readonly writers: Ref[] = [];
-  private readonly cache = new Map<string, WriterProof | null>();
+  private readonly writers: { ref: Ref; commit: string }[] = [];
   constructor(private readonly store: Store, private readonly project: string, private readonly repository: Repository) {
     requireContext(store, project, repository);
-    let ancestors: Set<string> | null = null;
+    let ancestors: Ancestry | null = null;
     for (const run of store.list<TaskRun>("task-run")) {
       if (run.value.projectId !== project || run.value.state !== "committed") continue;
-      ancestors ??= new Set(git(repository.root, ["rev-list", repository.head]).split("\n"));
-      if (!run.value.commit || !ancestors.has(run.value.commit)) continue;
-      this.writers.push(writerSource(store, project, reference(run)).run);
+      ancestors ??= readAncestry(repository);
+      if (!text(run.value.commit)) continue;
+      if (ancestors.has(run.value.commit)) writerSource(store, project, reference(run));
+      // Pin the set of accepted Store revisions, not their Git reachability: replace/shallow can
+      // change which of these commits is reachable even though repository.head is the same OID.
+      this.writers.push({ ref: reference(run), commit: run.value.commit });
     }
   }
   latest(path: string): WriterProof | null {
-    if (this.cache.has(path)) return this.cache.get(path)!;
-    const result = selectWriter(this.store, this.project, this.repository, this.writers, path);
-    this.cache.set(path, result); return result;
+    requireContext(this.store, this.project, this.repository, path);
+    requireCondition(text(path), "ownership_proof_foreign", "An accepted writer needs an exact path");
+    if (!this.writers.length) return null;
+    const ancestry = readAncestry(this.repository);
+    const candidates = this.writers.filter(writer => ancestry.has(writer.commit))
+      .map(writer => writerSource(this.store, this.project, writer.ref)).filter(writer => writer.task.writePaths.includes(path));
+    return chooseWriter(this.store, this.project, this.repository, candidates, path, ancestry);
   }
 }

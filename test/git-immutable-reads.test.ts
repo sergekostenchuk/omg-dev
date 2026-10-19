@@ -109,7 +109,8 @@ test('GITSRC2 tree belongs to the status OID even when HEAD moves between subpro
 test('GITSRC2 immutable forms reuse bytes; buffers are independent and input/HEAD/abbreviations/options bypass', t => {
   const f = fixture(t), log = trace(t), blob = f.raw(['rev-parse', `${f.head}:a.txt`]);
   const forms = [['rev-parse', `${f.head}^{tree}`], ['ls-tree', '-r', '-z', f.tree],
-    ['ls-tree', '-z', f.head, '--', 'a.txt'], ['show', `${f.head}:a.txt`], ['cat-file', 'blob', blob]];
+    ['ls-tree', '-z', f.head, '--', 'a.txt'], ['show', `${f.head}:a.txt`], ['cat-file', 'blob', blob],
+    ['rev-list', '--parents', '-n', '1', f.head], ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', f.head, f.tree]];
   for (const args of forms) {
     const first = gitBytes(f.repo, args), expected = Buffer.from(first); first.fill(0);
     const count = gitCalls(), second = gitBytes(f.repo, args); assert.deepEqual(second, expected);
@@ -117,8 +118,8 @@ test('GITSRC2 immutable forms reuse bytes; buffers are independent and input/HEA
     assert.equal(gitCalls(), count + 2); assert.equal(log.count(args), 1, args.join(' '));
   }
   for (const args of [['rev-parse', 'HEAD'], ['rev-parse', `${f.head.slice(0, 10)}^{tree}`],
-    ['rev-parse', '--verify', `${f.head}^{tree}`], ['rev-list', '--parents', '-n', '1', f.head],
-    ['merge-base', '--is-ancestor', f.head, f.head], ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', f.head, f.tree]]) {
+    ['rev-parse', '--verify', `${f.head}^{tree}`], ['rev-list', '--parents', '-n', '2', f.head],
+    ['merge-base', '--is-ancestor', f.head, f.head], ['diff-tree', '--no-commit-id', '--name-only', '-r', '-z', 'HEAD', f.tree]]) {
     const count = log.count(args); gitBytes(f.repo, args); gitBytes(f.repo, args); assert.equal(log.count(args), count + 2);
   }
   const args = forms[0]!; const before = log.count(args);

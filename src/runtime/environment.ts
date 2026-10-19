@@ -108,7 +108,7 @@ export function gitCalls(): number { return gitEntries; }
 const fullOid = (value: string) => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
 const objectPath = (value: string) => value.length > 0 && !value.includes('\0') && !value.startsWith('/')
   && value.split('/').every(part => part !== '.' && part !== '..');
-/** Closed forms only. In particular: no HEAD, abbreviated OID, revision walk, diff, filters or arbitrary options. */
+/** Closed forms only: no HEAD, abbreviated OID, unbounded revision walk, filters or arbitrary options. */
 function immutableGitRead(args: readonly string[]): boolean {
   if (args[0] === 'rev-parse' && args.length === 2 && args[1]!.endsWith('^{tree}')) return fullOid(args[1]!.slice(0, -7));
   if (args[0] === 'cat-file' && args.length === 3 && args[1] === 'blob') return fullOid(args[2]!);
@@ -118,6 +118,10 @@ function immutableGitRead(args: readonly string[]): boolean {
   }
   if (args[0] === 'ls-tree') return args.length === 4 && args[1] === '-r' && args[2] === '-z' && fullOid(args[3]!)
     || args.length === 5 && args[1] === '-z' && fullOid(args[2]!) && args[3] === '--' && objectPath(args[4]!);
+  if (args[0] === 'diff-tree') return args.length === 7 && args[1] === '--no-commit-id' && args[2] === '--name-only'
+    && args[3] === '-r' && args[4] === '-z' && fullOid(args[5]!) && fullOid(args[6]!);
+  if (args[0] === 'rev-list') return args.length === 5 && args[1] === '--parents' && args[2] === '-n'
+    && args[3] === '1' && fullOid(args[4]!);
   return false;
 }
 const gitMemo = new Map<string, { bytes: Buffer; size: number }>();
@@ -135,7 +139,10 @@ function rememberGit(key: string, bytes: Buffer): void {
 }
 function runGit(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv, input?: Uint8Array): Buffer {
   const result = spawnSync("git", ["--literal-pathspecs", "-c", "core.hooksPath=/dev/null", ...args], { cwd, env, input, timeout: 15_000, maxBuffer: 8_000_000 });
-  if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", { action: args[0], stderr: result.stderr?.toString("utf8"), error: result.error?.message });
+  if (result.error || result.status !== 0) throw new EngineError("git_failed", "Git command failed", {
+    action: args[0], status: result.status, signal: result.signal,
+    stderr: result.stderr?.toString("utf8"), error: result.error ? result.error.message ?? String(result.error) : undefined,
+  });
   return result.stdout;
 }
 function gitFileStamp(path: string): string {
@@ -213,16 +220,33 @@ export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffe
   gitEntries++; // PF4: even a successful memo hit is a Git-dependent read, before lookup.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
   const eligible = input === undefined && immutableGitRead(args) && JSON.stringify(args).length <= 4096;
-  // Unknown commands/options may write. These read-only verbs leave existing immutable entries available.
-  if (!['rev-parse', 'status', 'ls-tree', 'ls-files', 'show', 'cat-file', 'diff', 'diff-tree', 'rev-list', 'merge-base',
+  // These exact candidate writes can add immutable objects and rewrite the index. Every subsequent
+  // lookup still observes objects/refs/config; errors clear the memo, including partial writes.
+  const candidateWrite = input === undefined && (args.length === 1 && args[0] === 'write-tree'
+    || args.length === 4 && args[0] === 'add' && args[1] === '--all' && args[2] === '--' && args[3] === '.');
+  // Other writes/options retain the conservative clearing boundary.
+  if (!candidateWrite && !['rev-parse', 'status', 'ls-tree', 'ls-files', 'show', 'cat-file', 'diff', 'diff-tree', 'rev-list', 'merge-base',
     'for-each-ref', 'check-ignore', 'var'].includes(args[0]!)) clearGitMemo();
   const context = eligible ? gitMemoContext(cwd, env) : null;
   const key = context === null ? null : JSON.stringify([context, args]);
   const saved = key === null ? undefined : gitMemo.get(key);
   if (saved && key) { gitMemo.delete(key); gitMemo.set(key, saved); return Buffer.from(saved.bytes); }
-  const bytes = runGit(cwd, args, env, input);
+  let bytes: Buffer;
+  try { bytes = runGit(cwd, args, env, input); }
+  catch (error) { if (candidateWrite) clearGitMemo(); throw error; }
   if (key && gitMemoContext(cwd, env) === context) rememberGit(key, bytes);
   return bytes;
+}
+/** One fresh reachability query; status 1 is a Git answer, other failures are not a negative proof. */
+export function gitIsAncestor(root: string, ancestor: string, head: string): boolean {
+  try { gitBytes(root, ['merge-base', '--is-ancestor', ancestor, head]); return true; }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'git_failed' && error.details !== null && typeof error.details === 'object') {
+      const details = error.details as Record<string, unknown>;
+      if (details['status'] === 1 && details['signal'] === null && details['error'] === undefined) return false;
+    }
+    throw error;
+  }
 }
 function requireCommand(command: Command): void {
   requireCondition(command && typeof command.executable === "string" && command.executable.length > 0
