@@ -451,6 +451,21 @@ test('D8.1 a native stage-closure/v1 admission carries absence guards through th
   ]);
   assert.deepEqual(omValue(prepareFrame(f.store, frame2Request)).guards.filter(guard => !isRef(guard)),
     [{ id: `om-frame:${project}:2`, absent: true }], 'The stage-only window still has no operations frame');
+  // A preserved absence guard keeps its force at the atomic write — and this race must run while
+  // every delivered guard is still current, so the later appearance of the absent record is the
+  // only invalidation the refusal can mean.
+  const admission = inputAdmission as TransactionGuard[] | null;
+  assert.ok(admission?.some(guard => 'absent' in guard && guard.id === absent.id));
+  assert.equal(transactionGuardsCurrent(f.store, admission!), true,
+    'Only the later appearance of the injected absent record must invalidate these guards');
+  f.store.write({ id: absent.id, kind: 'fixture', expected: 0, value: { project } });
+  const afterCompetitor = canonical(f.store.list().flatMap(head => f.store.history(head.id)));
+  assert.equal(transactionGuardsCurrent(f.store, admission!), false);
+  assert.throws(() => f.store.writeMany([{ id: 'd81-bridge-probe', kind: 'fixture', expected: 0, value: { project } }],
+    admission!), (error: unknown) => error instanceof EngineError && error.code === 'input_stale' && error.message.includes(absent.id));
+  assert.equal(f.store.get('d81-bridge-probe'), null);
+  assert.equal(canonical(f.store.list().flatMap(head => f.store.history(head.id))), afterCompetitor,
+    'The refused atomic write leaves no record and no revision after the competitor');
   // The real N2 over the same store: the operations proposal goes through the actual current
   // producers — prepareFrame, candidate, gate, settle — turning graph-layer:p:2 into an OM-accepted
   // layer and creating om-frame:p:2.
@@ -512,14 +527,6 @@ test('D8.1 a native stage-closure/v1 admission carries absence guards through th
   assert.equal(transactionGuardsCurrent(g.store, [...frame3Admission]), false);
   assert.throws(() => g.store.writeMany([{ id: 'd81-bridge-probe-3', kind: 'fixture', expected: 0, value: { project: 'garden' } }],
     [...frame3Admission]), { code: 'input_stale' });
-  // A preserved absence guard keeps its force at the atomic write: the record's later appearance
-  // turns the same delivered guards into an input_stale refusal.
-  const admission = inputAdmission as TransactionGuard[] | null;
-  assert.ok(admission?.some(guard => 'absent' in guard && guard.id === absent.id));
-  f.store.write({ id: absent.id, kind: 'fixture', expected: 0, value: { project } });
-  assert.equal(transactionGuardsCurrent(f.store, admission!), false);
-  assert.throws(() => f.store.writeMany([{ id: 'd81-bridge-probe', kind: 'fixture', expected: 0, value: { project } }],
-    admission!), { code: 'input_stale' });
 });
 
 test('D8.1 OM channel reader validates its public arguments and preserves input bytes', () => {
