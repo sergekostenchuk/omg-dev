@@ -654,11 +654,11 @@ test('AT1 policy (№4117): the policy decided once at its producer reaches the 
   assert.ok(!packet.brief.text.includes('Keep the elsewhere rule'), 'An ordinary decision of another consumer stays out');
 });
 
-import { IMPACT_BOUNDARY, IMPACT_PARSER } from '../src/om/impact.js';
+import { IMPACT_BOUNDARY, impactParser } from '../src/om/impact.js';
 import { IMPACT_BRIEF_CONTRACT, briefImpactForm } from '../src/om/packet-brief.js';
 test('AT1 №4170: the brief of an L3 works chain shows the declared boundary of its inventory as a limit of completeness, not a proof of no influence', t => {
   const { basis, input } = sample(t);
-  const impact = { contract: IMPACT_BRIEF_CONTRACT, snapshot: { commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, parser: IMPACT_PARSER, boundary: [...IMPACT_BOUNDARY], map: [], tests: [] };
+  const impact = { contract: IMPACT_BRIEF_CONTRACT, snapshot: { commit: 'a'.repeat(40), tree: 'b'.repeat(40) }, parser: impactParser(), boundary: [...IMPACT_BOUNDARY], map: [], tests: [] };
   assert.ok(briefImpactForm(impact));
   const { boundary: _boundary, ...without } = impact;
   assert.equal(briefImpactForm(without), false, 'a brief impact keeps its boundary');

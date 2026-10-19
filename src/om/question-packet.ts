@@ -2,7 +2,7 @@ import { BRIEF_PACKET_CONTRACT, WORKS_BRIEF_PACKET_CONTRACT, BRIEF_VERSION, WORK
   briefReadings, withReadings, type BriefReadings, type CarriedBasis, type CarriedEntry, type ReadingEntry, type ReadingOrigin, type ReadingSnapshot,
   IMPACT_BRIEF_CONTRACT, briefImpactForm, type BriefImpact, BRIEF_SELECTION_CONTRACT, BASIS_BRIEF_SELECTION_CONTRACT, type BriefSelectionContract } from './packet-brief.js';
 import { SELECTED_SPECIFICATION_CODES, hasBasisApplications } from './selected-specification.js';
-import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, IMPACT_PARSER, deriveTestMap, isRepository, readSnapshot, resolveSnapshot, transitionField } from './impact.js';
+import { IMPACT_BOUNDARY, IMPACT_GATE_CODES, impactParser, deriveTestMap, isRepository, readSnapshot, resolveSnapshot, transitionField } from './impact.js';
 import { IMPACT_SEMANTIC_CODES } from '../graph/semantics.js';
 import { CANDIDATE_REFUSAL_CODES } from './frame-candidate.js';
 import { ANSWER_FORM_CODES, readTextResult, readPointerResult, tooLargeRead, type ReadResult } from './answer-form.js';
@@ -1231,7 +1231,7 @@ function impactOf(value: unknown, target: string): BriefImpact {
 /** The one resolution of a new works root: HEAD once, the tree of that commit, the test map of that exact tree. */
 function issuedImpact(workspace: string): BriefImpact {
   const snapshot = resolveSnapshot(workspace);
-  return { contract: IMPACT_BRIEF_CONTRACT, snapshot, parser: IMPACT_PARSER, boundary: [...IMPACT_BOUNDARY], ...deriveTestMap(readSnapshot(workspace, snapshot)) };
+  return { contract: IMPACT_BRIEF_CONTRACT, snapshot, parser: impactParser(), boundary: [...IMPACT_BOUNDARY], ...deriveTestMap(readSnapshot(workspace, snapshot)) };
 }
 /** MP2 (№2968 §1): the explicit saved neighbour form — its known contract and exact finished sources; anything else refuses. */
 function neighbourForm(value: unknown, target: string): { contract: typeof NEIGHBOR_CONTRACT; sources: NeighbourSource[] } {

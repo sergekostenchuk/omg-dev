@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { builtinModules } from 'node:module';
-import ts from 'typescript';
+import { builtinModules, createRequire } from 'node:module';
+import type * as Ts from 'typescript';
 import { posix } from 'node:path';
 import { EngineError } from '../errors.js';
 import { git, gitBytes } from '../runtime/environment.js';
@@ -16,7 +16,25 @@ import type { ImpactDecision } from '../graph/model.js';
  * inventory widens no write scope: it is what a work has to decide about (keep or update), not a grant.
  */
 export const IMPACT_CONTRACT = 'om-impact/v1' as const;
-export const IMPACT_CODES = Object.freeze(['impact_repository_unavailable', 'impact_snapshot_invalid'] as const);
+export const IMPACT_CODES = Object.freeze(['impact_repository_unavailable', 'impact_snapshot_invalid',
+  'impact_parser_unavailable'] as const);
+
+// IMPORT2b: typescript is a ~1 s cold-load — it must not run at module import. The parser is
+// required synchronously at first ACTUAL use through the `ts` facade below; a failure there is a
+// typed refusal, never a silent empty inventory.
+type TsModule = typeof Ts;
+let tsModule: TsModule | undefined;
+const loadTs = (): TsModule => {
+  if (!tsModule) {
+    try { tsModule = createRequire(import.meta.url)('typescript') as TsModule; }
+    catch (cause) {
+      throw new EngineError('impact_parser_unavailable',
+        'The impact inventory requires the typescript parser', { cause });
+    }
+  }
+  return tsModule;
+};
+const ts: TsModule = new Proxy({} as TsModule, { get: (_t, p) => Reflect.get(loadTs(), p) });
 export interface RepositorySnapshot { commit: string; tree: string }
 export type ImpactVia = 'import' | 'launch' | 'script' | 'resolution' | 'write' | 'config';
 /** A test case addressed by its file and the full chain of its enclosing groups; `null` path when no reliable address exists. */
@@ -145,9 +163,12 @@ export function snapshotFiles(snapshot: RepositorySnapshot, paths: readonly stri
  * substitutions too, and the names the file declares. A parse diagnostic proves nothing: the file becomes one addressed
  * unknown, answered through the readiness door. The parser's exact version is part of the inventory's basis.
  */
-export const IMPACT_PARSER: string = `typescript@${ts.version}`;
-const SCRIPT_KINDS: Readonly<Record<string, ts.ScriptKind>> = { '.ts': ts.ScriptKind.TS, '.mts': ts.ScriptKind.TS, '.cts': ts.ScriptKind.TS,
-  '.tsx': ts.ScriptKind.TSX, '.js': ts.ScriptKind.JS, '.mjs': ts.ScriptKind.JS, '.cjs': ts.ScriptKind.JS, '.jsx': ts.ScriptKind.JSX };
+export function impactParser(): string { return `typescript@${ts.version}`; }
+let scriptKinds: Readonly<Record<string, Ts.ScriptKind>> | undefined;
+const scriptKindsOf = (): Readonly<Record<string, Ts.ScriptKind>> => scriptKinds ??= {
+  '.ts': ts.ScriptKind.TS, '.mts': ts.ScriptKind.TS, '.cts': ts.ScriptKind.TS,
+  '.tsx': ts.ScriptKind.TSX, '.js': ts.ScriptKind.JS, '.mjs': ts.ScriptKind.JS,
+  '.cjs': ts.ScriptKind.JS, '.jsx': ts.ScriptKind.JSX };
 interface Reference { target: string; via: ImpactVia; line: number }
 /** A literal transition: `operation` when a load or a URL takes it (an unresolved one is then unknown), not for a mere string naming a path. */
 interface Specifier { value: string; via: ImpactVia; line: number; operation: boolean; site: TransitionSite; text: string; cwd?: boolean; script?: boolean; bin?: boolean }
@@ -183,7 +204,7 @@ const wholeFile = (path: string, text: string, line: number, message: string): S
  * and the last value of a comma ((0, require)) — change no transition; it is recognized through them, its place stays the
  * whole original expression.
  */
-function strip(node: ts.Expression): ts.Expression {
+function strip(node: Ts.Expression): Ts.Expression {
   for (;;) {
     if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isNonNullExpression(node)
       || ts.isTypeAssertionExpression(node) || ts.isPartiallyEmittedExpression(node) || ts.isExpressionWithTypeArguments(node)) node = node.expression;
@@ -191,25 +212,25 @@ function strip(node: ts.Expression): ts.Expression {
     else return node;
   }
 }
-const staticText = (node: ts.Expression | undefined): string | null => {
+const staticText = (node: Ts.Expression | undefined): string | null => {
   const value = node && strip(node);
   return value && (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) ? value.text : null;
 };
 /** An ESM or URL specifier without its ?query and #hash; a leading # is a package import, never a fragment (require keeps both). */
 const withoutQuery = (value: string): string => value.replace(/^(.+?)[?#].*$/s, '$1');
-const isName = (node: ts.Expression | undefined, name: string): boolean => { const value = node && strip(node); return !!value && ts.isIdentifier(value) && value.text === name; };
+const isName = (node: Ts.Expression | undefined, name: string): boolean => { const value = node && strip(node); return !!value && ts.isIdentifier(value) && value.text === name; };
 /** `object.name` through wrappers, with `object` matching. */
-const isMember = (node: ts.Expression | undefined, name: string, object: (value: ts.Expression) => boolean): boolean => {
+const isMember = (node: Ts.Expression | undefined, name: string, object: (value: Ts.Expression) => boolean): boolean => {
   const value = node && strip(node);
   return !!value && ts.isPropertyAccessExpression(value) && value.name.text === name && object(value.expression);
 };
-const isImportMeta = (node: ts.Expression): boolean => { const value = strip(node); return ts.isMetaProperty(value) && value.keywordToken === ts.SyntaxKind.ImportKeyword; };
-const isImportMetaUrl = (node: ts.Expression | undefined): boolean => isMember(node, 'url', isImportMeta);
+const isImportMeta = (node: Ts.Expression): boolean => { const value = strip(node); return ts.isMetaProperty(value) && value.keywordToken === ts.SyntaxKind.ImportKeyword; };
+const isImportMetaUrl = (node: Ts.Expression | undefined): boolean => isMember(node, 'url', isImportMeta);
 /** A callee that is a URL constructor: URL, or URL of an object (globalThis.URL, url.URL). */
-const isUrl = (node: ts.Expression): boolean => isName(node, 'URL') || isMember(node, 'URL', () => true);
+const isUrl = (node: Ts.Expression): boolean => isName(node, 'URL') || isMember(node, 'URL', () => true);
 const LOADERS = new Set(['require', 'createRequire']);
 /** The literal text an expression begins with: a literal, a template's head, the left of a concatenation. */
-function leading(node: ts.Expression | undefined): string {
+function leading(node: Ts.Expression | undefined): string {
   const value = node && strip(node);
   if (!value) return '';
   if (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value)) return value.text;
@@ -217,13 +238,13 @@ function leading(node: ts.Expression | undefined): string {
   return ts.isBinaryExpression(value) && value.operatorToken.kind === ts.SyntaxKind.PlusToken ? leading(value.left) : '';
 }
 /** URL as a value that may construct (an alias, an argument, any member) — not a type and not the right side of instanceof. */
-function urlValue(node: ts.Identifier): boolean {
+function urlValue(node: Ts.Identifier): boolean {
   const parent = node.parent;
   return !(ts.isBinaryExpression(parent) && parent.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && parent.right === node);
 }
 const schemeOf = (value: string): string | undefined => /^([a-z][a-z0-9+.-]*):/i.exec(value)?.[1]?.toLowerCase();
 /** describe/suite/test/it, or one of them with .only/.skip/.todo — never a member of another object (t.test). */
-function testCall(node: ts.Expression): string | null {
+function testCall(node: Ts.Expression): string | null {
   const callee = strip(node);
   if (ts.isIdentifier(callee)) return TEST_CALLS.has(callee.text) ? callee.text : null;
   if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && TEST_CALLS.has(callee.expression.text)
@@ -231,15 +252,15 @@ function testCall(node: ts.Expression): string | null {
   return null;
 }
 /** Whether an identifier stands where a value is referred to — not a name of a member, a declaration, a label or a type. */
-function referenced(node: ts.Identifier): boolean {
+function referenced(node: Ts.Identifier): boolean {
   const parent = node.parent;
   if (!parent || ts.isShorthandPropertyAssignment(parent)) return true;
   if (ts.isTypeReferenceNode(parent) || ts.isTypeQueryNode(parent) || ts.isQualifiedName(parent) || ts.isExpressionWithTypeArguments(parent) && ts.isHeritageClause(parent.parent)) return false;
-  const named = parent as { name?: ts.Node; propertyName?: ts.Node; label?: ts.Node };
+  const named = parent as { name?: Ts.Node; propertyName?: Ts.Node; label?: Ts.Node };
   return named.name !== node && named.propertyName !== node && named.label !== node;
 }
 /** An access to a member that is the target of an assignment (exports.commit = …, this.commit = …, Store.prototype.commit = …). */
-function assigned(access: ts.Node): boolean {
+function assigned(access: Ts.Node): boolean {
   let node = access;
   while (node.parent && (ts.isParenthesizedExpression(node.parent) || ts.isNonNullExpression(node.parent) || ts.isAsExpression(node.parent)
     || ts.isSatisfiesExpression(node.parent) || ts.isTypeAssertionExpression(node.parent))) node = node.parent;
@@ -259,25 +280,25 @@ function assigned(access: ts.Node): boolean {
  * container, an assignment to a member, a string naming it — makes it `possible`, an unknown answered through the readiness
  * door, never an absence (№4160 п.2). References, parameters, imports, locals and labels declare no point.
  */
-function declarations(source: ts.SourceFile): { names: Set<string>; members: Set<string>; possible: Map<string, string>; opaque: string | null } {
-  const names = new Set<string>(), members_ = new Set<string>(), possible = new Map<string, string>(), typings = source.isDeclarationFile, targets = new Set<ts.Node>();
+function declarations(source: Ts.SourceFile): { names: Set<string>; members: Set<string>; possible: Map<string, string>; opaque: string | null } {
+  const names = new Set<string>(), members_ = new Set<string>(), possible = new Map<string, string>(), typings = source.isDeclarationFile, targets = new Set<Ts.Node>();
   let opaque: string | null = null;
-  const shown = (node: ts.Node) => excerpt(source.text.slice(node.getStart(source), node.getEnd()));
-  const ambient = (node: ts.Node) => !typings && (ts.getCombinedModifierFlags(node as ts.Declaration) & ts.ModifierFlags.Ambient) !== 0;
-  const bodied = (node: { body?: ts.Node | undefined }) => typings || node.body !== undefined;
-  const nameText = (name: ts.Node | undefined): string | null => {
+  const shown = (node: Ts.Node) => excerpt(source.text.slice(node.getStart(source), node.getEnd()));
+  const ambient = (node: Ts.Node) => !typings && (ts.getCombinedModifierFlags(node as Ts.Declaration) & ts.ModifierFlags.Ambient) !== 0;
+  const bodied = (node: { body?: Ts.Node | undefined }) => typings || node.body !== undefined;
+  const nameText = (name: Ts.Node | undefined): string | null => {
     if (!name) return null;
     if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isPrivateIdentifier(name) || ts.isNumericLiteral(name) || ts.isNoSubstitutionTemplateLiteral(name)) return name.text;
     return ts.isComputedPropertyName(name) ? staticText(name.expression) : null;
   };
-  const bound = (name: ts.BindingName): string[] => ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)
+  const bound = (name: Ts.BindingName): string[] => ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)
     ? name.elements.flatMap(element => ts.isOmittedExpression(element) ? [] : bound(element.name)) : [name.text];
-  const bind = (name: ts.BindingName): void => {
+  const bind = (name: Ts.BindingName): void => {
     if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) { for (const element of name.elements) if (!ts.isOmittedExpression(element)) bind(element.name); }
     else names.add(name.text);
   };
   // A member counts under its own name and, qualified, under its owner's (Store.commit — return №4173 G12).
-  const members = (list: readonly (ts.ClassElement | ts.ObjectLiteralElementLike)[], owner?: string): void => {
+  const members = (list: readonly (Ts.ClassElement | Ts.ObjectLiteralElementLike)[], owner?: string): void => {
     const add = (text: string) => { names.add(text); if (owner) members_.add(`${owner}.${text}`); };
     for (const member of list) {
       const counted = (ts.isMethodDeclaration(member) || ts.isGetAccessorDeclaration(member) || ts.isSetAccessorDeclaration(member)) ? bodied(member)
@@ -290,18 +311,18 @@ function declarations(source: ts.SourceFile): { names: Set<string>; members: Set
           && (ts.getCombinedModifierFlags(parameter) & (ts.ModifierFlags.ParameterPropertyModifier)) !== 0) add(parameter.name.text);
     }
   };
-  const holder = (value: ts.Expression | undefined, owner?: string): boolean => {
+  const holder = (value: Ts.Expression | undefined, owner?: string): boolean => {
     const held = value && strip(value);
     if (held && ts.isObjectLiteralExpression(held)) members(held.properties, owner);
     if (held && ts.isClassExpression(held)) members(held.members, owner);
     return !!held && (ts.isObjectLiteralExpression(held) || ts.isClassExpression(held) || ts.isFunctionExpression(held) || ts.isArrowFunction(held));
   };
-  const exportsObject = (node: ts.Expression): boolean => isName(node, 'exports') || isMember(node, 'exports', value => isName(value, 'module'));
-  const statements = (list: readonly ts.Statement[], prefix?: string): void => {
+  const exportsObject = (node: Ts.Expression): boolean => isName(node, 'exports') || isMember(node, 'exports', value => isName(value, 'module'));
+  const statements = (list: readonly Ts.Statement[], prefix?: string): void => {
     for (const statement of list) {
       if (ambient(statement)) continue;
       // Return №4173 G10: `export default function/class` declares the point `default` as well.
-      const isDefault = (ts.getCombinedModifierFlags(statement as unknown as ts.Declaration) & ts.ModifierFlags.Default) !== 0;
+      const isDefault = (ts.getCombinedModifierFlags(statement as unknown as Ts.Declaration) & ts.ModifierFlags.Default) !== 0;
       if (ts.isFunctionDeclaration(statement) && bodied(statement)) { if (statement.name) names.add(statement.name.text); if (isDefault) names.add('default'); }
       if ((ts.isClassDeclaration(statement) || ts.isInterfaceDeclaration(statement)
         || ts.isTypeAliasDeclaration(statement) || ts.isEnumDeclaration(statement)) && statement.name) names.add(statement.name.text);
@@ -319,7 +340,7 @@ function declarations(source: ts.SourceFile): { names: Set<string>; members: Set
       if (ts.isExportAssignment(statement)) { names.add('default'); if (!holder(statement.expression, 'default')) opaque ??= shown(statement); }
       if (ts.isModuleDeclaration(statement)) {
         // A dotted namespace A.B is a chain of declarations; each name is declared, the innermost block read.
-        let module: ts.ModuleDeclaration = statement, chain = prefix ?? '';
+        let module: Ts.ModuleDeclaration = statement, chain = prefix ?? '';
         for (;;) {
           if (ts.isIdentifier(module.name)) {
             names.add(module.name.text);
@@ -331,7 +352,7 @@ function declarations(source: ts.SourceFile): { names: Set<string>; members: Set
           if (module.body && ts.isModuleBlock(module.body)) {
             // Return №4186 P5: NS.x is only what the body of NS exports — never a local of it, nor a member of a class or object in it.
             for (const inner of module.body.statements) {
-              if (!(ts.getCombinedModifierFlags(inner as unknown as ts.Declaration) & ts.ModifierFlags.Export) && !ts.isExportDeclaration(inner)) continue;
+              if (!(ts.getCombinedModifierFlags(inner as unknown as Ts.Declaration) & ts.ModifierFlags.Export) && !ts.isExportDeclaration(inner)) continue;
               if ((ts.isFunctionDeclaration(inner) && bodied(inner) || ts.isClassDeclaration(inner) || ts.isInterfaceDeclaration(inner) || ts.isTypeAliasDeclaration(inner)
                 || ts.isEnumDeclaration(inner)) && inner.name) members_.add(`${chain}.${inner.name.text}`);
               if (ts.isVariableStatement(inner)) for (const declaration of inner.declarationList.declarations)
@@ -355,21 +376,21 @@ function declarations(source: ts.SourceFile): { names: Set<string>; members: Set
     }
   };
   statements(source.statements);
-  const memberish = (node: ts.Node) => ts.isMethodDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isGetAccessorDeclaration(node)
+  const memberish = (node: Ts.Node) => ts.isMethodDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isGetAccessorDeclaration(node)
     || ts.isSetAccessorDeclaration(node) || ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node) || ts.isMethodSignature(node)
     || ts.isPropertySignature(node) || ts.isEnumMember(node);
   // A signature or an ambient member declares no point here: its absence is proved.
-  const signature = (node: ts.Node) => (ts.isMethodDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) && !bodied(node) || ambient(node);
-  const mayDeclare = (node: ts.Node): boolean => {
+  const signature = (node: Ts.Node) => (ts.isMethodDeclaration(node) || ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) && !bodied(node) || ambient(node);
+  const mayDeclare = (node: Ts.Node): boolean => {
     const parent = node.parent;
     if (!parent || ts.isImportDeclaration(parent) || ts.isExportDeclaration(parent) || ts.isExternalModuleReference(parent) || ts.isLiteralTypeNode(parent)) return false;
     if (ts.isComputedPropertyName(parent)) return !!parent.parent && memberish(parent.parent) && !signature(parent.parent);
-    if (memberish(parent) && (parent as { name?: ts.Node }).name === node) return !signature(parent);
+    if (memberish(parent) && (parent as { name?: Ts.Node }).name === node) return !signature(parent);
     if (ts.isPropertyAccessExpression(parent) && parent.name === node) return assigned(parent);
     if (ts.isElementAccessExpression(parent) && strip(parent.argumentExpression) === node) return assigned(parent);
     return ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node);
   };
-  const scan = (node: ts.Node): void => {
+  const scan = (node: Ts.Node): void => {
     // Return №4163 п.3: a name produced by computation, inherited, spread in or written by reflection — the file is no fully
     // static container, so no absence is proved in it.
     if (ts.isComputedPropertyName(node) && staticText(node.expression) === null || ts.isSpreadAssignment(node)
@@ -396,41 +417,41 @@ function declarations(source: ts.SourceFile): { names: Set<string>; members: Set
  * fileURLToPath(import.meta.url), import.meta.dirname and .filename, a comparison with import.meta.url — loads nothing.
  * One cause per transition: a recognized form takes the import.meta of its base with it.
  */
-function facts(path: string, text: string, source: ts.SourceFile): FileFacts {
-  const specifiers: FileFacts['specifiers'] = [], unknowns: ScannedUnknown[] = [], cases: CaseAddress[] = [], taken = new Set<ts.Node>(), explained = new Set<ts.Node>();
+function facts(path: string, text: string, source: Ts.SourceFile): FileFacts {
+  const specifiers: FileFacts['specifiers'] = [], unknowns: ScannedUnknown[] = [], cases: CaseAddress[] = [], taken = new Set<Ts.Node>(), explained = new Set<Ts.Node>();
   let addressable = true;
-  const at = (node: ts.Node) => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
-  const literal = (node: ts.Node, via: ImpactVia, value: string, specifier: ts.Expression | null, operation = true, extra: Partial<Specifier> = {}) => {
+  const at = (node: Ts.Node) => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+  const literal = (node: Ts.Node, via: ImpactVia, value: string, specifier: Ts.Expression | null, operation = true, extra: Partial<Specifier> = {}) => {
     const start = node.getStart(source), end = node.getEnd();
     if (specifier) taken.add(strip(specifier));
     specifiers.push({ value, via, line: at(node), operation, site: { start, end, hash: sha256(text.slice(start, end)) }, text: text.slice(start, end), ...extra });
   };
   /** Return №4173 G4: a run of a package script or bin named by the literal words of a call — npm run/test/start, yarn, pnpm, npx. */
-  const runs = (node: ts.CallExpression | ts.NewExpression) => {
+  const runs = (node: Ts.CallExpression | Ts.NewExpression) => {
     const tokens: string[] = [];
     for (const argument of node.arguments ?? []) {
       const value = strip(argument);
       const items = ts.isArrayLiteralExpression(value) ? value.elements : [value];
-      for (const item of items) { const word = staticText(item as ts.Expression); if (word !== null) tokens.push(...words(word)); }
+      for (const item of items) { const word = staticText(item as Ts.Expression); if (word !== null) tokens.push(...words(word)); }
     }
     for (const run of scriptRuns(tokens)) literal(node, 'launch', run.name, null, true, run.bin ? { bin: true } : { script: true });
   };
   // One cause per transition: an unknown covers its whole expression, no second unknown is asked inside it (literal edges stay).
-  const covered = new Set<ts.Node>();
-  const cover = (node: ts.Node): void => { covered.add(node); ts.forEachChild(node, cover); };
-  const unknown = (node: ts.Node, kind: ScannedUnknown['kind']) => {
+  const covered = new Set<Ts.Node>();
+  const cover = (node: Ts.Node): void => { covered.add(node); ts.forEachChild(node, cover); };
+  const unknown = (node: Ts.Node, kind: ScannedUnknown['kind']) => {
     if (covered.has(node)) return;
     const start = node.getStart(source), end = node.getEnd();
     unknowns.push({ file: path, line: at(node), kind, text: excerpt(text.slice(start, end)), site: { start, end, hash: sha256(text.slice(start, end)) } });
     cover(node);
   };
   /** The parts of a transition already given its one cause: require, createRequire and import.meta inside it. */
-  const explain = (node: ts.Node | undefined): void => {
+  const explain = (node: Ts.Node | undefined): void => {
     if (!node) return;
     if (ts.isMetaProperty(node) || ts.isIdentifier(node) && (LOADERS.has(node.text) || node.text === 'URL')) explained.add(node);
     ts.forEachChild(node, explain);
   };
-  const load = (node: ts.Node, kind: 'dynamic-import' | 'dynamic-require' | 'dynamic-url', via: ImpactVia, specifier: ts.Expression | undefined) => {
+  const load = (node: Ts.Node, kind: 'dynamic-import' | 'dynamic-require' | 'dynamic-url', via: ImpactVia, specifier: Ts.Expression | undefined) => {
     const value = staticText(specifier);
     // Return №4186 P1: an ESM specifier names its file without ?query or #hash (require reads them as part of the name).
     if (value !== null) literal(node, via, kind === 'dynamic-require' ? value : withoutQuery(value), specifier!);
@@ -442,7 +463,7 @@ function facts(path: string, text: string, source: ts.SourceFile): FileFacts {
    * base's, proved by its literal head (`http://${host}`). A literal relative to this file is a launch; a file: URL, a
    * computed spec and any other base are unknown.
    */
-  const url = (node: ts.CallExpression | ts.NewExpression, args: readonly ts.Expression[]) => {
+  const url = (node: Ts.CallExpression | Ts.NewExpression, args: readonly Ts.Expression[]) => {
     explain(node.expression);
     const [spec, base] = args, value = staticText(spec);
     const own = value === null ? undefined : schemeOf(value);
@@ -459,11 +480,11 @@ function facts(path: string, text: string, source: ts.SourceFile): FileFacts {
     explain(node); unknown(node, 'dynamic-url');
   };
   /** The require function createRequire makes, when its base is this file. */
-  const created = (node: ts.Expression): ts.CallExpression | null => {
+  const created = (node: Ts.Expression): Ts.CallExpression | null => {
     const value = strip(node);
     return ts.isCallExpression(value) && (isName(value.expression, 'createRequire') || isMember(value.expression, 'createRequire', () => true)) ? value : null;
   };
-  const visit = (node: ts.Node, chain: readonly string[]): void => {
+  const visit = (node: Ts.Node, chain: readonly string[]): void => {
     let inner = chain;
     if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier))
       literal(node, 'import', withoutQuery(node.moduleSpecifier.text), node.moduleSpecifier);
@@ -473,7 +494,7 @@ function facts(path: string, text: string, source: ts.SourceFile): FileFacts {
       literal(node, 'import', node.argument.literal.text, node.argument.literal);
     else if (ts.isCallExpression(node)) {
       const callee = strip(node.expression), spec = node.arguments[0];
-      const requireOf = (value: ts.Expression) => isName(value, 'require') || isMember(value, 'require', () => true);
+      const requireOf = (value: Ts.Expression) => isName(value, 'require') || isMember(value, 'require', () => true);
       const maker = ts.isPropertyAccessExpression(callee) && callee.name.text === 'resolve' ? created(callee.expression) : created(callee);
       // The href of a URL a literal names relative to this file is that file: import(new URL('./x.js', import.meta.url).href).
       const located = spec && strip(spec), wrapped = located && ts.isPropertyAccessExpression(located) && located.name.text === 'href' ? strip(located.expression) : null;
@@ -521,7 +542,7 @@ function facts(path: string, text: string, source: ts.SourceFile): FileFacts {
       // Return №4173 G9: code from a string — eval, the Function constructor — loads what this analysis cannot see.
       || ts.isIdentifier(node) && (node.text === 'eval' || node.text === 'Function') && referenced(node))) {
       if (ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) explain(node.parent.expression);
-      let whole: ts.Node = ts.isPropertyAccessExpression(node.parent) && node.parent.name === node ? node.parent : node;
+      let whole: Ts.Node = ts.isPropertyAccessExpression(node.parent) && node.parent.name === node ? node.parent : node;
       // The whole expression it heads: a member chain, a call of it, the wrappers around it.
       while (whole.parent && (ts.isPropertyAccessExpression(whole.parent) && whole.parent.expression === whole
         || ts.isElementAccessExpression(whole.parent) && whole.parent.expression === whole || ts.isCallExpression(whole.parent) && whole.parent.expression === whole
@@ -534,11 +555,11 @@ function facts(path: string, text: string, source: ts.SourceFile): FileFacts {
     }
     ts.forEachChild(node, child => visit(child, inner));
     // Return №4173 G8: the JSDoc of a JavaScript file types through import('…') too.
-    for (const doc of (node as { jsDoc?: ts.Node[] }).jsDoc ?? []) visit(doc, inner);
+    for (const doc of (node as { jsDoc?: Ts.Node[] }).jsDoc ?? []) visit(doc, inner);
   };
   visit(source, []);
   // Return №4173 G8: /// <reference path> and <reference types> are transitions of the file as well.
-  const directive = (reference: ts.FileReference, value: string) => {
+  const directive = (reference: Ts.FileReference, value: string) => {
     const start = reference.pos, end = reference.end;
     specifiers.push({ value, via: 'import', line: source.getLineAndCharacterOfPosition(start).line + 1, operation: true,
       site: { start, end, hash: sha256(text.slice(start, end)) }, text: text.slice(start, end) });
@@ -551,7 +572,7 @@ function facts(path: string, text: string, source: ts.SourceFile): FileFacts {
 }
 /** One parse of a file of a kind the selection takes as code; a kind the parser does not read is one unknown of the file. */
 function analyze(path: string, text: string): Analysis {
-  const kind = SCRIPT_KINDS[posix.extname(path)];
+  const kind = scriptKindsOf()[posix.extname(path)];
   const unread = (line: number, message: string): Analysis =>
     ({ facts: { specifiers: [], unknowns: [wholeFile(path, text, line, message)], cases: [], addressable: false }, names: new Set(), members: new Set(), possible: new Map(), opaque: null, diagnostic: message });
   if (kind === undefined) return unread(0, `The parser does not read files of the kind ${posix.extname(path)}`);
@@ -562,11 +583,11 @@ function analyze(path: string, text: string): Analysis {
     throw error;
   }
 }
-function parsed(path: string, text: string, kind: ts.ScriptKind, unread: (line: number, message: string) => Analysis): Analysis {
+function parsed(path: string, text: string, kind: Ts.ScriptKind, unread: (line: number, message: string) => Analysis): Analysis {
   const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, kind);
   // The parse diagnostics are the parser's own list; a parser that keeps none proves nothing either.
   const listed = (source as unknown as { parseDiagnostics?: unknown }).parseDiagnostics;
-  const first = Array.isArray(listed) ? listed[0] as ts.Diagnostic | undefined : { messageText: 'the parser keeps no diagnostics', start: 0 };
+  const first = Array.isArray(listed) ? listed[0] as Ts.Diagnostic | undefined : { messageText: 'the parser keeps no diagnostics', start: 0 };
   const found = facts(path, text, source);
   if (!first) return { facts: found, ...declarations(source), diagnostic: null };
   const diagnostic = ts.flattenDiagnosticMessageText(first.messageText, ' ');
@@ -1214,7 +1235,7 @@ export function deriveImpact(files: SnapshotFiles & { readonly unanalyzed?: Read
     result.push({ work: work.work, affected, entries, consumers: consumers.filter(path => !tests.has(path)),
       unknowns: sorted(unknowns, item => `${item.file}:${String(item.site.start).padStart(10, '0')}:${item.site.hash}`) });
   }
-  return { contract: IMPACT_CONTRACT, snapshot: { commit: files.snapshot.commit, tree: files.snapshot.tree }, parser: IMPACT_PARSER, boundary: [...IMPACT_BOUNDARY], works: result };
+  return { contract: IMPACT_CONTRACT, snapshot: { commit: files.snapshot.commit, tree: files.snapshot.tree }, parser: impactParser(), boundary: [...IMPACT_BOUNDARY], works: result };
 }
 
 /**
