@@ -1,4 +1,5 @@
-import { Store, type Revision } from "../storage/store.js";
+import { Store, storeObserved, type Revision, type RevisionIdentity, type TransactionGuard } from "../storage/store.js";
+import { provenStore } from "../storage/store-view.js";
 import { requireCondition } from "../errors.js";
 import { canonical, hashJson } from "../canonical.js";
 import { Discovery, type DiscoveryDraft, type Question } from "../discovery/discovery.js";
@@ -13,6 +14,30 @@ import { continuityFindings } from "./semantics.js";
 import { composeLayer, layerDesignSpec, LAYER_DESIGN_VERSION } from "./layer-design.js";
 import { obligationHandoff } from './obligation-handoff.js';
 import { requireTaskObligations } from './task-obligations.js';
+
+/** LG1: pure derivations shared inside one synchronous read — nothing store-dependent is cached,
+ * and only where the reading store is a proven Store outside active observation (LAYERGATE1-01).
+ * `projections` — projection hash by exact graph Ref + level; `fields` — an obligation field's hash
+ * (or node absence) by the exact Ref of the record holding the nodes + node/field. */
+interface GraphReadMemo { projections: Map<string, string>; fields: Map<string, string | null> }
+let graphReadScope: WeakMap<Store, GraphReadMemo> | null = null;
+/** One synchronous read, with no writes: share exact pure derivations across its neighboring graph
+ * gates. Each Store view keeps its own memo; neither a successful read nor an exception leaves a
+ * cache behind. Callers that gate the same vertex twice in one read reuse the derivations — the
+ * GateResult itself is never cached and the heads are re-compared on every call. */
+export function withGraphRead<T>(read: () => T): T {
+  if (graphReadScope) return read();
+  return withSourceMemo(() => {
+    graphReadScope = new WeakMap();
+    try { return read(); } finally { graphReadScope = null; }
+  });
+}
+function graphReadMemo(store: Store): GraphReadMemo | null {
+  if (!graphReadScope) return null;
+  let memo = graphReadScope.get(store);
+  if (!memo) { memo = { projections: new Map(), fields: new Map() }; graphReadScope.set(store, memo); }
+  return memo;
+}
 
 interface Obligation { node: string; field: string; valueHash: string; inputs: Ref[] }
 interface LayerProof { level: 1 | 2 | 3; hash: string; inputs: Ref[] }
@@ -122,8 +147,83 @@ export class GraphRepository {
     const layer = this.store.get<Layer>(`graph-layer:${projectId}:${level}`);
     return Boolean(layer?.value.layerProofs?.some(proof => proof.level === level));
   }
+  /** The physical Store this repository's reads are proven to be: a genuine Store, or a write-only
+   * view proven identical to one, while no capture is actively observing it (LAYERGATE1-01). Only
+   * then may a Ref-keyed memo or the shared headsMatch snapshot answer — an exact Ref out of any
+   * other store or view certifies no body, so opaque/observed reads derive from the body each get
+   * actually returns, and their source checks never borrow a Ref memo. */
+  #physical(): Store | null {
+    const physical = provenStore(this.store);
+    return physical !== null && !storeObserved(physical) ? physical : null;
+  }
+  /** The hash of one graph's projection at a level — a pure derivation of the graph body, shared
+   * inside a withGraphRead scope by the exact graph Ref and level, on proven reads only (LG1). */
+  #projectionHash(graph: Revision<Graph>, level: 1 | 2 | 3): string {
+    const memo = this.#physical() !== null ? graphReadMemo(this.store) : null;
+    const key = `${canonical(reference(graph))}:${level}`;
+    const cached = memo?.projections.get(key);
+    if (cached !== undefined) return cached;
+    const hash = hashJson(projectGraph(graph.value, level));
+    memo?.projections.set(key, hash);
+    return hash;
+  }
+  /** An obligation field's hash — a pure derivation of the record holding the nodes (layer
+   * projection or graph), shared inside a withGraphRead scope by its exact Ref + node/field, on
+   * proven reads only (LG1). `null` marks a node absent from the record. */
+  #obligationFieldHash(holder: Ref, nodes: readonly { id: string }[], node: string, field: string): string | null {
+    const memo = this.#physical() !== null ? graphReadMemo(this.store) : null;
+    const key = `${canonical(holder)}:${node}:${field}`;
+    if (memo && memo.fields.has(key)) return memo.fields.get(key)!;
+    const found = nodes.find(item => item.id === node);
+    const hash = found ? hashJson((found as unknown as Record<string, unknown>)[field]) : null;
+    memo?.fields.set(key, hash);
+    return hash;
+  }
+  /** The shared input scan of both graph gates (LG1): on a proved Store with no capture actively
+   * observing, the input heads come from ONE chunked headsMatch snapshot and each input is then
+   * compared to its snapshot head exactly as the per-input loop does — two revisions of one id are
+   * answered per input — and only the ids whose snapshot kind is Source get their bodies read and
+   * checked (a lawful Source id carries no 'source:' prefix requirement, G2a). The budget of one
+   * inspection is then 1 + ceil(D/999) + S physical reads here (D distinct inputs, S matched
+   * Sources). Every other store or view, and every read a proof is capturing, keeps the per-input
+   * observable get — that fallback runs no snapshot and has no such budget. */
+  #evidenceInputs(inputs: Ref[], staleMessage: string): { findings: GateResult['findings']; guards: Ref[]; sources: StageExternalCheck[] } {
+    const findings: GateResult['findings'] = [], guards: Ref[] = [], sources: StageExternalCheck[] = [];
+    const physical = this.#physical();
+    if (physical !== null) {
+      const heads = new Map<string, RevisionIdentity>(
+        physical.headsMatch(inputs as TransactionGuard[]).heads.map(head => [head.id, head]));
+      for (const input of inputs) {
+        const head = heads.get(input.id);
+        if (!head || head.revision !== input.revision || head.hash !== input.hash) {
+          findings.push({ code: "graph_evidence_stale", target: input.id, message: staleMessage });
+          continue;
+        }
+        if (head.kind === "source") {
+          const current = physical.get<Source>(input.id, input.revision);
+          if (!current || current.kind !== "source" || current.hash !== input.hash || !sourceIsCurrent(current.value, input)) {
+            findings.push({ code: "graph_evidence_stale", target: input.id, message: staleMessage });
+            continue;
+          }
+          sources.push({ kind: "source", ref: input });
+        }
+        guards.push({ id: input.id, revision: input.revision, hash: input.hash });
+      }
+      return { findings, guards, sources };
+    }
+    for (const input of inputs) {
+      const current = this.store.get(input.id);
+      if (!current || current.hash !== input.hash || current.revision !== input.revision
+        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) findings.push({ code: "graph_evidence_stale", target: input.id, message: staleMessage });
+      else {
+        guards.push(reference(current));
+        if (current.kind === "source") sources.push({ kind: "source", ref: input });
+      }
+    }
+    return { findings, guards, sources };
+  }
   layerGate(projectId: string, level: 1 | 2 | 3, expected?: Ref): GateResult {
-    return withSourceMemo(() => this.#layerGate(projectId, level, expected));
+    return withGraphRead(() => this.#layerGate(projectId, level, expected));
   }
   #layerGate(projectId: string, level: 1 | 2 | 3, expected?: Ref): GateResult {
     const layer = this.store.get<Layer>(`graph-layer:${projectId}:${level}`);
@@ -132,22 +232,15 @@ export class GraphRepository {
     }
     const result: GateResult = { findings: [], guards: [reference(layer)] };
     const graph = this.store.get<Graph>(`graph:${projectId}`);
-    for (const proof of layer.value.layerProofs ?? []) if (!graph || hashJson(projectGraph(graph.value, proof.level)) !== proof.hash)
+    for (const proof of layer.value.layerProofs ?? []) if (!graph || this.#projectionHash(graph, proof.level) !== proof.hash)
       result.findings.push({ code: "graph_layer_unproven", target: `L${proof.level}`, message: "Layer semantics changed without an updated research result" });
     for (const obligation of layer.value.obligations) {
-      const node = layer.value.projection.nodes.find(item => item.id === obligation.node);
-      if (!node || hashJson((node as unknown as Record<string, unknown>)[obligation.field]) !== obligation.valueHash) result.findings.push({ code: "graph_field_unproven", target: `${obligation.node}/${obligation.field}`, message: "The field changed without a matching research result" });
+      if (this.#obligationFieldHash(reference(layer), layer.value.projection.nodes, obligation.node, obligation.field) !== obligation.valueHash) result.findings.push({ code: "graph_field_unproven", target: `${obligation.node}/${obligation.field}`, message: "The field changed without a matching research result" });
     }
-    const sources: StageExternalCheck[] = [];
-    for (const input of uniqueRefs(layer.value.inputs)) {
-      const current = this.store.get(input.id);
-      if (!current || current.hash !== input.hash || current.revision !== input.revision
-        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source, input))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Research behind this layer has changed" });
-      else {
-        result.guards.push(reference(current));
-        if (current.kind === "source") sources.push({ kind: "source", ref: input });
-      }
-    }
+    const checked = this.#evidenceInputs(uniqueRefs(layer.value.inputs), "Research behind this layer has changed");
+    result.findings.push(...checked.findings);
+    result.guards.push(...checked.guards);
+    const sources = checked.sources;
     const external: StageExternalCheck[] = [];
     const levelProof = layer.value.layerProofs?.find(p => p.level === level);
     const projectionHash = levelProof?.hash ?? hashJson(layer.value.projection);
@@ -157,7 +250,7 @@ export class GraphRepository {
     return result;
   }
   gate(projectId: string, expected?: Ref): GateResult {
-    return withSourceMemo(() => this.#gate(projectId, expected));
+    return withGraphRead(() => this.#gate(projectId, expected));
   }
   #gate(projectId: string, expected?: Ref): GateResult {
     const graph = this.store.get<Graph>(`graph:${projectId}`);
@@ -170,18 +263,14 @@ export class GraphRepository {
     }
     result.guards.push(reference(graph), reference(binding));
     result.findings.push(...validateGraph(graph.value).findings);
-    for (const proof of binding.value.layerProofs ?? []) if (hashJson(projectGraph(graph.value, proof.level)) !== proof.hash)
+    for (const proof of binding.value.layerProofs ?? []) if (this.#projectionHash(graph, proof.level) !== proof.hash)
       result.findings.push({ code: "graph_layer_unproven", target: `L${proof.level}`, message: "Layer semantics changed without an updated research result" });
     for (const obligation of binding.value.obligations) {
-      const node = graph.value.nodes.find(item => item.id === obligation.node);
-      if (!node || hashJson((node as unknown as Record<string, unknown>)[obligation.field]) !== obligation.valueHash) result.findings.push({ code: "graph_field_unproven", target: `${obligation.node}/${obligation.field}`, message: "The field changed without a matching research result" });
+      if (this.#obligationFieldHash(reference(graph), graph.value.nodes, obligation.node, obligation.field) !== obligation.valueHash) result.findings.push({ code: "graph_field_unproven", target: `${obligation.node}/${obligation.field}`, message: "The field changed without a matching research result" });
     }
-    for (const input of uniqueRefs(binding.value.inputs)) {
-      const current = this.store.get(input.id);
-      if (!current || current.hash !== input.hash || current.revision !== input.revision
-        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source, input))) result.findings.push({ code: "graph_evidence_stale", target: input.id, message: "Evidence used to refine the graph has changed" });
-      else result.guards.push(reference(current));
-    }
+    const checked = this.#evidenceInputs(uniqueRefs(binding.value.inputs), "Evidence used to refine the graph has changed");
+    result.findings.push(...checked.findings);
+    result.guards.push(...checked.guards);
     return result;
   }
 }

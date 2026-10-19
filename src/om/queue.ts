@@ -1,6 +1,7 @@
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import type { Graph } from '../graph/model.js';
+import { withGraphRead } from '../graph/repository.js';
 import { StageChecks } from '../product/stage-checks.js';
 import { isRef, reference, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
@@ -259,6 +260,7 @@ export function readBlockQueue(store: Store, request: { project: string; record:
 }
 /** M3 retains the current refinement admission that is intentionally not part of the common H/B1/L1 check. */
 function refinementGuards(store: Store, horizon: HorizonRecords, graph: Ref): Ref[] {
+  return withGraphRead(() => {
   const request = horizon.horizon.value.request, refinement = request.refinement;
   if (!refinement) return [];
   const guards = new Map<string, Ref>();
@@ -290,10 +292,11 @@ function refinementGuards(store: Store, horizon: HorizonRecords, graph: Ref): Re
     }
   }
   return [...guards.values()];
+  });
 }
 export function prepareBlockQueue(store: Store, request: QueueRequest): OmResult<Sealed<PreparedBlockQueue>> {
   requireRequest(store, request); request = copy(request);
-  return run(() => {
+  return run(() => withGraphRead(() => {
     const value = derive(store, request), id = idOf(request);
     const graph = store.get<Graph>(`graph:${request.project}`);
     if (!graph) fail('record_missing', `graph:${request.project}`, 'graph', 'A queue requires the current full graph');
@@ -306,7 +309,7 @@ export function prepareBlockQueue(store: Store, request: QueueRequest): OmResult
     const record: Revision<BlockQueueRecord> = { id, kind: 'block-weight', revision: 1, hash: hashJson(value), value };
     return { record, writes: existing ? [] : [{ id, kind: record.kind, expected: 0, value }],
       guards: uniqueTransactionGuards([...prepared.guards, ...refinement, request.horizon, request.policy.machinePath.layer, ...(existing ? [reference(existing)] : [])]) };
-  });
+  }));
 }
 export function writeBlockQueue(store: Store, request: QueueRequest): OmResult<Sealed<Revision<BlockQueueRecord>>> {
   requireRequest(store, request); request = copy(request);

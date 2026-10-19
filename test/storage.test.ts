@@ -681,6 +681,10 @@ test("headsMatch compares positive, absent and contradictory guards in one count
   const before = storeReads();
   const first = store.headsMatch([reference(a), reference(b), ghost]);
   assert.deepEqual([first.ok, first.conflict, first.mismatches], [true, false, []]);
+  assert.deepEqual(first.heads.map(head => head.id).sort(), ["hm:a", "hm:b"],
+    "the same snapshot reports the selected head identities — an absent id contributes none");
+  assert.equal(first.heads.find(head => head.id === "hm:a")!.kind, "k", "a found head carries its kind");
+  assert.equal(first.heads.find(head => head.id === "hm:a")!.revision, a.revision);
   assert.equal(storeReads() - before, 1, "one physical read for the whole guard set");
   assert.equal(store.headsMatch([]).ok, true, "the empty guard set holds");
   store.write({ id: "hm:b", kind: "k", expected: 1, value: { n: 2 } });

@@ -2,6 +2,7 @@ import { Ajv } from "ajv";
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { controlPredecessors } from "../graph/dependencies.js";
+import { withGraphRead } from "../graph/repository.js";
 import type { Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
 import { isRef, reference, type Ref, type StageArtifact } from "../pipeline/contracts.js";
@@ -384,6 +385,7 @@ function deriveHorizon(store: Store, request: HorizonRequest): HorizonResult<Sea
 }
 
 function currentHorizonSources(store: Store, request: HorizonRequest): HorizonResult<Sealed<TransactionGuard[]>> {
+  return withGraphRead(() => {
   const guards = new Map<string, TransactionGuard>();
   const remember = (guard: TransactionGuard) => {
     const previous = guards.get(guard.id);
@@ -398,7 +400,7 @@ function currentHorizonSources(store: Store, request: HorizonRequest): HorizonRe
   const matchHeads = (targetStore: Store, candidateGuards: readonly TransactionGuard[]): HeadsMatch => {
     const physical = provenStore(targetStore);
     if (physical && !storeObserved(physical)) return physical.headsMatch(candidateGuards);
-    const mismatches: HeadsMatchMismatch[] = [];
+    const mismatches: HeadsMatchMismatch[] = [], heads: HeadsMatch['heads'] = [];
     for (const g of candidateGuards) {
       const head = targetStore.get(g.id);
       if ('absent' in g) {
@@ -408,8 +410,9 @@ function currentHorizonSources(store: Store, request: HorizonRequest): HorizonRe
           mismatches.push({ id: g.id, expected: [g], actual: head ? { id: head.id, kind: head.kind, revision: head.revision, hash: head.hash } : null });
         }
       }
+      if (head) heads.push({ id: head.id, kind: head.kind, revision: head.revision, hash: head.hash });
     }
-    return { ok: mismatches.length === 0, conflict: false, mismatches };
+    return { ok: mismatches.length === 0, conflict: false, mismatches, heads };
   };
   try {
     const refs = [request.input, request.graph, ...(request.refinement ? [request.refinement] : []),
@@ -455,6 +458,7 @@ function currentHorizonSources(store: Store, request: HorizonRequest): HorizonRe
       return refuse("input_stale", error.message, address(request.project, "sources"), "producer");
     throw error;
   }
+  });
 }
 function gateRecord(record: HorizonRecord, horizon: Ref): OmHorizonRecord {
   const codes = [...new Set([...record.result.refusals.map(item => item.code), ...record.result.conflicts.map(item => item.code)])].sort(order);

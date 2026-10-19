@@ -136,11 +136,14 @@ export interface HeadsMatchMismatch {
   actual: RevisionIdentity | null;
 }
 /** The result of one snapshot head comparison: `ok` exactly when every guard held; `conflict` marks at
- * least one id required by contradictory guards — reported, never silently folded into a stale answer. */
+ * least one id required by contradictory guards — reported, never silently folded into a stale answer.
+ * `heads` is additive: the head identities the same snapshot selected for the requested ids — each
+ * found head with its kind, exactly the ids that were present; an absent or unselected id has none. */
 export interface HeadsMatch {
   ok: boolean;
   conflict: boolean;
   mismatches: HeadsMatchMismatch[];
+  heads: RevisionIdentity[];
 }
 
 /** PF4 (№3499 §3.1): one committed product event without its body — what a write changed, never what it wrote. */
@@ -224,6 +227,8 @@ export class Store {
    * found head and each absent id — counted and observed once per read, so a write of any other id
    * leaves the proof reusable and a moved or newly present selected id re-derives it. A chunk is never
    * described as a whole-Store list. The empty guard set runs no SELECT at all and reports no observation.
+   * `heads` additionally reports the found head identities (with kind) from that same snapshot, so a
+   * caller that must read selected bodies can choose them by kind without another head walk (LG1).
    */
   headsMatch(guards: readonly TransactionGuard[]): HeadsMatch {
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
@@ -273,7 +278,7 @@ export class Store {
         : actual !== null && actual.revision === guard.revision && actual.hash === guard.hash;
       if (!ok) mismatches.push({ id, expected: group, actual });
     }
-    return { ok: mismatches.length === 0, conflict, mismatches };
+    return { ok: mismatches.length === 0, conflict, mismatches, heads: [...heads.values()] };
   }
   get databaseId(): string { return String(this.#db.prepare("SELECT database_id FROM identity WHERE id=1").get()!['database_id']); }
   get<T = Json>(id: string, revision?: number): Revision<T> | null {

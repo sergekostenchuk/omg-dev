@@ -11,12 +11,13 @@ import { STAGES, reference, isRef, stageId, uniqueRefs, STAGE_CLOSURE_CONTRACT, 
   type GateContext, type GateResult, type Ref, type Finding, type StageExternalCheck } from "../pipeline/contracts.js";
 import { Discovery } from "../discovery/discovery.js";
 import { GraphRepository, graphProjectionHandler } from "../graph/repository.js";
-import { sourceExternalHandler, sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
+import { sourceExternalHandler, sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Graph } from "../graph/model.js";
 import { Environments, transactionGuardsCurrent, uniqueTransactionGuards } from "../runtime/environment.js";
 import { Refinement, REFINEMENT_EXTERNAL_CHECKS } from "../graph/refinement.js";
+import { withGraphRead } from "../graph/repository.js";
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
@@ -66,7 +67,7 @@ export class StageChecks {
     this.compiler = new Compiler(store, this.pipeline, this.refinement, this.environments);
   }
   validateStage(stage: Stage, context: GateContext): GateResult {
-    return withSourceMemo(() => this.#validateStage(stage, context));
+    return withGraphRead(() => this.#validateStage(stage, context));
   }
   #validateStage(stage: Stage, context: GateContext): GateResult {
     const rejected = (code: string, message: string): GateResult => ({ findings: [{ code, target: stage, message }], guards: [] });

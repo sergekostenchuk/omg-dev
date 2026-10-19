@@ -11,6 +11,7 @@ import { isRef, reference, type GateResult, type Ref, type StageArtifact } from 
 import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRoute, type Sealed } from "./refusal.js";
 import { Store, storeObserved, type Revision, type TransactionGuard, type HeadsMatch, type HeadsMatchMismatch } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
+import { withGraphRead } from "../graph/repository.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
 import { StageChecks } from "../product/stage-checks.js";
 import { readHorizon, type HorizonRecords } from "./horizon.js";
@@ -863,7 +864,7 @@ function frameCurrentSources(store: Store) {
   const matchHeads = (candidateGuards: readonly TransactionGuard[]): HeadsMatch => {
     const physical = provenStore(store);
     if (physical && !storeObserved(physical)) return physical.headsMatch(candidateGuards);
-    const mismatches: HeadsMatchMismatch[] = [];
+    const mismatches: HeadsMatchMismatch[] = [], heads: HeadsMatch['heads'] = [];
     for (const g of candidateGuards) {
       const head = store.get(g.id);
       if ('absent' in g) {
@@ -873,8 +874,9 @@ function frameCurrentSources(store: Store) {
           mismatches.push({ id: g.id, expected: [g], actual: head ? { id: head.id, kind: head.kind, revision: head.revision, hash: head.hash } : null });
         }
       }
+      if (head) heads.push({ id: head.id, kind: head.kind, revision: head.revision, hash: head.hash });
     }
-    return { ok: mismatches.length === 0, conflict: false, mismatches };
+    return { ok: mismatches.length === 0, conflict: false, mismatches, heads };
   };
   const checkHeads = (refs: readonly Ref[]) => {
     if (refs.length === 0) return;
@@ -903,7 +905,7 @@ export function prepareHorizonBasis(store: Store, request: HorizonBasisRequest):
     || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(request['project'])) frameInvalid("request");
   for (const key of ['graph', 'horizon']) if (!isRef(request[key])) frameInvalid(key);
   request = frameCopy(request);
-  return frameResult(() => {
+  return frameResult(() => withGraphRead(() => {
     const { guards, remember, checkHeads } = frameCurrentSources(store);
     const basis = horizonBasisSources(store, request, []);
     const inputRef = basis.horizon.horizon.value.request.input;
@@ -916,11 +918,11 @@ export function prepareHorizonBasis(store: Store, request: HorizonBasisRequest):
     for (const guard of prepared.guards) remember(guard);
     return { horizon: basis.horizon, upperRef: basis.upperRef, upper: basis.upper,
       guards: frameSorted(uniqueTransactionGuards([...guards.values()])) };
-  });
+  }));
 }
 /** Admit a layer by its producer without introducing an input or horizon dependency. */
 export function prepareLayerAcceptance(store: Store, request: LayerAcceptanceRequest): OmResult<Sealed<HistoricalLayerBasis & { guards: TransactionGuard[] }>> {
-  return frameResult(() => {
+  return frameResult(() => withGraphRead(() => {
     const basis = frameLayerAcceptance(store, request);
     const { guards, checkHeads, acceptGate } = frameCurrentSources(store);
     checkHeads([request.graph, request.layer, ...basis.currentReferences]);
@@ -931,7 +933,7 @@ export function prepareLayerAcceptance(store: Store, request: LayerAcceptanceReq
       acceptGate(engine.refinement.gate(request.project, phase), `refinement.${phase}`);
     }
     return { ...basis, guards: frameSorted(uniqueTransactionGuards([...guards.values()])) };
-  });
+  }));
 }
 /** New producers save this exact request; historical readers never add its contract. */
 export function currentFrameRequest(request: FrameRequest): Sealed<FrameRequest> {
@@ -944,7 +946,7 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
   if (!(store instanceof Store)) frameInvalid("store");
   requireFrameRequest(request);
   request = currentFrameRequest(request);
-  return frameResult(() => {
+  return frameResult(() => withGraphRead(() => {
     const read = frameReading(store, request, true);
     const { guards, remember, checkHeads, acceptGate } = frameCurrentSources(store);
     const horizonBasis = frameTake(prepareHorizonBasis(store, { project: request.project, graph: request.graph, horizon: request.horizon }));
@@ -986,5 +988,5 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
     for (const { name, gate } of gates) acceptGate(gate, name);
     return { ...read, guards: frameSorted(uniqueTransactionGuards([...guards.values()])),
       expected: { graph: request.graph.revision, layer: layerHead?.revision ?? 0, frame: frameHead?.revision ?? 0 } };
-  });
+  }));
 }

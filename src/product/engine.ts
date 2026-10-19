@@ -37,7 +37,7 @@ import {
   executionAdmission, listDrafts, listQuestions, listRuns, orderedQuestions, readDraft, readQuestion,
   REQUIREMENTS, stageFields, type DiscoveryDraft, type UpstreamStage, UPSTREAM_STAGES,
 } from "../discovery/projection-reader.js";
-import { GraphRepository } from "../graph/repository.js";
+import { GraphRepository, withGraphRead } from "../graph/repository.js";
 import { canonical, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { parseCommand } from "./commands.js";
@@ -128,7 +128,7 @@ export class ProductEngine {
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);
   }
   projection(project: string) {
-    return withRefinementRead(() => this.#projection(project));
+    return withRefinementRead(() => withGraphRead(() => this.#projection(project)));
   }
   #projection(project: string) {
     // Closure declarations are producer instructions, not a change to the historical projection wire.
