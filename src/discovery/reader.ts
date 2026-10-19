@@ -21,7 +21,7 @@ import { projectPaidReaderResult, projectReaderSelection, readerDraftEquivalent 
 
 export type ReaderSelection = ({ source: Ref } | { sourceIndex: number }) & { firstLine: number; lastLine: number };
 export interface ReaderResult {
-  /** New producer outputs name their derivation; absence is the historical reader era. */
+  /** Current producer outputs name their derivation. */
   contract?: 'reader-result/v2'; producer?: 'paid' | 'combined' | 'reused' | 'outside'; intent?: Ref;
   projectId: string; question: Ref; pilot: Ref; purpose: string; sources: Ref[];
   observations: Observation[]; unresolved: string[];
@@ -331,7 +331,7 @@ export function readReaderResultAt(store: Store, project: string, ref: Ref): Rev
       const record = store.get<ReaderResult>(selected.id, selected.revision);
       if (!record || record.kind !== 'reader-result' || record.revision !== 1
         || canonical(reference(record)) !== canonical(selected) || hashJson(record.value) !== record.hash
-        || record.id !== `${record.id.startsWith('reader-result:v2:') ? 'reader-result:v2:' : 'reader-result:'}${hashJson(record.value)}`)
+        || record.id !== `reader-result:v2:${hashJson(record.value)}`)
         invalid('The exact content-addressed reader result is missing');
       const value = record.value;
       if (!value || value.projectId !== project || !isRef(value.question) || !isRef(value.pilot)
@@ -367,44 +367,6 @@ export function readReaderResultAt(store: Store, project: string, ref: Ref): Rev
           || selector.end <= selector.start
           || observation.value !== original.value.content.slice(selector.start, selector.end))
           invalid('An observation differs from the original exact source bytes');
-      }
-      if (!record.id.startsWith('reader-result:v2:')) {
-        if (value.contract !== undefined)
-          invalid('An historical address cannot claim the new producer contract');
-        if (Object.hasOwn(value, 'producer') || Object.hasOwn(value, 'intent'))
-          invalid('An historical result cannot claim a partial new producer');
-        if (value.parts !== undefined) {
-          if (!Array.isArray(value.parts) || value.parts.length !== 2
-            || value.parts.some(part => !isRef(part)) || canonical(value.parts[0]) === canonical(value.parts[1]))
-            invalid('The historical combined result lost two exact parts');
-          const parts = value.parts.map(read);
-          const halves = splitReaderSources(supplied, 'reader_result_invalid');
-          for (let index = 0; index < 2; index++) {
-            const part = parts[index]!, expected = halves[index]!;
-            if (canonical([part.value.question, part.value.purpose]) !== canonical([value.question, value.purpose])
-              || canonical(part.value.coverage) !== canonical(expected.map(({lines: _lines, ...coverage}) => coverage))
-              || canonical(part.value.sources) !== canonical([...new Map(expected.map(item => [item.ref.id, item.ref])).values()]))
-              invalid('A historical combined child differs from its original half');
-          }
-          const outcome = combinedReaderOutcome(parts);
-          if (canonical(value.observations) !== canonical(outcome.observations)
-            || canonical(value.unresolved) !== canonical(outcome.unresolved))
-            invalid('The historical combined result differs from its exact children');
-        }
-        if (value.reusedFrom !== undefined) {
-          if (!Array.isArray(value.reusedFrom) || value.reusedFrom.some(origin => !isRef(origin)))
-            invalid('The historical reuse basis lost exact origins');
-          for (const originRef of value.reusedFrom) {
-            const origin = read(originRef);
-            if (!origin.value.observations.some(observation => supplied.some(source =>
-              canonical(observation.source) === canonical(source.ref)
-              && observation.selector.kind === 'text-range'
-              && observation.selector.start < source.visibleRange.end
-              && observation.selector.end > source.visibleRange.start)))
-              invalid('A historical reuse origin contributes no original source bytes');
-          }
-        }
-        return record; // The prior producer did not save an intent backlink.
       }
       if (value.contract !== 'reader-result/v2') invalid('The reader result has an unknown producer era');
       if (value.producer === 'outside') {

@@ -663,53 +663,6 @@ test('RS1 split bundle retains clipped requests and addressed outside children a
   assert.deepEqual(reopened.list('model-call'), calls);
 });
 
-test('RS1 exact previous producer from Git keeps completed source and bundle outcomes in their era', async t => {
-  const root = mkdtempSync(join(tmpdir(), 'omg-rs1-era-')), era = join(root, 'era'), archive = join(root, 'archive.tar'); mkdirSync(era);
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  execFileSync('git', ['archive', '--format=tar', `--output=${archive}`, '94af9c4ac0a06ca1ee911d626356e07ab7850c04']);
-  try {
-    execFileSync('tar', ['-xf', archive, '-C', era]);
-  } finally {
-    rmSync(archive, { force: true });
-  }
-  symlinkSync(resolve('node_modules'), join(era, 'node_modules'));
-  execFileSync(process.execPath, [resolve('node_modules/typescript/bin/tsc'), '-p', join(era, 'tsconfig.json')], { cwd: era });
-  const script = join(era, 'old-producer.mjs');
-  writeFileSync(script, `import {writeFileSync} from 'node:fs';
-import {Store} from './dist/src/storage/store.js'; import {ProductEngine} from './dist/src/product/engine.js';
-import {reference} from './dist/src/pipeline/contracts.js'; import {preparedFeatures} from './dist/test/product-fixture.js';
-import {readBundle} from './dist/src/discovery/reader.js';
-import {configureReaderPilot,pilotEnvironment} from './dist/src/discovery/reader-pilot.js';
-const root=${JSON.stringify(root)},store=new Store(root+'/state.sqlite'),engine=new ProductEngine(store);
-const adapter=root+'/adapter.mjs';
-writeFileSync(adapter,\`import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
-const research=s.role==='reader'?{selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]}
-:{action:'read_source',source:s.inventory.sources[0].ref,start:0,end:5};
-console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research}));\`);
-const command={executable:process.execPath,args:[adapter]};
-engine.execute({type:'create-project',project:'p',title:'p'});
-const environment=engine.environments.configure('p',{workspace:root,implementer:{actor:'i',model:'fixture',effort:'high',command},reviewer:{actor:'r',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:5000},0);
-const source=engine.discovery.evidence.document('p','old','abcde','text/plain',0);
-const draft=engine.prepare('p','discovery');await engine.researcher.run('p',draft.id,1);
-const turn=store.list('research-turn')[0];
-preparedFeatures(engine,'q');
-const env=engine.environments.configure('q',{...environment.value,projectId:'q'},0);
-const r0=engine.refinement.begin('q','R0');engine.refinement.finishResearch('q','R0',reference(r0),0);engine.refinement.sealLayer('q',1,0);
-const d=engine.refinement.begin('q','R1'),q=store.get(d.value.questions[0]);
-const pilot=configureReaderPilot(store,engine.environments,'q',{experimental:true,active:true,stopAfter:'L2',reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command},agentCommand:command,maxCalls:10,maxReportedTokens:100000,maxRequestChars:50000,maxReadChars:20000,maxReplyChars:10000},0);
-const original=engine.discovery.evidence.document('q','old','abcde','text/plain',0);
-const result=await readBundle(store,pilotEnvironment(env.value,pilot.value),pilot,reference(q),'old',[{source:reference(original),range:{start:0,end:5}}]);
-writeFileSync(root+'/expected.json',JSON.stringify({turn,result,source:reference(source)}));store.close();`);
-  execFileSync(process.execPath, [script], { cwd: era, maxBuffer: 4 << 20 });
-  const expected = JSON.parse(readFileSync(join(root, 'expected.json'), 'utf8'));
-  const store = new Store(join(root, 'state.sqlite')); t.after(() => store.close());
-  assert.equal(expected.turn.value.observation.contract, undefined);
-  assert.equal(expected.result.value.coverage[0].reading, undefined);
-  assert.deepEqual(readResearchConsumerTurn(store, reference(expected.turn)), expected.turn);
-  assert.deepEqual(readReaderResultAt(store, 'q', reference(expected.result)), expected.result);
-});
-
-
 test('RS1 grouped read_source outside does not cancel the following clipped child', async t => {
   const { root, store, engine, question, pilot } = await rs1BundleFixture(t);
   const source = engine.discovery.evidence.document('p', 'grouped', 'original', 'text/plain', 0);

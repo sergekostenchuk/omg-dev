@@ -43,9 +43,6 @@ import { readResearchConsumerIntent, readResearchConsumerTurn, readManagedPropos
   type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
 import { retryPlannedRead } from '../src/discovery/reading-plan.js';
 import { DatabaseSync } from "node:sqlite";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { realpathSync } from "node:fs";
 import { reusableReaderRanges, priorReaderIndex, bindReaderResultProof } from "../src/discovery/reader-reuse.js";
 import { retainPilotRead } from "../src/discovery/pilot-context.js";
 import { latestFocus } from "../src/discovery/research-continuation.js";
@@ -1911,11 +1908,13 @@ function rawDrop(database: string, id: string): void {
     raw.prepare("DELETE FROM heads WHERE entity_id=?").run(id);
   } finally { raw.close(); }
 }
-/** A copy of a reader result at its own recomputed content address (either era's prefix) with a substituted body. */
+/** A copy of a reader result at its own recomputed content address with a substituted body. */
 function forgedCopy(store: Store, record: Revision<ReaderResult>, patch: Partial<ReaderResult>): Revision<ReaderResult> {
   const value = { ...record.value, ...patch };
-  const prefix = record.id.startsWith("reader-result:v2:") ? "reader-result:v2:" : "reader-result:";
-  return store.write<ReaderResult>({ id: `${prefix}${hashJson(value)}`, kind: "reader-result", expected: 0, value });
+  for (const [k, v] of Object.entries(value)) {
+    if (v === undefined) delete (value as any)[k];
+  }
+  return store.write<ReaderResult>({ id: `reader-result:v2:${hashJson(value)}`, kind: "reader-result", expected: 0, value: value as ReaderResult });
 }
 function bundleTurn(store: Store, result: Revision<ReaderResult>, question: Revision<Question>, id: string): Revision<ResearchTurn> {
   return store.write<ResearchTurn>({ id, kind: "research-turn", expected: 0,
@@ -2050,113 +2049,6 @@ test("D8.4.1 S1/S3 for combined and reused results: proven through the common re
   assert.equal(f.store.list("model-call").length, calls);
 });
 
-const PRIOR_ERA_LOADER = String.raw`
-import ts from TYPESCRIPT;
-import { execFileSync } from 'node:child_process';
-let root, repository, baseline;
-export function initialize(data) { root = data.root; repository = data.repository; baseline = data.baseline; }
-export async function load(url, context, nextLoad) {
-  if (url.startsWith(root) && url.endsWith('.js')) {
-    const path = decodeURIComponent(url.slice(root.length)).replace(/\.js$/, '.ts');
-    const body = execFileSync('git', ['show', baseline + ':' + path], { cwd: repository, encoding: 'utf8', maxBuffer: 10_000_000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(body,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return nextLoad(url, context);
-}
-`;
-const PRIOR_ERA_SCENARIO = String.raw`
-import { register } from 'node:module';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-const config = CONFIG;
-register(config.loader, { data: { root: config.dist, repository: config.repository, baseline: config.baseline } });
-const { Store } = await import(config.dist + 'src/storage/store.js');
-const { ProductEngine } = await import(config.dist + 'src/product/engine.js');
-const { configureReaderPilot } = await import(config.dist + 'src/discovery/reader-pilot.js');
-const { readBundle } = await import(config.dist + 'src/discovery/reader.js');
-const { reference } = await import(config.dist + 'src/pipeline/contracts.js');
-const { preparedFeatures } = await import(config.dist + 'test/product-fixture.js');
-const { exampleGraph } = await import(config.dist + 'test/graph-fixture.js');
-const { enrichedGraph } = await import(config.dist + 'test/enriched-graph-fixture.js');
-const { projectGraph } = await import(config.dist + 'src/graph/project.js');
-const root = join(config.directory, 'prior'); mkdirSync(root, { recursive: true });
-const store = new Store(join(root, 'state.sqlite')), engine = new ProductEngine(store);
-const full = enrichedGraph(exampleGraph('p'), 'p'); preparedFeatures(engine, 'p', full);
-const { level: _level, ...initial } = projectGraph(full, 1);
-engine.graphs.save('p', initial, store.get('graph:p').revision, 'fixture');
-const command = { executable: process.execPath, args: ['--version'] };
-engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture-author', effort: 'high', command },
-  reviewer: { actor: 'assessor', model: 'fixture-assessor', effort: 'high', command }, fullCheck: command, timeoutMs: 3000 }, 0);
-const readerPath = join(root, 'reader.mjs');
-writeFileSync(join(root, 'README.md'), 'Planned runtime\nRestrict writes to the chosen scope.\nRoll back on failure.\n');
-writeFileSync(readerPath, "import {readFileSync} from 'node:fs';const req=JSON.parse(readFileSync(0,'utf8')),c=req.subject;"
-  + "const lines=c.sources[0].lines.filter(line=>line[0]>=2&&line[0]<=3);"
-  + "const research={selections:[{sourceIndex:0,firstLine:lines[0][0],lastLine:lines.at(-1)[0]}],unresolved:[]};"
-  + "console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research,usage:{inputTokens:100,outputTokens:25,cachedInputTokens:0,reasoningOutputTokens:5}}));");
-const pilot = configureReaderPilot(store, engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
-  reader: { actor: 'reader', model: 'fixture-reader', effort: 'high', speed: 'fast', command: { executable: process.execPath, args: [readerPath] } },
-  agentCommand: { executable: process.execPath, args: [readerPath] }, maxRequestChars: 100000, maxReadChars: 20000, maxReplyChars: 10000, maxCalls: 20, maxReportedTokens: 100000 }, 0);
-const r0 = engine.refinement.begin('p', 'R0'); engine.refinement.finishResearch('p', 'R0', reference(r0), 0); engine.refinement.sealLayer('p', 1, 0);
-const draft = engine.refinement.begin('p', 'R1'); const question = store.get(draft.value.questions[0]);
-const environment = engine.environments.get('p');
-const result = await readBundle(store, environment.value, pilot, reference(question), 'Read runtime conditions', [{ path: 'README.md', media: 'text/plain' }]);
-console.log(JSON.stringify({ root, database: join(root, 'state.sqlite'), draft: draft.id, question: question.id, result: reference(result),
-  id: result.id, calls: store.list('model-call').length }));
-store.close();
-`;
-
-test("D8.4.1 S4: a reader result of the previous era (producer 2a74d7f, address reader-result:<hash>) passes S1–S3 through the same common reader on every entry, without migration", async t => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "omg-d841-prior-era-")));
-  const stores: Store[] = [];
-  t.after(() => { for (const db of stores) db.close(); rmSync(directory, { recursive: true, force: true }); });
-  const loaderFile = join(directory, "prior-loader.mjs"), script = join(directory, "prior-producer.mjs");
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  const dist = pathToFileURL(fileURLToPath(new URL("../", import.meta.url))).href;
-  const repository = fileURLToPath(new URL("../../", import.meta.url));
-  writeFileSync(loaderFile, PRIOR_ERA_LOADER.replace("TYPESCRIPT", JSON.stringify(typescript)));
-  writeFileSync(script, PRIOR_ERA_SCENARIO.replace("CONFIG", JSON.stringify({ directory, repository, dist,
-    loader: pathToFileURL(loaderFile).href, baseline: "2a74d7f75e84fb089790cf5e9ca500e05decc54a" })));
-  const output = execFileSync(process.execPath, [script], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }).trim().split("\n").at(-1)!;
-  const produced = JSON.parse(output) as { root: string; database: string; draft: string; question: string; result: Ref; id: string; calls: number };
-  assert.ok(produced.id.startsWith("reader-result:") && !produced.id.startsWith("reader-result:v2:"), produced.id);
-  const store = new Store(produced.database); stores.push(store);
-  const record = readReaderResultAt(store, "p", produced.result);
-  assert.equal(record.value.contract, undefined, "the previous era carries no producer contract");
-  const draft = store.get<DiscoveryDraft>(produced.draft)!, question = store.get<Question>(produced.question)!;
-  const source = store.get<import("../src/evidence/evidence.js").Source>(record.value.sources[0]!.id, record.value.sources[0]!.revision)!;
-  const supplied = () => [numberedSource(source)];
-  const other = new ProductEngine(store).discovery.create("p", "discovery", "R0", "compilation",
-    [{ field: "other", kind: "design", prompt: "Another question", risk: "r", schema: { type: "object" } }]);
-  // S1 on every entry.
-  assert.deepEqual(reusableReaderRanges(store, "p", supplied()).reusedFrom, [produced.result]);
-  assert.equal(priorReaderIndex(store, "p", other.value.questions[0]!).length, 1);
-  const page = readPilotContext(store, draft, produced.result, "/observations/0", Number.MAX_SAFE_INTEGER);
-  assert.deepEqual(page.value, record.value.observations[0]);
-  assert.deepEqual(pilotContext(store, draft, question).readings.map(item => item.ref), [produced.result]);
-  retainPilotRead(store, "p", question.id, { action: "read_context", record: produced.result, pointer: "/observations/0" }, page);
-  assert.equal(pilotContext(store, draft, question).directReadings.length, 1);
-  const turn = bundleTurn(store, record, question, "fixture-turn-s4");
-  assert.ok(latestFocus(store, [turn], question)); assert.equal(workingSelections(store, [turn], question).length, 1);
-  assert.equal(store.list("model-call").length, produced.calls, "no repurchase");
-  // S3: a previous-era copy with substituted coverage at its recomputed address refuses every scan and the page.
-  const forged = forgedCopy(store, record, { coverage: record.value.coverage.map(entry => ({ ...entry, visibleRange: { start: 0, end: 3 } })) });
-  assert.ok(forged.id.startsWith("reader-result:") && !forged.id.startsWith("reader-result:v2:"));
-  assert.throws(() => reusableReaderRanges(store, "p", supplied()), readerInvalid);
-  assert.throws(() => priorReaderIndex(store, "p", other.value.questions[0]!), readerInvalid);
-  assert.throws(() => readPilotContext(store, draft, reference(forged), "/observations/0", Number.MAX_SAFE_INTEGER), readerInvalid);
-  assert.throws(() => pilotContext(store, draft, question), readerInvalid);
-  assert.throws(() => latestFocus(store, [bundleTurn(store, forged, question, "fixture-turn-s4-forged")], question), readerInvalid);
-  rawDrop(produced.database, forged.id);
-  // S2: today's file moved — the proven previous-era result is excluded without a refusal.
-  writeFileSync(join(produced.root, "README.md"), "changed today");
-  assert.equal(readReaderResultAt(store, "p", produced.result).id, record.id, "history stays provable");
-  assert.equal(pilotContext(store, draft, question).readings.length, 0);
-  assert.equal(reusableReaderRanges(store, "p", supplied()).observations.length, 0);
-  assert.equal(latestFocus(store, [turn], question), null);
-  assert.throws(() => readPilotContext(store, draft, produced.result, "/observations/0", Number.MAX_SAFE_INTEGER), { code: "research_evidence_stale" });
-});
-
 // ---------------------------------------------------------------------------
 // D8.4.1 круг 2 (№2332): никакое обязательное поле не читается до общего читателя (1); заявленный
 // проект не доверяется до доказательства (2). Пробы ревьюера — постоянные регрессии.
@@ -2164,7 +2056,8 @@ test("D8.4.1 S4: a reader result of the previous era (producer 2a74d7f, address 
 test("D8.4.1-2 (№2332-1): a candidate of this project whose mandatory question is unreadable reaches the common reader on every scan — an addressed refusal, never an untyped exception or a silent exclusion; a record without a readable body claims no project and no scope", async t => {
   const f = await readingFixture(t);
   for (const [name, patch] of [["question null", { question: null }], ["question not a reference", { question: "not-a-ref" }],
-    ["pilot null", { pilot: null }], ["sources null", { sources: null }], ["observations null", { observations: null }]] as const) {
+    ["pilot null", { pilot: null }], ["sources null", { sources: null }], ["observations null", { observations: null }],
+    ["contract missing", { contract: undefined as any }], ["contract unknown", { contract: "reader-result/v1" as any }]] as const) {
     const bad = forgedCopy(f.store, f.result, patch as unknown as Partial<ReaderResult>);
     assert.throws(() => readReaderResultAt(f.store, "p", reference(bad)), readerInvalid, name);
     assert.throws(() => priorReaderIndex(f.store, "p", f.otherQuestion.id), readerInvalid, `(2) ${name}`);
@@ -2177,6 +2070,25 @@ test("D8.4.1-2 (№2332-1): a candidate of this project whose mandatory question
   assert.equal(reusableReaderRanges(f.store, "p", f.supplied()).observations.length, 1, "records without a readable body belong to no project scope");
   assert.equal(pilotContext(f.store, f.draft, f.question).readings.length, 1);
   assert.equal(priorReaderIndex(f.store, "p", f.otherQuestion.id).length, 1);
+});
+
+test("LG61: absence of the mandatory reader-result/v2 contract or a legacy reader-result address is an addressed reader_result_invalid refusal", async t => {
+  const f = await readingFixture(t);
+  const withoutContract = forgedCopy(f.store, f.result, { contract: undefined as any });
+  assert.throws(() => readReaderResultAt(f.store, "p", reference(withoutContract)), readerInvalid, "missing contract");
+  assert.throws(() => priorReaderIndex(f.store, "p", f.otherQuestion.id), readerInvalid, "missing contract in index");
+  assert.throws(() => pilotContext(f.store, f.draft, f.question), readerInvalid, "missing contract in pilotContext");
+  assert.throws(() => reusableReaderRanges(f.store, "p", f.supplied()), readerInvalid, "missing contract in reusableReaderRanges");
+  rawDrop(f.database, withoutContract.id);
+
+  const unknownEra = forgedCopy(f.store, f.result, { contract: "reader-result/v1" as any });
+  assert.throws(() => readReaderResultAt(f.store, "p", reference(unknownEra)), readerInvalid, "unknown era");
+  rawDrop(f.database, unknownEra.id);
+
+  const legacyAddress = `reader-result:${hashJson(f.result.value)}`;
+  const legacyRecord = f.store.write({ id: legacyAddress, kind: "reader-result", expected: 0, value: f.result.value });
+  assert.throws(() => readReaderResultAt(f.store, "p", reference(legacyRecord)), readerInvalid, "legacy address without v2");
+  rawDrop(f.database, legacyAddress);
 });
 
 test("D8.4.1-2 (№2332-2): a rewritten projectId behind a saved Ref is the common reader's refusal on the page and in the direct read — never context_reference_foreign or false; a PROVEN result of another project keeps the previous access refusal", async t => {
