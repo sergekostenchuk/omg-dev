@@ -4,9 +4,9 @@ import { Discovery, type ResearchLevel } from "../discovery/discovery.js";
 import { orderedSpecs, readDraft, type DiscoveryDraft, type FieldSpec }
   from "../discovery/projection-reader.js";
 import { GraphRepository } from "./repository.js";
-import { Environments, inspectRepository, uniqueTransactionGuards, transactionGuardsCurrent, type RepositoryState } from "../runtime/environment.js";
+import { Environments, git, inspectRepository, uniqueTransactionGuards, transactionGuardsCurrent, type Environment, type ExecutionRoot, type RepositoryState } from "../runtime/environment.js";
 import { Pipeline } from "../pipeline/pipeline.js";
-import { reference, isRef, uniqueRefs, stageId, type StageArtifact, type Ref, type GateResult } from "../pipeline/contracts.js";
+import { STAGE_CLOSURE_CONTRACT, reference, isRef, uniqueRefs, stageId, type StageArtifact, type Ref, type GateResult, type Finding, type ExternalCheckHandlers } from "../pipeline/contracts.js";
 import { canonical, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import type { Graph } from "./model.js";
@@ -24,6 +24,13 @@ import { readinessObligations, type ReadinessObligations } from './obligation-re
 import { obligationHandoff } from './obligation-handoff.js';
 import { requireTaskObligations, TASK_OBLIGATION_CONTRACT } from './task-obligations.js';
 import { gateFeasibility as gateOmFeasibility } from '../compiler/om-readers.js';
+import { realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { runtimeContext, runtimeExecutableIdentity, runtimeSubjectPath } from '../runtime/runtime-observation.js';
+import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
+import type { ArtifactReceipt } from '../compiler/model.js';
+import type { TaskRun } from '../execution/model.js';
+import type { WriterIndex } from '../ownership/writer-index.js';
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
@@ -31,6 +38,142 @@ interface Milestone { projectId: string; phase: Phase; inputs: Ref[]; draft: Ref
   carried?: CarriedObligation[]; carriedContract?: 'r3-v1'; taskObligationContract?: string }
 export interface Feasibility { contractVersion?: number; projectId: string; ready: boolean; graph: Ref; environment: Ref; repository: RepositoryState | null; inputs: Ref[]; findings: GateResult['findings'];
   obligations?: ReadinessObligations }
+
+/** Only the saved external comparison slice of M8; importing its producer would invert the graph/OM boundary. */
+interface ExternalFeasibility extends Feasibility {
+  producer?: { contract: string; inspection: { root: string; executionRoot: Ref | null; workspace: Ref | null };
+    deliveries: { resolved: { receipt: Ref | null }[]; ownership: { indexes: Record<string, Ref> } | null } };
+}
+function externalBasis(store: Store, project: string, ref: Ref): Revision<ExternalFeasibility> {
+  requireCondition(isRef(ref), 'feasibility_not_ready', 'An exact feasibility basis is required');
+  const record = store.get<ExternalFeasibility>(ref.id, ref.revision);
+  requireCondition(record?.kind === 'feasibility' && record.hash === ref.hash && record.value.projectId === project
+    && [ `feasibility:${project}`, `om-feasibility:${project}` ].includes(record.id)
+    && record.value.ready && isRef(record.value.environment) && isRef(record.value.graph)
+    && record.value.repository && Array.isArray(record.value.inputs),
+  'feasibility_not_ready', 'The exact accepted feasibility basis is missing or foreign');
+  if (record.id === `om-feasibility:${project}`) requireCondition(record.value.producer?.contract === 'om-m8/v2'
+    && record.value.producer.inspection && record.value.producer.deliveries,
+  'feasibility_record_invalid', 'The saved M8 inspection is required');
+  return record;
+}
+function basisEnvironment(store: Store, project: string, basis: Revision<ExternalFeasibility>) {
+  const ref = basis.value.environment, environment = store.get<Environment>(ref.id, ref.revision);
+  requireCondition(environment?.kind === 'environment' && environment.hash === ref.hash
+    && environment.id === `environment:${project}` && environment.value.projectId === project,
+  'environment_missing', 'The exact environment of the inspection is unavailable');
+  return environment;
+}
+const externalFailure = (error: unknown, target: string): Finding => ({
+  code: error instanceof EngineError ? error.code : 'environment_missing', target,
+  message: error instanceof Error ? error.message : 'The saved external basis is unavailable',
+});
+/** Files and executables are read afresh. No stage, research or feasibility validator is called here. */
+export const REFINEMENT_EXTERNAL_CHECKS: ExternalCheckHandlers = {
+  repository(check, { store, projectId }) {
+    try {
+      const basis = externalBasis(store, projectId, check.basis), value = basis.value;
+      const environment = basisEnvironment(store, projectId, basis);
+      const graph = store.get<Graph>(value.graph.id, value.graph.revision);
+      requireCondition(graph?.kind === 'graph' && graph.hash === value.graph.hash,
+        'feasibility_not_ready', 'The exact inspected graph is unavailable');
+      const inspected = inspectRepository({ ...environment.value, workspace: value.repository!.root }, graph.value);
+      if (inspected.findings.length) return inspected.findings[0]!;
+      return canonical(inspected.state) === canonical(value.repository) ? null : {
+        code: value.producer ? 'feasibility_stale' : 'repository_stale', target: basis.id,
+        message: 'Repository state changed after the saved inspection',
+      };
+    } catch (error) { return externalFailure(error, check.basis.id); }
+  },
+  environment(check, { store, projectId }) {
+    try {
+      const basis = externalBasis(store, projectId, check.basis), value = basis.value;
+      const environment = basisEnvironment(store, projectId, basis);
+      const root = value.repository!.root;
+      const executionRef = value.producer ? value.producer.inspection.executionRoot
+        : value.inputs.find(ref => ref.id === `execution-root:${projectId}`) ?? null;
+      if (executionRef) {
+        const execution = store.get<ExecutionRoot>(executionRef.id, executionRef.revision);
+        requireCondition(execution?.kind === 'execution-root' && execution.hash === executionRef.hash
+          && execution.value.projectId === projectId && execution.value.state === 'ready'
+          && execution.value.path === root && execution.value.sourceRoot === environment.value.workspace,
+        'execution_root_recovery', 'The saved managed worktree basis is unavailable');
+        const saved = execution.value;
+        requireCondition(git(root, ['rev-parse', 'HEAD']) === saved.head
+          && git(root, ['symbolic-ref', 'HEAD']) === `refs/heads/${saved.branch}`,
+        'execution_root_recovery', 'The managed worktree head differs from its accepted state');
+        const common = (path: string) => realpathSync(resolve(path, git(path, ['rev-parse', '--git-common-dir'])));
+        requireCondition(common(root) === common(saved.sourceRoot), 'execution_root_foreign', 'Worktree belongs to another repository');
+      } else requireCondition(realpathSync(environment.value.workspace) === root,
+        'environment_missing', 'The inspection root differs from its saved environment');
+      // These are external runtime identities, not a second proof of the saved assessment.
+      for (const confirmation of value.obligations?.confirmations ?? []) {
+        const observation = store.get<RuntimeObservation>(confirmation.observation.id, confirmation.observation.revision);
+        requireCondition(observation?.kind === 'runtime-observation' && observation.hash === confirmation.observation.hash
+          && observation.value.projectId === projectId, 'environment_confirmation_required', 'The exact runtime comparison basis is unavailable');
+        const old = observation.value, current = runtimeContext(store, projectId);
+        const executable = realpathSync(process.execPath);
+        const subjects = old.subjects.map(subject => {
+          const path = runtimeSubjectPath(current.root, subject.requested, subject.kind);
+          return { requested: subject.requested, kind: subject.kind, path, identity: runtimeExecutableIdentity(path) };
+        });
+        requireCondition(canonical(current.binding) === canonical(old.runtimeBinding)
+          && executable === old.executable.path
+          && canonical(runtimeExecutableIdentity(executable)) === canonical(old.executable.identity)
+          && canonical(subjects) === canonical(old.subjects.map(({ requested, kind, path, identity }) => ({ requested, kind, path, identity }))),
+        'environment_confirmation_required', 'A declared runtime subject changed since its accepted observation');
+      }
+      return null;
+    } catch (error) { return externalFailure(error, check.basis.id); }
+  },
+  'om-feasibility'(check, { store, projectId }) {
+    try {
+      const basis = externalBasis(store, projectId, check.ref);
+      requireCondition(basis.value.producer, 'feasibility_record_invalid', 'This external check needs a saved M8 inspection');
+      const repository = basis.value.repository!;
+      for (const ref of uniqueRefs(basis.value.producer.deliveries.resolved.flatMap(item => item.receipt ? [item.receipt] : []))) {
+        const receipt = store.get<ArtifactReceipt>(ref.id, ref.revision);
+        requireCondition(receipt?.kind === 'artifact' && receipt.hash === ref.hash && receipt.value.projectId === projectId,
+          'artifact_foreign', 'The exact accepted delivery receipt is unavailable');
+        git(repository.root, ['merge-base', '--is-ancestor', receipt.value.commit, repository.head]);
+        requireCondition(git(repository.root, ['rev-parse', `${receipt.value.commit}^{tree}`]) === receipt.value.tree,
+          'artifact_foreign', 'The delivery commit no longer agrees with its saved tree');
+      }
+      const writers: Ref[] = [];
+      const ownership = basis.value.producer.deliveries.ownership;
+      requireCondition(ownership && ownership.indexes, 'feasibility_record_invalid', 'A ready M8 basis requires its saved ownership slice');
+      for (const [path, ref] of Object.entries(ownership.indexes)) {
+        const index = store.get<WriterIndex>(ref.id, ref.revision);
+        requireCondition(index?.kind === 'writer-index' && index.hash === ref.hash
+          && index.value.project === projectId && index.value.path === path,
+        'ownership_proof_foreign', 'The exact accepted writer slice is unavailable');
+        writers.push(...index.value.writers);
+      }
+      // No walk through previous indexes or run reviews: their producer already established the slice.
+      for (const ref of uniqueRefs(writers)) {
+        const run = store.get<TaskRun>(ref.id, ref.revision);
+        requireCondition(run?.kind === 'task-run' && run.hash === ref.hash && run.value.projectId === projectId
+          && run.value.commit && run.value.tree, 'ownership_proof_foreign', 'The exact accepted writer is unavailable');
+        git(repository.root, ['merge-base', '--is-ancestor', run.value.commit, repository.head]);
+        requireCondition(git(repository.root, ['rev-parse', `${run.value.commit}^{tree}`]) === run.value.tree
+          && git(repository.root, ['rev-list', '--parents', '-n', '1', run.value.commit]) === `${run.value.commit} ${run.value.parent}`,
+        'ownership_proof_foreign', 'The accepted writer no longer has its saved commit ancestry');
+      }
+      return null;
+    } catch (error) { return externalFailure(error, check.ref.id); }
+  },
+};
+
+function declareFeasibility(store: Store, ref: Ref, result: GateResult): GateResult {
+  if (result.findings.length) return result;
+  const sources = result.guards.filter(input => store.get(input.id, input.revision)?.kind === 'source');
+  result.closure = { contract: STAGE_CLOSURE_CONTRACT, external: [
+    { kind: 'repository', basis: ref }, { kind: 'environment', basis: ref },
+    ...(ref.id.startsWith('om-feasibility:') ? [{ kind: 'om-feasibility' as const, ref }] : []),
+    ...sources.map(source => ({ kind: 'source' as const, ref: source })),
+  ] };
+  return result;
+}
 
 export class Refinement {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly graphs: GraphRepository,
@@ -231,7 +374,7 @@ export class Refinement {
         repository: inspected.state, inputs: guards, findings, ...(obligations.value ? { obligations: obligations.value } : {}) } }],
       uniqueTransactionGuards([...guards, ...admissionGuards, ...(graphGate.admissionGuards ?? []), ...effective.admissionGuards, ...obligations.guards, ...obligations.admissionGuards, ...extraGuards]))[0]!;
   }
-  feasibilityGate(project: string, ref: Ref, allowHistorical = false): GateResult {
+  feasibilityGate(project: string, ref: Ref, allowHistorical = false, declareClosure = false): GateResult {
     if (!isRef(ref)) return { findings: [{ code: "feasibility_missing", target: project, message: "R3 result reference is required" }], guards: [] };
     if (ref.id.startsWith('om-feasibility:')) {
       const checked = gateOmFeasibility(this.store, { project, record: ref });
@@ -241,7 +384,8 @@ export class Refinement {
       const guards: Ref[] = [];
       // The M8 closure is historical evidence; only its current positive guards become stage proofs.
       for (const guard of admissionGuards) if (!('absent' in guard)) guards.push(guard);
-      return { findings: [], guards, admissionGuards };
+      const result: GateResult = { findings: [], guards, admissionGuards };
+      return declareClosure ? declareFeasibility(this.store, ref, result) : result;
     }
     const record = this.store.get<Feasibility>(ref.id);
     if (!record || record.kind !== "feasibility" || record.value.projectId !== project || record.hash !== ref.hash || record.revision !== ref.revision || !record.value.ready) {
@@ -270,7 +414,7 @@ export class Refinement {
     if (admissionGuards.length) result.admissionGuards = uniqueTransactionGuards(admissionGuards);
     if (!result.findings.length && !transactionGuardsCurrent(this.store, [...result.guards, ...admissionGuards]))
       result.findings.push({ code: "feasibility_stale", target: ref.id, message: "An R3 input changed while its admission was checked" });
-    return result;
+    return declareClosure ? declareFeasibility(this.store, ref, result) : result;
   }
   publish(project: string, ref: Ref, expected: number, extraGuards: TransactionGuard[] = []) {
     assertPilotBoundary(this.store, project, "R3");

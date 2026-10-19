@@ -6,7 +6,7 @@ import { requireGraph } from "../graph/validate.js";
 import type { Graph } from "../graph/model.js";
 import { hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { isRef, reference, uniqueRefs, type Ref, type GateResult } from "../pipeline/contracts.js";
+import { STAGE_CLOSURE_CONTRACT, isRef, reference, uniqueRefs, type Ref, type GateResult, type StageExternalCheck } from "../pipeline/contracts.js";
 import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
 import { checkedPlanDerivation, planDerivation, EXTERNAL_INPUT_DERIVATION, isTaskContextContract, type MachinePlan } from "./model.js";
 import { deriveTasks } from "./derive.js";
@@ -145,7 +145,7 @@ export class Compiler {
     checkedPlanDerivation(plan);
     return plan;
   }
-  gate(project: string, ref: Ref, allowHistorical = false): GateResult {
+  gate(project: string, ref: Ref, allowHistorical = false, declareClosure = false): GateResult {
     requireCondition(isRef(ref), "plan_ref_invalid", "A versioned plan reference is required");
     const plan = this.read(ref.id); const result: GateResult = { findings: [], guards: [reference(plan)] };
     if (plan.value.projectId !== project || plan.hash !== ref.hash || plan.revision !== ref.revision) {
@@ -154,11 +154,15 @@ export class Compiler {
     if (plan.value.version !== 2 && !allowHistorical) result.findings.push({ code: "plan_version_upgrade_required", target: ref.id,
       message: "New plan admission requires version 2 write grants; historical accepted plans remain readable" });
     const basis = this.store.get<Feasibility>(plan.value.feasibility.id, plan.value.feasibility.revision)!;
+    const external: StageExternalCheck[] = [{ kind: 'git-ancestry', basis: reference(plan) }];
+    let complete = true;
     if (plan.value.feasibility.id.startsWith('om-feasibility:')) {
-      const current = this.refinement.feasibilityGate(project, plan.value.feasibility);
+      const current = this.refinement.feasibilityGate(project, plan.value.feasibility, false, declareClosure);
       result.findings.push(...current.findings);
       result.guards.push(...current.guards);
       result.admissionGuards = uniqueTransactionGuards([...current.guards, ...(current.admissionGuards ?? [])]);
+      if (current.closure) external.push(...current.closure.external);
+      else complete = false;
     } else {
       const obligations = readinessObligations(this.store, project, basis.value.inputs, basis.value.obligations, 'consume', allowHistorical);
       result.findings.push(...obligations.findings);
@@ -172,9 +176,11 @@ export class Compiler {
       if (!current || current.revision !== input.revision || current.hash !== input.hash
         || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "plan_stale", target: input.id, message: "A source used to compile this plan changed" });
       else result.guards.push(reference(current));
+      if (current?.kind === 'source') external.push({ kind: 'source', ref: input });
     }
     if (!result.findings.length && result.admissionGuards?.length && !transactionGuardsCurrent(this.store, [...result.guards, ...result.admissionGuards]))
       result.findings.push({ code: "plan_stale", target: ref.id, message: "An admission dependency changed while this plan was checked" });
+    if (declareClosure && !result.findings.length && complete) result.closure = { contract: STAGE_CLOSURE_CONTRACT, external };
     return result;
   }
   publish(project: string, planRef: Ref, expected: number, extraGuards: TransactionGuard[] = []) {

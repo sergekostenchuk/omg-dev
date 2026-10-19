@@ -18,11 +18,11 @@ import { canonical, hashJson, type Json } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Graph } from "../graph/model.js";
 import { Environments, transactionGuardsCurrent, uniqueTransactionGuards } from "../runtime/environment.js";
-import { Refinement } from "../graph/refinement.js";
+import { Refinement, REFINEMENT_EXTERNAL_CHECKS } from "../graph/refinement.js";
 import { buildL1 } from "../graph/builder.js";
 import { projectGraph } from "../graph/project.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
-import { resultGate } from "../execution/result.js";
+import { EXECUTION_EXTERNAL_CHECKS, resultGate } from "../execution/result.js";
 import { conceptApplicationFindings, preparationFindings, specificationApplicationFindings } from "../discovery/preparation-validation.js";
 import { assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { readModelCallRecovery } from "../discovery/model-call-recovery.js";
@@ -232,9 +232,12 @@ export class StageChecks {
   constructor(readonly store: Store) {
     this.discovery = new Discovery(store); this.graphs = new GraphRepository(store, this.discovery);
     const validators = Object.fromEntries(STAGES.map(stage => [stage, (context: GateContext) => this.validateStage(stage, context)])) as unknown as StageValidators;
+    // G2a: source/graph-projection; G2b: repository/environment/om-feasibility (refinement) and git-ancestry (execution).
     this.pipeline = new Pipeline(store, validators, {
       source: sourceExternalHandler,
       "graph-projection": graphProjectionHandler,
+      ...REFINEMENT_EXTERNAL_CHECKS,
+      ...EXECUTION_EXTERNAL_CHECKS,
     });
     this.environments = new Environments(store);
     this.refinement = new Refinement(store, this.discovery, this.graphs, this.environments, this.pipeline);
@@ -248,17 +251,17 @@ export class StageChecks {
     if (stage === "om-g2") {
       const content = context.content as { feasibility?: unknown } | null;
       if (!content || Object.keys(content).join(",") !== "feasibility" || !isRef(content.feasibility)) return rejected("feasibility_missing", "This stage requires a bound R3 result");
-      return this.refinement.feasibilityGate(context.projectId, content.feasibility, context.accepted === true);
+      return this.refinement.feasibilityGate(context.projectId, content.feasibility, context.accepted === true, context.accepted !== true);
     }
     if (stage === "compilation") {
       const content = context.content as { plan?: unknown } | null;
       if (!content || Object.keys(content).join(",") !== "plan" || !isRef(content.plan)) return rejected("plan_missing", "Compilation stage requires a generated plan");
-      return this.compiler.gate(context.projectId, content.plan, context.accepted === true);
+      return this.compiler.gate(context.projectId, content.plan, context.accepted === true, context.accepted !== true);
     }
     if (stage === "execution") {
       const content = context.content as { result?: unknown } | null;
       if (!content || !isRef(content.result) || Object.keys(content).join(",") !== "result") return rejected("execution_result_missing", "Execution requires a complete committed result");
-      return resultGate(this.store, context.projectId, content.result);
+      return resultGate(this.store, context.projectId, content.result, context.accepted !== true);
     }
     if (!UPSTREAM_STAGES.includes(stage as UpstreamStage)) return rejected("stage_not_available", "This execution-stage module is not connected yet");
     const content = context.content as unknown as StageContent;

@@ -128,29 +128,53 @@ export class ProductEngine {
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);
   }
   projection(project: string) {
+    // Closure declarations are producer instructions, not a change to the historical projection wire.
+    const presented = <T extends GateResult>(gate: T): Omit<T, 'closure'> => {
+      const { closure: _closure, ...value } = gate; return value;
+    };
     const currentPlan = this.store.get<Ref>(`current-plan:${project}`);
     const om = this.#omProject(project);
     const feasibilityId = `${om ? 'om-feasibility' : 'feasibility'}:${project}`;
     const feasibility = this.store.get<Feasibility>(feasibilityId);
+    const stages = this.pipeline.project(project);
+    // Reuse only a successful closed inspection of these exact bytes in this call.
+    // Unaccepted/current replacements still have their own gate; no result survives the projection.
+    const closed = stages.filter(stage => stage.state === 'accepted' && stage.artifact?.value.closure);
+    const sameRef = (left: unknown, right: Ref) => isRef(left) && canonical(left) === canonical(right);
+    const contentGate = (key: string, ref: Ref): GateResult | null => {
+      const stage = closed.find(stage => sameRef((stage.artifact!.value.content as Record<string, Json>)[key], ref));
+      return stage ? { findings: [], guards: stage.guards,
+        ...(stage.admissionGuards?.length ? { admissionGuards: stage.admissionGuards } : {}) } : null;
+    };
+    const proofGate = (ref: Ref): GateResult | null => {
+      const stage = closed.find(stage => ['om-g2', 'compilation'].includes(stage.stage)
+        && stage.guards.some(guard => sameRef(guard, ref)));
+      return stage ? { findings: [], guards: stage.guards,
+        ...(stage.admissionGuards?.length ? { admissionGuards: stage.admissionGuards } : {}) } : null;
+    };
+    const graph = this.store.get<Graph>(`graph:${project}`);
     const drafts = listDrafts(this.store, project);
-    const research = new Map(drafts.map(draft => [draft.id, this.discovery.gate(project, reference(draft))]));
+    const research = new Map(drafts.map(draft => [draft.id, contentGate('draft', reference(draft)) ?? this.discovery.gate(project, reference(draft))]));
     const questions = listQuestions(this.store, project).map(question => {
       const findings = (research.get(question.value.draftId)?.findings ?? []).filter(finding => finding.target === question.id
         || ["discovery_stale", "research_context_stale"].includes(finding.code));
       return { ...question, assessment: { state: question.value.status === "answered" && findings.length ? "stale" : question.value.status, findings } };
     });
     const ownerQuestions = om ? listOwnerQuestions(this.store, project, ENGINE_OWNER_READERS) : null;
-    return { project: this.#project(project), stages: this.pipeline.project(project), graph: this.store.get<Graph>(`graph:${project}`),
+    return { project: this.#project(project), stages: stages.map(presented), graph,
       mapStatus: mapStatus(this.store, project),
-      graphGate: this.graphs.gate(project),
+      graphGate: presented(graph ? proofGate(reference(graph)) ?? this.graphs.gate(project) : this.graphs.gate(project)),
       drafts, questions,
       sources: this.store.list<Source>("source").filter(item => item.value.projectId === project),
       environment: this.store.get<Environment>(`environment:${project}`),
-      phases: PHASES.filter(phase => phase !== "R3").map(phase => ({ phase, record: this.store.get(`phase:${project}:${phase}`), gate: this.refinement.gate(project, phase) })),
-      feasibility, feasibilityGate: feasibility ? this.refinement.feasibilityGate(project, reference(feasibility))
+      phases: PHASES.filter(phase => phase !== "R3").map(phase => {
+        const record = this.store.get(`phase:${project}:${phase}`);
+        return { phase, record, gate: presented(record ? proofGate(reference(record)) ?? this.refinement.gate(project, phase) : this.refinement.gate(project, phase)) };
+      }),
+      feasibility, feasibilityGate: feasibility ? presented(contentGate('feasibility', reference(feasibility)) ?? this.refinement.feasibilityGate(project, reference(feasibility)))
         : om ? { findings: [{ code: 'feasibility_missing', target: feasibilityId, message: 'The OM project requires an M8 assessment' }], guards: [] } : null,
       plans: this.store.list<MachinePlan>("plan").filter(item => item.value.projectId === project), currentPlan,
-      planGate: currentPlan ? this.compiler.gate(project, currentPlan.value) : null,
+      planGate: currentPlan ? presented(contentGate('plan', currentPlan.value) ?? this.compiler.gate(project, currentPlan.value)) : null,
       runs: this.store.list<TaskRun>("task-run").filter(item => item.value.projectId === project),
       executionRoot: this.store.get<ExecutionRoot>(`execution-root:${project}`),
       executionRunning: this.executor.isRunning(project),

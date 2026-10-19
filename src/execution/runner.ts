@@ -26,6 +26,7 @@ import { executionOwnership } from "./ownership.js";
 import { taskStartProofs, requireCurrentTaskStart, requirePlanTaskObligations } from './task-obligations.js';
 import { assertPilotBoundary, type ExecutionAdmission } from "../discovery/reader-pilot.js";
 import { acquireRunExecution, releaseRunExecution, runOwnerState, RunControlGate, type RunExecution } from "../om/run-control.js";
+import { writeSealedExecutionStage } from './result.js';
 
 /**
  * The currency of an exact plan, read the same way by the admission's writer and by execution (№3953-1): the compiler gate
@@ -635,9 +636,7 @@ export class Executor {
       const result = this.store.get<ExecutionResult>(id) ?? this.store.write<ExecutionResult>({ id, kind: "execution-result", expected: 0, value });
       const previousStage = this.store.get<StageArtifact>(stageId(project, "execution"));
       if ((previousStage?.value.content as unknown as { result?: Ref } | undefined)?.result?.hash !== result.hash)
-        this.store.write<StageArtifact>({ id: stageId(project, "execution"), kind: "stage", expected: previousStage?.revision ?? 0,
-          value: { projectId: project, stage: "execution", status: "accepted", content: { result: reference(result) },
-            inputs: [reference(stage)], proofs: [reference(result), ...results.map(reference)] } });
+        writeSealedExecutionStage(this.store, project, reference(stage), reference(result), previousStage?.revision ?? 0);
       return results;
     } finally {
       unwatch?.(); if (held) releaseRunExecution(this.store, held);
