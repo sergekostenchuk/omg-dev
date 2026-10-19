@@ -2,13 +2,12 @@ import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import type { Graph } from '../graph/model.js';
 import { withGraphRead } from '../graph/repository.js';
-import { StageChecks } from '../product/stage-checks.js';
 import { isRef, reference, type Ref, type StageArtifact } from '../pipeline/contracts.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Store, type Revision, type TransactionGuard, type Write } from '../storage/store.js';
 import { readHorizon, type HorizonRecords } from './horizon.js';
 import { prepareHorizonBasis } from './frame-obligations.js';
-import { historicalTrace, readOmAdmissionGuards, readOmInput, withHistoricalReads } from './input.js';
+import { historicalTrace, readOmInput, withHistoricalReads } from './input.js';
 import { readLayerAcceptance, readLayerEnvelope } from './layer-basis.js';
 import { readRecord, writeGuarded } from './refs.js';
 import { readRoutes, prepareRoutes, type RoutesRecord } from './routes.js';
@@ -101,7 +100,7 @@ export function computeBlockWeights(upper: Graph, blocks: string[], policy: Queu
   return run(() => {
     checkPolicy(policy);
     const source = (target: string, field: string, message: string): never => fail('queue_source_invalid', target, field, message);
-    if (upper.version !== 1 && upper.version !== 2) source('upper', 'version', 'The upper graph version must be known');
+    if (upper.version !== 2) source('upper', 'version', 'The upper graph must use version 2');
     if (!upper.nodes.every(node => object(node) && text(node.id) && ['product', 'block', 'operation', 'work'].includes(node.kind) && text(node.outcome)
       && object(node.boundary) && text(node.boundary.writer) && text(node.boundary.rollback))) source('upper', 'nodes', 'Every node needs its structural identity');
     const nodes = new Map(upper.nodes.map(node => [node.id, node]));
@@ -271,26 +270,13 @@ function refinementGuards(store: Store, horizon: HorizonRecords, graph: Ref): Re
   };
   const traced = historicalTrace(store, (ref, head) => { if (head) remember(ref); }, 'distinct');
   current(traced, refinement);
-  if (refinement.id === `graph-layer:${request.project}:2`) {
-    const basis = readLayerAcceptance(traced, { project: request.project, level: 2, graph, layer: refinement });
-    if (!basis.ok) fail('horizon_refinement_unproven', basis.refusal.at.target, basis.refusal.at.field ?? 'acceptance', basis.refusal.message);
-    for (const ref of basis.value.currentReferences) current(traced, ref);
-  } else {
-    const phase = take(readRecord<{ layer: Ref }>(traced, refinement,
-      { unit: 'M3', target: refinement.id, kind: 'phase', id: `phase:${request.project}:L2` }));
-    // Legacy layers need the full projection check too, even when they predate layerProofs.
-    take(readLayerEnvelope(traced, { project: request.project, level: 2, graph, layer: phase.value.layer }));
-    const engine = new StageChecks(traced);
-    for (const [name, gate] of [['refinement.L2', engine.refinement.gate(request.project, 'L2')],
-      ['layer.2', engine.graphs.layerGate(request.project, 2, phase.value.layer)]] as const) {
-      const admission = take(readOmAdmissionGuards(gate.admissionGuards, name, 'G2'));
-      if (gate.findings.length) {
-        const finding = gate.findings[0]!;
-        fail('horizon_refinement_unproven', finding.target, finding.code, finding.message);
-      }
-      for (const ref of [...gate.guards, ...admission]) remember(ref);
-    }
-  }
+  if (refinement.id !== `graph-layer:${request.project}:2`)
+    fail('horizon_refinement_unproven', refinement.id, 'refinement', 'Refinement must name an accepted OM N2 layer');
+  const basis = readLayerAcceptance(traced, { project: request.project, level: 2, graph, layer: refinement });
+  if (!basis.ok) fail('horizon_refinement_unproven', basis.refusal.at.target, basis.refusal.at.field ?? 'acceptance', basis.refusal.message);
+  if (basis.value.producer !== 'om')
+    fail('horizon_refinement_unproven', refinement.id, 'producer', 'Refinement must retain its accepted OM frame');
+  for (const ref of basis.value.currentReferences) current(traced, ref);
   return [...guards.values()];
   });
 }
