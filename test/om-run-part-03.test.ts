@@ -3,12 +3,11 @@ import assert from "node:assert/strict";
 import { writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
-import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { type Refusal } from "../src/om/refusal.js";
 import type { Graph } from "../src/graph/model.js";
-import { ProductEngine } from "../src/product/engine.js";
+import { runIntegrityCheck } from "../src/om/integrity.js";
 import { git } from "../src/runtime/environment.js";
 import { Evidence } from "../src/evidence/evidence.js";
 import type { OmInputRecord } from "../src/om/input.js";
@@ -116,11 +115,14 @@ test("C01 №1852 H1 one pass per project: a repeated start reads it, equal conc
   assert.deepEqual(lost, again);
   assert.equal(again.revision, 1);
   assert.deepEqual(again.value.input, reference(f.store.get(`om-input:${project}`)!));
-  // The engine recognizes even an incomplete run record as B1-born: without its first B1 the era is an integrity refusal.
+  // G7 moved B1 provenance from the hot era read to om-fsck, including incomplete run records.
   const other = new Store(join(f.root, "orphan.sqlite"));
   t.after(() => other.close());
   other.write({ id: runId(project), kind: "om-run", expected: 0, value: { contract: "om-run/v1" } });
-  assert.throws(() => new ProductEngine(other).legacyRoute(project), (error: unknown) => error instanceof EngineError && error.code === "record_missing");
+  assert.deepEqual(ok(runIntegrityCheck(other, { project })).value.findings, [{
+    code: "record_missing", id: `om-input:${project}`, revision: 1, field: "revision", ref: null,
+    message: "OM provenance requires the exact first B1 input",
+  }]);
 });
 
 test("H1.2 R12 R10a 27 25 7 C61 C28 H1 end to end: the pass works L3 through MC2, G4b and one bound works acceptance, then M8 (not ready, then fixed), M9 and the existing compiler; no base is built for the completed pass", async t => {
