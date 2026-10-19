@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { Store } from '../src/storage/store.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { hashJson } from '../src/canonical.js';
-import { configureBudgetSegment, budgetSegment, reserveResearchCall, budgetUsage, raiseWorkingLimit, workingLimit, assertQuestionBudget, budgetGroups, type BudgetSegment, type Optimization } from '../src/runtime/research-budget.js';
+import { configureBudgetSegment, budgetSegment, reserveResearchCall, prepareNewSegmentReservation, segmentCompletionReserve, budgetUsage, raiseWorkingLimit, workingLimit, assertQuestionBudget, budgetGroups, segmentId, type BudgetSegment, type NewBudgetSegment, type BudgetSegmentTarget, type Optimization } from '../src/runtime/research-budget.js';
 import { assertPilotBoundary } from '../src/discovery/reader-pilot.js';
 import { configurePhasePolicy } from '../src/discovery/phase-policy.js';
 import { scopeObligations, type ResearchScope } from '../src/graph/research-scope.js';
@@ -269,3 +269,216 @@ test('an oversized saved working limit cannot hide a block overrun or admit anot
   assert.throws(() => assertQuestionBudget(store, segment, ['g']), { code: 'budget_owner_group_overrun' });
   assert.throws(() => reserveResearchCall(store, segment, 'after-overrun', ['g'], { ...estimate, tokens: 1 }), { code: 'budget_owner_group_limit' });
 });
+
+test('completion reserve is validated, immutable, and legacy segments remain compatible', t => {
+  const { store, basis, segment: legacy } = fixture(t);
+  assert.equal(segmentCompletionReserve(store, legacy), 0);
+  assert.equal(Object.hasOwn(budgetSegment(store, 'p', 'R2-L3').value, 'completionReserve'), false);
+
+  for (const invalid of [-1, 1.5, NaN, null as unknown as number, 20_000_001, '500' as unknown as number]) {
+    assert.throws(() => configureBudgetSegment(store, 'p', 'invalid-reserve', 20_000_000, 700_000, undefined, invalid),
+      { code: 'budget_completion_reserve_invalid' });
+  }
+
+  // 0 and exact limit are valid completion reserves
+  const zeroReserve = configureBudgetSegment(store, 'p', 'zero-reserve', 10_000_000, 700_000, undefined, 0);
+  assert.equal(budgetSegment(store, 'p', 'zero-reserve').value.completionReserve, 0);
+  assert.equal(segmentCompletionReserve(store, zeroReserve), 0);
+
+  const fullReserve = configureBudgetSegment(store, 'p', 'full-reserve', 10_000_000, 700_000, undefined, 10_000_000);
+  assert.equal(budgetSegment(store, 'p', 'full-reserve').value.completionReserve, 10_000_000);
+  assert.equal(segmentCompletionReserve(store, fullReserve), 10_000_000);
+
+  const segment = configureBudgetSegment(store, 'p', 'with-reserve', 10_000_000, 700_000, undefined, 2_000_000);
+  assert.equal(budgetSegment(store, 'p', 'with-reserve').value.completionReserve, 2_000_000);
+  assert.equal(segmentCompletionReserve(store, segment), 2_000_000);
+
+  // In-memory masquerade is rejected by hash mismatch
+  const estimate = { kind: 'estimated' as const, tokens: 1, basis: [reference(basis)], explanation: 'fixture' };
+  const masquerade = { ...segment, value: { ...segment.value, completionReserve: 0 } };
+  assert.throws(() => reserveResearchCall(store, masquerade, 'forged-call', ['g'], estimate), { code: 'budget_segment_invalid' });
+
+  // Removal of completionReserve on a segment that had it is a typed refusal, never fallback to 0
+  const { completionReserve: _removed, ...withoutReserve } = segment.value;
+  store.write({ id: segment.id, kind: segment.kind, expected: segment.revision, value: withoutReserve });
+  assert.throws(() => budgetSegment(store, 'p', 'with-reserve'), { code: 'budget_completion_reserve_changed' });
+  assert.throws(() => reserveResearchCall(store, store.get<BudgetSegment>(segment.id)!, 'call-no-reserve', ['g'], estimate),
+    { code: 'budget_completion_reserve_changed' });
+
+  // Changing completionReserve in a later revision is a typed refusal
+  const changed = store.write<BudgetSegment>({ id: segment.id, kind: segment.kind, expected: 2,
+    value: { ...segment.value, completionReserve: 3_000_000 } });
+  assert.throws(() => reserveResearchCall(store, changed, 'changed-call', ['g'], estimate), { code: 'budget_completion_reserve_changed' });
+
+  // Adding completionReserve to a legacy segment that was created without it is also a typed refusal
+  const legacyAdded = store.write<BudgetSegment>({ id: legacy.id, kind: legacy.kind, expected: legacy.revision,
+    value: { ...legacy.value, completionReserve: 500 } });
+  assert.throws(() => reserveResearchCall(store, legacyAdded, 'legacy-added-call', ['g'], estimate), { code: 'budget_completion_reserve_changed' });
+});
+
+test('classification research stays inside limit minus reserve while completion uses full limit, refusing both after overrun', t => {
+  const { store, basis } = fixture(t);
+  const segment = configureBudgetSegment(store, 'p', 'split-headroom', 10_000_000, 10_000_000, undefined, 2_000_000);
+  const estimate = { kind: 'estimated' as const, tokens: 7_500_000, basis: [reference(basis)], explanation: 'research batch' };
+
+  // Invalid classification is a typed refusal
+  assert.throws(() => reserveResearchCall(store, segment, 'invalid-class', ['g'], estimate, 'other' as unknown as 'research'),
+    { code: 'budget_class_invalid' });
+
+  // Research reserve of 7.5M fits in limit - R (10M - 2M = 8M)
+  const res1 = reserveResearchCall(store, segment, 'c1', ['g'], estimate, 'research');
+  store.writeMany([{ id: 'c1', kind: 'model-call', expected: 0, value: call('c1') }, ...res1.writes], res1.guards);
+
+  // Next research of 600k would reach 8.1M > 8M -> refuses budget_segment_exhausted
+  const estNext = { kind: 'estimated' as const, tokens: 600_000, basis: [reference(basis)], explanation: 'next chunk' };
+  assert.throws(() => reserveResearchCall(store, segment, 'c2-res', ['g'], estNext, 'research'),
+    { code: 'budget_segment_exhausted' });
+
+  // Default classification is 'research'
+  assert.throws(() => reserveResearchCall(store, segment, 'c2-def', ['g'], estNext),
+    { code: 'budget_segment_exhausted' });
+
+  // Completion reserve of 600k fits in full limit (7.5M + 600k = 8.1M <= 10M)
+  const res2 = reserveResearchCall(store, segment, 'c2-comp', ['g'], estNext, 'completion');
+  store.writeMany([{ id: 'c2-comp', kind: 'model-call', expected: 0, value: call('c2-comp') }, ...res2.writes], res2.guards);
+
+  // Completion call exceeding full limit (8.1M + 2M = 10.1M > 10M) refuses budget_segment_exhausted
+  const estOver = { kind: 'estimated' as const, tokens: 2_000_000, basis: [reference(basis)], explanation: 'exceed full' };
+  assert.throws(() => reserveResearchCall(store, segment, 'c3-comp', ['g'], estOver, 'completion'),
+    { code: 'budget_segment_exhausted' });
+
+  // Two reservations prepared against the same ledger snapshot conflict on CAS
+  const estSmall = { kind: 'estimated' as const, tokens: 100_000, basis: [reference(basis)], explanation: 'small' };
+  const left = reserveResearchCall(store, segment, 'snap-left', ['g'], estSmall, 'completion');
+  const right = reserveResearchCall(store, segment, 'snap-right', ['g'], estSmall, 'completion');
+  store.writeMany([{ id: 'snap-left', kind: 'model-call', expected: 0, value: call('snap-left') }, ...left.writes], left.guards);
+  assert.throws(() => store.writeMany([{ id: 'snap-right', kind: 'model-call', expected: 0, value: call('snap-right') }, ...right.writes], right.guards),
+    { code: 'revision_conflict' });
+
+  // Failed call with usage: null holds its reserve
+  const c1 = store.get<ModelCall>('c1')!;
+  store.write({ id: 'c1', kind: 'model-call', expected: c1.revision, value: { ...c1.value, status: 'failed', finishedAt: 2 } });
+  assert.equal(budgetUsage(store, segment).reserved >= 7_500_000, true);
+  // Still cannot allocate more research tokens
+  assert.throws(() => reserveResearchCall(store, segment, 'c-after-fail', ['g'], estNext, 'research'),
+    { code: 'budget_segment_exhausted' });
+
+  // Succeeded call with actual overrun (measured > limit) blocks both research and completion
+  const c2 = store.get<ModelCall>('c2-comp')!;
+  store.write({ id: 'c2-comp', kind: 'model-call', expected: c2.revision,
+    value: { ...c2.value, status: 'succeeded', finishedAt: 3, usage: { inputTokens: 11_000_000, outputTokens: 0, cachedInputTokens: 0, reasoningOutputTokens: 0 } } });
+  assert.equal(budgetUsage(store, segment).remaining < 0, true);
+
+  const estMin = { kind: 'estimated' as const, tokens: 1, basis: [reference(basis)], explanation: 'minimal' };
+  assert.throws(() => reserveResearchCall(store, segment, 'after-overrun-res', ['g'], estMin, 'research'),
+    { code: 'budget_segment_exhausted' });
+  assert.throws(() => reserveResearchCall(store, segment, 'after-overrun-comp', ['g'], estMin, 'completion'),
+    { code: 'budget_segment_exhausted' });
+});
+
+test('atomic preparation of new segment and first reserve returns expected:0 without existing segment guards and resolves races', t => {
+  const { store, basis } = fixture(t);
+  const estimate = { kind: 'estimated' as const, tokens: 500_000, basis: [reference(basis)], explanation: 'first reserve' };
+
+  const creating: NewBudgetSegment = {
+    projectId: 'p',
+    key: 'fresh-stage',
+    limit: 10_000_000,
+    initialGroupLimit: 10_000_000,
+    completionReserve: 2_000_000
+  };
+
+  // Validation on creating target
+  assert.throws(() => prepareNewSegmentReservation(store, { ...creating, limit: 0 }, 'c0', ['g'], estimate),
+    { code: 'budget_invalid' });
+  assert.throws(() => prepareNewSegmentReservation(store, { ...creating, completionReserve: -1 }, 'c0', ['g'], estimate),
+    { code: 'budget_completion_reserve_invalid' });
+  assert.throws(() => prepareNewSegmentReservation(store, { ...creating, completionReserve: 10_000_001 }, 'c0', ['g'], estimate),
+    { code: 'budget_completion_reserve_invalid' });
+  assert.throws(() => prepareNewSegmentReservation(store, { ...creating, ownerGroupCeiling: 20_000_000 }, 'c0', ['g'], estimate),
+    { code: 'budget_owner_ceiling_invalid' });
+
+  // Missing or undefined completionReserve on creating target is a typed refusal across both entrypoints
+  const { completionReserve: _omitted, ...missingReserve } = creating;
+  assert.throws(() => prepareNewSegmentReservation(store, missingReserve as unknown as NewBudgetSegment, 'c-missing', ['g'], estimate),
+    { code: 'budget_completion_reserve_invalid' });
+  assert.throws(() => prepareNewSegmentReservation(store, { ...creating, completionReserve: undefined as unknown as number }, 'c-undef', ['g'], estimate),
+    { code: 'budget_completion_reserve_invalid' });
+  assert.throws(() => reserveResearchCall(store, { creating: missingReserve as unknown as NewBudgetSegment }, 'c-missing-res', ['g'], estimate, 'research'),
+    { code: 'budget_completion_reserve_invalid' });
+  assert.throws(() => reserveResearchCall(store, { creating: { ...creating, completionReserve: undefined as unknown as number } }, 'c-undef-res', ['g'], estimate, 'research'),
+    { code: 'budget_completion_reserve_invalid' });
+  assert.equal(store.get(segmentId('p', missingReserve.key)), null);
+  assert.equal(store.get(`research-budget-ledger:${hashJson(segmentId('p', missingReserve.key))}`), null);
+  assert.equal(store.get('c-missing'), null);
+  assert.equal(store.get('c-missing-res'), null);
+
+  // Positive controls of explicit R=0 and R=limit through creating
+  const zeroCreating: NewBudgetSegment = { projectId: 'p', key: 'zero-creating', limit: 10_000_000, initialGroupLimit: 10_000_000, completionReserve: 0 };
+  const zeroPrep = prepareNewSegmentReservation(store, zeroCreating, 'call-zero', ['g'], estimate, 'research');
+  store.writeMany([{ id: 'call-zero', kind: 'model-call', expected: 0, value: call('call-zero') }, ...zeroPrep.writes], zeroPrep.guards);
+  const zeroSaved = budgetSegment(store, 'p', 'zero-creating');
+  assert.equal(zeroSaved.value.completionReserve, 0);
+  assert.equal(segmentCompletionReserve(store, zeroSaved), 0);
+  assert.doesNotThrow(() => reserveResearchCall(store, zeroSaved, 'zero-full', ['g'], { kind: 'estimated', tokens: 9_500_000, basis: [reference(basis)], explanation: 'full' }, 'research'));
+
+  const fullCreating: NewBudgetSegment = { projectId: 'p', key: 'full-creating', limit: 10_000_000, initialGroupLimit: 10_000_000, completionReserve: 10_000_000 };
+  assert.throws(() => prepareNewSegmentReservation(store, fullCreating, 'call-full-res', ['g'], { kind: 'estimated', tokens: 1, basis: [reference(basis)], explanation: '1 token' }, 'research'),
+    { code: 'budget_segment_exhausted' });
+  const fullPrep = prepareNewSegmentReservation(store, fullCreating, 'call-full-comp', ['g'], { kind: 'estimated', tokens: 10_000_000, basis: [reference(basis)], explanation: 'full' }, 'completion');
+  store.writeMany([{ id: 'call-full-comp', kind: 'model-call', expected: 0, value: call('call-full-comp') }, ...fullPrep.writes], fullPrep.guards);
+  const fullSaved = budgetSegment(store, 'p', 'full-creating');
+  assert.equal(fullSaved.value.completionReserve, 10_000_000);
+  assert.equal(segmentCompletionReserve(store, fullSaved), 10_000_000);
+
+  // Research exceeding limit - R on creating is refused
+  const estTooBig = { kind: 'estimated' as const, tokens: 8_000_001, basis: [reference(basis)], explanation: 'too big' };
+  assert.throws(() => prepareNewSegmentReservation(store, creating, 'c-too-big', ['g'], estTooBig, 'research'),
+    { code: 'budget_segment_exhausted' });
+
+  // Completion on creating can use full limit
+  const estComp = { kind: 'estimated' as const, tokens: 8_500_000, basis: [reference(basis)], explanation: 'completion fits' };
+  const compPrep = prepareNewSegmentReservation(store, creating, 'c-comp', ['g'], estComp, 'completion');
+  assert.equal(compPrep.writes.length, 2);
+  assert.equal(compPrep.writes[0]!.expected, 0);
+  assert.equal(compPrep.writes[1]!.expected, 0);
+  // Guards must contain basis but NOT reference(segment)
+  assert.equal(compPrep.guards.some(g => 'revision' in g && g.id.startsWith('research-budget:')), false);
+
+  // Normal preparation
+  const prep = prepareNewSegmentReservation(store, creating, 'first-call', ['g'], estimate, 'research');
+  assert.equal(prep.writes.length, 2);
+  assert.equal(prep.writes[0]!.kind, 'research-budget');
+  assert.equal(prep.writes[0]!.expected, 0);
+  assert.equal(prep.writes[1]!.kind, 'research-budget-ledger');
+  assert.equal(prep.writes[1]!.expected, 0);
+  // No segment guard because segment does not yet exist
+  assert.equal(prep.guards.some(g => 'revision' in g && g.id === prep.writes[0]!.id), false);
+
+  // Two concurrent stores prepare creating reservation for the same key
+  const other = new Store(store.path);
+  t.after(() => other.close());
+  const otherPrep = prepareNewSegmentReservation(other, creating, 'other-call', ['g'], estimate, 'research');
+
+  // First commits: model-call, segment, and ledger are all written in one transaction
+  store.writeMany([{ id: 'first-call', kind: 'model-call', expected: 0, value: call('first-call') }, ...prep.writes], prep.guards);
+  assert.equal(store.get<ModelCall>('first-call')!.value.status, 'running');
+  assert.equal(store.get(prep.writes[0]!.id)!.revision, 1);
+  assert.equal(store.get(prep.writes[1]!.id)!.revision, 1);
+
+  // Second store commit fails with revision_conflict
+  assert.throws(() => other.writeMany([{ id: 'other-call', kind: 'model-call', expected: 0, value: call('other-call') }, ...otherPrep.writes], otherPrep.guards),
+    { code: 'revision_conflict' });
+  // Loser writes nothing: neither call, nor second segment, nor second ledger
+  assert.equal(store.get('other-call'), null);
+  assert.equal(store.get(prep.writes[0]!.id)!.revision, 1);
+
+  // Subsequent call uses { saved: Revision<BudgetSegment> }
+  const savedSegment = budgetSegment(store, 'p', 'fresh-stage');
+  const target: BudgetSegmentTarget = { saved: savedSegment };
+  const nextRes = reserveResearchCall(store, target, 'second-call', ['g'], estimate, 'research');
+  assert.equal(nextRes.writes.length, 1);
+  assert.equal(nextRes.writes[0]!.expected, 1);
+  assert.equal(nextRes.guards.some(g => 'revision' in g && g.id === savedSegment.id), true);
+});
+
