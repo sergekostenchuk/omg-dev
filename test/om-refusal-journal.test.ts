@@ -2,10 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { Store, type Revision } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
@@ -1496,33 +1495,13 @@ test("C32 H1.0c every argument of the batch is checked for its shape before the 
   assert.equal(journalOf(store), null);
 });
 
-// The base the accepted single-row preparations must keep their output against (C34, C68).
-const BASE_COMMIT = "4e4351f65b6cf5e93683fcc874f2938437c21eb3";
-
-// One program runs the same steps twice, each time in its own process: once on the code of this tree, once on the
-// base loaded whole from Git. Only the modules differ, never the steps or the reading of their results. What the steps
-// produced is printed as ONE text, refusals and thrown defects with their messages and details, and compared as text.
-function journalRun(root: string, database: string, steps: readonly unknown[], base: boolean): { batch: string; text: string; outputs: unknown[]; history: unknown[] } {
+/**
+ * One program runs the same steps in its own process against this tree's built code and prints every outcome as ONE
+ * text: delivered values, refusals and thrown defects with their messages and details.
+ */
+function journalRun(root: string, database: string, steps: readonly unknown[], tag: string): { batch: string; outputs: unknown[]; history: unknown[] } {
   const repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(root, "journal-base-loader.mjs"), runner = join(root, "journal-runner.mjs");
-  const input = join(root, `journal-steps-${base ? "base" : "current"}.json`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/src/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', '${BASE_COMMIT}:' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}`);
+  const runner = join(root, `journal-runner-${tag}.mjs`), input = join(root, `journal-steps-${tag}.json`);
   writeFileSync(runner, `import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -1559,17 +1538,13 @@ try {
     history: store.list().map(record => [record.id, record.revision, record.hash]) }));
 } finally { store.close(); }`);
   writeFileSync(input, JSON.stringify(steps));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)} } });`;
-  const flags = base ? ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`] : [];
-  const printed = execFileSync(process.execPath, [...flags, runner, repository, database, input],
+  const printed = execFileSync(process.execPath, [runner, repository, database, input],
     { cwd: repository, encoding: "utf8", timeout: 120_000, maxBuffer: 10_000_000 });
   const split = printed.indexOf("\n");
-  const text = printed.slice(split + 1);
-  return { batch: printed.slice(0, split), text, ...(JSON.parse(text) as { outputs: unknown[]; history: unknown[] }) };
+  return { batch: printed.slice(0, split), ...(JSON.parse(printed.slice(split + 1)) as { outputs: unknown[]; history: unknown[] }) };
 }
 
-test("C34 C68 H1.0c a journal of the base 4e4351f is continued byte for byte as the base continues it, and a new journal is created in the explicit new form", async t => {
+test("C34 C68 H1.0c a journal is created in the explicit new form and continued exactly, a planted journal without its order is refused on every path", async t => {
   const { root, store } = fixture(t);
   const frame: FrameRequest = { project: PROJECT, level: 2, graph: BASE, horizon: refTo("om-horizon-gate:alpha:one"),
     layer: null, frame: null, upper: null };
@@ -1590,6 +1565,7 @@ test("C34 C68 H1.0c a journal of the base 4e4351f is continued byte for byte as 
     const moved = gateRecord(target, "g6:1", gateFailure({ gate: "G6" }));
     target.write({ id: moved.id, kind: UNIT_REFUSAL_KIND, expected: 1, value: gateFailure({ gate: "G6", refusals: [entry({ code: "repository_dirty" })] }) });
     records['moved'] = reference(moved);
+    // A journal planted by a raw Store write carries no order marker: rows no refusal gave, in no order this code wrote.
     target.write({ id: journalId("forged"), kind: REFUSAL_JOURNAL_KIND, expected: 0, value: { projectId: "forged", rows: ["a row"], classifications: [] } });
     return records;
   };
@@ -1634,38 +1610,23 @@ test("C34 C68 H1.0c a journal of the base 4e4351f is continued byte for byte as 
     { op: "prepareClassify", request: { project: PROJECT, classifications: [{ ...decide(g3!), basis: [{ role: "proposal" }] }] } },
     { op: "prepareRecord", request: record(refs['g3'], "alpha:beta") },
   ];
-  const era = join(root, "era.sqlite"), current = join(root, "current.sqlite"), base = join(root, "base.sqlite");
-  const fresh = join(root, "fresh.sqlite"), freshBase = join(root, "fresh-base.sqlite");
-  for (const path of [era, fresh, freshBase]) {
+  const first = join(root, "first.sqlite"), current = join(root, "current.sqlite"), fresh = join(root, "fresh.sqlite");
+  for (const path of [first, fresh]) {
     const target = new Store(path);
     try { assert.deepEqual(seed(target), refs); } finally { target.close(); }
   }
-  // Q3 (№2573-2): the journal is created by the base 4e4351f — a journal of its era — and both codes then continue it on
-  // identical copies: what the base did to it, the current code does byte for byte, by the rule of that era.
-  const created = journalRun(root, era, [steps[2]!], true).outputs as { result: { ok: boolean } }[];
+  // The creation run: a preparation on the missing journal, a classification it refuses as missing, then the record
+  // that creates the journal — all by this code, in the explicit new form.
+  const created = journalRun(root, first, steps.slice(0, 3), "first").outputs as { result: { ok: boolean; refusal?: { code: string } } }[];
   assert.equal(created[0]!.result.ok, true);
-  for (const path of [current, base]) copyFileSync(era, path);
+  assert.equal(created[1]!.result.ok, false); assert.equal(created[1]!.result.refusal!.code, "journal_missing");
+  assert.equal(created[2]!.result.ok, true);
+  copyFileSync(first, current);
   const continued = steps.slice(3);
-  const mine = journalRun(root, current, continued, false);
-  const theirs = journalRun(root, base, continued, true);
-  // Each run is what it says: this tree has the batch, the base does not.
+  const mine = journalRun(root, current, continued, "continued");
+  // This tree has the batch, and the run walked writes, repeats, both guard shapes and every refusal it names.
   assert.equal(mine.batch, "function");
-  assert.equal(theirs.batch, "undefined");
-  // Byte for byte: the printed outputs — writes, guards, values, refusals, thrown defects with message and details —
-  // and the records each store holds afterwards. NR1 (№3591/№3646): the steps of project "forged" continue a journal
-  // planted by a raw Store write (rows no refusal gave); the base refused it on reading, a planted self-consistent record
-  // is read as written now — those steps and that project's records are compared in the todo subtest below.
-  const planted = (step: unknown) => (step as { request?: { project?: string } }).request?.project === "forged";
-  assert.equal(continued.filter(planted).length, 2);
-  for (const [index, step] of continued.entries()) if (!planted(step))
-    assert.equal(JSON.stringify(mine.outputs[index]), JSON.stringify(theirs.outputs[index]), `step ${index + 3}: ${JSON.stringify(step).slice(0, 120)}`);
-  const unplanted = (run: typeof mine) => JSON.stringify(run.history.filter(row => !String((row as unknown[])[0]).includes("forged")));
-  assert.equal(unplanted(mine), unplanted(theirs));
-  await t.test("a journal planted by a raw write is refused when it is continued", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" },
-    () => assert.equal(mine.text, theirs.text));
-
-  // And the comparison is not empty: it walked writes, repeats, both guard shapes and every refusal it names.
-  type Output = { result?: { ok: boolean; value?: { writes?: unknown[]; guards?: Ref[] }; refusal?: { code: string } };
+  type Output = { result?: { ok: boolean; value?: { writes?: unknown[]; guards?: Ref[] }; refusal?: { code: string; at?: { field?: string } } };
     throws?: { code: string; message: string } };
   const outputs = mine.outputs as Output[];
   assert.equal(outputs.length, continued.length);
@@ -1675,15 +1636,21 @@ test("C34 C68 H1.0c a journal of the base 4e4351f is continued byte for byte as 
   assert.deepEqual(previous.map(ref => ref.id), [refs['g5']!.id, journalId(PROJECT)]);
   assert.equal(previous.find(ref => ref.id === journalId(PROJECT))!.revision, 1);
   const codes = new Set(outputs.map(item => item.throws?.code ?? (item.result!.ok ? "ok" : item.result!.refusal!.code)));
-  // NR1: journal_invalid came from the planted journal of project "forged" only (the todo subtest above).
+  // The steps of project "forged" continue a journal planted by a raw Store write: no order marker, so an addressed
+  // journal_invalid — a planted self-consistent record is not a journal of this code (NR1 covers deeper re-proofs).
+  const planted = (step: unknown) => (step as { request?: { project?: string } }).request?.project === "forged";
+  for (const [index, step] of continued.entries()) if (planted(step)) {
+    const refusal = outputs[index]!.result!.refusal!;
+    assert.deepEqual([refusal.code, refusal.at!.field], ["journal_invalid", "sourceOrder"], `planted step ${index + 3}`);
+  }
   for (const expected of ["ok", "journal_missing", "refusals_missing", "record_forged", "record_foreign", "reference_invalid", "input_stale",
-    "classification_conflict", "row_unknown", "journal_request_invalid"]) assert.ok(codes.has(expected), expected);
-  // The thrown defects carry their messages into the comparison, several different ones among them.
+    "classification_conflict", "row_unknown", "journal_request_invalid", "journal_invalid"]) assert.ok(codes.has(expected), expected);
+  // The thrown defects carry several different messages.
   assert.ok(new Set(outputs.flatMap(item => item.throws ? [item.throws.message] : [])).size >= 3);
 
-  // The era: the journal the base wrote reads in this tree, after a restart, as the one this tree wrote, and a batch of
-  // every source it holds with every decision it holds is a repeat of it.
-  const written = new Store(base); t.after(() => written.close());
+  // The journal this run wrote reads again after a restart, and a batch of every source it holds with every decision
+  // it holds is a repeat of it.
+  const written = new Store(current); t.after(() => written.close());
   const head = deliveredOf(readJournal(written, { project: PROJECT }));
   assert.deepEqual(JSON.parse(JSON.stringify(head)), (outputs[27]!.result as { value: unknown }).value);
   assert.deepEqual(deliveredOf(readJournalAt(written, PROJECT, reference(head))), head);
@@ -1691,24 +1658,61 @@ test("C34 C68 H1.0c a journal of the base 4e4351f is continued byte for byte as 
     classifications: [...head.value.classifications] })));
   assert.deepEqual([repeat.writes, repeat.guards, repeat.result], [[], [reference(head)], reference(head)]);
   assert.deepEqual(repeat.value, head.value);
-  assert.equal(Object.hasOwn(head.value, "sourceOrder"), false, "A journal of the base era stays unmarked when the current code continues it");
+  assert.equal(head.value.sourceOrder, SOURCE_ORDER, "A journal this code continues keeps the order marker it was written with");
 
-  // A journal the current code CREATES is of the explicit new form, marked on its preparation and its revision; the base
-  // creates the same journal unmarked. The two creations differ by the era they name, not by the rows of a one-source refusal.
+  // A journal the code CREATES is of the explicit new form, marked on its preparation and its revision.
   type Created = { result: { ok: boolean; value: { guards?: Ref[]; value: Record<string, unknown> } } };
   const creation = [steps[0]!, steps[2]!];
-  const newForm = journalRun(root, fresh, creation, false).outputs as Created[];
-  const baseForm = journalRun(root, freshBase, creation, true).outputs as Created[];
+  const newForm = journalRun(root, fresh, creation, "fresh").outputs as Created[];
   assert.deepEqual(newForm[0]!.result.value.guards, [refs['g3']]);
   assert.equal(newForm[0]!.result.value.value["sourceOrder"], SOURCE_ORDER);
   assert.equal(newForm[1]!.result.value.value["sourceOrder"], SOURCE_ORDER);
-  assert.equal(Object.hasOwn(baseForm[1]!.result.value.value, "sourceOrder"), false);
-  assert.deepEqual(newForm[1]!.result.value.value["rows"], baseForm[1]!.result.value.value["rows"]);
   const reread = new Store(fresh); t.after(() => reread.close());
   assert.equal(deliveredOf(readJournal(reread, { project: PROJECT })).value.sourceOrder, SOURCE_ORDER);
 });
 
-// ---- H1.0c S1: the marks of G4b, the typed reader registry and the ban on classifying a G4b row (C19, C21, C36, №1628).
+// A record planted at the journal's address is not a journal of this code whatever its body is made of: a null, a
+// bare array, an empty object and an unknown order are all the same addressed refusal on every read path — the exact
+// revision, the current head and the batch's own reading — and the refusal writes nothing.
+test("C34 H1.0c a planted journal body of any form is refused by its absent or foreign order on every path", t => {
+  const { store } = fixture(t);
+  const project = "planted", id = journalId(project);
+  let expected = 0;
+  for (const [name, value] of [["null", null], ["array", []], ["object", {}], ["unknown order", { sourceOrder: "unknown" }]] as const) {
+    const record = store.write({ id, kind: REFUSAL_JOURNAL_KIND, expected, value });
+    expected = record.revision;
+    const before = store.list();
+    for (const [path, result] of [
+      ["exact", readJournalAt(store, project, reference(record))],
+      ["current", readJournal(store, { project })],
+      ["batch", prepareJournalBatch(store, { project, sources: [], pending: [], classifications: [] })],
+    ] as [string, OmResult<unknown>][]) {
+      const refusal = refusalOf(result);
+      addressed(refusal, "journal_invalid", project);
+      assert.deepEqual([refusal.at.field, refusal.at.ref], ["sourceOrder", reference(record)], `${name} through ${path}`);
+    }
+    assert.deepEqual(store.list(), before, `${name} wrote nothing`);
+  }
+});
+
+// A frame or proposal source context carries today's work-zone contract at level 3 and nowhere else: a missing, null
+// or foreign contract at level 3 — and the contract itself at another level — are request defects, never read.
+test("Q3 the origin context of a frame or proposal requires the work-zone contract at level 3 and refuses it elsewhere", () => {
+  const basis = { id: "basis:p", revision: 1, hash: hex("a") };
+  const l3: FrameRequest = { project: "p", level: 3, horizon: basis, graph: basis, layer: null, frame: null,
+    upper: { horizon: basis, frame: null } };
+  const l2: FrameRequest = { project: "p", level: 2, horizon: basis, graph: basis, layer: null, frame: null, upper: null };
+  for (const kind of ["frame", "proposal"] as const) {
+    const source = (request: FrameRequest): OriginSource => kind === "frame"
+      ? { role: "basis", ref: basis, context: { kind, request } }
+      : { role: "basis", ref: basis, context: { kind, request: { frame: request, proposals: [basis] } } };
+    for (const valid of [{ ...l3, workZoneContract: "accepted-l2-v1" as const }, l2])
+      assert.deepEqual(normalizeOriginSource(source(valid)), source(valid));
+    for (const invalid of [l3, { ...l3, workZoneContract: null }, { ...l3, workZoneContract: "other" },
+      { ...l2, workZoneContract: "accepted-l2-v1" }] as unknown[])
+      assert.throws(() => normalizeOriginSource(source(invalid as FrameRequest)), code("journal_request_invalid"));
+  }
+});
 // The registry is process state, so every scenario that needs a reader — or needs to be sure there is none — runs in a
 // child process that imports refusal-journal and its leaves only. The reader there is synthetic: it proves nothing about
 // G4b itself (its real reader belongs to answers-gate); it lets the test see WHEN the journal calls it and on what view.

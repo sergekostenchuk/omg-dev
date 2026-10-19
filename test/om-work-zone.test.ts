@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { canonical, hashJson, type Json } from "../src/canonical.js";
+import { canonical, hashJson } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import type { Graph } from "../src/graph/model.js";
 import { RefinementRelations } from "../src/graph/relations.js";
@@ -9,10 +9,7 @@ import { sealed, type OmResult, type Refusal, type Sealed } from "../src/om/refu
 import { workZone, readWorkZone, prepareWorkZone, type WorkZoneRequest } from "../src/om/work-zone.js";
 import { gardenGraph, createOmFixture, refusedWith } from "./om-fixture.js";
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -28,8 +25,6 @@ import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { preparedFeatures } from './product-fixture.js';
-import { prepareCurrentGaps, prepareGaps, readGaps, writeGaps, type GapReadRequest, type GapRequest } from '../src/om/gaps.js';
-import { readGapLines } from '../src/om/gap-lines.js';
 
 type ZoneHorizon = Pick<Horizon, "nodes" | "execution">;
 const producer = "garden-produce-block", consumer = "garden-consume-block", later = "garden-later-block";
@@ -338,204 +333,4 @@ test('F1 preserves the historical engine era without a frame and excludes ready 
   f.reopen();
   assert.deepEqual(ok(readWorkZone(f.store, request)), read);
   denied(prepareWorkZone(f.store, request), 'input_stale');
-});
-
-/** This function runs in another process under the exact accepted producer, not under today's validators. */
-async function producePreWorkZoneHistory(database: string, lowerBridge: boolean) {
-  const assert: typeof import('node:assert/strict') = (await import('node:assert/strict')).default;
-  const { hashJson } = await import('../src/canonical.js');
-  const { reference } = await import('../src/pipeline/contracts.js');
-  const { Store } = await import('../src/storage/store.js');
-  const { ProductEngine } = await import('../src/product/engine.js');
-  const { projectGraph } = await import('../src/graph/project.js');
-  const { UPSTREAM_STAGES } = await import('../src/discovery/requirements.js');
-  const { writeOmInput } = await import('../src/om/input.js');
-  const { writeHorizon } = await import('../src/om/horizon.js');
-  const { prepareFrame, readFrame, fillObligations } = await import('../src/om/frame-obligations.js');
-  const { writeCandidate, gateCandidate } = await import('../src/om/frame-candidate.js');
-  const { settleCandidate } = await import('../src/om/frame-accept.js');
-  const { writeGaps, readGaps } = await import('../src/om/gaps.js');
-  const { writeGapLines } = await import('../src/om/gap-lines.js');
-  const { gardenGraph } = await import('./om-fixture.js');
-  const { preparedFeatures } = await import('./product-fixture.js');
-  const { preparedField } = await import('./preparation-fixture.js');
-  const accepted = <T>(result: OmResult<T>): T => {
-    if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
-    return result.value;
-  };
-  const store = new Store(database);
-  try {
-    const graph = gardenGraph(), producer = 'garden-produce-block', later = 'garden-later-block';
-    const outside = 'garden-refusal-operation';
-    graph.edges!.push({ id: 'refusal-realizes-consumer', relation: 'realizes', source: outside,
-      target: 'garden-consume-block', condition: 'The refusal operation also refines the consumer role' });
-    const remap = (value: Json, suffix: string): Json => {
-      const names: Record<string, string> = { 'garden-result': `garden-${suffix}`, 'garden-R1': `garden-R-${suffix}`,
-        'garden-B1': `garden-B-${suffix}`, 'garden-concept': `garden-concept-${suffix}`, 'Deliver result': `Deliver ${suffix}` };
-      if (typeof value === 'string') return names[value] ?? value;
-      if (Array.isArray(value)) return value.map(item => remap(item, suffix));
-      if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, remap(item, suffix)]));
-      return value;
-    };
-    const fields = (field: string): Json => {
-      const basic = preparedField('garden', field), variants = [basic, ...['later', 'data'].map(suffix => remap(basic, suffix))];
-      if (['conceptSections', 'behaviorContracts', 'featurePreparation', 'features'].includes(field))
-        return variants.flatMap(value => value as Json[]);
-      if (field === 'preparation' || field === 'operationRequirements') {
-        const value = structuredClone(basic) as Record<string, Json>;
-        for (const key of field === 'preparation' ? ['outcomes'] : ['outcomes', 'conceptCoverage'])
-          value[key] = variants.flatMap(item => (item as Record<string, Json>)[key] as Json[]);
-        return value;
-      }
-      return basic;
-    };
-    const requirement = graph.requirements![0]!;
-    graph.requirements!.push(...['later', 'data'].map(suffix => remap(requirement as unknown as Json, suffix) as unknown as typeof requirement));
-    for (const node of graph.nodes) node.implements!.push('garden-R-later', 'garden-R-data');
-    graph.journeys!.push({ id: 'garden-data-feature', actor: 'garden-user', variant: 'success', entry: producer,
-      path: [producer], outcome: 'garden-data', terminal: 'success' });
-    const { level: _level, ...projection } = projectGraph(graph, 1);
-    preparedFeatures(new ProductEngine(store), 'garden', projection as Graph, fields);
-    const input = accepted(writeOmInput(store, { project: 'garden', expected: 0,
-      stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:garden:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
-    const initial = accepted(writeHorizon(store, { project: 'garden', input: reference(input), graph: reference(store.get('graph:garden')!),
-      refinement: null, choice: { choiceVersion: 'history-first', features: [{ outcome: 'garden-result' }], excluded: [] }, available: {} }));
-    const original: FrameRequest = { project: 'garden', level: 2, graph: reference(store.get('graph:garden')!),
-      horizon: reference(initial.gate), layer: null, frame: null, upper: null };
-    const prepared = accepted(prepareFrame(store, original)), design = projectGraph(graph, 2);
-    const nodes = design.nodes.filter(node => node.kind === 'operation' && node.parent !== later);
-    const included = new Set(nodes.map(node => node.id));
-    const mapped = accepted(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-      { graph, reference: { ...original.graph, hash: hashJson(graph) }, frame: null }, prepared.upperRef, 2));
-    const proposal: LayerProposal = { base: { graph: original.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
-      nodes, fills: mapped.fills.filter(fill => included.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,
-        ...(fill.port === undefined ? {} : { port: fill.port }) })),
-      localConnectors: design.connectors.filter(connector => !prepared.upper.connectors.some(upper => upper.id === connector.id))
-        .map(connector => ({ ...connector, bindings: connector.bindings.filter(binding => binding.level === 2) })),
-      artifacts: design.artifacts, contracts: design.contracts, joins: design.joins, tests: design.tests,
-      edges: design.edges ?? [], journeys: design.journeys ?? [], packets: design.packets ?? [], transfers: design.transfers ?? [],
-      anchors: design.anchors, removes: [], replaces: [], redefines: [] };
-    const offered = store.write({ id: 'om-proposal:garden:history-work-zone', kind: 'layer-proposal', expected: 0, value: proposal });
-    const candidate = accepted(writeCandidate(store, { frame: original, proposals: [reference(offered)] }));
-    assert.equal(candidate.state, 'candidate'); if (candidate.state !== 'candidate') throw new Error('Missing candidate');
-    const candidateRef = reference(candidate.record), gate = accepted(gateCandidate(store, { project: 'garden', candidate: candidateRef }));
-    assert.equal(gate.passed, true);
-    const settled = accepted(settleCandidate(store, { project: 'garden', level: 2, candidate: candidateRef,
-      outcome: { gate: 'G3', candidate: candidateRef, graphHash: gate.graphHash, passed: gate.passed, codes: [] } }));
-    assert.ok(settled.graph && settled.layer && settled.frame);
-    const horizon = accepted(writeHorizon(store, { project: 'garden', input: reference(input), graph: reference(settled.graph),
-      refinement: reference(settled.layer), choice: { choiceVersion: 'history-lower-bridge', features: [{ outcome: 'garden-data' }], excluded: [] }, available: {} }));
-    let graphRef = reference(settled.graph);
-    if (lowerBridge) {
-      const lower = structuredClone(settled.graph.value) as Graph;
-      lower.nodes.push(structuredClone(graph.nodes.find(node => node.id === 'garden-produce-work')!));
-      lower.edges!.push({ id: 'outside-via-unaccepted-work', relation: 'realizes', source: outside,
-        target: 'garden-produce-work', condition: 'An unaccepted lower layer connects the outside operation' });
-      assert.deepEqual(projectGraph(lower, 2), projectGraph(settled.graph.value as Graph, 2));
-      graphRef = reference(store.write({ id: settled.graph.id, kind: settled.graph.kind, expected: settled.graph.revision, value: lower }));
-    }
-    const operations: FrameRequest = { ...original, graph: graphRef, layer: reference(settled.layer),
-      frame: reference(settled.frame), horizon: reference(horizon.gate) };
-    const works: FrameRequest = { ...operations, level: 3, layer: null, frame: null,
-      upper: { horizon: operations.horizon, frame: reference(settled.frame) } };
-    const sources: GapRequest = { project: 'garden', input: reference(input), graph: graphRef, horizon: operations.horizon,
-      operations: { frame: operations, proposals: [] }, works: { frame: works, proposals: [] } };
-    const oldFrame = accepted(readFrame(store, works)), gaps = accepted(writeGaps(store, sources));
-    const read: GapReadRequest = { sources, records: gaps.records.map(reference) };
-    accepted(readGaps(store, read));
-    const lines = accepted(writeGapLines(store, { project: 'garden', previous: null, pass: 1, gaps: read, closures: [] }));
-    return { read, works, zone: oldFrame.scope.nodes, collection: gaps.collection, lines: reference(lines),
-      request: { project: 'garden', graph: graphRef, layer: reference(settled.layer), frame: reference(settled.frame), horizon: operations.horizon } };
-  } finally { store.close(); }
-}
-
-function preWorkZoneHistory(t: TestContext, lowerBridge: boolean) {
-  const root = mkdtempSync(join(tmpdir(), 'omg-work-zone-era-')), database = join(root, 'state.sqlite');
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(root, 'accepted-producer-loader.mjs');
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  // Compile the accepted producer directly from Git. The loader changes no checkout, source or dist file.
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', 'ff8737d336f8069059b8dcd0fef5d69c5e31fef7:' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}
-`);
-  const repositoryUrl = pathToFileURL(repository).href;
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)}, { data: { root: ${JSON.stringify(repositoryUrl)} } });`;
-  const producer = producePreWorkZoneHistory.toString()
-    .replace(/import\((["'])\.\.\/src\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
-      `import(${JSON.stringify(new URL(`dist/src/${name}`, repositoryUrl).href)})`)
-    .replace(/import\((["'])\.\/([^"']+)\1\)/g, (_match, _quote: string, name: string) =>
-      `import(${JSON.stringify(new URL(`dist/test/${name}`, repositoryUrl).href)})`);
-  const output = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`,
-    '--input-type=module', '--eval', `process.stdout.write(JSON.stringify(await (${producer})(${JSON.stringify(database)}, ${lowerBridge})));`],
-  { cwd: repository, encoding: 'utf8', maxBuffer: 10_000_000 });
-  return { database, ...JSON.parse(output) as Awaited<ReturnType<typeof producePreWorkZoneHistory>> };
-}
-
-test('F1 historical D1 and D2 from the accepted old producer retain the lower bridge after restart while new preparation excludes it', t => {
-  const history = preWorkZoneHistory(t, true);
-  assert.deepEqual(history.zone, [prepOp, produceOp, 'garden-refusal-operation']);
-  assert.equal(history.read.records.length, 16);
-  assert.equal(Object.hasOwn(history.works, 'workZoneContract'), false);
-  for (let restart = 0; restart < 2; restart++) {
-    const store = new Store(history.database);
-    try {
-      const before = snapshot(store), historical = ok(readFrameBasis(store, history.works));
-      assert.deepEqual(historical.scope.nodes, history.zone);
-      assert.deepEqual(ok(readGaps(store, history.read)).collection, history.collection);
-      ok(readGapLines(store, { project: 'garden', record: history.lines }));
-      assert.deepEqual(ok(readWorkZone(store, history.request)).operations, [prepOp, produceOp]);
-      const current = ok(prepareFrame(store, history.works));
-      assert.equal(current.request.workZoneContract, 'accepted-l2-v1');
-      assert.deepEqual(current.scope.nodes, [prepOp, produceOp]);
-      const gaps = ok(prepareGaps(store, history.read.sources));
-      assert.ok('frame' in gaps.sources.works);
-      assert.equal(gaps.sources.works.frame.workZoneContract, 'accepted-l2-v1');
-      assert.ok(gaps.collection.gaps.length < history.collection.gaps.length);
-      denied(prepareCurrentGaps(store, history.read), 'input_stale');
-      assert.deepEqual(snapshot(store), before, 'Historical read and current preparation cannot rewrite the former era');
-    } finally { store.close(); }
-  }
-});
-
-test('F1 current D1 admission distinguishes identical collections from different eras until the new sources are explicitly saved', t => {
-  const history = preWorkZoneHistory(t, false), store = new Store(history.database);
-  t.after(() => store.close());
-  const old = ok(readGaps(store, history.read)), before = snapshot(store);
-  const prepared = ok(prepareGaps(store, history.read.sources));
-  assert.deepEqual(prepared.collection, old.collection, 'The distinction is the producer contract, not a conveniently different result');
-  assert.ok(prepared.writes.length > 0);
-  denied(prepareCurrentGaps(store, history.read), 'input_stale');
-  assert.deepEqual(snapshot(store), before);
-  const written = ok(writeGaps(store, history.read.sources));
-  assert.ok('frame' in written.sources.works);
-  assert.equal(written.sources.works.frame.workZoneContract, 'accepted-l2-v1');
-  const current: GapReadRequest = { sources: structuredClone(written.sources) as GapRequest, records: written.records.map(reference) };
-  ok(prepareCurrentGaps(store, current));
-  denied(readGaps(store, { sources: current.sources, records: history.read.records }), 'gap_record_forged');
-  denied(readGaps(store, { sources: history.read.sources, records: current.records }), 'gap_record_forged');
-  const after = snapshot(store);
-  const restarted = new Store(history.database);
-  try {
-    assert.deepEqual(ok(readGaps(restarted, history.read)).collection, old.collection);
-    ok(readGapLines(restarted, { project: 'garden', record: history.lines }));
-    denied(prepareCurrentGaps(restarted, history.read), 'input_stale');
-    ok(prepareCurrentGaps(restarted, current));
-    assert.deepEqual(ok(writeGaps(restarted, current.sources)), written);
-    assert.deepEqual(snapshot(restarted), after);
-  } finally { restarted.close(); }
 });
