@@ -601,7 +601,7 @@ test('№1679-2: a repeated diagnostic preserves the complete physical result an
 });
 
 test('№1631-1 C43/C44 e2e: a later attempt cannot inherit an earlier witness while its own process lives', async t => {
-  const f = executionFixture(t);
+  const f = executionFixture(t, "normal", { route: "om" });
   const originalWrite = f.store.write.bind(f.store), kill = process.kill.bind(process), pids: number[] = [];
   t.after(() => { process.kill = kill; for (const pid of pids) { try { kill(-pid, 'SIGKILL'); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e; } } });
   const injected = (input: { kind: string; value: { child?: unknown } }) => {
@@ -646,7 +646,7 @@ test('№1631-1 C43/C44 e2e: a later attempt cannot inherit an earlier witness w
 // end is durably resolved, a foreign process occupying the same pid later can
 // never block a new attempt of the same task-run.
 test('D8.5 r3 rows 4/8: a resolved witness survives a foreign reuse of its pid', async t => {
-  const f = executionFixture(t);
+  const f = executionFixture(t, "normal", { route: "om" });
   const originalWrite = f.store.write.bind(f.store), kill = process.kill.bind(process), pids: number[] = [];
   t.after(() => { process.kill = kill; for (const pid of pids) { try { kill(-pid, 'SIGKILL'); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e; } } });
   (f.store as { write: unknown }).write = (input: { kind: string; value: { child?: unknown } }) => {

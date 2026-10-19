@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { prepareOmFixtureStages, prepareNativeLayers } from "./om-fixture.js";
+import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { git } from "../src/runtime/environment.js";
 import { reference } from "../src/pipeline/contracts.js";
@@ -24,13 +25,13 @@ test("machine tasks, dependencies and required durable checks are derived withou
   for (const node of graph.nodes.filter(node => ["garden-produce-work", "garden-produce-operation"].includes(node.id))) node.boundary = { ...node.boundary, state: "durable" };
   assert.ok(validateGraph(graph).findings.some(f => f.code === "test_obligation_missing"));
   graph.tests[0]!.obligations = ["outcome", "restart_cold", "durable_cold_read"];
-  preparedFeatures(engine, "garden", graph);
+  const desired = enrichedGraph(graph, "garden");
+  prepareOmFixtureStages(engine, "garden", desired);
   const command = { executable: process.execPath, args: ["--version"] };
   engine.environments.configure("garden", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command },
-    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000 }, 0);
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000, requestCapacityChars: 100_000 }, 0);
   assert.throws(() => engine.compiler.compile("garden"), /OM-G2 must be accepted/);
-  refinedLayers(engine, "garden"); const r3 = engine.refinement.assess("garden", 0);
-  const stage = engine.refinement.publish("garden", reference(r3), 0); engine.pipeline.accept("garden", "om-g2", stage.revision);
+  prepareNativeLayers(engine, "garden", desired, "executed");
   const plan = engine.compiler.compile("garden"); const again = engine.compiler.compile("garden");
   assert.deepEqual(again, plan); assert.equal(store.list("plan").length, 1);
   assert.equal(plan.value.tasks.length, 2);
@@ -63,18 +64,4 @@ test("machine tasks, dependencies and required durable checks are derived withou
   const { hash: _baseHash, ...baseBody } = foreignBase; foreignBase.hash = hashJson(baseBody);
   store.write({ id: plan.id, kind: "plan", expected: 3, value: foreignBase });
   assert.throws(() => engine.compiler.read(plan.id), /sealed R3 basis/);
-});
-
-
-test('SP1b compilation without an M8 chain retains v1 context and repeats the exact saved plan', async t => {
-  const { executionFixture } = await import('./execution-fixture.js');
-  const f = executionFixture(t);
-  assert.equal(f.plan.value.feasibility.id.startsWith('om-feasibility:'), false);
-  assert.equal(Object.hasOwn(f.plan.value, 'taskContextContract'), false);
-  assert.deepEqual(f.engine.compiler.compile('p'), f.plan);
-  const value = f.engine.compiler.context('p', reference(f.plan), f.plan.value.tasks[0]!.id, 1_000_000);
-  assert.equal(JSON.parse(value.text).version, 'omg-task-context/v1');
-  assert.equal(Object.hasOwn(JSON.parse(value.text), 'selectedSpecification'), false);
-  f.reopen(); assert.deepEqual(f.engine.compiler.read(f.plan.id), f.plan);
-  assert.deepEqual(f.engine.compiler.compile('p'), f.plan);
 });

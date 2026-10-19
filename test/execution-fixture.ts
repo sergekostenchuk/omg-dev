@@ -3,11 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
 import { Store } from "../src/storage/store.js";
+import { EngineError } from "../src/errors.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { git } from "../src/runtime/environment.js";
 import { reference } from "../src/pipeline/contracts.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
+import { prepareOmFixtureStages, prepareNativeLayers } from "./om-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 
 // Controlled protocol agents exercise real OS processes, code, gates and Git.
@@ -71,7 +73,17 @@ if(mode==='overflow-produce') {const {produce}=await import('./produce.mjs');ass
 if(mode==='overflow-consume') {const {consume}=await import('./consume.mjs');assert.throws(()=>consume(Number.MAX_SAFE_INTEGER-1),/result_overflow/);}
 `;
 
-export function executionFixture(t: TestContext, behavior = "normal", refine = (engine: ProductEngine) => refinedLayers(engine, "p")) {
+export interface CurrentExecutionFixture {
+  route: "om";
+  beforeRoute?: (engine: ProductEngine) => void;
+}
+
+export function executionFixture(t: TestContext, behavior = "normal",
+  route: ((engine: ProductEngine) => void) | CurrentExecutionFixture = engine => refinedLayers(engine, "p")) {
+  const current = typeof route !== "function";
+  if (current && (!route || typeof route !== "object" || route.route !== "om"
+    || (route.beforeRoute !== undefined && typeof route.beforeRoute !== "function")))
+    throw new EngineError("execution_fixture_invalid", "The current fixture needs route om and an optional beforeRoute function", { target: "/route" });
   const directory = mkdtempSync(join(tmpdir(), "omg-execution-")), workspace = join(directory, "repo"); mkdirSync(workspace);
   const journal = join(directory, "calls.jsonl"), agent = join(directory, "agent.mjs"); writeFileSync(agent, AGENT);
   git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "A local numeric transformation product");
@@ -96,12 +108,19 @@ export function executionFixture(t: TestContext, behavior = "normal", refine = (
     test.command = { executable: process.execPath, args: ["check.mjs", test.node.includes("produce") ? "produce" : "consume"] };
     for (const mutation of test.contract!.counterfactuals) mutation.command = { executable: process.execPath, args: ["check.mjs", "mutation"] };
   }
-  preparedFeatures(engine, "p", graph);
+  if (current) prepareOmFixtureStages(engine, "p", graph);
+  else preparedFeatures(engine, "p", graph);
   const command = { executable: process.execPath, args: [agent, journal, behavior] };
   engine.environments.configure("p", { workspace, implementer: { actor: "worker", model: "protocol-fixture", effort: "high", command },
-    reviewer: { actor: "reviewer", model: "protocol-fixture", effort: "high", command }, fullCheck: { executable: process.execPath, args: ["check.mjs", "all"] }, timeoutMs: 10_000 }, 0);
-  refine(engine); const feasibility = engine.refinement.assess("p", 0);
-  const stage = engine.refinement.publish("p", reference(feasibility), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
+    reviewer: { actor: "reviewer", model: "protocol-fixture", effort: "high", command }, fullCheck: { executable: process.execPath, args: ["check.mjs", "all"] }, timeoutMs: 10_000,
+    ...(current ? { requestCapacityChars: 100_000 } : {}) }, 0);
+  if (typeof route === "function") {
+    route(engine); const feasibility = engine.refinement.assess("p", 0);
+    const stage = engine.refinement.publish("p", reference(feasibility), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
+  } else {
+    route.beforeRoute?.(engine);
+    prepareNativeLayers(engine, "p", graph, "executed");
+  }
   const plan = engine.compiler.compile("p"); const compilation = engine.compiler.publish("p", reference(plan), 0); engine.pipeline.accept("p", "compilation", compilation.revision);
   return { get store() { return store; }, get engine() { return engine; }, directory, workspace, initial, plan,
     calls: () => { try { return readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } },

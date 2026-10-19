@@ -4,7 +4,9 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, symlinkSync, linkS
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { join } from "node:path";
-import { executionFixture } from "./execution-fixture.js";
+import { executionFixture as legacyExecutionFixture } from "./execution-fixture.js";
+import { prepareOmFixtureStages, prepareNativeLayers, acceptNativeWorks } from "./om-fixture.js";
+const executionFixture = (t: test.TestContext, behavior = "normal") => legacyExecutionFixture(t, behavior, { route: "om" });
 import { reference } from "../src/pipeline/contracts.js";
 import { git, type ExecutionRoot, type Environment } from "../src/runtime/environment.js";
 import { Executor } from "../src/execution/runner.js";
@@ -20,12 +22,38 @@ import { prepareWriterIndex, readWriterIndex, writerIndexId, type WriterIndex } 
 import { Store } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
 import { finishCommit } from "../src/execution/commit.js";
-import { answerTechnicalFixture } from "./technical-research-fixture.js";
-import { deriveLayerFixture } from "./layer-design-fixture.js";
-import { requireGraph } from "../src/graph/validate.js";
+import { prepareFrame, type FrameRequest } from "../src/om/frame-obligations.js";
+import { writeHorizon } from "../src/om/horizon.js";
+import type { OmAcceptedFrame } from "../src/om/layer-basis.js";
+import type { LayerProposal } from "../src/om/frame-proposals.js";
+import { writeNeighbors, readNeighbors, type NeighborCollection } from "../src/om/neighbors.js";
+
+test("current execution fixture validates its route and runs the environment hook before OM admission", t => {
+  for (const route of [null, {}, { route: "legacy" }, { route: "om", beforeRoute: true }])
+    assert.throws(() => legacyExecutionFixture(t, "normal", route as never),
+      (error: unknown) => error instanceof EngineError && error.code === "execution_fixture_invalid"
+        && JSON.stringify(error.details) === JSON.stringify({ target: "/route" }));
+  let called = 0;
+  const f = legacyExecutionFixture(t, "normal", { route: "om", beforeRoute(engine) {
+    called++;
+    assert.equal(engine.store.get("om-input:p"), null);
+    const environment = engine.environments.get("p");
+    engine.environments.configure("p", { ...environment.value, timeoutMs: 12_000 }, environment.revision);
+  } });
+  assert.equal(called, 1);
+  assert.deepEqual(f.plan.value.environment, reference(f.engine.environments.get("p")));
+  assert.equal(f.engine.environments.get("p").value.timeoutMs, 12_000);
+  assert.equal(f.plan.value.feasibility.id, "om-feasibility:p");
+  assert.equal(f.store.get("feasibility:p"), null);
+  assert.equal(f.store.list("task-run").length, 0);
+});
 
 test("real executor processes consume compact context, run both gates and commit exact code receipts without changing the source branch", async t => {
   const f = executionFixture(t);
+  assert.equal(f.plan.value.feasibility.id, "om-feasibility:p");
+  assert.equal(f.store.get("feasibility:p"), null);
+  assert.equal(f.store.list("task-run").length, 0);
+  assert.equal(f.store.get("execution-root:p"), null);
   const runs = await f.engine.execute({ type: "execute-plan", project: "p", plan: reference(f.plan), ...f.options }) as { value: TaskRun }[];
   assert.deepEqual(runs.map(run => run.value.state), ["committed", "committed"]);
   const root = f.store.get<ExecutionRoot>("execution-root:p")!;
@@ -100,9 +128,13 @@ test("missing outputs, invented business values, scope escapes and insufficient 
     assert.equal(git(f.store.get<ExecutionRoot>("execution-root:p")!.value.path, ["rev-parse", "HEAD"]), f.initial);
   }
   const f = executionFixture(t);
-  const result = await f.engine.executor.run("p", reference(f.plan), { ...f.options, maxContextChars: 100 });
-  assert.equal(result[0]!.value.state, "interrupted"); assert.equal(f.calls().length, 0);
-  assert.match(result[0]!.value.error!, /essential context exceeds/);
+  await assert.rejects(f.engine.executor.run("p", reference(f.plan), { ...f.options, maxContextChars: 100 }),
+    { code: "capacity_mismatch" });
+  assert.equal(f.calls().length, 0);
+  assert.equal(f.store.list("task-run").length, 0);
+  assert.equal(f.store.list("artifact").length, 0);
+  assert.equal(f.store.get<ExecutionRoot>("execution-root:p")!.value.head, f.initial);
+  assert.equal(git(f.store.get<ExecutionRoot>("execution-root:p")!.value.path, ["rev-parse", "HEAD"]), f.initial);
 });
 
 test("committed implementation receipts cannot omit files or be rebound to a foreign accepted run", async t => {
@@ -277,16 +309,59 @@ test("Git clean filters cannot commit different code than the bytes subjected to
 });
 
 
+test("writer-index creation races roll back the real neighbors batch and its cold retry writes each revision once", t => {
+  const history = (store: Store) => store.identities("list").flatMap(row => store.history(row.id));
+  let captured: { store: Store; candidate: Ref; neighborId: string; index: Revision<WriterIndex>; history: unknown } | undefined;
+  assert.throws(() => legacyExecutionFixture(t, "delete", { route: "om", beforeRoute(engine) {
+    const store = engine.store, writeMany = store.writeMany.bind(store);
+    store.writeMany = (writes, guards) => {
+      const index = writes.find(write => write.kind === "writer-index" && write.expected === 0);
+      if (index) {
+        const neighbors = writes.find(write => write.kind === "om-neighbors");
+        assert.ok(neighbors, "Bootstrap indexes and neighbors must use the real common producer batch");
+        assert.equal(index.expected, 0); assert.equal(store.get(index.id), null);
+        const second = new Store(store.path);
+        try {
+          const pending = prepareWriterIndex(second, "p", (index.value as unknown as WriterIndex).path, null);
+          assert.equal(pending.writes.length, 1); assert.equal(pending.writes[0]!.expected, 0);
+          second.writeMany(pending.writes, pending.guards);
+          captured = { store, candidate: (neighbors.value as unknown as NeighborCollection).source.candidate,
+            neighborId: neighbors.id, index: second.get<WriterIndex>(index.id)!, history: history(second) };
+        } finally { second.close(); }
+        store.writeMany = writeMany;
+      }
+      return writeMany(writes, guards);
+    };
+  } }), (error: unknown) => error instanceof EngineError && error.code === "om_fixture_invalid"
+    && error.message.startsWith("revision_conflict:")
+    && (error.details as { target?: string; field?: string }).target === captured?.index.id
+    && (error.details as { field?: string }).field === "expected");
+  assert.ok(captured);
+  const { store, candidate, neighborId, index, history: afterRace } = captured;
+  assert.deepEqual(history(store), afterRace, "All saved history equals the snapshot after the competing write");
+  assert.equal(store.get(neighborId), null);
+  assert.deepEqual(store.get(index.id), index);
+  const reopened = new Store(store.path);
+  try {
+    const retry = writeNeighbors(reopened, { project: "p", candidate });
+    assert.ok(retry.ok, retry.ok ? "" : retry.refusal.message);
+    assert.equal(retry.value.id, neighborId); assert.equal(retry.value.revision, 1);
+    assert.deepEqual(reopened.get(index.id), index, "The retry reuses the competing bootstrap index");
+    const accepted = history(reopened);
+    const read = readNeighbors(reopened, { project: "p", neighbors: reference(retry.value) });
+    assert.ok(read.ok); assert.deepEqual(read.value, retry.value);
+    assert.deepEqual(writeNeighbors(reopened, { project: "p", candidate }), retry);
+    assert.deepEqual(history(reopened), accepted, "Reads and repeated production append no revisions");
+  } finally { reopened.close(); }
+});
+
 test("writer-index CAS conflicts keep native acceptance atomic and recovery appends the writer once", async t => {
-  for (const recovering of [false, true]) for (const existing of [false, true]) {
-    await t.test(`${recovering ? "recovery" : "finishCommit"} with ${existing ? "existing" : "absent"} index`, async t => {
+  for (const recovering of [false, true]) {
+    await t.test(`${recovering ? "recovery" : "finishCommit"} with admitted index`, async t => {
       const f = executionFixture(t, "delete");
       const path = f.plan.value.tasks[0]!.writePaths[0]!;
       const indexId = writerIndexId("p", path);
-      if (existing) {
-        const initial = prepareWriterIndex(f.store, "p", path, null);
-        f.store.writeMany(initial.writes, initial.guards);
-      }
+      assert.equal(f.store.get(indexId)!.revision, 1, "The current OM admission already owns this exact empty index");
       if (recovering) {
         const executor = new Executor(f.store, f.engine.compiler, f.engine.environments, () => { throw new Error("stop before finishCommit"); });
         await assert.rejects(executor.run("p", reference(f.plan), f.options), /stop before finishCommit/);
@@ -301,21 +376,16 @@ test("writer-index CAS conflicts keep native acceptance atomic and recovery appe
           raced = true;
           const index = inputs.find(write => write.id === indexId);
           assert.ok(index, "A committed run must share its transaction with every path index");
-          assert.equal(index.expected, existing ? 1 : 0);
+          assert.equal(index.expected, 1);
           before = { run: store.list("task-run"), root: store.get("execution-root:p"), receipts: store.list("artifact"), indexes: store.list("writer-index") };
           const second = new Store(store.path);
           try {
-            if (existing) {
-              const run = second.list<TaskRun>("task-run")[0]!;
-              const root = second.get<ExecutionRoot>("execution-root:p")!;
-              const task = f.plan.value.tasks.find(task => task.id === run.value.taskId)!;
-              const environment = second.get<Environment>(f.plan.value.environment.id, f.plan.value.environment.revision)!;
-              finishCommit(second, root, run, f.plan.value, task, environment.value);
-              before = { run: second.list("task-run"), root: second.get("execution-root:p"), receipts: second.list("artifact"), indexes: second.list("writer-index") };
-            } else {
-              const competing = prepareWriterIndex(second, "p", path, reference(second.get<ExecutionRoot>("execution-root:p")!));
-              second.writeMany(competing.writes, competing.guards);
-            }
+            const run = second.list<TaskRun>("task-run")[0]!;
+            const root = second.get<ExecutionRoot>("execution-root:p")!;
+            const task = f.plan.value.tasks.find(task => task.id === run.value.taskId)!;
+            const environment = second.get<Environment>(f.plan.value.environment.id, f.plan.value.environment.revision)!;
+            finishCommit(second, root, run, f.plan.value, task, environment.value);
+            before = { run: second.list("task-run"), root: second.get("execution-root:p"), receipts: second.list("artifact"), indexes: second.list("writer-index") };
           } finally { second.close(); }
         }
         return writeMany(inputs, guards);
@@ -330,14 +400,13 @@ test("writer-index CAS conflicts keep native acceptance atomic and recovery appe
       assert.deepEqual(store.list("task-run"), snapshot.run, "Losing index CAS must leave the accepted run unwritten");
       assert.deepEqual(store.get("execution-root:p"), snapshot.root, "Losing index CAS must leave the root unchanged");
       assert.deepEqual(store.list("artifact"), snapshot.receipts, "Losing index CAS must leave every receipt unchanged");
-      assert.deepEqual(store.list("writer-index").filter(index => index.id !== indexId),
-        (snapshot.indexes as { id: string }[]).filter(index => index.id !== indexId), "Other path indexes do not partially commit");
+      assert.deepEqual(store.list("writer-index"), snapshot.indexes, "The losing transaction leaves every index exactly as the winner committed it");
       const pending = store.list<TaskRun>("task-run")[0]!;
-      assert.equal(pending.value.state, existing ? "committed" : "commit_pending");
+      assert.equal(pending.value.state, "committed");
       assert.equal(f.calls().length, 2);
       f.reopen();
       const recovered = await f.engine.executor.recover("p");
-      assert.equal(recovered.length, existing ? 0 : 1);
+      assert.equal(recovered.length, 0);
       const accepted = f.store.get<TaskRun>(pending.id)!;
       assert.equal(accepted.value.state, "committed");
       for (const writePath of f.plan.value.tasks[0]!.writePaths) {
@@ -369,33 +438,44 @@ test("writer index intervals bind each added writer to its own native acceptance
 
   const graph = structuredClone(f.plan.value.graphSnapshot);
   const successors = ["produce", "consume"].map(name => {
-    const old = graph.nodes.find(node => node.id === `p-${name}-work`)!;
-    const node = structuredClone(old); node.id = `p-upgrade-${name}`;
+    const node = graph.nodes.find(node => node.id === `p-${name}-work`)!;
     node.title = name === "produce" ? "Upgrade producer safety" : "Upgrade consumer safety";
     node.code = node.code.map(ref => ({ ...ref, status: "existing" }));
-    const check = structuredClone(graph.tests.find(test => test.node === old.id)!);
-    check.id = `${node.id}-test`; check.node = node.id; check.contract!.entrypoint.status = "existing";
-    check.covers = ["p-flow"];
+    const check = graph.tests.find(test => test.node === node.id)!;
+    check.contract!.entrypoint.status = "existing";
+    check.covers = [...new Set([...check.covers, "p-flow"])];
     check.contract!.counterfactuals.push({ connector: "p-flow", mutation: "substitute", expectedFailure: name === "produce" ? "output_overflow" : "result_overflow",
       command: { executable: process.execPath, args: ["check.mjs", `overflow-${name}`] } });
-    node.tests = [check.id]; graph.nodes.push(node); graph.tests.push(check);
-    graph.transfers!.push({ id: `transfer-${name}`, path: node.code[0]!.path, from: old.id, to: node.id, condition: "producer_committed" });
     return node;
   });
-  graph.horizon = successors.map(node => node.id);
-  const binding = graph.connectors[0]!.bindings.find(binding => binding.level === 3)!;
-  binding.producer = { node: successors[0]!.id, port: "out", codeRef: successors[0]!.code[0]! };
-  binding.consumers = [{ node: successors[1]!.id, port: "in", codeRef: successors[1]!.code[0]! }];
-  graph.edges!.push({ id: "use-previous-data", relation: "requires", source: successors[0]!.id, target: "p-produce-work", condition: "Use the accepted producer version as the implementation baseline" });
-  requireGraph(graph);
-  f.engine.graphs.save("p", graph, f.store.get("graph:p")!.revision, "fixture-researcher");
-  const research = f.engine.refinement.begin("p", "R2"); answerTechnicalFixture(f.engine, "p", research);
-  f.engine.refinement.finishResearch("p", "R2", reference(f.store.get(research.id)!), f.store.get("phase:p:R2")!.revision);
-  deriveLayerFixture(f.engine, "p", 3);
-  f.engine.refinement.sealLayer("p", 3, f.store.get("phase:p:L3")!.revision);
-  const feasibility = f.engine.refinement.assess("p", f.store.get("feasibility:p")!.revision);
-  const om = f.engine.refinement.publish("p", reference(feasibility), f.store.get("stage:p:om-g2")!.revision);
-  f.engine.pipeline.accept("p", "om-g2", om.revision);
+  // A fresh L3 acceptance upgrades the same work definitions. Writer intervals belong to exact accepted runs,
+  // so their distinct plan/run/root revisions must remain distinguishable even when the work ids are reused.
+  const acceptedGraph = reference(f.store.get("graph:p")!), layer2 = reference(f.store.get("graph-layer:p:2")!);
+  const frame2 = reference(f.store.get("om-frame:p:2")!), frame3 = f.store.get<OmAcceptedFrame>("om-frame:p:3")!;
+  const horizon = writeHorizon(f.store, { project: "p", input: reference(f.store.get("om-input:p")!), graph: acceptedGraph,
+    refinement: layer2, available: {}, choice: { choiceVersion: "upgrade", features: [{ outcome: "p-result" }], excluded: [] } });
+  assert.ok(horizon.ok, horizon.ok ? "" : horizon.refusal.message);
+  const request: FrameRequest = { project: "p", level: 3, graph: acceptedGraph, horizon: reference(horizon.value.gate),
+    layer: reference(f.store.get("graph-layer:p:3")!), frame: reference(frame3), upper: { frame: frame2, horizon: reference(horizon.value.gate) } };
+  const prepared = prepareFrame(f.store, request);
+  assert.ok(prepared.ok, prepared.ok ? "" : prepared.refusal.message);
+  const oldIds = new Set(["p-produce-work", "p-consume-work"]);
+  const replacements = prepared.value.result.fills.filter(fill => oldIds.has(fill.node));
+  const successor = (old: string) => successors.find(node => node.parent === graph.nodes.find(node => node.id === old)!.parent)!;
+  const proposal: LayerProposal = { base: { graph: request.graph, frame: request.frame }, level: 3, worksContract: "works-frame/v1",
+    source: "decision", status: "proposed", nodes: successors,
+    fills: replacements.map(fill => ({ obligation: fill.obligation, node: successor(fill.node).id,
+      ...(fill.port === undefined ? {} : { port: fill.port, codeRef: successor(fill.node).code[0]! }) })),
+    replaces: replacements.map(fill => ({ obligation: fill.obligation, base: { node: fill.node, graph: request.graph },
+      with: { node: successor(fill.node).id, port: fill.port ?? null }, basis: "Upgrade the implementation while retaining its accepted predecessor and writer history" })),
+    tests: graph.tests.filter(test => successors.some(node => node.id === test.node)),
+    transfers: graph.transfers!.filter(transfer => successors.some(node => node.id === transfer.to)),
+    edges: graph.edges!.filter(edge => successors.some(node => node.id === edge.source)),
+    localConnectors: [], artifacts: [], contracts: [], joins: [], journeys: [], packets: [], anchors: [],
+    removes: successors.map(node => node.id), redefines: graph.tests.filter(test => successors.some(node => node.id === test.node)).map(test => test.id) };
+  const proposed = f.store.write({ id: "om-proposal:p:upgrade", kind: "layer-proposal", expected: 0, value: proposal });
+  acceptNativeWorks(f.engine, "p", { frame: { project: "p", level: 2, graph: acceptedGraph, horizon: request.horizon,
+    layer: layer2, frame: frame2, upper: null }, proposals: [] }, { frame: request, proposals: [reference(proposed)] });
   const plan = f.engine.compiler.compile("p");
   const compilation = f.engine.compiler.publish("p", reference(plan), f.store.get("stage:p:compilation")!.revision);
   f.engine.pipeline.accept("p", "compilation", compilation.revision);
@@ -569,7 +649,7 @@ process.exit(result.status ?? 1);
 `;
 const EX1_BUDGET: Omit<ExecutionAdmissionSettings, "plan"> = { roleLaunches: 40, softInput: 6_000_000, roleReserve: { implement: 5000, review: 2000 }, maxCorrections: 1 };
 function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreModules?: boolean; modules?: boolean; admit?: boolean; tap?: boolean; progress?: boolean;
-  budget?: Partial<Omit<ExecutionAdmissionSettings, "plan">>; implementer?: { executable: string; args: string[] } } = {}) {
+  legacy?: boolean; budget?: Partial<Omit<ExecutionAdmissionSettings, "plan">>; implementer?: { executable: string; args: string[] } } = {}) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "omg-ex1-"))), workspace = join(directory, "repo"), bin = join(directory, "bin");
   mkdirSync(workspace); mkdirSync(bin);
   git(workspace, ["init", "-b", "main"]);
@@ -590,16 +670,20 @@ function ex1Fixture(t: test.TestContext, options: { timeoutMs?: number; ignoreMo
     proof.command = { executable: process.execPath, args: ["check.mjs", proof.node.includes("produce") ? "produce" : "consume"] };
     for (const mutation of proof.contract!.counterfactuals) mutation.command = { executable: process.execPath, args: ["check.mjs", "mutation"] };
   }
-  preparedFeatures(engine, "p", graph);
+  if (options.legacy) preparedFeatures(engine, "p", graph);
+  else prepareOmFixtureStages(engine, "p", graph);
   // `progress`: the full check prints progress on stdout while its failure stays on stderr (№3986-2).
   writeFileSync(join(directory, "full.mjs"), options.tap ? EX2_TAP_FULL(directory)
     : options.progress ? EX1_FULL(directory).replace("\nappendFileSync(", "\nconsole.log('Building candidate...');\nappendFileSync(") : EX1_FULL(directory));
   const adapter = { executable: process.execPath, args: [fileURLToPath(new URL("../src/adapters/codex-stdio.js", import.meta.url))] };
   engine.environments.configure("p", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command: options.implementer ?? adapter },
     reviewer: { actor: "reviewer", model: "fixture", effort: "high", command: adapter },
-    fullCheck: { executable: process.execPath, args: [join(directory, "full.mjs")] }, timeoutMs: options.timeoutMs ?? 30_000 }, 0);
-  refinedLayers(engine, "p"); const feasibility = engine.refinement.assess("p", 0);
-  const stage = engine.refinement.publish("p", reference(feasibility), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
+    fullCheck: { executable: process.execPath, args: [join(directory, "full.mjs")] }, timeoutMs: options.timeoutMs ?? 30_000,
+    ...(options.legacy ? {} : { requestCapacityChars: 100_000 }) }, 0);
+  if (options.legacy) {
+    refinedLayers(engine, "p"); const feasibility = engine.refinement.assess("p", 0);
+    const stage = engine.refinement.publish("p", reference(feasibility), 0); engine.pipeline.accept("p", "om-g2", stage.revision);
+  } else prepareNativeLayers(engine, "p", graph, "executed");
   const plan = engine.compiler.compile("p"); const compilation = engine.compiler.publish("p", reference(plan), 0); engine.pipeline.accept("p", "compilation", compilation.revision);
   writeFileSync(join(bin, "codex"), PROVIDER(directory, database)); chmodSync(join(bin, "codex"), 0o755);
   const path = process.env["PATH"]; process.env["PATH"] = `${bin}${delimiter}${path}`; t.after(() => { process.env["PATH"] = path; });
@@ -823,8 +907,18 @@ test("EX1 a launch never started costs nothing: the open record of a launch whos
   writeFileSync(ghost, "#!/bin/sh\nexit 1\n"); chmodSync(ghost, 0o755);
   t.after(() => rmSync(dirname(ghost), { recursive: true, force: true }));
   const f = ex1Fixture(t, { budget: { roleLaunches: 1, maxCorrections: 0 }, implementer: { executable: ghost, args: [] } });
-  rmSync(ghost);
+  const writeMany = f.store.writeMany.bind(f.store);
+  let removed = false;
+  t.mock.method(f.store, "writeMany", ((writes, guards) => {
+    const result = writeMany(writes, guards);
+    // Remove only after the admitted send is durable: M8 checked the executable before this race.
+    if (!removed && writes.some(write => write.kind === "execution-send" && write.expected === 0)) {
+      removed = true; rmSync(ghost);
+    }
+    return result;
+  }) as Store["writeMany"]);
   const runs = await f.run({ maxCorrections: 0 });
+  assert.equal(removed, true);
   assert.notEqual(runs[0]!.value.state, "committed");
   assert.deepEqual(f.sends().map(row => [row.value.status, row.value.group, row.value.usage]), [["not-started", null, null]]);
   assert.doesNotThrow(() => requireBudgetProbe(f), "The one admitted launch is still available");
@@ -1018,14 +1112,14 @@ ${body}
 const EX1_BASE = "88bc91e13f777004274ed9410be806f386fd9419";
 
 test("EX1 era: the records the base wrote are read by the new code with the same result — a pilot without an admission keeps the boundary; a base attempt's code finding opens its one correction", async t => {
-  const f = ex1Fixture(t, { admit: false });
+  const f = ex1Fixture(t, { legacy: true, admit: false });
   const command = JSON.stringify(f.command());
   const base = ex1AtCommit(f.directory, f.database, EX1_BASE, "era-boundary", `
 try { await engine.execute(${command}); out('ran'); } catch (error) { out(error.code); }`);
   assert.equal(base, "pilot_boundary_reached");
   f.reopen();
   await assert.rejects(f.run(), { code: "pilot_boundary_reached" }, "The base's pilot and policy keep the same boundary for the new code");
-  const g = executionFixture(t, "correct");
+  const g = legacyExecutionFixture(t, "correct");
   const options = JSON.stringify(g.options), plan = JSON.stringify(reference(g.plan));
   assert.deepEqual(ex1AtCommit(g.directory, g.store.path, EX1_BASE, "era-correct", `
 const runs = await engine.executor.run('p', ${plan}, ${options}); out(runs.map(run => run.value.state));`), ["needs_code"]);
@@ -1188,7 +1282,7 @@ test("EX2 the restored slot is one: a restored correction that fails again exhau
   f.reopen();
   await assert.rejects(f.run({ retry: true }), { code: "execution_corrections_exhausted" });
   assert.equal(f.store.list(EXECUTION_RECOVERY_KIND).length, 1, "no second restoration");
-  const g = ex1Fixture(t, { tap: true });
+  const g = ex1Fixture(t, { legacy: true, tap: true });
   g.behave({ "implement:1": "wrong", "implement:2": "wrong" });
   assert.equal((await g.run())[0]!.value.state, "needs_code");
   await assert.rejects(g.run({ retry: true }), { code: "execution_corrections_exhausted" });
@@ -1347,7 +1441,7 @@ test("EX3 the shared limits stop an execution with corrections left: launches or
 });
 
 test("EX3 era: the base stops a task at its negative review with its one correction spent; under a new admission of three the new code continues it — the saved review is shown to the correction, never bought again, and the count goes on from the base's", async t => {
-  const f = ex1Fixture(t, { tap: true });
+  const f = ex1Fixture(t, { legacy: true, tap: true });
   f.behave({ "implement:1": "wrong", "review:1": "code" });
   const command = JSON.stringify(f.command());
   assert.deepEqual(ex1AtCommit(f.directory, f.database, EX3_BASE, "ex3-era", `
@@ -1407,7 +1501,7 @@ test("EX4 an addressed limit names one exact task of this plan, once: a task of 
 });
 
 test("EX4 era: the three corrections the base used count — an addressed five gives exactly two more; a restart and a repeated admission give no sixth; the limit is absolute, and the neighbouring task keeps the ordinary three", async t => {
-  const f = ex1Fixture(t, { budget: { maxCorrections: 3 } });
+  const f = ex1Fixture(t, { legacy: true, budget: { maxCorrections: 3 } });
   f.behave({ implement: "wrong" });
   const command = JSON.stringify(f.command({ maxCorrections: 3 }));
   assert.deepEqual(ex1AtCommit(f.directory, f.database, EX4_BASE, "ex4-era", `
@@ -1527,7 +1621,7 @@ test("EX5 a review that finds the plan unexecutable among code defects returns a
 });
 
 test("EX5 era: a negative review the base saved is read as it wrote it — its correction under the new code is given that finding with the five classes, and the task commits", async t => {
-  const f = ex1Fixture(t);
+  const f = ex1Fixture(t, { legacy: true });
   f.behave({ "review:1": "code:The result is wrong" });
   const command = JSON.stringify(f.command({ maxCorrections: 0 }));
   assert.deepEqual(ex1AtCommit(f.directory, f.database, EX5_BASE, "ex5-era", `
@@ -1618,11 +1712,11 @@ test("EX6 a clarification names one exact task of this plan, once, with its text
 });
 
 test("EX6 era: without a clarification every request is byte for byte the base's, and the admission the base wrote reads as it wrote it", async t => {
-  const f = ex1Fixture(t);
+  const f = ex1Fixture(t, { legacy: true });
   const command = JSON.stringify(f.command({ maxCorrections: 1 }));
   assert.deepEqual(ex1AtCommit(f.directory, f.database, EX6_BASE, "ex6-era", `
 out((await engine.execute(${command})).map(run => run.value.state));`), ["committed", "committed"]);
-  const g = ex1Fixture(t);
+  const g = ex1Fixture(t, { legacy: true });
   assert.deepEqual((await g.run({ maxCorrections: 1 })).map(run => run.value.state), ["committed", "committed"]);
   // AT3a: the requests are the base's but for exactly what AT3a adds under admission — the unexecutable outcome of the
   // implementation (the engine's rule and the adapter's line) and the addressed form of the review rules.
@@ -1734,7 +1828,7 @@ test("AT3a row 10: the saved outcome of a failed check's review is read on a rep
 });
 
 test("AT3a rows 11, 12: era — the code before AT3a stops a task on a plan finding of strings, and the new code reads it as it wrote it; without admission the requests and outcomes stay as they were", async t => {
-  const f = ex1Fixture(t);
+  const f = ex1Fixture(t, { legacy: true });
   f.behave({ "review:1": "plan" });
   const command = JSON.stringify(f.command());
   assert.deepEqual(ex1AtCommit(f.directory, f.database, AT3A_BASE, "at3a-era", `
@@ -1744,7 +1838,7 @@ out((await engine.execute(${command})).map(run => run.value.state));`), ["needs_
   assert.deepEqual([saved.value.review?.findings, saved.value.review?.contract, saved.value.planDefect], [["The responsibility cannot deliver"], undefined, undefined]);
   const [again] = await f.run({ retry: true });
   assert.deepEqual([again!.value.state, again!.revision, f.provider().length], ["needs_plan", saved.revision, 2], "read by its own era, nothing bought");
-  const legacy = executionFixture(t, "plan-defect");
+  const legacy = legacyExecutionFixture(t, "plan-defect");
   const [stopped] = await legacy.engine.executor.run("p", reference(legacy.plan), legacy.options);
   assert.deepEqual([stopped!.value.state, stopped!.value.review?.findings, stopped!.value.review?.contract], ["needs_plan", ["The proposed responsibility cannot deliver the required result"], undefined],
     "without admission a plan finding of strings stops as before (legacy repair route)");
@@ -1783,7 +1877,7 @@ test("AT3a row 10 (№4135): a lost process between the failed full check and it
 // ---- AT3a return №4141: the saved failed check is reviewed as saved; the unexecutable answer binds the real working copy ----
 test("AT3a return №4141 P2-1: the live form of task 1 — a needs_code the code before AT3a wrote, with its candidate, a failed full check, no review and no correction left — is reviewed once as saved, with no implementation bought and no correction slot opened", async t => {
   for (const [verdict, state] of [["plan-addressed", "needs_plan"], ["ok", "needs_code"]] as const) {
-    const f = ex1Fixture(t, { tap: true });
+    const f = ex1Fixture(t, { legacy: true, tap: true });
     f.behave({ "implement:1": "wrong" });
     const command = JSON.stringify(f.command({ maxCorrections: 0 }));
     assert.deepEqual(ex1AtCommit(f.directory, f.database, AT3A_BASE, `at3a-live-${verdict}`, `

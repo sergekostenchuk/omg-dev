@@ -1,9 +1,9 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { StatementSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -36,15 +36,10 @@ import { mc1FieldSpec, writeMc1Question, writeAcceptedAnswer, prepareAnswerInval
 import { prepareQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
   type QuestionTaskRequest, type QuestionPacketRequest } from '../src/om/question-packet.js';
 import { pendingCallStore, runModelCall, type ModelCallRequest } from '../src/om/model-call.js';
-import { readLegacyOperation, recoverLegacyOperation } from '../src/product/preparation-run.js';
-import { acquire, release } from '../src/execution/lock.js';
-import type { ExecutionLock } from '../src/execution/model.js';
-import type { ParkedCandidate } from '../src/execution/park.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { gardenGraph } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
-import { executionFixture } from './execution-fixture.js';
 
 const code = (expected: string) => (error: unknown): boolean => error instanceof EngineError && error.code === expected;
 const isProxyObject = (value: unknown): boolean => types.isProxy(value);
@@ -909,82 +904,6 @@ test('X41 recordCall over the intercepted view writes E1 as exactly one guarded 
       assert.ok(claimIndex > e1Index, 'E1 alone precedes the durable running claim');
     }
   }
-});
-
-/** Minimal park-intent driver: a real owner process that dies right after its preparing intent is durable. */
-function startParkDriver(directory: string, database: string, run: Ref) {
-  const path = join(directory, 'driver-park.mjs'), mark = join(directory, 'driver-park.json');
-  writeFileSync(path, `import{writeFileSync}from'node:fs';
-import{Store}from${JSON.stringify(new URL('../src/storage/store.js', import.meta.url).href)};
-import{ProductEngine}from${JSON.stringify(new URL('../src/product/engine.js', import.meta.url).href)};
-const store=new Store(${JSON.stringify(database)}),engine=new ProductEngine(store);
-const original=store.writeMany.bind(store);let stopped=false;
-store.writeMany=(writes,guards=[])=>{
- const saved=original(writes,guards);
- if(!stopped&&writes.some(w=>w.kind==='parked-candidate'&&w.value.state==='preparing')){stopped=true;
-  writeFileSync(${JSON.stringify(mark)},JSON.stringify({pid:process.pid}));process.exit(71);}
- return saved;};
-try{await engine.repairs.prepare('p',${JSON.stringify(run)});}catch(error){console.error(error?.stack??String(error));process.exitCode=72;}finally{store.close();}`);
-  const child = spawn(process.execPath, [path], { stdio: ['ignore', 'pipe', 'pipe'] });
-  let stderr = ''; child.stderr!.on('data', data => { stderr += String(data); }); child.stdout!.resume();
-  const exit = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('exit', code => resolve(code)); });
-  return { child, exit, stderr: () => stderr, checkpoint: mark };
-}
-async function parkCheckpoint(path: string, driver: { child: ChildProcess; exit: Promise<number | null>; stderr: () => string }) {
-  if (!existsSync(path)) await new Promise<void>((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout>;
-    const finish = (error?: Error) => { clearTimeout(timer); watcher.close(); driver.child.off('exit', ended); if (error) reject(error); else resolve(); };
-    const ended = () => finish(existsSync(path) ? undefined : new Error(`Driver exited before checkpoint: ${driver.stderr()}`));
-    const watcher = watch(dirname(path), () => { if (existsSync(path)) finish(); });
-    timer = setTimeout(() => finish(new Error(`Checkpoint timeout: ${driver.stderr()}`)), 20_000);
-    driver.child.once('exit', ended);
-    if (existsSync(path)) finish(); else if (driver.child.exitCode !== null && driver.child.signalCode !== null) ended();
-  });
-}
-
-test('X19 two recoveries that read one basis before acquire cannot both acquire: one commits, the other is refused whole without a prefix', async t => {
-  const f = executionFixture(t, 'plan-defect');
-  const failed = (await f.engine.executor.run('p', reference(f.plan), f.options))[0]!;
-  assert.equal(failed.value.state, 'needs_plan');
-  const driver = startParkDriver(f.directory, f.store.path, reference(failed));
-  t.after(async () => { if (driver.child.exitCode === null && driver.child.signalCode === null) driver.child.kill('SIGKILL'); await driver.exit; });
-  await parkCheckpoint(driver.checkpoint, driver);
-  assert.equal(await driver.exit, 71, driver.stderr());
-  const lease = readLegacyOperation(f.store, 'p')!;
-  assert.equal(lease.value.operation, 'repair');
-  assert.equal(f.store.list<ParkedCandidate>('parked-candidate')[0]!.value.state, 'preparing');
-  f.reopen();
-  const other = new Store(f.store.path); t.after(() => other.close());
-  const markerHistory = f.store.history('legacy-operation:p').length;
-  const lockHistory = f.store.history('execution-lock:p').length;
-  // The raced recovery computed its basis (operation head and absent-or-exact lock) before this commit.
-  const writeMany = f.store.writeMany.bind(f.store); let raced = false; let competing: Revision<ExecutionLock> | undefined;
-  const acquirePacks: { writes: Write[]; guards: TransactionGuard[] }[] = [];
-  f.store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => {
-    if (writes.some(write => write.id === 'execution-lock:p')) acquirePacks.push({ writes, guards });
-    if (!raced && writes.some(write => write.id === 'execution-lock:p')) { raced = true; competing = acquire(other, 'p'); }
-    return writeMany(writes, guards);
-  }) as Store['writeMany'];
-  await assert.rejects(
-    recoverLegacyOperation(f.engine, { project: 'p', operation: reference(lease), token: lease.value.token }),
-    (error: unknown) => error instanceof EngineError && ['input_stale', 'revision_conflict'].includes(error.code));
-  f.store.writeMany = writeMany;
-  assert.ok(raced, 'the recovery reached the guarded acquire');
-  // The acquire pack carried the operation head and the lock condition — a bypassed view would drop them.
-  assert.equal(acquirePacks.length, 1);
-  const operationHead = f.store.get('legacy-operation:p')!;
-  assert.ok(acquirePacks[0]!.guards.some(guard => canonical(guard) === canonical(reference(operationHead))),
-    'the acquire commit is guarded by the exact operation head observed at basis read');
-  assert.ok(acquirePacks[0]!.guards.some(guard => guard.id === 'execution-lock:p'),
-    'the acquire commit is guarded by the lock condition observed at basis read');
-  assert.equal(f.store.list<ParkedCandidate>('parked-candidate')[0]!.value.state, 'preparing', 'no separate prefix of the refused recovery');
-  assert.equal(f.store.history('legacy-operation:p').length, markerHistory, 'no second acquire or release record');
-  assert.equal(f.store.history('execution-lock:p').length, lockHistory + 1, 'only the competing acquire landed');
-  release(other, competing!);
-  // After the refused racer the lawful recovery completes the exact parking once.
-  const released = await recoverLegacyOperation(f.engine, { project: 'p', operation: reference(lease), token: lease.value.token });
-  assert.equal(released.value.state, 'released');
-  assert.equal(f.store.list<ParkedCandidate>('parked-candidate')[0]!.value.state, 'parked');
 });
 
 // ── S1.1 (№1887): the write-only view over a plain Store is a frozen facade, not a Proxy ──

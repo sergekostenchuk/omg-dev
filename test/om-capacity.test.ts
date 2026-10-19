@@ -244,20 +244,22 @@ test("V1 propagates unexpected storage failures instead of disguising them as ab
   }
 });
 
-test("V1 retains legacy environment bytes, accepted plan hash and guards across opt-in and restart", t => {
-  const f = executionFixture(t), environment = f.engine.environments.get("p"), plan = f.engine.compiler.read(f.plan.id);
-  assert.equal(Object.hasOwn(environment.value, "requestCapacityChars"), false);
+test("V1 retains accepted OM environment bytes, plan hash and guards across capacity changes and restart", t => {
+  const f = executionFixture(t, "normal", { route: "om" }), environment = f.engine.environments.get("p"), plan = f.engine.compiler.read(f.plan.id);
+  assert.equal(environment.value.requestCapacityChars, 100_000);
+  assert.equal(plan.value.feasibility.id, "om-feasibility:p");
+  assert.equal(f.store.get("feasibility:p"), null);
   assert.equal(environment.value.workspace, realpathSync(f.workspace));
   assert.equal(hashJson(environment.value), environment.hash);
   const baseline = canonical(plan), guards = canonical(plan.value.guards), environmentBytes = canonical(environment);
-  refusalOf(readCapacity(f.store, request(reference(environment), true, "p")), "capacity_missing");
+  assert.equal(valueOf(readCapacity(f.store, request(reference(environment), true, "p"))).maxRequestChars, 100_000);
   assert.deepEqual(f.engine.environments.effective("p").environment, environment);
   assert.equal(canonical(f.engine.compiler.read(plan.id)), baseline);
   assert.deepEqual(f.engine.compiler.gate("p", reference(plan)).findings, []);
   assert.ok(plan.value.guards.some(guard => canonical(guard) === canonical(reference(environment))));
   const { projectId: _projectId, ...settings } = environment.value;
-  const changed = f.engine.environments.configure("p", { ...settings, requestCapacityChars: 100_000 }, environment.revision);
-  assert.equal(valueOf(readCapacity(f.store, request(reference(changed), true, "p"))).maxRequestChars, 100_000);
+  const changed = f.engine.environments.configure("p", { ...settings, requestCapacityChars: 200_000 }, environment.revision);
+  assert.equal(valueOf(readCapacity(f.store, request(reference(changed), true, "p"))).maxRequestChars, 200_000);
   assert.equal(canonical(f.store.get(environment.id, environment.revision)), environmentBytes);
   assert.equal(canonical(f.engine.compiler.read(plan.id)), baseline);
   assert.equal(canonical(f.engine.compiler.read(plan.id).value.guards), guards);
@@ -266,7 +268,7 @@ test("V1 retains legacy environment bytes, accepted plan hash and guards across 
   assert.equal(canonical(f.store.get(environment.id, environment.revision)), environmentBytes);
   assert.equal(canonical(f.engine.compiler.read(plan.id)), baseline);
   assert.equal(canonical(f.engine.compiler.read(plan.id).value.guards), guards);
-  refusalOf(readCapacity(f.store, request(reference(environment), false, "p")), "capacity_missing");
+  assert.equal(valueOf(readCapacity(f.store, request(reference(environment), false, "p"))).maxRequestChars, 100_000);
 });
 
 test("V1 one configured character capacity supplies exact bounded context and real local protocol transport without truncation", async t => {
