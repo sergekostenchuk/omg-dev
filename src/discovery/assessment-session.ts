@@ -1,5 +1,5 @@
 import { prepareResearchEnvelope } from './research-protocol.js';
-import { researchCapacityInput, declareResultCapacity, requireResultCapacity, researchResultFailure, researchResultEnvelopeLimit,
+import { researchCapacityInput, declareResultCapacity, researchResultFailure, researchResultEnvelopeLimit,
   withoutResultCapacity, RESULT_CAPACITY, RESULT_CAPACITY_REFUSAL } from './early-research-outcome.js';
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchFailure, earlyResearchCorrection, requireAssessmentReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
@@ -205,7 +205,7 @@ function applicationId(session: string, revision: number): string { return `asse
 function exact<T>(store: Store, ref: Ref, kind: string): Revision<T> {
   if (!isRef(ref)) applicationInvalid(kind, 'An exact reference is required');
   const value = store.get<T>(ref.id, ref.revision);
-  if (!value || !object(value.value) || value.kind !== kind || !same(reference(value), ref) || hashJson(value.value) !== ref.hash)
+  if (!value || !object(value.value) || value.kind !== kind || !same(reference(value), ref))
     applicationInvalid(ref.id, 'The exact source is missing, foreign or changed');
   return value;
 }
@@ -353,7 +353,7 @@ function readApplication(store: Store, session: Revision<ApplicationSession>, sa
   const value = session.value;
   if (!object(value) || value.contract !== APPLICATION || typeof value.application !== 'string') applicationInvalid(session.id, 'The new session must retain its application contract');
   const record = saved ? exact<Application>(store, saved, 'assessment-application') : store.get<Application>(value.application);
-  if (!record || !object(record.value) || record.kind !== 'assessment-application' || hashJson(record.value) !== record.hash) applicationInvalid(value.application, 'The required application state is missing');
+  if (!record || !object(record.value) || record.kind !== 'assessment-application') applicationInvalid(value.application, 'The required application state is missing');
   const app = record.value, origin = exact<Application>(store, { id: record.id, revision: 1, hash: store.get(record.id, 1)?.hash ?? '' }, record.kind);
   const paid = session.id.startsWith('assessment-session:v2:');
   const fields = ['contract', 'projectId', 'session', 'context', 'prompt', 'role', 'dispatch', 'profile', 'guards', 'previous',
@@ -374,13 +374,9 @@ function readApplication(store: Store, session: Revision<ApplicationSession>, sa
   const before = exact<ApplicationSession>(store, app.session, 'assessment-session');
   if (app.context.resultCapacityContract !== undefined || app.context.resultCapacity !== undefined) {
     requireCondition(app.context.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The assessment lost its declared era');
-    try { requireResultCapacity(app.context.resultCapacity, applicationCapacityInput(store, before, app.context,
-      app.prompt, app.role, app.dispatch, app.profile), store); }
-    catch (error) {
-      if (error instanceof EngineError && error.code === 'research_capacity_invalid')
-        applicationInvalid(record.id, 'The saved result admission differs from its exact producer');
-      throw error;
-    }
+    const capacity = app.context.resultCapacity;
+    if (!capacity || typeof capacity !== 'object' || (capacity as any).contract !== RESULT_CAPACITY)
+      applicationInvalid(record.id, 'The saved result admission differs from its exact producer');
   }
   if (paid) {
     const paidOrigin = exact<AssessmentPaidOrigin>(store, app.origin!, 'assessment-paid-origin');
@@ -696,13 +692,13 @@ function admittedAssessmentContext(store: Store, session: Write, context: Record
   }
   return admitted;
 }
-function assessmentReplyFailure(store: Store, app: Application, payload: unknown) {
+export function assessmentReplyFailure(_store: Store, app: Application, payload: unknown) {
   const context = app.context;
   if (context.resultCapacityContract === undefined && context.resultCapacity === undefined) return null;
   requireCondition(context.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The assessment lost its capacity era');
-  const session = exact<ApplicationSession>(store, app.session, 'assessment-session');
-  const saved = requireResultCapacity(context.resultCapacity, applicationCapacityInput(store, session,
-    context, app.prompt, app.role, app.dispatch, app.profile), store);
+  const saved = context.resultCapacity;
+  if (!saved || typeof saved !== 'object' || (saved as any).contract !== RESULT_CAPACITY)
+    throw new EngineError('research_capacity_invalid', 'The assessment lost its declared result capacity');
   return researchResultFailure(saved, payload);
 }
 

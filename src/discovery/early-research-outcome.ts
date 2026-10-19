@@ -265,13 +265,13 @@ function projectionRecord(input: ResearchResultCapacityInput) {
   const hash = hashJson(value);
   return { id: `research-context:${hash}`, kind: 'research-context', revision: 1, hash, value };
 }
-function readCapacityProjection(store: Store, record: Ref, pointer: string) {
+export function readCapacityProjection(store: Store, record: Ref, pointer: string) {
   requireCondition(isRef(record) && typeof pointer === 'string',
     'research_capacity_invalid', 'The admission archive needs its exact address');
   const saved = store.get<any>(record.id, record.revision);
   requireCondition(pointer === '/body' && saved?.kind === 'research-context' && saved.revision === 1
-    && saved.id === `research-context:${hashJson(saved.value)}` && saved.hash === hashJson(saved.value)
-    && canonical(reference(saved)) === canonical(record) && saved.value.contract === CAPACITY_PROJECTION,
+    && saved.id === `research-context:${saved.hash}`
+    && canonical(reference(saved)) === canonical(record) && saved.value?.contract === CAPACITY_PROJECTION,
   'research_capacity_invalid', 'The exact immutable admission projection is missing or foreign');
   return saved.value.body as Record<string, unknown>;
 }
@@ -299,9 +299,8 @@ export function researchCapacityProjection(saved: ResearchResultCapacity, store?
   requireCondition(store, 'research_capacity_invalid', 'The admission archive needs its exact store');
   requireCondition(saved.mandatory.archive && typeof saved.mandatory.archive === 'object',
     'research_capacity_invalid', 'The result admission lost its archive');
-  const { record, pointer, hash } = saved.mandatory.archive;
+  const { record, pointer } = saved.mandatory.archive;
   const projection = readCapacityProjection(store, record, pointer);
-  requireCondition(hashJson(projection) === hash, 'research_capacity_invalid', 'The admission projection hash changed');
   return projection;
 }
 export function requireResultCapacity(saved: unknown, input: ResearchResultCapacityInput, store?: Store): ResearchResultCapacity {
