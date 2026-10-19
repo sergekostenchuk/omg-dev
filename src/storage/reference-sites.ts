@@ -139,6 +139,26 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["value", "claims", INDEX, "basis", "authority"],
     ["value", "claims", INDEX, "basis", "authority", "ref"],
   ] },
+  // DR3a1: a v7 research attempt declares every reference of its contract —
+  // draft, accepted plan answer, generating call, a duplicate's original,
+  // refused/impossible evidence, and inside the submitted end's claims the
+  // same dossier links as the research-answer rule above plus the
+  // planQuestions link targets and claim-to-claim ClaimAddress containers.
+  { kind: "research-attempt", contract: "v7-attempt/v1", data: [], refs: [
+    ["draft"], ["planAnswer"], ["call"],
+    ["end", "of"],
+    ["end", "evidence", INDEX],
+    ["end", "value", "claims", INDEX, "planQuestions", INDEX, "planAnswer"],
+    ["end", "value", "claims", INDEX, "scope", "variants", INDEX],
+    ["end", "value", "claims", INDEX, "basis", "source", "ref"],
+    ["end", "value", "claims", INDEX, "basis", "from", "container"],
+    ["end", "value", "claims", INDEX, "basis", "from", INDEX, "container"],
+    ["end", "value", "claims", INDEX, "basis", "authority"],
+    ["end", "value", "claims", INDEX, "basis", "authority", "ref"],
+    ["end", "value", "claims", INDEX, "contradicts", INDEX, "container"],
+    ["end", "value", "claims", INDEX, "refutedBy", INDEX, "container"],
+    ["end", "value", "claims", INDEX, "supersedes", "container"],
+  ] },
   { kind: "research-assessment", contract: null, data: [["value"], ["observations", INDEX, "value"]] },
   { kind: "research-checkpoint", contract: null, data: [["proposal"], ["observations", INDEX, "value"]] },
   { kind: "research-context", contract: null, data: contextData(["body"]) },

@@ -2,18 +2,18 @@ import { EngineError } from "../errors.js";
 import { isRef, type Ref } from "../pipeline/contracts.js";
 import type { Json } from "../canonical.js";
 import type { Store, Revision } from "../storage/store.js";
-import { proveIssuedAnswer, savedAcceptanceAct, issuedAnswerSchemaHolds,
-  type AnswerProvenance, type ResearchProvenance } from "./projection-reader.js";
+import { proveIssuedAnswer, savedAcceptanceAct, issuedAnswerSchemaHolds } from "./projection-reader.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
 import type { ResearchAcceptanceBinding } from "./research-consumer-transition.js";
+import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_KIND, provenAcceptance } from "./v7-contracts.js";
+import { proveAttempt, type V7Attempt } from "./v7-plan-questions.js";
 
-/** The record contract marking a research-answer that carries a typed claims
- * collection at value.claims. It sits at the root of the record body, next to
- * projectId/question/assessment; a marker inside the payload does not make a
- * record this contract. The v7 producer writes it (DR3a); DR2 declares the
- * address and the traversal contract on it. */
-export const DISCOVERY_CLAIMS_CONTRACT = "discovery-claims/v7";
+/** The record contract marking a typed claims collection: at the body root
+ * of a claims-carrying research answer (DR2), and at the submitted end of a
+ * research attempt (DR3a1) — a marker inside an arbitrary payload never
+ * makes a record this contract. */
+export { DISCOVERY_CLAIMS_CONTRACT };
 
 /** Typed address of a claim inside an immutable accepted container
  * (strategy A): the exact Ref of the container record, the kind it must
@@ -29,10 +29,13 @@ export interface ClaimAddress {
 
 interface ClaimsAnswer extends ResearchAnswer { contract: string }
 
-export interface ResolvedClaim { container: Revision<ClaimsAnswer>; claim: Json }
+export interface ResolvedClaim { container: Revision<ClaimsAnswer> | Revision<V7Attempt>; claim: Json }
 /** A resolved claim with the separate proof that its container is accepted —
  * resolution alone never stands for acceptance. */
 export interface ProvenClaim extends ResolvedClaim {
+  /** A proven claim's container is always a claims-carrying research answer —
+   * the attempt route never reaches acceptance in DR3a1. */
+  container: Revision<ClaimsAnswer>;
   answer: Revision<ResearchAnswer>;
   assessment: Revision<ResearchAssessment> | null;
   binding: Revision<ResearchAcceptanceBinding> | null;
@@ -59,11 +62,17 @@ export function resolveClaimAddress(store: Store, address: ClaimAddress): Resolv
     || !isRef(a["container"]) || typeof a["containerKind"] !== "string" || a["containerKind"].length === 0
     || typeof a["pointer"] !== "string" || typeof a["claimId"] !== "string" || a["claimId"].length === 0)
     refuse(address, "address", "an address needs project, an exact container Ref, containerKind, pointer and claimId");
-  if (a["containerKind"] !== "research-answer")
-    refuse(address, "containerKind", "the claims contract lives only on research-answer records");
   const pointer = CLAIM_POINTER.exec(a["pointer"] as string);
   if (pointer === null || !Number.isSafeInteger(Number(pointer[1])))
     refuse(address, "pointer", "the pointer must be /claims/<index>");
+  const index = Number(pointer[1]);
+  if (a["containerKind"] === "research-answer") return resolveAnswerClaim(store, address, index);
+  if (a["containerKind"] === V7_ATTEMPT_KIND) return resolveAttemptClaim(store, address, index);
+  refuse(address, "containerKind", "the claims contract lives on a research-answer or a research-attempt record");
+}
+
+function resolveAnswerClaim(store: Store, address: ClaimAddress, index: number): ResolvedClaim {
+  const a = address as unknown as Record<string, unknown>;
   const containerRef = a["container"] as Ref;
   const container = store.get<ClaimsAnswer>(containerRef.id, containerRef.revision);
   if (container === null || container.kind !== a["containerKind"] || container.hash !== containerRef.hash)
@@ -74,7 +83,7 @@ export function resolveClaimAddress(store: Store, address: ClaimAddress): Resolv
     refuse(address, "container", "the container is not a v7 claims record");
   const payload = container.value.value;
   const claims = object(payload) && Array.isArray(payload["claims"]) ? payload["claims"] : null;
-  const claim = claims === null ? null : claims[Number(pointer[1])];
+  const claim = claims === null ? null : claims[index];
   if (!object(claim)) refuse(address, "pointer", "the pointer does not name a claim element");
   if (claim["id"] !== a["claimId"])
     refuse(address, "claimId", "the element at the pointer carries another id");
@@ -84,21 +93,39 @@ export function resolveClaimAddress(store: Store, address: ClaimAddress): Resolv
   return { container, claim };
 }
 
+/** The attempt route of DR3a1: the saved containerKind routes the address
+ * through the attempt reader — a consistent, project-owning submitted
+ * attempt is the claims container of its claims. A damaged, foreign or
+ * inconsistent attempt refuses the address; there is no fallback to the
+ * field-answer path for an attempt container. */
+function resolveAttemptClaim(store: Store, address: ClaimAddress, index: number): ResolvedClaim {
+  const a = address as unknown as Record<string, unknown>;
+  let proof: ReturnType<typeof proveAttempt>;
+  try { proof = proveAttempt(store, a["container"] as Ref); }
+  catch (error) {
+    if (error instanceof EngineError)
+      refuse(address, "container", `the addressed attempt is not a consistent claims container: ${error.message}`);
+    throw error;
+  }
+  if (proof.attempt.value.project !== a["project"])
+    refuse(address, "project", "the container belongs to another project");
+  if (proof.claims === undefined)
+    refuse(address, "container", "only a submitted attempt carries a claims collection");
+  const claim = proof.claims[index];
+  if (!object(claim)) refuse(address, "pointer", "the pointer does not name a claim element");
+  if (claim["id"] !== a["claimId"])
+    refuse(address, "claimId", "the element at the pointer carries another id");
+  return { container: proof.attempt, claim };
+}
+
 /** The acceptance half of a claims container, interpreted by the common
  * answer-provenance reader: a managed acceptance is proven by its saved
  * binding K; every other research answer needs its own supported, well-formed
  * assessment of this exact value by an independent assessor, bound to the
  * named question, with its observations. The record's existence alone is
- * never an acceptance. */
-export function provenAcceptance(provenance: AnswerProvenance): provenance is ResearchProvenance {
-  if (provenance.kind !== "research-answer") return false;
-  if (provenance.binding !== null) return true;
-  return provenance.supported && provenance.wellFormed && provenance.independent
-    && provenance.valueMatches && provenance.bindsQuestion === true && provenance.hasObservations
-    && provenance.observations.every(item => object(item)
-      && typeof item["projectId"] === "string" && isRef(item["source"])
-      && object(item["selector"]) && item["value"] !== undefined);
-}
+ * never an acceptance. The predicate itself lives in v7-contracts — the plan
+ * reader proves the same provenance for its accepted plan answers. */
+export { provenAcceptance };
 
 /** The separate half: the addressed claim is usable only when its container
  * is proven an accepted answer of the question it names — question record,
@@ -107,7 +134,15 @@ export function provenAcceptance(provenance: AnswerProvenance): provenance is Re
  * container is an addressed refusal, not a claim. */
 export function proveClaimAddress(store: Store, address: ClaimAddress): ProvenClaim {
   const resolved = resolveClaimAddress(store, address);
-  const question = store.get<Question>(resolved.container.value.question);
+  // The attempt route resolves structurally, but what an accepted ATTEMPT is
+  // is not decided — DR3a1 always refuses the acceptance half here, with its
+  // own typed code, and never falls back to the field-answer path.
+  if (resolved.container.kind === V7_ATTEMPT_KIND)
+    throw new EngineError("claim_attempt_not_accepted",
+      "[claim_attempt_not_accepted] The claim lives inside a structurally valid attempt; "
+      + "the acceptance of an attempt is not decided yet", { address });
+  const container = resolved.container as Revision<ClaimsAnswer>;
+  const question = store.get<Question>(container.value.question);
   if (question === null || question.kind !== "question" || question.value.projectId !== address.project)
     refuse(address, "question", "the container does not answer a question of this project");
   const draft = store.get<DiscoveryDraft>(question.value.draftId);
@@ -118,7 +153,7 @@ export function proveClaimAddress(store: Store, address: ClaimAddress): ProvenCl
     proven = proveIssuedAnswer(store, draft,
       { question, foreign: false, answered: true, answerRef: address.container,
         field: question.value.spec.field },
-      resolved.container as unknown as Revision<Record<string, unknown>>,
+      container as unknown as Revision<Record<string, unknown>>,
       { verifyIssuedQuestion: true });
   } catch (error) {
     // A record whose acceptance chain reads to nothing (e.g. a missing
@@ -135,7 +170,7 @@ export function proveClaimAddress(store: Store, address: ClaimAddress): ProvenCl
       address.container, proven.proof.value))
     refuse(address, "container", "the addressed claim lives in an answer that was never accepted");
   const provenance = proven.proof.provenance;
-  return { ...resolved,
+  return { ...resolved, container,
     answer: proven.proof.record as unknown as Revision<ResearchAnswer>,
     assessment: provenance.assessment, binding: provenance.binding };
 }

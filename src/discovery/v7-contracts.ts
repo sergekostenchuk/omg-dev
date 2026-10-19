@@ -4,7 +4,7 @@ import { canonical, hashJson, HASH_PATTERN, type Json } from "../canonical.js";
 import { isRef, type Ref } from "../pipeline/contracts.js";
 import type { Revision } from "../storage/store.js";
 import type { Discovery, DiscoveryDraft, FieldSpec } from "./discovery.js";
-import type { IssuedAnswerProof } from "./projection-reader.js";
+import type { IssuedAnswerProof, AnswerProvenance, ResearchProvenance } from "./projection-reader.js";
 
 /** Era-7 contract facts of the new Discovery map (Стадия 1 · Discovery, D1–D2). */
 export const V7_CONTRACT_ERA = 7;
@@ -247,3 +247,247 @@ export function discoveryAcceptanceActId(projectId: string, draftId: string, fie
   return `${DISCOVERY_ACCEPTANCE_ACT_KIND}:${projectId}:${hashJson({ draftId, field, answer: { id: answer.id, revision: answer.revision, hash: answer.hash } })}`;
 }
 export const acceptanceActId = discoveryAcceptanceActId;
+
+/* ---------- DR3a1: research attempts (research-attempt / v7-attempt/v1) ---------- */
+
+/** The record contract marking a claims collection: at the body root of a
+ * claims-carrying research answer (DR2), and at the submitted end of a
+ * research attempt (DR3a1). A marker inside an arbitrary payload does not
+ * make a record this contract. */
+export const DISCOVERY_CLAIMS_CONTRACT = "discovery-claims/v7";
+
+/** The new base-layer record kind and body contract of one v7 research
+ * attempt on a plan-question — an immutable record per (project, accepted
+ * plan-question, generating call); its claims live only in the end. */
+export const V7_ATTEMPT_KIND = "research-attempt";
+export const V7_ATTEMPT_CONTRACT = "v7-attempt/v1";
+
+/** The closed list of refused/impossible end codes — the agreed minimum of
+ * the DR3a packet; extending it is a DR3b review decision. */
+export const V7_ATTEMPT_END_CODES = Object.freeze(["source_unavailable",
+  "outside_plan_scope", "needs_owner_authority"] as const);
+export type V7AttemptEndCode = typeof V7_ATTEMPT_END_CODES[number];
+
+/** The discriminated claim kinds of discovery-claims/v7 and the unknown's
+ * moment enum. */
+export const V7_CLAIM_KINDS = Object.freeze(["fact", "inference", "hypothesis",
+  "unknown", "owner-decision"] as const);
+export const V7_UNKNOWN_MOMENTS = Object.freeze(["om-pass", "feasibility",
+  "task-start", "task-result"] as const);
+/** The ClaimAddress pointer shape inside claims — /claims/<index>, no padding. */
+export const V7_CLAIM_POINTER = /^\/claims\/(0|[1-9][0-9]*)$/;
+
+const CLAIM_FIELDS: readonly string[] = ["id", "kind", "text", "axis", "planQuestions",
+  "scope", "basis", "contradicts", "refutedBy", "supersedes"];
+const CLAIM_REQUIRED: readonly string[] = ["id", "kind", "text", "axis", "planQuestions",
+  "scope", "basis"];
+const CLAIM_ADDRESS_FIELDS: readonly string[] = ["project", "container", "containerKind",
+  "pointer", "claimId"];
+
+/** What the claims check needs from the attempt it belongs to. */
+export interface V7ClaimsContext {
+  /** Every declared Ref and every ClaimAddress names a record of this project. */
+  project: string;
+  /** The attempt's own plan-question: the exact accepted plan-answer Ref and
+   * the stable plan-question id inside it — every claim must serve it. */
+  planAnswer: Ref;
+  planQuestionId: string;
+  /** Existence prover injected by the reader: true when `ref` names a record
+   * present at its exact revision and hash and carrying context.project. */
+  projectRef: (ref: Ref) => boolean;
+}
+
+// A function declaration — const arrow `never` loses narrowing under this compiler.
+function attemptRefuse(field: string, reason: string): never {
+  throw new EngineError("attempt_invalid", `[${field}] ${reason}`, { field, reason });
+}
+
+const exactFields = (value: Record<string, Json>, allowed: readonly string[], at: string) => {
+  for (const key of Object.keys(value))
+    if (!allowed.includes(key)) attemptRefuse(`${at}.${key}`, "only the contracted fields are carried");
+};
+
+/** A ClaimAddress link inside claims: the exact fields, this project, a
+ * /claims/<i> pointer and an existing container of this project. */
+function checkClaimAddress(value: unknown, context: V7ClaimsContext, at: string): void {
+  if (!obj(value)) attemptRefuse(at, "a claim link is a ClaimAddress object");
+  exactFields(value, CLAIM_ADDRESS_FIELDS, at);
+  if (value["project"] !== context.project)
+    attemptRefuse(`${at}.project`, "a link addresses claims of this project");
+  if (!isRef(value["container"]) || !context.projectRef(value["container"]))
+    attemptRefuse(`${at}.container`, "the addressed container is missing, changed or foreign");
+  if (!nonempty(value["containerKind"]))
+    attemptRefuse(`${at}.containerKind`, "the link names the container kind");
+  if (typeof value["pointer"] !== "string" || !V7_CLAIM_POINTER.test(value["pointer"]))
+    attemptRefuse(`${at}.pointer`, "the pointer is /claims/<index>");
+  if (!nonempty(value["claimId"])) attemptRefuse(`${at}.claimId`, "the link names the claim id");
+}
+
+function checkClaimPlanQuestions(value: unknown, context: V7ClaimsContext, at: string): void {
+  if (!Array.isArray(value) || value.length === 0)
+    attemptRefuse(`${at}.planQuestions`, "a claim names the plan questions it serves");
+  let own = false;
+  for (const [index, entry] of value.entries()) {
+    const field = `${at}.planQuestions.${index}`;
+    if (!obj(entry)) attemptRefuse(field, "a plan-question link is an object");
+    exactFields(entry, ["planAnswer", "planQuestionId"], field);
+    if (!isRef(entry["planAnswer"]) || !context.projectRef(entry["planAnswer"]))
+      attemptRefuse(`${field}.planAnswer`, "the plan answer is missing, changed or foreign");
+    if (!nonempty(entry["planQuestionId"]))
+      attemptRefuse(`${field}.planQuestionId`, "the link needs its plan-question id");
+    if (canonical(entry["planAnswer"]) === canonical(context.planAnswer)
+      && entry["planQuestionId"] === context.planQuestionId) own = true;
+  }
+  if (!own)
+    attemptRefuse(`${at}.planQuestions`, "every claim of an attempt serves the attempt's own plan-question");
+}
+
+function checkClaimScope(value: unknown, context: V7ClaimsContext, at: string): void {
+  if (!obj(value)) attemptRefuse(`${at}.scope`, "a claim needs its scope");
+  exactFields(value, ["variants", "region", "asOf"], `${at}.scope`);
+  const variants = value["variants"];
+  if (variants !== "common") {
+    if (!Array.isArray(variants) || variants.length === 0)
+      attemptRefuse(`${at}.scope.variants`, "scope is 'common' or a non-empty list of exact variant Refs");
+    for (const [index, ref] of variants.entries())
+      if (!isRef(ref) || !context.projectRef(ref))
+        attemptRefuse(`${at}.scope.variants.${index}`, "a variant names an existing exact Ref of this project");
+  }
+  for (const key of ["region", "asOf"] as const)
+    if (value[key] !== undefined && !nonempty(value[key]))
+      attemptRefuse(`${at}.scope.${key}`, `${key} is a non-empty string`);
+}
+
+/** The basis form discriminated by the claim kind — the DR2 shape taken over
+ * to the attempt: fact's pinned source, inference's proven links, the
+ * unknown's full ND-02 form and the owner-decision's saved authority. */
+function checkClaimBasis(kind: string, basis: unknown, context: V7ClaimsContext, at: string): void {
+  const b = `${at}.basis`;
+  if (!obj(basis)) attemptRefuse(b, `a ${kind} claim needs its basis`);
+  const projectRef = (ref: unknown, field: string) => {
+    if (!isRef(ref) || !context.projectRef(ref))
+      attemptRefuse(field, "the exact Ref is missing, changed or foreign");
+  };
+  switch (kind) {
+    case "fact": {
+      exactFields(basis, ["source", "limit", "asOf", "apiVersion", "region"], b);
+      const source = basis["source"];
+      if (!obj(source)) attemptRefuse(`${b}.source`, "a fact names its pinned source");
+      exactFields(source, ["ref", "range", "valueHash"], `${b}.source`);
+      projectRef(source["ref"], `${b}.source.ref`);
+      const range = source["range"];
+      if (!obj(range)) attemptRefuse(`${b}.source.range`, "a fact's source names its pinned range");
+      exactFields(range, ["start", "end"], `${b}.source.range`);
+      if (!Number.isSafeInteger(range["start"]) || (range["start"] as number) < 0
+        || !Number.isSafeInteger(range["end"]) || (range["end"] as number) <= (range["start"] as number))
+        attemptRefuse(`${b}.source.range`, "a fact's range is whole offsets 0 <= start < end");
+      if (typeof source["valueHash"] !== "string" || !new RegExp(HASH_PATTERN).test(source["valueHash"]))
+        attemptRefuse(`${b}.source.valueHash`, "a fact's source value is hash-pinned");
+      if (!nonempty(basis["limit"])) attemptRefuse(`${b}.limit`, "a fact names its limitation");
+      if (!nonempty(basis["asOf"])) attemptRefuse(`${b}.asOf`, "a fact names its as-of date");
+      for (const key of ["apiVersion", "region"] as const)
+        if (basis[key] !== undefined && !nonempty(basis[key]))
+          attemptRefuse(`${b}.${key}`, `${key} is a non-empty string`);
+      break;
+    }
+    case "inference": {
+      exactFields(basis, ["from", "reasoning"], b);
+      const from = basis["from"];
+      if (!Array.isArray(from) || from.length === 0)
+        attemptRefuse(`${b}.from`, "an inference names the claims it follows from");
+      for (const [index, entry] of from.entries())
+        checkClaimAddress(entry, context, `${b}.from.${index}`);
+      if (!nonempty(basis["reasoning"]))
+        attemptRefuse(`${b}.reasoning`, "an inference states its reasoning");
+      break;
+    }
+    case "hypothesis": {
+      exactFields(basis, ["howToVerify"], b);
+      if (!nonempty(basis["howToVerify"]))
+        attemptRefuse(`${b}.howToVerify`, "a hypothesis states how it is verified");
+      break;
+    }
+    case "unknown": {
+      exactFields(basis, ["origin", "unknownId", "question", "affects", "consumer",
+        "blocksCurrentStage", "moment", "closeCriterion"], b);
+      for (const key of ["origin", "unknownId", "question", "consumer", "closeCriterion"] as const)
+        if (!nonempty(basis[key])) attemptRefuse(`${b}.${key}`, `an unknown needs its ${key}`);
+      const affects = basis["affects"];
+      if (!Array.isArray(affects) || affects.length === 0 || affects.some(item => !nonempty(item)))
+        attemptRefuse(`${b}.affects`, "an unknown names the affected areas — a non-empty list of texts");
+      if (typeof basis["blocksCurrentStage"] !== "boolean")
+        attemptRefuse(`${b}.blocksCurrentStage`, "an unknown states whether it blocks the current stage");
+      if (typeof basis["moment"] !== "string"
+        || !(V7_UNKNOWN_MOMENTS as readonly string[]).includes(basis["moment"]))
+        attemptRefuse(`${b}.moment`, `a moment is one of ${V7_UNKNOWN_MOMENTS.join(", ")}`);
+      break;
+    }
+    case "owner-decision": {
+      exactFields(basis, ["authority"], b);
+      projectRef(basis["authority"], `${b}.authority`);
+      break;
+    }
+    default:
+      attemptRefuse(b, `kind "${kind}" has no basis form`);
+  }
+}
+
+/** The structural half of discovery-claims/v7 on an attempt (POOL Р-4): a
+ * non-empty collection, unique ids, only the contracted fields, an axis of
+ * the 12, planQuestions naming the attempt's own plan-question, a 'common'
+ * or explicit variant scope and a basis discriminated by the claim kind.
+ * Every declared exact Ref must exist at its revision and hash inside the
+ * project — the check is structural; whether a from/contradicts link names
+ * ACCEPTED claims is the DR3b semantic layer. */
+export function checkV7Claims(claims: unknown, context: V7ClaimsContext): void {
+  if (!Array.isArray(claims) || claims.length === 0)
+    throw new EngineError("attempt_claims_empty",
+      "[claims] a submitted attempt carries a non-empty claims collection",
+      { field: "claims", reason: "empty claims" });
+  const seen = new Set<string>();
+  for (const [index, raw] of claims.entries()) {
+    const at = `claims.${index}`;
+    if (!obj(raw)) attemptRefuse(at, "a claim is an object");
+    exactFields(raw, CLAIM_FIELDS, at);
+    for (const key of CLAIM_REQUIRED)
+      if (raw[key] === undefined) attemptRefuse(`${at}.${key}`, `a claim needs its ${key}`);
+    if (!nonempty(raw["id"])) attemptRefuse(`${at}.id`, "a claim needs its id");
+    if (seen.has(raw["id"]))
+      attemptRefuse(`${at}.id`, `claim id "${raw["id"]}" is not unique inside the attempt`);
+    seen.add(raw["id"]);
+    const kind = raw["kind"];
+    if (typeof kind !== "string" || !(V7_CLAIM_KINDS as readonly string[]).includes(kind))
+      attemptRefuse(`${at}.kind`, "a claim kind is fact, inference, hypothesis, unknown or owner-decision");
+    if (!nonempty(raw["text"])) attemptRefuse(`${at}.text`, "a claim needs its text");
+    if (typeof raw["axis"] !== "string" || !(V7_AXES as readonly string[]).includes(raw["axis"]))
+      attemptRefuse(`${at}.axis`, "a claim addresses one of the 12 axes");
+    checkClaimPlanQuestions(raw["planQuestions"], context, at);
+    checkClaimScope(raw["scope"], context, at);
+    for (const link of ["contradicts", "refutedBy"] as const) {
+      const list = raw[link];
+      if (list === undefined) continue;
+      if (!Array.isArray(list))
+        attemptRefuse(`${at}.${link}`, `${link} is a list of ClaimAddress links`);
+      for (const [i, entry] of list.entries()) checkClaimAddress(entry, context, `${at}.${link}.${i}`);
+    }
+    if (raw["supersedes"] !== undefined && raw["supersedes"] !== null)
+      checkClaimAddress(raw["supersedes"], context, `${at}.supersedes`);
+    checkClaimBasis(kind, raw["basis"], context, at);
+  }
+}
+
+/** The acceptance half of an interpreted answer provenance — the shared
+ * contract for every consumer of a saved research-answer acceptance: a
+ * managed acceptance is proven by its saved binding K; every other research
+ * answer needs its own supported, well-formed assessment of this exact value
+ * by an independent assessor, bound to the named question, with well-formed
+ * observations. The record's existence alone is never an acceptance. */
+export function provenAcceptance(provenance: AnswerProvenance): provenance is ResearchProvenance {
+  if (provenance.kind !== "research-answer") return false;
+  if (provenance.binding !== null) return true;
+  return provenance.supported && provenance.wellFormed && provenance.independent
+    && provenance.valueMatches && provenance.bindsQuestion === true && provenance.hasObservations
+    && provenance.observations.every(item => obj(item)
+      && typeof item["projectId"] === "string" && isRef(item["source"])
+      && obj(item["selector"]) && item["value"] !== undefined);
+}

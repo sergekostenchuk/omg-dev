@@ -8,7 +8,9 @@ import { DISCOVERY_CLAIMS_CONTRACT, resolveClaimAddress, proveClaimAddress,
 import { type ResearchAnswer, type ResearchAssessment } from "../src/discovery/research-model.js";
 import { Discovery, type DiscoveryDraft, type FieldSpec, type Question } from "../src/discovery/discovery.js";
 import { V7_CONTRACT_ERA, DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT,
+  V7_ATTEMPT_KIND, V7_ATTEMPT_CONTRACT, V7_PLAN_FIELD,
   discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from "../src/discovery/v7-contracts.js";
+import { v7AttemptId, type V7Attempt, type V7AttemptEnd } from "../src/discovery/v7-plan-questions.js";
 import { checkStoreIntegrity } from "../src/storage/fsck.js";
 import { referenceSites } from "../src/storage/reference-sites.js";
 import { reference, isRef, type Ref } from "../src/pipeline/contracts.js";
@@ -483,5 +485,174 @@ test("DR2: контрпримеры связности акта принятия
     thrown(() => proveClaimAddress(store, addressOf("p", copy, "/claims/0", "c-1")),
       "claim_address_invalid", "never accepted");
   }
+});
+
+/* ---------- DR3a1: маршрут попытки ---------- */
+
+const rand = () => Math.random().toString(16).slice(2);
+
+/** Моделируемая принятая редакция плана: v7-драфт, вопрос plan со спекой
+ * V7_PLAN_FIELD, ответ с планом и сохранённый акт принятия — те же формы
+ * ревизий, что пишет #answer (DR3a1-фикстура). */
+function writePlanAccepted(store: Store, discovery: Discovery, options: {
+  project?: string; questions: Json[];
+}): { draft: Revision<DiscoveryDraft>; question: Revision<Question>; planAnswer: Ref } {
+  const project = options.project ?? "p";
+  const draftId = `discovery-draft:${project}:${rand()}`;
+  const questionId = `question:${project}:${rand()}`;
+  const draft = store.write<DiscoveryDraft>({ id: draftId, kind: "discovery-draft", expected: 0,
+    value: { projectId: project, createdAt: 1, stage: "discovery", level: "R0",
+      consumer: "om-g2", fields: { plan: null }, questions: [questionId], inputs: [],
+      contractVersion: V7_CONTRACT_ERA } });
+  const question = store.write<Question>({ id: questionId, kind: "question", expected: 0,
+    value: { projectId: project, draftId, stage: "discovery", level: "R0", consumer: "om-g2",
+      spec: V7_PLAN_FIELD, beforeHash: hashJson(null), status: "open", answer: null } });
+  const planValue = { edition: 1,
+    frame: { id: `research-answer:${project}:frame`, revision: 1, hash: hashJson("frame") },
+    previous: null, questions: options.questions } as unknown as Json;
+  const source = discovery.evidence.document(project, `basis-${rand()}`, "s", "text/plain", 0);
+  const env = store.write({ id: `environment:${project}:${rand()}`, kind: "environment",
+    expected: 0, value: { state: "ready" } });
+  const assessment = store.write<ResearchAssessment>({
+    id: `research-assessment:${project}:${rand()}`, kind: "research-assessment", expected: 0,
+    value: { projectId: project, question: reference(question), value: planValue,
+      observations: [discovery.evidence.observe(project, reference(source),
+        { kind: "text-range", start: 0, end: source.value.content.length })],
+      verdict: "supported", reasons: [], researcher: "r", assessor: "a",
+      environment: reference(env) } });
+  const answer = store.write<ResearchAnswer>({
+    id: `research-answer:${project}:plan-${rand()}`, kind: "research-answer", expected: 0,
+    value: { projectId: project, question: questionId,
+      assessment: asJson(reference(assessment)), value: planValue } as unknown as ResearchAnswer });
+  const draftAfter = { ...draft.value, fields: { ...draft.value.fields, plan: planValue } };
+  const questionAfter = { ...question.value, status: "answered" as const, answer: reference(answer) };
+  store.writeMany([
+    { id: draftId, kind: "discovery-draft", expected: draft.revision, value: draftAfter },
+    { id: questionId, kind: "question", expected: question.revision, value: questionAfter },
+    { id: discoveryAcceptanceActId(project, draftId, "plan", reference(answer)),
+      kind: DISCOVERY_ACCEPTANCE_ACT_KIND, expected: 0,
+      value: { contract: DISCOVERY_ACCEPTANCE_ACT_CONTRACT, projectId: project, draftId,
+        field: "plan", draftBefore: reference(draft),
+        draftAfter: { id: draftId, revision: draft.revision + 1, hash: hashJson(draftAfter) },
+        questionBefore: reference(question),
+        questionAfter: { id: questionId, revision: question.revision + 1, hash: hashJson(questionAfter) },
+        answer: reference(answer), assessment: reference(assessment),
+        binding: null } satisfies DiscoveryAcceptanceAct },
+  ]);
+  return { draft: store.get<DiscoveryDraft>(draftId)!, question: store.get<Question>(questionId)!,
+    planAnswer: reference(answer) };
+}
+
+function writeCallRecord(store: Store, projectId: string, draftId: string, questionId: string,
+  planAnswer: Ref) {
+  return store.write({ id: `model-call:${projectId}:${questionId}:${rand()}`, kind: "model-call",
+    expected: 0, value: { projectId, draftId, questionId, planAnswer: asJson(planAnswer),
+      purpose: "research", requestId: `r-${rand()}`, startedAt: 1, finishedAt: 2,
+      status: "succeeded",
+      requested: { actor: "fixture", model: "fixture", effort: "medium",
+        command: { executable: "fixture", args: [] } },
+      confirmed: { model: "fixture", effort: "medium", speed: null },
+      request: { chars: 10, bytes: 10, hash: hashJson("req") },
+      response: { chars: 20, bytes: 20 },
+      usage: null, usageSource: "unavailable", error: null } });
+}
+
+function writeAttemptRecord(store: Store, opts: { project: string; draft: Ref; planAnswer: Ref;
+  planQuestionId: string; call: Ref; end: V7AttemptEnd; id?: string }): Revision<V7Attempt> {
+  const key = { project: opts.project, planAnswer: opts.planAnswer,
+    planQuestionId: opts.planQuestionId, call: opts.call };
+  const value: V7Attempt = { contract: V7_ATTEMPT_CONTRACT, ...key, draft: opts.draft, end: opts.end };
+  return store.write<V7Attempt>({ id: opts.id ?? v7AttemptId(key), kind: V7_ATTEMPT_KIND,
+    expected: 0, value });
+}
+
+function attemptFactClaim(store: Store, project: string, id: string, planAnswer: Ref,
+  planQuestionId: string, overrides: Record<string, Json> = {}): Json {
+  const src = store.write({ id: `source:${project}:${rand()}`, kind: "source", expected: 0,
+    value: { projectId: project, content: "basis" } });
+  return { id, kind: "fact", text: `Claim ${id}`, axis: "market",
+    planQuestions: [{ planAnswer: asJson(planAnswer), planQuestionId }],
+    scope: { variants: "common" },
+    basis: { source: { ref: asJson(reference(src)), range: { start: 0, end: 3 },
+      valueHash: hashJson("v") }, limit: "snapshot", asOf: "2026-10" },
+    ...overrides } as unknown as Json;
+}
+
+const attemptAddress = (project: string, attempt: Revision<V7Attempt>, pointer: string,
+  claimId: string): ClaimAddress =>
+  ({ project, container: reference(attempt), containerKind: V7_ATTEMPT_KIND, pointer, claimId });
+
+const PLAN_QUESTIONS = [{ id: "q-blk", axis: "rules", domain: "construction",
+  text: "What covers q-blk?", class: "blocking", criterion: "named basis",
+  requiredDepth: "deep", roles: ["expert"], searchPlaces: ["docs"] },
+  { id: "q-sup", axis: "market", domain: "construction", text: "What covers q-sup?",
+    class: "supporting", criterion: "named basis", requiredDepth: "deep",
+    roles: ["expert"], searchPlaces: ["docs"] }] as unknown as Json[];
+
+test("DR3a1: маршрут попытки — resolve цел, prove отказывает claim_attempt_not_accepted", t => {
+  const { store, discovery } = fixture(t);
+  const { draft, planAnswer } = writePlanAccepted(store, discovery,
+    { project: "p", questions: PLAN_QUESTIONS });
+  const call = writeCallRecord(store, "p", draft.id, "q-blk", planAnswer);
+  const attempt = writeAttemptRecord(store, { project: "p", draft: reference(draft), planAnswer,
+    planQuestionId: "q-blk", call: reference(call),
+    end: { type: "submitted", contract: DISCOVERY_CLAIMS_CONTRACT, value: { claims: [
+      attemptFactClaim(store, "p", "c-1", planAnswer, "q-blk"),
+      attemptFactClaim(store, "p", "c-2", planAnswer, "q-blk")] } } });
+  const resolved = resolveClaimAddress(store, attemptAddress("p", attempt, "/claims/1", "c-2"));
+  assert.equal((resolved.claim as Record<string, Json>)["id"], "c-2");
+  assert.equal(resolved.container.id, attempt.id);
+  const refused = thrown(() => proveClaimAddress(store,
+    attemptAddress("p", attempt, "/claims/0", "c-1")), "claim_attempt_not_accepted");
+  assert.ok(refused !== null);
+});
+
+test("DR3a1: маршрут попытки — повреждённые, чужие и не-submitted попытки отказывают без fallback", t => {
+  const { store, discovery } = fixture(t);
+  const { draft, planAnswer } = writePlanAccepted(store, discovery,
+    { project: "p", questions: PLAN_QUESTIONS });
+  const call = writeCallRecord(store, "p", draft.id, "q-blk", planAnswer);
+  const good = writeAttemptRecord(store, { project: "p", draft: reference(draft), planAnswer,
+    planQuestionId: "q-blk", call: reference(call),
+    end: { type: "submitted", contract: DISCOVERY_CLAIMS_CONTRACT, value: { claims: [
+      attemptFactClaim(store, "p", "c-1", planAnswer, "q-blk")] } } });
+  // Чужой проект в адресе.
+  thrown(() => resolveClaimAddress(store, attemptAddress("other", good, "/claims/0", "c-1")),
+    "claim_address_invalid", "another project");
+  // Не-submitted конец — структурно согласованная попытка, но claims нет.
+  const refused = writeAttemptRecord(store, { project: "p", draft: reference(draft), planAnswer,
+    planQuestionId: "q-blk",
+    call: reference(writeCallRecord(store, "p", draft.id, "q-blk", planAnswer)),
+    end: { type: "refused", code: "outside_plan_scope", evidence: [], text: "x" } });
+  thrown(() => resolveClaimAddress(store, attemptAddress("p", refused, "/claims/0", "c-1")),
+    "claim_address_invalid", "submitted");
+  // Повреждённая попытка (подменённый контракт тела) — отказ на resolve, prove тоже.
+  const tampered = store.write<V7Attempt>({ id: good.id, kind: V7_ATTEMPT_KIND, expected: good.revision,
+    value: { ...good.value, contract: "other/v9" as typeof V7_ATTEMPT_CONTRACT } });
+  thrown(() => resolveClaimAddress(store, attemptAddress("p", tampered, "/claims/0", "c-1")),
+    "claim_address_invalid");
+  thrown(() => proveClaimAddress(store, attemptAddress("p", tampered, "/claims/0", "c-1")),
+    "claim_address_invalid");
+  // Указатель вне списка и чужой claimId.
+  const whole = writeAttemptRecord(store, { project: "p", draft: reference(draft), planAnswer,
+    planQuestionId: "q-blk",
+    call: reference(writeCallRecord(store, "p", draft.id, "q-blk", planAnswer)),
+    end: { type: "submitted", contract: DISCOVERY_CLAIMS_CONTRACT, value: { claims: [
+      attemptFactClaim(store, "p", "c-1", planAnswer, "q-blk")] } } });
+  thrown(() => resolveClaimAddress(store, attemptAddress("p", whole, "/claims/5", "c-1")),
+    "claim_address_invalid", "pointer");
+  thrown(() => resolveClaimAddress(store, attemptAddress("p", whole, "/claims/0", "c-9")),
+    "claim_address_invalid", "another id");
+  // Попытка с битым claims (пустая коллекция) — повреждение внутри, отказ.
+  const broken = writeAttemptRecord(store, { project: "p", draft: reference(draft), planAnswer,
+    planQuestionId: "q-blk",
+    call: reference(writeCallRecord(store, "p", draft.id, "q-blk", planAnswer)),
+    end: { type: "submitted", contract: DISCOVERY_CLAIMS_CONTRACT, value: { claims: [] } } });
+  thrown(() => resolveClaimAddress(store, attemptAddress("p", broken, "/claims/0", "c-1")),
+    "claim_address_invalid");
+  // Чужой вид записи по адресу попытки — отказ.
+  thrown(() => resolveClaimAddress(store, { project: "p", container: reference(call),
+    containerKind: V7_ATTEMPT_KIND, pointer: "/claims/0", claimId: "c-1" }),
+    "claim_address_invalid");
 });
 
