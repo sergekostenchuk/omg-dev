@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, copyFileSync, symlinkSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -176,19 +176,20 @@ const base = resolve(fileURLToPath(import.meta.url), "../../..");
 const fixture = (t: TestContext, sources: Record<string, string>, manifest: string, tag = "EXCL1") => {
   const root = mkdtempSync(join(tmpdir(), "excl1-probe-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  mkdirSync(join(root, "dist/test"), { recursive: true }); mkdirSync(join(root, "scripts"));
+  mkdirSync(join(root, "dist/test"), { recursive: true });
   writeFileSync(join(root, "package.json"), "{\"type\":\"module\"}");
-  if (!existsSync(join(root, "node_modules"))) symlinkSync(join(base, "node_modules"), join(root, "node_modules"), "dir");
-  for (const name of ["excl1-register.mjs", "excl1-resolve.mjs"]) copyFileSync(join(base, "scripts", name), join(root, "scripts", name));
-  copyFileSync(join(base, "dist/test/excl1-wrap.js"), join(root, "dist/test/excl1-wrap.js"));
   for (const [name, code] of Object.entries(sources)) writeFileSync(join(root, "dist/test", name), code);
-  const list = join(root, `${tag}-TESTS.txt`); writeFileSync(list, manifest);
+  const childEnv: Record<string, string | undefined> = { ...process.env };
+  for (const listTag of ["EXCL1", "EXCL2"]) {
+    const list = join(root, `${listTag}-TESTS.txt`);
+    writeFileSync(list, listTag === tag ? manifest : "");
+    childEnv[`OMG_${listTag}`] = list;
+  }
   const runFiles = new Set(Object.keys(sources).filter(n => n.endsWith(".test.js")).map(n => n.replace(/\.js$/, ".ts")));
   const check = () => verifyExclusionKeys(parseExclusionList(manifest), name => sources[name.replace(/\.ts$/, ".js")] ?? null, runFiles);
-  const childEnv: Record<string, string | undefined> = { ...process.env, [`OMG_${tag}`]: list };
   delete childEnv.NODE_TEST_CONTEXT;
   const run = (hook = true) => spawnSync(process.execPath,
-    [...(hook ? ["--import", join(root, "scripts/excl1-register.mjs")] : []), "--test", "--test-reporter=tap",
+    [...(hook ? ["--import", join(base, "scripts/excl1-register.mjs")] : []), "--test", "--test-reporter=tap",
       ...Object.keys(sources).filter(n => n.endsWith(".test.js")).map(n => join(root, "dist/test", n))],
     { cwd: root, env: childEnv, encoding: "utf8" });
   return { root, check, run };
@@ -237,4 +238,37 @@ test("EXCL2 e2e: a name listed in the second list is skipped with the EXCL2 tag"
   f.check();
   const hooked = f.run(); assert.equal(hooked.status, 0, hooked.stderr); assert.match(hooked.stdout, /# SKIP EXCL2 вид 2/);
   assert.equal(existsSync(join(f.root, "a-ran")), false);
+});
+
+test("EXCL probes isolate both inherited lists while preserving NODE_OPTIONS in hooked and plain children", t => {
+  const root = mkdtempSync(join(tmpdir(), "excl1-outer-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const outer = join(root, "outer.txt"); writeFileSync(outer, "a.test.ts :: other # outside this probe\n");
+  const previous = [process.env.OMG_EXCL1, process.env.OMG_EXCL2];
+  const options = process.env.NODE_OPTIONS ?? null;
+  process.env.OMG_EXCL1 = outer; process.env.OMG_EXCL2 = outer;
+  try {
+    for (const tag of ["EXCL1", "EXCL2"]) {
+      const f = fixture(t, {
+        "a.test.js": `import test from 'node:test'; import assert from 'node:assert/strict';
+          import { writeFileSync } from 'node:fs';
+          assert.equal(process.env.NODE_OPTIONS ?? null, ${JSON.stringify(options)});
+          test('listed',()=>writeFileSync('listed-ran','yes'));
+          test('other',()=>writeFileSync('other-ran','yes'));`,
+      }, "a.test.ts :: listed # local probe\n", tag);
+      f.check();
+      const hooked = f.run(); assert.equal(hooked.status, 0, hooked.stdout + hooked.stderr);
+      assert.match(hooked.stdout, new RegExp(`# SKIP ${tag} local probe`));
+      assert.equal(existsSync(join(f.root, "listed-ran")), false);
+      assert.equal(existsSync(join(f.root, "other-ran")), true, "The other inherited list must not skip this probe's neighbor");
+      const plain = f.run(false); assert.equal(plain.status, 0, plain.stdout + plain.stderr);
+      assert.match(plain.stdout, /# pass 2/); assert.match(plain.stdout, /# skipped 0/);
+      assert.equal(existsSync(join(f.root, "listed-ran")), true);
+    }
+  } finally {
+    for (const [index, tag] of ["EXCL1", "EXCL2"].entries()) {
+      if (previous[index] === undefined) delete process.env[`OMG_${tag}`];
+      else process.env[`OMG_${tag}`] = previous[index];
+    }
+  }
 });
