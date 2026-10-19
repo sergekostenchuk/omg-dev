@@ -1,7 +1,7 @@
 import { Store, checkTransactionGuards, storeObserved, type Revision, type TransactionGuard, type Write } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import { EngineError, requireCondition } from "../errors.js";
-import { canonical, type Json } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { uniqueTransactionGuards, transactionGuardsCurrent } from "../runtime/environment.js";
 import { sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
 import { STAGES, predecessor, reference, stageId, isRef, uniqueRefs, STAGE_CLOSURE_CONTRACT,
@@ -241,7 +241,12 @@ export class Pipeline {
       // A kind with no registered executor — and any miss of a live dependency — falls back to the
       // full inspection: never a silent pass, and the sealed exceptions and verbatim findings the
       // old path names are preserved (№6201 п.1).
-      if (!handler || handler(check, context) !== null) return null;
+      const outcome = handler ? handler(check, context) : null;
+      // A saved-admission breach observed inside an executor's own read window is the stale refusal
+      // itself (№6232 G1-01): falling back would launder it into a fresh admission the new head
+      // cannot breach. Every other miss still falls back to the full inspection below.
+      if (outcome !== null && outcome.code === "input_stale") return stale([outcome]);
+      if (!handler || outcome !== null) return null;
     }
     return { stage, state: "accepted", artifact, findings: [],
       guards: uniqueRefs([reference(artifact), ...value.proofs]),
@@ -291,8 +296,15 @@ export class Pipeline {
     const own = this.#ownAdmission.get(checked);
     requireCondition(!sealed || own !== undefined, "stage_closure_invalid",
       "A sealed execution's closure needs the admission of its own full inspection");
+    // The positive read-commit pin of this project's dispatch counter is a condition of the
+    // acceptance write itself, never of later reads: it stays in the write guards (and so keeps
+    // guarding the atomic commit) but a legitimate later dispatch must not make the stage stale.
+    // Every fresh scan pins the counter anew before returning.
+    const dispatchPin = `project-dispatch:${hashJson(value.projectId)}`;
+    const admission = (sealed ? [...own!] : [...(checked.admissionGuards ?? [])])
+      .filter(guard => "absent" in guard || guard.id !== dispatchPin);
     return { contract: STAGE_CLOSURE_CONTRACT, proofs: [],
-      admission: sealed ? [...own!] : [...(checked.admissionGuards ?? [])],
+      admission,
       inherited: uniqueExternalChecks(inherited), external,
       writeGuards: [...writeGuards] };
   }

@@ -8,7 +8,7 @@ import { GraphRepository } from "./repository.js";
 import { Environments, git, inspectRepository, uniqueTransactionGuards, transactionGuardsCurrent, type Environment, type ExecutionRoot, type RepositoryState } from "../runtime/environment.js";
 import { Pipeline } from "../pipeline/pipeline.js";
 import { STAGE_CLOSURE_CONTRACT, reference, isRef, uniqueRefs, stageId, type StageArtifact, type Ref, type GateResult, type Finding, type ExternalCheckHandlers } from "../pipeline/contracts.js";
-import { canonical, type Json } from "../canonical.js";
+import { canonical, hashJson, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import type { Graph } from "./model.js";
 import { sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
@@ -130,6 +130,25 @@ export const REFINEMENT_EXTERNAL_CHECKS: ExternalCheckHandlers = {
         requireCondition(observation?.kind === 'runtime-observation' && observation.hash === confirmation.observation.hash
           && observation.value.projectId === projectId, 'environment_confirmation_required', 'The exact runtime comparison basis is unavailable');
         const old = observation.value, current = runtimeContext(store, projectId);
+        // Pin the context's guards and the dispatch counter before the confirmation scan, exactly as
+        // the live gate does (obligation-readiness): a later failed or in-flight observation for the
+        // same check is new contrary evidence, a concurrent observation dispatch bumps the counter,
+        // and a native reader-pilot/execution-root creation inside the scan must be caught afterwards
+        // by the pinned guards — never by re-reading whatever head the counter moved to. A breach of
+        // the pinned admission is a saved-guard breach (`input_stale`), not a live-check miss.
+        const dispatch = store.get(`project-dispatch:${hashJson(projectId)}`);
+        // A saved confirmation without the counter it was pinned to is unavailable like the live
+        // gate's own `if (!dispatch) return null` — an empty guard set must not launder that absence.
+        requireCondition(dispatch !== null, 'environment_confirmation_required',
+          'The dispatch counter the accepted confirmation was pinned to is unavailable');
+        requireCondition(!store.list<RuntimeObservation>('runtime-observation').some(record => record.id !== observation.id
+          && record.value.projectId === projectId && record.value.requestedFor === old.requestedFor
+          && canonical(record.value.check) === canonical(old.check)
+          && record.value.startedAt >= old.startedAt), 'environment_confirmation_required',
+          'A later runtime observation supersedes the accepted confirmation');
+        requireCondition(transactionGuardsCurrent(store, [...current.guards, ...current.admissionGuards,
+          reference(dispatch)]), 'input_stale',
+          'An admission dependency changed while the accepted confirmations were checked');
         const executable = realpathSync(process.execPath);
         const subjects = old.subjects.map(subject => {
           const path = runtimeSubjectPath(current.root, subject.requested, subject.kind);

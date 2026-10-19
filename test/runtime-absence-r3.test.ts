@@ -357,7 +357,7 @@ function omValue<T>(result: OmResult<T>): T {
   return result.value;
 }
 
-test('D8.1 native OM gates have no absence channel and all four bridge entrances reject unsupported or malformed channels', async t => {
+test('D8.1 a native stage-closure/v1 admission carries absence guards through the input bridge while legacy entrances reject them', async t => {
   const f = fixture(t), project = 'p', graph = reference(f.store.get<Graph>('graph:p')!);
   const layers = { 2: f.store.get<FixtureLayer>('graph-layer:p:2')!, 3: f.store.get<FixtureLayer>('graph-layer:p:3')! };
   const inputRequest: InputRequest = { project, expected: 0,
@@ -381,8 +381,9 @@ test('D8.1 native OM gates have no absence channel and all four bridge entrances
   }
   const positive = reference(f.store.write({ id: 'd81-bridge-positive', kind: 'fixture', expected: 0, value: { project } }));
   const second = reference(f.store.write({ id: 'd81-bridge-second', kind: 'fixture', expected: 0, value: { project } }));
-  const absent = { id: positive.id, absent: true };
+  const absent = { id: 'd81-bridge-missing', absent: true };
   const before = f.store.list().map(reference);
+  let inputAdmission: TransactionGuard[] | null = null;
   const routes: Record<string, () => OmResult<{ readonly guards: readonly TransactionGuard[] }>> = {
     input: () => prepareOmInput(f.store, inputRequest),
     horizon: () => prepareHorizon(f.store, horizonRequest),
@@ -413,17 +414,21 @@ test('D8.1 native OM gates have no absence channel and all four bridge entrances
       try {
         const result = prepare(); assert.ok(hits > 0, route);
         if (channel === undefined || Array.isArray(channel) && channel.length === 0) assert.deepEqual(omValue(result), native);
-        else if (channel === channels[2]) {
+        else if (channel === channels[2]
+          || route === 'input' && (channel === channels[3] || channel === channels[4] || channel === channels[5])) {
+          // A native stage-closure/v1 admission is the full TransactionGuard channel: absence guards
+          // pass the bridge verbatim and stay in the delivered guards for the atomic write.
           const value = omValue(result);
           const { guards, ...body } = value, { guards: previousGuards, ...previousBody } = native;
           assert.deepEqual(body, previousBody);
-          assert.deepEqual([...guards].map(canonical).sort(), [...previousGuards, positive, second].map(canonical).sort(), route);
+          assert.deepEqual([...guards].map(canonical).sort(), [...previousGuards, ...(channel as TransactionGuard[])].map(canonical).sort(), route);
+          if (route === 'input' && channel === channels[3]) inputAdmission = [...guards];
         } else {
           assert.equal(result.ok, false, route);
           if (!result.ok) {
             assert.equal(result.refusal.code, channel === channels[3] || channel === channels[4] || channel === channels[5]
               ? 'om_admission_guard_unsupported' : 'om_admission_guard_invalid', `${route}: channel ${channels.indexOf(channel)}`);
-            if (result.refusal.code === 'om_admission_guard_unsupported') assert.equal(result.refusal.at.target, positive.id);
+            if (result.refusal.code === 'om_admission_guard_unsupported') assert.equal(result.refusal.at.target, absent.id);
             assert.ok(result.refusal.at.field?.includes('admissionGuards'));
             assert.equal(result.refusal.route, 'producer');
           }
@@ -432,6 +437,13 @@ test('D8.1 native OM gates have no absence channel and all four bridge entrances
       assert.deepEqual(f.store.list().map(reference), before, 'A refused or prepared bridge must not write admission records');
     }
   }
+  // A preserved absence guard keeps its force at the atomic write: the record's later appearance
+  // turns the same delivered guards into an input_stale refusal.
+  assert.ok(inputAdmission?.some(guard => 'absent' in guard && guard.id === absent.id));
+  f.store.write({ id: absent.id, kind: 'fixture', expected: 0, value: { project } });
+  assert.equal(transactionGuardsCurrent(f.store, inputAdmission!), false);
+  assert.throws(() => f.store.writeMany([{ id: 'd81-bridge-probe', kind: 'fixture', expected: 0, value: { project } }],
+    inputAdmission!), { code: 'input_stale' });
 });
 
 test('D8.1 OM channel reader validates its public arguments and preserves input bytes', () => {

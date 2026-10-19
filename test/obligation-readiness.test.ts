@@ -205,6 +205,22 @@ test('transient dispatch guards protect stage acceptance without becoming perman
   assert.equal(f.engine.pipeline.inspect('p', 'om-g2').state, 'accepted');
 });
 
+test('a missing dispatch counter refuses the closed stage read like the live predicate', async t => {
+  const f = fixture(t); await f.observe(); const ready = f.assess();
+  const draft = f.engine.refinement.publish('p', reference(ready), 0);
+  const accepted = f.engine.pipeline.accept('p', 'om-g2', draft.revision);
+  assert.ok(accepted.value.closure);
+  assert.equal(f.engine.pipeline.inspect('p', 'om-g2').state, 'accepted');
+  const counter = f.store.list('project-dispatch')[0]!;
+  const view = new Proxy(f.store, { get(target, prop) {
+    if (prop === 'get') return (id: string, revision?: number) => id === counter.id ? null : target.get(id, revision);
+    const value = Reflect.get(target, prop, target); return typeof value === 'function' ? value.bind(target) : value;
+  } }) as Store;
+  assert.ok(readinessObligations(view, 'p', ready.value.inputs, ready.value.obligations, 'consume')
+    .findings.some(item => item.code === 'environment_confirmation_required'));
+  assert.equal(new ProductEngine(view).pipeline.inspect('p', 'om-g2').state, 'stale');
+});
+
 test('historical admission follows the sealed producing R2 era, not a missing new R3 field', t => {
   const f = fixture(t), inputs = [reference(f.r2Phase)];
   assert.ok(readinessObligations(f.store, 'p', inputs, undefined, 'consume', true).findings.some(item => item.code === 'obligation_handoff_missing'));
