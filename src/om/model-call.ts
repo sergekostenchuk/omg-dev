@@ -1893,8 +1893,10 @@ async function modelCallUnder(store: Store, request: ModelCallRequest, signal: A
       // Refs exactly equal to a pending writeRef drop out (№1734, C20) — the
       // absent guards of H1.0d are kept, nothing is dropped by id alone.
       const all = [...guards, ...prepared.guards, ...admission.guards, request.packet, ...(environment?.guards ?? [])];
+      // HASH1: a pending writeRef hashes its value once in this call, never once per guard it is compared against.
+      const pending = new Set(inputs.map(write => canonical(writeRef(write))));
       return controlled.writeMany(inputs, (environment ? environment.remap(all) : all)
-        .filter(guard => !isRef(guard) || !inputs.some(write => same(writeRef(write), guard))));
+        .filter(guard => !isRef(guard) || !pending.has(canonical(guard))));
     } });
     const admitted = take(recordCall(guarded, request.project, assignment.admission));
     // E1 alone precedes the durable running claim. A repeat without that claim has not sent;

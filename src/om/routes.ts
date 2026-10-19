@@ -1,4 +1,4 @@
-import { canonical, hashJson } from '../canonical.js';
+import { canonical, canonicalSorted, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { Store, type Revision, type TransactionGuard, type Write, storeObserved } from '../storage/store.js';
@@ -47,8 +47,7 @@ export const ROUTES_KIND = 'route-result';
 
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
-const order = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
-const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
+const sorted = canonicalSorted;
 const same = (left: unknown, right: unknown) => canonical(left) === canonical(right);
 const unique = <T>(values: readonly T[]): T[] => sorted([...new Map(values.map(value => [canonical(value), value])).values()]);
 class RoutingFailure extends Error { constructor(readonly refusal: Refusal) { super(refusal.message); } }

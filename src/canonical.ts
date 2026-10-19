@@ -37,6 +37,20 @@ export const compositeKey = (parts: readonly unknown[]): string => canonical(par
 /** Code-unit order of keys: what is written must not depend on the machine's locale. */
 export const compareKeys = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
 
+/** Stable sort by the canonical key of each element, exactly as the `[...values].sort(cmp)` it replaces: the spread
+ * densifies holes into real undefined elements, and sort never calls its comparator on undefined — it moves last
+ * without a key. With fewer than two comparable values no key is computed at all, just as no comparison ran. Equal
+ * keys keep input order, duplicates and element references pass through, the input array is never mutated. */
+export const canonicalSorted = <T>(values: readonly T[]): T[] => {
+  const copy = [...values];
+  const defined = copy.filter(value => value !== undefined);
+  const sorted = defined.length < 2 ? defined
+    : defined.map(value => [canonical(value), value] as const)
+      .sort((a, b) => compareKeys(a[0], b[0]))
+      .map(pair => pair[1]);
+  return [...sorted, ...copy.filter(value => value === undefined)];
+};
+
 export const digest = (value: string | Uint8Array): string => createHash("sha256").update(value).digest("hex");
 export const hashJson = (value: unknown): string => digest(canonical(value));
 

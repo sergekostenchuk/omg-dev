@@ -1,6 +1,6 @@
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Ajv } from "ajv";
-import { canonical, hashJson } from "../canonical.js";
+import { canonical, canonicalSorted, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEVEL, type CodeRef, type Graph, type Node } from "../graph/model.js";
 import { RefinementRelations } from "../graph/relations.js";
@@ -97,7 +97,7 @@ export interface ObservedProposal { record: Revision<LayerProposal>; definitions
 const object = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
+const sorted = canonicalSorted;
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const parts = ['nodes', 'localConnectors', 'artifacts', 'contracts', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers', 'anchors'] as const;
 type Validator = ReturnType<Ajv['compile']>;

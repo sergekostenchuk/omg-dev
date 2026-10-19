@@ -1,5 +1,5 @@
 import { isWebDocumentSource } from '../evidence/evidence.js';
-import { canonical, digest, hashJson, type Json } from "../canonical.js";
+import { canonical, canonicalSorted, digest, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import {
   acceptedIssuance, contractEraAtLeast, contractEraOf, explicitContractEraOf,
@@ -131,7 +131,7 @@ type Row = Record<string, any>;
 const object = (value: unknown): value is Row => isPlainObject(value);
 const text = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
+const sorted = canonicalSorted;
 const at = (target: string, field: string, ref?: Ref) => ({ unit: "G1", target, field, ...(ref ? { ref } : {}) });
 function invalid(field: string): never { return raise("input_request_invalid", "OM input needs a well-formed request", at("om-input", field)); }
 function copy<T>(value: T): T {

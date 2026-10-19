@@ -554,6 +554,48 @@ test('E4 admits before spawning, saves MC1 candidates and actual usage, and repl
   assert.ok(before.some(ref => ref.id === actual.record.id));
 });
 
+test('HASH1 write interception computes each pending writeRef once and drops only exact Refs (№1734, C20 kept)', t => {
+  // Counting hashJson calls needs createHash patched BEFORE canonical.js is evaluated — an ESM named import of a
+  // builtin binds at load time — so the probe lives in a data-URL --import of a child process running the driver.
+  // The preload must reach node:crypto through createRequire: an ESM `import` would snapshot the builtin's
+  // facade before the patch lands, while the CJS path leaves the shared exports object mutable for later.
+  const preload = `import {createRequire} from 'node:module';
+const crypto=createRequire(process.cwd()+'/x.js')('node:crypto');const real=crypto.createHash;
+globalThis.__hash1Digested=[];crypto.createHash=a=>{const h=real(a),u=h.update.bind(h);
+h.update=(d,e)=>{globalThis.__hash1Digested.push({b:String(d),s:new Error().stack});return u(d,e)};return h};`;
+  const driver = fileURLToPath(new URL('../../test/hash1-digests-driver.mjs', import.meta.url));
+  const raw = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(preload)}`, driver],
+    { encoding: 'utf8', maxBuffer: 40_000_000, timeout: 300_000 });
+  const result = JSON.parse(raw.split('\n').find(line => line.startsWith('HASH1_RESULT '))!.slice(13)) as {
+    status: string;
+    calls: { kinds: string[]; guards: number; refGuards: number; absentGuards: number;
+      pendingSurvivors: number; sameIdKept: number; sites: Record<string, number>[]; txn: number[] }[];
+  };
+  assert.equal(result.status, 'succeeded', '№1734/C20: a dispatch whose pending writeRefs drop out still commits');
+  assert.ok(result.calls.length > 0, 'the dispatch wrote through the intercepted store');
+  let filtered = 0, manyGuarded = 0;
+  for (const call of result.calls) {
+    assert.equal(call.pendingSurvivors, 0, `${call.kinds}: no Ref exactly equal to a pending write reached writeMany`);
+    assert.ok(call.txn.every(n => n >= 1), `${call.kinds}: every committed value is hashed by the transaction itself`);
+    // A pending-ref filter (the C20 interception or externalGuards) digests each pending value once, so its
+    // callsite is shared by every write of the batch with count 1. Per-guard hashing would put ~refGuards there.
+    const common = Object.keys(call.sites[0] ?? {})
+      .filter(site => site !== 'other' && call.sites.every(tally => tally[site] !== undefined));
+    for (const site of common) {
+      assert.ok(call.sites.every(tally => tally[site] === 1),
+        `${call.kinds}: model-call.js:${site} digests a pending value once per write, not once per guard`);
+      filtered += 1;
+    }
+    if (call.refGuards > 50) manyGuarded += 1;
+  }
+  assert.ok(filtered > 0, 'at least one batch went through a pending-ref filter shared by all its writes');
+  assert.ok(manyGuarded > 0, 'the fixture exercised a batch guarded by many Refs');
+  assert.ok(result.calls.reduce((n, call) => n + call.sameIdKept, 0) > 0,
+    'Refs on pending ids that are not the pending write itself survive the filter (№1734, C20)');
+  t.diagnostic(JSON.stringify(result.calls.map(call => ({ kinds: call.kinds, guards: call.guards,
+    sameIdKept: call.sameIdKept, sites: call.sites }))));
+});
+
 test('E4 saves node response, proposal, result and completed runtime atomically while leaving acceptance to C5', async t => {
   const f = e4Fixture(t, 'node'); f.steps([{ research: e4Node(f) }]);
   const writeMany = f.store.writeMany.bind(f.store), batches: string[][] = [];

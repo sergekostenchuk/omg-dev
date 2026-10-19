@@ -1,6 +1,6 @@
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 import { Ajv } from 'ajv';
-import { canonical, hashJson, type Json } from '../canonical.js';
+import { canonical, canonicalSorted, hashJson, type Json } from '../canonical.js';
 import { QUESTION_MOMENTS } from '../discovery/projection-reader.js';
 import { isSupportedEra, questionMomentRequired } from '../discovery/projection-reader.js';
 import { EngineError } from '../errors.js';
@@ -91,7 +91,7 @@ export interface GapReadRequest { sources: GapRequest; records: Ref[] }
 const object = (value: unknown): value is Record<string, any> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-const sorted = <T>(values: readonly T[]): T[] => [...values].sort((a, b) => order(canonical(a), canonical(b)));
+const sorted = canonicalSorted;
 const unique = <T>(values: readonly T[]): T[] => sorted([...new Map(values.map(value => [canonical(value), value])).values()]);
 const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
 const isKind = (value: unknown): value is GapKind => typeof value === 'string' && (KNOWLEDGE_KINDS as readonly string[]).includes(value);

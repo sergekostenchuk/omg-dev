@@ -1,5 +1,5 @@
 import { Ajv } from "ajv";
-import { canonical, hashJson } from "../canonical.js";
+import { canonical, canonicalSorted, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEVEL, type Graph } from "../graph/model.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
@@ -64,7 +64,7 @@ const positive = (value: unknown): value is number => Number.isSafeInteger(value
 const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => Object.keys(value).length === keys.length
   && Object.keys(value).every(key => keys.includes(key));
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
-const sorted = <T>(values: T[]) => [...values].sort((a, b) => order(canonical(a), canonical(b)));
+const sorted = canonicalSorted;
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
 const graphShapes = [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
 class BasisFailure extends Error {

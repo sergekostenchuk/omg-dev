@@ -1,6 +1,6 @@
 import { bindingFlowIdentity } from "../graph/flow-identity.js";
 import { Ajv } from "ajv";
-import { canonical, hashJson, type Json } from "../canonical.js";
+import { canonical, canonicalSorted, hashJson, type Json } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEVEL, type Binding, type CodeRef, type Endpoint, type Graph, type Node } from "../graph/model.js";
 import { projectGraph } from "../graph/project.js";
@@ -43,7 +43,7 @@ const frameObject = (value: unknown): value is Record<string, unknown> => typeof
 const frameText = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const frameHash = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const frameOrder = (left: string, right: string) => left < right ? -1 : left > right ? 1 : 0;
-const frameSorted = <T>(values: readonly T[]) => [...values].sort((a, b) => frameOrder(canonical(a), canonical(b)));
+const frameSorted = canonicalSorted;
 function frameCopy<T>(value: T): T {
   try { return sealed(value) as T; }
   catch (error) {
