@@ -165,6 +165,22 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "research-attempt-binding", contract: "research-attempt-binding/v1", data: [], refs: [
     ["turn"], ["pending"], ["intent"], ["planAnswer"], ["attempt"],
   ] },
+  // DR3b-M: the attempts assessment names exactly its packet (plan answer, real Question, each attempt and its K),
+  // its baseline (the exact state and every material container), the paid session/application, the environment,
+  // the return target and every classified attempt/claim container — reasons and other texts are not references.
+  { kind: "discovery-assessment", contract: "discovery-assessment/v1", data: [], refs: [
+    ["subject", "packet", "planAnswer"], ["subject", "packet", "question"],
+    ["subject", "packet", "entries", INDEX, "attempt"], ["subject", "packet", "entries", INDEX, "binding"],
+    ["baseline", "state", "ref"], ["baseline", "materials", INDEX, "container"],
+    ["session"], ["application"], ["environment"],
+    ["return", "target", "attempt"], ["return", "target", "claim", "container"],
+    ["novelty", "attempts", INDEX, "attempt"], ["novelty", "noProgress", INDEX, "attempt"],
+    ["novelty", "accepted", INDEX, "claim", "container"], ["novelty", "rejected", INDEX, "claim", "container"],
+    ["novelty", "newContent", INDEX, "claim", "container"], ["novelty", "duplicates", INDEX, "claim", "container"],
+    ["novelty", "duplicates", INDEX, "of", "container"],
+    ["novelty", "transition", "bases", INDEX, "claim", "container"],
+    ["novelty", "transition", "bases", INDEX, "constraint"],
+  ] },
   { kind: "research-assessment", contract: null, data: [["value"], ["observations", INDEX, "value"]] },
   { kind: "research-checkpoint", contract: null, data: [["proposal"], ["observations", INDEX, "value"]] },
   { kind: "research-context", contract: null, data: contextData(["body"]) },

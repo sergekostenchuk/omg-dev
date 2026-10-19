@@ -5,6 +5,7 @@ import type { LayerDelta } from "./layer-delta.js";
 import type { BundleInput } from "./reader.js";
 import type { ContextPage } from "./working-context.js";
 import type { WebAction } from "./web-research.js";
+import type { ClaimAddress } from "./claim-address.js";
 
 /** ASM1.1 (№4791): the producer contract binding a direct assessment to the exact material its assessor saw. */
 export const DIRECT_ASSESSMENT_ORIGIN = 'direct-assessment-origin/v1' as const;
@@ -62,4 +63,79 @@ export interface ResearchTurn {
   recoveredRequest?: Ref;
   plannedBy?: Ref;
   dispatchMode?: "planning" | "synthesis";
+}
+
+/* ---------- DR3b-M (codex-omg №7546 §1): the assessment of a packet of v7 attempts ---------- */
+
+/** The subject of one attempts assessment: one plan-question of one exact plan edition and the completed managed
+ * attempts of the packet, each with its exact attempt binding K, in the proven order (the ascending number of the K
+ * original turn). Fixed before payment; nothing is added to a sent packet. */
+export const V7_ATTEMPT_PACKET_CONTRACT = "v7-attempt-packet/v1" as const;
+export interface V7AttemptPacketEntry { attempt: Ref; binding: Ref }
+export interface V7AttemptPacket {
+  contract: typeof V7_ATTEMPT_PACKET_CONTRACT;
+  project: string;
+  planAnswer: Ref;
+  planQuestionId: string;
+  /** The real Question of the plan field — the basis every producing intent of the packet named. */
+  question: Ref;
+  entries: V7AttemptPacketEntry[];
+}
+
+/** The comparison basis fixed with the packet: the exact previous progress state of the question (or its explicit
+ * absence, guarded by absence) and the exact accepted materials the novelty is judged against. */
+export const V7_PROGRESS_BASELINE_CONTRACT = "v7-progress-baseline/v1" as const;
+export interface V7ProgressBaseline {
+  contract: typeof V7_PROGRESS_BASELINE_CONTRACT;
+  state: { kind: "absent"; id: string } | { kind: "state"; ref: Ref };
+  materials: ClaimAddress[];
+}
+
+export interface V7NoveltyAttemptRow { attempt: Ref; reason: string }
+export interface V7NoveltyClaimRow { claim: ClaimAddress; reason: string }
+export interface V7NoveltyDuplicateRow { claim: ClaimAddress; of: ClaimAddress; reason: string }
+/** A basis of a proposed question transition: an accepted claim, or the proven constraint of a refused/impossible
+ * attempt of the packet (its code and evidence). */
+export type V7TransitionBasis = { claim: ClaimAddress } | { constraint: Ref };
+export interface V7QuestionTransition {
+  outcome: "open" | "closed" | "unknown";
+  bases: V7TransitionBasis[];
+  reason: string;
+  /** closed only: the saved sufficiency decision against the accepted plan's own criterion and depth. */
+  sufficiency?: { criterion: string; requiredDepth: string; reason: string };
+  /** unknown only (mandatory for a blocking question): the consequence and the next action. */
+  consequence?: string;
+  nextAction?: string;
+}
+/** The mandatory, complete classification of an attempts assessment. Every packet attempt has one row; every claim of
+ * a submitted attempt is accepted or rejected; every accepted claim is new content or a duplicate of an earlier
+ * accepted basis; noProgress names exactly the attempts without an acknowledged new basis. */
+export interface V7Novelty {
+  attempts: V7NoveltyAttemptRow[];
+  accepted: V7NoveltyClaimRow[];
+  rejected: V7NoveltyClaimRow[];
+  newContent: V7NoveltyClaimRow[];
+  duplicates: V7NoveltyDuplicateRow[];
+  noProgress: V7NoveltyAttemptRow[];
+  transition: V7QuestionTransition | null;
+}
+
+/** The separate, versioned assessment form of a v7 attempts packet. The old ResearchAssessment keeps its own meaning;
+ * other subject kinds (dossier, bundle) are not admitted. The form names the paid session and application — whether
+ * they prove a paid assessment is the paid reader's (DR3b-A), and its application is DR3b-P's. */
+export const DISCOVERY_ASSESSMENT_CONTRACT = "discovery-assessment/v1" as const;
+export interface DiscoveryAttemptsAssessment {
+  contract: typeof DISCOVERY_ASSESSMENT_CONTRACT;
+  projectId: string;
+  subject: { kind: "attempts"; packet: V7AttemptPacket };
+  baseline: V7ProgressBaseline;
+  session: Ref;
+  application: Ref;
+  assessor: string;
+  environment: Ref;
+  verdict: "supported" | "return";
+  reasons: string[];
+  /** return only: where the work goes back — one packet attempt or one of its claims. */
+  return: { target: { attempt: Ref } | { claim: ClaimAddress }; reason: string } | null;
+  novelty: V7Novelty;
 }
