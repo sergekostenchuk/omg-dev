@@ -1,5 +1,6 @@
+import { provenStore } from "../storage/store-view.js";
 import { researchScope, scopedQuestions, researchGapDeferred, type ResearchScope } from "./research-scope.js";
-import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
+import { Store, storeObserved, type Revision, type TransactionGuard } from "../storage/store.js";
 import { Discovery, type ResearchLevel } from "../discovery/discovery.js";
 import { orderedSpecs, readDraft, type DiscoveryDraft, type FieldSpec }
   from "../discovery/projection-reader.js";
@@ -10,7 +11,7 @@ import { STAGE_CLOSURE_CONTRACT, reference, isRef, uniqueRefs, stageId, type Sta
 import { canonical, type Json } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import type { Graph } from "./model.js";
-import { sourceIsCurrent, type Source } from "../evidence/evidence.js";
+import { sourceIsCurrent, withSourceMemo, type Source } from "../evidence/evidence.js";
 import { derivedDraft, type Derivation } from "../discovery/derived-draft.js";
 import { REFINEMENT_CONTRACT_VERSION, refinementQuestions, deferredGap, type TechnicalGap, type TechnicalReport } from "./research-contracts.js";
 import { technicalResearchFindings } from "./research-evidence.js";
@@ -34,6 +35,23 @@ import type { WriterIndex } from '../ownership/writer-index.js';
 
 export const PHASES = ["R0", "L1", "R1", "L2", "R2", "L3", "R3"] as const;
 export type Phase = typeof PHASES[number];
+interface RefinementReadMemo { gates: Map<string, GateResult>; inputs: Map<string, boolean> }
+let refinementReadScope: WeakMap<Store, RefinementReadMemo> | null = null;
+/** One synchronous read, with no writes: share exact results across its neighboring gates.
+ * A Store view has its own key. Neither a successful read nor an exception leaves a cache behind. */
+export function withRefinementRead<T>(read: () => T): T {
+  if (refinementReadScope) return read();
+  return withSourceMemo(() => {
+    refinementReadScope = new WeakMap();
+    try { return read(); } finally { refinementReadScope = null; }
+  });
+}
+function refinementMemo(store: Store): RefinementReadMemo {
+  let memo = refinementReadScope!.get(store);
+  if (!memo) { memo = { gates: new Map(), inputs: new Map() }; refinementReadScope!.set(store, memo); }
+  return memo;
+}
+
 interface Milestone { projectId: string; phase: Phase; inputs: Ref[]; draft: Ref | null; layer: Ref | null; contractVersion?: number;
   carried?: CarriedObligation[]; carriedContract?: 'r3-v1'; taskObligationContract?: string }
 export interface Feasibility { contractVersion?: number; projectId: string; ready: boolean; graph: Ref; environment: Ref; repository: RepositoryState | null; inputs: Ref[]; findings: GateResult['findings'];
@@ -319,15 +337,49 @@ export class Refinement {
     return this.graphs.deriveLayer(project, level, expected, draft, actor, inputs);
   }
   gate(project: string, phase: Phase): GateResult {
-    const milestone = this.store.get<Milestone>(`phase:${project}:${phase}`);
+    return withRefinementRead(() => {
+      const milestone = this.store.get<Milestone>(`phase:${project}:${phase}`);
+      // Active application proofs must observe every read, in their historical order.
+      const physical = provenStore(this.store);
+      const memo = physical && !storeObserved(physical) ? refinementMemo(this.store) : undefined;
+      const key = milestone?.kind === 'phase' ? canonical(reference(milestone)) : null;
+      const cached = key ? memo?.gates.get(key) : undefined;
+      if (cached) return structuredClone(cached);
+      const result = this.#phaseGate(project, phase, milestone, memo, physical ?? this.store);
+      if (key) memo?.gates.set(key, structuredClone(result));
+      return result;
+    });
+  }
+  #phaseGate(project: string, phase: Phase, milestone: Revision<Milestone> | null, memo: RefinementReadMemo | undefined, physical: Store): GateResult {
     const result: GateResult = { findings: [], guards: [] };
     if (!milestone || milestone.kind !== "phase") { result.findings.push({ code: "phase_missing", target: phase, message: "Refinement phase is not complete" }); return result; }
     result.guards.push(reference(milestone));
-    for (const ref of uniqueRefs(milestone.value.inputs)) {
-      const current = this.store.get(ref.id);
-      if (!current || current.revision !== ref.revision || current.hash !== ref.hash
-        || (current.kind === "source" && !sourceIsCurrent(current.value as unknown as Source))) result.findings.push({ code: "phase_stale", target: ref.id, message: "An input to this phase changed" });
-      else result.guards.push(reference(current));
+    const inputs = uniqueRefs(milestone.value.inputs);
+    const moved = memo ? new Set(physical.headsMatch(inputs).mismatches.map(item => item.id)) : null;
+    for (const ref of inputs) {
+      let current: boolean;
+      if (!memo) {
+        // Compatibility for captured/replayed application reads: no hidden dependency reads.
+        const record = this.store.get(ref.id);
+        current = !!record && record.revision === ref.revision && record.hash === ref.hash
+          && (record.kind !== 'source' || sourceIsCurrent(record.value as unknown as Source));
+      } else if (moved!.has(ref.id)) current = false;
+      else {
+        const key = canonical(ref);
+        if (!memo.inputs.has(key)) {
+          // headsMatch compares heads without bodies; exact identity selects only actual Source bodies.
+          const identity = physical.identities('get', ref.id, ref.revision)[0];
+          let valid = !!identity && identity.hash === ref.hash && identity.revision === ref.revision;
+          if (valid && identity!.kind === 'source') {
+            const source = this.store.get<Source>(ref.id, ref.revision);
+            valid = !!source && source.kind === 'source' && source.hash === ref.hash && sourceIsCurrent(source.value, ref);
+          }
+          memo.inputs.set(key, valid);
+        }
+        current = memo.inputs.get(key)!;
+      }
+      if (!current) result.findings.push({ code: "phase_stale", target: ref.id, message: "An input to this phase changed" });
+      else result.guards.push({ id: ref.id, revision: ref.revision, hash: ref.hash });
     }
     if (milestone.value.contractVersion === REFINEMENT_CONTRACT_VERSION) {
       const index = PHASES.indexOf(phase);

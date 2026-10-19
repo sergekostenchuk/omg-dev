@@ -43,7 +43,7 @@ import { EngineError, requireCondition } from "../errors.js";
 import { parseCommand } from "./commands.js";
 import type { Graph } from "../graph/model.js";
 import { Environments, transactionGuardsCurrent, uniqueTransactionGuards, workspacePath, type Environment } from "../runtime/environment.js";
-import { Refinement, PHASES, type Feasibility } from "../graph/refinement.js";
+import { withRefinementRead, Refinement, PHASES, type Feasibility } from "../graph/refinement.js";
 import { buildL1 } from "../graph/builder.js";
 import type { ChatTurn } from "./chat.js";
 import type { Source } from "../evidence/evidence.js";
@@ -128,6 +128,9 @@ export class ProductEngine {
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);
   }
   projection(project: string) {
+    return withRefinementRead(() => this.#projection(project));
+  }
+  #projection(project: string) {
     // Closure declarations are producer instructions, not a change to the historical projection wire.
     const presented = <T extends GateResult>(gate: T): Omit<T, 'closure'> => {
       const { closure: _closure, ...value } = gate; return value;
