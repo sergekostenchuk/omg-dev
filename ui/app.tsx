@@ -101,7 +101,6 @@ function StagePanel({ view, stage, cmd, run, busy }: { view: View; stage: Stage;
         <div className="action-row">{stage === "operation-map" && <button className="secondary" disabled={busy} onClick={() => run(() => cmd({ type: "build-map", project, draftId: draft.id, expected: view.graph?.revision ?? 0 }), "Карта построена из пользовательского пути")}>Построить карту из пути</button>}
           <button disabled={busy || !ready} onClick={() => run(() => cmd({ type: "draft-stage", project, stage, draftId: draft.id, expected: current.artifact?.revision ?? 0 }), "Результат стадии собран")}>Собрать результат стадии</button></div></>}
     </>}
-    {stage === "om-g2" && <RefinementPanel view={view} cmd={cmd} run={run} busy={busy}/>}
     {stage === "compilation" && <PlanPanel view={view} busy={busy} compile={() => { void run(() => cmd({ type: "compile", project }), "Машинный план скомпилирован и проверен"); }}/>} 
     {stage === "execution" && <ExecutionPanel view={view} command={cmd} refresh={() => run(async () => {}, "Состояние исполнения обновлено")}/>}
     {current.artifact && <><div className="artifact-bar"><div><strong>Версия {current.artifact.revision}</strong><small>Привязана к исходным данным и доказательствам</small></div><button disabled={busy || current.state !== "draft"} onClick={() => run(() => cmd({ type: "accept-stage", project, stage, expected: current.artifact!.revision }), "Результат принят")}>Принять результат</button></div><details><summary>Содержание и привязки</summary><pre>{JSON.stringify(current.artifact.value.content, null, 2)}</pre></details></>}
@@ -134,17 +133,6 @@ function QuestionPanel({ question, view, cmd, run, busy }: { question: View['que
         <button disabled={busy || (q.spec.kind === "fact" ? !source : !answer.trim())}>{q.spec.kind === "fact" ? "Проверить по источнику" : "Принять решение"}</button>
       </form>}
   </article>;
-}
-
-function RefinementPanel({ view, cmd, run, busy }: { view: View; cmd: Cmd; run: Run; busy: boolean }) {
-  const project = view.project.value.id;
-  const currentR3 = view.feasibility?.value.ready === true && view.feasibilityGate?.findings.length === 0;
-  return <div><p className="muted">Каждый уровень уточняет ту же карту. R3 проверяет репозиторий и среду до компиляции задач.</p><div className="phase-grid">{view.phases.map(item => <div className="phase" key={item.phase}><strong>{item.phase}</strong><Badge state={item.record ? item.gate.findings.length ? "stale" : "accepted" : "missing"}/>
-    {item.phase.startsWith("R") ? <button className="secondary" disabled={busy} onClick={() => run(() => cmd({ type: "begin-research", project, level: item.phase }), "Исследование открыто")}>Открыть вопросы</button> : <button className="secondary" disabled={busy} onClick={() => run(() => cmd({ type: "seal-layer", project, level: Number(item.phase.slice(1)), expected: item.record?.revision ?? 0 }), "Уровень зафиксирован")}>Зафиксировать уровень</button>}</div>)}</div>
-    {view.drafts.filter(d => d.value.stage === "om-g2").map(draft => <div key={draft.id} className="research-group"><h3>{draft.value.level}</h3>{draft.value.questions.map(id => { const q = view.questions.find(item => item.id === id); return q ? <QuestionPanel key={`${id}:${q.revision}`} question={q} view={view} cmd={cmd} run={run} busy={busy}/> : null; })}<button disabled={busy} onClick={() => run(() => cmd({ type: "finish-research", project, level: draft.value.level, draft: ref(draft), expected: view.phases.find(p => p.phase === draft.value.level)?.record?.revision ?? 0 }), "Исследование завершено")}>Завершить {draft.value.level}</button></div>)}
-    <div className="action-row"><button disabled={busy || !view.environment} onClick={() => run(() => cmd({ type: "assess", project, expected: view.feasibility?.revision ?? 0 }), "Проверка R3 выполнена")}>Проверить R3</button>{!view.environment && <span className="muted">Сначала выберите рабочую папку и роли.</span>}</div>
-    {view.feasibility && <div className="findings"><h3>R3: {currentR3 ? "проверка пройдена" : "требует внимания"}</h3>{[...view.feasibility.value.findings, ...(view.feasibilityGate?.findings ?? [])].map((f,i) => <p key={i}>{f.message} · {f.target}</p>)}<button disabled={busy || !currentR3} onClick={() => run(() => cmd({ type: "draft-om", project, feasibility: ref(view.feasibility!), expected: view.stages.find(s => s.stage === "om-g2")!.artifact?.revision ?? 0 }), "Результат OM-G2 собран")}>Собрать результат OM-G2</button></div>}
-  </div>;
 }
 
 function GraphPanel({ view, cmd, run, busy }: { view: View; cmd: Cmd; run: Run; busy: boolean }) {
@@ -221,6 +209,7 @@ function OwnerPanel({ view, run, busy }: { view: View; run: Run; busy: boolean }
   const [invitation, setInvitation] = useState(""); const [session, setSession] = useState<{ session: { id: string }; expiresAt: number } | null>(null);
   const listed = view.ownerQuestions; const items = listed && listed.ok ? listed.value : [];
   const pending = items.filter(item => !item.answered);
+  if (!session && listed?.ok && items.length === 0) return <section className="stage-panel owner-panel"><h2>Вопросы операционной карты</h2><p className="empty-inline">Нет вопросов, ожидающих решения владельца.</p></section>;
   return <section className="stage-panel owner-panel"><div className="section-heading"><div><div className="eyebrow">РЕШЕНИЯ ВЛАДЕЛЬЦА</div><h2>Вопросы операционной карты</h2></div>{session && <Badge state="open"/>}</div>
     {listed && !listed.ok && <p className="muted">Список вопросов владельца недоступен: {listed.refusal.message}</p>}
     {!session ? <>

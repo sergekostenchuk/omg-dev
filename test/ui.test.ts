@@ -8,8 +8,14 @@ import { Store } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { createProductServer } from "../src/server.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
-import { answerDiscoveryFixture, preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { answerDiscoveryFixture } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
+import { prepareOmFixtureStages, prepareNativeLayers } from "./om-fixture.js";
+import { enrichedGraph } from "./enriched-graph-fixture.js";
+import { exampleGraph } from "./graph-fixture.js";
+import { listOwnerQuestions } from "../src/om/owner-result.js";
+import { readRoutes } from "../src/om/routes.js";
+import { readOmInput } from "../src/om/input.js";
 import { git, MODE_ROLE_COMMANDS, resolveRoleMode } from "../src/runtime/environment.js";
 import { reference } from "../src/pipeline/contracts.js";
 
@@ -152,17 +158,39 @@ test("browser compiles the accepted map and reloads the generated task dependenc
   git(workspace, ["init", "-b", "main"]); writeFileSync(join(workspace, "README.md"), "Product input\n");
   git(workspace, ["add", "README.md"]); git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial"]);
   const store = new Store(join(root, "state.sqlite")); const engine = new ProductEngine(store);
-  preparedFeatures(engine, "garden"); const command = { executable: process.execPath, args: ["--version"] };
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const graph = enrichedGraph(exampleGraph("garden"), "garden");
+  prepareOmFixtureStages(engine, "garden", graph); const command = { executable: process.execPath, args: ["--version"] };
   engine.environments.configure("garden", { workspace, implementer: { actor: "worker", model: "fixture", effort: "high", command },
-    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000 }, 0);
-  refinedLayers(engine, "garden"); const r3 = engine.refinement.assess("garden", 0);
-  const om = engine.refinement.publish("garden", reference(r3), 0); engine.pipeline.accept("garden", "om-g2", om.revision);
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 1000, requestCapacityChars: 100_000 }, 0);
+  prepareNativeLayers(engine, "garden", graph, "executed");
+  assert.equal(store.list("phase").length, 0);
+  assert.equal(store.get("om-feasibility:garden")?.kind, "feasibility");
+  assert.equal(engine.pipeline.inspect("garden", "om-g2").state, "accepted");
   const server = createProductServer(engine);
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const browser = await chromium.launch({ channel: "chrome", headless: true });
-  t.after(async () => { await browser.close(); await new Promise<void>(resolve => server.close(() => resolve())); store.close(); rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await browser.close(); await new Promise<void>(resolve => server.close(() => resolve())); });
   const page = await browser.newPage();
+  const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
+  let projected = 0;
+  await page.route("**/api/project?*", async route => {
+    const response = await route.fetch(), view = await response.json();
+    // LG30 removes these projection fields. Do not let an old server shape mask a UI dependency.
+    delete view.phases; delete view.feasibility; delete view.feasibilityGate;
+    const ownerQuestions = listOwnerQuestions(store, "garden", { routes: readRoutes, input: readOmInput });
+    assert.deepEqual(ownerQuestions, { ok: true, value: [] });
+    await route.fulfill({ response, json: { ...view, ownerQuestions } });
+    projected++;
+  });
   await page.goto(`http://127.0.0.1:${(server.address() as { port: number }).port}/#token=${server.accessToken}`);
+  await page.getByLabel("Выбор стадии", { exact: true }).selectOption("om-g2");
+  await page.getByText("Нет вопросов, ожидающих решения владельца.", { exact: true }).waitFor();
+  assert.equal(await page.getByLabel("Одноразовое приглашение", { exact: true }).count(), 0);
+  assert.equal(await page.getByRole("button", { name: "Войти как владелец", exact: true }).count(), 0);
+  assert.equal(await page.locator(".phase-grid, .phase, .stage-panel .research-group").count(), 0);
+  for (const name of ["Открыть вопросы", "Зафиксировать уровень", "Завершить R0", "Завершить R1", "Завершить R2", "Проверить R3", "Собрать результат OM-G2"])
+    assert.equal(await page.getByRole("button", { name, exact: true }).count(), 0, name);
   await page.getByLabel("Выбор стадии", { exact: true }).selectOption("compilation");
   await page.getByRole("button", { name: "Скомпилировать машинный план", exact: true }).click();
   await page.getByRole("heading", { name: "Задач в горизонте: 2", exact: true }).waitFor();
@@ -170,4 +198,7 @@ test("browser compiles the accepted map and reloads the generated task dependenc
   await page.reload(); await page.getByLabel("Выбор стадии", { exact: true }).selectOption("compilation");
   await page.getByRole("heading", { name: "Задач в горизонте: 2", exact: true }).waitFor();
   assert.equal(await page.locator(".stage-panel .section-heading .badge.accepted").count(), 1);
+  await page.getByText("Нет вопросов, ожидающих решения владельца.", { exact: true }).waitFor();
+  assert.ok(projected >= 2, "The cold reload receives the narrowed projection too");
+  assert.deepEqual(errors, []);
 });
