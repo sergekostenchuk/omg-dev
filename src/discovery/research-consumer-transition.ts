@@ -1,4 +1,6 @@
-import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME, researchResultFailure,
+import type { AssessmentTransportSubject } from './continuation-packet.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V2, type DiscoveryAttemptsAssessmentV2 } from './research-model.js';
+import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME, researchResultFailure, requireAttemptsAssessmentReply,
   type EarlyUnknownAdmission } from './early-research-outcome.js';
 import { Ajv, type ValidateFunction } from 'ajv';
 import { canonical, digest, hashJson } from '../canonical.js';
@@ -2255,3 +2257,26 @@ export function projectPaidOwnerReview(beforeRun: ResearchRun, beforeTurn: Manag
       : null,
     limit, owner, error: null, pauseCode: null } };
 }
+
+/** A projector consumes already proven physical/session inputs. It neither
+ * proves a caller's Ref nor accepts claims; the historical reader does both
+ * structural and provenance checks before exposing the resulting assessment. */
+export function projectPaidAttemptsAssessment(input: { subject: AssessmentTransportSubject;
+  session: Ref; application: Ref; environment: Ref; assessor: string; result: unknown }):
+  { id: string; value: DiscoveryAttemptsAssessmentV2 } {
+  requireCondition(input.subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2
+    && isRef(input.session) && isRef(input.application) && isRef(input.environment)
+    && typeof input.assessor === 'string' && input.assessor.trim().length > 0,
+    'discovery_assessment_invalid', 'A projected assessment needs its exact paid inputs and explicit v2 subject');
+  requireAttemptsAssessmentReply(input.result, input.subject);
+  requireCondition(input.result !== null && typeof input.result === 'object' && !Object.hasOwn(input.result, 'action'),
+    'discovery_assessment_invalid', 'A continuation is not a terminal packet assessment');
+  const result = input.result as Pick<DiscoveryAttemptsAssessmentV2, 'verdict'|'reasons'|'return'|'novelty'|'methodology'>;
+  const value: DiscoveryAttemptsAssessmentV2 = { contract: DISCOVERY_ASSESSMENT_CONTRACT_V2,
+    projectId: input.subject.packet.project, subject: { kind: 'attempts', packet: input.subject.packet }, baseline: input.subject.baseline,
+    session: input.session, application: input.application, assessor: input.assessor, environment: input.environment,
+    verdict: result.verdict, reasons: result.reasons, return: result.return, novelty: result.novelty, methodology: result.methodology };
+  return { id: discoveryAssessmentId(value), value };
+}
+export const discoveryAssessmentId = (value: Pick<DiscoveryAttemptsAssessmentV2, 'projectId'|'session'|'application'>) =>
+  `discovery-assessment:v2:${hashJson({ projectId: value.projectId, session: value.session, application: value.application })}`;

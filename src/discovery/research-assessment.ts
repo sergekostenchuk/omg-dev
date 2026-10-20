@@ -1,3 +1,9 @@
+import { packetAssessmentSubject, methodologyAssessmentTransport, assessmentQuestionContract } from './continuation-packet.js';
+import { proveAttemptPacket, checkProgressBaseline, baselineGuards, checkDiscoveryAssessmentForm,
+  DISCOVERY_ASSESSMENT_KIND, type ProvenAttemptPacket } from './v7-attempt-assessment.js';
+import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V2, type V7AttemptPacket, type V7ProgressBaseline,
+  type DiscoveryAttemptsAssessmentV2 } from './research-model.js';
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { BASIS_APPLICATION_CONTRACT_ERA, contractEraOf, readDraft, readRecord, readStageArtifact } from './projection-reader.js';
 import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.js';
@@ -24,7 +30,7 @@ import { assessmentSessionWithProof, readAssessmentSessionOutcomeAt,
   readAssessmentPaidOrigin, readDirectAssessmentMaterials, type AssessmentPaidOriginInput } from "./assessment-session.js";
 import { assessmentReadView, readResearchConsumerIntent, readResearchConsumerTurn,
   prepareManagedProposalRefusal, type AssessmentReadProof } from './response-recovery.js';
-import { researchAction } from './research-consumer-transition.js';
+import { researchAction, projectPaidAttemptsAssessment, discoveryAssessmentId } from './research-consumer-transition.js';
 import { resolveResearchBasis } from '../graph/research-basis.js';
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 import { collectRuntimeSelection, emptyRuntimeAdmission } from '../graph/runtime-evidence.js';
@@ -563,4 +569,114 @@ export function readResearchAssessmentAt(store: Store, projectId: string, turnId
     && same(assessment.value, projected),
     'research_assessment_binding_invalid', `[${turnId}] Saved assessment does not derive from its exact paid producer`);
   return assessment;
+}
+
+function attemptsCandidate(store: Store, proven: ProvenAttemptPacket, baseline: V7ProgressBaseline) {
+  const materials = new Map<string, { ref: Ref; kind: string; value: unknown }>();
+  const related = new Map<string, { address: ClaimAddress; claim: Json }>();
+  const pending: Json[] = proven.entries.flatMap(entry => entry.attempt.claims ?? []);
+  const baselineClaims = baseline.materials.map(address => ({ address, claim: resolveClaimAddress(store, address).claim }));
+  pending.push(...baselineClaims.map(item => item.claim));
+  // Only contracted basis paths are references. Free claim JSON is never scanned
+  // for Ref-shaped values. Exact material is paged by the shared packer/archive.
+  for (let index = 0; index < pending.length; index++) {
+    const claim = pending[index];
+    if (!claim || typeof claim !== 'object' || Array.isArray(claim)) continue;
+    const basis = claim.basis;
+    if (!basis || typeof basis !== 'object' || Array.isArray(basis)) continue;
+    const source = claim.kind === 'fact' && basis.source && typeof basis.source === 'object'
+      && !Array.isArray(basis.source) ? basis.source.ref : claim.kind === 'owner-decision' ? basis.authority : null;
+    if (isRef(source) && !materials.has(canonical(source))) {
+      const record = readRecord(store, source.id, source.revision);
+      requireCondition(record && same(reference(record), source) && hashJson(record.value) === record.hash
+        && (claim.kind !== 'fact' || record.kind === 'source'),
+        'discovery_assessment_invalid', `[${source.id}] The attempt basis needs its exact saved material`);
+      materials.set(canonical(source), { ref: source, kind: record!.kind, value: record!.value });
+    }
+    if (claim.kind === 'inference' && Array.isArray(basis.from)) for (const item of basis.from) {
+      const key = canonical(item);
+      if (related.has(key)) continue;
+      const address = item as unknown as ClaimAddress, resolved = resolveClaimAddress(store, address);
+      related.set(key, { address, claim: resolved.claim }); pending.push(resolved.claim);
+    }
+  }
+  return { planQuestion: proven.planQuestion,
+    attempts: proven.entries.map(entry => ({ attempt: reference(entry.attempt.attempt), binding: reference(entry.binding),
+      end: entry.attempt.attempt.value.end })), baseline: baselineClaims,
+    relatedClaims: [...related.values()], materials: [...materials.values()] };
+}
+
+/** A derives a judgment from one exact paid terminal. P alone may apply it. */
+function attemptsAssessmentValue(store: Store, proof: AssessmentProof): DiscoveryAttemptsAssessmentV2 {
+  const subject = packetAssessmentSubject(proof.context);
+  requireCondition(subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2,
+    'discovery_assessment_invalid', 'The paid attempts assessment must declare its v2 methodology before dispatch');
+  const { value } = projectPaidAttemptsAssessment({ subject: subject!, session: proof.session,
+    application: proof.application, assessor: proof.role.actor, environment: proof.environment, result: proof.result });
+  requireCondition(same(proof.question, subject!.packet.question) && proof.dispatch.projectId === value.projectId
+    && same(proof.role, proof.dispatch.reviewer), 'discovery_assessment_invalid', 'The paid assessor belongs to this exact subject and role');
+  const checked = checkDiscoveryAssessmentForm(store, value);
+  requireCondition(same(proof.context.value, attemptsCandidate(store, checked.packet, subject!.baseline))
+    && Array.isArray(proof.context.observations) && proof.context.observations.length === 0
+    && proof.prompt === assessmentQuestionContract(subject!).prompt,
+    'discovery_assessment_invalid', 'The paid assessor did not receive the exact attempt contents and baseline');
+  return value;
+}
+
+/** Structural supported/v2 labels are insufficient: re-derive the entire saved
+ * assessment from the producer's physical receipt, application and terminal. */
+export function readDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<DiscoveryAttemptsAssessmentV2> {
+  const saved = isRef(ref) ? store.get<DiscoveryAttemptsAssessmentV2>(ref.id, ref.revision) : null;
+  requireCondition(saved?.kind === DISCOVERY_ASSESSMENT_KIND && saved.revision === 1 && same(reference(saved), ref)
+    && saved.hash === hashJson(saved.value) && saved.value !== null && typeof saved.value === 'object'
+    && saved.value.projectId === projectId,
+    'discovery_assessment_invalid', 'The exact discovery assessment is absent, changed or foreign');
+  requireCondition(saved!.value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2,
+    'discovery_assessment_invalid', 'This producer proves the explicit paid v2 assessment');
+  const proof = readAssessmentSessionOutcomeAt(store, projectId, saved!.value.session, saved!.value.application);
+  const derived = attemptsAssessmentValue(store, proof);
+  requireCondition(saved!.id === discoveryAssessmentId(derived) && same(saved!.value, derived),
+    'discovery_assessment_invalid', 'The assessment differs from its exact paid terminal');
+  return saved!;
+}
+
+/** Assess a fixed packet. The shared session resumes its paid application before
+ * admission of another call. Fresh admissions guard the current plan/baseline;
+ * saving a received judgment does not apply it or update an attempt/K record. */
+export async function assessAttempts(store: Store, packet: V7AttemptPacket, baseline: V7ProgressBaseline,
+  environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>):
+  Promise<Revision<DiscoveryAttemptsAssessmentV2>> {
+  requireCondition(isRef(environment) && typeof root === 'string' && root.length > 0
+    && (pilot === undefined || isRef(pilot)), 'discovery_assessment_invalid', 'Exact environment and workspace are required');
+  const proven = proveAttemptPacket(store, packet);
+  checkProgressBaseline(store, baseline, packet);
+  const draft = proven.entries[0]!.attempt.draft;
+  const question = exact<Question>(store, packet.question, 'question');
+  environment = exact<Environment>(store, reference(environment), 'environment');
+  if (pilot) pilot = exact<ReaderPilot>(store, reference(pilot), 'reader-pilot');
+  requireCondition(!pilot || pilot.value.projectId === packet.project,
+    'discovery_assessment_invalid', 'The assessor profile belongs to this packet project');
+  requireCondition(environment.value.projectId === packet.project && realpathSync(root) === realpathSync(environment.value.workspace),
+    'discovery_assessment_invalid', 'The assessor needs the packet project and its configured workspace');
+  const subject = { kind: 'attempts' as const, packet, baseline, assessment: methodologyAssessmentTransport() };
+  const context = { assessmentSubject: subject, value: attemptsCandidate(store, proven, baseline), observations: [] };
+  const dispatch = pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value;
+  const delivered = await assessmentSessionWithProof(store, draft, question, environment, dispatch, pilot, context,
+    assessmentQuestionContract(subject).prompt, signal, baselineGuards(baseline));
+  requireCondition(delivered.proof, 'discovery_assessment_invalid', 'The attempts assessment needs its exact paid terminal proof');
+  requireCondition(same(delivered.proof!.environment, reference(environment))
+    && same(delivered.proof!.role, dispatch.reviewer) && same(delivered.proof!.profile, pilot ? reference(pilot) : null),
+    'discovery_assessment_invalid', 'The paid assessment belongs to another environment, role or profile');
+  const value = attemptsAssessmentValue(store, delivered.proof!);
+  requireCondition(same(value.subject.packet, packet) && same(value.baseline, baseline),
+    'discovery_assessment_invalid', 'The paid terminal belongs to another packet or baseline');
+  const id = discoveryAssessmentId(value), existing = store.get<DiscoveryAttemptsAssessmentV2>(id);
+  if (existing) return readDiscoveryAssessment(store, packet.project, reference(existing));
+  try { return store.write<DiscoveryAttemptsAssessmentV2>({ id, kind: DISCOVERY_ASSESSMENT_KIND, expected: 0, value }); }
+  catch (error) {
+    if (!(error instanceof EngineError) || error.code !== 'revision_conflict') throw error;
+    const saved = store.get(id);
+    if (!saved) throw error;
+    return readDiscoveryAssessment(store, packet.project, reference(saved));
+  }
 }

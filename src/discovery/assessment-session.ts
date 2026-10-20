@@ -1,8 +1,10 @@
+import { packetAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject } from './continuation-packet.js';
+import { proveAttemptPacket, checkDiscoveryAssessmentForm } from './v7-attempt-assessment.js';
 import { prepareResearchEnvelope } from './research-protocol.js';
 import { researchCapacityInput, declareResultCapacity, researchResultFailure, researchResultEnvelopeLimit,
   withoutResultCapacity, RESULT_CAPACITY, RESULT_CAPACITY_REFUSAL } from './early-research-outcome.js';
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
-import { earlyResearchFailure, earlyResearchCorrection, requireAssessmentReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
+import { earlyResearchFailure, earlyResearchCorrection, requireAssessmentReply, requireAttemptsAssessmentReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { Evidence } from '../evidence/evidence.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { Environments, uniqueTransactionGuards, transactionGuardsCurrent } from '../runtime/environment.js';
@@ -24,7 +26,21 @@ import { researchAction, researchCall } from "./research-protocol.js";
 import { readResearchContext, researchContextReadEra, requireCurrentPriorContext } from "./research-limits.js";
 import { recoveredResponseBoundary, recoveryAssessmentSessionId, recoverySessionWrites, markRecoveredSessionWritten,
   readResearchExecution, isResponseRecovery, markApplicationResponseRecovered, assessmentReadView, assessmentSessionEra,
-  proposalRefusalId, readLimitedCallRetryPermit, type AssessmentReadProof } from './response-recovery.js';
+  proposalRefusalId, readLimitedCallRetryPermit, readResearchConsumerIntent, type AssessmentReadProof } from './response-recovery.js';
+
+/** The packet's producers are the proven K intents, never the current implementer
+ * setting or only the first entry. Shared by admission and the historical reader. */
+function requireAttemptsAssessorIndependence(store: Store, context: unknown, actor: string): AssessmentTransportSubject | null {
+  const subject = packetAssessmentSubject(context);
+  if (!subject?.assessment) return null; // Original T keeps the contract of its era.
+  const packet = proveAttemptPacket(store, subject.packet);
+  for (const entry of packet.entries) {
+    const intent = readResearchConsumerIntent(store, entry.binding.value.intent);
+    requireCondition(typeof actor === 'string' && actor.length > 0 && intent.value.role.actor !== actor,
+      'assessor_not_independent', `[${entry.attempt.attempt.id}] The assessor must differ from every attempt producer`);
+  }
+  return subject;
+}
 
 export function assessmentRolePrompt(prompt: string): string { return prompt + '\n' + instruction; }
 
@@ -87,7 +103,9 @@ function advanceAssessment(store: Store, draft: Revision<DiscoveryDraft>, questi
   historicalReadEra?: 'legacy'): { value: Session; failure?: unknown } {
   const workspace = contextWorkspace(current.workspace, current.focus);
   const { offset, candidate, candidateOffset } = assessmentPacket(current, context, sent);
-  requireAssessmentReply(response);
+  const assessmentSubject = packetAssessmentSubject(context);
+  if (assessmentSubject?.assessment) requireAttemptsAssessmentReply(response, assessmentSubject);
+  else requireAssessmentReply(response);
   if (response?.action === "read_context") {
     const action = researchAction(response);
     requireCondition(action.action === "read_context", "assessment_invalid", "Expected an addressed read");
@@ -112,8 +130,14 @@ function advanceAssessment(store: Store, draft: Revision<DiscoveryDraft>, questi
  * historical read, never from the current draft or an error label. */
 function correctableAssessmentReply(draft: Revision<DiscoveryDraft>, question: Revision<Question>,
   before: Session, context: Record<string, any>, subject: Record<string, any>, payload: unknown): EngineError | null {
-  const invalid = earlyResearchFailure(draft.value, question.value, 'assessor', payload);
-  if (invalid) return invalid;
+  const assessmentSubject = packetAssessmentSubject(context);
+  if (assessmentSubject?.assessment) {
+    try { requireAttemptsAssessmentReply(payload, assessmentSubject); }
+    catch (error) { if (error instanceof EngineError) return error; throw error; }
+  } else {
+    const invalid = earlyResearchFailure(draft.value, question.value, 'assessor', payload);
+    if (invalid) return invalid;
+  }
   if (subject.working?.deliveryContract !== 'research-delivery/v1') return null;
   const page = assessmentPacket(before, context, subject);
   if ((payload as {action?: unknown})?.action === 'assessment_checkpoint'
@@ -692,14 +716,31 @@ function admittedAssessmentContext(store: Store, session: Write, context: Record
   }
   return admitted;
 }
-export function assessmentReplyFailure(_store: Store, app: Application, payload: unknown) {
+export function assessmentReplyFailure(store: Store, app: Application, payload: unknown) {
   const context = app.context;
   if (context.resultCapacityContract === undefined && context.resultCapacity === undefined) return null;
   requireCondition(context.resultCapacityContract === RESULT_CAPACITY, 'research_capacity_invalid', 'The assessment lost its capacity era');
   const saved = context.resultCapacity;
   if (!saved || typeof saved !== 'object' || (saved as any).contract !== RESULT_CAPACITY)
     throw new EngineError('research_capacity_invalid', 'The assessment lost its declared result capacity');
-  return researchResultFailure(saved, payload);
+  const capacityFailure = researchResultFailure(saved, payload);
+  if (capacityFailure) return capacityFailure;
+  const subject = packetAssessmentSubject(context);
+  if (subject?.assessment && object(payload) && !Object.hasOwn(payload,'action')) {
+    try {
+      requireAttemptsAssessmentReply(payload, subject);
+      const session = exact<ApplicationSession>(store, app.session, 'assessment-session');
+      const application = store.get<Application>(applicationId(app.session.id, app.session.revision), 1);
+      if (!application || application.kind !== 'assessment-application')
+        applicationInvalid(app.session.id, 'The assessment reply lost its original application');
+      // This is M2's structural/evidence check, not P's semantic acceptance.
+      // Exact sources are captured by evaluateApplication's shared read view.
+      checkDiscoveryAssessmentForm(store, {...payload,contract:subject.assessment.contract,projectId:app.projectId,
+        subject:{kind:'attempts',packet:subject.packet},baseline:subject.baseline,
+        session:app.session,application:reference(application),environment:session.value.binding!.environment,assessor:app.role.actor});
+    } catch(error) { if(error instanceof EngineError) return error; throw error; }
+  }
+  return null;
 }
 
 function applicationWrite(store: Store, session: Write, context: Record<string, any>, prompt: string, role: RoleBinding, dispatch: Environment, profile: Ref | null,
@@ -810,16 +851,39 @@ function assessmentCorrection(store: Store, app: Application, before: Session,
         const failure = assessmentReplyFailure(store, previous.value, outcome.payload)
           ?? correctableAssessmentReply(sourceDraft, sourceQuestion, before, app.context,
             outcome.subject, outcome.payload);
-        if (failure) return failure.code === 'research_context_incomplete'
-          ? { contract: 'assessment-context-correction/v1', role: 'assessor',
-              attempt: predecessor, call: previous.value.received, code: failure.code,
-              details: failure.details, instruction: 'The previous final verdict did not receive all saved context. Read the exact record and pointer at next, using a smaller addressed page. The candidate and prior call remain saved.' }
-          : earlyResearchCorrection('assessor', failure, predecessor, sourceQuestion.value);
+        if (failure) {
+          if (failure.code === 'research_context_incomplete') return { contract: 'assessment-context-correction/v1', role: 'assessor',
+            attempt: predecessor, call: previous.value.received, code: failure.code,
+            details: failure.details, instruction: 'The previous final verdict did not receive all saved context. Read the exact record and pointer at next, using a smaller addressed page. The candidate and prior call remain saved.' };
+          const correction = earlyResearchCorrection('assessor', failure, predecessor, sourceQuestion.value);
+          const subject = packetAssessmentSubject(app.context);
+          if (subject?.assessment) correction.responseContract = {
+            schema: assessmentQuestionContract(subject).schema,
+            instruction: 'Correct only the attempts assessment reply, including novelty and methodology; preserve the exact packet, baseline and supplied material cursor.' };
+          return correction;
+        }
       }
     }
     predecessor = previous.value.previous;
   }
   return null;
+}
+/** Dispatch and physical replay share the exact prepared application, including
+ * predecessor feedback and independence from every proven packet producer. */
+export function readAssessmentDispatchAdmission(store: Store, applicationRef: Ref) {
+  const raw = exact<Application>(store, applicationRef, 'assessment-application');
+  const session = exact<ApplicationSession>(store, raw.value.session, 'assessment-session');
+  const application = readApplication(store, session, applicationRef), app = application.value;
+  if (application.revision !== 1 || app.state !== 'prepared')
+    applicationInvalid(application.id, 'Dispatch admission needs its exact original prepared application');
+  requireAttemptsAssessorIndependence(store, app.context, app.role.actor);
+  const binding = session.value.binding!;
+  const correction = assessmentCorrection(store, app, session.value,
+    exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft'),
+    exact<Question>(store, binding.question, 'question'));
+  return { application, session, environment: binding.environment, role: app.role, dispatch: app.dispatch,
+    profile: app.profile, prompt: assessmentRolePrompt(app.prompt),
+    context: assessmentDispatchContext(session.value, session.id, app.context, correction) };
 }
 function requireRetryable(store: Store, app: Application) {
   if (!app.received) applicationInvalid(app.session.id, 'A failed attempt needs its exact physical outcome');
@@ -1030,6 +1094,7 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
   let session = store.get<ApplicationSession>(id);
   if (!session) {
     if (isResponseRecovery()) applicationInvalid(id, 'The selected recovery session is missing');
+    requireAttemptsAssessorIndependence(store, basis, dispatch.reviewer.actor);
     const barrier = readBarrier(store, draft.value.projectId, reference(question));
     if (barrier && !barrier.value.completion) barrierRefusal(store, barrier);
     const guards = uniqueTransactionGuards([...currentAdmission(store, draft, question, environment, context, extraGuards, barrier ? reference(barrier) : undefined),
@@ -1163,7 +1228,10 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
       const binding = session.value.binding!;
       const sourceDraft = exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft'), sourceQuestion = exact<Question>(store, binding.question, 'question');
       const response = applicationResponse(store, app, reference(call));
-      const changed = changedDependency(store, app.guards);
+      // An attempts verdict is a saved judgment of immutable packet/baseline bytes.
+      // Today's admission controls another dispatch and P, not retention of this paid result.
+      const attempts = packetAssessmentSubject(app.context)?.assessment !== undefined;
+      const changed = attempts ? null : changedDependency(store, app.guards);
       if (changed) refuseApplication(store, application, changed.reason, [...changed.guards, reference(call)], [], null, reference(call));
       const advanced = evaluateApplication(store, app, session, sourceDraft, sourceQuestion, response);
       if (advanced.failure && !(advanced.failure instanceof EngineError)) throw advanced.failure;
@@ -1197,13 +1265,15 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
         value: { ...app, state: 'applied', after: pendingRef(write), received: reference(call), resolution: advanced.proof } };
       const barrier = terminal ? readBarrier(store, app.projectId, binding.question) : null;
       const release = barrier && !barrier.value.completion && object(nextValue.result)
-        && ['insufficient', 'conflicting'].includes(nextValue.result.verdict)
+        && (['insufficient', 'conflicting'].includes(nextValue.result.verdict) || attempts && nextValue.result.verdict === 'return')
         && permitsAssessmentCorrection(store, barrier, app)
         ? [{ id: barrier.id, kind: barrier.kind, expected: barrier.revision,
           value: { ...barrier.value, completion: pendingRef(applied) } } satisfies Write] : [];
       store.writeMany([write, applied, ...release,
         ...(!terminal ? [applicationWrite(store, write, app.context, app.prompt, app.role, app.dispatch, app.profile, uniqueTransactionGuards([...app.guards, ...advanced.guards]), pendingRef(applied), app.origin, application)] : []), ...recovered.writes],
-      uniqueTransactionGuards([reference(session), reference(application), ...app.guards, ...response.guards, ...advanced.guards, ...recovered.guards]));
+      uniqueTransactionGuards([reference(session), reference(application),
+        ...(attempts && terminal ? [reference(call)] : [...app.guards, ...response.guards]),
+        ...advanced.guards, ...recovered.guards]));
       markRecoveredSessionWritten(recovered);
       if (terminal) return { result: nextValue.result, terminal: pendingRef(write), applied: pendingRef(applied) };
     } catch (error) {
@@ -1233,8 +1303,8 @@ export async function assessmentSession(store: Store, draft: Revision<DiscoveryD
     signal, extraGuards)).result;
 }
 
-/** Exact terminal proof for a managed assessor session; no current session/application head is consulted. */
-export function readAssessmentSessionOutcomeAt(store: Store, projectId: string, terminal: Ref, applied: Ref): {
+/** Prove one exact applied step; checkpoint and terminal steps share the same origin. */
+export function readAssessmentApplicationOutcomeAt(store: Store, projectId: string, terminal: Ref, applied: Ref): {
   result: unknown; session: Ref; application: Ref; draft: Ref; question: Ref; environment: Ref; inputs: Ref[]; received: Ref;
   context: Record<string, any>; prompt: string; role: RoleBinding; dispatch: Environment; profile: Ref | null;
   origin: Ref | null;
@@ -1242,14 +1312,15 @@ export function readAssessmentSessionOutcomeAt(store: Store, projectId: string, 
   if (!store || typeof store.get !== 'function' || typeof projectId !== 'string' || !projectId.trim()
     || !isRef(terminal) || !isRef(applied)) applicationInvalid('assessment-session', 'Exact terminal proof needs project, session and application');
   const session = exact<ApplicationSession>(store, terminal, 'assessment-session');
-  if (session.value.projectId !== projectId || session.value.contract !== APPLICATION || session.value.result === null
+  if (session.value.projectId !== projectId || session.value.contract !== APPLICATION
     || !session.value.binding || !isRef(session.value.binding.question))
-    applicationInvalid(terminal.id, 'The exact managed session has no terminal result or question');
+    applicationInvalid(terminal.id, 'The exact managed session has no application contract or question');
   const application = readApplication(store, session, applied);
   if (application.value.state !== 'applied' || !same(application.value.after, terminal)
     || !isRef(application.value.received))
     applicationInvalid(applied.id, 'The exact application did not produce this terminal result');
   proveAppliedAssessment(store, application, session);
+  requireAttemptsAssessorIndependence(store, application.value.context, application.value.role.actor);
   return { result: session.value.result, session: terminal, application: applied,
     draft: session.value.binding.draft, question: session.value.binding.question,
     environment: session.value.binding.environment, inputs: session.value.binding.inputs,
@@ -1257,6 +1328,13 @@ export function readAssessmentSessionOutcomeAt(store: Store, projectId: string, 
     context: application.value.context, prompt: application.value.prompt, role: application.value.role,
     origin: application.value.origin ?? null,
     dispatch: application.value.dispatch, profile: application.value.profile };
+}
+
+/** Exact terminal proof; historical callers still require a completed result. */
+export function readAssessmentSessionOutcomeAt(store: Store, projectId: string, terminal: Ref, applied: Ref) {
+  const proof = readAssessmentApplicationOutcomeAt(store, projectId, terminal, applied);
+  if (proof.result === null) applicationInvalid(terminal.id, 'The exact managed session has no terminal result');
+  return proof;
 }
 
 /** Preserve the public result API while exposing the exact physical application to new managed producers. */
@@ -1329,7 +1407,7 @@ function evaluateApplication(store: Store, app: Application, before: Revision<Ap
     for (const observation of app.context.observations) requireCondition(new Evidence(inputs.store).verify(observation),
       'research_context_application_source_stale', 'An original observation is no longer supported by its source');
     const pilot = app.profile ? exact<ReaderPilot>(store, app.profile, 'reader-pilot') : undefined;
-    const capacityFailure = assessmentReplyFailure(store, app, paid.payload);
+    const capacityFailure = assessmentReplyFailure(inputs.store, app, paid.payload);
     if (capacityFailure) throw capacityFailure;
     const historicalReadEra = historicalAssessmentReadEra(paid, inputs, proof !== undefined);
     const advanced = advanceAssessment(inputs.store, draft, question, pilot, before.value, app.context, paid.subject, paid.payload,

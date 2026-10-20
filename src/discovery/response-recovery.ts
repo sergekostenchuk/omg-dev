@@ -1,3 +1,4 @@
+import { packetAssessmentSubject, proveAssessmentTransportSubject, assessmentQuestionContract, assessmentTransportPrompt, continuationPrompt } from './continuation-packet.js';
 import { prepareResearchEnvelope } from './research-protocol.js';
 import { readRequestWire, readArchiveBody, prepareContextPreparation, readPreparationRecord, readPreparedContext,
   CONTEXT_PREPARATION_CONTRACT, ARCHIVE_PARTS_CONTRACT, type ContextPreparationBinding } from './request-parts.js';
@@ -63,7 +64,7 @@ import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
 import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queueOriginOf, queuedChildReached } from './reading-plan.js';
-import { paidOriginId, paidSessionId, limitedAssessmentRetryScope } from './assessment-session.js';
+import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRolePrompt, readAssessmentDispatchAdmission, readAssessmentApplicationOutcomeAt } from './assessment-session.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 import { ATTEMPT_BINDING_CONTRACT, ATTEMPT_BINDING_FIELDS, ATTEMPT_BINDING_KIND, addressedQuestionId, attemptBindingId,
   callAddressesSubject, planSubjectOf, sameSubject, questionDispatchId, type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -3268,6 +3269,46 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     && canonical(body.contextWorkspace ?? []) === canonical(workspace.entries.map(entry => entry.result))
     && !workspace.blocked,
   'response_recovery_cursor_stale', 'The archived cursor, notes, materials context or workspace was already changed');
+  const appRef = !synthesis && applicationEra ? call.value.assessmentApplication : undefined;
+  const declared = packetAssessmentSubject(body), wireSubject = packetAssessmentSubject(request.subject);
+  // The original T/A physical producer persists assessmentKey. It also exposes
+  // a lost wire subject; calls from the older assessment era need no new read.
+  const attemptsCall = declared || wireSubject || Object.hasOwn(call.value, 'assessmentKey');
+  const rawApplication = attemptsCall && isRef(appRef)
+    ? store.get<Record<string, any>>(appRef.id, appRef.revision) : null;
+  const admittedSubject = packetAssessmentSubject(rawApplication?.value.context);
+  if (declared?.assessment || wireSubject?.assessment || admittedSubject?.assessment) {
+    requireCondition(!synthesis && applicationEra && isRef(appRef)
+      && admittedSubject?.assessment && declared?.assessment && wireSubject?.assessment,
+      'discovery_assessment_subject_invalid', 'A paid methodology assessment needs its original application and complete subjects');
+    const claim = store.get<ModelCall>(call.id, 1)!;
+    const admission = readAssessmentDispatchAdmission(store, appRef!);
+    const running = store.get<Record<string, any>>(appRef!.id, 2);
+    const transportPrompt = assessmentTransportPrompt(admission.prompt, assessmentRolePrompt(''), declared!);
+    const checks: Record<string, boolean> = {
+      session: canonical(reference(admission.session)) === canonical(reference(session)),
+      role: canonical(admission.role) === canonical(role) && canonical(admission.role) === canonical(admission.dispatch.reviewer),
+      profile: canonical(admission.profile) === canonical(profile),
+      application: running?.kind === 'assessment-application' && running.hash === hashJson(running.value)
+        && canonical(running.value) === canonical({...admission.application.value,state:'running',call:reference(claim!)}),
+      context: Object.entries(admission.context).every(([key,value]) => Object.hasOwn(body,key) && canonical(body[key]) === canonical(value)),
+      analystSubject: !Object.hasOwn(body,'subject') && !Object.hasOwn(request.subject,'subject'),
+      assessmentSubject: canonical(admittedSubject) === canonical(declared) && canonical(declared) === canonical(wireSubject),
+      capacity: canonical(packetAssessmentSubject(body.resultCapacity?.bindings)) === canonical(declared)
+        && canonical(packetAssessmentSubject(request.subject.resultCapacity?.bindings)) === canonical(declared),
+      question: canonical(body.question) === canonical(assessmentQuestionContract(declared!))
+        && canonical(request.subject.question) === canonical({...assessmentQuestionContract(declared!),
+          schemaAddress:{record:archiveRef,pointer:'/body/question/schema'}}),
+      continuation: ['initial','continuation'].includes(call.value.packet.kind)
+        && request.subject.continuation?.kind === call.value.packet.kind,
+      prompt: request.prompt === (call.value.packet.kind === 'continuation'
+        ? continuationPrompt('assessor', transportPrompt) : transportPrompt),
+    };
+    const mismatch = Object.keys(checks).find(key => !checks[key]);
+    if (mismatch) throw new EngineError('discovery_assessment_subject_invalid',
+      `The paid call lost its exact assessment ${mismatch}`, {field:mismatch});
+    proveAssessmentTransportSubject(store, body, project, reference(question));
+  }
   const consumerEra = call.id.startsWith('model-call:consumer:v1:');
   if (!consumerEra && Object.hasOwn(call.value, 'consumerIntent'))
     consumerInvalid(call.id, 'A legacy physical address cannot masquerade as the new consumer producer');
@@ -3396,6 +3437,81 @@ export function readResearchResponse(store: Store, project: string, callRef: Ref
     subject: result.subject, payload: result.payload, prompt: result.prompt, guards: result.guards };
 }
 
+/** Attempts recovery is pinned to its paid application, not today's plan,
+ * baseline or environment heads. It can apply only the selected physical step. */
+async function recoverAttemptsAssessmentResponse(store: Store, project: string, callRef: Ref,
+  sessionRef: Ref, declaredBy: string, id: string): Promise<Revision<ResponseRecovery> | null> {
+  const claim = store.get<ModelCall>(callRef.id, 1), appRef = claim?.value.assessmentApplication;
+  const original = isRef(appRef) ? store.get<Record<string, any>>(appRef.id, appRef.revision) : null;
+  const subject = packetAssessmentSubject(original?.value.context);
+  if (!subject?.assessment) return null; // Historical T and v1 assessments retain their own recovery.
+  const admission = readAssessmentDispatchAdmission(store, appRef!);
+  requireCondition(admission.session.value.projectId === project
+    && canonical(reference(admission.session)) === canonical(sessionRef),
+    'response_recovery_session_stale', 'Attempts recovery names the exact pre-application session of its selected paid call');
+  const binding = admission.session.value.binding!;
+  const draft = store.get<DiscoveryDraft>(binding.draft.id, binding.draft.revision)!;
+  const question = store.get<Question>(binding.question.id, binding.question.revision)!;
+  const paid = readResearchResponse(store, project, callRef, admission.session, draft, question, admission.role, admission.profile);
+  const environment = store.get<Environment>(binding.environment.id, binding.environment.revision)!;
+  const pilot = admission.profile ? store.get<ReaderPilot>(admission.profile.id, admission.profile.revision)! : undefined;
+  const restore = () => import('./research-assessment.js').then(module => module.assessAttempts(store,
+    subject.packet, subject.baseline, environment, admission.dispatch.workspace, undefined, pilot));
+  const origin = { projectId: project, declaredBy, call: callRef, request: paid.request, response: paid.response,
+    archive: paid.archive, sessionBefore: sessionRef };
+  const sessionHead = store.get<RecoverableContextSession>(admission.session.id);
+  requireCondition(sessionHead?.kind === 'assessment-session', 'response_recovery_session_stale', 'The assessment session disappeared');
+  const application = store.get<Record<string, any>>(appRef!.id);
+  requireCondition(application?.kind === 'assessment-application' && object(application.value),
+    'response_recovery_not_applied', 'The selected assessment application is missing');
+  const receiptAt = (after: Ref) => {
+    const existing = store.get<ResponseRecovery>(id);
+    if (existing) {
+      const value: ResponseRecovery = {...origin,declaredBy:existing.value?.declaredBy,
+        sessionAfter:after,state:'applied'};
+      requireCondition(existing.kind === 'research-response-recovery' && existing.revision === 1
+        && existing.hash === hashJson(existing.value) && typeof existing.value.declaredBy === 'string'
+        && existing.value.declaredBy.trim().length > 0 && canonical(existing.value) === canonical(value),
+        'response_recovery_invalid', 'The attempts recovery receipt must derive from its exact paid applied step');
+    }
+    return existing;
+  };
+  if (application.value.state === 'applied') {
+    const proof = readAssessmentApplicationOutcomeAt(store, project, application.value.after, reference(application));
+    requireCondition(canonical(proof.received) === canonical(callRef), 'response_recovery_call_foreign',
+      'This assessment step consumed another physical response');
+    const existing = receiptAt(proof.session);
+    // A terminal step can finish the discovery-assessment write after a crash;
+    // a checkpoint remains one checkpoint and cannot send its next request here.
+    if (proof.result !== null) await restore();
+    if (existing) return existing;
+    const value: ResponseRecovery = {...origin,sessionAfter:proof.session,state:'applied'};
+    return store.writeMany<ResponseRecovery>([{id,kind:'research-response-recovery',expected:0,value}],
+      [reference(application), reference(sessionHead), callRef, paid.request, paid.response, paid.archive])[0]!;
+  }
+  requireCondition(application.value.state === 'running'
+    && canonical(reference(sessionHead)) === canonical(sessionRef),
+    'response_recovery_not_applied', 'Only the selected unconsumed paid application can advance during recovery');
+  requireCondition(!store.get(id), 'response_recovery_invalid', 'An unconsumed application cannot have an applied recovery receipt');
+  const scope: RecoveryScope = { store, id, project, draft: draft.id, question: question.id, purpose: 'assessor',
+    role: admission.role, profile: admission.profile, session: sessionRef, archive: paid.archive,
+    subject: paid.subject, payload: paid.payload, origin,
+    guards: uniqueRefs([sessionRef, reference(application), callRef, paid.request, paid.response, paid.archive]),
+    delivered: false, applied: false };
+  return current.run(scope, async () => {
+    let failure: unknown = null;
+    try { await restore(); } catch (error) { failure = error; }
+    if (scope.applied) {
+      const applied = store.get<Record<string, any>>(appRef!.id)!;
+      const proof = readAssessmentApplicationOutcomeAt(store, project, applied.value.after, reference(applied));
+      const receipt = receiptAt(proof.session);
+      if (receipt) return receipt;
+    }
+    if (failure) throw failure;
+    throw new EngineError('response_recovery_not_applied', 'The selected attempts response did not produce its application');
+  });
+}
+
 /** Reprocess one saved succeeded response through the ordinary synthesis or
  * assessment consumer, stopping before any additional paid request. */
 export async function recoverResearchResponse(store: Store, environments: Environments, project: string,
@@ -3403,6 +3519,8 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
   requireCondition(!current.getStore() && isRef(callRef) && isRef(sessionRef) && typeof declaredBy === 'string' && declaredBy.trim(),
     'response_recovery_invalid', 'Recovery needs exact references and its actual declaring operator');
   const id = `research-response-recovery:${hashJson([project, callRef, sessionRef])}`;
+  const attempts = await recoverAttemptsAssessmentResponse(store, project, callRef, sessionRef, declaredBy, id);
+  if (attempts) return attempts;
   const previous = store.get<ResponseRecovery>(id);
   if (previous) {
     requireCondition(previous.kind === 'research-response-recovery' && previous.revision === 1 && previous.value.projectId === project

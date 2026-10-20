@@ -1,6 +1,6 @@
 import { baselineGuards } from './v7-attempt-assessment.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
-import { assessmentRolePrompt } from './assessment-session.js';
+import { assessmentRolePrompt, readAssessmentDispatchAdmission } from './assessment-session.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 
 /** DR3a3-S2 (codex-omg №7690 решение 2): the final synthesis of a v7
@@ -32,7 +32,7 @@ function planSubjectRole(capacityPurpose: unknown, auditPurpose: unknown, contex
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, readModelCallRecovery, executionOf } from './model-call-recovery.js';
 import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowance } from "./invocation-progress.js";
-import { contextWorkspace, requireContextDelivery } from './context-workspace.js';
+import { requireContextDelivery } from './context-workspace.js';
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
 import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject } from "./continuation-packet.js";
@@ -165,12 +165,7 @@ function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleB
         'discovery_assessment_subject_invalid', 'The prepared application must guard its original baseline');
       requireCondition(!Object.hasOwn(app.context, 'subject') && !Object.hasOwn(app.context.resultCapacity.bindings, 'subject'),
         'discovery_assessment_subject_invalid', 'An assessor cannot masquerade as an analyst plan subject');
-      const workspace = contextWorkspace(session.value.workspace, session.value['focus']);
-      const feedback = app.context.resultCapacityCorrection;
-      const expected = {...app.context, ...(feedback ? {failures:[feedback]} : {}), assessmentSession:session.id,
-        assessmentState:{offset:session.value['offset'],candidateOffset:session.value['candidateOffset']??0,
-          total:JSON.stringify(app.context.observations).length}, assessmentNotes:session.value['notes'],
-        contextWorkspace:workspace.entries.map(entry=>entry.result),focus:null};
+      const expected = readAssessmentDispatchAdmission(audit.store, reference(application)).context;
       requireCondition(canonical(context)===canonical(expected), 'discovery_assessment_subject_invalid',
         'The dispatch context must be the exact prepared application and session cursor');
       // Historical paid recovery does not depend on live plan or baseline heads.
