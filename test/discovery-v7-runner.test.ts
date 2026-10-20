@@ -8,7 +8,10 @@ import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING, DISCOVERY_CLAIMS
 import { Store, type Revision } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
-import { hashJson, type Json } from '../src/canonical.js';
+import { canonical, hashJson, type Json } from '../src/canonical.js';
+import { EngineError } from '../src/errors.js';
+import { stageBudgetPlan, stageBudgetSegmentId } from '../src/discovery/stage-token-budget.js';
+import { budgetUsage, type BudgetSegment, type CallEstimate } from '../src/runtime/research-budget.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { uniqueTransactionGuards } from "../src/runtime/environment.js";
@@ -80,10 +83,10 @@ function acceptNextPlanEdition(f: Fixture, project: string, draft: Revision<Disc
 }
 
 
-async function setup(t: test.TestContext, questions = [planQuestion('support','market'), planQuestion('block','industry','blocking')]) {
+async function setup(t: test.TestContext, questions = [planQuestion('support','market'), planQuestion('block','industry','blocking')], calibrated = true) {
   const f=fixture(t);f.engine.execute({type:'create-project',project:'p',title:'P'});
   const wire=join(f.root,'wire.ndjson'), settings=join(f.root,'reply.json'), adapter=join(f.root,'adapter.mjs');
-  const configure=(replies: unknown[]=[], tokens=10)=>writeFileSync(settings,JSON.stringify({replies,tokens}));
+  const configure=(replies: unknown[]=[], tokens: number | null=10)=>writeFileSync(settings,JSON.stringify({replies,tokens}));
   configure();
   writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
@@ -91,25 +94,30 @@ let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim()
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
 let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
-console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure('p',{workspace:f.root,
     implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},
     fullCheck:command,timeoutMs:5000},0);
   const calibration=f.discovery.create('p','discovery','R0','concept',[
     {field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'object'}}],[],6);
-  await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
-    {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'analyst'});
-  configure([ended(),{necessary:true,reason:'Calibration review'}]);
-  await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
-    {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+  const calibrate = async (tokens = 10) => {
+    configure([], tokens);
+    await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'analyst'});
+    configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    configure();writeFileSync(wire,'');
+  };
+  if (calibrated) await calibrate();
   configure();writeFileSync(wire,'');
   const v=acceptPlan(f,'p',questions);
   const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
     .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
   const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]);
-  return {...f,v,questions,run,wires,history,configure,environment};
+  return {...f,v,questions,run,wires,history,configure,environment,calibrate};
 }
 
 const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
@@ -386,4 +394,144 @@ test('R: paid replay stays free before one new turn in current allowance', async
   assert.equal(after.value.status, 'completed');
   assert.equal(assignedCalls().length, paidCalls.length + 1);
   for (const call of paidCalls) assert.equal(assignedCalls().filter(id => id === call).length, 1);
+});
+
+
+// Observe the real transport refusal without changing its reads, writes or result.
+function observeBudgetFailures(t: test.TestContext): EngineError[] {
+  const observed: EngineError[] = [];
+  const prototype = Researcher.prototype as unknown as { receivedIntent(...args: unknown[]): Promise<unknown> };
+  const original = prototype.receivedIntent;
+  t.mock.method(prototype, 'receivedIntent', async function (this: Researcher, ...args: unknown[]) {
+    try { return await Reflect.apply(original, this, args); }
+    catch (error) {
+      if (error instanceof EngineError) observed.push(error);
+      throw error;
+    }
+  });
+  return observed;
+}
+function assertBudgetPause(run: Revision<{ status: string; pauseCode?: string | null; error: string | null }>,
+  failure: EngineError, cold: Store) {
+  assert.ok(failure);
+  assert.equal(run.value.status, 'paused');
+  assert.equal(run.value.pauseCode, failure.code);
+  const saved = { code: failure.code, message: failure.message, details: failure.details };
+  assert.equal(run.value.error, canonical(saved));
+  assert.deepEqual(JSON.parse(run.value.error!), saved);
+  assert.deepEqual(cold.get(run.id), run);
+  return JSON.parse(run.value.error!).details as {
+    segment: Ref; class: 'research'; remaining: number; estimate: CallEstimate | null;
+  };
+}
+
+test('a4: missing estimate persists the uncreated segment address and resumes the same prepared intent after calibration', async t => {
+  const f = await setup(t, undefined, false), failures = observeBudgetFailures(t);
+  const planned = stageBudgetPlan(f.store, f.v.draft);
+  assert.ok(planned.isNew);
+  const segment = { id: planned.writes[0]!.id, revision: 1, hash: hashJson(planned.writes[0]!.value) };
+  const paused = await f.run(1);
+  assert.equal(paused.value.pauseCode, 'budget_estimate_missing');
+  assert.deepEqual(assertBudgetPause(paused, failures.at(-1)!, f.open()),
+    { segment, class: 'research', remaining: 18_000_000, estimate: null });
+  const prepared = f.store.list<any>('research-consumer-intent')
+    .find(row => row.value.cursor.run === paused.id)!;
+  assert.equal(prepared.value.state, 'prepared');
+  const before = f.store.list('model-call');
+  const repeat = await f.run(1, f.open());
+  assert.equal(repeat.value.error, paused.value.error);
+  assertBudgetPause(repeat, failures.at(-1)!, f.open());
+  assert.deepEqual(f.store.get(prepared.id), prepared);
+  assert.deepEqual(f.store.list('model-call'), before);
+  assert.equal(f.store.get(segment.id), null);
+  assert.deepEqual(f.store.list('research-budget-ledger'), []);
+  assert.equal(f.wires().length, 0);
+  await f.calibrate();
+  const continued = await f.run(1, f.open());
+  assert.equal(continued.value.pauseCode, 'research_turns_exhausted');
+  assert.deepEqual(f.wires().map(row => row.subject.question.id), ['block']);
+  assert.deepEqual(f.store.get(prepared.id, 1), prepared);
+  assert.equal(f.store.get<any>(prepared.id)!.value.state, 'applied');
+  assert.equal(f.store.list('research-attempt').length, 1);
+});
+
+test('a4: first reservation refusal saves the real estimate without creating segment ledger or call', async t => {
+  const f = await setup(t, undefined, false), failures = observeBudgetFailures(t);
+  await f.calibrate(V7_STAGE_TOKEN_CEILING);
+  const before = f.store.list('model-call'), paused = await f.run(1);
+  assert.equal(paused.value.pauseCode, 'discovery_budget_reserve');
+  const details = assertBudgetPause(paused, failures.at(-1)!, f.open());
+  assert.equal(details.segment.id, stageBudgetSegmentId('p'));
+  assert.equal(details.remaining, 18_000_000);
+  assert.equal(details.class, 'research');
+  assert.ok(details.estimate && details.estimate.tokens > details.remaining);
+  assert.ok(details.estimate.basis.length > 0);
+  assert.equal(f.store.get(details.segment.id), null);
+  assert.deepEqual(f.store.list('research-budget-ledger'), []);
+  assert.deepEqual(f.store.list('model-call'), before);
+  assert.equal(f.wires().length, 0);
+});
+
+for (const [tokens, code] of [[18_000_000, 'discovery_budget_reserve'],
+  [V7_STAGE_TOKEN_CEILING, 'discovery_budget_overrun']] as const)
+test(`a4: paid replay precedes ${code}, preserving negative remaining and the unpaid next intent`, async t => {
+  const f = await setup(t), failures = observeBudgetFailures(t), write = f.store.writeMany.bind(f.store);
+  f.configure([], tokens);
+  let interrupted = false;
+  f.store.writeMany = ((writes, guards = []) => {
+    if (!interrupted && writes.some(w => w.kind === 'research-turn' && w.expected === 0)) {
+      interrupted = true; throw new Error('cut after paid response');
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  await f.run(1); f.store.writeMany = write;
+  assert.equal(interrupted, true); assert.equal(f.wires().length, 1);
+  const ledger = f.store.list('research-budget-ledger'), calls = f.store.list('model-call');
+  const paused = await f.run(1, f.open());
+  assert.equal(paused.value.pauseCode, code, JSON.stringify(paused.value));
+  const details = assertBudgetPause(paused, failures.at(-1)!, f.open());
+  const segment = f.store.get<BudgetSegment>(stageBudgetSegmentId('p'))!;
+  assert.deepEqual(details.segment, reference(segment));
+  assert.equal(details.class, 'research');
+  assert.equal(details.remaining, 18_000_000 - tokens - 1);
+  assert.ok(details.remaining < 0);
+  if (code === 'discovery_budget_overrun') assert.equal(details.estimate, null);
+  else assert.ok(details.estimate && details.estimate.tokens > 0);
+  assert.equal(f.store.list('research-attempt').length, 1);
+  assert.equal(f.store.list('research-attempt-binding').length, 1);
+  assert.equal(f.store.list<any>('research-turn')[0]!.value.status, 'completed');
+  const prepared = f.store.list<any>('research-consumer-intent')
+    .filter(row => row.value.cursor.run === paused.id && row.value.state === 'prepared');
+  assert.equal(prepared.length, 1);
+  assert.equal(prepared[0]!.value.cursor.subject.planQuestionId, 'support');
+  const repeated = await f.run(1, f.open());
+  assert.equal(repeated.value.error, paused.value.error);
+  assertBudgetPause(repeated, failures.at(-1)!, f.open());
+  assert.deepEqual(f.store.get(prepared[0]!.id), prepared[0]);
+  assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
+  assert.deepEqual(f.store.list('model-call'), calls);
+  assert.equal(f.wires().length, 1);
+});
+
+test('a4: unknown usage keeps its reservation through a cold paid replay', async t => {
+  const f = await setup(t, [planQuestion('block', 'industry', 'blocking')]), write = f.store.writeMany.bind(f.store);
+  f.configure([], null);
+  let interrupted = false;
+  f.store.writeMany = ((writes, guards = []) => {
+    if (!interrupted && writes.some(w => w.kind === 'research-turn' && w.expected === 0)) {
+      interrupted = true; throw new Error('cut after unknown-usage response');
+    }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  await f.run(1); f.store.writeMany = write;
+  assert.equal(interrupted, true);
+  const segment = f.store.get<BudgetSegment>(stageBudgetSegmentId('p'))!;
+  const before = budgetUsage(f.store, segment), ledger = f.store.list('research-budget-ledger');
+  assert.equal(before.measured, 0); assert.ok(before.reserved > 0);
+  const done = await f.run(1, f.open(), false);
+  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(f.wires().length, 1);
+  assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
+  const after = budgetUsage(f.open(), segment);
+  assert.equal(after.measured, 0); assert.equal(after.reserved, before.reserved);
 });

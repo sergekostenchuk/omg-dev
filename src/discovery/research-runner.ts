@@ -1519,7 +1519,10 @@ export class Researcher {
       requireCondition(current.value.status !== "running" || canonical(current.value.owner) === canonical(owner)
         || processStart(current.value.owner.pid) !== current.value.owner.started, "research_busy", "Another researcher owns this run");
       const pauseCode = error instanceof EngineError ? error.code : "research_interrupted";
-      const message = error instanceof Error ? error.message : "Research was interrupted";
+      const message = error instanceof EngineError
+        && ["discovery_budget_reserve", "budget_estimate_missing", "discovery_budget_overrun"].includes(error.code)
+        ? canonical({ code: error.code, message: error.message, details: error.details })
+        : error instanceof Error ? error.message : "Research was interrupted";
       if (current.value.status === "paused" && current.value.pauseCode === pauseCode && current.value.error === message) return current;
       return this.save(current, { status: "paused", owner, pauseCode, error: message });
     }
