@@ -21,7 +21,7 @@ import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store, observeStore, type Revision, type StoreObserver, type TransactionGuard, type Write } from '../src/storage/store.js';
 import { captureView } from '../src/storage/store-view.js';
 import { writeOmInput } from '../src/om/input.js';
-import { inputDecisionWrite, writeAddressing, writeApplyAnswer } from '../src/om/addressing.js';
+import { inputDecisionWrite, writeAddressing, writeApplyAnswer, type InputDecisionProposal } from '../src/om/addressing.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeHorizon, writeHorizonIssuance, readHorizonIssuance, type HorizonRequest } from '../src/om/horizon.js';
 import { beginAttempt, completeAttempt, openSeries, prepareOpenSeries, readSeriesAt,
@@ -29,7 +29,7 @@ import { beginAttempt, completeAttempt, openSeries, prepareOpenSeries, readSerie
   prepareSeriesLineAdmission, readSeriesMembership, seriesCurrentId, seriesMembershipId, type RepairSeries } from '../src/om/series.js';
 import { prepareSeriesDiscard, writeSeriesDiscard, readDiscardedSeriesTransition } from '../src/om/series.js';
 import { closeAttempt } from '../src/om/repeat-gate.js';
-import type { FrameAttemptBinding } from '../src/om/layer-basis.js';
+import type { FrameAttemptBinding, OmAcceptedFrame } from '../src/om/layer-basis.js';
 import { writeSeriesTransition, readPreparedSeriesTransition } from '../src/om/series-transition.js';
 import { prepareQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket, type QuestionPacketRequest } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
@@ -43,13 +43,14 @@ import { assessAnswer } from '../src/discovery/research-assessment.js';
 import type { Question } from '../src/discovery/discovery.js';
 import { prepareAcceptedAnswer, writeAcceptedAnswer, readAcceptedAnswer, readAnswerForInput, answerSourceGuards,
   applicableAnswerTask, confirmAnswerGapClosure, answerIndexId, type AnswerRequest, type Mc1QuestionRecord } from '../src/om/accepted-answer.js';
-import { prepareFrame, fillObligations, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
-import type { LayerProposal } from '../src/om/frame-proposals.js';
+import { prepareFrame, fillObligations, type FrameRead, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
+import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate, type AcceptedFrameRequest } from '../src/om/frame-accept.js';
 import { writeGuarded } from '../src/om/refs.js';
 import type { OmResult } from '../src/om/refusal.js';
-import { createOmFixture, gardenGraph, refusedWith } from './om-fixture.js';
+import { receiptId, type ArtifactReceipt } from '../src/compiler/model.js';
+import { createOmFixture, gardenGraph, refusedWith, acceptNativeWorks, type OmPreparedFixture } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -1672,19 +1673,77 @@ function acceptBoundB3Frame(store: Store, frame: FrameRequest, binding: FrameAtt
   return { project, level: 2, graph: reference(accepted.graph), layer: reference(accepted.layer), frame: reference(accepted.frame) };
 }
 
+/** Run the genuine L3→M8 route on top of the fixture's accepted L2 so real artifact receipts exist. */
+async function executeForReceipts(f: OmPreparedFixture, upperFrame: Ref): Promise<void> {
+  const store = f.store, engine = f.engine;
+  const head = () => reference(store.get<Graph>(`graph:${project}`)!);
+  const desired = gardenGraph(), proposal = (frame: FrameRead): Ref => {
+    const graph = structuredClone(desired), level = frame.request.level;
+    if (level === 3) {
+      for (const field of ["nodes", "artifacts", "contracts", "anchors", "joins", "tests", "edges", "journeys", "packets", "transfers"] as const) {
+        const upper = frame.upper[field] ?? [], ids = new Set(upper.map((item: { id: string }) => item.id));
+        Object.assign(graph, { [field]: [...structuredClone(upper), ...(graph[field] ?? []).filter(item => !ids.has(item.id))] });
+      }
+      graph.connectors = frame.upper.connectors.map((upper: Graph["connectors"][number]) => ({ ...structuredClone(upper),
+        wakeTest: desired.connectors.find(connector => connector.id === upper.id)?.wakeTest ?? upper.wakeTest, bindings: [...structuredClone(upper.bindings),
+        ...(desired.connectors.find(connector => connector.id === upper.id)?.bindings ?? []).filter(binding => binding.level === 3)] }));
+    }
+    const projected = projectGraph(graph, level);
+    const mapped = ok(fillObligations(frame.upper, frame.scope,
+      { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? "operation" : "work")
+      && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
+    const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,
+      ...(level === 3 ? { worksContract: "works-frame/v1" as const } : {}), source: "decision", status: "proposed", nodes,
+      fills: mapped.fills.filter(fill => selected.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,
+        ...(fill.port === undefined ? {} : { port: fill.port,
+          ...(level === 3 ? { codeRef: structuredClone(nodes.find(node => node.id === fill.node)!.code[0]!) } : {}) }) })),
+      localConnectors: level === 3 ? [] : projected.connectors.map(connector => ({ ...connector,
+        bindings: connector.bindings.filter(binding => binding.level === 2) })).filter(connector => connector.bindings.length),
+      artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins,
+      tests: projected.tests.filter(test => level === 2 || selected.has(test.node)), edges: projected.edges ?? [],
+      journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
+      anchors: level === 2 ? projected.anchors : [], removes: [], replaces: [], redefines: [] };
+    return reference(store.write({ id: `om-proposal:${project}:B3-executed-${level}`, kind: "layer-proposal", expected: 0, value }));
+  };
+  const input0 = store.get(`om-input:${project}`)!;
+  const decisions: InputDecisionProposal["decision"][] = [
+    { target: `${project}-B1`, field: "nodes", value: [`${project}-produce-block`, `${project}-consume-block`] },
+    { target: `${project}-B1`, field: "state", value: { writer: `${project}-produce-block`, authority: `${project}-consume-block`, rollback: `${project}-consume-block` } },
+    { target: `${project}-R1#1`, field: "checkKind", value: "test" },
+  ];
+  const input = ok(writeAddressing(store, { project, input: reference(input0), graph: head(),
+    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input: reference(input0), graph: head(), layers: [], decision }) as Write })) }));
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: head(),
+    refinement: reference(store.get(`graph-layer:${project}:2`)!), available: {},
+    choice: { choiceVersion: "B3-executed-works", features: [{ outcome: `${project}-result` }], excluded: [] } }));
+  const frame3: FrameRequest = { project, level: 3, graph: head(), horizon: reference(horizon.gate), layer: null, frame: null,
+    upper: { horizon: reference(horizon.gate), frame: upperFrame } };
+  const works: ProposalRequest = { frame: frame3, proposals: [proposal(structuredClone(ok(prepareFrame(store, frame3))) as unknown as FrameRead)] };
+  const operations: ProposalRequest = { frame: { project, level: 2, graph: frame3.graph, horizon: reference(horizon.gate),
+      layer: reference(store.get(`graph-layer:${project}:2`)!), frame: upperFrame, upper: null }, proposals: [] };
+  acceptNativeWorks(engine, project, operations, works);
+  const plan = engine.compiler.compile(project);
+  const compilation = engine.compiler.publish(project, reference(plan), 0);
+  engine.pipeline.accept(project, "compilation", compilation.revision);
+  const runs = await engine.executor.run(project, reference(plan), { retry: false, maxContextChars: 200_000, maxCorrections: 0 });
+  assert.equal(runs.length, plan.value.tasks.length);
+  assert.ok(plan.value.tasks.every(task => runs.some(run => run.value.taskId === task.id && run.value.state === "committed")));
+}
+
 test('B3 real managed A to B to A creates successors but never rediscovers the original accepted result', async t => {
-  const f = await createOmFixture(t); let store = f.store;
-  const input = ok(writeOmInput(store, { project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const f = await createOmFixture(t, 'standard', project, { mode: 'n2' }); let store = f.store;
+  const input = store.get(`om-input:${project}`)!;
   ok(openSeries(store, { project, block, line: 1, slice: opaqueSlice, predecessor: null, basis: null }));
-  const phase = reference(store.get('phase:garden:L2')!);
-  const firstHorizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(f.graphRevision),
-    refinement: phase, available: {}, choice: { choiceVersion: 'return-bootstrap', features: [{ outcome: 'garden-result' }], excluded: [] } }));
+  const frame2 = store.get<OmAcceptedFrame>(`om-frame:${project}:2`)!;
+  const l2Graph = reference(f.graphRevision);
+  const firstHorizon = ok(writeHorizon(store, { project, input: reference(input), graph: l2Graph,
+    refinement: reference(f.layers[2]), available: {}, choice: { choiceVersion: 'return-bootstrap', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const bootstrapPair = appliedPair(f, reference(firstHorizon.gate), 'return-bootstrap');
   const bootstrap = ok(applySeriesActivation(store, bootstrapPair));
   const standing = bootstrap.series.find(row => row.value.block === block)!;
-  const frame: FrameRequest = { project, level: 2, graph: reference(f.graphRevision), horizon: reference(firstHorizon.gate),
-    layer: reference(f.layers[2]), frame: null, upper: null };
+  const frame: FrameRequest = { project, level: 2, graph: l2Graph, horizon: reference(firstHorizon.gate),
+    layer: reference(f.layers[2]), frame: reference(frame2), upper: null };
   const frameRead = ok(prepareFrame(store, frame));
   const obligations = frameRead.result.obligations.filter(row => row.upper.node === block).map(row => row.id).sort();
   assert.ok(obligations.length);
@@ -1699,9 +1758,13 @@ test('B3 real managed A to B to A creates successors but never rediscovers the o
   const achievedKeys = achieved.value.attempts[0]!.outcome!.achieved.map(item => item.key).sort();
   assert.ok(achievedKeys.length);
 
-  const producer = 'garden-produce-block', data = reference(f.receipts['garden-data']!);
-  const horizonFor = (name: string, ready: boolean) => ok(writeHorizon(store, { project, input: reference(input),
-    graph: acceptance.graph, refinement: acceptance.layer,
+  await executeForReceipts(f, acceptance.frame);
+  const graphHead = () => reference(store.get<Graph>(`graph:${project}`)!);
+  const layer2 = () => reference(store.get<OmAcceptedFrame>(`graph-layer:${project}:2`)!);
+  const producer = 'garden-produce-block',
+    data = reference(store.get<ArtifactReceipt>(receiptId(project, 'garden-data'))!);
+  const horizonFor = (name: string, ready: boolean) => ok(writeHorizon(store, { project, input: reference(store.get(`om-input:${project}`)!),
+    graph: graphHead(), refinement: layer2(),
     available: ready ? { [producer]: { 'garden-data': data } } : {},
     choice: { choiceVersion: name, features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const a = horizonFor('return-A', false), pairA = appliedPair(f, reference(a.gate), 'return-A');

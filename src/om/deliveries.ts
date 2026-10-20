@@ -7,7 +7,7 @@ import { writeGrants } from '../compiler/ownership.js';
 import { controlPredecessors } from '../graph/dependencies.js';
 import type { Graph } from '../graph/model.js';
 import { RefinementRelations } from '../graph/relations.js';
-import { graphSchema, graphV2Schema } from '../graph/schema.js';
+import { graphV2Schema } from '../graph/schema.js';
 import { selectWriter, type WriterProof } from '../ownership/owners.js';
 import { prepareWriterIndex, readWriterIndex } from '../ownership/writer-index.js';
 import type { ExecutionRoot } from '../runtime/environment.js';
@@ -52,7 +52,7 @@ const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const unique = <T>(refs: readonly T[]): T[] => [...new Map(refs.map(ref => [canonical(ref), ref])).values()]
   .sort((a, b) => order(canonical(a), canonical(b)));
 const ajv = new Ajv({ strict: true, allowUnionTypes: true });
-const shapes = [ajv.compile(sealed(graphSchema)), ajv.compile(sealed(graphV2Schema))];
+const shape = ajv.compile(sealed(graphV2Schema));
 function invalid(field: string): OmResult<never> {
   return refused('delivery_request_invalid', 'Delivery checking needs explicit, well-formed sources',
     { unit: 'F7.4', target: 'deliveries', field }, 'producer');
@@ -64,7 +64,7 @@ function invalid(field: string): OmResult<never> {
 export function checkDeliveries(store: Store, project: string, graph: Graph, bases: DeliveryBases,
   options: DeliveryInputOptions): OmResult<Sealed<DeliveryCheck>> {
   if (!(store instanceof Store) || !text(project)) return invalid('store/project');
-  if (!object(graph) || !shapes[graph.version === 2 ? 1 : 0]!(graph)) return invalid('graph');
+  if (!object(graph) || graph.version !== 2 || !shape(graph)) return invalid('graph');
   if (!object(bases) || !Object.values(bases).every(map => object(map) && Object.values(map).every(isRef))) return invalid('bases');
   if (!object(options) || typeof options.owner !== 'function' || !Array.isArray(options.identities)
     || !options.identities.every(text) || (Object.hasOwn(options, 'current') && typeof options.current !== 'boolean')) return invalid('options');

@@ -1,6 +1,6 @@
-import { fillObligations, prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
-import type { LayerProposal } from "../src/om/frame-proposals.js";
-import { writeCandidate } from "../src/om/frame-candidate.js";
+import { fillObligations, prepareFrame, type FrameRead, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
+import { gateCandidate, writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { readLayerAcceptance } from "../src/om/layer-basis.js";
 import { createOmFixture, refusedWith } from "./om-fixture.js";
@@ -19,10 +19,17 @@ import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { Store, type Revision } from "../src/storage/store.js";
+import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { writeOmInput } from "../src/om/input.js";
-import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
+import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from "../src/om/addressing.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
+import { writeGapLines } from "../src/om/gap-lines.js";
+import { writeOmObligations } from "../src/om/obligations.js";
+import { writeWorksFrame } from "../src/om/works-frame.js";
+import { writeNeighbors } from "../src/om/neighbors.js";
+import { writeAtomicGate } from "../src/om/atomic-gate.js";
+import { writeFeasibility } from "../src/om/feasibility.js";
+import { writeHandoff } from "../src/om/handoff.js";
 import { writeHorizon, prepareHorizonIssuance, writeHorizonIssuance, readHorizonIssuance,
   type HorizonRequest } from "../src/om/horizon.js";
 import { beginAttempt, completeAttempt, openSeries, readSeriesAt, type RepairSeries } from "../src/om/series.js";
@@ -31,10 +38,11 @@ import { prepareSeriesTransition, writeSeriesTransition, readPreparedSeriesTrans
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Sealed } from "../src/om/refusal.js";
 import { gardenGraph } from "./om-fixture.js";
-import { preparedFeatures, refinedLayers } from "./product-fixture.js";
+import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 import { git } from "../src/runtime/environment.js";
-import { receiptId, type ArtifactReceipt } from "../src/compiler/model.js";
+import { nodeSignature, receiptId, type ArtifactReceipt, type CompiledTask } from "../src/compiler/model.js";
+import type { TaskRun } from "../src/execution/model.js";
 
 const project = "garden", producer = "garden-produce-block", block = "garden-consume-block", independent = "garden-later-block";
 const opaqueSlice = "legacy:opaque-subject", clone = structuredClone;
@@ -132,6 +140,94 @@ function stop(store: Store, owner = block) {
   }
   assert.ok(saved?.value.stop);
   return saved;
+}
+
+/** The same current OM route the garden fixture drives natively: L2 admission, addressing, L3 and the M8 handoff. */
+function nativeSetup(engine: ProductEngine, desired: Graph) {
+  const store = engine.store;
+  let input = ok(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const graphRef = reference(store.get(`graph:${project}`)!);
+  const first = ok(writeHorizon(store, { project, input: reference(input), graph: graphRef,
+    refinement: null, available: {}, choice: { choiceVersion: "fixture-operations", features: [{ outcome: `${project}-result` }], excluded: [] } }));
+  const proposal = (frame: FrameRead): Ref => {
+    const graph = structuredClone(desired), level = frame.request.level;
+    if (level === 3) {
+      for (const field of ["nodes", "artifacts", "contracts", "anchors", "joins", "tests", "edges", "journeys", "packets", "transfers"] as const) {
+        const upper = frame.upper[field] ?? [], ids = new Set(upper.map(item => item.id));
+        Object.assign(graph, { [field]: [...structuredClone(upper), ...(graph[field] ?? []).filter(item => !ids.has(item.id))] });
+      }
+      graph.connectors = frame.upper.connectors.map(upper => ({ ...structuredClone(upper),
+        wakeTest: desired.connectors.find(connector => connector.id === upper.id)?.wakeTest ?? upper.wakeTest, bindings: [...structuredClone(upper.bindings),
+        ...(desired.connectors.find(connector => connector.id === upper.id)?.bindings ?? []).filter(binding => binding.level === 3)] }));
+    }
+    const projected = projectGraph(graph, level);
+    const mapped = ok(fillObligations(frame.upper, frame.scope,
+      { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? "operation" : "work")
+      && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
+    const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,
+      ...(level === 3 ? { worksContract: "works-frame/v1" as const } : {}), source: "decision", status: "proposed", nodes,
+      fills: mapped.fills.filter(fill => selected.has(fill.node)).map(fill => {
+        return { obligation: fill.obligation, node: fill.node,
+        ...(fill.port === undefined ? {} : { port: fill.port,
+          ...(level === 3 ? { codeRef: structuredClone(nodes.find(node => node.id === fill.node)!.code[0]!) } : {}) }) }; }),
+      localConnectors: level === 3 ? [] : projected.connectors.map(connector => ({ ...connector,
+        bindings: connector.bindings.filter(binding => binding.level === 2) })).filter(connector => connector.bindings.length),
+      artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins,
+      tests: projected.tests.filter(test => level === 2 || selected.has(test.node)), edges: projected.edges ?? [],
+      journeys: projected.journeys ?? [], packets: projected.packets ?? [], transfers: projected.transfers ?? [],
+      anchors: level === 2 ? projected.anchors : [], removes: [], replaces: [], redefines: [] };
+    return reference(store.write({ id: `om-proposal:${project}:fixture-${level}`, kind: "layer-proposal", expected: 0, value }));
+  };
+  const frame2: FrameRequest = { project, level: 2, graph: graphRef, horizon: reference(first.gate), layer: null, frame: null, upper: null };
+  const candidate2 = ok(writeCandidate(store, { frame: frame2, proposals: [proposal(structuredClone(ok(prepareFrame(store, frame2))) as unknown as FrameRead)] }));
+  assert.equal(candidate2.state, "candidate");
+  if (candidate2.state !== "candidate") assert.fail("Native L2 candidate is required");
+  const gate2 = ok(gateCandidate(store, { project, candidate: reference(candidate2.record) }));
+  const accepted2 = ok(settleCandidate(store, { project, level: 2, candidate: reference(candidate2.record),
+    outcome: { gate: "G3", candidate: gate2.candidate, graphHash: gate2.graphHash, passed: gate2.passed, codes: gate2.findings.map(finding => finding.code) } }));
+  assert.equal(accepted2.state, "accepted"); assert.ok(accepted2.graph && accepted2.layer && accepted2.frame);
+  const graph = reference(accepted2.graph), layer = reference(accepted2.layer), upperFrame = reference(accepted2.frame);
+  const decisions: InputDecisionProposal["decision"][] = [
+    { target: `${project}-B1`, field: "nodes", value: [`${project}-produce-block`, `${project}-consume-block`] },
+    { target: `${project}-B1`, field: "state", value: { writer: `${project}-produce-block`, authority: `${project}-consume-block`, rollback: `${project}-consume-block` } },
+    { target: `${project}-R1#1`, field: "checkKind", value: "test" },
+  ];
+  input = ok(writeAddressing(store, { project, input: reference(input), graph,
+    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input: reference(input), graph, layers: [], decision }) as Write })) }));
+  const horizon = ok(writeHorizon(store, { project, input: reference(input), graph, refinement: layer, available: {},
+    choice: { choiceVersion: "fixture-works", features: [{ outcome: `${project}-result` }], excluded: [] } }));
+  const frame3: FrameRequest = { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
+    upper: { horizon: reference(horizon.gate), frame: upperFrame } };
+  const works: ProposalRequest = { frame: frame3, proposals: [proposal(structuredClone(ok(prepareFrame(store, frame3))) as unknown as FrameRead)] };
+  const gaps = ok(writeGaps(store, { project, input: reference(input), graph, horizon: reference(horizon.gate),
+    operations: { frame: { ...frame2, graph, layer, frame: upperFrame, horizon: reference(horizon.gate) }, proposals: [] }, works }));
+  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const handoff = ok(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
+  assert.deepEqual(handoff.handoff.obligations, []);
+  return { store, input, graph, layer, upperFrame, horizon, frame3, works, gapRead, handoff,
+    environment: reference(engine.environments.get(project)) };
+}
+
+function nativeExecuted(engine: ProductEngine, desired: Graph, sources: Ref[] = []): void {
+  const { store, works, gapRead, handoff, environment } = nativeSetup(engine, desired);
+  const candidate3 = ok(writeWorksFrame(store, { ...works, works: { contract: "works-frame/v1",
+    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings: [] } }));
+  assert.equal(candidate3.state, "candidate");
+  if (candidate3.state !== "candidate") throw new EngineError("om_fixture_invalid", "Native L3 candidate is required");
+  const neighbors = ok(writeNeighbors(store, { project, candidate: reference(candidate3.record) }));
+  const gate3 = ok(writeAtomicGate(store, { project, candidate: reference(candidate3.record), neighbors: reference(neighbors),
+    environment, gaps: gapRead, results: [], sources }));
+  assert.equal(gate3.value.result.passed, true, canonical(gate3.value.result.findings));
+  const accepted3 = ok(settleCandidate(store, { project, level: 3, candidate: reference(candidate3.record),
+    outcome: { ...gate3.value.result, codes: [...gate3.value.result.codes], basis: reference(gate3) } }));
+  assert.equal(accepted3.state, "accepted"); assert.ok(accepted3.graph && accepted3.layer && accepted3.frame);
+  const feasibility = ok(writeFeasibility(store, { project, graph: reference(accepted3.graph), layer: reference(accepted3.layer),
+    frame: reference(accepted3.frame), environment, expected: 0 }));
+  assert.equal(feasibility.value.ready, true);
+  ok(writeHandoff(store, { project, feasibility: reference(feasibility), expected: 0 }));
 }
 
 test("prepared transition establishes an active legacy basis without changing its stopped series", t => {
@@ -628,17 +724,16 @@ test("accepted shared L2 frame changes for independent C without changing B whil
 });
 
 test("boundary slices ignore unrelated real receipt revisions but bind consumed receipts and preserve a stopped supplier", async t => {
-  const f = await createOmFixture(t), store = f.store;
-  const input = ok(writeOmInput(store, { project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const f = await createOmFixture(t, "standard", project, { mode: "executed" }), store = f.store;
+  const input = store.get(`om-input:${project}`)!, graph = reference(f.graphRevision);
   const consumerSeries = ok(openSeries(store, { project, block, line: 1, slice: opaqueSlice, predecessor: null, basis: null }));
   ok(openSeries(store, { project, block: producer, line: 1, slice: opaqueSlice, predecessor: null, basis: null }));
   const supplierSeries = stop(store, producer), series = [reference(consumerSeries), reference(supplierSeries)];
   const data = f.receipts["garden-data"]!, extra = f.receipts["garden-prep"]!;
   assert.ok(data.value.run && extra.value.run, "Both receipts come from real fixture execution");
   const preparedAt = (version: string, dataRef: Ref, extraRef: Ref) => {
-    const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(f.graphRevision),
-      refinement: reference(store.get("phase:garden:L2")!),
+    const horizon = ok(writeHorizon(store, { project, input: reference(input), graph,
+      refinement: reference(f.layers[2]),
       choice: { choiceVersion: version, features: [{ outcome: "garden-result" }], excluded: [] },
       available: { [producer]: { "garden-data": dataRef, "garden-prep": extraRef } } }));
     assert.deepEqual(horizon.horizon.value.result.horizon.nodes, [block]);
@@ -763,8 +858,14 @@ test("a genuinely refused horizon has an exact prepared transition and negative 
   assert.deepEqual(f.store.history(series.id), savedSeries);
 });
 
-test("a genuinely executed provider permits omitted external receipt and retains every explicit exact external receipt", async t => {
-  for (const onlyExternal of [false, true]) await t.test(onlyExternal ? "external-only provider outside the horizon" : "internal and external inputs from the same provider", async t => {
+test("external inputs on the current OM route: an executed supplier's internal receipt is exact and retained, an external-only supplier outside the horizon needs none, a supplier inside the horizon cannot add an external L1 flow, and no work claims an external outcome", async t => {
+  // LG15 (codex-omg2 №7682): the same executed supplier cannot also provide an external input on this accepted L1 —
+  // the slice consumes external inputs through L1 bindings, writeHorizon keeps the exact accepted L1, and an in-horizon
+  // supplier's L1 flow must be refined down to a work that would claim the external artifact. The scenarios below
+  // measure that obstacle instead of an unreachable positive same-supplier case.
+  for (const onlyExternal of [false, true]) await t.test(onlyExternal
+    ? "an external-only supplier outside the horizon and its ready boundary carries no receipt; cold read and repeat change nothing"
+    : "an executed supplier's committed receipt is exact and retained in the slice; an external L1 flow cannot be added over its accepted L1", async t => {
   const root = mkdtempSync(join(tmpdir(), "omg-transition-external-")), workspace = join(root, "workspace"), database = join(root, "state.sqlite");
   mkdirSync(workspace); writeFileSync(join(workspace, "README.md"), "Local external-flow regression fixture.\n");
   git(workspace, ["init", "-b", "main"]); git(workspace, ["add", "README.md"]);
@@ -772,20 +873,28 @@ test("a genuinely executed provider permits omitted external receipt and retains
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const graph = gardenGraph(), external = "garden-external-input", flowId = "garden-external-flow";
-  graph.artifacts.push({ ...clone(graph.artifacts.find(item => item.id === "garden-data")!), id: external, external: true });
-  const flow = graph.connectors.find(item => item.id === "garden-flow")!;
-  graph.connectors.push({ ...clone(flow), id: flowId, artifact: external, wakeTest: null,
-    bindings: ([1,2,3] as const).map(level => {
-      const binding = clone(flow.bindings.find(item => item.level === level && item.anchor === null)!);
-      binding.consumers = binding.consumers.filter(endpoint => endpoint.node.includes("consume")); return binding;
-    }) });
-  graph.tests.find(item => item.id === "garden-produce-work-test")!.covers.push(flowId);
+  const extProvider = "garden-later-block";
   if (onlyExternal) {
+    graph.artifacts.push({ ...clone(graph.artifacts.find(item => item.id === "garden-data")!), id: external, external: true });
+    for (const id of ["garden-later-block", "garden-later-operation", "w-garden-later-operation"])
+      graph.nodes.find(node => node.id === id)!.ports.push({ id: "out", direction: "out", contract: "garden-contract" });
+    const flow = graph.connectors.find(item => item.id === "garden-flow")!;
+    graph.connectors.push({ ...clone(flow), id: flowId, artifact: external, wakeTest: null,
+      bindings: ([1, 2, 3] as const).map(level => {
+        const binding = clone(flow.bindings.find(item => item.level === level && item.anchor === null)!);
+        binding.producer = { node: level === 1 ? "garden-later-block" : level === 2 ? "garden-later-operation" : "w-garden-later-operation", port: "out" };
+        binding.consumers = binding.consumers.filter(endpoint => endpoint.node.includes("consume"));
+        return binding;
+      }) });
     for (const binding of flow.bindings) binding.consumers = binding.consumers.filter(endpoint => !endpoint.node.includes("consume"));
     flow.bindings = flow.bindings.filter(binding => binding.consumers.length > 0);
+    for (const journey of graph.journeys ?? []) if (journey.path[0] === "garden-produce-block" && journey.path[1] === "garden-consume-block") {
+      journey.entry = "garden-later-block"; journey.path = ["garden-later-block", "garden-consume-block"];
+    }
   }
-  preparedFeatures(engine, project, graph);
-  engine.discovery.evidence.document(project, external, "Declared external fixture input", "text/plain", 0);
+  const { level: _level, ...l1 } = projectGraph(graph, 1);
+  preparedFeatures(engine, project, l1 as Graph, undefined, "");
+  const source = engine.discovery.evidence.document(project, external, "Declared external fixture input", "text/plain", 0);
   const agent = join(root, "agent.mjs");
   writeFileSync(agent, `
 import {readFileSync,writeFileSync,mkdirSync} from 'node:fs';
@@ -804,73 +913,205 @@ process.stdout.write(JSON.stringify(response));
   engine.environments.configure(project, { workspace,
     implementer: { actor: "fixture-implementer", model: "fixture", effort: "high", command },
     reviewer: { actor: "fixture-reviewer", model: "fixture", effort: "high", command },
-    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000 }, 0);
-  refinedLayers(engine, project);
-  const feasibility = engine.refinement.assess(project, 0), om = engine.refinement.publish(project, reference(feasibility), 0);
-  engine.pipeline.accept(project, "om-g2", om.revision);
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000,
+    requestCapacityChars: 100_000 }, 0);
+  nativeExecuted(engine, graph, onlyExternal ? [reference(source)] : []);
   const plan = engine.compiler.compile(project), compilation = engine.compiler.publish(project, reference(plan), 0);
   engine.pipeline.accept(project, "compilation", compilation.revision);
   const runs = await engine.executor.run(project, reference(plan), { retry: false, maxContextChars: 100_000, maxCorrections: 0 });
-  const supplierTask = plan.value.tasks.find(task => task.node === "garden-produce-work")!;
-  const supplierRun = runs.find(run => run.value.taskId === supplierTask.id)!;
-  assert.equal(supplierRun.value.state, "committed");
+  const supplierTask = plan.value.tasks.find(task => task.node === "garden-produce-work");
+  const supplierRun = supplierTask ? runs.find(run => run.value.taskId === supplierTask.id) : undefined;
   const consumerTask = plan.value.tasks.find(task => task.node === "garden-consume-work")!;
   const consumerRun = runs.find(run => run.value.taskId === consumerTask.id)!;
   // V3 executes the external consumer; B3 still consumes the exact committed supplier evidence below.
   assert.equal(consumerRun.value.state, "committed");
   assert.equal(consumerRun.value.error, null);
-  const dataReceipt = store.get<ArtifactReceipt>(receiptId(project, "garden-data"))!;
-  const externalReceipt = store.get<ArtifactReceipt>(receiptId(project, external))!;
-  assert.ok(dataReceipt?.value.run && externalReceipt?.value.run, "Both named receipts are produced by actual committed fixture execution");
-  for (const receipt of [dataReceipt, externalReceipt]) {
+  const dataReceipt = store.get<ArtifactReceipt>(receiptId(project, "garden-data"));
+  if (!onlyExternal) assert.ok(dataReceipt?.value.run && supplierRun?.value.state === "committed",
+    "The internal receipt is produced by actual committed fixture execution");
+  else assert.equal(dataReceipt, null, "The external-only route never executes the internal supplier");
+  const evidence: [Revision<ArtifactReceipt>, CompiledTask, Revision<TaskRun>][] =
+    onlyExternal ? [] : [[dataReceipt!, supplierTask!, supplierRun!]];
+  const acceptedGraph = store.get<Graph>(`graph:${project}`)!;
+  for (const [receipt, task, run] of evidence) {
     assert.deepEqual(receipt.value.plan, reference(plan));
-    assert.deepEqual(receipt.value.run, reference(supplierRun));
-    assert.equal(receipt.value.node, supplierTask.node);
-    assert.equal(receipt.value.commit, supplierRun.value.commit);
-    assert.equal(receipt.value.tree, supplierRun.value.tree);
+    assert.deepEqual(receipt.value.run, reference(run));
+    assert.equal(receipt.value.node, task.node);
+    assert.equal(receipt.value.signature, nodeSignature(acceptedGraph.value,
+      acceptedGraph.value.nodes.find(node => node.id === task.node)!));
+    assert.equal(receipt.value.commit, run.value.commit);
+    assert.equal(receipt.value.tree, run.value.tree);
   }
-  const input = ok(writeOmInput(store, { project, expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const input = reference(store.get(`om-input:${project}`)!), graphHead = reference(store.get<Graph>(`graph:${project}`)!),
+    l2Layer = reference(store.get(`graph-layer:${project}:2`)!);
   const series = ok(openSeries(store, { project, block, line: 1, slice: opaqueSlice, predecessor: null, basis: null }));
-  const prepare = (version: string, namedExternal: Ref | null) => {
-    const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),
-      refinement: reference(store.get(`phase:${project}:L2`)!),
+  const prepare = (version: string) => {
+    const horizon = ok(writeHorizon(store, { project, input, graph: graphHead,
+      refinement: l2Layer,
       choice: { choiceVersion: version, features: [{ outcome: "garden-result" }], excluded: [] },
-      available: onlyExternal && !namedExternal ? {} : { [producer]: {
-        ...(onlyExternal ? {} : { "garden-data": reference(dataReceipt) }),
-        ...(namedExternal ? { [external]: namedExternal } : {}) } } }));
+      available: onlyExternal ? {} : { [producer]: { "garden-data": reference(dataReceipt!) } } }));
     assert.equal(horizon.gate.value.state, "accepted");
     assert.deepEqual(horizon.horizon.value.result.horizon.nodes, [block]);
     if (onlyExternal) {
       assert.deepEqual(horizon.horizon.value.result.horizon.boundary, []);
       assert.equal(Object.hasOwn(horizon.horizon.value.result.horizon.execution, producer), false,
         "The explicit receipt belongs to a supplier outside both the selected horizon and its ready boundary");
+      assert.equal(horizon.horizon.value.result.horizon.externalInputs.some(item => item.artifact === external && item.source === extProvider), true);
+    } else {
+      assert.deepEqual(horizon.horizon.value.result.horizon.boundary.find(item => item.block === producer)?.basis,
+        { "garden-data": reference(dataReceipt!) }, "The ready supplier's basis is exactly its committed receipt");
+      assert.deepEqual(horizon.horizon.value.result.horizon.externalInputs, []);
     }
-    assert.equal(horizon.horizon.value.result.horizon.externalInputs.some(item => item.artifact === external && item.source === producer), true);
     const record = ok(writeSeriesTransition(store, request(reference(horizon.gate), [reference(series)], version)));
     return { horizon, record };
   };
-  const without = prepare("external-unnamed", null), withReceipt = prepare("external-named", reference(externalReceipt));
+  const without = prepare("external-unnamed");
   const receipts = (record: typeof without.record) => (decision(record).slice!.body as Record<string, Json>).receipts;
-  const internalReceipts = onlyExternal ? [] : [{ source: producer, artifact: "garden-data", receipt: reference(dataReceipt) }];
+  const internalReceipts = onlyExternal ? [] : [{ source: producer, artifact: "garden-data", receipt: reference(dataReceipt!) }];
   assert.deepEqual(receipts(without.record), internalReceipts);
-  assert.deepEqual(receipts(withReceipt.record), [...internalReceipts,
-    { source: producer, artifact: external, receipt: reference(externalReceipt) },
-  ]);
-  assert.notDeepEqual(decision(without.record).slice, decision(withReceipt.record).slice);
-  assert.equal(ok(comparePreparedSeriesSlices(store, { project, previous: reference(without.record), next: reference(withReceipt.record), block })), "new-work");
-  // A new exact revision of the genuine receipt bytes exercises Ref identity, not a claim of another execution.
-  const nextReceipt = store.write({ id: externalReceipt.id, kind: externalReceipt.kind, expected: externalReceipt.revision, value: externalReceipt.value });
-  const revised = prepare("external-next-exact", reference(nextReceipt));
-  assert.deepEqual(receipts(revised.record), [...internalReceipts, { source: producer, artifact: external, receipt: reference(nextReceipt) }]);
-  assert.equal(ok(comparePreparedSeriesSlices(store, { project, previous: reference(withReceipt.record), next: reference(revised.record), block })), "new-work");
   store.close(); store = new Store(database);
   const exact = new ExactOnlyStore(database);
   try {
     assert.deepEqual(ok(readPreparedSeriesTransition(exact, { project, record: reference(without.record) })).record, without.record);
-    assert.deepEqual(ok(readPreparedSeriesTransition(exact, { project, record: reference(withReceipt.record) })).record, withReceipt.record);
-    assert.deepEqual(ok(readPreparedSeriesTransition(exact, { project, record: reference(revised.record) })).record, revised.record);
   } finally { exact.close(); }
   assert.deepEqual(store.get(series.id), series);
+  // A repeat of the same preparation reads the saved records and writes nothing.
+  const settled = snapshot(store), again = prepare("external-unnamed");
+  assert.deepEqual(again.record, without.record);
+  assert.deepEqual(snapshot(store), settled, "The repeated preparation changes nothing");
+  if (!onlyExternal) {
+    // The obstacle, measured: the supplier's external L1 flow cannot be added over the previously accepted L1 — the
+    // L2 frame over the accepted layer refuses the changed upper layer before any write.
+    const desired = clone(store.get<Graph>(`graph:${project}`)!.value);
+    desired.artifacts.push({ ...clone(desired.artifacts.find(item => item.id === "garden-data")!), id: external, external: true });
+    desired.nodes.find(node => node.id === producer)!.ports.push({ id: "out-external", direction: "out", contract: "garden-contract" });
+    const baseFlow = desired.connectors.find(item => item.id === "garden-flow")!;
+    const l1Binding = clone(baseFlow.bindings.find(item => item.level === 1 && item.anchor === null)!);
+    l1Binding.producer = { node: producer, port: "out-external" };
+    l1Binding.consumers = l1Binding.consumers.filter(endpoint => endpoint.node.includes("consume"));
+    desired.connectors.push({ ...clone(baseFlow), id: flowId, artifact: external, wakeTest: null, bindings: [l1Binding] });
+    const frame2: FrameRequest = { project, level: 2, graph: graphHead, horizon: reference(without.horizon.gate),
+      layer: l2Layer, frame: reference(store.get(`om-frame:${project}:2`)!), upper: null };
+    const read = ok(prepareFrame(store, frame2)) as unknown as FrameRead;
+    const before = snapshot(store);
+    const drift = fillObligations(read.upper, read.scope,
+      { graph: desired, reference: { ...read.request.graph, hash: hashJson(desired) }, frame: null }, read.upperRef, 2);
+    assert.equal(drift.ok, false, "A changed upper layer is refused");
+    if (!drift.ok) assert.deepEqual([drift.refusal.code, drift.refusal.at.target, drift.refusal.at.field],
+      ["frame_upper_drift", `graph:${project}`, "upper"]);
+    assert.deepEqual(snapshot(store), before, "The refused frame writes nothing");
+  }
+  });
+
+  await t.test("a supplier inside the horizon cannot realize an external flow: L2 refines it, the supplier's L3 work would produce a second artifact and L3 is not accepted", async t => {
+  const root = mkdtempSync(join(tmpdir(), "omg-transition-inside-external-")), workspace = join(root, "workspace"), database = join(root, "state.sqlite");
+  mkdirSync(workspace); writeFileSync(join(workspace, "README.md"), "Local inside-horizon external-flow fixture.\n");
+  git(workspace, ["init", "-b", "main"]); git(workspace, ["add", "README.md"]);
+  git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture baseline"]);
+  const store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const graph = gardenGraph(), external = "garden-external-input", flowId = "garden-external-flow";
+  graph.artifacts.push({ ...clone(graph.artifacts.find(item => item.id === "garden-data")!), id: external, external: true });
+  // The same supplier at every level declares the external output next to its internal garden-data flow.
+  const flow = graph.connectors.find(item => item.id === "garden-flow")!;
+  const bindings = ([1, 2, 3] as const).map(level => {
+    const binding = clone(flow.bindings.find(item => item.level === level && item.anchor === null)!);
+    graph.nodes.find(node => node.id === binding.producer.node)!.ports.push({ id: "out-external", direction: "out", contract: "garden-contract" });
+    binding.producer = { node: binding.producer.node, port: "out-external" };
+    binding.consumers = binding.consumers.filter(endpoint => endpoint.node.includes("consume"));
+    return binding;
+  });
+  graph.connectors.push({ ...clone(flow), id: flowId, artifact: external, wakeTest: null, bindings });
+  const supplierWork = bindings[2]!.producer.node;
+  // The supplier work's own test covers the new connector too, so only the single-artifact rule can stand in the way.
+  const proof = graph.tests.find(item => item.node === supplierWork && item.covers.includes("garden-flow"))!;
+  proof.covers.push(flowId);
+  proof.contract!.counterfactuals.push({ ...clone(proof.contract!.counterfactuals.find(item => item.connector === "garden-flow")!), connector: flowId });
+  const { level: _level, ...l1 } = projectGraph(graph, 1);
+  preparedFeatures(engine, project, l1 as Graph, undefined, "");
+  engine.environments.configure(project, { workspace,
+    implementer: { actor: "fixture-implementer", model: "fixture", effort: "high", command: { executable: process.execPath, args: ["--version"] } },
+    reviewer: { actor: "fixture-reviewer", model: "fixture", effort: "high", command: { executable: process.execPath, args: ["--version"] } },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000, requestCapacityChars: 100_000 }, 0);
+  const { works, gapRead, handoff, environment } = nativeSetup(engine, graph);
+  const l2 = store.get<Graph>(`graph:${project}`)!.value;
+  assert.ok(l2.connectors.find(item => item.id === flowId)?.bindings.some(binding => binding.level === 2),
+    "The supplier's external flow is refined at L2 — operations carry no single-artifact rule");
+  const candidate3 = ok(writeWorksFrame(store, { ...works, works: { contract: "works-frame/v1",
+    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings: [] } }));
+  assert.equal(candidate3.state, "candidate", "The works frame itself admits the refined flow");
+  if (candidate3.state !== "candidate") return;
+  const neighbors = ok(writeNeighbors(store, { project, candidate: reference(candidate3.record) }));
+  const gate3 = ok(writeAtomicGate(store, { project, candidate: reference(candidate3.record), neighbors: reference(neighbors),
+    environment, gaps: gapRead, results: [], sources: [] }));
+  assert.equal(gate3.value.result.passed, false);
+  assert.deepEqual(gate3.value.result.findings.map(finding => [finding.code, finding.target]), [["work_artifact_not_single", supplierWork]],
+    "Exactly the supplier's work would produce both garden-data and the external artifact");
+  const before = snapshot(store);
+  const settled = settleCandidate(store, { project, level: 3, candidate: reference(candidate3.record),
+    outcome: { ...gate3.value.result, codes: [...gate3.value.result.codes], basis: reference(gate3) } });
+  assert.equal(ok(settled).state, "rejected", "A failed gate never accepts L3");
+  assert.equal(store.get(`om-frame:${project}:3`), null, "No accepted L3 frame exists");
+  const evidence = (rows: ReturnType<typeof snapshot>) => rows.filter(row => {
+    const kind = store.get(row.head.id)?.kind;
+    return kind === "artifact" || kind === "task-run" || kind === "plan" || kind === "graph-layer" || kind === "om-frame";
+  });
+  assert.deepEqual(evidence(snapshot(store)), evidence(before), "The refused settlement adds no layer, frame, plan, run or receipt");
+  });
+
+  await t.test("a horizon producer cannot claim an external artifact as its outcome", async t => {
+  const { store, request, rogue } = externalOutcomeFixture(t);
+  const attempt = refusedWithoutEvidence(store, request);
+  const finding = (attempt.findings ?? []).find(item => item.code === "external_outcome")!;
+  assert.ok(finding, "The refusal names the exact external outcome claim");
+  assert.equal(finding.target, rogue);
   });
 });
+
+/** The external-outcome refusal scenario: a work that claims an external artifact as its outcome, on the current
+ * native route up to its works frame request. */
+function externalOutcomeFixture(t: { after(fn: () => void): void }) {
+  const root = mkdtempSync(join(tmpdir(), "omg-transition-external-outcome-")), workspace = join(root, "workspace"), database = join(root, "state.sqlite");
+  mkdirSync(workspace); writeFileSync(join(workspace, "README.md"), "Local external-outcome regression fixture.\n");
+  git(workspace, ["init", "-b", "main"]); git(workspace, ["add", "README.md"]);
+  git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture baseline"]);
+  const store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const graph = gardenGraph(), rogue = "garden-rogue-work";
+  graph.artifacts.push({ ...clone(graph.artifacts.find(item => item.id === "garden-data")!), id: "garden-claimed-external",
+    external: true, terminal: true });
+  graph.nodes.push({ ...clone(graph.nodes.find(node => node.id === "garden-produce-work")!), id: rogue,
+    outcome: "garden-claimed-external", ports: [], tests: [],
+    code: [{ path: `${rogue}.txt`, access: "write", status: "planned" }] });
+  const { level: _level, ...l1 } = projectGraph(graph, 1);
+  preparedFeatures(engine, project, l1 as Graph, undefined, "");
+  engine.environments.configure(project, { workspace,
+    implementer: { actor: "fixture-implementer", model: "fixture", effort: "high",
+      command: { executable: process.execPath, args: ["--version"] } },
+    reviewer: { actor: "fixture-reviewer", model: "fixture", effort: "high",
+      command: { executable: process.execPath, args: ["--version"] } },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 10_000,
+    requestCapacityChars: 100_000 }, 0);
+  const { works, handoff } = nativeSetup(engine, graph);
+  const request = { ...works, works: { contract: "works-frame/v1" as const,
+    producer: reference(handoff.producer), ledger: reference(handoff.record), bindings: [] } };
+  return { store, request, rogue };
+}
+
+/** LG15-02 (codex-omg2 №7575): two refused works-frame attempts measured from a snapshot taken BEFORE the first one: the same refusal, no new or
+ * changed record after either attempt, and no L3 candidate, plan, run or receipt (kind "artifact") evidence. */
+function refusedWithoutEvidence(store: Store, request: Parameters<typeof writeWorksFrame>[1]) {
+  const before = snapshot(store);
+  const attempt = writeWorksFrame(store, request);
+  assert.equal(attempt.ok, false, "A horizon work claiming an external outcome is refused");
+  if (attempt.ok) assert.fail("unreachable");
+  assert.equal(attempt.refusal.code, "graph_invalid");
+  assert.deepEqual(snapshot(store), before, "The first refused attempt writes nothing");
+  const again = writeWorksFrame(store, request);
+  assert.deepEqual(again.ok ? {} : again.refusal, attempt.refusal, "The repeat reproduces the exact refusal");
+  assert.deepEqual(snapshot(store), before, "The repeated refused attempt writes nothing");
+  assert.equal(store.list().filter(row => row.kind === "artifact" || row.kind === "task-run" || row.kind === "plan"
+    || row.kind === "frame-candidate" && (row.value as { level?: number }).level === 3).length, 0,
+    "The refused work leaves no L3 candidate, plan, run or receipt evidence");
+  return attempt.refusal;
+}

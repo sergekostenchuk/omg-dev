@@ -103,29 +103,30 @@ function horizonSource(store: Store, request: SeriesTransitionRequest): HorizonR
   return horizon;
 }
 interface SliceFrame extends FilledFrame { identities: string[] }
-function frameSource(store: Store, horizon: HorizonRecords, horizonRef: Ref, graph: Graph): SliceFrame {
+function frameSource(store: Store, horizon: HorizonRecords, horizonRef: Ref): SliceFrame {
   const source = horizon.horizon.value.request;
   const request: FrameRequest = { project: source.project, level: 2, horizon: horizonRef, graph: source.graph,
     layer: null, frame: null, upper: null };
   const base = take(readFrameBasis(store, request));
-  if (source.refinement?.id === `graph-layer:${source.project}:2`) {
-    const accepted = take(readLayerAcceptance(store, { project: source.project, level: 2, graph: source.graph, layer: source.refinement }));
-    const read = take(readFrame(store, { ...request, layer: source.refinement, frame: accepted.frame }));
-    if (!read.accepted?.frame) fail(source.refinement.id, 'frame', 'Accepted OM disclosure requires its exact correspondence frame');
-    return { ...read.result as FilledFrame, identities: read.accepted.frame.value.fills
-      .filter(fill => fill.source === 'identity').map(fill => fill.node) };
-  }
-  // readHorizon has proved the research milestone, including old L2 without a modern own layer proof.
-  return { ...take(fillObligations(base.upper as Graph, base.scope as FrameScope, source.refinement
-    ? { graph, reference: source.graph, frame: null } : null, base.upperRef, 2)) as FilledFrame, identities: [] };
+  if (source.refinement === null)
+    // An L1 horizon has no layer to accept; the slice keeps the level-1 projection semantics.
+    return { ...take(fillObligations(base.upper as Graph, base.scope as FrameScope, null, base.upperRef, 2)) as FilledFrame,
+      identities: [] };
+  if (source.refinement.id !== `graph-layer:${source.project}:2`)
+    fail(source.refinement.id, 'refinement', 'A disclosed horizon names its exact accepted level-2 layer', 'series_slice_unproven');
+  const accepted = take(readLayerAcceptance(store, { project: source.project, level: 2, graph: source.graph, layer: source.refinement }));
+  const read = take(readFrame(store, { ...request, layer: source.refinement, frame: accepted.frame }));
+  if (!read.accepted?.frame) fail(source.refinement.id, 'frame', 'Accepted OM disclosure requires its exact correspondence frame');
+  return { ...read.result as FilledFrame, identities: read.accepted.frame.value.fills
+    .filter(fill => fill.source === 'identity').map(fill => fill.node) };
 }
 function endpoint(value: Endpoint): Endpoint {
   return { node: value.node, port: value.port, ...(value.codeRef === undefined ? {} : { codeRef: { ...value.codeRef } }) };
 }
-function nodeContent(node: Node, version: Graph['version']): Node {
+function nodeContent(node: Node): Node {
   return { id: node.id, kind: node.kind, parent: node.parent, title: node.title, outcome: node.outcome,
     boundary: { ...node.boundary }, ports: sorted(node.ports), code: sorted(node.code), tests: sorted(node.tests),
-    ...(version === 2 ? { purpose: node.purpose!, benefit: node.benefit!, beneficiary: node.beneficiary!, implements: sorted(node.implements!) } : {}) };
+    purpose: node.purpose!, benefit: node.benefit!, beneficiary: node.beneficiary!, implements: sorted(node.implements!) };
 }
 function required<T extends { id: string }>(source: readonly T[], ids: Iterable<string>, field: string): T[] {
   return sorted([...new Set(ids)].map(id => {
@@ -136,6 +137,7 @@ function required<T extends { id: string }>(source: readonly T[], ids: Iterable<
 }
 function projectSlice(graph: Graph, horizon: Horizon, frame: SliceFrame, block: string, hasL2: boolean,
   availableReceipts: Record<string, HorizonBasis>): SeriesSlice {
+  if (graph.version !== 2) fail(block, 'graph.version', 'A local slice requires the version-2 graph contract', 'series_slice_unproven');
   // Cap sources at the proved layer before local selection, including a connector's layer-specific wake test.
   const full = graph, level = hasL2 ? 2 : 1;
   const { level: _level, ...projection } = projectGraph(graph, level);
@@ -177,7 +179,7 @@ function projectSlice(graph: Graph, horizon: Horizon, frame: SliceFrame, block: 
     if (nodesById.get(fill.node)?.kind !== 'operation') fail(fill.node, 'fills', 'An accepted L2 correspondence names an operation', 'series_slice_unproven');
     selected.add(fill.node);
   }
-  const nodes = required(graph.nodes, selected, 'nodes').map(node => nodeContent(node, graph.version));
+  const nodes = required(graph.nodes, selected, 'nodes').map(node => nodeContent(node));
   required(graph.nodes, nodes.flatMap(node => node.parent === null ? [] : [node.parent]), 'nodes.parent');
   const connectors = graph.connectors.flatMap(connector => {
     const bindings: Binding[] = connector.bindings.filter(binding => binding.level <= (hasL2 ? 2 : 1)).flatMap(binding => {
@@ -229,11 +231,11 @@ function projectSlice(graph: Graph, horizon: Horizon, frame: SliceFrame, block: 
     required(graph.nodes, [test.node], 'tests.node');
     required(graph.connectors, [...test.covers, ...(test.contract?.counterfactuals.map(item => item.connector) ?? [])], 'tests.covers');
   }
-  const requirements = graph.version === 2 ? required(graph.requirements!, nodes.flatMap(node => node.implements!), 'implements') : [];
-  const edges = graph.version === 2 ? graph.edges!.filter(edge => selected.has(edge.source)) : [];
-  const transfers = graph.version === 2 ? graph.transfers!.filter(transfer => selected.has(transfer.to)) : [];
-  const packets = graph.version === 2 ? graph.packets!.filter(packet => selected.has(packet.unit)).map(packet => ({ ...packet, writePaths: sorted(packet.writePaths) })) : [];
-  const journeys = graph.version === 2 ? graph.journeys!.flatMap(journey => {
+  const requirements = required(graph.requirements!, nodes.flatMap(node => node.implements!), 'implements');
+  const edges = graph.edges!.filter(edge => selected.has(edge.source));
+  const transfers = graph.transfers!.filter(transfer => selected.has(transfer.to));
+  const packets = graph.packets!.filter(packet => selected.has(packet.unit)).map(packet => ({ ...packet, writePaths: sorted(packet.writePaths) }));
+  const journeys = graph.journeys!.flatMap(journey => {
     const segments: { entry: string; path: string[]; exit: string | null; outcome?: string; terminal?: string }[] = [];
     for (let index = 0; index < journey.path.length;) {
       if (!selected.has(journey.path[index]!)) { index++; continue; }
@@ -243,7 +245,7 @@ function projectSlice(graph: Graph, horizon: Horizon, frame: SliceFrame, block: 
         exit: journey.path[index] ?? null, ...(index === journey.path.length ? { outcome: journey.outcome, terminal: journey.terminal } : {}) });
     }
     return segments.length ? [{ id: journey.id, actor: journey.actor, variant: journey.variant, segments }] : [];
-  }) : [];
+  });
   required(graph.nodes, [...edges.map(edge => edge.target), ...transfers.map(transfer => transfer.from),
     ...anchors.map(anchor => anchor.owner), ...journeys.flatMap(journey => journey.segments.flatMap(segment =>
       [segment.entry, ...(segment.exit === null ? [] : [segment.exit])]))], 'semantic.target');
@@ -252,8 +254,8 @@ function projectSlice(graph: Graph, horizon: Horizon, frame: SliceFrame, block: 
     ...journeys.flatMap(journey => journey.segments.flatMap(segment => segment.outcome === undefined ? [] : [segment.outcome]))], 'artifacts');
   const contracts = required(graph.contracts, [...nodes.flatMap(node => node.ports.map(port => port.contract)),
     ...artifacts.map(artifact => artifact.contract)], 'contracts');
-  const actors = graph.version === 2 ? required(graph.actors!, [...nodes.map(node => node.beneficiary!),
-    ...requirements.map(item => item.beneficiary), ...journeys.map(item => item.actor)], 'actors').map(actor => ({ ...actor, channels: sorted(actor.channels) })) : [];
+  const actors = required(graph.actors!, [...nodes.map(node => node.beneficiary!),
+    ...requirements.map(item => item.beneficiary), ...journeys.map(item => item.actor)], 'actors').map(actor => ({ ...actor, channels: sorted(actor.channels) }));
   // A boundary can carry receipts for other consumers. Only actual local consumption is a slice dependency.
   const receipts: { source: string; artifact: string; receipt: Ref }[] = [];
   const consume = (source: string, artifact: string) => {
@@ -297,7 +299,7 @@ function derive(store: Store, request: SeriesTransitionRequest): PreparedSeriesT
   // A proved refusal carries the named sources, but cannot assert active participation or a local slice.
   if (horizon.gate.value.state === 'refused')
     return { contract: SERIES_TRANSITION_CONTRACT, state: 'prepared', request, decisions: [] };
-  const frame = frameSource(store, horizon, request.horizon, graph);
+  const frame = frameSource(store, horizon, request.horizon);
   const decisions = seriesSources.map(({ ref, series }) => {
     const participation = h.nodes.includes(series.block) ? 'active' : h.excluded.some(item => item.block === series.block)
       ? 'excluded' : h.boundary.some(item => item.block === series.block) ? 'boundary' : 'unselected';

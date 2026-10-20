@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { canonical, hashJson } from '../src/canonical.js';
 import { requireCompatibleReceipt, resolveArtifact } from '../src/compiler/inputs.js';
 import { nodeSignature, type ArtifactReceipt } from '../src/compiler/model.js';
-import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
+import type { OmAcceptedFrame } from '../src/om/layer-basis.js';
 import { EngineError } from '../src/errors.js';
 import { ProductEngine } from '../src/product/engine.js';
 import type { Graph } from '../src/graph/model.js';
@@ -21,7 +21,6 @@ import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.j
 import { writeGapLines } from '../src/om/gap-lines.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { writeOmInput } from '../src/om/input.js';
 import { writeOmObligations } from '../src/om/obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
@@ -59,38 +58,31 @@ async function readyCandidate(t: TestContext, fixture?: Awaited<ReturnType<typeo
         for (const head of this.list()) preExecution.push(...this.history(head.id));
       return writeMany.call(this, inputs, guards);
     } as typeof writeMany;
-    try { f = await createCrossOmFixture(t); } finally { Store.prototype.writeMany = writeMany; }
+    try { f = await createCrossOmFixture(t, 'garden', { mode: 'executed' }); } finally { Store.prototype.writeMany = writeMany; }
   }
   const store = f.store;
-  const input = ok(writeOmInput(store, { project: 'garden', expected: 0,
-    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.stages[stage])])) as Record<UpstreamStage, Ref> }));
+  const input = store.get(`om-input:garden`)!;
+  const frame2 = store.get<OmAcceptedFrame>(`om-frame:garden:2`)!, frame3 = store.get<OmAcceptedFrame>(`om-frame:garden:3`)!;
+  const graphHead = reference(f.graphRevision);
   const receipt = f.receipts['garden-data']!;
   const bases: DeliveryBases = available ? { 'garden-produce-block': { 'garden-data': reference(receipt) } } : {};
-  const horizon = ok(writeHorizon(store, { project: 'garden', input: reference(input), graph: reference(f.graphRevision),
-    refinement: reference(store.get('phase:garden:L2')!), available: bases,
+  const horizon = ok(writeHorizon(store, { project: 'garden', input: reference(input), graph: graphHead,
+    refinement: reference(f.layers[2]), available: bases,
     choice: { choiceVersion: 'deliveries-ready', features: [{ outcome: 'garden-result' }], excluded: [] } }));
-  const frame: FrameRequest = { project: 'garden', level: 3, graph: reference(f.graphRevision), horizon: reference(horizon.gate),
-    layer: reference(f.layers[3]), frame: null, upper: { horizon: reference(horizon.gate), frame: null } };
+  const frame: FrameRequest = { project: 'garden', level: 3, graph: graphHead, horizon: reference(horizon.gate),
+    layer: reference(f.layers[3]), frame: reference(frame3), upper: { horizon: reference(horizon.gate), frame: reference(frame2) } };
   const current = ok(prepareFrame(store, frame));
-  const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 3, worksContract: 'works-frame/v1',
+  const proposal: LayerProposal = { base: { graph: frame.graph, frame: frame.frame }, level: 3, worksContract: 'works-frame/v1',
     source: 'decision', status: 'proposed', nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [], joins: [],
     tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
-  // This legacy accepted consumer has no code. Its explicit replacement preserves the outside work.
-  const outside = clone(f.graph.nodes.find(node => node.id === 'w-garden-later-operation')!);
-  outside.code = [{ path: 'future/garden-later.ts', access: 'write', status: 'planned', symbol: 'consume' }];
-  proposal.nodes.push(outside); proposal.removes.push(outside.id);
-  for (const fill of current.result.fills.filter(item => item.node === outside.id)) {
-    proposal.fills.push({ obligation: fill.obligation, node: outside.id,
-      ...(fill.port === undefined ? {} : { port: fill.port, codeRef: clone(outside.code[0]!) }) });
-    proposal.replaces.push({ obligation: fill.obligation, base: { node: outside.id, graph: frame.graph },
-      with: { node: outside.id, port: fill.port ?? null }, basis: 'Retain the accepted consumer with an explicit planned code address' });
-  }
+  // Outside consumers of the accepted upper flows are preserved by derived om-identity representatives;
+  // identity ids are reserved and cannot be introduced or replaced by proposals.
   const proposalRef = reference(store.write({ id: 'om-proposal:garden:deliveries-carry', kind: 'layer-proposal', expected: 0, value: proposal }));
   const works: ProposalRequest = { frame: current.request as FrameRequest, proposals: [proposalRef] };
   const gaps = ok(writeGaps(store, { project: 'garden', input: reference(input), graph: frame.graph, horizon: frame.horizon,
-    operations: { frame: { ...frame, level: 2, layer: reference(f.layers[2]), upper: null }, proposals: [] }, works }));
+    operations: { frame: { ...frame, level: 2, layer: reference(f.layers[2]), frame: reference(frame2), upper: null }, proposals: [] }, works }));
   const gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
-  const lines = ok(writeGapLines(store, { project: 'garden', previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const lines = ok(writeGapLines(store, { project: 'garden', previous: reference(store.get('om-gap-lines:garden:history')!), pass: 2, gaps: gapRead, closures: [] }));
   const ledger = ok(writeOmObligations(store, { project: 'garden', gaps: gapRead, lines: reference(lines), assignments: [] }));
   const request: CandidateRequest = { ...works, works: { contract: 'works-frame/v1',
     producer: reference(ledger.producer), ledger: reference(ledger.record), bindings: [] } };
@@ -379,7 +371,10 @@ test('F3 proves saved ready-producer deliveries and preserves the separate M8 ex
     const database = join(f.root, 'before-execution.sqlite'), store = new Store(database);
     try {
       assert.ok(c.preExecution.length);
-      for (const row of c.preExecution) store.write({ id: row.id, kind: row.kind, expected: row.revision - 1, value: row.value });
+      // The current route creates writer indexes inside compilation; replay the pre-execution
+      // database without them so the first admission remains genuinely empty.
+      for (const row of c.preExecution) if (row.kind !== 'writer-index')
+        store.write({ id: row.id, kind: row.kind, expected: row.revision - 1, value: row.value });
       assert.equal(store.get('execution-root:garden'), null); assert.deepEqual(store.list('task-run'), []);
       const first = await readyCandidate(t, { ...f, store }, false);
       const before = heads(store), prepared = ok(prepareDeliveries(store, first.request));
@@ -407,9 +402,12 @@ test('F3 proves saved ready-producer deliveries and preserves the separate M8 ex
         }
         return writeMany(writes, guards);
       }) as typeof store.writeMany;
+      // The plan binds its exact environment record, so execution must name the capacity
+      // recorded in the replayed database, not a caller default.
+      const maxContextChars = store.get<{ requestCapacityChars?: number }>('environment:garden')!.value.requestCapacityChars!;
       let runs;
       try { runs = await new ProductEngine(store).executor.run('garden', reference(f.plan),
-        { retry: false, maxContextChars: 100_000, maxCorrections: 0 }); }
+        { retry: false, maxContextChars, maxCorrections: 0 }); }
       finally { store.writeMany = writeMany; }
       assert.equal(runs.length, f.plan.value.tasks.length); assert.ok(runs.every(run => run.value.state === 'committed'));
       const after = heads(store);
@@ -518,34 +516,24 @@ test('F3 proves saved ready-producer deliveries and preserves the separate M8 ex
     });
   });
 
-  await t.test('legacy accepted runs initialize missing indexes in the neighbor transaction and competing creation is atomic', () => {
+  await t.test('missing indexes over accepted runs cannot be retrofitted and nothing is written', () => {
     const path = join(f.root, 'legacy-without-index.sqlite'), legacy = new Store(path);
     try {
-      // Replay the same native producer bytes from before the additive index contract; runs are unchanged.
+      // Replay the same native producer bytes without the index records; runs are unchanged.
       for (const head of f.store.list()) if (head.kind !== 'writer-index') for (const row of f.store.history(head.id))
         legacy.write({ id: row.id, kind: row.kind, expected: row.revision - 1, value: row.value });
-      const before = heads(legacy), prepared = ok(prepareDeliveries(legacy, c.request));
-      assert.deepEqual(heads(legacy), before); assert.ok(prepared.writes.length);
-      assert.ok(prepared.writes.every(write => write.expected === 0));
-      denied(readDeliveries(legacy, clone(prepared.request) as DeliveryReadRequest), 'writer_index_invalid');
-      const rival = new Store(path);
+      const before = heads(legacy);
+      // Bootstrap indexes over om-committed writers can never be proven: om writer indexes exist only
+      // through the commit transition that writes them. Preparation refuses before writing anything.
+      denied(prepareDeliveries(legacy, c.request), 'writer_index_invalid');
+      assert.deepEqual(heads(legacy), before);
+      const rival = new Store(path), selected = c.graph.nodes.filter(node => c.graph.horizon.includes(node.id))
+        .flatMap(node => node.code.filter(code => code.access === 'write').map(code => code.path)).sort()[0]!;
       try {
-        const selected = Object.keys(prepared.request.ownership.indexes)[0]!;
-        const index = prepareWriterIndex(rival, 'garden', selected, prepared.request.ownership.root);
-        rival.writeMany(index.writes, index.guards);
+        assert.throws(() => prepareWriterIndex(rival, 'garden', selected, reference(rival.get('execution-root:garden')!)),
+          engineCode('writer_index_invalid'));
       } finally { rival.close(); }
-      const captured = heads(legacy);
-      denied(writeGuarded(legacy, { unit: 'F3', target: 'legacy-admission', guards: prepared.guards,
-        writes: [...prepared.writes, { id: 'fixture:legacy-admission', kind: 'fixture', expected: 0, value: prepared.request }] }), 'revision_conflict');
-      assert.deepEqual(heads(legacy), captured);
-      const retried = ok(prepareDeliveries(legacy, c.request));
-      ok(writeGuarded(legacy, { unit: 'F3', target: 'legacy-admission', guards: retried.guards,
-        writes: [...retried.writes, { id: 'fixture:legacy-admission', kind: 'fixture', expected: 0, value: retried.request }] }));
-      const historical = ok(readDeliveries(legacy, clone(retried.request) as DeliveryReadRequest));
-      assert.deepEqual(historical.writers, retried.writers);
-      const restarted = new Store(path);
-      try { assert.deepEqual(ok(readDeliveries(restarted, clone(retried.request) as DeliveryReadRequest)), historical); }
-      finally { restarted.close(); }
+      assert.deepEqual(heads(legacy), before);
     } finally { legacy.close(); }
   });
 
