@@ -194,3 +194,45 @@ test('DR4-M decision/state/scope/handoff service refs are all enumerated and fsc
   // Even a well-shaped record is returned only as structural; O will prove real saved authority.
   assert.equal(readVariantDecisionStructural(f.store, 'p', broken).verification, 'structural');
 });
+
+// DR4-M-01: the independent review's discriminator probes, including the saved-record path.
+test('DR4-M-01 owner decoder rejects an array operation without coercion', t => {
+  const f = fixture(t);
+  for (const [operation, previous] of [['initial', null], ['revise', f.owner], ['override', f.model]] as const)
+    assert.throws(() => decodeVariantOwnerDecision({ ...f.ownerValue, operation: [operation], previous }),
+      { code: 'discovery_variant_decision_invalid', details: { field: 'operation' } });
+});
+
+test('DR4-M-01 prospective owner scope rejects an array operation without coercion', t => {
+  const f = fixture(t), { contract: _contract, authority: _authority, ...basis } = f.ownerValue;
+  for (const [operation, previous] of [['initial', null], ['revise', f.owner], ['override', f.model]] as const)
+    assert.throws(() => decodeVariantChoiceScope({ ...basis, action: VARIANT_OWNER_ACTION, operation: [operation], previous }),
+      { code: 'discovery_variant_decision_invalid', details: { field: 'operation' } });
+});
+
+test('DR4-M-01 cold exact structural reader rejects the stored array discriminator', t => {
+  const f = fixture(t);
+  const refs = [
+    f.save('discovery-variant-owner-decision', { ...f.ownerValue, operation: ['revise'], previous: f.owner }),
+    f.save('discovery-variant-owner-decision', { ...f.ownerValue, operation: ['override'], previous: f.model }),
+  ];
+  const cold = new Store(f.path);
+  try {
+    for (const ref of refs) assert.throws(() => readVariantDecisionStructural(cold, 'p', ref),
+      { code: 'discovery_variant_decision_invalid', details: { field: 'operation' } });
+  } finally { cold.close(); }
+});
+
+test('DR4-M-01 exact string initial/revise/override keep their previous-decision meanings', t => {
+  const f = fixture(t);
+  for (const [operation, previous] of [['initial', null], ['revise', f.owner], ['override', f.model]] as const) {
+    const value: VariantOwnerDecision = { ...f.ownerValue, operation, previous,
+      outcome: { kind: 'reject_all', reason: operation } };
+    assert.deepEqual(decodeVariantOwnerDecision(value), value);
+    const { contract: _contract, authority: _authority, ...basis } = value;
+    assert.deepEqual(decodeVariantChoiceScope({ ...basis, action: VARIANT_OWNER_ACTION }),
+      { ...basis, action: VARIANT_OWNER_ACTION });
+    const ref = f.save('discovery-variant-owner-decision', value);
+    assert.deepEqual(readVariantDecisionStructural(f.store, 'p', ref).record.value, value);
+  }
+});

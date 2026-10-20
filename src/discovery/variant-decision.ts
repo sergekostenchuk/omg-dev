@@ -54,7 +54,8 @@ function basis(value: Record<string, unknown>, contract: string) {
   variantNullableRef(value.expectedSelection, 'expectedSelection'); variantNullableRef(value.previous, 'previous'); outcome(value.outcome);
 }
 function operation(value: Record<string, unknown>) {
-  if (!['initial', 'revise', 'override'].includes(String(value.operation))) decisionError('operation', 'Unknown owner operation');
+  if (typeof value.operation !== 'string' || !['initial', 'revise', 'override'].includes(value.operation))
+    decisionError('operation', 'Unknown owner operation');
   if ((value.operation === 'initial') !== (value.previous === null)) decisionError('previous', 'Initial has no previous decision; revise and override require one');
 }
 export function decodeVariantOwnerDecision(value: unknown): VariantOwnerDecision {
