@@ -1,3 +1,5 @@
+import { EngineError } from "../errors.js";
+import { currentPlan, planOwnerSubject } from "./v7-plan-questions.js";
 /**
  * projection-reader — единая граница чтения модуля Discovery.
  *
@@ -916,15 +918,22 @@ export function executionAdmission(store: Store, draft: Revision<DiscoveryDraft>
   purpose: AdmissionPurpose, policy?: ProducerPolicy): ExecutionAdmission {
   const era = contractEraOf(draft.value), explicitEra = explicitContractEraOf(draft.value).version;
   const producerEra = producerContractEra(draft.value.stage as UpstreamStage, policy);
-  const admitted = purpose === "early-drive" ? ADMISSION_CONTRACT_ERAS.includes(era)
-    : era === producerEra;
+  const v7 = era === 7 && draft.value.stage === "discovery";
+  const admitted = v7 ? purpose !== "stage-result" && producerEra === 7
+    : purpose === "early-drive" ? ADMISSION_CONTRACT_ERAS.includes(era) : era === producerEra;
+  if (v7 && admitted) {
+    const plan = currentPlan(store, draft.value.projectId);
+    if (canonical(reference(plan.draft)) !== canonical(reference(draft)))
+      throw new EngineError("plan_questions_invalid", "Admission requires the exact current plan draft");
+  }
   const paused = purpose === "new-research" && ADMISSION_CONTRACT_ERAS.includes(era) && !admitted;
   const message = admitted || !ADMISSION_CONTRACT_ERAS.includes(era) ? null
     : era === PAID_RESTORE_CONTRACT_ERA
     ? `Paid v${era} work is retained; prepare Discovery v5 before new research or acceptance`
     : `Paid v${era} work is retained; prepare Discovery v${producerEra} before new research or acceptance`;
   let form: ExecutionAdmission["form"] = null;
-  if (admitted && purpose === "early-drive") {
+  if (v7 && admitted) form = "valid";
+  else if (admitted && purpose === "early-drive") {
     if (!Array.isArray(draft.value.questions)) form = "lost";
     else {
       const questions = orderedQuestions(store, draft.value);
@@ -939,4 +948,10 @@ export function executionAdmission(store: Store, draft: Revision<DiscoveryDraft>
   }
   return { era, explicitEra, admitted, upgradeRequired: !admitted, paused,
     paidRestore: purpose === "new-research" && era === PAID_RESTORE_CONTRACT_ERA, message, form };
+}
+
+/** Logical owner subjects are interpreted inside the Discovery boundary. */
+export { planOwnerSubject };
+export function hasPlanQuestions(draft: DiscoveryDraft): boolean {
+  return draft.stage === "discovery" && contractEraOf(draft) === 7;
 }

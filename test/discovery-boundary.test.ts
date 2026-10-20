@@ -450,3 +450,15 @@ test("boundary: hasBasisApplications — правило форм за грани
     { stage: "specification", contractVersion: 6 },
   ]), false, "лишняя строка производителя не принимается");
 });
+
+test('R v7 admission remains explicit and requires an accepted plan without opening stage-result',async t=>{
+  const {store,discovery}=fixture(t);
+  const {createPartialV7Draft}=await import('../src/discovery/v7-contracts.js');
+  const draft=createPartialV7Draft(discovery,'r-boundary','concept');
+  const before=store.list();
+  assert.equal(executionAdmission(store,draft,'new-research').admitted,false);
+  assert.equal(executionAdmission(store,draft,'stage-result',{discovery:7}).admitted,false);
+  assert.throws(()=>executionAdmission(store,draft,'new-research',{discovery:7}),{code:'plan_questions_invalid'});
+  assert.equal(acceptedIssuance(store,draft).issued,false);
+  assert.deepEqual(store.list(),before);
+});

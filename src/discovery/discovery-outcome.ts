@@ -1,3 +1,4 @@
+import { provePlanQuestions } from "./v7-plan-questions.js";
 import type { ResearchAssessment } from './research-model.js';
 import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
@@ -416,6 +417,22 @@ export function discoveryInspection(store: Store, draft: Revision<DiscoveryDraft
   }
   const invalidPrefix = gate.findings.find(finding => finding.code === 'discovery_prefix_closure_invalid');
   if (invalidPrefix) throw new EngineError(invalidPrefix.code, `[${invalidPrefix.target}] ${invalidPrefix.message}`);
+  if (draft.value.contractVersion === 7 && draft.value.stage === 'discovery'
+    && draft.value.fields.plan !== null && draft.value.fields.plan !== undefined) {
+    const questions = draft.value.questions.map(id => store.get<Question>(id));
+    requireCondition(questions.every(q => q?.kind === 'question' && q.value.projectId === draft.value.projectId
+      && q.value.draftId === draft.id), 'plan_questions_invalid', 'Discovery lost a question of its plan');
+    const plan = questions.find(q => q!.value.spec.field === 'plan');
+    requireCondition(plan, 'plan_questions_invalid', 'Discovery lost its plan question');
+    if (plan.value.status === 'answered') {
+      requireCondition(isRef(plan.value.answer), 'plan_questions_invalid', 'The answered plan lost its exact answer');
+      provePlanQuestions(store, draft, plan.value.answer);
+    }
+    // Traversal ends are not stage acceptance. Retain the full gate, including unresolved fields;
+    // before a plan exists the original partial-v7 prefix reader keeps its constant read budget.
+    return { outcome: { state: 'researching', verdict: null, report: null, conditions: [], ownerChoices: [],
+      reason: null, guards: gate.guards, findings: [] }, gate };
+  }
   return { outcome: outcomeFromGate(store, draft, gate), gate };
 }
 

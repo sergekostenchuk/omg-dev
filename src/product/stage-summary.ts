@@ -1,7 +1,8 @@
+import type { V7PlanSubject } from "../discovery/v7-managed-attempt.js";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { discoveryConstraintBindings, discoveryDecisionId } from "../discovery/discovery-outcome.js";
 import {
-  acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome,
+  acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planOwnerSubject,
   isAdmissionEra, isPreparationEra, isSupportedEra, issuedEntry, issuedForm,
   listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft,
   readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions,
@@ -55,6 +56,7 @@ export interface SummaryAccepted {
 }
 export interface SummaryQuestion { ref: Ref; field: string; status: Question["status"] }
 export interface SummaryRun {
+  subject?: V7PlanSubject;
   ref: Ref; status: ResearchRun["status"]; pauseCode: string | null; error: string | null;
   question: Ref | null; missing: string[]; door: string | null;
 }
@@ -636,7 +638,11 @@ function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDr
     `[${run.id}] A needs-owner run has no addressed owner question`);
   let door: string | null = run.value.status === "paused" ? "research-stage" : null;
   let questionRef: Ref | null = null;
-  if (run.value.status === "needs_owner" && owner) {
+  let subject: V7PlanSubject | undefined;
+  if (run.value.status === "needs_owner" && owner && hasPlanQuestions(draft.value)) {
+    const proven = planOwnerSubject(store, run);
+    subject = proven.subject; questionRef = proven.question; door = "research-stage";
+  } else if (run.value.status === "needs_owner" && owner) {
     const entry = issuedEntry(store, draft, owner.question);
     requireCondition(entry !== null && !entry.foreign, "stage_summary_run_invalid",
       `[${run.id}] The owner pause names no question of this draft`);
@@ -645,7 +651,7 @@ function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDr
   }
   const missing = owner ? [owner.reason] : run.value.error ? [run.value.error] : [];
   return { ref: reference(run), status: run.value.status, pauseCode: run.value.pauseCode ?? null,
-    error: run.value.error, question: questionRef, missing, door };
+    error: run.value.error, question: questionRef, missing, door, ...(subject ? { subject } : {}) };
 }
 
 function readCandidate(store: Store, project: string, draft: Revision<DiscoveryDraft>): SummaryCandidate {
@@ -769,7 +775,8 @@ function selectDiscoveryCandidate(store: Store, project: string, explicit: strin
   const entryRefs = currentEntryRefs(store, project);
   const valid = (draft: Revision<DiscoveryDraft> | null): draft is Revision<DiscoveryDraft> => Boolean(draft
     && draft.kind === "discovery-draft" && draft.value.projectId === project && draft.value.stage === "discovery"
-    && draft.value.level === "R0" && draft.value.consumer === "concept" && isAdmissionEra(contractEraOf(draft.value))
+    && draft.value.level === "R0" && draft.value.consumer === "concept"
+    && (isAdmissionEra(contractEraOf(draft.value)) || hasPlanQuestions(draft.value))
     && same(draft.value.inputs, entryRefs));
   if (explicit !== undefined) {
     const draft = readDraft(store, explicit);

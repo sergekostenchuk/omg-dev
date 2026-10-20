@@ -1,9 +1,12 @@
 import { canonical, hashJson, type Json } from "../canonical.js";
-import { isRef, type Ref } from "../pipeline/contracts.js";
+import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import type { ResearchAnswer } from "./research-model.js";
+import type { ResearchAnswer, ResearchRun } from "./research-model.js";
+import { readResearchConsumerTurn } from "./response-recovery.js";
+import { planSubjectOf, type V7PlanSubject } from "./v7-managed-attempt.js";
+import { turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
 import { issuedAnswerSchemaHolds, orderedQuestions, proveIssuedAnswer, readExact,
   savedAcceptanceAct } from "./projection-reader.js";
 import { DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_CONTRACT,
@@ -151,6 +154,40 @@ export function nextPlanQuestion(store: Store, projectId: string): V7PlanQuestio
     ?? questions[0] ?? null;
 }
 
+/** One initial traversal, not DR3b question acceptance: every proven end counts. */
+export function planAttemptSelection(store: Store, projectId: string): CurrentPlan & {
+  attempts: Revision<V7Attempt>[]; next: V7PlanQuestion | null;
+} {
+  const plan = currentPlan(store, projectId);
+  const attempts = store.list<V7Attempt>(V7_ATTEMPT_KIND)
+    .filter(record => canonical(record.value?.planAnswer ?? null) === canonical(plan.planAnswer)
+      || record.value?.project === projectId && !isRef(record.value.planAnswer))
+    .map(record => proveAttemptWithPlan(store, reference(record), plan).attempt);
+  const ended = new Set(attempts.map(record => record.value.planQuestionId));
+  const open = plan.questions.filter(question => !ended.has(question.planQuestionId));
+  return { ...plan, attempts,
+    next: open.find(question => (question.question as Record<string, Json>)["class"] === "blocking") ?? open[0] ?? null };
+}
+
+/** A saved owner pause belongs to the paid turn, never to the plan field's answered flag. */
+export function planOwnerSubject(store: Store, run: Revision<ResearchRun>): {
+  subject: V7PlanSubject; question: Ref;
+} {
+  const candidates = store.list<ManagedResearchTurn>("research-turn")
+    .filter(turn => turn.value.run === run.id && turn.value.number === run.value.turns);
+  if (candidates.length !== 1) refuse("research_owner_question_invalid", run.id, "the owner pause lost its unique paid turn");
+  const turn = readResearchConsumerTurn(store, reference(candidates[0]!)) as Revision<ManagedResearchTurn>;
+  const subject = planSubjectOf(turn.value), action = turnAction(turn.value);
+  if (!subject || !isRef(turn.value.question) || turn.value.status !== "completed" || action.action !== "need_owner"
+    || run.value.ownerQuestion?.question !== subject.planQuestionId
+    || action.question !== subject.planQuestionId
+    || !obj(turn.value.observation) || turn.value.observation.necessary !== true
+    || run.value.ownerQuestion.reason !== turn.value.observation.reason
+    || canonical(run.value.ownerQuestion.searched) !== canonical(action.searched))
+    refuse("research_owner_question_invalid", run.id, "the owner pause differs from its paid subject");
+  return { subject, question: turn.value.question };
+}
+
 /* ---------- the research-attempt record (v7-attempt/v1) ---------- */
 
 /** The terminal state of one attempt. A submitted attempt is itself the
@@ -245,6 +282,10 @@ function projectRefOf(view: Store, project: string) {
  * changes nothing. What acceptance of an attempt MEANS is not decided yet;
  * this proof is the structural half the DR3b admission will build on. */
 export function proveAttempt(view: Store, ref: Ref): V7AttemptProof {
+  return proveAttemptWithPlan(view, ref);
+}
+
+function proveAttemptWithPlan(view: Store, ref: Ref, plan?: CurrentPlan): V7AttemptProof {
   const attempt = readExact<V7Attempt>(view, ref);
   if (attempt === null || attempt.kind !== V7_ATTEMPT_KIND || attempt.revision !== 1)
     refuse("attempt_invalid", "attempt", "the record is missing, foreign or changed");
@@ -265,7 +306,10 @@ export function proveAttempt(view: Store, ref: Ref): V7AttemptProof {
     || draft.value.projectId !== value["project"] || draft.value.contractVersion !== V7_CONTRACT_ERA
     || draft.value.stage !== "discovery")
     refuse("attempt_invalid", "draft", "the attempt's draft is missing, foreign or not a v7 discovery draft");
-  const planQuestion = provePlanQuestions(view, draft, value["planAnswer"])
+  const questions = plan && canonical(reference(draft)) === canonical(reference(plan.draft))
+    && canonical(value["planAnswer"]) === canonical(plan.planAnswer)
+    ? plan.questions : provePlanQuestions(view, draft, value["planAnswer"]);
+  const planQuestion = questions
     .find(item => item.planQuestionId === value["planQuestionId"]);
   if (planQuestion === undefined)
     refuse("attempt_invalid", "planQuestionId", "the plan question is not in the proven accepted plan");
@@ -313,7 +357,7 @@ export function proveAttempt(view: Store, ref: Ref): V7AttemptProof {
         || !obj(original.value.end) || original.value.end["type"] !== "submitted")
         refuse("attempt_invalid", "end.of",
           "the original is not a submitted attempt of this plan-question at this plan edition");
-      const provenOriginal = proveAttempt(view, end["of"]);
+      const provenOriginal = proveAttemptWithPlan(view, end["of"], plan);
       const originalValue = provenOriginal.attempt.value;
       if (originalValue.project !== key.project || originalValue.planQuestionId !== key.planQuestionId
         || canonical(originalValue.planAnswer) !== canonical(key.planAnswer)

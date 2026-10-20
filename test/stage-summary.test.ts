@@ -699,3 +699,17 @@ test("DS1.3b preserves the exact owner question and door of a structured needs-o
   assert.equal(summary.candidate?.door, "answer-decision");
   assert.match(renderStageSummary(summary), /The exact owner answer is required/);
 });
+
+test('R v7 summary refuses an unproved logical owner request instead of treating the physical plan as its answer',async t=>{
+  const {store,engine}=fixture(t);
+  const {createPartialV7Draft}=await import('../src/discovery/v7-contracts.js');
+  engine.execute({type:'create-project',project:'p',title:'P'});
+  const draft=createPartialV7Draft(engine.discovery,'p','concept');
+  store.write({id:`research-run:${hashJson(['p',draft.id])}`,kind:'research-run',expected:0,
+    value:{projectId:'p',draftId:draft.id,status:'needs_owner',turns:1,limit:1,requestChars:0,inputs:[],
+      owner:{pid:0,started:'gone'},ownerQuestion:{question:'logical-plan-question',reason:'Choose',searched:[]},error:null}});
+  const before=store.list(),summary=stageSummary(store,'p','discovery',draft.id);
+  assert.equal(summary.candidate!.run,null);
+  assert.equal(summary.candidate!.runFailure!.code,'research_owner_question_invalid');
+  assert.deepEqual(store.list(),before);
+});
