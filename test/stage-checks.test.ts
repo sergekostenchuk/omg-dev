@@ -78,7 +78,7 @@ test("R2 №2419-4 rows 1–2: the lower kit inspects every stage and gates ever
     for (const level of [1, 2, 3] as const) same(() => checks.graphs.layerGate(project, level), () => engine.graphs.layerGate(project, level));
     for (const phase of PHASES) same(() => checks.refinement.gate(project, phase), () => engine.refinement.gate(project, phase));
     same(() => checks.pipeline.inspect("absent", "features"), () => engine.pipeline.inspect("absent", "features"));
-    same(() => checks.omProject(project), () => (engine.legacyRoute(project)).om);
+    same(() => checks.omProject(project), () => (engine.checks.legacyRoute(project)).om);
   };
   const before = heads(store);
   compare();
@@ -372,7 +372,7 @@ for (const missing of ['answer', 'answer-null', 'value', 'assessment', 'assessme
 
 // ---- S1.5 (№2363): the search for saved OM provenance follows the Store it is given ----
 
-const legacyRoute = (engine: ProductEngine) => engine.legacyRoute('p');
+const legacyRoute = (engine: ProductEngine) => engine.checks.legacyRoute('p');
 const provenanceRefusal = (store: Store) => {
   const report = runIntegrityCheck(store, { project: 'p' }); assert.ok(report.ok);
   assert.ok(report.value.value.findings.some(f => f.code === 'record_missing' && f.id === 'om-input:p' && f.revision === 1));

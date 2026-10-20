@@ -46,11 +46,6 @@ export type ProductCommand =
   | { type: "recover-execution"; project: string }
   | { type: "configure"; project: string; expected: number; environment: Omit<Environment, "projectId"> }
   | { type: "configure-om-dispatch"; project: string; protocol: "codex-stdio" | "devin-stdio" }
-  | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
-  | { type: "finish-research"; project: string; level: "R0" | "R1" | "R2"; draft: Ref; expected: number }
-  | { type: "seal-layer"; project: string; level: 1 | 2 | 3; expected: number }
-  | { type: "prepare-layer"; project: string; level: 2 | 3 }
-  | { type: "build-layer"; project: string; level: 2 | 3; draft: Ref; expected: number }
   | { type: "assess"; project: string; expected: number }
   | { type: "draft-om"; project: string; feasibility: Ref; expected: number }
   | { type: "compile"; project: string }
@@ -67,7 +62,6 @@ export type ProductCommand =
   | { type: "reopen-question"; question: string; expected: number }
   | { type: "save-graph"; project: string; expected: number; graph: unknown }
   | { type: "build-map"; project: string; draftId: string; expected: number }
-  | { type: "refine-graph"; project: string; expected: number; draft: Ref }
   | { type: "draft-stage"; project: string; stage: UpstreamStage; draftId: string; expected: number }
   | { type: "accept-stage"; project: string; stage: Stage; expected: number }
   | { type: "project"; project: string }
@@ -97,7 +91,6 @@ environmentSettings.properties['requestCapacityChars'] = { type: "integer", mini
 environmentSettings.properties['webResearch'] = object({ enabled: { type: "boolean" }, gatewayUrl: string,
   timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 }, budgetContract: { const: 'web-budget/v2' },
   limits: object({ materialChars: { const: 2000000 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) });
-const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
 const text = { ...string, pattern: "\\S" };
@@ -154,11 +147,6 @@ const schema = { oneOf: [
   command("recover-execution", { project }),
   command("configure", { project, expected, environment: environmentSettings }),
   command("configure-om-dispatch", { project, protocol: { enum: ["codex-stdio", "devin-stdio"] } }),
-  command("begin-research", { project, level: researchLevel }),
-  command("finish-research", { project, level: researchLevel, draft: ref, expected }),
-  command("seal-layer", { project, level: { enum: [1, 2, 3] }, expected }),
-  command("prepare-layer", { project, level: { enum: [2, 3] } }),
-  command("build-layer", { project, level: { enum: [2, 3] }, draft: ref, expected }),
   command("assess", { project, expected }), command("draft-om", { project, feasibility: ref, expected }),
   command("compile", { project }), command("draft-plan", { project, plan: ref, expected }),
   command("task-context", { project, plan: ref, task: string, maxChars: { type: "integer", minimum: 1 } }),
@@ -175,7 +163,6 @@ const schema = { oneOf: [
   command("reopen-question", { question: string, expected }),
   command("save-graph", { project, expected, graph: { type: "object" } }),
   command("build-map", { project, draftId: string, expected }),
-  command("refine-graph", { project, expected, draft: ref }),
   command("draft-stage", { project, stage: { enum: UPSTREAM_STAGES }, draftId: string, expected }),
   command("accept-stage", { project, stage, expected }),
   command("project", { project }), stageSummary, command("export-stage", { project, stage }),

@@ -322,7 +322,7 @@ test("an explicit reserve resumes unknown usage without converting it into measu
   assert.equal(store.get<ModelCall>(unknown.id)!.value.usage, null);
 });
 
-test("a previously prepared L3 cannot bypass the pilot boundary through build-layer", t => {
+test("a previously prepared L3 cannot bypass the pilot boundary through layer construction", t => {
   const { engine, store, draft: r1, full } = fixture(t);
   configurePhasePolicy(store, "p", "L3", "R2-L3", 0);
   answerTechnicalFixture(engine, "p", r1);
@@ -337,7 +337,7 @@ test("a previously prepared L3 cannot bypass the pilot boundary through build-la
   const ready3 = answerLayerFixture(engine, "p", l3, 3, full);
   configurePhasePolicy(store, "p", "L2", "R2-L3", 1);
   const before = store.get("graph:p")!;
-  assert.throws(() => engine.execute({ type: "build-layer", project: "p", level: 3, draft: reference(ready3), expected: before.revision }),
+  assert.throws(() => engine.refinement.buildLayer("p", 3, reference(ready3), before.revision, "fixture"),
     { code: "pilot_boundary_reached" });
   assert.deepEqual(store.get(before.id), before);
   assert.throws(() => engine.execute({ type: "compile", project: "p" }), { code: "pilot_boundary_reached" });

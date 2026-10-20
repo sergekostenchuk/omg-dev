@@ -310,7 +310,7 @@ test("LG01a executed uses accepted L3 and M8 M9 with real committed runs and rec
     assert.equal(compilation.value.status, "accepted");
     assert.deepEqual((compilation.value.content as { plan: unknown }).plan, reference(fixture.plan));
     assert.equal(fixture.plan.value.feasibility.id, m8.id);
-    assert.equal(fixture.engine.legacyRoute(fixture.project).om, true);
+    assert.equal(fixture.engine.checks.omProject(fixture.project), true);
     assert.ok(fixture.plan.value.tasks.length > 0);
     assert.equal(fixture.runs.length, fixture.plan.value.tasks.length);
     assert.ok(fixture.runs.every(run => run.value.state === "committed"));

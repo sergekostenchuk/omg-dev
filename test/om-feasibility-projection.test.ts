@@ -3,12 +3,9 @@ import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import { checkStoreIntegrity } from "../src/storage/fsck.js";
 import { b1OriginCheck } from "../src/om/b1-origin.js";
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import test, { type TestContext } from 'node:test';
 import { canonical, hashJson } from '../src/canonical.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
@@ -95,7 +92,7 @@ async function mixedNativeFixture(t: TestContext): Promise<MixedNativeFixture> {
       reviewer: { actor: 'external-reviewer', model: 'fixture', effort: 'high', command: nativeCommand },
       fullCheck: nativeCommand, timeoutMs: 5_000, requestCapacityChars: 200000 }, 0);
     refinedLayers(engine, project);
-    const legacy = engine.execute({ type: 'assess', project, expected: 0 });
+    const legacy = engine.refinement.assess(project, 0);
     assert.equal(legacy.id, 'feasibility:' + project); assert.equal(legacy.value.ready, true);
     assert.deepEqual(engine.refinement.feasibilityGate(project, reference(legacy), true).findings, []);
     for (const inputRef of legacy.value.inputs) { const rec = store.get(inputRef.id, inputRef.revision); assert.ok(rec, 'native input missing: ' + inputRef.id); assert.deepEqual(reference(rec), inputRef); }
@@ -208,8 +205,9 @@ test('G1.2 a native legacy project with a new B1 never falls back to its saved R
   const f = executionFixture(t), legacy = f.store.get<Feasibility>('feasibility:p')!;
   const oldPlan = f.plan, oldStage = f.store.get('stage:p:om-g2')!, oldProjection = f.engine.projection('p');
   assert.equal(f.store.get('om-input:p'), null);
-  assert.deepEqual(oldProjection.feasibility, legacy);
-  assert.deepEqual(oldProjection.feasibilityGate?.findings, []);
+  assert.equal(oldProjection.feasibility, null);
+  assert.equal(oldProjection.feasibilityGate, null);
+  assert.equal(oldProjection.ownerQuestions, null);
   const input = firstInput(f.store, 'p');
   assert.equal(input.revision, 1);
   assert.equal(f.store.get('om-frame:p:3'), null, 'Native L3 acceptance cannot decide the project era');
@@ -228,30 +226,22 @@ test('G1.2 a native legacy project with a new B1 never falls back to its saved R
   assert.equal(history(f.store), before, 'Changing the selected producer never rewrites either historical era');
 });
 
-test('G1.2 native assess guards B1 absence against another Store before writing its R3 result', t => {
+test('LG30-C assess before B1 refuses instead of producing another native R3, including after restart', t => {
   const f = executionFixture(t), legacy = f.store.get<Feasibility>('feasibility:p')!;
-  const other = new Store(f.store.path), writeMany = f.store.writeMany.bind(f.store);
-  let created = false;
-  f.store.writeMany = (<T>(writes: Write[], guards: TransactionGuard[] = []): Revision<T>[] => {
-    if (!created && writes.some(write => write.id === legacy.id)) {
-      created = true;
-      assert.equal(f.store.get('om-input:p'), null, 'The selected legacy producer still has no B1 before the competing transaction');
-      assert.equal(firstInput(other, 'p').revision, 1);
-    }
-    return writeMany<T>(writes, guards);
-  }) as Store['writeMany'];
-  try {
-    assert.throws(() => f.engine.execute({ type: 'assess', project: 'p', expected: legacy.revision }),
-      (error: unknown) => error instanceof EngineError && error.code === 'input_stale');
-    assert.equal(created, true, 'The new origin is inserted after route selection and immediately before the actual write');
-    assert.deepEqual(f.store.get(legacy.id), legacy);
-    assert.equal(f.store.history(legacy.id).length, 1);
+  const before = history(f.store);
+  for (const restart of [false, true]) {
+    if (restart) f.reopen();
+    assert.throws(() => f.engine.execute({ type: 'assess', project: 'p', expected: legacy.revision }), (error: unknown) => {
+      assert.ok(error instanceof EngineError);
+      assert.equal(error.code, 'feasibility_source_missing');
+      assert.deepEqual(error.details, { unit: 'M8', target: 'om-input:p', field: 'input' });
+      return true;
+    });
+    assert.equal(f.store.get('om-input:p'), null);
     assert.equal(f.store.get('om-feasibility:p'), null);
-    assert.ok(f.store.get('om-input:p'));
-  } finally { f.store.writeMany = writeMany; other.close(); }
-  f.reopen();
-  missingM8(f.engine, 'p');
-  assert.deepEqual(f.store.get(legacy.id), legacy);
+    assert.deepEqual(f.store.get(legacy.id), legacy);
+    assert.equal(history(f.store), before);
+  }
 });
 
 test('G1.2 the projection and assess command select the genuine accepted-works M8 producer and its revision space', async t => {
@@ -539,69 +529,6 @@ test('G1.2 ordinary graph authoring cannot return a proven OM project to the leg
   assert.ok(view.feasibilityGate && view.feasibilityGate.findings.length > 0);
   assert.deepEqual(ok(readOmInput(f.store, f.project, reference(f.store.get(`om-input:${f.project}`, 1)!))).id, `om-input:${f.project}`);
   assert.equal(history(f.store), before);
-});
-
-const HISTORY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root,ts;
-export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){
- const prefix=new URL('dist/',root).href;
- if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
-  if(relative.startsWith('src/')||relative.startsWith('test/')){
-   const source=execFileSync('git',['show','177d0c5d5a0d:'+relative],
-    {cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
-  }
- }
- return next(url,context);
-}`;
-
-test('G1.2 the complete 177d0c5 producer retains native projection and assess bytes after restart', t => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-g12-history-')));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url)), loader = join(directory, 'loader.mjs'), script = join(directory, 'producer.mjs');
-  writeFileSync(loader, HISTORY_LOADER);
-  writeFileSync(script, `import{copyFileSync}from'node:fs';import{join}from'node:path';import{pathToFileURL}from'node:url';
-const repository=process.argv[2],directory=process.argv[3],src=path=>pathToFileURL(join(repository,'dist/src',path)).href;
-const{executionFixture}=await import(pathToFileURL(join(repository,'dist/test/execution-fixture.js')).href);
-const{canonical}=await import(src('canonical.js'));
-const cleanup=[];
-try{
- const f=executionFixture({after:fn=>cleanup.push(fn)}),database=join(directory,'before-assess.sqlite');
- const beforeProjection=f.engine.projection('p'),beforeHistory=canonical(f.store.list().flatMap(row=>f.store.history(row.id)));
- f.store.close();copyFileSync(join(f.directory,'state.sqlite'),database);f.reopen();
- const assessed=f.engine.execute({type:'assess',project:'p',expected:1});
- const projection=f.engine.projection('p'),history=canonical(f.store.list().flatMap(row=>f.store.history(row.id)));
- f.store.close();process.stdout.write(JSON.stringify({directory:f.directory,database,beforeProjection,beforeHistory,assessed,projection,history}));
-}catch(error){for(const fn of cleanup)try{fn();}catch{}throw error;}
-`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
-{data:{root:${JSON.stringify(pathToFileURL(repository).href)},typescript:${JSON.stringify(typescript)}}});`;
-  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
-  const raw = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, script, repository, directory],
-    { cwd: repository, env: environment, encoding: 'utf8', timeout: 120_000, maxBuffer: 40_000_000 });
-  const old = JSON.parse(raw) as { directory: string; database: string; beforeProjection: ReturnType<ProductEngine['projection']>;
-    beforeHistory: string; assessed: Revision<Feasibility>; projection: ReturnType<ProductEngine['projection']>; history: string };
-  t.after(() => rmSync(old.directory, { recursive: true, force: true }));
-  let store = new Store(old.database);
-  try {
-    let engine = new ProductEngine(store);
-    assert.equal(store.get('om-input:p'), null);
-    assert.equal(history(store), old.beforeHistory);
-    assert.deepEqual(engine.projection('p'), old.beforeProjection);
-    assert.equal(history(store), old.beforeHistory);
-    assert.deepEqual(engine.execute({ type: 'assess', project: 'p', expected: 1 }), old.assessed,
-      'The same base-produced database gives exactly the same native producer bytes');
-    assert.deepEqual(engine.projection('p'), old.projection);
-    assert.equal(history(store), old.history);
-    store.close(); store = new Store(old.database); engine = new ProductEngine(store);
-    assert.deepEqual(engine.execute({ type: 'project', project: 'p' }), old.projection);
-    assert.equal(history(store), old.history);
-    assert.equal(store.get('om-feasibility:p'), null);
-  } finally { store.close(); }
 });
 
 async function assessCasRace(t: TestContext, options: {

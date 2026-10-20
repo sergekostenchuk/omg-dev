@@ -4,12 +4,11 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, unlinkSync
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Store, observeStore, storeReads, type Revision, type TransactionGuard } from '../src/storage/store.js';
+import { Store, observeStore, storeReads, type Revision } from '../src/storage/store.js';
 import { storeView, provenStore } from '../src/storage/store-view.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { PHASES, withRefinementRead } from '../src/graph/refinement.js';
-import { canonical } from '../src/canonical.js';
-import { reference, uniqueRefs, type Ref } from '../src/pipeline/contracts.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { git, type Environment } from '../src/runtime/environment.js';
 import type { Graph } from '../src/graph/model.js';
 import type { Source } from '../src/evidence/evidence.js';
@@ -35,32 +34,21 @@ function fixture(t: TestContext, graph = exampleGraph('p'), complete = true) {
     reopen() { store.close(); store = new Store(join(directory, 'state.sqlite')); engine = new ProductEngine(store); } };
 }
 function reads<T>(run: () => T) { const before = storeReads(), value = run(); return { value, count: storeReads() - before }; }
-function countBodies(t: TestContext, store: Store) {
-  const signatures = new Map(phases.map(phase => [canonical(uniqueRefs(store.get<{inputs: Ref[]}>(`phase:p:${phase}`)!.value.inputs)), phase]));
-  assert.equal(signatures.size, 6);
-  const counts = new Map<string, number>();
-  const original = Store.prototype.headsMatch;
-  t.mock.method(Store.prototype, 'headsMatch', function (this: Store, refs: readonly TransactionGuard[]) {
-    const phase = signatures.get(canonical(refs));
-    if (phase) counts.set(phase, (counts.get(phase) ?? 0) + 1);
-    return original.call(this, refs);
-  });
-  return counts;
-}
-function allOnce(counts: Map<string, number>) { assert.deepEqual(Object.fromEntries(counts), Object.fromEntries(phases.map(phase => [phase, 1]))); }
-
-test('G6 a real projection computes each refinement phase once; the next projection owns a fresh scope', t => {
+test('G6 a current projection skips refinement phases without writes; the next projection retains its read bound', t => {
   const f = fixture(t); f.reopen();
-  const expected = phases.map(phase => f.engine.refinement.gate('p', phase));
-  const counts = countBodies(t, f.store);
+  const gate = t.mock.method(Object.getPrototypeOf(f.engine.refinement), 'gate', () => {
+    throw new Error('The current projection must not read Refinement phase gates');
+  });
   t.mock.method(Store.prototype, 'writeMany', () => { throw new Error('projection scope must not write'); });
   const first = reads(() => f.engine.projection('p'));
-  allOnce(counts);
-  assert.deepEqual(first.value.phases.map(row => row.gate), expected, 'Codes, guards and admissionGuards are preserved');
+  assert.equal(Object.hasOwn(first.value, 'phases'), false);
+  assert.equal(gate.mock.callCount(), 0);
   t.diagnostic(`projection Store reads=${first.count}`);
   assert.ok(first.count <= 2400, `projection budget: ${first.count}`);
-  counts.clear();
-  const second = reads(() => f.engine.projection('p')); allOnce(counts);
+  const second = reads(() => f.engine.projection('p'));
+  assert.equal(Object.hasOwn(second.value, 'phases'), false);
+  assert.equal(gate.mock.callCount(), 0);
+  assert.deepEqual(second.value, first.value);
   assert.equal(second.count, first.count);
 });
 

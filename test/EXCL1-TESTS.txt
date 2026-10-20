@@ -37,7 +37,6 @@ om-atomic-gate.test.ts :: G5 two D7 of one exact request (the older rule and tod
 om-call-record.test.ts :: genuine E5.0 E1 and E4 records remain historical after restart while an old open E1 cannot launch E4 # вид 1: эра 3eb5dac
 om-compiler-readers.test.ts :: R3+R4 on a saved legal base the slot reproduces the base implementation exactly: compile, refinement gate, plan gate, basis, sources, context, detail and task obligations — M8, absent and substituted basis, head shift, changed dependency and legacy # вид 1: эра ee2bf80
 om-feasibility-boundary.test.ts :: G1.1 complete 3e495b1 producer preserves legacy feasibility and plans while M8 v1 is explicitly superseded without rewriting history # вид 1: эра 3e495b1
-om-feasibility-projection.test.ts :: G1.2 the complete 177d0c5 producer retains native projection and assess bytes after restart # вид 1: эра 177d0c5
 om-feasibility.test.ts :: G1 reads unchanged feasibility stages and plan from the complete 2f2721d producer after restart and preserves positive writeGuarded results # вид 1: эра 2f2721d
 om-frame-candidate.test.ts :: FJ1 rows 4/9/10/13: b595c7b produces accepted and pending legacy C4, designed identity joins and rebase in a separate process # вид 1: эра b595c7b, b595c7b5
 om-gap-lines.test.ts :: D2, structural identity and G7 preserve real 41fcb54 L2 producer history after restart # вид 1: эра 41fcb54, 41fcb547

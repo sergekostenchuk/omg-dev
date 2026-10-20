@@ -40,10 +40,10 @@ import { EngineError, requireCondition } from "../errors.js";
 import { parseCommand } from "./commands.js";
 import type { Graph } from "../graph/model.js";
 import { Environments, transactionGuardsCurrent, uniqueTransactionGuards, workspacePath, type Environment } from "../runtime/environment.js";
-import { withRefinementRead, Refinement, PHASES, type Feasibility } from "../graph/refinement.js";
+import { Refinement, type Feasibility } from "../graph/refinement.js";
 import { buildL1 } from "../graph/builder.js";
 import type { ChatTurn } from "./chat.js";
-import type { Source } from "../evidence/evidence.js";
+import { withSourceMemo, type Source } from "../evidence/evidence.js";
 import { Compiler, type MachinePlan } from "../compiler/compiler.js";
 import { Executor, planCurrentGuards } from "../execution/runner.js";
 import type { TaskRun } from "../execution/model.js";
@@ -119,7 +119,7 @@ export class ProductEngine {
     return this.pipeline.draft(project, stage, content as unknown as Json, expected);
   }
   projection(project: string) {
-    return withRefinementRead(() => withGraphRead(() => this.#projection(project)));
+    return withSourceMemo(() => withGraphRead(() => this.#projection(project)));
   }
   #projection(project: string) {
     // Closure declarations are producer instructions, not a change to the historical projection wire.
@@ -128,7 +128,7 @@ export class ProductEngine {
     };
     const currentPlan = this.store.get<Ref>(`current-plan:${project}`);
     const om = this.#omProject(project);
-    const feasibilityId = `${om ? 'om-feasibility' : 'feasibility'}:${project}`;
+    const feasibilityId = `om-feasibility:${project}`;
     const feasibility = this.store.get<Feasibility>(feasibilityId);
     const stages = this.pipeline.project(project);
     // Reuse only a successful closed inspection of these exact bytes in this call.
@@ -161,10 +161,6 @@ export class ProductEngine {
       drafts, questions,
       sources: this.store.list<Source>("source").filter(item => item.value.projectId === project),
       environment: this.store.get<Environment>(`environment:${project}`),
-      phases: PHASES.filter(phase => phase !== "R3").map(phase => {
-        const record = this.store.get(`phase:${project}:${phase}`);
-        return { phase, record, gate: presented(record ? proofGate(reference(record)) ?? this.refinement.gate(project, phase) : this.refinement.gate(project, phase)) };
-      }),
       feasibility, feasibilityGate: feasibility ? presented(contentGate('feasibility', reference(feasibility)) ?? this.refinement.feasibilityGate(project, reference(feasibility)))
         : om ? { findings: [{ code: 'feasibility_missing', target: feasibilityId, message: 'The OM project requires an M8 assessment' }], guards: [] } : null,
       plans: this.store.list<MachinePlan>("plan").filter(item => item.value.projectId === project), currentPlan,
@@ -172,15 +168,10 @@ export class ProductEngine {
       runs: this.store.list<TaskRun>("task-run").filter(item => item.value.projectId === project),
       executionRoot: this.store.get<ExecutionRoot>(`execution-root:${project}`),
       executionRunning: this.executor.isRunning(project),
-      preparationRun: this.store.get(`preparation-run:${project}`),
       researchRuns: listRuns(this.store, project),
       chat: this.store.list<ChatTurn>("chat").filter(item => item.value.projectId === project).sort((a,b) => a.value.createdAt - b.value.createdAt),
-      // H2.0 (№2719-7): the owner-question detail for the UI — om-state names the wait, this projection names the
-      // exact questions and their answered state. Listing proves nothing and grants nothing. The key exists only
-      // where it has content (or a refusal to report): era tests compare old-producer projections byte-for-byte,
-      // and a database without owner-routed questions must keep its exact historical shape (G1.2, B3).
-      ...(ownerQuestions === null || ownerQuestions.ok && ownerQuestions.value.length === 0 ? {}
-        : { ownerQuestions }),
+      // Always expose the current owner-question result, including an empty list or pre-B1 null.
+      ownerQuestions,
     };
   }
   /**
@@ -195,18 +186,13 @@ export class ProductEngine {
   ownerDecision(authority: unknown, request: unknown) {
     return writeOwnerResult(this.store, authority, request, ENGINE_OWNER_READERS);
   }
-  /** Capture the absent dependency before resolving the project era. It belongs only to new production. */
-  legacyRoute(project: string): { om: boolean; guards: TransactionGuard[] } { return this.checks.legacyRoute(project); }
-  #legacyProductionGuards(project: string): TransactionGuard[] { return this.checks.legacyProductionGuards(project); }
-  #production<T>(project: string, guards: TransactionGuard[], produce: () => T): T { return this.checks.production(project, guards, produce); }
-  #planProductionGuards(project: string, planRef: Ref): TransactionGuard[] { return this.checks.planProductionGuards(project, planRef); }
   compile(project: string, extraGuards: TransactionGuard[] = []) { return this.checks.compile(project, extraGuards); }
   /** The first B1 is an immutable era boundary, independent of current stage or layer readiness. */
   #omProject(project: string): boolean { return this.checks.omProject(project); }
   #assess(project: string, expected: number) {
-    // Capture the negative dependency before selecting the legacy route, and keep it until its transaction.
-    const legacyGuards: TransactionGuard[] = [{ id: `om-input:${project}`, absent: true }];
-    if (!this.#omProject(project)) return this.refinement.assess(project, expected, legacyGuards);
+    if (!this.#omProject(project))
+      throw new EngineError('feasibility_source_missing', 'M8 requires the first accepted OM input',
+        { unit: 'M8', target: `om-input:${project}`, field: 'input' });
     const id = `om-feasibility:${project}`;
     // This scalar command has no original source Refs: stale callers must reload the projection.
     const current = this.store.get(id);
@@ -348,24 +334,31 @@ export class ProductEngine {
       // OWN1 (№3714): read only — the questions the pass decided in the bypass, with the model's choice and its alternatives.
       case "om-decisions": this.#project(command.project); return listBypassDecisions(this.store, { project: command.project });
       case "om-regate": this.#project(command.project); return regateRun(this.store, { project: command.project });
-      case "begin-research": this.#project(command.project); return this.refinement.begin(command.project, command.level);
-      case "finish-research": this.#project(command.project); return this.refinement.finishResearch(command.project, command.level, command.draft, command.expected);
-      case "seal-layer": this.#project(command.project); return this.refinement.sealLayer(command.project, command.level, command.expected);
-      case "prepare-layer": this.#project(command.project); return this.refinement.prepareLayer(command.project, command.level);
-      case "build-layer": this.#project(command.project); return this.refinement.buildLayer(command.project, command.level, command.draft, command.expected, this.actor);
       case "task-context": this.#project(command.project); return this.compiler.context(command.project, command.plan, command.task, command.maxChars);
       case "task-detail": this.#project(command.project); return this.compiler.detail(command.project, command.plan, command.task, command.kind, command.selector, command.maxChars);
       case "assess": this.#project(command.project); return this.#assess(command.project, command.expected);
       case "draft-om": {
         this.#project(command.project);
-        const guards = command.feasibility.id === `om-feasibility:${command.project}` ? [] : this.#legacyProductionGuards(command.project);
-        return this.#production(command.project, guards, () => this.refinement.publish(command.project, command.feasibility, command.expected, guards));
+        if (command.feasibility.id !== `om-feasibility:${command.project}`)
+          throw new EngineError('feasibility_route_invalid', 'Publish this project’s M8 assessment',
+            { unit: 'product', target: command.feasibility.id, field: 'feasibility' });
+        return this.refinement.publish(command.project, command.feasibility, command.expected, []);
       }
       case "compile": return this.compile(command.project);
       case "draft-plan": {
         this.#project(command.project); assertPilotBoundary(this.store, command.project, "R3");
-        const guards = this.#planProductionGuards(command.project, command.plan);
-        return this.#production(command.project, guards, () => this.compiler.publish(command.project, command.plan, command.expected, guards));
+        // Route on the exact supplied revision. The publisher still proves the whole plan and its live admission.
+        const plan = this.store.get<MachinePlan>(command.plan.id, command.plan.revision);
+        if (plan?.value?.feasibility?.id !== `om-feasibility:${command.project}`) {
+          // Preserve the core refusal for absent/corrupt/foreign plans before rejecting a valid native plan.
+          const checked = this.compiler.gate(command.project, command.plan);
+          requireCondition(checked.findings.length === 0, 'plan_stale', 'Plan inputs are not current');
+          requireCondition(plan && plan.kind === 'plan', 'plan_missing', 'The exact machine plan is missing');
+          requireCondition(plan.value && isRef(plan.value.feasibility), 'plan_invalid', 'The exact machine plan requires its feasibility reference');
+          throw new EngineError('plan_route_invalid', 'Publish a plan compiled from this project’s M8 assessment',
+            { unit: 'product', target: command.plan.id, field: 'feasibility', feasibility: plan.value.feasibility });
+        }
+        return this.compiler.publish(command.project, command.plan, command.expected, []);
       }
       case "create-project": return this.store.write<Project>({ id: `project:${command.project}`, kind: "project", expected: 0, value: { id: command.project, title: command.title } });
       case "prepare-stage": return this.prepare(command.project, command.stage);
@@ -400,14 +393,13 @@ export class ProductEngine {
         const graph = buildL1(existing?.value.id ?? `${command.project}:map`, project.value.title, draft.value.fields['mapDesign'], initial, concept);
         return this.graphs.saveDerived(command.project, graph, command.expected, this.actor, reference(draft));
       }
-      case "refine-graph": this.#project(command.project); return this.graphs.refine(command.project, command.expected, command.draft, this.actor);
       case "draft-stage": return this.draft(command.project, command.stage, command.draftId, command.expected);
       case "accept-stage": {
         this.#project(command.project);
         if (["om-g2", "compilation", "execution"].includes(command.stage)) assertPilotBoundary(this.store, command.project, "R3");
         let guards: TransactionGuard[] = [];
         if (command.stage === 'om-g2' || command.stage === 'compilation') {
-          const route = this.legacyRoute(command.project);
+          const route = this.checks.legacyRoute(command.project);
           const artifact = this.store.get<StageArtifact>(stageId(command.project, command.stage));
           const content = artifact?.value?.content as unknown as { feasibility?: Ref; plan?: Ref } | undefined;
           const plan = isRef(content?.plan) ? this.store.get<MachinePlan>(content.plan.id, content.plan.revision) : null;
@@ -415,7 +407,7 @@ export class ProductEngine {
             : plan?.value?.feasibility?.id === `om-feasibility:${command.project}`;
           guards = uniqueTransactionGuards([...(artifact ? [reference(artifact)] : []), ...(om ? [] : route.guards)]);
         }
-        return this.#production(command.project, guards, () => this.pipeline.accept(command.project, command.stage, command.expected, guards));
+        return this.checks.production(command.project, guards, () => this.pipeline.accept(command.project, command.stage, command.expected, guards));
       }
       case "project": return this.projection(command.project);
       case "stage-summary": this.#project(command.project); return stageSummary(this.store, command.project, command.stage, command.draftId);

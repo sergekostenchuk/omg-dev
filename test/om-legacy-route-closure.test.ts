@@ -133,17 +133,52 @@ const commands: Array<{ name: string; point: NativePoint; target: string; invoke
   { name: 'accept-stage compilation', point: 'compilation-draft', target: 'stage:p:compilation', invoke: f => f.engine.execute({ type: 'accept-stage', project: 'p', stage: 'compilation', expected: f.store.get('stage:p:compilation')!.revision }) },
 ];
 
+function nativeDraftRefusal(name: string, f: NativeFixture) {
+  return name === 'draft-om'
+    ? { code: 'feasibility_route_invalid', details: { unit: 'product', target: f.feasibility.id, field: 'feasibility' } }
+    : { code: 'plan_route_invalid', details: { unit: 'product', target: planOf(f).id,
+      field: 'feasibility', feasibility: planOf(f).value.feasibility } };
+}
+
 for (const command of commands) {
   test(`G1.3 mixed project refuses ${command.name} without any new legacy result`, t => {
     const f = nativeFixture(t, command.point);
     firstInput(f.store);
     const before = history(f.store);
     for (let repeat = 0; repeat < 2; repeat++) {
-      assert.throws(() => command.invoke(f), addressed);
+      if (command.name === 'draft-om' || command.name === 'draft-plan')
+        assert.throws(() => command.invoke(f), nativeDraftRefusal(command.name, f));
+      else assert.throws(() => command.invoke(f), addressed);
       assert.equal(history(f.store), before);
       if (repeat === 0) f.reopen();
     }
   });
+
+  if (command.name === 'draft-om' || command.name === 'draft-plan') {
+    test(`LG30-C ${command.name} refuses native input before and after B1 without attempting writes, including cold repeats`, t => {
+      const f = nativeFixture(t, command.point);
+      for (const afterB1 of [false, true]) {
+        if (afterB1) firstInput(f.store);
+        const before = history(f.store);
+        for (let repeat = 0; repeat < 2; repeat++) {
+          const writeMany = f.store.writeMany.bind(f.store);
+          let writes = 0;
+          f.store.writeMany = (<T>(batch: Write[], guards: TransactionGuard[] = []): Revision<T>[] => {
+            writes++;
+            return writeMany<T>(batch, guards);
+          }) as Store['writeMany'];
+          try {
+            assert.throws(() => command.invoke(f), nativeDraftRefusal(command.name, f));
+            assert.equal(writes, 0, 'A native draft is refused before its transaction');
+            assert.equal(history(f.store), before);
+          } finally { f.store.writeMany = writeMany; }
+          f.reopen();
+          assert.equal(history(f.store), before);
+        }
+      }
+    });
+    continue;
+  }
 
   test(`G1.3 ${command.name} closes the era-selection-to-write window`, t => {
     const f = nativeFixture(t, command.point), other = new Store(f.store.path), writeMany = f.store.writeMany.bind(f.store);
@@ -304,6 +339,54 @@ test('G1.3 actual M8 product commands publish, accept, compile and repeat withou
   assert.equal(history(f.store), before);
 });
 
+test('LG30-C M8 draft commands distinguish foreign addresses, damaged exact refs and missing exact plan revisions without writes', async t => {
+  const f = await m8CommandFixture(t), { project } = f;
+  const saved = writeFeasibility(f.store, f.feasibility);
+  if (!saved.ok) assert.fail(`${saved.refusal.code}: ${saved.refusal.message}`);
+  let engine = new ProductEngine(f.store);
+  const foreign = `${project}-foreign`;
+  engine.execute({ type: 'create-project', project: foreign, title: 'Foreign M8 project' });
+  const feasibility = reference(saved.value);
+  const deniedFeasibility = () => {
+    const before = history(f.store);
+    for (const id of [`om-feasibility:${foreign}`, `${feasibility.id}:suffix`, `feasibility:${project}`])
+      assert.throws(() => engine.execute({ type: 'draft-om', project, feasibility: { ...feasibility, id }, expected: 0 }),
+        { code: 'feasibility_route_invalid', details: { unit: 'product', target: id, field: 'feasibility' } });
+    for (const ref of [{ ...feasibility, hash: '0'.repeat(64) }, { ...feasibility, revision: feasibility.revision + 1 }])
+      assert.throws(() => engine.execute({ type: 'draft-om', project, feasibility: ref, expected: 0 }),
+        { code: 'feasibility_not_ready' });
+    assert.equal(history(f.store), before);
+  };
+  deniedFeasibility();
+  f.restart(); engine = new ProductEngine(f.store); deniedFeasibility();
+  const om = engine.execute({ type: 'draft-om', project, feasibility, expected: 0 }) as Revision<StageArtifact>;
+  engine.execute({ type: 'accept-stage', project, stage: 'om-g2', expected: om.revision });
+  const plan = engine.execute({ type: 'compile', project }) as Revision<MachinePlan>;
+  const expected = f.store.get(`stage:${project}:compilation`)!.revision;
+  const before = history(f.store);
+  for (const restart of [false, true]) {
+    if (restart) { f.restart(); engine = new ProductEngine(f.store); }
+    for (const ref of [{ ...reference(plan), hash: '0'.repeat(64) }, { ...reference(plan), revision: plan.revision + 1 }])
+      assert.throws(() => engine.execute({ type: 'draft-plan', project, plan: ref, expected }), { code: 'plan_stale' });
+    assert.throws(() => engine.execute({ type: 'draft-plan', project, plan: { ...reference(plan), id: 'plan:missing' }, expected }),
+      { code: 'plan_missing' });
+    assert.throws(() => engine.execute({ type: 'draft-plan', project: foreign, plan: reference(plan), expected: 0 }),
+      { code: 'plan_stale' });
+    const get = f.store.get.bind(f.store);
+    let exactReads = 0;
+    f.store.get = (<T>(id: string, revision?: number): Revision<T> | null => {
+      if (id === plan.id && revision === plan.revision) { exactReads++; return null; }
+      return get<T>(id, revision);
+    }) as Store['get'];
+    try {
+      assert.deepEqual(f.store.get(plan.id), plan, 'The current head remains available');
+      assert.throws(() => engine.execute({ type: 'draft-plan', project, plan: reference(plan), expected }), { code: 'plan_missing' });
+      assert.ok(exactReads > 0, 'Route selection must read the commanded exact revision, not substitute its head');
+    } finally { f.store.get = get; }
+    assert.equal(history(f.store), before);
+  }
+});
+
 const NATIVE_HISTORY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 let root,ts;
@@ -439,13 +522,13 @@ function provenanceFixture(t: TestContext) {
 }
 /** G7: the same provenance predicate now refuses at the fsck/start boundary. */
 function refusesProvenance(engine: ProductEngine, project = 'p') {
-  assert.equal(engine.legacyRoute(project).om, false);
+  assert.equal(engine.checks.legacyRoute(project).om, false);
   const result = runIntegrityCheck(engine.store, { project }); assert.ok(result.ok);
   assert.ok(result.value.value.findings.some(f => f.code === 'record_missing' && f.id === `om-input:${project}` && f.revision === 1));
   assert.equal(integrityGate(engine.store, project)?.ok, false);
 }
 const stillLegacy = (engine: ProductEngine, project = 'p') => {
-  assert.deepEqual(engine.legacyRoute(project), { om: false, guards: [{ id: `om-input:${project}`, absent: true }] });
+  assert.deepEqual(engine.checks.legacyRoute(project), { om: false, guards: [{ id: `om-input:${project}`, absent: true }] });
   const report = runIntegrityCheck(engine.store, { project }); assert.ok(report.ok);
   assert.ok(!report.value.value.findings.some(f => f.code === 'record_missing' && f.id === `om-input:${project}`));
 };

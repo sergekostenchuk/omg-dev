@@ -40,7 +40,7 @@ for (const kind of ['producer', 'writer-index', 'historical-owner', 'incomplete-
     if (kind === 'incomplete-ref') store.write({ id: 'graph-layer:p:1', kind: 'graph-layer', expected: 0,
       value: { inputs: [{ id: 'om-input:p' }] } });
     const reads = storeReads();
-    assert.deepEqual(engine.legacyRoute('p'), { om: false, guards: [{ id: 'om-input:p', absent: true }] });
+    assert.deepEqual(engine.checks.legacyRoute('p'), { om: false, guards: [{ id: 'om-input:p', absent: true }] });
     assert.equal(storeReads() - reads, 1, 'hot routing does not scan saved provenance');
     const manual = engine.execute({ type: 'om-fsck', project: 'p' }) as ReturnType<typeof runIntegrityCheck>;
     assert.ok(manual.ok);

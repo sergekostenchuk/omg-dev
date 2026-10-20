@@ -213,7 +213,7 @@ test('R4 a fit environment without an adapter gets exactly one adapter record, a
   // The setting starts nothing: no executor, no repository (the workspace is not one), and no era evidence.
   assert.equal(f.ran(), false);
   assert.equal(f.store.get(`om-input:${f.project}`), null);
-  assert.equal(f.engine.legacyRoute(f.project).om, false);
+  assert.equal(f.engine.checks.legacyRoute(f.project).om, false);
   assert.doesNotThrow(() => f.engine.projection(f.project));
 });
 
@@ -445,7 +445,7 @@ test('R4 the produced dispatch admits the real E2 packet, the E4 implementer and
   const f = chain(t), { dispatch } = f.dispatched;
   // B1 exists already: the command was legal after it, and it changed nothing of the era.
   assert.ok(f.store.get(`om-input:${f.project}`));
-  assert.equal(f.engine.legacyRoute(f.project).om, true);
+  assert.equal(f.engine.checks.legacyRoute(f.project).om, true);
   assert.deepEqual(f.engine.execute(COMMAND), f.dispatched);
   assert.deepEqual(dispatch.config, reference(f.configured));
   const environment = f.store.get<Environment>(ENVIRONMENT)!.value;

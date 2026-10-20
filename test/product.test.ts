@@ -10,7 +10,9 @@ import { Store, type Revision } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { RESEARCH_CONTRACT_VERSION, UPSTREAM_STAGES } from "../src/discovery/requirements.js";
 import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
-import { reference } from "../src/pipeline/contracts.js";
+import { reference, type Ref } from "../src/pipeline/contracts.js";
+import { writeOmInput } from "../src/om/input.js";
+import type { UpstreamStage } from "../src/discovery/requirements.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
@@ -209,6 +211,49 @@ test("LG30-B preparation, repair and phase-research doors are refused by engine,
   try {
     const engine = new ProductEngine(cold), before = cold.list().flatMap(record => cold.history(record.id));
     for (const input of commands) assert.throws(() => engine.execute(input), { code: "command_invalid" });
+    assert.deepEqual(cold.list().flatMap(record => cold.history(record.id)), before);
+  } finally { cold.close(); }
+});
+
+test("LG30-C retired Refinement commands are refused by engine, CLI and HTTP without writes", async t => {
+  const f = lg30Commands(t), ref = reference(f.project);
+  const commands = [
+    { type: "begin-research", project: "p", level: "R1" },
+    { type: "finish-research", project: "p", level: "R1", draft: ref, expected: 0 },
+    { type: "seal-layer", project: "p", level: 2, expected: 0 },
+    { type: "prepare-layer", project: "p", level: 2 },
+    { type: "build-layer", project: "p", level: 2, draft: ref, expected: 0 },
+    { type: "refine-graph", project: "p", draft: ref, expected: 0 },
+  ];
+  await refusesRetiredCommands(f, commands);
+  const projection = f.engine.projection("p");
+  assert.equal(Object.hasOwn(projection, "phases"), false);
+  assert.equal(Object.hasOwn(projection, "preparationRun"), false);
+  assert.equal(Object.hasOwn(projection, "ownerQuestions"), true);
+  assert.equal(projection.ownerQuestions, null);
+  assert.equal(projection.feasibility, null);
+  assert.equal(projection.feasibilityGate, null);
+});
+
+test("LG30-C first B1 exposes empty ownerQuestions and missing M8 through both projection doors and cold reopen", t => {
+  const f = lg30Commands(t), project = "questions";
+  preparedFeatures(f.engine, project);
+  const written = writeOmInput(f.store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> });
+  assert.ok(written.ok, written.ok ? "" : written.refusal.message);
+  const before = f.store.list().flatMap(record => f.store.history(record.id));
+  const cold = new Store(f.path);
+  try {
+    for (const engine of [f.engine, new ProductEngine(cold)]) {
+      const view = engine.projection(project);
+      assert.deepEqual(view.ownerQuestions, { ok: true, value: [] });
+      assert.equal(Object.hasOwn(view, "phases"), false);
+      assert.equal(Object.hasOwn(view, "preparationRun"), false);
+      assert.equal(view.feasibility, null);
+      assert.deepEqual(view.feasibilityGate, { findings: [{ code: "feasibility_missing", target: `om-feasibility:${project}`,
+        message: "The OM project requires an M8 assessment" }], guards: [] });
+      assert.deepEqual(engine.execute({ type: "project", project }), view);
+    }
     assert.deepEqual(cold.list().flatMap(record => cold.history(record.id)), before);
   } finally { cold.close(); }
 });
