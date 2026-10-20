@@ -6,6 +6,7 @@ import type { BundleInput } from "./reader.js";
 import type { ContextPage } from "./working-context.js";
 import type { WebAction } from "./web-research.js";
 import type { ClaimAddress } from "./claim-address.js";
+import type { V7PlanSubject } from "./v7-managed-attempt.js";
 
 /** ASM1.1 (№4791): the producer contract binding a direct assessment to the exact material its assessor saw. */
 export const DIRECT_ASSESSMENT_ORIGIN = 'direct-assessment-origin/v1' as const;
@@ -63,6 +64,10 @@ export interface ResearchTurn {
   recoveredRequest?: Ref;
   plannedBy?: Ref;
   dispatchMode?: "planning" | "synthesis";
+  /** DR3a3-S3: the exact plan subject. On a paid planner/analyst turn (O@1) it is fixed by the producer together
+   * with attemptContract; on a queued child, its split parts and retries it is only the lineage of the exact
+   * planner parent — never an attempt marker, so the child does not own an answer or K. */
+  subject?: V7PlanSubject;
 }
 
 /* ---------- DR3b-M (codex-omg №7546 §1): the assessment of a packet of v7 attempts ---------- */

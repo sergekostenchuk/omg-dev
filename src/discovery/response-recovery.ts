@@ -388,6 +388,25 @@ function managedSearchParent(store: Store, child: Revision<Record<string, any>>)
   return matches[0] ?? null;
 }
 
+/** DR3a3-S3: a legacy-address turn carries a plan subject only as the lineage
+ * of its exact planner parent — a paid planning-mode O@1 of the attempt era
+ * with the same subject. A child of such a parent cannot lose it, a child of
+ * a field-path parent cannot gain one, and the lineage never makes the child
+ * an attempt. A field-path child whose parent is not saved keeps its rules. */
+function queuedChildLineage(store: Store, saved: Revision<Record<string, any>>): void {
+  const plannedBy = saved.value.plannedBy;
+  const parent = isRef(plannedBy) ? store.get<Record<string, any>>(plannedBy.id, plannedBy.revision) : null;
+  const exact = !!parent && parent.kind === 'research-turn' && canonical(reference(parent)) === canonical(plannedBy);
+  if (!Object.hasOwn(saved.value, 'subject') && !exact) return;
+  let child: V7PlanSubject | null = null, owner: V7PlanSubject | null = null;
+  try { child = planSubjectOf(saved.value); owner = exact ? planSubjectOf(parent!.value) : null; }
+  catch { consumerInvalid(saved.id, 'The queued turn or its planner parent carries a damaged plan subject'); }
+  if (child && (!exact || parent!.value.attemptContract !== ATTEMPT_BINDING_CONTRACT
+    || parent!.value.dispatchMode !== 'planning' || isRef(parent!.value.plannedBy))
+    || !sameSubject(child, owner))
+    consumerInvalid(saved.id, 'The queued turn subject differs from the subject of its exact planner parent');
+}
+
 /** The saved process result is a bounded capture made with the completed turn.
  * Recompute its entire content-addressed value and the turn from exact pending
  * action, queued parent and every saved Source byte; today's files are not a
@@ -936,7 +955,11 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
         || child.value.run !== before.value.run || child.value.number !== before.value.number + index + 1
         || canonical(child.value.action) !== canonical(action.reads[index])
         || canonical(child.value.question) !== canonical(before.value.question)
-        || canonical(child.value.plannedBy) !== canonical(reference(before)))
+        || canonical(child.value.plannedBy) !== canonical(reference(before))
+        // DR3a3-S3: every child carries exactly its planner's subject lineage (none on the field path).
+        || Object.hasOwn(child.value, 'subject') !== Object.hasOwn(before.value, 'subject')
+        || canonical(child.value.subject ?? null) !== canonical(before.value.subject ?? null)
+        || ['attemptContract', 'attempt', 'attemptBinding'].some(field => Object.hasOwn(child.value, field)))
         consumerInvalid(before.id, 'A saved reader child differs from its paid queue position');
     }
     return { kind: 'reading-plan-queued', children: children as Ref[] };
@@ -1103,8 +1126,9 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
     if (Object.hasOwn(saved.value, 'contract') && saved.value.contract === 'research-consumer-turn/v1'
       || Object.hasOwn(saved.value, 'consumerIntent') || Object.hasOwn(saved.value, 'acceptanceContract')
       || Object.hasOwn(saved.value, 'acceptanceBinding')
-      || ['attemptContract', 'subject', 'attempt', 'attemptBinding'].some(field => Object.hasOwn(saved.value, field)))
+      || ['attemptContract', 'attempt', 'attemptBinding'].some(field => Object.hasOwn(saved.value, field)))
       consumerInvalid(saved.id, 'A legacy turn address cannot claim a new consumer producer');
+    queuedChildLineage(store, saved);
     if (saved.value.action?.action === 'read_source' && object(saved.value.observation)
       && Object.hasOwn(saved.value.observation, 'contract')) {
       const before = store.get<Record<string, any>>(saved.id, saved.revision - 1);

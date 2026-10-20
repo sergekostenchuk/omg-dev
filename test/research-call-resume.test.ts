@@ -121,6 +121,63 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
 });
 
 
+// DR3a3-S3 (№7690 §3 S3, №8173): the field-path planned queue is a neighbour of the v7 planner queue — an explicit
+// v7Planning beside planning.fields changes nothing on it, its paid planner and children carry no subject, and a
+// subject forged onto one of its children is refused by the turn reader.
+test('S3 v6 neighbour: explicit v7Planning beside planning.fields leaves the field-path planned queue unchanged; its children carry no subject and a forged subject is refused', async t => {
+  const summaries: unknown[] = [];
+  for (const v7 of [false, true]) {
+    const root = mkdtempSync(join(tmpdir(), 'omg-s3-v6-plan-'));
+    const store = new Store(join(root, 'state.sqlite')), engine = new ProductEngine(store);
+    t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+    preparedFeatures(engine, 'p');
+    for (const name of ['a', 'b']) writeFileSync(join(root, `${name}.txt`), 'Header\nScoped condition\nException\n');
+    const adapter = join(root, 'adapter.mjs');
+    writeFileSync(adapter, `import{readFileSync}from'node:fs';
+const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
+const research=s.role==='reader'?{selections:[{sourceIndex:0,firstLine:2,lastLine:3}],unresolved:[]}
+ :s.dispatchMode==='planning'?{action:'read_plan',question:s.question.id,reads:['a','b'].map(n=>({action:'read_bundle',purpose:n,inputs:[{path:n+'.txt',media:'text/plain'}]}))}
+ :{action:'pause',reason:'Done'};
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+    const command = { executable: process.execPath, args: [adapter] };
+    engine.environments.configure('p', { workspace: root, implementer: { actor: 'author', model: 'fixture', effort: 'high', command },
+      reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 5000 }, 0);
+    const r0 = engine.refinement.begin('p', 'R0'); engine.refinement.finishResearch('p', 'R0', reference(r0), 0);
+    engine.refinement.sealLayer('p', 1, 0);
+    const draft = engine.refinement.begin('p', 'R1'), question = store.get<Question>(draft.value.questions[0]!)!;
+    configureReaderPilot(store, engine.environments, 'p', { experimental: true, active: true, stopAfter: 'L2',
+      reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command }, agentCommand: command,
+      maxCalls: 10, maxReportedTokens: 100000, maxRequestChars: 50000, maxReadChars: 20000, maxReplyChars: 10000,
+      planning: { fields: [question.value.spec.field], maxRequestChars: 50000, maxRounds: 3 },
+      ...(v7 ? { v7Planning: { contract: 'v7-plan-planning/v1' as const, maxRequestChars: 17321, maxRounds: 1 } } : {}) }, 0);
+    const run = await engine.researcher.run('p', draft.id, 4);
+    const turns = store.list<ResearchTurn>('research-turn');
+    const planner = turns.find(turn => turn.id.startsWith('research-turn:v1:') && turn.value.dispatchMode === 'planning');
+    assert.ok(planner, JSON.stringify(run.value));
+    const children = turns.filter(turn => turn.value.plannedBy).sort((a, b) => a.value.number - b.value.number);
+    assert.equal(children.length, 2);
+    assert.equal((planner.value.action as { question?: string }).question, question.id, 'the field plan addresses its Question id');
+    for (const turn of [planner, ...children]) {
+      for (const field of ['subject', 'attemptContract']) assert.equal(Object.hasOwn(turn.value, field), false, field);
+      readResearchConsumerTurn(store, reference(turn));
+    }
+    assert.ok(children.every(child => canonical(child.value.plannedBy) === canonical(reference(store.get(planner.id, 1)!))));
+    // Fixture addresses (Question UUIDs, call ids) differ between the two stores; the compared outcome does not.
+    summaries.push({ status: run.value.status, pauseCode: run.value.pauseCode ?? null,
+      planner: { ...(planner.value.action as object), question: '<own question>' },
+      children: children.map(child => [child.value.number, child.value.action, child.value.status, child.value.error]),
+      calls: store.list<ModelCall>('model-call').map(call => `${call.value.purpose}:${call.value.status}`).sort() });
+    if (v7) {
+      const child = children[0]!;
+      const subject = { contract: V7_PLAN_SUBJECT_CONTRACT, planAnswer: reference(planner), planQuestionId: 'q-forged' };
+      const forged = store.write<ResearchTurn>({ id: child.id, kind: child.kind, expected: child.revision,
+        value: { ...child.value, subject } as ResearchTurn });
+      assert.throws(() => readResearchConsumerTurn(store, reference(forged)), { code: 'research_consumer_intent_invalid' });
+    }
+  }
+  assert.deepEqual(summaries[1], summaries[0], 'an explicit v7Planning does not change the field path');
+});
+
 test('reader reuses exact paid coordinates after restart without a second physical call', async t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-d84-reader-')), database = join(root, 'db.sqlite');
   const stores: Store[] = [], open = () => { const db = new Store(database); stores.push(db); return db; };
