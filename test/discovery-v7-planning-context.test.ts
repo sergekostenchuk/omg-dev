@@ -126,6 +126,11 @@ test("S2 planner transport: a planner context declared by another role, and a da
     "an analyst admission over a planning context");
   assert.match(failure(() => pack(f, p, { ...A, planAnswer: { id: "x" } as unknown as Ref }, "reading-planner")),
     /^research_plan_subject_invalid: /);
+  // S2-01 (codex-omg №8142): a planner context with the final-page controls would receive the attempt-end
+  // instruction of synthesis — a mixed role, refused before any archive.
+  assert.match(failure(() => pack(f, p, A, "reading-planner", { context: { ...callContext(A, true),
+    contextControls: { version: 2, stage: "final", mode: "finalization", remainingLookups: null, instruction: "final" } } })),
+  /^research_capacity_invalid: /);
   assert.equal(f.store.list("research-context").length, archives, "a refused packet saved no archive");
 });
 

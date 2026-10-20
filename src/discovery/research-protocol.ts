@@ -22,7 +22,8 @@ function planSubjectRole(capacityPurpose: unknown, auditPurpose: unknown, contex
   const finalizing = c.contextControls?.mode === 'finalization';
   switch (capacityPurpose) {
     case 'analyst': return auditPurpose === 'analyst' && !session && !['planning', 'consolidation'].includes(mode) && !finalizing;
-    case 'reading-planner': return auditPurpose === 'reading-planner' && mode === 'planning' && !session;
+    // The final page belongs to synthesis alone: a planner never receives the attempt-end instruction.
+    case 'reading-planner': return auditPurpose === 'reading-planner' && mode === 'planning' && !session && !finalizing;
     case 'synthesis': return auditPurpose === 'analyst' && session && !['planning', 'consolidation'].includes(mode);
     case 'consolidation': return auditPurpose === 'analyst' && session && mode === 'consolidation';
     default: return false;
