@@ -1,6 +1,6 @@
 import type { ProductEngine, StageContent } from "./engine.js";
 import {
-  contractEraOf, discoveryOutcome, executionAdmission, isPaidRestoreEra, isPostPreparationForm,
+  contractEraOf, discoveryOutcome, executionAdmission, isPostPreparationForm,
   readDraft, readRecord, readResearchRun, readRun, readStageArtifact, researchRunId, type DiscoveryOutcome, type ResearchRun,
   UPSTREAM_STAGES, type UpstreamStage,
 } from "../discovery/projection-reader.js";
@@ -56,7 +56,7 @@ export class StageResearch {
     const restorePaid = async (): Promise<Revision<ResearchRun> | null> => {
       const runId = researchRunId(project, draftId);
       let restored = readResearchRun(store, project, draftId);
-      if (isPaidRestoreEra(contractEraOf(draft.value)) || restored) {
+      if (restored) {
         try { restored = await researcher.run(project,draftId,1,undefined,{restoreOnly:true}); }
         catch(error) { if(!(error instanceof EngineError)) throw error; restored = readRecord<ResearchRun>(store, runId); }
       }

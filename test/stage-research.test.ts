@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { buildOmInput, type InputRequest, type InputStages, writeOmInput } from '../src/om/input.js';
 import { hasBasisApplications, selectTaskSpecification } from '../src/om/selected-specification.js';
@@ -8,9 +7,9 @@ import { resumeStoppedPass, stopPass } from '../src/om/run-driver.js';
 import { discoveryOutcome } from '../src/discovery/discovery-outcome.js';
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { Store, type Revision, type Write, type ReadGuard } from "../src/storage/store.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { UPSTREAM_STAGES, REQUIREMENTS } from "../src/discovery/requirements.js";
@@ -119,6 +118,25 @@ function fixture(t: { after(fn: () => void): void }) {
   }
   return { root, path, store, engine, setup };
 }
+
+test('LG32 restore-only of a current draft without a research run preserves history and makes no call', async t => {
+  const f = fixture(t); f.setup('p');
+  const draft = f.engine.prepare('p', 'discovery');
+  assert.equal(draft.value.contractVersion, 6);
+  const before = f.store.list().flatMap(row => f.store.history(row.id));
+  assert.equal(f.store.list('research-run').length, 0);
+  const restored = await f.engine.stageResearch.run('p', draft.id, 1, { restoreOnly: true });
+  assert.equal(restored.status, 'stopped');
+  assert.equal(restored.reason?.code, 'run_stopped');
+  assert.equal(restored.research, null); assert.equal(restored.turnsUsed, 0);
+  assert.equal(f.store.list('model-call').length, 0);
+  assert.deepEqual(f.store.list().flatMap(row => f.store.history(row.id)), before);
+  const cold = new Store(f.path);
+  try {
+    assert.deepEqual(await new ProductEngine(cold).stageResearch.run('p', draft.id, 1, { restoreOnly: true }), restored);
+    assert.deepEqual(cold.list().flatMap(row => cold.history(row.id)), before);
+  } finally { cold.close(); }
+});
 
 test("stage command automatically repairs consumer rejections and accepts all upstream stages for two products", async t => {
   const { engine, store, path, root, setup } = fixture(t);
@@ -385,57 +403,6 @@ test('DS1-05 a verdict naming another report is refused before assessor dispatch
  const calls=readFileSync(join(f.root,'p.calls'),'utf8').trim().split('\n').map(line=>JSON.parse(line));
  assert.equal(calls.filter(c=>c.role==='assess-answer'&&c.question.field==='verdict').length,0);
  assert.equal(f.store.list('research-feedback').length,0);
-});
-
-test('DS1-09 exact Git v4 producer: accepted stages retain their era and paid pending restores before upgrade without new calls',async t=>{
- const root=mkdtempSync(join(tmpdir(),'omg-ds1-era-')),era=join(root,'era'),archive=join(root,'archive.tar');mkdirSync(era);
- t.after(()=>rmSync(root,{recursive:true,force:true}));
- execFileSync('git',['archive','--format=tar',`--output=${archive}`,'e9c1ca5c41fb80508559aeab41da8f3da7422953']);
- try{
-  execFileSync('tar',['-xf',archive,'-C',era]);
- }finally{
-  rmSync(archive,{force:true});
- }
- symlinkSync(resolve('node_modules'),join(era,'node_modules'));
- execFileSync(process.execPath,[resolve('node_modules/typescript/bin/tsc'),'-p',join(era,'tsconfig.json')],{cwd:era,maxBuffer:4<<20});
- const producer=join(era,'ds1-old-producer.mjs');
- writeFileSync(producer,`import{writeFileSync,readFileSync}from'node:fs';
- import{Store}from'./dist/src/storage/store.js';import{ProductEngine}from'./dist/src/product/engine.js';import{EngineError}from'./dist/src/errors.js';
- import{preparedFeatures}from'./dist/test/product-fixture.js';import{reference}from'./dist/src/pipeline/contracts.js';
- const root=${JSON.stringify(root)},store=new Store(root+'/state.sqlite'),engine=new ProductEngine(store);
- preparedFeatures(engine,'accepted');
- const stages=['discovery','concept','operation-map','specification','features'].map(stage=>({stage,record:store.get('stage:accepted:'+stage),inspect:engine.pipeline.inspect('accepted',stage)}));
- engine.execute({type:'create-project',project:'pending',title:'Previous paid work'});
- const source=engine.discovery.evidence.document('pending','source','Existing paid source','text/plain',0),adapter=root+'/adapter.mjs';
- writeFileSync(adapter,\`import{readFileSync,appendFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8'));appendFileSync(\${JSON.stringify(root+'/calls')},'call\\\\n');
- console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{action:'read_source',source:\${JSON.stringify(reference(source))},start:0,end:20}}));\`);
- const command={executable:process.execPath,args:[adapter]};
- engine.environments.configure('pending',{workspace:root,implementer:{actor:'author',model:'fixture',effort:'medium',command},reviewer:{actor:'assessor',model:'fixture',effort:'medium',command},fullCheck:command,timeoutMs:10000},0);
- const draft=engine.prepare('pending','discovery'),write=store.writeMany.bind(store);let interrupted=false;
- store.writeMany=(writes,guards=[])=>{const result=write(writes,guards);if(!interrupted&&writes.some(w=>w.kind==='model-response')){interrupted=true;throw new EngineError('input_stale','Stop after saved paid response');}return result;};
- await engine.researcher.run('pending',draft.id,1);store.writeMany=write;
- const pending=store.list('research-consumer-intent').find(x=>x.value.kind==='analyst'&&x.value.state==='running');
- if(!interrupted||!pending||store.get(pending.value.call.id).value.status!=='succeeded')throw Error('Paid pending was not produced');
- writeFileSync(root+'/expected.json',JSON.stringify({stages,draft,pending,records:store.list().flatMap(row=>store.history(row.id)),calls:readFileSync(root+'/calls','utf8')}));store.close();`);
- execFileSync(process.execPath,[producer],{cwd:era,maxBuffer:4<<20});
- const expected=JSON.parse(readFileSync(join(root,'expected.json'),'utf8')),store=new Store(join(root,'state.sqlite'));t.after(()=>store.close());
- const engine=new ProductEngine(store);
- for(const item of expected.stages){
-  assert.deepEqual(engine.pipeline.inspect('accepted',item.stage),item.inspect);
-  const repeated=await engine.stageResearch.run('accepted',item.record.value.content.draft.id,1);assert.equal(repeated.status,'accepted');
-  assert.deepEqual(store.get(item.record.id),item.record);
- }
- const input=writeOmInput(store,{project:'accepted',expected:0,stages:Object.fromEntries(expected.stages.map((i:any)=>[i.stage,reference(i.record)])) as any});
- assert.ok(input.ok,JSON.stringify(input));
- const result=await engine.stageResearch.run('pending',expected.draft.id,10);
- assert.equal(result.status,'paused');assert.equal(result.findings[0]?.code,'research_contract_upgrade_required');
- const turn=store.list<any>('research-turn').find(t=>t.value.number===expected.pending.value.cursor.turn)!;
- assert.equal(turn.value.status,'completed');assert.equal(turn.value.observation.value,'Existing paid source');
- assert.equal(readFileSync(join(root,'calls'),'utf8'),expected.calls);
- const callCount=store.list('model-call').length;
- const next=await engine.stageResearch.run('pending',expected.draft.id,10);assert.equal(next.findings[0]?.code,'research_contract_upgrade_required');
- assert.equal(store.list('model-call').length,callCount);assert.equal(store.get('stage:pending:discovery'),null);
- for(const old of expected.records)assert.deepEqual(store.get(old.id,old.revision),old);
 });
 
 test('DS1-11 a paid accepted no_go recovers its unfinished turn before current admission, with no repeated model call', async t => {

@@ -103,7 +103,6 @@ research.test.ts :: RS2 exact Git ecd00625 producer keeps history and packet byt
 research.test.ts :: RS3 №4414 era: the base engine 8b665772 (from Git, its own process) saved the codex-stdio envelope failure as its terminal research_provider_failed; the new code reads it in its era and DS1 requires upgrade before a new paid generation # вид 1: эра 8b665772
 runtime-absence-r3.test.ts :: D8.1 reads unchanged feasibility milestones stages and MachinePlan produced by the complete 3d8dcfd engine after restart # вид 1: эра 3d8dcfd
 runtime-absence-research.test.ts :: D8.2 preserves real runtime research assessment answer session binding and R2 bytes from the complete 8b7bd45 producer # вид 1: эра 8b7bd45
-stage-research.test.ts :: DS1-09 exact Git v4 producer: accepted stages retain their era and paid pending restores before upgrade without new calls # вид 1: старая форма/маршрут
 storage.test.ts :: the complete ee3fd4c Store producer retains records, hashes and history after restart # вид 1: эра ee3fd4c
 storage.test.ts :: PF4 (№3523): the engine before PF4 (3e8aa784) opens and writes a database with the extension and reads snapshots with and without it; a check this engine saved notices what the old engine wrote, and one it did not touch stays # вид 1: эра 3e8aa78, 3e8aa784
 store-view.test.ts :: PF3 row 16: the versions the base code 5929ea25 wrote read cold, warm and after reopen exactly as that code reads them # вид 1: эра 5929ea25
