@@ -1,7 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, watch } from 'node:fs';
-import { execFileSync, spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -692,6 +692,44 @@ test('D8 observation timeout is durable and replay after restart never repeats t
 });
 
 test('D8 losing the real observer after every persisted boundary recovers without another external action', async t => {
+  const observerExit = async (boundary: string, script: string, timeoutMs = 30_000, executable = process.execPath) => {
+    const started = performance.now(), deadline = started + timeoutMs;
+    const diagnostic: { boundary: string; elapsed: number; exitCode: number | null; signal: NodeJS.Signals | null;
+      error: { name: string; code: string | null; message: string } | null; stderr: string } = {
+      boundary, elapsed: 0, exitCode: null, signal: null, error: null, stderr: '',
+    };
+    const failed = (error: unknown) => {
+      const caught = error instanceof Error ? error : new Error(String(error));
+      diagnostic.error ??= { name: caught.name, code: 'code' in caught && typeof caught.code === 'string' ? caught.code : null, message: caught.message };
+    };
+    const deadlineError = { name: 'Error', code: 'observer_deadline', message: `Observer did not close within ${timeoutMs} ms` };
+    let child: ChildProcess;
+    try { child = spawn(executable, ['--input-type=module', '-e', script], { stdio: ['ignore', 'ignore', 'pipe'] }); }
+    catch (error) { failed(error); diagnostic.elapsed = performance.now() - started; return diagnostic; }
+    // One deadline covers startup and the actual exit, not just the persisted write.
+    // Await close even after an error/deadline: the killed observer must be reaped
+    // before its Store is reopened or the fixture is removed.
+    await new Promise<void>(resolve => {
+      child.stderr!.setEncoding('utf8');
+      child.stderr!.on('data', (chunk: string) => { diagnostic.stderr += chunk; });
+      child.once('error', failed);
+      const timer = setTimeout(() => {
+        diagnostic.error ??= deadlineError;
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        // A descendant retaining stderr must not keep close pending after the
+        // observer's exit. Bytes collected before the deadline remain diagnostic.
+        child.stderr!.destroy();
+      }, Math.max(0, deadline - performance.now()));
+      child.once('close', (exitCode, signal) => {
+        clearTimeout(timer);
+        diagnostic.exitCode = exitCode; diagnostic.signal = signal;
+        diagnostic.elapsed = performance.now() - started;
+        if (performance.now() >= deadline) diagnostic.error ??= deadlineError;
+        resolve();
+      });
+    });
+    return diagnostic;
+  };
   for (const boundary of ['admitted', 'snapshot', 'child', 'observed']) {
     const f = fixture(t), request = { type: 'observe-runtime', project: f.project, scope: reference(f.ledger.record),
       obligation: selector(f.obligations[0]!), key: 'crash-boundary' };
@@ -703,8 +741,10 @@ if(record){const value=record.value;const selected=boundary==='admitted'?value.s
 boundary==='snapshot'?value.status==='running'&&value.snapshot!==null&&value.child===null:
 boundary==='child'?value.status==='running'&&value.child!==null:value.status==='observed';if(selected)process.exit(77);}return saved;};
 await new ProductEngine(store).execute(${JSON.stringify(request)});throw Error('The observer missed its persisted boundary');`;
-    const child = spawnSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 10_000 });
-    assert.equal(child.status, 77, `${boundary}: ${child.stderr}`);
+    const child = await observerExit(boundary, script), diagnostic = JSON.stringify(child);
+    assert.equal(child.error, null, diagnostic);
+    assert.equal(child.signal, null, diagnostic);
+    assert.equal(child.exitCode, 77, diagnostic);
     f.reopen(); const persisted = f.store.list<RuntimeObservation>('runtime-observation')[0]!;
     assert.ok(persisted); if (persisted.value.snapshot) t.after(() => rmSync(persisted.value.snapshot!, { recursive: true, force: true }));
     const before = existsSync(f.marker) ? readFileSync(f.marker, 'utf8') : '';
@@ -746,6 +786,27 @@ await new ProductEngine(store).execute(${JSON.stringify(request)});throw Error('
     assert.equal(readFileSync(f.marker, 'utf8'), before + 'executed\n');
     assert.equal(f.store.get<{ serial: number }>(`project-dispatch:${hashJson(f.project)}`)!.value.serial, 2);
   }
+  await t.test('observer deadline kills and reaps the child with complete diagnostics', async () => {
+    const result = await observerExit('deadline-probe', 'setInterval(() => {}, 1000)', 50), diagnostic = JSON.stringify(result);
+    assert.equal(result.boundary, 'deadline-probe'); assert.ok(result.elapsed >= 0);
+    assert.equal(result.exitCode, null, diagnostic); assert.equal(result.signal, 'SIGKILL', diagnostic);
+    assert.equal(result.error?.code, 'observer_deadline', diagnostic); assert.equal(typeof result.stderr, 'string');
+  });
+  await t.test('observer unexpected exit retains its code and stderr', async () => {
+    const result = await observerExit('exit-probe', "console.error('observer diagnostic probe');process.exit(78)"), diagnostic = JSON.stringify(result);
+    assert.equal(result.boundary, 'exit-probe'); assert.equal(result.exitCode, 78, diagnostic);
+    assert.equal(result.signal, null, diagnostic); assert.equal(result.error, null, diagnostic);
+    assert.match(result.stderr, /observer diagnostic probe/); assert.ok(result.elapsed >= 0);
+  });
+  await t.test('observer spawn failure retains its error and cannot report success', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'omg-observer-missing-'));
+    try {
+      const result = await observerExit('spawn-probe', '', 30_000, join(directory, 'absent-node')), diagnostic = JSON.stringify(result);
+      assert.equal(result.boundary, 'spawn-probe'); assert.notEqual(result.exitCode, 77, diagnostic);
+      assert.equal(result.signal, null, diagnostic); assert.equal(result.error?.code, 'ENOENT', diagnostic);
+      assert.ok(result.elapsed >= 0); assert.equal(result.stderr, '');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
 });
 
 test('D8 changing every consumer guard through a second Store prevents partial acceptance and leaves frozen history readable', async t => {
