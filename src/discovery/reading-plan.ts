@@ -126,43 +126,86 @@ export function queuedChildReached(store: Store, stored: unknown, current: Revis
   return true;
 }
 
-/** DR3a3-S3-01: the queue origin of one turn under its exact planner parent —
- * the writer's own derivation, read back: an original child is the parent's
- * read at its derived position, a split part is named by the recorded
- * splitInto of its split child, and every revision of the turn keeps one
- * basis and lineage. Returns the original child's first revision, or null. */
+/** DR3a3-S3-02: the revisions of one queued turn, read back as its writers
+ * made them — every transition is either the completion of a pending revision
+ * (only status, assessment, observation and error change) or the lawful retry
+ * of a failed one (exactly projectPlannedRetry). Returns the first revision. */
+function queuedTurnChain(store: Store, turn: Revision<ResearchTurn>): Revision<ResearchTurn> | null {
+  const revisions: Revision<ResearchTurn>[] = [];
+  for (let revision = 1; revision <= turn.revision; revision += 1) {
+    const step = store.get<ResearchTurn>(turn.id, revision);
+    if (step?.kind !== "research-turn" || hashJson(step.value) !== step.hash) return null;
+    revisions.push(step);
+  }
+  if (revisions.at(-1)?.hash !== turn.hash) return null;
+  const basis = (value: ResearchTurn) => {
+    const { status: _status, assessment: _assessment, observation: _observation, error: _error, ...rest } = value;
+    return canonical(rest);
+  };
+  for (let index = 1; index < revisions.length; index += 1) {
+    const before = revisions[index - 1]!, after = revisions[index]!;
+    const completion = before.value.status === "pending" && after.value.status === "completed" && basis(after.value) === basis(before.value);
+    const retry = before.value.status === "completed" && Boolean(before.value.error)
+      && canonical(after.value) === canonical(projectPlannedRetry(before, reference(before)));
+    if (!completion && !retry) return null;
+  }
+  return revisions[0]!;
+}
+/** The two pages splitPlannedContextRead derives from one context read: the
+ * same read with only its page changed, halves of the source range in order. */
+function lawfulSplitPages(source: ResearchAction, parts: ResearchAction[]): boolean {
+  const page = (action: ResearchAction) => (action as { page?: { offset?: unknown; limit?: unknown } }).page;
+  const withoutPage = (action: ResearchAction) => { const { page: _page, ...rest } = action as { page?: unknown }; return canonical(rest); };
+  if (source.action !== "read_context" || parts.length !== 2) return false;
+  const pages = parts.map(page);
+  if (!parts.every(part => part.action === "read_context" && withoutPage(part) === withoutPage(source))
+    || !pages.every(item => item && Object.keys(item).sort().join(",") === "limit,offset"
+      && Number.isSafeInteger(item.offset) && Number(item.offset) >= 0 && Number.isSafeInteger(item.limit) && Number(item.limit) > 0))
+    return false;
+  const [first, second] = pages as { offset: number; limit: number }[];
+  const sourceLimit = page(source)?.limit;
+  return first!.offset === (Number(page(source)?.offset ?? 0)) && second!.offset === first!.offset + first!.limit
+    && first!.limit === Math.ceil((first!.limit + second!.limit) / 2)
+    && (sourceLimit === undefined || first!.limit + second!.limit <= Number(sourceLimit));
+}
+/** DR3a3-S3-01/02: the queue origin of one turn under its exact planner parent
+ * — the writers' own derivation, read back. An original child is exactly the
+ * queue projector's child at its derived position; a split part is exactly
+ * splitPlannedContextRead's part of a lawfully divided member, the same read
+ * with a lawful page; every revision follows a lawful completion or retry.
+ * Returns the original child's first revision, or null. */
 export function queueOriginOf(store: Store, turn: Revision<ResearchTurn>, parent: Revision<ResearchTurn>,
   seen = new Set<string>()): Ref | null {
   if (seen.has(turn.id)) return null; seen.add(turn.id);
   const plan = parent.value.action as Extract<ResearchAction, { action: "read_plan" }>;
   if (plan?.action !== "read_plan" || !Array.isArray(plan.reads) || turn.kind !== "research-turn") return null;
-  const basis = (value: ResearchTurn) => canonical({ run: value.run, number: value.number, question: value.question,
-    action: value.action, plannedBy: value.plannedBy ?? null, splitFrom: value.splitFrom ?? null, lineage: lineage(value) });
-  const first = store.get<ResearchTurn>(turn.id, 1);
-  if (first?.kind !== "research-turn" || hashJson(first.value) !== first.hash || first.value.status !== "pending"
-    || canonical(first.value.plannedBy) !== canonical(reference(parent)) || first.value.run !== parent.value.run) return null;
-  for (let revision = 2; revision <= turn.revision; revision += 1) {
-    const step = store.get<ResearchTurn>(turn.id, revision);
-    if (step?.kind !== "research-turn" || hashJson(step.value) !== step.hash || basis(step.value) !== basis(first.value)) return null;
-  }
-  if (store.get(turn.id, turn.revision)?.hash !== turn.hash) return null;
+  const first = queuedTurnChain(store, turn);
+  if (!first || first.value.status !== "pending") return null;
   const split = first.value.splitFrom;
   if (!isRef(split)) {
     const index = plan.reads.findIndex((_, i) => turn.id === `research-turn:${hashJson([parent.id, "read", i])}`);
-    return index >= 0 && canonical(plan.reads[index]) === canonical(first.value.action)
-      && first.value.number === parent.value.number + index + 1 ? reference(first) : null;
+    const expected: ResearchTurn = { run: parent.value.run, number: parent.value.number + index + 1, action: plan.reads[index]!,
+      assessment: null, observation: null, error: null, status: "pending", question: parent.value.question,
+      plannedBy: reference(parent), ...(Object.hasOwn(parent.value, "subject") ? { subject: parent.value.subject } : {}) };
+    return index >= 0 && canonical(first.value) === canonical(expected) ? reference(first) : null;
   }
   const source = store.get<ResearchTurn>(split.id, split.revision);
   const divided = store.get<ResearchTurn>(split.id, split.revision + 1);
   const into = (divided?.value.observation as { splitInto?: unknown } | null)?.splitInto;
-  const index = Array.isArray(into) ? into.findIndex(ref => canonical(ref) === canonical(reference(first))) : -1;
-  return source?.kind === "research-turn" && source.hash === split.hash && source.value.status === "pending"
-    && divided?.kind === "research-turn" && hashJson(divided.value) === divided.hash
-    && divided.value.status === "completed" && !divided.value.error && index >= 0
-    && turn.id === `research-turn:${hashJson([split, index, first.value.action])}`
-    && canonical(first.value.replayedFrom) === canonical(split)
-    && canonical(first.value.question) === canonical(source.value.question) && lineage(first.value) === lineage(source.value)
-    ? queueOriginOf(store, source, parent, seen) : null;
+  if (source?.kind !== "research-turn" || source.hash !== split.hash || source.value.status !== "pending"
+    || divided?.kind !== "research-turn" || hashJson(divided.value) !== divided.hash
+    || !Array.isArray(into) || into.length !== 2 || !into.every(isRef)
+    || canonical(divided.value) !== canonical({ ...source.value, status: "completed", error: null,
+      observation: { splitInto: into, reason: "context_read_limit" } })) return null;
+  const parts = (into as Ref[]).map(ref => store.get<ResearchTurn>(ref.id, ref.revision));
+  const index = (into as Ref[]).findIndex(ref => canonical(ref) === canonical(reference(first)));
+  if (index < 0 || !parts.every((part, i) => part?.kind === "research-turn" && part.hash === (into as Ref[])[i]!.hash
+      && part.id === `research-turn:${hashJson([split, i, part.value.action])}`
+      && canonical(part.value) === canonical({ ...source.value, number: part.value.number, action: part.value.action,
+        status: "pending", error: null, observation: null, replayedFrom: split, splitFrom: split }))
+    || parts[1]!.value.number !== parts[0]!.value.number + 1 || parts[0]!.value.number <= source.value.number
+    || !lawfulSplitPages(source.value.action as ResearchAction, parts.map(part => part!.value.action as ResearchAction))) return null;
+  return queueOriginOf(store, source, parent, seen);
 }
 
 /** The parts of one split child: each keeps the child's exact run, Question,
