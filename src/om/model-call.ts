@@ -3081,6 +3081,51 @@ export function readManagedModelDiagnostic(store: Store, binding: Revision<Compl
   ModelCallResult<Sealed<{ reason: FinishModelAttemptRequest['reason']; request: FinishModelAttemptRequest }>> {
   return result(() => deriveManagedModelDiagnostic(store, binding, ref));
 }
+/** Admission of an E4 into a NEW G7 claim. Saved closes keep their trusted reader above. */
+export function checkManagedModelDiagnostic(store: Store, snapshot: CompletionSnapshot, ref: Ref):
+  ModelCallResult<Sealed<{ reason: FinishModelAttemptRequest['reason']; request: FinishModelAttemptRequest }>> {
+  return result(() => {
+    const binding = snapshot.binding, project = binding.value.project;
+    const record = take(readRecord<UnitRefusalRecord>(store, ref, { unit: 'E4', target: ref.id,
+      kind: UNIT_REFUSAL_KIND, idPrefix: `${unitRefusalNamespace(project)}e4:` }));
+    const value = record.value;
+    if (!object(value) || value.gate !== 'E4' || !Array.isArray(value.refusals) || !value.refusals.length
+      || value.refusals.some(row => !object(row) || !text(row.code) || !text(row.goal) || !text(row.remedy)
+        || !object(row.origin) || !text(row.origin.stage) || !Array.isArray(row.origin.sources)
+        || row.origin.sources.some(source => !object(source) || typeof source.role !== 'string' || !['packet', 'call', 'response', 'evidence'].includes(source.role)
+          || !isRef(source.ref))))
+      fail('completion_invalid', ref.id, 'diagnostic', 'An E4 claim needs a complete terminal diagnostic', ref);
+    const first = record.value.refusals[0]!, sources = first.origin.sources;
+    for (const role of ['packet', 'call', 'response'] as const) {
+      const count = sources.filter(source => source.role === role).length;
+      if (role === 'response' ? count > 1 : count !== 1)
+        fail('completion_invalid', ref.id, role, `An E4 terminal names ${role === 'response' ? 'at most' : 'exactly'} one ${role}`, ref);
+    }
+    if (!['model-call:refused', 'model-call:off-form', 'model-call:interrupted', 'model-call:awaiting-owner'].includes(first.origin.stage))
+      fail('completion_invalid', ref.id, 'reason', 'An E4 diagnostic names a supported terminal reason', ref);
+    const proof = deriveManagedModelDiagnostic(store, binding, ref), request = proof.request;
+    requirePacketOfAttempt(store, binding, request.packet);
+    const assigned = packetCompletionAssignments(store, binding, request.packet);
+    if (!snapshot.assignments.some(row => same(reference(row), reference(assigned.selected))))
+      fail('completion_foreign', ref.id, 'assignment', 'The E4 must belong to an exactly registered step of this work', ref);
+    checkedAssignmentCall(store, binding, assigned.selected, request.packet, request.call);
+    const response = request.response ? take(readPacketResponse(store, { project, packet: request.packet, call: request.call, response: request.response })) : null;
+    const exchange = request.evidence!.filter(source => store.get(source.id, source.revision)?.kind === EXCHANGE_KIND);
+    if (exchange.length) {
+      if (exchange.length !== 1) fail('completion_invalid', ref.id, 'exchange', 'A terminal has one exact physical exchange', ref);
+      const saved = take(readRecord<ModelExchange>(store, exchange[0]!, { unit: 'E4', target: ref.id, kind: EXCHANGE_KIND, id: exchange[0]!.id }));
+      requireModelRequest(store, saved.value.request);
+      const { transport } = checkedModelExchange(store, saved.value.request, request.call, exchange[0]!);
+      if (transport.kind === 'answered' ? !response || response.record.value.raw !== transport.raw : response !== null)
+        fail('completion_invalid', ref.id, 'response', 'The terminal retains exactly the response its physical exchange received', ref);
+    }
+    // The same producer proves the terminal reason and every marker, including all goals and source roles.
+    const expected = modelFinishDiagnostic(store, request, binding);
+    if (!same(writeRef(expected), ref) || !same(expected.value, value))
+      fail('completion_invalid', ref.id, 'diagnostic', 'All E4 markers must reproduce the exact terminal of this registered call', ref);
+    return proof;
+  });
+}
 /** The physical E1 stores a fingerprint, while registration carries the actual body. */
 function completionCallPacket(store: Store, project: string, request: AnyRecordCallRequest | AnyCallRecord): Ref {
   const candidates = store.list<QuestionPacketRecord>('question-packet').filter(record => record.value.project === project

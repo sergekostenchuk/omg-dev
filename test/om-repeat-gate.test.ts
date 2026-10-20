@@ -40,7 +40,7 @@ import { assessFact, assessmentAttemptReason, assessmentRefusalId,
   readAssessmentSet, readCurrentAssessmentAttemptClosure, ASSESSMENT_RESULT_KIND,
   type AssessmentIntentRequest, type AssessmentResultRecord } from "../src/om/assessment.js";
 import {
-  classifyRefusal, journalId, normalizeOriginSource, originSourceKey, recordRefusal, unitRefusalNamespace,
+  classifyRefusal, journalId, normalizeOriginSource, originSourceKey, readJournal, recordRefusal, unitRefusalNamespace,
   REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND, type RefusalJournal, type OriginSource,
 } from "../src/om/refusal-journal.js";
 import {
@@ -4379,7 +4379,7 @@ function lp6Gate(t: test.TestContext) {
     restart() { store.close(); store = new Store(database); },
     sent(): unknown[] { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; },
     head: () => store.get<RepairSeries>(`repair-series:${project}:1:${block}`)!,
-    async round(ordinal: number, answers: readonly Lp6Answer[]) {
+    async round(ordinal: number, answers: readonly Lp6Answer[], fixedGoal?: AttemptGoal) {
       const routes = routesNow();
       // Today's joined routing puts every open input field of the block in ONE batch: a field answer covers the whole
       // batch — the named field by its own value, the rest by the fixture's — exactly as several E4s did on the split route.
@@ -4390,7 +4390,7 @@ function lp6Gate(t: test.TestContext) {
       assert.ok(batches.every(Boolean), "M6 gives the block every named batch");
       const sends = batches.map(batch => ({ batch, answers: answers.filter(answer => batchOf(answer) === batch) }));
       const items = batches.flatMap(batch => batch.items);
-      const goal: AttemptGoal = { key: `lp6:${ordinal}:${answers.map(answer => answer.field).join("+")}`,
+      const goal: AttemptGoal = fixedGoal ?? { key: `lp6:${ordinal}:${answers.map(answer => answer.field).join("+")}`,
         questions: items.map(item => gapLineKey(project, item.target, item.field)).sort(), result: gapLineExpectedResult(project, items[0]!.target, items[0]!.field) };
       const series = deliveredOf(openAttempt(store, { ...address, attempt: ordinal, goal,
         completion: { routes: reference(routes), batches: batches.map(batch => batch.id).sort() } } as never));
@@ -4717,4 +4717,116 @@ test("G6.2 a G5 finding of the candidate is the derivation's, addressed to the a
   deliveredOf(openAttempt(store, { ...address("c2"), attempt: 1, goal: goal() }));
   addressed(refusalOf(closeAttempt(store, { ...address("c2"), attempt: 1, outcome: refusedBy(orphan) })), "origin_unreadable", at("c2"));
   assert.equal(store.list(ORIGIN_HOLD_KIND).length, 0);
+});
+
+
+test("G7FIX a new close cannot claim the real E4 terminal of another managed attempt with the same full goal", async t => {
+  const f = lp6Gate(t), first = await f.round(1, [{ field: "nodes", cannot: "No evidence" }]);
+  const original = deliveredOf(f.claim(1)).outcome;
+  deliveredOf(f.close(1, original));
+  await f.round(2, [{ field: "nodes", cannot: "Still no evidence" }], first.goal);
+  const own = deliveredOf(f.claim(2)).outcome;
+  const claim = { ...own, refusals: [...own.refusals, ...original.refusals] };
+  const request = { ...f.address, attempt: 2, outcome: claim };
+  const before = mechanismSnapshot(f.store);
+  for (const result of [prepareManagedClaim(f.store, request), prepareCloseAttempt(f.store, request), closeAttempt(f.store, request)]) {
+    const issue = refusalOf<unknown>(result);
+    assert.deepEqual([issue.code, issue.at.unit, issue.at.field], ["completion_foreign", "E4", "packet"]);
+  }
+  assert.deepEqual(mechanismSnapshot(f.store), before, "No journal classification, close, series or work was written");
+  const journal = deliveredOf(readJournal(f.store, { project: f.project }));
+  const diagnosticOf = (claim: ClaimedRefusal) => journal.value.rows.find(row => row.id === claim.row)!.source;
+  const oldValue = f.store.get(diagnosticOf(original.refusals[0]!).id)!.value as unknown as {
+    refusals: { origin: { sources: { role: string; ref: Ref }[] } }[] };
+  for (const role of ["call", "response"] as const) {
+    const value = structuredClone(f.store.get(diagnosticOf(own.refusals[0]!).id)!.value) as unknown as {
+      gate: string; refusals: { origin: { sources: { role: string; ref: Ref }[] } }[] };
+    const foreign = oldValue.refusals[0]!.origin.sources.find(row => row.role === role)!;
+    for (const row of value.refusals) row.origin.sources = row.origin.sources.map(source => source.role === role ? foreign : source);
+    const diagnostic = f.store.write({ id: `${unitRefusalNamespace(f.project)}e4:${hashJson(value as unknown as Json)}`,
+      kind: UNIT_REFUSAL_KIND, expected: 0, value: value as unknown as Json });
+    const rows = deliveredOf(recordRefusal(f.store, { project: f.project, source: reference(diagnostic) })).value.rows
+      .filter(row => row.source.id === diagnostic.id).map(row => ({ row: row.id, name: row.code, goal: row.goal }));
+    const invalid = { ...request, outcome: { ...own, refusals: [...own.refusals, ...rows] } };
+    const unchanged = mechanismSnapshot(f.store);
+    for (const result of [prepareManagedClaim(f.store, invalid), prepareCloseAttempt(f.store, invalid), closeAttempt(f.store, invalid)]) {
+      const issue = refusalOf<unknown>(result);
+      assert.deepEqual([issue.code, issue.at.unit, issue.at.field], role === "call"
+        ? ["completion_foreign", "E4", "call"] : ["record_foreign", "E2", "id"], `foreign ${role}`);
+    }
+    assert.deepEqual(mechanismSnapshot(f.store), unchanged);
+  }
+  deliveredOf(f.close(2, own));
+  const closed = mechanismSnapshot(f.store);
+  f.restart();
+  assert.deepEqual(deliveredOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 2, outcome: own })).writes, []);
+  deliveredOf(f.close(2, own));
+  assert.deepEqual(mechanismSnapshot(f.store), closed, "Cold exact repeats keep the saved close");
+});
+
+test("G7FIX incomplete or contradictory E4 markers give addressed refusals on complete work without partial writes", async t => {
+  const f = lp6Gate(t);
+  await f.round(1, [{ field: "nodes", cannot: "No evidence" }]);
+  const own = deliveredOf(f.claim(1)).outcome;
+  const journal = deliveredOf(readJournal(f.store, { project: f.project }));
+  const source = journal.value.rows.find(row => row.id === own.refusals[0]!.row)!.source;
+  type Diagnostic = { gate: string; refusals: { code: string; goal: string; remedy: string;
+    origin: { name: string; stage: string; subject: string; sources: { role: string; ref: Ref }[] } }[] };
+  const original = f.store.get<Diagnostic>(source.id, source.revision)!.value;
+  const cases: [string, string, (value: Diagnostic) => void][] = [
+    ["missing packet", "packet", value => { value.refusals[0]!.origin.sources = value.refusals[0]!.origin.sources.filter(row => row.role !== "packet"); }],
+    ["missing call", "call", value => { value.refusals[0]!.origin.sources = value.refusals[0]!.origin.sources.filter(row => row.role !== "call"); }],
+    ["missing response", "response", value => { value.refusals[0]!.origin.sources = value.refusals[0]!.origin.sources.filter(row => row.role !== "response"); }],
+    ["duplicate packet", "packet", value => { value.refusals[0]!.origin.sources.push(value.refusals[0]!.origin.sources.find(row => row.role === "packet")!); }],
+    ["contradictory subject", "diagnostic", value => { value.refusals[0]!.origin.subject = "foreign-call"; }],
+    ["contradictory goal markers", "diagnostic", value => { assert.ok(value.refusals.length > 1); value.refusals[1]!.remedy = "Another terminal"; }],
+    ["unsupported terminal", "reason", value => { value.refusals[0]!.origin.stage = "model-call:invented"; }],
+  ];
+  for (const [label, field, change] of cases) {
+    const value = structuredClone(original) as Diagnostic;
+    change(value);
+    const record = f.store.write({ id: `${unitRefusalNamespace(f.project)}e4:${hashJson(value as unknown as Json)}`,
+      kind: UNIT_REFUSAL_KIND, expected: 0, value: value as unknown as Json });
+    const rows = deliveredOf(recordRefusal(f.store, { project: f.project, source: reference(record) })).value.rows
+      .filter(row => row.source.id === record.id).map(row => ({ row: row.id, name: row.code, goal: row.goal }));
+    const request = { ...f.address, attempt: 1, outcome: { ...own, refusals: [...own.refusals, ...rows] } };
+    const before = mechanismSnapshot(f.store);
+    for (const result of [prepareManagedClaim(f.store, request), prepareCloseAttempt(f.store, request), closeAttempt(f.store, request)]) {
+      const issue = refusalOf<unknown>(result);
+      assert.deepEqual([issue.code, issue.at.unit, issue.at.target, issue.at.field], ["completion_invalid", "E4", record.id, field], label);
+    }
+    assert.deepEqual(mechanismSnapshot(f.store), before, label);
+  }
+  deliveredOf(f.close(1, own));
+});
+
+test("G7FIX own semantic and technical E4 terminals remain admissible and unknown G4 still raises its hold", async t => {
+  for (const terminal of ["refused", "awaiting-owner", "off-form", "interrupted"] as const) {
+    const f = m5Fixture(t, true);
+    f.steps([terminal === "refused" ? { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: f.batch.items.map(item => item.gap), action: "cannot_answer", reason: "No evidence" }, usage: lp6Usage }
+      : terminal === "awaiting-owner" ? { research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: f.batch.items.map(item => item.gap), action: "need_owner", reason: "Owner needed", decision: "Decide it" }, usage: lp6Usage }
+      : terminal === "off-form" ? { research: {}, usage: lp6Usage } : { rawStdout: "", exitCode: 3 }]);
+    deliveredOf(await runModelCall(f.store, f.call()));
+    const request = { ...f.address, attempt: 1, outcome: deliveredOf(prepareManagedClaim(f.store, { ...f.address, attempt: 1,
+      outcome: outcome() })).outcome };
+    assert.equal(request.outcome.reason, terminal);
+    deliveredOf(closeAttempt(f.store, request));
+    const before = mechanismSnapshot(f.store);
+    f.restart();
+    assert.deepEqual(deliveredOf(prepareCloseAttempt(f.store, request)).writes, []);
+    deliveredOf(closeAttempt(f.store, request));
+    assert.deepEqual(mechanismSnapshot(f.store), before);
+  }
+  const f = lp6Gate(t), round = await f.round(1, [{ field: "nodes", cannot: "No evidence" }]);
+  const unknown = journalled(f.store, f.project, { stage: "question-packet", subject: "unknown-subject",
+    sources: [{ role: "input", ref: reference(f.store.get(`om-input:${f.project}`)!) }] }, { gate: "G4", code: "unknown-origin" });
+  const own = deliveredOf(f.claim(1)).outcome;
+  const result = deliveredOf(f.close(1, { ...own, refusals: [...own.refusals, unknown] }));
+  assert.equal(result.holds.length, 1);
+  const row = result.routed.find(row => row.row === unknown.row)!;
+  assert.deepEqual([row.class, row.toModel], ["unknown", false]);
+  const saved = f.saved(1), binding = deliveredOf(readCompletionBinding(f.store, f.project, saved.series, 1))!;
+  const before = mechanismSnapshot(f.store);
+  assert.equal(refusalOf(openAttempt(f.store, { ...f.address, attempt: 2, goal: round.goal, completion: binding.value.plan } as never)).code, "origin_held");
+  assert.deepEqual(mechanismSnapshot(f.store), before);
 });

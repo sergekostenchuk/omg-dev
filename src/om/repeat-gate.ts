@@ -1736,7 +1736,7 @@ function requestOf(address: Address): AnySeriesRequest {
 import { completionWorkId, completionCloseId, COMPLETION_CLOSE_KIND, COMPLETION_WORK_KIND, ATTEMPT_PROGRESS_CONTRACT,
   readCompletionBinding, readCompletionOwnerAt, prepareManagedCompleteAttempt,
   type CompletionWork, type ManagedClosure, type ClaimedOutcome, type AdministrativeEnd, type AttemptProgress } from './series.js';
-import { readCompletionEffectiveAt, readManagedModelDiagnostic, checkCompletionLedger, pendingCallStore,
+import { readCompletionEffectiveAt, readManagedModelDiagnostic, checkManagedModelDiagnostic, checkCompletionLedger, pendingCallStore,
   completionClosedWork, prepareCompletionProducts, readModelCallState, modelCallRecordId, readCompletionAreaInput,
   COMPLETION_CESSATION_KIND, COMPLETION_FINALIZATION_KIND, AREA_INPUT_VARIANT,
   type CompletionCessation, type CompletionFinalization, type CompletionSnapshot } from './model-call.js';
@@ -2130,7 +2130,7 @@ function closeInput(close: Sealed<CompletionCloseRecord> | CompletionCloseRecord
     ...(close.contract === 'om-completion-close/v2' ? { progress: ATTEMPT_PROGRESS_CONTRACT } : {}) };
 }
 function deriveManagedClose(store: Store, input: ManagedCloseInput, final = true) {
-  const derived = deriveManagedOutcome(store, input), { reason, confirmed, classifications, journal, series, owner, snapshot } = derived;
+  const derived = deriveManagedOutcome(store, input, !final), { reason, confirmed, classifications, journal, series, owner, snapshot } = derived;
   if (reason === null || input.claim.reason !== reason)
     managedFail(owner.series.id, 'reason', 'The reason must follow the full proved composition, without hiding local outcomes', 'completion_reason_invalid');
   if (final) for (const row of classifications) {
@@ -2147,7 +2147,7 @@ function deriveManagedClose(store: Store, input: ManagedCloseInput, final = true
   return { value, snapshot, routed: derived.routed, classifications, rows: derived.rows, address: derived.address, guards: confirmed.guards ?? [] };
 }
 /** Everything a managed close derives before its reason is compared: the one formula for the close and the claim preparer (H1). */
-function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
+function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput, newClaim = false) {
   const closure: ManagedClosure = { binding: input.binding, work: input.work, additions: input.additions, journal: input.journal,
     ...(input.progress === undefined ? {} : { progress: input.progress }) };
   const snapshot = managedTake(checkManagedCompletionClaims(store, input.project, closure, input.claim.accepting, input.claim.refusals));
@@ -2175,6 +2175,7 @@ function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
   const journal = input.journal ? managedTake(readJournalAt(store, input.project, input.journal)) : null;
   const rows = new Map(journal?.value.rows.map(row => [row.id, row]) ?? []);
   const routed: RoutedRefusal[] = [], classifications: RefusalClassification[] = [];
+  const diagnostics = new Map<string, ReturnType<typeof readManagedModelDiagnostic>>();
   let subject = false;
   for (const claim of input.claim.refusals) {
     const row = rows.get(claim.row);
@@ -2190,7 +2191,10 @@ function deriveManagedOutcome(store: Store, input: ManagedOutcomeInput) {
       classified = { row: row.id, class: 'proposal', addressee: `node:${proof.target}`, basis: [{ role: 'assessment', ref: reference(proof.result) }] };
       subject = true;
     } else if (row.gate === 'E4') {
-      const proof = managedTake(readManagedModelDiagnostic(store, snapshot.binding, row.source));
+      const key = canonical(row.source);
+      if (!diagnostics.has(key)) diagnostics.set(key, newClaim ? checkManagedModelDiagnostic(store, snapshot as CompletionSnapshot, row.source)
+        : readManagedModelDiagnostic(store, snapshot.binding, row.source));
+      const proof = managedTake(diagnostics.get(key)!);
       const semantic = proof.reason === 'refused';
       subject ||= semantic;
       classified = { row: row.id, class: semantic ? 'proposal' : 'conditions',
@@ -2344,7 +2348,7 @@ export function prepareManagedClaim(store: Store, request: AnyCloseAttemptReques
       const refusals = unique([...snapshot.refusals, ...request.outcome.refusals], row => row.row);
       const claim = { accepting, cancelling: [...request.outcome.cancelling], refusals };
       const derived = deriveManagedOutcome(store, { project: request.project, binding: heads.binding, work: closure.work, additions: [],
-        series: reference(heads.series), ledger: heads.ledger, journal: heads.journal, claim, ...era });
+        series: reference(heads.series), ledger: heads.ledger, journal: heads.journal, claim, ...era }, true);
       if (derived.reason === null) managedFail(heads.series.id, 'reason',
         'The composition is complete but no proved ground closes it yet: the pause stands with its producer or control', 'completion_reason_invalid');
       return { outcome: completionClaim({ reason: derived.reason, ...claim }),
