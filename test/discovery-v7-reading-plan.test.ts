@@ -191,57 +191,96 @@ test("S3 split and retry keep the exact parent, Question and subject; the retry 
     "every revision of the retry chain keeps the subject");
 });
 
-test("S3-02 queue origin: only the writers' own chain — original child, completion, lawful retry and lawful split — keeps the origin", t => {
+test("S3-02/03 queue origin: only the writers' own chain — original child, completion, no-progress pause, lawful retry and the exact split of the historical bytes — keeps the origin", t => {
   // The runner's positions: the paid planner is turn 1, its queue is written at run.turns=1 and a split at 2.
   const f = fixture(t), p = planned(f, "s3-origin"), run = runOf(p, 2);
   const A = subjectOf(p.planAnswer, "q-supply");
-  const contextRead = { action: "read_context", record: reference(p.plan), pointer: "/answer" } as ResearchAction;
+  // The material of the read: an exact archived record of ten characters (in memory, structural input only).
+  // A whole-body archive keeps its body as an object (readArchiveBody); the read selects a string inside it.
+  const material = memo("research-context:s3-material", "research-context", 1, { body: { text: "abcdefghij" } });
+  const contextRead = { action: "read_context", record: reference(material), pointer: "/body/text", page: { offset: 0, limit: 10 } } as ResearchAction;
   const parent = plannerTurn(p, runOf(p, 0), intentRef, A, readPlan("q-supply", [contextRead]));
   const queued = projectReadingQueue(runOf(p, 1), parent, p.plan, readPlan("q-supply", [contextRead]))[0]!;
   const original = memo<ResearchTurn>(queued.id, "research-turn", 1, queued.value);
   const origin = reference(original);
-  assert.deepEqual(queueOriginOf(view([original]), original, parent), origin);
+  const rows = (...more: Revision<any>[]) => view([material, original, ...more]);
+  assert.deepEqual(queueOriginOf(rows(), original, parent), origin);
   // Completion and lawful retry of a failed revision.
   const failed = memo<ResearchTurn>(original.id, "research-turn", 2, { ...original.value, status: "completed", error: "retryable" });
   const retried = memo<ResearchTurn>(original.id, "research-turn", 3, projectPlannedRetry(failed, reference(failed)));
-  assert.deepEqual(queueOriginOf(view([original, failed, retried]), retried, parent), origin);
-  // Lawful split: the same read, only its page halves the range, parts recorded by the divided revision.
-  const halves = [{ ...contextRead, page: { offset: 0, limit: 5 } }, { ...contextRead, page: { offset: 5, limit: 5 } }] as ResearchAction[];
+  assert.deepEqual(queueOriginOf(rows(failed, retried), retried, parent), origin);
+  // S3-03: the runner's no-progress pause names the exact earlier completed read of this run and Question;
+  // its lawful continuation is a completion. Another pending rewrite is not a pause.
+  const earlier = memo<ResearchTurn>("research-turn:s3-earlier", "research-turn", 2, { ...original.value, number: 1,
+    status: "completed", observation: { value: "abcde" } });
+  const paused = memo<ResearchTurn>(original.id, "research-turn", 2, { ...original.value,
+    observation: { code: "research_no_progress", previous: reference(earlier) }, status: "pending" });
+  assert.deepEqual(queueOriginOf(rows(earlier, paused), paused, parent), origin);
+  const resumed = memo<ResearchTurn>(original.id, "research-turn", 3, { ...paused.value, status: "completed", observation: { value: "abcdefghij" } });
+  assert.deepEqual(queueOriginOf(rows(earlier, paused, resumed), resumed, parent), origin, "the paused read completes later");
+  const noPrevious = memo<ResearchTurn>(original.id, "research-turn", 2, { ...paused.value,
+    observation: { code: "research_no_progress", previous: { id: "research-turn:missing", revision: 1, hash: hashJson("missing") } } });
+  assert.equal(queueOriginOf(rows(noPrevious), noPrevious, parent), null, "the pause names an existing earlier read");
+  const otherPending = memo<ResearchTurn>(original.id, "research-turn", 2, { ...original.value, observation: { note: "kept" } });
+  assert.equal(queueOriginOf(rows(otherPending), otherPending, parent), null, "no other pending rewrite");
+  // S3-02: the split is exactly the writer's cut of the full selected range — 5+5 of 10 characters.
+  const page = (offset: number, limit: number) => ({ ...contextRead, page: { offset, limit } }) as ResearchAction;
   const split = (actions: ResearchAction[], base = original) => {
     const parts = projectSplitParts(run, base, actions).map(part => memo<ResearchTurn>(part.id, "research-turn", 1, part.value));
     const divided = memo<ResearchTurn>(base.id, "research-turn", base.revision + 1, { ...base.value, status: "completed", error: null,
       observation: { splitInto: parts.map(reference), reason: "context_read_limit" } });
     return { parts, divided };
   };
-  const lawful = split(halves);
-  assert.deepEqual(queueOriginOf(view([original, lawful.divided, ...lawful.parts]), lawful.parts[1]!, parent), origin);
+  const lawful = split([page(0, 5), page(5, 5)]);
+  assert.deepEqual(queueOriginOf(rows(lawful.divided, ...lawful.parts), lawful.parts[1]!, parent), origin);
   // A successful child cannot become pending again; a retry is only of a failed revision and only exactly projected.
   const done = memo<ResearchTurn>(original.id, "research-turn", 2, { ...original.value, status: "completed", error: null,
     observation: { value: "done" } });
   const reopened = memo<ResearchTurn>(original.id, "research-turn", 3, { ...original.value });
-  assert.equal(queuedChildReached(view([original, done, reopened]), origin, reopened), false, "the shared retry predicate refuses it");
-  assert.equal(queueOriginOf(view([original, done, reopened]), reopened, parent), null);
+  assert.equal(queuedChildReached(rows(done, reopened), origin, reopened), false, "the shared retry predicate refuses it");
+  assert.equal(queueOriginOf(rows(done, reopened), reopened, parent), null);
   const retryOfDone = memo<ResearchTurn>(original.id, "research-turn", 3, projectPlannedRetry(done, reference(done)));
-  assert.equal(queueOriginOf(view([original, done, retryOfDone]), retryOfDone, parent), null);
+  assert.equal(queueOriginOf(rows(done, retryOfDone), retryOfDone, parent), null);
   const looseRetry = memo<ResearchTurn>(original.id, "research-turn", 3, { ...original.value, observation: { note: "kept" } });
-  assert.equal(queueOriginOf(view([original, failed, looseRetry]), looseRetry, parent), null);
+  assert.equal(queueOriginOf(rows(failed, looseRetry), looseRetry, parent), null);
   const rewritten = memo<ResearchTurn>(original.id, "research-turn", 2, { ...original.value, status: "completed", error: null,
     observation: null, number: 9 });
-  assert.equal(queueOriginOf(view([original, rewritten]), rewritten, parent), null, "a completion keeps the pending basis");
-  // A split part never acquires the origin by a splitInto marker: another record, one part, uneven pages or a changed basis.
+  assert.equal(queueOriginOf(rows(rewritten), rewritten, parent), null, "a completion keeps the pending basis");
+  // S3-04's shared proof: a damaged intermediate revision under a restored head is not this queue's child.
+  const damaged = memo<ResearchTurn>(original.id, "research-turn", 2, { ...original.value, action: reads[0]!, status: "completed", error: "x" });
+  const restored = memo<ResearchTurn>(original.id, "research-turn", 3, projectPlannedRetry(damaged, reference(damaged)));
+  assert.equal(queueOriginOf(rows(damaged, restored), restored, parent), null);
+  // A split part never acquires the origin by a splitInto marker.
+  const stringBody = memo("research-context:s3-string-body", "research-context", 1, { body: "abcdefghij" });
+  const onString = { ...contextRead, record: reference(stringBody), pointer: "/body" } as ResearchAction;
+  const stringParent = plannerTurn(p, runOf(p, 0), intentRef, A, readPlan("q-supply", [onString]));
+  const stringChild = projectReadingQueue(runOf(p, 1), stringParent, p.plan, readPlan("q-supply", [onString]))[0]!;
+  const stringOriginal = memo<ResearchTurn>(stringChild.id, "research-turn", 1, stringChild.value);
+  const stringCut = split([{ ...onString, page: { offset: 0, limit: 5 } }, { ...onString, page: { offset: 5, limit: 5 } }] as ResearchAction[], stringOriginal);
+  assert.equal(queueOriginOf(view([stringBody, stringOriginal, stringCut.divided, ...stringCut.parts]), stringCut.parts[0]!, stringParent), null,
+    "an archive whose body is not an object is refused by readArchiveBody, so the writer never splits it");
   const unrelated = { ...contextRead, record: { id: "context:unrelated", revision: 1, hash: hashJson("unrelated") } } as ResearchAction;
   const foreign = split([{ ...unrelated, page: { offset: 0, limit: 5 } }, { ...unrelated, page: { offset: 5, limit: 5 } }] as ResearchAction[]);
-  assert.equal(queueOriginOf(view([original, foreign.divided, ...foreign.parts]), foreign.parts[0]!, parent), null);
-  const single = split([{ ...contextRead, page: { offset: 0, limit: 1 } }] as ResearchAction[]);
-  assert.equal(queueOriginOf(view([original, single.divided, ...single.parts]), single.parts[0]!, parent), null);
-  const uneven = split([{ ...contextRead, page: { offset: 0, limit: 2 } }, { ...contextRead, page: { offset: 2, limit: 8 } }] as ResearchAction[]);
-  assert.equal(queueOriginOf(view([original, uneven.divided, ...uneven.parts]), uneven.parts[1]!, parent), null);
-  const gap = split([{ ...contextRead, page: { offset: 0, limit: 5 } }, { ...contextRead, page: { offset: 6, limit: 5 } }] as ResearchAction[]);
-  assert.equal(queueOriginOf(view([original, gap.divided, ...gap.parts]), gap.parts[1]!, parent), null);
+  assert.equal(queueOriginOf(rows(foreign.divided, ...foreign.parts), foreign.parts[0]!, parent), null, "another record");
+  for (const [name, actions] of [["one part", [page(0, 1)]], ["a prefix of the range", [page(0, 1), page(1, 1)]],
+    ["uneven halves", [page(0, 2), page(2, 8)]], ["a gap", [page(0, 5), page(6, 5)]], ["beyond the material", [page(0, 6), page(6, 6)]]] as const) {
+    const cut = split([...actions]);
+    assert.equal(queueOriginOf(rows(cut.divided, ...cut.parts), cut.parts[0]!, parent), null, name);
+  }
   const changed = lawful.parts.map(part => memo<ResearchTurn>(part.id, "research-turn", 1, { ...part.value, question: { ...part.value.question!, revision: 9 } }));
   const changedDivided = memo<ResearchTurn>(original.id, "research-turn", 2, { ...lawful.divided.value,
     observation: { splitInto: changed.map(reference), reason: "context_read_limit" } });
-  assert.equal(queueOriginOf(view([original, changedDivided, ...changed]), changed[0]!, parent), null);
+  assert.equal(queueOriginOf(rows(changedDivided, ...changed), changed[0]!, parent), null, "a changed basis of a part");
+  // Malformed siblings are refusals, never a JavaScript exception or a confirmed origin.
+  const nullSibling = memo<ResearchTurn>(lawful.parts[1]!.id, "research-turn", 1, null as unknown as ResearchTurn);
+  const unhashed = { ...lawful.parts[1]!, hash: hashJson("another value") };
+  const second = memo<ResearchTurn>(lawful.parts[1]!.id, "research-turn", 2, { ...lawful.parts[1]!.value, status: "completed" });
+  for (const [name, sibling, extra] of [["null value", nullSibling, []], ["unhashed value", unhashed, []],
+    ["a later revision", second, [lawful.parts[1]!]]] as [string, Revision<ResearchTurn>, Revision<ResearchTurn>[]][]) {
+    const divided = memo<ResearchTurn>(original.id, "research-turn", 2, { ...lawful.divided.value,
+      observation: { splitInto: [reference(lawful.parts[0]!), reference(sibling)], reason: "context_read_limit" } });
+    assert.equal(queueOriginOf(rows(divided, lawful.parts[0]!, sibling, ...extra), lawful.parts[0]!, parent), null, name);
+  }
 });
 
 test("S3 mode isolation: A never inherits B's plan, mode or failed child; the field path and old planning recovery ignore subject turns", t => {
