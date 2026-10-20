@@ -180,8 +180,8 @@ test('R2 (№2419, №2427, №2430): the product engine is one-way over OM and 
   const { load, full } = collectEdges(sources(root));
   assert.deepEqual(componentOf(load, 'product/engine.ts'), ['product/engine.ts']);
   // Its helpers take the engine as a typed parameter (import type): a product-layer cycle with no OM or lower module.
-  assert.deepEqual(componentOf(full, 'product/engine.ts'), ['product/engine.ts', 'product/preparation-run.ts',
-    'product/refinement-research.ts', 'product/repair-feedback.ts', 'product/repairs.ts', 'product/stage-research.ts']);
+  assert.deepEqual(componentOf(full, 'product/engine.ts'), ['product/commands.ts', 'product/early-stage-driver.ts',
+    'product/engine.ts', 'product/stage-research.ts']);
   for (const [name, targets] of full)
     if (name.startsWith('om/') || name === 'product/stage-checks.ts')
       assert.ok(!targets.includes('product/engine.ts') && !targets.includes('product/preparation-run.ts'),

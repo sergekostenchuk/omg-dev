@@ -12,8 +12,6 @@ import { projectGraph } from "../src/graph/project.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { Refinement } from "../src/graph/refinement.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { beginLegacyOperation } from "../src/product/preparation-run.js";
-import { processStart } from "../src/runtime/process-identity.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { applySeriesActivation, beginAttempt, openSeries } from "../src/om/series.js";
@@ -159,16 +157,7 @@ test("R1 R3 №1852 H1.1 cold OM: the machine writes B1, the pass with every out
   assert.deepEqual(heads(f.store), before, "An equal repeat writes nothing");
 });
 
-test("R2 H1.1 the first B1 keeps its admission: an active legacy operation or an unaccepted stage is refused and nothing later is built", t => {
-  const f = basesFixture(t);
-  // A legacy preparation is running (its lease is the pending preparation record, as the engine writes it).
-  const value = { projectId: project, status: "running", phase: "R2", draft: null, plan: null,
-    owner: { pid: process.pid, started: processStart(process.pid) }, error: null, code: null, findings: [], calls: 0 };
-  const lease: Write = { id: `preparation-run:${project}`, kind: "preparation-run", expected: 0, value };
-  beginLegacyOperation(f.store, project, "prepare", { id: lease.id, revision: 1, hash: hashJson(value) }, [lease]);
-  const legacy = refusal(writeRunBases(f.store, { project }));
-  assert.equal(legacy.code, "legacy_operation_active");
-  assert.deepEqual(f.store.list().filter(row => row.id.startsWith("om-")).map(row => row.id), [], "No OM record is written");
+test("R2 H1.1 the first B1 keeps its admission: an unaccepted stage is refused and nothing later is built", t => {
   const g = basesFixture(t);
   redraftFeatures(g, false);
   const unaccepted = refusal(writeRunBases(g.store, { project }));

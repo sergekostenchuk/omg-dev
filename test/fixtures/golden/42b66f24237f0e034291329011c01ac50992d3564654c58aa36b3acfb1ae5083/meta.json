@@ -1,5 +1,5 @@
 {
-  "producerDigest": "93c65cdd310a9ad3ff2df75bdb053bd5923a27ecf05efbe4f8ae16aef7e33e98",
+  "producerDigest": "38ff4c353b56ff9286dfdbc0e967ce25513c02618a06e27a4e0663178c606f92",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -791,7 +791,7 @@
     },
     {
       "path": "src/product/commands.ts",
-      "sha256": "b8e8d5ea05d48a58af93facba9e9eca52237417a643216ac08d9b12faee6e346"
+      "sha256": "34bdf30903b833d8835bc99064b15372f0e8c2d19019da240cbeadd7b786ffb5"
     },
     {
       "path": "src/product/early-stage-driver.ts",
@@ -799,31 +799,19 @@
     },
     {
       "path": "src/product/engine.ts",
-      "sha256": "5e42e492a9940d3345802175757e7ea7073acee7edc962e43c3cb78db91c0002"
+      "sha256": "8e1ab21526130867fc8d4fba30b4c205a7a6fd11afcc48cda1a996ece8cc231f"
     },
     {
       "path": "src/product/owner-authority.ts",
       "sha256": "0953dde580e784d1d612d8cfea982f67c55ed4be8baa944422bdc89d57c85015"
     },
     {
-      "path": "src/product/preparation-run.ts",
-      "sha256": "5d0c84ed927da34b3dd5e4cdee77f3052c6d9c9798ff89c8a134fbd5ae1c86e0"
-    },
-    {
       "path": "src/product/project-mode.ts",
       "sha256": "e257a1e64198f5e0732e3789748e319f909f982cc21c3ed2e6f7219f31f59eec"
     },
     {
-      "path": "src/product/refinement-research.ts",
-      "sha256": "75dc10059aecd702da7366a86f3622722b4c2f57c14f98e49d734ba14b38f106"
-    },
-    {
       "path": "src/product/repair-feedback.ts",
-      "sha256": "ee347fdaeea5d975ee2221b1df356bb5bbc1342a4db243ffd5c14892b9269856"
-    },
-    {
-      "path": "src/product/repairs.ts",
-      "sha256": "aa6a79b3897b2141335e581b2d52b0a55ffafdef2f389e46c93c87c49608933c"
+      "sha256": "1405477fca7023f2e369d2e01e20e17f8e0f2d9a6f84d7e9bf5e9e1127ed2452"
     },
     {
       "path": "src/product/stage-checks.ts",
@@ -939,48 +927,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "a899f366c91a0ed8efa7610e3f9985a63a8cabaadd69a849eea4995fbbf027a4"
+      "hash": "fcbf6020178de0bd1368072fb1ead3e36d8b5485a5cbdcf5a37bf895e3662818"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "c4d403aa6098bb5641a3047c0365876908017425836346c489736e339973d004"
+      "hash": "aa08b8ed444628ce242c3c96936f4ad90095157e2f9efa0aa84bf6a820c0d36c"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "bbd6329178caec91cecad78c16dd3fd1dd56c5b35a133cedffde9d50c14c3104"
+      "hash": "0aaf0250026ec037e1e0dc4d40046ae50b088405701f4d9055703ae6de2f3e70"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "50b2db4810266c176c53b1e127d187f8bc44510e986175dda199baa21d3489cc"
+      "hash": "f95b364ea38e0c41ddce15409368aab3d46c57ffe2ca0b27d9df9bb1adff5fca"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "2c702b6a524da85e39c61771e23c861a4ab5ae6fed29a2be50a8750c9b6ab8b3"
+      "hash": "866e771b9675f74f460e57e3b493ae27479b6e65433e6d9c934bea6a3afceb08"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "8ae45465086aa5ec9f95691341d28bb25452262ce6da1fd98d82967a29d78a58"
+      "hash": "551198d1bf710b1c3aebf73242718afe6bda9ca06dc918e340e6132cd2d586a3"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "f85565b438e7db995df45a95ebfe295be0e8ff1b78f86293b2d2ce701bf6ad4c"
+      "hash": "c76de942f0d6fbf953e1aa168908b591c8fa7d598bcd6a30e4a1042f9b54455e"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "651b34b8391dd7f04e2fc560642bdd13cb04e38be4f25976df1b176807798d0c"
+      "hash": "f7cf53ec2febddce927e32e1560ff2539a12e364c899863a7af679a9774c4a1f"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-lg30a/.golden-build-rJ3b4l/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-lg30b/.golden-build-svOqiE/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "feb840ae386d9fb96f452c08ae2481e5e79a8f476c6a5debc3b9b3c0d32198fa",
+  "sqliteFileSha256": "0ea482296de294220e9df4f61f758b963f21b5deb419c042cb7daf3625915fab",
   "sqliteBytes": 14561280
 }

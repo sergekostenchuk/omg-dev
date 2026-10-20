@@ -23,7 +23,6 @@ import type { ModelCall } from "../src/runtime/model-usage.js";
 import { answerTechnicalFixture } from "./technical-research-fixture.js";
 import { layerDesignOf, layerDesignSpec } from "../src/graph/layer-design.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView } from "../src/discovery/layer-delta.js";
-import type { ConsumerResult } from "../src/discovery/consumer-research.js";
 import type { Json } from "../src/canonical.js";
 import { answerLayerFixture } from "./layer-design-fixture.js";
 import type { ResearchRun, ResearchTurn } from "../src/discovery/research-model.js";
@@ -277,8 +276,10 @@ test("L2 accepts a model delta, inherits exact L1, and gives the assessor change
     "The delta preserves every node value; new nodes append without rewriting upper node order");
   assert.throws(() => expandLayerDelta(store, draft, question, { ...delta, base: { ...delta.base, revision: 999 } }), { code: "graph_stale" });
   const l1 = store.get("graph-layer:p:1")!;
-  const result = await engine.execute({ type: "research-phase", project: "p", phase: "L2", draftId: draft.id, maxTurns: 3 }) as ConsumerResult;
-  assert.equal(result.status, "accepted", JSON.stringify(result));
+  const result = await engine.researcher.run("p", draft.id, 3);
+  assert.equal(result.value.status, "completed", JSON.stringify(result.value));
+  const built = engine.refinement.buildLayer("p", 2, reference(store.get(draft.id)!), store.get("graph:p")!.revision, "fixture");
+  engine.refinement.sealLayer("p", 2, 0, reference(built));
   assert.deepEqual(store.get(l1.id), l1);
   assert.deepEqual(engine.refinement.gate("p", "L2").findings, []);
   const review = readFileSync(join(root, "calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line))

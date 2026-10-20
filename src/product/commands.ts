@@ -13,7 +13,6 @@ import type { AdapterLineageDeclaration } from '../adapters/adapter-lineage.js';
 import type { EarlyStageInstruction } from './early-stage-driver.js';
 
 export type ProductCommand =
-  | {type:"recover-legacy-operation";project:string;operation:Ref;token:string}
   | {type:'recover-research-response';project:string;call:Ref;session:Ref}
   | ({type:'declare-adapter-lineage';project:string} & AdapterLineageDeclaration)
   | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
@@ -24,7 +23,6 @@ export type ProductCommand =
   | {type:"permit-cancelled-call-retry";project:string;call:Ref}
   | {type:"recover-om-capacity";project:string;packet:Ref}
   | {type:"permit-limited-call-retry";project:string;call:Ref}
-  | {type:"continue-preparation";project:string;maxCalls:number}
   | { type: "om-start"; project: string; outcomes?: string[] }
   | { type: "om-continue"; project: string; resumeStop?: string; release?: "regate_owner_policy" }
   | { type: "om-state"; project: string }
@@ -39,7 +37,6 @@ export type ProductCommand =
   | { type: "early-stage-run"; project: string; maxTurns: number; maxCalls: number; draftId?: string; outcomes?: string[];
       instruction?: EarlyStageInstruction }
   | { type: "revise-early-stage-input"; project: string; expected: number; instruction: EarlyStageInstruction }
-  | { type: "research-phase"; project: string; phase: "R1" | "R2" | "L2" | "L3"; draftId: string; maxTurns: number }
   | { type: "model-usage"; project: string; since: number }
   | { type: "configure-reader-pilot"; project: string; expected: number; settings: ReaderPilotSettings }
   | { type: "configure-saved-synthesis"; project: string; question: string; expected: number }
@@ -47,7 +44,6 @@ export type ProductCommand =
   | { type: "execute-plan"; project: string; plan: Ref; retry: boolean; maxContextChars: number; maxCorrections: number }
   | { type: "stop-execution"; project: string }
   | { type: "recover-execution"; project: string }
-  | { type: "repair-plan"; project: string; run: Ref; maxTurns: number }
   | { type: "configure"; project: string; expected: number; environment: Omit<Environment, "projectId"> }
   | { type: "configure-om-dispatch"; project: string; protocol: "codex-stdio" | "devin-stdio" }
   | { type: "begin-research"; project: string; level: "R0" | "R1" | "R2" }
@@ -133,7 +129,6 @@ const schema = { oneOf: [
   command("om-decisions", { project }),
   // RL3 (№4205): the owner's explicit reopening of a completed pass's accepted L3 by the AT1 door.
   command("om-regate", { project }),
-  command("recover-legacy-operation",{project,operation:ref,token:string}),
   command('observe-runtime',{project,scope:ref,obligation:string,key:string}),
   command('recover-runtime-observation',{project,observation:ref}),
   command('retry-planned-read',{project,child:ref}),
@@ -145,21 +140,18 @@ const schema = { oneOf: [
   command("permit-cancelled-call-retry", {project,call:ref}),
   command("recover-om-capacity", {project,packet:ref}),
   command("permit-limited-call-retry", {project,call:ref}),
-  command("continue-preparation", {project,maxCalls:{type:"integer",minimum:1,maximum:100}}),
   command("set-map-status", { project, expected, base: ref, nodes: { type: "array", minItems: 1, items: object({
     id: string, status: { enum: ["existing", "future"] }, explanation: string,
     code: { type: "array", items: object({ path: string, access: { enum: ["read", "write"] }, status: { const: "existing" } }) },
   }) } }),
   command("research-stage", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   earlyStageRun, reviseEarlyStageInput,
-  command("research-phase", { project, phase: { enum: ["R1", "R2", "L2", "L3"] }, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("model-usage", { project, since: expected }),
   command("configure-reader-pilot", { project, expected, settings: readerPilotSchema }),
   command("configure-saved-synthesis", { project, question: string, expected }),
   command("research-draft", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("execute-plan", { project, plan: ref, retry: { type: "boolean" }, maxContextChars: { type: "integer", minimum: 1 }, maxCorrections: expected }), command("stop-execution", { project }),
   command("recover-execution", { project }),
-  command("repair-plan", { project, run: ref, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("configure", { project, expected, environment: environmentSettings }),
   command("configure-om-dispatch", { project, protocol: { enum: ["codex-stdio", "devin-stdio"] } }),
   command("begin-research", { project, level: researchLevel }),

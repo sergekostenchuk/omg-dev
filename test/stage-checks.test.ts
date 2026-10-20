@@ -1,4 +1,4 @@
-import { runIntegrityCheck } from "../src/om/integrity.js";
+import { runIntegrityCheck, integrityGate } from "../src/om/integrity.js";
 import { discoveryOutcome } from '../src/discovery/discovery-outcome.js';
 import type { DiscoveryDraft, Question } from '../src/discovery/discovery.js';
 import { preparedField } from './preparation-fixture.js';
@@ -10,14 +10,12 @@ import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { canonical, hashJson } from "../src/canonical.js";
+import { canonical, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { PHASES } from "../src/graph/refinement.js";
 import { STAGES, reference, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { beginLegacyOperation, finishLegacyOperation, readLegacyOperation as productRead, type LegacyOperation } from "../src/product/preparation-run.js";
-import { readLegacyOperation as lowerRead, StageChecks } from "../src/product/stage-checks.js";
-import { processStart } from "../src/runtime/process-identity.js";
+import { StageChecks } from "../src/product/stage-checks.js";
 import { Store, observeStore, type Revision, type StoreObserver, type TransactionGuard, type Write } from "../src/storage/store.js";
 import { captureView, storeView } from "../src/storage/store-view.js";
 import { writeFeasibility, type FeasibilityRequest } from "../src/om/feasibility.js";
@@ -248,43 +246,6 @@ store.close();
   } finally { store.close(); }
 });
 
-test("R2 №2427-4: the old export and the new lower entry read one lawful active and released legacy-operation chain alike after a restart, and refuse alike when its required basis is damaged", t => {
-  const { store } = legacyBase(t);
-  const pending = () => {
-    const prior = store.get(`preparation-run:${project}`), value = { projectId: project, status: "running", phase: "R2", draft: null, plan: null,
-      owner: { pid: process.pid, started: processStart(process.pid) }, error: null, code: null, findings: [], calls: 0 };
-    const write: Write = { id: `preparation-run:${project}`, kind: "preparation-run", expected: prior?.revision ?? 0, value };
-    return { write, basis: { id: write.id, revision: write.expected + 1, hash: hashJson(value) } as Ref };
-  };
-  const first = pending();
-  const active = beginLegacyOperation(store, project, "prepare", first.basis, [first.write]);
-  const reads = (s: Store) => { const read = (reader: typeof lowerRead) => { try { return reader(s, project); } catch (error) { return outcome(error); } }; return [read(productRead), read(lowerRead)]; };
-  const [activeOld, activeNew] = reads(store);
-  assert.deepEqual(activeNew, activeOld); assert.equal((activeNew as Revision<LegacyOperation>).value.state, "active");
-  const run = store.get<Record<string, unknown>>(`preparation-run:${project}`)!;
-  const paused = store.write({ id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, status: "paused", error: "Fixture pause", code: "fixture_pause" } });
-  finishLegacyOperation(store, active, reference(paused));
-  const path = store.path; store.close();
-  const reopened = new Store(path);
-  try {
-    const [releasedOld, releasedNew] = reads(reopened);
-    assert.deepEqual(releasedNew, releasedOld); assert.equal((releasedNew as Revision<LegacyOperation>).value.state, "released");
-  } finally { reopened.close(); }
-  // Damage the exact required basis — the bytes of the running preparation the lease names — beneath both readers.
-  const database = new DatabaseSync(path);
-  try {
-    database.exec("DROP TRIGGER IF EXISTS revisions_no_update");
-    database.prepare("UPDATE revisions SET body=? WHERE entity_id=? AND revision=?").run("{}", first.basis.id, first.basis.revision);
-  }
-  finally { database.close(); }
-  const damaged = new Store(path);
-  try {
-    const [oldRefusal, newRefusal] = reads(damaged);
-    assert.deepEqual(newRefusal, oldRefusal);
-    assert.ok(!(newRefusal as { value?: unknown }).value, `A damaged basis is refused alike: ${JSON.stringify(newRefusal)}`);
-  } finally { damaged.close(); }
-});
-
 test("G7 replaces Q4's hot provenance scan with one first-B1 read; fsck retains the exact missing-origin finding", t => {
   const directory = mkdtempSync(join(tmpdir(), "omg-g7-era-")), store = new Store(join(directory, "state.sqlite"));
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
@@ -408,3 +369,50 @@ for (const missing of ['answer', 'answer-null', 'value', 'assessment', 'assessme
   assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.store.list('model-call').length, 0);
  });
 }
+
+// ---- S1.5 (№2363): the search for saved OM provenance follows the Store it is given ----
+
+const legacyRoute = (engine: ProductEngine) => engine.legacyRoute('p');
+const provenanceRefusal = (store: Store) => {
+  const report = runIntegrityCheck(store, { project: 'p' }); assert.ok(report.ok);
+  assert.ok(report.value.value.findings.some(f => f.code === 'record_missing' && f.id === 'om-input:p' && f.revision === 1));
+  assert.equal(integrityGate(store, 'p')?.ok, false);
+};
+const bareLegacy = { om: false, guards: [{ id: 'om-input:p', absent: true }] };
+
+test('S1.5 №2363 a provenance record written by a second Store refuses fsck and the integrity gate before and after reopening', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-s15-second-')), database = join(directory, 'state.sqlite');
+  let store = new Store(database), engine = new ProductEngine(store);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  engine.execute({ type: 'create-project', project: 'p', title: 'p' });
+  assert.deepEqual(legacyRoute(engine), bareLegacy);
+  const other = new Store(database);
+  try { other.write({ id: 'om-horizon:p:h1', kind: 'om-horizon', expected: 0, value: {} }); } finally { other.close(); }
+  assert.deepEqual(legacyRoute(engine), bareLegacy); provenanceRefusal(store);
+  store.close(); store = new Store(database); engine = new ProductEngine(store);
+  assert.deepEqual(legacyRoute(engine), bareLegacy); provenanceRefusal(store);
+});
+
+test('S1.5 №2363 G7 views read only exact first B1; fsck examines committed records, not a virtual provenance record absent from the file', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'omg-s15-view-')), database = join(directory, 'state.sqlite');
+  const store = new Store(database);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  new ProductEngine(store).execute({ type: 'create-project', project: 'p', title: 'p' });
+  const ghost: Revision = { id: 'om-horizon:p:ghost', kind: 'om-horizon', revision: 1, hash: '0'.repeat(64), value: {} };
+  class Overlay extends Store {
+    override get<T = Json>(id: string, revision?: number): Revision<T> | null { return id === ghost.id ? ghost as Revision<T> : super.get<T>(id, revision); }
+    override list<T = Json>(kind?: string): Revision<T>[] {
+      const rows = super.list<T>(kind); return kind === undefined || kind === ghost.kind ? [...rows, ghost as Revision<T>] : rows;
+    }
+    override history<T = Json>(id: string): Revision<T>[] { return id === ghost.id ? [ghost as Revision<T>] : super.history<T>(id); }
+  }
+  const overlay = new Overlay(database);
+  try {
+    assert.deepEqual(legacyRoute(new ProductEngine(overlay)), bareLegacy);
+    assert.equal(integrityGate(overlay, 'p'), null, 'No committed provenance exists in this database');
+  } finally { overlay.close(); }
+  assert.deepEqual(legacyRoute(new ProductEngine(store)), bareLegacy, 'The genuine Store holds no provenance');
+  // A transparent Proxy, bound to its target the way the engine's own trace views are: no proven Store, the same records.
+  const proxied = new Proxy(store, { get(target, key) { const value: unknown = Reflect.get(target, key, target); return typeof value === 'function' ? value.bind(target) : value; } });
+  assert.deepEqual(legacyRoute(new ProductEngine(proxied)), bareLegacy, 'A Proxy reads the same exact first B1 and agrees');
+});

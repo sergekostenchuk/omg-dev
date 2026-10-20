@@ -1,10 +1,13 @@
 import type { Store } from "../storage/store.js";
 import type { Discovery, DiscoveryDraft, Question } from "../discovery/discovery.js";
-import type { PlanRepair } from "./repairs.js";
 import { EngineError } from "../errors.js";
 import { canonical, hashJson } from "../canonical.js";
 
-export function reopenRejectedRepair(store: Store, discovery: Discovery, repair: PlanRepair, repairId: string, error: unknown): PlanRepair['phase'] | null {
+interface RepairProposal {
+  projectId: string; draftId: string; phase: "research" | "design" | "compile" | "reissued";
+}
+
+export function reopenRejectedRepair(store: Store, discovery: Discovery, repair: RepairProposal, repairId: string, error: unknown): RepairProposal['phase'] | null {
   if (!(error instanceof EngineError)) return null;
   const technical = repair.phase === "research" && error.code === "technical_research_incomplete";
   const design = ["design", "compile"].includes(repair.phase) && ["accepted_prefix_repeated", "graph_invalid", "upper_layer_drift",

@@ -161,21 +161,11 @@ function lg30Commands(t: test.TestContext) {
 const lg30Web = { enabled: true, gatewayUrl: "http://127.0.0.1:18890", timeoutMs: 1000,
   budgetContract: "web-budget/v2", limits: { materialChars: 2000000, responseBytes: 100000 } };
 
-test("LG30-A retired R2 policy, trial and web-v1 commands are refused by engine, CLI and HTTP without writes", async t => {
-  const f = lg30Commands(t);
-  f.engine.execute(f.configure(0, lg30Web));
+async function refusesRetiredCommands(f: ReturnType<typeof lg30Commands>, commands: { type: string }[]) {
   const server = createProductServer(f.engine);
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/command`;
   const before = f.store.list().flatMap(record => f.store.history(record.id));
-  const ref = reference(f.project);
-  // These are command-shaped inputs, not fabricated scope/policy records in storage.
-  const commands = [
-    { type: "apply-obligation-policy", project: "p", scope: ref, policy: { version: 1, sourceScope: ref, assignments: [] } },
-    { type: "allocate-research-trial", project: "p", key: "new-trial", previousPolicy: ref, limit: 10, blockLimit: 5 },
-    f.configure(1, { enabled: true, gatewayUrl: lg30Web.gatewayUrl, timeoutMs: 1000,
-      limits: { httpAttempts: 1, pages: 1, receivedChars: 1000, responseBytes: 100000 } }),
-  ];
   try {
     for (const input of commands) {
       assert.throws(() => f.engine.execute(input), { code: "command_invalid" }, input.type);
@@ -188,6 +178,39 @@ test("LG30-A retired R2 policy, trial and web-v1 commands are refused by engine,
       assert.deepEqual(f.store.list().flatMap(record => f.store.history(record.id)), before, input.type);
     }
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+}
+
+test("LG30-A retired R2 policy, trial and web-v1 commands are refused by engine, CLI and HTTP without writes", async t => {
+  const f = lg30Commands(t);
+  f.engine.execute(f.configure(0, lg30Web));
+  const ref = reference(f.project);
+  // These are command-shaped inputs, not fabricated scope/policy records in storage.
+  const commands = [
+    { type: "apply-obligation-policy", project: "p", scope: ref, policy: { version: 1, sourceScope: ref, assignments: [] } },
+    { type: "allocate-research-trial", project: "p", key: "new-trial", previousPolicy: ref, limit: 10, blockLimit: 5 },
+    f.configure(1, { enabled: true, gatewayUrl: lg30Web.gatewayUrl, timeoutMs: 1000,
+      limits: { httpAttempts: 1, pages: 1, receivedChars: 1000, responseBytes: 100000 } }),
+  ];
+  await refusesRetiredCommands(f, commands);
+});
+
+test("LG30-B preparation, repair and phase-research doors are refused by engine, CLI and HTTP without writes", async t => {
+  const f = lg30Commands(t);
+  f.engine.execute(f.configure(0, lg30Web));
+  const ref = reference(f.project);
+  const commands = [
+    { type: "continue-preparation", project: "p", maxCalls: 1 },
+    { type: "recover-legacy-operation", project: "p", operation: ref, token: "previous-owner" },
+    { type: "repair-plan", project: "p", run: ref, maxTurns: 1 },
+    ...["R1", "R2", "L2", "L3"].map(phase => ({ type: "research-phase", project: "p", phase, draftId: "draft:p", maxTurns: 1 })),
+  ];
+  await refusesRetiredCommands(f, commands);
+  const cold = new Store(f.path);
+  try {
+    const engine = new ProductEngine(cold), before = cold.list().flatMap(record => cold.history(record.id));
+    for (const input of commands) assert.throws(() => engine.execute(input), { code: "command_invalid" });
+    assert.deepEqual(cold.list().flatMap(record => cold.history(record.id)), before);
+  } finally { cold.close(); }
 });
 
 test("LG30-A configure preserves absent web settings and exact v2 settings; missing or disguised contracts never write", t => {

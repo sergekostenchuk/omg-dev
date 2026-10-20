@@ -23,7 +23,6 @@ import { recoverResearchResponse, permitCancelledCallRetry, permitLimitedCallRet
 import { recoverContextSession } from '../discovery/context-recovery.js';
 import { retryPlannedRead } from '../discovery/reading-plan.js';
 import { observeRuntime, recoverRuntimeObservation } from '../runtime/runtime-observation.js';
-import { continuePreparation, recoverLegacyOperation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
 import { Store, type Revision, type TransactionGuard } from "../storage/store.js";
 import { StageChecks, type Project } from "./stage-checks.js";
@@ -50,10 +49,8 @@ import { Executor, planCurrentGuards } from "../execution/runner.js";
 import type { TaskRun } from "../execution/model.js";
 import type { ExecutionRoot } from "../runtime/environment.js";
 import { Researcher } from "../discovery/research-runner.js";
-import { PlanRepairs } from "./repairs.js";
 import { StageResearch } from "./stage-research.js";
 import { EarlyStageDriver } from "./early-stage-driver.js";
-import { RefinementResearch } from "./refinement-research.js";
 import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
 import { configureSavedSynthesis } from "../discovery/saved-synthesis.js";
@@ -77,10 +74,8 @@ export class ProductEngine {
   readonly compiler: Compiler;
   readonly executor: Executor;
   readonly researcher: Researcher;
-  readonly repairs: PlanRepairs;
   readonly stageResearch: StageResearch;
   readonly earlyStages: EarlyStageDriver;
-  readonly refinementResearch: RefinementResearch;
   /** The lower kit of stage checks, era and compile (R2, №2419): the fields above are its very instances. */
   readonly checks: StageChecks;
   /** H2.0: the in-memory owner-session registry — its bearer map dies with this engine (and its server). */
@@ -92,10 +87,8 @@ export class ProductEngine {
     this.environments = this.checks.environments; this.refinement = this.checks.refinement; this.compiler = this.checks.compiler;
     this.executor = new Executor(store, this.compiler, this.environments);
     this.researcher = new Researcher(store, this.discovery, this.environments);
-    this.repairs = new PlanRepairs(this);
     this.stageResearch = new StageResearch(this);
     this.earlyStages = new EarlyStageDriver(this);
-    this.refinementResearch = new RefinementResearch(this, actor);
   }
   protected validateStage(stage: Stage, context: GateContext): GateResult { return this.checks.validateStage(stage, context); }
   #project(id: string): Revision<Project> { return this.checks.project(id); }
@@ -299,14 +292,11 @@ export class ProductEngine {
       }
       case 'recover-context-session': this.#project(command.project); return recoverContextSession(this.store,command.project,command.session,command.selector);
       case 'retry-planned-read': this.#project(command.project); return retryPlannedRead(this.store,command.project,command.child);
-      case "recover-legacy-operation": this.#project(command.project); return recoverLegacyOperation(this,command);
-      case "continue-preparation": this.#project(command.project); return continuePreparation(this,command.project,command.maxCalls);
       case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,
         { projectId: command.project, base: command.base, nodes: command.nodes, actor: this.actor }, command.expected, this.environments.effective(command.project).root);
       case "research-stage": this.#project(command.project); return this.stageResearch.run(command.project, command.draftId, command.maxTurns);
       case "early-stage-run": return this.earlyStages.run(command);
       case "revise-early-stage-input": return this.earlyStages.reviseInput(command.project, command.expected, command.instruction);
-      case "research-phase": this.#project(command.project); return this.refinementResearch.run(command.project, command.phase, command.draftId, command.maxTurns);
       case "model-usage": this.#project(command.project); return modelUsage(this.store, command.project, command.since);
       case "configure-reader-pilot": this.#project(command.project); return configureReaderPilot(this.store, this.environments, command.project, command.settings, command.expected,
         plan => planCurrentGuards(this.store, this.compiler, plan));
@@ -323,7 +313,6 @@ export class ProductEngine {
       case "execute-plan": this.#project(command.project); assertPilotBoundary(this.store, command.project, "execution", command.plan); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };
       case "recover-execution": this.#project(command.project); return this.executor.recover(command.project);
-      case "repair-plan": this.#project(command.project); return this.repairs.run(command.project, command.run, command.maxTurns);
       case "configure": this.#project(command.project); return this.environments.configure(command.project, command.environment, command.expected);
       case "configure-om-dispatch": {
         // Legal before and after the first B1: the adapter is a setting, never evidence of the OM era.
