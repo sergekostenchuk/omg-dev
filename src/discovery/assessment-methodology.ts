@@ -76,7 +76,7 @@ function sourceAt(reads: SourceReads, ref: unknown, at: string): Revision<Source
     || typeof row.value.content !== 'string' || digest(row.value.content) !== row.value.sha256)
     invalid(at, 'The exact Source bytes are absent, changed or foreign');
   const origin: unknown = row.value.origin;
-  if (!obj(origin) || !['file','owner-document','web'].includes(String(origin.kind))
+  if (!obj(origin) || typeof origin.kind !== 'string' || !['file','owner-document','web'].includes(origin.kind)
     || typeof origin.location !== 'string') invalid(at, 'The Source origin is malformed');
   if (origin.kind === 'web' && (!isRef(origin.capture)
     || !text(origin.fetchedAt) || !Number.isFinite(Date.parse(origin.fetchedAt))
@@ -236,7 +236,7 @@ export function checkAssessmentMethodology(store: Store, value: unknown, subject
     if (!fact || seen.has(key)) invalid(`${p}.claim`, 'Each accepted fact has exactly one methodology row; foreign/rejected claims are forbidden');
     seen.add(key);
     shape(row.significance, ['kind','reason'], `${p}.significance`);
-    if (!['blocking','material','supporting'].includes(String(row.significance.kind))
+    if (typeof row.significance.kind !== 'string' || !['blocking','material','supporting'].includes(row.significance.kind)
       || subject.blocking && row.significance.kind !== 'blocking') invalid(`${p}.significance`, 'A blocking question cannot downgrade its fact significance');
     words(row.significance.reason, `${p}.significance.reason`);
     const sources = checkSources(reads, row.sources, `${p}.sources`);
@@ -245,7 +245,7 @@ export function checkAssessmentMethodology(store: Store, value: unknown, subject
       invalid(`${p}.sources`, 'The fact\'s pinned Source must be included');
     const temporal = row.temporalApplicability;
     shape(temporal, ['status','scope','reason','evidence'], `${p}.temporalApplicability`);
-    if (!['established','limited','unknown'].includes(String(temporal.status))) invalid(`${p}.temporalApplicability.status`, 'State temporal applicability explicitly');
+    if (typeof temporal.status !== 'string' || !['established','limited','unknown'].includes(temporal.status)) invalid(`${p}.temporalApplicability.status`, 'State temporal applicability explicitly');
     words(temporal.scope, `${p}.temporalApplicability.scope`); words(temporal.reason, `${p}.temporalApplicability.reason`);
     evidences(reads, temporal.evidence, `${p}.temporalApplicability.evidence`, temporal.status === 'established');
     const corroboration = row.corroboration;
@@ -272,7 +272,7 @@ export function checkAssessmentMethodology(store: Store, value: unknown, subject
     words(corroboration.reason, `${p}.corroboration.reason`);
     const refutation = row.refutation;
     shape(refutation, ['status','reason','traces','counterarguments','limitations'], `${p}.refutation`);
-    if (!['performed','not_performed','unavailable'].includes(String(refutation.status))) invalid(`${p}.refutation.status`, 'Search has an explicit status, never a boolean');
+    if (typeof refutation.status !== 'string' || !['performed','not_performed','unavailable'].includes(refutation.status)) invalid(`${p}.refutation.status`, 'Search has an explicit status, never a boolean');
     words(refutation.reason, `${p}.refutation.reason`);
     if (!Array.isArray(refutation.traces) || (refutation.status === 'performed' && refutation.traces.length === 0
       || refutation.status === 'not_performed' && refutation.traces.length !== 0))

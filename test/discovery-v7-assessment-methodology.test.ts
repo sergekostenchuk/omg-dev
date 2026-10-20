@@ -159,26 +159,26 @@ async function admit(f:Awaited<ReturnType<typeof setup>>, reply:unknown, id='q-i
   f.store.writeMany(application.writes,application.guards);
   return {...m,response,turn:f.store.get<ResearchTurn>(turnId)!,call:f.store.get<ResearchConsumerIntent>(m.intent.id)!.value.call!};
 }
-async function methodologyFixture(t:test.TestContext) {
+async function methodologyFixture(t:test.TestContext,planQuestionId='q-industry') {
   const f=await setup(t);
   const document=(key:string,fact:string,published='2026-10-19',project='p')=>
     f.discovery.evidence.document(project,key,JSON.stringify({fact,published,version:'2.1'}),'application/json',0);
   const source=document('survey','Measured throughput is 42 units per day'),second=document('independent','Independent measurement: 42 units per day');
-  const claim={id:'fact-throughput',kind:'fact',text:'Throughput is 42 units per day',axis:'industry',
-    planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId:'q-industry'}],scope:{variants:'common'},
+  const claim={id:'fact-throughput',kind:'fact',text:'Throughput is 42 units per day',axis:planQuestionId==='q-industry'?'industry':'market',
+    planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId}],scope:{variants:'common'},
     basis:{source:{ref:reference(source),range:{start:0,end:source.value.content.length},valueHash:hashJson(source.value.content)},
       limit:'Measured deployment only',asOf:'2026-10'}};
-  const m=await admit(f,{action:'answer',question:'q-industry',value:{type:'submitted',contract:DISCOVERY_CLAIMS_CONTRACT,
-    value:{claims:[claim]}},citations:[]});
-  const recorded=recordV7Attempt(f.store,{project:'p',planAnswer:m.selected.planAnswer,planQuestionId:'q-industry',
+  const m=await admit(f,{action:'answer',question:planQuestionId,value:{type:'submitted',contract:DISCOVERY_CLAIMS_CONTRACT,
+    value:{claims:[claim]}},citations:[]},planQuestionId);
+  const recorded=recordV7Attempt(f.store,{project:'p',planAnswer:m.selected.planAnswer,planQuestionId,
     call:m.call,end:attemptEndOfAction(m.response,m.selected)});
   const done=completeResearchAttemptTurn(f.store,'p',reference(m.turn),reference(recorded.attempt));
-  const packet=projectAttemptPacket(f.store,{project:'p',planAnswer:m.selected.planAnswer,planQuestionId:'q-industry',
+  const packet=projectAttemptPacket(f.store,{project:'p',planAnswer:m.selected.planAnswer,planQuestionId,
     entries:[{attempt:reference(recorded.attempt),binding:reference(done.binding)}]});
   const baseline={contract:V7_PROGRESS_BASELINE_CONTRACT,state:{kind:'absent' as const,id:v7ProgressStateId(packet)},materials:[]};
   const address:ClaimAddress={project:'p',container:reference(recorded.attempt),containerKind:'research-attempt',pointer:'/claims/0',claimId:claim.id};
   const method:AssessmentMethodology={contract:ASSESSMENT_METHODOLOGY_CONTRACT,policy:ASSESSMENT_METHODOLOGY_POLICY,facts:[{
-    claim:address,significance:{kind:'blocking',reason:'This fact is used by the blocking criterion'},
+    claim:address,significance:{kind:planQuestionId==='q-industry'?'blocking':'supporting',reason:'This fact is used by the plan question criterion'},
     sources:[methodSource(source),methodSource(second)],
     temporalApplicability:{status:'established',scope:'The measured deployment in October 2026',reason:'Dated report of this deployment',evidence:[selected(source,'/published')]},
     corroboration:{status:'independent',sources:[reference(source),reference(second)],reason:'Separately authored measurement'},
@@ -206,7 +206,7 @@ async function methodologyFixture(t:test.TestContext) {
     assessor:f.environment.value.reviewer.actor,environment:reference(f.environment),verdict:'supported',reasons:['Measured facts'],return:null,
     novelty:{attempts:[{attempt:reference(recorded.attempt),reason:'Reviewed'}],accepted:[{claim:address,reason:'Measured'}],rejected:[],
       newContent:[{claim:address,reason:'New measurement'}],duplicates:[],noProgress:[],transition:null},methodology:method};
-  const subject={project:'p',planAnswer:packet.planAnswer,planQuestionId:packet.planQuestionId,blocking:true,accepted:[address]};
+  const subject={project:'p',planAnswer:packet.planAnswer,planQuestionId:packet.planQuestionId,blocking:planQuestionId==='q-industry',accepted:[address]};
   return {...f,m,document,source,second,address,form,method,methodSubject:subject};
 }
 function refused(fn:()=>unknown,field:string,code='discovery_novelty_invalid') {
@@ -240,6 +240,39 @@ test('M2: versioned methodology proves dates, source independence and saved sear
     bad(m=>m.facts[0].significance.kind='supporting',`${prefix}.significance`);
     for(const field of ['claim','significance','sources','temporalApplicability','corroboration','refutation'])
       bad(m=>delete m.facts[0][field],prefix);
+  });
+  await t.test('M2-01: full assessment rejects coerced statuses before checking their mandatory evidence',()=>{
+    for(const status of [['performed'],null,true,1,{},'PERFORMED','']){
+      const form:any=structuredClone(f.form);
+      form.methodology.facts[0].refutation.status=status;
+      form.methodology.facts[0].refutation.traces=[];
+      refused(()=>checkDiscoveryAssessmentForm(f.store,form),`${prefix}.refutation.status`);
+    }
+    for(const status of [['established'],null,true,1,{},'ESTABLISHED','']){
+      const form:any=structuredClone(f.form);
+      form.methodology.facts[0].temporalApplicability.status=status;
+      form.methodology.facts[0].temporalApplicability.evidence=[];
+      refused(()=>checkDiscoveryAssessmentForm(f.store,form),`${prefix}.temporalApplicability.status`);
+    }
+    for(const status of ['not_performed','unavailable']){
+      const form:any=structuredClone(f.form);form.methodology.facts[0].refutation.status=status;
+      assert.deepEqual(checkDiscoveryAssessmentForm(f.store,form).value,form);
+    }
+    for(const status of ['established','limited','unknown']){
+      const form:any=structuredClone(f.form);form.methodology.facts[0].temporalApplicability.status=status;
+      assert.deepEqual(checkDiscoveryAssessmentForm(f.store,form).value,form);
+    }
+  });
+  await t.test('M2-01: full assessment rejects malformed saved Source origin discriminators',()=>{
+    for(const kind of [['owner-document'],['web'],null,true,1,{},'OWNER-DOCUMENT','']){
+      // Negative corruption only: keep exact hash-valid Source bytes with a bad origin.
+      const value:any=structuredClone(f.second.value);value.origin.kind=kind;
+      const source=f.store.write<Source>({id:`bad-origin-${rand()}`,kind:'source',expected:0,value});
+      const form=structuredClone(f.form),fact=factOf(form.methodology);
+      fact.sources[1]=methodSource(source);
+      fact.corroboration={status:'independent',sources:[reference(f.source),reference(source)],reason:'Separately authored measurement'};
+      refused(()=>checkDiscoveryAssessmentForm(f.store,form),`${prefix}.sources.1.source`);
+    }
   });
   await t.test('every new nested structure is required and rejected claims get no accepting methodology',()=>{
     const shapes:[string[],string[]][]=[
@@ -431,4 +464,18 @@ test('M2: versioned methodology proves dates, source independence and saved sear
     assert.equal(claimContentKey(f.store,f.address),beforeKey);
     assert.equal(f.store.list('discovery-assessment').length,0,'A/P have not produced or applied a v2 assessment');
   });
+});
+
+// A blocking question's stricter guard must not mask malformed significance kinds.
+test('M2-01: full assessment requires exact significance strings on a nonblocking plan question',async t=>{
+  const f=await methodologyFixture(t,'q-market');
+  assert.equal(f.methodSubject.blocking,false);
+  for(const kind of ['supporting','material','blocking']){
+    const form:any=structuredClone(f.form);form.methodology.facts[0].significance.kind=kind;
+    assert.deepEqual(checkDiscoveryAssessmentForm(f.store,form).value,form);
+  }
+  for(const kind of [['supporting'],['material'],['blocking'],null,true,1,{},'SUPPORTING','']){
+    const form:any=structuredClone(f.form);form.methodology.facts[0].significance.kind=kind;
+    refused(()=>checkDiscoveryAssessmentForm(f.store,form),'methodology.facts.0.significance');
+  }
 });
