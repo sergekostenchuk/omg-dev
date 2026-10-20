@@ -65,7 +65,7 @@ function prepareChoice(store: Store, decision: DiscoveryConditionRequest): Prepa
   };
   if (!draft || draft.kind !== 'discovery-draft' || draft.value.projectId !== decision.project
     || !isDiscoveryV5(draft.value) || !question)
-    return refuse('discovery_choice_foreign', 'The choice needs this project’s Discovery v5/v6 verdict');
+    return refuse('discovery_choice_foreign', 'The choice needs this project’s Discovery v6 verdict');
   const id = discoveryDecisionId(decision.project, draft.id, decision.verdictRef, decision.conditionId);
   const roundId = discoveryChoiceRoundId(decision.project, draft.id, decision.verdictRef);
   const existing = store.get<DiscoveryConditionDecision>(id), round = store.get<DiscoveryChoiceRound>(roundId);

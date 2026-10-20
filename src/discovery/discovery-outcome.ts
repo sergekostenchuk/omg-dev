@@ -228,7 +228,7 @@ function questionSchema(value: Json) {
 }
 // The v5 research gate is also the explicit subject route of v6. Keep the exported name for its consumers.
 export const isDiscoveryV5 = (draft: DiscoveryDraft) => draft.stage === 'discovery'
-  && (draft.contractVersion === 5 || draft.contractVersion === 6);
+  && draft.contractVersion === 6;
 
 /** Read the accepted prefix in question order. A reopened question stops the
  * prefix even though the draft deliberately retains its previous field value. */

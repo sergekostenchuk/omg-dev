@@ -14,7 +14,7 @@ import { renderStageSummary, stageSummary, type DiscoveryStageSummary,
   type StructuredStageSummary } from "../src/product/stage-summary.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { preparedField } from "./preparation-fixture.js";
-import { answerDiscoveryFixture, currentUpstreamFixtureValue, preparedFeatures, withHistoricalUpstream } from "./product-fixture.js";
+import { answerDiscoveryFixture, currentUpstreamFixtureValue, preparedFeatures } from "./product-fixture.js";
 import { answerDiscoveryCondition } from "../src/discovery/discovery-decision.js";
 import { DiscoveryChoiceSessions, issueDiscoveryChoiceInvitation } from "../src/product/owner-authority.js";
 import type { Ref } from "../src/pipeline/contracts.js";
@@ -429,25 +429,6 @@ test("DS1.3a detects a second Store changing a selected head during the read", t
   finally { f.store.get = original; }
 });
 
-test("DS1.3a reads saved v3–v5 histories and the current v6 stage by their own contracts", t => {
-  const f = fixture(t);
-  withHistoricalUpstream("1189043f4bc7", () => preparedFeatures(f.engine, "v3"));
-  withHistoricalUpstream("e9c1ca5c41fb80508559aeab41da8f3da7422953", () => preparedFeatures(f.engine, "v4"));
-  withHistoricalUpstream("4dc199d7eeb73128ec4d39a9154216d9cbf32a1f", () => preparedFeatures(f.engine, "v5"));
-  preparedFeatures(f.engine, "v6");
-  for (const [project, version] of [["v3", 3], ["v4", 4], ["v5", 5], ["v6", 6]] as const) {
-    const summary = stageSummary(f.store, project, "discovery");
-    assert.equal(summary.accepted?.contractVersion, version);
-    if (version < 5) {
-      assert.equal(summary.accepted?.report, null);
-      assert.ok(summary.accepted?.limitations.every(item => item.includes(`contractVersion ${version}`)));
-    } else assert.equal(summary.accepted?.verdict?.outcome, "go");
-  }
-  const v6 = stageSummary(f.store, "v6", "specification");
-  assert.equal(v6.accepted?.contractVersion, 6);
-  assert.ok(v6.accepted?.fields.some(field => field.field === "behaviorContracts"));
-});
-
 test("DS1.3a renders saved web URLs, capture time, quote and documentary proof limit without fetching", t => {
   const f = fixture(t);
   f.engine.execute({ type: "create-project", project: "web", title: "web" });
@@ -520,27 +501,6 @@ test("DS1.3b auto-selects the sole structured candidate whose accepted question 
   assert.equal(automatic.candidate?.draft.id, draft.id);
   assert.deepEqual(automatic.candidate?.questions.find(item => item.field === "audience"),
     { ref: reference(reopened.get<Question>(question.id)!), field: "audience", status: "open" });
-});
-
-test("DS1.3b reads genuine legacy specification and features without inventing fields absent in their era", t => {
-  const f = fixture(t);
-  withHistoricalUpstream("63d2b07", () => preparedFeatures(f.engine, "legacy-v1"));
-  const specification = stageSummary(f.store, "legacy-v1", "specification");
-  assert.equal(specification.accepted?.contractVersion, 1);
-  assert.equal(specification.accepted?.material.stage, "specification");
-  if (specification.accepted?.material.stage === "specification") {
-    assert.deepEqual(specification.accepted.material.behavior?.value, ["behavior for legacy-v1"]);
-    assert.equal(specification.accepted.material.behaviorContracts, null);
-  }
-  assert.ok(specification.accepted?.limitations.some(item => item.includes("behaviorContracts отсутствует")));
-  const features = stageSummary(f.store, "legacy-v1", "features");
-  assert.equal(features.accepted?.contractVersion, 1);
-  if (features.accepted?.material.stage === "features") {
-    assert.deepEqual(features.accepted.material.features?.value,
-      [{ title: "Deliver result", outcome: "legacy-v1-result", requirements: [0] }]);
-    assert.equal(features.accepted.material.preparation, null);
-  }
-  assert.ok(features.accepted?.limitations.some(item => item.includes("featurePreparation отсутствует")));
 });
 
 test("DS1.3b preserves the complete specification contract and both requirement identity threads", t => {

@@ -65,7 +65,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:{
   return { root, store, engine, source, complete, question, configure };
 }
 
-for (const era of [5, 6] as const) test(`G4b v${era}: one full gate accompanies outcome and stage admission on a cold Store`, t => {
+for (const era of [6] as const) test(`G4b v${era}: one full gate accompanies outcome and stage admission on a cold Store`, t => {
   const f = fixture(t), draft = f.complete(era);
   const cold = new Store(f.store.path); t.after(() => cold.close());
   const expected = new Discovery(cold).gate('p', reference(draft));
@@ -94,7 +94,7 @@ test('G4b stage checks the requested draft Ref even if a newer draft has identic
   assert.ok(result.findings.some(finding => finding.code === 'discovery_stale'));
 });
 
-for (const era of [5, 6] as const) test(`G4b v${era}: reopen keeps old fields but stops the accepted prefix; a new answer gets a new gate`, t => {
+for (const era of [6] as const) test(`G4b v${era}: reopen keeps old fields but stops the accepted prefix; a new answer gets a new gate`, t => {
   const f = fixture(t), draft = f.complete(era), q = f.question(draft, 'objective');
   const old = discoveryInspection(f.store, draft);
   const reopened = f.engine.discovery.reopen(q.id, q.revision);
@@ -243,7 +243,7 @@ test(`G4b ${state}: public outcome never carries the internal gate or prefix`, t
   assert.ok(inspected.gate);
 });
 
-for (const era of [5, 6] as const) test(`G4b v${era}: committed outcome is three Store reads and zero old answer bodies on cold/10x-history stores`, t => {
+for (const era of [6] as const) test(`G4b v${era}: committed outcome is three Store reads and zero old answer bodies on cold/10x-history stores`, t => {
   const f = fixture(t), draft = f.complete(era);
   const originalGet = Store.prototype.get;
   let oldBodies = 0;

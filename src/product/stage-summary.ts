@@ -3,7 +3,7 @@ import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { discoveryConstraintBindings, discoveryDecisionId } from "../discovery/discovery-outcome.js";
 import {
   acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planOwnerSubject,
-  isAdmissionEra, isPreparationEra, isSupportedEra, issuedEntry, issuedForm,
+  isAdmissionEra, isSupportedEra, issuedEntry, issuedForm,
   listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft,
   readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions,
   type DiscoveryChoice, type DiscoveryDraft, type FormEntry, type IssuedAnswerProof,
@@ -391,10 +391,7 @@ function readAccepted(store: Store, artifact: Revision<StageArtifact>, current: 
   const limitations: string[] = [];
   let researchPlan: SummaryField | null = null, report: SummaryAccepted["report"] = null;
   let verdict: SummaryAccepted["verdict"] = null, preparation: SummaryField | null = fields.get("preparation")?.summary ?? null;
-  if (!issuance.prepared) {
-    limitations.push(`researchPlan отсутствует в contractVersion ${version}`,
-      `researchReport отсутствует в contractVersion ${version}`, `verdict отсутствует в contractVersion ${version}`);
-  } else {
+  {
     const plan = fields.get("researchPlan")!, reportRead = fields.get("researchReport")!, verdictRead = fields.get("verdict")!;
     researchPlan = plan.summary;
     report = researchReportSummary(proofs, artifact.value.projectId, plan, reportRead);
@@ -446,7 +443,6 @@ function candidateResearch(store: Store, project: string, draft: Revision<Discov
     verdict: SummaryResearchVerdict | null; failure: SummaryFailure | null } {
   let researchPlan: SummaryField | null = null, report: SummaryResearchReport | null = null;
   let verdict: SummaryResearchVerdict | null = null, failure: SummaryFailure | null = null;
-  if (!isPreparationEra(contractEraOf(draft.value))) return { researchPlan, report, verdict, failure };
   const readable = (field: string): FormEntry | null => {
     const index = records.findIndex(entry => entry.field === field);
     if (index < 0 || !records.slice(0, index + 1).every(entry => entry.status === "answered")) return null;
@@ -613,13 +609,6 @@ function readStructuredAccepted(store: Store, artifact: Revision<StageArtifact>,
   }
   const fields = new Map(issuance.fields.map(name => [name, readAcceptedField(proofs, artifact, draft, issuance, name)]));
   const limitations: string[] = [];
-  if (stage === "concept" && !fields.has("conceptSections")) limitations.push(`conceptSections отсутствует в contractVersion ${version}`);
-  if (stage === "operation-map") {
-    if (!fields.has("operationRequirements")) limitations.push(`operationRequirements отсутствует в contractVersion ${version}`);
-    if (!fields.has("mapDesign")) limitations.push(`mapDesign отсутствует в contractVersion ${version}`);
-  }
-  if (stage === "specification" && !fields.has("behaviorContracts")) limitations.push(`behaviorContracts отсутствует в contractVersion ${version}`);
-  if (stage === "features" && !fields.has("featurePreparation")) limitations.push(`featurePreparation отсутствует в contractVersion ${version}`);
   const layer = stage === "operation-map" ? layerSummary(store, proofs, artifact.value.projectId, content.graph as Ref) : null;
   if (layer) limitations.push(...layer.limitations);
   return { state: current && same(reference(current), reference(artifact)) ? "accepted" : "previously_accepted",
@@ -717,7 +706,7 @@ function readCandidate(store: Store, project: string, draft: Revision<DiscoveryD
     }
   }
   const verdictEntry = records.find(entry => entry.field === "verdict");
-  if (isPreparationEra(contractEraOf(draft.value)) && verdictEntry) {
+  if (verdictEntry) {
     const before = records.slice(0, verdictEntry.index);
     if (before.every(entry => entry.status === "answered")) {
       try {

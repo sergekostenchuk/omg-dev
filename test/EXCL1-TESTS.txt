@@ -5,7 +5,6 @@
 
 assessment-session-resume.test.ts :: D8.3 reads byte-identical assessment history from the whole b603c2b producer after two restarts without dispatch # вид 1: эра b603c2b
 discovery-v6-era.test.ts :: DS1.2e the released v5 requirement literal and all schema/prompt bytes stay exact # вид 1: старая форма/маршрут
-discovery-v6-era.test.ts :: P3-83 saved v5 accepted replay keeps its public shape and paid bytes after a new Store # вид 1: старая форма/маршрут
 discovery-v6-era.test.ts :: DS2 genuine pre-DS2 v6 keeps unfinished and paid work, accepted summary and B1 exact closure after restart # поддерживаемое издание v6 до DS2; исторический Git-производитель, исключён из check:backend
 discovery.test.ts :: D8.4.2-2 P2-1 (№2276-1): a K of the accepted D8.4e producer (c60be08, UUID answer) keeps its full contract; the new producer alone writes the managed address # вид 1: эра c60be08
 early-stage-briefs.test.ts :: RS4 exact Git 8b665772 producer: old completed and paid pending history and reader continuation survive restart unchanged # вид 1: эра 8b665772
@@ -118,8 +117,6 @@ om-run-part-02.test.ts :: G5.1 return №3867-1 a restart after the saved failed
 om-run-part-04.test.ts :: G5.1 rows 1, 6, 7 an ambiguous producer end the base answered before the wake-test era is asked its wake test once, by the accepting attempt; the works are accepted with that test waking the sleeping flow, and a restart or re-entry pays nothing again # вид 1: предложение до wakeTest; текущий E3 отказывает при неоднозначном выборе без wakeTest
 om-run-part-06.test.ts :: LP6 return №3371: an accepted field beside a real failure of the same attempt — a refusal of the model (the reviewer's probe), the owner's wait, an interrupted call — is no reconciled row: the stop stands for the producer, for the reader of a transition and after a reopen, and the facts A6 is shown keep the mixed end # вид 1: старый stop none/none/none и его reconciliation; текущие mixed outcomes проверяются отдельно (№7299)
 product.test.ts :: DS1 explicit historical upstream uses its Git producer and leaves current fixtures on the current contract # вид 1: историческая эра (upstream Git producer / v3–v5), найден GUARD1 в финальном прогоне 4ce78bf2
-stage-summary.test.ts :: DS1.3a reads saved v3–v5 histories and the current v6 stage by their own contracts # вид 1: историческая эра (upstream Git producer / v3–v5), найден GUARD1 в финальном прогоне 4ce78bf2
-stage-summary.test.ts :: DS1.3b reads genuine legacy specification and features without inventing fields absent in their era # вид 1: историческая эра (upstream Git producer / v3–v5), найден GUARD1 в финальном прогоне 4ce78bf2
 
 # OLD-DISCOVERY (№7903): собственная логика старого Discovery; общие механизмы и нижние потребители сохранены.
 early-stage-driver.test.ts :: IN1 initializes verbatim Source, brief and fallback objective before the first researchPlan call # вид OLD-DISCOVERY: собственная логика старого Discovery v6, удаляется с включением v7 (слово владельца 20.10)
