@@ -13,6 +13,8 @@ import { projectSynthesisSessionV3Initial, synthesisSessionV3Address, synthesisS
   RESEARCH_CHECKPOINT_V2_PREFIX, type SynthesisSessionV3Origin } from "../src/discovery/research-consumer-transition.js";
 import { V7_PLAN_SUBJECT_CONTRACT, questionDispatchId, type V7PlanSubject } from "../src/discovery/v7-managed-attempt.js";
 import { prepareResearchConsumerIntent } from "../src/discovery/response-recovery.js";
+import { researchCall } from "../src/discovery/research-protocol.js";
+import { uniqueTransactionGuards } from "../src/runtime/environment.js";
 import { synthesisControls } from "../src/discovery/synthesis-controls.js";
 import { contextWorkspace } from "../src/discovery/context-workspace.js";
 import type { Environment } from "../src/runtime/environment.js";
@@ -205,7 +207,7 @@ test("S1 forms (structural): the subject is mandatory and exact, the era is the 
   assert.deepEqual(synthesisSessionSubject(lawful), subjectOf(p.planAnswer, "q-supply"));
 });
 
-test("S1 session → step → handoff (structural): the step names exactly the session subject, the second O@1 producer takes that subject, and the unconnected v3 step producer stays unavailable", t => {
+test("S1 session → step → handoff (structural): the step names exactly the session subject, the second O@1 producer takes that subject, and the unconnected v3 step stops before any consumer state while its paid send stays unavailable", async t => {
   const f = fixture(t), p = planned(f, "dr3a3s1-steps");
   const A = subjectOf(p.planAnswer, "q-supply"), B = subjectOf(p.planAnswer, "q-market");
   const session = projectSynthesisSessionV3Initial(origin(p, A));
@@ -232,8 +234,10 @@ test("S1 session → step → handoff (structural): the step names exactly the s
     runId: "research-run:x", number: 2, question: reference(p.plan), subject: A,
     action: { action: "answer", question: p.plan.id, value: end, citations: [] } })), /^research_response_invalid: /,
   "K-01 class: the handoff answer addresses the plan-question id, not the Question id");
-  // The v3 step producer is not connected before S5: the real intent producer refuses a session step that
-  // names a subject before any consumer state exists.
+  // The v3 step is not connected before S5. Since S2 (codex-omg №7690 §3 S2) the packer carries the synthesis
+  // role's subject, so the real intent producer no longer stops in its preflight: it stops at the exact guard
+  // of its owner — the v3 session, whose producer is S5 — before any consumer state exists. The paid send of
+  // the synthesis role stays closed (below).
   const dispatch = p.environment.value;
   const owner = { id: session.id, revision: 1, hash: hashJson(session.value) };
   assert.match(failure(() => prepareResearchConsumerIntent(f.store, { projectId: p.project, kind: "synthesis",
@@ -241,10 +245,15 @@ test("S1 session → step → handoff (structural): the step names exactly the s
     question: reference(p.plan), role: dispatch.implementer, dispatch, profile: null,
     cursor: { sessionId: session.id, offset: 0, materialOffset: 0, materialEncoding: null, subject: A,
       context: stepContext(session.id, p.materials), prompt: "Return the declared research action",
-      delivery: null }, basis: [owner], guards: [owner, reference(p.draft), reference(p.plan)] })),
-  /^research_v7_mode_unavailable: /);
+      delivery: null }, basis: [owner], guards: uniqueTransactionGuards([owner, reference(p.draft), reference(p.plan)]) })),
+  /^input_stale: /);
   for (const kind of ["research-consumer-intent", "model-call", "model-request", "request-manifest", "synthesis-session"])
     assert.deepEqual(f.store.list(kind), [], `the refused admission wrote no ${kind}`);
+  await assert.rejects(researchCall(dispatch.implementer, dispatch, "Return the declared research action",
+    stepContext(session.id, p.materials), undefined, { store: f.store, draftId: p.draft.id, questionId: p.plan.id, purpose: "analyst" }),
+  { code: "research_v7_mode_unavailable" });
+  for (const kind of ["model-call", "model-request", "research-budget-ledger"])
+    assert.deepEqual(f.store.list(kind), [], `the closed paid send wrote no ${kind}`);
 });
 
 test("S1 one projector for writer and reader: the v2 partial note and the v2 saved-only selection are subject-scoped forms with their own addresses", t => {

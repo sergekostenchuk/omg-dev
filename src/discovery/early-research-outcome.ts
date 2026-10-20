@@ -1,5 +1,5 @@
 import { assessmentRolePrompt } from './assessment-session.js';
-import { packetAssessmentSubject, assessmentQuestionContract, assessmentTransportPrompt, ATTEMPTS_ASSESSMENT_RESPONSE } from './continuation-packet.js';
+import { packetAssessmentSubject, packetPlanSubject, assessmentQuestionContract, assessmentTransportPrompt, ATTEMPTS_ASSESSMENT_RESPONSE } from './continuation-packet.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
@@ -245,20 +245,26 @@ export function researchCapacityInput(input: {
       return note.checkpoint;
     });
   }
-  const forms = input.actionMode === 'consolidation' ? ['summary']
+  // DR3a3-S2: a v7 plan-question declares the subject it is admitted for and
+  // its own action contract: an attempt ends with an answer, never answer_delta,
+  // and the plan field's FieldSpec is not the result contract.
+  const planSubject = packetPlanSubject(input.bindings);
+  const forms = (input.actionMode === 'consolidation' ? ['summary']
     : input.purpose === 'assessor' ? ['verdict', 'assessment_checkpoint', 'read_context']
     : input.purpose === 'escalation-assessor' ? ['escalation']
     : input.purpose === 'reader' ? ['selections']
     : input.purpose === 'synthesis' ? ['answer', 'answer_delta', 'checkpoint', 'read_context', 'need_research', 'need_owner', 'pause']
     : ['answer', 'answer_delta', 'checkpoint', 'need_owner', 'need_research', 'read_context',
-      'read_source', 'search', 'read', 'read_bundle', 'read_plan', 'synthesize', 'web_search', 'web_fetch', 'pause'];
+      'read_source', 'search', 'read', 'read_bundle', 'read_plan', 'synthesize', 'web_search', 'web_fetch', 'pause'])
+    .filter(kind => !planSubject || kind !== 'answer_delta');
   const envelope = { protocol: 'omg-agent/v1', requestId: '00000000-0000-0000-0000-000000000000',
     mode: 'research', model: input.binding.model,
     effort: input.binding.effort, ...(input.binding.speed ? { speed: input.binding.speed } : {}),
     prompt: assessmentSubject ? assessmentTransportPrompt(input.prompt, assessmentRolePrompt('')) : input.prompt,
     subject: { stage: input.draft.stage, level: input.draft.level, consumer: input.draft.consumer,
       contractVersion: input.draft.contractVersion ?? 1, purpose: input.purpose,
-      question: assessmentSubject ? assessmentQuestionContract(assessmentSubject) : { id: input.question.id, ...input.question.value.spec },
+      question: assessmentSubject ? assessmentQuestionContract(assessmentSubject)
+        : planSubject ? { id: planSubject.planQuestionId, subject: planSubject } : { id: input.question.id, ...input.question.value.spec },
       inputs: input.draft.inputs, ...mandatory, cursor: input.cursor ?? {},
       responseOutputLimit: researchResponseOutputLimit(input.physicalReplyLimit ?? null),
       access: { exactOriginals: true, incompletePagesAreNotComplete: true,

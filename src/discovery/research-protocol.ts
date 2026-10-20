@@ -2,6 +2,32 @@ import { baselineGuards } from './v7-attempt-assessment.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { assessmentRolePrompt } from './assessment-session.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
+
+/** DR3a3-S2 (codex-omg №7690 решение 2): the final synthesis of a v7
+ * plan-question returns the end of its attempt (K) — never answer_delta and
+ * never an answer judged by the plan field's own citations; every other rule
+ * of the final page is the same. */
+const ATTEMPT_END_SENTENCE = 'Return answer/answer_delta only with sufficient valid citations and required evidence.';
+export const V7_FINAL_SYNTHESIS_INSTRUCTION = FINAL_SYNTHESIS_INSTRUCTION.replace(ATTEMPT_END_SENTENCE,
+  'Return the end of this plan-question attempt as {action:"answer",question:subject.question.id,value:<one end of subject.question.schema>,citations:[]}: a submitted end carries every claim with its basis inside value, refused or impossible name their evidence, duplicate names its exact original. An attempt has no answer_delta.');
+if (V7_FINAL_SYNTHESIS_INSTRUCTION === FINAL_SYNTHESIS_INSTRUCTION)
+  throw new Error('The v7 final synthesis instruction lost its attempt-end sentence');
+
+/** DR3a3-S2: the roles of a v7 plan-question and how each packet declares
+ * itself — the saved result admission's purpose, the caller purpose and the
+ * dispatch context must name the same role. */
+function planSubjectRole(capacityPurpose: unknown, auditPurpose: unknown, context: unknown): boolean {
+  const c = (context && typeof context === 'object' && !Array.isArray(context) ? context : {}) as Record<string, any>;
+  const session = typeof c.synthesisSession === 'string', mode = c.dispatchMode;
+  const finalizing = c.contextControls?.mode === 'finalization';
+  switch (capacityPurpose) {
+    case 'analyst': return auditPurpose === 'analyst' && !session && !['planning', 'consolidation'].includes(mode) && !finalizing;
+    case 'reading-planner': return auditPurpose === 'reading-planner' && mode === 'planning' && !session;
+    case 'synthesis': return auditPurpose === 'analyst' && session && !['planning', 'consolidation'].includes(mode);
+    case 'consolidation': return auditPurpose === 'analyst' && session && mode === 'consolidation';
+    default: return false;
+  }
+}
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
 import { physicalClaim, authorizeModelDispatch, prepareLateModelReceipt, readModelCallRecovery, executionOf } from './model-call-recovery.js';
 import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowance } from "./invocation-progress.js";
@@ -198,10 +224,16 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
     proveAssessmentTransportSubject(audit.store,context,environment.projectId,reference(basis));
     prompt = assessmentTransportPrompt(prompt,assessmentRolePrompt(''));
   }
-  requireCondition(!planSubject || audit?.purpose === 'analyst' && capacity?.purpose === 'analyst'
-    && !['planning','consolidation'].includes((context as any)?.dispatchMode) && !(context as any)?.synthesisSession
-    && (context as any)?.contextControls?.mode !== 'finalization',
-    'research_v7_mode_unavailable', 'Only the analyst plan-question path is connected');
+  // DR3a3-S2: the packer and its proof carry one exact plan subject for every
+  // role of a v7 plan-question — analyst, reading planner, synthesis and
+  // consolidation — each declared consistently; no other role carries one.
+  // The paid admission of the roles not yet connected stays closed in researchCall.
+  if (planSubject) {
+    requireCondition(['analyst', 'reading-planner', 'synthesis', 'consolidation'].includes(capacity?.purpose),
+      'research_v7_mode_unavailable', 'Only the roles of a v7 plan-question carry a plan subject');
+    requireCondition(planSubjectRole(capacity?.purpose, audit?.purpose, context), 'research_capacity_invalid',
+      'The packet role differs from the role its saved result admission declares');
+  }
   requireCondition(!planSubject || audit?.questionId && draft, 'research_plan_subject_invalid',
     'A plan subject requires the common saved-question packet');
   const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
@@ -209,14 +241,15 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
+  const finalInstruction = planSubject ? V7_FINAL_SYNTHESIS_INSTRUCTION : FINAL_SYNTHESIS_INSTRUCTION;
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' && !planSubject ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? finalInstruction : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' && !planSubject ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const packingContext = capacity === undefined ? context : { ...context as Record<string, unknown>, resultCapacity: capacity };
   const requestLimit = capacity === undefined ? audit?.pilot?.value.maxRequestChars ?? DEFAULT_RESEARCH_REQUEST_CHARS
     : capacity.envelopeLimitChars;
   const outputLimit = researchResponseOutputLimit(audit?.pilot?.value.physicalLimits?.maxReplyChars ?? null);
   const overhead = JSON.stringify(outputLimit).length + 32 + Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
-    controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
+    controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subjectFor = (limit: number) => {
     const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
       limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}), continuation: !packetState.initial,
@@ -232,7 +265,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   let subjectLimit = requestLimit - overhead;
   let subject = subjectFor(subjectLimit);
   const physicalLimit = Math.min(requestLimit, audit?.pilot?.value.physicalLimits?.maxRequestChars ?? requestLimit);
-  if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
+  if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = finalInstruction;
   const canonicalWire = JSON.stringify({ ...envelope, subject });
   let input = canonicalWire;
   if (requestContract === REQUEST_MANIFEST_CONTRACT) {
@@ -244,7 +277,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   for (let attempt = 0; packetState && input.length > physicalLimit && attempt < 4; attempt += 1) {
     subjectLimit -= input.length - physicalLimit + 128;
     subject = subjectFor(subjectLimit);
-    if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = FINAL_SYNTHESIS_INSTRUCTION;
+    if (!consolidating && (subject as any)?.contextControls?.mode === 'finalization') envelope.prompt = finalInstruction;
     input = JSON.stringify({ ...envelope, subject });
     if (requestContract === REQUEST_MANIFEST_CONTRACT) {
       requireCondition(partitionResearchWire(envelope, subject).join('') === input,
