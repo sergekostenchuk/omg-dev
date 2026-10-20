@@ -205,7 +205,7 @@ test('effective process identity and HOME changes invalidate runtime confirmatio
  assert.equal(collectRuntimeEvidence(f.store,'p',f.spec,p.report,[p.observation]).proofs.length,0);
 });
 
-test('active observation blocks policy changes, concurrent keys and recovery of its live owner',async t=>{
+test('active observation blocks concurrent keys and recovery of its live owner',async t=>{
  const f=fixture(t,'wait',0,10000),pending=f.observe();
  await until(()=>Boolean(f.store.list<RuntimeObservation>('runtime-observation')[0]?.value.child));
  const active=f.store.list<RuntimeObservation>('runtime-observation')[0]!;
@@ -213,8 +213,6 @@ test('active observation blocks policy changes, concurrent keys and recovery of 
  try{
  const duplicate=await f.observe();assert.equal(duplicate.observation.value.status,'running');assert.equal(duplicate.source,null);
  await assert.rejects(f.observe('other'),{code:'runtime_observation_busy'});
- const policy={...f.scope.value.policy!,assignments:f.scope.value.policy!.assignments.map(a=>({...a,reason:'Changed declaration'}))};
- assert.throws(()=>f.engine.execute({type:'apply-obligation-policy',project:'p',scope:reference(f.scope),policy}),{code:'obligation_application_busy'});
  assert.throws(()=>f.engine.execute({type:'recover-runtime-observation',project:'p',observation:reference(active)}),{code:'runtime_observation_busy'});
  await assert.rejects(researchCall(f.environment.value.implementer,f.environment.value,'Do not dispatch during observation',{},undefined,
   {store:f.store,draftId:f.draft.id,questionId:f.question.id,purpose:'analyst'}),{code:'runtime_observation_busy'});

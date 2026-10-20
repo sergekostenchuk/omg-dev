@@ -21,9 +21,7 @@ import '../om/compiler-readers.js';
 import { declareAdapterLineage } from '../adapters/adapter-lineage.js';
 import { recoverResearchResponse, permitCancelledCallRetry, permitLimitedCallRetry } from '../discovery/response-recovery.js';
 import { recoverContextSession } from '../discovery/context-recovery.js';
-import { allocateResearchTrial } from '../discovery/research-trial.js';
 import { retryPlannedRead } from '../discovery/reading-plan.js';
-import { applyObligationPolicy } from '../graph/obligation-application.js';
 import { observeRuntime, recoverRuntimeObservation } from '../runtime/runtime-observation.js';
 import { continuePreparation, recoverLegacyOperation } from "./preparation-run.js";
 import { mapStatus, saveMapStatus } from "../graph/map-status.js";
@@ -282,7 +280,6 @@ export class ProductEngine {
       case 'declare-adapter-lineage': this.#project(command.project); return declareAdapterLineage(this.store, command.project, command, this.actor);
       case 'observe-runtime': this.#project(command.project); return observeRuntime(this.store,command.project,command);
       case 'recover-runtime-observation': this.#project(command.project); return recoverRuntimeObservation(this.store,command.project,command.observation);
-      case 'apply-obligation-policy': this.#project(command.project); return applyObligationPolicy(this.store,command.project,command.scope,command.policy);
       // DRY6-02: the explicit addressed door of an older cancelled attempt — one new attempt of exactly that call.
       case "permit-cancelled-call-retry": this.#project(command.project); return permitCancelledCallRetry(this.store, command, this.actor);
       case "recover-om-capacity": this.#project(command.project); return recoverOmCapacity(this.store, command, this.actor);
@@ -302,7 +299,6 @@ export class ProductEngine {
       }
       case 'recover-context-session': this.#project(command.project); return recoverContextSession(this.store,command.project,command.session,command.selector);
       case 'retry-planned-read': this.#project(command.project); return retryPlannedRead(this.store,command.project,command.child);
-      case 'allocate-research-trial': this.#project(command.project); return allocateResearchTrial(this.store,command.project,command);
       case "recover-legacy-operation": this.#project(command.project); return recoverLegacyOperation(this,command);
       case "continue-preparation": this.#project(command.project); return continuePreparation(this,command.project,command.maxCalls);
       case "set-map-status": this.#project(command.project); return saveMapStatus(this.store,

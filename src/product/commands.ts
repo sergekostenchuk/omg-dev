@@ -9,7 +9,6 @@ import type { DetailSelector } from "../compiler/context.js";
 import type { Environment } from "../runtime/environment.js";
 import { readerPilotSchema, type ReaderPilotSettings } from "../discovery/reader-pilot.js";
 import type { ContextRecoverySelector } from '../discovery/context-recovery.js';
-import { obligationPolicySchema, type ObligationPolicy } from '../graph/obligation-policy.js';
 import type { AdapterLineageDeclaration } from '../adapters/adapter-lineage.js';
 import type { EarlyStageInstruction } from './early-stage-driver.js';
 
@@ -19,10 +18,8 @@ export type ProductCommand =
   | ({type:'declare-adapter-lineage';project:string} & AdapterLineageDeclaration)
   | {type:'observe-runtime';project:string;scope:Ref;obligation:string;key:string}
   | {type:'recover-runtime-observation';project:string;observation:Ref}
-  | {type:'apply-obligation-policy';project:string;scope:Ref;policy:ObligationPolicy}
   | {type:'retry-planned-read';project:string;child:Ref}
   | {type:'recover-context-session';project:string;session:Ref;selector:ContextRecoverySelector}
-  | {type:'allocate-research-trial';project:string;key:string;previousPolicy:Ref;limit:number;blockLimit:number}
   | {type:"recover-model-call";project:string;call:Ref}
   | {type:"permit-cancelled-call-retry";project:string;call:Ref}
   | {type:"recover-om-capacity";project:string;packet:Ref}
@@ -101,15 +98,9 @@ const environmentSettings = object({ workspace: string, implementer: role, revie
 // Added after object() fixed the required set, so a configure without it stays valid; the saved-environment validator judges the value.
 environmentSettings.properties['requestCapacityChars'] = { type: "integer", minimum: 1 };
 // WB1 (№4552): optional like the capacity; without it the project keeps working without web research.
-environmentSettings.properties['webResearch'] = { oneOf: [
-  object({ enabled: { type: "boolean" }, gatewayUrl: string,
-    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
-    limits: object({ httpAttempts: { type: "integer", minimum: 1 }, pages: { type: "integer", minimum: 1 },
-      receivedChars: { type: "integer", minimum: 1 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) }),
-  object({ enabled: { type: "boolean" }, gatewayUrl: string,
-    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 }, budgetContract: { const: 'web-budget/v2' },
-    limits: object({ materialChars: { const: 2000000 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) })
-] };
+environmentSettings.properties['webResearch'] = object({ enabled: { type: "boolean" }, gatewayUrl: string,
+  timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 }, budgetContract: { const: 'web-budget/v2' },
+  limits: object({ materialChars: { const: 2000000 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) });
 const researchLevel = { enum: ["R0", "R1", "R2"] };
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
@@ -145,13 +136,11 @@ const schema = { oneOf: [
   command("recover-legacy-operation",{project,operation:ref,token:string}),
   command('observe-runtime',{project,scope:ref,obligation:string,key:string}),
   command('recover-runtime-observation',{project,observation:ref}),
-  command('apply-obligation-policy',{project,scope:ref,policy:obligationPolicySchema}),
   command('retry-planned-read',{project,child:ref}),
   command('recover-context-session',{project,session:ref,selector:recoverySelector}),
   command('recover-research-response', { project, call: ref, session: ref }),
   command('declare-adapter-lineage', { project, path: string, sha256: { type: 'string', pattern: '^[a-f0-9]{64}$' },
     basis: { type: 'array', minItems: 1, items: string } }),
-  command('allocate-research-trial',{project,key:string,previousPolicy:ref,limit:{type:'integer',minimum:1},blockLimit:{type:'integer',minimum:1}}),
   command("recover-model-call", {project,call:ref}),
   command("permit-cancelled-call-retry", {project,call:ref}),
   command("recover-om-capacity", {project,packet:ref}),

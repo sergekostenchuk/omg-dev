@@ -15,6 +15,8 @@ import { exampleGraph } from "./graph-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { designOf } from "../src/graph/builder.js";
+import { createProductServer } from "../src/server.js";
+import type { Environment } from "../src/runtime/environment.js";
 
 test("the real product command path carries two independent products from brief to traceable features and cold reopen", t => {
   const root = mkdtempSync(join(tmpdir(), "omg-product-")); const path = join(root, "state.sqlite"); const store = new Store(path);
@@ -139,4 +141,71 @@ test('DS1 explicit historical upstream uses its Git producer and leaves current 
   assert.equal(version('current'), RESEARCH_CONTRACT_VERSION);
   for (const project of ['era', 'current']) for (const stage of UPSTREAM_STAGES)
     assert.equal(engine.pipeline.inspect(project, stage).state, 'accepted');
+});
+
+
+function lg30Commands(t: test.TestContext) {
+  const root = mkdtempSync(join(tmpdir(), "omg-lg30-")), path = join(root, "state.sqlite"), store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const engine = new ProductEngine(store);
+  const project = engine.execute({ type: "create-project", project: "p", title: "Current commands" }) as Revision;
+  const command = { executable: process.execPath, args: ["--version"] };
+  const environment: Omit<Environment, "projectId"> = { workspace: root, timeoutMs: 1000, requestCapacityChars: 100000,
+    implementer: { actor: "author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command };
+  const configure = (expected: number, web: unknown) => ({ type: "configure", project: "p", expected,
+    environment: web === undefined ? environment : { ...environment, webResearch: web } });
+  return { path, store, engine, project, configure };
+}
+
+const lg30Web = { enabled: true, gatewayUrl: "http://127.0.0.1:18890", timeoutMs: 1000,
+  budgetContract: "web-budget/v2", limits: { materialChars: 2000000, responseBytes: 100000 } };
+
+test("LG30-A retired R2 policy, trial and web-v1 commands are refused by engine, CLI and HTTP without writes", async t => {
+  const f = lg30Commands(t);
+  f.engine.execute(f.configure(0, lg30Web));
+  const server = createProductServer(f.engine);
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/command`;
+  const before = f.store.list().flatMap(record => f.store.history(record.id));
+  const ref = reference(f.project);
+  // These are command-shaped inputs, not fabricated scope/policy records in storage.
+  const commands = [
+    { type: "apply-obligation-policy", project: "p", scope: ref, policy: { version: 1, sourceScope: ref, assignments: [] } },
+    { type: "allocate-research-trial", project: "p", key: "new-trial", previousPolicy: ref, limit: 10, blockLimit: 5 },
+    f.configure(1, { enabled: true, gatewayUrl: lg30Web.gatewayUrl, timeoutMs: 1000,
+      limits: { httpAttempts: 1, pages: 1, receivedChars: 1000, responseBytes: 100000 } }),
+  ];
+  try {
+    for (const input of commands) {
+      assert.throws(() => f.engine.execute(input), { code: "command_invalid" }, input.type);
+      const cli = spawnSync(process.execPath, [new URL("../src/cli.js", import.meta.url).pathname, "command", f.path],
+        { input: JSON.stringify(input), encoding: "utf8", timeout: 10000 });
+      assert.equal(cli.status, 1, cli.stderr); assert.equal(JSON.parse(cli.stderr.split("\n").find(line => line.startsWith("{"))!).error, "command_invalid");
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json",
+        "X-OMG-Token": server.accessToken }, body: JSON.stringify(input) });
+      assert.equal(response.status, 400); assert.equal((await response.json() as { error: string }).error, "command_invalid");
+      assert.deepEqual(f.store.list().flatMap(record => f.store.history(record.id)), before, input.type);
+    }
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});
+
+test("LG30-A configure preserves absent web settings and exact v2 settings; missing or disguised contracts never write", t => {
+  const f = lg30Commands(t);
+  const plain = f.engine.execute(f.configure(0, undefined)) as Revision<Environment>;
+  assert.equal(Object.hasOwn(plain.value, "webResearch"), false);
+  const current = f.engine.execute(f.configure(1, lg30Web)) as Revision<Environment>;
+  assert.deepEqual(current.value.webResearch, lg30Web);
+  const { budgetContract: _contract, ...missingContract } = lg30Web;
+  for (const web of [null, {}, missingContract, { ...lg30Web, budgetContract: "web-budget/v1" },
+    { ...lg30Web, limits: { ...lg30Web.limits, pages: 1 } }, { ...lg30Web, limits: { responseBytes: 100000 } },
+    { ...lg30Web, limits: { materialChars: 2000001, responseBytes: 100000 } }]) {
+    assert.throws(() => f.engine.execute(f.configure(2, web)), { code: "command_invalid" });
+    assert.deepEqual(f.store.history(current.id), [plain, current]);
+  }
+  const disabled = { ...lg30Web, enabled: false };
+  const saved = f.engine.execute(f.configure(2, disabled)) as Revision<Environment>;
+  assert.deepEqual(saved.value.webResearch, disabled);
+  const cold = new Store(f.path);
+  try { assert.deepEqual(cold.history(current.id), [plain, current, saved]); } finally { cold.close(); }
 });
