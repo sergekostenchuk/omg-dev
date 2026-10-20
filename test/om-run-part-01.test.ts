@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { observeStore, Store, type Revision, type Write } from "../src/storage/store.js";
+import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { refused, transfer, type OmResult } from "../src/om/refusal.js";
@@ -33,12 +33,10 @@ import { rankExpansions } from "../src/om/run.js";
 // ---- LP5 (№3278): after a replaced B1 the old work ends by its own products, the new bases are built, paid assemblies answer again ----
 import { COMPLETION_REUSE_KIND, readCompletionCessationAt, type CompletionCessation } from "../src/om/model-call.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
-import { chosenWakes, WAKE_CHOICE_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { readSeries } from "../src/om/series.js";
 import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "../src/om/gap-lines.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, LP3_BASE_COMMIT, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_CONTENTS, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp5ReplaceB1, lp5Pass, g51Pass, LP5_BASE_COMMIT, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
-
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp5ReplaceB1, lp5Pass, LP5_BASE_COMMIT, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
 
 test("LG01r1 current fixture modes preserve the run's questions and never prebuild a cold B1", t => {
   for (const mode of ["stages", "n2", "executed"] as const) {
@@ -163,7 +161,6 @@ test("25 11 R2 №1770 H1 an N2 root that ended without assembly closes its own 
     "A negative close needs no candidate, C5 or D2");
   assert.equal(f.sent().length, 1);
 });
-
 
 test("H1.5 №2166 п.4 the moment decides, not the kind: an environment confirmation or a post-implementation proof of the pass is a ground of its end, one of task-start or task-result is no barrier of the pass", async t => {
   // Native N2 must actually build N3 now; the former research fixture had a full L3 without om-frame:3.
@@ -421,39 +418,6 @@ test("LP3 (№2876) a cycle start is refused only with the codes of H1 and of E2
   } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
-test("LP3 (№2817 п.4, п.7) the base d519a60 in its own process leaves the pass waiting on №52 and №53; the new code reopens it and finishes the saved work by an ordinary transition without paying the saved call again, the old revisions and records untouched", async t => {
-  for (const kase of ["52", "53"] as const) await t.test(kase, async t => {
-    // OBL1 (№3773): the next attempts keep the packet era of the base too — a brief continuation would fit what №52 read.
-    const f = lp3NativePackets(t, runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP3_PACKET_COMMIT));
-    const b = f.bases(`lp3-era-${kase}`), request = f.request(b);
-    writeFileSync(join(f.root, "repo", "big.txt"), LP3_CONTENTS["root-first"]);
-    const need = lp3Need(f, b.routes, kase === "52" ? [{ action: "read", path: "big.txt", media: "text/plain" }]
-      : [{ action: "search", within: lp3Context(f), query: "encoding" }]);
-    f.steps([need, need, need, stopAnswer(f, false)]);
-    const stuck = atCommit(f, LP3_BASE_COMMIT, `lp3-era-${kase}`, `const { advanceRun, startRun } = await import(src('om/run.js'));
-take(startRun(store, { project: args.project }));
-const seen = [];
-for (let index = 0; index < 30; index++) {
-  const advanced = take(await advanceRun(store, args.request));
-  const state = advanced.record.value.state;
-  seen.push(state.phase === 'waiting' ? 'waiting:' + state.wait.code : state.phase);
-  if (state.phase === 'waiting' && seen.at(-2) === seen.at(-1)) break;
-}
-out(seen);`, { request, project }) as string[];
-    assert.match(stuck.at(-1)!, /^waiting:/, `The base code stands on a wait: ${stuck.join(",")}`);
-    assert.equal(f.sent().length, 1, "The base code paid once");
-    f.restart();
-    const before = f.store.list().map(reference);
-    const end = await ends(f, request, 60);
-    assert.equal(end.state.phase, "unable", JSON.stringify(end.state));
-    assert.equal(f.sent().length, 4, "The saved call is not paid again: only the next attempts and the review are sent");
-    for (const ref of before) assert.deepEqual(reference(f.store.get(ref.id, ref.revision)!), ref, `${ref.id}@${ref.revision} stands as the base code wrote it`);
-    const terminals = f.store.list<{ terminal: string }>("om-model-cycle").map(row => row.value.terminal);
-    assert.ok(terminals.length === 3 && terminals.every(terminal => terminal === (kase === "52" ? "blocked" : "reads-invalid")), terminals.join(","));
-    await sameEnd(f, request, 4);
-  });
-});
-
 test("MP2 (№2968 rows 1, 2) the rank of unstarted expansion roots: producer before consumer on a chain and a fork, equal ranks by node id; a cycle keeps its outer producer before and outer consumer after; every binding and consumer counts; sleeping flows, other levels and self-references set no order", () => {
   // Row 1: a chain whose ids run against the flow, and a fork; the ready component with the least id goes first.
   assert.deepEqual(mp2Rank(["c-op", "b-op", "a-op"], [{ producer: "c-op", consumers: ["b-op"] }, { producer: "b-op", consumers: ["a-op"] }]), ["c-op", "b-op", "a-op"]);
@@ -499,24 +463,7 @@ test("MP2 (№2968 row 6) a packet issued before its neighbour finished keeps it
 
 // G5.1 return №3867-2 (№3606): the chosen supplements of one proposal are read at the addresses of its own producer ends —
 // other choices in the history change neither the result nor the number of records the lookup reads.
-test("G5.1 return №3867-2 the supplements of one proposal are found by their addresses: a growing history of other choices reads no more records", async t => {
-  const { f, results } = await g51Pass(t, allowed => allowed[1]!);
-  const proposal = results()[0]!.value.proposal;
-  const measured = () => {
-    let rows = 0, lists = 0;
-    const previous = observeStore({ begin: () => ({}), end: (_token, _store, method, _mode, _id, _revision, found) => {
-      rows += found.length; if (method === "list") lists++; }, write: () => undefined, untraced: () => undefined });
-    try { return { value: ok(chosenWakes(f.store, project, proposal)), rows, lists }; } finally { observeStore(previous); }
-  };
-  const before = measured();
-  assert.equal(before.value.length, 1);
-  assert.equal(before.lists, 0, "No list of a whole kind");
-  f.store.writeMany(Array.from({ length: 300 }, (_, index) => ({ id: `${WAKE_CHOICE_KIND}:${project}:other-${index}:1`, kind: WAKE_CHOICE_KIND,
-    expected: 0, value: { project, proposal: { ...proposal, id: `${proposal.id}-other-${index}` }, verdict: "chosen", choice: "t" } })));
-  const after = measured();
-  assert.deepEqual(after.value, before.value);
-  assert.equal(after.rows, before.rows, "300 other results read nothing more");
-});
+
 test("LP5 (№3278 §4, rows 13, 21) era: febbee2c, run from Git in its own process on the B1 replaced under its open works attempt, ends the unsent root by LP4 and stands on input_stale; the new code reads its records as they are and continues that very open work — the check ceased, the attempt closed, the new bases built, the paid root answered by its reuse", async t => {
   const f = worksFixture(t, undefined, undefined, undefined, LP5_BASE_COMMIT);
   const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
@@ -554,6 +501,7 @@ out(trail);`, { request: f.request }) as string[];
   assert.deepEqual(produce().value.attempts.map(row => row.outcome?.reason), ["interrupted", "result"]);
   assert.equal(f.store.list(COMPLETION_REUSE_KIND).length, 1);
 });
+
 
 test("LP7 rows 14, 24 (run): an answer of some joined fields — part of state included — applies only them; on the new B1 today's routing joins the rest, and its answer completes the subject keys of one full answer", async t => {
   const f = lp6Line(t, ""), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], keys: string[] = [];

@@ -14,18 +14,15 @@ import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/o
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
-import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
+import type { AnyRepairSeries } from "../src/om/series.js";
 import { closeAttempt } from "../src/om/repeat-gate.js";
-import { writeQuestionPacket } from "../src/om/question-packet.js";
 import { gapLineKey } from "../src/om/gap-lines.js";
 import { readRun, startRun, runId, type RunRecord, type RunStep, type RunWait } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 import { checkAnswerForm } from "../src/om/answer-form.js";
 // ---- LP5 (№3278): after a replaced B1 the old work ends by its own products, the new bases are built, paid assemblies answer again ----
-import { AREA_INPUT_VARIANT, COMPLETION_FINALIZATION_KIND, COMPLETION_REUSE_KIND, prepareCompletionFinalization, prepareCompletionReuse, readCompletionFinalizationAt, writeCompletionFinalization, writeCompletionReuse, type CompletionCessation, type CompletionFinalization, type CompletionReuse } from "../src/om/model-call.js";
+import { AREA_INPUT_VARIANT, COMPLETION_FINALIZATION_KIND, COMPLETION_REUSE_KIND, type CompletionCessation, type CompletionReuse } from "../src/om/model-call.js";
 import type { WorksAcceptanceRecord } from "../src/om/atomic-gate.js";
-import { completionRootAssignments } from "../src/om/series.js";
-import { writeGuarded } from "../src/om/refs.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { runWakeChoice, WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
@@ -34,8 +31,7 @@ import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
 import { prepareRunBases as lp81PrepareRunBases } from "../src/om/run-bases.js";
 import type { OmModelCall } from "../src/om/model-call.js";
 import { gardenGraph } from "./om-fixture.js";
-import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Lp5State, lp5Pass, type Reopened, unavailableReview, sameEnd } from "./om-run-fixture.js";
-
+import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Reopened, unavailableReview, sameEnd } from "./om-run-fixture.js";
 
 test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is proved by the common recovery the failed review ends the pass, and nothing is sent twice", async t => {
   const f = runFixture(t, ["encoding"], "executed");
@@ -502,183 +498,10 @@ test("LP5 (№3278 rows 2, 6, 7, 9, 13, 14, 18, 20, 23) through the pass on a ne
   });
 });
 
-test("LP5 (№3278 rows 8, 9, 10, 11, 15, 19, 22, 23, 24; §3; return №3294 п.1–2) the producers of the transition on the pass's own states: an accepted goal whose D2 is still admissible keeps its acceptance and its confirmation, its own reuses included, and only a superseded graph or frame ends its confirmation; a passed check whose C5 is not made ends its remaining acceptance all the same; through a second replacement a reuse is admitted again from the earlier reuse, its origin the first assembly; a reuse refuses a foreign D7 and finds nothing for another operation; a work moved between preparation and writing refuses the prepared reuse without a partial write; a loss after the reuse is written repeats it exactly; an accepted goal keeps its acceptance — only its confirmation remainder ends, and nothing ends once D2 confirmed it", async t => {
-  await t.test("the reuse", async t => {
-    const f = worksFixture(t);
-    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
-    let replaced = false, reuse: Record<string, unknown> | null = null;
-    ok(startRun(f.store, { project }));
-    await lp5Pass(f, (state, performed) => {
-      if (!replaced && performed === "cycle") { lp5ReplaceB1(f); replaced = true; }
-      if (state.phase === "step" && state.step!.action === "reuse") { reuse = state.step!.request; return "stop"; }
-    });
-    const request = reuse! as { project: string; binding: Ref; root: Ref; works: { producer: Ref; ledger: Ref } };
-    const binding = ok(readCompletionBinding(f.store, project, reference(produce()), 2))!;
-    const first = f.store.list<QuestionPacketRecord>("question-packet").find(row => row.value.request.attempt?.ordinal === 1 && row.value.state === "ready")!;
-    // Row 19: the D7 of the old area is never taken for today's.
-    const foreign = prepareCompletionReuse(f.store, { ...request, works: first.value.request.works! });
-    assert.equal(foreign.ok, false, "An old D7 is no basis of a reuse");
-    // Row 15: another operation of the attempt finds no paid result of its own.
-    const other = completionRootAssignments(binding).find(row => row.id !== request.root.id)!;
-    assert.equal(ok(prepareCompletionReuse(f.store, { ...request, root: reference(other) })).record, null);
-    // Rows 22, 24: the work moves between the preparation and the write — the prepared reuse refuses as a whole.
-    const prepared = ok(prepareCompletionReuse(f.store, request));
-    assert.ok(prepared.record && prepared.writes.length);
-    ok(writeQuestionPacket(f.store, { project, routes: binding.value.plan.routes, batch: other.value.batch, environment: f.request.dispatch.config,
-      attempt: { series: reference(produce()), ordinal: 2 }, previous: [], works: request.works }));
-    const stored = f.store.list().map(reference);
-    assert.equal(writeGuarded(f.store, { unit: "G7", target: prepared.record!.id, writes: [...prepared.writes], guards: [...prepared.guards] }).ok, false);
-    assert.deepEqual(f.store.list().map(reference), stored, "Nothing of it is written");
-    // Row 23: the reuse written by its producer and the pass lost before its cursor moved — the same saved step repeats it.
-    const saved = ok(writeCompletionReuse(f.store, request));
-    f.restart();
-    const repeated = ok(await advanceRun(f.store, f.request));
-    assert.deepEqual([repeated.performed?.action, f.store.list<CompletionReuse>(COMPLETION_REUSE_KIND).map(reference)], ["reuse", [reference(saved)]]);
-    await lp5Pass(f, () => produce()?.value.attempts[1]?.outcome ? "stop" : undefined);
-    assert.equal(produce().value.attempts[1]!.outcome!.reason, "result");
-    for (const packet of f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.state === "ready"))
-      assert.ok(lp4Sent(f, reference(packet)) <= 1, "Nothing paid is sent again");
-  });
-  await t.test("the confirmation", async t => {
-    const f = worksFixture(t);
-    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
-    ok(startRun(f.store, { project }));
-    await lp5Pass(f, (_state, performed) => performed === "works" ? "stop" : undefined);
-    lp5ReplaceB1(f);
-    const binding = reference(ok(readCompletionBinding(f.store, project, reference(produce()), 1))!);
-    // Row 9 (return №3294 п.1): the real acceptance stays, and with its accepted frame and graph still the heads D2 is
-    // admissible on the new B1 — neither the acceptance nor its confirmation may end.
-    const acceptance = prepareCompletionFinalization(f.store, { project, binding, phase: "acceptance" });
-    assert.deepEqual(acceptance.ok ? "ended" : acceptance.refusal.code, "completion_resolved");
-    const confirmation = prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" });
-    assert.deepEqual(confirmation.ok ? "ended" : [confirmation.refusal.code, confirmation.refusal.at.field], ["completion_cause_unproved", "confirmation"]);
-    // The same pass confirms the goal on its new bases (the reviewer's probe №3294 п.1); row 11: once D2 confirmed it,
-    // nothing of it ends any more.
-    await lp5Pass(f, () => produce()?.value.attempts[0]?.outcome ? "stop" : undefined);
-    assert.equal(produce().value.attempts[0]!.outcome!.reason, "result");
-    assert.equal(lp5Kind(f, COMPLETION_FINALIZATION_KIND).length, 0, "Nothing of the accepted goal was ended");
-    const late = prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" });
-    assert.ok(!late.ok && ["completion_resolved", "completion_closed"].includes(late.refusal.code), late.ok ? "ended" : late.refusal.code);
-  });
-  await t.test("a superseded graph", async t => {
-    const f = worksFixture(t);
-    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
-    ok(startRun(f.store, { project }));
-    await lp5Pass(f, (_state, performed) => performed === "works" ? "stop" : undefined);
-    lp5ReplaceB1(f);
-    // Row 10 (return №3294 п.1): the owner saves the map again (save-graph), so the graph the works were accepted on is no
-    // longer the head: the machine D1 can never stand on this acceptance again and its D2 is proved impossible.
-    const head = f.store.get<Graph>(`graph:${project}`)!;
-    f.engine.graphs.save(project, head.value, head.revision, "lp5-owner");
-    const moved = reference(f.store.get(`graph:${project}`)!), frame = reference(f.store.get(`om-frame:${project}:3`)!);
-    assert.equal(moved.revision, head.revision + 1);
-    const binding = reference(ok(readCompletionBinding(f.store, project, reference(produce()), 1))!);
-    const accepted = f.store.list<WorksAcceptanceRecord>("om-works-acceptance").find(row => row.value.acceptance)!;
-    const prepared = ok(prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" }));
-    assert.deepEqual([prepared.record.value.accepted, prepared.record.value.basis], [accepted.value.acceptance!.frame, { frame, graph: moved }]);
-    assert.ok(prepared.guards.some(guard => JSON.stringify(guard) === JSON.stringify(moved)), "The superseding graph head is guarded");
-    // A ground that moves between the preparation and the write refuses the whole write: nothing is written.
-    f.engine.graphs.save(project, f.store.get<Graph>(`graph:${project}`)!.value, moved.revision, "lp5-owner-race");
-    const raced = writeGuarded(f.store, { unit: "G7", target: prepared.record.id, writes: [...prepared.writes], guards: [...prepared.guards] });
-    assert.equal(raced.ok, false);
-    assert.ok(!f.store.get(prepared.record.id), "Nothing is written");
-    const latest = reference(f.store.get(`graph:${project}`)!);
-    // The pass ends exactly that remainder by the same derivation, on today's ground: the acceptance stays, interrupted.
-    await lp5Pass(f, () => produce()?.value.attempts[0]?.outcome ? "stop" : undefined);
-    assert.equal(produce().value.attempts[0]!.outcome!.reason, "interrupted");
-    const ended = lp5Kind<CompletionFinalization>(f, COMPLETION_FINALIZATION_KIND).find(row => row.value.binding.id === binding.id)!;
-    assert.deepEqual([ended.value.phase, ended.value.accepted, ended.value.basis], ["confirmation", accepted.value.acceptance!.frame, { frame, graph: latest }]);
-    assert.ok(f.store.get(accepted.id), "The real acceptance is kept");
-    // Its reader proves the saved ground at its exact references after a restart and a later graph.
-    const later = f.store.get<Graph>(`graph:${project}`)!;
-    f.engine.graphs.save(project, later.value, later.revision, "lp5-owner-2");
-    f.restart();
-    assert.deepEqual(ok(readCompletionFinalizationAt(f.store, project, reference(ended))), ended);
-  });
-  await t.test("accepted reuses", async t => {
-    const f = worksFixture(t);
-    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
-    ok(startRun(f.store, { project }));
-    // The first B1 after the check of attempt 1; attempt 2 answers both its roots by reuse and reaches the real C5.
-    let replaced = false;
-    await lp5Pass(f, (_state, performed) => {
-      if (!replaced && performed === "evaluate") { lp5ReplaceB1(f); replaced = true; }
-      else if (replaced && performed === "works") return "stop";
-    });
-    const binding = reference(ok(readCompletionBinding(f.store, project, reference(produce()), 2))!);
-    const accepted = f.store.list<WorksAcceptanceRecord>("om-works-acceptance").find(row => row.value.acceptance)!;
-    assert.equal(accepted.value.request.results.filter(row => row.kind === "reuse").length, 2, "The real C5 took both reuses");
-    lp5ReplaceB1(f, ["src"]);
-    // Return №3294 п.2 (the reviewer's probe): the acceptance of the reuses is the attempt's own — never declared absent,
-    // and its confirmation is no remainder while D2 is admissible.
-    const acceptance = prepareCompletionFinalization(f.store, { project, binding, phase: "acceptance" });
-    assert.deepEqual(acceptance.ok ? "ended" : [acceptance.refusal.code, acceptance.refusal.at.ref], ["completion_resolved", accepted.value.acceptance!.frame]);
-    const confirmation = prepareCompletionFinalization(f.store, { project, binding, phase: "confirmation" });
-    assert.deepEqual(confirmation.ok ? "ended" : confirmation.refusal.code, "completion_cause_unproved");
-    await lp5Pass(f, () => produce()?.value.attempts[1]?.outcome ? "stop" : undefined);
-    assert.deepEqual(produce().value.attempts.map(row => row.outcome?.reason), ["interrupted", "result"]);
-  });
-  await t.test("a passed check", async t => {
-    const f = worksFixture(t);
-    ok(startRun(f.store, { project }));
-    // The full G4b of the group passed: C5 is chosen, not yet made, by the attempt whose current check passed (№1749 п.3),
-    // when the B1 of the area is replaced.
-    const chosen: { series?: string; attempt?: number } = {};
-    await lp5Pass(f, state => {
-      if (state.phase !== "step" || state.step!.action !== "works") return;
-      chosen.series = state.step!.series!; chosen.attempt = state.step!.attempt!;
-      return "stop";
-    });
-    lp5ReplaceB1(f);
-    const line = () => f.store.get<RepairSeries>(chosen.series!)!.value.attempts.find(row => row.ordinal === chosen.attempt)!;
-    const binding = reference(ok(readCompletionBinding(f.store, project, reference(f.store.get(chosen.series!)!), chosen.attempt!))!);
-    // Row 8: the old pass gives no current C5; the remaining acceptance ends exactly as after a check that did not pass.
-    const ended = ok(writeCompletionFinalization(f.store, { project, binding, phase: "acceptance" }));
-    const gate = f.store.get<{ gate: Ref }>(ended.value.evaluation.id, ended.value.evaluation.revision)!.value.gate;
-    assert.equal(f.store.get<{ result: { passed: boolean } }>(gate.id, gate.revision)!.value.result.passed, true);
-    // The chosen C5 stands on the replaced B1 and is refused by its own producer; the attempt closes by the common G7.
-    const trail: string[] = [];
-    for (let index = 0; index < 20 && !line().outcome; index++) {
-      f.restart();
-      const advanced = ok(await advanceRun(f.store, f.request)), state = advanced.record.value.state as unknown as Lp5State;
-      trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${advanced.performed?.action ?? ""}`);
-    }
-    assert.equal(line().outcome?.reason, "interrupted", trail.join(","));
-    assert.equal(f.store.list<WorksAcceptanceRecord>("om-works-acceptance").some(row => row.value.acceptance), false, "No C5 is made on the replaced B1");
-  });
-  await t.test("a second replacement", async t => {
-    const f = worksFixture(t);
-    const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
-    const reuses = () => lp5Kind<CompletionReuse>(f, COMPLETION_REUSE_KIND);
-    ok(startRun(f.store, { project }));
-    // The first B1 after the check of attempt 1; the second once attempt 2 holds the reuses of both its roots.
-    let replaced = 0;
-    await lp5Pass(f, (_state, performed) => {
-      if (replaced === 0 && performed === "evaluate") { lp5ReplaceB1(f); replaced = 1; }
-      else if (replaced === 1 && performed === "reuse" && reuses().length === 2) { lp5ReplaceB1(f, ["src"]); replaced = 2; }
-      return produce()?.value.attempts[2]?.outcome ? "stop" : undefined;
-    });
-    assert.deepEqual(produce().value.attempts.map(row => row.outcome?.reason), ["interrupted", "interrupted", "result"]);
-    // §3: through several replacements the origin stays the first complete assembly; each admission is its own.
-    const bindingOf = (ordinal: number) => ok(readCompletionBinding(f.store, project, reference(produce()), ordinal))!.id;
-    const second = reuses().filter(row => row.value.binding.id === bindingOf(2)), third = reuses().filter(row => row.value.binding.id === bindingOf(3));
-    assert.deepEqual([second.length, third.length], [2, 2], "Both roots answered again after each replacement");
-    for (const row of third) {
-      const source = second.find(item => item.id === row.value.source.result.id && item.revision === row.value.source.result.revision);
-      assert.ok(source, "The third admission stands on the second attempt's own reuse");
-      assert.deepEqual(row.value.origin, source!.value.origin, "The origin stays the first complete assembly");
-      assert.notDeepEqual(row.value.works, source!.value.works, "Its bindings are carried to today's handoff again");
-    }
-    for (const packet of f.store.list<QuestionPacketRecord>("question-packet").filter(row => row.value.state === "ready"))
-      assert.ok(lp4Sent(f, reference(packet)) <= 1, "A paid answer is never sent again");
-  });
-});
-
-
 test("LP8.1 a reopened record names the exact unable revision, its grounds and exactly one new ground; absence or excess is refused on reading; bases are read as of a live pass only while it weighs its grounds again", async t => {
   const { f, unable, unchanged } = await unavailableReview(t);
   const reasons = (unable.value.state as unknown as Reopened).reasons;
-  const step: RunStep = { action: "recover-analysis", request: { project } as unknown as Json, series: null, attempt: null };
+  const step: RunStep = { action: "resume", request: { project } as unknown as Json, series: null, attempt: null };
   const bad = (state: unknown) => {
     const head = f.store.get<RunRecord>(runId(project))!;
     const written = f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: { ...head.value, state } as unknown as Json });

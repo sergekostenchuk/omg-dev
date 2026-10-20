@@ -14,11 +14,10 @@ import { readAcceptedAnswer as readAcceptedAnswerOf } from "./accepted-answer.js
 import { writeApplyAnswer as writeApplyAnswerOf, writeOwnerDecision as writeOwnerDecisionOf } from "./addressing.js";
 import { ownerAnswersHeld, type OwnerAnswer } from "./owner-result.js";
 import { openSeries as openSeriesOf, readAnySeriesAt as readAnySeriesAtOf, readCompletionBinding as readCompletionBindingOf, completionRootAssignments, completionWorkId, completionCloseId, prepareSeriesLineAdmission as prepareSeriesLineAdmissionOf,
-  resumeSeries as resumeSeriesOf, reconcileSeries as reconcileSeriesOf, prepareReconcileSeries as prepareReconcileSeriesOf, seriesAddress, seriesRequestOf,
+  resumeSeries as resumeSeriesOf, seriesAddress, seriesRequestOf,
   type AnyRepairSeries, type AttemptGoal, type CompletionAssignment, type CompletionOwner, type CompletionWork, type SeriesOwner } from "./series.js";
 import { closeAttempt as closeAttemptOf, openAttempt as openAttemptOf, prepareManagedClaim as prepareManagedClaimOf, readCompletionCloseAt as readCompletionCloseAtOf, readStopContext as readStopContextOf } from "./repeat-gate.js";
-import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest,
-  readRecoveredStopAnalysis, stopAnalysisRecoverable, writeStopAnalysisRecovery as writeStopAnalysisRecoveryOf, type AnalysisRecord } from "./stop-analysis.js";
+import { prepareStopAnalysis as prepareStopAnalysisOf, readStopAnalysis as readStopAnalysisOf, runStopAnalysis as runStopAnalysisOf, type StopAnalysisRequest, type AnalysisRecord } from "./stop-analysis.js";
 import { ceasedCycleGround as ceasedCycleGroundOf, modelCallRecordId, modelCycleId, prepareCompletionCause as prepareCompletionCauseOf, readCompletionWorkAt as readCompletionWorkAtOf, readManagedModelDiagnostic as readManagedModelDiagnosticOf, readModelCycle as readModelCycleOf, readPartAssembly as readPartAssemblyOf, recoverOmModelCall, runModelCycle as runModelCycleOf,
   writeCompletionCessation as writeCompletionCessationOf, readAreaReplacement as readAreaReplacementOf,
   prepareCompletionFinalization as prepareCompletionFinalizationOf, writeCompletionFinalization as writeCompletionFinalizationOf,
@@ -36,10 +35,10 @@ import { prepareSettleCandidate as prepareSettleCandidateOf, readWorkRejection a
 import { readJournalAt as readJournalAtOf } from "./refusal-journal.js";
 import { readAcceptedFrameLayer as readAcceptedFrameLayerOf, type FrameAttemptBinding } from "./layer-basis.js";
 import type { AcceptedFrameRequest } from "./frame-accept.js";
-import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf, producerProposal as producerProposalOf,
+import { prepareWorksAcceptance as prepareWorksAcceptanceOf, prepareWorksSources as prepareWorksSourcesOf,
   readAtomicGate as readAtomicGateOf, readWorksAcceptance as readWorksAcceptanceOf, gateImpact, gatePolicies, readinessResolutions,
   type WorkProposalSource, type WorksAcceptanceRequest } from "./atomic-gate.js";
-import { runWakeChoice as runWakeChoiceOf, wakeStanding as wakeStandingOf, type WakeChoiceRequest, type WriteOrderRequest } from "./wake-choice.js";
+import { runWakeChoice as runWakeChoiceOf, wakeStanding as wakeStandingOf, type WriteOrderRequest } from "./wake-choice.js";
 import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines as writeGapLinesOf, type GapLinesRecord } from "./gap-lines.js";
 import { prepareOmObligations as prepareOmObligationsOf, writeOmObligations as writeOmObligationsOf } from "./obligations.js";
 import { prepareFeasibility as prepareFeasibilityOf, readFeasibility as readFeasibilityOf, writeFeasibility as writeFeasibilityOf, type OmFeasibility } from "./feasibility.js";
@@ -117,8 +116,6 @@ const readAnySeriesAt = transferring("series", readAnySeriesAtOf);
 const readCompletionBinding = transferring("series", readCompletionBindingOf);
 const prepareSeriesLineAdmission = transferring("series", prepareSeriesLineAdmissionOf);
 const resumeSeries = transferring("series", resumeSeriesOf);
-const reconcileSeries = transferring("series", reconcileSeriesOf);
-const prepareReconcileSeries = transferring("series", prepareReconcileSeriesOf);
 const closeAttempt = transferring("repeat-gate", closeAttemptOf);
 const openAttempt = transferring("repeat-gate", openAttemptOf);
 const prepareManagedClaim = transferring("repeat-gate", prepareManagedClaimOf);
@@ -126,7 +123,6 @@ const readCompletionCloseAt = transferring("repeat-gate", readCompletionCloseAtO
 const readStopContext = transferring("repeat-gate", readStopContextOf);
 const prepareStopAnalysis = transferring("stop-analysis", prepareStopAnalysisOf);
 const readStopAnalysis = transferring("stop-analysis", readStopAnalysisOf);
-const writeStopAnalysisRecovery = transferring("stop-analysis", writeStopAnalysisRecoveryOf);
 const prepareCompletionCause = transferring("model-call", prepareCompletionCauseOf);
 const ceasedCycleGround = transferring("model-call", ceasedCycleGroundOf);
 const readCompletionWorkAt = transferring("model-call", readCompletionWorkAtOf);
@@ -166,7 +162,6 @@ const readWorksAcceptance = transferring("atomic-gate", readWorksAcceptanceOf);
 const readAcceptedFrameLayer = transferring("layer-basis", readAcceptedFrameLayerOf);
 const prepareWorksAcceptance = transferring("atomic-gate", prepareWorksAcceptanceOf);
 const prepareWorksSources = transferring("atomic-gate", prepareWorksSourcesOf);
-const producerProposal = transferring("atomic-gate", producerProposalOf);
 const wakeStanding = transferring("wake-choice", wakeStandingOf);
 const runWakeChoice = (...args: Parameters<typeof runWakeChoiceOf>) => runWakeChoiceOf(...args).then(value => transfer("wake-choice", value));
 const writeGapLines = transferring("gap-lines", writeGapLinesOf);
@@ -201,7 +196,7 @@ export interface RunIntent { readonly outcomes: readonly string[] }
 
 export const RUN_ACTIONS = Object.freeze(["open-series", "open", "register", "lines", "obligations", "packet", "cycle", "assess",
   "candidate", "routes", "evaluate", "accept", "works", "confirm", "cease", "cease-check", "close", "analyze", "resume", "feasibility",
-  "handoff", "compile", "bases", "apply", "finalize", "reuse", "reconcile", "recover-analysis", "wake", "readiness"] as const);
+  "handoff", "compile", "bases", "apply", "finalize", "reuse", "wake", "readiness"] as const);
 export type RunAction = typeof RUN_ACTIONS[number];
 /** A chosen action: the exact request of its producer and the attempt it serves, if any. */
 export interface RunStep { readonly action: RunAction; readonly request: Json; readonly series: string | null; readonly attempt: number | null }
@@ -441,12 +436,9 @@ export async function advanceRun(store: Store, request: RunRequest, control?: Ru
       const ground: RunReopenGround = "step" in again ? { step: again.step } : "complete" in again ? { complete: again.complete } : { wait: again.wait };
       return transition(guarded, head, { phase: "reopened", from: reference(head), reasons: state.reasons, ground }, head.value.last, null, []);
     }
-    // LP3 (№2817-4, №2870): a saved cycle of a packet E2's reader proves to be a step of a cycle (a continuation or a later
-    // part, chosen by the order of the products) and that was never cycled is not performed: the pass chooses again by an
-    // ordinary new transition, and its history and the saved records stay as they are. A cycle of it that was performed is
-    // found again by its own request; a packet whose place is not proved is performed as saved and keeps its refusal.
-    // LP4 (№2887): so is a saved cycle never performed whose root's remaining work is proved ceased by a step of its own.
-    if (state.phase === "step" && (misplacedCycle(store, state.step) || ceasedCycle(store, state.step)))
+    // LP4 (№2887): a saved cycle never performed whose root's remaining work is proved ceased by a step of its own is not
+    // performed: the pass chooses again by an ordinary new transition, and its history and the saved records stay as they are.
+    if (state.phase === "step" && ceasedCycle(store, state.step))
       return transition(guarded, head, { phase: "ready" }, head.value.last, null, []);
     if (state.phase === "step") return settle(guarded, head, state.step, await perform(guarded, store, hold, request, state.step));
     const history = historyOf(store, head), performed = history.performed;
@@ -626,19 +618,14 @@ async function perform(store: Store, raw: Store, hold: RunControlHold, request: 
       }
       case "evaluate": return mapped(writeAnswersEvaluation(store, body as never), written => [refOf(written.evaluation)]);
       case "analyze": return mapped(await recovering(raw, project, () => runStopAnalysis(raw, body as never, undefined, hold)), record => [refOf(record)]);
-      case "wake": return mapped(await recovering(raw, project, () => runWakeChoice(raw, (body as { wake: WakeChoiceRequest }).wake,
+      case "wake": return mapped(await recovering(raw, project, () => runWakeChoice(raw, (body as { wake: WriteOrderRequest }).wake,
         (body as { ordinal: number }).ordinal, undefined, hold)),
         choice => [refOf(choice)]);
-      // LP8 (№3622): the one acceptance of a saved reviewer answer the old adapter wrapper refused — no model is called.
-      case "recover-analysis": return mapped(writeStopAnalysisRecovery(store, body as never), record => [refOf(record)]);
       case "cease": return mapped(writeCompletionCessation(store, body as never), record => [refOf(record)]);
       case "cease-check": return mapped(writeAnswersCheckCessation(store, body as never), record => [refOf(record)]);
       case "finalize": return mapped(writeCompletionFinalization(store, body as never), record => [refOf(record)]);
       case "reuse": return mapped(writeCompletionReuse(store, body as never), record => [refOf(record)]);
       case "resume": return mapped(resumeSeries(store, body as never), record => [refOf(record)]);
-      // LP6: the series revision and the exact transition record of the reconciled stop.
-      case "reconcile": return mapped(reconcileSeries(store, body as never), record => [refOf(record),
-        ...("block" in record.value ? (record.value.reconciliations ?? []).filter(item => item.after === body['stop']).map(item => refOf(item.transition)) : [])]);
       case "bases": {
         const build = body as unknown as BasesStep;
         return mapped(writeRunBases(store, { project }, { guards: build.guards, open: build.open, completion: build.completion }),
@@ -872,7 +859,7 @@ function machineBases(store: Store, request: RunRequest, open: readonly Ref[]): 
  */
 // RL3: the owner's reopening of the accepted works is one more root — D1 derives the reopened works' gaps from it.
 const rootIds = (project: string): string[] => [`om-input:${project}`, `graph:${project}`, `om-frame:${project}:2`, `om-frame:${project}:3`,
-  `phase:${project}:L2`, `repo-inventory:${project}`, ...["discovery", "concept", "operation-map", "specification", "features"].map(stage => `stage:${project}:${stage}`),
+  `repo-inventory:${project}`, ...["discovery", "concept", "operation-map", "specification", "features"].map(stage => `stage:${project}:${stage}`),
   l3ReopenId(project)];
 /** The roots the machine bases derive from, each at its head or — where the choice depends on its absence — as absent. */
 function rootGuards(store: Store, project: string): TransactionGuard[] {
@@ -1151,16 +1138,8 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
   }
   const context = read.value.context;
   stand(trail, read.value.reads as Ref[]);
-  // LP8 (№3622): a failed review read with its recovery — the saved recovered review, the recovery step for an answer the
-  // old adapter wrapper refused, or the failure as it stands.
-  const analysisOf = (ref: Ref, attempt: number | null): { record: Sealed<Revision<AnalysisRecord>> } | { step: RunStep } => {
-    const record = take(readStopAnalysis(store, { project, record: ref })) as Sealed<Revision<AnalysisRecord>>;
-    if (record.value.state !== "failed") return { record };
-    const recovered = readRecoveredStopAnalysis(store, project, ref);
-    if (recovered) return { record: recovered };
-    if (stopAnalysisRecoverable(store, project, ref)) return step("recover-analysis", { project, failure: ref }, series.id, attempt);
-    return { record };
-  };
+  const analysisOf = (ref: Ref): { record: Sealed<Revision<AnalysisRecord>> } => ({
+    record: take(readStopAnalysis(store, { project, record: ref })) as Sealed<Revision<AnalysisRecord>> });
   // №1814: the A6 of one exact ground goes on with the request this pass saved for it — its original dispatch — and
   // finds its result by that request; only a ground never analysed gets the current dispatch. A6 names a hold by the
   // hold itself, and a stop by its origin series and stop attempt, never by the series revision or the dispatch.
@@ -1169,9 +1148,7 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
     const analysis = saved ?? { project, series: reference(series), hold: hold.hold, dispatch: request.dispatch };
     const done = performed("analyze", analysis);
     if (!done) return (saved ? unavailable(store, series, analysis as unknown as StopAnalysisRequest) : null) ?? step("analyze", analysis, series.id, hold.attempt);
-    const reviewed = analysisOf(done[0]!, hold.attempt);
-    if ("step" in reviewed) return reviewed;
-    const record = reviewed.record;
+    const record = analysisOf(done[0]!).record;
     if (record.value.state === "failed") return { final: [reasonOf("hold-analysis-failed", "analysis_failed", hold.hold.id, "hold",
       "The independent review of this hold ended without a result of its own; nothing automatic lifts the hold", [hold.hold, done[0]!])] };
     if (record.value.state === "origin-unestablished") return { final: [reasonOf("hold-origin-unestablished", "origin_hold", hold.hold.id, "hold",
@@ -1181,15 +1158,6 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
   }
   const stop = context.stop;
   if (!stop) return null;
-  // LP6 (№3325 §5): a block stop whose whole counted window the new era proves false is lifted by its own transition
-  // first — before the second rung and before A6 is asked or paid for. A window with a real failure keeps the old rules
-  // below; a missing or broken proof is a typed refusal of the pass, never a ground to pay for A6.
-  if ("block" in series.value) {
-    const reconcile = { ...seriesRequestOf(series.value), stop: stop.attempt };
-    const fit = prepareReconcileSeries(store, reconcile as never);
-    if (fit.ok) { if (fit.value.writes.length) return step("reconcile", reconcile, series.id, null); }
-    else if (fit.refusal.code !== "progress_unproved") throw new RunFailure(fit.refusal);
-  }
   if (context.ladder.rung >= 2) {
     const escalation = series.value.escalations.find(item => item.after === stop.attempt);
     return { final: [reasonOf("stop-second-rung", "owner_decision", series.id, "stop",
@@ -1200,9 +1168,7 @@ function ladder(store: Store, request: RunRequest, series: Sealed<Revision<AnyRe
   const analysis = saved ?? { project, series: reference(series), hold: null, dispatch: request.dispatch };
   const done = performed("analyze", analysis);
   if (!done) return (saved ? unavailable(store, series, analysis as unknown as StopAnalysisRequest) : null) ?? step("analyze", analysis, series.id, stop.attempt);
-  const reviewed = analysisOf(done[0]!, stop.attempt);
-  if ("step" in reviewed) return reviewed;
-  const record = reviewed.record;
+  const record = analysisOf(done[0]!).record;
   if (record.value.state === "decided") return step("resume", { ...seriesRequestOf(series.value), stop: stop.attempt, ground: "review-record",
     text: `The independent review of this stop decided: ${record.value.change?.text ?? record.value.cause?.text ?? "an addressed change"}`,
     review: { ref: reference(record) } }, series.id, null);
@@ -1669,14 +1635,10 @@ function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revis
       if (transition) return transition;
       const sources = prepareWorksSources(store, { project, results });
       if (!sources.ok) {
-        // G5.1 (№3847): a sleeping flow whose producer work, answered before the wake-test era, has several covering tests
-        // and named none asks that one choice, paid by this accepting attempt; the works step then takes it.
-        const wake = sources.refusal.code === "sleeping_wake_test_missing"
-          ? wakeStep(store, project, results, sources.refusal, { series: reference(series), attempt: ordinal }, request.dispatch, series.id)
-          // G6.1 (№3857 п.4, №3891): a shared file several write orders of which are lawful asks that choice, paid by this
-          // accepting attempt, by the same mechanism; the works step then takes it.
-          : sources.refusal.code === "write_order_choice_missing"
-            ? orderStep(store, project, results, sources.refusal, { series: reference(series), attempt: ordinal }, request.dispatch, series.id) : null;
+        // G6.1 (№3857 п.4, №3891): a shared file several write orders of which are lawful asks that choice, paid by this
+        // accepting attempt; the works step then takes it.
+        const wake = sources.refusal.code === "write_order_choice_missing"
+          ? orderStep(store, project, results, sources.refusal, { series: reference(series), attempt: ordinal }, request.dispatch, series.id) : null;
         return wake ?? { wait: waitOf(sources.refusal, project) };
       }
       return step("works", { gate: checked.request, works: { project, environment: request.dispatch.config, sources: [...sources.value.sources],
@@ -1812,20 +1774,6 @@ function groupTransition(store: Store, project: string, routesRef: Ref, group: r
     uniqueRefs([...blocking.map(route => route.answer!), ...group.map(row => reference(row.series))]), "dependent");
 }
 /**
- * G5.1: the wake step of the refused producer end — its proposal among this group's sources, while its choice is still
- * open and one more intent is lawful. The step names the ordinal it asks, so a failed first intent is a new request.
- */
-function wakeStep(store: Store, project: string, results: WorkProposalSource[], refusal: Refusal, accepting: { series: Ref; attempt: number },
-  dispatch: RunRequest["dispatch"], series: string): Choice | null {
-  const work = refusal.at.field, connector = refusal.at.target;
-  if (!work) return null;
-  const proposal = take(producerProposal(store, project, results, work));
-  if (!proposal) return null;
-  const wake: WakeChoiceRequest = { project, proposal, work, connector, accepting, dispatch };
-  const standing = take(wakeStanding(store, wake));
-  return standing.next === null ? null : step("wake", { wake, ordinal: standing.next }, series, accepting.attempt);
-}
-/**
  * G6.1: the write-order step of the refused shared file — the exact proposals of the group's candidate and the file its
  * refusal names, while that choice is open and one more intent is lawful.
  */
@@ -1901,20 +1849,6 @@ function packetPlace(store: Store, project: string, packet: Ref): OmResult<"star
   }
   // A proved capacity recovery is a step of its predecessor's cycle, including when the predecessor was its root.
   return { ok: true, value: !request.recovery && !request.continuation && !request.correction && request.previous.length === 0 ? "start" : "step" };
-}
-/**
- * A saved cycle that is no work of the pass: never performed (no cycle of its exact request) and started with a packet
- * proved to be a step of a cycle. Whatever is not so proved — the start of a cycle, or any refusal of reading the packet —
- * is performed as saved, and its producer gives its own result or refusal (№2870).
- */
-function misplacedCycle(store: Store, step: RunStep): boolean {
-  if (step.action !== "cycle") return false;
-  const request = step.request as { project?: unknown; packet?: unknown };
-  if (typeof request.project !== "string" || !isRef(request.packet) || store.get(modelCycleId(step.request as never))) return false;
-  const read = readQuestionPacket(store, { project: request.project, record: request.packet });
-  if (read.ok && (Boolean(read.value.value.request.recovery) || Boolean(readOmCapacityRecovery(store, request.project, request.packet)))) return false;
-  const place = packetPlace(store, request.project, request.packet);
-  return place.ok && place.value === "step";
 }
 /**
  * LP4 (№2887, №2902): a saved cycle never performed (no cycle of its exact request) whose root — the root of its packet's

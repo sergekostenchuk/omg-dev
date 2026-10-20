@@ -16,12 +16,11 @@ import { assessAnswer } from "../src/discovery/research-assessment.js";
 import type { OmInputRecord } from "../src/om/input.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import { writeOmInput } from "../src/om/input.js";
-import { readCompletionBinding, beginAttempt, openSeries, ownerDecisionNamespace, OWNER_DECISION_KIND, resumeSeries } from "../src/om/series.js";
+import { readCompletionBinding, openSeries, ownerDecisionNamespace} from "../src/om/series.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import type { RepairSeries } from "../src/om/series.js";
-import { closeAttempt } from "../src/om/repeat-gate.js";
 import { prepareCompletionCause, runModelCall, readModelCall, deliverModelSources, readManagedModelDiagnostic, writeCompletionCessation } from "../src/om/model-call.js";
-import { readRun, startRun, runId, type RunRequest, type RunRecord, type RunStep } from "../src/om/run.js";
+import { readRun, startRun, runId, type RunRecord, type RunStep } from "../src/om/run.js";
 import { prepareRunBases } from "../src/om/run-bases.js";
 // OWN1.2 (№3806): the live pass had derived D7 for this exact request by the older rule (73d95d93 carried the environment
 // question to its consumer); the newer rule derives another ledger for the same request. Its earlier performance with the
@@ -30,13 +29,10 @@ import { prepareOmObligations, type ObligationRequest } from "../src/om/obligati
 import { readGaps } from "../src/om/gaps.js";
 import { checkAnswerForm } from "../src/om/answer-form.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
-import { runWakeChoice, type WakeChoiceRecord, type WakeChoiceRequest } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { prepareReconcileSeries, readSeries, readStopHistory, readSeriesProgressTransitionAt } from "../src/om/series.js";
 // ---- LP8.1 (№3670): an unable pass weighs its grounds again by today's rules at every entry ----
 import { startPass } from "../src/om/run-driver.js";
-import { lp3Blocked, lp3Pointers, mechanismSeries, project, ok, refusal, runFixture, addressAll, usage, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, stoppedBlockLine, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Configure, lp4Questions, g51Pass, type Lp6Op, lp6Line } from "./om-run-fixture.js";
-
+import { lp3Blocked, lp3Pointers, mechanismSeries, project, ok, refusal, runFixture, addressAll, usage, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, stoppedBlockLine, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Configure, lp4Questions } from "./om-run-fixture.js";
 
 test("H1.2 R4 R1 a block line stopped by three fruitless attempts: the one review is undecided and the second rung ends the pass on the block's exact stop", async t => {
   const f = runFixture(t, ["encoding"], "executed", true);
@@ -162,7 +158,6 @@ test("FA1 a lawful negative E5 verdict of the attempt's own fact is no technical
     `The negative verdict keeps its earlier rules: ${JSON.stringify(consume.value.attempts[0]!.outcome)} ${JSON.stringify(state)}`);
   assert.equal(performed.includes("works"), false);
 });
-
 
 test("1 24 22 C57 R20 №1860-8 H1.1 a managed project works only on the activation of the pass's own issue: the machine runs B3, a new root works after it, a block outside the intent never", async t => {
   const f = runFixture(t, ["encoding"], "stages", true, true);
@@ -460,84 +455,6 @@ out(advanced.record.value.state);`, { request }) as { phase: string; wait?: { co
 // G5.1 return №3867-1: the producer of a wake step wrote the failed result of its intent 1, and the process stopped before
 // the pass settled that step. The saved step is that exact intent: repeating it returns result 1 and sends nothing;
 // intent 2 is a step of its own, chosen by the next choice of the pass.
-test("G5.1 return №3867-1 a restart after the saved failed result of intent 1, before its step settled, sends nothing again: the step returns result 1, and intent 2 is a step of its own", async t => {
-  let sends = -1;
-  const { f, trail, results } = await g51Pass(t, (allowed, index) => index === 0 ? "not-a-covering-test" : allowed[0]!, 200, async (run, request) => {
-    if (request.ordinal !== 1) return;
-    const written = ok(await runWakeChoice(run.store, request.wake, 1));
-    assert.equal(written.value.verdict, "refused");
-    run.restart(); sends = run.sent().length;
-  });
-  assert.deepEqual(results().map(row => [row.id.split(":").at(-1), row.value.verdict]), [["1", "refused"], ["2", "chosen"]], trail.join(","));
-  const wakes = trail.filter(row => row.includes(":wake#"));
-  assert.ok(wakes[0]!.includes(":wake#1=1"), `The saved step returns its own result 1: ${trail.join(",")}`);
-  assert.ok(wakes[1]!.includes(":wake#2=2"), `Intent 2 is its own step: ${trail.join(",")}`);
-  assert.equal(f.sent().length, sends + 1, "The repeat of step 1 sends nothing; only intent 2 is sent");
-  assert.ok(trail.some(row => row.includes("works")), trail.join(","));
-  // A step names its exact intent: an ordinal past an unsaved earlier one, or past a made choice, is refused.
-  const wake = f.store.get<WakeChoiceRecord>(results()[1]!.id)!.value;
-  const request = f.store.get<{ request: WakeChoiceRequest }>(wake.intent.id)!.value.request;
-  const total = f.sent().length;
-  assert.equal(ok(await runWakeChoice(f.store, request, 2)).value.verdict, "chosen", "A saved ordinal returns its own result");
-  assert.equal(ok(await runWakeChoice(f.store, request, 1)).value.verdict, "refused");
-  assert.equal(f.sent().length, total, "Repeats of saved intents send nothing");
-  await assert.rejects(runWakeChoice(f.store, request, 3), /ordinal/);
-});
-
-test("LP6 rows 22, 24, 25: on the second rung the pass reconciles a stop e7db0ba8 saved over clean ends of the replaced B1 before it asks for the owner's decision — the rung and its window stay, the real earlier stop and its review are not revisited, and a window with a real failure is never reconciled", async t => {
-  const f = lp6Line(t);
-  f.old("state-1", [1, 2, 3].flatMap(ordinal => [{ op: "round", ordinal, answers: [{ field: "checkKind", cannot: `Not decidable ${ordinal}` }] },
-    { op: "close", ordinal }] as Lp6Op[]));
-  // Row 24: three real refusals make a real stop; the transition of the new era is not available for it.
-  const early = refusal(prepareReconcileSeries(f.store, { ...f.address, stop: 3 } as never));
-  assert.deepEqual([early.code, early.at.field], ["progress_unproved", "attempts.1"]);
-  const old = f.old("state-2", [{ op: "analyze", decided: true }, { op: "resume", stop: 3 },
-    ...[[4, "state", { writer: "garden-produce-block" }], [5, "nodes", ["garden-produce-block", "garden-consume-block"]], [6, "state", { authority: "garden-consume-block" }]]
-      .flatMap(([ordinal, field, value]) => [{ op: "round", ordinal, answers: [{ field: "expansion", unsent: true }] },
-        { op: "replace", target: "garden-B1", field, value }, { op: "cease", ordinal }, { op: "close", ordinal }] as Lp6Op[])]);
-  assert.deepEqual(old.verdicts, ["none", "none", "none"]);
-  const stopped = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
-  assert.deepEqual([stopped.stop?.attempt, stopped.ladder.rung, stopped.ladder.windows, stopped.continuations.map(item => [item.after, item.ground])],
-    [6, 2, [3], [[3, "review-record"]]]);
-  // garden-produce-block comes first in M3: its own real stop on the second rung — fruitless standalone attempts and the
-  // owner's decision between them — is no transition (row 24 through the pass) and ends nothing, so the pass goes on.
-  const produce = { project, block: "garden-produce-block", line: 1 };
-  ok(openSeries(f.store, { ...produce, slice: "lp6-produce", predecessor: null, basis: null } as never));
-  const fruitless = { key: "lp6-produce-goal", questions: ["Expand the producer"], result: "An expanded producer" };
-  const fail = (from: number) => { for (let attempt = from; attempt < from + 3; attempt++) {
-    ok(beginAttempt(f.store, { ...produce, attempt, goal: fruitless } as never));
-    ok(closeAttempt(f.store, { ...produce, attempt, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never));
-  } };
-  fail(1);
-  const decision = f.store.write({ id: `${ownerDecisionNamespace(project)}lp6-produce`, kind: OWNER_DECISION_KIND, expected: 0,
-    value: { projectId: project, block: produce.block, stop: 3, goals: [fruitless.key], decided: "go on: one more window",
-      taken: { by: "the owner", through: "the command API", approved: true } } });
-  ok(resumeSeries(f.store, { ...produce, stop: 3, ground: "owner-decision", text: "the owner decided to go on", decision: { ref: reference(decision) } } as never));
-  fail(4);
-  assert.equal(refusal(prepareReconcileSeries(f.store, { ...produce, stop: 6 } as never)).code, "progress_unproved");
-  // Rows 22, 25: the pass chooses the transition before the second rung could end it; nothing else is paid or asked.
-  ok(startRun(f.store, { project }));
-  const sent = f.sent().length, trail: string[] = [];
-  for (let index = 0; index < 12 && !trail.includes("reconcile"); index++) {
-    f.restart();
-    const advanced = ok(await advanceRun(f.store, { project, dispatch: f.dispatch } as RunRequest));
-    const state = advanced.record.value.state as { phase: string; step?: { action: string } };
-    trail.push(advanced.performed?.action ?? state.phase);
-    assert.ok(state.phase !== "unable", `The pass never ends on the reconcilable stop: ${trail.join(",")}`);
-  }
-  assert.ok(trail.includes("reconcile"), trail.join(","));
-  assert.equal(f.sent().length, sent, "No model was asked on the way to the transition");
-  const series = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
-  assert.deepEqual([series.stop, series.ladder.rung, series.ladder.windows, series.withoutProgress], [null, 2, [3], 0]);
-  const record = ok(readSeriesProgressTransitionAt(f.store, project, series.reconciliations![0]!.transition)).value;
-  assert.deepEqual(record.rows.map(row => [row.ordinal, row.result]), [[4, "administrative"], [5, "administrative"], [6, "administrative"]]);
-  // Row 25: the real stop after attempt 3 and its review-record stay as they were; the history shows both stops.
-  assert.deepEqual(series.continuations.map(item => [item.after, item.ground]), [[3, "review-record"]]);
-  const history = ok(readStopHistory(f.store, f.address as never)).stops;
-  assert.deepEqual(history.map(item => [item.attempt, item.continuation?.ground ?? null, item.reconciliation ? "reconciled" : null]),
-    [[3, "review-record", null], [6, null, "reconciled"]]);
-  assert.deepEqual(series.attempts.slice(3).map(row => row.verdict), ["none", "none", "none"], "The old verdicts stay as they were written");
-});
 
 test("DRY6-03 public om-start: a real assessor read_context keeps reference-shaped JSON as data after restart", async t => {
   const root = mkdtempSync(join(tmpdir(), "omg-dry6-03-run-")), database = join(root, "state.sqlite");

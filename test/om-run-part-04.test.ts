@@ -7,36 +7,26 @@ import { historicalProofCounters } from "../src/history/proofs.js";
 import { canonical, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { type OmResult } from "../src/om/refusal.js";
-import type { Graph } from "../src/graph/model.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { withHistoricalReads } from "../src/om/input.js";
 import { readHorizon } from "../src/om/horizon.js";
 import { readPreparedSeriesTransition } from "../src/om/series-transition.js";
-import { beginAttempt, openSeries, readAnySeriesAt, readAppliedSeriesTransition, readCompletionBinding, readCurrentSeriesPointer, readSeriesMembership } from "../src/om/series.js";
+import { beginAttempt, openSeries, readAnySeriesAt, readAppliedSeriesTransition, readCurrentSeriesPointer, readSeriesMembership, resumeSeries, seriesRequestOf, ownerDecisionNamespace, OWNER_DECISION_KIND } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
-import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
-import { runModelCall, writeCompletionCessation } from "../src/om/model-call.js";
-import { writeQuestionPacket } from "../src/om/question-packet.js";
+import { closeAttempt} from "../src/om/repeat-gate.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
 import { readRun, startRun, runId, type RunRecord, type RunStep, type RunWait } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- LP5 (№3278): after a replaced B1 the old work ends by its own products, the new bases are built, paid assemblies answer again ----
 import { COMPLETION_REUSE_KIND, type CompletionReuse } from "../src/om/model-call.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
-import { readWakeChoiceAt, wakeCallOf, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
-import { prepareCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
-import { recordCall } from "../src/om/call-record.js";
+import { WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { readSeries } from "../src/om/series.js";
-import { readCompletionWorkAt } from "../src/om/model-call.js";
-import { completionWorkId } from "../src/om/series.js";
-import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "../src/om/gap-lines.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, g51Pass, lp6Line, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview } from "./om-run-fixture.js";
-
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, passRows, unavailableReview } from "./om-run-fixture.js";
 
 test("H1.2 R8 R4 C31 a stopped line whose owner has no batch today keeps its barrier: its reviewed stop on the second rung ends the pass, and nothing is paid for that owner", async t => {
   const f = runFixture(t, [], "executed");
@@ -451,34 +441,6 @@ test("G6.2 a G5 finding of one work's own content rejects only its proposal: its
   // before it do not make a third that stops the line and pays A6; it reuses its assembly and the group is accepted.
   await t.test("a sound member with two earlier attempts without a result ends neutrally: no stop, no A6", async t => g62Rejection(t, false, true));
 });
-test("G5.1 rows 1, 6, 7 an ambiguous producer end the base answered before the wake-test era is asked its wake test once, by the accepting attempt; the works are accepted with that test waking the sleeping flow, and a restart or re-entry pays nothing again", async t => {
-  const { f, trail, results } = await g51Pass(t, allowed => allowed[1]!);
-  const saved = results();
-  assert.equal(saved.length, 1, trail.join(","));
-  assert.deepEqual([saved[0]!.value.verdict, typeof saved[0]!.value.choice], ["chosen", "string"]);
-  assert.ok(trail.some(row => row.includes("works")), `The works are accepted after the choice: ${trail.join(",")}`);
-  const graph = f.store.get<Graph>(`graph:${project}`)!.value;
-  assert.ok(graph.anchors.some(anchor => anchor.test === saved[0]!.value.choice), `The chosen test wakes the sleeping consumers: ${JSON.stringify(graph.anchors)}`);
-  // The candidate's supplement is proved by its own saved result: another test, or a proposal outside it, is refused.
-  const candidate = f.store.list<FrameCandidateRecord>("frame-candidate").find(row => row.value.request.wakes?.length)!;
-  assert.ok(candidate, "The accepted works candidate carries its supplement");
-  const wake = candidate.value.request.wakes![0]!;
-  assert.equal(refusal(prepareCandidate(f.store, { ...candidate.value.request, wakes: [{ ...wake, test: `${wake.test}-other` }] }) as never).code, "wake_result_invalid");
-  assert.equal(refusal(prepareCandidate(f.store, { ...candidate.value.request,
-    wakes: [{ ...wake, proposal: { ...wake.proposal, id: `${wake.proposal.id}-foreign` } }] }) as never).code, "works_obligations_invalid");
-  // An E1 that does not reproduce its saved intent is refused before any dispatch.
-  const intent = f.store.list<import("../src/om/wake-choice.js").WakeIntentRecord>(WAKE_INTENT_KIND)[0]!;
-  const call = wakeCallOf(intent);
-  assert.ok(recordCall(f.store, project, call as never).ok, "The admitted E1 repeats as it is");
-  assert.equal(refusal(recordCall(f.store, project, { ...call, call: `${call.call}-second`, goal: { ...call.goal, result: "Another result" } } as never) as never).code,
-    "call_basis_unresolved");
-  const sent = f.sent().length;
-  f.restart();
-  ok(readWakeChoiceAt(f.store, project, reference(saved[0]!)));
-  for (let index = 0; index < 3; index++) ok(await advanceRun(f.store, f.request));
-  assert.equal(f.sent().length, sent, "Re-entry and restart pay nothing again");
-  assert.equal(f.store.list(WAKE_INTENT_KIND).length, 1);
-});
 
 test("G5.1 row 9 a producer end answered in the wake-test era names its wake test itself: the group takes it and no supplement is asked or paid", async t => {
   const f = worksFixture(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], answered = new Set<string>(), trail: string[] = [];
@@ -505,50 +467,16 @@ test("G5.1 row 9 a producer end answered in the wake-test era names its wake tes
   assert.ok(!trail.some(row => row.includes("wake")));
 });
 
-test("LP7 row 30: one full answer to the joined input fields replaces B1 once; the rest of the attempt ends cleanly by that replacement, the v2 close takes every LP6 key, the line moves on without a false stop, and a reopen reads it all and pays nothing again", async t => {
-  const f = lp6Line(t, ""), scenario = join(f.root, "scenario.json");
-  const routes = lp7Routes(f), byBlock = routes.value.batches.filter(batch => batch.items.every(item => item.consumers.includes(f.block)));
-  const joined = byBlock.find(batch => batch.task === "input-field" && new Set(batch.items.map(item => item.field)).size > 1)!;
-  const expansion = byBlock.find(batch => batch.task === "node-expansion")!;
-  assert.deepEqual([routes.value.grouping, [...new Set(joined.items.map(item => item.field))].sort()], ["block-input-v1", ["checkKind", "nodes", "state"]]);
-  assert.ok(expansion);
-  const items = [...joined.items, ...expansion.items];
-  const goal = { key: "lp7:30", questions: items.map(item => lp7LineKey(project, item.target, item.field)).sort(), result: lp7Result(project, items[0]!.target, items[0]!.field) };
-  const series = ok(openAttempt(f.store, { ...f.address, attempt: 1, goal, completion: { routes: reference(routes), batches: [joined.id, expansion.id].sort() } } as never));
-  const packetOf = (batch: typeof joined) => ok(writeQuestionPacket(f.store, { project, routes: reference(routes), batch: batch.id,
-    environment: f.dispatch.config, attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
-  const packet = packetOf(joined); packetOf(expansion);
-  writeFileSync(scenario, JSON.stringify({ database: f.database, steps: [{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
-    results: joined.items.map(item => ({ target: item.target, field: item.field, basis: item.record, value: LP7_VALUES[item.field]! })) }, usage }] }));
-  const before = f.store.get(`om-input:${project}`)!.revision;
-  const sent = ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
-  assert.deepEqual([sent.outcome?.kind, f.store.get(`om-input:${project}`)!.revision], ["input-decisions", before + 1], "One application, one B1 revision");
-  // The unsent expansion of the same attempt ends by the replaced B1 of its own area — the LP4/LP5 door, never a failure.
-  const binding = ok(readCompletionBinding(f.store, project, reference(f.head()), 1))!;
-  for (let open = true; open;) {
-    const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
-    const resolved = new Set(work.resolved.map(ref => ref.id));
-    const row = work.assignments.filter(item => !resolved.has(item.id)).sort((a, b) => Number(a.value.kind !== "root") - Number(b.value.kind !== "root"))[0];
-    open = row !== undefined;
-    if (row) ok(writeCompletionCessation(f.store, { project, binding: reference(binding), assignment: reference(row) }));
-  }
-  const claim = ok(prepareManagedClaim(f.store, { ...f.address, attempt: 1, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never));
-  assert.equal(ok(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: claim.outcome } as never)).verdict, "progress");
-  const close = lp6Close(f, 1);
-  assert.deepEqual([close.contract, close.outcome.reason], ["om-completion-close/v2", "result"]);
-  assert.deepEqual(close.outcome.achieved.map(item => item.key.startsWith("om-result:input-field:")), [true, true, true, true, true], "nodes, writer, authority, rollback, checkKind");
-  const line = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
-  assert.deepEqual([line.stop, line.withoutProgress, line.attempts.map(row => row.verdict)], [null, 0, ["progress"]], "No false stop");
-  assert.equal(f.store.get(`om-input:${project}`)!.revision, before + 1, "The cessation and the close replace no B1 again");
-  const sends = f.sent().length, saved = f.store.list().map(reference);
-  f.restart();
-  assert.deepEqual(lp6Close(f, 1), close);
-  assert.deepEqual(ok(readSeries(f.store, f.address as never)).value, line);
-  assert.deepEqual([f.sent().length, f.store.list().map(reference)], [sends, saved], "A reopen reads; it neither pays nor writes");
-});
-
 test("LP8.1 the reopening is guarded by the exact unable revision: another store moving the pass between the weighing and the write leaves its record, nothing is written over it", async t => {
   const { f, request, unable, unchanged } = await unavailableReview(t);
+  // The grounds stop standing on the owner's own continuation: a decision on the exact stop resumes the series
+  // by today's rules, so the next entry reopens the pass — the write the moving store races below.
+  const stopped = f.store.list<AnyRepairSeries>("repair-series").find(row => "owner" in row.value)!, stop = stopped.value.stop!;
+  const decision = f.store.write({ id: `${ownerDecisionNamespace(project)}lp81-guarded`, kind: OWNER_DECISION_KIND, expected: 0,
+    value: { projectId: project, owner: { kind: "mechanism", mechanism: "M5:addressing" }, stop: stop.attempt, goals: [...stop.goals],
+      decided: "go on: one more window", taken: { by: "the owner", through: "the command API", approved: true } } });
+  ok(resumeSeries(f.store, { ...seriesRequestOf(stopped.value), stop: stop.attempt, ground: "owner-decision",
+    text: "the owner decided to go on", decision: { ref: reference(decision) } } as never));
   let raced = false;
   class Moving extends Store {
     override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {

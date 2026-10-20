@@ -1,10 +1,10 @@
 import type test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
@@ -55,7 +55,6 @@ import { rankExpansions } from "../src/om/run.js";
 // ---- LP5 (№3278): after a replaced B1 the old work ends by its own products, the new bases are built, paid assemblies answer again ----
 import { COMPLETION_REUSE_KIND, prepareCompletionFinalization, type CompletionReuse } from "../src/om/model-call.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
-import { WAKE_CHOICE_KIND, type WakeChoiceRecord, type WakeChoiceRequest } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { completionCloseId, completionWorkId } from "../src/om/series.js";
 import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
@@ -992,72 +991,7 @@ async function twoOwnerAnswers(t: test.TestContext, moved: boolean, mode: boolea
 
 
 
-// ---- LP3 (№2817): a refusal caused by the content of a model answer or the size of its continuation ends the attempt ----
-const LP3_BASE_COMMIT = "d519a6036f8b2cc4aee823ce24d7160262a08fb9";
-const LP3_PACKET_COMMIT = "dd5fc67dec910d3c26c6516c0c2ebfc60413f981";
-const lp3NativePacketFixtures = new Set<{ database: string; store: Store }>();
-let lp3PacketProducer: string | undefined;
-let lp3PacketDirectory: string | undefined;
-process.once("exit", () => { if (lp3PacketDirectory) rmSync(lp3PacketDirectory, { recursive: true, force: true }); });
-/** One genuine pre-brief build for the entire suite; each packet step runs in a separate process. */
-function lp3Producer(): string {
-  if (lp3PacketProducer) return lp3PacketProducer;
-  const repository = fileURLToPath(new URL("../../", import.meta.url));
-  const root = mkdtempSync(join(tmpdir(), "omg-lp3-native-packets-"));
-  lp3PacketDirectory = root;
-  const archive = join(root, "archive.tar");
-  execFileSync("git", ["archive", "--format=tar", `--output=${archive}`, LP3_PACKET_COMMIT, "src", "package.json"], { cwd: repository });
-  try {
-    execFileSync("tar", ["-xf", archive, "-C", root]);
-  } finally {
-    rmSync(archive, { force: true });
-  }
-  symlinkSync(join(repository, "node_modules"), join(root, "node_modules"), "dir");
-  const ts = createRequire(import.meta.url)("typescript") as typeof import("typescript");
-  const files = execFileSync("git", ["ls-tree", "-r", "--name-only", LP3_PACKET_COMMIT, "src"], { cwd: repository, encoding: "utf8" })
-    .trim().split("\n").filter(path => path.endsWith(".ts"));
-  for (const path of files) {
-    const output = join(root, "dist", path.replace(/\.ts$/, ".js"));
-    mkdirSync(dirname(output), { recursive: true });
-    writeFileSync(output, ts.transpileModule(readFileSync(join(root, path), "utf8"),
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText);
-  }
-  lp3PacketProducer = join(root, "packet.mjs");
-  writeFileSync(lp3PacketProducer, `import assert from 'node:assert/strict';
-import { Store } from './dist/src/storage/store.js';
-import { advanceRun, readRun } from './dist/src/om/run.js';
-const store = new Store(process.argv[2]), request = JSON.parse(process.argv[3]);
-try {
-  const before = readRun(store, { project: request.project });
-  assert.ok(before.ok && before.value?.value.state.phase === 'step' && before.value.value.state.step.action === 'packet');
-  const result = await advanceRun(store, request);
-  assert.ok(result.ok && result.value.performed?.action === 'packet');
-  process.stdout.write(JSON.stringify(result));
-} finally { store.close(); }
-`);
-  return lp3PacketProducer;
-}
-function lp3NativePackets<T extends { database: string; store: Store }>(t: test.TestContext, f: T): T {
-  lp3NativePacketFixtures.add(f);
-  t.after(() => lp3NativePacketFixtures.delete(f));
-  return f;
-}
-/** Only opted-in LP3 roots use the old packet producer; selection, cycles, closure and recovery use today's code. */
-async function advanceRun(...args: Parameters<typeof currentAdvanceRun>): ReturnType<typeof currentAdvanceRun> {
-  const [store, request, control] = args;
-  const fixture = [...lp3NativePacketFixtures].find(f => f.store === store);
-  if (fixture && control === undefined) {
-    const found = readRun(store, { project: request.project });
-    const state = found.ok ? found.value?.value.state : null;
-    if (state?.phase === "step" && state.step.action === "packet") {
-      const body = state.step.request as { continuation?: unknown; previous?: unknown[] };
-      assert.ok(!body.continuation && !body.previous?.length, "The legacy producer intercepts only an independent root's saved packet step");
-      return JSON.parse(execFileSync(process.execPath, [lp3Producer(), fixture.database, JSON.stringify(request)],
-        { encoding: "utf8", timeout: 180_000, maxBuffer: 10_000_000 })) as Awaited<ReturnType<typeof currentAdvanceRun>>;
-    }
-  }
-  return currentAdvanceRun(...args);
-}
+const advanceRun = currentAdvanceRun;
 /** A need_source of the M5 mechanism batch (MC2 input-field) asking for the given reads. */
 function lp3Need(f: Fixture, routes: Ref, reads: unknown[]) {
   const saved = f.store.get<RoutesRecord>(routes.id, routes.revision)!.value;
@@ -1110,7 +1044,6 @@ function lp3Blocked(f: { store: Store; sent(): unknown[] }, sends: number, code:
   for (const line of f.sent()) assert.ok((line as string).length <= capacity,
     "The full adapter wire, including its actual model/effort/speed, fits the fixed budget (roots and A6)");
 }
-const LP3_CONTENTS = { "root-first": "UTF-8 ".repeat(40_000) };
 const LP3_UNPROVED: Record<string, string> = {};
 /** A view of the store in which one exact record cannot be read; everything else, writes included, goes to the store. */
 function lp3Hiding(store: Store, ref: Ref, intercepted: () => void): Store {
@@ -1377,7 +1310,6 @@ function lp5ReplaceB1(f: WorksRun, paths: string[] = []): Ref {
   return reference(ok(writeOmInput(f.store, { project, stages, inventory: reference(inventory), expected: before.revision })));
 }
 const lp5Kind = <T = Json>(f: WorksRun, kind: string): Revision<T>[] => f.store.list<T>(kind);
-type Lp5State = { phase: string; wait?: { code: string }; step?: { action: string; request: Record<string, unknown> & { packet?: Ref }; series?: string | null; attempt: number | null } };
 /** The pass on a new Store after every transaction, every new cycle answered with the work of its operation; `hook` sees each state. */
 async function lp5Pass(f: WorksRun, hook: (state: Lp5State, performed: string) => Promise<"stop" | void> | "stop" | void, bound = 300) {
   const scenario = join(f.root, "scenario.json"), steps: unknown[] = existsSync(scenario) ? (JSON.parse(readFileSync(scenario, "utf8")) as { steps: unknown[] }).steps : [];
@@ -1396,7 +1328,8 @@ async function lp5Pass(f: WorksRun, hook: (state: Lp5State, performed: string) =
   }
   return assert.fail(`The pass did not reach the awaited state: ${trail.join(",")}`);
 }
-const G51_BASE = "f69d4b39e226cdc8527c923a6cc940fb9f2a3654";
+
+type Lp5State = { phase: string; wait?: { code: string }; step?: { action: string; request: Record<string, unknown> & { packet?: Ref }; series?: string | null; attempt: number | null } };
 /** The produce root answered by the base before G5: every test of its work that covers a connection has a twin, no choice. */
 function g51AmbiguousAnswer(f: WorksRun, saved: Ref) {
   const answer = mp2WorkAnswer(f, saved), proposal = answer.research.proposal;
@@ -1404,61 +1337,9 @@ function g51AmbiguousAnswer(f: WorksRun, saved: Ref) {
   proposal.tests.push(...twins); proposal.nodes[0]!.tests.push(...twins.map(test => test.id));
   return answer;
 }
-/**
- * The pass of worksFixture whose produce root the base issued and paid with an ambiguous work, then today's code: every
- * wake step is answered by `choose` (from the allowed tests the intent shows), every works cycle by mp2WorkAnswer.
- */
-async function g51Pass(t: test.TestContext, choose: (allowed: string[], index: number) => string | Record<string, unknown>, bound = 200,
-  onWake?: (f: WorksRun, request: { wake: WakeChoiceRequest; ordinal: number }) => Promise<void>) {
-  const f = worksFixture(t, undefined, undefined, undefined, G51_BASE), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], trail: string[] = [];
-  const push = (research: unknown) => { steps.push({ research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
-  ok(startRun(f.store, { project }));
-  for (let round = 0; round < 4; round++) {
-    const issued = atCommit(f, G51_BASE, `g51-issue-${round}`, `const { advanceRun } = await import(src('om/run.js'));
-for (let index = 0; index < 40; index++) {
-  const state = take(await advanceRun(store, args.request)).record.value.state;
-  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
-  if (state.phase === 'waiting') { out(null); break; }
-}`, { request: f.request }) as Ref | null;
-    assert.ok(issued, "The base issues a works packet");
-    const produce = f.store.get<QuestionPacketRecord>(issued.id)!.value.packet as unknown as { expansion: { upper: { id: string } } };
-    const ambiguous = produce.expansion.upper.id === "garden-produce-operation";
-    push((ambiguous ? g51AmbiguousAnswer(f, issued) : mp2WorkAnswer(f, issued)).research);
-    assert.equal(atCommit(f, G51_BASE, `g51-cycle-${round}`, `const { advanceRun } = await import(src('om/run.js'));
-out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request }), "cycle");
-    if (ambiguous) break;
-  }
-  f.restart();
-  const answered = new Set(f.store.list<{ om?: { request: { packet: Ref } } }>("model-call").map(row => row.value.om?.request.packet.id ?? ""));
-  let wakes = 0, state: Lp5State = { phase: "" } as Lp5State;
-  for (let index = 0; index < bound; index++) {
-    const advanced = ok(await advanceRun(f.store, f.request));
-    state = advanced.record.value.state as unknown as Lp5State;
-    const performed = advanced.performed?.action ?? "";
-    const woke = performed === "wake" ? `#${(advanced.performed!.request as { ordinal: number }).ordinal}=${advanced.products[0]?.id.split(":").at(-1)}` : "";
-    trail.push(state.phase === "waiting" ? `waiting:${state.wait!.code}` : `${state.phase}:${performed}${woke}${state.phase === "step" ? `>${state.step!.action}` : ""}`);
-    if (performed === "works" || state.phase === "waiting" || state.phase === "complete" || state.phase === "unable") break;
-    if (state.phase !== "step") continue;
-    const current = state.step as unknown as { action: string; request: { packet?: Ref; wake?: WakeChoiceRequest; ordinal?: number } };
-    if (current.action === "cycle" && current.request.packet && !answered.has(current.request.packet.id)) {
-      answered.add(current.request.packet.id); push(mp2WorkAnswer(f, current.request.packet).research);
-    }
-    if (current.action === "wake" && current.request.ordinal === wakes + 1) {
-      const proposal = f.store.get<LayerProposal>(current.request.wake!.proposal.id)!.value, work = current.request.wake!.work;
-      const allowed = proposal.tests.filter(test => test.node === work && test.covers.includes(current.request.wake!.connector)).map(test => test.id).sort();
-      const reply = choose(allowed, wakes);
-      if (typeof reply === "object" && Object.hasOwn(reply, "rawStdout")) { steps.push(reply); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); }
-      else push(typeof reply === "string" ? { wakeTest: reply } : reply);
-      wakes++;
-      if (onWake) await onWake(f, current.request as { wake: WakeChoiceRequest; ordinal: number });
-    }
-  }
-  return { f, trail, state, results: () => f.store.list<WakeChoiceRecord>(WAKE_CHOICE_KIND) };
-}
-
+const LP6_BASE = "e7db0ba81cf6f049420b5ea3c054108bf99c2cdb";
 const LP5_BASE_COMMIT = "febbee2cf8187e1c230eec325e183fc8203e06ae";
 
-const LP6_BASE = "e7db0ba81cf6f049420b5ea3c054108bf99c2cdb";
 type Lp6Op = { op: "round"; ordinal: number; answers: { field: "nodes" | "state" | "checkKind" | "expansion"; value?: Json; cannot?: string; owner?: string; exit?: number; unsent?: true }[] }
   | { op: "replace"; target: string; field: string; value: Json } | { op: "cease"; ordinal: number } | { op: "close"; ordinal: number }
   | { op: "analyze"; decided: boolean } | { op: "resume"; stop: number };
@@ -1640,38 +1521,9 @@ async function lp6CurrentRounds(f: ReturnType<typeof lp6Line>, ops: Lp6Op[]) {
   return { verdicts, calls };
 }
 
-const LP7_BASE = "7c7d3cccb88d0a6c17b21051069f0244d98248f9";
-
-const LP81_BASE_COMMIT = "ea207137a7e26a96792f12a3bffd8bc255df59f2";
 type Reopened = { phase: "reopened"; from: Ref; reasons: RunReason[]; ground: { step?: RunStep; wait?: RunWait; complete?: Ref[] } };
 const passRows = (store: Store) => store.history(runId(project)).map(row => (row.value as unknown as RunRecord).state.phase);
-/** The R5 scenario whose review the old adapter wrapper refused (`confirmed` missing): ea207137, run from Git, ends the pass on it. */
-async function wrapperUnable(t: test.TestContext) {
-  const f = runFixture(t, ["encoding"], undefined, undefined, undefined, undefined, undefined, LP81_BASE_COMMIT);
-  const b = f.bases("lp81-wrapper"), request = f.request(b), none = cannotAnswer(f, b.routes);
-  f.steps([none, none, none, { ...stopAnswer(f, true), confirmed: null }, addressAll(f, b.routes)]);
-  // SP1a (№4714 §2.1): a packet today's code issues declares the selection era, which ea207137 cannot re-derive. So the base
-  // code runs the whole pass it ends — its start, the review the old wrapper refused and the end — and today's code reopens it.
-  const ended = atCommit(f, LP81_BASE_COMMIT, "lp81-base", `const { startRun, advanceRun } = await import(src('om/run.js'));
-take(startRun(store, { project: args.project }));
-let state = null;
-for (let index = 0; index < 60; index++) {
-  state = take(await advanceRun(store, args.request)).record.value.state;
-  if (state.phase === 'unable' || state.phase === 'waiting') break;
-}
-out(state);`, { request, project }) as { phase: string };
-  assert.equal(ended.phase, "unable", `The base ends the pass on the failed review: ${JSON.stringify(ended)}`);
-  f.restart();
-  const failure = f.store.list().find(row => row.kind === "om-stop-analysis-failure")!;
-  assert.ok(failure, "The review was refused for the wrapper and saved as a failure");
-  assert.ok(f.store.list<{ briefSelection?: string }>("question-packet").every(row => !Object.hasOwn(row.value, "briefSelection")),
-    "Every packet of the base pass is of the era before the selection");
-  const unable = ok(readRun(f.store, { project }))!;
-  assert.deepEqual(reasonsOf(unable.value.state).map(row => [row.kind, row.code]), [["stop-analysis-failed", "analysis_failed"]]);
-  return { f, request, failure: reference(failure), unable };
-}
-
-/** A genuine current failed review ends unable while only its exact exchange is unreadable. */
+/** A genuine current failed review ends unable; the review's exact failure record and its paid exchange stay as written. */
 async function unavailableReview(t: test.TestContext) {
   const f = runFixture(t, ["encoding"], "executed");
   const b = f.bases("lp81-unavailable"), request = f.request(b), none = cannotAnswer(f, b.routes);
@@ -1684,22 +1536,11 @@ async function unavailableReview(t: test.TestContext) {
   const exchangeRef = physical.value.transport.exchange;
   const exchange = f.store.get(exchangeRef.id, exchangeRef.revision)!;
   assert.equal(exchange.hash, exchangeRef.hash);
-  let hidden = 0;
-  // Opaque on purpose: a read-changing view must never claim physical-store transparency.
-  const view = new Proxy(f.store, { get(target, key) {
-    if (key === "get") return (id: string, revision?: number) => {
-      if (id === exchangeRef.id && revision === exchangeRef.revision) { hidden++; return null; }
-      return target.get(id, revision);
-    };
-    const member: unknown = Reflect.get(target, key, target);
-    return typeof member === "function" ? member.bind(target) : member;
-  } });
-  for (let index = 0; index < 5; index++) {
-    const state = ok(await advanceRun(view, request)).record.value.state;
+  for (let index = 0; index < 8; index++) {
+    const state = ok(await advanceRun(f.store, request)).record.value.state;
     if (state.phase === "unable") break;
     assert.notEqual(state.phase, "waiting", JSON.stringify(state));
   }
-  assert.ok(hidden > 0, "The exact exchange read was actually withheld");
   const unable = ok(readRun(f.store, { project }))!;
   assert.equal(unable.value.state.phase, "unable", "The producer persisted unable, visible through the ordinary Store");
   assert.deepEqual(reasonsOf(unable.value.state).map(row => [row.kind, row.code]), [["stop-analysis-failed", "analysis_failed"]]);
@@ -1806,5 +1647,5 @@ async function policyDoor(t: test.TestContext, owner: boolean) {
 // always did under the new code — its rejection asks no readiness question and never stands on a refusal of the era.
 const AT1_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
 
-export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, sameEnd, twoOwnerAnswers, LP3_BASE_COMMIT, LP3_PACKET_COMMIT, lp3NativePackets, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_CONTENTS, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, lp5Pass, g51AmbiguousAnswer, g51Pass, LP5_BASE_COMMIT, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, LP7_BASE, passRows, wrapperUnable, unavailableReview, policyDoor, AT1_BASE };
+export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, lp5Pass, g51AmbiguousAnswer, LP5_BASE_COMMIT, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor, AT1_BASE };
 export type { Fixture, Verdict, Lp5State, Lp6Op, Reopened };

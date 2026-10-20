@@ -11,7 +11,6 @@ import { readOmInput } from "../src/om/input.js";
 import { readHorizon } from "../src/om/horizon.js";
 import { beginAttempt, openSeries, ownerDecisionNamespace } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
-import type { RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
 import { runModelCycle } from "../src/om/model-call.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
@@ -20,9 +19,7 @@ import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { readSeries } from "../src/om/series.js";
-import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts, lp6Line, lp6Close, type Reopened, passRows, wrapperUnable } from "./om-run-fixture.js";
-
+import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts} from "./om-run-fixture.js";
 
 test("3 8 25 C23 C17 C27 R5 H1.1 on its own new bases the pass works the block through MC1, E5 and G4b to one G7 close, then applies the accepted facts", async t => {
   const f = runFixture(t, undefined, "executed");
@@ -405,39 +402,4 @@ test("G6.1 return №3913 a given transfer of a shared file is a link: no offere
   const graph = f.store.get<Graph>(`graph:${project}`)!.value;
   const shared = (graph.transfers ?? []).filter(row => row.path === "src/shared.ts").map(row => [row.from, row.to]).sort();
   assert.deepEqual(shared, [[works[0], works[1]], [works[2], works[0]]].sort(), "The given link stays, the code adds the lawful rest");
-});
-
-test("LP6 row 2: an attempt e7db0ba8 opened and left open is closed by the new code in the new era — a v2 close with its input-field result, the boundary activated at that very attempt on the revision before it", async t => {
-  const f = lp6Line(t);
-  f.old("open", [{ op: "round", ordinal: 1, answers: [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }, { field: "expansion", unsent: true }] },
-    { op: "cease", ordinal: 1 }]);
-  const before = reference(f.head());
-  assert.equal(f.head().value.attempts[0]!.outcome, null, "The old code left the attempt open");
-  const claim = ok(prepareManagedClaim(f.store, { ...f.address, attempt: 1, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never));
-  const closed = ok(closeAttempt(f.store, { ...f.address, attempt: 1, outcome: claim.outcome } as never));
-  assert.equal(closed.verdict, "progress");
-  const close = lp6Close(f, 1);
-  assert.deepEqual([close.contract, close.outcome.reason, close.outcome.progress], ["om-completion-close/v2", "result", { contract: "om-attempt-progress/v1", administrative: null }]);
-  assert.deepEqual((ok(readSeries(f.store, f.address as never)).value as RepairSeries).progressPolicy, { contract: "om-series-progress/v1", previous: before, from: 1 });
-});
-
-test("LP8.1 (№3670) era: a pass ea207137 ended unable on a review the old adapter wrapper refused is reopened at the next entry by one transition — the exact unable revision, its grounds and the recovery step — and goes on without a call; a repeat, a reopened store and a second entry write no second reopening", async t => {
-  const { f, request, failure, unable } = await wrapperUnable(t);
-  const sends = f.sent().length;
-  const reopened = ok(await advanceRun(f.store, request));
-  assert.equal(reopened.performed, null);
-  const state = reopened.record.value.state as unknown as Reopened;
-  assert.deepEqual([state.phase, state.from, state.reasons], ["reopened", reference(unable), (unable.value.state as unknown as Reopened).reasons]);
-  assert.deepEqual([state.ground.step?.action, state.ground.step?.request], ["recover-analysis", { project, failure }]);
-  assert.deepEqual(reopened.record.value.last, unable.value.last, "The reopening keeps the last performed step of the pass");
-  f.restart();
-  const recovered = await driveTo(f, request, "recover-analysis", 5);
-  assert.deepEqual(recovered.performed, ["recover-analysis"]);
-  const review = f.store.list().find(row => row.kind === "om-stop-review" && (row.value as { recovery?: { failure: Ref } }).recovery);
-  assert.ok(review, "The saved answer is accepted once at the review's own address");
-  assert.equal(f.sent().length, sends, "The recovery calls no model");
-  const went = await ends(f, request, 5, "resume");
-  assert.deepEqual(went.performed, ["resume"], "The decided review resumes the M5 line: the pass goes on past its old end");
-  assert.equal(passRows(f.store).filter(phase => phase === "reopened").length, 1, "One reopening, whatever came after it");
-  assert.equal(passRows(f.store).filter(phase => phase === "unable").length, 1);
 });

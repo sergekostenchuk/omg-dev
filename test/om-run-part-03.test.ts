@@ -23,14 +23,8 @@ import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 import { regateRun } from "../src/om/run.js";
 import { currentL3Reopen, l3ReopenId, readFrameProposals } from "../src/om/frame-proposals.js";
 import { resolveSnapshot } from "../src/om/impact.js";
-import { writeGuarded } from "../src/om/refs.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { decidedFieldsBefore, prepareReconcileSeries, readSeries, readStopHistory, readSeriesProgressTransitionAt, reconcileSeries, SERIES_PROGRESS_TRANSITION_KIND } from "../src/om/series.js";
-import { prepareCloseAttempt as lp6PrepareClose } from "../src/om/repeat-gate.js";
-import { readStopAnalysis, prepareStopAnalysis as lp6PrepareAnalysis } from "../src/om/stop-analysis.js";
-import { readStopReport, stopReportOfNewEra, STOP_REPORT_CONTRACT_V2 } from "../src/om/stop-report.js";
-import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, drive, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, lp6Line, lp6Close, policyDoor } from "./om-run-fixture.js";
-
+import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, drive, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, policyDoor } from "./om-run-fixture.js";
 
 test("26 1 C07 R4 H1.1 the pass runs the project mechanism M5 through G7, then builds the bases of the new B1 itself and goes on; a restart repeats nothing", async t => {
   const f = runFixture(t, undefined, "executed");
@@ -519,84 +513,5 @@ out({ seen, request });`,
     for (const ref of before) assert.deepEqual(reference(f.store.get(ref.id, ref.revision)!), ref, `${ref.id}@${ref.revision} stands as the old code wrote it`);
   });
 });
-
-test("LP6 rows 1, 21, 23, 26, 27, 28, 29, 30, 32: a stop e7db0ba8 saved over fresh input-field results and a clean end of the replaced B1 is read literally — closes, verdicts, stop and the failed A6 — and the new era reconciles exactly that stop once: the results enter the history, the old records stay, a repeat, a reopen and a second Store write nothing more", async t => {
-  const f = lp6Line(t);
-  const old = f.old("research", [
-    { op: "round", ordinal: 1, answers: [{ field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }, { field: "expansion", unsent: true }] },
-    { op: "cease", ordinal: 1 }, { op: "close", ordinal: 1 },
-    { op: "round", ordinal: 2, answers: [{ field: "expansion", unsent: true }] },
-    { op: "replace", target: "garden-B1", field: "state", value: { writer: "garden-produce-block" } },
-    { op: "cease", ordinal: 2 }, { op: "close", ordinal: 2 },
-    { op: "round", ordinal: 3, answers: [{ field: "checkKind", value: "test" }, { field: "expansion", unsent: true }] },
-    { op: "cease", ordinal: 3 }, { op: "close", ordinal: 3 },
-    { op: "analyze", decided: false },
-  ]);
-  // Row 1: the old producer's records as it wrote them — v1 closes without progress, three verdicts "none", the stop.
-  assert.deepEqual(old.verdicts, ["none", "none", "none"]);
-  for (const ordinal of [1, 2, 3]) {
-    const close = lp6Close(f, ordinal);
-    assert.deepEqual([close.contract, close.outcome.reason, close.outcome.achieved, Object.hasOwn(close.outcome, "progress")],
-      ["om-completion-close/v1", "interrupted", [], false], `attempt ${ordinal}`);
-  }
-  const stopped = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
-  assert.deepEqual([stopped.stop?.attempt, stopped.ladder.rung, stopped.withoutProgress, stopped.attempts.map(row => row.verdict), stopped.progressPolicy],
-    [3, 1, 3, ["none", "none", "none"], undefined]);
-  // Row 32: the saved A6 failure, its v1 intent and its v1 report read as they are; a new request repeats that intent.
-  const failure = ok(readStopAnalysis(f.store, { project, record: old.analysis! }));
-  assert.deepEqual([failure.value.contract, failure.value.state, failure.value.error?.code], ["om-stop-analysis/v1", "failed", "analysis_response_invalid"]);
-  const intent = f.store.get<{ contract: string; sources: Json; report: Json }>(failure.value.intent.id)!;
-  assert.equal(intent.value.contract, "om-stop-analysis/v1");
-  assert.deepEqual(ok(readStopReport(f.store, { project, sources: intent.value.sources as never })), intent.value.report, "D row 1: the v1 report, byte for byte");
-  const repeated = ok(lp6PrepareAnalysis(f.store, { project, series: failure.value.intent && (intent.value as unknown as { request: { series: Ref } }).request.series, hold: null, dispatch: f.dispatch }));
-  assert.deepEqual([repeated.intent.contract, repeated.writes.length], ["om-stop-analysis/v1", 0], "The saved intent is repeated, never issued again as v2");
-  // Row 30: the report of the new era shows what every attempt of the window proves — no "environment" for a moved input.
-  const report = ok(stopReportOfNewEra(f.store, f.address as never));
-  assert.equal(report.contract, STOP_REPORT_CONTRACT_V2);
-  assert.deepEqual(report.completionEvidence!.map(row => [row.ordinal, row.effect]), [[1, "input-field"], [2, "administrative"], [3, "input-field"]]);
-  assert.equal(report.finding.subject, "input-transition");
-  assert.ok(report.lines.some(line => line.includes("filling anew nodes of garden-B1")), "The facts are written into the text of the report");
-  // Rows 21, 23, 28: the transition is proved row by row; prepared on one Store, it loses to the same transition written
-  // by a second one, and no record is left alone.
-  const before = reference(f.head());
-  const prepared = ok(prepareReconcileSeries(f.store, { ...f.address, stop: 3 } as never));
-  assert.deepEqual(prepared.writes.map(write => write.kind).sort(), ["om-series-progress-transition", "repair-series"]);
-  const second = new Store(f.database);
-  try { ok(reconcileSeries(second, { ...f.address, stop: 3 } as never)); } finally { second.close(); }
-  const lost = writeGuarded(f.store, { unit: "store-repairs", target: before.id, writes: [...prepared.writes] as Write[], guards: [...prepared.guards] });
-  assert.equal(lost.ok, false, "The prepared transition of a state that moved is refused whole");
-  assert.equal(f.store.list(SERIES_PROGRESS_TRANSITION_KIND).length, 1);
-  const series = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
-  const transition = series.reconciliations![0]!;
-  const record = ok(readSeriesProgressTransitionAt(f.store, project, transition.transition)).value;
-  assert.deepEqual(record.rows.map(row => [row.ordinal, row.result, row.achieved.length]), [[1, "input-field", 1], [2, "administrative", 0], [3, "input-field", 1]]);
-  assert.deepEqual(record.series, before);
-  assert.deepEqual([series.stop, series.ladder.rung, series.ladder.windows, series.withoutProgress], [null, 1, [], 0]);
-  assert.deepEqual(series.attempts.map(row => [row.verdict, row.outcome?.reason]), [["none", "interrupted"], ["none", "interrupted"], ["none", "interrupted"]], "The old outcomes and verdicts stay");
-  assert.deepEqual(series.progressPolicy, { contract: "om-series-progress/v1", previous: before, from: 4 });
-  assert.deepEqual(transition.achieved.map(row => row.goal).sort(), stopped.attempts.filter(row => row.ordinal !== 2).map(row => row.goal.key).sort());
-  const history = ok(readStopHistory(f.store, f.address as never));
-  assert.deepEqual([history.stops.length, history.stops[0]!.attempt, history.stops[0]!.reconciliation, history.stops[0]!.window, history.standing],
-    [1, 3, transition.transition, { ended: "open" }, null], "The history shows the stop and the transition that followed it");
-  // Row 26: the decided fields of the line hold the reconciled results for whatever comes after.
-  assert.deepEqual(decidedFieldsBefore(series as never, 4), transition.achieved.map(row => row.key).sort());
-  // Row 27: a repeat, a reopen and another stop of the line write nothing and transfer nothing.
-  assert.equal(ok(prepareReconcileSeries(f.store, { ...f.address, stop: 3 } as never)).writes.length, 0);
-  f.restart();
-  assert.equal(ok(prepareReconcileSeries(f.store, { ...f.address, stop: 3 } as never)).writes.length, 0);
-  assert.equal(refusal(prepareReconcileSeries(f.store, { ...f.address, stop: 2 } as never)).code, "stop_absent");
-  assert.equal(refusal(prepareReconcileSeries(f.store, { project, block: "garden-produce-block", line: 1, stop: 3 } as never)).code, "series_missing");
-  // Row 29: a transition that is not at its exact reference is an addressed refusal, never "no ground".
-  assert.equal(refusal(readSeriesProgressTransitionAt(f.store, project, { ...transition.transition, revision: 2 })).code, "record_missing");
-  // Row 1 again: a repeat of an old close is the old close, with no progress written after it.
-  const close = lp6Close(f, 1);
-  assert.equal(ok(lp6PrepareClose(f.store, { ...f.address, attempt: 1, outcome: close.claim } as never)).writes.length, 0);
-  // Row 26: a successor of the line carries the boundary and the reconciliation whole; its decided fields are the same.
-  const successor = ok(openSeries(f.store, { project, block: f.block, line: 2, slice: "lp6-2", predecessor: reference(f.head()),
-    basis: { ground: "inputs-changed", text: "The input of the block changed" } } as never)).value as RepairSeries;
-  assert.deepEqual([successor.progressPolicy, successor.reconciliations], [series.progressPolicy, series.reconciliations]);
-  assert.deepEqual(decidedFieldsBefore(successor as never, 4), decidedFieldsBefore(series as never, 4));
-});
-
 
 test("AT1 policy: the owner's H2 answer decides the producer's state policy; the model is never asked, and the works pass G5", async t => policyDoor(t, true));

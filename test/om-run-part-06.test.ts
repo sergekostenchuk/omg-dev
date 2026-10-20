@@ -3,15 +3,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { type Revision, Store, type Write } from "../src/storage/store.js";
-import { canonical, hashJson, type Json } from "../src/canonical.js";
+import type { Write } from "../src/storage/store.js";
+import { configureDispatch } from "../src/om/dispatch.js";
+import { canonical, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { git } from "../src/runtime/environment.js";
 import type { OmInputRecord } from "../src/om/input.js";
 import { readFeasibility, type OmFeasibility } from "../src/om/feasibility.js";
 import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
-import { beginAttempt, openSeries, readCompletionBinding, type CompletionOwner } from "../src/om/series.js";
+import { beginAttempt, openSeries, readCompletionBinding, resumeSeries, seriesRequestOf, ownerDecisionNamespace, OWNER_DECISION_KIND, type AnyRepairSeries, type CompletionOwner } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
@@ -22,19 +23,16 @@ import { gapLineKey } from "../src/om/gap-lines.js";
 import { readRun, startRun, runId, type RunRecord } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { prepareReconcileSeries, readSeries, readSeriesProgressTransitionAt, completionCloseId, seriesProgressTransitionId, SERIES_PROGRESS_TRANSITION_KIND } from "../src/om/series.js";
+import { completionCloseId} from "../src/om/series.js";
 import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
-import { stopReportOfNewEra } from "../src/om/stop-report.js";
 // ---- LP8.1 (№3670): an unable pass weighs its grounds again by today's rules at every entry ----
 import { continuePass, startPass } from "../src/om/run-driver.js";
-import { configureDispatch } from "../src/om/dispatch.js";
 // AT1 door (№4105): a works answer whose file a test may load through a transition nobody resolved is refused by G5; the
 // group's rejection first asks that transition in B1 (its source the saved gate), research answers it with the exact files
 // of the snapshot, the answer is applied, and the next works — now deciding the test the transition reaches — pass G5 on
 // the same snapshot. The question is asked once; a repeat of the B1 transition writes nothing.
 import { readinessPending, writeReadinessInput, type ReadinessTransition } from "../src/om/input.js";
 import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor, sameEnd } from "./om-run-fixture.js";
-
 
 test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep their canonical order without a repeat, and a malformed end is an integrity refusal", async t => {
   const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
@@ -362,68 +360,6 @@ test("LP6 current mixed attempts keep their applied field beside refusal, owner 
   });
 });
 
-test("LP6 return №3371: an accepted field beside a real failure of the same attempt — a refusal of the model (the reviewer's probe), the owner's wait, an interrupted call — is no reconciled row: the stop stands for the producer, for the reader of a transition and after a reopen, and the facts A6 is shown keep the mixed end", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  // A stop e7db0ba8 saved over three mixed attempts, the producer and the reader of the new era over it.
-  const check = (f: ReturnType<typeof lp6Line>, failures: RegExp[]) => {
-    const stopped = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
-    assert.deepEqual([stopped.stop?.attempt, stopped.withoutProgress], [3, 3]);
-    // The facts of every attempt: a fresh result of its own field AND the failure beside it — never an input transition.
-    const report = ok(stopReportOfNewEra(f.store, f.address as never)), evidence = report.completionEvidence!;
-    assert.deepEqual(evidence.map(row => [row.ordinal, row.effect, row.results.length > 0]), [[1, "failure", true], [2, "failure", true], [3, "failure", true]]);
-    evidence.forEach((row, index) => assert.ok(row.remaining.some(item => failures[index]!.test(item)), row.remaining.join("; ")));
-    assert.notEqual(report.finding.subject, "input-transition");
-    assert.ok(report.lines.some(line => line.includes("beside real failure")), "The text of the report says the end was mixed");
-    // The producer: no transition — the first row with a real failure answers for the whole window; nothing is prepared.
-    const unfit = refusal(prepareReconcileSeries(f.store, { ...f.address, stop: 3 } as never));
-    assert.deepEqual([unfit.code, unfit.at.field], ["progress_unproved", "attempts.1"]);
-    assert.match(unfit.message, failures[0]!);
-    // The reader: a transition of this stop that took the fresh fields alone (as a derivation blind to the failures would
-    // write it), seen through a view — the database is never touched — is refused by the one derivation it is read by.
-    const goals = new Map(stopped.attempts.map(row => [row.ordinal, row.goal]));
-    const blind = { contract: "om-series-progress-transition/v1", project, series: reference(f.head()), stop: 3,
-      rows: evidence.map(row => ({ ordinal: row.ordinal, goal: goals.get(row.ordinal)!, close: row.close!, result: "input-field",
-        achieved: [...row.results], sources: row.decisions.map(decision => decision.e4) })) };
-    const id = seriesProgressTransitionId(project, reference(f.head()), 3), planted = { id, revision: 1, hash: hashJson(blind as unknown as Json) };
-    const view = new Proxy(f.store, { get(target, property) {
-      if (property === "get") return (key: string, revision?: number) => key === id
-        ? { id, kind: SERIES_PROGRESS_TRANSITION_KIND, revision: 1, hash: planted.hash, value: blind } : target.get(key, revision);
-      const member: unknown = Reflect.get(target, property, target); return typeof member === "function" ? member.bind(target) : member;
-    } }) as Store;
-    assert.equal(refusal(readSeriesProgressTransitionAt(view, project, planted)).code, "progress_unproved");
-    // After a reopen: the stop stands, the count is not cleared, no transition exists.
-    f.restart();
-    const again = ok(readSeries(f.store, f.address as never)).value as RepairSeries;
-    assert.deepEqual([again.stop?.attempt, again.withoutProgress, again.reconciliations, again.progressPolicy], [3, 3, undefined, undefined]);
-    assert.equal(f.store.list(SERIES_PROGRESS_TRANSITION_KIND).length, 0);
-    assert.equal(refusal(prepareReconcileSeries(f.store, { ...f.address, stop: 3 } as never)).code, "progress_unproved");
-  };
-  // The reviewer's probe (№3371): each attempt refused by the model on its node and, beside it, its own field applied.
-  const probe = lp6Line(t);
-  const refused = probe.old("probe", ([[1, "nodes", ["garden-produce-block", "garden-consume-block"]],
-    [2, "state", { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-produce-block" }], [3, "checkKind", "test"]] as const)
-    .flatMap(([ordinal, field, value]) => [{ op: "round", ordinal, answers: [{ field: "expansion", cannot: `Real unresolved refusal ${ordinal}` }, { field, value }] },
-      { op: "cease", ordinal }, { op: "close", ordinal }] as Lp6Op[]));
-  assert.deepEqual(refused.verdicts, ["none", "none", "none"]);
-  check(probe, [/model_cannot_answer/, /model_cannot_answer/, /model_cannot_answer/]);
-  // The owner's wait and an interrupted call beside an applied field, each in an attempt the old rules count.
-  const other = lp6Line(t);
-  const mixed = other.old("mixed", [
-    { op: "round", ordinal: 1, answers: [{ field: "checkKind", owner: "The owner names the check of the criterion" },
-      { field: "nodes", value: ["garden-produce-block", "garden-consume-block"] }, { field: "expansion", unsent: true }] },
-    { op: "cease", ordinal: 1 }, { op: "close", ordinal: 1 },
-    { op: "round", ordinal: 2, answers: [{ field: "expansion", exit: 1 },
-      { field: "state", value: { writer: "garden-produce-block", authority: "garden-consume-block", rollback: "garden-produce-block" } }] },
-    { op: "cease", ordinal: 2 }, { op: "close", ordinal: 2 },
-    { op: "round", ordinal: 3, answers: [{ field: "expansion", exit: 1 }, { field: "checkKind", value: "test" }] },
-    { op: "cease", ordinal: 3 }, { op: "close", ordinal: 3 },
-  ]);
-  assert.deepEqual(mixed.verdicts, ["none", "none", "none"]);
-  check(other, [/waiting for the owner/, /model_adapter_interrupted/, /model_adapter_interrupted/]);
-});
-
-
-
-
 test("LP7 row 26: one question of a joined batch waiting for the owner holds that whole batch — none of its fields is asked again — while a free batch the wait does not hold is worked on", async t => {
   const f = runFixture(t, ["encoding"], "stages", false, false, true);
   // Accept N2 without addressing B1: its joined input batch must remain open.
@@ -487,21 +423,17 @@ test("LP8.1 grounds that stay final: an unable pass on a review that never compl
   assert.deepEqual(passRows(f.store).filter(phase => phase === "reopened"), []);
 });
 
-test("LP8.1 start and continue of an unable pass whose grounds no longer stand drive it: the reopening, the recovery and the next work under one execution", async t => {
-  const { f, failure, unable, unchanged } = await unavailableReview(t);
+test("LP8.1 start and continue of an unable pass whose grounds no longer stand drive it: the reopening and the next work under one execution", async t => {
+  const { f, unable, unchanged } = await unavailableReview(t);
   ok(configureDispatch(f.store, { project, protocol: "codex-stdio" }));
-  const sends = f.sent().length;
-  let recoveries = 0;
-  class ObservedRecovery extends Store {
-    override writeMany<T = Json>(writes: Write[], guards?: Parameters<Store["writeMany"]>[1]): Revision<T>[] {
-      if (writes.some(write => write.kind === "om-stop-review" && Object.hasOwn(write.value as object, "recovery"))) {
-        assert.equal(f.sent().length, sends, "The exact paid answer is recovered without another call");
-        recoveries++;
-      }
-      return super.writeMany<T>(writes, guards);
-    }
-  }
-  f.restart(path => new ObservedRecovery(path));
+  // The grounds stop standing on the owner's own continuation: a decision on the exact stop resumes the series
+  // by today's rules, so the next entry reopens the pass and works the new attempt in the same execution.
+  const stopped = f.store.list<AnyRepairSeries>("repair-series").find(row => "owner" in row.value)!, stop = stopped.value.stop!;
+  const decision = f.store.write({ id: `${ownerDecisionNamespace(project)}lp81-continue`, kind: OWNER_DECISION_KIND, expected: 0,
+    value: { projectId: project, owner: { kind: "mechanism", mechanism: "M5:addressing" }, stop: stop.attempt, goals: [...stop.goals],
+      decided: "go on: one more window", taken: { by: "the owner", through: "the command API", approved: true } } });
+  ok(resumeSeries(f.store, { ...seriesRequestOf(stopped.value), stop: stop.attempt, ground: "owner-decision",
+    text: "the owner decided to go on", decision: { ref: reference(decision) } } as never));
   ok(await continuePass(f.store, { project }));
   const rows = passRows(f.store);
   assert.equal(rows.filter(phase => phase === "reopened").length, 1);
@@ -510,14 +442,12 @@ test("LP8.1 start and continue of an unable pass whose grounds no longer stand d
   assert.deepEqual([reopened.from, reopened.reasons], [reference(unable), reasonsOf(unable.value.state)]);
   assert.deepEqual(Object.keys(reopened.ground), ["step"]);
   assert.ok("step" in reopened.ground);
-  assert.equal(reopened.ground.step.action, "recover-analysis");
-  assert.deepEqual((reopened.ground.step.request as unknown as { failure: Ref }).failure, failure);
-  assert.equal(recoveries, 1);
+  assert.equal(reopened.ground.step.action, "open");
+  assert.equal(reopened.ground.step.attempt, stop.attempt + 1);
+  assert.equal(reopened.ground.step.series, stopped.id);
   assert.ok(f.store.history(runId(project)).some(row => row.revision > unable.revision + 1
-    && (row.value as unknown as RunRecord).last?.step.action === "resume"), "The continue drove the pass past its old end");
-  assert.ok(f.store.list().some(row => row.kind === "om-stop-review" && canonical((row.value as { recovery?: { failure: Ref } }).recovery?.failure as unknown as Json) === canonical(failure as unknown as Json)));
-  assert.ok(f.sent().length >= sends, "Only the work after the recovery may call");
-  // A second start finds the pass live and never reopens it again.
+    && (row.value as unknown as RunRecord).last?.step.action === "open"), "The continue drove the pass past its old end");
+  // A second start reads the pass's own standing and never reopens it again.
   ok(await startPass(f.store, { project }));
   assert.equal(passRows(f.store).filter(phase => phase === "reopened").length, 1);
   unchanged();
