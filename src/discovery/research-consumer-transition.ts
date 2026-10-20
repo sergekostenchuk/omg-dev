@@ -519,6 +519,10 @@ export const RESEARCH_CHECKPOINT_V2_CONTRACT = 'research-checkpoint/v2' as const
 export const RESEARCH_CHECKPOINT_V2_PREFIX = 'research-checkpoint:v2:' as const;
 const CHECKPOINT_V2_FIELDS = ['contract', 'projectId', 'draft', 'question', 'subject', 'status',
   'proposal', 'observations', 'unresolved'].sort().join(',');
+/** The wire checkpoint's unresolved list (schema above: array of non-empty
+ * text) — one rule for the v2 projector input and the saved v2 form. */
+export const checkpointUnresolvedHolds = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every(item => typeof item === 'string' && item.length > 0);
 export function projectCheckpointValueV2(projectId: string, draft: Ref, question: Ref, subject: V7PlanSubject,
   action: CheckpointProposalInput, observe: (source: Ref, selector: Selector) => Observation): { id: string; value: Record<string, any> } {
   const exact = requirePlanSubject(subject, 'research-checkpoint');
@@ -526,6 +530,8 @@ export function projectCheckpointValueV2(projectId: string, draft: Ref, question
     && Object.hasOwn(action, 'value') && Array.isArray(action.citations) && Array.isArray(action.unresolved)
     && action.citations.every(citation => recordValue(citation) && isRef(citation.source) && recordValue(citation.selector)),
   'research_question_foreign', 'Checkpoint belongs to another plan-question');
+  requireCondition(checkpointUnresolvedHolds(action.unresolved), 'research_response_invalid',
+    'Checkpoint unresolved items must be non-empty texts');
   const observations = action.citations.map(citation => observe(citation.source, citation.selector));
   const value = { contract: RESEARCH_CHECKPOINT_V2_CONTRACT, projectId, draft, question, subject: exact,
     status: 'unassessed', proposal: action.value, observations, unresolved: action.unresolved };
@@ -536,7 +542,7 @@ export function researchCheckpointV2Holds(value: unknown): boolean {
   if (!recordValue(value) || Object.keys(value).sort().join(',') !== CHECKPOINT_V2_FIELDS
     || value.contract !== RESEARCH_CHECKPOINT_V2_CONTRACT || typeof value.projectId !== 'string' || !value.projectId
     || !isRef(value.draft) || !isRef(value.question) || value.status !== 'unassessed'
-    || !Array.isArray(value.observations) || !Array.isArray(value.unresolved)) return false;
+    || !Array.isArray(value.observations) || !checkpointUnresolvedHolds(value.unresolved)) return false;
   try { requirePlanSubject(value.subject, 'research-checkpoint'); return true; } catch { return false; }
 }
 

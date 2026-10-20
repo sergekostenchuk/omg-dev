@@ -164,6 +164,11 @@ test("S1 subject proof (structural, in memory): the session subject stands on th
   const q = planned(f, "dr3a3s1-subject-other");
   const borrowed = projectSynthesisSessionV3Initial(origin(p, subjectOf(q.planAnswer, "q-supply")));
   assert.match(proof(borrowed), /^research_plan_subject_invalid: .*plan anchor/, "another project's plan is not this session's subject");
+  // Control (codex-omg №7894): the plan Question reopened after acceptance answers nothing — not an anchor.
+  f.discovery.reopen(p.plan.id, f.store.get<Question>(p.plan.id)!.revision);
+  const reopened = projectSynthesisSessionV3Initial(origin(p, subjectOf(next.planAnswer, "q-supply"),
+    { draft: reference(f.store.get<DiscoveryDraft>(p.draft.id)!), question: reference(f.store.get<Question>(p.plan.id)!) }));
+  assert.match(proof(reopened), /^research_plan_subject_invalid: .*plan anchor/);
   // A v2 session has no subject to prove.
   const { subject: _s, ...v2Binding } = lawful.value.binding;
   assert.equal(proveSynthesisSessionSubject(f.store, { id: `${SYNTHESIS_SESSION_V2_PREFIX}${hashJson("v2")}`,
@@ -274,6 +279,16 @@ test("S1 one projector for writer and reader: the v2 partial note and the v2 sav
   assert.match(failure(() => proveCheckpointRecord(f.store, misplaced)), /^context_lookup_integrity: /);
   assert.match(failure(() => proveCheckpointRecord(f.store, revision(note.id, { ...note.value, subject: null }))),
     /^context_lookup_integrity: .*exact subject form/);
+  // S1-01 (codex-omg №7894): unresolved is the wire list of non-empty texts — a number, null, an object or a
+  // Ref inside it is a damaged form: refused by the form check and by the exact prover, and at the projector input.
+  for (const item of [17, null, { question: "unresolved" }, reference(p.material), ""]) {
+    const value = { ...note.value, unresolved: [item] };
+    assert.equal(researchCheckpointV2Holds(value), false, `unresolved item ${JSON.stringify(item)} is not text`);
+    assert.match(failure(() => proveCheckpointRecord(f.store, revision(`${RESEARCH_CHECKPOINT_V2_PREFIX}${hashJson(value)}`, value))),
+      /^context_lookup_integrity: .*exact subject form/);
+    assert.match(failure(() => projectCheckpointValueV2(p.project, reference(p.draft), reference(p.plan), A,
+      { ...action("q-supply"), unresolved: [item] as unknown as string[] }, observe)), /^research_response_invalid: .*non-empty texts/);
+  }
   assert.equal(snapshot(f.store), before, "proving a note reads exact sources only");
   for (const broken of [{ ...note.value, subject: undefined }, { ...note.value, status: "accepted" }, { ...note.value, extra: true },
     { ...note.value, subject: { ...A, planQuestionId: 7 } }])
