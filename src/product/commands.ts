@@ -40,6 +40,7 @@ export type ProductCommand =
   | { type: "model-usage"; project: string; since: number }
   | { type: "configure-reader-pilot"; project: string; expected: number; settings: ReaderPilotSettings }
   | { type: "configure-saved-synthesis"; project: string; question: string; expected: number }
+  | { type: "configure-v7-saved-synthesis"; project: string; subject?: unknown; expected: number }
   | { type: "research-draft"; project: string; draftId: string; maxTurns: number }
   | { type: "execute-plan"; project: string; plan: Ref; retry: boolean; maxContextChars: number; maxCorrections: number }
   | { type: "stop-execution"; project: string }
@@ -93,6 +94,10 @@ environmentSettings.properties['webResearch'] = object({ enabled: { type: "boole
   limits: object({ materialChars: { const: 2000000 }, responseBytes: { type: "integer", minimum: 1, maximum: 64000000 } }) });
 const recoverySelector=object({record:ref,pointer:{type:'string'}});
 recoverySelector.properties['page']=object({offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1}});
+// DR3a3-S4 (решение 3): the subject is judged by its producer, after object() fixed the required set — a missing,
+// null or damaged subject is the same research_plan_subject_invalid from the parser path and the direct API.
+const savedV7Synthesis = command("configure-v7-saved-synthesis", { project, expected });
+savedV7Synthesis.properties['subject'] = {};
 const text = { ...string, pattern: "\\S" };
 // Optional after object() fixed the required set: an absent intent or stop is the driver's own case, never an empty value.
 const omStart = command("om-start", { project });
@@ -141,7 +146,7 @@ const schema = { oneOf: [
   earlyStageRun, reviseEarlyStageInput,
   command("model-usage", { project, since: expected }),
   command("configure-reader-pilot", { project, expected, settings: readerPilotSchema }),
-  command("configure-saved-synthesis", { project, question: string, expected }),
+  command("configure-saved-synthesis", { project, question: string, expected }), savedV7Synthesis,
   command("research-draft", { project, draftId: string, maxTurns: { type: "integer", minimum: 1, maximum: 100 } }),
   command("execute-plan", { project, plan: ref, retry: { type: "boolean" }, maxContextChars: { type: "integer", minimum: 1 }, maxCorrections: expected }), command("stop-execution", { project }),
   command("recover-execution", { project }),

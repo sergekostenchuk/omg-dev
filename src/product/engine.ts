@@ -53,7 +53,7 @@ import { StageResearch } from "./stage-research.js";
 import { EarlyStageDriver } from "./early-stage-driver.js";
 import { modelUsage } from "../runtime/model-usage.js";
 import { configureReaderPilot, assertPilotBoundary } from "../discovery/reader-pilot.js";
-import { configureSavedSynthesis } from "../discovery/saved-synthesis.js";
+import { configureSavedSynthesis, configureV7SavedSynthesis } from "../discovery/saved-synthesis.js";
 import { OwnerSessions, issueOwnerInvitation, type OwnerAuthority } from "./owner-authority.js";
 import { listOwnerQuestions, writeOwnerResult, type OwnerReaders } from "../om/owner-result.js";
 import { readOmInput } from "../om/input.js";
@@ -295,6 +295,8 @@ export class ProductEngine {
           "research_question_foreign", "Saved synthesis must target a question and draft of this project");
         return configureSavedSynthesis(this.store, question.id, command.expected);
       }
+      case "configure-v7-saved-synthesis": this.#project(command.project);
+        return configureV7SavedSynthesis(this.store, command.project, command.subject, command.expected);
       case "research-draft": this.#project(command.project); return this.researcher.run(command.project, command.draftId, command.maxTurns);
       case "execute-plan": this.#project(command.project); assertPilotBoundary(this.store, command.project, "execution", command.plan); return this.executor.run(command.project, command.plan, command);
       case "stop-execution": this.#project(command.project); return { stopped: this.executor.stop(command.project) };

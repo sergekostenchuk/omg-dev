@@ -14,15 +14,30 @@ import { EngineError } from "../errors.js";
 import { foldContextEvent, recordContextPacket, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
 import { readArchiveBody } from './request-parts.js';
-import { projectCheckpointValue, admittedResearchAction, contextReadIdentity, matchAcceptedPaidAnswer,
+import { projectCheckpointValue, admittedResearchAction, contextReadIdentity, matchAcceptedPaidAnswer, turnAction,
   type AcceptedPaidAnswerInputs, type ProjectedContextRead } from './research-consumer-transition.js';
+import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { expandLayerDelta } from './layer-delta.js';
+
+/** DR3a3-S4 (решение 6): the history of one exact subject — its turns only,
+ * chosen before any "latest" is picked, so A never reads B's or another plan
+ * edition's proposal, focus, selections, workspace or repeated reads. Without
+ * a subject the caller's turns are read as before (its own selection). */
+function subjectTurns(turns: Revision<ResearchTurn>[], subject?: V7PlanSubject): Revision<ResearchTurn>[] {
+  return subject === undefined ? turns : turns.filter(turn => sameSubject(planSubjectOf(turn.value), subject));
+}
+/** The action of a history turn: a subject turn is read by its own subject
+ * (turnAction), a field-path turn keeps its saved action as before. */
+function historyAction(turn: Revision<ResearchTurn>): unknown {
+  return Object.hasOwn(turn.value, 'subject') ? turnAction(turn.value) : turn.value.action;
+}
 
 /** Keep one latest proposal even after many reads push its turn out of the
  * compact conversation history. Its identity also stabilizes synthesis resume. */
-export function latestProposal(turns: Revision<ResearchTurn>[], questionId: string) {
-  return [...turns].reverse().find(turn => (turn.value.action as { question?: string })?.question === questionId
-    && ["answer", "answer_delta"].includes(String((turn.value.action as { action?: string })?.action)))?.value.action ?? null;
+export function latestProposal(turns: Revision<ResearchTurn>[], questionId: string, subject?: V7PlanSubject) {
+  const found = [...subjectTurns(turns, subject)].reverse().find(turn => (historyAction(turn) as { question?: string })?.question === questionId
+    && ["answer", "answer_delta"].includes(String((historyAction(turn) as { action?: string })?.action)));
+  return found ? historyAction(found) as ResearchTurn['action'] : null;
 }
 
 export interface PreparedCheckpoint {
@@ -55,15 +70,16 @@ export function checkpoint(store: Store, draft: Revision<DiscoveryDraft>, questi
   return prepared.existing ?? store.writeMany(prepared.writes, prepared.guards)[0]!;
 }
 
-export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>) {
-  for (const turn of [...turns].reverse()) {
+export function latestFocus(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>,
+  subject?: V7PlanSubject) {
+  for (const turn of [...subjectTurns(turns, subject)].reverse()) {
     const observation = turn.value.observation as any;
     if(observation?.splitInto)continue; // Queue expansion is not a delivered reading.
     const reader = observation?.ref ? store.get<any>(observation.ref.id) : null;
     if (turn.value.question?.id !== question.id && reader?.value.question?.id !== question.id) continue;
     if (turn.value.status !== "completed" || turn.value.error) return null;
     if (turn.value.question && canonical(turn.value.question) !== canonical(reference(question))) return null;
-    const action = (turn.value.action as { action?: string })?.action;
+    const action = (historyAction(turn) as { action?: string })?.action;
     const materialRef = observation?.value?.ref ?? observation?.ref;
     // D8.4.1 (№2314): a reader material named by its saved address is proven as a whole by the
     // common reader first — lost, damaged or substituted is its addressed refusal (S3), thrown as
@@ -114,11 +130,12 @@ function readerSelection(store: Store, focus: any, question: Revision<Question>)
 
 /** A comparison needs multiple explicitly requested materials at once. Use
  * most-recent-first order; the wire packer, not a fixed item count, limits size. */
-export function workingSelections(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>) {
+export function workingSelections(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>,
+  subject?: V7PlanSubject) {
   const selected: { key: string; kind: string; value: unknown }[] = [], seen = new Set<string>();
-  for (const turn of [...turns].reverse()) {
-    if (turn.value.question?.id === question.id && ["answer", "answer_delta", "checkpoint"].includes(String((turn.value.action as any)?.action))) break;
-    const focus = latestFocus(store, [turn], question);
+  for (const turn of [...subjectTurns(turns, subject)].reverse()) {
+    if (turn.value.question?.id === question.id && ["answer", "answer_delta", "checkpoint"].includes(String((historyAction(turn) as any)?.action))) break;
+    const focus = latestFocus(store, [turn], question, subject);
     if (!focus) continue;
     const item = readerSelection(store, focus, question) ?? { key: canonical(focus), kind: "context", value: focus };
     if (!seen.has(item.key)) { seen.add(item.key); selected.push(item); }
@@ -129,15 +146,15 @@ export function workingSelections(store: Store, turns: Revision<ResearchTurn>[],
 /** Reconstruct this question's addressed originals across run boundaries.
  * Old turns are read as history, not re-executed or retroactively rejected. */
 export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],question:Revision<Question>,
-  packetForTurn?: (turn: Revision<ResearchTurn>) => Record<string, any> | null):ContextWorkspace {
+  packetForTurn?: (turn: Revision<ResearchTurn>) => Record<string, any> | null, subject?: V7PlanSubject):ContextWorkspace {
   let workspace:ContextWorkspace={entries:[],sinceProgress:0};
-  for(const turn of turns){
+  for(const turn of subjectTurns(turns, subject)){
     if (!turn.value.question || canonical(turn.value.question) !== canonical(reference(question))
       || turn.value.status !== 'completed' || turn.value.error) continue;
     const packet = packetForTurn?.(turn);
     if (packet?.working?.deliveryContract === 'research-delivery/v1')
       workspace = recordContextPacket(workspace, packet);
-    const action=(turn.value.action as ResearchAction).action;
+    const action=(historyAction(turn) as ResearchAction).action;
     if(action!=='read_context') { workspace=foldContextEvent(workspace,action); continue; }
     let result: ContextLookup | null;
     if (packet?.working?.deliveryContract === 'research-delivery/v1') {
@@ -161,7 +178,7 @@ export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],qu
           ? { ...(record.value as Record<string, unknown>), body: readArchiveBody(store, record).body } : record.value,
         question: turn.value.question,
         ...(reader ? { readerResult: { ref: readerRef!, value: reader.value } } : {}) });
-    } else result = latestFocus(store,[turn],question) as ContextLookup|null;
+    } else result = latestFocus(store,[turn],question,subject) as ContextLookup|null;
     if(!result)continue;
     workspace=foldContextEvent(workspace,action,result);
   }
@@ -188,15 +205,16 @@ function contextReadKey(store: Store, observation: any, action: Extract<Research
 /** Compare the underlying reading, not its newly generated archive wrapper.
  * A/A and A/B/A both stop on the second unchanged request without a checkpoint. */
 export function repeatedContextRead(store: Store, turns: Revision<ResearchTurn>[], question: Revision<Question>,
-  afterTurn: number, observation: unknown, action: Extract<ResearchAction, { action: "read_context" }>) {
+  afterTurn: number, observation: unknown, action: Extract<ResearchAction, { action: "read_context" }>,
+  subject?: V7PlanSubject) {
   const key = contextReadKey(store, observation, action, question);
-  for (const turn of [...turns].reverse()) {
+  for (const turn of [...subjectTurns(turns, subject)].reverse()) {
     if (turn.value.number <= afterTurn) break;
     if (turn.value.question?.id !== question.id) continue;
-    const prior = turn.value.action as ResearchAction;
+    const prior = historyAction(turn) as ResearchAction;
     if (prior.action === "checkpoint" || prior.action === "answer" || prior.action === "answer_delta") break;
     if (turn.value.error || turn.value.status !== "completed" || prior.action !== "read_context") continue;
-    const oldFocus = latestFocus(store, [turn], question);
+    const oldFocus = latestFocus(store, [turn], question, subject);
     if (!oldFocus) continue;
     const previous = contextReadKey(store, oldFocus, prior, question);
     if (key === previous) return reference(turn);

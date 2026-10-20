@@ -174,3 +174,21 @@ test("saved-synthesis product command rejects missing fields, foreign project/qu
   assert.throws(() => f.configure(), { code: "revision_conflict" });
   assert.equal(f.store.list("saved-synthesis").length, 1);
 });
+
+// DR3a3-S4 (№7690 §3 S4): the v1 saved-only command, its address and reader are a neighbour of the new
+// configure-v7-saved-synthesis — they keep their contract, and the new command never reads or writes them.
+test("S4 v6 neighbour: the v1 saved-only command and reader keep their contract beside configure-v7-saved-synthesis", t => {
+  const f = fixture(t, "answer", "R1");
+  const saved = f.configure() as Revision<unknown>;
+  assert.equal(saved.id, `saved-synthesis:${f.question.id}`);
+  const materials = savedSynthesisMaterials(f.store, f.draft, f.question);
+  assert.ok(materials && materials.length > 0);
+  for (const subject of [undefined, null, f.question.id,
+    { contract: "v7-plan-subject/v1", planAnswer: reference(f.question), planQuestionId: "result" }]) {
+    const command: Record<string, unknown> = { type: "configure-v7-saved-synthesis", project: "p", expected: 0 };
+    if (subject !== undefined) command.subject = subject;
+    assert.throws(() => f.engine.execute(command), { code: "research_plan_subject_invalid" }, JSON.stringify(subject));
+  }
+  assert.deepEqual(f.store.list("saved-synthesis").map(row => reference(row)), [reference(saved)]);
+  assert.deepEqual(savedSynthesisMaterials(f.store, f.draft, f.question), materials);
+});

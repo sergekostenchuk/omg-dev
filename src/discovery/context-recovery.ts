@@ -10,11 +10,14 @@ import { contextLookupKey, contextWorkspace, type ContextWorkspace } from './con
 import { readerPilot } from './reader-pilot.js';
 import { readResearchContext } from './research-limits.js';
 import { contextValue } from './working-context.js';
-import { parseSynthesisSessionV2, projectContextRecoveryTransition, CONTEXT_RECOVERY_SUPERSEDE_REASON,
-  proveCheckpointRecord } from './research-consumer-transition.js';
+import { parseSynthesisSessionV2, parseSynthesisSessionV3, projectContextRecoveryTransition, CONTEXT_RECOVERY_SUPERSEDE_REASON,
+  proveCheckpointRecord, researchCheckpointV2Holds, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
 import { readReaderResultAt } from './reader.js';
 import { listResearchConsumerIntents, researchConsumerIntentId } from './response-recovery.js';
-import { synthesisStepKey } from './synthesis-session.js';
+import { proveSynthesisSessionSubject, synthesisStepKey } from './synthesis-session.js';
+import { callAddressesSubject, questionDispatchId, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
+import { planQuestionContract } from './continuation-packet.js';
+import { EngineError } from '../errors.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 
 export interface ContextSessionBinding { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] }
@@ -33,6 +36,8 @@ export function recoverContextSession(store: Store, project: string, sessionRef:
     && session.value.projectId === project, 'context_session_foreign', 'Recovery requires this project\'s context session');
   if (session.kind === 'synthesis-session' && session.id.startsWith('synthesis-session:v2:'))
     return recoverContextSessionV2(store, project, session, sessionRef, selector);
+  if (session.kind === 'synthesis-session' && session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX))
+    return recoverContextSessionV3(store, project, session, sessionRef, selector);
   // №2000-11: a paid managed assessment session has no operator workspace
   // recovery; its only lawful path is the managed one through its exact origin.
   requireCondition(!(session.kind === 'assessment-session' && session.id.startsWith('assessment-session:v2:')),
@@ -170,6 +175,17 @@ function recoverContextSessionV2(store: Store, project: string, session: Revisio
   if (proofRecord.kind === 'reader-result') readReaderResultAt(store, project, selector.record);
   else if (proofRecord.kind === 'research-checkpoint') proveCheckpointRecord(store, proofRecord);
   const result = readResearchContext(store, draft, questionHead.id, pilot, selector.record, selector.pointer, selector.page);
+  return writeSessionRecovery(store, project, session, sessionRef, selector, result, intents,
+    [reference(questionHead), reference(pilot), dispatchGuard]);
+}
+
+/** The one write of an operator recovery of a v2 or v3 session: the shared
+ * transition formula the chain reader re-derives, the sources the new
+ * material names, the session CAS and absence-of-new-claim guards for both
+ * step variants of the current head, plus the caller's scope guards. */
+function writeSessionRecovery(store: Store, project: string, session: Revision<RecoverableContextSession>, sessionRef: Ref,
+  selector: ContextRecoverySelector, result: ReturnType<typeof readResearchContext>,
+  intents: ReturnType<typeof listResearchConsumerIntents>, scopeGuards: TransactionGuard[]): Revision<RecoverableContextSession> {
   const workspace = contextWorkspace(session.value.workspace, session.value['focus']);
   const preparedAtHead = intents.filter(intent => intent.value.state === 'prepared'
     && intent.value.owner.revision === session.revision);
@@ -214,6 +230,84 @@ function recoverContextSessionV2(store: Store, project: string, session: Revisio
   });
   return store.writeMany<RecoverableContextSession>([{ id: session.id, kind: session.kind,
     expected: session.revision, value: transition.session as unknown as RecoverableContextSession }],
-  uniqueTransactionGuards([sessionRef, selector.record, reference(questionHead), reference(pilot), dispatchGuard,
-    ...sourceRefs, ...claimGuards]))[0]!;
+  uniqueTransactionGuards([sessionRef, selector.record, ...scopeGuards, ...sourceRefs, ...claimGuards]))[0]!;
+}
+
+/** DR3a3-S4 (решения 5, 6): the record an operator recovery of a v3 session
+ * may name. A reader-result is the common reader's exact result (shared by
+ * subjects of one Question); a checkpoint is only a v2 note of the session's
+ * own subject — never a v1 note of the physical Question or another subject's
+ * note, so the operator cannot make a foreign note this session's own. One
+ * predicate for the writer below and the v3 chain reader. */
+export function recoveryRecordSubjectHolds(record: Revision<Record<string, any>>, subject: V7PlanSubject): boolean {
+  if (record.kind !== 'research-checkpoint') return true;
+  return researchCheckpointV2Holds(record.value) && sameSubject(record.value.subject, subject);
+}
+
+/** The v3 operator context recovery: the v2 rules on the session's exact
+ * subject. The answered plan anchor is the v7 norm, so the session's subject
+ * must be proven and still current instead. Decision 5: the subject step's
+ * dispatch counter and the common reader's physical Question counter are both
+ * guarded, and a running call of either scope refuses — a dispatch between
+ * this check and the write conflicts. */
+function recoverContextSessionV3(store: Store, project: string, session: Revision<RecoverableContextSession>,
+  sessionRef: Ref, selector: ContextRecoverySelector): Revision<RecoverableContextSession> {
+  const parsed = parseSynthesisSessionV3(session.value);
+  requireCondition(parsed, 'context_binding_missing', 'The v3 session must retain its producer contract, binding and subject');
+  const binding = parsed.binding, subject = binding.subject;
+  const draft = store.get<DiscoveryDraft>(binding.draft.id, binding.draft.revision);
+  const draftHead = store.get<DiscoveryDraft>(binding.draft.id);
+  const questionHead = store.get<Question>(binding.question.id);
+  requireCondition(draft?.kind === 'discovery-draft' && draftHead?.kind === 'discovery-draft' && questionHead?.kind === 'question'
+    && draft.value.projectId === project && questionHead.value.projectId === project
+    && questionHead.value.draftId === draft.id && draft.value.questions.includes(questionHead.id),
+  'context_binding_foreign', 'Session research must belong to the exact project, draft, question and environment');
+  requireCondition(session.value.result === null, 'context_session_complete',
+    'An accepted answer or completed context session cannot be recovered');
+  requireCondition(canonical(reference(session)) === canonical(sessionRef),
+    'context_session_stale', 'Recover the current exact session revision');
+  try {
+    proveSynthesisSessionSubject(store, session);
+    planQuestionContract(store, draftHead, questionHead, subject);
+  } catch (error) {
+    if (error instanceof EngineError)
+      throw new EngineError('context_binding_stale', `The session plan subject is no longer current: ${error.message}`);
+    throw error;
+  }
+  const intents = listResearchConsumerIntents(store, project, draft.id)
+    .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind)
+      && intent.value.owner.id === session.id && ['prepared', 'running'].includes(intent.value.state));
+  requireCondition(!intents.some(intent => intent.value.state === 'running'),
+    'context_recovery_claim_pending',
+    'A claimed step without its application cannot accept an operator context replacement');
+  const pilot = readerPilot(store, project);
+  requireCondition(pilot, 'reader_pilot_required', 'Context recovery requires the current active reader preset');
+  const counterGuards: TransactionGuard[] = [subject, null].map(scope => {
+    const id = questionDispatchId(project, questionHead.id, scope);
+    const counter = store.get<{ projectId: string; question: string; serial: number; subject?: unknown }>(id);
+    requireCondition(!counter || counter.kind === 'question-dispatch' && counter.value.projectId === project
+      && counter.value.question === questionHead.id && Number.isSafeInteger(counter.value.serial) && counter.value.serial > 0
+      && (scope ? sameSubject((counter.value.subject ?? null) as V7PlanSubject | null, scope) : !Object.hasOwn(counter.value, 'subject')),
+    'context_recovery_basis_missing', 'Recovery needs the saved dispatch counters of its subject and Question');
+    return counter ? reference(counter) : { id, absent: true as const };
+  });
+  requireCondition(!store.list<ModelCall>('model-call').some(call => call.value.projectId === project && call.value.status === 'running'
+    && (call.value.questionId === questionHead.id
+      || callAddressesSubject(call.value as unknown as Record<string, unknown>, reference(questionHead), subject))),
+  'context_call_active', 'Finish or recover the running model call of this subject or Question before changing its context');
+  requireCondition(selector && isRef(selector.record) && typeof selector.pointer === 'string',
+    'context_recovery_invalid', 'Recovery requires an exact record and JSON pointer');
+  const proofRecord = store.get<Record<string, any>>(selector.record.id, selector.record.revision);
+  requireCondition(proofRecord && proofRecord.value !== null && typeof proofRecord.value === 'object'
+    && !Array.isArray(proofRecord.value)
+    && hashJson(proofRecord.value) === proofRecord.hash
+    && canonical(reference(proofRecord)) === canonical(selector.record),
+  'context_lookup_integrity', 'The exact recovery record is missing or changed');
+  requireCondition(recoveryRecordSubjectHolds(proofRecord, subject), 'context_reference_foreign',
+    'A v3 session recovers only its own subject\'s notes; another subject\'s or a field-path note is foreign');
+  if (proofRecord.kind === 'reader-result') readReaderResultAt(store, project, selector.record);
+  else if (proofRecord.kind === 'research-checkpoint') proveCheckpointRecord(store, proofRecord);
+  const result = readResearchContext(store, draft, questionHead.id, pilot, selector.record, selector.pointer, selector.page);
+  return writeSessionRecovery(store, project, session, sessionRef, selector, result, intents,
+    [reference(questionHead), reference(draftHead), subject.planAnswer, reference(pilot), ...counterGuards]);
 }
