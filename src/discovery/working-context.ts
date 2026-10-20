@@ -2,7 +2,7 @@ import { sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { activeSynthesisNotes, consolidationInput, consolidationPage, consolidationFragment,
   CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
-import { FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
+import { proveAssessmentTransportSubject, sameAssessmentSubject, assessmentQuestionContract, type AssessmentTransportSubject, FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -97,12 +97,26 @@ function conclusionSources(body: Record<string, any>, archive: Ref, questionId: 
 }
 
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
-  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null } = {}): Record<string, any> {
+  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null; assessmentSubject?: AssessmentTransportSubject | null } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
   const planSubject = packetPlanSubject(options);
+  const assessmentSubject = proveAssessmentTransportSubject(store, body, projectId, reference(question));
+  requireCondition(sameAssessmentSubject(body, options.assessmentSubject ? {assessmentSubject:options.assessmentSubject} : {}),
+    'discovery_assessment_subject_invalid', 'The packer must retain its admitted assessment subject');
+  requireCondition(!assessmentSubject || !planSubject && options.purpose === 'assessor',
+    'discovery_assessment_subject_invalid', 'An assessment packet belongs only to its assessor');
+  const assessmentContract = assessmentSubject ? assessmentQuestionContract(assessmentSubject) : null;
+  if (assessmentContract) {
+    for (const supplied of [body['question'], ...(Array.isArray(body['questions']) ? body['questions'] : [])].filter(q => q !== undefined))
+      requireCondition(supplied && typeof supplied === 'object' && !Array.isArray(supplied)
+        && Object.entries(supplied).every(([key,value]) => Object.hasOwn(assessmentContract,key)
+          && canonical(value) === canonical(assessmentContract[key as keyof typeof assessmentContract])),
+        'discovery_assessment_subject_invalid', 'An assessment cannot use the plan FieldSpec as its result contract');
+    body = {...body, question:assessmentContract};
+  }
   const planContract = planSubject ? planQuestionContract(store, draft, question, planSubject) : null;
   if (planSubject && Object.hasOwn(body, 'subject')) requireCondition(sameSubject(packetPlanSubject(body), planSubject),
     'research_plan_subject_invalid', 'Context cannot select a different plan subject');
@@ -122,10 +136,10 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     body = {...body, subject:planSubject, question:planContract,
       ...(Object.hasOwn(body,'questions')?{questions:[planContract]}:{})};
   }
-  if (planSubject && options.previous) {
+  if ((planSubject || assessmentSubject) && options.previous) {
     const previous = store.get<Archive>(options.previous.id,options.previous.revision);
     requireCondition(previous?.hash === options.previous.hash && previous.value.projectId === projectId
-      && previous.value.question.id === questionId && sameSubject(packetPlanSubject(previous.value),planSubject),
+      && previous.value.question.id === questionId && sameAssessmentSubject(previous.value.body,body) && sameSubject(packetPlanSubject(previous.value),planSubject),
       'continuation_foreign','The previous archive belongs to another exact subject');
   }
 
@@ -220,14 +234,17 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (neighborMaterial) requireCondition(neighborMaterial.stageNeighbors?.contract === 'stage-neighbors/v1',
     'context_stage_neighbors_incomplete', `[${question.id}] The assessor needs its declared stage material`);
   const hasQuestion = Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader';
-  const selected = planContract ? {question:planContract,schemaPointer:'/body/question/schema'} : hasQuestion ? selectedQuestion(question, archivedBody) : null;
-  const contract = planContract ?? (selected ? { id: question.id, ...question.value.spec } : null);
+  const responseContract = assessmentContract ?? planContract;
+  const selected = responseContract ? {question:responseContract,schemaPointer:'/body/question/schema'} : hasQuestion ? selectedQuestion(question, archivedBody) : null;
+  const contract = responseContract ?? (selected ? { id: question.id, ...question.value.spec } : null);
   const projectedQuestion = selected ? { ...selected.question,
     ...(selected.schemaPointer && body['dispatchMode'] !== 'consolidation'
       ? { schemaAddress: { record: reference(archive), pointer: selected.schemaPointer } } : {}) } : null;
   if (projectedQuestion) body = { ...body, question: projectedQuestion,
     ...(Object.hasOwn(body, 'questions') ? { questions: [projectedQuestion] } : {}) };
   const finish = (packet: Record<string, any>) => {
+    requireCondition(sameAssessmentSubject(packet, archivedBody), 'discovery_assessment_subject_invalid',
+      'Every initial or continuation packet must preserve packet and baseline');
     if (planSubject) packet.subject = planSubject;
     requirePacketMaterialDelivery(packet, reference(archive), (record, pointer) =>
       contextValue(archivedContext(store, draft, record), pointer));
@@ -413,6 +430,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     // A saved lookup is an original, not a repeat of the foundation. Replacing
     // its value inside the copy-removal walk changes its identity and makes a
     // valid paid read fail the delivery proof (including inventory lookups).
+    if (assessmentSubject) body['assessmentSubject'] = assessmentSubject;
     if (exactWorkspace !== undefined) body['contextWorkspace'] = exactWorkspace;
     if (newMapPrerequisites) body['prerequisites'] = newMapPrerequisites;
     if (projectedQuestion) { body['question'] = projectedQuestion; if (Object.hasOwn(original, 'questions')) body['questions'] = [projectedQuestion]; }
@@ -473,7 +491,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     if (!packet.materialDelivery) serveArchivedMaterial(packet, addressed, maxChars);
     return finish(packet);
   }
-  const mandatory = ["resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
+  const mandatory = ["assessmentSubject", "resultCapacity", "assessmentContextContract", "stageNeighbors", "discoveryContext", "discoveryBasisCatalogue", "webResearch", "answerContext", "contextWorkspace", "savedEvidence", "conclusions", "conclusionCitations", "conclusionRefs", "conclusionUnresolved", "conclusionEncoding", "contextControls", "contextCorrection", "currentRead", "originals", "corrections", "request", "candidate", "proposalChanges", "purpose", "sources", "questions", "prerequisites", "operationMap", "researchMissing", "fields", "mapStatusFindings", "mapStatus", "researchScope", "role", "stage", "level", "consumer", "contextEncoding", "allowedConsumers", "gapFields", "graphBase",
     "core", "map", "draft", "question", "value", "representation", "consumerFeedback", "assessmentState", "openGaps", "failures", "unresolvedEvidence", "dispatchMode", "readPlanStatus", "sourceCatalogue", "sourceLocations", "bases", "runtimeProofs", "synthesisState", "synthesisNotes", "previousProposalRef"];
   if(body['assessmentState']) mandatory.splice(mandatory.indexOf("value"),1);
   const ordered = options.common && !options.continuation

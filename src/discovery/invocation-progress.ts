@@ -1,3 +1,4 @@
+import { assessmentSubjectKey, type AssessmentTransportSubject } from './continuation-packet.js';
 import { callAddressesSubject, sameSubject, planSubjectOf, type V7PlanSubject } from './v7-managed-attempt.js';
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Store } from '../storage/store.js';
@@ -10,7 +11,7 @@ import {contextLookupKey} from './context-workspace.js';
 /** Preserve the engine-owned progress identity for accounting. Distinct calls
  * are governed by their token budget, not a fixed invocation count. Repeated
  * delivered lookup keys are rejected by the context consumer. */
-export function invocationProgress(store:Store,questionId:string,purpose:string,context:Record<string,any>,subject:V7PlanSubject|null=null,actor?:string) {
+export function invocationProgress(store:Store,questionId:string,purpose:string,context:Record<string,any>,subject:V7PlanSubject|null=null,actor?:string,assessmentSubject:AssessmentTransportSubject|null=null) {
   const question=store.get(questionId);
   requireCondition(question?.kind==='question','continuation_question_missing','Progress requires its bound question');
   let step:unknown;
@@ -27,11 +28,12 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
         && (!subject || r.value.projectId===(question.value as any).projectId && sameSubject(planSubjectOf(r.value),subject))).map(reference);
     step={evidence};
   }
-  const key=hashJson(subject ? {version:2,projectId:(question.value as any).projectId,subject,purpose,actor,step}
+  const key=hashJson(assessmentSubject ? {version:3,projectId:(question.value as any).projectId,assessmentSubject,purpose,actor,step} : subject ? {version:2,projectId:(question.value as any).projectId,subject,purpose,actor,step}
     : {version:1,question:reference(question),purpose,step});
   const calls=store.list<ModelCall>('model-call').filter(c=>callAddressesSubject(c.value as unknown as Record<string,unknown>,reference(question),subject)
+    && ((c.value as unknown as {assessmentKey?:string}).assessmentKey??null)===assessmentSubjectKey(assessmentSubject)
     && c.value.purpose===purpose && c.value.progressKey===key
-    && (!subject || c.value.projectId===(question.value as any).projectId && c.value.requested.actor===actor));
+    && (!(subject||assessmentSubject) || c.value.projectId===(question.value as any).projectId && c.value.requested.actor===actor));
   return {key,guards:calls.map(reference)};
 }
 

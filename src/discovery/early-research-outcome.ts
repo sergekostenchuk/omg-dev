@@ -1,3 +1,5 @@
+import { assessmentRolePrompt } from './assessment-session.js';
+import { packetAssessmentSubject, assessmentQuestionContract, assessmentTransportPrompt, ATTEMPTS_ASSESSMENT_RESPONSE } from './continuation-packet.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
@@ -30,6 +32,13 @@ export function requireAssessmentReply(response: any): void {
     && Array.isArray(response.reasons) && response.reasons.every((r: unknown) => typeof r === 'string')
     && (response.verdict === 'supported' || response.reasons.length > 0),
   'assessment_invalid', 'Expected an assessment verdict or continuation');
+}
+export function requireAttemptsAssessmentReply(response: unknown): void {
+  if ((response as any)?.action === 'read_context' || (response as any)?.action === 'assessment_checkpoint') {
+    requireAssessmentReply(response); return;
+  }
+  requireCondition(new Ajv({strict:true}).compile(ATTEMPTS_ASSESSMENT_RESPONSE)(response),
+    'discovery_novelty_invalid', 'An attempts verdict needs its complete novelty classification');
 }
 export function requireEscalationReply(response: any): void {
   requireCondition(response && typeof response.necessary === 'boolean'
@@ -202,7 +211,18 @@ export function researchCapacityInput(input: {
   cursor?: Record<string, unknown>;
 }): ResearchResultCapacityInput {
   const c = input.context;
-  const keys = ['discoveryContext', 'discoveryBasisCatalogue', 'assessmentContextContract', 'stageNeighbors',
+  const assessmentSubject = packetAssessmentSubject(c);
+  if (assessmentSubject) {
+    requireCondition(input.role === 'assessor' && input.purpose === 'assessor'
+      && isRef(input.bindings.question) && canonical(assessmentSubject.packet.question) === canonical(input.bindings.question)
+      && assessmentSubject.packet.project === input.draft.projectId,
+      'discovery_assessment_subject_invalid', 'The capacity admission must preserve the exact assessment Question and project');
+    requireCondition(!Object.hasOwn(input.bindings,'assessmentSubject')
+      || canonical(input.bindings.assessmentSubject) === canonical(assessmentSubject),
+      'discovery_assessment_subject_invalid', 'Capacity cannot substitute another packet or baseline');
+  } else requireCondition(!Object.hasOwn(input.bindings,'assessmentSubject'),
+    'discovery_assessment_subject_invalid', 'The capacity context lost its declared assessment subject');
+  const keys = ['assessmentSubject', 'discoveryContext', 'discoveryBasisCatalogue', 'assessmentContextContract', 'stageNeighbors',
     'allowedActions', 'allowedConsumers', 'gapFields', 'researchScope', 'graphBase', 'contextEncoding',
     'dispatchMode', 'savedOnly', 'scope', 'responseContract', 'access', 'deliveryRules', 'criteria',
     'contextControls', 'synthesisState', 'synthesisSession', 'previousProposalRef', 'consolidation'];
@@ -234,10 +254,11 @@ export function researchCapacityInput(input: {
       'read_source', 'search', 'read', 'read_bundle', 'read_plan', 'synthesize', 'web_search', 'web_fetch', 'pause'];
   const envelope = { protocol: 'omg-agent/v1', requestId: '00000000-0000-0000-0000-000000000000',
     mode: 'research', model: input.binding.model,
-    effort: input.binding.effort, ...(input.binding.speed ? { speed: input.binding.speed } : {}), prompt: input.prompt,
+    effort: input.binding.effort, ...(input.binding.speed ? { speed: input.binding.speed } : {}),
+    prompt: assessmentSubject ? assessmentTransportPrompt(input.prompt, assessmentRolePrompt('')) : input.prompt,
     subject: { stage: input.draft.stage, level: input.draft.level, consumer: input.draft.consumer,
       contractVersion: input.draft.contractVersion ?? 1, purpose: input.purpose,
-      question: { id: input.question.id, ...input.question.value.spec },
+      question: assessmentSubject ? assessmentQuestionContract(assessmentSubject) : { id: input.question.id, ...input.question.value.spec },
       inputs: input.draft.inputs, ...mandatory, cursor: input.cursor ?? {},
       responseOutputLimit: researchResponseOutputLimit(input.physicalReplyLimit ?? null),
       access: { exactOriginals: true, incompletePagesAreNotComplete: true,
@@ -247,7 +268,7 @@ export function researchCapacityInput(input: {
     && Number.isSafeInteger(goal.targetChars) && goal.targetChars > 0
     && Number.isSafeInteger(goal.fullTargetChars) && goal.fullTargetChars > 0,
   'research_capacity_invalid', 'Consolidation result admission needs its exact item and full-form targets');
-  return { operation: input.operation, generation: input.generation, bindings: input.bindings,
+  return { operation: input.operation, generation: input.generation, bindings: { ...input.bindings, ...(assessmentSubject ? {assessmentSubject} : {}) },
     role: input.role, purpose: input.purpose, actionMode: input.actionMode,
     envelopeLimitChars: input.limit, mandatoryEnvelope: envelope, forms: forms.map(kind => ({ kind,
       ...(goal ? { specialLimits: { targetChars: goal.targetChars, fullTargetChars: goal.fullTargetChars } } : {}) })) };

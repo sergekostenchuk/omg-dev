@@ -1,3 +1,5 @@
+import { proveAttemptPacket, checkProgressBaseline } from './v7-attempt-assessment.js';
+import { V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT, type V7AttemptPacket, type V7ProgressBaseline } from './research-model.js';
 import { planSubjectOf, sameSubject, callAddressesSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { provePlanQuestions } from './v7-plan-questions.js';
 import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_END_CODES, isDiscoveryV7Draft } from './v7-contracts.js';
@@ -9,6 +11,80 @@ import type { ModelCall } from '../runtime/model-usage.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
+
+/** The transport subject is fixed before payment. The assessment producer owns
+ * its session; these fields never turn an analyst intent into an assessor. */
+export interface AssessmentTransportSubject {
+  kind: 'attempts'; packet: V7AttemptPacket; baseline: V7ProgressBaseline;
+}
+export function packetAssessmentSubject(container: unknown): AssessmentTransportSubject | null {
+  if (!container || typeof container !== 'object' || !Object.hasOwn(container, 'assessmentSubject')) return null;
+  const subject = (container as Record<string, any>).assessmentSubject;
+  requireCondition(subject && typeof subject === 'object' && !Array.isArray(subject)
+    && Object.keys(subject).sort().join(',') === 'baseline,kind,packet' && subject.kind === 'attempts'
+    && subject.packet && typeof subject.packet === 'object' && !Array.isArray(subject.packet)
+    && subject.baseline && typeof subject.baseline === 'object' && !Array.isArray(subject.baseline),
+    'discovery_assessment_subject_invalid', 'An attempts assessment needs its exact packet and baseline');
+  requireCondition(subject.packet.contract === V7_ATTEMPT_PACKET_CONTRACT
+    && typeof subject.packet.project === 'string' && subject.packet.project.length > 0
+    && typeof subject.packet.planQuestionId === 'string' && subject.packet.planQuestionId.length > 0
+    && isRef(subject.packet.question) && isRef(subject.packet.planAnswer) && Array.isArray(subject.packet.entries)
+    && subject.packet.entries.length > 0 && subject.packet.entries.every((entry:any)=>entry && isRef(entry.attempt) && isRef(entry.binding))
+    && subject.baseline.contract === V7_PROGRESS_BASELINE_CONTRACT && Array.isArray(subject.baseline.materials)
+    && subject.baseline.state && (subject.baseline.state.kind === 'absent' && typeof subject.baseline.state.id === 'string'
+      || subject.baseline.state.kind === 'state' && isRef(subject.baseline.state.ref)),
+    'discovery_assessment_subject_invalid', 'The assessment packet or baseline is incomplete');
+  return subject;
+}
+export function proveAssessmentTransportSubject(store: Store, container: unknown, project: string, question: Ref) {
+  const subject = packetAssessmentSubject(container);
+  if (!subject) return null;
+  const proven = proveAttemptPacket(store, subject.packet);
+  checkProgressBaseline(store, subject.baseline, proven.packet);
+  requireCondition(subject.packet.project === project && canonical(subject.packet.question) === canonical(question),
+    'discovery_assessment_subject_invalid', 'The assessment must retain its actual Question basis and project');
+  return subject;
+}
+export function assessmentSubjectKey(subject: AssessmentTransportSubject | null): string | null {
+  return subject ? hashJson(subject) : null;
+}
+export function sameAssessmentSubject(a: unknown, b: unknown): boolean {
+  return canonical(packetAssessmentSubject(a)) === canonical(packetAssessmentSubject(b));
+}
+
+/** This is the response shape transported by T. The paid producer A proves
+ * the verdict and complete novelty against M; the model never sets N or keys. */
+export const ATTEMPTS_ASSESSMENT_RESPONSE = {
+  type: 'object', additionalProperties: false, required: ['verdict', 'reasons', 'return', 'novelty'],
+  properties: {
+    verdict: { enum: ['supported', 'return'] },
+    reasons: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 } },
+    return: { anyOf: [{ type: 'null' }, { type: 'object', required: ['target', 'reason'],
+      properties: { target: { type: 'object' }, reason: { type: 'string', minLength: 1 } }, additionalProperties: false }] },
+    novelty: { type: 'object', additionalProperties: false,
+      required: ['attempts', 'accepted', 'rejected', 'newContent', 'duplicates', 'noProgress', 'transition'],
+      properties: {
+        ...Object.fromEntries(['attempts', 'accepted', 'rejected', 'newContent', 'duplicates', 'noProgress']
+          .map(key => [key, { type: 'array', items: { type: 'object' } }])),
+        transition: { anyOf: [{ type: 'null' }, { type: 'object' }] }
+      } }
+  }
+} as const;
+export const ATTEMPTS_ASSESSMENT_INSTRUCTION = 'Assess exactly assessmentSubject.packet against assessmentSubject.baseline. '
+  + 'Return verdict supported or return, nonempty reasons, return (null for supported), and mandatory novelty with '
+  + 'attempts, accepted, rejected, newContent, duplicates, noProgress and transition. Classify every packet attempt and '
+  + 'submitted claim exactly once; every accepted claim is newContent or a proven duplicate. No omitted novelty defaults. '
+  + 'Do not return a plan-field answer, assign content keys, streak/N or authority. A checkpoint or addressed read is not a verdict.';
+/** The shared session producer still appends its single-answer instructions.
+ * Strip exactly that known suffix, preserving the supplied base prompt. */
+export function assessmentTransportPrompt(prompt: string, singleAnswerSuffix: string): string {
+  const base = prompt.endsWith(singleAnswerSuffix) ? prompt.slice(0, -singleAnswerSuffix.length) : prompt;
+  return base.includes(ATTEMPTS_ASSESSMENT_INSTRUCTION) ? base : `${base}\n${ATTEMPTS_ASSESSMENT_INSTRUCTION}`;
+}
+export function assessmentQuestionContract(subject: AssessmentTransportSubject) {
+  return { id: subject.packet.planQuestionId, basis: subject.packet.question,
+    prompt: ATTEMPTS_ASSESSMENT_INSTRUCTION, schema: ATTEMPTS_ASSESSMENT_RESPONSE };
+}
 
 /** The preflight packer can read the producer's capacity binding; actual dispatch
  * separately requires that binding to equal the saved consumer intent. */
@@ -52,25 +128,27 @@ export const FOUNDATION_FIELDS = ['core','map','researchScope','mapStatus','allo
   'fields','sourceCatalogue','inventory','catalogue','prerequisites','operationMap','objective','problem','actors',
   'constraints','specificationConstraints','concept','requirements','nodes','files','records','value','previousProposal','currentProposal'] as const;
 // This row serializes attempts; successful model-call records establish delivery.
-interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject }
+interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string }
 export interface ContinuationPacketState {
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
-  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null;
+  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null;
 }
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null): ContinuationPacketState {
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
     'continuation_question_missing','Every role invocation requires its exact question and draft');
-  const id=`continuation-state:${hashJson(subject ? [projectId,subject,purpose,actor] : [projectId,questionId,purpose,actor])}`;
+  const assessmentKey = assessmentSubjectKey(assessmentSubject);
+  const id=`continuation-state:${hashJson(assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? [projectId,subject,purpose,actor] : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
   const calls=store.list<ModelCall>('model-call').filter(c=>c.value.projectId===projectId
+    && ((c.value as unknown as {assessmentKey?:string}).assessmentKey ?? null) === assessmentKey
     && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor)
     .sort((a,b)=>a.value.startedAt-b.value.startedAt||a.id.localeCompare(b.id));
   requireCondition(!calls.some(c=>c.value.status==='running'),'continuation_call_active',
     'This question/role has an unfinished invocation; recover its actual outcome before another dispatch');
-  if(state) requireCondition(state.kind==='continuation-state' && state.value.question===questionId
+  if(state) requireCondition((state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId
     && sameSubject(packetPlanSubject(state.value),subject) && state.value.projectId===projectId && state.value.purpose===purpose && state.value.actor===actor,
     'continuation_foreign','Continuation state belongs to another role/question');
   if(state) requireCondition(typeof state.value.activeCall==='string'&&calls.some(c=>c.id===state.value.activeCall),
@@ -83,15 +161,16 @@ export function continuationState(store: Store, projectId: string, draftId: stri
     const original=isRef(ref)?store.get<any>(ref.id,ref.revision):null;
     requireCondition(original?.kind==='research-context'&&original.hash===ref.hash&&original.value?.projectId===projectId
       &&isRef(original.value.question)&&original.value.question.id===questionId
+      &&sameAssessmentSubject(original.value.body, assessmentSubject ? {assessmentSubject} : {})
       &&sameSubject(packetPlanSubject(original.value),subject),'continuation_foreign','Delivered foundation belongs to another question');
   }
   return {initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
-    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject};
+    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject};
 }
 export function continuationDispatch(state: ContinuationPacketState, callId: string): { writes: Write[]; guards: ReadGuard[] } {
   return {writes:[{id:state.id,kind:'continuation-state',expected:state.state?.revision??0,
     value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,
-      activeCall:callId,attempts:state.attempts+1,...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards]};
+      activeCall:callId,attempts:state.attempts+1,...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards]};
 }
 
 export const CONTINUATION_INSTRUCTION = 'This is an independent stateless continuation, not a remembered conversation. The question field MUST equal subject.question.id, never the prompt text. Use the supplied question contract, saved conclusions, current piece and exact original addresses. Never infer omitted context to be empty or irrelevant. The complete project foundation was transported earlier and is not repeated. If a specific condition is missing, request a small child pointer via read_context; never request the entire foundation again. Saved conclusions/checkpoints are unassessed proposals, not evidence. Preserve exceptions, conflicting findings and source citations. Follow the current phase protocol and advance only the supplied cursor. Do not reread already paid files or request a reader to extract them again.';
@@ -163,9 +242,10 @@ export function continuationMetadata(state: ContinuationPacketState, archive: Re
   const original = store.get<{ projectId: string; draft: Ref; question: Ref; body: Record<string, unknown>; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
   requireCondition(original?.kind === 'research-context' && original.hash === foundation.hash
     && original.value?.projectId === state.projectId && isRef(original.value.draft) && original.value.draft.id === state.draft.id
-    && isRef(original.value.question) && original.value.question.id === state.question.id && sameSubject(packetPlanSubject(original.value),state.subject) && original.value.body && typeof original.value.body === 'object' && !Array.isArray(original.value.body),
+    && isRef(original.value.question) && original.value.question.id === state.question.id
+    && sameAssessmentSubject(original.value.body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject) && original.value.body && typeof original.value.body === 'object' && !Array.isArray(original.value.body),
   'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
-  return {kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
+  return {...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
     foundation,current:archive,previousCalls:state.priorCalls,
     foundationPointers:contextSections(original.value.body, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
 }

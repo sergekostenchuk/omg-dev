@@ -1,3 +1,7 @@
+import { researchCapacityProjection } from './early-research-outcome.js';
+import { readResearchExecution } from './response-recovery.js';
+import type { RecoverableContextSession } from './context-recovery.js';
+import { packetAssessmentSubject, sameAssessmentSubject, assessmentSubjectKey } from './continuation-packet.js';
 import type { Store, Revision } from "../storage/store.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import type { ModelCall } from "../runtime/model-usage.js";
@@ -15,12 +19,12 @@ import { archivedContext } from "./working-context.js";
 export function replayLimitedResponse(store: Store, pilot: Revision<ReaderPilot>, role: RoleBinding,
   draftId: string, questionId: string | undefined, purpose: string, input: string) {
   const request = JSON.parse(input);
-  if (!isRef(request.subject?.working?.archive) || request.subject?.subject?.contract === 'v7-plan-subject/v1') return null;
+  if (!isRef(request.subject?.working?.archive) || request.subject?.subject?.contract === 'v7-plan-subject/v1' || Object.hasOwn(request.subject, 'assessmentSubject')) return null;
   // C51 era boundary: a managed consumer call is recovered only through its
   // own intent chain; replaying its bytes here would reuse the operation key
   // without the intent binding. This path serves pre-intent calls only.
   const calls = store.list<ModelCall>("model-call").filter(call => call.value.status === "failed"
-    && !Object.hasOwn(call.value, 'planAnswer')
+    && !Object.hasOwn(call.value, 'planAnswer') && !Object.hasOwn(call.value, 'assessmentKey')
     && !call.id.startsWith("model-call:consumer:v1:")
     && !(call.value as { consumerIntent?: unknown }).consumerIntent
     && call.value.error === "pilot_reply_limit" && call.value.profile?.id === pilot.id
@@ -83,7 +87,7 @@ export function replayableLegacyCall(store: Store, pilot: Revision<ReaderPilot>,
       && turn.value.recoveredRequest.id === call.id
       && store.get<ModelCall>(call.id, turn.value.recoveredRequest.revision)?.hash === turn.value.recoveredRequest.hash);
   const calls = store.list<ModelCall>("model-call").filter(call => call.value.status === "failed"
-    && !Object.hasOwn(call.value, 'planAnswer')
+    && !Object.hasOwn(call.value, 'planAnswer') && !Object.hasOwn(call.value, 'assessmentKey')
     && !call.id.startsWith("model-call:consumer:v1:")
     && !(call.value as { consumerIntent?: unknown }).consumerIntent
     && call.value.error === "pilot_reply_limit" && call.value.profile?.id === pilot.id
@@ -104,4 +108,46 @@ export function replayableLegacyCall(store: Store, pilot: Revision<ReaderPilot>,
   requireCondition(matches.length <= 1, "research_replay_invalid",
     "Several saved paid calls match this exact request");
   return matches[0] ?? null;
+}
+
+/** T owns transport replay only. A owns the assessment result and application.
+ * Follow one prepared application -> its immutable running revision -> exact
+ * paid wire. No lookup by Question, packet hash, progress or today's heads. */
+export function replayAssessmentApplication(store: Store, session: Revision<RecoverableContextSession>,
+  application: Revision<Record<string, any>>) {
+  const app=application.value, expected=packetAssessmentSubject(app.context);
+  if (!expected) return null;
+  const bound=store.get<Record<string,any>>(application.id,2);
+  if (!bound) return null;
+  const fail=(condition:unknown,message:string)=>requireCondition(condition,'research_replay_invalid',message);
+  fail(bound.kind===application.kind && bound.hash===hashJson(bound.value) && isRef(bound.value.call)
+    && canonical(bound.value)===canonical({...app,state:'running',call:bound.value.call}),
+    'The assessment application lost its exact atomic call binding');
+  const origin=store.get<ModelCall>(bound.value.call.id,bound.value.call.revision);
+  fail(origin?.kind==='model-call' && origin.hash===bound.value.call.hash && isRef((origin.value as any).assessmentApplication)
+    && canonical((origin.value as any).assessmentApplication)===canonical(reference(application))
+    && (origin.value as any).assessmentKey===assessmentSubjectKey(expected),
+    'The reserved call belongs to another application or assessment subject');
+  const call=store.get<ModelCall>(origin!.id);
+  fail(call,'The reserved call is missing');
+  requireCondition(call!.value.status!=='running','research_context_application_running',
+    'Recover the in-flight physical outcome before another assessment dispatch');
+  const binding=session.value.binding!;
+  const draft=store.get<DiscoveryDraft>(binding.draft.id,binding.draft.revision);
+  const question=store.get<Question>(binding.question.id,binding.question.revision);
+  fail(draft?.hash===binding.draft.hash && question?.hash===binding.question.hash,
+    'The original assessment draft and Question are unavailable');
+  const paid=readResearchExecution(store,app.projectId,reference(call!),session,draft!,question!,app.role,app.profile);
+  fail(paid.kind==='response','The application has no paid assessment response');
+  fail(paid.prompt===researchCapacityProjection(app.context.resultCapacity,store).prompt
+    && sameAssessmentSubject(paid.body,app.context) && sameAssessmentSubject(paid.subject,app.context)
+    && canonical(paid.body.resultCapacity)===canonical(app.context.resultCapacity)
+    && canonical(paid.subject.resultCapacity)===canonical(app.context.resultCapacity),
+    'The paid context or capacity belongs to another packet or baseline');
+  // Identity of the complete prepared context is checked against the immutable
+  // body, not reconstructed from the current plan/baseline or caller's values.
+  fail(Object.keys(app.context).every(key=>Object.hasOwn(paid.body,key)
+    && canonical(paid.body[key])===canonical(app.context[key])),
+    'The paid wire changed its prepared assessment context');
+  return paid.kind==='response'?paid:null;
 }
