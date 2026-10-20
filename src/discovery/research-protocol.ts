@@ -223,7 +223,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
     const basis = audit.store.get<Question>(audit.questionId);
     requireCondition(basis, 'discovery_assessment_subject_invalid', 'The assessment Question is missing');
     proveAssessmentTransportSubject(audit.store,context,environment.projectId,reference(basis));
-    prompt = assessmentTransportPrompt(prompt,assessmentRolePrompt(''));
+    prompt = assessmentTransportPrompt(prompt,assessmentRolePrompt(''),assessmentSubject);
   }
   // DR3a3-S2: the packer and its proof carry one exact plan subject for every
   // role of a v7 plan-question — analyst, reading planner, synthesis and

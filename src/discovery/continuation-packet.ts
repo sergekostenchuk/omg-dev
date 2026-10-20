@@ -1,3 +1,5 @@
+import { ASSESSMENT_METHODOLOGY_CONTRACT, ASSESSMENT_METHODOLOGY_POLICY } from './assessment-methodology.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V2 } from './research-model.js';
 import { proveAttemptPacket, checkProgressBaseline } from './v7-attempt-assessment.js';
 import { V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT, type V7AttemptPacket, type V7ProgressBaseline } from './research-model.js';
 import { planSubjectOf, sameSubject, callAddressesSubject, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -15,17 +17,35 @@ import { EngineError, requireCondition } from '../errors.js';
 
 /** The transport subject is fixed before payment. The assessment producer owns
  * its session; these fields never turn an analyst intent into an assessor. */
+// Resolve M2 constants at use time: its evidence reader also uses the transport.
+export function methodologyAssessmentTransport() {
+  return { contract: DISCOVERY_ASSESSMENT_CONTRACT_V2, methodology: ASSESSMENT_METHODOLOGY_CONTRACT,
+    policy: ASSESSMENT_METHODOLOGY_POLICY } as const;
+}
 export interface AssessmentTransportSubject {
   kind: 'attempts'; packet: V7AttemptPacket; baseline: V7ProgressBaseline;
+  /** Absent only for the original T contract. Never retrofit a paid request. */
+  assessment?: ReturnType<typeof methodologyAssessmentTransport>;
 }
 export function packetAssessmentSubject(container: unknown): AssessmentTransportSubject | null {
   if (!container || typeof container !== 'object' || !Object.hasOwn(container, 'assessmentSubject')) return null;
   const subject = (container as Record<string, any>).assessmentSubject;
   requireCondition(subject && typeof subject === 'object' && !Array.isArray(subject)
-    && Object.keys(subject).sort().join(',') === 'baseline,kind,packet' && subject.kind === 'attempts'
+    && Object.keys(subject).sort().join(',') === (Object.hasOwn(subject, 'assessment')
+      ? 'assessment,baseline,kind,packet' : 'baseline,kind,packet') && subject.kind === 'attempts'
     && subject.packet && typeof subject.packet === 'object' && !Array.isArray(subject.packet)
     && subject.baseline && typeof subject.baseline === 'object' && !Array.isArray(subject.baseline),
     'discovery_assessment_subject_invalid', 'An attempts assessment needs its exact packet and baseline');
+  if (Object.hasOwn(subject, 'assessment')) {
+    const declaration = subject.assessment;
+    const valid = declaration && typeof declaration === 'object' && !Array.isArray(declaration)
+      && Object.keys(declaration).sort().join(',') === 'contract,methodology,policy'
+      && declaration.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2
+      && declaration.methodology === ASSESSMENT_METHODOLOGY_CONTRACT
+      && declaration.policy === ASSESSMENT_METHODOLOGY_POLICY;
+    if (!valid) throw new EngineError('discovery_assessment_subject_invalid',
+      'The assessment needs its exact supported methodology contract and policy', { field: 'assessmentSubject.assessment' });
+  }
   requireCondition(subject.packet.contract === V7_ATTEMPT_PACKET_CONTRACT
     && typeof subject.packet.project === 'string' && subject.packet.project.length > 0
     && typeof subject.packet.planQuestionId === 'string' && subject.packet.planQuestionId.length > 0
@@ -71,20 +91,80 @@ export const ATTEMPTS_ASSESSMENT_RESPONSE = {
       } }
   }
 } as const;
+/** Wire shape only: M2 proves exact references; A/P prove the paid assessment,
+ * semantic attribution and application. Shared $defs keep mandatory capacity small. */
+const methodText = { type: 'string', minLength: 1 } as const;
+const methodRef = { $ref: '#/$defs/ref' } as const;
+const methodEvidence = { type: 'array', items: { $ref: '#/$defs/evidence' } } as const;
+const methodObject = (properties: Record<string, unknown>) => ({ type: 'object', additionalProperties: false,
+  required: Object.keys(properties), properties });
+function buildMethodologyResponseContract() { return {
+  ...ATTEMPTS_ASSESSMENT_RESPONSE,
+  required: [...ATTEMPTS_ASSESSMENT_RESPONSE.required, 'methodology'],
+  properties: { ...ATTEMPTS_ASSESSMENT_RESPONSE.properties,
+    methodology: methodObject({ contract: { const: ASSESSMENT_METHODOLOGY_CONTRACT },
+      policy: { const: ASSESSMENT_METHODOLOGY_POLICY }, facts: { type: 'array', items: { $ref: '#/$defs/fact' } } }) },
+  $defs: {
+    ref: methodObject({ id: methodText, revision: { type: 'integer', minimum: 1 }, hash: methodText }),
+    claim: methodObject({ project: methodText, container: methodRef, containerKind: methodText,
+      pointer: { type: 'string' }, claimId: methodText }),
+    evidence: methodObject({ source: methodRef, selector: { oneOf: [
+      methodObject({ kind: { const: 'text-range' }, start: { type: 'integer', minimum: 0 }, end: { type: 'integer', minimum: 1 } }),
+      methodObject({ kind: { const: 'json-pointer' }, pointer: { type: 'string' } })] } }),
+    knowledge: { oneOf: [
+      methodObject({ status: { const: 'known' }, value: methodText, evidence: { ...methodEvidence, minItems: 1 } }),
+      methodObject({ status: { const: 'unknown' }, reason: methodText })] },
+    source: methodObject({ source: methodRef, role: { enum: ['primary', 'secondary'] }, reason: methodText,
+      evidence: { ...methodEvidence, minItems: 1 }, original: { anyOf: [methodRef, { type: 'null' }] },
+      originalReason: methodText, limitation: { anyOf: [methodText, { type: 'null' }] },
+      publicationDate: { $ref: '#/$defs/knowledge' }, eventDate: { $ref: '#/$defs/knowledge' },
+      version: { $ref: '#/$defs/knowledge' }, retrievedAt: { anyOf: [methodText, { type: 'null' }] } }),
+    fact: methodObject({ claim: { $ref: '#/$defs/claim' },
+      significance: methodObject({ kind: { enum: ['blocking', 'material', 'supporting'] }, reason: methodText }),
+      sources: { type: 'array', minItems: 1, items: { $ref: '#/$defs/source' } },
+      temporalApplicability: { oneOf: [
+        methodObject({ status: { const: 'established' }, scope: methodText, reason: methodText, evidence: { ...methodEvidence, minItems: 1 } }),
+        methodObject({ status: { enum: ['limited', 'unknown'] }, scope: methodText, reason: methodText, evidence: methodEvidence })] },
+      corroboration: { oneOf: [
+        methodObject({ status: { const: 'independent' }, sources: { type: 'array', minItems: 2, items: methodRef }, reason: methodText }),
+        methodObject({ status: { const: 'single_confirmation' }, reason: methodText, limitation: methodText })] },
+      refutation: { oneOf: ['performed', 'not_performed', 'unavailable'].map(status => methodObject({
+        status: { const: status }, reason: methodText, traces: { type: 'array',
+          ...(status === 'performed' ? { minItems: 1 } : status === 'not_performed' ? { maxItems: 0 } : {}),
+          items: methodObject({ turn: methodRef, capture: methodRef }) },
+        counterarguments: methodEvidence, limitations: { type: 'array', items: methodText } })) } })
+  }
+} as const; }
+let methodologyResponseContract: ReturnType<typeof buildMethodologyResponseContract> | undefined;
+export function assessmentResponseContract(subject: AssessmentTransportSubject | null) {
+  return subject?.assessment ? (methodologyResponseContract ??= buildMethodologyResponseContract()) : ATTEMPTS_ASSESSMENT_RESPONSE;
+}
 export const ATTEMPTS_ASSESSMENT_INSTRUCTION = 'Assess exactly assessmentSubject.packet against assessmentSubject.baseline. '
   + 'Return verdict supported or return, nonempty reasons, return (null for supported), and mandatory novelty with '
   + 'attempts, accepted, rejected, newContent, duplicates, noProgress and transition. Classify every packet attempt and '
   + 'submitted claim exactly once; every accepted claim is newContent or a proven duplicate. No omitted novelty defaults. '
   + 'Do not return a plan-field answer, assign content keys, streak/N or authority. A checkpoint or addressed read is not a verdict.';
+export const ATTEMPTS_METHODOLOGY_INSTRUCTION = 'The declared assessment contract and methodology policy are part of this exact assessment subject. '
+  + 'Return mandatory methodology with the declared contract and policy, and one row for every accepted fact at its exact ClaimAddress. '
+  + 'Keep exact sources and selectors; primary/secondary status with reasons; significance and temporal applicability; publication date, event date and version with evidence or explicit unknown reasons. '
+  + 'retrievedAt is retrieval time, never publication or event time. Prefer primary sources; secondary-only evidence needs a reason and limitation. '
+  + 'For significant claims, including every blocking claim, require independent confirmation or an explicit single_confirmation limitation. Mirrors and captures of one original are not independent. '
+  + 'Refutation has performed/not_performed/unavailable status, reason, exact saved search turns and captures, counterarguments and limitations; never invent a search or infer absence of refutations from no hits. '
+  + 'Limitations do not satisfy missing plan criteria. Methodology flags create neither novelty nor progress, streak/N, acceptance or authority.';
+function assessmentInstruction(subject: AssessmentTransportSubject) {
+  return subject.assessment ? `${ATTEMPTS_ASSESSMENT_INSTRUCTION}\n${ATTEMPTS_METHODOLOGY_INSTRUCTION}` : ATTEMPTS_ASSESSMENT_INSTRUCTION;
+}
 /** The shared session producer still appends its single-answer instructions.
  * Strip exactly that known suffix, preserving the supplied base prompt. */
-export function assessmentTransportPrompt(prompt: string, singleAnswerSuffix: string): string {
+export function assessmentTransportPrompt(prompt: string, singleAnswerSuffix: string, subject: AssessmentTransportSubject | null = null): string {
   const base = prompt.endsWith(singleAnswerSuffix) ? prompt.slice(0, -singleAnswerSuffix.length) : prompt;
-  return base.includes(ATTEMPTS_ASSESSMENT_INSTRUCTION) ? base : `${base}\n${ATTEMPTS_ASSESSMENT_INSTRUCTION}`;
+  const general = base.includes(ATTEMPTS_ASSESSMENT_INSTRUCTION) ? base : `${base}\n${ATTEMPTS_ASSESSMENT_INSTRUCTION}`;
+  return subject?.assessment && !general.includes(ATTEMPTS_METHODOLOGY_INSTRUCTION)
+    ? `${general}\n${ATTEMPTS_METHODOLOGY_INSTRUCTION}` : general;
 }
 export function assessmentQuestionContract(subject: AssessmentTransportSubject) {
   return { id: subject.packet.planQuestionId, basis: subject.packet.question,
-    prompt: ATTEMPTS_ASSESSMENT_INSTRUCTION, schema: ATTEMPTS_ASSESSMENT_RESPONSE };
+    prompt: assessmentInstruction(subject), schema: assessmentResponseContract(subject) };
 }
 
 /** The preflight packer can read the producer's capacity binding; actual dispatch

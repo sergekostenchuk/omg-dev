@@ -1,3 +1,4 @@
+import { methodologyAssessmentTransport, ATTEMPTS_METHODOLOGY_INSTRUCTION } from '../src/discovery/continuation-packet.js';
 import { assessmentSession, assessmentRolePrompt } from '../src/discovery/assessment-session.js';
 import { contextWorkspace } from '../src/discovery/context-workspace.js';
 import { readRequestWire } from '../src/discovery/request-parts.js';
@@ -194,7 +195,8 @@ function dispatchContext(session:any, app:any) {
 async function paidAssessment(f:Awaited<ReturnType<typeof packetFixture>>, subject=f.subject, conflicts=0, tokens=10, candidate=0) {
   const reply={verdict:'return',reasons:['No new evidence'],return:{target:{attempt:subject.packet.entries[0]!.attempt},reason:'No evidence'},
     novelty:{attempts:[{attempt:subject.packet.entries[0]!.attempt,reason:'No evidence'}],accepted:[],rejected:[],newContent:[],duplicates:[],
-      noProgress:[{attempt:subject.packet.entries[0]!.attempt,reason:'No evidence'}],transition:null}};
+      noProgress:[{attempt:subject.packet.entries[0]!.attempt,reason:'No evidence'}],transition:null},
+    ...(subject.assessment?{methodology:{contract:subject.assessment.methodology,policy:subject.assessment.policy,facts:[]}}:{})};
   writeFileSync(f.settings,JSON.stringify({tokens,reply}));
   const existingApps=new Set(f.store.list('assessment-application').map(a=>a.id));
   const write=f.store.writeMany.bind(f.store),other=f.open(),stop=new Error('T stopped after durable paid response');
@@ -356,4 +358,56 @@ test('T: prepareCall cannot replace the call or assessment key',async t=>{
         assert.match((error as Error).message,/preserve the call/);return true;});
   assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   assert.deepEqual(f.store.get(app.id),app);
+});
+
+test('T2: real paid producer preserves the M2 methodology contract on continuation and exact cold replay',async t=>{
+  const f=await packetFixture(t),subject={...f.subject,assessment:methodologyAssessmentTransport()};
+  const legacy=await paidAssessment(f),paid=await paidAssessment(f,subject),next=await paidAssessment(f,subject,0,10,1);
+  const wire=f.wires().at(-1);
+  assert.equal(wire.subject.continuation.kind,'continuation');
+  assert.deepEqual(wire.subject.assessmentSubject,subject);
+  assert.ok(wire.subject.question.schema.required.includes('methodology'));
+  assert.ok(wire.prompt.includes(ATTEMPTS_METHODOLOGY_INSTRUCTION));
+  assert.equal(wire.prompt.split(ATTEMPTS_ASSESSMENT_INSTRUCTION).length,2);
+  assert.deepEqual(paid.prepared.value.context.resultCapacity.bindings.assessmentSubject,subject);
+  assert.notEqual(paid.app.value.call.id,legacy.app.value.call.id);
+  assert.notEqual(f.store.get<ModelCall>(paid.app.value.call.id)!.value.progressKey,f.store.get<ModelCall>(legacy.app.value.call.id)!.value.progressKey);
+  assert.equal(requireAttemptsAssessmentReply(paid.reply,subject),undefined);
+  // A current source head must not reselect the paid response's contract or policy.
+  f.discovery.reopen(f.m.question.id,f.m.question.revision);
+  const sent=f.wires().length,history=f.store.list().flatMap(r=>f.store.history(r.id));
+  assert.deepEqual(await paid.invoke(f.open()),paid.reply);assert.deepEqual(await next.invoke(f.open()),next.reply);
+  assert.deepEqual(await legacy.invoke(f.open()),legacy.reply);
+  await assert.rejects(paid.invoke(f.open(),{...dispatchContext(paid.session,paid.prepared.value),assessmentSubject:f.subject}),
+    {code:'discovery_assessment_subject_invalid'});
+  await assert.rejects(legacy.invoke(f.open(),{...dispatchContext(legacy.session,legacy.prepared.value),assessmentSubject:subject}),
+    {code:'discovery_assessment_subject_invalid'});
+  await assert.rejects(paid.invoke(f.open(),{...dispatchContext(paid.session,paid.prepared.value),
+    assessmentSubject:{...subject,assessment:{...subject.assessment,policy:'future'}}}),{code:'discovery_assessment_subject_invalid'});
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list().flatMap(r=>f.store.history(r.id)),history);
+});
+
+test('T2: incomplete methodology declaration refuses before adapter and ledger; paid overrun stays atomic',async t=>{
+  const f=await packetFixture(t),subject={...f.subject,assessment:methodologyAssessmentTransport()};
+  const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
+  for(const assessment of [null,{}, {contract:subject.assessment.contract,methodology:subject.assessment.methodology}, {...subject.assessment,policy:null}, {...subject.assessment,methodology:['assessment-methodology/v1']}]){
+    await assert.rejects(assessmentSession(f.store,f.m.draft,f.m.question,f.environment,f.environment.value,undefined,
+      {assessmentSubject:{...subject,assessment},value:{attempts:subject.packet.entries},observations:[]},ATTEMPTS_ASSESSMENT_INSTRUCTION,
+      undefined,baselineGuards(subject.baseline)),{code:'discovery_assessment_subject_invalid'});
+  }
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  const paid=await paidAssessment(f,subject,4,20_000_001);
+  assert.equal(paid.clashes,4);
+  assert.ok(paid.reservationKinds.includes('research-budget-ledger'));
+  assert.ok(paid.reservationKinds.includes('assessment-application'));
+  assert.ok(paid.terminalKinds.includes('budget-incident'));
+  const after=f.wires().length,accounting=f.store.list('research-budget-ledger');
+  assert.deepEqual(await paid.invoke(f.open()),paid.reply);
+  const segment=f.store.get<BudgetSegment>(stageBudgetSegmentId('p'))!,usage=budgetUsage(f.store,segment);
+  assert.equal(usage.reserved,0);assert.ok(usage.measured>segment.value.limit);
+  for(const kind of ['model-call','model-response','budget-incident'])assert.ok(paid.terminalKinds.includes(kind));
+  await assert.rejects(assessmentSession(f.store,f.m.draft,f.m.question,f.environment,f.environment.value,undefined,
+    {assessmentSubject:subject,value:{attempts:subject.packet.entries,next:true},observations:[]},ATTEMPTS_ASSESSMENT_INSTRUCTION,
+    undefined,baselineGuards(subject.baseline)),{code:'discovery_budget_overrun'});
+  assert.equal(f.wires().length,after);assert.deepEqual(f.store.list('research-budget-ledger'),accounting);
 });

@@ -1,5 +1,5 @@
 import { assessmentRolePrompt } from './assessment-session.js';
-import { packetAssessmentSubject, packetPlanSubject, assessmentQuestionContract, assessmentTransportPrompt, ATTEMPTS_ASSESSMENT_RESPONSE } from './continuation-packet.js';
+import { packetAssessmentSubject, packetPlanSubject, assessmentQuestionContract, assessmentTransportPrompt, assessmentResponseContract, type AssessmentTransportSubject } from './continuation-packet.js';
 import { buildResearchResultCapacity, requireResearchResultCapacity, measureResearchResult,
   type ResearchResultCapacity, type ResearchResultCapacityInput } from './research-delivery.js';
 import type { Environment, RoleBinding } from '../runtime/environment.js';
@@ -33,12 +33,16 @@ export function requireAssessmentReply(response: any): void {
     && (response.verdict === 'supported' || response.reasons.length > 0),
   'assessment_invalid', 'Expected an assessment verdict or continuation');
 }
-export function requireAttemptsAssessmentReply(response: unknown): void {
+const attemptsReplyValidators = new WeakMap<object, ReturnType<Ajv['compile']>>();
+export function requireAttemptsAssessmentReply(response: unknown, subject: AssessmentTransportSubject | null = null): void {
+  if (subject) packetAssessmentSubject({assessmentSubject: subject});
   if ((response as any)?.action === 'read_context' || (response as any)?.action === 'assessment_checkpoint') {
     requireAssessmentReply(response); return;
   }
-  requireCondition(new Ajv({strict:true}).compile(ATTEMPTS_ASSESSMENT_RESPONSE)(response),
-    'discovery_novelty_invalid', 'An attempts verdict needs its complete novelty classification');
+  const schema = assessmentResponseContract(subject);
+  let validate = attemptsReplyValidators.get(schema);
+  if (!validate) { validate = new Ajv({strict:true}).compile(schema); attemptsReplyValidators.set(schema, validate); }
+  requireCondition(validate(response), 'discovery_novelty_invalid', 'An attempts verdict needs its declared novelty and methodology');
 }
 export function requireEscalationReply(response: any): void {
   requireCondition(response && typeof response.necessary === 'boolean'
@@ -260,7 +264,7 @@ export function researchCapacityInput(input: {
   const envelope = { protocol: 'omg-agent/v1', requestId: '00000000-0000-0000-0000-000000000000',
     mode: 'research', model: input.binding.model,
     effort: input.binding.effort, ...(input.binding.speed ? { speed: input.binding.speed } : {}),
-    prompt: assessmentSubject ? assessmentTransportPrompt(input.prompt, assessmentRolePrompt('')) : input.prompt,
+    prompt: assessmentSubject ? assessmentTransportPrompt(input.prompt, assessmentRolePrompt(''), assessmentSubject) : input.prompt,
     subject: { stage: input.draft.stage, level: input.draft.level, consumer: input.draft.consumer,
       contractVersion: input.draft.contractVersion ?? 1, purpose: input.purpose,
       question: assessmentSubject ? assessmentQuestionContract(assessmentSubject)
