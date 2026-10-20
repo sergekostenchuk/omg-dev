@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { canonical, digest, hashJson, type Json } from '../src/canonical.js';
+import { canonical, canonicalSorted, digest, hashJson, type Json } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
 import { Store, type Revision, type Write, type TransactionGuard } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -16,13 +16,21 @@ import { configureReaderPilot, type ReaderPilotSettings } from '../src/discovery
 import type { Source } from '../src/evidence/evidence.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
+import { prepareFrame, fillObligations, type FrameRead } from '../src/om/frame-obligations.js';
+import type { LayerProposal } from '../src/om/frame-proposals.js';
+import { writeWorksAcceptance } from '../src/om/atomic-gate.js';
+import { readAcceptedFrame, type AcceptedFrameRequest } from '../src/om/frame-accept.js';
+import { readWorksFrame } from '../src/om/works-frame.js';
+import { writeFeasibility } from '../src/om/feasibility.js';
+import { writeHandoff } from '../src/om/handoff.js';
+import { writeGuarded } from '../src/om/refs.js';
 import { type CarriedObligation, type RuntimeCheck } from '../src/graph/obligation-policy.js';
 import { findObligationConfirmation, frozenObligationConfirmation, readinessObligations } from '../src/graph/obligation-readiness.js';
 import { runtimeSupport } from '../src/graph/runtime-evidence.js';
-import { bindTaskObligations, taskBindingId } from '../src/graph/task-obligations.js';
+import { taskBindingId } from '../src/graph/task-obligations.js';
 import { taskStartProofs, taskResultProofs, requireCurrentTaskStart, requireCurrentTaskResult, requireTaskObligationProofs } from '../src/execution/task-obligations.js';
 import type { TaskRun } from '../src/execution/model.js';
-import { receiptId, type CompiledTask, type MachinePlan } from '../src/compiler/model.js';
+import { receiptId, type MachinePlan } from '../src/compiler/model.js';
 import { runtimeContext, type RuntimeObservationResult } from '../src/runtime/runtime-observation.js';
 import { Environments, git, uniqueTransactionGuards, transactionGuardsCurrent, type ExecutionRoot } from '../src/runtime/environment.js';
 import { ensureWorktree } from '../src/execution/worktree.js';
@@ -31,8 +39,8 @@ import { writeOmInput, readOmInput, type OmInputRecord } from '../src/om/input.j
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, readGaps, type GapRequest, type GapMoment } from '../src/om/gaps.js';
-import { writeGapLines, gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
-import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRequest } from '../src/om/question-packet.js';
+import { writeGapLines, readGapLines, gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
+import { prepareQuestionTasks, writeQuestionPacket, partResponseId, preparePartResult, type QuestionPacketRequest } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
 import { openSeries, beginAttempt, completeAttempt, type RepairSeries } from '../src/om/series.js';
 import { recordCall } from '../src/om/call-record.js';
@@ -43,12 +51,14 @@ import { readLateModelReceipt } from '../src/discovery/model-call-recovery.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import type { ProcessResult } from '../src/runtime/process.js';
 import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment,
-  writeOmObligations, readOmObligationLedger, type OwnerGapAssignment, type ObligationRequest, type OmObligationHandoff, type OmObligationRecord } from '../src/om/obligations.js';
-import type { OmResult } from '../src/om/refusal.js';
+  writeOmObligations, readOmObligations, readOmObligationLedger, type OwnerGapAssignment, type ObligationRequest, type OmObligations, type OmObligationRecord } from '../src/om/obligations.js';
+import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { gardenGraph, prepareNativeLayers } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { taskObligationExecutionFixture } from './execution-fixture.js';
+
+const { fixtureAnswer }: { fixtureAnswer: (packet: unknown, answer: unknown) => unknown } = await import(new URL('../../test/om-adapter-fixture.mjs', import.meta.url).href);
 
 const clone = structuredClone;
 const selector = (obligation: CarriedObligation) => taskBindingId(obligation);
@@ -66,9 +76,9 @@ async function until(predicate: () => boolean): Promise<void> {
   }
 }
 
-/** Use the native B1 -> D1 -> D2 -> H2 -> D7 producer, never a caller-built ledger. */
+/** Current B1 -> D1 -> D2 -> H2 -> D7 producers; task consumers additionally accept N3 and compile M8. */
 function fixture(t: TestContext, options: { count?: number; multipleConsumers?: boolean; sameCheck?: boolean; declared?: boolean;
-  mode?: 'normal' | 'wait' | 'timeout'; questionOrigin?: 'unknowns' | 'remainingQuestions'; moments?: Exclude<GapMoment, 'om-pass'>[] } = {}) {
+  mode?: 'normal' | 'wait' | 'timeout'; task?: boolean; questionOrigin?: 'unknowns' | 'remainingQuestions'; moments?: Exclude<GapMoment, 'om-pass'>[] } = {}) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'omg-om-runtime-'))), database = join(root, 'state.sqlite'), project = 'garden';
   let store = new Store(database), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -81,6 +91,11 @@ function fixture(t: TestContext, options: { count?: number; multipleConsumers?: 
       target: 'garden-later-block', condition: 'One operation serves two retained consumers' });
   }
   writeFileSync(join(root, 'README.md'), 'Controlled OM declaration fixture.\n');
+  if (options.task) {
+    writeFileSync(join(root, '.gitignore'), 'state.sqlite*\ncondition.txt\ninvocations.log*\nworktrees/\n');
+    git(root, ['init', '-b', 'main']); git(root, ['add', 'README.md', '.gitignore']);
+    git(root, ['-c', 'user.name=OMG Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'fixture baseline']);
+  }
   const { level: _level, ...projection } = projectGraph(desired, 1);
   const questions = Array.from({ length: count }, (_, index) => ({
     question: `Observe local runtime condition ${index}`, consumer, blocksCurrentStage: false,
@@ -98,30 +113,40 @@ function fixture(t: TestContext, options: { count?: number; multipleConsumers?: 
   const command = { executable: process.execPath, args: ['--version'] };
   const environment = engine.environments.configure(project, { workspace: root,
     implementer: { actor: 'worker', model: 'fixture', effort: 'high', command },
-    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 3000 }, 0);
+    reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command }, fullCheck: command, timeoutMs: 3000,
+    ...(options.task ? { requestCapacityChars: 200_000 } : {}) }, 0);
   // LG13-pre2 (№7640 п.2): the two consumers stand on a real accepted OM N2 of this changed graph — the exact
   // graph-layer:2 and om-frame:2 the L3 reads name as their upper witness — never on Refinement phases. The N2
-  // producer writes B1 itself; the single-consumer pass stays before N2 and writes its first B1 here.
-  if (multiple) prepareNativeLayers(engine, project, desired, 'n2');
-  let input = multiple ? store.get<OmInputRecord>(`om-input:${project}`)! : ok(writeOmInput(store, { project, expected: 0,
+  // producer writes B1 itself. LG40 task consumers also need that accepted N2 before their N3/M8;
+  // the other single-consumer probes stay before N2 and write their first B1 here.
+  const acceptedUpper = multiple || options.task;
+  if (acceptedUpper) prepareNativeLayers(engine, project, desired, 'n2');
+  let input = acceptedUpper ? store.get<OmInputRecord>(`om-input:${project}`)! : ok(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
   const unaddressed = input;
   const graph = store.get<Graph>(`graph:${project}`)!, upper = store.get(`graph-layer:${project}:2`)!;
-  const upperFrame = multiple ? reference(store.get(`om-frame:${project}:2`)!) : null;
+  const upperFrame = acceptedUpper ? reference(store.get(`om-frame:${project}:2`)!) : null;
   input = ok(writeAddressing(store, { project, input: reference(input), graph: reference(graph),
-    decisions: input.value.input.questions.map(question => ({ pending: inputDecisionWrite({ project, input: reference(input), graph: reference(graph),
-      layers: multiple ? [reference(upper)] : [], decision: { target: question.id, field: 'address',
-        value: { consumer, kind: 'environment-confirmation' } } }) as Write })) }));
+    decisions: [
+      ...input.value.input.questions.map(question => ({ pending: inputDecisionWrite({ project, input: reference(input), graph: reference(graph),
+        layers: multiple ? [reference(upper)] : [], decision: { target: question.id, field: 'address',
+          value: { consumer, kind: 'environment-confirmation' } } }) as Write })),
+      ...(options.task ? [
+        { target: `${project}-B1`, field: 'nodes' as const, value: [`${project}-produce-block`, `${project}-consume-block`] },
+        { target: `${project}-B1`, field: 'state' as const, value: { writer: `${project}-produce-block`, authority: `${project}-consume-block`, rollback: `${project}-consume-block` } },
+        { target: `${project}-R1#1`, field: 'checkKind' as const, value: 'test' },
+      ].map(decision => ({ pending: inputDecisionWrite({ project, input: reference(input), graph: reference(graph), layers: [], decision }) as Write })) : []),
+    ] }));
   const horizon = ok(writeHorizon(store, { project, input: reference(input), graph: reference(graph),
-    refinement: multiple ? reference(upper) : null, available: {},
+    refinement: acceptedUpper ? reference(upper) : null, available: {},
     choice: { choiceVersion: 'runtime-first-pass', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
     operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: multiple ? reference(upper) : null, frame: upperFrame, upper: null } },
-    works: multiple ? { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
+      layer: acceptedUpper ? reference(upper) : null, frame: upperFrame, upper: null } },
+    works: acceptedUpper ? { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate),
       layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame } } } : { state: 'upper-not-accepted', layer: reference(upper) } };
-  const gaps = ok(writeGaps(store, sources)), gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
-  const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  let gaps = ok(writeGaps(store, sources)); const gapRead = { sources: clone(gaps.sources) as GapRequest, records: options.task ? canonicalSorted(gaps.records.map(reference)) : gaps.records.map(reference) };
+  let lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
   const marker = join(root, 'invocations.log'), condition = join(root, 'condition.txt'); writeFileSync(condition, 'ready');
   const script = engine.discovery.evidence.document(project, 'runtime-module',
     `import{readFileSync,appendFileSync,existsSync}from'node:fs';const input=JSON.parse(readFileSync(0,'utf8'));
@@ -130,7 +155,7 @@ if(mode==='wait')await new Promise(resolve=>{const timer=setInterval(()=>{if(exi
 if(mode==='timeout')await new Promise(resolve=>setTimeout(resolve,2000));
 console.log(JSON.stringify({protocol:input.protocol,obligation:input.obligation,condition:readFileSync(condition,'utf8')}));
 process.exitCode=readFileSync(condition,'utf8')==='ready'&&!existsSync(marker+'.fail')?0:7;`, 'text/plain', 0);
-  const request: ObligationRequest = { project, gaps: gapRead, lines: reference(lines), assignments: gaps.records
+  let request: ObligationRequest = { project, gaps: gapRead, lines: reference(lines), assignments: gaps.records
     .filter(row => row.value.gap.kind === 'environment-confirmation').map(row => {
       const value = clone(normalizeOwnerGapAssignment({ contract: OM_OWNER_ASSIGNMENT_CONTRACT, project,
         context: { gaps: gapRead, lines: reference(lines) }, gap: reference(row), assignments: row.value.gap.consumers.map(responsibleConsumer => {
@@ -144,32 +169,97 @@ process.exitCode=readFileSync(condition,'utf8')==='ready'&&!existsSync(marker+'.
         }) })) as OwnerGapAssignment;
       return { pending: { id: `om-owner-gap-assignment:${project}:${hashJson(value)}`, kind: OM_OWNER_ASSIGNMENT_KIND, expected: 0, value } };
     }) };
-  const ledger = ok(writeOmObligations(store, request));
+  let ledger: Sealed<OmObligations> = ok(writeOmObligations(store, request));
+  let accepted: AcceptedFrameRequest | null = null;
+  if (options.task) {
+    assert.ok(!('state' in sources.works));
+    const works = sources.works;
+    const frame = clone(ok(prepareFrame(store, works.frame))) as unknown as FrameRead;
+    const graph = clone(desired);
+    for (const field of ['nodes', 'artifacts', 'contracts', 'anchors', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers'] as const) {
+      const upper = frame.upper[field] ?? [], ids = new Set(upper.map(item => item.id));
+      Object.assign(graph, { [field]: [...clone(upper), ...(graph[field] ?? []).filter(item => !ids.has(item.id))] });
+    }
+    graph.connectors = frame.upper.connectors.map(upper => ({ ...clone(upper),
+      wakeTest: desired.connectors.find(item => item.id === upper.id)?.wakeTest ?? upper.wakeTest,
+      bindings: [...clone(upper.bindings), ...(desired.connectors.find(item => item.id === upper.id)?.bindings ?? []).filter(item => item.level === 3)] }));
+    const projected = projectGraph(graph, 3);
+    const mapped = ok(fillObligations(frame.upper, frame.scope,
+      { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, 3));
+    const nodes = projected.nodes.filter(node => node.kind === 'work' && frame.scope.nodes.includes(node.parent!));
+    const routes = ok(writeRoutes(store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+    const adapter = store.write({ id: `adapter:${project}:runtime-task-fixture`, kind: 'dispatch-adapter', expected: 0,
+      value: { projectId: project, protocol: 'fixture' } });
+    const results: { kind: 'part'; record: Ref }[] = [], opened = new Map<string, number>();
+    const carried = clone(ledger.handoff.obligations) as CarriedObligation[];
+    for (const batch of routes.value.batches.filter(item => item.level === 3 && item.task === 'node-expansion')) {
+      const work = nodes.find(node => node.parent === batch.node)!; assert.ok(work, batch.node ?? 'node');
+      const upperNode = store.get<Graph>(`graph:${project}`)!.value.nodes.find(node => node.id === batch.node)!;
+      const block = upperNode.parent!;
+      const ordinal = (opened.get(block) ?? 0) + 1;
+      if (ordinal === 1) ok(openSeries(store, { project, block, line: 1, slice: `runtime-fixture:${block}`, predecessor: null, basis: null }));
+      else ok(completeAttempt(store, { project, block, line: 1, attempt: ordinal - 1,
+        outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } }));
+      opened.set(block, ordinal);
+      const goal = { key: `runtime-fixture:${batch.node}`, questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+        result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+      const series = ok(beginAttempt(store, { project, block, line: 1, attempt: ordinal, goal }));
+      const packet = ok(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id, environment: reference(environment),
+        attempt: { series: reference(series), ordinal }, previous: [], works: { producer: reference(ledger.producer), ledger: reference(ledger.record) } })).record;
+      assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'whole');
+      const payload = packet.value.packet as unknown as { requestId: string; questions: { id: string }[]; expansion: { assigned: string[] }; works: { assigned: string[] } };
+      const bindings = carried.filter(item => payload.works.assigned.includes(taskBindingId(item))).map(item => ({
+        id: taskBindingId(item), scope: item.scope, obligation: item.obligation, consumers: [{ node: work.id, tests: [] }],
+      }));
+      const body: Omit<LayerProposal, 'base' | 'level' | 'source' | 'status'> = {
+        nodes: [work], tests: projected.tests.filter(proof => work.tests.includes(proof.id)),
+        fills: mapped.fills.filter(fill => fill.node === work.id && payload.expansion.assigned.includes(fill.obligation)).map(fill => ({
+          obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port, codeRef: clone(work.code[0]!) }),
+        })), localConnectors: [], artifacts: [], contracts: [], joins: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [],
+      };
+      const questions = new Set(payload.questions.map(item => item.id));
+      const call = ok(recordCall(store, project, { call: payload.requestId, purpose: 'model-design', basis: null, block,
+        gaps: batch.items.filter(item => questions.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
+        series: reference(series), attempt: ordinal, goal, dispatch: { adapter: reference(adapter), config: reference(environment) }, packet: clone(packet.value.packet) as Json })).call;
+      const response = store.write({ id: partResponseId(project, reference(call)), kind: 'part-response', expected: 0, value: { project,
+        packet: reference(packet), call: reference(call), requestId: payload.requestId,
+        raw: JSON.stringify(fixtureAnswer(packet.value.packet, { protocol: packet.value.answerProtocol, requestId: payload.requestId, action: 'answer', proposal: body, bindings })) } });
+      const part = ok(preparePartResult(store, { project, packet: reference(packet), call: reference(call), response: reference(response) }));
+      ok(writeGuarded(store, { unit: 'fixture', target: part.record.id, writes: part.writes, guards: part.guards }));
+      results.push({ kind: 'part', record: reference(part.record) });
+    }
+    assert.equal(results.length, nodes.length);
+    const completion = ok(writeWorksAcceptance(store, { project, results, environment: reference(environment), sources: [] }));
+    assert.equal(completion.state, 'accepted'); assert.ok(completion.acceptance); accepted = clone(completion.acceptance);
+    const settled = ok(readAcceptedFrame(store, accepted)); assert.ok(settled.frame);
+    const candidate = ok(readWorksFrame(store, { project, candidate: settled.frame.value.acceptance.candidate }));
+    ledger = ok(readOmObligations(store, { project, producer: candidate.value.works!.producer }));
+    request = clone(ledger.record.value.request) as ObligationRequest;
+    gaps = ok(readGaps(store, request.gaps));
+    lines = ok(readGapLines(store, { project, record: request.lines }));
+  }
   const obligations = clone(ledger.handoff.obligations) as CarriedObligation[];
   const observe = (obligation = obligations[0]!, key = selector(obligation)) => engine.execute({ type: 'observe-runtime', project,
     scope: reference(ledger.record), obligation: selector(obligation), key }) as Promise<RuntimeObservationResult>;
   const reopen = () => { store.close(); store = new Store(database); engine = new ProductEngine(store); };
   return { root, database, project, desired, environment, graph, unaddressed, input, gaps, lines, script, request, ledger, obligations, marker, condition,
-    get store() { return store; }, get engine() { return engine; }, observe, reopen };
+    get store() { return store; }, get engine() { return engine; }, accepted, observe, reopen };
 }
 
 function taskFixture(f: ReturnType<typeof fixture>) {
-  const graph = clone(f.desired), node = graph.nodes.find(node => node.id === 'garden-produce-work')!;
-  graph.researchObligations = f.obligations.filter(obligation => obligation.moment === 'task-start' || obligation.moment === 'task-result')
-    .map(obligation => ({ id: taskBindingId(obligation), scope: obligation.scope,
-    obligation: obligation.obligation, consumers: [{ node: node.id, tests: [] }] }));
-  const bindings = bindTaskObligations(f.store, f.project, graph, clone(f.ledger.handoff) as OmObligationHandoff);
-  assert.deepEqual(bindings.findings, []);
-  const savedGraph = f.store.write({ id: 'compiled-graph:garden:runtime-fixture', kind: 'graph', expected: 0, value: graph });
-  const task: CompiledTask = { id: 'task:runtime-fixture', node: node.id, title: 'Runtime-bound fixture work', outcome: node.outcome,
-    signature: hashJson(node), boundary: node.boundary, writePaths: [], readPaths: [], tests: [], dependencies: [], inputs: [], produces: [], obligations: [],
-    researchObligations: bindings.byNode.get(node.id)! };
-  const feasibility = f.store.write({ id: 'feasibility:garden:runtime-fixture', kind: 'feasibility', expected: 0,
-    value: { projectId: f.project, inputs: clone(f.ledger.inputs) } });
-  const plan = f.store.write<MachinePlan>({ id: 'plan:garden:runtime-fixture', kind: 'plan', expected: 0,
-    value: { projectId: f.project, graph: reference(savedGraph), graphSnapshot: graph, feasibility: reference(feasibility), tasks: [task] } });
+  assert.ok(f.accepted, 'Task consumers use the accepted N3 from current producers');
+  const feasibility = ok(writeFeasibility(f.store, { project: f.project, graph: f.accepted.graph, layer: f.accepted.layer, frame: f.accepted.frame,
+    environment: reference(f.engine.environments.get(f.project)), expected: 0 }));
+  assert.equal(feasibility.value.ready, true, canonical(feasibility.value.findings));
+  ok(writeHandoff(f.store, { project: f.project, feasibility: reference(feasibility), expected: 0 }));
+  const plan = f.engine.compiler.compile(f.project);
+  assert.equal(plan.value.feasibility.id, `om-feasibility:${f.project}`);
+  const compilation = f.engine.compiler.publish(f.project, reference(plan), 0);
+  f.engine.pipeline.accept(f.project, 'compilation', compilation.revision);
+  const task = clone(plan.value.tasks.find(task => task.node === 'garden-produce-work')!); assert.ok(task);
   const run: TaskRun = { projectId: f.project, plan: reference(plan), taskId: task.id, attempt: 1, state: 'implementing',
-    parent: 'parent-fixture', tree: 'candidate-fixture', commit: null, implementation: null, artifacts: [], checks: [], review: null,
+    obligationStartProofs: [], obligationResultProofs: [],
+    parent: plan.value.base.head, tree: 'candidate-fixture', commit: null, implementation: null, artifacts: [], checks: [], review: null,
     reviewSubject: null, error: null, child: null, inputs: [], usage: [], createdAt: 1, updatedAt: 1 };
   return { task, run };
 }
@@ -227,9 +317,8 @@ for (const questionOrigin of ['unknowns', 'remainingQuestions'] as const) {
   });
 
   test(`B1.1 ${questionOrigin} environment task-result deadline reaches native task proofs without becoming task-start`, async t => {
-    const f = fixture(t, { questionOrigin, moments: ['task-result'] }); b11ExactMomentChain(f, questionOrigin, ['task-result']);
-    // Graph/plan/run are explicit downstream fixtures; every declaration above
-    // comes from the actual stage -> B1 -> D3 -> D1/D2 -> H2/D7 producers.
+    const f = fixture(t, { task: true, questionOrigin, moments: ['task-result'] }); b11ExactMomentChain(f, questionOrigin, ['task-result']);
+    // The plan is compiled from accepted N3/M8; its task is bound to these exact OM declarations.
     const { task, run } = taskFixture(f), obligation = f.obligations[0]!;
     assert.equal(task.researchObligations!.length, 1);
     assert.equal(task.researchObligations![0]!.requirement.kind, 'environment-confirmation');
@@ -263,14 +352,14 @@ for (const questionOrigin of ['unknowns', 'remainingQuestions'] as const) {
 test('B1.1 three explicit deadlines of one environment kind retain separate confirmation consumers', async t => {
   const moments = ['feasibility', 'task-start', 'task-result'] as const;
   for (const questionOrigin of ['unknowns', 'remainingQuestions'] as const) {
-    const f = fixture(t, { questionOrigin, moments: [...moments], sameCheck: true });
+    const f = fixture(t, { task: true, questionOrigin, moments: [...moments], sameCheck: true });
     b11ExactMomentChain(f, questionOrigin, [...moments]);
     const r3 = f.obligations.find(item => item.moment === 'R3')!, start = f.obligations.find(item => item.moment === 'task-start')!,
       result = f.obligations.find(item => item.moment === 'task-result')!;
     assert.equal(new Set(f.obligations.map(selector)).size, 3);
     assert.ok(f.obligations.every(item => item.kind === 'environment-confirmation' && same(item.runtimeCheck, r3.runtimeCheck)));
-    const { task, run } = taskFixture(f); assert.equal(task.researchObligations!.length, 2);
     await f.observe(r3);
+    const { task, run } = taskFixture(f); assert.equal(task.researchObligations!.length, 2);
     const readiness = readinessObligations(f.store, f.project, clone(f.ledger.inputs) as Ref[]);
     assert.deepEqual(readiness.findings, []); assert.equal(readiness.value!.confirmations.length, 1);
     assert.equal(readiness.value!.confirmations[0]!.obligation, selector(r3));
@@ -344,10 +433,13 @@ function missingDependency(f: ReturnType<typeof fixture>, dependency: 'reader-pi
   const id = `${dependency}:${f.project}`;
   let head = '';
   if (dependency === 'execution-root') {
-    writeFileSync(join(f.root, '.gitignore'), 'state.sqlite*\nworktrees/\ninvocations.log*\n');
-    git(f.root, ['init', '-q']); git(f.root, ['config', 'user.name', 'Runtime fixture']);
-    git(f.root, ['config', 'user.email', 'runtime@fixture.invalid']);
-    git(f.root, ['add', 'README.md', '.gitignore', 'condition.txt']); git(f.root, ['commit', '-qm', 'Declared runtime workspace']);
+    // Task fixtures already have the exact repository snapshot accepted by N3/M8.
+    if (!existsSync(join(f.root, '.git'))) {
+      writeFileSync(join(f.root, '.gitignore'), 'state.sqlite*\nworktrees/\ninvocations.log*\n');
+      git(f.root, ['init', '-q']); git(f.root, ['config', 'user.name', 'Runtime fixture']);
+      git(f.root, ['config', 'user.email', 'runtime@fixture.invalid']);
+      git(f.root, ['add', 'README.md', '.gitignore', 'condition.txt']); git(f.root, ['commit', '-qm', 'Declared runtime workspace']);
+    }
     head = git(f.root, ['rev-parse', 'HEAD']);
   }
   return { id, create(active = true) {
@@ -368,7 +460,7 @@ function missingDependency(f: ReturnType<typeof fixture>, dependency: 'reader-pi
 
 test('D8 negative guards survive all three task-admission windows for native pilot and execution-root creators', async t => {
   for (const dependency of ['reader-pilot', 'execution-root'] as const) for (const window of ['scan', 'pinned', 'prepared'] as const) {
-    const f = fixture(t), creator = missingDependency(f, dependency), { task, run } = taskFixture(f);
+    const f = fixture(t, { task: true }), creator = missingDependency(f, dependency), { task, run } = taskFixture(f);
     const observed = await f.observe(), admitted = taskStartProofs(f.store, run, task);
     run.obligationStartProofs = admitted.proofs;
     const savedProof = admitted.proofs[0]!.confirmation;
@@ -492,7 +584,7 @@ test('D8 public OM observation executes the declared module once, retains its ex
 });
 
 test('D8 task admission consumes real OM confirmation and freezes it across later environment changes', async t => {
-  const f = fixture(t), { task, run } = taskFixture(f), obligation = f.obligations[0]!;
+  const f = fixture(t, { task: true }), { task, run } = taskFixture(f), obligation = f.obligations[0]!;
   assert.throws(() => taskStartProofs(f.store, run, task), { code: 'task_obligation_start_required' });
   await f.observe(); run.obligationStartProofs = taskStartProofs(f.store, run, task).proofs;
   run.obligationResultProofs = taskResultProofs(f.store, run, task).proofs;
@@ -537,7 +629,7 @@ test('D8 distinct obligations and consumer assignments cannot borrow another obs
 });
 
 test('D8 complete task proof sets reject a lost, duplicated or substituted assignment confirmation', async t => {
-  const f = fixture(t, { count: 2 }), { task, run } = taskFixture(f);
+  const f = fixture(t, { task: true, count: 2 }), { task, run } = taskFixture(f);
   for (const obligation of f.obligations) await f.observe(obligation);
   run.obligationStartProofs = taskStartProofs(f.store, run, task).proofs;
   run.obligationResultProofs = taskResultProofs(f.store, run, task).proofs;
@@ -624,7 +716,7 @@ test('D8 changing check, executable, subjects, environment or status cannot masq
 });
 
 test('D8 the owner return condition, consumer and moment remain part of the exact confirmation contract', async t => {
-  const f = fixture(t), obligation = f.obligations[0]!, observed = await f.observe(); assert.ok(observed.source);
+  const f = fixture(t, { task: true }), obligation = f.obligations[0]!, observed = await f.observe(); assert.ok(observed.source);
   const proof = findObligationConfirmation(f.store, f.project, obligation)!.proof;
   for (const mutate of [(value: CarriedObligation) => { value.returnCondition = 'A different condition'; },
     (value: CarriedObligation) => { value.runtimeCheck!.satisfies = 'A different condition'; },
@@ -849,7 +941,7 @@ test('D8 declaration, checker and environment races reject the complete observat
 
 test('D8 a genuine failed observation after either list snapshot cannot commit stale task admission', async t => {
   for (const snapshotKind of ['source', 'runtime-observation'] as const) {
-    const f = fixture(t), { task, run } = taskFixture(f), initial = await f.observe();
+    const f = fixture(t, { task: true }), { task, run } = taskFixture(f), initial = await f.observe();
     assert.equal(initial.observation.value.result!.exitCode, 0);
     const race = raceCompletedObservation(f, snapshotKind);
     let admission: ReturnType<typeof taskStartProofs> | undefined;
@@ -874,7 +966,7 @@ test('D8 a genuine failed observation after either list snapshot cannot commit s
 });
 
 test('D8 a genuine failed observation during pinned task-start validation pauses before dispatch', async t => {
-  const f = fixture(t), { task, run } = taskFixture(f); await f.observe();
+  const f = fixture(t, { task: true }), { task, run } = taskFixture(f); await f.observe();
   run.obligationStartProofs = taskStartProofs(f.store, run, task).proofs;
   const race = raceCompletedObservation(f, 'runtime-observation');
   try { assert.throws(() => requireCurrentTaskStart(f.store, run, task), { code: 'task_obligation_start_stale' }); }
@@ -886,7 +978,7 @@ test('D8 a genuine failed observation during pinned task-start validation pauses
 });
 
 test('D8 an environment change inside the final observation scan invalidates pinned task-start admission', async t => {
-  const f = fixture(t), { task, run } = taskFixture(f); await f.observe();
+  const f = fixture(t, { task: true }), { task, run } = taskFixture(f); await f.observe();
   run.obligationStartProofs = taskStartProofs(f.store, run, task).proofs;
   const original = f.store.list.bind(f.store), second = new Store(f.database), engine = new ProductEngine(second);
   const { projectId: _projectId, ...settings } = f.environment.value; let raced = false;

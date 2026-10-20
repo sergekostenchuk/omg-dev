@@ -37,7 +37,7 @@ export function planCurrentGuards(store: Store, compiler: Compiler, planRef: Ref
   requireCondition(plan.revision === planRef.revision && plan.hash === planRef.hash, "plan_foreign", "Execution must use the exact generated plan");
   const root = store.get<ExecutionRoot>(`execution-root:${plan.value.projectId}`);
   if (root?.value.state === "ready") return currentBasis(store, plan, root.value);
-  const gate = compiler.gate(plan.value.projectId, planRef, true);
+  const gate = compiler.gate(plan.value.projectId, planRef);
   requireCondition(gate.findings.length === 0, "plan_stale", "Refresh changed plan inputs before creating its worktree");
   return [...gate.guards, ...(gate.admissionGuards ?? [])];
 }
@@ -89,7 +89,7 @@ export function requireExecutionBudget(store: Store, admission: ExecutionAdmissi
   if (committed + forecast > softInput) throw new EngineError("execution_budget_exhausted", "The admitted input would be exceeded by this launch",
     { target: plan.id, field: "softInput", committed, forecast, limit: softInput });
 }
-// ---- EX2 (№3980): a correction sees what failed; a slot spent blind by the earlier producer is restored, narrowly. ----
+// ---- EX2 (№3980): a correction sees the saved check that failed. ----
 
 const TAP_SUMMARY = /^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms)\b/;
 const tail = (text: string, limit: number): string => text.length <= limit ? text : text.slice(text.length - limit);
@@ -149,72 +149,13 @@ function failedCheck(run: TaskRun, limit: number): (Omit<ExecutionSendFeedback, 
   return { check: index, chars: excerpt.text.length, truncated: excerpt.truncated, text: excerpt.text };
 }
 
-export const EXECUTION_RECOVERY_KIND = "execution-recovery";
-export const EXECUTION_RECOVERY_CONTRACT = "execution-recovery/v1";
-/** The technical restoration of one correction slot: exactly which launch went blind, and the failed check it was not shown. */
-export interface ExecutionRecovery {
-  contract: typeof EXECUTION_RECOVERY_CONTRACT; project: string; plan: Ref; task: string; send: Ref; basis: Ref; check: number;
-  reason: "correction-without-check-output";
-}
-const recoveryId = (sendId: string): string => sendId.replace(/^execution-send:/, `${EXECUTION_RECOVERY_KIND}:`);
-/**
- * The one derivation of a blind correction (№3980), shared by its writer and every reader: a paid correction launch of the
- * earlier producer (it names no `feedback`), answering the needs_code outcome of the attempt before it, whose failed check had
- * output on stdout while the error the launch was given is exactly the earlier producer's stderr tail — the diagnostics never
- * reached it. Anything else is no basis: an old correction is never restored by the absence of the new field alone.
- */
-export function blindCorrection(store: Store, plan: Revision<MachinePlan>, task: CompiledTask, send: Revision<ExecutionSend>): ExecutionRecovery | null {
-  const value = send.value;
-  if (value.role !== "implement" || !value.correction || UNSENT.includes(value.status) || "feedback" in value || value.task !== task.id
-    || canonical(value.plan) !== canonical(reference(plan)) || send.id !== `${executionSendPrefix(plan.value.projectId, plan.value.hash)}${taskScope(task)}${value.attempt}:implement:${value.ordinal}`)
-    return null;
-  const history = store.history<TaskRun>(runId(plan.value.hash, task.id));
-  const first = history.findIndex(row => row.value.attempt === value.attempt);
-  const basis = first > 0 ? history.slice(0, first).reverse().find(row => row.value.attempt === value.attempt - 1 && row.value.state === "needs_code") : undefined;
-  if (!basis) return null;
-  const index = basis.value.checks.findIndex(check => check.result.exitCode !== 0 || check.result.signal !== null);
-  const failed = index < 0 ? null : basis.value.checks[index]!.result;
-  // Proved withheld: the launch was given exactly the earlier producer's stderr tail, and the saved stdout holds a failing
-  // test's diagnostics (a TAP `not ok` block) that this error does not contain. Progress output on stdout proves nothing (№3986-2).
-  if (!failed || basis.value.error !== (failed.stderr.slice(-2000) || "A required check failed")
-    || !notOkBlocks(failed.stdout).some(block => !basis.value.error!.includes(block.split("\n")[0]!.trim()))) return null;
-  return { contract: EXECUTION_RECOVERY_CONTRACT, project: value.project, plan: reference(plan), task: task.id, send: reference(send), basis: reference(basis),
-    check: index, reason: "correction-without-check-output" };
-}
-/**
- * Reads a saved restoration as written: its basis was proved by its producer when it was created (NR, №3606) and is never
- * derived again here. Only its form is checked — a record without its exact launch at its own address is refused (T4).
- */
-function readRecovery(store: Store, id: string, revision: number): ExecutionRecovery {
-  const record = store.get<ExecutionRecovery>(id, revision);
-  const send = record?.value?.send;
-  if (!record || record.kind !== EXECUTION_RECOVERY_KIND || record.value.contract !== EXECUTION_RECOVERY_CONTRACT
-    || typeof send?.id !== "string" || !Number.isSafeInteger(send.revision) || typeof send.hash !== "string" || recoveryId(send.id) !== id)
-    throw new EngineError("execution_recovery_invalid", "A restored correction slot names its exact launch at its own address", { target: id, field: "send" });
-  return record.value;
-}
-/** Writes the restoration of each blind correction launch of the task once; a repeated entry finds it and restores nothing more. */
-function restoreBlindCorrections(store: Store, plan: Revision<MachinePlan>, task: CompiledTask): void {
-  for (const send of sendsOf(store, plan, taskScope(task))) {
-    if (store.get(recoveryId(send.id))) continue;
-    const value = blindCorrection(store, plan, task, send);
-    if (value) store.writeMany([{ id: recoveryId(send.id), kind: EXECUTION_RECOVERY_KIND, expected: 0, value: value as never }], [reference(send)]);
-  }
-}
-/** Correction attempts this task of this plan has already launched: durable, so a retry never opens another (№3947); a launch
- * the earlier producer sent blind is not counted once its restoration is saved (№3980). */
+/** Correction attempts this task of this plan has already launched: durable, so a retry never opens another (№3947). */
 export function correctionsUsed(store: Store, plan: Revision<MachinePlan>, task: CompiledTask): number {
-  const restored = new Set(store.identities("prefix", `${EXECUTION_RECOVERY_KIND}:${plan.value.projectId}:${plan.value.hash}:${taskScope(task)}`)
-    .filter(row => row.kind === EXECUTION_RECOVERY_KIND).map(row => readRecovery(store, row.id, row.revision).send.id));
   return new Set(sendsOf(store, plan, taskScope(task)).filter(row => row.value.role === "implement" && row.value.correction
-    && !UNSENT.includes(row.value.status) && !restored.has(row.id)).map(row => row.value.attempt)).size;
+    && !UNSENT.includes(row.value.status)).map(row => row.value.attempt)).size;
 }
-/**
- * Whether one more correction may open: the one count of used corrections, with any slot the earlier producer spent blind
- * restored first — on every branch that decides it, so a review of a saved failed check (AT3a) keeps that restoration.
- */
+/** Every branch deciding whether to correct uses the same durable count. */
 function correctionRoom(store: Store, plan: Revision<MachinePlan>, task: CompiledTask, limit: number): boolean {
-  if (correctionsUsed(store, plan, task) >= limit) restoreBlindCorrections(store, plan, task);
   return correctionsUsed(store, plan, task) < limit;
 }
 /**
@@ -424,12 +365,6 @@ export class Executor {
         for (const send of open) if (send.value.group && runOwnerState(send.value.group) !== "gone")
           throw new EngineError("executor_still_running", "A launch of this task is still running; its end is not proved", { target: send.id, field: "group" });
         if (open.length) this.store.writeMany(open.map(send => lostSendClosure(this.store, send)));
-        // A negative review of this attempt's exact tree, saved but not applied (an earlier era's lost process): its outcome is
-        // applied — a plan finding stops, a code finding asks its correction — never bought again (№3961-1).
-        if (run && ["interrupted", "checking", "reviewing"].includes(run.value.state) && run.value.review?.verdict === "request_changes"
-          && run.value.tree && run.value.reviewSubject === subjectHash(run.value.plan, task.id, run.value.parent, run.value.tree))
-          run = this.save(run, reviewOutcome(run.value.review, { plan: run.value.plan, task, attempt: run.value.attempt, tree: run.value.tree,
-            checks: run.value.checks, source: "review" })!);
         if (run && (run.value.state === "needs_plan" || !options.retry && !corrections.has(task.id))) { results.push(run); return results; }
         const guards = currentBasis(this.store, plan, root.value);
         const actual = { ...environment.value, workspace: root.value.path };
@@ -453,18 +388,12 @@ export class Executor {
         }
         if (!run) requireCondition(!git(root.value.path, ["status", "--porcelain", "--untracked-files=all"]),
           "worktree_dirty", "The managed worktree contains an unfinished change; recover that attempt first");
-        const om = plan.value.feasibility.id.startsWith('om-feasibility:');
-        let maxRequestChars = options.maxContextChars;
-        let capacityGuards: readonly Ref[] = [];
-        if (om) {
-          const capacity = readCapacity(this.store, { project, environment: plan.value.environment, current: true });
-          if (!capacity.ok) throw new EngineError(capacity.refusal.code, capacity.refusal.message, capacity.refusal.at);
-          maxRequestChars = capacity.value.maxRequestChars;
-          capacityGuards = capacity.value.guards;
-          if (options.maxContextChars !== maxRequestChars) throw new EngineError('capacity_mismatch',
-            'Execution must use the technical capacity of its exact plan environment',
-            { unit: 'G3', target: environment.id, field: 'maxContextChars', expected: maxRequestChars, actual: options.maxContextChars });
-        }
+        const capacity = readCapacity(this.store, { project, environment: plan.value.environment, current: true });
+        if (!capacity.ok) throw new EngineError(capacity.refusal.code, capacity.refusal.message, capacity.refusal.at);
+        const maxRequestChars = capacity.value.maxRequestChars, capacityGuards = capacity.value.guards;
+        if (options.maxContextChars !== maxRequestChars) throw new EngineError('capacity_mismatch',
+          'Execution must use the technical capacity of its exact plan environment',
+          { unit: 'G3', target: environment.id, field: 'maxContextChars', expected: maxRequestChars, actual: options.maxContextChars });
         const contextSources = loadTaskContextSources(this.store, plan);
         const previous = run?.value;
         // A review this attempt already answered is never bought again for the same saved check (its outcome stands).
@@ -480,7 +409,6 @@ export class Executor {
         } else {
           basis = run ? correctionBasis(this.store, run.id) : null;
           correction = basis !== null;
-          if (correction && correctionsUsed(this.store, plan, task) >= limit) restoreBlindCorrections(this.store, plan, task);
           if (correction && correctionsUsed(this.store, plan, task) >= limit)
             throw new EngineError("execution_corrections_exhausted", "This task already used its corrections; a retry opens no other",
               { target: task.id, field: "maxCorrections", limit });
@@ -495,10 +423,11 @@ export class Executor {
           }
           const candidate: TaskRun = { projectId: project, plan: reference(plan), taskId: task.id, attempt: (previous?.attempt ?? 0) + 1,
             state: "implementing", parent, tree: null, commit: null, implementation: null, artifacts: [], checks: [], review: null,
+            obligationStartProofs: [], obligationResultProofs: [],
             reviewSubject: null, child: null, error: null, inputs: [], usage: previous?.usage ?? [], createdAt: previous?.createdAt ?? Date.now(), updatedAt: Date.now() };
           const starts = taskStartProofs(this.store, candidate, task);
           run = this.store.writeMany<TaskRun>([{ id: runId(plan.value.hash, task.id), kind: "task-run", expected: run?.revision ?? 0,
-            value: { ...candidate, ...(task.researchObligations !== undefined ? { obligationStartProofs: starts.proofs } : {}) } }],
+            value: { ...candidate, obligationStartProofs: starts.proofs } }],
           [reference(lock), reference(root), ...guards, ...capacityGuards, ...starts.guards])[0]!;
         }
         // What the correction is shown of the attempt it corrects: the excerpt of its failed check, from the saved result (№3980).
@@ -621,7 +550,7 @@ export class Executor {
           run = this.save(run, { state: obligationPause ? 'awaiting_obligation' : interrupted ? "interrupted" : planDefect ? "needs_plan" : "needs_code",
             // A refused or unproven stop keeps the last committed child identity;
             // the next entry repeats the check instead of trusting a bare null.
-            child: stopRefusal ? run.value.child : null, error: om && code === 'context_budget_exceeded' && error instanceof EngineError
+            child: stopRefusal ? run.value.child : null, error: code === 'context_budget_exceeded' && error instanceof EngineError
               ? `${code}: ${task.id}: ${error.message}; ${canonical(error.details)}`
               : obligationPause || code === "execution_budget_exhausted" ? `${code}: ${error instanceof Error ? error.message : 'Missing obligation evidence'}`
                 : error instanceof Error ? error.message : "Execution failed" }, closure());

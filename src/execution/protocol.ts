@@ -29,8 +29,8 @@ export interface ExecutionSend {
   request: { hash: string; chars: number }; group: ExecutionSendGroup | null;
   status: ExecutionSendStatus; usage: TokenUsage | null; startedAt: number; finishedAt: number | null;
   /** EX2: the failed check a correction was shown (its index in the corrected attempt's checks, the excerpt's size, a cut), or
-   * none. Every launch of this era names it; a launch of the earlier era has no such key. */
-  feedback?: ExecutionSendFeedback | null;
+   * none. Every launch names this field. */
+  feedback: ExecutionSendFeedback | null;
 }
 export interface ExecutionSendFeedback { check: number; chars: number; truncated: boolean; basis: Ref }
 export interface ExecutionSendSubject {

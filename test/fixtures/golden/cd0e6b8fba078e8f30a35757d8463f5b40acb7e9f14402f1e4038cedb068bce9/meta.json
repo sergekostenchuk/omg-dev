@@ -1,5 +1,5 @@
 {
-  "producerDigest": "5d6eb588c9e7cbc247c956c813af9cf42dcac0313f871cf2443a1ca80107614e",
+  "producerDigest": "63b031db27f59b0685919c6dd5fd0123676e3c276b157244566cc077e3a46451",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -375,7 +375,7 @@
     },
     {
       "path": "src/execution/commit.ts",
-      "sha256": "e94b631fe1888cb007b97961083bafefc764483d1610e4f7e3a91224efdc8373"
+      "sha256": "cc06149f11a360529460f3e738f5103ea92355e19eaeab8b9199481d360cec54"
     },
     {
       "path": "src/execution/inputs.ts",
@@ -387,7 +387,7 @@
     },
     {
       "path": "src/execution/model.ts",
-      "sha256": "98ee8bbdd420b4f3e4eef518ee2fcde96d5f387c6f5dc6e3e52da9c0556f0d81"
+      "sha256": "a77a9f9112f9d90b3f8d771c91c824639f63db510c1249dbfcc603fc5ac8102c"
     },
     {
       "path": "src/execution/ownership.ts",
@@ -403,7 +403,7 @@
     },
     {
       "path": "src/execution/protocol.ts",
-      "sha256": "4199b3deb32a190e6f93b438f9fd6d273c6939ec67b535dcb0ede591a6e91639"
+      "sha256": "c8030d1e6f1ad74b8a52d5788d61dfa2fe8d5c75cffc3e14ab48704b8fa9b5bb"
     },
     {
       "path": "src/execution/recovery.ts",
@@ -415,7 +415,7 @@
     },
     {
       "path": "src/execution/runner.ts",
-      "sha256": "5e09f2816df215275a55c46ecdd66632074c108da1378aa1825304b6fd48d6d4"
+      "sha256": "c5f8d230fdfb5fe869a2048d12b2bf583e6cdabcb713a671136a820d3964658d"
     },
     {
       "path": "src/execution/supervisor.ts",
@@ -423,7 +423,7 @@
     },
     {
       "path": "src/execution/task-obligations.ts",
-      "sha256": "565c317a954e3f2cd3d9ef7ded05d73d88c5bb0ddef4780cd6d0d012f97ec29d"
+      "sha256": "287f7fb28da699cb2c003eb996b6d87969f3d8c421706133d48463912ad1a686"
     },
     {
       "path": "src/execution/worktree.ts",
@@ -939,48 +939,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "19a1d7b14a8ab246b2202d135c0343dc6c0eed9b1941712d4ed7a61a6c7bac41"
+      "hash": "a812089fcc3d5aa227f81923e6fbbeb4de7ae034d9c38af56e9d9d5dfbeb38cd"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "9164b6d32b6598e2ccad1fca09fb7d9662a3045f8371eee9d988e042ab0c288c"
+      "hash": "6a81b19a883c2efee9a04a6aa7e92747b2a95cac64a025a556ac07c66a56bac9"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "c1b0cbf42671a0a515daa66a858945ee429b9d6253cacdba3075202d64135b3b"
+      "hash": "2843542106cd822f9e369d7011b1e7f18e4a49ca58b8863aa75b3f4c5451d0cf"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "ac8ce87742c09bcd957babd0b4d003a0efac47e0dd495b17d18116557fdb1df8"
+      "hash": "aeb752b56bc4c1d58c296eb4af8eeaf826d8b084c2277c9db6145616dbbf9850"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "3bee23944ad3b8183594d5bedd7fd9e0885951c3222d69a204b22b324b94c47b"
+      "hash": "d75d5371563f40f43e9f20da3d726bc633ccf271f6097e133682449ff86b7c41"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "fabfa1ebbd2f4aad5321f93e973f1e2d5a3f3d7230e2b6491a93ad72c6bddcba"
+      "hash": "7712c84fbcf7361a7ce66e7b6e8efe0607eb4b7edd37b8abb72698de2ebceef8"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "ed73fa8440477f966959c66c9db103c10d1bc7d5c169bfa54f63b086cad82b28"
+      "hash": "501b626b3775d089d8eb655cee883bb7f4ad345168c0ca1ea88d97d9de8bfe20"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "d2416894ee726369760999881404a30b9a2017d778bc393703fae2bb9fd92a6c"
+      "hash": "4af0becb8bb174afb9e3dadb6e9baf78c402cebc8d399cade2f44dd5408e75f3"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-s4/.golden-build-uT0KbN/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-gitsrc5/.golden-build-JfyuSd/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "2e5d5b777a6d4a63b8f68b1fa1098fb3d42bfcf24b0cfe9bf0cce034c53f4247",
-  "sqliteBytes": 14557184
+  "sqliteFileSha256": "911bd53c3069ae1bca6f4089915f262fb091d24c08fdb94cb49b535825f5f6f7",
+  "sqliteBytes": 14561280
 }

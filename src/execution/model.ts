@@ -29,8 +29,8 @@ export interface AgentUsage { mode: "implement" | "review"; model: string; effor
 export interface ExecutionOptions { retry: boolean; maxContextChars: number; maxCorrections: number }
 export interface CheckResult { command: { executable: string; args: string[] }; result: ProcessResult }
 export interface TaskRun {
-  obligationStartProofs?: import('./task-obligations.js').TaskRuntimeProof[];
-  obligationResultProofs?: import('./task-obligations.js').TaskObligationProof[];
+  obligationStartProofs: import('./task-obligations.js').TaskRuntimeProof[];
+  obligationResultProofs: import('./task-obligations.js').TaskObligationProof[];
   projectId: string; plan: Ref; taskId: string; attempt: number; state: RunState;
   parent: string; tree: string | null; commit: string | null;
   implementation: string | null; artifacts: ArtifactValue[]; checks: CheckResult[];

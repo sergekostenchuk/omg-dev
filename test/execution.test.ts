@@ -1109,29 +1109,6 @@ ${body}
   assert.ok(loaded.includes("src/storage/store.ts") && loaded.includes("src/execution/runner.ts"), `The producer ran on the modules of ${commit}: ${loaded.join(", ")}`);
   return output;
 }
-const EX1_BASE = "88bc91e13f777004274ed9410be806f386fd9419";
-
-test("EX1 era: the records the base wrote are read by the new code with the same result — a pilot without an admission keeps the boundary; a base attempt's code finding opens its one correction", async t => {
-  const f = ex1Fixture(t, { legacy: true, admit: false });
-  const command = JSON.stringify(f.command());
-  const base = ex1AtCommit(f.directory, f.database, EX1_BASE, "era-boundary", `
-try { await engine.execute(${command}); out('ran'); } catch (error) { out(error.code); }`);
-  assert.equal(base, "pilot_boundary_reached");
-  f.reopen();
-  await assert.rejects(f.run(), { code: "pilot_boundary_reached" }, "The base's pilot and policy keep the same boundary for the new code");
-  const g = legacyExecutionFixture(t, "correct");
-  const options = JSON.stringify(g.options), plan = JSON.stringify(reference(g.plan));
-  assert.deepEqual(ex1AtCommit(g.directory, g.store.path, EX1_BASE, "era-correct", `
-const runs = await engine.executor.run('p', ${plan}, ${options}); out(runs.map(run => run.value.state));`), ["needs_code"]);
-  g.reopen();
-  const written = g.store.list<TaskRun>("task-run")[0]!;
-  assert.equal(written.value.state, "needs_code", "The base stopped on its code finding");
-  assert.equal(g.store.list(EXECUTION_SEND_KIND).length, 0, "The base era records no launches");
-  const runs = await g.engine.executor.run("p", reference(g.plan), { ...g.options, retry: true, maxCorrections: 1 });
-  assert.deepEqual(runs.map(run => run.value.state), ["committed", "committed"]);
-  assert.deepEqual(g.store.list<ExecutionSend>(EXECUTION_SEND_KIND).filter(row => row.value.role === "implement").map(row => row.value.correction).sort(),
-    [false, true, true], "The base attempt's finding is corrected once; task 2 corrects its own");
-});
 
 test("EX1 a launch record is closed once, from sent; a subject without its exact task, attempt, role or ordinal is refused before any write", t => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "omg-ex1-send-")));
@@ -1168,16 +1145,35 @@ test("EX1 №3961-1 a negative review is applied with its launch: a lost process
   assert.deepEqual(g.provider().map(call => call.mode), ["implement", "review", "implement", "review", "implement", "review"],
     "The code finding is corrected; the reviewed tree is never reviewed again");
   assert.equal(runs[0]!.value.attempt, 2);
-  // A negative review saved but not applied (the window before this return): its outcome is applied on the next entry, no launch.
+  // Current production closes the review launch and applies its verdict in the same write.
   for (const kind of ["plan", "code"] as const) {
     const h = ex1Fixture(t, { budget: { maxCorrections: 0 } });
     h.behave({ "review:1": kind === "plan" ? "plan-addressed" : kind });
-    assert.equal(await ex1Process(h, { maxCorrections: 0 }, kind === "plan" ? "needs_plan" : "needs_code"), 9);
-    const applied = h.store.list<TaskRun>("task-run")[0]!;
-    h.store.write({ id: applied.id, kind: applied.kind, expected: applied.revision, value: { ...applied.value, state: "reviewing", error: null } as never });
+    const write = h.store.writeMany.bind(h.store); let applied = 0;
+    h.store.writeMany = ((writes, guards) => {
+      const negative = writes.find(item => item.kind === "task-run" && (item.value as TaskRun).review?.verdict === "request_changes");
+      if (negative) {
+        const run = negative.value as TaskRun;
+        assert.equal(run.state, kind === "plan" ? "needs_plan" : "needs_code");
+        const closures = writes.filter(item => item.kind === EXECUTION_SEND_KIND);
+        assert.equal(closures.length, 1);
+        const send = closures[0]!.value as ExecutionSend;
+        assert.deepEqual([send.plan, send.task, send.attempt, send.role, send.status],
+          [run.plan, run.taskId, run.attempt, "review", "answered"]);
+        applied++;
+      }
+      return write(writes, guards);
+    }) as Store["writeMany"];
+    let stopped: Revision<TaskRun>[];
+    try { stopped = await h.run({ maxCorrections: 0 }); }
+    finally { h.store.writeMany = write; }
+    assert.equal(applied, 1, `${kind}: the producer wrote one atomic negative outcome`);
+    const saved = stopped[0]!;
+    h.reopen();
+    assert.deepEqual(h.store.get(saved.id), saved);
     const entered = await h.run({ maxCorrections: 0 });
-    assert.equal(entered[0]!.value.state, kind === "plan" ? "needs_plan" : "needs_code", kind);
-    assert.equal(h.provider().length, 2, `${kind}: the saved review is applied, not bought again`);
+    assert.deepEqual(entered[0], saved, `${kind}: cold entry preserves the applied verdict`);
+    assert.equal(h.provider().length, 2, `${kind}: the saved review is not bought again`);
   }
 });
 
@@ -1201,15 +1197,14 @@ test("EX1 №3961-3 the reads of a decision are addressed by its plan and task: 
   const other = "f".repeat(64);
   for (let index = 0; index < 300; index++) f.store.write({ id: `execution-send:p:${other}:${String(index).padStart(40, "0")}:1:implement:1`, kind: EXECUTION_SEND_KIND, expected: 0,
     value: { contract: "execution-send/v1", project: "p", plan: { id: `plan:p:external-inputs-v1:${other}`, revision: 1, hash: other }, task: `task:${index}`, attempt: 1,
-      role: "implement", ordinal: 1, correction: true, admission: null, request: { hash: "h", chars: 1 }, group: null, status: "answered", usage: null, startedAt: index, finishedAt: index } as never });
+      role: "implement", ordinal: 1, correction: true, admission: null, feedback: null, request: { hash: "h", chars: 1 }, group: null, status: "answered", usage: null, startedAt: index, finishedAt: index } as never });
   assert.equal(measure(), before, "300 launches of another plan are not read");
   assert.ok(before > 0);
 });
 
 
-// ---- EX2 (№3980): the correction sees what failed; a blind slot is restored narrowly ----
-import { checkFeedback, blindCorrection, EXECUTION_RECOVERY_KIND, FIVE_CLASSES, IMPLEMENT_CLASSES, CORRECTION_CLASSES, REVIEW_CLASSES, REVIEW_PASS, REVIEW_CHANGES, REVIEW_CHANGES_ADDRESSED, reviewClasses, IMPLEMENT_UNEXECUTABLE, riskMap, CLARIFICATION_HEAD, CLARIFICATION_REVIEW, type ExecutionRecovery } from "../src/execution/runner.js";
-const EX2_BASE = "afb55c7ddd110c7cf27b1493a722209e68455f73";
+// ---- EX2 (№3980): the correction sees what failed ----
+import { checkFeedback, FIVE_CLASSES, IMPLEMENT_CLASSES, CORRECTION_CLASSES, REVIEW_CLASSES, REVIEW_PASS, REVIEW_CHANGES, REVIEW_CHANGES_ADDRESSED, reviewClasses, IMPLEMENT_UNEXECUTABLE, riskMap, CLARIFICATION_HEAD, CLARIFICATION_REVIEW } from "../src/execution/runner.js";
 
 test("EX2 a correction sees what failed: a TAP failure on stdout under a warning on stderr reaches it — the not ok block with its expected and actual, the summary — and its launch names that feedback", async t => {
   const f = ex1Fixture(t, { tap: true });
@@ -1245,91 +1240,6 @@ test("EX2 a failure without TAP gives the tails of both streams; a long one is c
   assert.match(long.text, /not ok 1 - case 1/);
   const quiet = checkFeedback({ executable: "/x/tsc", args: ["-p", "."] }, { exitCode: 2, signal: null, stdout: "src/a.ts(1,1): error TS2304: Cannot find name 'x'.", stderr: "" }, 0, 4000);
   assert.deepEqual([quiet.truncated, /error TS2304/.test(quiet.text), /^failed check: tsc -p \. → exit 2/.test(quiet.text)], [false, true, true]);
-});
-
-/** The live case: the base (EX1) executes with a correction that fails again — its errors are the stderr tail, its correction launch names no feedback. */
-async function blindByBase(t: test.TestContext, then: Record<string, string>, fixture: { tap?: boolean; progress?: boolean } = { tap: true }) {
-  const f = ex1Fixture(t, fixture);
-  f.behave({ "implement:1": "wrong", "implement:2": "wrong" });
-  const command = JSON.stringify(f.command());
-  assert.equal(ex1AtCommit(f.directory, f.database, EX2_BASE, "ex2-blind", `
-try { await engine.execute(${command}); out('ran'); } catch (error) { out(error.code); }`), "ran");
-  f.reopen();
-  const runs = f.store.list<TaskRun>("task-run");
-  assert.deepEqual([runs[0]!.value.state, runs[0]!.value.attempt], ["needs_code", 2], "the base spent its one correction");
-  const blind = f.sends().find(row => row.value.attempt === 2)!;
-  assert.equal("feedback" in blind.value, false, "the base's launch names no feedback");
-  if (fixture.tap) assert.match(f.provider().filter(call => call.mode === "implement")[1]!.correction!.error!, /^\(node:\d+\) Warning|ExperimentalWarning/, "the base showed only the stderr tail");
-  f.behave(then);
-  return { f, blind };
-}
-test("EX2 a correction slot the earlier producer spent blind is restored once, by its exact launch: a restart does not restore it again, and the restored correction is shown what failed", async t => {
-  const { f, blind } = await blindByBase(t, {});
-  const runs = await f.run({ retry: true });
-  assert.deepEqual(runs.map(run => run.value.state), ["committed", "committed"]);
-  const recoveries = f.store.list<ExecutionRecovery>(EXECUTION_RECOVERY_KIND);
-  assert.equal(recoveries.length, 1);
-  assert.deepEqual([recoveries[0]!.value.send.id, recoveries[0]!.value.check], [blind.id, 0]);
-  const sighted = f.provider().filter(call => call.mode === "implement")[2]!.correction!;
-  assert.match(sighted.error!, /not ok 1 - produce returns its successor/, "the restored correction sees the failure of the attempt it corrects");
-  assert.ok(f.sends().find(row => row.value.attempt === 3)!.value.feedback, "and its launch names it");
-  assert.equal(f.sends().filter(row => row.value.role === "implement" && row.value.task === f.plan.value.tasks[0]!.id).length, 3, "both earlier launches stay in the account");
-});
-test("EX2 the restored slot is one: a restored correction that fails again exhausts the limit, a restart creates no second slot; an ordinary failed correction of this era exhausts it as before", async t => {
-  const { f } = await blindByBase(t, { "implement:3": "wrong" });
-  const runs = await f.run({ retry: true });
-  assert.equal(runs[0]!.value.state, "needs_code");
-  f.reopen();
-  await assert.rejects(f.run({ retry: true }), { code: "execution_corrections_exhausted" });
-  assert.equal(f.store.list(EXECUTION_RECOVERY_KIND).length, 1, "no second restoration");
-  const g = ex1Fixture(t, { legacy: true, tap: true });
-  g.behave({ "implement:1": "wrong", "implement:2": "wrong" });
-  assert.equal((await g.run())[0]!.value.state, "needs_code");
-  await assert.rejects(g.run({ retry: true }), { code: "execution_corrections_exhausted" });
-  assert.equal(g.store.list(EXECUTION_RECOVERY_KIND).length, 0, "a correction shown its failure is no basis");
-});
-test("EX2 a restoration is proved when it is created and read as written: the reader takes no history and its cost does not grow with later revisions; a record without its launch is refused by its form", async t => {
-  const { f, blind } = await blindByBase(t, {});
-  const task = f.plan.value.tasks[0]!;
-  assert.ok(blindCorrection(f.store, f.plan, task, blind), "the base's blind launch is a basis when the restoration is created");
-  await f.run({ retry: true });
-  assert.equal(f.store.list(EXECUTION_RECOVERY_KIND).length, 1);
-  const measure = () => {
-    let histories = 0, rows = 0;
-    const history = f.store.history.bind(f.store), get = f.store.get.bind(f.store), identities = f.store.identities.bind(f.store);
-    f.store.history = ((...args: Parameters<Store["history"]>) => { histories++; const found = history(...args); rows += found.length; return found; }) as Store["history"];
-    f.store.get = ((...args: Parameters<Store["get"]>) => { const found = get(...args); if (found) rows++; return found; }) as Store["get"];
-    f.store.identities = ((...args: Parameters<Store["identities"]>) => { const found = identities(...args); rows += found.length; return found; }) as Store["identities"];
-    try { correctionsUsed(f.store, f.plan, task); } finally { f.store.history = history; f.store.get = get; f.store.identities = identities; }
-    return { histories, rows };
-  };
-  const before = measure();
-  assert.equal(before.histories, 0, "the saved restoration is not derived again");
-  const run = f.store.list<TaskRun>("task-run").find(row => row.value.taskId === task.id)!;
-  for (let index = 0; index < 300; index++) {
-    const head = f.store.get<TaskRun>(run.id)!;
-    f.store.write({ id: run.id, kind: "task-run", expected: head.revision, value: { ...head.value, updatedAt: head.value.updatedAt + 1 } as never });
-  }
-  assert.deepEqual(measure(), before, "300 later revisions of the task run add nothing to the read");
-  const id = blind.id.replace(/^execution-send:/, `${EXECUTION_RECOVERY_KIND}:`), saved = f.store.get<ExecutionRecovery>(id)!;
-  const { send: _send, ...withoutSend } = saved.value;
-  f.store.write({ id, kind: EXECUTION_RECOVERY_KIND, expected: saved.revision, value: withoutSend as never });
-  assert.throws(() => correctionsUsed(f.store, f.plan, task), { code: "execution_recovery_invalid" }, "T4: a restoration without its launch");
-});
-
-test("EX2 №3986-2 progress output on stdout proves no blindness: when the earlier correction was given the whole failure on stderr, no slot is restored", async t => {
-  const { f, blind } = await blindByBase(t, {}, { progress: true });
-  const given = f.provider().filter(call => call.mode === "implement")[1]!.correction!.error!;
-  assert.match(given, /AssertionError/, "the earlier producer passed the whole failure");
-  const basis = f.store.history<TaskRun>(f.store.list<TaskRun>("task-run")[0]!.id).find(row => row.value.state === "needs_code" && row.value.attempt === 1)!;
-  assert.match(basis.value.checks[0]!.result.stdout, /Building candidate/);
-  assert.equal(blindCorrection(f.store, f.plan, f.plan.value.tasks[0]!, blind), null);
-  // AT3a return №4141 P2-1: the saved failed check no review has read is reviewed once — no implementation is bought.
-  const [reviewed] = await f.run({ retry: true });
-  assert.deepEqual([reviewed!.value.state, reviewed!.value.review?.kind], ["needs_code", "code"]);
-  await assert.rejects(f.run({ retry: true }), { code: "execution_corrections_exhausted" });
-  assert.equal(f.store.list(EXECUTION_RECOVERY_KIND).length, 0);
-  assert.deepEqual(f.provider().map(call => call.mode), ["implement", "implement", "review"], "only the review of the saved failure, no further implementation");
 });
 
 test("EX2 №3986-1 the outcome a correction answers survives a refused launch: after the gate refused the correction, the next one is shown the original not ok, its expected and actual and the saved check", async t => {

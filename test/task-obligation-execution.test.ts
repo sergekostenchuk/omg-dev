@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { taskObligationExecutionFixture } from './execution-fixture.js';
+import { executionFixture, taskObligationExecutionFixture } from './execution-fixture.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { type TaskRun } from '../src/execution/model.js';
 import { type ExecutionRoot, git } from '../src/runtime/environment.js';
@@ -14,6 +14,11 @@ import { Owners } from '../src/ownership/owners.js';
 
 function fixture(t: test.TestContext) {
   const f = taskObligationExecutionFixture(t);
+  assert.equal(f.plan.value.version, 2);
+  assert.equal(f.plan.value.feasibility.id, 'om-feasibility:p');
+  assert.equal(f.store.get('feasibility:p'), null);
+  assert.equal(f.store.list('research-scope').length, 0);
+  requirePlanTaskObligations(f.store, f.plan.value);
   const { condition, observe } = f;
   const run = (retry = false) => f.engine.executor.run('p', reference(f.plan), { ...f.options, retry });
   const prepare = async () => {
@@ -22,6 +27,29 @@ function fixture(t: test.TestContext) {
   };
   return { ...f, condition, observe, run, prepare };
 }
+
+test('M8 tasks without carried obligations still persist both exact empty proof sets', async t => {
+  const f = executionFixture(t, 'normal', { route: 'om' });
+  assert.equal(f.plan.value.feasibility.id, 'om-feasibility:p');
+  assert.ok(f.plan.value.tasks.every(task => Array.isArray(task.researchObligations) && task.researchObligations.length === 0));
+  const runs = await f.engine.executor.run('p', reference(f.plan), f.options);
+  assert.deepEqual(runs.map(run => run.value.state), ['committed', 'committed']);
+  for (const run of runs) {
+    const task = f.plan.value.tasks.find(task => task.id === run.value.taskId)!;
+    for (const saved of f.store.history<TaskRun>(run.id)) {
+      assert.deepEqual(saved.value.obligationStartProofs, []);
+      assert.deepEqual(saved.value.obligationResultProofs, []);
+    }
+    requireTaskObligationProofs(f.store, run.value, task);
+    for (const field of ['obligationStartProofs', 'obligationResultProofs'] as const) {
+      const missing = structuredClone(run.value) as Partial<TaskRun>;
+      delete missing[field];
+      assert.throws(() => requireTaskObligationProofs(f.store, missing as TaskRun, task), { code: 'task_obligation_proof_missing' });
+    }
+    const omitted = structuredClone(task); delete omitted.researchObligations;
+    assert.throws(() => requirePlanTaskObligations(f.store, f.plan.value, omitted), { code: 'task_obligation_plan_foreign' });
+  }
+});
 
 test('task start refuses missing evidence; late result waits and resumes without rerunning implementation, tests or review', async t => {
   const f = fixture(t); await f.prepare();

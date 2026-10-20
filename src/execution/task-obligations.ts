@@ -7,7 +7,7 @@ import { checkedPlanDerivation, type CompiledTask, type MachinePlan } from '../c
 import type { Feasibility } from '../graph/refinement.js';
 import type { Graph } from '../graph/model.js';
 import type { TaskRun } from './model.js';
-import { taskObligationHandoff, requireTaskObligations } from '../graph/task-obligations.js';
+import { requireTaskObligations } from '../graph/task-obligations.js';
 import { findObligationConfirmation, frozenObligationConfirmation, type ObligationConfirmation } from '../graph/obligation-readiness.js';
 import type { ObligationHandoffForm } from '../compiler/om-readers.js';
 import { requireBasis } from '../compiler/basis.js';
@@ -23,13 +23,9 @@ export function requirePlanTaskObligations(store: Store, plan: MachinePlan, task
   const basis = store.get<Feasibility>(plan.feasibility.id, plan.feasibility.revision);
   requireCondition(basis?.kind === 'feasibility' && basis.hash === plan.feasibility.hash && basis.value.projectId === plan.projectId,
     'task_obligation_plan_foreign', 'Task obligations need the exact feasibility basis');
-  let handoff: ReturnType<typeof taskObligationHandoff>;
-  if (plan.feasibility.id.startsWith('om-feasibility:')) {
-    const checked = requireBasis(store, plan);
-    requireCondition(checked, 'task_obligation_plan_foreign', 'An M8 plan needs its proved compilation basis');
-    handoff = structuredClone(checked.value.obligations.handoff) as ObligationHandoffForm;
-  } else handoff = taskObligationHandoff(store, plan.projectId, basis.value.inputs);
-  if (!handoff) return;
+  const checked = requireBasis(store, plan);
+  requireCondition(checked, 'task_obligation_plan_foreign', 'An M8 plan needs its proved compilation basis');
+  const handoff = structuredClone(checked.value.obligations.handoff) as ObligationHandoffForm;
   const graph = store.get<Graph>(plan.graph.id, plan.graph.revision);
   requireCondition(graph?.kind === 'graph' && graph.hash === plan.graph.hash && canonical(graph.value) === canonical(plan.graphSnapshot),
     'task_obligation_plan_foreign', 'The task obligation graph must be the actual sealed graph');
@@ -106,9 +102,8 @@ export function requireTaskObligationProofs(store: Store, run: TaskRun, task: Co
     && run.taskId === task.id, 'task_obligation_plan_foreign', 'Proofs must belong to the exact project, plan and named task');
   checkedPlanDerivation(plan, run.projectId);
   requirePlanTaskObligations(store, plan.value, task);
-  if (task.researchObligations === undefined) return;
   for (const [moment, saved] of [['task-start', run.obligationStartProofs], ['task-result', run.obligationResultProofs]] as const) {
-    const required = task.researchObligations.filter(item => item.requirement.moment === moment);
+    const required = task.researchObligations!.filter(item => item.requirement.moment === moment);
     requireCondition(Array.isArray(saved) && saved.every(item => item && typeof item.binding === 'string')
       && saved.length === required.length && new Set(saved.map(item => item.binding)).size === saved.length,
       'task_obligation_proof_missing', `The exact ${moment} proof set is missing, duplicated or contains extras`);

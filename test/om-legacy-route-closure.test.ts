@@ -256,9 +256,10 @@ for (const defect of ['plan', 'compile-stage', 'accept-stage'] as const) {
   });
 }
 
-test('G1.3 an already accepted native plan executes and cold-resumes across B1 without repeated work', async t => {
-  const f = executionFixture(t);
-  firstInput(f.store);
+test('G1.3 an accepted M8 plan executes and cold-resumes after publication without repeated work', async t => {
+  const f = executionFixture(t, 'normal', { route: 'om' });
+  assert.equal(f.plan.value.feasibility.id, 'om-feasibility:p');
+  assert.ok(f.store.get('om-input:p'));
   let interrupted = false;
   const executor = new Executor(f.store, f.engine.compiler, f.engine.environments, () => {
     if (!interrupted) { interrupted = true; throw new Error('G1.3 crash after exact Git publication'); }
@@ -279,6 +280,23 @@ test('G1.3 an already accepted native plan executes and cold-resumes across B1 w
   assert.equal(f.calls().length, 4);
   assert.deepEqual(f.store.list('writer-index'), writers);
   assert.deepEqual(f.store.list('task-run'), taskRuns);
+});
+
+test('LG40 an accepted native plan is refused before any model launch, before and after B1 and restart', async t => {
+  const f = executionFixture(t);
+  assert.equal(f.plan.value.feasibility.id, 'feasibility:p');
+  const plan = structuredClone(f.plan);
+  for (const withB1 of [false, true]) {
+    if (withB1) firstInput(f.store);
+    for (let repeat = 0; repeat < 2; repeat++) {
+      if (repeat) f.reopen();
+      await assert.rejects(f.engine.executor.run('p', reference(f.plan), f.options), { code: 'task_obligation_plan_foreign' });
+      assert.deepEqual(f.store.get(plan.id), plan);
+      assert.equal(f.calls().length, 0);
+      assert.deepEqual(f.store.list('task-run'), []);
+      assert.equal(f.store.get('execution-root:p'), null);
+    }
+  }
 });
 
 interface M8CommandFixture {

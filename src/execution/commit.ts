@@ -30,7 +30,7 @@ export function commitIntent(store: Store, root: Revision<ExecutionRoot>, run: R
   task: CompiledTask, environment: Environment, guards: TransactionGuard[]): Revision<TaskRun> {
   requirePlanTaskObligations(store, plan, task);
   const proof = taskResultProofs(store, run.value, task);
-  const candidate = { ...run.value, ...(task.researchObligations !== undefined ? { obligationResultProofs: proof.proofs } : {}) };
+  const candidate = { ...run.value, obligationResultProofs: proof.proofs };
   requireGates(candidate, task, environment, store); requireWorktree(root.value, run.value.parent);
   const commit = git(root.value.path, ["-c", "user.name=OMG Engine", "-c", "user.email=engine@omg.local", "commit-tree", run.value.tree!, "-p", run.value.parent],
     `${task.title}\n\nOMG plan: ${plan.hash}\nOMG task: ${task.id}\n`);
