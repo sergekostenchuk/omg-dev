@@ -1,7 +1,8 @@
+import { sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { activeSynthesisNotes, consolidationInput, consolidationPage, consolidationFragment,
   CONSOLIDATION_DELIVERY, CONSOLIDATION_FRAGMENT } from './conclusion-consolidation.js';
-import { FOUNDATION_FIELDS, contextSections, selectedQuestion, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
+import { FOUNDATION_FIELDS, contextSections, selectedQuestion, packetPlanSubject, planQuestionContract, replaceFoundationCopies, candidateDelta, originalIndex, compactConclusions, CONCLUSION_ENCODING, correctionIndex } from "./continuation-packet.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
@@ -16,7 +17,7 @@ import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summar
 import { addressArchivedMaterials, serveArchivedMaterial, packAddressedValue,
   requirePacketMaterialDelivery, planResearchDelivery, type AddressedOriginal } from './research-delivery.js';
 
-interface Archive { projectId: string; draft: Ref; question: Ref; body: Record<string, Json> }
+interface Archive { projectId: string; draft: Ref; question: Ref; subject?: V7PlanSubject; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number; encoding?: 'canonical-json' }
 const instruction = "Full context is retained in working.archive in SQLite. sourceCatalogue lists exact source refs and locations; a structured source TOC may be paged, with total, next and the exact archive address of every section. A heading is navigation, not a reading of its body. Omitted collections are NOT empty, irrelevant or disproved. Use read_context with that record, a /body/... pointer and optional page:{offset,limit} to retrieve exact array items or UTF-16 string characters. An oversized requested page is delivered as a positive bounded range with its exact requested, served page and next; the original remains unchanged. The read envelope limit is declared in the result as envelopeLimitChars when clipping occurs. For an oversized object or single array item, page:{offset,limit,encoding:'canonical-json'} reads exact UTF-16 characters of its canonical JSON; continue at served.next without treating a fragment as the complete value. working.sections gives addresses and sizes. readings and selectedContext retain recently requested materials together, newest first, within the fixed budget. Use these supplied materials for comparison instead of requesting them again; repeated unchanged reads without a checkpoint pause research. focus is the latest non-reader material, not the entire research. Save intermediate proposed findings using checkpoint with question,value,citations,unresolved; checkpoints are unassessed and never replace source evidence. Re-read exact sources for exceptions or contradictions. Never infer absence from the current window.";
 
@@ -96,11 +97,38 @@ function conclusionSources(body: Record<string, any>, archive: Ref, questionId: 
 }
 
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
-  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string } = {}): Record<string, any> {
+  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
+  const planSubject = packetPlanSubject(options);
+  const planContract = planSubject ? planQuestionContract(store, draft, question, planSubject) : null;
+  if (planSubject && Object.hasOwn(body, 'subject')) requireCondition(sameSubject(packetPlanSubject(body), planSubject),
+    'research_plan_subject_invalid', 'Context cannot select a different plan subject');
+  if (planContract) {
+    requireCondition(!Object.hasOwn(body,'questions') || Array.isArray(body['questions']),
+      'research_plan_subject_invalid','The supplied plan-question collection must be an array');
+    if (Array.isArray(body['history'])) body['history'] = body['history'].filter((turn:any) =>
+      turn && sameSubject(packetPlanSubject(turn),planSubject));
+    // Validate supplied question fields against the accepted plan item, never
+    // reinterpret the plan Question's FieldSpec as an attempt schema.
+    for (const supplied of [body['question'], ...(body['questions'] ?? [])].filter(q => q !== undefined)) {
+      requireCondition(supplied && typeof supplied === 'object' && !Array.isArray(supplied)
+        && Object.entries(supplied).every(([key,value]) => Object.hasOwn(planContract,key)
+          && canonical(value) === canonical(planContract[key as keyof typeof planContract])),
+        'research_plan_subject_invalid', 'The supplied question differs from its accepted plan question');
+    }
+    body = {...body, subject:planSubject, question:planContract,
+      ...(Object.hasOwn(body,'questions')?{questions:[planContract]}:{})};
+  }
+  if (planSubject && options.previous) {
+    const previous = store.get<Archive>(options.previous.id,options.previous.revision);
+    requireCondition(previous?.hash === options.previous.hash && previous.value.projectId === projectId
+      && previous.value.question.id === questionId && sameSubject(packetPlanSubject(previous.value),planSubject),
+      'continuation_foreign','The previous archive belongs to another exact subject');
+  }
+
   if (Object.hasOwn(body, 'contextWorkspace')) requireExactContextWorkspace(body['contextWorkspace'], result => {
     const delivered = result as ProjectedContextRead;
     const clipped = delivered.contract === 'research-context-read/v2';
@@ -149,7 +177,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   } as Json;
   body['unresolvedEvidence'] = (Array.isArray(body['readings']) ? body['readings'] : []).flatMap((entry: any) =>
     Array.isArray(entry.unresolved) && entry.unresolved.length ? [{ reading: entry.ref ?? null, purpose: entry.purpose ?? null, unresolved: entry.unresolved }] : []);
-  const value: Archive = { projectId, draft: reference(draft), question: reference(question), body };
+  const value: Archive = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}), body };
   const id = `research-context:${hashJson(value)}`;
   let archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
     [reference(draft), reference(question), ...draft.value.inputs])[0]!;
@@ -159,7 +187,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       && Object.hasOwn(archivedBody, field)
       && canonical(packet[field]) === canonical(archivedBody[field]));
   const materialRecord = (field: string, material: unknown): Ref => {
-    const stable: Archive = { projectId, draft: reference(draft), question: reference(question),
+    const stable: Archive = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}),
       body: { [field]: material as Json } };
     const stableId = `research-context:${hashJson(stable)}`;
     const saved = store.get(stableId) ?? store.writeMany([
@@ -178,7 +206,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     archivedBody = { ...body,
       ...(sourceNavigation ? { sourceCatalogue: sourceNavigation } : {}),
       ...(plannerCorrections?.length ? { corrections: plannerCorrections } : {}) };
-    const projected: Archive = { projectId, draft: reference(draft), question: reference(question), body: archivedBody };
+    const projected: Archive = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}), body: archivedBody };
     const projectedId = `research-context:${hashJson(projected)}`;
     archive = store.get(projectedId) ?? store.writeMany([
       { id: projectedId, kind: 'research-context', expected: 0, value: projected }],
@@ -192,14 +220,15 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (neighborMaterial) requireCondition(neighborMaterial.stageNeighbors?.contract === 'stage-neighbors/v1',
     'context_stage_neighbors_incomplete', `[${question.id}] The assessor needs its declared stage material`);
   const hasQuestion = Object.hasOwn(body, 'question') || Object.hasOwn(body, 'questions') || (options.purpose ?? body['role']) !== 'reader';
-  const selected = hasQuestion ? selectedQuestion(question, archivedBody) : null;
-  const contract = selected ? { id: question.id, ...question.value.spec } : null;
+  const selected = planContract ? {question:planContract,schemaPointer:'/body/question/schema'} : hasQuestion ? selectedQuestion(question, archivedBody) : null;
+  const contract = planContract ?? (selected ? { id: question.id, ...question.value.spec } : null);
   const projectedQuestion = selected ? { ...selected.question,
     ...(selected.schemaPointer && body['dispatchMode'] !== 'consolidation'
       ? { schemaAddress: { record: reference(archive), pointer: selected.schemaPointer } } : {}) } : null;
   if (projectedQuestion) body = { ...body, question: projectedQuestion,
     ...(Object.hasOwn(body, 'questions') ? { questions: [projectedQuestion] } : {}) };
   const finish = (packet: Record<string, any>) => {
+    if (planSubject) packet.subject = planSubject;
     requirePacketMaterialDelivery(packet, reference(archive), (record, pointer) =>
       contextValue(archivedContext(store, draft, record), pointer));
     requirePlanningNavigation(packet, reference(archive), archivedBody);
@@ -400,7 +429,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     delete body['history'];
   }
   if (options.common) {
-    const conclusions=compactConclusions((body['synthesisNotes'] ? activeSynthesisNotes(body['synthesisNotes']) : undefined) ?? body['assessmentNotes'] ?? body['checkpoints'] ?? body['previousProposal'] ?? (body['history'] as any[] ?? []).filter(h=>h.action?.question===questionId && ['checkpoint','answer','answer_delta'].includes(h.action.action)).map(h=>({proposal:h.action})));
+    const conclusions=compactConclusions((body['synthesisNotes'] ? activeSynthesisNotes(body['synthesisNotes']) : undefined) ?? body['assessmentNotes'] ?? body['checkpoints'] ?? body['previousProposal'] ?? (body['history'] as any[] ?? []).filter(h=>h.action?.question===(planSubject?.planQuestionId??questionId) && ['checkpoint','answer','answer_delta'].includes(h.action.action)).map(h=>({proposal:h.action})));
     body['conclusions']=conclusions.items; body['conclusionCitations']=conclusions.citations;
     body['conclusionRefs']=conclusions.references; body['conclusionUnresolved']=conclusions.unresolved; body['conclusionEncoding']=CONCLUSION_ENCODING;
     if(body['history']) {
@@ -473,7 +502,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if (retained) for (const key of conclusionKeys) delete packet[key];
   const addressedConclusions = !retained && packet.conclusions && (JSON.stringify(packet).length > maxChars - 1024
     || JSON.stringify(packet.conclusions).length > Math.floor(maxChars / 3))
-    ? conclusionSources(archivedBody, reference(archive), questionId) : [];
+    ? conclusionSources(archivedBody, reference(archive), planSubject?.planQuestionId??questionId) : [];
   if (addressedConclusions.length) {
     packet.working.conclusionOrigins = addressedConclusions.map(item => ({ record: item.record, pointer: item.pointer,
       chars: JSON.stringify(item.value).length }));

@@ -1,3 +1,4 @@
+import { callAddressesSubject, sameSubject, planSubjectOf, type V7PlanSubject } from './v7-managed-attempt.js';
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { Store } from '../storage/store.js';
 import { hashJson } from '../canonical.js';
@@ -9,7 +10,7 @@ import {contextLookupKey} from './context-workspace.js';
 /** Preserve the engine-owned progress identity for accounting. Distinct calls
  * are governed by their token budget, not a fixed invocation count. Repeated
  * delivered lookup keys are rejected by the context consumer. */
-export function invocationProgress(store:Store,questionId:string,purpose:string,context:Record<string,any>) {
+export function invocationProgress(store:Store,questionId:string,purpose:string,context:Record<string,any>,subject:V7PlanSubject|null=null,actor?:string) {
   const question=store.get(questionId);
   requireCondition(question?.kind==='question','continuation_question_missing','Progress requires its bound question');
   let step:unknown;
@@ -22,11 +23,15 @@ export function invocationProgress(store:Store,questionId:string,purpose:string,
   else if(purpose==='reader')step={sources:context.sources?.map((s:any)=>({ref:s.ref??null,range:s.visibleRange??null,content:hashJson(s)}))??[]};
   else {
     const evidence=['reader-result','pilot-reading'].flatMap(kind=>store.list<any>(kind))
-      .filter(r=>r.value.question===questionId||r.value.question?.id===questionId).map(reference);
+      .filter(r=>(r.value.question===questionId||r.value.question?.id===questionId)
+        && (!subject || r.value.projectId===(question.value as any).projectId && sameSubject(planSubjectOf(r.value),subject))).map(reference);
     step={evidence};
   }
-  const key=hashJson({version:1,question:reference(question),purpose,step});
-  const calls=store.list<ModelCall>('model-call').filter(c=>c.value.questionId===questionId&&c.value.purpose===purpose&&c.value.progressKey===key);
+  const key=hashJson(subject ? {version:2,projectId:(question.value as any).projectId,subject,purpose,actor,step}
+    : {version:1,question:reference(question),purpose,step});
+  const calls=store.list<ModelCall>('model-call').filter(c=>callAddressesSubject(c.value as unknown as Record<string,unknown>,reference(question),subject)
+    && c.value.purpose===purpose && c.value.progressKey===key
+    && (!subject || c.value.projectId===(question.value as any).projectId && c.value.requested.actor===actor));
   return {key,guards:calls.map(reference)};
 }
 

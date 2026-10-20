@@ -15,11 +15,12 @@ import { archivedContext } from "./working-context.js";
 export function replayLimitedResponse(store: Store, pilot: Revision<ReaderPilot>, role: RoleBinding,
   draftId: string, questionId: string | undefined, purpose: string, input: string) {
   const request = JSON.parse(input);
-  if (!isRef(request.subject?.working?.archive)) return null;
+  if (!isRef(request.subject?.working?.archive) || request.subject?.subject?.contract === 'v7-plan-subject/v1') return null;
   // C51 era boundary: a managed consumer call is recovered only through its
   // own intent chain; replaying its bytes here would reuse the operation key
   // without the intent binding. This path serves pre-intent calls only.
   const calls = store.list<ModelCall>("model-call").filter(call => call.value.status === "failed"
+    && !Object.hasOwn(call.value, 'planAnswer')
     && !call.id.startsWith("model-call:consumer:v1:")
     && !(call.value as { consumerIntent?: unknown }).consumerIntent
     && call.value.error === "pilot_reply_limit" && call.value.profile?.id === pilot.id
@@ -82,6 +83,7 @@ export function replayableLegacyCall(store: Store, pilot: Revision<ReaderPilot>,
       && turn.value.recoveredRequest.id === call.id
       && store.get<ModelCall>(call.id, turn.value.recoveredRequest.revision)?.hash === turn.value.recoveredRequest.hash);
   const calls = store.list<ModelCall>("model-call").filter(call => call.value.status === "failed"
+    && !Object.hasOwn(call.value, 'planAnswer')
     && !call.id.startsWith("model-call:consumer:v1:")
     && !(call.value as { consumerIntent?: unknown }).consumerIntent
     && call.value.error === "pilot_reply_limit" && call.value.profile?.id === pilot.id

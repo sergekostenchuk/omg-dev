@@ -1,3 +1,4 @@
+import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { assessmentRolePrompt } from './assessment-session.js';
 import { FINAL_SYNTHESIS_INSTRUCTION } from './synthesis-controls.js';
 import { CONSOLIDATION_INSTRUCTION, COMPACT_CHECKPOINT_INSTRUCTION, TIGHTENING_INSTRUCTION } from './conclusion-consolidation.js';
@@ -6,7 +7,7 @@ import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowa
 import { requireContextDelivery } from "./context-workspace.js";
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
-import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt } from "./continuation-packet.js";
+import { continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
 import { phasePolicy } from "./phase-policy.js";
@@ -160,13 +161,20 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
   requestContract?: string) {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
+  const planSubject = packetPlanSubject(capacity?.bindings ?? {});
+  requireCondition(!planSubject || audit?.purpose === 'analyst' && capacity?.purpose === 'analyst'
+    && !['planning','consolidation'].includes((context as any)?.dispatchMode) && !(context as any)?.synthesisSession
+    && (context as any)?.contextControls?.mode !== 'finalization',
+    'research_v7_mode_unavailable', 'Only the analyst plan-question path is connected');
+  requireCondition(!planSubject || audit?.questionId && draft, 'research_plan_subject_invalid',
+    'A plan subject requires the common saved-question packet');
   const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
-    audit.questionId, audit.purpose, role.actor) : null;
+    audit.questionId, audit.purpose, role.actor, planSubject) : null;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
   const envelope = { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
+    effort: role.effort, ...(role.speed ? { speed: role.speed } : {}), prompt: consolidating ? ((context as any)?.consolidation?.tightening ? TIGHTENING_INSTRUCTION : '') + CONSOLIDATION_INSTRUCTION : finalizing ? FINAL_SYNTHESIS_INSTRUCTION : packetState && !packetState.initial ? continuationPrompt(audit!.purpose, prompt) + (audit!.purpose === 'analyst' && !planSubject ? COMPACT_CHECKPOINT_INSTRUCTION : '') : prompt };
   const packingContext = capacity === undefined ? context : { ...context as Record<string, unknown>, resultCapacity: capacity };
   const requestLimit = capacity === undefined ? audit?.pilot?.value.maxRequestChars ?? DEFAULT_RESEARCH_REQUEST_CHARS
     : capacity.envelopeLimitChars;
@@ -175,7 +183,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
     controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:FINAL_SYNTHESIS_INSTRUCTION,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subjectFor = (limit: number) => {
     const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
-      limit, { common: true, purpose: audit!.purpose, continuation: !packetState.initial,
+      limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), continuation: !packetState.initial,
         ...(packetState.latest ? { previous: packetState.latest } : {}),
         ...(audit!.pilot ? { contextChars: audit!.pilot.value.maxRequestChars } : {}),
         ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}) })
@@ -224,6 +232,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     : role.actor === environment.reviewer.actor ? 'reviewer' : 'reader';
   role = resolveRoleMode(roleName, role, 'research');
   let consumerIntent: Revision<ResearchConsumerIntent> | null = null;
+  let planSubject: V7PlanSubject | null = null;
   // Preview bypasses only the unsaved intent it synthesized for a prospective
   // request. A durable intent may already own a paid reply, which must be
   // replayed before preview reaches the next provider boundary.
@@ -253,6 +262,9 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       && canonical(consumerIntent.value.dispatch) === canonical(environment)
       && canonical(consumerIntent.value.profile) === canonical(audit.pilot ? reference(audit.pilot) : null),
     'research_consumer_intent_invalid', 'The saved consumer operation differs from the selected role, project, question or environment');
+    planSubject = planSubjectOf(consumerIntent.value.cursor);
+    requireCondition(!planSubject || consumerIntent.value.kind === 'analyst' && audit.purpose === 'analyst',
+      'research_v7_mode_unavailable', 'The v7 planner and synthesis consumers are not connected');
     if (consumerIntent.value.state !== 'prepared' && !isResponseRecovery()) {
       if (consumerIntent.value.state === 'applied') throw new EngineError('research_consumer_intent_applied', 'The completed consumer operation must return its saved output');
       const paid = resumeResearchConsumerExecution(audit.store, environment.projectId, reference(consumerIntent));
@@ -294,6 +306,14 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     requireCondition(draft?.kind === 'discovery-draft' && recordValue(draft.value)
       && draft.value.projectId === environment.projectId && Array.isArray(draft.value.questions)
       && Array.isArray(draft.value.inputs), 'discovery_draft_invalid', 'The call needs its saved project draft');
+  if (draft && isDiscoveryV7Draft(draft.value)) {
+    requireCondition(!['reading-planner','synthesis','consolidation'].includes(consumerIntent?.value.kind ?? audit!.purpose)
+      && !(context as any)?.synthesisSession && !['planning','consolidation'].includes((context as any)?.dispatchMode),
+      'research_v7_mode_unavailable', 'The v7 planner and synthesis consumers are not connected');
+    const question = audit!.questionId ? audit!.store.get<Question>(audit!.questionId) : null;
+    requireCondition(!(audit!.purpose === 'analyst' && question?.value.spec.field === 'plan' && question.value.status === 'answered') || planSubject,
+      'research_plan_subject_invalid', 'An accepted plan needs its exact saved plan-question subject');
+  }
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
   let segment = null;
   let groups: string[] = [];
@@ -330,6 +350,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     requireCondition(consumerIntent.value.cursor.resultCapacityContract === RESULT_CAPACITY
       && consumerIntent.value.cursor.resultCapacity !== undefined,
       'research_capacity_invalid', 'The saved consumer admission lost its declared capacity');
+  requireCondition(sameSubject(packetPlanSubject(capacity?.bindings ?? {}),planSubject),
+    'research_plan_subject_invalid', 'The packet binding must equal the saved consumer subject');
   const { packetState, subject, envelope, input, requestLimit } = prepareResearchEnvelope(role, environment,
     prompt, context, audit, capacity, requestId, requestContract);
   if (capacity !== undefined) requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,
@@ -391,7 +413,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     throw error;
   }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
-  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>):null;
+  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor):null;
   const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
   const reservation = !segment && !stagePlan && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
   const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length, packetState?.initial === false ? "continuation" : "initial") : null;
@@ -446,13 +468,13 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     reservation.guards.push(...manifestReservationResult.guards);
   }
   if (packetState) {
-    const questionCounterId=`question-dispatch:${hashJson(audit!.questionId!)}`;
-    const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number}>(questionCounterId);
+    const questionCounterId=`question-dispatch:${hashJson(planSubject ? [environment.projectId,planSubject] : audit!.questionId!)}`;
+    const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number;subject?:V7PlanSubject}>(questionCounterId);
     requireCondition(!questionCounter||(questionCounter.kind==='question-dispatch'&&questionCounter.value.projectId===environment.projectId
-      &&questionCounter.value.question===audit!.questionId&&Number.isSafeInteger(questionCounter.value.serial)&&questionCounter.value.serial>=0),
+      &&questionCounter.value.question===audit!.questionId&&sameSubject(packetPlanSubject(questionCounter.value),planSubject)&&Number.isSafeInteger(questionCounter.value.serial)&&questionCounter.value.serial>=0),
     'research_dispatch_invalid','Invalid question dispatch counter');
     reservation.writes.push({id:questionCounterId,kind:'question-dispatch',expected:questionCounter?.revision??0,
-      value:{projectId:environment.projectId,question:audit!.questionId,serial:(questionCounter?.value.serial??0)+1}});
+      value:{projectId:environment.projectId,question:audit!.questionId,...(planSubject?{subject:planSubject}:{}),serial:(questionCounter?.value.serial??0)+1}});
     if(questionCounter) reservation.guards.push(reference(questionCounter));
     if(audit!.session) reservation.guards.push(audit!.session);
     const dispatch = continuationDispatch(packetState, callId);
@@ -473,7 +495,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       ...(audit?.application ? { assessmentApplication: audit.application } : {}),
       ...(consumerIntent ? { consumerIntent: reference(consumerIntent) } : {}),
       profile: audit?.pilot ? reference(audit.pilot) : null,
-      questionId: audit?.questionId ?? null,
+      questionId: planSubject?.planQuestionId ?? audit?.questionId ?? null,
+      ...(planSubject ? { planAnswer:planSubject.planAnswer } : {}),
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
       ...(runtime ? { runtime } : {}),
       confirmed: { model: null, effort: null, speed: null }, request: { chars: input.length, bytes: Buffer.byteLength(input), hash: digest(input), ...(useWireManifest

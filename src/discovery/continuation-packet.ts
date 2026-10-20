@@ -1,3 +1,6 @@
+import { planSubjectOf, sameSubject, callAddressesSubject, type V7PlanSubject } from './v7-managed-attempt.js';
+import { provePlanQuestions } from './v7-plan-questions.js';
+import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_END_CODES, isDiscoveryV7Draft } from './v7-contracts.js';
 import { contextTable } from './context-tables.js';
 import { Evidence, type Source } from "../evidence/evidence.js";
 import type { Store, Revision, Write, ReadGuard } from '../storage/store.js';
@@ -7,32 +10,68 @@ import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
 
+/** The preflight packer can read the producer's capacity binding; actual dispatch
+ * separately requires that binding to equal the saved consumer intent. */
+export function packetPlanSubject(cursor: unknown): V7PlanSubject | null {
+  try { return planSubjectOf(cursor); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'research_consumer_intent_invalid')
+      throw new EngineError('research_plan_subject_invalid', 'The packet needs a complete exact v7 plan subject');
+    throw error;
+  }
+}
+export function planQuestionContract(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>, subject: V7PlanSubject) {
+  requireCondition(isDiscoveryV7Draft(draft.value) && question.value.spec.field === 'plan'
+    && question.value.status === 'answered' && canonical(question.value.answer) === canonical(subject.planAnswer),
+    'research_plan_subject_invalid', 'The plan subject must belong to its exact accepted Question basis');
+  let selected;
+  try { selected = provePlanQuestions(store, draft, subject.planAnswer).find(q => q.planQuestionId === subject.planQuestionId); }
+  catch (error) {
+    if (error instanceof EngineError && error.code === 'plan_questions_invalid')
+      throw new EngineError('research_plan_subject_invalid', 'The packet plan answer has no valid acceptance proof');
+    throw error;
+  }
+  requireCondition(selected, 'research_plan_subject_invalid', 'The plan question is not in the accepted plan');
+  const refSchema = { type: 'object', additionalProperties: false, required: ['id', 'revision', 'hash'],
+    properties: { id: {type:'string'}, revision: {type:'integer', minimum:1}, hash: {type:'string'} } };
+  const schema = { oneOf: [
+    { type:'object', additionalProperties:false, required:['type','contract','value'], properties:{
+      type:{const:'submitted'}, contract:{const:DISCOVERY_CLAIMS_CONTRACT},
+      value:{type:'object', additionalProperties:false, required:['claims'], properties:{claims:{type:'array',items:{type:'object'}}}} } },
+    ...['refused','impossible'].map(type => ({type:'object', additionalProperties:false,
+      required:['type','code','evidence','text'], properties:{type:{const:type},code:{enum:[...V7_ATTEMPT_END_CODES]},
+        evidence:{type:'array',items:refSchema},text:{type:'string',minLength:1}}})),
+    {type:'object',additionalProperties:false,required:['type','of'],properties:{type:{const:'duplicate'},of:refSchema}}
+  ] };
+  return { ...structuredClone(selected.question as Record<string, any>), id: subject.planQuestionId, schema };
+}
+
 /** Project-wide foundation, not the current question's small response contract.
  * These fields never travel again as an implicit part of a continuation. */
 export const FOUNDATION_FIELDS = ['core','map','researchScope','mapStatus','allowedConsumers','gapFields',
   'fields','sourceCatalogue','inventory','catalogue','prerequisites','operationMap','objective','problem','actors',
   'constraints','specificationConstraints','concept','requirements','nodes','files','records','value','previousProposal','currentProposal'] as const;
 // This row serializes attempts; successful model-call records establish delivery.
-interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number }
+interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject }
 export interface ContinuationPacketState {
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
-  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string;
+  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null;
 }
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string): ContinuationPacketState {
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
     'continuation_question_missing','Every role invocation requires its exact question and draft');
-  const id=`continuation-state:${hashJson([projectId,questionId,purpose,actor])}`;
+  const id=`continuation-state:${hashJson(subject ? [projectId,subject,purpose,actor] : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
   const calls=store.list<ModelCall>('model-call').filter(c=>c.value.projectId===projectId
-    && c.value.questionId===questionId && c.value.purpose===purpose && c.value.requested.actor===actor)
+    && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor)
     .sort((a,b)=>a.value.startedAt-b.value.startedAt||a.id.localeCompare(b.id));
   requireCondition(!calls.some(c=>c.value.status==='running'),'continuation_call_active',
     'This question/role has an unfinished invocation; recover its actual outcome before another dispatch');
   if(state) requireCondition(state.kind==='continuation-state' && state.value.question===questionId
-    && state.value.projectId===projectId && state.value.purpose===purpose && state.value.actor===actor,
+    && sameSubject(packetPlanSubject(state.value),subject) && state.value.projectId===projectId && state.value.purpose===purpose && state.value.actor===actor,
     'continuation_foreign','Continuation state belongs to another role/question');
   if(state) requireCondition(typeof state.value.activeCall==='string'&&calls.some(c=>c.id===state.value.activeCall),
     'continuation_call_missing','The serialized attempt has no matching call; repair its outcome before continuation');
@@ -43,15 +82,16 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   for(const ref of archives){
     const original=isRef(ref)?store.get<any>(ref.id,ref.revision):null;
     requireCondition(original?.kind==='research-context'&&original.hash===ref.hash&&original.value?.projectId===projectId
-      &&isRef(original.value.question)&&original.value.question.id===questionId,'continuation_foreign','Delivered foundation belongs to another question');
+      &&isRef(original.value.question)&&original.value.question.id===questionId
+      &&sameSubject(packetPlanSubject(original.value),subject),'continuation_foreign','Delivered foundation belongs to another question');
   }
   return {initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
-    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor};
+    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject};
 }
 export function continuationDispatch(state: ContinuationPacketState, callId: string): { writes: Write[]; guards: ReadGuard[] } {
   return {writes:[{id:state.id,kind:'continuation-state',expected:state.state?.revision??0,
     value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,
-      activeCall:callId,attempts:state.attempts+1}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards]};
+      activeCall:callId,attempts:state.attempts+1,...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards]};
 }
 
 export const CONTINUATION_INSTRUCTION = 'This is an independent stateless continuation, not a remembered conversation. The question field MUST equal subject.question.id, never the prompt text. Use the supplied question contract, saved conclusions, current piece and exact original addresses. Never infer omitted context to be empty or irrelevant. The complete project foundation was transported earlier and is not repeated. If a specific condition is missing, request a small child pointer via read_context; never request the entire foundation again. Saved conclusions/checkpoints are unassessed proposals, not evidence. Preserve exceptions, conflicting findings and source citations. Follow the current phase protocol and advance only the supplied cursor. Do not reread already paid files or request a reader to extract them again.';
@@ -120,12 +160,12 @@ export function selectedQuestion(question: Revision<Question>, body: Record<stri
 
 export function continuationMetadata(state: ContinuationPacketState, archive: Ref, store: Store) {
   const foundation = state.basis ?? archive;
-  const original = store.get<{ projectId: string; draft: Ref; question: Ref; body: Record<string, unknown> }>(foundation.id, foundation.revision);
+  const original = store.get<{ projectId: string; draft: Ref; question: Ref; body: Record<string, unknown>; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
   requireCondition(original?.kind === 'research-context' && original.hash === foundation.hash
     && original.value?.projectId === state.projectId && isRef(original.value.draft) && original.value.draft.id === state.draft.id
-    && isRef(original.value.question) && original.value.question.id === state.question.id && original.value.body && typeof original.value.body === 'object' && !Array.isArray(original.value.body),
+    && isRef(original.value.question) && original.value.question.id === state.question.id && sameSubject(packetPlanSubject(original.value),state.subject) && original.value.body && typeof original.value.body === 'object' && !Array.isArray(original.value.body),
   'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
-  return {kind:state.initial?'initial':'continuation',role:state.purpose,question:state.question.id,
+  return {kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
     foundation,current:archive,previousCalls:state.priorCalls,
     foundationPointers:contextSections(original.value.body, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
 }

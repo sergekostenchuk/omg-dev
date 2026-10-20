@@ -31,6 +31,8 @@ export interface ModelCall {
   packet?: { archive: Ref; kind: string; maxChars: number };
   budget?: { segment: Ref; groups: string[]; estimate: import("./research-budget.js").CallEstimate };
   questionId?: string | null;
+  /** Exact accepted plan edition for a v7 plan-question call. */
+  planAnswer?: Ref;
   /** The producer of the call: its consumer intent (analyst/planner/escalation) or its assessment application. */
   consumerIntent?: Ref; assessmentApplication?: Ref;
   startedAt: number; finishedAt: number | null; status: "running" | "succeeded" | "failed";
