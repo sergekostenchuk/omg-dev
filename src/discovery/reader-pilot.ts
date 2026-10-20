@@ -8,6 +8,10 @@ import { isRef, reference, stageId, type Ref, type StageArtifact } from "../pipe
 import { canonical } from "../canonical.js";
 import type { ModelCall } from "../runtime/model-usage.js";
 
+export interface V7PlanningSettings {
+  contract: "v7-plan-planning/v1"; maxRequestChars: number; maxRounds: number;
+}
+
 export interface ReaderPilotSettings {
   experimental: true; active: boolean; stopAfter: "L2";
   reader: RoleBinding; agentCommand: Command;
@@ -20,6 +24,7 @@ export interface ReaderPilotSettings {
   contextLimits?: { maxLookups: number; maxChars: number };
   physicalLimits?: { maxRequestChars: number; maxReplyChars: number; basis: string };
   planning?: { fields: string[]; maxRequestChars: number; maxRounds: number };
+  v7Planning?: V7PlanningSettings;
   unknownReserves?: { call: Ref; tokens: number }[];
   execution?: ExecutionAdmissionSettings;
 }
@@ -58,6 +63,9 @@ readerPilotSchema.properties['contextLimits'] = object({ maxLookups: positive, m
 readerPilotSchema.properties['physicalLimits'] = object({ maxRequestChars: positive, maxReplyChars: positive, basis: text });
 readerPilotSchema.properties['planning'] = object({ fields: { type: "array", minItems: 1, uniqueItems: true, items: text },
   maxRequestChars: positive, maxRounds: positive });
+const v7PlanningSchema = object({ contract: { const: "v7-plan-planning/v1" },
+  maxRequestChars: positive, maxRounds: positive });
+readerPilotSchema.properties['v7Planning'] = v7PlanningSchema;
 readerPilotSchema.properties['callTimeoutMs'] = { type: "integer", minimum: 1, maximum: 3_000_000 };
 const executionSchema = object({ plan: object({ id: text, revision: positive, hash: { type: "string", pattern: "^[a-f0-9]{64}$" } }),
   roleLaunches: positive, softInput: positive, roleReserve: object({ implement: positive, review: positive }),
@@ -67,6 +75,10 @@ executionSchema.properties['taskCorrections'] = { type: "array", minItems: 1,
 executionSchema.properties['taskClarifications'] = { type: "array", minItems: 1, items: object({ task: text, text }) };
 readerPilotSchema.properties['execution'] = executionSchema;
 const valid = new Ajv({ allErrors: true }).compile<ReaderPilotSettings>(readerPilotSchema);
+const validV7Planning = new Ajv({ allErrors: true }).compile<V7PlanningSettings>(v7PlanningSchema);
+function validSettings(settings: unknown): settings is ReaderPilotSettings {
+  return valid(settings) && (!Object.hasOwn(settings, 'v7Planning') || validV7Planning(settings.v7Planning));
+}
 const validExecution = new Ajv({ allErrors: true }).compile<ExecutionAdmissionSettings>(executionSchema);
 
 /**
@@ -107,7 +119,7 @@ export function prepareReaderPilot(store: Store, environments: Environments, pro
   if (execution !== undefined && !validExecution(execution))
     throw new EngineError("execution_admission_invalid", "An execution admission needs its exact plan, budget, reserves and correction limit",
       { target: project, field: "execution", errors: validExecution.errors });
-  if (!valid(settings)) throw new EngineError("reader_pilot_invalid", "The experiment requires explicit roles, limits and its L2 stop boundary", valid.errors);
+  if (!validSettings(settings)) throw new EngineError("reader_pilot_invalid", "The experiment requires explicit roles, limits and its L2 stop boundary", valid.errors ?? validV7Planning.errors);
   const env = environments.get(project).value;
   requireCondition(settings.reader.actor !== env.implementer.actor && settings.reader.actor !== env.reviewer.actor,
     "reader_role_invalid", "The reader must have its own identity and cannot accept its extraction");
@@ -140,7 +152,7 @@ export function readerPilot(store: Store, project: string): Revision<ReaderPilot
   if (!record) return null;
   requireCondition(record.kind === "reader-pilot" && record.value.projectId === project, "reader_pilot_invalid", "Foreign pilot configuration");
   const { projectId: _projectId, ...settings } = record.value;
-  requireCondition(valid(settings), "reader_pilot_invalid", "Stored pilot configuration is invalid");
+  requireCondition(validSettings(settings), "reader_pilot_invalid", "Stored pilot configuration is invalid");
   return record.value.active ? record : null;
 }
 
