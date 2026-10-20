@@ -12,7 +12,7 @@ import type { OmInputRecord } from "../src/om/input.js";
 import { readFeasibility, type OmFeasibility } from "../src/om/feasibility.js";
 import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
-import { openSeries, readCompletionBinding, resumeSeries, seriesRequestOf, ownerDecisionNamespace, OWNER_DECISION_KIND, type AnyRepairSeries, type CompletionOwner } from "../src/om/series.js";
+import { readCompletionBinding, resumeSeries, seriesRequestOf, ownerDecisionNamespace, OWNER_DECISION_KIND, type AnyRepairSeries, type CompletionOwner } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
@@ -31,7 +31,7 @@ import { continuePass, startPass } from "../src/om/run-driver.js";
 // of the snapshot, the answer is applied, and the next works — now deciding the test the transition reaches — pass G5 on
 // the same snapshot. The question is asked once; a repeat of the B1 transition writes nothing.
 import { readinessPending, writeReadinessInput, type ReadinessTransition } from "../src/om/input.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor, sameEnd, managedRefusedCycle } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor, sameEnd, managedAwaitOwner } from "./om-run-fixture.js";
 
 test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep their canonical order without a repeat, and a malformed end is an integrity refusal", async t => {
   const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
@@ -111,18 +111,42 @@ test("25 7 C61 №1749 H1 works of several blocks: each pays once, the full G4b 
 });
 
 test("H1.2 R7 C25 an owner-control whose question is no longer open holds nothing: the line's work on today's question goes on", async t => {
-  const f = runFixture(t, ["encoding"], "executed", true);
-  const b = f.bases("h12-resolved"), request = f.request(b);
-  const address = { project, block: "garden-consume-block", line: 1 };
-  ok(openSeries(f.store, { ...address, slice: "h12-resolved", predecessor: null, basis: null }));
-  // The earlier managed attempt of the line was refused; its close saved no waiting diagnostic and it holds nothing for
-  // today's work on the same routes.
-  await managedRefusedCycle(f, b, "garden-consume-block", 1);
+  const f = runFixture(t, [], "stages", false, false, true);
+  const b = f.bases("h12-resolved");
+  const routes = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!;
+  // The joined input-field batch of the block's contract — nodes, state and the criterion's checkKind — are the questions
+  // a model may lawfully send to the owner (every 'answer' field of a pass question is the model's own to decide).
+  const joined = routes.value.batches.filter(batch =>
+    batch.items.some(row => row.field === "checkKind" && row.consumers.includes("garden-consume-block")));
+  assert.ok(joined.length === 1, "The cold input leaves the joined contract batch open");
+  // Attempt 1 of the line works by a real managed cycle: its model call asked the owner and the attempt ended
+  // awaiting-owner — the close keeps its waiting diagnostic, aimed at questions still open today.
+  await managedAwaitOwner(f, b, "garden-consume-block", 1, joined);
+  const closing = f.store.list<{ waiting: unknown[] }>("om-completion-close").at(-1)!;
+  assert.ok(closing.value.waiting.length > 0, "The close keeps a real owner-control diagnostic of the wait");
+  // Meanwhile B1 decides every field of the joined batch (a lawful decision of another producer): the waited questions
+  // leave today's open routes, while the line's other batches stay open.
+  const input = f.store.get<OmInputRecord>(`om-input:${project}`)!;
+  ok(writeAddressing(f.store, { project, input: reference(input), graph: f.graph,
+    decisions: joined[0]!.items.map(item => ({ pending: structuredClone(inputDecisionWrite({ project,
+      input: reference(input), graph: f.graph, layers: [], decision: { target: item.target,
+        field: item.field as "nodes" | "state" | "checkKind",
+        value: item.field === "nodes" ? ["garden-produce-block", "garden-consume-block"]
+          : item.field === "checkKind" ? "test"
+          : { writer: "garden-produce-block", authority: "garden-user", rollback: "garden-produce-block" } } })) as Write })) }));
+  const request = f.request(f.bases("h12-resolved-2"));
   ok(startRun(f.store, { project }));
-  const driven = await driveTo(f, request, "open", 10);
-  assert.deepEqual(driven.performed, ["open"], "A new attempt of the line opens for today's question; the old one holds nothing");
-  assert.equal(blockSeries(f).value.attempts.length, 2);
-  assert.notEqual(ok(readRun(f.store, { project }))!.value.state.phase, "unable");
+  // The line's work on today's questions goes on: the independent fill batches get their real node answers, and the
+  // consume line — its earlier wait held nothing once its questions were gone — opens a new managed attempt.
+  let state = ok(await advanceRun(f.store, request)).record.value.state;
+  for (let index = 0; index < 40 && blockSeries(f).value.attempts.length < 2; index++) {
+    assert.notEqual(state.phase, "unable", JSON.stringify(state));
+    if (state.phase === "step" && state.step.action === "cycle")
+      f.push(nodeAnswer(f, state.step as Parameters<typeof nodeAnswer>[1]) as Record<string, unknown>);
+    state = ok(await advanceRun(f.store, request)).record.value.state;
+  }
+  assert.equal(blockSeries(f).value.attempts.length, 2, "A new attempt opens; the wait of a gone question holds nothing");
+  assert.notEqual(state.phase, "unable");
 });
 
 test("25 R4 №1770 H1 N2 mixed: A's assembly waits open for the frame; B's negative attempt closes by its own G7 meanwhile, nothing is paid twice", async t => {

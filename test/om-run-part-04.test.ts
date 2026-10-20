@@ -24,7 +24,7 @@ import { COMPLETION_REUSE_KIND, type CompletionReuse } from "../src/om/model-cal
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, passRows, unavailableReview, managedRefusedCycle } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, passRows, unavailableReview, eraRefusal, eraRefusedClose } from "./om-run-fixture.js";
 
 test("H1.2 R8 R4 C31 a stopped line whose owner has no batch today keeps its barrier: its reviewed stop on the second rung ends the pass, and nothing is paid for that owner", async t => {
   const f = runFixture(t, [], "executed");
@@ -267,18 +267,20 @@ test("G6 В3 a paid assembly ended by its area's B1 is reused while its area's q
 test("H1.2 R6 R6a 12 21 H1 stop and origin holds together: the origin route goes first (A6 on the exact hold), no attempt opens, an unestablished origin ends the pass without paying the other holds or the stop", async t => {
   const f = runFixture(t, ["encoding"], "executed", true);
   const b = f.bases("h1-hold"), request = f.request(b);
-  // Three managed attempts of the block were refused with a refusal of unknown origin: A3 stopped the
-  // series and G7 raised a hold for each.
+  // Three earlier standalone attempts of the block were refused with a refusal of unknown origin: A3 stopped the
+  // series and G7 raised a hold for each (the earlier mode, read by its own contract).
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h1-hold", predecessor: null, basis: null }));
+  const goal = { key: "h1-hold-goal", questions: ["Address one contract"], result: "A supported contract" };
   const holds: Ref[] = [];
-  for (const attempt of [1, 2]) await managedRefusedCycle(f, b, "garden-consume-block", attempt);
-  // A standing hold refuses the next open of the line, so the three unknown origins are claimed by the last close.
-  const closed = await managedRefusedCycle(f, b, "garden-consume-block", 3, ["h1-origin-1", "h1-origin-2", "h1-origin-3"]);
-  holds.push(...closed.holds);
+  for (const attempt of [1, 2, 3]) {
+    const row = eraRefusal(f.store, `h1-origin-${attempt}`, goal.key,
+      { name: "artifact_missing", stage: "layer-check", subject: `artifact:fixture-${attempt}`, sources: [] });
+    holds.push(...eraRefusedClose(f.store, address, attempt, goal, row).holds);
+  }
   assert.ok(blockSeries(f).value.stop, "A3 stopped the series");
   assert.ok(holds.length > 0, "G7 raised the origin holds");
-  f.push({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage });
+  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }]);
   ok(startRun(f.store, { project }));
   const driven = await ends(f, request, 10);
   assert.deepEqual(driven.performed, ["analyze"], "The origin route first; nothing else of the line is paid once a hold stands unlifted");

@@ -40,8 +40,7 @@ import { readRoutes, type RouteBatch, type RoutesRecord } from "../src/om/routes
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
 import { type ModelCallOutcome, type ModelCycleRecord, readModelCall, runModelCall, runModelCycle, readCompletionWorkAt, writeCompletionCessation } from "../src/om/model-call.js";
-import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines, type GapLinesRecord } from "../src/om/gap-lines.js";
-import { writeOmObligations } from "../src/om/obligations.js";
+import { gapLineExpectedResult, gapLineKey } from "../src/om/gap-lines.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { advanceRun as currentAdvanceRun, cycleStartOf, readRun, startRun, runId, type RunRequest, type RunRecord, type RunResult, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases, type RunBases } from "../src/om/run-bases.js";
@@ -951,37 +950,55 @@ function managedPlan(routes: Revision<RoutesRecord>, block: string, batches?: re
     result: gapLineExpectedResult(project, selected[0]!.items[0]!.target, selected[0]!.items[0]!.field) };
   return { goal, completion: { routes: reference(routes), batches: selected.map(batch => batch.id).sort() } };
 }
-/** LG05: one refused claim of a managed close — `hold` names an unknown origin G7 raises its hold for, otherwise a feasibility origin routed to conditions. */
-function refusedOutcome(store: Store, name: string, goal: string, env: Ref, hold = false) {
+/**
+ * LG05: a refusal row of the earlier mode — one a gate of that era wrote and A2 journalled, and G7 cannot place its
+ * origin (no class, so the close raises a hold). No refusal producer of the current era writes such an origin: E4 rows
+ * always carry `model-call:*` (conditions/proposal), E5 `fact-assessment` (proposal), G5 `atomicity` names one proposal
+ * per row, and a G4b row is never a counted refusal — an unplaceable origin exists only on rows of the earlier mode,
+ * which is why this record keeps its era form, read by its own contract (like stoppedBlockLine).
+ */
+function eraRefusal(store: Store, name: string, goal: string, origin: { name: string; stage: string; subject: string; sources: readonly unknown[] }) {
   const source = store.write({ id: `${unitRefusalNamespace(project)}${name}`, kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "G3", refusals: [{ code: `fixture_${name}`, goal, remedy: "Identify the exact origin",
-      origin: hold ? { name: "workspace_unavailable", stage: "feasibility", subject: "workspace", sources: [] }
-        : { name: "environment_unavailable", stage: "feasibility", subject: "environment", sources: [{ role: "environment", ref: env }] } }] } });
-  const row = ok(recordRefusal(store, { project, source: reference(source) })).value.rows.find(entry => entry.source.id === source.id)!;
-  return { reason: "refused" as const, accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] };
+    value: { gate: "G3", refusals: [{ code: `unrecognized_fixture_refusal`, goal, remedy: "Identify the exact origin", origin }] } });
+  return ok(recordRefusal(store, { project, source: reference(source) })).value.rows.find(entry => entry.source.id === source.id)!;
+}
+/** The close of an earlier-mode attempt refused by the refusal `eraRefusal` journalled — G7 raises a hold of its unknown origin. */
+function eraRefusedClose(store: Store, address: { project: string; block: string; line: number }, attempt: number, goal: { key: string; questions: string[]; result: string }, row: { id: string; code: string; goal: string }) {
+  ok(beginAttempt(store, { ...address, attempt, goal }));
+  return ok(closeAttempt(store, { ...address, attempt, outcome: { reason: "refused", accepting: [], cancelling: [],
+    refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
 }
 /**
- * LG05: one managed attempt of `block` worked and refused by a real cycle — its root packet asked, the model answered
- * cannot_answer and G7 closed the attempt by the derived claim. `holds` names the unknown origins the claim carries,
- * for which the close raises its holds (a standing hold refuses the next open, so several holds are raised by one close).
+ * LG05: one managed attempt of `block` on exactly these batches, whose model call asked the owner (`need_owner`) and
+ * whose close ended `awaiting-owner` — a real cycle by the current producers (open, packet, call, claim, close), whose
+ * close record keeps its waiting diagnostic for owedBy.
  */
-async function managedRefusedCycle(f: Fixture, bases: RunBases, block: string, attempt: number, holds: readonly string[] = []) {
+async function managedAwaitOwner(f: Fixture, bases: RunBases, block: string, attempt: number,
+  batches: readonly RouteBatch[], worked: readonly RouteBatch[] = []) {
   const request = f.request(bases), routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!;
-  const batch = routes.value.batches.find(item => item.items.every(row => row.consumers.includes(block)))!;
-  const { goal, completion } = managedPlan(routes, block, [batch]), address = { project, block, line: 1 };
+  const { goal, completion } = managedPlan(routes, block, [...batches, ...worked]), address = { project, block, line: 1 };
+  // The line is opened only when absent — an earlier era attempt of it stays the head the managed attempt follows.
+  if (!f.store.list<RepairSeries>("repair-series").some(row => (row.value as { block?: string }).block === block))
+    ok(openSeries(f.store, { ...address, slice: "managed-await", predecessor: null, basis: null }));
   const opened = ok(openAttempt(f.store, { ...address, attempt, goal, completion }));
-  const packet = ok(writeQuestionPacket(f.store, { project, routes: bases.routes, batch: batch.id, environment: request.dispatch.config,
-    attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record;
-  const scenario = join(f.root, "scenario.json");
-  const steps = (existsSync(scenario) ? JSON.parse(readFileSync(scenario, "utf8")).steps : []) as unknown[];
-  steps.splice(f.sent().length, 0, { research: { protocol: "$answerProtocol", requestId: "$requestId",
-    questionIds: (packet.value.packet as { questions: { id: string }[] }).questions.map(row => row.id),
-    action: "cannot_answer", reason: "The requested information is unavailable" }, usage });
+  // Every packet is registered first; then all scripted replies land in the file at once and the calls are paid in
+  // order — the worked roots by their node answers, the asked root by need_owner.
+  const packets = [...worked, batches[0]!].map(batch => ok(writeQuestionPacket(f.store, { project, routes: bases.routes,
+    batch: batch.id, environment: request.dispatch.config,
+    attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record);
+  const replies = [...packets.slice(0, worked.length).map(saved => nodeAnswer(f, { request: { packet: reference(saved) } })),
+    { research: { protocol: "$answerProtocol", requestId: "$requestId",
+      questionIds: (packets.at(-1)!.value.packet as { questions: { id: string }[] }).questions.map(row => row.id),
+      action: "need_owner", reason: "The owner must settle this question", decision: "Decide it" }, usage }];
+  const steps = (existsSync(join(f.root, "scenario.json")) ? JSON.parse(readFileSync(join(f.root, "scenario.json"), "utf8")).steps : []) as unknown[];
+  steps.splice(f.sent().length, 0, ...replies);
   f.steps(steps as Record<string, unknown>[]);
-  ok(await runModelCall(f.store, { project, packet: reference(packet), dispatch: request.dispatch, role: "implementer" }));
-  const claimed = { reason: "refused" as const, accepting: [], cancelling: [],
-    refusals: holds.map(name => refusedOutcome(f.store, name, goal.key, request.dispatch.config, true).refusals[0]!) };
-  const claim = ok(prepareManagedClaim(f.store, { ...address, attempt, outcome: claimed }));
+  // A node-expansion root closes only through its cycle (the paid part answers are proved by their exact assembly);
+  // the asked input-field root is the one E4 call that ends waiting.
+  for (const saved of packets.slice(0, worked.length))
+    ok(await runModelCycle(f.store, { project, packet: reference(saved), dispatch: request.dispatch, role: "implementer" }));
+  ok(await runModelCall(f.store, { project, packet: reference(packets.at(-1)!), dispatch: request.dispatch, role: "implementer" }));
+  const claim = ok(prepareManagedClaim(f.store, { ...address, attempt, outcome: { reason: "awaiting-owner", accepting: [], cancelling: [], refusals: [] } }));
   return ok(closeAttempt(f.store, { ...address, attempt, outcome: claim.outcome }));
 }
 /** A managed attempt of `block` planned on exactly this batch — the plan an earlier pass saved (the reviewer's helper, №2221). */
@@ -1252,26 +1269,10 @@ async function g62Rejection(t: test.TestContext, chain: boolean, prior = false) 
   const consumeAddress = { project, block: "garden-consume-block", line: 1 };
   if (prior) {
     ok(openSeries(f.store, { ...consumeAddress, slice: "g62-prior", predecessor: null, basis: null } as Parameters<typeof openSeries>[1]));
-    const batch = f.routes.value.batches.find(item => item.items.every(row => row.consumers.includes("garden-consume-block")))!;
-    const { goal, completion } = managedPlan(f.routes, "garden-consume-block", [batch]);
-    // Each prior attempt is a real managed one: its works packet asks with the exact D2 lines and D7 ledger of the
-    // routes' own D1 scope, the one producer the cycle reaches fails, and G7 closes the attempt on its diagnostic.
-    const scope = f.routes.value.request.gaps as never;
+    const goal = { key: "g62-prior", questions: ["Address one contract"], result: "A supported contract" };
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const opened = ok(openAttempt(f.store, { ...consumeAddress, attempt, goal, completion } as Parameters<typeof openAttempt>[1]));
-      const latest = f.store.get<GapLinesRecord>(gapLinesId(project));
-      const lines = ok(writeGapLines(f.store, { project, previous: latest ? reference(latest) : null,
-        pass: (latest?.value.request.pass ?? 0) + 1, gaps: scope, closures: [] }));
-      const d7 = ok(writeOmObligations(f.store, { project, gaps: scope, lines: reference(lines), assignments: [] }));
-      const packet = ok(writeQuestionPacket(f.store, { project, routes: reference(f.routes), batch: batch.id,
-        environment: f.request.dispatch.config, attempt: { series: reference(opened), ordinal: attempt },
-        previous: [], works: { producer: reference(d7.producer), ledger: reference(d7.record) } })).record;
-      steps.push({ rawStdout: "", exitCode: 1, usage });
-      writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
-      ok(await runModelCycle(f.store, { project, packet: reference(packet), dispatch: f.request.dispatch, role: "implementer" }));
-      const claim = ok(prepareManagedClaim(f.store, { ...consumeAddress, attempt,
-        outcome: { reason: "refused" as const, accepting: [], cancelling: [], refusals: [] } } as Parameters<typeof prepareManagedClaim>[1]));
-      ok(closeAttempt(f.store, { ...consumeAddress, attempt, outcome: claim.outcome } as Parameters<typeof closeAttempt>[1]));
+      ok(beginAttempt(f.store, { ...consumeAddress, attempt, goal } as Parameters<typeof beginAttempt>[1]));
+      ok(closeAttempt(f.store, { ...consumeAddress, attempt, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as Parameters<typeof closeAttempt>[1]));
     }
   }
   ok(startRun(f.store, { project }));
@@ -1690,5 +1691,5 @@ async function policyDoor(t: test.TestContext, owner: boolean) {
 // always did under the new code — its rejection asks no readiness question and never stands on a refusal of the era.
 const AT1_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
 
-export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, managedPlan, refusedOutcome, managedRefusedCycle, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor, AT1_BASE };
+export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, managedPlan, eraRefusal, eraRefusedClose, managedAwaitOwner, ownerAnswers, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor, AT1_BASE };
 export type { Fixture, Verdict, Lp5State, Lp6Op, Reopened };

@@ -18,7 +18,7 @@ import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts, managedRefusedCycle} from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts, eraRefusal, eraRefusedClose } from "./om-run-fixture.js";
 
 test("3 8 25 C23 C17 C27 R5 H1.1 on its own new bases the pass works the block through MC1, E5 and G4b to one G7 close, then applies the accepted facts", async t => {
   const f = runFixture(t, undefined, "executed");
@@ -143,10 +143,13 @@ test("H1.2 R6 an origin the review establishes lifts its own hold and the pass g
   const b = f.bases("h12-established"), request = f.request(b);
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h12-established", predecessor: null, basis: null }));
-  const closed = await managedRefusedCycle(f, b, "garden-consume-block", 1, ["h12-workspace"]);
+  const goal = { key: "h12-established-goal", questions: ["Address one contract"], result: "A supported contract" };
+  const row = eraRefusal(f.store, "h12-workspace", goal.key,
+    { name: "workspace_unavailable", stage: "feasibility", subject: "workspace", sources: [] });
+  const closed = eraRefusedClose(f.store, address, 1, goal, row);
   assert.equal(closed.holds.length, 1, "G7 raised one hold of unknown origin");
-  f.push({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null,
-    origin: { class: "conditions", basis: [{ role: "environment", ref: request.dispatch.config }] } }, usage });
+  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null,
+    origin: { class: "conditions", basis: [{ role: "environment", ref: request.dispatch.config }] } }, usage }]);
   ok(startRun(f.store, { project }));
   const driven = await driveTo(f, request, "open", 10);
   assert.deepEqual(driven.performed, ["analyze", "open"], "The review lifts its own hold and the next attempt opens on the same line");
@@ -270,17 +273,20 @@ test("4 9 C21 H1 a lost assessor after its claim is recovered the same way: the 
 test("4 9 12 21 C21 №1814 H1 A6 on an origin hold keeps its saved request through a live executor, its loss, a new Environment revision and a restart", async t => {
   const f = runFixture(t, ["encoding"], "executed", true);
   const b = f.bases("h1-a6-hold"), request = f.request(b);
-  // Three managed attempts refused with a refusal of unknown origin: A3 stopped the series, G7 raised holds.
+  // Three earlier standalone attempts refused with a refusal of unknown origin: A3 stopped the series, G7 raised holds.
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h1-a6-hold", predecessor: null, basis: null }));
-  for (const attempt of [1, 2]) await managedRefusedCycle(f, b, "garden-consume-block", attempt);
-  await managedRefusedCycle(f, b, "garden-consume-block", 3, ["h1-a6-origin-1", "h1-a6-origin-2", "h1-a6-origin-3"]);
-  const paid = f.sent().length;
+  const goal = { key: "h1-a6-hold-goal", questions: ["Address one contract"], result: "A supported contract" };
+  for (const attempt of [1, 2, 3]) {
+    const row = eraRefusal(f.store, `h1-a6-origin-${attempt}`, goal.key,
+      { name: "artifact_missing", stage: "layer-check", subject: `artifact:fixture-${attempt}`, sources: [] });
+    eraRefusedClose(f.store, address, attempt, goal, row);
+  }
   ok(startRun(f.store, { project }));
   const analyzing = await until(f, request, "analyze", 10);
   assert.ok((analyzing.request as { hold: unknown }).hold !== null, "A6 reviews the exact hold first");
   await a6Survives(t, f, request, analyzing, () => f.request(b));
-  assert.equal(f.sent().length, paid, "The saved A6 request ends its held call; the pass itself sends nothing");
+  assert.equal(f.sent().length, 0);
 });
 
 test("MP2 (№2968 rows 1, 3, 4, 5) through the pass a block designs its producer operation first; the consumer's brief carries the producer's finished work with its write paths; the producer's own brief has the explicit empty set; a saved step goes on before any rank", async t => {
