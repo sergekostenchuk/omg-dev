@@ -252,6 +252,29 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // DRS1a2: the v2 intent is the v1 form without cursor.context — every other
   // field keeps the structural scan (preparation, guards, subject, capacity data).
   { kind: "research-consumer-intent", contract: "research-consumer-intent/v2", data: capacityData(["cursor", "resultCapacity"]) },
+  // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
+  { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
+    ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
+    ["questions", INDEX, "applications", INDEX], ["questions", INDEX, "reason", "grounds", INDEX]] },
+  { kind: "discovery-variant", contract: "discovery-variant/v1", data: [["proposal"]], refs: [
+    ["draft"], ["snapshot"], ["origin", "intent"], ["origin", "call"], ["origin", "response"],
+    ["criteria", KEY, "grounds", INDEX], ["criteria", KEY, "quantity", "grounds", INDEX]] },
+  { kind: "discovery-variant-set", contract: "discovery-variant-set/v1", data: [], refs: [
+    ["draft"], ["snapshot"], ["origin", "intent"], ["origin", "call"], ["origin", "response"],
+    ["members", INDEX], ["recommendation", "member"]] },
+  { kind: "discovery-variant-none", contract: "discovery-variant-none/v1", data: [], refs: [
+    ["draft"], ["snapshot"], ["origin", "intent"], ["origin", "call"], ["origin", "response"], ["reasons", INDEX, "grounds", INDEX]] },
+  { kind: "discovery-variant-owner-decision", contract: "discovery-variant-owner-decision/v1", data: [], refs: [
+    ["draft"], ["set"], ["mode"], ["expectedSelection"], ["previous"], ["outcome", "member"], ["authority", "grant"], ["authority", "session"]] },
+  { kind: "discovery-variant-model-decision", contract: "discovery-variant-model-decision/v1", data: [], refs: [
+    ["draft"], ["set"], ["mode"], ["expectedSelection"], ["previous"], ["outcome", "member"],
+    ["origin", "intent"], ["origin", "call"], ["origin", "response"]] },
+  { kind: "discovery-variant-state", contract: "discovery-variant-state/v1", data: [], refs: [
+    ["draft"], ["mode"], ["result"], ["set"], ["decision"], ["previous"]] },
+  { kind: "discovery-variant-scope", contract: "discovery-variant-scope/v1", data: [], refs: [
+    ["draft"], ["set"], ["member"], ["decision"], ["mode"]] },
+  { kind: "discovery-variant-handoff", contract: "discovery-variant-handoff/v1", data: [], refs: [
+    ["draft"], ["frame"], ["plan"], ["snapshot"], ["result"], ["set"], ["decision"], ["scope"], ["choice"], ["stop", "grounds", INDEX]] },
   { kind: "om-answer-closure", contract: "om-answer-closure/v1", data: [],
     refs: [["answer"], ["guards", INDEX], ["external", INDEX, "ref"], ["references", INDEX]] },
   { kind: "discovery-acceptance-act", contract: "discovery-acceptance-act/v1", data: [],

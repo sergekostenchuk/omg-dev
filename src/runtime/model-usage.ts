@@ -33,6 +33,8 @@ export interface ModelCall {
   questionId?: string | null;
   /** Exact accepted plan edition for a v7 plan-question call. */
   planAnswer?: Ref;
+  /** DR4: structural carrier; the saved intent, not this field alone, proves the producer. */
+  variantSubject?: import('../discovery/discovery-variants.js').VariantSubject;
   /** The producer of the call: its consumer intent (analyst/planner/escalation) or its assessment application. */
   consumerIntent?: Ref; assessmentApplication?: Ref;
   startedAt: number; finishedAt: number | null; status: "running" | "succeeded" | "failed";
