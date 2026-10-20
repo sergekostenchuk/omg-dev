@@ -16,6 +16,7 @@ import { validateGraph } from "../src/graph/validate.js";
 import { reference, type StageArtifact } from "../src/pipeline/contracts.js";
 import { delivered, refused, type OmResult } from "../src/om/refusal.js";
 import { readAcceptedFrame } from "../src/om/frame-accept.js";
+import { flowKey, representativeId, workAnchorId } from "../src/om/frame-obligations.js";
 import type { OmAcceptedFrame, LayerBasis } from "../src/om/layer-basis.js";
 import { readHandoff } from "../src/om/handoff.js";
 import type { OmFeasibility } from "../src/om/feasibility.js";
@@ -38,8 +39,15 @@ function assertComposes(graph: Graph): void {
   assert.equal(canonical(l3), canonical(graph));
 }
 
+function sleepingGardenAnchor(graph: Graph): string {
+  const connector = graph.connectors.find(item => item.id === "garden-flow")!;
+  const upper = connector.bindings.find(binding => binding.level === 2 && binding.anchor === null && binding.producer.port === "out");
+  assert.ok(upper);
+  return workAnchorId(connector.id, flowKey(upper), { node: "garden-produce-work", port: "out" });
+}
+
 test("the standard garden fixture has accepted stages, derived layers and compiler-valid artifact receipts", async t => {
-  const fixture = await createOmFixture(t);
+  const fixture = await createOmFixture(t, "standard", "garden", { mode: "executed" });
   assert.deepEqual(validateGraph(fixture.graph).findings, []);
   assertComposes(fixture.graph);
   assert.deepEqual(fixture.graph.nodes.reduce<Record<string, number>>((counts, node) => {
@@ -49,12 +57,12 @@ test("the standard garden fixture has accepted stages, derived layers and compil
   assert.deepEqual(fixture.graph.artifacts.map(artifact => artifact.id).sort(),
     ["garden-data", "garden-later", "garden-prep", "garden-refusal", "garden-result"]);
   assert.deepEqual(fixture.graph.connectors.map(connector => connector.id).sort(), ["garden-flow", "garden-prep-flow"]);
-  for (const [id, parent] of [["w-garden-later-operation", "garden-later-operation"],
-    ["w-garden-refusal-operation", "garden-refusal-operation"]] as const) {
+  for (const parent of ["garden-later-operation", "garden-refusal-operation"]) {
+    const id = representativeId(parent, 3);
     const representative = fixture.graph.nodes.find(node => node.id === id)!;
     assert.deepEqual([representative.kind, representative.parent, fixture.graph.horizon.includes(id)], ["work", parent, false]);
   }
-  assert.deepEqual(fixture.graph.anchors, [{ id: "anchor-garden-flow", owner: "garden-produce-work",
+  assert.deepEqual(fixture.graph.anchors, [{ id: sleepingGardenAnchor(fixture.graph), owner: "garden-produce-work",
     outcome: "garden-data", test: "garden-produce-work-test" }]);
   assert.equal(fixture.graph.connectors.find(connector => connector.id === "garden-flow")!.wakeTest, "garden-produce-work-test");
 
@@ -107,7 +115,7 @@ test("the standard garden fixture has accepted stages, derived layers and compil
 });
 
 test("the cross-flow fixture preserves each producer and consumer port through all three layers", async t => {
-  const fixture = await createCrossOmFixture(t);
+  const fixture = await createCrossOmFixture(t, "garden", { mode: "executed" });
   assert.deepEqual(validateGraph(fixture.graph).findings, []);
   assertComposes(fixture.graph);
   const flow = fixture.graph.connectors.find(item => item.id === "garden-flow")!;
@@ -126,11 +134,11 @@ test("the cross-flow fixture preserves each producer and consumer port through a
   const sleeping = flow.bindings.filter(binding => binding.level === 3 && binding.anchor !== null);
   assert.deepEqual(sleeping.map(binding => [binding.producer.node, binding.producer.port,
     binding.consumers[0]!.node, binding.consumers[0]!.port, binding.anchor]),
-  [["garden-produce-work", "out", "w-garden-later-operation", "in", "anchor-garden-flow"]]);
+  [["garden-produce-work", "out", representativeId("garden-later-operation", 3), "in", sleepingGardenAnchor(fixture.graph)]]);
 });
 
 test("missing, forged and masquerading fixture inputs are rejected at their exact engine boundaries", async t => {
-  const fixture = await createOmFixture(t);
+  const fixture = await createOmFixture(t, "standard", "garden", { mode: "executed" });
   const invalid = (target: string) => (error: unknown) => {
     assert.ok(error instanceof EngineError);
     assert.equal(error.code, OM_FIXTURE_ERROR);
@@ -150,7 +158,8 @@ test("missing, forged and masquerading fixture inputs are rejected at their exac
   const flow = disconnected.connectors.find(item => item.id === "garden-flow")!;
   flow.bindings = flow.bindings.filter(binding => binding.anchor === null);
   flow.wakeTest = null;
-  disconnected.anchors = disconnected.anchors.filter(anchor => anchor.id !== "anchor-garden-flow");
+  disconnected.anchors = disconnected.anchors.filter(anchor => anchor.id !== sleepingGardenAnchor(fixture.graph));
+  assert.equal(disconnected.anchors.length, 0);
   assert.deepEqual(validateGraph(disconnected).findings, []);
   const l2 = projection(disconnected, 2);
   assert.throws(() => composeLayer(l2, 3, layerDesignOf(disconnected, 3, L3_ASSEMBLY), L3_ASSEMBLY),
@@ -189,8 +198,8 @@ test("missing, forged and masquerading fixture inputs are rejected at their exac
 });
 
 test("two fixture calls isolate identical project identities in separate persistent databases", async t => {
-  const first = await createOmFixture(t);
-  const second = await createOmFixture(t);
+  const first = await createOmFixture(t, "standard", "garden", { mode: "executed" });
+  const second = await createOmFixture(t, "standard", "garden", { mode: "executed" });
   assert.notEqual(first.database, second.database);
   assert.notEqual(first.store.databaseId, second.store.databaseId);
   first.store.write({ id: "fixture-local", kind: "marker", expected: 0, value: { owner: "first" } });
@@ -204,13 +213,12 @@ test("an interrupted execution cannot return a completed garden fixture", async 
   t.mock.method(Executor.prototype, "run", function (this: Executor, ...args: Parameters<Executor["run"]>) {
     return run.call(this, args[0], args[1], args[2], AbortSignal.abort());
   });
-  for (const create of [() => createOmFixture(t), () => createOmFixture(t, "standard", "garden", { mode: "executed" })])
-    await assert.rejects(create(), error => {
-      assert.ok(error instanceof EngineError);
-      assert.equal(error.code, OM_FIXTURE_ERROR);
-      assert.deepEqual(error.details, { target: "/runs" });
-      return true;
-    });
+  await assert.rejects(createOmFixture(t, "standard", "garden", { mode: "executed" }), error => {
+    assert.ok(error instanceof EngineError);
+    assert.equal(error.code, OM_FIXTURE_ERROR);
+    assert.deepEqual(error.details, { target: "/runs" });
+    return true;
+  });
 });
 
 test("a missing committed receipt rejects fixture creation at the exact record", async t => {
@@ -226,15 +234,12 @@ test("a missing committed receipt rejects fixture creation at the exact record",
   t.mock.method(Store.prototype, "get", function (this: Store, ...args: Parameters<Store["get"]>) {
     return completed && args[0] === missing ? null : get.apply(this, args);
   });
-  for (const create of [() => createOmFixture(t), () => createOmFixture(t, "standard", "garden", { mode: "executed" })]) {
-    completed = false;
-    await assert.rejects(create(), error => {
-      assert.ok(error instanceof EngineError);
-      assert.equal(error.code, OM_FIXTURE_ERROR);
-      assert.deepEqual(error.details, { target: missing });
-      return true;
-    });
-  }
+  await assert.rejects(createOmFixture(t, "standard", "garden", { mode: "executed" }), error => {
+    assert.ok(error instanceof EngineError);
+    assert.equal(error.code, OM_FIXTURE_ERROR);
+    assert.deepEqual(error.details, { target: missing });
+    return true;
+  });
 });
 
 

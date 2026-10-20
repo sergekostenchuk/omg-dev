@@ -7,9 +7,9 @@ import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join } from 'node:path';
-import { canonical, hashJson } from '../src/canonical.js';
+import { canonical, canonicalSorted, hashJson } from '../src/canonical.js';
 import { checkedPlanDerivation, planDerivation, type ArtifactReceipt, type MachinePlan, type TaskInput, receiptId } from '../src/compiler/model.js';
-import { resolveArtifact, resolvePlanExternalSource } from '../src/compiler/inputs.js';
+import { resolveArtifact, resolvePlanExternalSource, resolveExternalSource } from '../src/compiler/inputs.js';
 import { sourceIsCurrent, type Source } from '../src/evidence/evidence.js';
 import { executionInputs } from '../src/execution/inputs.js';
 import { ensureWorktree } from '../src/execution/worktree.js';
@@ -21,16 +21,29 @@ import type { TaskRun } from '../src/execution/model.js';
 import type { Graph } from '../src/graph/model.js';
 import { writeFeasibility, readFeasibility, type FeasibilityRequest } from '../src/om/feasibility.js';
 import { writeHandoff } from '../src/om/handoff.js';
-import { checkAtomicWorks } from '../src/om/atomic-gate.js';
+import { checkAtomicWorks, prepareCandidateSources, writeAtomicGate } from '../src/om/atomic-gate.js';
+import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from '../src/om/addressing.js';
+import { writeHorizon } from '../src/om/horizon.js';
+import { fillObligations, prepareFrame, representativeId, type FrameRead, type FrameRequest } from '../src/om/frame-obligations.js';
+import { settleCandidate } from '../src/om/frame-accept.js';
+import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.js';
+import { writeGaps, type GapRequest } from '../src/om/gaps.js';
+import { writeGapLines } from '../src/om/gap-lines.js';
+import { writeOmObligations } from '../src/om/obligations.js';
+import { writeWorksFrame } from '../src/om/works-frame.js';
+import { writeNeighbors } from '../src/om/neighbors.js';
+import type { OmResult } from '../src/om/refusal.js';
+import { projectGraph } from '../src/graph/project.js';
 import { requireGraph } from '../src/graph/validate.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { git, Environments, type ExecutionRoot } from '../src/runtime/environment.js';
-import { Store, type Revision } from '../src/storage/store.js';
+import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
-import { executionFixture } from './execution-fixture.js';
+import { executionFixture, refreshExecutionPlan } from './execution-fixture.js';
+import { prepareNativeLayers, prepareOmFixtureStages } from './om-fixture.js';
 
 export type ExternalInputMode = 'inside' | 'outside' | 'mixed' | 'control';
 export interface ExternalAgentCall {
@@ -101,8 +114,104 @@ export function externalInputGraph(mode: ExternalInputMode): Graph {
   return requireGraph(graph);
 }
 
+/** The external supplier stays outside B1; mixed has a separate internal producer. */
+function currentExternalInputGraph(mode: ExternalInputMode): Graph {
+  const graph = externalInputGraph(mode);
+  if (mode === 'control') {
+    for (const node of graph.nodes) if (node.id.startsWith('p-consume-')) node.ports = [];
+  }
+  if (mode === 'mixed') {
+    for (const kind of ['block', 'operation', 'work'] as const) {
+      const original = graph.nodes.find(node => node.id === `p-produce-${kind}`)!;
+      graph.nodes.push({ ...structuredClone(original), id: `p-external-${kind}`,
+        parent: kind === 'block' ? 'p-product' : `p-external-${kind === 'operation' ? 'block' : 'operation'}`,
+        outcome: 'p-external', tests: [], code: [] });
+    }
+    const connector = graph.connectors.find(item => item.id === 'p-external-flow')!;
+    connector.returnsTo = 'p-external-block';
+    for (const binding of connector.bindings) {
+      binding.producer = { node: `p-external-${(['block', 'operation', 'work'] as const)[binding.level - 1]}`, port: 'out' };
+    }
+    const proof = graph.tests.find(item => item.node === 'p-produce-work')!;
+    proof.covers = ['p-flow'];
+    proof.contract!.counterfactuals = proof.contract!.counterfactuals.filter(item => item.connector === 'p-flow');
+  }
+  return requireGraph(graph);
+}
+function externalOk<T>(result: OmResult<T>): T {
+  if (!result.ok) throw new EngineError(result.refusal.code, result.refusal.message, result.refusal.at);
+  return result.value;
+}
+
+/** Real N2, D1/D2/D7, C5 and G5, with exactly the Sources derived for this candidate. */
+function prepareExternalWorks(engine: ProductEngine, desired: Graph, reject = false) {
+  const store = engine.store, project = 'p';
+  prepareNativeLayers(engine, project, desired, 'n2');
+  const graph = reference(store.get('graph:p')!), layer = reference(store.get('graph-layer:p:2')!),
+    upper = reference(store.get('om-frame:p:2')!), input = reference(store.get('om-input:p')!);
+  const decisions: InputDecisionProposal['decision'][] = [
+    { target: 'p-B1', field: 'nodes', value: ['p-produce-block', 'p-consume-block'] },
+    { target: 'p-B1', field: 'state', value: { writer: 'p-produce-block', authority: 'p-consume-block', rollback: 'p-consume-block' } },
+    { target: 'p-R1#1', field: 'checkKind', value: 'test' },
+  ];
+  const addressed = externalOk(writeAddressing(store, { project, input, graph,
+    decisions: decisions.map(decision => ({ pending: inputDecisionWrite({ project, input, graph, layers: [],
+      decision: structuredClone(decision) }) as Write })) }));
+  const horizon = externalOk(writeHorizon(store, { project, input: reference(addressed), graph, refinement: layer,
+    available: {}, choice: { choiceVersion: 'external-input-works', features: [{ outcome: 'p-result' }], excluded: [] } }));
+  const frame: FrameRequest = { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
+    upper: { horizon: reference(horizon.gate), frame: upper } };
+  const basis = structuredClone(externalOk(prepareFrame(store, frame))) as unknown as FrameRead;
+  const proposed = structuredClone(desired);
+  for (const field of ['nodes', 'artifacts', 'contracts', 'anchors', 'joins', 'tests', 'edges', 'journeys', 'packets', 'transfers'] as const) {
+    const inherited = basis.upper[field] ?? [], ids = new Set(inherited.map(item => item.id));
+    Object.assign(proposed, { [field]: [...structuredClone(inherited), ...(proposed[field] ?? []).filter(item => !ids.has(item.id))] });
+  }
+  proposed.connectors = basis.upper.connectors.map(connector => ({ ...structuredClone(connector),
+    bindings: [...structuredClone(connector.bindings), ...(desired.connectors.find(item => item.id === connector.id)?.bindings ?? [])
+      .filter(binding => binding.level === 3)] }));
+  const prerequisite = proposed.edges?.find(edge => edge.id === 'p-external-prerequisite');
+  if (prerequisite) prerequisite.target = representativeId('p-produce-operation', 3);
+  const projected = projectGraph(proposed, 3), nodes = projected.nodes.filter(node => node.kind === 'work' && basis.scope.nodes.includes(node.parent!)),
+    selected = new Set(nodes.map(node => node.id));
+  const fills = externalOk(fillObligations(basis.upper, basis.scope,
+    { graph: proposed, reference: { ...graph, hash: hashJson(proposed) }, frame: null }, basis.upperRef, 3));
+  const proposal: LayerProposal = { base: { graph, frame: null }, level: 3, worksContract: 'works-frame/v1', source: 'decision', status: 'proposed', nodes,
+    fills: fills.fills.filter(fill => selected.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,
+      ...(fill.port === undefined ? {} : { port: fill.port, codeRef: structuredClone(nodes.find(node => node.id === fill.node)!.code[0]!) }) })),
+    localConnectors: [], artifacts: projected.artifacts, contracts: projected.contracts, joins: projected.joins,
+    tests: projected.tests.filter(proof => selected.has(proof.node)), edges: proposed.edges ?? [], journeys: projected.journeys ?? [],
+    packets: projected.packets ?? [], transfers: projected.transfers ?? [], anchors: [], removes: [], replaces: [], redefines: [] };
+  const record = store.write({ id: 'om-proposal:p:external-works', kind: 'layer-proposal', expected: 0, value: proposal });
+  const works: ProposalRequest = { frame, proposals: [reference(record)] };
+  const gaps = externalOk(writeGaps(store, { project, input: reference(addressed), graph, horizon: reference(horizon.gate),
+    operations: { frame: { project, level: 2, graph, layer, frame: upper, horizon: reference(horizon.gate), upper: null }, proposals: [] }, works }));
+  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: canonicalSorted(gaps.records.map(reference)) };
+  const lines = externalOk(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
+  const obligations = externalOk(writeOmObligations(store, { project, gaps: gapRead, lines: reference(lines), assignments: [] }));
+  assert.deepEqual(obligations.handoff.obligations, []);
+  const candidate = externalOk(writeWorksFrame(store, { ...works, works: { contract: 'works-frame/v1',
+    producer: reference(obligations.producer), ledger: reference(obligations.record), bindings: [] } }));
+  assert.equal(candidate.state, 'candidate');
+  if (candidate.state !== 'candidate') throw new Error('Expected an external-input works candidate');
+  const candidateRef = reference(candidate.record), neighbors = externalOk(writeNeighbors(store, { project, candidate: candidateRef }));
+  const sources = externalOk(prepareCandidateSources(store, { project, candidate: candidateRef, neighbors: reference(neighbors) }));
+  const gate = externalOk(writeAtomicGate(store, { project, candidate: candidateRef, neighbors: reference(neighbors),
+    environment: reference(engine.environments.get(project)), gaps: gapRead, results: [], sources: [...sources.sources] }));
+  assert.equal(gate.value.result.passed, !reject, canonical(gate.value.result.findings));
+  const accepted = externalOk(settleCandidate(store, { project, level: 3, candidate: candidateRef,
+    outcome: { ...gate.value.result, codes: [...gate.value.result.codes], basis: reference(gate) } }));
+  if (reject) { assert.equal(accepted.state, 'rejected'); return { gate, accepted }; }
+  assert.equal(accepted.state, 'accepted'); assert.ok(accepted.graph && accepted.layer && accepted.frame);
+  const feasibility = externalOk(writeFeasibility(store, { project, graph: reference(accepted.graph), layer: reference(accepted.layer),
+    frame: reference(accepted.frame), environment: reference(engine.environments.get(project)), expected: 0 }));
+  assert.equal(feasibility.value.ready, true);
+  externalOk(writeHandoff(store, { project, feasibility: reference(feasibility), expected: 0 }));
+  return { gate, accepted };
+}
+
 export function externalInputFixture(t: TestContext, mode: ExternalInputMode = 'inside', configure?:
-  (engine: ProductEngine, graph: Graph, workspace: string) => void, prepareGraph?: (graph: Graph) => void) {
+  (engine: ProductEngine, graph: Graph, workspace: string) => void, prepareGraph?: (graph: Graph) => void, current: boolean | 'reject-mixed' | 'missing-source' | 'wrong-source' = false) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-external-input-'))), workspace = join(directory, 'repo');
   mkdirSync(workspace);
   const journal = join(directory, 'calls.jsonl'), agent = join(directory, 'agent.mjs');
@@ -122,24 +231,48 @@ if(mode==='consume-mutation') { const {consume}=await import('./consume.mjs'); a
   const initial = git(workspace, ['rev-parse', 'HEAD']);
   let store = new Store(join(directory, 'state.sqlite')), engine = new ProductEngine(store);
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
-  const graph = externalInputGraph(mode), artifact = mode === 'control' ? 'p-data' : 'p-external';
+  const graph = current && current !== 'reject-mixed' ? currentExternalInputGraph(mode) : externalInputGraph(mode), artifact = mode === 'control' ? 'p-data' : 'p-external';
   prepareGraph?.(graph);
-  preparedFeatures(engine, 'p', graph);
-  const source = engine.discovery.evidence.document('p', artifact, '2', 'application/json', 0);
+  if (current) prepareOmFixtureStages(engine, 'p', graph);
+  else preparedFeatures(engine, 'p', graph);
+  const source = engine.discovery.evidence.document('p', current === 'missing-source' ? 'unrelated' : artifact,
+    current === 'wrong-source' ? JSON.stringify('not a number') : '2', 'application/json', 0);
   const command = { executable: process.execPath, args: [agent, journal, mode] };
   engine.environments.configure('p', { workspace, implementer: { actor: 'worker', model: 'protocol-fixture', effort: 'high', command },
     reviewer: { actor: 'reviewer', model: 'protocol-fixture', effort: 'high', command },
-    fullCheck: { executable: process.execPath, args: ['check.mjs', 'all'] }, timeoutMs: 10_000 }, 0);
+    fullCheck: { executable: process.execPath, args: ['check.mjs', 'all'] }, timeoutMs: 10_000,
+    ...(current ? { requestCapacityChars: 100_000 } : {}) }, 0);
   configure?.(engine, graph, workspace);
-  refinedLayers(engine, 'p');
-  const feasibility = engine.refinement.assess('p', 0);
-  const stage = engine.refinement.publish('p', reference(feasibility), 0); engine.pipeline.accept('p', 'om-g2', stage.revision);
+  if (current) {
+    try {
+      const result = prepareExternalWorks(engine, graph, current === 'reject-mixed');
+      // G5 derives the rejected in-horizon supplier as internal; its collector lawfully asks for no Source.
+      assert.deepEqual(result.gate.value.request.sources, current === 'reject-mixed' ? [] : [reference(source)]);
+      if (current === 'reject-mixed') throw new EngineError('external_fixture_rejected', 'G5 rejected the original two-artifact work',
+        { findings: result.gate.value.result.findings, state: result.accepted.state });
+    }
+    catch (error) {
+      if (error instanceof EngineError) t.diagnostic(JSON.stringify({ code: error.code, message: error.message, at: error.details }));
+      throw error;
+    }
+  }
+  else {
+    refinedLayers(engine, 'p');
+    const feasibility = engine.refinement.assess('p', 0);
+    const stage = engine.refinement.publish('p', reference(feasibility), 0); engine.pipeline.accept('p', 'om-g2', stage.revision);
+  }
   const plan = engine.compiler.compile('p');
   const compilation = engine.compiler.publish('p', reference(plan), 0); engine.pipeline.accept('p', 'compilation', compilation.revision);
   return { get store() { return store; }, get engine() { return engine; }, directory, workspace, initial, graph, artifact, source, plan,
     calls: (): ExternalAgentCall[] => { try { return readFileSync(journal, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)); } catch { return []; } },
     reopen: () => { store.close(); store = new Store(join(directory, 'state.sqlite')); engine = new ProductEngine(store); return engine; },
     options: { retry: false, maxContextChars: 100_000, maxCorrections: 0 } };
+}
+
+/** Current consumers use M8; the default above remains the serialized v3 historical producer. */
+function currentExternalInputFixture(t: TestContext, mode: ExternalInputMode = 'inside',
+  configure?: (engine: ProductEngine, graph: Graph, workspace: string) => void, prepareGraph?: (graph: Graph) => void) {
+  return externalInputFixture(t, mode, configure, prepareGraph, true);
 }
 
 /** A deliberately resealed body lets negative tests reach the semantic reader rather than fail its checksum first. */
@@ -151,29 +284,40 @@ export function externalPlanVariant(store: Store, original: Revision<MachinePlan
 }
 
 for (const mode of ['inside', 'outside'] as const) test(`an external supplier ${mode} the plan reaches committed with its exact Source`, async t => {
-  const f = externalInputFixture(t, mode), sourceRef = reference(f.source);
+  const f = currentExternalInputFixture(t, mode), sourceRef = reference(f.source);
   const consumer = f.plan.value.tasks.find(task => task.node === 'p-consume-work')!;
   assert.equal(f.plan.value.derivation, 'external-inputs/v1');
   assert.match(f.plan.id, /^plan:p:external-inputs-v1:/);
   assert.deepEqual(consumer.inputs, [{ connector: 'p-external-flow', artifact: f.artifact, producerTask: null, receipt: null, source: sourceRef }]);
   assert.deepEqual(f.plan.value.guards.filter(ref => ref.id === f.source.id), [sourceRef]);
   assert.deepEqual(consumer.dependencies, []);
-  assert.equal(f.plan.value.tasks.some(task => task.node === 'p-produce-work'), mode === 'inside');
+  assert.equal(f.plan.value.tasks.some(task => task.node === 'p-produce-work'), false, 'B1 selects the consumer; an external flow does not add its supplier');
+  assert.equal(f.plan.value.tasks.length, 1);
   assert.deepEqual(f.engine.compiler.compile('p'), f.plan);
   assert.deepEqual(f.engine.compiler.read(f.plan.id), f.plan);
   const runs = await f.engine.executor.run('p', reference(f.plan), f.options);
-  assert.deepEqual(runs.map(run => run.value.state), mode === 'inside' ? ['committed', 'committed'] : ['committed'], JSON.stringify(runs.map(run => run.value.error)));
+  assert.deepEqual(runs.map(run => run.value.state), ['committed'], JSON.stringify(runs.map(run => run.value.error)));
   const run = runs.find(run => run.value.taskId === consumer.id)!;
   assert.deepEqual(run.value.inputs, [sourceRef]);
   const envelope = f.calls().find(call => call.mode === 'implement' && call.subject.context.binding.task === consumer.id)!.subject;
   assert.deepEqual(envelope.context.inputs, consumer.inputs);
   assert.deepEqual(envelope.inputs, [{ connector: 'p-external-flow', artifact: f.artifact, ref: sourceRef, kind: 'source', value: f.source.value }]);
   assert.deepEqual(f.engine.compiler.read(f.plan.id), f.plan, 'The supplier receipt cannot replace the consumer Source during historical reading');
+  assert.equal(f.calls().filter(call => call.mode === 'implement').length, 1);
+  assert.ok(f.calls().every(call => call.subject.context.binding.task === consumer.id));
+  f.reopen();
+  const durable = () => f.store.list().filter(row => ['plan', 'task-run', 'artifact', 'writer-index', 'execution-root'].includes(row.kind)).flatMap(row => f.store.history(row.id));
+  const before = canonical(durable()), calls = f.calls();
+  assert.deepEqual(await f.engine.executor.run('p', reference(f.plan), f.options), runs);
+  assert.equal(canonical(durable()), before);
+  assert.deepEqual(f.calls(), calls);
   assert.equal(git(f.workspace, ['rev-parse', 'HEAD']), f.initial);
 });
 
-test('one supplier preserves separate external Source and internal exact-plan result inputs', async t => {
-  const f = externalInputFixture(t, 'mixed');
+test('separate external supplier and internal producer preserve both exact consumer inputs', async t => {
+  const f = currentExternalInputFixture(t, 'mixed');
+  assert.equal(f.plan.value.tasks.length, 2);
+  assert.equal(f.plan.value.tasks.some(task => task.node === 'p-external-work'), false);
   const producer = f.plan.value.tasks.find(task => task.node === 'p-produce-work')!;
   const consumer = f.plan.value.tasks.find(task => task.node === 'p-consume-work')!;
   assert.deepEqual(consumer.dependencies, [producer.id]);
@@ -183,6 +327,12 @@ test('one supplier preserves separate external Source and internal exact-plan re
     { connector: 'p-external-flow', artifact: f.artifact, producerTask: null, receipt: null, source: reference(f.source) });
   const runs = await f.engine.executor.run('p', reference(f.plan), f.options);
   assert.deepEqual(runs.map(run => run.value.state), ['committed', 'committed'], JSON.stringify(runs.map(run => run.value.error)));
+  assert.equal(f.calls().filter(call => call.mode === 'implement').length, 2);
+  f.reopen();
+  assert.deepEqual(f.engine.compiler.read(f.plan.id), f.plan);
+  const calls = f.calls();
+  assert.deepEqual(await f.engine.executor.run('p', reference(f.plan), f.options), runs);
+  assert.deepEqual(f.calls(), calls);
   const receipt = f.store.get<ArtifactReceipt>(receiptId('p', 'p-data'))!;
   const consumerRun = runs.find(run => run.value.taskId === consumer.id)!;
   assert.deepEqual(new Set(consumerRun.value.inputs.map(canonical)), new Set([reference(f.source), reference(receipt)].map(canonical)));
@@ -201,16 +351,57 @@ test('one supplier preserves separate external Source and internal exact-plan re
 });
 
 test('an external control predecessor outside the plan resolves without an L3 connector', async t => {
-  const f = externalInputFixture(t, 'control'), consumer = f.plan.value.tasks[0]!;
+  const f = currentExternalInputFixture(t, 'control'), consumer = f.plan.value.tasks[0]!;
   assert.deepEqual(consumer.inputs, [{ connector: 'p-external-prerequisite', artifact: 'p-data', producerTask: null, receipt: null, source: reference(f.source) }]);
   assert.equal(f.plan.value.graphSnapshot.connectors.some(connector => connector.id === 'p-external-prerequisite'), false);
+  assert.equal(f.plan.value.tasks.length, 1);
+  const representative = representativeId('p-produce-operation', 3);
+  assert.ok(f.plan.value.graphSnapshot.nodes.some(node => node.id === representative && !f.plan.value.graphSnapshot.horizon.includes(node.id)));
+  assert.ok(f.plan.value.graphSnapshot.edges!.some(edge => edge.id === 'p-external-prerequisite'
+    && edge.relation === 'requires' && edge.source === consumer.node && edge.target === representative));
   const runs = await f.engine.executor.run('p', reference(f.plan), f.options);
   assert.deepEqual(runs.map(run => run.value.state), ['committed'], JSON.stringify(runs.map(run => run.value.error)));
   assert.deepEqual(runs[0]!.value.inputs, [reference(f.source)]);
+  assert.equal(f.calls().filter(call => call.mode === 'implement').length, 1);
+  assert.ok(f.calls().every(call => call.subject.context.binding.task === consumer.id));
+  f.reopen();
+  assert.deepEqual(f.engine.compiler.read(f.plan.id), f.plan);
+  const calls = f.calls();
+  assert.deepEqual(await f.engine.executor.run('p', reference(f.plan), f.options), runs);
+  assert.deepEqual(f.calls(), calls);
 });
 
+test('G5 rejects the original one-supplier mixed candidate with exact Sources and no accepted L3', t => {
+  let engine!: ProductEngine, before!: unknown;
+  assert.throws(() => externalInputFixture(t, 'mixed', value => { engine = value; before = engine.store.get('graph-layer:p:3'); }, undefined, 'reject-mixed'), error => {
+    assert.ok(error instanceof EngineError); assert.equal(error.code, 'external_fixture_rejected');
+    const details = error.details as { findings: { code: string; target: string }[]; state: string };
+    assert.equal(details.state, 'rejected');
+    assert.ok(details.findings.some(finding => finding.code === 'work_artifact_not_single' && finding.target === 'p-produce-work'));
+    return true;
+  });
+  assert.deepEqual(engine.store.get('graph-layer:p:3'), before);
+  assert.equal(engine.store.get('om-frame:p:3'), null);
+  assert.deepEqual(engine.store.list('plan'), []); assert.deepEqual(engine.store.list('task-run'), []);
+  assert.equal(engine.store.get('execution-root:p'), null);
+  const source = engine.store.get<Source>('source:p:p-external')!;
+  assert.deepEqual(resolveExternalSource(engine.store, 'p', externalInputGraph('mixed'), 'p-external', reference(source), true),
+    { source: reference(source), receipt: null }, 'The Source is valid; the refusal concerns the two-artifact work');
+});
+for (const variant of ['missing-source', 'wrong-source'] as const)
+  test(`G5 addresses a genuinely ${variant} before accepting external works`, t => {
+    let engine!: ProductEngine, before!: unknown;
+    assert.throws(() => externalInputFixture(t, 'outside', value => { engine = value; before = engine.store.get('graph-layer:p:3'); }, undefined, variant), error => {
+      assert.ok(error instanceof EngineError);
+      assert.equal(error.code, variant === 'missing-source' ? 'atomic_gate_basis_unproven' : 'artifact_contract_mismatch');
+      assert.deepEqual(error.details, { unit: 'G5', target: 'p-external', field: 'sources' }); return true;
+    });
+    assert.deepEqual(engine.store.get('graph-layer:p:3'), before);
+    assert.deepEqual(engine.store.list('plan'), []); assert.deepEqual(engine.store.list('task-run'), []);
+  });
+
 test('historical Source selection refuses two different exact revisions instead of selecting the first', t => {
-  const f = externalInputFixture(t), original = reference(f.source);
+  const f = currentExternalInputFixture(t), original = reference(f.source);
   const next = f.engine.discovery.evidence.document('p', f.artifact, '3', 'application/json', f.source.revision);
   assert.deepEqual(f.engine.compiler.read(f.plan.id), f.plan, 'A historical read still resolves the source actually sealed by the plan');
   const conflicted = externalPlanVariant(f.store, f.plan, plan => {
@@ -247,7 +438,7 @@ const addressedPlan = (code: string, id: string) => (error: unknown) => {
 };
 
 test('plan derivation uses the namespace position, including a legacy project named external-inputs-v1', t => {
-  const f = externalInputFixture(t);
+  const f = currentExternalInputFixture(t);
   const legacy = { ...f.plan, id: `plan:external-inputs-v1:${f.plan.value.hash}` };
   assert.equal(planDerivation(legacy.id), 'legacy');
   assert.equal(checkedPlanDerivation(legacy), 'legacy', 'Extra marker content cannot change the old namespace');
@@ -263,7 +454,7 @@ test('plan derivation uses the namespace position, including a legacy project na
 });
 
 test('new marker is mandatory for historical read and a no-write compile result after reopening', t => {
-  const f = externalInputFixture(t);
+  const f = currentExternalInputFixture(t);
   for (const marker of [undefined, null, 'external-inputs/unknown']) {
     const variant = externalPlanVariant(f.store, f.plan, value => {
       if (marker === undefined) delete value.derivation;
@@ -279,7 +470,7 @@ test('new marker is mandatory for historical read and a no-write compile result 
 });
 
 test('each external input requires its exact triple and Source guard after reopening', t => {
-  const f = externalInputFixture(t);
+  const f = currentExternalInputFixture(t);
   const changes: [string, (plan: MachinePlan) => void][] = [
     ['source absent', plan => { delete (plan.tasks.find(task => task.node === 'p-consume-work')!.inputs[0] as unknown as Record<string, unknown>)['source']; }],
     ['source null', plan => { plan.tasks.find(task => task.node === 'p-consume-work')!.inputs[0]!.source = null; }],
@@ -291,7 +482,9 @@ test('each external input requires its exact triple and Source guard after reope
   ];
   for (const [name, change] of changes) {
     const variant = externalPlanVariant(f.store, f.plan, change); f.reopen();
-    assert.throws(() => f.engine.compiler.read(variant.id), addressedPlan('plan_input_invalid', variant.id), name);
+    assert.throws(() => resolvePlanExternalSource(f.store, variant, f.artifact), addressedPlan('plan_input_invalid', variant.id), name);
+    assert.throws(() => f.engine.compiler.read(variant.id), name.startsWith('guard ')
+      ? { code: 'plan_basis_incomplete' } : addressedPlan('plan_input_invalid', variant.id), name);
   }
   for (const source of [{ ...reference(f.source), revision: 100 }, { ...reference(f.source), hash: hashJson('wrong source') }]) {
     const variant = externalPlanVariant(f.store, f.plan, plan => {
@@ -299,22 +492,20 @@ test('each external input requires its exact triple and Source guard after reope
       plan.guards = plan.guards.map(ref => ref.id === f.source.id ? source : ref);
     });
     f.reopen();
-    assert.throws(() => f.engine.compiler.read(variant.id), { code: 'external_input_missing' });
+    assert.throws(() => resolvePlanExternalSource(f.store, variant, f.artifact), { code: 'external_input_missing' });
+    assert.throws(() => f.engine.compiler.read(variant.id), { code: 'plan_basis_incomplete' });
   }
 });
 
 test('an owned Source file changed by the first task remains the sealed input of the next task', async t => {
-  const f = externalInputFixture(t, 'mixed', (_engine, _graph, workspace) => {
+  const f = currentExternalInputFixture(t, 'mixed', (_engine, _graph, workspace) => {
     writeFileSync(join(workspace, 'produce.mjs'), '2');
     git(workspace, ['add', 'produce.mjs']);
     git(workspace, ['-c', 'user.name=Fixture', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'initial numeric source']);
   });
   const root = ensureWorktree(f.store, f.engine.environments, f.plan.value);
   const source = f.engine.discovery.evidence.file('p', f.artifact, root.value.path, 'produce.mjs', 'application/json', f.source.revision);
-  const feasibility = f.engine.refinement.assess('p', f.store.get('feasibility:p')!.revision);
-  const stage = f.engine.refinement.publish('p', reference(feasibility), f.store.get('stage:p:om-g2')!.revision);
-  f.engine.pipeline.accept('p', 'om-g2', stage.revision);
-  const plan = f.engine.compiler.compile('p');
+  const plan = refreshExecutionPlan(f.engine);
   const compilation = f.engine.compiler.publish('p', reference(plan), f.store.get('stage:p:compilation')!.revision);
   f.engine.pipeline.accept('p', 'compilation', compilation.revision);
   assert.ok(sourceIsCurrent(source.value));
@@ -334,9 +525,16 @@ test('an owned Source file changed by the first task remains the sealed input of
 
 for (const point of ['compile', 'compile-repeat', 'implementing', 'commit_pending'] as const)
   test(`a second Store changes Source at ${point} without accepting a stale result`, async t => {
-    const f = externalInputFixture(t, 'outside');
+    const f = currentExternalInputFixture(t, 'outside');
     const second = new Store(f.store.path); t.after(() => second.close());
-    if (point === 'compile') f.engine.discovery.evidence.document('p', f.artifact, '2', 'application/json', f.source.revision);
+    if (point === 'compile') {
+      f.engine.discovery.evidence.document('p', f.artifact, '2', 'application/json', f.source.revision);
+      const feasibility = externalOk(writeFeasibility(f.store, { project: 'p', graph: reference(f.store.get('graph:p')!),
+        layer: reference(f.store.get('graph-layer:p:3')!), frame: reference(f.store.get('om-frame:p:3')!),
+        environment: reference(f.engine.environments.get('p')), expected: f.store.get('om-feasibility:p')!.revision }));
+      assert.equal(feasibility.value.ready, true);
+      externalOk(writeHandoff(f.store, { project: 'p', feasibility: reference(feasibility), expected: f.store.get('stage:p:om-g2')!.revision }));
+    }
     const source = f.store.get<Source>(f.source.id)!, plans = f.store.list('plan'), pointer = f.store.get('current-plan:p');
     const write = f.store.writeMany.bind(f.store), get = f.store.get.bind(f.store);
     let raced = false;
@@ -375,11 +573,11 @@ for (const point of ['compile', 'compile-repeat', 'implementing', 'commit_pendin
     assert.equal(f.store.get<Source>(source.id)!.value.content, '3');
   });
 
-test('committed writers and internal receipts reject a lost new-era marker before the no-obligations exit', async t => {
-  const f = externalInputFixture(t, 'mixed');
+test('committed M8 writers and internal receipts reject a lost new-era marker without carried obligations', async t => {
+  const f = currentExternalInputFixture(t, 'mixed');
   const runs = await f.engine.executor.run('p', reference(f.plan), f.options);
   const task = f.plan.value.tasks.find(task => task.node === 'p-produce-work')!;
-  assert.equal(task.researchObligations, undefined);
+  assert.deepEqual(task.researchObligations, []);
   const run = runs.find(run => run.value.taskId === task.id)!;
   assert.equal(run.value.state, 'committed');
   const root = f.store.get<ExecutionRoot>('execution-root:p')!.value;
@@ -838,7 +1036,7 @@ test('legacy no-write compilation keeps its original admission guards when a sec
 });
 
 test('two external connectors retain both task inputs while sharing one exact Source guard', t => {
-  const f = externalInputFixture(t, 'inside', undefined, graph => {
+  const f = currentExternalInputFixture(t, 'inside', undefined, graph => {
     const connector = { ...structuredClone(graph.connectors[0]!), id: 'p-external-flow-second' };
     graph.connectors.push(connector);
     const producerTest = graph.tests.find(item => item.node === 'p-produce-work')!;
