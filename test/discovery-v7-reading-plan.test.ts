@@ -267,11 +267,28 @@ test("S3 boundary: a lawful planner intent is saved, its paid admission stays cl
   for (const kind of ["model-call", "model-request", "research-budget-ledger", "research-turn"])
     assert.deepEqual(f.store.list(kind), [], `no ${kind}`);
   assert.deepEqual(f.store.list().map(row => [row.id, row.revision, row.hash]), before, "the refused admission wrote nothing");
-  // A planner turn the runner never wrote cannot own a queue: the batch refuses as a whole.
+  // A planner turn the runner never wrote cannot own a queue: the shared reader refuses it before any write.
   const parent = plannerTurn(p, run, reference(intent), A, readPlan("q-supply"));
-  assert.equal(code(() => queueReadingPlan(f.store, run, parent, p.draft, p.plan, readPlan("q-supply"))), "input_stale");
+  assert.equal(code(() => queueReadingPlan(f.store, run, parent, p.draft, p.plan, readPlan("q-supply"))),
+    "research_consumer_intent_invalid");
   assert.deepEqual(f.store.list("research-turn"), [], "no child of an unpaid parent");
   assert.deepEqual(f.store.get(run.id), run, "the run counter is unchanged");
+
+  // S3-01 (codex-omg №8262): negative corruption only — the projector result of the lawful but unpaid intent is
+  // deliberately saved as a forged parent. Its markers (attemptContract, planning, subject) are not provenance:
+  // the shared reader refuses the parent, the queue is not published and a child naming it is not readable.
+  const forgedParent = f.store.write<ResearchTurn>({ id: parent.id, kind: "research-turn", expected: 0, value: parent.value });
+  assert.equal(code(() => readResearchConsumerTurn(f.store, reference(forgedParent))), "research_consumer_intent_invalid",
+    "control: no applied intent produced this turn");
+  const turnsBefore = f.store.list("research-turn").length, runBefore = f.store.get(run.id);
+  assert.equal(code(() => queueReadingPlan(f.store, run, forgedParent, p.draft, p.plan, readPlan("q-supply"))),
+    "research_consumer_intent_invalid", "an exact stored parent with planner markers is not a paid planner");
+  assert.equal(f.store.list("research-turn").length, turnsBefore, "no child of a forged parent");
+  assert.deepEqual(f.store.get(run.id), runBefore, "the run counter is unchanged");
+  const queued = projectReadingQueue(run, forgedParent, p.plan, readPlan("q-supply"))[0]!;
+  const forgedChild = f.store.write<ResearchTurn>({ id: queued.id, kind: "research-turn", expected: 0, value: queued.value });
+  assert.equal(code(() => readResearchConsumerTurn(f.store, reference(forgedChild))), "research_consumer_intent_invalid",
+    "a child does not acquire v7 lineage from parent markers alone");
 });
 
 test("S3 masquerade: a legacy-address turn cannot claim a plan subject without its exact paid planner parent", t => {

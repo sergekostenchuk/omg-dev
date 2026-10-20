@@ -1,4 +1,4 @@
-import { consumerResultCapacity, type ResearchConsumerIntent } from './response-recovery.js';
+import { consumerResultCapacity, readResearchConsumerTurn, type ResearchConsumerIntent } from './response-recovery.js';
 import { declareResultCapacity } from './early-research-outcome.js';
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
@@ -126,6 +126,45 @@ export function queuedChildReached(store: Store, stored: unknown, current: Revis
   return true;
 }
 
+/** DR3a3-S3-01: the queue origin of one turn under its exact planner parent —
+ * the writer's own derivation, read back: an original child is the parent's
+ * read at its derived position, a split part is named by the recorded
+ * splitInto of its split child, and every revision of the turn keeps one
+ * basis and lineage. Returns the original child's first revision, or null. */
+export function queueOriginOf(store: Store, turn: Revision<ResearchTurn>, parent: Revision<ResearchTurn>,
+  seen = new Set<string>()): Ref | null {
+  if (seen.has(turn.id)) return null; seen.add(turn.id);
+  const plan = parent.value.action as Extract<ResearchAction, { action: "read_plan" }>;
+  if (plan?.action !== "read_plan" || !Array.isArray(plan.reads) || turn.kind !== "research-turn") return null;
+  const basis = (value: ResearchTurn) => canonical({ run: value.run, number: value.number, question: value.question,
+    action: value.action, plannedBy: value.plannedBy ?? null, splitFrom: value.splitFrom ?? null, lineage: lineage(value) });
+  const first = store.get<ResearchTurn>(turn.id, 1);
+  if (first?.kind !== "research-turn" || hashJson(first.value) !== first.hash || first.value.status !== "pending"
+    || canonical(first.value.plannedBy) !== canonical(reference(parent)) || first.value.run !== parent.value.run) return null;
+  for (let revision = 2; revision <= turn.revision; revision += 1) {
+    const step = store.get<ResearchTurn>(turn.id, revision);
+    if (step?.kind !== "research-turn" || hashJson(step.value) !== step.hash || basis(step.value) !== basis(first.value)) return null;
+  }
+  if (store.get(turn.id, turn.revision)?.hash !== turn.hash) return null;
+  const split = first.value.splitFrom;
+  if (!isRef(split)) {
+    const index = plan.reads.findIndex((_, i) => turn.id === `research-turn:${hashJson([parent.id, "read", i])}`);
+    return index >= 0 && canonical(plan.reads[index]) === canonical(first.value.action)
+      && first.value.number === parent.value.number + index + 1 ? reference(first) : null;
+  }
+  const source = store.get<ResearchTurn>(split.id, split.revision);
+  const divided = store.get<ResearchTurn>(split.id, split.revision + 1);
+  const into = (divided?.value.observation as { splitInto?: unknown } | null)?.splitInto;
+  const index = Array.isArray(into) ? into.findIndex(ref => canonical(ref) === canonical(reference(first))) : -1;
+  return source?.kind === "research-turn" && source.hash === split.hash && source.value.status === "pending"
+    && divided?.kind === "research-turn" && hashJson(divided.value) === divided.hash
+    && divided.value.status === "completed" && !divided.value.error && index >= 0
+    && turn.id === `research-turn:${hashJson([split, index, first.value.action])}`
+    && canonical(first.value.replayedFrom) === canonical(split)
+    && canonical(first.value.question) === canonical(source.value.question) && lineage(first.value) === lineage(source.value)
+    ? queueOriginOf(store, source, parent, seen) : null;
+}
+
 /** The parts of one split child: each keeps the child's exact run, Question,
  * planner parent and subject lineage, and names the child as its origin. */
 export function projectSplitParts(run:Revision<ResearchRun>,child:Revision<ResearchTurn>,actions:ResearchAction[]):{id:string;value:ResearchTurn}[]{
@@ -148,6 +187,9 @@ export function splitPlannedContextRead(store:Store,run:Revision<ResearchRun>,ch
   requireCondition(parent?.kind==='research-turn'&&parent.hash===child.value.plannedBy!.hash
     &&lineage(parent.value)===lineage(child.value),
     'reading_plan_split_invalid','Split only a child of its exact planner parent and subject');
+  // S3-01: a v7 child is divided only after the shared reader proves its paid
+  // planner parent and its place in that parent's queue.
+  if(Object.hasOwn(child.value,'subject'))readResearchConsumerTurn(store,reference(child));
   const full=readPilotContext(store,draft,action.record,action.pointer,Number.MAX_SAFE_INTEGER,action.page);
   requireCondition((typeof full.value==='string'||Array.isArray(full.value))&&full.value.length>1,
     'reading_plan_blocked','The oversized context value cannot be divided into smaller array/string pages');
@@ -200,6 +242,9 @@ export function retryPlannedRead(store:Store,project:string,ref:Ref){
   if(subject){
     requireCondition(isDiscoveryV7Draft(draft.value),'research_plan_subject_invalid','A plan subject belongs to a v7 draft');
     planQuestionContract(store,draft,question,subject);
+    // S3-01: the shared reader proves the paid planner parent (producer →
+    // applied intent → O@1 → its queue) and this child's place in it.
+    readResearchConsumerTurn(store,ref);
   }
   // Decision 5: the common reader keeps its physical Question counter and its
   // active-call check; a subject child guards its subject step as well — both
@@ -291,6 +336,10 @@ export function projectReadingQueue(run: Revision<ResearchRun>, parent: Revision
 export function queueReadingPlan(store: Store, run: Revision<ResearchRun>, parent: Revision<ResearchTurn>,
   draft: Revision<DiscoveryDraft>, question: Revision<Question>, action: Extract<ResearchAction, { action: "read_plan" }>) {
   const projected = projectReadingQueue(run, parent, question, action);
+  // S3-01: markers are not provenance — before a v7 queue is published or
+  // returned, the shared reader proves its parent: producer, applied intent,
+  // the exact paid O@1 and every later revision. The field path keeps its rules.
+  if (Object.hasOwn(parent.value, "subject")) readResearchConsumerTurn(store, reference(parent));
   const existing = projected.map(child => store.get<ResearchTurn>(child.id));
   if (existing.some(Boolean)) {
     // №1745/C23: the whole saved queue must be this exact plan's children —

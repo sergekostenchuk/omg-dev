@@ -62,7 +62,7 @@ import type { ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, R
 import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
 import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
-import { queuedChildReached } from './reading-plan.js';
+import { queueOriginOf, queuedChildReached } from './reading-plan.js';
 import { paidOriginId, paidSessionId, limitedAssessmentRetryScope } from './assessment-session.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 import { ATTEMPT_BINDING_CONTRACT, ATTEMPT_BINDING_FIELDS, ATTEMPT_BINDING_KIND, addressedQuestionId, attemptBindingId,
@@ -389,10 +389,13 @@ function managedSearchParent(store: Store, child: Revision<Record<string, any>>)
 }
 
 /** DR3a3-S3: a legacy-address turn carries a plan subject only as the lineage
- * of its exact planner parent — a paid planning-mode O@1 of the attempt era
- * with the same subject. A child of such a parent cannot lose it, a child of
- * a field-path parent cannot gain one, and the lineage never makes the child
- * an attempt. A field-path child whose parent is not saved keeps its rules. */
+ * of its exact planner parent. A child of a subject parent cannot lose it, a
+ * child of a field-path parent cannot gain one, and the lineage never makes
+ * the child an attempt. A field-path child keeps its historical rules.
+ * S3-01: parent markers are not provenance — the shared reader proves the
+ * parent (producer → applied intent → the paid planning O@1 → every later
+ * revision, its queue included), and the child must be derived from that
+ * parent's own read_plan of the same subject by the writer's formula. */
 function queuedChildLineage(store: Store, saved: Revision<Record<string, any>>): void {
   const plannedBy = saved.value.plannedBy;
   const parent = isRef(plannedBy) ? store.get<Record<string, any>>(plannedBy.id, plannedBy.revision) : null;
@@ -401,10 +404,30 @@ function queuedChildLineage(store: Store, saved: Revision<Record<string, any>>):
   let child: V7PlanSubject | null = null, owner: V7PlanSubject | null = null;
   try { child = planSubjectOf(saved.value); owner = exact ? planSubjectOf(parent!.value) : null; }
   catch { consumerInvalid(saved.id, 'The queued turn or its planner parent carries a damaged plan subject'); }
-  if (child && (!exact || parent!.value.attemptContract !== ATTEMPT_BINDING_CONTRACT
-    || parent!.value.dispatchMode !== 'planning' || isRef(parent!.value.plannedBy))
-    || !sameSubject(child, owner))
+  if (!child) {
+    if (owner) consumerInvalid(saved.id, 'The queued turn lost the subject of its exact planner parent');
+    return;
+  }
+  if (!exact || !sameSubject(child, owner)) consumerInvalid(saved.id, 'The queued turn subject differs from the subject of its exact planner parent');
+  const head = store.get<Record<string, any>>(parent!.id)!;
+  try {
+    readResearchConsumerTurn(store, plannedBy);
+    if (head.revision !== parent!.revision) readResearchConsumerTurn(store, reference(head));
+  } catch (error) {
+    if (error instanceof EngineError) consumerInvalid(saved.id, `The queued turn's planner parent has no proven paid origin: ${error.message}`);
+    throw error;
+  }
+  const plan = turnAction(parent!.value);
+  if (parent!.value.attemptContract !== ATTEMPT_BINDING_CONTRACT || parent!.value.dispatchMode !== 'planning'
+    || isRef(parent!.value.plannedBy) || plan.action !== 'read_plan' || plan.question !== child.planQuestionId)
     consumerInvalid(saved.id, 'The queued turn subject differs from the subject of its exact planner parent');
+  const origin = queueOriginOf(store, saved as Revision<ResearchTurn>, parent as Revision<ResearchTurn>);
+  if (!origin) consumerInvalid(saved.id, 'The queued turn is not derived from its exact planner parent');
+  // The completed planner revision, when written, publishes exactly this queue.
+  const children = head.value.observation?.children;
+  if (head.revision !== parent!.revision && (head.revision !== parent!.revision + 1 || head.value.observation?.state !== 'queued'
+    || !Array.isArray(children) || !children.some((ref: unknown) => canonical(ref) === canonical(origin))))
+    consumerInvalid(saved.id, 'The completed planner did not publish this queued turn');
 }
 
 /** The saved process result is a bounded capture made with the completed turn.
