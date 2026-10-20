@@ -174,7 +174,7 @@ test("R1 R9 R10 H1.3 cold OM × start: the machine bases of the intent, the E4.1
   assert.equal(stateOf(outcome)?.step?.action, "cycle", "The stopped cycle stays the saved step of the pass");
   assert.equal(f.sent().length, 1, "One real dispatch reached the provider");
   const call = f.store.list<OmModelCall>("model-call")[0]!;
-  assert.equal(call.value.om.request.dispatch.adapter.id, `adapter:${project}:codex-stdio`, "The dispatch is the one E4.1 configured");
+  assert.equal(call.value.om.request.dispatch.adapter.id, `adapter:${project}:active`, "The dispatch is the one E4.1 configured");
   assert.deepEqual([call.value.status, call.value.error], ["failed", "process_cancelled"], "The live call was cancelled, its outcome saved");
   const control = ok(readRunControl(f.store, { project }));
   assert.deepEqual([control.stopped, control.finished, control.control!.value.execution], [true, true, null], "The drive gave its execution up");
@@ -580,7 +580,7 @@ test(`ENV1 a missing ${missing}: the status names its address before OM; the sta
   const f = driverFixture(t, true, ["encoding"], true, missing === "capacity" ? { capacity: false, dispatch: false } : { dispatch: false });
   const shown = conditionOf(f.store, missing);
   assert.deepEqual([shown.state, shown.requiredBy], ["missing", "om-start"]);
-  assert.equal(shown.at, missing === "capacity" ? `environment:${project}` : `adapter:${project}:codex-stdio`);
+  assert.equal(shown.at, missing === "capacity" ? `environment:${project}` : `adapter:${project}:active`);
   const before = snapshot(f.store);
   const refused = refusal(await startPass(f.store, { project }));
   assert.equal(refused.code, missing === "capacity" ? "capacity_missing" : "record_missing");

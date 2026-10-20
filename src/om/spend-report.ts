@@ -21,10 +21,9 @@ import { taskBindingId } from '../graph/task-obligations.js';
 
 export const SPEND_REPORT_SCOPE = 'om-e1';
 export const SPEND_PURPOSE_SET_V2 = 'om-e1-purposes/v2';
-// These fixed lists keep old byPurpose keys stable when E1 admits a later purpose.
-const LEGACY_CALL_PURPOSES = Object.freeze(['model-research', 'model-design', 'stop-analysis', 'origin-analysis'] as const);
-const V2_CALL_PURPOSES = Object.freeze([...LEGACY_CALL_PURPOSES, 'fact-assessment'] as const);
-type LegacyCallPurpose = typeof LEGACY_CALL_PURPOSES[number];
+// Snapshot contract: the five purposes (four original + fact-assessment). Old unmarked snapshots removed (LG23).
+const V2_CALL_PURPOSES = Object.freeze(['model-research', 'model-design', 'stop-analysis', 'origin-analysis', 'fact-assessment'] as const);
+type V2CallPurpose = typeof V2_CALL_PURPOSES[number];
 export const SPEND_REPORT_CODES = Object.freeze(['spend_request_invalid', 'spend_source_invalid', 'spend_basis_invalid',
   'call_without_record', 'call_not_settled'] as const);
 export interface SpendSignificanceSource { call: Ref; gaps: GapReadRequest; obligations: Ref | null }
@@ -32,10 +31,8 @@ interface SpendSnapshotSources {
   project: string; ledger: Ref | null; calls: Ref[]; series: Ref[]; histories: CallLedgerHistory[];
   significance: SpendSignificanceSource[]; late: { call: Ref; receipt: Ref | null }[];
 }
-/** Old saved snapshots have no marker; current captures name their purpose set explicitly. */
-export interface LegacySpendSnapshot extends SpendSnapshotSources { purposeSet?: never }
 export interface VersionedSpendSnapshot extends SpendSnapshotSources { purposeSet: typeof SPEND_PURPOSE_SET_V2 }
-export type SpendSnapshot = LegacySpendSnapshot | VersionedSpendSnapshot;
+export type SpendSnapshot = VersionedSpendSnapshot;
 export interface SpendRequest { project: string; histories?: CallLedgerHistory[]; significance?: SpendSignificanceSource[] }
 export interface SpendSignificance { obligations: number | null; consumers: number | null; blocks: number | null; sources: Ref[] }
 export interface SpendRow {
@@ -48,7 +45,7 @@ export interface SpendRow {
 export interface SpendTotals { calls: number; measuredCalls: number; unmeasuredCalls: number; reportedTokens: TokenUsage | null }
 export interface SpendReport {
   scope: typeof SPEND_REPORT_SCOPE; snapshot: SpendSnapshot; rows: SpendRow[]; findings: Refusal[];
-  totals: SpendTotals; byPurpose: Record<LegacyCallPurpose, SpendTotals> & Partial<Record<CallPurpose, SpendTotals>>;
+  totals: SpendTotals; byPurpose: Record<V2CallPurpose, SpendTotals>;
 }
 const object = (value: unknown): value is Record<string, any> => isPlainObject(value);
 const same = (a: unknown, b: unknown): boolean => canonical(a) === canonical(b);
@@ -89,9 +86,8 @@ function requireOptions(request: { histories?: unknown; significance?: unknown }
 }
 function requireSnapshot(store: Store, snapshot: Sealed<SpendSnapshot>): void {
   requireProject(store, snapshot);
-  const versioned = Object.hasOwn(snapshot, 'purposeSet');
-  if (!keys(snapshot, ['project', 'ledger', 'calls', 'series', 'histories', 'significance', 'late', ...(versioned ? ['purposeSet'] : [])])
-    || versioned && snapshot.purposeSet !== SPEND_PURPOSE_SET_V2
+  if (!keys(snapshot, ['project', 'ledger', 'calls', 'series', 'histories', 'significance', 'late', 'purposeSet'])
+    || snapshot.purposeSet !== SPEND_PURPOSE_SET_V2
     || !(snapshot.ledger === null || ref(snapshot.ledger))
     || !array(snapshot.calls) || !snapshot.calls.every(ref) || !array(snapshot.series) || !snapshot.series.every(ref)
     || !array(snapshot.late) || !snapshot.late.every(item => object(item) && keys(item, ['call', 'receipt']) && ref(item.call)
@@ -205,7 +201,7 @@ function physicalCall(store: Store, snapshot: SpendSnapshot, at: Ref): Physical 
 
 function derive(store: Store, snapshot: SpendSnapshot): SpendReport {
   const { project } = snapshot;
-  const purposes = snapshot.purposeSet === SPEND_PURPOSE_SET_V2 ? V2_CALL_PURPOSES : LEGACY_CALL_PURPOSES;
+  const purposes = V2_CALL_PURPOSES;
   const permitted = new Set<string>(purposes);
   const ledger = snapshot.ledger ? take(readCallLedgerAt(store, project, snapshot.ledger, snapshot.histories)) : null;
   if (!ledger && snapshot.histories.length) fail('spend_basis_invalid', callLedgerId(project), 'histories', 'No ledger rows exist for these historical contexts');

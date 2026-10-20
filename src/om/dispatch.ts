@@ -14,8 +14,6 @@ import { readRecord, writeGuarded } from "./refs.js";
  */
 export const DISPATCH_CODES = Object.freeze(["dispatch_request_invalid", "environment_missing", "dispatch_adapter_invalid"] as const);
 
-/** The original era's protocol kept as a compatibility export; the accepted set is DISPATCH_PROTOCOLS. */
-export const DISPATCH_PROTOCOL = "codex-stdio";
 export const DISPATCH_PROTOCOLS = STDIO_PROTOCOLS;
 
 export interface DispatchReadRequest { project: string }
@@ -23,7 +21,7 @@ export interface DispatchRequest { project: string; protocol: StdioProtocol }
 /** The pair E1/E4/E5/A6 and H1 take as `dispatch`, and the heads a consumer keeps guarding while it relies on them. */
 export interface OmDispatch { dispatch: DispatchContract; references: Ref[]; guards: Ref[] }
 
-interface Basis { environment: Ref; adapter: Ref | null; protocol: StdioProtocol | null; active: Ref | null }
+interface Basis { environment: Ref; adapter: Ref | null; protocol: StdioProtocol | null }
 
 const UNIT = "E4.1";
 const ADAPTER_KIND = "dispatch-adapter";
@@ -33,9 +31,7 @@ const PROJECT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 // What readEnvironmentAt declares for a saved record that cannot serve. Any other failure is not this unit's to name.
 const ENVIRONMENT_DEFECTS = new Set(["environment_invalid", "role_invalid", "reviewer_not_independent", "command_unavailable"]);
 
-/** The original era's per-protocol address: adapter:<project>:codex-stdio. */
-const adapterId = (project: string): string => `adapter:${project}:${DISPATCH_PROTOCOL}`;
-/** The current selection record every later switch revises; historical records keep serving their exact Refs. */
+/** The single selection record: adapter:<project>:active (LG23: original-era per-protocol address removed). */
 const activeId = (project: string): string => `adapter:${project}:active`;
 
 function invalid(field: string, message: string): never {
@@ -95,18 +91,11 @@ function derive(store: Store, project: string): OmResult<Basis> {
   }
   const capacity = readCapacity(store, { project, environment, current: true });
   if (!capacity.ok) return capacity;
-  // The active selection outranks the original-era record; a corrupt one refuses instead of falling back.
   const active = store.get(activeId(project));
-  if (active) {
-    const read = readAdapter(store, project, activeId(project), active);
-    if (!read.ok) return read;
-    return { ok: true, value: { environment, adapter: reference(active), protocol: read.value, active: reference(active) } };
-  }
-  const id = adapterId(project), saved = store.get(id);
-  if (!saved) return { ok: true, value: { environment, adapter: null, protocol: null, active: null } };
-  const read = readAdapter(store, project, id, saved);
+  if (!active) return { ok: true, value: { environment, adapter: null, protocol: null } };
+  const read = readAdapter(store, project, activeId(project), active);
   if (!read.ok) return read;
-  return { ok: true, value: { environment, adapter: reference(saved), protocol: read.value, active: null } };
+  return { ok: true, value: { environment, adapter: reference(active), protocol: read.value } };
 }
 
 function outcome(config: Ref, adapter: Ref): OmDispatch {
@@ -119,35 +108,31 @@ export function readDispatch(store: Store, request: DispatchReadRequest): OmResu
   const basis = derive(store, request.project);
   if (!basis.ok) return basis;
   if (!basis.value.adapter) return refused("record_missing", "The project's adapter is not configured yet",
-    { unit: UNIT, target: adapterId(request.project), field: "adapter" }, "producer");
+    { unit: UNIT, target: activeId(request.project), field: "adapter" }, "producer");
   return delivered(outcome(basis.value.environment, basis.value.adapter));
 }
 
 /**
  * Writes the adapter selection of the project under the exact environment it was derived from, and returns the
- * dispatch. The original codex-stdio record keeps its own address; a Devin selection creates the active record,
- * and switching protocols is a new revision of it. Repeating the same configuration writes nothing.
+ * dispatch. One selection record adapter:<project>:active is revised on each protocol switch. Repeating the same
+ * configuration writes nothing.
  */
 export function configureDispatch(store: Store, request: DispatchRequest): OmResult<Sealed<OmDispatch>> {
   requireRequest(store, request, true);
-  const project = request.project, id = adapterId(project), active = activeId(project);
+  const project = request.project, active = activeId(project);
   const basis = derive(store, project);
   if (!basis.ok) return basis;
-  const { environment, adapter, protocol, active: activeRef } = basis.value;
+  const { environment, adapter, protocol } = basis.value;
   if (adapter && protocol === request.protocol) return delivered(outcome(environment, adapter));
-  const absentActive = { id: active, absent: true as const };
-  const written = activeRef
+  const written = adapter
     // The active record selects the current protocol; switching revises it under its own exact guard.
-    ? writeGuarded(store, { unit: UNIT, target: active, guards: [environment, activeRef],
-        writes: [{ id: active, kind: ADAPTER_KIND, expected: activeRef.revision, value: { projectId: project, protocol: request.protocol } }] })
-    : request.protocol === DISPATCH_PROTOCOL
-      // The original era's path stays untouched while no active selection exists.
-      ? writeGuarded(store, { unit: UNIT, target: id, guards: [environment, absentActive],
-          writes: [{ id, kind: ADAPTER_KIND, expected: 0, value: { projectId: project, protocol: DISPATCH_PROTOCOL } }] })
-      : writeGuarded(store, { unit: UNIT, target: active, guards: [environment, absentActive],
-          writes: [{ id: active, kind: ADAPTER_KIND, expected: 0, value: { projectId: project, protocol: request.protocol } }] });
+    ? writeGuarded(store, { unit: UNIT, target: active, guards: [environment, adapter],
+        writes: [{ id: active, kind: ADAPTER_KIND, expected: adapter.revision, value: { projectId: project, protocol: request.protocol } }] })
+    : writeGuarded(store, { unit: UNIT, target: active, guards: [environment],
+        writes: [{ id: active, kind: ADAPTER_KIND, expected: 0, value: { projectId: project, protocol: request.protocol } }] });
   if (written.ok) return delivered(outcome(environment, reference(written.value[0]!)));
-  if (written.refusal.code !== "revision_conflict") return written;
+  if (written.refusal.code !== "revision_conflict"
+    && !(written.refusal.code === "input_stale" && written.refusal.at?.target === active)) return written;
   // Another Store changed the selection first: it serves only if it is exactly the protocol this request asked for.
   const winner = derive(store, project);
   if (!winner.ok) return winner;

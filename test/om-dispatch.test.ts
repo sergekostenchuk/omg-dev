@@ -13,7 +13,7 @@ import { ProductEngine } from '../src/product/engine.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { projectGraph } from '../src/graph/project.js';
 import type { Graph } from '../src/graph/model.js';
-import { configureDispatch, readDispatch, DISPATCH_CODES, DISPATCH_PROTOCOL, type OmDispatch } from '../src/om/dispatch.js';
+import { configureDispatch, readDispatch, DISPATCH_CODES, type OmDispatch } from '../src/om/dispatch.js';
 import { readCapacity } from '../src/om/capacity.js';
 import type { OmResult, Refusal } from '../src/om/refusal.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
@@ -36,8 +36,10 @@ const devinAdapter = fileURLToPath(new URL('../src/adapters/devin-stdio.js', imp
 const originalPath = process.env['PATH'];
 const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
 const ENVIRONMENT = 'environment:garden';
-const ADAPTER = 'adapter:garden:codex-stdio';
-const COMMAND = { type: 'configure-om-dispatch', project: 'garden', protocol: DISPATCH_PROTOCOL };
+const ADAPTER = 'adapter:garden:active';
+// The protocol the fixtures select; the unit's own compatibility export is gone (LG23).
+const PROTOCOL = 'codex-stdio' as const;
+const COMMAND = { type: 'configure-om-dispatch', project: 'garden', protocol: PROTOCOL };
 
 function valueOf<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`Unexpected refusal: ${result.refusal.code}: ${result.refusal.message} ${JSON.stringify(result.refusal.at)}`);
@@ -98,11 +100,11 @@ test('R1 malformed commands and direct requests are refused before any read or w
   const f = light(t), before = heads(f.store);
   const bad: unknown[] = [null, 'configure-om-dispatch', [], {}, { type: 'configure-om-dispatch' },
     { type: 'configure-om-dispatch', project: f.project },
-    { type: 'configure-om-dispatch', protocol: DISPATCH_PROTOCOL },
+    { type: 'configure-om-dispatch', protocol: PROTOCOL },
     { ...COMMAND, protocol: 'pretend-codex' }, { ...COMMAND, protocol: undefined }, { ...COMMAND, adapter: 'adapter:garden:codex-stdio' },
     { ...COMMAND, project: 'a b' }, { ...COMMAND, project: '' }, { ...COMMAND, project: 'a'.repeat(81) }, { ...COMMAND, project: 7 }];
   for (const command of bad) rejects(() => f.engine.execute(command), 'command_invalid');
-  const good = { project: f.project, protocol: DISPATCH_PROTOCOL } as const;
+  const good = { project: f.project, protocol: PROTOCOL } as const;
   const direct: [string, () => unknown][] = [
     ['store', () => configureDispatch({} as Store, good)], ['store', () => readDispatch(null as never, { project: f.project })],
     ['request', () => configureDispatch(f.store, null as never)], ['request', () => configureDispatch(f.store, [] as never)],
@@ -147,7 +149,7 @@ test('R3 an absent project, environment or capacity keeps its own code and addre
   rejects(() => f.engine.execute({ ...COMMAND, project: 'nowhere' }), 'project_missing');
   const missing = { unit: 'E4.1', target: ENVIRONMENT, field: 'environment' };
   rejects(() => f.engine.execute(COMMAND), 'environment_missing', missing);
-  for (const refusal of [refusalOf(configureDispatch(f.store, { project: f.project, protocol: DISPATCH_PROTOCOL })),
+  for (const refusal of [refusalOf(configureDispatch(f.store, { project: f.project, protocol: PROTOCOL })),
     refusalOf(readDispatch(f.store, { project: f.project }))]) {
     assert.equal(refusal.code, 'environment_missing');
     assert.deepEqual(refusal.at, missing);
@@ -162,7 +164,7 @@ test('R3 an absent project, environment or capacity keeps its own code and addre
   // A saved environment the shared reader refuses keeps that reader's code, and is judged before the capacity reader.
   const stored = f.store.write({ id: ENVIRONMENT, kind: 'environment', expected: noCapacity.revision,
     value: { ...noCapacity.value, requestCapacityChars: 0 } });
-  const refused = refusalOf(configureDispatch(f.store, { project: f.project, protocol: DISPATCH_PROTOCOL }));
+  const refused = refusalOf(configureDispatch(f.store, { project: f.project, protocol: PROTOCOL }));
   assert.equal(refused.code, 'environment_invalid');
   assert.deepEqual(refused.at, { unit: 'E4.1', target: ENVIRONMENT, field: 'requestCapacityChars', ref: reference(stored) });
   assert.equal(f.store.get(ADAPTER), null);
@@ -175,7 +177,7 @@ test('R3 a failure inside the shared environment reader is not mistaken for a re
     if (id === ENVIRONMENT && revision !== undefined) throw new RangeError('storage failure');
     return get(id, revision);
   }) as Store['get'];
-  const calls: (() => unknown)[] = [() => configureDispatch(f.store, { project: f.project, protocol: DISPATCH_PROTOCOL }),
+  const calls: (() => unknown)[] = [() => configureDispatch(f.store, { project: f.project, protocol: PROTOCOL }),
     () => readDispatch(f.store, { project: f.project }), () => f.engine.execute(COMMAND)];
   for (const call of calls) assert.throws(call, error => error instanceof RangeError && error.message === 'storage failure');
   f.store.get = get;
@@ -220,10 +222,10 @@ test('R5 an equal saved adapter repeats to the same dispatch with no writes, als
   assert.deepEqual(f.dispatch(), first);
   assert.deepEqual(heads(f.store), saved);
   assert.deepEqual(new ProductEngine(f.store, 'another-operator').execute(COMMAND), first);
-  assert.deepEqual(valueOf(configureDispatch(f.store, { project: f.project, protocol: DISPATCH_PROTOCOL })), first);
+  assert.deepEqual(valueOf(configureDispatch(f.store, { project: f.project, protocol: PROTOCOL })), first);
   assert.deepEqual(heads(f.store), saved);
   const second = f.other();
-  assert.deepEqual(valueOf(configureDispatch(second, { project: f.project, protocol: DISPATCH_PROTOCOL })), first);
+  assert.deepEqual(valueOf(configureDispatch(second, { project: f.project, protocol: PROTOCOL })), first);
   assert.deepEqual(heads(second), saved);
   f.reopen();
   assert.deepEqual(f.dispatch(), first);
@@ -253,7 +255,7 @@ test('R6 a new environment revision gives a new config and the same adapter, and
 });
 
 test('R7 an environment that moves before the adapter write leaves no adapter, and a concurrent equal creation yields one object', t => {
-  const f = light(t), request = { project: f.project, protocol: DISPATCH_PROTOCOL } as const, other = f.other();
+  const f = light(t), request = { project: f.project, protocol: PROTOCOL } as const, other = f.other();
   const writeMany = f.store.writeMany.bind(f.store);
   let moves = 0;
   // The competing Store moves the environment head between our derivation and our adapter write, twice.
@@ -307,7 +309,7 @@ test('R8 a genuine adapter-lineage or another project\'s adapter is never taken 
   assert.equal(lineage.kind, 'adapter-lineage');
   f.enroll('orchard');
   const orchard = f.engine.execute({ ...COMMAND, project: 'orchard' }) as OmDispatch;
-  assert.equal(orchard.dispatch.adapter.id, 'adapter:orchard:codex-stdio');
+  assert.equal(orchard.dispatch.adapter.id, 'adapter:orchard:active');
   const before = heads(f.store);
   assert.equal(refusalOf(readDispatch(f.store, { project: f.project })).code, 'record_missing');
   const mine = f.dispatch();
@@ -316,15 +318,15 @@ test('R8 a genuine adapter-lineage or another project\'s adapter is never taken 
   for (const kept of [reference(lineage), orchard.dispatch.adapter]) assert.deepEqual(reference(f.store.get(kept.id)!), kept);
   // The two smallest cases of the canonical address holding something else; not a forgery matrix.
   f.enroll('garden2'); f.enroll('garden3');
-  const foreignKind = f.store.write({ id: 'adapter:garden2:codex-stdio', kind: 'adapter-lineage', expected: 0,
+  const foreignKind = f.store.write({ id: 'adapter:garden2:active', kind: 'adapter-lineage', expected: 0,
     value: { projectId: 'garden2', protocol: 'codex-stdio' } });
-  const foreignBody = f.store.write({ id: 'adapter:garden3:codex-stdio', kind: 'dispatch-adapter', expected: 0,
+  const foreignBody = f.store.write({ id: 'adapter:garden3:active', kind: 'dispatch-adapter', expected: 0,
     value: { projectId: 'orchard', protocol: 'codex-stdio' } });
   const settled = heads(f.store);
-  const kind = refusalOf(configureDispatch(f.store, { project: 'garden2', protocol: DISPATCH_PROTOCOL }));
+  const kind = refusalOf(configureDispatch(f.store, { project: 'garden2', protocol: PROTOCOL }));
   assert.equal(kind.code, 'record_foreign');
   assert.deepEqual(kind.at, { unit: 'E4.1', target: foreignKind.id, field: 'kind', ref: reference(foreignKind) });
-  const body = refusalOf(configureDispatch(f.store, { project: 'garden3', protocol: DISPATCH_PROTOCOL }));
+  const body = refusalOf(configureDispatch(f.store, { project: 'garden3', protocol: PROTOCOL }));
   assert.equal(body.code, 'dispatch_adapter_invalid');
   assert.deepEqual(body.at, { unit: 'E4.1', target: foreignBody.id, field: 'projectId', ref: reference(foreignBody) });
   rejects(() => f.engine.execute({ ...COMMAND, project: 'garden3' }), 'dispatch_adapter_invalid', body.at);
@@ -334,10 +336,10 @@ test('R8 a genuine adapter-lineage or another project\'s adapter is never taken 
 
 test('R1 R3 R8 the catalog names exactly the codes this unit emits, and each has its own path', t => {
   const f = light(t, { configured: false }), seen = new Set<string>();
-  try { configureDispatch(f.store, { project: 'a b', protocol: DISPATCH_PROTOCOL }); } catch (error) { seen.add((error as EngineError).code); }
+  try { configureDispatch(f.store, { project: 'a b', protocol: PROTOCOL }); } catch (error) { seen.add((error as EngineError).code); }
   seen.add(refusalOf(readDispatch(f.store, { project: f.project })).code);
   f.enroll('garden3');
-  f.store.write({ id: 'adapter:garden3:codex-stdio', kind: 'dispatch-adapter', expected: 0, value: { projectId: 'orchard', protocol: 'codex-stdio' } });
+  f.store.write({ id: 'adapter:garden3:active', kind: 'dispatch-adapter', expected: 0, value: { projectId: 'orchard', protocol: 'codex-stdio' } });
   seen.add(refusalOf(readDispatch(f.store, { project: 'garden3' })).code);
   assert.deepEqual([...seen].sort(), [...DISPATCH_CODES].sort());
 });
@@ -509,7 +511,6 @@ test('AD1 a Devin selection creates the active record, repeats without writes an
   const f = light(t);
   const first = f.engine.execute(DEVIN_COMMAND) as OmDispatch;
   assert.equal(first.dispatch.adapter.id, ACTIVE);
-  assert.equal(f.store.get(ADAPTER), null, 'the codex-era address stays empty');
   const active = f.store.get<{ projectId: string; protocol: string }>(ACTIVE)!;
   assert.equal(active.kind, 'dispatch-adapter'); assert.equal(active.revision, 1);
   assert.deepEqual(active.value, { projectId: 'garden', protocol: 'devin-stdio' });
@@ -525,28 +526,27 @@ test('AD1 a Devin selection creates the active record, repeats without writes an
   assert.equal(f.ran(), false);
 });
 
-test('AD1 codex → devin → codex revises the active record while the historical record keeps its exact ref', t => {
+test('AD1 codex → devin → codex revises the one selection record and each revision keeps its exact ref', t => {
   const f = light(t), first = f.dispatch();
   assert.equal(first.dispatch.adapter.id, ADAPTER);
   const devin = valueOf(configureDispatch(f.store, { project: f.project, protocol: DEVIN }));
   assert.equal(devin.dispatch.adapter.id, ACTIVE);
-  assert.equal(f.store.get(ACTIVE)!.revision, 1);
-  // The historical codex record keeps serving its exact persisted ref, never redirected through the selection.
-  assert.deepEqual(f.store.get<{ protocol: string }>(ADAPTER)!.value, { projectId: 'garden', protocol: 'codex-stdio' });
-  assert.deepEqual(first.dispatch.adapter, reference(f.store.get(ADAPTER)!));
+  assert.equal(f.store.get(ACTIVE)!.revision, 2);
+  // The codex revision stays readable at its exact ref; the selection moved on to the devin one.
+  assert.deepEqual(f.store.get<{ protocol: string }>(ADAPTER, first.dispatch.adapter.revision)!.value, { projectId: 'garden', protocol: 'codex-stdio' });
+  assert.deepEqual(first.dispatch.adapter, reference(f.store.get(ADAPTER, 1)!));
   const back = valueOf(configureDispatch(f.store, { project: f.project, protocol: 'codex-stdio' }));
-  assert.equal(back.dispatch.adapter.id, ACTIVE, 'switching back revises the active record, not the old address');
-  assert.equal(back.dispatch.adapter.revision, 2);
+  assert.equal(back.dispatch.adapter.id, ACTIVE, 'switching back revises the same selection record');
+  assert.equal(back.dispatch.adapter.revision, 3);
   assert.equal(f.store.get<{ protocol: string }>(ACTIVE)!.value.protocol, 'codex-stdio');
   const saved = heads(f.store);
   assert.deepEqual(valueOf(configureDispatch(f.store, { project: f.project, protocol: 'codex-stdio' })), back);
   assert.deepEqual(valueOf(readDispatch(f.store, { project: f.project })), back);
   assert.deepEqual(heads(f.store), saved);
-  assert.equal(f.store.history(ACTIVE).length, 2); assert.equal(f.store.history(ADAPTER).length, 1);
+  assert.equal(f.store.history(ACTIVE).length, 3);
 });
-
 test('AD1 a competing Store never reports its different protocol as this request\'s success', t => {
-  const f = light(t), request = { project: f.project, protocol: DISPATCH_PROTOCOL } as const, other = f.other();
+  const f = light(t), request = { project: f.project, protocol: PROTOCOL } as const, other = f.other();
   const writeMany = f.store.writeMany.bind(f.store); let raced = false;
   f.store.writeMany = ((writes, guards) => {
     if (!raced && writes.some(write => write.kind === 'dispatch-adapter')) {
@@ -560,7 +560,7 @@ test('AD1 a competing Store never reports its different protocol as this request
   f.store.writeMany = writeMany;
   assert.equal(raced, true);
   assert.equal(refusedResult.ok, false, 'a competing devin selection is never reported as the codex success');
-  assert.equal(f.store.get(ADAPTER), null, 'our codex record was not written');
+  assert.equal(f.store.history(ACTIVE).length, 1, 'our codex write left no revision');
   assert.equal(f.store.get<{ protocol: string }>(ACTIVE)!.value.protocol, 'devin-stdio');
   // A later codex request is a lawful switch of the active record, not a rewrite of history.
   const switched = valueOf(configureDispatch(f.store, request));
@@ -569,18 +569,18 @@ test('AD1 a competing Store never reports its different protocol as this request
   assert.equal(f.store.history(ACTIVE).length, 2);
 });
 
-test('AD1 a corrupt active record refuses instead of silently falling back to the codex-era address', t => {
+test('AD1 a corrupt active record refuses without falling back to an earlier revision', t => {
   const f = light(t), codex = f.dispatch();
   assert.equal(codex.dispatch.adapter.id, ADAPTER);
   valueOf(configureDispatch(f.store, { project: f.project, protocol: DEVIN }));
-  const broken = f.store.write({ id: ACTIVE, kind: 'dispatch-adapter', expected: 1,
+  const broken = f.store.write({ id: ACTIVE, kind: 'dispatch-adapter', expected: 2,
     value: { projectId: 'orchard', protocol: 'pretend' } });
   const refusal = refusalOf(readDispatch(f.store, { project: f.project }));
   assert.equal(refusal.code, 'dispatch_adapter_invalid');
   assert.equal(refusal.at.target, ACTIVE);
   assert.deepEqual(refusalOf(configureDispatch(f.store, { project: f.project, protocol: 'codex-stdio' })).code, 'dispatch_adapter_invalid');
-  // The intact codex-era record is still there, unread because the active selection outranks it.
-  assert.equal(f.store.get<{ protocol: string }>(ADAPTER)!.value.protocol, 'codex-stdio');
+  // The codex revision stays readable at its exact ref; the active head is the corrupt one.
+  assert.deepEqual(f.store.get<{ protocol: string }>(ACTIVE, 1)!.value, { projectId: 'garden', protocol: 'codex-stdio' });
   assert.equal(f.store.get(ACTIVE)!.hash, broken.hash);
 });
 
@@ -588,7 +588,6 @@ test('AD1 an end-to-end OM call over the devin dispatch, an independent E5 actor
   // The chain runs OM → the real devin-stdio adapter → the local devin binary stub, never a protocol-only relabel.
   const f = chain(t, 'devin'), { dispatch } = f.dispatched;
   assert.equal(dispatch.adapter.id, `adapter:${f.project}:active`);
-  assert.equal(f.store.get(ADAPTER), null, 'the codex-era address stays empty on a Devin-only project');
   const request = f.request();
   const model = valueOf(await runModelCall(f.store, request));
   assert.equal(model.record.value.status, 'succeeded');

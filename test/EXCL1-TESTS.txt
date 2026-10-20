@@ -117,7 +117,6 @@ om-question-packet.test.ts :: MP1.1 rows 5–8,20: actual managed correction →
 om-run-g5-choice.test.ts :: G5.1 rows 3, 5 a choice outside the allowed tests is refused, asked once more showing why, then chosen; twice refused, the wait stands with no third call # вид 1, найден GUARD1
 om-series-transition-prepared.test.ts :: the whole b1143aa producer leaves its stopped legacy series and exact B1 horizon bytes unchanged # вид 1, найден GUARD1
 om-spend-report.test.ts :: E6 reads unchanged E1 bytes from the complete 0da9006 producer after restart # вид 1, найден GUARD1
-om-spend-report.test.ts :: E6 replays the exact four-purpose report produced by cf5d56f after restart # вид 1, найден GUARD1
 stage-checks.test.ts :: R2 №2419-5: a compile produced by the code of base 4c2d5b3 in its own process is read by the lower kit as by ProductEngine, and its repeat after a restart writes nothing # вид 1, найден GUARD1
 
 # GS3a: wake-choice supplements exist only for proposals admitted before the wakeTest requirement.

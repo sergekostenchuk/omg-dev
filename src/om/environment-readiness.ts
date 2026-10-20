@@ -34,8 +34,6 @@ export interface OmStartReadiness extends EnvironmentReadiness { guards: Transac
 
 /** The conditions a NEW OM pass requires (contract table): its research runners, the exact Git root and HEAD, capacity, dispatch. */
 const OM_START = Object.freeze(["environment", "research:implementer", "research:reviewer", "repository", "capacity", "dispatch"]);
-// The address of the active adapter selection (dispatch.ts:39): its absence is part of the dispatch a new pass stands on.
-const activeAdapterId = (project: string): string => `adapter:${project}:active`;
 
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 function requireRequest(store: unknown, request: unknown): asserts request is { project: string } {
@@ -114,8 +112,8 @@ function observe(store: Store, project: string): Observed {
     requiredBy: "om-start", at: capacity.refusal.at.target, refs: [envRef], code: capacity.refusal.code, action: "configure requestCapacityChars" }));
   const dispatch = readDispatch(store, { project });
   if (dispatch.ok) {
-    const adapter = dispatch.value.dispatch.adapter, active = activeAdapterId(project);
-    guards.push(...dispatch.value.guards, ...(adapter.id === active ? [] : [{ id: active, absent: true as const }]));
+    const adapter = dispatch.value.dispatch.adapter;
+    guards.push(...dispatch.value.guards);
     conditions.push(condition({ condition: "dispatch", state: "available", requiredBy: "om-start", at: adapter.id, refs: [...dispatch.value.references],
       observed: { protocol: store.get<{ protocol?: Json }>(adapter.id, adapter.revision)?.value.protocol ?? null }, action: "none" }));
   } else conditions.push(condition({ condition: "dispatch", state: dispatch.refusal.code === "record_missing" ? "missing" : "invalid",

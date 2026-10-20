@@ -41,7 +41,8 @@ test("ENV1 the reader names every condition with its moment; a ready environment
   const admitted = omStartReadiness(f.store, "p");
   assert.ok(admitted.ok);
   assert.ok(admitted.value.guards.some(guard => JSON.stringify(guard) === JSON.stringify(environment)), "The environment is guarded");
-  assert.ok(admitted.value.guards.some(guard => guard.id === "adapter:p:active" && "absent" in guard), "So is the absent active selection");
+  assert.ok(!admitted.value.guards.some(guard => guard.id === "adapter:p:active" && "absent" in guard),
+    "One selection record after LG23: no extra guard for the absent active path");
 });
 
 test("ENV1 a research command naming a missing adapter script is a refusal of its own moment; a known adapter module is classified, never proved", t => {
