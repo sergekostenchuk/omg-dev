@@ -1767,7 +1767,10 @@ export type TurnTransitionProof =
   | { kind: 'early-model-refusal'; draft: Revision<DiscoveryDraft>; question: Revision<Question>;
       producer: Revision<ResearchConsumerIntent>; web?: boolean;
       /** UNK1: the unknown-era admission of the producer (earlyUnknownAdmission); absent in the DRY5FIX era. */
-      unknown?: EarlyUnknownAdmission }
+      unknown?: EarlyUnknownAdmission;
+      /** DRS1a2: the producer's exact call context, read by its own contract
+       * (consumerIntentContext); a v2 producer carries none in its cursor. */
+      context?: Record<string, any> }
   /** WB1: a web turn completes only from its saved capture (gateway answer or local refusal). */
   | { kind: 'web'; projectId: string; capture: Revision<WebCapture>; budget?: Revision<WebMaterialBudget> | null }
   | { kind: 'question-reopened'; original: Revision<Question>;
@@ -2161,11 +2164,14 @@ export function projectResearchTurnRevision(before: ManagedResearchTurn,
       && (!unknown || unknown.questionId === question.id && unknown.targets.every(row =>
         draft.value.inputs.some(input => canonical(input) === canonical(row.stage)))),
     'research_consumer_intent_invalid', 'The early refusal names the action era of its own producer');
+    requireCondition(producer.value.contract === 'research-consumer-intent/v1' || recordValue(proof.context),
+      'research_consumer_intent_invalid', 'The early refusal of a compact producer needs its exact restored context');
+    const context = proof.context ?? producer.value.cursor.context;
     const failure = earlyResearchFailure(draft.value, question.value, 'analyst', action,
-      producer.value.cursor.context?.discoveryContext ?? null, proof.web === true, unknown,
-      producer.value.cursor.context?.discoveryBasisCatalogue ?? null,
-      deliveredConceptSections(producer.value.cursor.context, draft.value),
-      producer.value.cursor.context?.prerequisites ?? null);
+      context?.discoveryContext ?? null, proof.web === true, unknown,
+      context?.discoveryBasisCatalogue ?? null,
+      deliveredConceptSections(context, draft.value),
+      context?.prerequisites ?? null);
     requireCondition(failure, 'research_consumer_intent_invalid', 'A valid early reply cannot become a model refusal');
     return { ...before, status: 'completed', assessment: null,
       observation: { contract: EARLY_RESEARCH_OUTCOME, code: failure.code, details: failure.details ?? null,

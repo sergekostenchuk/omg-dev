@@ -1,5 +1,6 @@
 import { prepareResearchEnvelope } from './research-protocol.js';
-import { readRequestWire } from './request-parts.js';
+import { readRequestWire, readArchiveBody, prepareContextPreparation, readPreparationRecord, readPreparedContext,
+  CONTEXT_PREPARATION_CONTRACT, ARCHIVE_PARTS_CONTRACT, type ContextPreparationBinding } from './request-parts.js';
 import { stageNeighbors, STAGE_NEIGHBOR_CONTEXT } from './stage-neighbors.js';
 import { earlyResearchStage, earlyResearchFailure, earlyUpstreamTargets, deliveredConceptSections,
   EARLY_RESEARCH_OUTCOME, requireEscalationReply, researchCapacityInput, declareResultCapacity,
@@ -166,8 +167,13 @@ function responseSessionBinding(session: Revision<RecoverableContextSession>) {
 const object = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
 export type ResearchConsumerKind = 'synthesis' | 'consolidation' | 'reader' | 'analyst' | 'reading-planner' | 'escalation-assessor';
+/** DRS1a2: v2 keeps the analyst call context once in an immutable
+ * context-preparation/v1 (request parts) and names it by exact Ref; its cursor
+ * carries no context. v1 keeps cursor.context. The saved contract decides. */
+export const CONSUMER_INTENT_V1 = 'research-consumer-intent/v1' as const;
+export const CONSUMER_INTENT_V2 = 'research-consumer-intent/v2' as const;
 export interface ResearchConsumerIntent {
-  contract: 'research-consumer-intent/v1'; projectId: string; kind: ResearchConsumerKind; key: string;
+  contract: typeof CONSUMER_INTENT_V1 | typeof CONSUMER_INTENT_V2; projectId: string; kind: ResearchConsumerKind; key: string;
   rootKey: string; generation: number; previous: Ref | null;
   owner: Ref; draft: Ref; question: Ref; role: RoleBinding; dispatch: Environment; profile: Ref | null;
   cursor: Record<string, any>; basis: Ref[]; guards: TransactionGuard[];
@@ -175,9 +181,11 @@ export interface ResearchConsumerIntent {
   call: Ref | null; request: Ref | null; archive: Ref | null; outputs: Ref[] | null;
   refusal: { code: string; kind: 'provider-failed' | 'terminal' | 'reader-invalid' | 'consumer-invalid';
     call: Ref; request: Ref; response: Ref | null; archive: Ref; capacity?: Record<string, unknown> } | null;
+  /** v2 only: the exact immutable preparation (revision 1) holding the context. */
+  preparation?: Ref;
 }
 export type ResearchConsumerIntentInput = Omit<ResearchConsumerIntent,
-  'contract' | 'rootKey' | 'generation' | 'previous' | 'state' | 'call' | 'request' | 'archive' | 'outputs' | 'refusal'>;
+  'contract' | 'rootKey' | 'generation' | 'previous' | 'state' | 'call' | 'request' | 'archive' | 'outputs' | 'refusal' | 'preparation'>;
 const consumerKinds: ResearchConsumerKind[] = ['synthesis', 'consolidation', 'reader', 'analyst', 'reading-planner', 'escalation-assessor'];
 function sameLogicalConsumerStep(a: ResearchConsumerIntent, b: ResearchConsumerIntent): boolean {
   if (a.projectId !== b.projectId || a.kind !== b.kind || a.rootKey !== b.rootKey
@@ -236,17 +244,21 @@ export function researchConsumerIntentId(projectId: string, kind: ResearchConsum
 function pendingRef(write: Write): Ref { return { id: write.id, revision: write.expected + 1, hash: hashJson(write.value) }; }
 function consumerShape(value: unknown, id: string): asserts value is ResearchConsumerIntent {
   if (!object(value)) consumerInvalid(id, 'The saved consumer intent is not a record');
+  // DRS1a2: the contract is read first; v2 adds only its exact preparation and
+  // drops cursor.context — analyst only.
+  const v2 = value.contract === CONSUMER_INTENT_V2;
   if (Object.keys(value).sort().join(',') !== ['archive', 'basis', 'call', 'contract', 'cursor', 'dispatch', 'draft',
     'generation', 'guards', 'key', 'kind', 'outputs', 'owner', 'previous', 'profile', 'projectId', 'question',
-    'refusal', 'request', 'role', 'rootKey', 'state'].sort().join(',')
-    || value.contract !== 'research-consumer-intent/v1' || typeof value.projectId !== 'string' || !value.projectId
+    'refusal', 'request', 'role', 'rootKey', 'state', ...(v2 ? ['preparation'] : [])].sort().join(',')
+    || !(value.contract === CONSUMER_INTENT_V1 || v2) || typeof value.projectId !== 'string' || !value.projectId
     || !consumerKinds.includes(value.kind) || typeof value.key !== 'string' || !value.key
     || value.rootKey !== value.key || !Number.isSafeInteger(value.generation) || value.generation < 0
     || !(value.previous === null || isRef(value.previous))
     || !isRef(value.owner) || !isRef(value.draft) || !isRef(value.question)
     || !object(value.role) || !object(value.dispatch) || value.dispatch.projectId !== value.projectId
     || !(value.profile === null || isRef(value.profile)) || !object(value.cursor)
-    || !object(value.cursor.context)
+    || (v2 ? value.kind !== 'analyst' || !isRef(value.preparation) || value.preparation.revision !== 1
+      || Object.hasOwn(value.cursor, 'context') : !object(value.cursor.context))
     || typeof (value.cursor.prompt ?? value.cursor.instruction) !== 'string'
     || !Array.isArray(value.basis) || !value.basis.every(isRef)
     || !Array.isArray(value.guards) || canonical(uniqueTransactionGuards(value.guards)) !== canonical(value.guards)
@@ -333,7 +345,31 @@ export function readResearchConsumerIntent(store: Store, ref: Ref): Revision<Res
   consumerShape(saved.value, saved.id);
   if (saved.id !== researchConsumerIntentId(saved.value.projectId, saved.value.kind, saved.value.key, saved.value.generation))
     consumerInvalid(saved.id, 'The intent address does not match its saved producer');
+  // DRS1a2 (P2-03): a v2 intent stands on the one exact preparation of its own
+  // step — the record and its binding, without re-reading history or parts.
+  if (saved.value.contract === CONSUMER_INTENT_V2)
+    readPreparationRecord(store, saved.value.preparation!, preparationBinding(saved.value, saved.id));
   return saved;
+}
+/** DRS1a2: the step a v2 preparation must be bound to — from the intent's own
+ * saved fields: project/draft/Question/owner, kind, instruction, the exact
+ * attempt subject and the immutable action-era fields of its cursor. */
+export function preparationBinding(intent: ResearchConsumerIntent, id = 'research-consumer-intent'): ContextPreparationBinding {
+  const cursor = intent.cursor;
+  return { projectId: intent.projectId, draft: intent.draft, question: intent.question, owner: intent.owner,
+    kind: 'analyst', instruction: cursor.prompt ?? cursor.instruction, subject: cursorSubject(intent, id),
+    earlyActions: typeof cursor.earlyActions === 'string' ? cursor.earlyActions : null,
+    graphBase: isRef(cursor.graphBase) ? cursor.graphBase : null };
+}
+/** DRS1a2: the exact call context of a saved intent by its own contract — v1
+ * its cursor.context, v2 the context restored from its bound preparation. The
+ * contract decides before any representation is chosen; nothing else (a
+ * caller field, a pending value) substitutes it. */
+export function consumerIntentContext(store: Store, intent: ResearchConsumerIntent, id = 'research-consumer-intent'): Record<string, any> {
+  if (intent.contract === CONSUMER_INTENT_V1) return intent.cursor.context;
+  if (intent.contract === CONSUMER_INTENT_V2)
+    return readPreparedContext(store, intent.preparation!, preparationBinding(intent, id)).context;
+  consumerInvalid(id, 'The consumer intent names an unknown contract');
 }
 /** A queued managed plan owns its children even though their old addresses do
  * not contain the managed-era marker. Find the exact queue before deciding
@@ -536,12 +572,13 @@ export function projectPaidLayerDesignRefusal(store: Store, producer: Revision<R
       && object(delivery)
       && delivery.run === before.value.run
       && delivery.turn === before.value.number)) return null;
+  const producerContext = consumerIntentContext(store, producer.value, producer.id);
   const graphRef = action.action === 'answer_delta' ? action.base
-    : producer.value.cursor.graphBase ?? (producer.value.profile ? producer.value.cursor.context?.graphBase : null);
+    : producer.value.cursor.graphBase ?? (producer.value.profile ? producerContext?.graphBase : null);
   if (!isRef(graphRef)
     || action.action === 'answer_delta' && (!producer.value.profile
-      || !isRef(producer.value.cursor.context?.graphBase)
-      || canonical(graphRef) !== canonical(producer.value.cursor.context.graphBase))
+      || !isRef(producerContext?.graphBase)
+      || canonical(graphRef) !== canonical(producerContext.graphBase))
     || isRef(producer.value.cursor.graphBase)
       && canonical(graphRef) !== canonical(producer.value.cursor.graphBase)
     || action.action === 'answer' && !producer.value.profile
@@ -563,11 +600,11 @@ export function projectPaidLayerDesignRefusal(store: Store, producer: Revision<R
     || graph.id !== `graph:${producer.value.projectId}`) return null;
   if (action.action === 'answer' && !producer.value.profile && draft.value.level !== 'R2') return null;
   if (producer.value.profile) {
-    if (!isRef(producer.value.cursor.context?.graphBase)
-      || canonical(producer.value.cursor.context.graphBase) !== canonical(graphRef)) return null;
+    if (!isRef(producerContext?.graphBase)
+      || canonical(producerContext.graphBase) !== canonical(graphRef)) return null;
   } else {
     const upper = draft.value.level === 'R2' ? 2 : 1;
-    const map = producer.value.cursor.context?.operationMap;
+    const map = producerContext?.operationMap;
     const layerRef = map?.ref;
     const layer = isRef(layerRef) ? store.get<{ projection: Graph }>(layerRef.id, layerRef.revision) : null;
     if (!isRef(layerRef) || !layer || layer.kind !== 'graph-layer'
@@ -764,6 +801,7 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
     const refusalProducer = readResearchConsumerIntent(store, before.value.consumerIntent);
     const admission = earlyUnknownAdmission(store, refusalProducer, draft, question);
     return { kind: 'early-model-refusal', draft, question, producer: refusalProducer,
+      context: consumerIntentContext(store, refusalProducer.value, refusalProducer.id),
       ...(intentWebCapability(store, producer) ? { web: true } : {}), ...(admission ? { unknown: admission } : {}) };
   }
   const localRefusal = projectPaidLocalRefusal(before.value as ManagedResearchTurn, earlyUnknownEra(producer.value.cursor));
@@ -815,10 +853,11 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
     const legacySizeRefusal = after.value.error === 'Use a smaller addressed context page'
       && after.value.observation?.code === 'context_read_limit';
     let refused = false;
-    try { projectResearchContextRead(record.value, action.record, action.pointer, action.page,
+    const recordValue = contextRecordValue(store, record);
+    try { projectResearchContextRead(recordValue, action.record, action.pointer, action.page,
       maxChars, legacySizeRefusal ? 'legacy' : 'bounded'); }
     catch (error) { if (error instanceof EngineError) refused = true; else throw error; }
-    if (refused) return { kind: 'context-refusal', recordValue: record.value,
+    if (refused) return { kind: 'context-refusal', recordValue,
       record: action.record, maxChars,
       ...(!legacySizeRefusal ? { projection: 'bounded' as const } : {}) };
     if (after.value.error !== null) {
@@ -836,12 +875,12 @@ function historicalTurnTransitionProof(store: Store, producer: Revision<Research
       const paid = readResearchConsumerExecutionFromIntent(store, producer.value.projectId, producer);
       if (paid.kind !== 'response' || !Array.isArray(paid.subject.contextWorkspace))
         consumerInvalid(before.id, 'The refused delivery lost its exact original packet');
-      return { kind: 'delivery-refusal', recordValue: record.value, record: action.record,
+      return { kind: 'delivery-refusal', recordValue, record: action.record,
         maxChars, workspace, delivered: paid.subject.contextWorkspace,
         ...(pilot?.value.contextLimits?.maxLookups !== undefined
           ? { maxLookups: pilot.value.contextLimits.maxLookups } : {}) };
     }
-    return { kind: 'read-context', recordValue: record.value,
+    return { kind: 'read-context', recordValue,
       record: action.record, maxChars };
   }
   if (action.action === 'read_bundle' && after.value.status === 'completed' && after.value.error === null) {
@@ -1298,7 +1337,10 @@ export function listResearchConsumerIntentsByRoot(store: Store, projectId: strin
       && record.value.cursor.rootKey === rootKey);
 }
 /** Rebuild the declaration from the exact producer, never today's heads. */
-export function consumerResultCapacity(store: Store, intent: ResearchConsumerIntent) {
+export function consumerResultCapacity(store: Store, intent: ResearchConsumerIntent,
+  /** DRS1a2: the producer's own not yet published context (the one origin of
+   * its preparation); every saved intent reads its context by its contract. */
+  pendingContext?: Record<string, any>) {
   const draft = store.get<DiscoveryDraft>(intent.draft.id, intent.draft.revision);
   const question = store.get<Question>(intent.question.id, intent.question.revision);
   const profile = intent.profile ? store.get<ReaderPilot>(intent.profile.id, intent.profile.revision) : null;
@@ -1306,7 +1348,7 @@ export function consumerResultCapacity(store: Store, intent: ResearchConsumerInt
     && canonical(reference(question)) === canonical(intent.question)
     && (!intent.profile || profile && canonical(reference(profile)) === canonical(intent.profile)),
   'research_capacity_invalid', 'Result capacity needs the exact draft, question and profile');
-  const cursor = intent.cursor, context = cursor.context;
+  const cursor = intent.cursor, context = pendingContext ?? consumerIntentContext(store, intent);
   return researchCapacityInput({ operation: intent.key, generation: intent.generation,
     bindings: { projectId: intent.projectId, draft: intent.draft, question: intent.question,
       inputsHash: hashJson(draft.value.inputs), basis: intent.basis, owner: intent.owner,
@@ -1376,7 +1418,10 @@ function requireIntentSubject(store: Store, value: ResearchConsumerIntent, id: s
     consumerInvalid(id, 'The attempt subject names a plan-question outside its proven plan edition');
 }
 export function prepareResearchConsumerIntent(store: Store, input: ResearchConsumerIntentInput,
-  permits: readonly Ref[] = []): Revision<ResearchConsumerIntent> {
+  permits: readonly Ref[] = [],
+  /** DRS1a2: a trusted parameter of the calling code (never a context field)
+   * selecting the compact v2 storage for an analyst call. */
+  options: { contextContract?: typeof CONTEXT_PREPARATION_CONTRACT } = {}): Revision<ResearchConsumerIntent> {
   if (!object(input)) consumerInvalid('research-consumer-intent', 'A complete consumer admission is required');
   if (!Array.isArray(permits) || !permits.every(isRef))
     consumerInvalid('research-consumer-intent', 'Retry permits must be exact saved terminal references');
@@ -1405,6 +1450,27 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
   // Retain an existing attempt's era; a new external generation declares its
   // own admission. An old paid/unsent operation is never reclassified here.
   value.cursor = { ...input.cursor };
+  // DRS1a2: the compact contract is chosen by the calling code for an analyst
+  // call only (not in preview, which writes nothing). Its preparation is built
+  // here from the one context this producer also declares capacity for, and is
+  // published in the same batch as the intent that first names it.
+  if (options.contextContract !== undefined)
+    requireCondition(options.contextContract === CONTEXT_PREPARATION_CONTRACT && input.kind === 'analyst',
+      'research_consumer_intent_invalid', 'Only an analyst call may select the compact context contract');
+  const compact = options.contextContract === CONTEXT_PREPARATION_CONTRACT && !isResearchPreview();
+  let context: Record<string, any> = value.cursor.context;
+  let preparationWrites: Write[] = [], preparationGuards: Ref[] = [];
+  const toCompact = () => {
+    if (!compact) return;
+    requireCondition(object(context), 'research_consumer_intent_invalid', 'The compact call needs its exact context object');
+    const { context: _carried, ...cursor } = value.cursor;
+    value.cursor = cursor;
+    value.contract = CONSUMER_INTENT_V2;
+    const prepared = prepareContextPreparation(store, preparationBinding(value, input.key), context);
+    value.preparation = prepared.preparation;
+    preparationWrites = prepared.writes; preparationGuards = prepared.guards;
+  };
+  toCompact();
   if (previous && !replacing && previous.value.state !== 'prepared') {
     if (previous.value.cursor.resultCapacityContract !== undefined) {
       value.cursor.resultCapacityContract = previous.value.cursor.resultCapacityContract;
@@ -1427,20 +1493,28 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
       delete value.cursor.resultCapacityPrompt;
     }
     const correction = previous ? consumerCapacityCorrection(store, previous) : null;
-    if (correction) value.cursor.context = { ...value.cursor.context, failures: [correction] };
+    if (correction) {
+      context = { ...context, failures: [correction] };
+      if (compact) toCompact(); else value.cursor.context = context;
+    }
     value.cursor.resultCapacityContract = RESULT_CAPACITY;
     const profile = value.profile ? store.get<ReaderPilot>(value.profile.id, value.profile.revision)! : undefined;
     for (let n = 0; n < 4; n += 1) {
-      value.cursor.resultCapacity = declareResultCapacity(store, consumerResultCapacity(store, value));
+      value.cursor.resultCapacity = declareResultCapacity(store, consumerResultCapacity(store, value, context));
       const actual = prepareResearchEnvelope(value.role, value.dispatch, value.cursor.prompt ?? value.cursor.instruction,
-        value.cursor.context, { store, draftId: value.draft.id, questionId: value.question.id,
-          purpose: ['synthesis', 'consolidation'].includes(value.kind) ? 'analyst' : value.kind, ...(profile ? { pilot: profile } : {}) },
+        context, { store, draftId: value.draft.id, questionId: value.question.id,
+          purpose: ['synthesis', 'consolidation'].includes(value.kind) ? 'analyst' : value.kind, ...(profile ? { pilot: profile } : {}),
+          ...(compact ? { contextContract: ARCHIVE_PARTS_CONTRACT } : {}) },
         value.cursor.resultCapacity);
-      if (consumerResultCapacity(store, value).mandatoryEnvelope.prompt === actual.envelope.prompt) { value.cursor.resultCapacityPrompt = actual.envelope.prompt; break; }
+      if (consumerResultCapacity(store, value, context).mandatoryEnvelope.prompt === actual.envelope.prompt) { value.cursor.resultCapacityPrompt = actual.envelope.prompt; break; }
       value.cursor.resultCapacityPrompt = actual.envelope.prompt;
       requireCondition(n < 3, 'research_capacity_configuration', 'The admission prompt has no stable packet projection');
     }
   }
+  // The preflight above may have saved content-addressed parts the
+  // preparation shares; its writes are derived again on the final store state
+  // (the Ref is unchanged), so the batch writes only parts still absent.
+  toCompact();
   consumerShape(value, 'research-consumer-intent');
   requireEscalationNeighbors(store, value, 'research-consumer-intent');
   if (previous && !sameLogicalConsumerStep(previous.value, value))
@@ -1454,16 +1528,20 @@ export function prepareResearchConsumerIntent(store: Store, input: ResearchConsu
       consumerInvalid(id, 'The operation key names a different saved admission');
     if (checked.value.state === 'prepared' && canonical(checked.value) !== canonical(value)) {
       if (isResearchPreview()) return { ...checked, revision: checked.revision + 1, hash: hashJson(value), value };
-      return store.writeMany<ResearchConsumerIntent>([{ id, kind: checked.kind, expected: checked.revision, value }],
-        uniqueTransactionGuards([reference(checked), ...value.guards]))[0]!;
+      return store.writeMany<ResearchConsumerIntent>([...preparationWrites, { id, kind: checked.kind, expected: checked.revision, value }],
+        uniqueTransactionGuards([reference(checked), ...value.guards, ...preparationGuards])).at(-1)!;
     }
     return checked;
   }
   if (isResearchPreview()) return { id, kind: 'research-consumer-intent', revision: 1,
     hash: hashJson(value), value };
-  return store.writeMany<ResearchConsumerIntent>([{ id, kind: 'research-consumer-intent', expected: 0, value }],
-    uniqueTransactionGuards([...value.guards, ...(replacing ? [reference(previous!), currentRefusedCall!] : []),
-      { id, absent: true }]))[0]!;
+  // DRS1a2 (P2-04): one batch publishes the new parts, the preparation and the
+  // intent — each new record expected:0 — and positively guards only records
+  // that already exist; the intent's saved guards never name a record of
+  // this batch.
+  return store.writeMany<ResearchConsumerIntent>([...preparationWrites, { id, kind: 'research-consumer-intent', expected: 0, value }],
+    uniqueTransactionGuards([...value.guards, ...preparationGuards, ...(replacing ? [reference(previous!), currentRefusedCall!] : []),
+      { id, absent: true }])).at(-1)!;
 }
 export function prepareResearchConsumerReservation(store: Store, intentRef: Ref, call: Write,
   request: Ref, archive: Ref): { writes: Write[]; guards: TransactionGuard[] } {
@@ -1854,12 +1932,13 @@ export function earlyResearchConsumerFailure(store: Store, intent: Revision<Rese
   // never apply to an attempt subject — its reply is checked by the subject/end
   // contract, and a malformed paid end is a refusal without a second payment.
   if (cursorSubject(intent.value, intent.id)) return consumerCapacityFailure(store, intent, paid.payload);
+  const context = consumerIntentContext(store, intent.value, intent.id);
   return consumerCapacityFailure(store, intent, paid.payload) ?? earlyResearchFailure(draft.value, question.value,
     intent.value.kind as 'analyst' | 'escalation-assessor', paid.payload,
-    intent.value.cursor.context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question),
-    intent.value.cursor.context?.discoveryBasisCatalogue ?? null,
-    deliveredConceptSections(intent.value.cursor.context, draft.value),
-    intent.value.cursor.context?.prerequisites ?? null);
+    context?.discoveryContext ?? null, intentWebCapability(store, intent), earlyUnknownAdmission(store, intent, draft, question),
+    context?.discoveryBasisCatalogue ?? null,
+    deliveredConceptSections(context, draft.value),
+    context?.prerequisites ?? null);
 }
 /** UNK1 (№4686 §3): the unknown-era admission of one early analyst call, from its saved cursor and original draft — null in
  * the DRY5FIX era, so an old need_research keeps its refusal. */
@@ -2334,11 +2413,20 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
     || hashJson(response.value) !== response.hash || hashJson(archive.value) !== archive.hash
     || response.value.projectId !== projectId
     || response.value.draftId !== intent.value.draft.id
-    || !object(archive.value) || !object(archive.value.body) || !isRef(archive.value.draft) || !isRef(archive.value.question)
+    || !object(archive.value) || !isRef(archive.value.draft) || !isRef(archive.value.question)
     || canonical(archive.value.draft) !== canonical(intent.value.draft)
     || canonical(archive.value.question) !== canonical(intent.value.question)
     || typeof response.value.text !== 'string')
     consumerInvalid(intent.id, 'The exact saved wire records or archive are missing or foreign');
+  // DRS1a2: the archive body by the archive's own saved contract — the whole
+  // body literally, archive-parts/v1 restored from its exact parts.
+  let archived: { body: Record<string, any>; partGuards: Ref[] };
+  try { archived = readArchiveBody(store, archive); }
+  catch (error) {
+    if (error instanceof EngineError) consumerInvalid(intent.id, `The exact saved wire records or archive are missing or foreign: ${error.code}`);
+    throw error;
+  }
+  const archiveBody = archived.body;
   if (digest(requestText) !== call.value.request.hash || requestText.length !== call.value.request.chars
     || Buffer.byteLength(requestText) !== call.value.request.bytes
     || response.value.text.length !== call.value.response!.chars || Buffer.byteLength(response.value.text) !== call.value.response!.bytes)
@@ -2360,24 +2448,24 @@ function readResearchConsumerExecutionFromIntent(store: Store, projectId: string
         && canonical(saved.value.draft) === canonical(archive.value.draft)
         && canonical(saved.value.question) === canonical(archive.value.question),
       'research_context_undelivered', 'The material address is not a saved original of this research question');
-      return contextValue(saved.value, pointer);
+      return contextValue({ ...saved.value, body: readArchiveBody(store, saved).body }, pointer);
     });
-  requirePlanningNavigation(envelope.subject, archiveRef, archive.value.body);
+  requirePlanningNavigation(envelope.subject, archiveRef, archiveBody);
   if (intent.value.cursor.resultCapacityContract !== undefined
     && (envelope.prompt !== intent.value.cursor.resultCapacityPrompt
       || canonical(envelope.subject.resultCapacity) !== canonical(intent.value.cursor.resultCapacity)
-      || canonical(archive.value.body.resultCapacity) !== canonical(intent.value.cursor.resultCapacity)))
+      || canonical(archiveBody.resultCapacity) !== canonical(intent.value.cursor.resultCapacity)))
     consumerInvalid(intent.id, 'The paid request or archive lost its exact result declaration');
   if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
-    if (archive.value.body.synthesisSession !== intent.value.owner.id
-      || archive.value.body.dispatchMode !== (intent.value.kind === 'consolidation' ? 'consolidation' : 'synthesis')
-      || canonical(envelope.subject.synthesisState) !== canonical(archive.value.body.synthesisState))
+    if (archiveBody.synthesisSession !== intent.value.owner.id
+      || archiveBody.dispatchMode !== (intent.value.kind === 'consolidation' ? 'consolidation' : 'synthesis')
+      || canonical(envelope.subject.synthesisState) !== canonical(archiveBody.synthesisState))
       consumerInvalid(intent.id, 'The paid synthesis page belongs to another saved session');
   } else if (intent.value.kind === 'reader' && envelope.subject.role !== 'reader')
     consumerInvalid(intent.id, 'The paid reader request belongs to another source selection');
   physicalExecution(store, call, response.value, 'consumerExecution', 'consumerIntent', 'research-consumer-execution/v1');
   const guards = uniqueTransactionGuards([reference(intent), reference(call), requestRef, responseRef, archiveRef,
-    ...partGuards, ...intent.value.guards]);
+    ...partGuards, ...archived.partGuards, ...intent.value.guards]);
   const base = { intent, call, request: requestRef, response: responseRef, archive: archiveRef,
     subject: envelope.subject, prompt: envelope.prompt, guards };
   if (call.value.status === 'failed') {
@@ -2972,7 +3060,7 @@ function validateRunnerApplicationWrites(store: Store, intent: Revision<Research
       runId: priorRun.id, intent: reference(origin), response: paid.payload,
       question: selectedQuestion, ...(subject ? { subject } : {}),
       owner: runWrite.value.owner as ResearchRun['owner'], limit: runWrite.value.limit,
-      context: intent.value.cursor.context, ...(intent.value.cursor.mode ? { mode: intent.value.cursor.mode } : {}),
+      context: consumerIntentContext(store, intent.value, intent.id), ...(intent.value.cursor.mode ? { mode: intent.value.cursor.mode } : {}),
       ...(intentWebCapability(store, intent) ? { web: true } : {}), ...(earlyUnknownEra(intent.value.cursor) ? { unknown: true } : {}) });
     expectedRun = projected.run;
     // D8.4e: the era of a SAVED application is its own producer's form — a
@@ -3467,11 +3555,19 @@ export function readResearchContextRecordAt(store: Store, draft: Revision<Discov
   return record;
 }
 
+/** DRS1a2: the addressable value of an exact context record — a
+ * research-context archive with its body by its own contract (a compact archive
+ * keeps it in parts); any other record as saved. The saved Revision itself is
+ * never rewritten with the restored body. */
+export function contextRecordValue(store: Store, record: Revision<unknown>): unknown {
+  return record.kind === 'research-context'
+    ? { ...(record.value as Record<string, unknown>), body: readArchiveBody(store, record).body } : record.value;
+}
 export function readResearchContextOutcomeAt(store: Store, draft: Revision<DiscoveryDraft>, _question: Revision<Question>,
   action: Extract<ResearchAction, { action: 'read_context' }>, maxChars: number,
   mode: 'legacy' | 'bounded' = 'bounded') {
   const record = readResearchContextRecordAt(store, draft, action);
-  return projectResearchContextRead(record.value, action.record, action.pointer, action.page, maxChars, mode);
+  return projectResearchContextRead(contextRecordValue(store, record), action.record, action.pointer, action.page, maxChars, mode);
 }
 
 function checkedContextIdentity(store: Store, projectId: string, draft: Revision<DiscoveryDraft>,
@@ -3482,8 +3578,11 @@ function checkedContextIdentity(store: Store, projectId: string, draft: Revision
     ? observation.value : observation;
   const nested = object(value) && isRef(value.ref) && value.ref.id.startsWith('reader-result:')
     ? readReaderResultAt(store, projectId, value.ref) : null;
+  // DRS1a2: an archive's addressed original is its body by the archive's own
+  // contract (a compact archive keeps it in parts, never as value.body).
+  const recordValue = contextRecordValue(store, record);
   return { projectId, action, observation: observation as ContextReadIdentityInput['observation'],
-    recordKind: record.kind, recordValue: record.value, question,
+    recordKind: record.kind, recordValue, question,
     ...(nested ? { readerResult: { ref: reference(nested), value: nested.value } } : {}) };
 }
 

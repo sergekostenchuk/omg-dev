@@ -33,8 +33,9 @@ import { replayAssessmentApplication, replayLimitedResponse } from "./response-r
 import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
   readResearchConsumerIntent, resumeResearchConsumerExecution,
-  refuseResearchConsumerIntent, prepareResearchConsumerReservation,
+  refuseResearchConsumerIntent, prepareResearchConsumerReservation, consumerIntentContext, CONSUMER_INTENT_V2,
   type ResearchConsumerIntent } from './response-recovery.js';
+import { ARCHIVE_PARTS_CONTRACT } from './request-parts.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { projectResearchPhysicalReply } from './research-consumer-transition.js';
 import { earlyResearchStage, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS, RESULT_CAPACITY } from './early-research-outcome.js';
@@ -54,6 +55,9 @@ export interface ResearchCallAudit {
   /** Virtual producer only inside the no-dispatch preview scope. */
   previewIntent?: Revision<ResearchConsumerIntent>;
   requestContract?: string;
+  /** DRS1a2: the archive contract of the packer — set only by trusted code: the
+   * intent producer's preflight, and researchCall from the saved intent. */
+  contextContract?: typeof ARCHIVE_PARTS_CONTRACT;
 }
 type AssessmentReservation = { kind: 'replay-only' } | {
   kind: 'application'; session: Revision<RecoverableContextSession>; application: Revision<Record<string, any>>;
@@ -178,7 +182,7 @@ function preparedAssessmentCall(reservation: AssessmentReservation | null, call:
 /** The same real packet builder declares admission and later dispatches it.
  * Preflight may save a content-addressed archive, never a call or usage. */
 export function prepareResearchEnvelope(role: RoleBinding, environment: Environment, prompt: string,
-  context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot'>,
+  context: unknown, audit?: Pick<ResearchCallAudit, 'store' | 'draftId' | 'questionId' | 'purpose' | 'pilot' | 'contextContract'>,
   capacity?: Record<string, any>, requestId = '00000000-0000-0000-0000-000000000000',
   requestContract?: string) {
   const draft = audit?.store.get<DiscoveryDraft>(audit.draftId);
@@ -218,7 +222,8 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
       limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}), continuation: !packetState.initial,
         ...(packetState.latest ? { previous: packetState.latest } : {}),
         ...(audit!.pilot ? { contextChars: audit!.pilot.value.maxRequestChars } : {}),
-        ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}) })
+        ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}),
+        ...(audit!.contextContract ? { contextContract: audit!.contextContract } : {}) })
       : packingContext && typeof packingContext === 'object' && !Array.isArray(packingContext) ? { ...packingContext } : packingContext;
     if (packetState) (packed as any).continuation = continuationMetadata(packetState, (packed as any).working.archive, audit!.store);
     if (packed && typeof packed === 'object') (packed as Record<string, unknown>).responseOutputLimit = outputLimit;
@@ -308,9 +313,9 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     }
     if (consumerIntent.value.state === 'prepared') {
       const savedPrompt = consumerIntent.value.cursor.prompt ?? consumerIntent.value.cursor.instruction;
+      // DRS1a2: the saved context by the intent's own contract (v2: its preparation).
       requireCondition(typeof savedPrompt === 'string' && canonical(savedPrompt) === canonical(prompt)
-        && Object.hasOwn(consumerIntent.value.cursor, 'context')
-        && canonical(consumerIntent.value.cursor.context) === canonical(context),
+        && canonical(consumerIntentContext(audit.store, consumerIntent.value, consumerIntent.id)) === canonical(context),
       'research_consumer_intent_invalid', 'The unsent intent must preserve its exact original prompt and consumer context');
     }
   }
@@ -397,8 +402,15 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     'research_plan_subject_invalid', 'The packet binding must equal the saved consumer subject');
   requireCondition(sameAssessmentSubject(context, capacity?.bindings ?? {}),
     'discovery_assessment_subject_invalid', 'The saved capacity must preserve its assessment subject');
+  // DRS1a2: the archive contract follows the saved intent only — a v2 analyst
+  // call packs the compact archive; every other call keeps the whole body.
+  let packAudit = audit;
+  if (audit) {
+    const { contextContract: _caller, ...rest } = audit;
+    packAudit = consumerIntent?.value.contract === CONSUMER_INTENT_V2 ? { ...rest, contextContract: ARCHIVE_PARTS_CONTRACT } : rest;
+  }
   const { packetState, subject, envelope, input, requestLimit } = prepareResearchEnvelope(role, environment,
-    prompt, context, audit, capacity, requestId, requestContract);
+    prompt, context, packAudit, capacity, requestId, requestContract);
   if (capacity !== undefined) requireCondition(researchCapacityProjection(capacity, audit?.store).prompt === envelope.prompt,
     'research_capacity_invalid', 'The actual role prompt differs from its predeclared result admission');
   audit?.onContext?.(subject as Record<string, any>);

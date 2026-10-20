@@ -242,6 +242,16 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "om-limited-call-retry-permit", contract: "om-limited-call-retry-permit/v1", data: [] },
   { kind: "request-manifest", contract: "request-manifest/v1", data: [["wire"]], refs: [["parts", INDEX], ["intent"], ["call"]] },
   { kind: "request-part", contract: "request-part/v1", data: [["text"]], refs: [] },
+  // DRS1a2: the immutable preparation of an analyst call names its step and its
+  // exact parts; the compact archive names its metadata and parts; neither has
+  // free data (the JSON lives inside the parts, whose text is data).
+  { kind: "context-preparation", contract: "context-preparation/v1", data: [],
+    refs: [["draft"], ["question"], ["owner"], ["subject", "planAnswer"], ["graphBase"], ["parts", INDEX]] },
+  { kind: "research-context", contract: "archive-parts/v1", data: [],
+    refs: [["draft"], ["question"], ["subject", "planAnswer"], ["parts", INDEX]] },
+  // DRS1a2: the v2 intent is the v1 form without cursor.context — every other
+  // field keeps the structural scan (preparation, guards, subject, capacity data).
+  { kind: "research-consumer-intent", contract: "research-consumer-intent/v2", data: capacityData(["cursor", "resultCapacity"]) },
   { kind: "om-answer-closure", contract: "om-answer-closure/v1", data: [],
     refs: [["answer"], ["guards", INDEX], ["external", INDEX, "ref"], ["references", INDEX]] },
   { kind: "discovery-acceptance-act", contract: "discovery-acceptance-act/v1", data: [],

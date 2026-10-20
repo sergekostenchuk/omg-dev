@@ -1,4 +1,4 @@
-import { REQUEST_MANIFEST_CONTRACT } from "./request-parts.js";
+import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
 import { currentPlan, planAttemptSelection, planOwnerSubject, provePlanQuestions } from "./v7-plan-questions.js";
 import { recordV7Attempt } from "./v7-attempts.js";
 import { planSubjectOf, sameSubject, attemptEndOfAction, addressedQuestionId, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "./v7-managed-attempt.js";
@@ -26,7 +26,7 @@ import { turnAction, projectPaidTurnAdmission, projectPaidOwnerReview, projectPa
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
   type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
 import { completeResearchAttemptTurn, earlyResearchConsumerFailure, consumerCapacityFailure, captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
-  assessmentReadView, prepareResearchConsumerIntent, readResearchConsumerIntent,
+  assessmentReadView, prepareResearchConsumerIntent, readResearchConsumerIntent, consumerIntentContext, contextRecordValue,
   readResearchConsumerTurn, readResearchConsumerExecution, resumeResearchConsumerExecution,
   prepareResearchConsumerApplication, readResearchContextOutcomeAt, readResearchContextRecordAt, synthesisTurnMatches,
   readContextIdentityAt, readContextTurnHistoryAt, projectPaidLayerDesignRefusal,
@@ -111,7 +111,9 @@ function dispatchModeAfterRecovery(turns: Revision<ResearchTurn>[], question: Re
 export class Researcher {
   constructor(private readonly store: Store, private readonly discovery: Discovery, private readonly environments: Environments) {}
   async run(project: string, draftId: string, limit: number, signal?: AbortSignal,
-    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy } = {}): Promise<Revision<ResearchRun>> {
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy;
+      /** DRS1a2: trusted opt-in of the compact analyst storage on the v7 path. */
+      contextContract?: typeof CONTEXT_PREPARATION_CONTRACT } = {}): Promise<Revision<ResearchRun>> {
     requireCondition(Number.isInteger(limit) && limit >= 1 && limit <= 100, "research_budget_invalid", "Research requires an explicit bounded turn allowance");
     let draft = this.store.get<DiscoveryDraft>(draftId);
     requireCondition(draft?.kind === "discovery-draft" && draft.value.projectId === project, "discovery_foreign", "Research draft must belong to this project");
@@ -687,13 +689,14 @@ export class Researcher {
             (failedTurn.value as ManagedResearchTurn).consumerIntent) : null;
           const failedDraft = failedProducer ? this.store.get<DiscoveryDraft>(failedProducer.value.draft.id, failedProducer.value.draft.revision)! : null;
           const failedQuestion = failedProducer ? this.store.get<Question>(failedProducer.value.question.id, failedProducer.value.question.revision)! : null;
+          const failedContext = failedProducer ? consumerIntentContext(this.store, failedProducer.value, failedProducer.id) : null;
           const failure = failedIntent ? earlyResearchConsumerFailure(this.store, failedIntent)
             : failedProducer ? earlyResearchFailure(failedDraft!.value, failedQuestion!.value,
-              'analyst', failedTurn!.value.action, failedProducer.value.cursor.context?.discoveryContext ?? null,
+              'analyst', failedTurn!.value.action, failedContext?.discoveryContext ?? null,
               intentWebCapability(this.store, failedProducer), earlyUnknownAdmission(this.store, failedProducer, failedDraft!, failedQuestion!),
-              failedProducer.value.cursor.context?.discoveryBasisCatalogue ?? null,
-              deliveredConceptSections(failedProducer.value.cursor.context, failedDraft!.value),
-              failedProducer.value.cursor.context?.prerequisites ?? null) : null;
+              failedContext?.discoveryBasisCatalogue ?? null,
+              deliveredConceptSections(failedContext, failedDraft!.value),
+              failedContext?.prerequisites ?? null) : null;
           // WB1 (№4639): the cause follows the failed call; the actions offered follow the dispatch of this new call.
           if (failure) Object.assign(context, { failures: [earlyResearchCorrection('analyst', failure,
             reference(failedIntent ?? failedTurn!), pending[0]!.value, webResearchCapability(draft.value.stage, 'analyst', dispatch), !mode)] });
@@ -718,7 +721,7 @@ export class Researcher {
         if (lastTurn && (lastTurn.value.observation as { contract?: unknown } | null)?.contract === EARLY_UNKNOWN) {
           const unknown = (lastTurn.value.observation as { unknown: EarlyUnknown }).unknown;
           const producer = readResearchConsumerIntent(this.store, (lastTurn.value as ManagedResearchTurn).consumerIntent);
-          const delivered = (producer.value.cursor.context as { inventory?: { sources?: { ref?: unknown }[] } } | null)?.inventory?.sources;
+          const delivered = (consumerIntentContext(this.store, producer.value, producer.id) as { inventory?: { sources?: { ref?: unknown }[] } } | null)?.inventory?.sources;
           requireCondition(Array.isArray(delivered) && delivered.every(row => isRef(row?.ref)), 'research_consumer_intent_invalid',
             `[${lastTurn.id}] The unknown's call lost the inventory it delivered`);
           const seen = new Set(delivered.map(row => canonical(row.ref)));
@@ -893,15 +896,16 @@ export class Researcher {
             const originalQuestion = this.store.get<Question>(pendingTurn.value.question.id, pendingTurn.value.question.revision)!;
             const web = intentWebCapability(this.store, producer);
             const admission = earlyUnknownAdmission(this.store, producer, originalDraft, originalQuestion);
+            const producerContext = consumerIntentContext(this.store, producer.value, producer.id);
             const failure = earlyResearchFailure(originalDraft.value, originalQuestion.value, 'analyst', action,
-              producer.value.cursor.context?.discoveryContext ?? null, web, admission,
-              producer.value.cursor.context?.discoveryBasisCatalogue ?? null,
-              deliveredConceptSections(producer.value.cursor.context, originalDraft.value),
-              producer.value.cursor.context?.prerequisites ?? null);
+              producerContext?.discoveryContext ?? null, web, admission,
+              producerContext?.discoveryBasisCatalogue ?? null,
+              deliveredConceptSections(producerContext, originalDraft.value),
+              producerContext?.prerequisites ?? null);
             if (failure) {
               const value = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn,
-                { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer, ...(web ? { web: true } : {}),
-                  ...(admission ? { unknown: admission } : {}) });
+                { kind: 'early-model-refusal', draft: originalDraft, question: originalQuestion, producer, context: producerContext,
+                  ...(web ? { web: true } : {}), ...(admission ? { unknown: admission } : {}) });
               const saved = this.store.writeMany<ResearchTurn | ResearchRun>([
                 { id: pendingTurn.id, kind: pendingTurn.kind, expected: pendingTurn.revision, value },
                 { id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, status: 'paused',
@@ -986,7 +990,7 @@ export class Researcher {
               catch(failure) {
                 const exact = managed ? readResearchContextRecordAt(this.store, draft, action) : null;
                 const projected = managed ? projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, {
-                  kind: 'delivery-refusal', recordValue: exact!.value, record: action.record,
+                  kind: 'delivery-refusal', recordValue: contextRecordValue(this.store, exact!), record: action.record,
                   maxChars: pilot?.value.maxRequestChars ?? 300000, workspace: originalWorkspace,
                   delivered: sent.contextWorkspace,
                   ...(pilot?.value.contextLimits?.maxLookups !== undefined
@@ -1018,7 +1022,7 @@ export class Researcher {
             const exact = this.store.get(action.record.id, action.record.revision);
             requireCondition(exact && canonical(reference(exact)) === canonical(action.record),
               'research_consumer_intent_invalid', 'The addressed read lost its exact record');
-            turnProof = { kind: 'read-context', recordValue: exact.value, record: action.record,
+            turnProof = { kind: 'read-context', recordValue: contextRecordValue(this.store, exact), record: action.record,
               maxChars: pilot?.value.maxRequestChars ?? 300000 };
           } else if (action.action === "checkpoint") {
             const saved = checkpoint(this.store, draft, pending[0]!, action);
@@ -1206,7 +1210,7 @@ export class Researcher {
                 try {
                   const record = readResearchContextRecordAt(this.store, draft, action);
                   const readMode = researchContextReadEra(this.store, sent);
-                  const proof = { kind: 'context-refusal' as const, recordValue: record.value,
+                  const proof = { kind: 'context-refusal' as const, recordValue: contextRecordValue(this.store, record),
                     record: action.record, maxChars: pilot?.value.maxRequestChars ?? 300000,
                     ...(readMode === 'bounded' ? { projection: 'bounded' as const } : {}) };
                   const projected = projectResearchTurnRevision(pendingTurn.value as ManagedResearchTurn, proof);
@@ -1305,7 +1309,7 @@ export class Researcher {
   /** The initial v7 plan traversal uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
-    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy }): Promise<Revision<ResearchRun>> {
+    options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy; contextContract?: typeof CONTEXT_PREPARATION_CONTRACT }): Promise<Revision<ResearchRun>> {
     const id = `research-run:${hashJson([project, draftId])}`;
     const owner = { pid: process.pid, started: processStart(process.pid) };
     requireCondition(owner.started, "research_process_unknown", "Cannot identify the research process");
@@ -1430,7 +1434,7 @@ export class Researcher {
               readContextTurnHistoryAt(this.store, project, draft, reference(question), sameTurns, turn.value.number), reference(question));
             addContextLookup(workspace, result, paid.subject.contextWorkspace);
             const record = readResearchContextRecordAt(this.store, draft, action);
-            proof = { kind: "read-context", recordValue: record.value, record: action.record, maxChars: 300000 };
+            proof = { kind: "read-context", recordValue: contextRecordValue(this.store, record), record: action.record, maxChars: 300000 };
           } else if (action.action === "web_search" || action.action === "web_fetch") {
             await executeWebTurn({ store: this.store, projectId: project, stage: draft.value.stage,
               environment: this.store.get<Environment>(`environment:${project}`)!, turn });
@@ -1509,7 +1513,8 @@ export class Researcher {
           guards: uniqueTransactionGuards([reference(run), reference(selection.draft), reference(selection.question),
             reference(environment), ...effective.guards, ...selection.draft.value.inputs, selection.planAnswer,
             ...selectedTurns.map(reference), ...sources.list().map(reference),
-            { id: paidTurnId(id, run.value.turns + 1), absent: true }]) });
+            { id: paidTurnId(id, run.value.turns + 1), absent: true }]) }, [],
+          options.contextContract ? { contextContract: options.contextContract } : {});
       }
     } catch (error) {
       const current = this.store.get<ResearchRun>(id) ?? run;
@@ -1554,8 +1559,10 @@ export class Researcher {
   private async receivedIntent(intent: Revision<ResearchConsumerIntent>, dispatch: Environment,
     pilot: Revision<ReaderPilot> | null, signal?: AbortSignal) {
     const cursor = intent.value.cursor;
-    requireCondition(typeof cursor.instruction === "string" && cursor.context && typeof cursor.context === "object"
-      && !Array.isArray(cursor.context), "research_consumer_intent_invalid",
+    // DRS1a2: the call context by the intent's own contract (v2: its preparation).
+    const context = consumerIntentContext(this.store, intent.value, intent.id);
+    requireCondition(typeof cursor.instruction === "string" && context && typeof context === "object"
+      && !Array.isArray(context), "research_consumer_intent_invalid",
       "The original research instruction and context are missing");
     if (intent.value.state === "prepared") {
       // C61: only an unsent intent pays — the dispatch/profile equality guards
@@ -1563,7 +1570,7 @@ export class Researcher {
       requireCondition(canonical(intent.value.dispatch) === canonical(dispatch)
         && canonical(intent.value.profile) === canonical(pilot ? reference(pilot) : null),
         "research_consumer_context_stale", "The original research dispatch or reader profile changed");
-      await researchCall(intent.value.role, intent.value.dispatch, cursor.instruction, cursor.context, signal,
+      await researchCall(intent.value.role, intent.value.dispatch, cursor.instruction, context, signal,
         { store: this.store, draftId: intent.value.draft.id, questionId: intent.value.question.id,
           purpose: intent.value.kind, ...(planSubjectOf(intent.value.cursor) ? { requestContract: REQUEST_MANIFEST_CONTRACT } : {}), ...(pilot ? { pilot } : {}), consumerIntent: reference(intent), ...(isResearchPreview() ? { previewIntent: intent } : {}) });
     }
@@ -1674,7 +1681,7 @@ export class Researcher {
     const turnId = paidTurnId(run.id, cursor.turn);
     const projected = projectPaidTurnAdmission(run.value, {
       runId: run.id, intent: reference(originalIntent), response: paid.payload,
-      question: selectedQuestion, owner, limit, context: cursor.context, ...(subject ? { subject } : {}),
+      question: selectedQuestion, owner, limit, context: consumerIntentContext(this.store, intent.value, intent.id), ...(subject ? { subject } : {}),
       ...(cursor.mode ? { mode: cursor.mode } : {}), ...(intentWebCapability(this.store, intent) ? { web: true } : {}),
       ...(earlyUnknownEra(cursor) ? { unknown: true } : {}) });
     const writes: Write[] = [

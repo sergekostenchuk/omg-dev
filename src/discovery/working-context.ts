@@ -16,6 +16,7 @@ import { readReaderResultAt } from './reader.js';
 import { priorEvidenceSources, packPriorEvidence } from './prior-evidence-summary.js';
 import { addressArchivedMaterials, serveArchivedMaterial, packAddressedValue,
   requirePacketMaterialDelivery, planResearchDelivery, type AddressedOriginal } from './research-delivery.js';
+import { ARCHIVE_PARTS_CONTRACT, prepareArchiveParts, readArchiveBody } from './request-parts.js';
 
 interface Archive { projectId: string; draft: Ref; question: Ref; subject?: V7PlanSubject; body: Record<string, Json> }
 export interface ContextPage { offset: number; limit: number; encoding?: 'canonical-json' }
@@ -57,7 +58,22 @@ export function archivedContext(store: Store, draft: Revision<DiscoveryDraft>, r
   requireCondition(original?.hash === record.value.draft.hash && canonical(original.value.inputs) === canonical(draft.value.inputs)
     && question?.revision === record.value.question.revision && question.hash === record.value.question.hash,
     "context_reference_stale", "The question or its research basis has changed");
-  return record.value;
+  // DRS1a2: the body by the archive's own contract; the saved record is not rewritten.
+  return { ...record.value, body: readArchiveBody(store, record).body } as Archive;
+}
+
+/** DRS1a2: the one writer of every archive of this packer — the whole body,
+ * or archive-parts/v1 for a compact call — with the same metadata either way. */
+function saveArchive(store: Store, compact: boolean, metadata: Omit<Archive, 'body'>,
+  body: Record<string, Json>, guards: Ref[]): Revision<any> {
+  if (!compact) {
+    const value: Archive = { ...metadata, body };
+    const id = `research-context:${hashJson(value)}`;
+    return store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }], guards)[0]!;
+  }
+  const prepared = prepareArchiveParts(store, metadata, body);
+  if (prepared.writes.length) store.writeMany(prepared.writes, [...guards, ...prepared.guards]);
+  return store.get(prepared.archive.id, prepared.archive.revision)!;
 }
 
 /** The complete request is a product journal entry, not a replacement source.
@@ -97,11 +113,17 @@ function conclusionSources(body: Record<string, any>, archive: Ref, questionId: 
 }
 
 export function workingContext(store: Store, projectId: string, draftId: string, questionId: string,
-  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null; assessmentSubject?: AssessmentTransportSubject | null } = {}): Record<string, any> {
+  context: unknown, maxChars: number, options: { continuation?: boolean; common?: boolean; previous?: Ref; contextChars?: number; extractedChars?:number; purpose?: string; subject?: V7PlanSubject | null; assessmentSubject?: AssessmentTransportSubject | null;
+    /** DRS1a2: set only by trusted code for a compact analyst call. */
+    contextContract?: typeof ARCHIVE_PARTS_CONTRACT } = {}): Record<string, any> {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question" && draft.value.projectId === projectId
     && question.value.draftId === draftId && draft.value.questions.includes(questionId), "context_basis_missing", "A working set needs its exact question and draft");
   let body = JSON.parse(JSON.stringify(context)) as Record<string, any>;
+  requireCondition(options.contextContract === undefined
+    || options.contextContract === ARCHIVE_PARTS_CONTRACT && options.purpose === 'analyst',
+  'context_contract_invalid', 'The compact archive contract belongs only to an analyst call');
+  const compact = options.contextContract === ARCHIVE_PARTS_CONTRACT;
   const planSubject = packetPlanSubject(options);
   const assessmentSubject = proveAssessmentTransportSubject(store, body, projectId, reference(question));
   requireCondition(sameAssessmentSubject(body, options.assessmentSubject ? {assessmentSubject:options.assessmentSubject} : {}),
@@ -139,7 +161,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   if ((planSubject || assessmentSubject) && options.previous) {
     const previous = store.get<Archive>(options.previous.id,options.previous.revision);
     requireCondition(previous?.hash === options.previous.hash && previous.value.projectId === projectId
-      && previous.value.question.id === questionId && sameAssessmentSubject(previous.value.body,body) && sameSubject(packetPlanSubject(previous.value),planSubject),
+      && previous.value.question.id === questionId && sameAssessmentSubject(readArchiveBody(store, previous).body,body) && sameSubject(packetPlanSubject(previous.value),planSubject),
       'continuation_foreign','The previous archive belongs to another exact subject');
   }
 
@@ -191,22 +213,16 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   } as Json;
   body['unresolvedEvidence'] = (Array.isArray(body['readings']) ? body['readings'] : []).flatMap((entry: any) =>
     Array.isArray(entry.unresolved) && entry.unresolved.length ? [{ reading: entry.ref ?? null, purpose: entry.purpose ?? null, unresolved: entry.unresolved }] : []);
-  const value: Archive = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}), body };
-  const id = `research-context:${hashJson(value)}`;
-  let archive = store.get(id) ?? store.writeMany([{ id, kind: "research-context", expected: 0, value }],
-    [reference(draft), reference(question), ...draft.value.inputs])[0]!;
+  const metadata: Omit<Archive, 'body'> = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}) };
+  let archive = saveArchive(store, compact, metadata, body, [reference(draft), reference(question), ...draft.value.inputs]);
   let archivedBody = body;
   const exactArchivedFields = (packet: Record<string, any>, fields: string[]) => fields.filter(field =>
     Object.hasOwn(packet, field) && packet[field] !== undefined
       && Object.hasOwn(archivedBody, field)
       && canonical(packet[field]) === canonical(archivedBody[field]));
   const materialRecord = (field: string, material: unknown): Ref => {
-    const stable: Archive = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}),
-      body: { [field]: material as Json } };
-    const stableId = `research-context:${hashJson(stable)}`;
-    const saved = store.get(stableId) ?? store.writeMany([
-      { id: stableId, kind: 'research-context', expected: 0, value: stable }],
-      [reference(draft), reference(question), ...draft.value.inputs])[0]!;
+    const saved = saveArchive(store, compact, metadata, { [field]: material as Json },
+      [reference(draft), reference(question), ...draft.value.inputs]);
     return reference(saved);
   };
   const sourceNavigation = hasStructuredSources ? structuredCatalogue(inventory, reference(archive), maxChars) : null;
@@ -220,11 +236,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
     archivedBody = { ...body,
       ...(sourceNavigation ? { sourceCatalogue: sourceNavigation } : {}),
       ...(plannerCorrections?.length ? { corrections: plannerCorrections } : {}) };
-    const projected: Archive = { projectId, draft: reference(draft), question: reference(question), ...(planSubject?{subject:planSubject}:{}), body: archivedBody };
-    const projectedId = `research-context:${hashJson(projected)}`;
-    archive = store.get(projectedId) ?? store.writeMany([
-      { id: projectedId, kind: 'research-context', expected: 0, value: projected }],
-      [reference(draft), reference(question), ...draft.value.inputs, first])[0]!;
+    archive = saveArchive(store, compact, metadata, archivedBody,
+      [reference(draft), reference(question), ...draft.value.inputs, first]);
     body = archivedBody;
   }
   const relatedResearch = body['discoveryContext'];
@@ -396,7 +409,8 @@ export function workingContext(store: Store, projectId: string, draftId: string,
   }
   if (options.continuation) {
     const exactWorkspace = body['contextWorkspace'];
-    const previousBody=options.previous?store.get<Archive>(options.previous.id,options.previous.revision)?.value.body:undefined;
+    const previousRecord=options.previous?store.get<Archive>(options.previous.id,options.previous.revision):null;
+    const previousBody=previousRecord?readArchiveBody(store, previousRecord).body:undefined;
     const mapMaterial = (value: Record<string, any> | undefined) => Array.isArray(value?.['prerequisites'])
       ? value['prerequisites'].find((item: any) => item.stage === 'concept')?.operationMapMaterial : undefined;
     const currentMapMaterial = mapMaterial(body);
@@ -415,7 +429,7 @@ export function workingContext(store: Store, projectId: string, draftId: string,
       if(previous) requireCondition(previous.hash===options.previous!.hash && previous.value.projectId===projectId
         && previous.value.question.id===questionId,'continuation_foreign','Candidate delta requires the same question');
       dynamic['candidate']={current:{record:reference(archive),pointer:'/body/value'},
-        previous:options.previous??null,changes:previous?candidateDelta(previous.value.body['value'],body['value']):[],
+        previous:options.previous??null,changes:previous?candidateDelta(readArchiveBody(store, previous).body['value'],body['value']):[],
         instruction:'Only changed candidate fields are supplied; exact full candidates remain at their addresses.'};
     }
     if(body['assessmentState']) dynamic['value']=body['value'];

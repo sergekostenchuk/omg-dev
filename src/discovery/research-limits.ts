@@ -8,6 +8,7 @@ import type { DiscoveryDraft, Question } from './discovery.js';
 import { requireCondition } from '../errors.js';
 import type { ContextLookup } from './context-workspace.js';
 import { projectResearchContextSelection } from './research-consumer-transition.js';
+import { readArchiveBody } from './request-parts.js';
 
 export function researchReadLimit(store: Store, pilot: Revision<ReaderPilot>, questionId: string, _metric: 'readChars' | 'extractedChars', _required: number, _basis: Ref[]) {
   const question=store.get<Question>(questionId);
@@ -23,7 +24,8 @@ export function researchContextReadEra(store: Store, packet: Record<string, any>
   requireCondition(archive?.kind === 'research-context'
     && canonical(reference(archive)) === canonical(archiveRef) && hashJson(archive.value) === archive.hash,
     'research_context_invalid', 'The paid context read lost its exact packet archive');
-  const contract = archive.value.body?.contextReadContract;
+  // DRS1a2: the packet body by the archive's own contract (whole or parts).
+  const contract = readArchiveBody(store, archive).body['contextReadContract'];
   requireCondition(contract === undefined || contract === 'research-context-read/v2',
     'research_context_invalid', 'The paid context read declares an unknown delivery rule');
   return contract === 'research-context-read/v2' ? 'bounded' : 'legacy';

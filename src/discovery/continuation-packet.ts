@@ -4,6 +4,7 @@ import { planSubjectOf, sameSubject, callAddressesSubject, type V7PlanSubject } 
 import { provePlanQuestions } from './v7-plan-questions.js';
 import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_END_CODES, isDiscoveryV7Draft } from './v7-contracts.js';
 import { contextTable } from './context-tables.js';
+import { readArchiveBody } from './request-parts.js';
 import { Evidence, type Source } from "../evidence/evidence.js";
 import type { Store, Revision, Write, ReadGuard } from '../storage/store.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
@@ -159,9 +160,10 @@ export function continuationState(store: Store, projectId: string, draftId: stri
   const archives=delivered.flatMap(c=>c.value.packet?[c.value.packet.archive]:[]);
   for(const ref of archives){
     const original=isRef(ref)?store.get<any>(ref.id,ref.revision):null;
+    // DRS1a2: the delivered body by the archive's own contract (whole or parts).
     requireCondition(original?.kind==='research-context'&&original.hash===ref.hash&&original.value?.projectId===projectId
       &&isRef(original.value.question)&&original.value.question.id===questionId
-      &&sameAssessmentSubject(original.value.body, assessmentSubject ? {assessmentSubject} : {})
+      &&sameAssessmentSubject(readArchiveBody(store, original).body, assessmentSubject ? {assessmentSubject} : {})
       &&sameSubject(packetPlanSubject(original.value),subject),'continuation_foreign','Delivered foundation belongs to another question');
   }
   return {initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
@@ -239,15 +241,20 @@ export function selectedQuestion(question: Revision<Question>, body: Record<stri
 
 export function continuationMetadata(state: ContinuationPacketState, archive: Ref, store: Store) {
   const foundation = state.basis ?? archive;
-  const original = store.get<{ projectId: string; draft: Ref; question: Ref; body: Record<string, unknown>; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
+  const original = store.get<{ projectId: string; draft: Ref; question: Ref; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
+  // DRS1a2: the saved foundation record and its restored body are separate —
+  // the record proves the address and metadata, the body comes by its contract.
+  let body: Record<string, unknown> | null = null;
+  try { if (original?.kind === 'research-context' && original.hash === foundation.hash) body = readArchiveBody(store, original).body; }
+  catch (error) { if (!(error instanceof EngineError)) throw error; }
   requireCondition(original?.kind === 'research-context' && original.hash === foundation.hash
     && original.value?.projectId === state.projectId && isRef(original.value.draft) && original.value.draft.id === state.draft.id
     && isRef(original.value.question) && original.value.question.id === state.question.id
-    && sameAssessmentSubject(original.value.body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject) && original.value.body && typeof original.value.body === 'object' && !Array.isArray(original.value.body),
+    && body !== null && sameAssessmentSubject(body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject),
   'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
   return {...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
     foundation,current:archive,previousCalls:state.priorCalls,
-    foundationPointers:contextSections(original.value.body, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
+    foundationPointers:contextSections(body!, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
 }
 
 export function continuationPrompt(purpose: string, currentPrompt?: string): string {

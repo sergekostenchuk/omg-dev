@@ -13,6 +13,7 @@ import { isReaderResultRef } from "./pilot-context.js";
 import { EngineError } from "../errors.js";
 import { foldContextEvent, recordContextPacket, type ContextWorkspace, type ContextLookup } from './context-workspace.js';
 import { requireCurrentPriorContext } from './research-limits.js';
+import { readArchiveBody } from './request-parts.js';
 import { projectCheckpointValue, admittedResearchAction, contextReadIdentity, matchAcceptedPaidAnswer,
   type AcceptedPaidAnswerInputs, type ProjectedContextRead } from './research-consumer-transition.js';
 import { expandLayerDelta } from './layer-delta.js';
@@ -154,8 +155,11 @@ export function addressedWorkspace(store:Store,turns:Revision<ResearchTurn>[],qu
       const readerRef = isReaderResultRef(action.record) ? action.record
         : selected && isReaderResultRef(selected) ? selected : null;
       const reader = readerRef ? readReaderResultAt(store, question.value.projectId, readerRef) : null;
+      // DRS1a2: an archive's addressed original is its body by its own contract.
       contextReadIdentity({ projectId: question.value.projectId, action, observation,
-        recordKind: record.kind, recordValue: record.value, question: turn.value.question,
+        recordKind: record.kind, recordValue: record.kind === 'research-context'
+          ? { ...(record.value as Record<string, unknown>), body: readArchiveBody(store, record).body } : record.value,
+        question: turn.value.question,
         ...(reader ? { readerResult: { ref: readerRef!, value: reader.value } } : {}) });
     } else result = latestFocus(store,[turn],question) as ContextLookup|null;
     if(!result)continue;
@@ -170,9 +174,11 @@ function contextReadKey(store: Store, observation: any, action: Extract<Research
   const page = observation.page ?? null;
   const archive = store.get<any>(action.record.id, action.record.revision);
   if (archive?.kind !== "research-context") return canonical([action.record, action.pointer, page]);
+  // DRS1a2: the archive body by its own contract (a compact archive keeps it in parts).
+  const archived = { ...archive.value, body: readArchiveBody(store, archive).body };
   const parts = action.pointer.split("/");
   for (let end = parts.length; end > 1; end--) {
-    const parent = contextValue(archive.value, parts.slice(0, end).join("/")) as any;
+    const parent = contextValue(archived, parts.slice(0, end).join("/")) as any;
     const origin = parent?.source ?? parent?.ref;
     if (isRef(origin)) return canonical([origin, parts.slice(end), page, observation.value]);
   }
