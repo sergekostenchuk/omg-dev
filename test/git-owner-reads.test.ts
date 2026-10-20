@@ -14,7 +14,7 @@ import { reference } from '../src/pipeline/contracts.js';
 import { EngineError } from '../src/errors.js';
 import { receiptId, type ArtifactReceipt, type CompiledTask } from '../src/compiler/model.js';
 import type { TaskRun } from '../src/execution/model.js';
-import type { Revision } from '../src/storage/store.js';
+import type { Revision, Store } from '../src/storage/store.js';
 import { executionFixture } from './execution-fixture.js';
 import { validateGraph } from '../src/graph/validate.js';
 import { projectGraph } from '../src/graph/project.js';
@@ -56,7 +56,7 @@ function fixture(t: TestContext) {
   return { directory, root, head, tree, commit };
 }
 function trace(t: TestContext) {
-  const original = children.spawnSync, calls: string[][] = [];
+  const original = children.spawnSync, calls: string[][] = [], batches: string[] = [];
   type Result = ReturnType<typeof children.spawnSync>;
   let after: ((args: string[]) => void) | undefined;
   let replace: ((args: string[], result: Result) => Result) | undefined;
@@ -65,15 +65,20 @@ function trace(t: TestContext) {
     const result = Reflect.apply(original, children, args) as Result;
     if (argv) {
       calls.push(argv);
+      const input = (args[2] as { input?: string | Uint8Array } | undefined)?.input;
+      const batch = argv[0] === 'cat-file' && argv[1] === '--batch' && input !== undefined
+        ? (typeof input === 'string' ? input : Buffer.from(input).toString('utf8')) : null;
+      const batchOid = batch && /^(?:[a-f0-9]{40}|[a-f0-9]{64})\n$/.test(batch) ? batch.trim() : null;
+      if (batchOid) batches.push(batchOid);
       const path = process.env['GITSRC4_TRACE'];
-      if (path) appendFileSync(path, JSON.stringify({ test: t.name, args: argv }) + '\n');
+      if (path) appendFileSync(path, JSON.stringify({ test: t.name, args: argv, batchOid, cwd: (args[2] as { cwd?: string } | undefined)?.cwd, stack: new Error().stack }) + '\n');
       after?.(argv);
       return replace?.(argv, result) ?? result;
     }
     return result;
   }) as typeof original;
   syncBuiltinESMExports(); t.after(() => { children.spawnSync = original; syncBuiltinESMExports(); });
-  return { calls, after(fn: (args: string[]) => void) { after = fn; },
+  return { calls, countBatch(oid: string) { return batches.filter(value => value === oid).length; }, after(fn: (args: string[]) => void) { after = fn; },
     replace(fn: (args: string[], result: Result) => Result) { replace = fn; },
     count(args: string[]) { return calls.filter(row => JSON.stringify(row) === JSON.stringify(args)).length; } };
 }
@@ -320,7 +325,8 @@ test('GITSRC4 M8 writers keep gates and exact parents while selection uses a bou
     const log = trace(sub), args = ['rev-list', '--parents', '-n', '1', writer.value.commit!];
     readWriterIndex(f.store, 'p', path, reference(firstIndex), reference(firstRoot));
     readWriterIndex(f.store, 'p', path, reference(firstIndex), reference(firstRoot));
-    assert.equal(log.count(args), 1, 'the exact-parent command is reused through common memo, not replaced by ancestry');
+    assert.equal(log.count(args), 1, 'the exact commit membership read is shared across both worktrees');
+    assert.equal(log.countBatch(writer.value.commit!), 1, 'the actual single-parent object proof is shared without an ancestry shortcut');
     const extra = raw(repository.root, ['commit-tree', writer.value.tree!, '-p', writer.value.parent], 'extra ancestor\n');
     for (const parents of [[extra], [writer.value.parent, extra]]) {
       const replacement = raw(repository.root, ['commit-tree', writer.value.tree!, ...parents.flatMap(parent => ['-p', parent])], 'parent counterexample\n');
@@ -355,6 +361,21 @@ test('GITSRC4 M8 writers keep gates and exact parents while selection uses a bou
     try { assert.throws(() => owners.latest(path), code('git_failed')); }
     finally { writeFileSync(config, saved); }
     assert.equal(owners.latest(path)!.commit, latest.value.commit);
+  });
+
+  await t.test('a Git change inside the M8 gate read invalidates the active ancestry scope', () => {
+    const config = join(common, 'config'), saved = readFileSync(config), get = f.store.get.bind(f.store);
+    let changed = false;
+    f.store.get = ((...args: Parameters<Store['get']>) => {
+      const row = get(...args);
+      if (!changed && row?.kind === 'environment') { changed = true; writeFileSync(config, '[broken\n'); }
+      return row;
+    }) as Store['get'];
+    try {
+      assert.throws(() => selectWriter(f.store, 'p', current, refs, path), code('git_failed'));
+      assert.equal(changed, true, 'the mutation happened after the fresh selection graph was read');
+    } finally { f.store.get = get; writeFileSync(config, saved); }
+    assert.equal(selectWriter(f.store, 'p', current, refs, path)!.commit, latest.value.commit);
   });
 
   await t.test('the same Owners instance rechecks null and selected results after Git reachability changes', () => {

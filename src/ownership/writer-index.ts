@@ -3,7 +3,7 @@ import { EngineError } from "../errors.js";
 import { checkedPlanDerivation, type CompiledTask, type MachinePlan } from "../compiler/model.js";
 import type { TaskRun } from "../execution/model.js";
 import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
-import { git, type ExecutionRoot } from "../runtime/environment.js";
+import { git, gitBytes, type ExecutionRoot } from "../runtime/environment.js";
 import type { Revision, Store, Write } from "../storage/store.js";
 import { readWriter } from "./owners.js";
 
@@ -94,8 +94,20 @@ function commitOrigin(store: Store, project: string, path: string, root: Revisio
   if (boundaryOnly) {
     if (git(directory, ["rev-parse", `${run.value.commit}^{tree}`]) !== run.value.tree) invalid(project, path, "origin.tree");
   } else readWriter(store, project, { root: directory, head: root.value.head }, runRef, path);
-  if (git(directory, ["rev-list", "--parents", "-n", "1", run.value.commit!]) !== `${run.value.commit} ${run.value.parent}`)
-    invalid(project, path, "origin.parent");
+  // A shallow traversal may omit this parent while the actual commit object still proves it.
+  // --batch binds the exact object's type and body together; tags, merge/transitive parents and replacements stay observable.
+  const oid = run.value.commit!;
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid)) invalid(project, path, "origin.parent");
+  const bytes = gitBytes(directory, ['cat-file', '--batch'], Buffer.from(oid + '\n'));
+  const line = bytes.indexOf(10), header = bytes.subarray(0, line).toString('utf8').split(' '), size = Number(header[2]);
+  if (line < 0 || header.length !== 3 || header[0] !== oid || header[1] !== 'commit' || !Number.isSafeInteger(size) || size < 0
+    || bytes.length !== line + 1 + size + 1 || bytes.at(-1) !== 10) invalid(project, path, 'origin.parent');
+  const body = bytes.subarray(line + 1, line + 1 + size), separator = body.indexOf('\n\n');
+  if (separator < 0) invalid(project, path, 'origin.parent');
+  const fields = body.subarray(0, separator).toString('utf8').split('\n');
+  const parents = fields.filter(field => field.startsWith('parent ')).map(field => field.slice(7));
+  if (fields[0] !== `tree ${run.value.tree}` || parents.length !== 1 || parents[0] !== run.value.parent)
+    invalid(project, path, 'origin.parent');
 }
 function checked(store: Store, project: string, path: string, record: Revision<WriterIndex>,
   checkedWriters = new Set<string>(), repository?: string, checkedIndexes = new Set<string>(), boundaryOnly = false): Revision<WriterIndex> {

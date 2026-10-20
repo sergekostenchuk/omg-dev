@@ -102,7 +102,7 @@ export function git(cwd: string, args: string[], input?: string): string {
   return gitBytes(cwd, args, input === undefined ? undefined : Buffer.from(input)).toString("utf8").trim();
 }
 let gitEntries = 0;
-/** Entries into gitBytes (git goes through it) in this process, whatever their outcome (S1.3, №2217): a historical proof
+/** Git-dependent reads (including shared object/ancestry reads), whatever their outcome (S1.3, №2217): a historical proof
  * whose action ran git depends on more than its Store and is never kept beyond its operation. */
 export function gitCalls(): number { return gitEntries; }
 const fullOid = (value: string) => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(value);
@@ -180,7 +180,9 @@ function gitMemoContext(cwd: string, env: NodeJS.ProcessEnv): string | null {
     const head = smallGitFile(resolve(dir, 'HEAD'), 4096).trimEnd();
     if (!fullOid(head) && !/^ref: refs\/[^\r\n]+$/.test(head)) return null;
     if ([resolve(common, 'shallow'), resolve(common, 'info/grafts'), resolve(common, 'objects/info/alternates'),
-      resolve(common, 'objects/info/http-alternates'), resolve(common, 'refs/replace')].some(path => existsSync(path))) return null;
+      resolve(common, 'objects/info/http-alternates')].some(path => existsSync(path))) return null;
+    const replacements = resolve(common, 'refs/replace');
+    if (existsSync(replacements) && readdirSync(replacements).length) return null;
     const packed = smallGitFile(resolve(common, 'packed-refs'), 1_048_576);
     if (/(?:^|\n)[^\n]* refs\/replace\//.test(packed)) return null;
     const executable = executablePath({ executable: 'git', args: [] }, root);
@@ -199,7 +201,7 @@ function gitMemoContext(cwd: string, env: NodeJS.ProcessEnv): string | null {
     }
     const configs = [...gitConfigPaths.paths, resolve(common, 'config'), resolve(dir, 'config.worktree')]
       .map(path => [path, gitFileStamp(path), smallGitFile(path)]);
-    if (configs.some(([, , text]) => /include|partialclone|refstorage|alternate/i.test(text!))) return null;
+    if (configs.some(([, , text]) => /include|partialclone|refstorage|alternate|^\s*worktree\s*=|^\s*bare\s*=\s*true/im.test(text!))) return null;
     const objects = resolve(common, 'objects'), entries = readdirSync(objects).sort();
     if (entries.length > 260) return null;
     const objectStamps: string[] = [gitFileStamp(objects)];
@@ -212,14 +214,76 @@ function gitMemoContext(cwd: string, env: NodeJS.ProcessEnv): string | null {
         for (const pack of packs) objectStamps.push(pack, gitFileStamp(resolve(objects, entry, pack)));
       }
     }
-    return JSON.stringify([root, common, digest(JSON.stringify([identity, gitFile, commonFile, head,
-      gitDirectoryIdentity(dir), gitDirectoryIdentity(common), gitDirectoryIdentity(resolve(common, 'refs')), configs, objectStamps]))]);
+    // Exact object reads are shared by linked worktrees of this object store. HEAD and the gitdir
+    // spelling do not change an OID's bytes; a present worktree config still remains a distinct input.
+    return JSON.stringify([common, digest(JSON.stringify([identity,
+      gitDirectoryIdentity(common), gitDirectoryIdentity(resolve(common, 'refs')), gitFileStamp(replacements),
+      configs.filter(([, stamp]) => stamp !== 'absent'), objectStamps]))]);
   } catch { return null; } // Metadata/read errors never substitute for the command's original result or refusal.
+}
+/** Fresh object-store identity for a synchronous ownership read; null forbids sharing in exceptional Git layouts. */
+export function gitObjectReadContext(cwd: string): string | null {
+  gitEntries++; // PF4: reusing an active ancestry graph still depends on fresh Git metadata.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+  return gitMemoContext(cwd, env);
+}
+type GitAncestry = ReadonlyMap<string, readonly string[]>;
+const ancestryReads: { context: string; graph: GitAncestry }[] = [];
+function ancestorIn(graph: GitAncestry, ancestor: string, head: string): boolean {
+  const pending = [head], seen = new Set<string>();
+  while (pending.length) {
+    const commit = pending.pop()!;
+    if (commit === ancestor) return true;
+    if (seen.has(commit)) continue;
+    seen.add(commit); pending.push(...graph.get(commit) ?? []);
+  }
+  return false;
+}
+/** One fresh Git graph per synchronous read; callbacks receive a detached view, never the private proof itself. */
+export function withGitAncestry<T>(cwd: string, head: string, action: (graph: GitAncestry) => T): T {
+  const context = fullOid(head) ? gitObjectReadContext(cwd) : null;
+  const shared = context === null ? undefined : ancestryReads.findLast(read => read.context === context && read.graph.has(head));
+  const graph = new Map<string, readonly string[]>();
+  if (shared) {
+    const pending = [head];
+    while (pending.length) {
+      const commit = pending.pop()!, parents = shared.graph.get(commit);
+      if (graph.has(commit) || !parents) continue;
+      graph.set(commit, parents); pending.push(...parents);
+    }
+  } else for (const line of git(cwd, ['rev-list', '--parents', head]).split('\n').filter(Boolean)) {
+    const [commit, ...parents] = line.split(' '); graph.set(commit!, Object.freeze(parents));
+  }
+  const view = () => action(new Map(graph));
+  if (context === null || gitObjectReadContext(cwd) !== context) return view();
+  ancestryReads.push({ context, graph });
+  try { return view(); } finally { ancestryReads.pop(); }
+}
+function ancestryAnswer(cwd: string, args: readonly string[], env: NodeJS.ProcessEnv): Buffer | null {
+  const ancestorQuery = args.length === 4 && args[0] === 'merge-base' && args[1] === '--is-ancestor'
+    && fullOid(args[2]!) && fullOid(args[3]!);
+  const parentQuery = args.length === 5 && args[0] === 'rev-list' && args[1] === '--parents' && args[2] === '-n'
+    && args[3] === '1' && fullOid(args[4]!);
+  if (!ancestryReads.length || !ancestorQuery && !parentQuery) return null;
+  const head = args[ancestorQuery ? 3 : 4]!, context = gitMemoContext(cwd, env);
+  const shared = context === null ? undefined : ancestryReads.findLast(read => read.context === context && read.graph.has(head));
+  if (!shared) return null;
+  // Absence alone cannot distinguish an unreachable commit from a missing object or a tag.
+  if (ancestorQuery && !ancestryReads.some(read => read.context === context && read.graph.has(args[2]!))) return null;
+  if (parentQuery) return Buffer.from([head, ...shared.graph.get(head)!].join(' ') + '\n');
+  if (ancestorIn(shared.graph, args[2]!, head)) return Buffer.alloc(0);
+  throw new EngineError('git_failed', 'Git command failed', { action: 'merge-base', status: 1, signal: null, stderr: '' });
 }
 export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffer {
   gitEntries++; // PF4: even a successful memo hit is a Git-dependent read, before lookup.
   const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
-  const eligible = input === undefined && immutableGitRead(args) && JSON.stringify(args).length <= 4096;
+  const ancestry = input === undefined ? ancestryAnswer(cwd, args, env) : null;
+  if (ancestry !== null) return ancestry;
+  // One exact batch object binds type and contents in the same Git response, including under shallow.
+  const batchInput = input !== undefined && args.length === 2 && args[0] === 'cat-file' && args[1] === '--batch'
+    ? Buffer.from(input) : null;
+  const batchObject = batchInput !== null && /^(?:[a-f0-9]{40}|[a-f0-9]{64})\n$/.test(batchInput.toString('utf8'));
+  const eligible = (input === undefined && immutableGitRead(args) || batchObject) && JSON.stringify(args).length <= 4096;
   // These exact candidate writes can add immutable objects and rewrite the index. Every subsequent
   // lookup still observes objects/refs/config; errors clear the memo, including partial writes.
   const candidateWrite = input === undefined && (args.length === 1 && args[0] === 'write-tree'
@@ -228,11 +292,15 @@ export function gitBytes(cwd: string, args: string[], input?: Uint8Array): Buffe
   if (!candidateWrite && !['rev-parse', 'status', 'ls-tree', 'ls-files', 'show', 'cat-file', 'diff', 'diff-tree', 'rev-list', 'merge-base',
     'for-each-ref', 'check-ignore', 'var'].includes(args[0]!)) clearGitMemo();
   const context = eligible ? gitMemoContext(cwd, env) : null;
-  const key = context === null ? null : JSON.stringify([context, args]);
+  // Only object identity/content and bounded parent reads share across worktrees. Other forms
+  // retain their cwd rather than broadening their existing memo boundary.
+  const sharedObject = batchObject || ['rev-parse', 'rev-list', 'cat-file'].includes(args[0]!);
+  const key = context === null ? null : JSON.stringify([context, sharedObject ? null : cwd, args,
+    batchObject ? batchInput!.toString('utf8') : null]);
   const saved = key === null ? undefined : gitMemo.get(key);
   if (saved && key) { gitMemo.delete(key); gitMemo.set(key, saved); return Buffer.from(saved.bytes); }
   let bytes: Buffer;
-  try { bytes = runGit(cwd, args, env, input); }
+  try { bytes = runGit(cwd, args, env, batchObject ? batchInput! : input); }
   catch (error) { if (candidateWrite) clearGitMemo(); throw error; }
   if (key && gitMemoContext(cwd, env) === context) rememberGit(key, bytes);
   return bytes;

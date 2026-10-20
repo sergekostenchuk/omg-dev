@@ -5,7 +5,7 @@ import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { git, gitBytes, gitCalls, inspectRepository, type Environment } from '../src/runtime/environment.js';
+import { git, gitBytes, gitCalls, gitObjectReadContext, gitIsAncestor, withGitAncestry, inspectRepository, type Environment } from '../src/runtime/environment.js';
 import { EngineError } from '../src/errors.js';
 import { historicalProof } from '../src/history/proofs.js';
 import { reference } from '../src/pipeline/contracts.js';
@@ -256,4 +256,67 @@ test('GITSRC2 byte bound evicts responses and a command that can write clears th
   const args = ['cat-file', 'blob', blobs[0]!]; gitBytes(f.repo, args); assert.equal(log.count(args), 2, '9 MiB cannot remain in an 8 MiB memo');
   gitBytes(f.repo, args); assert.equal(log.count(args), 2);
   git(f.repo, ['update-ref', 'refs/heads/memo-check', f.head]); gitBytes(f.repo, args); assert.equal(log.count(args), 3);
+});
+
+
+test('GITSRC5 linked worktrees share exact object bytes but preserve worktree configuration and PF4 dependencies', t => {
+  const f = fixture(t), linked = join(f.root, 'linked');
+  f.raw(['worktree', 'add', '--detach', '-q', linked, f.head]);
+  const blob = f.raw(['rev-parse', `${f.head}:a.txt`]), args = ['cat-file', 'blob', blob], log = trace(t);
+  assert.equal(gitBytes(f.repo, args).toString(), 'one\n');
+  assert.equal(gitBytes(linked, args).toString(), 'one\n');
+  assert.equal(log.count(args), 1, 'two spellings of the same object store do not repeat the exact read');
+  assert.equal(gitObjectReadContext(f.repo), gitObjectReadContext(linked));
+  const store = new Store(join(f.root, 'context-proof.sqlite'));
+  try {
+    const row = store.write({ id: 'proof:context', kind: 'proof', expected: 0, value: {} }); let reads = 0;
+    const read = () => historicalProof(store, { reader: 'GITSRC5', project: 'p', ref: reference(row), parameters: {} }, source => {
+      reads++; assert.notEqual(gitObjectReadContext(linked), null); return reference(source.get(row.id, 1)!);
+    }, () => { throw new Error('cycle'); });
+    read(); read(); assert.equal(reads, 2, 'a shared graph context cannot become a Store-only historical proof');
+  } finally { store.close(); }
+  f.raw(['config', 'extensions.worktreeConfig', 'true']);
+  f.raw(['config', '--worktree', 'core.quotePath', 'false'], undefined, linked);
+  const before = log.count(args);
+  gitBytes(f.repo, args); gitBytes(linked, args); assert.equal(log.count(args), before + 2);
+  const dir = f.raw(['rev-parse', '--absolute-git-dir'], undefined, linked);
+  writeFileSync(join(dir, 'config.worktree'), '[broken\n');
+  assert.throws(() => gitBytes(linked, args), failed);
+  assert.equal(gitBytes(f.repo, args).toString(), 'one\n', 'a bad linked config does not poison the original worktree');
+});
+
+for (const format of ['sha1', 'sha256']) test(`GITSRC5 exact batch objects include the input OID in their memo key (${format})`, t => {
+  const f = fixture(t, format), args = ['cat-file', '--batch'], input = Buffer.from(f.head + '\n'), log = trace(t);
+  const first = gitBytes(f.repo, args, input), expected = Buffer.from(first); first.fill(0);
+  assert.deepEqual(gitBytes(f.repo, args, input), expected); assert.equal(log.count(args), 1);
+  const blob = f.raw(['rev-parse', `${f.head}:a.txt`]);
+  const other = gitBytes(f.repo, args, Buffer.from(blob + '\n'));
+  assert.ok(other.toString().startsWith(`${blob} blob 4\n`)); assert.equal(log.count(args), 2);
+  assert.deepEqual(gitBytes(f.repo, args, input), expected); assert.equal(log.count(args), 2);
+  const shallow = join(f.repo, '.git/shallow'); writeFileSync(shallow, f.head + '\n');
+  assert.deepEqual(gitBytes(f.repo, args, input), expected);
+  assert.deepEqual(gitBytes(f.repo, args, input), expected); assert.equal(log.count(args), 4, 'shallow still bypasses memo');
+  rmSync(shallow);
+  const object = join(f.repo, '.git/objects', f.head.slice(0, 2), f.head.slice(2)), bytes = readFileSync(object);
+  rmSync(object); assert.equal(gitBytes(f.repo, args, input).toString(), `${f.head} missing\n`);
+  writeFileSync(object, bytes); assert.deepEqual(gitBytes(f.repo, args, input), expected);
+  const before = log.count(args);
+  gitBytes(f.repo, args, Buffer.from(f.head + '\n' + blob + '\n'));
+  gitBytes(f.repo, args, Buffer.from(f.head + '\n' + blob + '\n'));
+  assert.equal(log.count(args), before + 2, 'multiple or symbolic batch inputs are outside the closed memo form');
+});
+
+
+
+test('GITSRC5 a callback cannot forge the private Git graph and unknown objects still reach Git', t => {
+  const f = fixture(t), fork = f.raw(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+    'commit-tree', f.tree, '-p', f.head], 'detached descendant\n');
+  withGitAncestry(f.repo, f.head, view => {
+    const forged = view as Map<string, readonly string[]>;
+    forged.set(f.head, [fork]); forged.set(fork, []);
+    assert.equal(gitIsAncestor(f.repo, fork, f.head), false, 'callback-authored edges are never an ancestry proof');
+    assert.equal(gitIsAncestor(f.repo, f.head, f.head), true);
+    assert.throws(() => gitIsAncestor(f.repo, 'f'.repeat(40), f.head), failed, 'missing object is not status 1');
+  });
+  assert.equal(gitIsAncestor(f.repo, fork, f.head), false);
 });

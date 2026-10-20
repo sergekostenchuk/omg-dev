@@ -2,7 +2,7 @@ import type { Store } from "../storage/store.js";
 import type { MachinePlan, CompiledTask } from "../compiler/model.js";
 import type { TaskRun } from "../execution/model.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
-import { git, gitIsAncestor, type RepositoryState, type Environment } from "../runtime/environment.js";
+import { git, gitIsAncestor, withGitAncestry, type RepositoryState, type Environment } from "../runtime/environment.js";
 import { treeFile } from "../runtime/git-files.js";
 import { canonical, digest } from "../canonical.js";
 import { requireCondition } from "../errors.js";
@@ -60,9 +60,10 @@ function requireGateShape(writer: WriterSource, environment: Environment): void 
 }
 
 function writerReachable(repository: Repository, commit: string): boolean {
-  if (!commitName(commit) || !gitIsAncestor(repository.root, commit, repository.head)) return false;
+  if (!commitName(commit)) return false;
+  if (!gitIsAncestor(repository.root, commit, repository.head)) return false;
   // merge-base peels annotated tags; the former rev-list membership required the commit OID itself.
-  // This bounded, memo-eligible read is also the exact form commitOrigin uses for its parent proof.
+  // This bounded read proves commit identity; commitOrigin separately reads its actual parent object.
   return git(repository.root, ['rev-list', '--parents', '-n', '1', commit]).split(' ')[0] === commit;
 }
 
@@ -95,6 +96,9 @@ function checkedWriter(store: Store, project: string, repository: Repository, wr
 }
 
 type Ancestry = ReadonlyMap<string, readonly string[]>;
+function withAncestry<T>(repository: Repository, action: (graph: Ancestry) => T): T {
+  return withGitAncestry(repository.root, repository.head, action);
+}
 function readAncestry(repository: Repository): Ancestry {
   return new Map(git(repository.root, ['rev-list', '--parents', repository.head]).split('\n').filter(Boolean)
     .map(line => { const [commit, ...parents] = line.split(' '); return [commit!, parents] as const; }));
@@ -119,7 +123,8 @@ function chooseWriter(store: Store, project: string, repository: Repository, can
     return writerReachable(repository, writer.value.commit!)
       ? checkedWriter(store, project, repository, writer, path) : null;
   }
-  const graph = ancestry ?? readAncestry(repository);
+  if (!ancestry) return withAncestry(repository, graph => chooseWriter(store, project, repository, candidates, path, graph));
+  const graph = ancestry;
   const accepted = candidates.filter(writer => graph.has(writer.value.commit!));
   if (!accepted.length) return null;
   let latest = accepted[0]!;
@@ -163,9 +168,10 @@ export class Owners {
     requireContext(this.store, this.project, this.repository, path);
     requireCondition(text(path), "ownership_proof_foreign", "An accepted writer needs an exact path");
     if (!this.writers.length) return null;
-    const ancestry = readAncestry(this.repository);
-    const candidates = this.writers.filter(writer => ancestry.has(writer.commit))
-      .map(writer => writerSource(this.store, this.project, writer.ref)).filter(writer => writer.task.writePaths.includes(path));
-    return chooseWriter(this.store, this.project, this.repository, candidates, path, ancestry);
+    return withAncestry(this.repository, ancestry => {
+      const candidates = this.writers.filter(writer => ancestry.has(writer.commit))
+        .map(writer => writerSource(this.store, this.project, writer.ref)).filter(writer => writer.task.writePaths.includes(path));
+      return chooseWriter(this.store, this.project, this.repository, candidates, path, ancestry);
+    });
   }
 }
