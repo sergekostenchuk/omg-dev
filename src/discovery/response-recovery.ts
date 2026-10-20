@@ -45,6 +45,7 @@ import { isResearchPreview } from './research-preview.js';
 import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply,
   isReservationOnlySessionStep, turnAction, responseAction, webResearchCapability, earlyUnknownEra, EARLY_UNKNOWN,
   projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
+  parseSynthesisSessionV3, synthesisSessionSubject, synthesisStepSubject, SYNTHESIS_SESSION_V3_PREFIX,
   projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
   projectAddressedWorkspace, projectResearchTurnRevision, projectSourceReadingTurn, isCorrectableLayerDesignFailure,
@@ -64,7 +65,7 @@ import { queuedChildReached } from './reading-plan.js';
 import { paidOriginId, paidSessionId, limitedAssessmentRetryScope } from './assessment-session.js';
 import { readResearchAssessmentAt, assessmentBindingId } from './research-assessment.js';
 import { ATTEMPT_BINDING_CONTRACT, ATTEMPT_BINDING_FIELDS, ATTEMPT_BINDING_KIND, addressedQuestionId, attemptBindingId,
-  callAddressesSubject, planSubjectOf, sameSubject, type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
+  callAddressesSubject, planSubjectOf, sameSubject, questionDispatchId, type ResearchAttemptBinding, type V7PlanSubject } from './v7-managed-attempt.js';
 import { proveAttempt, provePlanQuestions, type V7Attempt } from './v7-plan-questions.js';
 import { V7_CONTRACT_ERA } from './v7-contracts.js';
 
@@ -145,6 +146,13 @@ function responseSessionBinding(session: Revision<RecoverableContextSession>) {
   if (session.kind === 'synthesis-session' && session.id.startsWith('synthesis-session:v2:')) {
     const parsed = parseSynthesisSessionV2(session.value);
     requireCondition(parsed, 'response_recovery_binding_missing', 'The v2 session must retain its complete research binding');
+    return parsed.binding;
+  }
+  // DR3a3-S1: a v3 session keeps its exact subject; it never falls back to
+  // the address-less legacy check below, which knows no subject.
+  if (session.kind === 'synthesis-session' && session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX)) {
+    const parsed = parseSynthesisSessionV3(session.value);
+    requireCondition(parsed, 'response_recovery_binding_missing', 'The v3 session must retain its complete research binding and subject');
     return parsed.binding;
   }
   const binding = session.value.binding;
@@ -1164,6 +1172,16 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
   if (intent.value.state !== 'applied' || !directOutput || synthesis && !synthesisHandoff
     || !synthesis && intent.value.owner.id !== saved.value.run)
     consumerInvalid(saved.id, 'The new turn is not the exact output of its accepted consumer intent');
+  // DR3a3-S1: the second producer of O@1 — the handoff turn carries the
+  // subject of the exact session its step produced (none for v2), which the
+  // step intent and the turn already share above.
+  if (synthesis && session?.kind === 'synthesis-session') {
+    let bound: V7PlanSubject | null;
+    try { bound = synthesisStepSubject(intent.value, session); }
+    catch { consumerInvalid(saved.id, 'The handoff session and its step name different subjects'); }
+    if (!sameSubject(bound!, turnSubject))
+      consumerInvalid(saved.id, 'The handoff turn subject differs from the subject of its exact session');
+  }
   // Every requested later revision must retain the paid action and binding.
   // The proof for a local owner refusal is deliberately distinct from the
   // later paid escalation assessor; an absent reviewer is not itself proof.
@@ -2740,6 +2758,11 @@ function synthesisTransitionProofInput(store: Store, intent: Revision<ResearchCo
   paid: ResearchConsumerExecution, beforeRevision?: number): SynthesisTransitionInput {
   const cursor = intent.value.cursor;
   const session = store.get<SynthesisSessionState>(intent.value.owner.id, beforeRevision ?? intent.value.owner.revision);
+  // DR3a3-S1: the v3 transition (actions parsed by the saved subject) is
+  // connected with its producer in S5; until then it is an addressed refusal.
+  if (session?.kind === 'synthesis-session' && session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX))
+    throw new EngineError('research_v7_mode_unavailable',
+      `[${intent.id}] The v3 synthesis transition is not connected yet`, { session: reference(session) });
   if (!session || session.kind !== 'synthesis-session' || !object(session.value)
     || hashJson(session.value) !== session.hash
     || (beforeRevision === undefined && canonical(reference(session)) !== canonical(intent.value.owner))
@@ -3254,21 +3277,23 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
   }
   const session = store.get<RecoverableContextSession>(sessionRef.id), call = store.get<ModelCall>(callRef.id);
   const isV2Synthesis = !!session && session.kind === 'synthesis-session' && session.id.startsWith('synthesis-session:v2:');
+  // DR3a3-S1: a v3 session takes the same exact-restoration path as v2, with its subject.
+  const isV3Synthesis = !!session && session.kind === 'synthesis-session' && session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX);
   requireCondition(session && ['synthesis-session', 'assessment-session'].includes(session.kind) && object(session.value)
     && session.value.projectId === project
-    && (isV2Synthesis || canonical(reference(session)) === canonical(sessionRef)),
+    && (isV2Synthesis || isV3Synthesis || canonical(reference(session)) === canonical(sessionRef)),
   'response_recovery_session_stale', 'Recovery requires the current exact supported session');
   // №2000-11: a paid managed assessment session has no operator replay; its
   // recovery is the automatic managed path through the exact saved origin.
   requireCondition(!(session.kind === 'assessment-session' && session.id.startsWith('assessment-session:v2:')),
     'response_recovery_invalid', 'A paid managed assessment session recovers only through its exact origin, never operator replay');
-  if (isV2Synthesis) {
+  if (isV2Synthesis || isV3Synthesis) {
     // №1555 X27: v2 recovery is the exact restoration of the selected paid
     // step; sessionRef must name the proven pre-application state of that
     // step, never an arbitrary current head. An already lawful A is confirmed
     // once by a receipt-link to the proven sessionBefore/sessionAfter — never
     // a second application; a later session revision never stalemates it.
-    const parsed = parseSynthesisSessionV2(session!.value);
+    const parsed = isV3Synthesis ? parseSynthesisSessionV3(session!.value) : parseSynthesisSessionV2(session!.value);
     requireCondition(parsed, 'response_recovery_binding_missing', 'The v2 session must retain its producer contract');
     const bound = listResearchConsumerIntents(store, project, parsed.binding.draft.id)
       .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind)
@@ -3316,7 +3341,10 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
   }
   if (!synthesis) requireCondition(Array.isArray(body.observations) && body.observations.every((observation: any) =>
     observation.projectId === project && new Evidence(store).verify(observation)), 'response_recovery_evidence_stale', 'Assessment recovery requires its actual current evidence');
-  const counter = store.get(`question-dispatch:${hashJson(question.id)}`);
+  // DR3a3-S1 (решение 5): the audited counter of the step's own scope — the
+  // subject counter C writes for a v3 session, the Question counter otherwise.
+  const counter = store.get(questionDispatchId(project, question.id,
+    isV3Synthesis ? synthesisSessionSubject(session) : null));
   requireCondition(counter, 'response_recovery_binding_missing', 'Recovery requires the audited dispatch guard');
   const projectCounter = store.get(`project-dispatch:${hashJson(project)}`);
   const run = store.get<{ projectId: string; draftId: string; status: string; owner?: { pid: number; started: string } }>(`research-run:${hashJson([project, draft.id])}`);

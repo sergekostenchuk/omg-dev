@@ -84,6 +84,14 @@ export function addressedQuestionId(question: Ref, subject: V7PlanSubject | null
   return subject ? subject.planQuestionId : question.id;
 }
 
+/** DR3a3-S1 (решение 5): the one address of the paid-step dispatch counter.
+ * A subject step serialises on its project+subject (the scope C writes); a
+ * field question keeps its Question-id counter unchanged. Producers and
+ * recovery readers derive the counter only through this formula. */
+export function questionDispatchId(projectId: string, questionId: string, subject: V7PlanSubject | null): string {
+  return `question-dispatch:${hashJson(subject ? [projectId, subject] as unknown as Json : questionId)}`;
+}
+
 /** Call ownership by subject: an attempt's call names the plan-question id
  * and the exact plan answer; a field-question call names the Question record
  * id and carries no plan answer. Matching the id alone is not enough. */

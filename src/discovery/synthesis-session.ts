@@ -27,8 +27,12 @@ import { admittedResearchAction, contextReadIdentity, projectSynthesisTransition
   isReservationOnlySessionStep, synthesisReservationConsumed,
   SYNTHESIS_SESSION_CONTRACT, CONTEXT_RECOVERY_SUPERSEDE_REASON, exactContextLookup, readerDraftEquivalent,
   projectResearchContextSelection,
-  type SynthesisSessionState, type SynthesisSessionDelivery, type SynthesisTransition } from './research-consumer-transition.js';
+  SYNTHESIS_SESSION_CONTRACT_V3, SYNTHESIS_SESSION_V2_PREFIX, SYNTHESIS_SESSION_V3_PREFIX, synthesisSessionV3Address,
+  projectSynthesisSessionV3Initial, synthesisSessionSubject, synthesisStepSubject,
+  type SynthesisSessionState, type SynthesisSessionStateV3, type SynthesisSessionDelivery, type SynthesisTransition } from './research-consumer-transition.js';
 import { isResearchPreview } from './research-preview.js';
+import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
+import { provePlanQuestions } from './v7-plan-questions.js';
 
 interface Session {
   projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
@@ -220,7 +224,7 @@ function plannedQueueOrigin(store: Store, child: Revision<ResearchTurn>, parent:
  * heads decide admission of a NEW synthesis step, never the authenticity of
  * the initial workspace after a graph or Source has lawfully advanced. */
 function runnerWorkspaceAt(store: Store, delivery: SynthesisSessionDelivery,
-  question: Revision<Question>, bindingDraft: Ref): ContextWorkspace {
+  question: Revision<Question>, bindingDraft: Ref, subject: V7PlanSubject | null = null): ContextWorkspace {
   const run = store.get<ResearchRun>(delivery.run, 1);
   requireCondition(run?.kind === 'research-run' && hashJson(run.value) === run.hash
     && run.value.projectId === question.value.projectId && run.value.draftId === question.value.draftId,
@@ -237,6 +241,9 @@ function runnerWorkspaceAt(store: Store, delivery: SynthesisSessionDelivery,
     if (!isRef(turn.value.question)
       || canonical(turn.value.question) !== canonical(reference(question))
       || turn.value.status !== 'completed' || turn.value.error) continue;
+    // DR3a3-S1 (решение 6): a v3 session inherits only its own subject's
+    // turns; one physical Question at another plan-question is not its history.
+    if (subject && !sameSubject(planSubjectOf(turn.value), subject)) continue;
     const origin = (turn.value as ResearchTurn & { consumerIntent?: unknown }).consumerIntent;
     requireCondition(turn.value.plannedBy === undefined || isRef(turn.value.plannedBy),
       'synthesis_session_invalid', 'A planned lookup needs its exact parent Ref');
@@ -292,7 +299,10 @@ function runnerWorkspaceAt(store: Store, delivery: SynthesisSessionDelivery,
 }
 
 function synthesisSessionShape(value: unknown, id: string): asserts value is SynthesisSessionState {
-  if (!object(value) || value.contract !== SYNTHESIS_SESSION_CONTRACT
+  // DR3a3-S1: the era is the address prefix; v3 adds only its mandatory
+  // subject and its own address formula to the common v2 conditions.
+  const v3 = id.startsWith(SYNTHESIS_SESSION_V3_PREFIX);
+  if (!object(value) || value.contract !== (v3 ? SYNTHESIS_SESSION_CONTRACT_V3 : SYNTHESIS_SESSION_CONTRACT)
     || typeof value.projectId !== 'string' || !value.projectId
     || !Number.isSafeInteger(value.offset) || value.offset < 0
     || !(value.materialOffset === undefined || Number.isSafeInteger(value.materialOffset) && (value.materialOffset as number) >= 0)
@@ -320,9 +330,53 @@ function synthesisSessionShape(value: unknown, id: string): asserts value is Syn
         && Number.isSafeInteger(value.contextCorrection.next) && value.contextCorrection.next >= 0
         && Array.isArray(value.contextCorrection.ranges)))
     synthesisSessionInvalid(id, 'The saved synthesis session lost its producer contract');
-  if (id !== `synthesis-session:v2:${hashJson([value.binding.draft.id, { id: value.binding.question.id, hash: value.binding.question.hash },
-    value.binding.inputs, value.basis.materials, value.basis.previousProposal, value.basis.previousProposalRef])}`)
+  const subject = synthesisSessionSubject({ id, value });
+  const address = subject
+    ? synthesisSessionV3Address({ projectId: value.projectId, draft: value.binding.draft, question: value.binding.question,
+      inputs: value.binding.inputs, subject, materials: value.basis.materials,
+      previousProposal: value.basis.previousProposal, previousProposalRef: value.basis.previousProposalRef })
+    : `synthesis-session:v2:${hashJson([value.binding.draft.id, { id: value.binding.question.id, hash: value.binding.question.hash },
+      value.binding.inputs, value.basis.materials, value.basis.previousProposal, value.basis.previousProposalRef])}`;
+  if (id !== address)
     synthesisSessionInvalid(id, 'The session address does not match its saved producer basis');
+}
+
+/** DR3a3-S1: the subject of a session, proven on exact saved records only
+ * (an old plan need not be current today): none for v2; for v3 the plan
+ * answer at its exact revision, the bound Question is the draft's plan anchor
+ * answered by exactly that answer, and the plan-question id belongs to that
+ * accepted edition. Reads only the exact records the binding names; writes
+ * nothing. The exact session reader applies it to the saved head. */
+export function proveSynthesisSessionSubject(store: Store, session: { id: string; value: unknown }): V7PlanSubject | null {
+  const subject = synthesisSessionSubject(session);
+  if (!subject) return null;
+  const refuse = (message: string): never => {
+    throw new EngineError('research_plan_subject_invalid', `[${session.id}] ${message}`, { reason: 'subject' });
+  };
+  const value = session.value as SynthesisSessionState;
+  const answer = store.get(subject.planAnswer.id, subject.planAnswer.revision);
+  if (!answer || canonical(reference(answer)) !== canonical(subject.planAnswer) || hashJson(answer.value) !== answer.hash)
+    refuse('The exact plan answer of the session subject is missing or changed');
+  const binding = value.binding;
+  const draft = isRef(binding?.draft) ? store.get<DiscoveryDraft>(binding.draft.id, binding.draft.revision) : null;
+  const question = isRef(binding?.question) ? store.get<Question>(binding.question.id, binding.question.revision) : null;
+  if (!draft || draft.kind !== 'discovery-draft' || canonical(reference(draft)) !== canonical(binding.draft)
+    || !question || question.kind !== 'question' || canonical(reference(question)) !== canonical(binding.question)
+    || !object(question.value) || question.value.spec?.field !== 'plan'
+    || question.value.draftId !== draft.id || question.value.projectId !== value.projectId
+    || canonical(question.value.answer ?? null) !== canonical(subject.planAnswer))
+    refuse('The session plan anchor is not the plan Question answered by its subject plan answer');
+  let known = false;
+  try {
+    known = provePlanQuestions(store, draft!, subject.planAnswer)
+      .some(item => item.planQuestionId === subject.planQuestionId);
+  } catch (error) {
+    if (error instanceof EngineError && error.code === 'plan_questions_invalid')
+      refuse(`The subject plan answer has no accepted plan of this draft: ${error.message}`);
+    throw error;
+  }
+  if (!known) refuse('The subject plan-question is not in its accepted plan edition');
+  return subject;
 }
 
 /** The historical reader: proves the whole session chain on exact saved
@@ -330,10 +384,22 @@ function synthesisSessionShape(value: unknown, id: string): asserts value is Syn
  * transition the producer used), one-time delivery marks and operator context
  * recoveries. No current heads participate. */
 export function readSynthesisSession(store: Store, ref: Ref): Revision<SynthesisSessionState> {
+  return readSynthesisSessionChain(store, ref, SYNTHESIS_SESSION_V2_PREFIX);
+}
+
+/** DR3a3-S1: the exact reader of a v3 session — the same historical chain
+ * proof on saved bases, plus its proven subject: every step intent of the
+ * session names that subject, and the inherited runner context holds only
+ * turns of that subject. A v2 Ref is not a v3 session. */
+export function readSynthesisSessionV3(store: Store, ref: Ref): Revision<SynthesisSessionStateV3> {
+  return readSynthesisSessionChain(store, ref, SYNTHESIS_SESSION_V3_PREFIX) as unknown as Revision<SynthesisSessionStateV3>;
+}
+
+function readSynthesisSessionChain(store: Store, ref: Ref, era: string): Revision<SynthesisSessionState> {
   if (!store || typeof store.get !== 'function' || !isRef(ref))
     synthesisSessionInvalid('synthesis-session', 'An exact saved session is required');
   const head = store.get<SynthesisSessionState>(ref.id, ref.revision);
-  if (!head || head.kind !== 'synthesis-session' || !head.id.startsWith('synthesis-session:v2:')
+  if (!head || head.kind !== 'synthesis-session' || !head.id.startsWith(era)
     || canonical(reference(head)) !== canonical(ref) || hashJson(head.value) !== head.hash)
     synthesisSessionInvalid(ref.id, 'The exact synthesis session is missing or changed');
   synthesisSessionShape(head.value, head.id);
@@ -343,8 +409,12 @@ export function readSynthesisSession(store: Store, ref: Ref): Revision<Synthesis
     if (!exact || canonical(reference(exact)) !== canonical(source) || hashJson(exact.value) !== exact.hash)
       synthesisSessionInvalid(head.id, `An exact session binding source is missing: ${source.id}`);
   }
+  const subject = proveSynthesisSessionSubject(store, head);
   const intents = listResearchConsumerIntents(store, head.value.projectId, head.value.binding.draft.id)
     .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind) && intent.value.owner.id === head.id);
+  // Session → intent: a step of this session names exactly the session's
+  // subject (none for v2); another subject never becomes this session's step.
+  for (const intent of intents) synthesisStepSubject(intent.value, head);
   const byOutput = new Map<number, Revision<ResearchConsumerIntent>>();
   for (const intent of intents) {
     if (intent.value.state !== 'applied' || !intent.value.outputs) continue;
@@ -358,17 +428,22 @@ export function readSynthesisSession(store: Store, ref: Ref): Revision<Synthesis
   if (!initial || initial.revision !== 1 || initial.kind !== head.kind || hashJson(initial.value) !== initial.hash)
     synthesisSessionInvalid(head.id, 'The initial session revision is missing');
   synthesisSessionShape(initial.value, head.id);
-  const expectedInitial: SynthesisSessionState = { contract: SYNTHESIS_SESSION_CONTRACT,
-    projectId: initial.value.projectId, offset: 0, notes: [], result: null,
-    basis: initial.value.basis, binding: initial.value.binding,
-    // The runner's reserved position is part of the first record (№1658 К2).
-    ...(initial.value.delivery != null ? { delivery: initial.value.delivery } : {}) };
+  // A v3 first record is re-derived by the producer's own projector.
+  const expectedInitial: Record<string, any> = subject
+    ? projectSynthesisSessionV3Initial({ projectId: initial.value.projectId,
+      binding: initial.value.binding as SynthesisSessionStateV3['binding'], basis: initial.value.basis,
+      delivery: initial.value.delivery ?? null }).value
+    : { contract: SYNTHESIS_SESSION_CONTRACT,
+      projectId: initial.value.projectId, offset: 0, notes: [], result: null,
+      basis: initial.value.basis, binding: initial.value.binding,
+      // The runner's reserved position is part of the first record (№1658 К2).
+      ...(initial.value.delivery != null ? { delivery: initial.value.delivery } : {}) };
   if (initial.value.workspace !== undefined) {
     if (!initial.value.delivery) synthesisSessionInvalid(head.id, 'A direct session cannot inherit a runner context');
     const question = store.get<Question>(initial.value.binding.question.id, initial.value.binding.question.revision);
     if (!question || canonical(reference(question)) !== canonical(initial.value.binding.question)
       || canonical(initial.value.workspace) !== canonical(runnerWorkspaceAt(store, initial.value.delivery,
-        question, initial.value.binding.draft)))
+        question, initial.value.binding.draft, subject)))
       synthesisSessionInvalid(head.id, 'The initial context differs from the exact completed runner prefix');
     expectedInitial.workspace = initial.value.workspace;
   }
@@ -646,8 +721,11 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     // A previous-era unfinished operation of this same task keeps its lawful
     // recovery path (№1555 X04): the new era neither adopts its paid response
     // nor silently buys another one over it — the refusal names that session.
+    // DR3a3-S1: only the address-less era is previous; a v3 session of a
+    // plan-question is a later era, not a legacy owner of this task.
     const legacyPending = store.list<Session>('synthesis-session')
-      .filter(record => !record.id.startsWith('synthesis-session:v2:') && object(record.value)
+      .filter(record => !record.id.startsWith(SYNTHESIS_SESSION_V2_PREFIX)
+        && !record.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX) && object(record.value)
         && record.value.projectId === projectId && object(record.value.binding)
         && isRef(record.value.binding.question) && record.value.binding.question.id === question.id
         && record.value.result === null);

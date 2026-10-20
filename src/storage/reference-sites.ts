@@ -202,6 +202,17 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   { kind: "assessment-session", contract: "assessment-application/v1", data: assessmentSessionData() },
   { kind: "synthesis-session", contract: null, data: synthesisSessionData() },
   { kind: "synthesis-session", contract: "synthesis-session/v2", data: synthesisSessionData() },
+  // DR3a3-S1: the v3 session keeps the v2 data subtrees (proposals, notes,
+  // results and pauses are model data); its binding, materials' sources and
+  // binding.subject.planAnswer remain engine references of the structural scan.
+  { kind: "synthesis-session", contract: "synthesis-session/v3", data: synthesisSessionData() },
+  // DR3a3-S1: the v2 partial note — the proposal and observed values are data;
+  // draft, question, subject.planAnswer and observation sources are references.
+  { kind: "research-checkpoint", contract: "research-checkpoint/v2", data: [["proposal"], ["observations", INDEX, "value"]] },
+  // DR3a3-S1: the saved-only selection of one subject names exactly these refs.
+  { kind: "saved-synthesis", contract: "saved-synthesis/v2", data: [], refs: [
+    ["draft"], ["question"], ["inputs", INDEX], ["subject", "planAnswer"], ["checkpoints", INDEX],
+  ] },
   { kind: "web-capture", contract: "web-capture/v1", data: [["response"]] },
   { kind: "web-capture", contract: "web-capture/v2", data: [["response"]] },
   { kind: "web-capture", contract: "web-capture/v3", data: [["response"]],

@@ -342,6 +342,106 @@ export interface SynthesisSessionState {
     unit: string; total: number; next: number; ranges: { offset: number; end: number }[] } | null;
 }
 
+/* ---------- DR3a3-S1 (codex-omg №7690, решения 2, 3, 8): the subject forms ----------
+ * A v7 plan-question is one subject of one physical plan Question. Its session,
+ * partial note and saved-only selection are separately typed forms with a
+ * mandatory exact subject and their own address space; the v2/v1 forms keep
+ * their formulas and meaning. One projector serves the writer and the reader. */
+
+export const SYNTHESIS_SESSION_CONTRACT_V3 = 'synthesis-session/v3' as const;
+export const SYNTHESIS_SESSION_V2_PREFIX = 'synthesis-session:v2:' as const;
+export const SYNTHESIS_SESSION_V3_PREFIX = 'synthesis-session:v3:' as const;
+export interface SynthesisSessionBindingV3 { draft: Ref; question: Ref; environment: Ref; inputs: Ref[]; subject: V7PlanSubject }
+export type SynthesisSessionStateV3 = Omit<SynthesisSessionState, 'contract' | 'binding'>
+  & { contract: typeof SYNTHESIS_SESSION_CONTRACT_V3; binding: SynthesisSessionBindingV3 };
+
+/** The exact subject of a saved subject-bearing form. Missing, null, damaged
+ * or unknown-contract is research_plan_subject_invalid — never "no subject". */
+export function requirePlanSubject(value: unknown, where: string): V7PlanSubject {
+  let subject: V7PlanSubject | null = null;
+  try { subject = planSubjectOf({ subject: value }); } catch { subject = null; }
+  if (!subject) throw new EngineError('research_plan_subject_invalid',
+    `[${where}] The form needs its exact v7-plan-subject/v1 subject`, { reason: 'subject' });
+  return subject;
+}
+
+/** The v3 task address (решение 8): project, draft, the exact subject, the
+ * Question's semantic basis (id/hash), inputs, materials and the previous
+ * proposal with its exact Ref. The environment stays out of the task identity
+ * (it lives in the binding), as in v2; the v2 formula is unchanged. */
+export function synthesisSessionV3Address(input: { projectId: string; draft: Ref; question: Ref; inputs: readonly Ref[];
+  subject: V7PlanSubject; materials: unknown; previousProposal: unknown; previousProposalRef: Ref | null }): string {
+  return `${SYNTHESIS_SESSION_V3_PREFIX}${hashJson([input.projectId, input.draft.id, input.subject,
+    { id: input.question.id, hash: input.question.hash }, input.inputs, input.materials,
+    input.previousProposal ?? null, input.previousProposalRef ?? null])}`;
+}
+
+export interface SynthesisSessionV3Origin {
+  projectId: string; binding: SynthesisSessionBindingV3; basis: SynthesisSessionBasis;
+  delivery?: SynthesisSessionDelivery | null; workspace?: ContextWorkspace;
+}
+
+/** The first record of a v3 session and its address. The producer writes
+ * exactly this value; the exact reader re-derives it from the saved binding,
+ * basis, reservation and inherited runner context. */
+export function projectSynthesisSessionV3Initial(origin: SynthesisSessionV3Origin): { id: string; value: SynthesisSessionStateV3 } {
+  requireCondition(recordValue(origin) && typeof origin.projectId === 'string' && !!origin.projectId
+    && recordValue(origin.binding) && isRef(origin.binding.draft) && isRef(origin.binding.question)
+    && isRef(origin.binding.environment) && Array.isArray(origin.binding.inputs) && origin.binding.inputs.every(isRef)
+    && recordValue(origin.basis) && Array.isArray(origin.basis.materials)
+    && (origin.basis.previousProposalRef === null || isRef(origin.basis.previousProposalRef)),
+  'synthesis_session_invalid', 'A v3 synthesis session needs its exact binding and basis');
+  const subject = requirePlanSubject(origin.binding.subject, 'synthesis-session');
+  requireCondition(origin.workspace === undefined || origin.delivery != null,
+    'synthesis_session_invalid', 'A direct session cannot inherit a runner context');
+  const binding: SynthesisSessionBindingV3 = { draft: origin.binding.draft, question: origin.binding.question,
+    environment: origin.binding.environment, inputs: [...origin.binding.inputs], subject };
+  const basis: SynthesisSessionBasis = { materials: origin.basis.materials,
+    previousProposal: origin.basis.previousProposal ?? null, previousProposalRef: origin.basis.previousProposalRef ?? null };
+  const value: SynthesisSessionStateV3 = { contract: SYNTHESIS_SESSION_CONTRACT_V3, projectId: origin.projectId,
+    offset: 0, notes: [], result: null, basis, binding,
+    ...(origin.delivery != null ? { delivery: origin.delivery } : {}),
+    ...(origin.workspace !== undefined ? { workspace: origin.workspace } : {}) };
+  return { id: synthesisSessionV3Address({ projectId: origin.projectId, draft: binding.draft, question: binding.question,
+    inputs: binding.inputs, subject, materials: basis.materials, previousProposal: basis.previousProposal,
+    previousProposalRef: basis.previousProposalRef }), value };
+}
+
+/** The subject a saved synthesis session is bound to: none for v2 and the
+ * earlier eras, the mandatory exact subject for v3. The era is the address
+ * prefix together with the contract: a contract that disagrees with its
+ * address, or a pre-v3 record carrying a subject, is not a lawful session. */
+export function synthesisSessionSubject(session: { id: string; value: unknown }): V7PlanSubject | null {
+  const value = session.value as Record<string, any>;
+  const v3 = typeof session.id === 'string' && session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX);
+  if (!recordValue(value) || (value.contract === SYNTHESIS_SESSION_CONTRACT_V3) !== v3 || !recordValue(value.binding))
+    throw new EngineError('synthesis_session_invalid',
+      `[${session.id}] The saved session contract does not match its address era`);
+  if (!v3) {
+    if (Object.hasOwn(value.binding, 'subject'))
+      throw new EngineError('synthesis_session_invalid',
+        `[${session.id}] A pre-v3 synthesis session cannot carry a v7 plan subject`);
+    return null;
+  }
+  return requirePlanSubject(value.binding.subject, session.id);
+}
+
+/** DR3a3-S1: the subject of one synthesis/consolidation step of a session —
+ * the step intent's saved cursor and the exact session must agree (none for
+ * v2). The exact session reader applies it to every step, and the synthesis
+ * handoff — the second producer of O@1 — fixes exactly this subject on its
+ * turn: never a caller's context or today's selected question. */
+export function synthesisStepSubject(intent: { cursor: unknown }, session: { id: string; value: unknown }): V7PlanSubject | null {
+  let declared: V7PlanSubject | null;
+  try { declared = planSubjectOf(intent.cursor); }
+  catch { throw new EngineError('research_consumer_intent_invalid', `[${session.id}] The synthesis step carries a damaged plan subject`); }
+  const bound = synthesisSessionSubject(session);
+  if (!sameSubject(declared, bound))
+    throw new EngineError('research_consumer_intent_invalid',
+      `[${session.id}] The synthesis step names another subject than its exact session`);
+  return bound;
+}
+
 /** Payload/proof failures of a received synthesis reply are saved as the
  * step's unresumable refusal; exact-read and integrity failures are not: an
  * origin-proof failure (reader_result_invalid / context_lookup_integrity)
@@ -410,6 +510,74 @@ export function projectCheckpointValue(projectId: string, draft: Ref, question: 
   return { id: `research-checkpoint:${hashJson(value)}`, value };
 }
 
+/** DR3a3-S1 (решение 2): the saved partial note of a v7 plan-question —
+ * proposed, unassessed findings with checked sources, never accepted claims
+ * and never an attempt end. The wire checkpoint addresses the plan-question
+ * id; the record keeps the real Question Ref and the exact subject. One
+ * formula for the writer and the exact reader, like v1 above. */
+export const RESEARCH_CHECKPOINT_V2_CONTRACT = 'research-checkpoint/v2' as const;
+export const RESEARCH_CHECKPOINT_V2_PREFIX = 'research-checkpoint:v2:' as const;
+const CHECKPOINT_V2_FIELDS = ['contract', 'projectId', 'draft', 'question', 'subject', 'status',
+  'proposal', 'observations', 'unresolved'].sort().join(',');
+export function projectCheckpointValueV2(projectId: string, draft: Ref, question: Ref, subject: V7PlanSubject,
+  action: CheckpointProposalInput, observe: (source: Ref, selector: Selector) => Observation): { id: string; value: Record<string, any> } {
+  const exact = requirePlanSubject(subject, 'research-checkpoint');
+  requireCondition(recordValue(action) && typeof action.question === 'string' && action.question === exact.planQuestionId
+    && Object.hasOwn(action, 'value') && Array.isArray(action.citations) && Array.isArray(action.unresolved)
+    && action.citations.every(citation => recordValue(citation) && isRef(citation.source) && recordValue(citation.selector)),
+  'research_question_foreign', 'Checkpoint belongs to another plan-question');
+  const observations = action.citations.map(citation => observe(citation.source, citation.selector));
+  const value = { contract: RESEARCH_CHECKPOINT_V2_CONTRACT, projectId, draft, question, subject: exact,
+    status: 'unassessed', proposal: action.value, observations, unresolved: action.unresolved };
+  return { id: `${RESEARCH_CHECKPOINT_V2_PREFIX}${hashJson(value)}`, value };
+}
+/** The exact form of a saved v2 note: its fields, project-bound refs and subject. */
+export function researchCheckpointV2Holds(value: unknown): boolean {
+  if (!recordValue(value) || Object.keys(value).sort().join(',') !== CHECKPOINT_V2_FIELDS
+    || value.contract !== RESEARCH_CHECKPOINT_V2_CONTRACT || typeof value.projectId !== 'string' || !value.projectId
+    || !isRef(value.draft) || !isRef(value.question) || value.status !== 'unassessed'
+    || !Array.isArray(value.observations) || !Array.isArray(value.unresolved)) return false;
+  try { requirePlanSubject(value.subject, 'research-checkpoint'); return true; } catch { return false; }
+}
+
+/** DR3a3-S1 (решение 3): the saved-only selection of one subject — its own
+ * address space from project+subject, the exact Question/draft/inputs, the
+ * subject and the exact v2 checkpoints of that subject in their proven order.
+ * Choosing and proving the checkpoints belongs to the command (S4); this is
+ * the one form its writer and readers share. */
+export const SAVED_SYNTHESIS_V2_CONTRACT = 'saved-synthesis/v2' as const;
+export interface SavedSynthesisV2 {
+  contract: typeof SAVED_SYNTHESIS_V2_CONTRACT; projectId: string; draft: Ref; question: Ref; inputs: Ref[];
+  subject: V7PlanSubject; checkpoints: Ref[];
+}
+const SAVED_SYNTHESIS_V2_FIELDS = ['contract', 'projectId', 'draft', 'question', 'inputs', 'subject', 'checkpoints'].sort().join(',');
+export const savedSynthesisV2Id = (projectId: string, subject: V7PlanSubject): string =>
+  `saved-synthesis:v2:${hashJson([projectId, subject])}`;
+export function projectSavedSynthesisV2(input: Omit<SavedSynthesisV2, 'contract'>): { id: string; value: SavedSynthesisV2 } {
+  const value: SavedSynthesisV2 = { contract: SAVED_SYNTHESIS_V2_CONTRACT, projectId: input?.projectId,
+    draft: input?.draft, question: input?.question, inputs: input?.inputs,
+    subject: requirePlanSubject(input?.subject, 'saved-synthesis'), checkpoints: input?.checkpoints };
+  const id = savedSynthesisV2Id(value.projectId, value.subject);
+  savedSynthesisV2Shape(value, id);
+  return { id, value };
+}
+/** The saved-only form and its address. No eligible checkpoint is
+ * saved_synthesis_missing; any other deviation is saved_synthesis_stale. */
+export function savedSynthesisV2Shape(value: unknown, id: string): asserts value is SavedSynthesisV2 {
+  if (!recordValue(value) || Object.keys(value).sort().join(',') !== SAVED_SYNTHESIS_V2_FIELDS
+    || value.contract !== SAVED_SYNTHESIS_V2_CONTRACT || typeof value.projectId !== 'string' || !value.projectId
+    || !isRef(value.draft) || !isRef(value.question) || !Array.isArray(value.inputs) || !value.inputs.every(isRef)
+    || !Array.isArray(value.checkpoints))
+    throw new EngineError('saved_synthesis_stale', `[${id}] The saved-only selection lost its exact form`);
+  const subject = requirePlanSubject(value.subject, id);
+  requireCondition(id === savedSynthesisV2Id(value.projectId, subject),
+    'saved_synthesis_stale', 'The saved-only selection address does not match its project and subject');
+  requireCondition(value.checkpoints.length > 0, 'saved_synthesis_missing', 'No paid checkpoint of this exact subject is selected');
+  requireCondition(value.checkpoints.every(ref => isRef(ref) && ref.id.startsWith(RESEARCH_CHECKPOINT_V2_PREFIX))
+    && new Set(value.checkpoints.map(ref => ref.id)).size === value.checkpoints.length,
+  'saved_synthesis_stale', 'The saved-only selection names only distinct v2 checkpoints');
+}
+
 function exactCheckpoint(projectId: string, draft: Ref, question: Ref,
   action: CheckpointProposalInput, store: Store): { id: string; value: Record<string, any> } {
   return projectCheckpointValue(projectId, draft, question, action,
@@ -427,7 +595,12 @@ export type ContextRecordProver = (record: Revision<Record<string, any>>) => voi
  * context-recovery producer: every observation re-derives from its exact
  * pinned source and the content address matches the value. */
 export function proveCheckpointRecord(store: Store, record: Revision<Record<string, any>>): void {
-  requireCondition(record.id === `research-checkpoint:${hashJson(record.value)}`
+  // DR3a3-S1: a research-checkpoint/v2 note keeps its own address space and
+  // exact form (with its subject); the v1 branch is unchanged.
+  const v2 = recordValue(record.value) && record.value.contract === RESEARCH_CHECKPOINT_V2_CONTRACT;
+  requireCondition(!v2 || researchCheckpointV2Holds(record.value),
+    'context_lookup_integrity', 'A saved v2 checkpoint lost its exact subject form');
+  requireCondition(record.id === `${v2 ? RESEARCH_CHECKPOINT_V2_PREFIX : 'research-checkpoint:'}${hashJson(record.value)}`
     && Array.isArray(record.value.observations)
     && record.value.observations.every((observation: any) => recordValue(observation)
       && observation.projectId === record.value.projectId
@@ -666,6 +839,19 @@ export function parseSynthesisSessionV2(value: unknown): {
   return value as { contract: typeof SYNTHESIS_SESSION_CONTRACT; projectId: string; offset: number;
     materialOffset: number; binding: { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] };
     notes: unknown[]; result: unknown };
+}
+
+/** DR3a3-S1: the same shared parse for the v3 form — the v2 conditions plus
+ * the mandatory exact subject; reads nothing. */
+export function parseSynthesisSessionV3(value: unknown): {
+  contract: typeof SYNTHESIS_SESSION_CONTRACT_V3; projectId: string; offset: number; materialOffset: number;
+  binding: SynthesisSessionBindingV3; notes: unknown[]; result: unknown;
+} | null {
+  if (!recordValue(value) || value.contract !== SYNTHESIS_SESSION_CONTRACT_V3
+    || !parseSynthesisSessionV2({ ...value, contract: SYNTHESIS_SESSION_CONTRACT })) return null;
+  try { planSubjectOf({ subject: value.binding.subject }); } catch { return null; }
+  return value as { contract: typeof SYNTHESIS_SESSION_CONTRACT_V3; projectId: string; offset: number;
+    materialOffset: number; binding: SynthesisSessionBindingV3; notes: unknown[]; result: unknown };
 }
 
 /** A reservation is consumed only by a delivery INTO ITS OWN turn (№1676):

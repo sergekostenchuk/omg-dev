@@ -82,6 +82,9 @@ test("om-fsck reference sites: stored producer semantics keep engine refs and tr
     notes: [{ checkpoint: question, proposal: { action: "checkpoint", question: question.id,
       value: { nested: REF_SHAPED_DATA }, citations: [{ source }], unresolved: [] }, page: { offset: 0, end: 1 } }],
     result: { action: "answer", question: question.id, value: { nested: REF_SHAPED_DATA }, citations: [{ source }] } };
+  const planAnswer = { id: "research-answer:garden:plan", revision: 2, hash: "c".repeat(64) };
+  const synthesisSessionV3 = { ...synthesisSession, contract: "synthesis-session/v3",
+    binding: { ...synthesisSession.binding, subject: { contract: "v7-plan-subject/v1", planAnswer, planQuestionId: "q-supply" } } };
   const copiedContext = {
     observations: [observation], value: { nested: REF_SHAPED_DATA },
     currentProposal: { nested: REF_SHAPED_DATA }, priorEvidence: [observation],
@@ -121,6 +124,8 @@ test("om-fsck reference sites: stored producer semantics keep engine refs and tr
     { name: "assessment-session/legacy", kind: "assessment-session",
       value: Object.fromEntries(Object.entries(assessmentSession).filter(([key]) => key !== "contract" && key !== "application")) },
     { name: "synthesis-session/current", kind: "synthesis-session", value: synthesisSession },
+    // DR3a3-S1: the v3 session of one plan-question — the same data subtrees as v2, plus its subject.
+    { name: "synthesis-session/v3", kind: "synthesis-session", value: synthesisSessionV3 },
     { name: "synthesis-session/legacy", kind: "synthesis-session",
       value: Object.fromEntries(Object.entries(synthesisSession).filter(([key]) => key !== "contract" && key !== "basis" && key !== "binding")) },
     { name: "research-context", kind: "research-context", value: { draft: source, question, body: { ...copiedContext,
@@ -173,8 +178,16 @@ test("om-fsck reference sites: stored producer semantics keep engine refs and tr
     .some(site => site.field === "basis.materials[1].value.evidence[0].source" && site.ref.id === source.id));
   assert.ok(referenceSites("assessment-session", { ...assessmentSession, contract: "assessment-application/v2" })
     .some(site => site.ref.id === REF_SHAPED_DATA.id), "An unknown assessment era fails closed");
-  assert.ok(referenceSites("synthesis-session", { ...synthesisSession, contract: "synthesis-session/v3" })
+  // DR3a3-S1: synthesis-session/v3 is a declared era now; the unknown-era
+  // check keeps failing closed on a discriminator no producer writes.
+  assert.ok(referenceSites("synthesis-session", { ...synthesisSession, contract: "synthesis-session/v9-unknown" })
     .some(site => site.ref.id === REF_SHAPED_DATA.id), "An unknown session era fails closed");
+  const v3Sites = referenceSites("synthesis-session", synthesisSessionV3);
+  assert.ok(v3Sites.some(site => site.field === "binding.subject.planAnswer" && site.ref.id === planAnswer.id),
+    "The v3 session subject names its exact plan answer as an engine reference");
+  assert.ok(v3Sites.some(site => site.field === "basis.materials[0].value.source" && site.ref.id === source.id)
+    && v3Sites.some(site => site.field === "basis.materials[1].value.evidence[0].source" && site.ref.id === source.id),
+  "The v3 session keeps the material sources of the v2 era");
 });
 
 test("om-fsck: lawful JSON observations and an old integrity diagnostic remain data across a reopened store", t => {
