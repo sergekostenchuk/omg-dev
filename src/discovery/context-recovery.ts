@@ -14,10 +14,11 @@ import { parseSynthesisSessionV2, parseSynthesisSessionV3, projectContextRecover
   proveCheckpointRecord, researchCheckpointV2Holds, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
 import { readReaderResultAt } from './reader.js';
 import { listResearchConsumerIntents, researchConsumerIntentId } from './response-recovery.js';
-import { proveSynthesisSessionSubject, synthesisStepKey } from './synthesis-session.js';
+import { readSynthesisSessionV3, synthesisStepKey } from './synthesis-session.js';
 import { callAddressesSubject, questionDispatchId, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { planQuestionContract } from './continuation-packet.js';
 import { EngineError } from '../errors.js';
+import { provenSubjectSessions } from './saved-synthesis.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 
 export interface ContextSessionBinding { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] }
@@ -245,8 +246,8 @@ export function recoveryRecordSubjectHolds(record: Revision<Record<string, any>>
 }
 
 /** The v3 operator context recovery: the v2 rules on the session's exact
- * subject. The answered plan anchor is the v7 norm, so the session's subject
- * must be proven and still current instead. Decision 5: the subject step's
+ * subject. The whole saved chain is proven first (S4-02); the answered plan
+ * anchor is the v7 norm, so the session's subject must be still current. Decision 5: the subject step's
  * dispatch counter and the common reader's physical Question counter are both
  * guarded, and a running call of either scope refuses — a dispatch between
  * this check and the write conflicts. */
@@ -266,8 +267,11 @@ function recoverContextSessionV3(store: Store, project: string, session: Revisio
     'An accepted answer or completed context session cannot be recovered');
   requireCondition(canonical(reference(session)) === canonical(sessionRef),
     'context_session_stale', 'Recover the current exact session revision');
+  // S4-02: the exact session is read by its full historical chain reader
+  // first — a blocked marker or workspace without its paid transition is not
+  // a session this reader admits, and nothing is appended to it.
+  readSynthesisSessionV3(store, sessionRef);
   try {
-    proveSynthesisSessionSubject(store, session);
     planQuestionContract(store, draftHead, questionHead, subject);
   } catch (error) {
     if (error instanceof EngineError)
@@ -305,6 +309,11 @@ function recoverContextSessionV3(store: Store, project: string, session: Revisio
   'context_lookup_integrity', 'The exact recovery record is missing or changed');
   requireCondition(recoveryRecordSubjectHolds(proofRecord, subject), 'context_reference_foreign',
     'A v3 session recovers only its own subject\'s notes; another subject\'s or a field-path note is foreign');
+  // S4-01 class: a note's form is not its origin — a recovered note must have
+  // been written by a paid transition of a proven session of this subject.
+  requireCondition(proofRecord.kind !== 'research-checkpoint'
+    || provenSubjectSessions(store, subject).notes.has(canonical(selector.record)), 'context_reference_foreign',
+    'A recovered note needs its proven paid synthesis origin of this subject');
   if (proofRecord.kind === 'reader-result') readReaderResultAt(store, project, selector.record);
   else if (proofRecord.kind === 'research-checkpoint') proveCheckpointRecord(store, proofRecord);
   const result = readResearchContext(store, draft, questionHead.id, pilot, selector.record, selector.pointer, selector.page);

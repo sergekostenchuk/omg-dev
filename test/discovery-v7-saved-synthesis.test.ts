@@ -5,12 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
 import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
-import { configureV7SavedSynthesis, savedV7SynthesisMaterials, selectSavedCheckpointsV2,
+import { configureV7SavedSynthesis, notesInProvenOrder, provenSubjectSessions, savedV7SynthesisMaterials, selectSavedCheckpointsV2,
   savedSynthesisMaterials } from "../src/discovery/saved-synthesis.js";
-import { recoveryRecordSubjectHolds } from "../src/discovery/context-recovery.js";
+import { recoverContextSession, recoveryRecordSubjectHolds } from "../src/discovery/context-recovery.js";
+import { readSynthesisSessionV3 } from "../src/discovery/synthesis-session.js";
 import { latestFocus, latestProposal, workingSelections } from "../src/discovery/research-continuation.js";
-import { projectSavedSynthesisV2, RESEARCH_CHECKPOINT_V2_CONTRACT, SYNTHESIS_SESSION_CONTRACT_V3,
-  type SynthesisSessionStateV3 } from "../src/discovery/research-consumer-transition.js";
+import { projectCheckpointValueV2, projectSavedSynthesisV2, projectSynthesisSessionV3Initial, RESEARCH_CHECKPOINT_V2_CONTRACT,
+  SYNTHESIS_SESSION_CONTRACT_V3, type SynthesisSessionStateV3 } from "../src/discovery/research-consumer-transition.js";
 import { V7_PLAN_SUBJECT_CONTRACT, ATTEMPT_BINDING_CONTRACT, type V7PlanSubject } from "../src/discovery/v7-managed-attempt.js";
 import type { ResearchTurn } from "../src/discovery/research-model.js";
 import { EngineError } from "../src/errors.js";
@@ -144,6 +145,13 @@ test("S4 selection in memory: A never takes B's or another edition's notes, take
   assert.deepEqual(selectSavedCheckpointsV2([session("a", A, [a1, a2, merged])], A)!.checkpoints, [merged.checkpoint]);
   assert.equal(selectSavedCheckpointsV2([session("a", A, []), sessions[1]!], A), null, "no note is no selection");
   assert.equal(code(() => selectSavedCheckpointsV2([...sessions, session("a-other", A, [note("x")])], A)), "research_synthesis_ambiguous");
+  // A saved choice reads only one proven session's notes in their proven order (S4-01).
+  const order = [a1.checkpoint, a2.checkpoint, merged.checkpoint];
+  assert.equal(notesInProvenOrder(order, [a1.checkpoint, a2.checkpoint]), true);
+  assert.equal(notesInProvenOrder(order, [merged.checkpoint]), true, "a later frontier of the same session");
+  assert.equal(notesInProvenOrder(order, [a2.checkpoint, a1.checkpoint]), false, "reordered");
+  assert.equal(notesInProvenOrder(order, [a1.checkpoint, b1.checkpoint]), false, "mixed with another session's note");
+  assert.equal(notesInProvenOrder(order, []), false, "an empty choice");
 });
 
 test("S4 reader: no choice is null; a choice of another subject, form or basis is stale; a lost note version refuses; the v1 reader and address stay apart", t => {
@@ -158,7 +166,8 @@ test("S4 reader: no choice is null; a choice of another subject, form or basis i
     draft: reference(p.draft), question: reference(p.plan), inputs: p.draft.value.inputs, subject, checkpoints: [lost], ...overrides });
   const forgedA = choice(A);
   const written = f.store.write({ id: forgedA.id, kind: "saved-synthesis", expected: 0, value: forgedA.value });
-  assert.equal(code(() => savedV7SynthesisMaterials(f.store, p.draft, p.plan, A)), "synthesis_evidence_stale", "a lost note version");
+  // S4-01: the origin is proven before the note is read — a note no proven session wrote refuses first.
+  assert.equal(code(() => savedV7SynthesisMaterials(f.store, p.draft, p.plan, A)), "saved_synthesis_stale", "no proven origin");
   f.store.write({ id: forgedA.id, kind: "saved-synthesis", expected: written.revision, value: { ...forgedA.value, subject: B } });
   assert.equal(code(() => savedV7SynthesisMaterials(f.store, p.draft, p.plan, A)), "saved_synthesis_stale", "another subject at A's address");
   f.store.write({ id: forgedA.id, kind: "saved-synthesis", expected: written.revision + 1, value: { ...forgedA.value, inputs: [p.planAnswer] } });
@@ -205,4 +214,48 @@ test("S4 history in memory: focus, selections and proposal are chosen among the 
   assert.deepEqual(workingSelections(store, turns, p.plan, B).map(item => item.value), [{ query: "B" }]);
   assert.deepEqual(workingSelections(store, turns, p.plan, A).map(item => item.value), [{ query: "A" }],
     "A's selections are its own reads after its own answer");
+});
+
+test("S4-01: a forged note and choice with a real plan and source but no paid transition never become saved findings", t => {
+  const f = fixture(t), p = planned(f, "s4-origin");
+  const A = subjectOf(p.planAnswer, "q-supply");
+  const source = f.discovery.evidence.document(p.project, "injection-source", "A real source, but no paid synthesis happened.", "text/plain", 0);
+  const projected = projectCheckpointValueV2(p.project, reference(p.draft), reference(p.plan), A,
+    { question: "q-supply", value: { text: "Injected proposal" },
+      citations: [{ source: reference(source), selector: { kind: "text-range", start: 0, end: 10 } }], unresolved: ["unassessed"] },
+    (ref, selector) => f.discovery.evidence.observe(p.project, ref, selector));
+  // Deliberate negative corruption only: a well-formed note and choice written without their producers.
+  const note = f.store.write({ id: projected.id, kind: "research-checkpoint", expected: 0, value: projected.value });
+  const choice = projectSavedSynthesisV2({ projectId: p.project, draft: reference(p.draft), question: reference(p.plan),
+    inputs: p.draft.value.inputs, subject: A, checkpoints: [reference(note)] });
+  f.store.write({ id: choice.id, kind: "saved-synthesis", expected: 0, value: choice.value });
+  assert.deepEqual([f.store.list("synthesis-session").length, f.store.list("research-consumer-intent").length], [0, 0]);
+  assert.equal(provenSubjectSessions(f.store, A).notes.size, 0, "no proven session, no proven note");
+  assert.equal(code(() => savedV7SynthesisMaterials(f.store, p.draft, p.plan, A)), "saved_synthesis_stale",
+    "the form of a note is not its paid origin");
+});
+
+test("S4-02: a v3 session with a forged blocked marker is refused by the full chain reader before any recovery revision", t => {
+  const f = fixture(t), p = planned(f, "s4-blocked");
+  const A = subjectOf(p.planAnswer, "q-supply");
+  const command = { executable: process.execPath, args: ["--version"] };
+  const environment = f.engine.environments.configure(p.project, { workspace: f.root,
+    implementer: { actor: "author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 30000 }, 0);
+  f.engine.execute({ type: "configure-reader-pilot", project: p.project, expected: 0, settings: { experimental: true, active: true,
+    stopAfter: "L2", reader: { actor: "reader", model: "fixture", effort: "high", speed: "inherited", command }, agentCommand: command,
+    maxRequestChars: 100000, maxReadChars: 20000, maxReplyChars: 10000, maxCalls: 20, maxReportedTokens: 100000 } });
+  const initial = projectSynthesisSessionV3Initial({ projectId: p.project, binding: { draft: reference(p.draft), question: reference(p.plan),
+    environment: reference(environment), inputs: p.draft.value.inputs, subject: A },
+    basis: { materials: [], previousProposal: null, previousProposalRef: null } });
+  // Deliberate negative corruption only: a lawful binding with a blocked workspace no paid transition produced.
+  const forged = f.store.write({ id: initial.id, kind: "synthesis-session", expected: 0,
+    value: { ...initial.value, workspace: { entries: [], sinceProgress: 2, blocked: "forged block without paid transition" } } });
+  assert.equal(code(() => readSynthesisSessionV3(f.store, reference(forged))), "synthesis_session_invalid", "control");
+  const before = f.store.list().map(row => [row.id, row.revision, row.hash]);
+  assert.equal(code(() => recoverContextSession(f.store, p.project, reference(forged), { record: reference(p.draft), pointer: "/fields" })),
+    "synthesis_session_invalid", "a proven subject alone does not authorize a recovery");
+  assert.equal(code(() => f.engine.execute({ type: "recover-context-session", project: p.project, session: reference(forged),
+    selector: { record: reference(p.draft), pointer: "/fields" } })), "synthesis_session_invalid", "the same refusal through the command");
+  assert.deepEqual(f.store.list().map(row => [row.id, row.revision, row.hash]), before, "no recovery revision");
 });

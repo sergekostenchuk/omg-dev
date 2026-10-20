@@ -105,6 +105,28 @@ function savedNoteV2(store: Store, project: string, question: Revision<Question>
   return record;
 }
 
+/** S4-01: the proven sessions of one subject and every note their paid
+ * transitions wrote. Each v3 session of the subject is read by its exact
+ * historical chain reader (every revision a lawful paid transition, its
+ * checkpoint equal to the transition's), on saved bases only — not today's
+ * plan and not today's active frontier: the append-only notes keep every
+ * note ever written. A damaged session of unknown subject refuses. */
+export function provenSubjectSessions(store: Store, subject: V7PlanSubject) {
+  const sessions = store.list<SynthesisSessionStateV3>('synthesis-session')
+    .filter(head => head.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX) && sameSubject(synthesisSessionSubject(head), subject))
+    .map(head => readSynthesisSessionV3(store, reference(head)));
+  const notes = new Set(sessions.flatMap(session => session.value.notes.map(note => canonical(note.checkpoint))));
+  return { sessions, notes };
+}
+
+/** The chosen notes, in order, within one session's append-only notes — a
+ * subsequence: never reordered, never mixed with another session's notes. */
+export function notesInProvenOrder(sessionNotes: readonly Ref[], chosen: readonly Ref[]): boolean {
+  let next = 0;
+  for (const note of sessionNotes) if (next < chosen.length && canonical(note) === canonical(chosen[next])) next += 1;
+  return chosen.length > 0 && next === chosen.length;
+}
+
 /** configure-v7-saved-synthesis: a new saved-only choice of one subject needs
  * its current accepted plan answer (the answered plan anchor is normal here);
  * the notes come from the subject's proven session. No eligible note is
@@ -113,9 +135,7 @@ function savedNoteV2(store: Store, project: string, question: Revision<Question>
 export function configureV7SavedSynthesis(store: Store, project: string, subject: unknown, expected: number): Revision<SavedSynthesisV2> {
   const basis = savedSubjectBasis(store, project, subject);
   planQuestionContract(store, basis.draft, basis.question, basis.subject);
-  const sessions = store.list<SynthesisSessionStateV3>('synthesis-session')
-    .filter(head => head.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX) && sameSubject(synthesisSessionSubject(head), basis.subject))
-    .map(head => readSynthesisSessionV3(store, reference(head)));
+  const { sessions } = provenSubjectSessions(store, basis.subject);
   const picked = selectSavedCheckpointsV2(sessions, basis.subject);
   requireCondition(picked, 'saved_synthesis_missing', 'No paid note of this exact subject exists');
   const notes = picked.checkpoints.map(ref => savedNoteV2(store, project, basis.question, basis.subject, ref));
@@ -141,6 +161,12 @@ export function savedV7SynthesisMaterials(store: Store, draft: Revision<Discover
     && saved.value.draft.id === draft.id && canonical(saved.value.question) === canonical(reference(question))
     && canonical(saved.value.inputs) === canonical(draft.value.inputs),
   'saved_synthesis_stale', 'Recovery cannot use notes of a different subject, question or basis');
+  // S4-01: the form of a note is not its origin — the chosen notes are notes
+  // that paid transitions of ONE proven session of this subject wrote, in that
+  // session's proven order (its append-only history, not today's frontier).
+  requireCondition(provenSubjectSessions(store, exact).sessions
+    .some(session => notesInProvenOrder(session.value.notes.map(note => note.checkpoint), saved.value.checkpoints)), 'saved_synthesis_stale',
+    'The chosen notes are not the paid notes of one proven session of this subject in their proven order');
   return saved.value.checkpoints.map(ref => {
     const record = savedNoteV2(store, draft.value.projectId, question, exact, ref);
     return { kind: 'saved-findings', value: { checkpoint: ref, proposal: record.value.proposal, unresolved: record.value.unresolved,
