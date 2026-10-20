@@ -1,3 +1,4 @@
+import { checkAssessmentMethodology } from "./assessment-methodology.js";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
@@ -12,7 +13,7 @@ import { proveClaimAddress, resolveClaimAddress, type ClaimAddress, type Resolve
 import { readDiscoveryConditionDecision, type DiscoveryConditionDecision } from "./discovery-outcome.js";
 import type { Source } from "../evidence/evidence.js";
 import { DISCOVERY_ASSESSMENT_CONTRACT, V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT,
-  type DiscoveryAttemptsAssessment, type V7AttemptPacket, type V7AttemptPacketEntry, type V7Novelty,
+  type VersionedDiscoveryAttemptsAssessment, DISCOVERY_ASSESSMENT_CONTRACT_V2, type V7AttemptPacket, type V7AttemptPacketEntry, type V7Novelty,
   type V7ProgressBaseline, type V7QuestionTransition } from "./research-model.js";
 
 /* DR3b-M (codex-omg №7546 §1, the M slice): the subject, the forms and the keys of a v7 attempts assessment.
@@ -383,7 +384,7 @@ function checkTransition(store: Store, value: unknown, packet: ProvenAttemptPack
 }
 
 export interface CheckedAttemptsAssessment {
-  value: DiscoveryAttemptsAssessment;
+  value: VersionedDiscoveryAttemptsAssessment;
   packet: ProvenAttemptPacket;
   baseline: V7ProgressBaseline;
 }
@@ -393,9 +394,10 @@ export interface CheckedAttemptsAssessment {
  * target, and the complete novelty. It never stands for a paid assessment, an application or an accepted claim. */
 export function checkDiscoveryAssessmentForm(store: Store, value: unknown): CheckedAttemptsAssessment {
   if (!obj(value)) subjectInvalid("assessment", "the assessment is an object");
-  if (value["contract"] !== DISCOVERY_ASSESSMENT_CONTRACT)
-    subjectInvalid("contract", "the assessment carries the discovery-assessment/v1 discriminator");
-  if (!exactKeys(value, ASSESSMENT_FIELDS))
+  const methodology = value["contract"] === DISCOVERY_ASSESSMENT_CONTRACT_V2;
+  if (!methodology && value["contract"] !== DISCOVERY_ASSESSMENT_CONTRACT)
+    subjectInvalid("contract", "the assessment carries a supported discovery-assessment discriminator");
+  if (!exactKeys(value, methodology ? [...ASSESSMENT_FIELDS, "methodology"] : ASSESSMENT_FIELDS))
     subjectInvalid("assessment", "the assessment carries exactly its contracted fields");
   if (!nonempty(value["projectId"])) subjectInvalid("projectId", "the assessment names its project");
   const subject = value["subject"];
@@ -428,8 +430,13 @@ export function checkDiscoveryAssessmentForm(store: Store, value: unknown): Chec
       : exactKeys(target, ["claim"]) && claims.includes(canonical(target["claim"]));
     if (!lawful) noveltyInvalid("return.target", "a return target is one packet attempt or one of its claims");
   }
-  checkNovelty(store, value["novelty"], packet, baseline, verdict);
-  return { value: value as unknown as DiscoveryAttemptsAssessment, packet, baseline };
+  const novelty = checkNovelty(store, value["novelty"], packet, baseline, verdict);
+  if (methodology) checkAssessmentMethodology(store, value["methodology"], {
+    project: packet.packet.project, planAnswer: packet.packet.planAnswer,
+    planQuestionId: packet.packet.planQuestionId, blocking: (packet.planQuestion.question as Record<string, Json>)["class"] === "blocking",
+    accepted: novelty.accepted.map(row => row.claim),
+  });
+  return { value: value as unknown as VersionedDiscoveryAttemptsAssessment, packet, baseline };
 }
 
 /* ---------- the content key (№7546 §1.4) ---------- */

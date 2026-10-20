@@ -139,3 +139,12 @@ export interface DiscoveryAttemptsAssessment {
   return: { target: { attempt: Ref } | { claim: ClaimAddress }; reason: string } | null;
   novelty: V7Novelty;
 }
+
+/** M2: v1 remains a historical form. A new producer explicitly chooses v2 and
+ * delivers this methodology contract/policy before payment (T2/A). */
+export const DISCOVERY_ASSESSMENT_CONTRACT_V2 = "discovery-assessment/v2" as const;
+export interface DiscoveryAttemptsAssessmentV2 extends Omit<DiscoveryAttemptsAssessment, "contract"> {
+  contract: typeof DISCOVERY_ASSESSMENT_CONTRACT_V2;
+  methodology: import("./assessment-methodology.js").AssessmentMethodology;
+}
+export type VersionedDiscoveryAttemptsAssessment = DiscoveryAttemptsAssessment | DiscoveryAttemptsAssessmentV2;
