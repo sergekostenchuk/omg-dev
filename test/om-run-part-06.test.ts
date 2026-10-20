@@ -12,14 +12,13 @@ import type { OmInputRecord } from "../src/om/input.js";
 import { readFeasibility, type OmFeasibility } from "../src/om/feasibility.js";
 import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
-import { beginAttempt, openSeries, readCompletionBinding, resumeSeries, seriesRequestOf, ownerDecisionNamespace, OWNER_DECISION_KIND, type AnyRepairSeries, type CompletionOwner } from "../src/om/series.js";
+import { openSeries, readCompletionBinding, resumeSeries, seriesRequestOf, ownerDecisionNamespace, OWNER_DECISION_KIND, type AnyRepairSeries, type CompletionOwner } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
 import type { RepairSeries } from "../src/om/series.js";
-import { closeAttempt, deriveCompletionEvidence } from "../src/om/repeat-gate.js";
+import { deriveCompletionEvidence } from "../src/om/repeat-gate.js";
 import { modelCallRecordId, prepareCompletionCause, runModelCall, type OmModelCall } from "../src/om/model-call.js";
-import { gapLineKey } from "../src/om/gap-lines.js";
 import { readRun, startRun, runId, type RunRecord } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
@@ -32,7 +31,7 @@ import { continuePass, startPass } from "../src/om/run-driver.js";
 // of the snapshot, the answer is applied, and the next works — now deciding the test the transition reaches — pass G5 on
 // the same snapshot. The question is asked once; a repeat of the B1 transition writes nothing.
 import { readinessPending, writeReadinessInput, type ReadinessTransition } from "../src/om/input.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor, sameEnd } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, until, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, nodeRefusal, addressQuestions, advanceRun, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2WorkAnswer, type Lp6Op, lp6Line, lp6CurrentRounds, lp6Close, passRows, unavailableReview, policyDoor, sameEnd, managedRefusedCycle } from "./om-run-fixture.js";
 
 test("H1.2 R7 C01 C33 C59 both kinds of line ask the owner: the grounds keep their canonical order without a repeat, and a malformed end is an integrity refusal", async t => {
   const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
@@ -113,12 +112,12 @@ test("25 7 C61 №1749 H1 works of several blocks: each pays once, the full G4b 
 
 test("H1.2 R7 C25 an owner-control whose question is no longer open holds nothing: the line's work on today's question goes on", async t => {
   const f = runFixture(t, ["encoding"], "executed", true);
-  const request = f.request(f.bases("h12-resolved"));
+  const b = f.bases("h12-resolved"), request = f.request(b);
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h12-resolved", predecessor: null, basis: null }));
-  // The earlier attempt asked the owner about a question that today's routes no longer carry (it was decided elsewhere).
-  ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h12-gone-goal", questions: [gapLineKey(project, "discovery:gone", "answer")], result: "A supported fact" } }));
-  ok(closeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "awaiting-owner", accepting: [], cancelling: [], refusals: [] } }));
+  // The earlier managed attempt of the line was refused; its close saved no waiting diagnostic and it holds nothing for
+  // today's work on the same routes.
+  await managedRefusedCycle(f, b, "garden-consume-block", 1);
   ok(startRun(f.store, { project }));
   const driven = await driveTo(f, request, "open", 10);
   assert.deepEqual(driven.performed, ["open"], "A new attempt of the line opens for today's question; the old one holds nothing");

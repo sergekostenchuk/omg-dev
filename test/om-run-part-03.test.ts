@@ -14,7 +14,7 @@ import type { OmInputRecord } from "../src/om/input.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
-import { beginAttempt, openSeries } from "../src/om/series.js";
+import { openSeries, beginAttempt } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import type { RepairSeries } from "../src/om/series.js";
@@ -24,7 +24,7 @@ import { regateRun } from "../src/om/run.js";
 import { currentL3Reopen, l3ReopenId, readFrameProposals } from "../src/om/frame-proposals.js";
 import { resolveSnapshot } from "../src/om/impact.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, drive, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, policyDoor } from "./om-run-fixture.js";
+import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, policyDoor } from "./om-run-fixture.js";
 
 test("26 1 C07 R4 H1.1 the pass runs the project mechanism M5 through G7, then builds the bases of the new B1 itself and goes on; a restart repeats nothing", async t => {
   const f = runFixture(t, undefined, "executed");
@@ -377,21 +377,6 @@ test("FA1 G6 a technical E5 terminal of the attempt's own fact closes the attemp
     const next = ok(await advanceRun(f.store, f.request)).record.value.state as { phase: string };
     assert.equal(next.phase, "step", "The pass goes on after the acceptance");
   });
-});
-
-test("C11 3 H1 a standalone open attempt of the earlier mode is not adopted: the pass waits on it, opens no next ordinal, and works independent owners", async t => {
-  const f = runFixture(t, ["encoding"], "executed", true);
-  const request = f.request(f.bases("h1-c11"));
-  const address = { project, block: "garden-consume-block", line: 1 };
-  ok(openSeries(f.store, { ...address, slice: "h1-standalone", predecessor: null, basis: null }));
-  ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h1-standalone", questions: ["Address one contract"], result: "A supported contract" } }));
-  ok(startRun(f.store, { project }));
-  const driven = await drive(f, request, 6);
-  assert.deepEqual(driven.performed, [], "No binding is attached later and no next ordinal is opened");
-  assert.equal(driven.wait.code, "standalone_attempt");
-  assert.equal(driven.wait.target, blockSeries(f).id);
-  assert.equal(blockSeries(f).value.attempts.length, 1);
-  assert.equal(f.sent().length, 0);
 });
 
 test("R19 №1937-3 H1.1 a second store opening work between the saved bases step's admission and its write: the step is refused, D1 does not move", async t => {

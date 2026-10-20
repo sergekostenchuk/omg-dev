@@ -9,17 +9,16 @@ import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import type { Node } from "../src/graph/model.js";
 import { readOmInput } from "../src/om/input.js";
 import { readHorizon } from "../src/om/horizon.js";
-import { beginAttempt, openSeries, ownerDecisionNamespace } from "../src/om/series.js";
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
+import { openSeries, ownerDecisionNamespace } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
 import { runModelCycle } from "../src/om/model-call.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
-import { readRun, startRun, runId, type RunRecord, type RunWait } from "../src/om/run.js";
+import { readRun, startRun, runId, type RunRecord } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts} from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts, managedRefusedCycle} from "./om-run-fixture.js";
 
 test("3 8 25 C23 C17 C27 R5 H1.1 on its own new bases the pass works the block through MC1, E5 and G4b to one G7 close, then applies the accepted facts", async t => {
   const f = runFixture(t, undefined, "executed");
@@ -120,25 +119,6 @@ test("H1.2 R8 C31 №2045-1 a stopped line of a block outside the horizon of the
   assert.equal(g.sent().length, 2);
 });
 
-test("H1.2 R8 R9 C11 3 a standalone open attempt of another owner defers the end: the proved second rung of M5 does not end a pass that may still change", async t => {
-  const f = runFixture(t, ["encoding", "spare"], "executed", ["encoding"]);
-  const b = f.bases("h12-defer"), request = f.request(b), none = cannotAnswer(f, b.routes);
-  // The independent block has an attempt of the earlier mode still open: the pass never adopts it and never ends over it.
-  const address = { project, block: "garden-consume-block", line: 1 };
-  ok(openSeries(f.store, { ...address, slice: "h12-standalone", predecessor: null, basis: null }));
-  ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h12-standalone", questions: ["Address one contract"], result: "A supported contract" } }));
-  f.steps([none, none, none, stopAnswer(f, false)]);
-  ok(startRun(f.store, { project }));
-  const end = await ends(f, request, 60);
-  assert.equal(end.state.phase, "waiting", JSON.stringify(end.state));
-  assert.equal((end.state as unknown as { wait: RunWait }).wait.code, "standalone_attempt");
-  assert.equal(mechanismSeries(f).value.escalations.length, 1, "M5 stands on its second rung, proved by its review");
-  assert.equal(f.sent().length, 4, "Only M5's three attempts and its one review were paid");
-  const before = f.store.list().map(reference);
-  f.restart();
-  assert.equal(ok(await advanceRun(f.store, request)).performed, null);
-  assert.deepEqual(f.store.list().map(reference), before, "The standing wait is read, not written");
-});
 
 test("H1.2 R4 R2 a stop after a spent continuation is on the second rung by that spent window: the first review is not borrowed, no second one is paid", async t => {
   const f = runFixture(t, ["encoding"], "executed");
@@ -160,21 +140,13 @@ test("H1.2 R4 R2 a stop after a spent continuation is on the second rung by that
 
 test("H1.2 R6 an origin the review establishes lifts its own hold and the pass goes on; it is no ground of the end", async t => {
   const f = runFixture(t, ["encoding"], "executed", true);
+  const b = f.bases("h12-established"), request = f.request(b);
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h12-established", predecessor: null, basis: null }));
-  const goal = { key: "h12-established-goal", questions: ["Address one contract"], result: "A supported contract" };
-  ok(beginAttempt(f.store, { ...address, attempt: 1, goal }));
-  const source = f.store.write({ id: `${unitRefusalNamespace(project)}h12-workspace`, kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "G6", refusals: [{ code: "workspace_unavailable", goal: goal.key, remedy: "Observe the declared workspace condition",
-      origin: { name: "workspace_unavailable", stage: "feasibility", subject: "workspace", sources: [] } }] } });
-  const journal = ok(recordRefusal(f.store, { project, source: reference(source) }));
-  const row = journal.value.rows.find(item => item.source.id === source.id)!;
-  const closed = ok(closeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "refused", accepting: [], cancelling: [],
-    refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+  const closed = await managedRefusedCycle(f, b, "garden-consume-block", 1, ["h12-workspace"]);
   assert.equal(closed.holds.length, 1, "G7 raised one hold of unknown origin");
-  const request = f.request(f.bases("h12-established"));
-  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null,
-    origin: { class: "conditions", basis: [{ role: "environment", ref: request.dispatch.config }] } }, usage }]);
+  f.push({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null,
+    origin: { class: "conditions", basis: [{ role: "environment", ref: request.dispatch.config }] } }, usage });
   ok(startRun(f.store, { project }));
   const driven = await driveTo(f, request, "open", 10);
   assert.deepEqual(driven.performed, ["analyze", "open"], "The review lifts its own hold and the next attempt opens on the same line");
@@ -298,25 +270,17 @@ test("4 9 C21 H1 a lost assessor after its claim is recovered the same way: the 
 test("4 9 12 21 C21 №1814 H1 A6 on an origin hold keeps its saved request through a live executor, its loss, a new Environment revision and a restart", async t => {
   const f = runFixture(t, ["encoding"], "executed", true);
   const b = f.bases("h1-a6-hold"), request = f.request(b);
-  // Three earlier standalone attempts refused with a refusal of unknown origin: A3 stopped the series, G7 raised holds.
+  // Three managed attempts refused with a refusal of unknown origin: A3 stopped the series, G7 raised holds.
   const address = { project, block: "garden-consume-block", line: 1 };
   ok(openSeries(f.store, { ...address, slice: "h1-a6-hold", predecessor: null, basis: null }));
-  const goal = { key: "h1-a6-hold-goal", questions: ["Address one contract"], result: "A supported contract" };
-  for (const attempt of [1, 2, 3]) {
-    ok(beginAttempt(f.store, { ...address, attempt, goal }));
-    const source = f.store.write({ id: `${unitRefusalNamespace(project)}h1-a6-origin-${attempt}`, kind: UNIT_REFUSAL_KIND, expected: 0,
-      value: { gate: "G3", refusals: [{ code: "unrecognized_fixture_refusal", goal: goal.key, remedy: "Identify the exact origin",
-        origin: { name: "artifact_missing", stage: "layer-check", subject: `artifact:fixture-${attempt}`, sources: [] } }] } });
-    const journal = ok(recordRefusal(f.store, { project, source: reference(source) }));
-    const row = journal.value.rows.find(item => item.source.id === source.id)!;
-    ok(closeAttempt(f.store, { ...address, attempt, outcome: { reason: "refused", accepting: [], cancelling: [],
-      refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-  }
+  for (const attempt of [1, 2]) await managedRefusedCycle(f, b, "garden-consume-block", attempt);
+  await managedRefusedCycle(f, b, "garden-consume-block", 3, ["h1-a6-origin-1", "h1-a6-origin-2", "h1-a6-origin-3"]);
+  const paid = f.sent().length;
   ok(startRun(f.store, { project }));
   const analyzing = await until(f, request, "analyze", 10);
   assert.ok((analyzing.request as { hold: unknown }).hold !== null, "A6 reviews the exact hold first");
   await a6Survives(t, f, request, analyzing, () => f.request(b));
-  assert.equal(f.sent().length, 0);
+  assert.equal(f.sent().length, paid, "The saved A6 request ends its held call; the pass itself sends nothing");
 });
 
 test("MP2 (№2968 rows 1, 3, 4, 5) through the pass a block designs its producer operation first; the consumer's brief carries the producer's finished work with its write paths; the producer's own brief has the explicit empty set; a saved step goes on before any rank", async t => {

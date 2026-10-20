@@ -965,10 +965,18 @@ function newWork(store: Store, request: RunRequest, bases: Bases, owner: Owner, 
   // the same goal again (№1860 п.5, C52) — its results are delivered first; a gap it still does not close waits,
   // addressed to that result, instead of a new ordinal.
   // RL3: a goal achieved before the owner reopened the works of these bases is no achievement of the reopened ones.
-  if (last && same(last.goal, goal) && last.outcome?.reason === "result" && !reopenedSince(store, project, series, last.ordinal, bases))
-    return samePlan(store, project, series, last.ordinal, bases) ? null
-    : wait("goal_achieved", series.id, "goal", "This goal was achieved on earlier routes; its gaps remain open on the current ones without a proved new subject",
-      [reference(series), bases.refs.routes], "neutral");
+  if (last && same(last.goal, goal) && last.outcome?.reason === "result") {
+    const binding = take(readCompletionBinding(store, project, originOf(store, project, series, last.ordinal), last.ordinal));
+    const reopen = worksReopen(bases.routes.value.request.gaps.sources.works);
+    const worked = binding === null ? null : (take(readRoutes(store, { project, record: binding.value.plan.routes }))
+      .record as unknown as Revision<RoutesRecord>).value.request.gaps.sources.works;
+    if (reopen === null || same(worksReopen(worked), reopen))
+      return series.value.attempts.some(attempt => attempt.ordinal === last.ordinal) && binding !== null
+        && !sameRef(binding.value.plan.routes, reference(bases.routes))
+        ? wait("goal_achieved", series.id, "goal", "This goal was achieved on earlier routes; its gaps remain open on the current ones without a proved new subject",
+          [reference(series), bases.refs.routes], "neutral")
+        : null;
+  }
   const ordinal = (attempts.at(-1)?.ordinal ?? 0) + 1;
   const plan = { routes: bases.refs.routes, batches: free.map(batch => batch.id).sort() };
   return step("open", { ...ownerRequest(project, owner, series.value.line), attempt: ordinal, goal,
@@ -978,28 +986,10 @@ function newWork(store: Store, request: RunRequest, bases: Bases, owner: Owner, 
 
 const sameOwner = (series: AnyRepairSeries, owner: Owner): boolean =>
   owner.block !== undefined ? "block" in series && series.block === owner.block : "owner" in series && same(series.owner, owner.owner);
-/** Whether the attempt of this line was worked on exactly these routes; a standalone attempt names none. */
-function samePlan(store: Store, project: string, series: Revision<AnyRepairSeries>, ordinal: number, bases: Bases): boolean {
-  if (!series.value.attempts.some(attempt => attempt.ordinal === ordinal)) return true;
-  const binding = take(readCompletionBinding(store, project, reference(series), ordinal));
-  return binding === null || sameRef(binding.value.plan.routes, reference(bases.routes));
-}
 /** RL3: the reopening a works source of D1 stands on — the record its frame request names — or none. */
 function worksReopen(works: unknown): Ref | null {
   const frame = object(works) && object(works.frame) ? works.frame : null;
   return frame && object(frame.reopen) && isRef(frame.reopen.record) ? frame.reopen.record : null;
-}
-/**
- * RL3: whether the owner reopened the works of these bases after this attempt was worked: its routes (read at the series
- * that made it) stand on no reopening or on another one. An attempt without routes is of an earlier mode, before any.
- */
-function reopenedSince(store: Store, project: string, series: Sealed<Revision<AnyRepairSeries>>, ordinal: number, bases: Bases): boolean {
-  const reopen = worksReopen(bases.routes.value.request.gaps.sources.works);
-  if (!reopen) return false;
-  const binding = take(readCompletionBinding(store, project, originOf(store, project, series, ordinal), ordinal));
-  if (!binding) return true;
-  const plan = take(readRoutes(store, { project, record: binding.value.plan.routes })).record as unknown as Revision<RoutesRecord>;
-  return !same(worksReopen(plan.value.request.gaps.sources.works), reopen);
 }
 /** RL3: the owner's reopening standing today on the accepted works frame, or none. */
 function standingReopen(store: Store, project: string): Revision<L3Reopen> | null {
@@ -1085,10 +1075,10 @@ function originOf(store: Store, project: string, series: Sealed<Revision<AnyRepa
 /** A closed attempt that ended waiting for the owner: the questions it was asked, and the grounds its own close proves. */
 interface Owed { readonly questions: readonly string[]; readonly reasons: RunReason[] }
 /**
- * Every closed attempt of the line that ended waiting for the owner and asked a question still open today (`keys`): a
- * managed close keeps its waiting sources at any reason of the attempt, a standalone one is read by its reason. The
- * attempt keeps its true origin — an inherited one is read at the series that made it — and its number is part of the
- * address (№1995 п.5). The message is the saved diagnostic of E4, never a text made up here.
+ * Every closed attempt of the line that ended waiting for the owner and asked a question still open today (`keys`): the
+ * managed close keeps its waiting sources at any reason of the attempt. The attempt keeps its true origin — an
+ * inherited one is read at the series that made it — and its number is part of the address (№1995 п.5). The message is
+ * the saved diagnostic of E4, never a text made up here.
  */
 function owedBy(store: Store, project: string, series: Sealed<Revision<AnyRepairSeries>>, keys: ReadonlySet<string>): Owed[] {
   const owed: Owed[] = [];
@@ -1096,25 +1086,22 @@ function owedBy(store: Store, project: string, series: Sealed<Revision<AnyRepair
     if (attempt.outcome === null || !attempt.goal.questions.some(question => keys.has(question))) continue;
     const origin = originOf(store, project, series, attempt.ordinal), field = `attempt.${attempt.ordinal}`;
     const binding = take(readCompletionBinding(store, project, origin, attempt.ordinal));
-    if (binding) {
-      const record = store.get(completionCloseId(project, binding.id));
-      if (!record) fail("record_missing", completionCloseId(project, binding.id), "close", "A closed managed attempt keeps its close record");
-      const close = take(readCompletionCloseAt(store, project, reference(record)));
-      if (!close.waiting.length) continue;
-      const unrecovered = close.waiting.filter(diagnostic => {
-        const checked = take(readManagedModelDiagnostic(store, binding as never, diagnostic));
-        if (checked.request.packet && readOmCapacityRecovery(store, project, checked.request.packet)) return false;
-        if (checked.request.call && readOmLimitedCallRetryPermit(store, project, checked.request.call)) return false;
-        return true;
-      });
-      if (!unrecovered.length) continue;
-      owed.push({ questions: attempt.goal.questions, reasons: unrecovered.map(diagnostic => {
-        const checked = take(readManagedModelDiagnostic(store, binding as never, diagnostic));
-        return reasonOf("owner-control", checked.request.code, series.id, field, checked.request.message, [reference(series), reference(record), diagnostic]);
-      }) });
-    } else if (attempt.outcome.reason === "awaiting-owner")
-      owed.push({ questions: attempt.goal.questions, reasons: [reasonOf("owner-control", "awaiting_owner", series.id, field,
-        `Attempt ${attempt.ordinal} of this line ended waiting for the owner; the earlier mode saved no diagnostic of the decision it needs`, [origin])] });
+    if (!binding) continue;
+    const record = store.get(completionCloseId(project, binding.id));
+    if (!record) fail("record_missing", completionCloseId(project, binding.id), "close", "A closed managed attempt keeps its close record");
+    const close = take(readCompletionCloseAt(store, project, reference(record)));
+    if (!close.waiting.length) continue;
+    const unrecovered = close.waiting.filter(diagnostic => {
+      const checked = take(readManagedModelDiagnostic(store, binding as never, diagnostic));
+      if (checked.request.packet && readOmCapacityRecovery(store, project, checked.request.packet)) return false;
+      if (checked.request.call && readOmLimitedCallRetryPermit(store, project, checked.request.call)) return false;
+      return true;
+    });
+    if (!unrecovered.length) continue;
+    owed.push({ questions: attempt.goal.questions, reasons: unrecovered.map(diagnostic => {
+      const checked = take(readManagedModelDiagnostic(store, binding as never, diagnostic));
+      return reasonOf("owner-control", checked.request.code, series.id, field, checked.request.message, [reference(series), reference(record), diagnostic]);
+    }) });
   }
   return owed;
 }
@@ -1340,16 +1327,14 @@ export function recoveredSuccessorPacket(store: Store, project: string, work: Co
 }
 
 /**
- * The open attempt continues by its registry. A standalone attempt (no binding) is never adopted: the pass waits for
- * its own E4/E5/G7 way (№1737 п.3). For a managed one the next unfinished assignment is chosen from the work itself,
- * never from today's E1 ledger (C23); a complete work is checked (block G4b) and closed through G7 with its derived claim.
+ * The open attempt continues by its registry. The next unfinished assignment is chosen from the work itself, never
+ * from today's E1 ledger (C23); a complete work is checked (block G4b) and closed through G7 with its derived claim.
  */
 function continueAttempt(store: Store, request: RunRequest, series: Sealed<Revision<AnyRepairSeries>>, ordinal: number, history: RunHistory,
   trail: Trail): Choice {
   const project = request.project;
   const binding = take(readCompletionBinding(store, project, reference(series), ordinal));
-  if (!binding) return wait("standalone_attempt", series.id, "attempt",
-    "A standalone attempt of the earlier mode continues by its own E4/E5/G7 way; the pass does not adopt it", [reference(series)]);
+  if (!binding) fail("record_missing", series.id, "attempt", "A managed attempt keeps its owner binding");
   const workHead = store.get<CompletionWork>(completionWorkId(project, binding.id));
   if (!workHead) fail("record_missing", completionWorkId(project, binding.id), "work", "A managed attempt keeps its registry");
   // The registry of open work is a head an end without a result depends on (№1995 п.3).

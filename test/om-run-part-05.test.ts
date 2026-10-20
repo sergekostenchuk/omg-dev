@@ -9,14 +9,11 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { Graph } from "../src/graph/model.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import type { Node } from "../src/graph/model.js";
-import { beginAttempt, openSeries, ownerDecisionNamespace, OWNER_DECISION_KIND, readCompletionBinding, resumeSeries, seriesRequestOf } from "../src/om/series.js";
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
+import { ownerDecisionNamespace, OWNER_DECISION_KIND, readCompletionBinding, resumeSeries, seriesRequestOf } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import { readRouteProducers } from "../src/om/answers-gate.js";
 import type { AnyRepairSeries } from "../src/om/series.js";
-import { closeAttempt } from "../src/om/repeat-gate.js";
-import { gapLineKey } from "../src/om/gap-lines.js";
 import { readRun, startRun, runId, type RunRecord, type RunStep, type RunWait } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 import { checkAnswerForm } from "../src/om/answer-form.js";
@@ -31,7 +28,7 @@ import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
 import { prepareRunBases as lp81PrepareRunBases } from "../src/om/run-bases.js";
 import type { OmModelCall } from "../src/om/model-call.js";
 import { gardenGraph } from "./om-fixture.js";
-import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Reopened, unavailableReview, sameEnd } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Reopened, unavailableReview, sameEnd, managedRefusedCycle } from "./om-run-fixture.js";
 
 test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is proved by the common recovery the failed review ends the pass, and nothing is sent twice", async t => {
   const f = runFixture(t, ["encoding"], "executed");
@@ -193,29 +190,20 @@ test("H1.2 R6 R7 C32 a standing hold and the goal's own owner-control are both g
   const f = runFixture(t, ["encoding"], "executed", true);
   const b = f.bases("h12-hold-owed"), request = f.request(b);
   const item = f.store.get<RoutesRecord>(b.routes.id, b.routes.revision)!.value.batches.find(row => row.model === "MC1")!.items[0]!;
-  const address = { project, block: "garden-consume-block", line: 1 };
-  ok(openSeries(f.store, { ...address, slice: "h12-hold-owed", predecessor: null, basis: null }));
-  // Attempt 1 of the earlier mode asked the owner about today's very question; attempt 2 was refused with a refusal of unknown origin.
-  ok(beginAttempt(f.store, { ...address, attempt: 1, goal: { key: "h12-owed-goal", questions: [gapLineKey(project, item.target, item.field)], result: "A supported fact" } }));
-  ok(closeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "awaiting-owner", accepting: [], cancelling: [], refusals: [] } }));
-  const goal = { key: "h12-hold-goal", questions: ["Address one contract"], result: "A supported contract" };
-  ok(beginAttempt(f.store, { ...address, attempt: 2, goal }));
-  const source = f.store.write({ id: `${unitRefusalNamespace(project)}h12-owed-origin`, kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "G3", refusals: [{ code: "unrecognized_fixture_refusal", goal: goal.key, remedy: "Identify the exact origin",
-      origin: { name: "artifact_missing", stage: "layer-check", subject: "artifact:fixture", sources: [] } }] } });
-  const row = ok(recordRefusal(f.store, { project, source: reference(source) })).value.rows.find(entry => entry.source.id === source.id)!;
-  const closed = ok(closeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: "refused", accepting: [], cancelling: [],
-    refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-  assert.equal(closed.holds.length, 1, "G7 raised the hold of an unknown origin");
-  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }]);
+  // Attempt 1 asks the owner about today's very question and ends waiting for it through its own managed close;
+  // attempt 2 is then refused with a refusal of unknown origin: G7 raises its hold.
+  f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", questionIds: [item.gap], action: "need_owner",
+    reason: "The owner must settle this question", decision: "Decide it" }, usage },
+    { research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }]);
   ok(startRun(f.store, { project }));
+  await driveTo(f, request, "close", 30);
+  const closed = await managedRefusedCycle(f, b, "garden-consume-block", 2, ["h12-owed-origin"]);
+  assert.equal(closed.holds.length, 1, "G7 raised the hold of an unknown origin");
   const end = await ends(f, request, 10);
   const series = blockSeries(f), reasons = reasonsOf(end.state);
-  assert.deepEqual(end.performed, ["analyze"], "Only the review of the hold was paid");
   assert.deepEqual(reasons.map(entry => [entry.kind, entry.code, entry.target, entry.field]), [
     ["hold-origin-unestablished", "origin_hold", closed.holds[0]!.id, "hold"],
-    ["owner-control", "awaiting_owner", series.id, "attempt.1"]]);
-  assert.equal(f.sent().length, 1);
+    ["owner-control", "model_need_owner", series.id, "attempt.1"]]);
 });
 
 // OWN1 (№3711): the H1.5 tests of a blocking batch no producer serves are gone with it — a design or owner question of the

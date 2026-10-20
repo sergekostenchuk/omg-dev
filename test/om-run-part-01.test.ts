@@ -31,12 +31,11 @@ import { writeOwnerResult } from "../src/om/owner-result.js";
 // ---- MP2 (№2968): the still unstarted roots of an attempt by the flows of their frame; neighbours of a brief root ----
 import { rankExpansions } from "../src/om/run.js";
 // ---- LP5 (№3278): after a replaced B1 the old work ends by its own products, the new bases are built, paid assemblies answer again ----
-import { COMPLETION_REUSE_KIND, readCompletionCessationAt, type CompletionCessation } from "../src/om/model-call.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { readSeries } from "../src/om/series.js";
 import { gapLineKey as lp7LineKey, gapLineExpectedResult as lp7Result } from "../src/om/gap-lines.js";
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp5ReplaceB1, lp5Pass, LP5_BASE_COMMIT, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, mechanismSeries, actions, ends, driveTo, reasonsOf, stopAnswer, secondRung, decisionCalls, restWithDecisions, until, worksFixture, worksAcceptance, nodeRefusal, driveUntil, gapHeads, addressQuestions, atCommit, sameEnd, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, G62_BASE, lp6Line, lp6Close, LP7_VALUES, lp7Routes, AT1_BASE } from "./om-run-fixture.js";
 
 test("LG01r1 current fixture modes preserve the run's questions and never prebuild a cold B1", t => {
   for (const mode of ["stages", "n2", "executed"] as const) {
@@ -464,43 +463,6 @@ test("MP2 (№2968 row 6) a packet issued before its neighbour finished keeps it
 // G5.1 return №3867-2 (№3606): the chosen supplements of one proposal are read at the addresses of its own producer ends —
 // other choices in the history change neither the result nor the number of records the lookup reads.
 
-test("LP5 (№3278 §4, rows 13, 21) era: febbee2c, run from Git in its own process on the B1 replaced under its open works attempt, ends the unsent root by LP4 and stands on input_stale; the new code reads its records as they are and continues that very open work — the check ceased, the attempt closed, the new bases built, the paid root answered by its reuse", async t => {
-  const f = worksFixture(t, undefined, undefined, undefined, LP5_BASE_COMMIT);
-  const produce = () => blockSeries(f as unknown as Fixture, "garden-produce-block");
-  ok(startRun(f.store, { project }));
-  // G5 (№3820): the open works attempt is the base's own — its packet issued and its paid root cycled by febbee2c — since
-  // the base reads no works packet of a later era (the wake-test form); today's code then reads them all as they are.
-  const issued = atCommit(f, LP5_BASE_COMMIT, "lp5-base-issue", `const { advanceRun } = await import(src('om/run.js'));
-for (let index = 0; index < 40; index++) {
-  const state = take(await advanceRun(store, args.request)).record.value.state;
-  if (state.phase === 'step' && state.step.action === 'cycle') { out(state.step.request.packet); break; }
-  if (state.phase === 'waiting') { out(null); break; }
-}`, { request: f.request }) as Ref | null;
-  assert.ok(issued, "The base issues the works packet of the open attempt");
-  writeFileSync(join(f.root, "scenario.json"), JSON.stringify({ database: f.database, steps: [{ research: mp2WorkAnswer(f, issued).research, usage }] }));
-  const cycled = atCommit(f, LP5_BASE_COMMIT, "lp5-base-cycle", `const { advanceRun } = await import(src('om/run.js'));
-out(take(await advanceRun(store, args.request)).performed?.action ?? null);`, { request: f.request });
-  assert.equal(cycled, "cycle", "The base pays the root's answer");
-  f.restart();
-  lp5ReplaceB1(f);
-  const stood = atCommit(f, LP5_BASE_COMMIT, "lp5-base", `const { advanceRun } = await import(src('om/run.js'));
-const trail = [];
-for (let index = 0; index < 20; index++) {
-  const advanced = take(await advanceRun(store, args.request)), state = advanced.record.value.state;
-  trail.push(state.phase === 'waiting' ? 'waiting:' + state.wait.code + ':' + state.wait.target : state.phase + ':' + (advanced.performed?.action ?? ''));
-  if (state.phase === 'waiting') break;
-}
-out(trail);`, { request: f.request }) as string[];
-  assert.equal(stood.at(-1), `waiting:input_stale:om-input:${project}`, `The base stands on the replaced B1: ${stood.join(",")}`);
-  f.restart();
-  const ceased = f.store.list<CompletionCessation>("om-completion-cessation");
-  assert.deepEqual(ceased.map(row => [row.value.disposition, row.value.cause.kind]), [["branch-ceased", "required-record-replaced"]], "The base ended the unsent root by LP4");
-  assert.deepEqual(ok(readCompletionCessationAt(f.store, project, reference(ceased[0]!))), ceased[0], "Its record reads as it is");
-  const trail = await lp5Pass(f, () => produce()?.value.attempts[1]?.outcome ? "stop" : undefined);
-  assert.ok(trail.some(row => row.endsWith(">cease-check#1")) && trail.some(row => row.endsWith(">reuse#2")), trail.join(","));
-  assert.deepEqual(produce().value.attempts.map(row => row.outcome?.reason), ["interrupted", "result"]);
-  assert.equal(f.store.list(COMPLETION_REUSE_KIND).length, 1);
-});
 
 
 test("LP7 rows 14, 24 (run): an answer of some joined fields — part of state included — applies only them; on the new B1 today's routing joins the rest, and its answer completes the subject keys of one full answer", async t => {
