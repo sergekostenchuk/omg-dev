@@ -5,6 +5,7 @@ import { isRef, type Ref } from "../pipeline/contracts.js";
 import type { Revision } from "../storage/store.js";
 import type { Discovery, DiscoveryDraft, FieldSpec } from "./discovery.js";
 import type { IssuedAnswerProof, AnswerProvenance, ResearchProvenance } from "./projection-reader.js";
+import { V7_FINAL_SCHEMA, checkV7Final, type V7FinalBundle } from "./v7-final-contracts.js";
 
 /** Era-7 contract facts of the new Discovery map (Стадия 1 · Discovery, D1–D2). */
 export const V7_CONTRACT_ERA = 7;
@@ -86,6 +87,16 @@ export const V7_PLAN_FIELD = { field: "plan", kind: "design", proof: "assessment
   risk: "План не покрывает оси рамки блокирующими вопросами или выходит по усталости",
   schema: V7_PLAN_SCHEMA } satisfies FieldSpec;
 
+/** DR7 7a.1: the D7 field — one exact bundle (итог, проекция, конституция и
+ * вердикт) in the form of v7-final-contracts; it is accepted as a whole, never
+ * as separate projection or constitution answers. */
+export const V7_FINAL_FIELD = { field: "final", kind: "design", proof: "assessment",
+  prompt: "По точному снимку досье сформируй итоговый комплект Discovery. dossier — точный Ref снимка досье. verdict: outcome — go, conditional, no_go или insufficient_evidence; reason — основание вывода; conditions — условия conditional (у go и отрицательного исхода пусты). Положительный исход (go, conditional): summary — what (что строим), forWhom (для кого), why (зачем), firstResult (первый результат), successCriterion (как поймём, что получилось), nonGoals (чего точно не делаем); projection — образ выбранного продукта для следующих стадий: users, payers, rules, externalSystems, unresolved; constitution — опора проекта: goal, consumers, nonGoals, successCriterion. Отрицательный исход (no_go, в том числе когда отклонены все варианты, и insufficient_evidence): summary — reasons (причины), found (что найдено), needed (что нужно); projection и constitution равны null — у отклонённого проекта нет образа продукта и конституции, не заполняй их.",
+  risk: "Итог выдаёт отклонённый проект за принятый или додумывает проекцию и конституцию без основания",
+  schema: V7_FINAL_SCHEMA } satisfies FieldSpec;
+
+/** The initial slice a v7 draft starts from: D1–D2 only. D7 joins a draft by
+ * its own question; an initial D1/D2 draft is never an incomplete D7. */
 const discoveryFields: readonly FieldSpec[] = Object.freeze([
   V7_BRIEF_FIELD, V7_OBJECTIVE_FIELD, V7_FRAME_FIELD, V7_PLAN_FIELD]);
 
@@ -97,7 +108,10 @@ const discoveryFields: readonly FieldSpec[] = Object.freeze([
  * partial table never becomes the acceptance/issuance contract — it is not
  * listed among the supported contract eras. */
 const fields: Partial<Record<V7Stage, readonly FieldSpec[]>> = { discovery: discoveryFields };
-export const V7_REQUIREMENTS = sealed({ fields,
+/** DR7 7a.1: the D7 contract is declared beside the initial slice, not appended to
+ * it — the initial draft keeps exactly D1–D2, and the stage stays incomplete
+ * until its whole producer contract is written (production does not open). */
+export const V7_REQUIREMENTS = sealed({ fields, final: V7_FINAL_FIELD,
   complete: { discovery: false } as Partial<Record<V7Stage, boolean>> });
 export type V7RequirementsTable = typeof V7_REQUIREMENTS;
 
@@ -146,6 +160,27 @@ export function checkV7FieldAnswer(draft: DiscoveryDraft, spec: FieldSpec, value
   prove: FieldAnswerProver): void {
   if (spec.field === V7_FRAME_FIELD.field) return checkV7Frame(value);
   if (spec.field === V7_PLAN_FIELD.field) return checkV7Plan(draft, value, prove);
+  if (spec.field === V7_FINAL_FIELD.field) { checkV7Final(value); return; }
+}
+
+/** The D7 state of a v7 Discovery draft, read from its own saved fields:
+ * absent — the draft has no D7 question (an initial D1/D2 draft: no D7 has
+ * begun, so nothing is incomplete); open — the D7 question is asked and not yet
+ * answered; present — the saved bundle in its proven form. A saved value that
+ * fails the form is a typed refusal, never read as absent or open. */
+export type V7FinalState = { state: "absent" } | { state: "open" } | { state: "present"; bundle: V7FinalBundle };
+export function v7FinalState(draft: DiscoveryDraft): V7FinalState {
+  if (!isDiscoveryV7Draft(draft) || !obj(draft.fields))
+    throw new EngineError("discovery_final_invalid", "A D7 bundle belongs to a v7 Discovery draft with its fields");
+  if (!Object.hasOwn(draft.fields, V7_FINAL_FIELD.field)) return { state: "absent" };
+  const value = draft.fields[V7_FINAL_FIELD.field];
+  if (value === null) return { state: "open" };
+  try { return { state: "present", bundle: checkV7Final(value) }; }
+  catch (error) {
+    if (error instanceof EngineError)
+      throw new EngineError("discovery_final_invalid", `The saved D7 bundle lost its form: ${error.message}`, error.details);
+    throw error;
+  }
 }
 
 function checkV7Frame(value: Json): void {
