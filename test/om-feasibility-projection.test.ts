@@ -23,9 +23,8 @@ import { readCall, recordCall } from '../src/om/call-record.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { executionFixture } from './execution-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
-import { answerTechnicalFixture } from './technical-research-fixture.js';
 import { deriveLayerFixture } from './layer-design-fixture.js';
-import { writeHorizon } from '../src/om/horizon.js';
+import { prepareHorizon, writeHorizon } from '../src/om/horizon.js';
 
 function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message} ${canonical(result.refusal.at)}`);
@@ -68,7 +67,8 @@ interface MixedNativeFixture {
   readonly store: Store; readonly engine: ProductEngine; readonly project: string; readonly workspace: string;
   readonly legacy: Revision<Feasibility>;
   readonly basis: OmResult<unknown>;
-  readonly omLayer: Revision<MixedLayerHead>;
+  readonly researchLayer: Revision<MixedLayerHead>;
+  readonly phaseL2: Ref;
   readonly beforeRefusal: string;
   readonly attempt: (store: Store) => OmResult<unknown>;
   restart(): void;
@@ -97,20 +97,22 @@ async function mixedNativeFixture(t: TestContext): Promise<MixedNativeFixture> {
     assert.deepEqual(engine.refinement.feasibilityGate(project, reference(legacy), true).findings, []);
     for (const inputRef of legacy.value.inputs) { const rec = store.get(inputRef.id, inputRef.revision); assert.ok(rec, 'native input missing: ' + inputRef.id); assert.deepEqual(reference(rec), inputRef); }
 ${input}`);
-    // The complete native history stays in this database; the OM N2 candidate names its exact research basis.
+    // The complete native history stays in this database; the OM N2 request names the native research
+    // layer head as its basis — the exact first step the frame contract refuses.
     once('    layer: null, frame: null, upper: null };',
       '    layer: reference(store.get(`graph-layer:${project}:2`)), frame: null, upper: null };');
-    // The next works-basis step is where the contract refuses: keep the refusal instead of throwing it.
-    once('const basis = ok(prepareFrame(', 'const basis = prepareFrame(');
-    once('frame: upperFrame } }));', 'frame: upperFrame } });');
-    const proposal = '        return reference(store.write({ id: `om-proposal:garden:external-${level}`';
-    once(proposal, `        value.replaces = value.fills.flatMap(fill => frame.result.fills
-          .filter(old => old.obligation === fill.obligation && old.source === 'accepted')
-          .map(old => ({ obligation: fill.obligation, base: { node: old.node, graph: frame.request.graph },
-            with: { node: fill.node, port: fill.port ?? null }, basis: 'Preserve the exact accepted fill in the OM contract' })));
-${proposal}`);
+    // Everything past prepareFrame(frame2) is unreachable for this producer; the refused basis step
+    // writes nothing, so the history snapshot wraps the call immediately.
+    const cutStart = prefix.indexOf('const proposal2 = proposal(');
+    const cutEnd = prefix.indexOf('return { root, workspace');
+    assert.ok(cutStart > 0 && cutEnd > cutStart, 'The mixed producer cuts the unreachable OM continuation');
+    prefix = `${prefix.slice(0, cutStart)}const basisHistory = canonical(store.list().flatMap(row => store.history(row.id)));
+    const basis = prepareFrame(store, frame2);
+    assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), basisHistory,
+        'The refused OM basis step writes nothing');
+    ${prefix.slice(cutEnd)}`;
     once('return { root, workspace, database, project, desired, basis, frame2, graph, layer, upperFrame, input, horizon, proposal,',
-      'return { root, workspace, database, project, desired, basis, frame2, graph, layer, upperFrame, input, horizon, proposal, legacy,');
+      'return { root, workspace, database, project, desired, basis, frame2, input, legacy,');
     prefix = prefix.replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g,
       (_match, _quote: string, path: string) => `from ${JSON.stringify(new URL(path, url).href)}`);
     assert.ok(!/\btest\(/.test(prefix), 'The mixed native producer does not import the original test registrations');
@@ -118,19 +120,40 @@ ${proposal}`);
   })();
   const base = (await mixedModule).acceptedOperationsFixture(t) as Omit<MixedNativeFixture, 'basis'> & { basis: OmResult<unknown> };
   const { store, engine, project } = base;
-  const omLayer = store.get<MixedLayerHead>(`graph-layer:${project}:2`)!;
-  // The one remaining continuation rebuilds the research work layer over the OM basis by the real producers.
-  engine.refinement.sealLayer(project, 2, 1);
-  const rebuiltR2 = engine.refinement.begin(project, 'R2');
-  answerTechnicalFixture(engine, project, rebuiltR2);
-  engine.refinement.finishResearch(project, 'R2', reference(store.get(rebuiltR2.id)!), 1);
-  deriveLayerFixture(engine, project, 3);
+  // The producer continues natively: a fresh research derivation supersedes the L2 layer head.
+  deriveLayerFixture(engine, project, 2);
+  // The native L2 head is a genuine research-derived layer: its own and upper proofs are intact and the
+  // absent OM acceptance is the only defect the OM contract sees.
+  const researchLayer = store.get<MixedLayerHead>(`graph-layer:${project}:2`)!;
+  // The saved R3 names its L2 milestone; the reseal now names the moved layer head, so the milestone
+  // itself receives a new revision — the provably changed input the native gate must report.
+  const phaseL2 = base.legacy.value.inputs.find(ref => ref.id === `phase:${project}:L2`);
+  assert.ok(phaseL2, 'The saved R3 names its L2 milestone input');
+  engine.refinement.sealLayer(project, 2, phaseL2.revision);
   const beforeRefusal = history(store);
-  const attempt = (s: Store) => writeHorizon(s, { project, input: reference(s.get(`om-input:${project}`)!),
-    graph: reference(s.get(`graph:${project}`)!), refinement: reference(omLayer), available: {},
-    choice: { choiceVersion: 'mixed-works-retry', features: [{ outcome: 'garden-result' }], excluded: [] } });
-  return { ...base, omLayer, basis: base.basis, beforeRefusal, attempt,
+  const attemptRequest = { project, input: reference(store.get(`om-input:${project}`)!),
+    graph: reference(store.get(`graph:${project}`)!), refinement: reference(researchLayer), available: {},
+    choice: { choiceVersion: 'mixed-works-retry', features: [{ outcome: 'garden-result' }], excluded: [] } };
+  return { ...base, researchLayer, phaseL2, basis: base.basis, beforeRefusal,
+    attempt: (s: Store) => writeHorizon(s, attemptRequest),
     get store() { return base.store; }, get engine() { return base.engine; }, restart: () => base.restart() };
+}
+interface OperationsN2 {
+  readonly store: Store; readonly project: string; readonly input: Revision<unknown>;
+  readonly graph: Ref; readonly layer: Ref;
+  restart(): void;
+}
+let operationsModule: Promise<{ acceptedOperationsFixture(t: TestContext): OperationsN2 }> | undefined;
+function operationsN2Fixture(t: TestContext): Promise<OperationsN2> {
+  operationsModule ??= (async () => {
+    const url = new URL('./om-feasibility.test.js', import.meta.url), source = readFileSync(url, 'utf8');
+    const boundary = source.indexOf('const heads ='); assert.ok(boundary > 0);
+    const prefix = source.slice(0, boundary).replace(/from (['"])(\.{1,2}\/[^'"]+)\1/g,
+      (_match, _quote: string, path: string) => `from ${JSON.stringify(new URL(path, url).href)}`);
+    assert.ok(!/\btest\(/.test(prefix), 'Importing the native producer does not register its tests');
+    return import(`data:text/javascript;base64,${Buffer.from(`${prefix}\nexport { acceptedOperationsFixture };`).toString('base64')}`);
+  })();
+  return operationsModule.then(module => module.acceptedOperationsFixture(t));
 }
 function missingM8(engine: ProductEngine, project: string) {
   const view = engine.projection(project);
@@ -317,32 +340,33 @@ test('G1.2 a genuine mixed project preserves native R3 while the OM continuation
     (error: unknown) => addressed(error) && (error as EngineError).code === 'revision_conflict'
       && ((error as EngineError).details as { target: string }).target === `om-feasibility:${f.project}`);
   assert.equal(history(f.store), beforeAssess, 'A native revision is not an expected revision of the M8 record');
-  // The real OM N2 acceptance happened on the exact research basis inside the fixture.
-  assert.equal(f.omLayer.value.acceptance?.producer, 'om');
-  // The next continuation step is refused at its exact contract point: the works frame cannot omit
-  // the saved research L3 (its head carries level-3 proofs).
+  // The OM continuation cannot name the research L2 head as its basis: the layer names no recorded
+  // OM acceptance, so the frame contract refuses at the exact first step.
   assert.equal(f.basis.ok, false);
   if (!f.basis.ok) {
     assert.equal(f.basis.refusal.code, 'frame_basis_unproven');
-    assert.deepEqual(f.basis.refusal.at, { unit: 'F4', target: `graph-layer:${f.project}:3`, field: 'layer' });
+    assert.deepEqual(f.basis.refusal.at, { unit: 'F4', target: `graph-layer:${f.project}:2`, field: 'acceptance' });
   }
-  // The remaining bridge — a fresh research L3 derived over the OM L2 by real producers — also cannot
-  // proceed: its graph write supersedes the accepted L2 head, so the works horizon names a non-head.
+  // The same layer cannot be named as works-horizon refinement either: its own and upper proofs are
+  // genuine — the absent OM acceptance is the only defect.
   const refused = f.attempt(f.store);
   assert.equal(refused.ok, false);
   if (!refused.ok) {
-    assert.equal(refused.refusal.code, 'input_stale');
-    assert.deepEqual(refused.refusal.at, { unit: 'G2', target: `graph-layer:${f.project}:2`, field: 'head', ref: reference(f.omLayer) });
+    assert.equal(refused.refusal.code, 'horizon_refinement_unproven');
+    assert.deepEqual(refused.refusal.at, { unit: 'G2', target: `graph-layer:${f.project}:2`, field: 'acceptance',
+      ref: reference(f.researchLayer) });
   }
   assert.equal(history(f.store), f.beforeRefusal, 'The refused step writes nothing');
   const repeat = f.attempt(f.store);
   assert.equal(repeat.ok, false);
-  if (!repeat.ok) assert.equal(repeat.refusal.code, 'input_stale');
+  if (!repeat.ok) assert.equal(repeat.refusal.code, 'horizon_refinement_unproven');
   assert.equal(history(f.store), f.beforeRefusal, 'A repeat of the refused step writes nothing');
-  // After the OM N2 acceptance the native gate names the superseded L2 input; the record itself is untouched.
+  // The reseal moved exactly the L2 milestone the saved R3 names; the native gate reports that target.
+  assert.notEqual(f.store.get(f.phaseL2.id)!.revision, f.phaseL2.revision);
   const stale = engine.refinement.feasibilityGate(f.project, reference(f.legacy), true);
-  assert.ok(stale.findings.some(finding => finding.code === 'feasibility_stale' && finding.target === `graph-layer:${f.project}:2`),
-    'The native gate addresses the exact layer revision the OM acceptance superseded');
+  const staleFindings = stale.findings.filter(finding => finding.code === 'feasibility_stale');
+  assert.ok(staleFindings.some(finding => finding.target === f.phaseL2.id),
+    'The native gate names the exact L2 milestone the reseal superseded');
   assert.ok(!stale.findings.some(finding => finding.code === 'feasibility_contract_superseded'),
     'An explicit native reference retains its own producer contract in a mixed project');
   assert.equal(canonical(f.store.get(f.legacy.id)), legacyBytes);
@@ -352,8 +376,38 @@ test('G1.2 a genuine mixed project preserves native R3 while the OM continuation
     assert.deepEqual(reference(f.store.get(input.id, input.revision)!), input);
   const cold = f.attempt(f.store);
   assert.equal(cold.ok, false);
-  if (!cold.ok) assert.equal(cold.refusal.code, 'input_stale');
+  if (!cold.ok) assert.equal(cold.refusal.code, 'horizon_refinement_unproven');
   assert.equal(history(f.store), f.beforeRefusal, 'A cold repeat of the refused step adds no records');
+});
+
+test('G1.2 a shifted OM N2 head refuses the works horizon at the exact stored layer revision', async t => {
+  const f = await operationsN2Fixture(t);
+  const request = { project: f.project, input: reference(f.input), graph: f.graph, refinement: f.layer,
+    available: {}, choice: { choiceVersion: 'mixed-n2-head-window', features: [{ outcome: 'garden-result' }], excluded: [] } };
+  const prepared = ok(prepareHorizon(f.store, request));
+  assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(f.layer)), 'The horizon guards the refinement head');
+  const head = f.store.get(f.layer.id)!;
+  f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: head.value });
+  const before = history(f.store);
+  const refused = writeHorizon(f.store, request);
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.refusal.code, 'input_stale');
+    assert.deepEqual(refused.refusal.at, { unit: 'G2', target: `graph-layer:${f.project}:2`, field: 'head', ref: f.layer });
+  }
+  assert.equal(history(f.store), before, 'The refused horizon writes nothing');
+  const repeat = writeHorizon(f.store, request);
+  assert.equal(repeat.ok, false);
+  if (!repeat.ok) assert.equal(repeat.refusal.code, 'input_stale');
+  assert.equal(history(f.store), before, 'A repeat of the refused horizon writes nothing');
+  f.restart();
+  const cold = writeHorizon(f.store, request);
+  assert.equal(cold.ok, false);
+  if (!cold.ok) {
+    assert.equal(cold.refusal.code, 'input_stale');
+    assert.deepEqual(cold.refusal.at, { unit: 'G2', target: `graph-layer:${f.project}:2`, field: 'head', ref: f.layer });
+  }
+  assert.equal(history(f.store), before, 'A cold repeat of the refused horizon adds no records');
 });
 
 test('G1.2 B1 revision one remains mandatory with a derived head and retained M8 references', async t => {

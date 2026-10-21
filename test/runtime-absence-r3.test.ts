@@ -10,12 +10,8 @@ import { UPSTREAM_STAGES } from '../src/discovery/requirements.js';
 import { readOmAdmissionGuards, writeOmInput, prepareOmInput, type InputRequest } from '../src/om/input.js';
 import { writeHorizon, prepareHorizon, type HorizonRequest } from '../src/om/horizon.js';
 import { prepareLayerAcceptance, prepareFrame, type FrameRequest } from '../src/om/frame-obligations.js';
-import { writeCandidate, gateCandidate } from '../src/om/frame-candidate.js';
-import { settleCandidate } from '../src/om/frame-accept.js';
-import type { LayerProposal } from '../src/om/frame-proposals.js';
-import { projectGraph } from '../src/graph/project.js';
 import type { OmResult } from '../src/om/refusal.js';
-import { createOmFixture, type FixtureLayer } from './om-fixture.js';
+import { createOmFixture } from './om-fixture.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
@@ -32,7 +28,7 @@ import { configureResearchScope } from '../src/graph/research-scope.js';
 import { configureReaderPilot } from '../src/discovery/reader-pilot.js';
 import type { ObligationPolicy, RuntimeCheck } from '../src/graph/obligation-policy.js';
 import { runtimeContext, type RuntimeObservationResult } from '../src/runtime/runtime-observation.js';
-import { Refinement, type Feasibility } from '../src/graph/refinement.js';
+import type { Feasibility } from '../src/graph/refinement.js';
 import { obligationHandoff } from '../src/graph/obligation-handoff.js';
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { Graph } from '../src/graph/model.js';
@@ -367,16 +363,12 @@ test('D8.1 a native stage-closure/v1 admission carries absence guards through th
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:${project}:${stage}`)!)])) as InputRequest['stages'] };
   const input = omValue(writeOmInput(f.store, inputRequest));
   inputRequest.expected = input.revision;
-  let graph = reference(f.store.get<Graph>('graph:p')!);
+  const graph = reference(f.store.get<Graph>('graph:p')!);
   // The current bridge: the first horizon names no refinement and the first OM frame is honestly
   // absent before any real N2 acceptance — the stage-only window.
   const horizonRequestA: HorizonRequest = { project, input: reference(input), graph, refinement: null,
     choice: { choiceVersion: 'd81-bridge-operations', features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} };
-  const horizonA = omValue(writeHorizon(f.store, horizonRequestA));
-  const layer2 = reference(f.store.get<FixtureLayer>('graph-layer:p:2')!);
-  const layer2Request = { project, graph, level: 2 as const, layer: layer2 };
-  const frame2Request: FrameRequest = { project, graph, level: 2, layer: layer2,
-    horizon: reference(horizonA.gate), frame: null, upper: null };
+  omValue(writeHorizon(f.store, horizonRequestA));
   assert.equal(f.store.get(`reader-pilot:${project}`), null);
   assert.equal(f.store.get(`execution-root:${project}`), null);
   for (const gate of [f.engine.pipeline.inspect(project, 'features'), f.engine.refinement.gate(project, 'L2'),
@@ -389,38 +381,31 @@ test('D8.1 a native stage-closure/v1 admission carries absence guards through th
   const second = reference(f.store.write({ id: 'd81-bridge-second', kind: 'fixture', expected: 0, value: { project } }));
   const absent = { id: 'd81-bridge-missing', absent: true };
   let inputAdmission: TransactionGuard[] | null = null;
-  // On the current route the input bridge and the horizon read the stage-closure/v1 features
-  // admission (absence guards pass verbatim); layer and frame acceptance consult the research gate
-  // of the layer's own phase, which rejects them.
+  // On the current route the input bridge, the horizon and the first OM frame all read the
+  // stage-closure/v1 features admission (absence guards pass verbatim); a research-derived layer
+  // is no longer an acceptance base, so the first frame window lives on a stage-only fixture.
   const exercise = (store: Store, routeProject: string, carryAbsent: boolean,
-    routes: [string, () => OmResult<{ readonly guards: readonly TransactionGuard[] }>, 'inspect' | 'R1' | 'R2'][]) => {
+    routes: [string, () => OmResult<{ readonly guards: readonly TransactionGuard[] }>][]) => {
     const before = store.list().map(reference);
-    for (const [route, prepare, spyOn] of routes) {
+    for (const [route, prepare] of routes) {
       const native = omValue(prepare());
       const channels = [undefined, [], [second, positive], [absent], [positive, absent], [absent, positive],
         null, {}, [null], [{ ...positive, absent: true }], [{ id: positive.id, absent: false }], new Array(1)];
       for (const channel of channels) {
-        let hits = 0, gateDepth = 0;
+        let hits = 0;
         const change = <T extends GateResult>(checked: T): T => {
           hits++; return { ...checked, admissionGuards: channel } as T;
         };
-        const nativeInspect = Pipeline.prototype.inspect, nativeGate = Refinement.prototype.gate;
-        const spy = spyOn === 'inspect'
-          ? t.mock.method(Pipeline.prototype, 'inspect', function(this: Pipeline, ...args: Parameters<Pipeline['inspect']>) {
-            const checked = nativeInspect.apply(this, args);
-            return args[0] === routeProject && args[1] === 'features' ? change(checked) : checked;
-          })
-          : t.mock.method(Refinement.prototype, 'gate', function(this: Refinement, ...args: Parameters<Refinement['gate']>) {
-            gateDepth++;
-            let checked: ReturnType<Refinement['gate']>;
-            try { checked = nativeGate.apply(this, args); } finally { gateDepth--; }
-            return gateDepth === 0 && args[0] === routeProject && args[1] === spyOn ? change(checked) : checked;
-          });
+        const nativeInspect = Pipeline.prototype.inspect;
+        const spy = t.mock.method(Pipeline.prototype, 'inspect', function(this: Pipeline, ...args: Parameters<Pipeline['inspect']>) {
+          const checked = nativeInspect.apply(this, args);
+          return args[0] === routeProject && args[1] === 'features' ? change(checked) : checked;
+        });
         try {
           const result = prepare(); assert.ok(hits > 0, route);
           if (channel === undefined || Array.isArray(channel) && channel.length === 0) assert.deepEqual(omValue(result), native);
           else if (channel === channels[2]
-            || spyOn === 'inspect' && carryAbsent && (channel === channels[3] || channel === channels[4] || channel === channels[5])) {
+            || carryAbsent && (channel === channels[3] || channel === channels[4] || channel === channels[5])) {
             // A native stage-closure/v1 admission is the full TransactionGuard channel: absence guards
             // pass the bridge verbatim and stay in the delivered guards for the atomic write.
             const value = omValue(result);
@@ -444,13 +429,27 @@ test('D8.1 a native stage-closure/v1 admission carries absence guards through th
     }
   };
   exercise(f.store, project, true, [
-    ['input', () => prepareOmInput(f.store, inputRequest), 'inspect'],
-    ['horizon', () => prepareHorizon(f.store, horizonRequestA), 'inspect'],
-    ['layer', () => prepareLayerAcceptance(f.store, layer2Request), 'R1'],
-    ['frame', () => prepareFrame(f.store, frame2Request), 'R1'],
+    ['input', () => prepareOmInput(f.store, inputRequest)],
+    ['horizon', () => prepareHorizon(f.store, horizonRequestA)],
   ]);
-  assert.deepEqual(omValue(prepareFrame(f.store, frame2Request)).guards.filter(guard => !isRef(guard)),
-    [{ id: `om-frame:${project}:2`, absent: true }], 'The stage-only window still has no operations frame');
+  // The honest first OM frame needs a store without any proved lower layer — this refined store
+  // already carries a research-sealed L2 and pretending it absent would be false, so the window
+  // runs on a separate stage-only fixture where om-frame:garden:2 is genuinely missing.
+  const s = await createOmFixture(t, 'standard', 'garden', { mode: 'stages' });
+  const sInputRequest: InputRequest = { project: 'garden', expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(s.stages[stage])])) as InputRequest['stages'] };
+  const sInput = omValue(writeOmInput(s.store, sInputRequest));
+  const sGraph = reference(s.graphRevision);
+  const sHorizonRequest: HorizonRequest = { project: 'garden', input: reference(sInput), graph: sGraph, refinement: null,
+    choice: { choiceVersion: 'd81-bridge-operations', features: [{ outcome: 'garden-result' }], excluded: [] }, available: {} };
+  const sHorizon = omValue(writeHorizon(s.store, sHorizonRequest));
+  const frame2Request: FrameRequest = { project: 'garden', graph: sGraph, level: 2, layer: null,
+    horizon: reference(sHorizon.gate), frame: null, upper: null };
+  exercise(s.store, 'garden', true, [
+    ['frame', () => prepareFrame(s.store, frame2Request)],
+  ]);
+  assert.deepEqual(omValue(prepareFrame(s.store, frame2Request)).guards.filter(guard => !isRef(guard)),
+    [{ id: 'om-frame:garden:2', absent: true }], 'The stage-only window still has no operations frame');
   // A preserved absence guard keeps its force at the atomic write — and this race must run while
   // every delivered guard is still current, so the later appearance of the absent record is the
   // only invalidation the refusal can mean.
@@ -466,43 +465,23 @@ test('D8.1 a native stage-closure/v1 admission carries absence guards through th
   assert.equal(f.store.get('d81-bridge-probe'), null);
   assert.equal(canonical(f.store.list().flatMap(head => f.store.history(head.id))), afterCompetitor,
     'The refused atomic write leaves no record and no revision after the competitor');
-  // The real N2 over the same store: the operations proposal goes through the actual current
-  // producers — prepareFrame, candidate, gate, settle — turning graph-layer:p:2 into an OM-accepted
-  // layer and creating om-frame:p:2.
-  const desired = f.store.get<Graph>('graph:p')!.value, design = projectGraph(desired, 2);
-  // The natively occupied L2 needs no fill of its own: the proposal declares the projected
-  // operations and inherits every accepted obligation, so no replacement is needed.
-  const proposal2: LayerProposal = { base: { graph: frame2Request.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
-    nodes: design.nodes.filter(node => node.kind === 'operation').map(node => structuredClone(node)),
-    fills: [],
-    localConnectors: design.connectors.map(connector => ({ ...structuredClone(connector),
-      bindings: connector.bindings.filter(binding => binding.level === 2) })).filter(connector => connector.bindings.length > 0),
-    artifacts: structuredClone(design.artifacts), contracts: structuredClone(design.contracts), joins: structuredClone(design.joins),
-    tests: structuredClone(design.tests), edges: structuredClone(design.edges ?? []), journeys: structuredClone(design.journeys ?? []),
-    packets: structuredClone(design.packets ?? []), transfers: structuredClone(design.transfers ?? []), anchors: structuredClone(design.anchors),
-    removes: [], replaces: [], redefines: [] };
-  const offered2 = f.store.write({ id: `om-proposal:${project}:d81-operations`, kind: 'layer-proposal', expected: 0, value: proposal2 });
-  const written2 = omValue(writeCandidate(f.store, { frame: frame2Request, proposals: [reference(offered2)] }));
-  assert.equal(written2.state, 'candidate');
-  const candidate2 = reference(written2.record);
-  const gate2 = omValue(gateCandidate(f.store, { project, candidate: candidate2 }));
-  const settled2 = omValue(settleCandidate(f.store, { project, level: 2, candidate: candidate2,
-    outcome: { gate: 'G3', candidate: candidate2, graphHash: gate2.graphHash, passed: gate2.passed,
-      codes: gate2.findings.map(finding => finding.code) } }));
-  assert.equal(settled2.state, 'accepted'); assert.ok(settled2.graph && settled2.layer && settled2.frame);
-  // This store's native graph-layer:p:3 was sealed over the pre-N2 layer: its basis still names the
-  // replaced graph-layer:p:2 revision, so the L3 continuation refuses the stale head by contract —
-  // there is no way to ask this store for an honest post-N2 frame-3 absence.
-  graph = reference(settled2.graph!);
-  const staleLayer3 = reference(f.store.get<FixtureLayer>('graph-layer:p:3')!);
-  const staleLayer = prepareLayerAcceptance(f.store, { project, graph, level: 3, layer: staleLayer3 });
-  assert.equal(staleLayer.ok, false);
-  if (!staleLayer.ok) {
-    assert.equal(staleLayer.refusal.code, 'input_stale');
-    assert.equal(staleLayer.refusal.at.unit, 'F4');
-    assert.equal(staleLayer.refusal.at.target, 'graph-layer:p:2');
-    assert.equal(staleLayer.refusal.at.field, 'head');
+  // The shifted-upper refusal on a genuinely accepted OM L3: the executed fixture's
+  // graph-layer:garden:3 names its exact accepted upper, so advancing that upper's head
+  // refuses the next L3 preparation as stale — and a refused preparation writes nothing.
+  const e = await createOmFixture(t, 'standard', 'garden', { mode: 'executed' });
+  const eGraph = reference(e.graphRevision), layer3E = reference(e.layers[3]);
+  omValue(prepareLayerAcceptance(e.store, { project: 'garden', graph: eGraph, level: 3, layer: layer3E }));
+  e.store.write({ id: 'graph-layer:garden:2', kind: 'graph-layer', expected: e.layers[2].revision, value: { ...e.layers[2].value } });
+  const afterShift = e.store.list().map(reference);
+  const shifted = prepareLayerAcceptance(e.store, { project: 'garden', graph: eGraph, level: 3, layer: layer3E });
+  assert.equal(shifted.ok, false);
+  if (!shifted.ok) {
+    assert.equal(shifted.refusal.code, 'input_stale');
+    assert.equal(shifted.refusal.at.unit, 'F4');
+    assert.equal(shifted.refusal.at.target, 'graph-layer:garden:2');
+    assert.equal(shifted.refusal.at.field, 'head');
   }
+  assert.deepEqual(e.store.list().map(reference), afterShift, 'A refused layer preparation writes nothing');
   // The second honest window lives on a real post-N2 store: mode 'n2' runs the actual N2 producers
   // and leaves om-frame:garden:3 genuinely absent before the first N3. Its features stage carries
   // the same stage-closure/v1 admission, so injected absence still merges into delivered guards.
@@ -516,8 +495,8 @@ test('D8.1 a native stage-closure/v1 admission carries absence guards through th
   const frame3Request: FrameRequest = { project: 'garden', graph: graphB, level: 3, layer: null,
     horizon: reference(horizonB.gate), frame: null, upper: { horizon: reference(horizonB.gate), frame: frame2B } };
   exercise(g.store, 'garden', true, [
-    ['horizon', () => prepareHorizon(g.store, horizonRequestB), 'inspect'],
-    ['frame', () => prepareFrame(g.store, frame3Request), 'inspect'],
+    ['horizon', () => prepareHorizon(g.store, horizonRequestB)],
+    ['frame', () => prepareFrame(g.store, frame3Request)],
   ]);
   const frame3Admission = omValue(prepareFrame(g.store, frame3Request)).guards;
   assert.deepEqual(frame3Admission.filter(guard => !isRef(guard)),

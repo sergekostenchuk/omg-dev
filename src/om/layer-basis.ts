@@ -2,7 +2,7 @@ import { Ajv } from "ajv";
 import { canonical, canonicalSorted, hashJson } from "../canonical.js";
 import { EngineError } from "../errors.js";
 import { LEVEL, type Graph } from "../graph/model.js";
-import { graphSchema, graphV2Schema } from "../graph/schema.js";
+import { graphV2Schema } from "../graph/schema.js";
 import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
@@ -28,7 +28,7 @@ export interface LayerEnvelopeRequest { project: string; level: 1 | 2 | 3; graph
 export interface HistoricalLayerRequest extends LayerEnvelopeRequest { level: 2 | 3; upper: Ref }
 export interface LayerEnvelope { graph: Revision<Graph>; layer: Revision<LayerBasis>; references: Ref[] }
 export interface HistoricalLayerBasis {
-  references: Ref[]; producer: "research" | "om"; upper: Ref; frame: Ref | null; currentReferences: Ref[]; open: string[];
+  references: Ref[]; producer: "om"; upper: Ref; frame: Ref | null; currentReferences: Ref[]; open: string[];
 }
 export interface LayerAcceptanceRequest extends LayerEnvelopeRequest { level: 2 | 3 }
 export type AcceptedAtomicGate = AtomicGateRecord['result'] & { basis: Ref };
@@ -42,14 +42,15 @@ export type OmFrameAcceptance = {
   producer: "om"; candidate: Ref;
   gate: CandidateGate & { name: "G3" } | AcceptedAtomicGate & { name: "G5" };
   graph: Ref; upper: Ref;
-} & (FrameAcceptanceProduction | { contract?: never; binding?: never; layer?: never });
+} & FrameAcceptanceProduction;
 export type OmAcceptedFrame = {
   project: string; candidateHash: string; layerHash: string; upperHash: string; lowerHash: string;
   fills: FrameFill[]; acceptance: OmFrameAcceptance;
 } & ({ level: 2; worksContract?: never } | { level: 3; worksContract: typeof WORKS_FRAME_CONTRACT });
 export interface FrameRebaseRequest { from: FrameRequest; to: FrameRequest }
 export interface OmRebasedFrame extends ConnectionFrame {
-  level: 3; upperHash: string; lowerHash: string; retired: FrameFill[]; rebasedFrom: Ref; rebase: FrameRebaseRequest;
+  level: 3; worksContract: typeof WORKS_FRAME_CONTRACT; upperHash: string; lowerHash: string;
+  retired: FrameFill[]; rebasedFrom: Ref; rebase: FrameRebaseRequest;
 }
 export interface RebaseBasis {
   frame: OmRebasedFrame; upper: Ref; references: Ref[]; currentReferences: Ref[]; open: string[];
@@ -66,7 +67,7 @@ const exactKeys = (value: Record<string, unknown>, keys: readonly string[]) => O
 const order = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const sorted = canonicalSorted;
 const schemas = new Ajv({ strict: true, allowUnionTypes: true });
-const graphShapes = [schemas.compile(sealed(graphSchema)), schemas.compile(sealed(graphV2Schema))];
+const graphShape = schemas.compile(sealed(graphV2Schema));
 class BasisFailure extends Error {
   constructor(readonly target: string, readonly field: string, message: string) { super(message); }
 }
@@ -113,7 +114,7 @@ function result<T>(action: () => T): OmResult<Sealed<T>> {
 function envelope(store: Store, request: LayerEnvelopeRequest): LayerEnvelope {
   const { project, level, graph: graphRef, layer: layerRef } = request, refs: Ref[] = [];
   const graph = exactRecord<Graph>(store, graphRef, `graph:${project}`, "graph", refs);
-  if (!object(graph.value) || !graphShapes[graph.value.version === 2 ? 1 : 0]!(graph.value))
+  if (!object(graph.value) || graph.value.version !== 2 || !graphShape(graph.value))
     reject(graphRef.id, "graph", "The saved graph has an invalid shape");
   const layer = readLayer(store, layerRef, project, level, refs);
   if (canonical(layer.value.projection) !== canonical(projectGraph(graph.value, level)))
@@ -147,12 +148,9 @@ function productionShape(value: unknown, project: string, level: 2 | 3): value i
     && value['layer']['id'] === `graph-layer:${project}:${level}` && positive(value['layer']['revision'])
     && exactKeys(value['layer'], ['id', 'revision']) && exactKeys(value, ['contract', 'binding', 'layer']);
 }
-function acceptanceProduction(value: OmFrameAcceptance, project: string, level: 2 | 3, target: string): FrameAcceptanceProduction | undefined {
-  if (!Object.hasOwn(value, 'contract')) {
-    if (Object.hasOwn(value, 'binding') || Object.hasOwn(value, 'layer'))
-      reject(target, 'acceptance.contract', 'Attempt bindings and result locators require their explicit producer contract');
-    return undefined;
-  }
+function acceptanceProduction(value: OmFrameAcceptance, project: string, level: 2 | 3, target: string): FrameAcceptanceProduction {
+  if (!Object.hasOwn(value, 'contract'))
+    reject(target, 'acceptance.contract', 'Attempt bindings and result locators require their explicit producer contract');
   const production = { contract: value.contract, binding: value.binding, layer: value.layer };
   if (!productionShape(production, project, level))
     reject(target, 'acceptance.contract', 'The new acceptance contract requires its binding or explicit null and exact result-layer locator');
@@ -240,17 +238,9 @@ export function readAcceptedFrameLayer(store: Store, request: { project: string;
       reject(frame.id, 'acceptance', 'The result must come from an exact candidate-accepting frame');
     const production = acceptanceProduction(frame.value.acceptance, project, level, frame.id);
     const layerId = `graph-layer:${project}:${level}`;
-    let layer: Revision<LayerBasis> | null;
-    if (production) {
-      layer = store.get<LayerBasis>(production.layer.id, production.layer.revision);
-      if (!layer || layer.id !== production.layer.id || layer.revision !== production.layer.revision)
-        reject(frame.id, 'acceptance.layer', 'The exact result-layer revision named by the producer is absent');
-    } else {
-      // This first-event lookup is the previous producer's historical contract only.
-      layer = store.history<LayerBasis>(layerId).filter(row => object(row.value) && object(row.value.acceptance)
-        && canonical(row.value.acceptance.frame ?? null) === canonical(request.frame)).sort((a, b) => a.revision - b.revision)[0] ?? null;
-      if (!layer) reject(frame.id, 'acceptance.layer', 'The historical accepting frame needs its saved result layer');
-    }
+    const layer = store.get<LayerBasis>(production.layer.id, production.layer.revision);
+    if (!layer || layer.id !== production.layer.id || layer.revision !== production.layer.revision)
+      reject(frame.id, 'acceptance.layer', 'The exact result-layer revision named by the producer is absent');
     const found = envelope(store, { project, level, graph: frame.value.acceptance.graph, layer: reference(layer) });
     if (!object(found.layer.value.acceptance) || canonical(found.layer.value.acceptance.frame) !== canonical(request.frame))
       reject(layerId, 'acceptance.frame', 'The exact result layer must link back to this accepting frame');
@@ -272,17 +262,12 @@ function historicalBasis(store: Store, request: HistoricalLayerRequest, found: L
 function verifyHistoricalBasis(store: Store, request: HistoricalLayerRequest, found: LayerEnvelope): HistoricalLayerBasis {
   const { project, level, upper: upperRef } = request;
   const lower = found.layer, refs = found.references;
-  const frame = lower.value.acceptance?.frame ?? null;
-  // The request names the upper basis: a research layer's own proof must name exactly it (a relation of the request to the
-  // record, O(inputs) — nothing is read or derived again).
-  if (!frame) {
-    const own = (lower.value.layerProofs ?? []).filter(proof => proof.level === level);
-    const bases = own.length === 1 ? unique(own[0]!.inputs.filter(ref => ref.id === upperRef.id)) : [];
-    if (bases.length !== 1 || canonical(bases[0]) !== canonical(upperRef))
-      reject(request.layer.id, "upper", "The own proof must name exactly this accepted upper basis");
-  }
-  let open: string[] = [], currentReferences = frame ? [upperRef, frame] : [request.graph, request.layer, upperRef];
-  if (frame && level === 3) {
+  const frame = lower.value.acceptance?.frame;
+  if (!frame) reject(request.layer.id, "acceptance", "A historical layer must name its recorded OM acceptance");
+  if (!lower.value.layerProofs?.some(proof => proof.level === level))
+    reject(request.layer.id, "layerProofs", "An accepted layer needs its own derivation proof");
+  let open: string[] = [], currentReferences = [upperRef, frame];
+  if (level === 3) {
     const savedFrame = exactRecord<Record<string, unknown>>(store, frame, `om-frame:${project}:3`, "connection-frame", refs).value;
     if (object(savedFrame) && !Object.hasOwn(savedFrame, "acceptance")) {
       const rebase = proveRebasedLayer(store, request, found);
@@ -290,11 +275,10 @@ function verifyHistoricalBasis(store: Store, request: HistoricalLayerRequest, fo
       currentReferences = [...rebase.currentReferences, frame];
     }
   }
-  // The basis names its direct links as written: the upper it stands on, its accepting frame, and for a research layer the
-  // saved inputs of its own derivation proof — references only; none of them is read or proved again.
+  // The basis names its direct links as written: the upper it stands on and its accepting frame — references only; none
+  // of them is read or proved again.
   refs.push(upperRef);
-  if (!frame) refs.push(...(lower.value.layerProofs ?? []).filter(proof => proof.level === level).flatMap(proof => proof.inputs));
-  return { references: unique(refs), producer: frame ? "om" : "research", upper: upperRef, frame,
+  return { references: unique(refs), producer: "om", upper: upperRef, frame,
     currentReferences: unique(currentReferences), open };
 }
 
@@ -312,18 +296,17 @@ export function readUnacceptedLayer(store: Store, request: LayerAcceptanceReques
   requireRequest(store, request);
   if (request.level !== 2 && request.level !== 3) invalidRequest();
   return result(() => {
-    const found = envelope(store, request), { layer, graph } = found;
+    const found = envelope(store, request), { layer } = found;
     const nativeUnaccepted = !Object.hasOwn(layer.value, "acceptance")
       && !(layer.value.layerProofs ?? []).some(proof => proof.level >= request.level);
-    const lowerKinds = request.level === 2 ? ["operation", "work"] : ["work"];
-    if (!nativeUnaccepted || graph.value.version !== 2 && graph.value.nodes.some(node => lowerKinds.includes(node.kind)))
+    if (!nativeUnaccepted)
       reject(layer.id, "acceptance", "This producer does not establish that the lower layer is still unaccepted");
     return { references: found.references, currentReferences: unique([request.graph, request.layer]) };
   });
 }
 /** Hash the layer's own nodes, bindings and dependent definitions, excluding its inherited upper. */
 export function lowerLayerHash(graph: Graph, level: 2 | 3): string {
-  if ((level !== 2 && level !== 3) || !object(graph) || !graphShapes[graph.version === 2 ? 1 : 0]!(graph)) invalidRequest();
+  if ((level !== 2 && level !== 3) || !object(graph) || graph.version !== 2 || !graphShape(graph)) invalidRequest();
   const projection = projectGraph(graph, level), upper = projectGraph(graph, (level - 1) as 1 | 2);
   const own = (key: "anchors" | "joins" | "tests" | "edges" | "transfers" | "packets") => {
     const inherited = new Set((upper[key] ?? []).map(value => hashJson(value)));
@@ -337,10 +320,10 @@ export function lowerLayerHash(graph: Graph, level: 2 | 3): string {
 }
 /** Shared accepted-body derivation: the writer and historical reader must not define different acceptance records. */
 export function omAcceptedFrame(candidate: Revision<FrameCandidateRecord>, gate: AcceptedFrameGate | Sealed<AcceptedFrameGate>, graph: Ref, upper: Ref,
-  production?: FrameAcceptanceProduction): Sealed<OmAcceptedFrame> {
+  production: FrameAcceptanceProduction): Sealed<OmAcceptedFrame> {
   if (!object(candidate) || !isRef(candidate) || candidate.kind !== "frame-candidate" || candidate.revision !== 1
     || !object(candidate.value) || !text(candidate.value.project) || ![2, 3].includes(candidate.value.level)
-    || !object(candidate.value.graph) || !graphShapes[candidate.value.graph.version === 2 ? 1 : 0]!(candidate.value.graph)
+    || !object(candidate.value.graph) || candidate.value.graph.version !== 2 || !graphShape(candidate.value.graph)
     || !object(candidate.value.base) || !isRef(candidate.value.base.graph)
     || candidate.value.base.frame !== null && !isRef(candidate.value.base.frame)
     || !hash(candidate.value.graphHash) || !hash(candidate.value.layerHash) || !hash(candidate.value.upperHash)
@@ -348,7 +331,7 @@ export function omAcceptedFrame(candidate: Revision<FrameCandidateRecord>, gate:
     || !hash(gate.graphHash) || !Array.isArray(gate.findings) || gate.findings.length !== 0) invalidRequest();
   const value = candidate.value;
   const level = value.level, upperLevel = (level - 1) as 1 | 2;
-  if (production !== undefined && !productionShape(production, value.project, level)) invalidRequest();
+  if (!productionShape(production, value.project, level)) invalidRequest();
   if (level === 3 ? value.works?.contract !== WORKS_FRAME_CONTRACT || !('gate' in gate) || gate.gate !== 'G5'
     || !('basis' in gate) || !isRef(gate.basis) || !Array.isArray(gate.codes) || gate.codes.length !== 0
     : 'basis' in gate || 'gate' in gate) invalidRequest();
@@ -361,8 +344,8 @@ export function omAcceptedFrame(candidate: Revision<FrameCandidateRecord>, gate:
     candidateHash: value.graphHash, layerHash: value.layerHash,
     upperHash: value.upperHash, lowerHash: lowerLayerHash(value.graph, level), fills: acceptedCandidateFills(value.fills),
     acceptance: { producer: "om", candidate: reference(candidate), gate: { name: level === 3 ? "G5" : "G3", ...gate }, graph, upper,
-      ...(production === undefined ? {} : { ...production, binding: production.binding === null ? null
-        : { ...production.binding, obligations: sorted(production.binding.obligations) } }) } }) as Sealed<OmAcceptedFrame>;
+      contract: production.contract, binding: production.binding === null ? null
+        : { ...production.binding, obligations: sorted(production.binding.obligations) }, layer: { ...production.layer } } }) as Sealed<OmAcceptedFrame>;
 }
 
 /** The accepted L3 envelope exposes its exact D7 pair to native consumers of layer inputs. */
@@ -385,7 +368,7 @@ export function buildAcceptedLayer(candidate: Revision<FrameCandidateRecord>, up
     || !object(upper) || !isRef(upper) || upper.kind !== 'graph-layer'
     || !validLayer(upper.value, (candidate.value.level - 1) as 1 | 2)
     || upper.hash !== hashJson(upper.value) || !object(candidate.value.graph)
-    || !graphShapes[candidate.value.graph.version === 2 ? 1 : 0]!(candidate.value.graph)) invalidRequest();
+    || candidate.value.graph.version !== 2 || !graphShape(candidate.value.graph)) invalidRequest();
   const proof = acceptedLayerProof(candidate, reference(upper), frame);
   if (canonical(upper.value.projection) !== canonical(projectGraph(candidate.value.graph, (candidate.value.level - 1) as 1 | 2))) invalidRequest();
   const proofs = [...(upper.value.layerProofs ?? []), { ...proof, inputs: [...proof.inputs] }];
@@ -455,16 +438,18 @@ function rebaseBasis(store: Store, request: FrameRebaseRequest, fresh: boolean):
   if (fresh && lowerLayerHash(originalGraph, 3) !== lowerLayerHash(graph, 3))
     reject(request.to.graph.id, "rebase.lower", "A rebase cannot change the accepted work layer's own content");
   const old = exactRecord<ConnectionFrame & Partial<OmRebasedFrame>>(store, request.from.frame!, `om-frame:${project}:3`, "connection-frame", refs).value;
+  if (old.worksContract !== WORKS_FRAME_CONTRACT)
+    reject(request.from.frame!.id, "rebase.worksContract", "The carried work layer needs its recorded works contract");
   const oldLayer = readLayer(store, request.from.layer!, project, 3, refs);
   if (fresh && old.retired !== undefined && (!object(oldLayer.value.acceptance)
     || canonical(oldLayer.value.acceptance.frame) !== canonical(request.from.frame) || !old.rebase || !Array.isArray(old.retired)))
     reject(request.from.frame!.id, "rebase.retired", "Retired fills need their exact prior verified OM rebase event");
   const carried = rebaseTake(carryFrameFills(after.upper as Graph, after.scope as Parameters<typeof carryFrameFills>[1],
     { graph, reference: request.to.graph }, { obligations: before.result.obligations, fills: old.fills,
-      ...(old.worksContract === WORKS_FRAME_CONTRACT ? { worksContract: WORKS_FRAME_CONTRACT } : {}) } as FrameCarrySource,
+      worksContract: WORKS_FRAME_CONTRACT } as FrameCarrySource,
     after.upperRef, request.to.level));
   const fills = carried.fills as FrameFill[], retired = sorted([...(old.retired ?? []), ...carried.retired]);
-  const rebased: OmRebasedFrame = { project, level: 3, ...(old.worksContract === WORKS_FRAME_CONTRACT ? { worksContract: WORKS_FRAME_CONTRACT } : {}), candidateHash: old.candidateHash,
+  const rebased: OmRebasedFrame = { project, level: 3, worksContract: WORKS_FRAME_CONTRACT, candidateHash: old.candidateHash,
     layerHash: hashJson(projectGraph(graph, 3)), upperHash: hashJson(projectGraph(graph, 2)), lowerHash: lowerLayerHash(graph, 3),
     fills, retired, rebasedFrom: request.from.frame!, rebase: request };
   return { frame: rebased, upper: after.upperRef, references: unique(refs),
@@ -474,12 +459,12 @@ function rebaseBasis(store: Store, request: FrameRebaseRequest, fresh: boolean):
 /** The writer and historical verifier derive the same explicitly carried proof envelope. */
 export function buildRebasedLayer(request: RebasedLayerRequest): Sealed<LayerBasis> {
   if (!object(request) || !object(request.frame) || !isRef(request.reference) || !object(request.graph)
-    || !graphShapes[request.graph.version === 2 ? 1 : 0]!(request.graph) || !isRef(request.upper) || !isRef(request.previous)
+    || request.graph.version !== 2 || !graphShape(request.graph) || !isRef(request.upper) || !isRef(request.previous)
     || !validLayer(request.upper.value, 2) || !validLayer(request.previous.value, 3) || !validRebaseRequest(request.frame.rebase)
     || !text(request.frame.project) || !hash(request.frame.candidateHash) || !hash(request.frame.layerHash)
     || !hash(request.frame.upperHash) || !hash(request.frame.lowerHash) || !Array.isArray(request.frame.fills)
     || !Array.isArray(request.frame.retired) || !isRef(request.frame.rebasedFrom)
-    || Object.hasOwn(request.frame, 'worksContract') && request.frame.worksContract !== WORKS_FRAME_CONTRACT) invalidRequest();
+    || request.frame.worksContract !== WORKS_FRAME_CONTRACT) invalidRequest();
   const { frame, graph, upper, previous } = request, project = frame.project;
   for (const rows of [frame.fills, frame.retired]) {
     if (!Array.from(rows).every(fill => object(fill) && ["accepted", "identity"].includes(fill.source))) invalidRequest();

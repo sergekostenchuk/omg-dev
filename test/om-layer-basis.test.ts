@@ -1,5 +1,4 @@
 import test from "node:test";
-import { checkStoreIntegrity } from "../src/storage/fsck.js";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
@@ -8,28 +7,20 @@ import { join } from "node:path";
 import { canonical, hashJson } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { Evidence, type Source } from "../src/evidence/evidence.js";
-import type { ResearchAnswer, ResearchAssessment } from "../src/discovery/research-model.js";
-import type { Question } from "../src/discovery/discovery.js";
+import type { ResearchAssessment } from "../src/discovery/research-model.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store } from "../src/storage/store.js";
 import { removeProofCache } from "../src/storage/schema.js";
-import { ProductEngine } from "../src/product/engine.js";
 import type { OmResult } from "../src/om/refusal.js";
-import { readLayerBasis, readLayerEnvelope, readLayerAcceptance, readUnacceptedLayer, readRebaseBasis, buildRebasedLayer, acceptedCandidateFills, lowerLayerHash, omAcceptedFrame, acceptedLayerProof,
-  type LayerBasis, type OmAcceptedFrame, type OmRebasedFrame, type RebasedLayerRequest, type LayerEnvelopeRequest } from "../src/om/layer-basis.js";
+import { readLayerBasis, readLayerAcceptance, readUnacceptedLayer, readRebaseBasis, buildRebasedLayer, acceptedCandidateFills, lowerLayerHash, omAcceptedFrame, acceptedLayerProof,
+  type LayerBasis, type OmAcceptedFrame, type OmRebasedFrame, type RebasedLayerRequest } from "../src/om/layer-basis.js";
 import { prepareHorizon, readHorizon, writeHorizon, type HorizonRecord, type HorizonRequest } from "../src/om/horizon.js";
 import { prepareFrame, readFrame, type FrameRequest } from "../src/om/frame-obligations.js";
 import { createOmFixture, type FixtureLayer, type OmFixture } from "./om-fixture.js";
-import { exampleGraph } from "./graph-fixture.js";
 import { writeCandidate, gateCandidate, readCandidate as importedReadCandidate, type FrameCandidateRecord, type CandidateGate } from "../src/om/frame-candidate.js";
 import type { Revision, Write } from "../src/storage/store.js";
 import { prepareSettleCandidate, settleCandidate, type SettleCandidateRequest } from "../src/om/frame-accept.js";
 import type { Graph } from "../src/graph/model.js";
-import { preparedFeatures } from "./product-fixture.js";
-import { answerTechnicalFixture } from "./technical-research-fixture.js";
-import { layerDesignOf } from "../src/graph/layer-design.js";
-import { acceptanceBindingId } from "../src/discovery/research-consumer-transition.js";
-import { paidOriginId } from "../src/discovery/assessment-session.js";
 
 type LayerBasisRequest = Parameters<typeof readLayerBasis>[1];
 const levels = [2, 3] as const;
@@ -151,54 +142,6 @@ test("the shared acceptance reader validates both OM levels, its complete bounda
   }
 });
 
-test("the legacy envelope accepts native v1 refinement without an own proof while retaining evidence integrity", t => {
-  const root = mkdtempSync(join(tmpdir(), "omg-legacy-layer-")), store = new Store(join(root, "state.sqlite"));
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  const engine = new ProductEngine(store);
-  engine.execute({ type: "create-project", project: "legacy", title: "Legacy" });
-  const initial = engine.graphs.save("legacy", exampleGraph("legacy"), 0, "owner");
-  const draft = engine.discovery.create("legacy", "om-g2", "R1", "legacy-produce-operation", [{
-    field: "title", kind: "decision", prompt: "Choose the operation title", risk: "A title must name its operation", schema: { type: "string" },
-  }]);
-  const answered = engine.discovery.decision(draft.value.questions[0]!, 1, "owner", "Accepted legacy producer");
-  const graph = engine.graphs.refine("legacy", initial.revision, reference(answered), "owner");
-  const layer = store.get<LayerBasis>("graph-layer:legacy:2")!;
-  assert.equal(graph.value.version, 1);
-  assert.equal(layer.value.layerProofs, undefined);
-  assert.equal(layer.value.obligations.length, 1);
-  assert.ok(layer.value.inputs.length > 0);
-  const request: LayerEnvelopeRequest = { project: "legacy", level: 2, graph: reference(graph), layer: reference(layer) };
-  const before = revisions(store), saved = delivered(readLayerEnvelope(store, request));
-  assert.deepEqual(saved.graph, graph);
-  assert.deepEqual(saved.layer, layer);
-  assert.deepEqual(revisions(store), before);
-  assert.throws(() => readLayerEnvelope(store, undefined as unknown as LayerEnvelopeRequest), malformed);
-  const incorrectRef = { ...request, layer: { ...request.layer, hash: "0".repeat(64) } };
-  refusedAs(readLayerEnvelope(store, incorrectRef), "layer_basis_unproven");
-  const variants: { field: string; change: (value: LayerBasis) => void }[] = [
-    { field: "inputs", change: value => { value.inputs = []; } },
-    { field: "obligations", change: value => { value.obligations[0]!.valueHash = "0".repeat(64); } },
-    { field: "layerProofs", change: value => { value.layerProofs = [{ level: 2, hash: "0".repeat(64), inputs: [] }]; } },
-  ];
-  for (const variant of variants) {
-    const value = clone(layer.value); variant.change(value);
-    const changed = store.write({ id: layer.id, kind: layer.kind, expected: store.get(layer.id)!.revision, value });
-    const beforeRead = revisions(store);
-    const refusal = refusedAs(readLayerEnvelope(store, { ...request, layer: reference(changed) }), "layer_basis_unproven");
-    assert.equal(refusal.at.field, variant.field);
-    assert.deepEqual(delivered(readLayerEnvelope(store, request)), saved);
-    assert.deepEqual(revisions(store), beforeRead);
-  }
-  for (const error of [new TypeError("legacy envelope failure"), new EngineError("record_corrupt", "legacy corruption", { target: graph.id })]) {
-    const get = store.get.bind(store), beforeRead = revisions(store);
-    try {
-      store.get = ((id: string, revision?: number) => { if (id === graph.id) throw error; return get(id, revision); }) as Store["get"];
-      assert.throws(() => readLayerEnvelope(store, request), actual => actual === error);
-    } finally { store.get = get; }
-    assert.deepEqual(revisions(store), beforeRead);
-  }
-});
-
 test("an unused exact source in a proof is refused consistently by the shared reader, G2 and both frame paths", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   const { f, request, horizon } = await fixture(t);
   const validBasis = basisRequest(f, 2), validFrame = frameRequest(f, reference(horizon.gate), 2);
@@ -313,14 +256,17 @@ test("OM acceptance builders preserve exact fill sources, distinguish the own lo
   const gate = delivered(gateCandidate(f.store, { project: f.project, candidate: reference(candidate) })) as CandidateGate;
   const graph = { id: candidate.value.base.graph.id, revision: candidate.value.base.graph.revision + 1, hash: candidate.value.graphHash };
   const upper = basisRequest(f, 2).upper, before = revisions(f.store);
-  const saved = omAcceptedFrame(candidate, gate, graph, upper);
+  const production = { contract: "om-frame-acceptance/v1" as const, binding: null,
+    layer: { id: `graph-layer:${f.project}:2`, revision: 2 } };
+  const saved = omAcceptedFrame(candidate, gate, graph, upper, production);
   const frameRef = { id: `om-frame:${f.project}:2`, revision: 1, hash: hashJson(saved) };
   const proof = acceptedLayerProof(candidate, upper, frameRef);
   assert.deepEqual(proof, { level: 2, hash: candidate.value.layerHash,
     inputs: [upper, reference(candidate), frameRef].sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0) });
   assert.ok(Object.isFrozen(proof) && Object.isFrozen(proof.inputs));
   assert.equal(saved.candidateHash, candidate.value.graphHash);
-  assert.deepEqual(saved.acceptance, { producer: "om", candidate: reference(candidate), gate: { name: "G3", ...gate }, graph, upper });
+  assert.deepEqual(saved.acceptance, { producer: "om", candidate: reference(candidate), gate: { name: "G3", ...gate }, graph, upper,
+    contract: "om-frame-acceptance/v1", binding: null, layer: { id: `graph-layer:${f.project}:2`, revision: 2 } });
   assert.deepEqual(saved.fills, acceptedCandidateFills(candidate.value.fills));
   assert.deepEqual(saved.fills.map(fill => fill.basis).sort((a, b) => canonical(a).localeCompare(canonical(b))),
     candidate.value.fills.map(fill => fill.basis).sort((a, b) => canonical(a).localeCompare(canonical(b))));
@@ -331,21 +277,26 @@ test("OM acceptance builders preserve exact fill sources, distinguish the own lo
   changed.nodes.find(node => node.kind === "work")!.title += " changed work";
   assert.notEqual(lowerLayerHash(changed, 3), lowerLayerHash(f.graph, 3));
   for (const value of [undefined, null, [], 0, "bad"]) {
-    assert.throws(() => omAcceptedFrame(value as unknown as Revision<FrameCandidateRecord>, gate, graph, upper), malformed);
-    assert.throws(() => omAcceptedFrame(candidate, value as unknown as CandidateGate, graph, upper), malformed);
-    assert.throws(() => omAcceptedFrame(candidate, gate, value as unknown as Ref, upper), malformed);
-    assert.throws(() => omAcceptedFrame(candidate, gate, graph, value as unknown as Ref), malformed);
+    assert.throws(() => omAcceptedFrame(value as unknown as Revision<FrameCandidateRecord>, gate, graph, upper, production), malformed);
+    assert.throws(() => omAcceptedFrame(candidate, value as unknown as CandidateGate, graph, upper, production), malformed);
+    assert.throws(() => omAcceptedFrame(candidate, gate, value as unknown as Ref, upper, production), malformed);
+    assert.throws(() => omAcceptedFrame(candidate, gate, graph, value as unknown as Ref, production), malformed);
     assert.throws(() => acceptedLayerProof(value as unknown as Revision<FrameCandidateRecord>, upper, frameRef), malformed);
     assert.throws(() => acceptedLayerProof(candidate, value as unknown as Ref, frameRef), malformed);
     assert.throws(() => acceptedLayerProof(candidate, upper, value as unknown as Ref), malformed);
     assert.throws(() => lowerLayerHash(value as unknown as Graph, 2), malformed);
     if (!Array.isArray(value)) assert.throws(() => acceptedCandidateFills(value as unknown as FrameCandidateRecord['fills']), malformed);
   }
-  assert.throws(() => omAcceptedFrame(candidate, { ...gate, graphHash: "0".repeat(64) }, graph, upper), malformed);
+  assert.throws(() => omAcceptedFrame(candidate, { ...gate, graphHash: "0".repeat(64) }, graph, upper, production), malformed);
   for (const addition of [{ basis: reference(candidate) }, { gate: "G5" }, { worksContract: "works-frame/v1", gate: "G5", basis: reference(candidate), codes: [] }])
-    assert.throws(() => omAcceptedFrame(candidate, { ...gate, ...addition }, graph, upper), malformed);
-  assert.throws(() => omAcceptedFrame(candidate, gate, { ...graph, revision: graph.revision + 1 }, upper), malformed);
-  assert.throws(() => omAcceptedFrame(candidate, gate, graph, { ...upper, id: "graph-layer:foreign:1" }), malformed);
+    assert.throws(() => omAcceptedFrame(candidate, { ...gate, ...addition }, graph, upper, production), malformed);
+  assert.throws(() => omAcceptedFrame(candidate, gate, { ...graph, revision: graph.revision + 1 }, upper, production), malformed);
+  assert.throws(() => omAcceptedFrame(candidate, gate, graph, { ...upper, id: "graph-layer:foreign:1" }, production), malformed);
+  for (const bad of [undefined, null, {}, { ...production, contract: "foreign/v1" }, { ...production, binding: {} },
+    { ...production, binding: { series: upper, ordinal: 1, obligations: ["x"], extra: 1 } },
+    { ...production, layer: { id: `graph-layer:foreign:2`, revision: 1 } }, { ...production, layer: { id: `graph-layer:${f.project}:2`, revision: 0 } },
+    { contract: production.contract, binding: production.binding }, { ...production, extra: 1 }])
+    assert.throws(() => omAcceptedFrame(candidate, gate, graph, upper, bad as Parameters<typeof omAcceptedFrame>[4]), malformed);
   assert.throws(() => acceptedLayerProof(candidate, { ...upper, id: "graph-layer:foreign:1" }, frameRef), malformed);
   assert.throws(() => acceptedLayerProof(candidate, upper, { ...frameRef, id: "om-frame:foreign:2" }), malformed);
   const withoutWorks = { ...candidate.value, level: 3 as const };
@@ -506,6 +457,8 @@ test("the rebase layer builder rejects forged graph hashes and malformed or nonc
   for (const field of ["layerHash", "upperHash", "lowerHash"] as const) rejects({ ...frame, [field]: "0".repeat(64) });
   for (const worksContract of [null, "", "works-frame/v2", "research"])
     rejects({ ...frame, worksContract });
+  const { worksContract: _dropped, ...withoutWorksContract } = frame;
+  rejects(withoutWorksContract);
   assert.ok(frame.fills.length > 1);
   for (const field of ["fills", "retired"] as const) {
     for (const value of [null, {}, [null], [{ ...frame.fills[0], source: "proposed" }],
@@ -579,84 +532,3 @@ test("D8.4.2: a damaged assessment inside the layer's saved proof refuses the hi
   f.reopen();
   assert.deepEqual(delivered(readLayerBasis(f.store, request)).references, baseline.references);
 });
-
-// ── D8.4.2 круг 2 (№2276-2): managed-ответ в основании слоя достижим и читается исторически ──
-
-test("D8.4.2-2 P2-2 (№2276-2): a layer built on a managed layerDesign answer is historically readable — its K chain is proven on the original store and joins the trail; a damaged K or paid origin refuses, the restored record reads again", async t => {
-  const root = mkdtempSync(join(tmpdir(), "omg-d842-managed-layer-"));
-  const database = join(root, "state.sqlite"), stores: Store[] = [];
-  const open = () => { const db = new Store(database); stores.push(db); return db; };
-  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
-  const store = open(), engine = new ProductEngine(store), project = "garden";
-  writeFileSync(join(root, "README.md"), "Garden design evidence.\n");
-  preparedFeatures(engine, project);
-  const source = engine.discovery.evidence.document(project, "layer-proof", "Grounded layer design", "text/plain", 0);
-  const adapter = join(root, "layer-adapter.mjs");
-  const command = { executable: process.execPath, args: [adapter] };
-  engine.environments.configure(project, { workspace: root,
-    implementer: { actor: "author", model: "fixture", effort: "high", command },
-    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 5000 }, 0);
-  const r0 = engine.refinement.begin(project, "R0");
-  engine.refinement.finishResearch(project, "R0", reference(store.get(r0.id)!), 0);
-  engine.refinement.sealLayer(project, 1, 0);
-  const r1 = engine.refinement.begin(project, "R1");
-  answerTechnicalFixture(engine, project, r1);
-  engine.refinement.finishResearch(project, "R1", reference(store.get(r1.id)!), 0);
-  const draft = engine.refinement.prepareLayer(project, 2), graph = store.get<Graph>(`graph:${project}`)!;
-  const question = store.get<Question>(draft.value.questions[0]!)!;
-  const value = layerDesignOf(graph.value, 2, question.value.spec.layerAssembly);
-  writeFileSync(adapter, `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),s=r.subject;
-const research=s.role==='assess-answer'?{verdict:'supported',reasons:[]}
- :{action:'answer',question:s.questions[0].id,value:${JSON.stringify(value)},citations:[{source:${JSON.stringify(reference(source))},selector:{kind:'text-range',start:0,end:${source.value.content.length}}}]};
-console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:5,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
-  const run = await engine.researcher.run(project, draft.id, 1);
-  assert.equal(run.value.status, "completed", JSON.stringify(run.value));
-  const answered = store.get<Question>(question.id)!, answer = store.get<ResearchAnswer>(answered.value.answer!.id)!;
-  assert.ok(answer.id.includes(":managed-v1:"), "the layer design answer is a managed acceptance");
-  const turnId = decodeURIComponent(answer.id.split(":managed-v1:")[1]!);
-  const bindingId = acceptanceBindingId(project, turnId), originId = paidOriginId(project, turnId);
-  const built = engine.refinement.buildLayer(project, 2, reference(store.get(draft.id)!), graph.revision, "fixture");
-  const layer = store.get(`graph-layer:${project}:2`)!, upper = store.get(`graph-layer:${project}:1`)!;
-  const request = { project, level: 2 as const, graph: reference(built), layer: reference(layer), upper: reference(upper) };
-  assert.ok((layer.value as unknown as { layerProofs: { level: number; inputs: Ref[] }[] }).layerProofs.find(item => item.level === 2)!.inputs
-    .some(ref => ref.id === bindingId), "the exact K is a saved basis of the layer proof");
-  const baseline = delivered(readLayerBasis(open(), request));
-  assert.ok(baseline.references.some(ref => ref.id === bindingId), "the K joins the historical trail");
-  // NR1 (№3600): the K's own chain (its paid origin) was proved when the K was accepted; the layer names the K, not its chain.
-  void originId;
-  const damage = (id: string, mutate: (value: Record<string, unknown>) => Record<string, unknown>) => {
-    const saved = store.get<Record<string, unknown>>(id)!;
-    const raw = new DatabaseSync(database);
-    try {
-      raw.exec("DROP TRIGGER IF EXISTS revisions_no_update");
-      raw.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
-        .run(canonical(mutate(saved.value)), hashJson(mutate(saved.value)), id, saved.revision);
-    } finally { raw.close(); }
-    // PF4 (№3499, №3533): an in-place change of an immutable revision is no event; the saved checks go with it.
-    removeProofCache(database);
-    return () => {
-      const raw2 = new DatabaseSync(database);
-      try {
-        raw2.exec("DROP TRIGGER IF EXISTS revisions_no_update");
-        raw2.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?").run(canonical(saved.value), hashJson(saved.value), id, saved.revision);
-      } finally { raw2.close(); }
-      removeProofCache(database);
-    };
-  };
-  for (const [name, id, mutate, address] of [
-    // K is itself a saved prerequisite of the layer proof: its change refuses at the exact-inputs check; the paid origin
-    // M is a source of the K chain proven on the original store: its change refuses through the common reader by address.
-    ["K", bindingId, (value: Record<string, unknown>) => ({ ...value, turn: { ...(value['turn'] as Ref), revision: 2 } }), "exact saved research prerequisites"],
-    ["paid origin M", originId, (value: Record<string, unknown>) => ({ ...value, application: "foreign-assessment-application" }), "assessment-paid-origin:"],
-  ] as const) {
-    const restore = damage(id, mutate);
-    // NR1 (№3646): the layer is read as written; the change made by another connection is found by om-fsck at the start —
-    // the saved proof of the layer still names the K by its old hash.
-    void address;
-    const findings = checkStoreIntegrity(open()).findings;
-    assert.ok(findings.length > 0, `${name}: om-fsck finds the changed revision`);
-    restore();
-    assert.deepEqual(delivered(readLayerBasis(open(), request)).references, baseline.references, `${name}: restored`);
-  }
-});
-

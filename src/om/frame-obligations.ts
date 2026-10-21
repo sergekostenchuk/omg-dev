@@ -924,14 +924,8 @@ export function prepareHorizonBasis(store: Store, request: HorizonBasisRequest):
 export function prepareLayerAcceptance(store: Store, request: LayerAcceptanceRequest): OmResult<Sealed<HistoricalLayerBasis & { guards: TransactionGuard[] }>> {
   return frameResult(() => withGraphRead(() => {
     const basis = frameLayerAcceptance(store, request);
-    const { guards, checkHeads, acceptGate } = frameCurrentSources(store);
+    const { guards, checkHeads } = frameCurrentSources(store);
     checkHeads([request.graph, request.layer, ...basis.currentReferences]);
-    if (basis.producer === "research") {
-      const engine = new StageChecks(store);
-      acceptGate(engine.graphs.layerGate(request.project, request.level, request.layer), `layer.${request.level}`);
-      const phase = request.level === 2 ? "R1" : "R2";
-      acceptGate(engine.refinement.gate(request.project, phase), `refinement.${phase}`);
-    }
     return { ...basis, guards: frameSorted(uniqueTransactionGuards([...guards.values()])) };
   }));
 }

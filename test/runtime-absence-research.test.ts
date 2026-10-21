@@ -699,36 +699,50 @@ test('D8.2 genuine gates preserve positive acceptance sources and new OM prepara
   const horizonRequest: import('../src/om/horizon.js').HorizonRequest = { project: 'p', graph, input: reference(input),
     refinement: null, choice: { choiceVersion: 'd82-historical-gates',
       features: [{ outcome: 'p-result' }], excluded: [] }, available: {} };
-  const horizon = value(writeHorizon(f.store, horizonRequest)), horizonRef = reference(horizon.gate);
-  const layerRequest = { project: 'p', graph, level: 2 as const, layer: reference(f.store.get('graph-layer:p:2')!) };
-  // Before any real N2 the only honest frame request is the L2 one: an L3 request needs an upper
-  // witness proving an accepted L2, which does not exist yet in the stage-only window.
-  const frameRequest: import('../src/om/frame-obligations.js').FrameRequest = { project: 'p', graph, level: 2,
-    layer: reference(f.store.get('graph-layer:p:2')!), horizon: horizonRef, frame: null, upper: null };
+  value(writeHorizon(f.store, horizonRequest));
+  // Before any real N2 the only honest frame request is the L2 one with layer/frame/upper null:
+  // an L3 request needs an upper witness proving an accepted L2, which does not exist yet.
   const before = canonical(f.store.list().flatMap(head => f.store.history(head.id)));
-  const prepared = [value(prepareOmInput(f.store, inputRequest)), value(prepareHorizon(f.store, horizonRequest)),
-    value(prepareLayerAcceptance(f.store, layerRequest)), value(prepareFrame(f.store, frameRequest))];
-  const frameAbsence = [{ id: 'om-frame:p:2', absent: true }];
-  for (const [index, item] of prepared.entries()) {
-    assert.deepEqual(item.guards.filter(guard => !isRef(guard)), index === 3 ? frameAbsence : []);
+  const preparedInput = value(prepareOmInput(f.store, inputRequest));
+  const preparedHorizon = value(prepareHorizon(f.store, horizonRequest));
+  for (const item of [preparedInput, preparedHorizon]) {
+    assert.deepEqual(item.guards.filter(guard => !isRef(guard)), []);
     const positive = item.guards.filter(isRef);
     for (const guard of positive) assert.deepEqual(guard, reference(f.store.get(guard.id, guard.revision)!));
   }
-  const currentLayer = value(prepareLayerAcceptance(f.store, layerRequest));
-  const historicalLayer = value(readLayerAcceptance(f.store, layerRequest));
-  const { guards: _guards, ...historicalBody } = currentLayer;
-  assert.deepEqual(historicalBody, historicalLayer, 'Adding current admission never changes the checked accepted layer content or source references');
   assert.deepEqual(f.store.get(phase.id, phase.revision), phase);
-  assert.equal(canonical(f.store.list().flatMap(head => f.store.history(head.id))), before, 'Preparing all four real OM entrances is read-only');
+  assert.equal(canonical(f.store.list().flatMap(head => f.store.history(head.id))), before, 'Preparing both real OM entrances is read-only');
   assert.equal(f.store.get('reader-pilot:p'), null);
   assert.equal(f.store.get('execution-root:p'), null);
+  // The honest first OM frame needs a store without any proved lower layer — this store already
+  // carries a research-sealed L2 and pretending it absent would be false, so the frame window
+  // moves to a separate stage-only fixture where om-frame:p:2 is genuinely missing.
+  const { createOmFixture } = await import('./om-fixture.js');
+  const s = await createOmFixture(t, 'standard', 'p', { mode: 'stages' });
+  const sInputRequest: import('../src/om/input.js').InputRequest = { project: 'p', expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(s.stages[stage])])) as import('../src/om/input.js').InputRequest['stages'] };
+  const sInput = value(writeOmInput(s.store, sInputRequest));
+  const sGraph = reference(s.graphRevision);
+  const sHorizonRequest: import('../src/om/horizon.js').HorizonRequest = { project: 'p', graph: sGraph, input: reference(sInput),
+    refinement: null, choice: { choiceVersion: 'd82-first-frame', features: [{ outcome: 'p-result' }], excluded: [] }, available: {} };
+  const sHorizon = value(writeHorizon(s.store, sHorizonRequest));
+  const sFrameRequest: import('../src/om/frame-obligations.js').FrameRequest = { project: 'p', graph: sGraph, level: 2,
+    layer: null, horizon: reference(sHorizon.gate), frame: null, upper: null };
+  const sBefore = canonical(s.store.list().flatMap(head => s.store.history(head.id)));
+  const preparedFrame = value(prepareFrame(s.store, sFrameRequest));
+  const frameAbsence = [{ id: 'om-frame:p:2', absent: true }];
+  assert.deepEqual(preparedFrame.guards.filter(guard => !isRef(guard)), frameAbsence,
+    'The stage-only window still has no operations frame');
+  for (const guard of preparedFrame.guards.filter(isRef))
+    assert.deepEqual(guard, reference(s.store.get(guard.id, guard.revision)!));
+  assert.equal(canonical(s.store.list().flatMap(head => s.store.history(head.id))), sBefore, 'The first OM frame preparation is read-only');
   for (const absent of frameAbsence) {
-    const saved = await f.store.snapshot(join(f.root, `frame-absence-${absent.id.split(':').at(-1)}`));
+    const saved = await s.store.snapshot(join(s.root, `frame-absence-${absent.id.split(':').at(-1)}`));
     const competing = new Store(saved.path);
     try {
       competing.write({ id: absent.id, kind: 'connection-frame', expected: 0, value: {} });
       const beforeRace = canonical(competing.list().flatMap(head => competing.history(head.id)));
-      const result = writeGuarded(competing, { unit: 'C4', target: 'p', guards: prepared[3]!.guards,
+      const result = writeGuarded(competing, { unit: 'C4', target: 'p', guards: preparedFrame.guards,
         writes: [{ id: 'fix-c:frame-result', kind: 'frame-result', expected: 0, value: {} },
           { id: 'fix-c:neighbor', kind: 'neighbor', expected: 0, value: {} }] });
       assert.equal(result.ok, false);
@@ -741,10 +755,18 @@ test('D8.2 genuine gates preserve positive acceptance sources and new OM prepara
   }
   // The second honest window runs on a real post-N2 store: fixture mode 'n2' performs the actual
   // N2 producers, so om-frame:p:2 exists and om-frame:p:3 is the frame that does not exist yet.
-  const { createOmFixture } = await import('./om-fixture.js');
   const n2 = await createOmFixture(t, 'standard', 'p', { mode: 'n2' });
   const graphN = reference(n2.graphRevision), layerN = reference(n2.layers[2]);
   const frameN = reference(n2.store.get('om-frame:p:2')!);
+  // The accepted OM L2 is the same checked body through the preparing and the historical readers:
+  // current admission adds guards but never changes content or source references.
+  const layerRequestN = { project: 'p', graph: graphN, level: 2 as const, layer: layerN };
+  const beforeN2 = canonical(n2.store.list().flatMap(head => n2.store.history(head.id)));
+  const currentLayer = value(prepareLayerAcceptance(n2.store, layerRequestN));
+  const historicalLayer = value(readLayerAcceptance(n2.store, layerRequestN));
+  const { guards: _guards, ...historicalBody } = currentLayer;
+  assert.deepEqual(historicalBody, historicalLayer, 'Adding current admission never changes the checked accepted layer content or source references');
+  assert.equal(canonical(n2.store.list().flatMap(head => n2.store.history(head.id))), beforeN2, 'Both layer readings are read-only');
   const worksRequest: import('../src/om/horizon.js').HorizonRequest = { project: 'p', graph: graphN,
     input: reference(n2.store.get('om-input:p')!), refinement: layerN, choice: { choiceVersion: 'd82-works',
       features: [{ outcome: 'p-result' }], excluded: [] }, available: {} };
