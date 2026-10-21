@@ -152,4 +152,16 @@ export interface DiscoveryAttemptsAssessmentV2 extends Omit<DiscoveryAttemptsAss
   contract: typeof DISCOVERY_ASSESSMENT_CONTRACT_V2;
   methodology: import("./assessment-methodology.js").AssessmentMethodology;
 }
-export type VersionedDiscoveryAttemptsAssessment = DiscoveryAttemptsAssessment | DiscoveryAttemptsAssessmentV2;
+export const DISCOVERY_ASSESSMENT_CONTRACT_V3 = 'discovery-assessment/v3' as const;
+export interface V7QuestionTransitionV3 extends Omit<V7QuestionTransition, 'sufficiency'> {
+  sufficiency?: NonNullable<V7QuestionTransition['sufficiency']> & {
+    methodologyRequirements: import('./assessment-methodology.js').MethodologyRequirement[];
+  };
+}
+export interface DiscoveryAttemptsAssessmentV3 extends Omit<DiscoveryAttemptsAssessmentV2, 'contract' | 'methodology' | 'novelty'> {
+  contract: typeof DISCOVERY_ASSESSMENT_CONTRACT_V3;
+  methodology: import('./assessment-methodology.js').AssessmentMethodology<'assessment-methodology-policy/v2'>;
+  novelty: Omit<V7Novelty, 'transition'> & { transition: V7QuestionTransitionV3 | null };
+}
+export type PaidDiscoveryAttemptsAssessment = DiscoveryAttemptsAssessmentV2 | DiscoveryAttemptsAssessmentV3;
+export type VersionedDiscoveryAttemptsAssessment = DiscoveryAttemptsAssessment | PaidDiscoveryAttemptsAssessment;

@@ -1,4 +1,4 @@
-import { checkAssessmentMethodology } from "./assessment-methodology.js";
+import { checkAssessmentMethodology, checkMethodologyRequirements, ASSESSMENT_METHODOLOGY_POLICY, ASSESSMENT_METHODOLOGY_POLICY_V2 } from "./assessment-methodology.js";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
@@ -13,7 +13,7 @@ import { proveClaimAddress, resolveClaimAddress, type ClaimAddress, type Resolve
 import { readDiscoveryConditionDecision, type DiscoveryConditionDecision } from "./discovery-outcome.js";
 import type { Source } from "../evidence/evidence.js";
 import { DISCOVERY_ASSESSMENT_CONTRACT, V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT,
-  type VersionedDiscoveryAttemptsAssessment, DISCOVERY_ASSESSMENT_CONTRACT_V2, type V7AttemptPacket, type V7AttemptPacketEntry, type V7Novelty,
+  type VersionedDiscoveryAttemptsAssessment, DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type V7AttemptPacket, type V7AttemptPacketEntry, type V7Novelty,
   type V7ProgressBaseline, type V7QuestionTransition } from "./research-model.js";
 
 /* DR3b-M (codex-omg №7546 §1, the M slice): the subject, the forms and the keys of a v7 attempts assessment.
@@ -283,7 +283,7 @@ function claimRows(value: unknown, claims: Map<string, PacketClaim>, field: stri
 /** The machine-checkable completeness of the novelty (№7546 §1.3): absence, duplication or contradiction of the
  * classification is a typed refusal — never read as "nothing new". */
 function checkNovelty(store: Store, novelty: unknown, packet: ProvenAttemptPacket, baseline: V7ProgressBaseline,
-  verdict: "supported" | "return"): V7Novelty {
+  verdict: "supported" | "return", requirements: boolean): V7Novelty {
   if (!obj(novelty)) noveltyInvalid("novelty", "an attempts assessment carries its novelty classification");
   if (!exactKeys(novelty, NOVELTY_FIELDS)) noveltyInvalid("novelty", "the novelty carries exactly its contracted parts");
   attemptRows(novelty["attempts"], packet, "novelty.attempts", true);
@@ -314,7 +314,7 @@ function checkNovelty(store: Store, novelty: unknown, packet: ProvenAttemptPacke
       noveltyInvalid(`novelty.duplicates.${index}.of`,
         "a duplicate names an accepted baseline material or an earlier accepted claim of this packet");
   }
-  const transition = checkTransition(store, novelty["transition"], packet, verdict, acceptedKeys, materials);
+  const transition = checkTransition(store, novelty["transition"], packet, verdict, acceptedKeys, materials, requirements);
   // An attempt progresses when one of its claims is new content, or when its proven constraint is a basis of the
   // proposed transition; every other attempt is exactly the noProgress set.
   const progressed = new Set<string>();
@@ -330,7 +330,7 @@ function checkNovelty(store: Store, novelty: unknown, packet: ProvenAttemptPacke
 }
 
 function checkTransition(store: Store, value: unknown, packet: ProvenAttemptPacket, verdict: "supported" | "return",
-  accepted: Set<string>, materials: Set<string>): V7QuestionTransition | null {
+  accepted: Set<string>, materials: Set<string>, requirements: boolean): V7QuestionTransition | null {
   if (value === null) return null;
   const at = "novelty.transition";
   if (verdict === "return") noveltyInvalid(at, "a return proposes no transition");
@@ -368,10 +368,12 @@ function checkTransition(store: Store, value: unknown, packet: ProvenAttemptPack
   if (outcome === "closed") {
     // Closing needs the saved sufficiency decision against the accepted plan's own criterion and depth; the
     // assessor never changes them.
-    if (!obj(sufficiency) || !exactKeys(sufficiency, ["criterion", "requiredDepth", "reason"])
+    if (!obj(sufficiency) || !exactKeys(sufficiency, ["criterion", "requiredDepth", "reason", ...(requirements ? ["methodologyRequirements"] : [])])
       || sufficiency["criterion"] !== plan["criterion"] || sufficiency["requiredDepth"] !== plan["requiredDepth"]
       || !nonempty(sufficiency["reason"]))
       noveltyInvalid(`${at}.sufficiency`, "closing states sufficiency against the plan's own criterion and depth");
+    if (requirements) checkMethodologyRequirements(store, sufficiency["methodologyRequirements"],
+      bases as V7QuestionTransition["bases"], packet.packet.project);
   } else if (sufficiency !== undefined) noveltyInvalid(`${at}.sufficiency`, "only a closing states sufficiency");
   const blocking = plan["class"] === "blocking";
   for (const key of ["consequence", "nextAction"] as const) {
@@ -394,7 +396,8 @@ export interface CheckedAttemptsAssessment {
  * target, and the complete novelty. It never stands for a paid assessment, an application or an accepted claim. */
 export function checkDiscoveryAssessmentForm(store: Store, value: unknown): CheckedAttemptsAssessment {
   if (!obj(value)) subjectInvalid("assessment", "the assessment is an object");
-  const methodology = value["contract"] === DISCOVERY_ASSESSMENT_CONTRACT_V2;
+  const requirements = value["contract"] === DISCOVERY_ASSESSMENT_CONTRACT_V3;
+  const methodology = requirements || value["contract"] === DISCOVERY_ASSESSMENT_CONTRACT_V2;
   if (!methodology && value["contract"] !== DISCOVERY_ASSESSMENT_CONTRACT)
     subjectInvalid("contract", "the assessment carries a supported discovery-assessment discriminator");
   if (!exactKeys(value, methodology ? [...ASSESSMENT_FIELDS, "methodology"] : ASSESSMENT_FIELDS))
@@ -430,12 +433,12 @@ export function checkDiscoveryAssessmentForm(store: Store, value: unknown): Chec
       : exactKeys(target, ["claim"]) && claims.includes(canonical(target["claim"]));
     if (!lawful) noveltyInvalid("return.target", "a return target is one packet attempt or one of its claims");
   }
-  const novelty = checkNovelty(store, value["novelty"], packet, baseline, verdict);
+  const novelty = checkNovelty(store, value["novelty"], packet, baseline, verdict, requirements);
   if (methodology) checkAssessmentMethodology(store, value["methodology"], {
     project: packet.packet.project, planAnswer: packet.packet.planAnswer,
     planQuestionId: packet.packet.planQuestionId, blocking: (packet.planQuestion.question as Record<string, Json>)["class"] === "blocking",
     accepted: novelty.accepted.map(row => row.claim),
-  });
+  }, requirements ? ASSESSMENT_METHODOLOGY_POLICY_V2 : ASSESSMENT_METHODOLOGY_POLICY);
   return { value: value as unknown as VersionedDiscoveryAttemptsAssessment, packet, baseline };
 }
 

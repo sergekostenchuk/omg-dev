@@ -4,6 +4,7 @@ import { isRef, type Ref } from '../pipeline/contracts.js';
 import type { Store, Revision } from '../storage/store.js';
 import type { Selector, Source } from '../evidence/evidence.js';
 import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
+import { V7_CLAIM_KINDS } from './v7-contracts.js';
 import { readResearchConsumerTurn } from './response-recovery.js';
 
 /** M2 is a structural, historical reader. A proves the paid assessor; P checks the
@@ -11,6 +12,8 @@ import { readResearchConsumerTurn } from './response-recovery.js';
  * not evidence that a claim is true. None of these annotations enters contentKey. */
 export const ASSESSMENT_METHODOLOGY_CONTRACT = 'assessment-methodology/v1' as const;
 export const ASSESSMENT_METHODOLOGY_POLICY = 'assessment-methodology-policy/v1' as const;
+export const ASSESSMENT_METHODOLOGY_POLICY_V2 = 'assessment-methodology-policy/v2' as const;
+export type MethodologyPolicy = typeof ASSESSMENT_METHODOLOGY_POLICY | typeof ASSESSMENT_METHODOLOGY_POLICY_V2;
 export interface MethodEvidence { source: Ref; selector: Selector }
 export type MethodKnowledge = { status: 'known'; value: string; evidence: MethodEvidence[] }
   | { status: 'unknown'; reason: string };
@@ -43,9 +46,9 @@ export interface FactMethodology {
   refutation: { status: 'performed' | 'not_performed' | 'unavailable'; reason: string;
     traces: { turn: Ref; capture: Ref }[]; counterarguments: MethodEvidence[]; limitations: string[] };
 }
-export interface AssessmentMethodology {
+export interface AssessmentMethodology<P extends MethodologyPolicy = typeof ASSESSMENT_METHODOLOGY_POLICY> {
   contract: typeof ASSESSMENT_METHODOLOGY_CONTRACT;
-  policy: typeof ASSESSMENT_METHODOLOGY_POLICY;
+  policy: P;
   facts: FactMethodology[];
 }
 export interface MethodologySubject {
@@ -215,11 +218,15 @@ function checkTrace(store: Store, subject: MethodologySubject, value: unknown, a
     invalid(at, 'A successful search cannot be described as unavailable');
 }
 
-export function checkAssessmentMethodology(store: Store, value: unknown, subject: MethodologySubject): AssessmentMethodology {
+export function checkAssessmentMethodology(store: Store, value: unknown, subject: MethodologySubject): AssessmentMethodology;
+export function checkAssessmentMethodology<P extends MethodologyPolicy>(store: Store, value: unknown,
+  subject: MethodologySubject, policy: P): AssessmentMethodology<P>;
+export function checkAssessmentMethodology(store: Store, value: unknown, subject: MethodologySubject,
+  policy: MethodologyPolicy = ASSESSMENT_METHODOLOGY_POLICY): AssessmentMethodology<MethodologyPolicy> {
   const at = 'methodology';
   const reads: SourceReads = { store, project: subject.project, sources: new Map() };
   shape(value, ['contract', 'policy', 'facts'], at);
-  if (value.contract !== ASSESSMENT_METHODOLOGY_CONTRACT || value.policy !== ASSESSMENT_METHODOLOGY_POLICY)
+  if (value.contract !== ASSESSMENT_METHODOLOGY_CONTRACT || value.policy !== policy)
     invalid(at, 'An explicit supported methodology contract and policy are required');
   if (!Array.isArray(value.facts)) invalid(`${at}.facts`, 'The methodology lists its accepted facts');
   const expected = new Map<string, Record<string, unknown>>();
@@ -287,7 +294,7 @@ export function checkAssessmentMethodology(store: Store, value: unknown, subject
       invalid(`${p}.refutation.limitations`, 'Search limitations are an explicit list of reasons');
   }
   if (seen.size !== expected.size) invalid(`${at}.facts`, 'Every accepted fact needs its methodology');
-  return value as unknown as AssessmentMethodology;
+  return value as unknown as AssessmentMethodology<MethodologyPolicy>;
 }
 
 /** P supplies the requirements proven against the plan. A structural limitation
@@ -302,4 +309,53 @@ export function methodologyClosureGaps(fact: FactMethodology, requirements: {
   if (requirements.versioned && !fact.sources.some(s => s.version.status === 'known')) gaps.push('version_unproven');
   if (requirements.independentConfirmation && fact.corroboration.status !== 'independent') gaps.push('single_confirmation');
   return gaps;
+}
+
+/** MR: requirements are part of the paid sufficiency decision, never inferred
+ * from free-text criterion or supplied as defaults by the progress consumer. */
+export interface MethodologyRequirement {
+  claim: ClaimAddress; dated: boolean; versioned: boolean; independentConfirmation: boolean; reason: string;
+}
+export function closureFactClaims(store: Store, bases: readonly ({ claim: ClaimAddress } | { constraint: Ref })[],
+  project: string): ClaimAddress[] {
+  const facts = new Map<string, ClaimAddress>(), visited = new Set<string>(), active = new Set<string>();
+  const visit = (address: ClaimAddress): void => {
+    const at = 'transition.sufficiency.methodologyRequirements';
+    if (!obj(address) || address.project !== project) invalid(at, 'A closing basis belongs to this exact project');
+    const key = canonical(address);
+    if (active.has(key)) invalid(at, 'Cyclic inference dependencies cannot ground closing');
+    if (visited.has(key)) return;
+    active.add(key);
+    const claim = resolveClaimAddress(store, address).claim;
+    if (!obj(claim) || typeof claim.kind !== 'string'
+      || !(V7_CLAIM_KINDS as readonly string[]).includes(claim.kind))
+      invalid(`${at}.claim.kind`, 'Every closing dependency has an exact known claim kind');
+    if (claim.kind === 'fact') facts.set(key, address);
+    else if (claim.kind === 'inference') {
+      const basis = claim.basis, from = obj(basis) ? basis.from : null;
+      if (Array.isArray(from) ? from.length === 0 : !obj(from))
+        invalid(`${at}.claim.basis.from`, 'An inference has nonempty exact claim premises');
+      for (const item of Array.isArray(from) ? from : [from]) visit(item as unknown as ClaimAddress);
+    }
+    active.delete(key);visited.add(key);
+  };
+  for (const basis of bases) if ('claim' in basis) visit(basis.claim);
+  return [...facts.values()].sort((a,b)=>canonical(a)<canonical(b)?-1:canonical(a)>canonical(b)?1:0);
+}
+export function checkMethodologyRequirements(store: Store, value: unknown,
+  bases: readonly ({ claim: ClaimAddress } | { constraint: Ref })[], project: string): MethodologyRequirement[] {
+  const at = 'transition.sufficiency.methodologyRequirements';
+  if (!Array.isArray(value)) invalid(at, 'Closed requires an explicit requirements list, including an explicit empty list');
+  const facts = new Set(closureFactClaims(store, bases, project).map(canonical)), seen = new Set<string>();
+  for (const [i,row] of value.entries()) {
+    const field = `${at}.${i}`;
+    shape(row, ['claim','dated','versioned','independentConfirmation','reason'], field);
+    const key = canonical(row.claim);
+    if (!facts.has(key) || seen.has(key)) invalid(`${field}.claim`, 'Each closing fact, including inference premises, occurs exactly once');
+    for (const name of ['dated','versioned','independentConfirmation'] as const)
+      if (typeof row[name] !== 'boolean') invalid(`${field}.${name}`, 'Requirements are explicit booleans, never defaults or coerced values');
+    words(row.reason, `${field}.reason`); seen.add(key);
+  }
+  if (seen.size !== facts.size) invalid(at, 'The requirements cover exactly the closing facts, not every accepted fact');
+  return value as MethodologyRequirement[];
 }
