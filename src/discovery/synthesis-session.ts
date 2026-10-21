@@ -15,7 +15,8 @@ import { reference, isRef, type Ref } from "../pipeline/contracts.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { checkpoint } from "./research-continuation.js";
-import { Evidence, sourceIsCurrent, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3 } from "../evidence/evidence.js";
+import { Evidence, projectSourceReading, sourceIsCurrent, SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2,
+  SOURCE_READ_CONTRACT_V3 } from "../evidence/evidence.js";
 import { readReaderResultAt, readerResultCurrent } from "./reader.js";
 import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWrites, markRecoveredSessionWritten,
   isResponseRecovery, prepareResearchConsumerIntent, readResearchConsumerIntent, findResearchConsumerIntent,
@@ -26,7 +27,7 @@ import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWr
 import { turnAction, contextReadIdentity, projectSynthesisTransition, projectContextRecoveryTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES,
   isReservationOnlySessionStep, synthesisReservationConsumed,
   SYNTHESIS_SESSION_CONTRACT, CONTEXT_RECOVERY_SUPERSEDE_REASON, exactContextLookup, readerDraftEquivalent,
-  projectResearchContextSelection, exactObservation,
+  projectResearchContextSelection, exactObservation, projectResearchSearchObservation, projectResearchSearchObservationV2,
   SYNTHESIS_SESSION_CONTRACT_V3, SYNTHESIS_SESSION_V2_PREFIX, SYNTHESIS_SESSION_V3_PREFIX, synthesisSessionV3Address,
   projectSynthesisSessionV3Initial, synthesisSessionSubject, synthesisStepSubject, requirePlanSubject,
   type SynthesisSessionState, type SynthesisSessionStateV3, type SynthesisSessionDelivery, type SynthesisTransition } from './research-consumer-transition.js';
@@ -34,6 +35,7 @@ import { isResearchPreview } from './research-preview.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { provePlanQuestions } from './v7-plan-questions.js';
 import { planQuestionContract } from './continuation-packet.js';
+import { STRUCTURED_SEARCH_CONTRACT } from '../evidence/source-navigation.js';
 import { provenSubjectSessions, savedFindingMaterial } from './saved-synthesis.js';
 
 interface Session {
@@ -228,9 +230,12 @@ function historicalAdmission(store: Store, session: Revision<SynthesisSessionSta
  * - reader: exactly the projection of its exact reader result of this project;
  * - context lookup: exactly the lookup of its exact record (a note or archive
  *   passes subjectContextRecordHolds), as the chain reader re-derives a recovery;
+ * - context search: exactly its immutable capture's observation, re-derived from the
+ *   capture's exact Sources by its contract;
+ * - context whole-file read: exactly its exact Source's read projection;
  * - context Source observation: exactly its pinned Source slice (exactObservation);
- * - context Source reading of a read contract: its exact Source of this project —
- *   the slice is the evidence reader's, checked by every send/application admission.
+ * - context Source reading of a read contract: exactly that contract's projection of
+ *   the pinned Source bytes (projectSourceReading).
  * Any other kind or form refuses. The writer applies it before any record, the
  * chain reader to the saved first record. */
 function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
@@ -244,8 +249,9 @@ function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, que
     if (!object(material) || !object(material.value)) return false;
     const value = material.value;
     if (material.kind === 'saved-findings') {
+      // S5-07: the named record must be a note (research-checkpoint) before its projection is read.
       const note = exact(value.checkpoint);
-      return !!note && subjectContextRecordHolds(store, projectId, draft.id, subject, note)
+      return note?.kind === 'research-checkpoint' && subjectContextRecordHolds(store, projectId, draft.id, subject, note)
         && canonical(value) === canonical(savedFindingMaterial(value.checkpoint, note.value).value);
     }
     if (material.kind === 'reader') {
@@ -268,14 +274,44 @@ function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, que
             ...(value.page.encoding === 'canonical-json' ? { encoding: value.page.encoding } : {}) } : undefined, prove);
       return canonical(lookup) === canonical(value);
     }
+    // S5-06: a search is exactly its immutable capture's observation, re-derived from the
+    // capture's exact Sources by its own contract (projectSearchTurnCompletion's form).
+    if (Object.hasOwn(value, 'capture')) {
+      const capture = exact(value.capture);
+      if (capture?.kind !== 'research-search-capture' || capture.revision !== 1 || !object(capture.value)
+        || capture.value.projectId !== projectId || capture.value.question?.id !== question.id
+        || capture.id !== `research-search-capture:${capture.value.contract === STRUCTURED_SEARCH_CONTRACT ? 'v2' : 'v1'}:${capture.hash}`
+        || !Array.isArray(capture.value.sources)) return false;
+      const sources = (capture.value.sources as unknown[]).map(exact);
+      if (!sources.every(found => found?.kind === 'source' && found.value.projectId === projectId)) return false;
+      const observe = capture.value.contract === STRUCTURED_SEARCH_CONTRACT
+        ? projectResearchSearchObservationV2 : projectResearchSearchObservation;
+      const observation = observe(capture.value.query, sources.map(found => ({ ref: reference(found!), value: found!.value as any })),
+        capture.value.process);
+      return canonical(observation) === canonical(capture.value.observation)
+        && canonical(value) === canonical({ ...capture.value.observation, capture: value.capture });
+    }
+    // S5-06: a whole-file read is exactly its exact Source's read projection.
+    if (Object.hasOwn(value, 'ref')) {
+      const read = exact(value.ref);
+      if (read?.kind !== 'source' || read.value.projectId !== projectId || typeof read.value.content !== 'string') return false;
+      const content: string = read.value.content;
+      return canonical(value) === canonical({ ref: value.ref, length: content.length, excerpt: content.slice(0, 3000),
+        truncated: content.length > 3000 });
+    }
     const source = exact(value.source);
     if (source?.kind !== 'source' || source.value.projectId !== projectId || value.projectId !== projectId) return false;
-    if ([SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(value.contract)) return true;
+    // A read of a contract is exactly that contract's projection of the pinned Source bytes.
+    if ([SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(value.contract))
+      return object(value.requested) && canonical(projectSourceReading(projectId, value.source, source.value as any,
+        value.requested as { start: number; end: number }, value.contract)) === canonical(value);
     return object(value.selector) && canonical(exactObservation(store, projectId, value.source,
       value.selector as Parameters<typeof exactObservation>[3])) === canonical(value);
   };
+  // An input the proof cannot read in its producer's form is no lawful material (a
+  // typed refusal by the caller), never a crash: EngineError and TypeError alike.
   try { return Array.isArray(materials) && materials.every(holds); }
-  catch (error) { if (error instanceof EngineError) return false; throw error; }
+  catch (error) { if (error instanceof EngineError || error instanceof TypeError) return false; throw error; }
 }
 
 /** S5 class (решение 6; S5-05): the previous proposal a v3 session stands on is

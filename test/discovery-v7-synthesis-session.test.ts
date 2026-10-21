@@ -22,7 +22,7 @@ import type { Write } from "../src/storage/store.js";
 import { Researcher } from "../src/discovery/research-runner.js";
 import { prepareResearchConsumerIntent, readResearchConsumerExecution, recoverResearchResponse,
   subjectContextRecordHolds } from "../src/discovery/response-recovery.js";
-import { addressedWorkspace } from "../src/discovery/research-continuation.js";
+import { addressedWorkspace, workingSelections } from "../src/discovery/research-continuation.js";
 import { PLANNING_INSTRUCTION } from "../src/discovery/reading-plan.js";
 import { digest, hashJson } from "../src/canonical.js";
 import { uniqueRefs } from "../src/pipeline/contracts.js";
@@ -888,4 +888,63 @@ test("S5 terminal/application conflict: two Stores apply one paid response — a
   assert.equal(f.calls(), calls, "no new call");
   assert.equal(f.store.list("research-budget-ledger").length, ledgers, "no new ledger");
   assert.deepEqual(readSynthesisSessionV3(f.open(), reference(session)), session);
+});
+
+/* ---------- круг 4 (codex-omg №9033): the producers' own material forms, re-derived; a wrong kind refuses typed ---------- */
+
+for (const mode of ["search", "read", "read_source", "read_context"] as const)
+  test(`S5-06 a lawful ${mode} material of the real runner reaches A's synthesis through workingSelections(A) and pays; its substituted bytes or missing proof are refused before any record or payment`, async t => {
+    const f = await paidPlanned(t, `s5r4-${mode.replaceAll("_", "-")}`);
+    const A = subjectOf(f.p.planAnswer, "q-supply");
+    const source = f.material("exact");
+    if (mode === "read") writeFileSync(join(f.p.environment.value.workspace, "local-source.txt"), "A true local source with enough content to read.");
+    const action = mode === "search" ? { action: "search", query: "Exact source" }
+      : mode === "read" ? { action: "read", path: "local-source.txt", media: "text/plain" }
+      : mode === "read_context" ? { action: "read_context", record: reference(f.p.draft), pointer: "/fields/plan" }
+      : { action: "read_source", source: source.value.source, start: 0, end: String(source.value.value).length };
+    f.configure([action, { action: "pause", reason: "stop after the real material" }]);
+    const run = await new Researcher(f.store, new Discovery(f.store), f.engine.environments)
+      .run(f.p.project, f.p.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
+    assert.equal(run.value.pauseCode, "research_model_paused", JSON.stringify(run.value));
+    const turns = f.store.list<any>("research-turn").filter(row => row.value.run === run.id);
+    const materials = workingSelections(f.store, turns, f.p.plan, A) as any[];
+    assert.equal(materials.length, 1, "the real material is selected for A");
+    const [material] = materials;
+    const changed = (patch: (value: any) => any) => [{ ...material, value: patch(structuredClone(material.value)) }];
+    const forgeries: [string, unknown[]][] = mode === "search"
+      ? [["repository matches", changed(value => ({ ...value, repositoryMatches: `${value.repositoryMatches} forged` }))],
+        ["missing capture", changed(({ capture: _capture, ...value }) => value)]]
+      : mode === "read"
+      ? [["excerpt", changed(value => ({ ...value, excerpt: "a forged excerpt" }))],
+        ["length", changed(value => ({ ...value, length: value.length + 1 }))]]
+      : mode === "read_context"
+      ? [["value", changed(value => ({ ...value, value: { forged: true } }))],
+        ["missing record", changed(({ record: _record, ...value }) => value)]]
+      : [["slice", changed(value => ({ ...value, value: "a forged slice" }))],
+        ["missing request", changed(({ requested: _requested, ...value }) => value)]];
+    const calls = f.calls(), before = history(f.store);
+    for (const [name, forged] of forgeries)
+      assert.equal(await code(() => paidRun(f, A, forged)), "context_reference_foreign", `${mode}: ${name}`);
+    assert.deepEqual(history(f.store), before, "a refused material wrote nothing");
+    assert.equal(f.calls(), calls, "and bought nothing");
+    f.configure([...Array(calls).fill(null), endOf(ENDS.refused)]);
+    assert.deepEqual(await paidRun(f, A, materials), { ...endOf(ENDS.refused), question: "q-supply" },
+      `the exact ${mode} material is A's lawful basis`);
+  });
+
+test("S5-07 a saved finding naming a record of another kind is a typed refusal: the writer refuses a Source used as the note before any record or payment, and the chain reader refuses such a saved basis", async t => {
+  const f = await paidPlanned(t, "s5r4-kind");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  const source = f.material("basis");
+  const wrong = [{ kind: "saved-findings", value: { checkpoint: source.value.source } }];
+  const calls = f.calls(), before = history(f.store);
+  assert.equal(await code(() => paidRun(f, A, [], { savedOnly: true, savedMaterials: wrong })), "context_reference_foreign");
+  assert.deepEqual(history(f.store), before);
+  assert.equal(f.calls(), calls);
+  // Negative corruption only: the projector's first record over that basis, saved without its producer.
+  const projected = projectSynthesisSessionV3Initial({ projectId: f.p.project, binding: { draft: reference(f.p.draft),
+    question: reference(f.p.plan), environment: reference(f.p.environment), inputs: f.p.draft.value.inputs, subject: A },
+    basis: { materials: wrong, previousProposal: null, previousProposalRef: null }, delivery: null });
+  const forged = f.store.write({ id: projected.id, kind: "synthesis-session", expected: 0, value: projected.value });
+  assert.equal(await code(async () => readSynthesisSessionV3(f.open(), reference(forged))), "synthesis_session_invalid");
 });
