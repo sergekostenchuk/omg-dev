@@ -450,8 +450,9 @@ export function normalizeClaimText(text: string): string {
 }
 const sortedSet = (items: string[]) => [...new Set(items)].sort();
 
-/** The accepted-premise proof an inference key needs. The default proves the answer path (proveClaimAddress); the
- * attempt path is accepted only by the DR3b-P application — until then its claims refuse with their own code. */
+/** The accepted-premise proof an inference key needs. The default common
+ * ClaimAddress reader proves historical answers or the exact accepted pointer
+ * of an atomically applied attempt. Resolution or payment alone never suffices. */
 export type PremiseAcceptance = (address: ClaimAddress) => void;
 export interface ContentKeyOptions {
   premise?: PremiseAcceptance;

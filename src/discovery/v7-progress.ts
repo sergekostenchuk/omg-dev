@@ -271,11 +271,11 @@ function orderedPrefix(store: Store, assessment: PaidDiscoveryAttemptsAssessment
   }
 }
 
-/** P.3's internal accepted-claim route uses the first atomic account. P.4
- * connects the public claim-address router to this same proof, not a new flag. */
+/** Premises and baseline materials use the same public acceptance proof as
+ * other consumers; an attempt retains its first atomic paid application. */
 function acceptedPremise(store: Store, address: ClaimAddress): ReturnType<typeof proveAppliedAttemptClaim> | null {
-  if (address.containerKind === V7_ATTEMPT_KIND) return proveAppliedAttemptClaim(store, address);
-  proveClaimAddress(store, address);return null;
+  const proof = proveClaimAddress(store, address);
+  return proof.kind === 'attempt' ? proof : null;
 }
 function methodology(store: Store, paid: Revision<PaidDiscoveryAttemptsAssessment>, reused: Revision<V7AttemptAccount>[]): V7MethodologyOrigin[] {
   const assessment = paid.value, transition = assessment.novelty.transition;

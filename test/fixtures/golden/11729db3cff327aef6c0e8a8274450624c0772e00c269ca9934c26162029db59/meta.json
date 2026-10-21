@@ -1,5 +1,5 @@
 {
-  "producerDigest": "b5ede6e4b92dd6a2052ebe3e91c27f5e0a282a447e8004c9bda653af299e0e37",
+  "producerDigest": "bb6041d9eab6c8e2cbd22a9b7680d59c99055b26fa225cf11198257a9c2556b2",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -95,7 +95,7 @@
     },
     {
       "path": "src/discovery/claim-address.ts",
-      "sha256": "c01f689babd196ee45c71ab3ba4206620d845a4c66b062894ad66b32fd91e7c5"
+      "sha256": "d441aeb76adce91b054387bcc1f126acf1f128c3b35dfd91d4ec37a6a412b167"
     },
     {
       "path": "src/discovery/conclusion-consolidation.ts",
@@ -231,7 +231,7 @@
     },
     {
       "path": "src/discovery/reader.ts",
-      "sha256": "6b7e9b315127ad13bd685d24d721c56be008f39572690548fcc73eeef95e3edc"
+      "sha256": "84f063d468dff846c8e7e563cae8f1eec285a877dd037c26ce7a6498707ea530"
     },
     {
       "path": "src/discovery/reading-plan.ts",
@@ -335,7 +335,7 @@
     },
     {
       "path": "src/discovery/v7-attempt-assessment.ts",
-      "sha256": "07d7b9fcb511d9e2756b0056f8378e0fbce7a5c22256895056b7951d972cd591"
+      "sha256": "f0e2fd268dd3d0a37b42c7a10fb3e5bea6600ca1fad32248c7c34f53aab66ef2"
     },
     {
       "path": "src/discovery/v7-attempts.ts",
@@ -359,7 +359,7 @@
     },
     {
       "path": "src/discovery/v7-progress.ts",
-      "sha256": "a4fc52919464b05882d88676bf246fca8c91706dc85dd924df90f93188d7b10c"
+      "sha256": "f762cec181d0848ea934b81fa10e4ebd1371b807641ea0fe3ec627f8e20c7689"
     },
     {
       "path": "src/discovery/variant-decision.ts",
@@ -971,48 +971,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "ad747274afa7808621b5c012a386187a5c33777cc4370cee19800fe629a76ce1"
+      "hash": "5e8c3228f6c70ad605840b1064870fd379afcd9011a3bed9ece2e80824f5d104"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "f549a971f4c90e08aa2048db1aba4c9c4bd4ab20daca83c5d43cf296249abd6d"
+      "hash": "3178d26559c3af6ebd67088db3f99d2ead4df2466f1a180b986919a61f138651"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "b2f913efaa2aebba4bfb8b0ca805b1801bfb42b9b7d7b9f1fde7130ee50a9480"
+      "hash": "b906a8b5defcf5ba5d267bc1c693de913e77e4742e930c86f7f1d2d19510d58e"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "5f51a44c1653bc06f32004ac985b479bb110439858d161ad607a7c1eab369505"
+      "hash": "fc4f83b412b2129250613c9e30b17029f3027ed48f6a59ad340e6db23f1aa102"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "91b37bf47108c8cae288665ecdc1809071b7bdd09adafdd0132077667a7875b8"
+      "hash": "4641b923e96df65bbee6a792f85a40c21e1d819a9a02dcb1eb95162d547800f8"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "eb2c1a079a503a4fd6f3554a9a32cdcb9d1ad4fb8fd062503034f39c45be64e4"
+      "hash": "4d1f33c2a271aff739f5a40f8b4128be16160ff255a1a3e9dc53e7a1abec6dde"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "8038219a7d018be471add7079dc18b4a1c0eb96fe17ca5971517510a232667f3"
+      "hash": "5e0a8da2e1a31c6e8fee5c289ee760cf806f39561c9b4933e7beeea4c1ab3ca5"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "23d3621091d5ff5550b9836ff995f8078b3fa52b623a7e645f66e33c28a66288"
+      "hash": "43f467fad63322f9dcefabf0f909fc445aef937e3c8d3628f8931419d77c7b3c"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-lg62c/.golden-build-ZYazmt/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-int-s65/.golden-build-eXDNIm/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "0cb0dc7c932dca47c759ea6b766daf1ce9e2d1787bd72a01aa977f9cd0c9db71",
-  "sqliteBytes": 14561280
+  "sqliteFileSha256": "f5b07ce228ce504d089924b2d4341cf25d30805f708d57030f566add0167bb7b",
+  "sqliteBytes": 14573568
 }

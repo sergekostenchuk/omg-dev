@@ -1,10 +1,11 @@
+import { proveAppliedAttemptClaim } from './v7-progress.js';
 import { EngineError } from "../errors.js";
 import { isRef, type Ref } from "../pipeline/contracts.js";
 import type { Json } from "../canonical.js";
 import type { Store, Revision } from "../storage/store.js";
 import { proveIssuedAnswer, savedAcceptanceAct, issuedAnswerSchemaHolds } from "./projection-reader.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import type { ResearchAnswer, ResearchAssessment } from "./research-model.js";
+import type { PaidDiscoveryAttemptsAssessment, V7ProgressApplication, ResearchAnswer, ResearchAssessment } from "./research-model.js";
 import type { ResearchAcceptanceBinding } from "./research-consumer-transition.js";
 import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_KIND, provenAcceptance } from "./v7-contracts.js";
 import { proveAttempt, type V7Attempt } from "./v7-plan-questions.js";
@@ -32,14 +33,19 @@ interface ClaimsAnswer extends ResearchAnswer { contract: string }
 export interface ResolvedClaim { container: Revision<ClaimsAnswer> | Revision<V7Attempt>; claim: Json }
 /** A resolved claim with the separate proof that its container is accepted —
  * resolution alone never stands for acceptance. */
-export interface ProvenClaim extends ResolvedClaim {
-  /** A proven claim's container is always a claims-carrying research answer —
-   * the attempt route never reaches acceptance in DR3a1. */
+export interface ProvenAnswerClaim extends ResolvedClaim {
+  kind: 'answer';
   container: Revision<ClaimsAnswer>;
   answer: Revision<ResearchAnswer>;
   assessment: Revision<ResearchAssessment> | null;
   binding: Revision<ResearchAcceptanceBinding> | null;
 }
+
+export interface ProvenAttemptClaim extends ResolvedClaim {
+  kind: 'attempt'; container: Revision<V7Attempt>; answer: null; binding: null;
+  assessment: Revision<PaidDiscoveryAttemptsAssessment>; application: Revision<V7ProgressApplication>;
+}
+export type ProvenClaim = ProvenAnswerClaim | ProvenAttemptClaim;
 
 const CLAIM_POINTER = /^\/claims\/(0|[1-9][0-9]*)$/;
 const object = (value: unknown): value is Record<string, Json> =>
@@ -131,16 +137,23 @@ export { provenAcceptance };
  * is proven an accepted answer of the question it names — question record,
  * draft and acceptance chain read through the same interpretation the
  * projection reader gives every consumer. A resolvable but unaccepted
- * container is an addressed refusal, not a claim. */
+ * container is an addressed refusal. An attempt requires its exact pointer in
+ * the first atomic application; a paid assessment alone is insufficient. */
 export function proveClaimAddress(store: Store, address: ClaimAddress): ProvenClaim {
   const resolved = resolveClaimAddress(store, address);
-  // The attempt route resolves structurally, but what an accepted ATTEMPT is
-  // is not decided — DR3a1 always refuses the acceptance half here, with its
-  // own typed code, and never falls back to the field-answer path.
-  if (resolved.container.kind === V7_ATTEMPT_KIND)
-    throw new EngineError("claim_attempt_not_accepted",
-      "[claim_attempt_not_accepted] The claim lives inside a structurally valid attempt; "
-      + "the acceptance of an attempt is not decided yet", { address });
+  if (resolved.container.kind === V7_ATTEMPT_KIND) {
+    let proof: ReturnType<typeof proveAppliedAttemptClaim>;
+    try { proof = proveAppliedAttemptClaim(store, address); }
+    catch (error) {
+      // Keep the public refusal contract of historical unapplied attempts.
+      // P.3 retains its internal field diagnostic; this address remains the subject.
+      if (error instanceof EngineError && error.code === 'claim_attempt_not_accepted')
+        throw new EngineError(error.code, error.message, { address });
+      throw error;
+    }
+    return { ...resolved, kind: 'attempt', container: resolved.container as Revision<V7Attempt>,
+      answer: null, binding: null, ...proof };
+  }
   const container = resolved.container as Revision<ClaimsAnswer>;
   const question = store.get<Question>(container.value.question);
   if (question === null || question.kind !== "question" || question.value.projectId !== address.project)
@@ -170,7 +183,7 @@ export function proveClaimAddress(store: Store, address: ClaimAddress): ProvenCl
       address.container, proven.proof.value))
     refuse(address, "container", "the addressed claim lives in an answer that was never accepted");
   const provenance = proven.proof.provenance;
-  return { ...resolved, container,
+  return { ...resolved, kind: 'answer', container,
     answer: proven.proof.record as unknown as Revision<ResearchAnswer>,
     assessment: provenance.assessment, binding: provenance.binding };
 }
