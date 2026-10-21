@@ -316,6 +316,17 @@ test('completion reserve is mandatory, validated and immutable; a missing reserv
   assert.throws(() => reserveResearchCall(store, { saved: legacy }, 'legacy-call', ['g'], estimate), { code: 'budget_completion_reserve_invalid' });
   assert.equal(store.get('legacy-call'), null);
 
+  // Adding a numeric completionReserve to a segment whose original policy has
+  // no reserve is the same immutability refusal, never a repair.
+  const legacyAdded = store.write<BudgetSegment>({ id: legacy.id, kind: legacy.kind, expected: legacy.revision,
+    value: { ...legacy.value, completionReserve: 500 } });
+  const callsAfterLegacyAdded = store.list('model-call').length;
+  const ledgersAfterLegacyAdded = store.list('research-budget-ledger').length;
+  assert.throws(() => reserveResearchCall(store, { saved: legacyAdded }, 'legacy-added-call', ['g'], estimate), { code: 'budget_completion_reserve_changed' });
+  assert.equal(store.get('legacy-added-call'), null);
+  assert.equal(store.list('model-call').length, callsAfterLegacyAdded);
+  assert.equal(store.list('research-budget-ledger').length, ledgersAfterLegacyAdded);
+
   const base = { projectId: 'p', key: 'with-reserve', limit: 10_000_000, initialGroupLimit: 700_000 };
   for (const invalid of [-1, 1.5, NaN, null as unknown as number, 20_000_001, '500' as unknown as number]) {
     assert.throws(() => prepareNewSegmentReservation(store, { ...base, key: 'invalid-reserve', completionReserve: invalid }, 'c0', ['g'], estimate),
