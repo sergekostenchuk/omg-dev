@@ -235,6 +235,22 @@ function requireReopenFits(frame: FrameRead, reopen: FrameReopen | null): void {
       reject('proposal_invalid', reopen.record.id, 'works', `The reopened work ${work} holds no accepted real fill of the horizon of this frame`);
   }
 }
+/**
+ * A stored works-frame request read with the reopening it names: the saved record at its exact reference must carry
+ * this frame and these works, and the reopened works must fit the frame that is read. A request that names none
+ * derives as its own era did. This is the historical reading — the standing head is never consulted (reopenFor,
+ * current=false) — for contexts the journal and G7 carry back to the era they describe.
+ */
+export function readProvenFrame(store: Store, request: FrameRequest): OmResult<Sealed<FrameRead>> {
+  if (!(store instanceof Store)) invalid('request');
+  requireRequest(request); request = copy(request);
+  return outcome(() => {
+    const { reopen } = reopenFor(store, request, false);
+    const frame = withReopen(take(readFrame(store, bare(request))) as FrameRead, reopen);
+    requireReopenFits(frame, reopen);
+    return frame;
+  });
+}
 function requireFrame(value: unknown): asserts value is FrameRead {
   if (!object(value)) invalid('frame');
   requireRequest(value['request']);
@@ -497,7 +513,7 @@ export function observeProposal(store: Store, request: ObserveProposalRequest): 
       reject('proposal_invalid', request.proposal.id, 'request', 'The observed proposal must occur in its own project context');
     if (new Set(context.proposals.map(ref => ref.id)).size !== context.proposals.length)
       reject('proposal_invalid', request.proposal.id, 'request.proposals', 'A proposal context names each exact participant once');
-    const frame = take(readFrame(store, bare(context.frame))), references = [...frame.references];
+    const frame = take(readProvenFrame(store, context.frame)), references = [...frame.references];
     let observed: ObservedProposal | null = null;
     for (const ref of context.proposals) {
       const record = take(readRecord<LayerProposal>(store, ref, { unit: 'F4.3', target: ref.id,

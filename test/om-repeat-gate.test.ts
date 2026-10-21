@@ -16,6 +16,7 @@ import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { fillObligations, prepareFrame, readFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
+import { l3ReopenId, L3_REOPEN_CONTRACT, L3_REOPEN_KIND, observeProposal, readProvenFrame, type FrameReopen } from "../src/om/frame-proposals.js";
 import { writeCandidate, readCandidate, gateCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeOmInput } from "../src/om/input.js";
@@ -1981,6 +1982,86 @@ test("G7 observes real first-pass and accepted bases of both producers through t
     context: { kind: "frame", request } } })).definitions;
   assert.ok(definitions.includes(`${native}-prep-operation`));
   assert.ok(definitions.includes(`${native}-prep`));
+});
+
+test("RJ1: a saved base or proposal context proves the exact reopening it names — absent, foreign or mismatched refuses; a moved head and a cold store change nothing", async t => {
+  const project = "rj1context";
+  const f = await createOmFixture(t, "standard", project, { mode: "executed" });
+  const store = f.store;
+  // The works frame request in the exact form D1 saves it after the L3 acceptance (run-bases.ts gapRequest), now
+  // naming the accepted frame — the shape a regated pass re-derives.
+  const candidate = store.list<FrameCandidateRecord>("frame-candidate").find(row => row.value.level === 3)!;
+  const saved = candidate.value.request;
+  const head = reference(store.get(`graph:${project}`)!);
+  const worksFrame = reference(store.get(`om-frame:${project}:3`)!);
+  const worksLayer = reference(store.get(`graph-layer:${project}:3`)!);
+  const basis = deliveredOf(readProvenFrame(store,
+    { ...saved.frame, graph: head, layer: worksLayer, frame: worksFrame, workZoneContract: "accepted-l2-v1" } as FrameRequest));
+  const zone = new Map(basis.result.obligations.map(item => [item.id, item.zone] as const));
+  const works = [...new Set(basis.result.fills
+    .filter(fill => fill.source === "accepted" && zone.get(fill.obligation) === "horizon"
+      && basis.accepted!.graph.nodes.some(node => node.id === fill.node && node.kind === "work"))
+    .map(fill => fill.node))].sort();
+  assert.ok(works.length > 0);
+  // The record an om-regate writes, in its exact contract (L3Reopen): every reopened work carries a finding of the door.
+  const snapshot = { commit: "a".repeat(40), tree: "b".repeat(40) };
+  const reopenRecord = store.write({ id: l3ReopenId(project), kind: L3_REOPEN_KIND, expected: 0, value: {
+    contract: L3_REOPEN_CONTRACT, project,
+    run: head, frame: worksFrame, graph: head,
+    input: reference(store.get(`om-input:${project}`)!), environment: head,
+    snapshot, findings: works.map(work => ({ code: "work_impact_undecided", field: "impact", message: "The door left this transition to the model", target: work })),
+    works: works.map(work => ({ work, definition: hashJson(work) })),
+    impact: { snapshot: structuredClone(snapshot), works: [] },
+    decision: { actor: "owner", command: "om-regate" },
+  } as unknown as Json });
+  const named: FrameReopen = { record: reference(reopenRecord), works };
+  const request = { ...saved.frame, graph: head, layer: worksLayer, frame: worksFrame,
+    workZoneContract: "accepted-l2-v1", reopen: named } as unknown as FrameRequest;
+  const base = (frame: unknown): OriginSource =>
+    ({ role: "base", ref: (frame as FrameRequest).graph, context: { kind: "frame", request: frame } }) as unknown as OriginSource;
+  const read = (frame: unknown) => readDefinitions(store, { project, source: base(frame) });
+
+  // A context naming no reopening derives exactly as its era did; the one naming the exact record reads it.
+  const { reopen: _absent, ...bare } = request as FrameRequest & { reopen: FrameReopen };
+  assert.ok(read(bare).ok, "A context naming no reopening reads as its own era did");
+  const named_read = read(request);
+  assert.ok(named_read.ok, `The saved context reads the exact reopening it names: ${named_read.ok ? "" : JSON.stringify(named_read.refusal)}`);
+
+  const before = store.list().map(reference);
+  const check = (frame: unknown) => {
+    const found = refusalOf(readDefinitions(store, { project, source: base(frame) }));
+    assert.ok(found.at.target.length > 0);
+  };
+  // Absent exact reopen: no record stands at the named reference.
+  check({ ...request, reopen: { ...named, record: { ...named.record, hash: hashJson("absent") } } });
+  // A foreign record of another kind is no reopening of this frame.
+  check({ ...request, reopen: { ...named, record: worksFrame } });
+  // The named works differ from the record's own.
+  check({ ...request, reopen: { ...named, works: [...works, "zz-foreign-work"] } });
+  assert.deepEqual(store.list().map(reference), before, "Every damaged context refuses without a write");
+
+  // A second revision naming ANOTHER frame moves the head; the saved context still reads its own named record.
+  const moved = store.write({ id: l3ReopenId(project), kind: L3_REOPEN_KIND, expected: reopenRecord.revision,
+    value: { ...(reopenRecord.value as Record<string, unknown>), frame: reference(store.get(`om-frame:${project}:2`)!) } as unknown as Json });
+  check({ ...request, reopen: { ...named, record: reference(moved) } });
+  assert.ok(read(request).ok, "A moved head never substitutes for the named record");
+
+  // The proposal context of the same assembly proves the same reopening through its own reader.
+  const proposal = reference(store.write({ id: `om-proposal:${project}:reopened`, kind: "layer-proposal", expected: 0,
+    value: { base: { graph: head, frame: worksFrame }, level: 3, source: "decision", status: "proposed",
+      worksContract: "works-frame/v1", nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [], joins: [],
+      tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] } as unknown as Json }));
+  const proposalContext = { frame: request, proposals: [proposal] };
+  assert.ok(observeProposal(store, { project, proposal, request: proposalContext }).ok,
+    "A proposal context reads the reopening its frame names");
+  refusalOf(observeProposal(store, { project, proposal,
+    request: { frame: { ...request, reopen: { ...named, works: ["zz-foreign-work"] } } as unknown as FrameRequest,
+      proposals: [proposal] } }));
+
+  // A cold store reads the saved context and its reopening the same way.
+  const engine = f.reopen();
+  assert.ok(readDefinitions(engine.store, { project, source: base(request) }).ok, "A cold store proves the named record");
+  assert.ok(observeProposal(engine.store, { project, proposal, request: proposalContext }).ok);
 });
 
 test("G7 refuses missing or alien observation contexts and unreadable modern sections without falling back to defines", t => {

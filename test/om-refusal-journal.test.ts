@@ -954,6 +954,63 @@ test("origin history preserves each work-zone era and refuses a forged contract 
   addressed(refusalOf(readJournal(reopened, { project: PROJECT })), "journal_invalid");
 });
 
+test("RJ1: an RL3 frame context may name its exact reopening — form, normalization and source identity; every damaged form is refused at its address", t => {
+  const { store, path } = fixture(t);
+  const reopenRef = refTo("om-l3-reopen:alpha", 1, "d");
+  const frame: FrameRequest = { project: PROJECT, level: 3, graph: BASE, horizon: refTo("om-horizon-gate:alpha:works"),
+    layer: refTo("graph-layer:alpha:3"), frame: refTo("om-frame:alpha:3"), workZoneContract: "accepted-l2-v1",
+    upper: { horizon: refTo("om-horizon-gate:alpha:works"), frame: refTo("om-frame:alpha:2") } };
+  const withReopen = (reopen: unknown): FrameRequest => ({ ...frame, reopen }) as FrameRequest;
+  const named = withReopen({ record: reopenRef, works: ["a-work", "b-work"] });
+  const bare: OriginSource = { role: "base", ref: BASE, context: { kind: "frame", request: frame } };
+  const carried: OriginSource = { role: "base", ref: BASE, context: { kind: "frame", request: named } };
+  // The reopening is part of the identity: an absent field reads exactly as before it; another record or other works is another source.
+  assert.notEqual(originSourceKey(bare), originSourceKey(carried));
+  for (const other of [{ record: refTo("om-l3-reopen:alpha", 2, "e"), works: ["a-work", "b-work"] }, { record: reopenRef, works: ["b-work"] },
+    { record: reopenRef, works: ["a-work", "b-work", "c-work"] }]) {
+    const source: OriginSource = { ...carried, context: { kind: "frame", request: withReopen(other) } };
+    assert.notEqual(originSourceKey(carried), originSourceKey(source));
+  }
+  // Normalization keeps the exact record and its works — in a frame context, and in the frame a proposal request names.
+  const normalized = normalizeOriginSource(carried);
+  assert.equal(normalized.context!.kind, "frame");
+  assert.deepEqual((normalized.context!.request as FrameRequest & { reopen: { record: Ref; works: string[] } }).reopen,
+    { record: reopenRef, works: ["a-work", "b-work"] });
+  const proposal = normalizeOriginSource({ role: "proposal", ref: PROPOSAL,
+    context: { kind: "proposal", request: { frame: named, proposals: [PROPOSAL] } } });
+  assert.equal(proposal.context!.kind, "proposal");
+  if (proposal.context!.kind === "proposal")
+    assert.deepEqual((proposal.context!.request.frame as FrameRequest & { reopen: unknown }).reopen, { record: reopenRef, works: ["a-work", "b-work"] });
+  assert.ok(deeplyFrozen(normalizeOriginSource(carried)));
+  // The reopening belongs to a works request over an accepted frame: wrong level, no frame, or any damaged form is refused.
+  let number = 0;
+  const damaged = [withReopen(null), withReopen("reopen"), withReopen({}), withReopen({ record: reopenRef }),
+    withReopen({ works: ["a-work"] }), withReopen({ record: reopenRef, works: ["a-work"], extra: 1 }),
+    withReopen({ record: "om-l3-reopen:alpha", works: ["a-work"] }), withReopen({ record: reopenRef, works: [] }),
+    withReopen({ record: reopenRef, works: ["a-work", "a-work"] }), withReopen({ record: reopenRef, works: ["b-work", "a-work"] }),
+    withReopen({ record: reopenRef, works: [""] }), withReopen({ record: reopenRef, works: [null] }),
+    { ...frame, level: 2, upper: null, workZoneContract: undefined, reopen: { record: reopenRef, works: ["a-work"] } },
+    { ...frame, frame: null, reopen: { record: reopenRef, works: ["a-work"] } }];
+  for (const request of damaged) {
+    const requestJson = JSON.parse(JSON.stringify(request));
+    const broken = { role: "base", ref: BASE, context: { kind: "frame", request: requestJson } };
+    assert.throws(() => normalizeOriginSource(broken), code("journal_request_invalid"));
+    const record = gateRecord(store, `reopen-broken-${number++}`, gateFailure({ refusals: [entry({ origin: origin({ sources: [broken] }) })] }));
+    const refusal = addressed(refusalOf(recordRefusal(store, { project: PROJECT, source: reference(record) })), "origin_source_invalid");
+    assert.ok(refusal.at.field!.startsWith("refusals.0.origin.sources.0.context"), refusal.at.field);
+  }
+  // A row journalled with the reopening keeps it byte-exact through classification, historical reading and restart.
+  const record = gateRecord(store, "reopen-row", gateFailure({ refusals: [entry({ origin: origin({ sources: [carried, bare] }) })] }));
+  const recorded = deliveredOf(recordRefusal(store, { project: PROJECT, source: reference(record) }));
+  const row = recorded.value.rows[0]!;
+  const saved = row.origin.sources.find(item => originSourceKey(item) === originSourceKey(carried))!;
+  assert.deepEqual((saved.context!.request as FrameRequest & { reopen: unknown }).reopen, { record: reopenRef, works: ["a-work", "b-work"] });
+  const classified = deliveredOf(classifyRefusal(store, { project: PROJECT, row: row.id, class: "unknown", addressee: "reviewer", basis: [carried] }));
+  assert.deepEqual(classified.value.classifications[0]!.basis, [normalizeOriginSource(carried)]);
+  store.close(); const reopened = new Store(path); t.after(() => reopened.close());
+  assert.deepEqual(deliveredOf(readJournal(reopened, { project: PROJECT })).value, classified.value);
+});
+
 // ---- H1.0c: one batch of the journal (№1446 п.5; cells C32, C33, C34, C68, C69) ----
 
 // A refusal record prepared by its producer in the caller's transaction: created by its own write, at revision 1.

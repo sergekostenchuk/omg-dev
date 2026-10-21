@@ -177,13 +177,24 @@ interface Prepared { readonly transition: JournalTransition; readonly current: R
 const INCOMING: Codes = { entry: "refusal_entry_invalid", origin: "origin_invalid", source: "origin_source_invalid" };
 function frameContextShape(value: unknown): value is FrameRequest {
   if (!isPlainObject(value) || !exactKeys(value, ["project", "level", "horizon", "graph", "layer", "frame", "upper",
-    ...(Object.hasOwn(value as object, "workZoneContract") ? ["workZoneContract"] : [])])) return false;
-  const frame = value as FrameRequest;
+    ...(Object.hasOwn(value as object, "workZoneContract") ? ["workZoneContract"] : []),
+    ...(Object.hasOwn(value as object, "reopen") ? ["reopen"] : [])])) return false;
+  const frame = value as FrameRequest & { readonly reopen?: unknown };
   // Today's producer marks every level-3 request with its work-zone contract (frame-obligations.ts): a level-3
   // context without one is of an earlier era, and the contract belongs to no other level.
   if (frame.level === 3 ? frame.workZoneContract !== "accepted-l2-v1" : Object.hasOwn(frame, "workZoneContract")) return false;
   if (!isText(frame.project) || ![2, 3].includes(frame.level) || !isRef(frame.horizon) || !isRef(frame.graph)
     || frame.layer !== null && !isRef(frame.layer) || frame.frame !== null && !isRef(frame.frame)) return false;
+  // RL3 (frame-proposals.ts): a works request over an accepted frame may carry the reopening it was derived with —
+  // the exact record and its works, canonically sorted and named once each. Its absence reads as before, anything
+  // malformed is refused, never repaired.
+  if (Object.hasOwn(frame, "reopen")) {
+    const reopen = frame.reopen;
+    if (frame.level !== 3 || frame.frame === null || !isPlainObject(reopen) || !exactKeys(reopen, ["record", "works"])) return false;
+    const value = reopen as { record: unknown; works: unknown };
+    if (!isRef(value.record) || !Array.isArray(value.works) || !value.works.length || !value.works.every(isText)
+      || canonical(value.works) !== canonical([...new Set(value.works as string[])].sort(compare))) return false;
+  }
   return frame.level === 2 ? frame.upper === null : isPlainObject(frame.upper) && exactKeys(frame.upper, ["horizon", "frame"])
     && isRef(frame.upper!.horizon) && (frame.upper!.frame === null || isRef(frame.upper!.frame));
 }
@@ -202,10 +213,13 @@ function sourceIssue(value: unknown): string | null {
 }
 const sourceRef = (ref: Ref): Ref => ({ id: ref.id, revision: ref.revision, hash: ref.hash });
 function normalizedFrameContext(frame: FrameRequest): FrameRequest {
+  const reopen = (frame as FrameRequest & { readonly reopen?: { record: Ref; works: string[] } }).reopen;
   return { project: frame.project, level: frame.level, horizon: sourceRef(frame.horizon), graph: sourceRef(frame.graph),
     layer: frame.layer === null ? null : sourceRef(frame.layer), frame: frame.frame === null ? null : sourceRef(frame.frame),
     upper: frame.upper === null ? null : { horizon: sourceRef(frame.upper.horizon), frame: frame.upper.frame === null ? null : sourceRef(frame.upper.frame) },
-    ...(Object.hasOwn(frame, "workZoneContract") ? { workZoneContract: frame.workZoneContract! } : {}) };
+    ...(Object.hasOwn(frame, "workZoneContract") ? { workZoneContract: frame.workZoneContract! } : {}),
+    // The exact record and its works stay separated in the normalized context: both belong to the row's identity.
+    ...(reopen === undefined ? {} : { reopen: { record: sourceRef(reopen.record), works: [...reopen.works] } }) };
 }
 /** Syntax and identity only: each producer still proves the source and its exact assembly context. */
 export function normalizeOriginSource(value: unknown): Sealed<OriginSource> {

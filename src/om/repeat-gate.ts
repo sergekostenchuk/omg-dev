@@ -25,8 +25,8 @@ import { withHistoricalReads, historicalRead } from "./input.js";
 import { confirmResults, readInputFieldResult, type ConfirmedResults, type FilledField, type InputFieldResult } from "./achievements.js";
 import { projectGraph } from "../graph/project.js";
 import type { Graph } from "../graph/model.js";
-import { readFrame, type FrameRequest } from "./frame-obligations.js";
-import { definitionIds, observeProposal, type ProposalRequest } from "./frame-proposals.js";
+import type { FrameRequest } from "./frame-obligations.js";
+import { definitionIds, observeProposal, readProvenFrame, type ProposalRequest } from "./frame-proposals.js";
 import { observeCandidate } from "./frame-candidate.js";
 import { assessmentAttemptReason, checkCurrentAssessmentAttemptClosure, isAssessmentCallName,
   readAssessmentRefusalAt } from "./assessment.js";
@@ -1166,7 +1166,7 @@ export function readDefinitions(store: Store, request: DefinitionRequest): OmRes
   if (source.context?.kind !== "frame" || source.context.request.project !== project)
     return unreadable("An accepted base needs its own exact frame sources", "context");
   const context = source.context.request as FrameRequest;
-  const basis = readFrame(store, context);
+  const basis = readProvenFrame(store, context);
   if (!basis.ok) return basis;
   const frame = basis.value;
   let graph = frame.upper;

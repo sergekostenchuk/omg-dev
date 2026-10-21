@@ -14,6 +14,7 @@ import type { OmInputRecord } from "../src/om/input.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
+import type { FrameRequest } from "../src/om/frame-obligations.js";
 import { openSeries, beginAttempt } from "../src/om/series.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { type RoutesRecord } from "../src/om/routes.js";
@@ -21,7 +22,7 @@ import type { RepairSeries } from "../src/om/series.js";
 import { readRun, startRun, runId, type RunRequest, type RunStep } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 import { regateRun } from "../src/om/run.js";
-import { currentL3Reopen, l3ReopenId, readFrameProposals } from "../src/om/frame-proposals.js";
+import { currentL3Reopen, l3ReopenId, observeProposal, readFrameProposals, readProvenFrame } from "../src/om/frame-proposals.js";
 import { resolveSnapshot } from "../src/om/impact.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { project, adapterFixture, ok, refusal, runFixture, type Fixture, addressAll, usage, blockSeries, actions, actionsSteps, ends, stopAnswer, secondRung, until, RacingStore, loadOperations, gardenPass, regatePolicy, worksFixture, worksAcceptance, factWorksPass, driveUntil, gapHeads, atCommit, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Context, LP4_COMMITS, lp4Sent, lp4Close, policyDoor } from "./om-run-fixture.js";
@@ -322,6 +323,88 @@ test("RL3 rows 1–9: om-regate refuses an unfinished pass and writes nothing wh
   before = store.list().map(reference);
   assert.equal(ok(regateRun(store, { project })).state, "passed");
   assert.deepEqual(store.list().map(reference), before);
+});
+/**
+ * RJ1 (№8696): the refusal of a regated works frame carries the reopening its contexts name — the journal keeps the
+ * exact record and works in the normalized source of both kinds, G7 proves them when it reads the origin, the row
+ * classifies unknown and its hold stands by the review's own record. The defective frame is never accepted, the managed
+ * close is complete, and a cold repeat writes nothing.
+ */
+test("RJ1: a G5 refusal of the regated works is journalled with its exact reopening, classified unknown and held; the proven read accepts the saved context and refuses every forgery", async t => {
+  const g = await gardenPass(t);
+  const { store, desired, commit, respond, drive, cycle } = g;
+  const stepOf = () => (ok(readRun(store, { project }))!.value.state as { step: RunStep }).step;
+  await drive(cycle);
+  respond(stepOf(), structuredClone(desired.nodes.find(node => node.id === "garden-consume-work")!), []);
+  await drive(state => state.phase === "complete");
+  const frame1 = reference(store.get(`om-frame:${project}:3`)!);
+  commit("a test reaches the consumed result", { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" });
+  const reopen = ok(regateRun(store, { project })).reopen!;
+  assert.deepEqual(await drive(cycle), ["bases", "open", "register", "lines", "obligations", "packet"]);
+  // The works answer leaves the reopened work's impact undecided on the file the snapshot gained: the candidate is
+  // refused at G5, its proposals rejected, and the refusal is journalled in the same transaction as the rejection.
+  respond(stepOf(), structuredClone(desired.nodes.find(node => node.id === "garden-consume-work")!), []);
+  // The hold's own review names no origin: the hold then stands by its own record, the pass reads it as a ground.
+  g.answer({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage } as unknown as Json);
+  assert.deepEqual(await drive(state => state.phase === "unable"), ["cycle", "evaluate", "works", "finalize", "close", "bases", "analyze"]);
+  type Reopened = FrameRequest & { reopen?: { record: Ref; works: string[] } };
+  interface Row { id: string; code: string; origin: { name: string; subject: string;
+    sources: { role: string; ref: Ref; context?: { kind: string; request: Reopened | { frame: Reopened; proposals: Ref[] } } }[] } }
+  const journal = store.get<{ rows: Row[]; classifications: { row: string; class: string; addressee: string }[] }>(`om-refusal-journal:${project}`)!.value;
+  const row = journal.rows.find(item => item.code === "work_impact_undecided" && item.origin.subject === "garden-consume-work")!;
+  const named = { record: reference(reopen), works: ["garden-consume-work"] };
+  const base = row.origin.sources.find(item => item.role === "base")!;
+  assert.equal(base.context!.kind, "frame");
+  const context = base.context!.request as Reopened;
+  assert.deepEqual(context.reopen, named, "The base keeps the exact reopening it was weighed against");
+  const proposal = row.origin.sources.find(item => item.role === "proposal")!;
+  assert.equal(proposal.context!.kind, "proposal");
+  const proposalRequest = proposal.context!.request as { frame: Reopened; proposals: Ref[] };
+  assert.deepEqual(proposalRequest.frame.reopen, named, "The proposal's frame keeps the exact same reopening");
+  const classification = journal.classifications.find(item => item.row === row.id)!;
+  assert.equal(classification.class, "unknown");
+  assert.equal(classification.addressee, `analysis:repair-series:${project}:1:garden-consume-block`);
+  // The managed close of the refusing attempt is complete: attempt 2 ended refused on exactly this row.
+  const series = store.get<RepairSeries>(`repair-series:${project}:1:garden-consume-block`)!.value;
+  assert.equal(series.attempts.length, 2);
+  const outcome = series.attempts[1]!.outcome!;
+  assert.equal(outcome.reason, "refused");
+  assert.deepEqual(outcome.refusals.map(item => item.row), [row.id]);
+  // The refusal's hold stands: the review established no origin, so the pass ends on it and the frame moved nowhere.
+  const holds = store.list<{ lift: unknown }>("om-origin-hold");
+  assert.equal(holds.length, 1);
+  assert.equal(holds[0]!.value.lift, null);
+  const end = (ok(readRun(store, { project }))!.value.state as unknown as { reasons: { kind: string; code: string; target: string }[] }).reasons;
+  assert.deepEqual(end.map(item => [item.kind, item.code, item.target]), [["hold-origin-unestablished", "origin_hold", holds[0]!.id]]);
+  assert.deepEqual(reference(store.get(`om-frame:${project}:3`)!), frame1, "The defective candidate wrote no frame");
+  assert.ok(store.list("layer-proposal").some(item => (item.value as { status?: string }).status === "rejected"), "The refusal rejected the proposal it named");
+  // The saved contexts prove what they name: the exact record reads after the head moved and on a cold store.
+  store.write({ id: reopen.id, kind: reopen.kind, expected: reopen.revision, value: reopen.value as unknown as Json });
+  assert.ok(readProvenFrame(store, context).ok, "The named record is read, never today's head");
+  const tampered = (reopen: { record: Ref; works: string[] }): Reopened => ({ ...context, reopen });
+  assert.equal(readProvenFrame(store, tampered({ ...named, works: ["garden-produce-work"] })).ok, false);
+  assert.equal(readProvenFrame(store, tampered({ ...named, record: frame1 })).ok, false, "A record of another kind is no reopening");
+  assert.equal(readProvenFrame(store, tampered({ record: { ...named.record, hash: "0".repeat(64) }, works: named.works })).ok, false);
+  const without = { ...context } as Record<string, unknown>; delete without["reopen"];
+  assert.ok(readProvenFrame(store, without as never).ok, "A context naming none derives as its own era did");
+  const observed = observeProposal(store, { project, proposal: proposal.ref, request: proposalRequest as never });
+  assert.ok(observed.ok, "The proposal's saved context reads its reopening too");
+  assert.equal(observeProposal(store, { project, proposal: proposal.ref,
+    request: { ...proposalRequest, frame: { ...proposalRequest.frame, reopen: { ...named, works: ["garden-produce-work"] } } } as never }).ok, false);
+  const cold = new Store(g.f.database);
+  try {
+    assert.ok(readProvenFrame(cold, context).ok, "A cold store reads the saved context");
+    assert.ok(observeProposal(cold, { project, proposal: proposal.ref, request: proposalRequest as never }).ok);
+  } finally { cold.close(); }
+  // A cold repeat writes nothing of its own: the unable pass reads its grounds again and neither performs a step
+  // nor writes a second refusal or hold (the run's read trail may move — the head moved above).
+  g.f.restart();
+  const product = (rows: readonly { id: string; revision: number }[]) => rows.filter(row =>
+    row.id.startsWith("om-unit-refusal:") || row.id.startsWith("om-origin-hold"))
+    .map(row => ({ id: row.id, revision: row.revision }));
+  const before = product(g.f.store.list());
+  assert.equal(ok(await advanceRun(g.f.store, g.request)).performed, null);
+  assert.deepEqual(product(g.f.store.list()), before);
 });
 test("RL3 №4218 exits 2 and 3: the owner's explicit release of the wait is one record of that reopening — a repeat is that record — and the pass then gives the policy to the model by OWN1 with the reopened works", async t => regatePolicy(t, "release"));
 // OWN1 (№3711, №3716) replaced the end of R13/R13b: in the bypass a late question no H2 assigned no longer ends the pass.
