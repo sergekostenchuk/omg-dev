@@ -1,5 +1,5 @@
-import { ASSESSMENT_METHODOLOGY_CONTRACT, ASSESSMENT_METHODOLOGY_POLICY } from './assessment-methodology.js';
-import { DISCOVERY_ASSESSMENT_CONTRACT_V2 } from './research-model.js';
+import { ASSESSMENT_METHODOLOGY_CONTRACT, ASSESSMENT_METHODOLOGY_POLICY, ASSESSMENT_METHODOLOGY_POLICY_V2, type MethodologyPolicy } from './assessment-methodology.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3 } from './research-model.js';
 import { proveAttemptPacket, checkProgressBaseline } from './v7-attempt-assessment.js';
 import { V7_ATTEMPT_PACKET_CONTRACT, V7_PROGRESS_BASELINE_CONTRACT, type V7AttemptPacket, type V7ProgressBaseline } from './research-model.js';
 import { planSubjectOf, sameSubject, callAddressesSubject, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -22,10 +22,15 @@ export function methodologyAssessmentTransport() {
   return { contract: DISCOVERY_ASSESSMENT_CONTRACT_V2, methodology: ASSESSMENT_METHODOLOGY_CONTRACT,
     policy: ASSESSMENT_METHODOLOGY_POLICY } as const;
 }
+/** MR is an explicit choice before capacity and payment; the v2 factory stays historical. */
+export function requirementsAssessmentTransport() {
+  return { contract: DISCOVERY_ASSESSMENT_CONTRACT_V3, methodology: ASSESSMENT_METHODOLOGY_CONTRACT,
+    policy: ASSESSMENT_METHODOLOGY_POLICY_V2 } as const;
+}
 export interface AssessmentTransportSubject {
   kind: 'attempts'; packet: V7AttemptPacket; baseline: V7ProgressBaseline;
   /** Absent only for the original T contract. Never retrofit a paid request. */
-  assessment?: ReturnType<typeof methodologyAssessmentTransport>;
+  assessment?: ReturnType<typeof methodologyAssessmentTransport> | ReturnType<typeof requirementsAssessmentTransport>;
 }
 export function packetAssessmentSubject(container: unknown): AssessmentTransportSubject | null {
   if (!container || typeof container !== 'object' || !Object.hasOwn(container, 'assessmentSubject')) return null;
@@ -40,9 +45,9 @@ export function packetAssessmentSubject(container: unknown): AssessmentTransport
     const declaration = subject.assessment;
     const valid = declaration && typeof declaration === 'object' && !Array.isArray(declaration)
       && Object.keys(declaration).sort().join(',') === 'contract,methodology,policy'
-      && declaration.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2
       && declaration.methodology === ASSESSMENT_METHODOLOGY_CONTRACT
-      && declaration.policy === ASSESSMENT_METHODOLOGY_POLICY;
+      && (declaration.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2 && declaration.policy === ASSESSMENT_METHODOLOGY_POLICY
+        || declaration.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3 && declaration.policy === ASSESSMENT_METHODOLOGY_POLICY_V2);
     if (!valid) throw new EngineError('discovery_assessment_subject_invalid',
       'The assessment needs its exact supported methodology contract and policy', { field: 'assessmentSubject.assessment' });
   }
@@ -98,12 +103,12 @@ const methodRef = { $ref: '#/$defs/ref' } as const;
 const methodEvidence = { type: 'array', items: { $ref: '#/$defs/evidence' } } as const;
 const methodObject = (properties: Record<string, unknown>) => ({ type: 'object', additionalProperties: false,
   required: Object.keys(properties), properties });
-function buildMethodologyResponseContract() { return {
+function buildMethodologyResponseContract(policy: MethodologyPolicy = ASSESSMENT_METHODOLOGY_POLICY) { return {
   ...ATTEMPTS_ASSESSMENT_RESPONSE,
   required: [...ATTEMPTS_ASSESSMENT_RESPONSE.required, 'methodology'],
   properties: { ...ATTEMPTS_ASSESSMENT_RESPONSE.properties,
     methodology: methodObject({ contract: { const: ASSESSMENT_METHODOLOGY_CONTRACT },
-      policy: { const: ASSESSMENT_METHODOLOGY_POLICY }, facts: { type: 'array', items: { $ref: '#/$defs/fact' } } }) },
+      policy: { const: policy }, facts: { type: 'array', items: { $ref: '#/$defs/fact' } } }) },
   $defs: {
     ref: methodObject({ id: methodText, revision: { type: 'integer', minimum: 1 }, hash: methodText }),
     claim: methodObject({ project: methodText, container: methodRef, containerKind: methodText,
@@ -135,8 +140,25 @@ function buildMethodologyResponseContract() { return {
         counterarguments: methodEvidence, limitations: { type: 'array', items: methodText } })) } })
   }
 } as const; }
+function buildRequirementsResponseContract() {
+  const schema = buildMethodologyResponseContract(ASSESSMENT_METHODOLOGY_POLICY_V2);
+  const bases = { type: 'array', minItems: 1, items: { oneOf: [
+    methodObject({ claim: { $ref: '#/$defs/claim' } }), methodObject({ constraint: methodRef })] } };
+  const sufficiency = methodObject({ criterion: methodText, requiredDepth: methodText, reason: methodText,
+    methodologyRequirements: { type: 'array', items: methodObject({ claim: { $ref: '#/$defs/claim' },
+      dated: { type: 'boolean' }, versioned: { type: 'boolean' }, independentConfirmation: { type: 'boolean' }, reason: methodText }) } });
+  const ordinary = { type: 'object', additionalProperties: false, required: ['outcome','bases','reason'],
+    properties: { outcome: { enum: ['open','unknown'] }, bases, reason: methodText,
+      consequence: methodText, nextAction: methodText } };
+  return { ...schema, properties: { ...schema.properties, novelty: { ...schema.properties.novelty,
+    properties: { ...schema.properties.novelty.properties, transition: { oneOf: [{ type: 'null' }, ordinary,
+      methodObject({ outcome: { const: 'closed' }, bases, reason: methodText, sufficiency })] } } } } };
+}
+let requirementsResponseContract: ReturnType<typeof buildRequirementsResponseContract> | undefined;
 let methodologyResponseContract: ReturnType<typeof buildMethodologyResponseContract> | undefined;
 export function assessmentResponseContract(subject: AssessmentTransportSubject | null) {
+  if (subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3)
+    return requirementsResponseContract ??= buildRequirementsResponseContract();
   return subject?.assessment ? (methodologyResponseContract ??= buildMethodologyResponseContract()) : ATTEMPTS_ASSESSMENT_RESPONSE;
 }
 export const ATTEMPTS_ASSESSMENT_INSTRUCTION = 'Assess exactly assessmentSubject.packet against assessmentSubject.baseline. '
@@ -151,16 +173,27 @@ export const ATTEMPTS_METHODOLOGY_INSTRUCTION = 'The declared assessment contrac
   + 'For significant claims, including every blocking claim, require independent confirmation or an explicit single_confirmation limitation. Mirrors and captures of one original are not independent. '
   + 'Refutation has performed/not_performed/unavailable status, reason, exact saved search turns and captures, counterarguments and limitations; never invent a search or infer absence of refutations from no hits. '
   + 'Limitations do not satisfy missing plan criteria. Methodology flags create neither novelty nor progress, streak/N, acceptance or authority.';
+export const ATTEMPTS_REQUIREMENTS_INSTRUCTION = 'For a closed transition, sufficiency.methodologyRequirements is mandatory. '
+  + 'List exactly every fact in the closing bases, recursively including inference premises, once at its exact ClaimAddress; an empty list is legal only if there are no such facts. '
+  + 'For each fact give explicit boolean dated, versioned and independentConfirmation, plus a nonempty reason deriving those requirements from the saved criterion and requiredDepth. '
+  + 'Never infer a false default from an absent requirement. Unknown dates or versions satisfy only requirements explicitly false. Retrieval time is not a publication/event date. '
+  + 'Closing requires established applicability, satisfaction of each declared requirement, and a proven performed refutation search without unresolved counterarguments or refutation limitations. '
+  + 'An explicit single_confirmation may support accepting a limited fact but cannot satisfy required independent confirmation. A source limitation alone is not a contradiction. '
+  + 'Keep unresolved questions open or justify unknown; requirements and reason text never clear an unresolved refutation.';
 function assessmentInstruction(subject: AssessmentTransportSubject) {
-  return subject.assessment ? `${ATTEMPTS_ASSESSMENT_INSTRUCTION}\n${ATTEMPTS_METHODOLOGY_INSTRUCTION}` : ATTEMPTS_ASSESSMENT_INSTRUCTION;
+  return ATTEMPTS_ASSESSMENT_INSTRUCTION
+    + (subject.assessment ? `\n${ATTEMPTS_METHODOLOGY_INSTRUCTION}` : '')
+    + (subject.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3 ? `\n${ATTEMPTS_REQUIREMENTS_INSTRUCTION}` : '');
 }
 /** The shared session producer still appends its single-answer instructions.
  * Strip exactly that known suffix, preserving the supplied base prompt. */
 export function assessmentTransportPrompt(prompt: string, singleAnswerSuffix: string, subject: AssessmentTransportSubject | null = null): string {
   const base = prompt.endsWith(singleAnswerSuffix) ? prompt.slice(0, -singleAnswerSuffix.length) : prompt;
   const general = base.includes(ATTEMPTS_ASSESSMENT_INSTRUCTION) ? base : `${base}\n${ATTEMPTS_ASSESSMENT_INSTRUCTION}`;
-  return subject?.assessment && !general.includes(ATTEMPTS_METHODOLOGY_INSTRUCTION)
+  const method = subject?.assessment && !general.includes(ATTEMPTS_METHODOLOGY_INSTRUCTION)
     ? `${general}\n${ATTEMPTS_METHODOLOGY_INSTRUCTION}` : general;
+  return subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3 && !method.includes(ATTEMPTS_REQUIREMENTS_INSTRUCTION)
+    ? `${method}\n${ATTEMPTS_REQUIREMENTS_INSTRUCTION}` : method;
 }
 export function assessmentQuestionContract(subject: AssessmentTransportSubject) {
   return { id: subject.packet.planQuestionId, basis: subject.packet.question,
