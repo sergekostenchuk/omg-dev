@@ -359,3 +359,15 @@ export function checkMethodologyRequirements(store: Store, value: unknown,
   if (seen.size !== facts.size) invalid(at, 'The requirements cover exactly the closing facts, not every accepted fact');
   return value as MethodologyRequirement[];
 }
+
+/** P.2 consumes M2's proven annotations and MR's explicit paid requirements.
+ * Source limitations describe the evidence; only unresolved refutation limits
+ * prevent closing. No unknown date/version or single confirmation is upgraded. */
+export function requireMethodologyClosure(fact: FactMethodology,
+  requirements: MethodologyRequirement, field: string): void {
+  const gaps = methodologyClosureGaps(fact, requirements);
+  if (fact.temporalApplicability.status !== 'established') gaps.push('applicability_unproven');
+  if (fact.refutation.status !== 'performed') gaps.push('refutation_unperformed');
+  if (fact.refutation.counterarguments.length || fact.refutation.limitations.length) gaps.push('refutation_unresolved');
+  if (gaps.length) invalid(field, `Closing requirements remain unmet: ${gaps.join(', ')}`);
+}

@@ -1,7 +1,12 @@
 import { canonical, HASH_RE } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, type Ref } from '../pipeline/contracts.js';
-import type { V7ProgressSubject, V7ProgressSummary } from './research-model.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V3, type PaidDiscoveryAttemptsAssessment,
+  type V7ProgressSubject, type V7ProgressSummary } from './research-model.js';
+import type { Store } from '../storage/store.js';
+import { requireMethodologyClosure } from './assessment-methodology.js';
+import type { ClaimAddress } from './claim-address.js';
+import { readDiscoveryAssessment } from './research-assessment.js';
 
 export type V7ProgressCounters = Pick<V7ProgressSummary, 'cursor' | 'count' | 'streak'>;
 export interface V7FoldAttempt { attempt: Ref; number: number; contentKeys: readonly string[] }
@@ -106,4 +111,72 @@ export function foldV7Progress(input: V7ProgressFoldInput): V7ProgressFold {
     fresh.push({ attempt: { ...row.attempt }, number: row.number, contentKeys: emitted, streak: after.streak });
   }
   return { counters: after, stalled: after.streak >= 3, fresh };
+}
+
+export interface V7MethodologyOrigin { claim: ClaimAddress; assessment: Ref }
+export interface V7AssessmentClosure {
+  assessment: Ref;
+  transition: PaidDiscoveryAttemptsAssessment['novelty']['transition'];
+  methodologyOrigins: V7MethodologyOrigin[];
+}
+function closureInvalid(field: string, reason: string): never {
+  throw new EngineError('discovery_novelty_invalid', `[${field}] ${reason}`, { field, reason });
+}
+/** P.2 checks methodological conditions, not acceptance or permission to apply
+ * closed. MR.5 re-derives each paid terminal through the common form checker.
+ * P.3/P.4 must prove external claims accepted and match every historical origin
+ * to the assessment of that exact accepted application, rather than substitute
+ * a different, more favourable paid reassessment. No heads are searched here. */
+export function checkV7AssessmentClosure(store: Store, project: string, assessment: Ref,
+  origins: readonly V7MethodologyOrigin[]): V7AssessmentClosure {
+  const paid = readDiscoveryAssessment(store, project, assessment).value;
+  const transition = paid.novelty.transition, at = 'transition.sufficiency.methodologyRequirements';
+  if (transition?.outcome === 'closed' && paid.contract !== DISCOVERY_ASSESSMENT_CONTRACT_V3)
+    closureInvalid(at, 'A new closed requires explicit paid v3 requirements, including an empty list without facts; historical v2 supplies no defaults');
+  const requirements = paid.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3 && transition?.outcome === 'closed'
+    ? paid.novelty.transition!.sufficiency!.methodologyRequirements : [];
+  if (!Array.isArray(origins)) closureInvalid('methodologyOrigins', 'Historical methodology origins are an explicit list');
+  const selected = new Map<string, { origin: V7MethodologyOrigin; field: string }>();
+  for (const [i, origin] of origins.entries()) {
+    const field = `methodologyOrigins.${i}`;
+    if (!obj(origin) || Object.keys(origin).length !== 2 || !['claim','assessment'].every(key => Object.hasOwn(origin, key)) || !isRef(origin.assessment))
+      closureInvalid(field, 'An origin names exactly its claim and exact paid assessment Ref');
+    const claim = origin.claim;
+    if (!obj(claim) || Object.keys(claim).length !== 5
+      || !['project','container','containerKind','pointer','claimId'].every(key => Object.hasOwn(claim, key)) || claim.project !== project || !isRef(claim.container)
+      || !text(claim.containerKind) || !text(claim.pointer) || !text(claim.claimId))
+      closureInvalid(`${field}.claim`, 'The origin carries the full exact claim address of this project');
+    const key = canonical(claim);
+    if (selected.has(key)) closureInvalid(`${field}.claim`, 'A historical fact has exactly one methodology origin');
+    const requirement = requirements.find(row => canonical(row.claim) === key);
+    if (!requirement || paid.methodology.facts.some(fact => canonical(fact.claim) === key))
+      closureInvalid(`${field}.claim`, 'Origins name only required external facts, never extra or current claims');
+    selected.set(key, { origin: { claim: requirement.claim, assessment: { ...origin.assessment } }, field });
+  }
+  const sources = new Map<string, PaidDiscoveryAttemptsAssessment>(), used: V7MethodologyOrigin[] = [];
+  for (const [i, row] of requirements.entries()) {
+    const field = `${at}.${i}`, key = canonical(row.claim);
+    let fact = paid.methodology.facts.find(item => canonical(item.claim) === key), ref = assessment;
+    if (!fact) {
+      const entry = selected.get(key);
+      if (!entry) closureInvalid(`${field}.claim`, 'The external closing fact needs its explicit original paid methodology');
+      ref = entry.origin.assessment;
+      let original = sources.get(canonical(ref));
+      if (!original) {
+        try { original = readDiscoveryAssessment(store, project, ref).value; }
+        catch (error) {
+          if (error instanceof EngineError) closureInvalid(`${entry.field}.assessment`, `The selected paid methodology is not provable: ${error.message}`);
+          throw error;
+        }
+        sources.set(canonical(ref), original);
+      }
+      if (!original.novelty.accepted.some(item => canonical(item.claim) === key))
+        closureInvalid(`${entry.field}.claim`, 'The selected paid assessment does not classify this exact fact as accepted');
+      fact = original.methodology.facts.find(item => canonical(item.claim) === key);
+      if (!fact) closureInvalid(`${entry.field}.claim`, 'The selected paid assessment lacks this exact fact methodology');
+    }
+    requireMethodologyClosure(fact, row, field);
+    used.push({ claim: structuredClone(row.claim), assessment: { ...ref } });
+  }
+  return { assessment: { ...assessment }, transition: structuredClone(transition), methodologyOrigins: used };
 }
