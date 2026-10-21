@@ -11,7 +11,6 @@ import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { type Sealed, type OmResult, type Refusal } from "../src/om/refusal.js";
-import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import type { Graph } from "../src/graph/model.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { git } from "../src/runtime/environment.js";
@@ -40,8 +39,10 @@ import { readRoutes, type RouteBatch, type RoutesRecord } from "../src/om/routes
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
 import { type ModelCallOutcome, type ModelCycleRecord, readModelCall, runModelCall, runModelCycle, readCompletionWorkAt, writeCompletionCessation } from "../src/om/model-call.js";
-import { gapLineExpectedResult, gapLineKey } from "../src/om/gap-lines.js";
-import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
+import { gapLineExpectedResult, gapLineKey, gapLinesId, writeGapLines, type GapLinesRecord } from "../src/om/gap-lines.js";
+import { prepareOmObligations, writeOmObligations } from "../src/om/obligations.js";
+import type { GapReadRequest } from "../src/om/gaps.js";
+import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { advanceRun as currentAdvanceRun, cycleStartOf, readRun, startRun, runId, type RunRequest, type RunRecord, type RunResult, type RunStep, type RunWait, type RunReason } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases, type RunBases } from "../src/om/run-bases.js";
 import { regateRun } from "../src/om/run.js";
@@ -449,7 +450,8 @@ async function gardenPass(t: test.TestContext) {
   commit("capture input", { "input.txt": "A captured external input" });
   const adapter = store.write({ id: `adapter:${project}:rl3`, kind: "dispatch-adapter", expected: 0, value: { projectId: project, protocol: "codex-stdio" } });
   const g = { f, store, workspace, desired, built, adapter, commit, respond: null as unknown as typeof respond, drive: null as unknown as typeof drive,
-    cycle: null as unknown as typeof cycle, request: { project, dispatch: { adapter: reference(adapter), config: reference(environment) } } as RunRequest };
+    cycle: null as unknown as typeof cycle, answer: null as unknown as (step: Json) => void,
+    request: { project, dispatch: { adapter: reference(adapter), config: reference(environment) } } as RunRequest };
   ok(startRun(store, { project }));
   // The pass works L3 through one paid answer to its completion, as in H1.2.
   const steps: Json[] = [];
@@ -477,7 +479,9 @@ async function gardenPass(t: test.TestContext) {
     return assert.fail(`The pass did not reach its next stop: ${performed.join(",")}`);
   };
   const cycle = (state: RunRecord["state"]) => state.phase === "step" && state.step.action === "cycle";
-  g.respond = respond; g.drive = drive; g.cycle = cycle;
+  /** Queues one more model answer after `respond` — the review of a hold runs on the same adapter. */
+  const answer = (step: Json) => { steps.push(step); writeFileSync(scenario, JSON.stringify({ database: f.database, steps })); };
+  g.respond = respond; g.drive = drive; g.cycle = cycle; g.answer = answer;
   return g;
 }
 /**
@@ -951,27 +955,28 @@ function managedPlan(routes: Revision<RoutesRecord>, block: string, batches?: re
   return { goal, completion: { routes: reference(routes), batches: selected.map(batch => batch.id).sort() } };
 }
 /**
- * LG05: a refusal row of the earlier mode — one a gate of that era wrote and A2 journalled, and G7 cannot place its
- * origin (no class, so the close raises a hold). No refusal producer of the current era writes such an origin: E4 rows
- * always carry `model-call:*` (conditions/proposal), E5 `fact-assessment` (proposal), G5 `atomicity` names one proposal
- * per row, and a G4b row is never a counted refusal — an unplaceable origin exists only on rows of the earlier mode,
- * which is why this record keeps its era form, read by its own contract (like stoppedBlockLine).
+ * The D7 ledger a managed works packet stands on (the worksLedger of run.ts): the D2 lines of exactly this routes'
+ * scope — today's head of the same scope, or a new pass of it — and the obligations derived from them, written by the
+ * real producers. A packet of a node-expansion L3 batch is asked with this exact `works` basis (F5).
  */
-function eraRefusal(store: Store, name: string, goal: string, origin: { name: string; stage: string; subject: string; sources: readonly unknown[] }) {
-  const source = store.write({ id: `${unitRefusalNamespace(project)}${name}`, kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "G3", refusals: [{ code: `unrecognized_fixture_refusal`, goal, remedy: "Identify the exact origin", origin }] } });
-  return ok(recordRefusal(store, { project, source: reference(source) })).value.rows.find(entry => entry.source.id === source.id)!;
-}
-/** The close of an earlier-mode attempt refused by the refusal `eraRefusal` journalled — G7 raises a hold of its unknown origin. */
-function eraRefusedClose(store: Store, address: { project: string; block: string; line: number }, attempt: number, goal: { key: string; questions: string[]; result: string }, row: { id: string; code: string; goal: string }) {
-  ok(beginAttempt(store, { ...address, attempt, goal }));
-  return ok(closeAttempt(store, { ...address, attempt, outcome: { reason: "refused", accepting: [], cancelling: [],
-    refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+function managedWorksLedger(f: Fixture, routes: Revision<RoutesRecord>): { producer: Ref; ledger: Ref } {
+  const scope = routes.value.request.gaps as unknown as GapReadRequest;
+  const sorted = (refs: readonly Ref[]) => [...refs].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const latest = f.store.get<GapLinesRecord>(gapLinesId(project));
+  const ofScope = !!latest && canonical(latest.value.request.gaps.sources) === canonical(scope.sources)
+    && canonical(sorted(latest.value.request.gaps.records)) === canonical(sorted(scope.records));
+  const lines = ofScope ? latest!
+    : ok(writeGapLines(f.store, { project, previous: latest ? reference(latest) : null,
+      pass: (latest?.value.request.pass ?? 0) + 1, gaps: scope, closures: [] }));
+  const obligations = { project, gaps: scope, lines: reference(lines), assignments: [] };
+  const prepared = ok(prepareOmObligations(f.store, obligations));
+  const written = prepared.writes.length ? ok(writeOmObligations(f.store, obligations)) : prepared;
+  return { producer: reference(written.producer), ledger: reference(written.record) };
 }
 /**
  * LG05: one managed attempt of `block` on exactly these batches, whose model call asked the owner (`need_owner`) and
  * whose close ended `awaiting-owner` — a real cycle by the current producers (open, packet, call, claim, close), whose
- * close record keeps its waiting diagnostic for owedBy.
+ * close record keeps its waiting diagnostic for owedBy. An L3 expansion root is asked with its exact D7 ledger (F5).
  */
 async function managedAwaitOwner(f: Fixture, bases: RunBases, block: string, attempt: number,
   batches: readonly RouteBatch[], worked: readonly RouteBatch[] = []) {
@@ -985,7 +990,8 @@ async function managedAwaitOwner(f: Fixture, bases: RunBases, block: string, att
   // order — the worked roots by their node answers, the asked root by need_owner.
   const packets = [...worked, batches[0]!].map(batch => ok(writeQuestionPacket(f.store, { project, routes: bases.routes,
     batch: batch.id, environment: request.dispatch.config,
-    attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record);
+    attempt: { series: reference(opened), ordinal: attempt }, previous: [],
+    ...(batch.task === "node-expansion" && batch.level === 3 ? { works: managedWorksLedger(f, routes) } : {}) })).record);
   const replies = [...packets.slice(0, worked.length).map(saved => nodeAnswer(f, { request: { packet: reference(saved) } })),
     { research: { protocol: "$answerProtocol", requestId: "$requestId",
       questionIds: (packets.at(-1)!.value.packet as { questions: { id: string }[] }).questions.map(row => row.id),
@@ -997,9 +1003,121 @@ async function managedAwaitOwner(f: Fixture, bases: RunBases, block: string, att
   // the asked input-field root is the one E4 call that ends waiting.
   for (const saved of packets.slice(0, worked.length))
     ok(await runModelCycle(f.store, { project, packet: reference(saved), dispatch: request.dispatch, role: "implementer" }));
-  ok(await runModelCall(f.store, { project, packet: reference(packets.at(-1)!), dispatch: request.dispatch, role: "implementer" }));
+  const asked = [...worked, batches[0]!].at(-1)!;
+  if (asked.task === "node-expansion")
+    ok(await runModelCycle(f.store, { project, packet: reference(packets.at(-1)!), dispatch: request.dispatch, role: "implementer" }));
+  else
+    ok(await runModelCall(f.store, { project, packet: reference(packets.at(-1)!), dispatch: request.dispatch, role: "implementer" }));
   const claim = ok(prepareManagedClaim(f.store, { ...address, attempt, outcome: { reason: "awaiting-owner", accepting: [], cancelling: [], refusals: [] } }));
   return ok(closeAttempt(f.store, { ...address, attempt, outcome: claim.outcome }));
+}
+/**
+ * LG05-04/07 (вердикт №8610 (a)): the real producer of origin holds in a runFixture store — nothing is written by hand.
+ * The completed pass is regated by a real workspace commit (a test file reaching a work's write path), then the pass
+ * itself opens and works the managed attempts of the reopened work's block: packets, cycles, works, closes — every
+ * refusal row and hold comes from settleCandidate/G7. `cycle` chooses the reply of each new packet of the regated
+ * drive (it is told the saved packet, its batch and the attempt ordinal; null → the batch's lawful default answer);
+ * `analyze` chooses the reply of an A6 analyze step (null → the step is left unanswered, so its repeat asks again);
+ * `pause` returns early — `step` on the chosen step before it is performed (as `until`), `performed` on the action just
+ * paid — and `resume` continues the same drive afterwards.
+ */
+/**
+ * A lawful works answer made unacceptable on purpose: the write scope lost its write access (`work_write_scope_
+ * unbounded`), and `integrations` adds an unproven one (`work_integration_unproven`) — each a real G5 row of the close.
+ * `removes` names the replaced work so the answer passes intake and reaches the gate.
+ */
+function defectedWork(f: Fixture, packet: Ref, integrations = false): Record<string, unknown> {
+  const answer = mp2WorkAnswer({ store: f.store, desired: gardenGraph() }, packet);
+  const proposal = answer.research.proposal as unknown as { nodes: { id: string; code?: { path: string; access: string; status: string }[];
+    integrations?: unknown[] }[]; removes?: string[]; fills?: { codeRef?: { access: string } }[] };
+  const work = proposal.nodes[0]!;
+  work.code = work.code!.map(item => ({ ...item, access: "read" }));
+  for (const fill of proposal.fills ?? []) if (fill.codeRef) fill.codeRef.access = "read";
+  if (integrations) work.integrations = [{ entry: "ghost.ts#Sym.m", contract: "garden-contract", basis: { existing: "ghost.ts" } }];
+  proposal.removes = [...new Set([...(proposal.removes ?? []), ...proposal.nodes.map(node => node.id)])];
+  return { research: answer.research, usage };
+}
+async function regatedHold(f: Fixture, options: { files?: Record<string, string>; bound?: number;
+  cycle?: (packet: Revision<QuestionPacketRecord>, batch: RouteBatch, attempt: number | null) => Record<string, unknown> | null;
+  analyze?: (request: unknown) => Record<string, unknown> | null;
+  pause?: { step?: string; performed?: string };
+  between?: () => Promise<void> | void } = {}) {
+  const desired = gardenGraph(), request = f.request(), workspace = join(f.root, "repo"), bound = options.bound ?? 300;
+  const defaultReply = (saved: Ref): Record<string, unknown> => {
+    const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+    const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+    if (batch.model === "MC1") {
+      const source = f.store.get<{ content: string }>(`source:${project}:brief`)!;
+      return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+        results: batch.items.map(item => ({ questionId: item.gap, value: { answer: "UTF-8" },
+          citations: [{ source: reference(source), selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage };
+    }
+    if (batch.task === "input-field")
+      return { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+        results: batch.items.map(item => ({ target: item.target, field: item.field, basis: item.record,
+          value: item.field === "address" ? { consumer: "garden-consume-block", kind: "repository-fact" } : OWN1_DECISION })) }, usage };
+    if (batch.task === "node-expansion" && batch.level === 3)
+      return { research: mp2WorkAnswer({ store: f.store, desired }, reference(packet)).research, usage };
+    return nodeAnswer(f, { request: { packet: reference(packet) } });
+  };
+  const seen = new Set<string>();
+  type Answer = (saved: Ref) => Record<string, unknown> | null;
+  type CyclePolicy = NonNullable<typeof options.cycle>;
+  const drive = async (answer: Answer | null, analyze = options.analyze,
+    pause = options.pause) => {
+    const performed: string[] = [];
+    let step: { action: string; request: unknown } | null = null;
+    for (let index = 0; index < bound; index++) {
+      const advanced = ok(await advanceRun(f.store, request));
+      if (advanced.performed) performed.push(advanced.performed.action);
+      const state = advanced.record.value.state as { phase: string; step?: { action: string; request: { packet?: Ref } } };
+      step = state.phase === "step" ? state.step as { action: string; request: unknown } : null;
+      if (state.phase === "step") {
+        if (step!.action === "cycle" && (step!.request as { packet?: Ref }).packet) {
+          const saved = (step!.request as { packet: Ref }).packet, key = JSON.stringify(saved);
+          if (!seen.has(key)) { seen.add(key); f.push((answer?.(saved) ?? defaultReply(saved)) as Record<string, unknown>); }
+        } else if (step!.action === "assess") f.push(assessor("supported") as Record<string, unknown>);
+        else if (step!.action === "analyze") { const reply = analyze?.(step!.request); if (reply) f.push(reply); }
+        if (pause?.step && step!.action === pause.step) return { state, performed, step };
+      }
+      if (pause?.performed && performed.at(-1) === pause.performed) return { state, performed, step };
+      if (["unable", "complete"].includes(state.phase)) return { state, performed, step };
+      if (state.phase === "waiting" && (state as { wait?: { code?: string } }).wait?.code !== "input_stale")
+        return { state, performed, step };
+    }
+    return null;
+  };
+  const first = await drive(null);
+  assert.equal(first?.state.phase, "complete", `a regatable pass must complete first: ${JSON.stringify(first?.state)}`);
+  await options.between?.();
+  const commit = (files: Record<string, string>) => {
+    for (const [path, text] of Object.entries(files)) writeFileSync(join(workspace, path), text);
+    git(workspace, ["add", ...Object.keys(files)]);
+    git(workspace, ["-c", "user.name=OMG Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "regate"]);
+    const regated = ok(regateRun(f.store, { project }));
+    assert.equal(regated.state, "reopened", `the commit must reopen works: ${JSON.stringify(regated)}`);
+    return regated;
+  };
+  const policy = (cycle?: CyclePolicy): Answer => saved => {
+    const packet = f.store.get<QuestionPacketRecord>(saved.id, saved.revision)!;
+    const routed = f.store.get<RoutesRecord>(packet.value.request.routes.id, packet.value.request.routes.revision)!.value;
+    const batch = routed.batches.find(row => row.id === packet.value.request.batch)!;
+    return cycle?.(packet, batch, packet.value.request.attempt?.ordinal ?? null) ?? null;
+  };
+  const regated = commit(options.files ?? { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" });
+  const secondAnswer = policy(options.cycle);
+  const second = await drive(secondAnswer);
+  /** A further regate of the same run — more committed files, its own cycle/analyze/pause policy. */
+  const again = async (files: Record<string, string>, local: { cycle?: CyclePolicy; analyze?: typeof options.analyze;
+    pause?: typeof options.pause } = {}) => {
+    const regate = commit(files);
+    const result = await drive(policy(local.cycle ?? options.cycle), local.analyze ?? options.analyze, local.pause);
+    return { regate, result };
+  };
+  return { regated, first, second, again,
+    resume: (local: { analyze?: typeof options.analyze; pause?: typeof options.pause } = {}) =>
+      drive(secondAnswer, local.analyze ?? options.analyze, local.pause ?? options.pause) };
 }
 /** A managed attempt of `block` planned on exactly this batch — the plan an earlier pass saved (the reviewer's helper, №2221). */
 function openPlanned(f: Fixture, bases: RunBases, block: string, batches: readonly RouteBatch[], slice = "before-h15", seriesCommit?: string) {
@@ -1691,5 +1809,5 @@ async function policyDoor(t: test.TestContext, owner: boolean) {
 // always did under the new code — its rejection asks no readiness question and never stands on a refusal of the era.
 const AT1_BASE = "e475bd594fc2f4cde4fb58b6f26f2083f7c00954";
 
-export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, managedPlan, eraRefusal, eraRefusedClose, managedAwaitOwner, ownerAnswers, sameEnd, twoOwnerAnswers, advanceRun, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor, AT1_BASE };
+export { project, adapterFixture, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, actions, actionsSteps, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, secondRung, frameAnswer, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, loadOperations, gardenPass, regatePolicy, nodeAnswer, worksFixture, worksAcceptance, factWorksPass, LostApplication, lostAfterClaim, heldAfterClaim, a6Survives, nodeRefusal, driveUntil, gapHeads, addressQuestions, answerBatch, atCommit, openPlanned, managedPlan, managedAwaitOwner, ownerAnswers, sameEnd, twoOwnerAnswers, advanceRun, regatedHold, defectedWork, lp3Need, lp3Order, lp3Blocked, lp3Pointers, LP3_UNPROVED, lp3Hiding, lp3Context, isRefOf, asCycleStart, asRunResult, LP4_COMMITS, lp4Configure, lp4Questions, lp4Sent, lp4Close, mp2Upper, mp2Rank, mp2Works, mp2WorkAnswer, twoArtifacts, threeArtifacts, G62_BASE, g62Rejection, lp5ReplaceB1, lp5Kind, g51AmbiguousAnswer, lp6Line, lp6CurrentRounds, lp6Close, LP7_VALUES, lp7Routes, passRows, unavailableReview, policyDoor, AT1_BASE };
 export type { Fixture, Verdict, Lp5State, Lp6Op, Reopened };

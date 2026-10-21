@@ -24,7 +24,7 @@ import { COMPLETION_REUSE_KIND, type CompletionReuse } from "../src/om/model-cal
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, passRows, unavailableReview, eraRefusal, eraRefusedClose } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, addressAll, usage, factsAll, type Verdict, assessor, mechanismSeries, blockSeries, actions, ends, driveTo, reasonsOf, stopAnswer, cannotAnswer, stoppedBlockLine, OWN1_DECISION, decisionCalls, restWithDecisions, until, RacingStore, nodeAnswer, worksFixture, worksAcceptance, a6Survives, driveUntil, addressQuestions, answerBatch, advanceRun, g62Rejection, lp5ReplaceB1, type Lp5State, g51AmbiguousAnswer, passRows, unavailableReview, regatedHold, defectedWork } from "./om-run-fixture.js";
 
 test("H1.2 R8 R4 C31 a stopped line whose owner has no batch today keeps its barrier: its reviewed stop on the second rung ends the pass, and nothing is paid for that owner", async t => {
   const f = runFixture(t, [], "executed");
@@ -265,26 +265,28 @@ test("G6 В3 a paid assembly ended by its area's B1 is reused while its area's q
 });
 
 test("H1.2 R6 R6a 12 21 H1 stop and origin holds together: the origin route goes first (A6 on the exact hold), no attempt opens, an unestablished origin ends the pass without paying the other holds or the stop", async t => {
-  const f = runFixture(t, ["encoding"], "executed", true);
-  const b = f.bases("h1-hold"), request = f.request(b);
-  // Three earlier standalone attempts of the block were refused with a refusal of unknown origin: A3 stopped the
-  // series and G7 raised a hold for each (the earlier mode, read by its own contract).
-  const address = { project, block: "garden-consume-block", line: 1 };
-  ok(openSeries(f.store, { ...address, slice: "h1-hold", predecessor: null, basis: null }));
-  const goal = { key: "h1-hold-goal", questions: ["Address one contract"], result: "A supported contract" };
-  const holds: Ref[] = [];
-  for (const attempt of [1, 2, 3]) {
-    const row = eraRefusal(f.store, `h1-origin-${attempt}`, goal.key,
-      { name: "artifact_missing", stage: "layer-check", subject: `artifact:fixture-${attempt}`, sources: [] });
-    holds.push(...eraRefusedClose(f.store, address, attempt, goal, row).holds);
-  }
-  assert.ok(blockSeries(f).value.stop, "A3 stopped the series");
-  assert.ok(holds.length > 0, "G7 raised the origin holds");
-  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }]);
+  const f = runFixture(t, [], "executed");
   ok(startRun(f.store, { project }));
-  const driven = await ends(f, request, 10);
-  assert.deepEqual(driven.performed, ["analyze"], "The origin route first; nothing else of the line is paid once a hold stands unlifted");
-  const reasons = reasonsOf(driven.state);
+  // The managed regate: the commit reopens the consume work; its line makes three real terminals — two off-form
+  // closes (conditions rows only, no hold), then a works refusal whose G5 rows have no placeable origin. A3 stops
+  // the series at the third and G7 raises a hold per row.
+  const held = await regatedHold(f, {
+    files: { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" },
+    cycle: (packet, batch, attempt) => {
+      if (batch.task !== "node-expansion" || batch.level !== 3) return null;
+      return (attempt ?? 0) < 3 ? { research: { answer: "untyped reviewer reply" }, usage }
+        : defectedWork(f, reference(packet), true);
+    },
+    analyze: () => ({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }),
+    pause: { step: "analyze" } });
+  const series = blockSeries(f);
+  assert.ok(series.value.stop, "A3 stopped the series");
+  assert.deepEqual(series.value.attempts.map(attempt => attempt.outcome?.reason), ["off-form", "off-form", "refused"], "Three real terminals of the regated line");
+  const holds = f.store.list<{ lift: { class: string } | null }>("om-origin-hold" as never).map(reference);
+  assert.ok(holds.length > 0, "G7 raised the origin holds");
+  const driven = await held.resume();
+  assert.deepEqual(driven?.performed, ["analyze"], "The origin route first; nothing else of the line is paid once a hold stands unlifted");
+  const reasons = reasonsOf(driven!.state);
   assert.deepEqual(reasons.map(row => [row.kind, row.code, row.field]), [["hold-origin-unestablished", "origin_hold", "hold"]]);
   assert.ok(holds.some(hold => hold.id === reasons[0]!.target), "The reason names the exact hold");
   const analyses = f.store.list().filter(row => row.kind === "om-origin-analysis");
@@ -292,7 +294,7 @@ test("H1.2 R6 R6a 12 21 H1 stop and origin holds together: the origin route goes
   assert.equal((analyses[0]!.value as { state: string }).state, "origin-unestablished");
   assert.ok(reasons[0]!.basis.some(ref => ref.id === analyses[0]!.id), "The review of this very hold is a Ref of the reason");
   assert.equal(blockSeries(f).value.attempts.length, 3, "No new attempt while the stop and the hold stand");
-  const before = f.store.list().map(reference), sends = f.sent().length;
+  const before = f.store.list().map(reference), sends = f.sent().length, request = f.request();
   f.restart();
   assert.equal(ok(await advanceRun(f.store, request)).performed, null);
   assert.deepEqual(f.store.list().map(reference), before, "The saved end is read, not paid again");

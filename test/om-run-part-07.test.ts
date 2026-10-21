@@ -9,16 +9,17 @@ import type { QuestionPacketRecord } from "../src/om/question-packet.js";
 import type { Node } from "../src/graph/model.js";
 import { readOmInput } from "../src/om/input.js";
 import { readHorizon } from "../src/om/horizon.js";
-import { openSeries, ownerDecisionNamespace } from "../src/om/series.js";
+import { ownerDecisionNamespace } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
 import { runModelCycle } from "../src/om/model-call.js";
 import { runStopAnalysis } from "../src/om/stop-analysis.js";
+import { readJournal } from "../src/om/refusal-journal.js";
 import { readRun, startRun, runId, type RunRecord } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
 import { WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
-import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts, eraRefusal, eraRefusedClose } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, addressAll, usage, factsAll, assessor, refOf, mechanismSeries, blockSeries, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, stoppedBlockLine, until, worksFixture, worksAcceptance, factWorksPass, lostAfterClaim, a6Survives, advanceRun, mp2Works, mp2WorkAnswer, threeArtifacts, regatedHold, defectedWork } from "./om-run-fixture.js";
 
 test("3 8 25 C23 C17 C27 R5 H1.1 on its own new bases the pass works the block through MC1, E5 and G4b to one G7 close, then applies the accepted facts", async t => {
   const f = runFixture(t, undefined, "executed");
@@ -139,23 +140,33 @@ test("H1.2 R4 R2 a stop after a spent continuation is on the second rung by that
 });
 
 test("H1.2 R6 an origin the review establishes lifts its own hold and the pass goes on; it is no ground of the end", async t => {
-  const f = runFixture(t, ["encoding"], "executed", true);
-  const b = f.bases("h12-established"), request = f.request(b);
-  const address = { project, block: "garden-consume-block", line: 1 };
-  ok(openSeries(f.store, { ...address, slice: "h12-established", predecessor: null, basis: null }));
-  const goal = { key: "h12-established-goal", questions: ["Address one contract"], result: "A supported contract" };
-  const row = eraRefusal(f.store, "h12-workspace", goal.key,
-    { name: "workspace_unavailable", stage: "feasibility", subject: "workspace", sources: [] });
-  const closed = eraRefusedClose(f.store, address, 1, goal, row);
-  assert.equal(closed.holds.length, 1, "G7 raised one hold of unknown origin");
-  f.steps([{ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null,
-    origin: { class: "conditions", basis: [{ role: "environment", ref: request.dispatch.config }] } }, usage }]);
+  const f = runFixture(t, [], "executed");
   ok(startRun(f.store, { project }));
-  const driven = await driveTo(f, request, "open", 10);
-  assert.deepEqual(driven.performed, ["analyze", "open"], "The review lifts its own hold and the next attempt opens on the same line");
-  const hold = f.store.get<{ lift: { class: string } | null }>(closed.holds[0]!.id)!;
-  assert.equal(hold.value.lift?.class, "conditions");
-  assert.notEqual(ok(readRun(f.store, { project }))!.value.state.phase, "unable");
+  // The managed regate reopens the consume work; its works answer loses the write access — a real G5 refusal whose
+  // row has no placeable origin, so G7 raises the hold the review below stands on.
+  const held = await regatedHold(f, {
+    files: { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" },
+    cycle: (packet, batch) => batch.task === "node-expansion" && batch.level === 3
+      ? defectedWork(f, reference(packet), false) : null,
+    // A6 establishes the origin on the row's own proposal source: the refused proposal held the defective work —
+    // the only class these grounds prove, so the lift is lawful and the hold goes.
+    analyze: () => {
+      const rows = (ok(readJournal(f.store, { project })).value as unknown as { rows: { origin: { sources: { role: string }[] } }[] }).rows;
+      const proposal = rows.at(-1)!.origin.sources.find(source => source.role === "proposal")!;
+      return { research: { protocol: "omg-stop-analysis/v1", cause: null, change: null,
+        origin: { class: "proposal", basis: [proposal] } }, usage };
+    },
+    pause: { step: "analyze" } });
+  const holds = f.store.list<{ lift: { class: string } | null }>("om-origin-hold" as never);
+  assert.equal(holds.length, 1, "G7 raised one hold of unknown origin");
+  const driven = await held.resume({ pause: { performed: "open" } });
+  assert.ok(driven, "The drive answered after the review");
+  const reviewed = driven.performed.lastIndexOf("analyze");
+  assert.ok(reviewed >= 0, "The review of the hold was paid");
+  assert.deepEqual(driven.performed.slice(reviewed), ["analyze", "open"], "The review lifts its own hold and the next attempt opens on the same line");
+  const lifted = f.store.get<{ lift: { class: string } | null }>(holds[0]!.id)!;
+  assert.equal(lifted.value.lift?.class, "proposal");
+  assert.notEqual(driven.state.phase, "unable");
 });
 
 test("C41 C43 К7 H1 a product written before the cursor moved is found again by the saved request: no second call, open or close", async t => {
@@ -271,22 +282,24 @@ test("4 9 C21 H1 a lost assessor after its claim is recovered the same way: the 
 });
 
 test("4 9 12 21 C21 №1814 H1 A6 on an origin hold keeps its saved request through a live executor, its loss, a new Environment revision and a restart", async t => {
-  const f = runFixture(t, ["encoding"], "executed", true);
-  const b = f.bases("h1-a6-hold"), request = f.request(b);
-  // Three earlier standalone attempts refused with a refusal of unknown origin: A3 stopped the series, G7 raised holds.
-  const address = { project, block: "garden-consume-block", line: 1 };
-  ok(openSeries(f.store, { ...address, slice: "h1-a6-hold", predecessor: null, basis: null }));
-  const goal = { key: "h1-a6-hold-goal", questions: ["Address one contract"], result: "A supported contract" };
-  for (const attempt of [1, 2, 3]) {
-    const row = eraRefusal(f.store, `h1-a6-origin-${attempt}`, goal.key,
-      { name: "artifact_missing", stage: "layer-check", subject: `artifact:fixture-${attempt}`, sources: [] });
-    eraRefusedClose(f.store, address, attempt, goal, row);
-  }
+  const f = runFixture(t, [], "executed");
   ok(startRun(f.store, { project }));
-  const analyzing = await until(f, request, "analyze", 10);
+  // The managed regate: three real terminals of the consume line — two off-form closes, then a works refusal whose
+  // G5 rows have no placeable origin — A3 stops the series and G7 raises a hold per row; the pass stands at A6.
+  const held = await regatedHold(f, {
+    files: { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" },
+    cycle: (packet, batch, attempt) => {
+      if (batch.task !== "node-expansion" || batch.level !== 3) return null;
+      return (attempt ?? 0) < 3 ? { research: { answer: "untyped reviewer reply" }, usage }
+        : defectedWork(f, reference(packet), true);
+    },
+    analyze: () => ({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }),
+    pause: { step: "analyze" } });
+  const analyzing = held.second!.step!;
   assert.ok((analyzing.request as { hold: unknown }).hold !== null, "A6 reviews the exact hold first");
-  await a6Survives(t, f, request, analyzing, () => f.request(b));
-  assert.equal(f.sent().length, 0);
+  const sends = f.sent().length;
+  await a6Survives(t, f, f.request(), analyzing, () => f.request());
+  assert.equal(f.sent().length, sends, "The saved review is repeated by its request; nothing is sent again");
 });
 
 test("MP2 (№2968 rows 1, 3, 4, 5) through the pass a block designs its producer operation first; the consumer's brief carries the producer's finished work with its write paths; the producer's own brief has the explicit empty set; a saved step goes on before any rank", async t => {
