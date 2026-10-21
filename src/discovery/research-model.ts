@@ -165,3 +165,11 @@ export interface DiscoveryAttemptsAssessmentV3 extends Omit<DiscoveryAttemptsAss
 }
 export type PaidDiscoveryAttemptsAssessment = DiscoveryAttemptsAssessmentV2 | DiscoveryAttemptsAssessmentV3;
 export type VersionedDiscoveryAttemptsAssessment = DiscoveryAttemptsAssessment | PaidDiscoveryAttemptsAssessment;
+
+/** P.1: the counters fold is a pure projection, not a saved acceptance. */
+export interface V7ProgressSubject { project: string; planAnswer: Ref; planQuestionId: string }
+export interface V7ProgressSummary {
+  cursor: { run: string; number: number } | null;
+  count: number; streak: number; outcome: 'open' | 'closed' | 'unknown' | 'stalled';
+  reason: string | null; nextAction: string | null;
+}
