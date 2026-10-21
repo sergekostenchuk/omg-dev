@@ -1312,7 +1312,8 @@ export class Researcher {
   private v7SynthesisRecovery(project: string, draftId: string): UnfinishedSynthesisOperation | null {
     const subjects = new Map<string, V7PlanSubject>();
     for (const head of this.store.list<any>("synthesis-session")) {
-      if (!head.id.startsWith("synthesis-session:v3:") || head.value.projectId !== project) continue;
+      if (!head.id.startsWith("synthesis-session:v3:") || head.value.projectId !== project
+        || head.value.binding?.draft?.id !== draftId) continue;
       const session = readSynthesisSessionV3(this.store, reference(head));
       if (session.value.binding.draft.id === draftId) subjects.set(canonical(session.value.binding.subject), session.value.binding.subject);
     }
@@ -1506,15 +1507,17 @@ export class Researcher {
           if (!run) run = this.store.write<ResearchRun>({ id, kind: "research-run", expected: 0,
             value: { projectId: project, draftId, environment: reference(environment), status: "paused", turns: 0,
               limit, inputs: draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null, owner, requestChars: 0 } });
-          if (run.value.status !== "running") run = this.save(run,
+          const restoreOnly = options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7 || used >= limit;
+          // Paid restoration is guarded by the session/application CAS. Do not
+          // erase a saved pause merely to rediscover the same no-new-work door.
+          if (!restoreOnly && run.value.status !== "running") run = this.save(run,
             { status: "running", owner, error: null, pauseCode: null }, [reference(synthesis.session)]);
           const context = { role: "research", stage: "discovery", subject: synthesis.subject!,
             savedMaterials: synthesis.session.value.basis.materials,
             previousProposal: synthesis.session.value.basis.previousProposal,
             previousProposalRef: synthesis.session.value.basis.previousProposalRef, inventory: { sources: [] }, history: [] };
           run = await this.applyV7Synthesis(project, run, draft, question, environment, context, owner, signal,
-            options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7 || used >= limit,
-            synthesis);
+            restoreOnly, synthesis);
           if (run.value.status === "paused") return run;
           used++;
           continue;

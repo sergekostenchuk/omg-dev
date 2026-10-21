@@ -208,6 +208,11 @@ test('S6.6: paid lookup applies in restore-only; the next synthesis send require
  assert.deepEqual(heads(f),before);assert.equal(f.wires().length,count);
  const session=readSynthesisSessionV3(f.open(),reference(sessions(f.store)[0]!));
  assert.ok(session.value.workspace?.entries.length);assert.equal(session.value.result,null);
+ const fixed = snapshot(f);
+ for (let repeat = 0; repeat < 2; repeat++) {
+  assert.deepEqual(await f.run(3,f.open(),false),restored);
+  assert.deepEqual(snapshot(f),fixed,'second and third restore-only entries preserve complete history and payment');
+ }
  const resumed=await f.run(3,f.open());assert.equal(resumed.value.status,'completed',JSON.stringify(resumed.value));
  assert.equal(f.wires().length,count+1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
 });
@@ -297,4 +302,65 @@ test('S6.6: a real paid consolidation resumes in restore-only before another syn
  assert.equal(f.wires().length,calls+1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
  for(const turn of f.store.list<any>('research-turn'))readResearchConsumerTurn(f.open(),reference(turn));
  const before=snapshot(f);await f.run(3,f.open(),false);assert.deepEqual(snapshot(f),before);
+});
+
+
+for (const terminal of [true, false])
+ test(`S6.6-01: disabling pilot preserves a paid ${terminal ? 'terminal' : 'lookup'} and admits no new send`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ const lookup={action:'read_context',record:reference(f.v.draft),pointer:'/stage',purpose:'Exact stage'};
+ f.configure([toSynthesis,terminal?ended():lookup,ended()]);
+ const restore=cutAfter(f,row=>row.kind==='model-call' && row.value.status==='succeeded' && row.value.purpose==='analyst');
+ await f.run(3);restore();
+ const other=f.open(),pilot=readerPilot(other,'p')!,{projectId:_project,...settings}=pilot.value;
+ new ProductEngine(other).execute({type:'configure-reader-pilot',project:'p',expected:pilot.revision,settings:{...settings,active:false}});
+ const cold=f.open(),write=cold.writeMany.bind(cold);let stale=0;
+ cold.writeMany=((writes,guards=[])=>{
+  try{return write(writes,guards);}catch(error){
+   if ((error as {code?:string}).code==='input_stale' && ++stale>=3)
+    throw new Error('Three stale applications of the same paid response');
+   throw error;
+  }
+ }) as Store['writeMany'];
+ const before=heads(f),calls=f.wires().length,result=await f.run(3,cold,false);
+ assert.equal(stale,0);assert.deepEqual(heads(f),before);assert.equal(f.wires().length,calls);
+ assert.equal(result.value.status,terminal?'completed':'paused',JSON.stringify(result.value));
+ if (!terminal) {
+  assert.equal(result.value.pauseCode,'research_restore_complete');
+  const refused=await f.run(3,f.open());
+  assert.equal(refused.value.pauseCode,'reader_pilot_required',JSON.stringify(refused.value));
+  assert.deepEqual(heads(f),before);assert.equal(f.wires().length,calls);
+ }
+ for(const turn of f.store.list<any>('research-turn'))readResearchConsumerTurn(f.open(),reference(turn));
+});
+
+for (const foreign of [true, false])
+ test(`S6.6-03: a damaged ${foreign ? 'foreign' : 'own'} draft session ${foreign ? 'cannot block this run' : 'is a typed refusal'}`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);f.configure([toSynthesis,ended()]);
+ const restore=cutAfter(f,row=>row.kind==='synthesis-session' && row.expected===0);
+ await assert.rejects(direct(f),/persistent cut/);restore();
+ const original=sessions(f.store)[0]!;
+ // Explicit negative mutation of a genuine producer: its exact Question is lost.
+ const damaged=structuredClone(original.value);damaged.binding.question.hash='0'.repeat(64);
+ if (foreign) {
+  // An actual other draft of the same project; its old era does not add a
+  // second active v7 plan. Its deliberately damaged v3 claim is irrelevant.
+  const other=f.discovery.create('p','discovery','R0','concept',[
+   {field:'old',kind:'fact',prompt:'Other draft',risk:'unknown',schema:{type:'object'}}],[],6);
+  damaged.binding.draft=reference(other);
+ }
+ const broken=f.store.write({id:foreign?original.id+':foreign':original.id,kind:original.kind,
+  expected:foreign?0:original.revision,value:damaged});
+ assert.throws(()=>readSynthesisSessionV3(f.open(),reference(broken)),{code:'synthesis_session_invalid'});
+ if (foreign) {
+  f.configure([ended()]);
+  const result=await f.run(3,f.open());assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+  assert.equal(f.wires().length,1);assert.deepEqual(f.store.get(broken.id),broken);
+  const own=readSynthesisSessionV3(f.open(),reference(f.store.get<any>(original.id)!));
+  assert.deepEqual(own.value.binding.draft,original.value.binding.draft);assert.ok(own.value.result);
+ } else {
+  const before=snapshot(f);
+  await assert.rejects(f.run(3,f.open()),{code:'synthesis_session_invalid'});
+  assert.deepEqual(snapshot(f),before);
+ }
 });

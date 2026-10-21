@@ -996,9 +996,18 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
   };
   // The application of a paid step: today's admission while its subject is
   // current; once the plan moved on, its exact saved history and the session CAS.
-  const applicationAdmission = (head: Revision<SynthesisSessionState>, intent: Revision<ResearchConsumerIntent> | null) =>
-    subject && !subjectCurrent() ? historicalAdmission(store, head, intent)
-      : synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, intent);
+  const applicationAdmission = (head: Revision<SynthesisSessionState>, intent: Revision<ResearchConsumerIntent> | null) => {
+    if (subject && !subjectCurrent()) return historicalAdmission(store, head, intent);
+    const guards = synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, intent);
+    if (!subject || !intent) return guards;
+    // The paid profile is immutable provenance, not a current send admission.
+    // Preserve material currency, but CAS the application against today's
+    // profile head; the next send still passes requireCurrent separately.
+    const currentPilot = store.get<ReaderPilot>(pilot.id);
+    requireCondition(currentPilot?.kind === 'reader-pilot' && currentPilot.value.projectId === projectId,
+      'reader_pilot_invalid', 'The paid synthesis step lost its reader profile head');
+    return uniqueTransactionGuards([...guards.filter(guard => guard.id !== pilot.id), reference(currentPilot)]);
+  };
   const permits = JSON.parse(canonical(opts.retryPermits
     ?? captureResearchConsumerRetryPermits(store, projectId))) as Ref[];
   // Resume-first: an unfinished operation of this task is continued before any
