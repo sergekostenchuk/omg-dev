@@ -318,6 +318,10 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // frame proposal revision and the previous set; meanings, consequences and support selectors are data.
   { kind: "frame-interpretations", contract: "frame-interpretations/v1", data: [], refs: [
     ["brief", "source"], ["frame"], ["previousSet"]] },
+  // DR5 5.1-F: the coverage cell names exactly its plan answer and its exact variant set and member — the
+  // plan-question id, depth and criterion are data; the cell confirms no coverage.
+  { kind: "discovery-coverage-cell", contract: "discovery-coverage-cell/v1", data: [], refs: [
+    ["subject", "planAnswer"], ["variant", "set"], ["variant", "member"]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
