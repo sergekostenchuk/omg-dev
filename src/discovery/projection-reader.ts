@@ -1,5 +1,8 @@
 import { EngineError } from "../errors.js";
-import { currentPlan, planOwnerSubject } from "./v7-plan-questions.js";
+import { currentPlan, planOwnerSubject, provePlanQuestions } from "./v7-plan-questions.js";
+import { readResearchConsumerTurn } from "./response-recovery.js";
+import { turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
+import { planSubjectOf, type V7PlanSubject } from "./v7-managed-attempt.js";
 /**
  * projection-reader — единая граница чтения модуля Discovery.
  *
@@ -952,6 +955,52 @@ export function executionAdmission(store: Store, draft: Revision<DiscoveryDraft>
 
 /** Logical owner subjects are interpreted inside the Discovery boundary. */
 export { planOwnerSubject };
+
+/** S6.9 (codex-omg №9689): the logical question a saved v7 run stop belongs to,
+ * read only from its proven basis — the summary reproduces the saved meaning of
+ * the run and never chooses the next work. `owner` — the proven owner pause
+ * (planOwnerSubject); `model-pause` — the unique paid pause turn of the run,
+ * proven with its producing intent (readResearchConsumerTurn), equal to the
+ * saved pause reason; `unbound` — the run stopped before a plan subject was
+ * fixed (a pause of the engine, or a paid pause on a field question): no
+ * subject is shown, never the next question of today's plan. The text comes
+ * from the exact plan edition of the subject, so a newer accepted edition never
+ * readdresses an older pause. A damaged declared binding is a typed refusal. */
+export interface PlanStopSubject {
+  binding: "owner" | "model-pause" | "unbound";
+  subject: V7PlanSubject | null; question: Ref | null; text: string | null;
+}
+export function planStopSubject(store: Store, draft: Revision<DiscoveryDraft>, run: Revision<ResearchRun>): PlanStopSubject {
+  const invalid = (message: string): never => {
+    throw new EngineError("research_stop_subject_invalid", `[${run.id}] ${message}`, { run: reference(run) });
+  };
+  const planned = (binding: "owner" | "model-pause", subject: V7PlanSubject, question: Ref): PlanStopSubject => {
+    const entry = provePlanQuestions(store, draft, subject.planAnswer)
+      .find(item => item.planQuestionId === subject.planQuestionId);
+    if (!entry) invalid("The saved subject names no question of its exact plan edition");
+    const element = entry!.question;
+    const text = element && typeof element === "object" && !Array.isArray(element) && typeof element["text"] === "string"
+      ? element["text"] : null;
+    return { binding, subject, question, text };
+  };
+  if (run.value.status === "needs_owner") {
+    const proven = planOwnerSubject(store, run);
+    return planned("owner", proven.subject, proven.question);
+  }
+  if (run.value.status !== "paused" || run.value.pauseCode !== "research_model_paused")
+    return { binding: "unbound", subject: null, question: null, text: null };
+  const candidates = store.list<ManagedResearchTurn>("research-turn")
+    .filter(turn => turn.value.run === run.id && turn.value.number === run.value.turns);
+  if (candidates.length !== 1) invalid("The paid pause lost its unique paid turn");
+  const turn = readResearchConsumerTurn(store, reference(candidates[0]!)) as Revision<ManagedResearchTurn>;
+  const action = turnAction(turn.value);
+  if (turn.value.status !== "completed" || action.action !== "pause" || !isRef(turn.value.question)
+    || run.value.error !== action.reason)
+    invalid("The paid pause differs from its paid turn");
+  const subject = planSubjectOf(turn.value);
+  if (!subject) return { binding: "unbound", subject: null, question: turn.value.question, text: null };
+  return planned("model-pause", subject, turn.value.question as Ref);
+}
 export function hasPlanQuestions(draft: DiscoveryDraft): boolean {
   return draft.stage === "discovery" && contractEraOf(draft) === 7;
 }

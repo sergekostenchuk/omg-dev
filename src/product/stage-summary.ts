@@ -2,7 +2,7 @@ import type { V7PlanSubject } from "../discovery/v7-managed-attempt.js";
 import { canonical, digest, hashJson, type Json } from "../canonical.js";
 import { discoveryConstraintBindings, discoveryDecisionId } from "../discovery/discovery-outcome.js";
 import {
-  acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planOwnerSubject,
+  acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planStopSubject,
   isAdmissionEra, isSupportedEra, issuedEntry, issuedForm,
   listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft,
   readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions,
@@ -57,6 +57,11 @@ export interface SummaryAccepted {
 export interface SummaryQuestion { ref: Ref; field: string; status: Question["status"] }
 export interface SummaryRun {
   subject?: V7PlanSubject;
+  /** S6.9: on a v7 plan run stop — what the saved stop belongs to (planStopSubject): the proven owner pause,
+   * the proven paid model pause, or a stop before any plan subject was fixed. */
+  subjectBinding?: "owner" | "model-pause" | "unbound";
+  /** S6.9: the question text of the subject's exact plan edition, when it carries one. */
+  subjectText?: string | null;
   ref: Ref; status: ResearchRun["status"]; pauseCode: string | null; error: string | null;
   question: Ref | null; missing: string[]; door: string | null;
 }
@@ -628,9 +633,13 @@ function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDr
   let door: string | null = run.value.status === "paused" ? "research-stage" : null;
   let questionRef: Ref | null = null;
   let subject: V7PlanSubject | undefined;
-  if (run.value.status === "needs_owner" && owner && hasPlanQuestions(draft.value)) {
-    const proven = planOwnerSubject(store, run);
-    subject = proven.subject; questionRef = proven.question; door = "research-stage";
+  let stop: { subjectBinding: "owner" | "model-pause" | "unbound"; subjectText: string | null } | undefined;
+  if ((run.value.status === "needs_owner" || run.value.status === "paused") && hasPlanQuestions(draft.value)) {
+    // S6.9: the physical Question stays the ground; the logical question comes from the proven stop basis only.
+    const proven = planStopSubject(store, draft, run);
+    if (proven.subject) subject = proven.subject;
+    questionRef = proven.question; door = "research-stage";
+    stop = { subjectBinding: proven.binding, subjectText: proven.text };
   } else if (run.value.status === "needs_owner" && owner) {
     const entry = issuedEntry(store, draft, owner.question);
     requireCondition(entry !== null && !entry.foreign, "stage_summary_run_invalid",
@@ -640,7 +649,7 @@ function candidateRun(store: Store, project: string, draft: Revision<DiscoveryDr
   }
   const missing = owner ? [owner.reason] : run.value.error ? [run.value.error] : [];
   return { ref: reference(run), status: run.value.status, pauseCode: run.value.pauseCode ?? null,
-    error: run.value.error, question: questionRef, missing, door, ...(subject ? { subject } : {}) };
+    error: run.value.error, question: questionRef, missing, door, ...(subject ? { subject } : {}), ...(stop ?? {}) };
 }
 
 function readCandidate(store: Store, project: string, draft: Revision<DiscoveryDraft>): SummaryCandidate {
@@ -976,6 +985,7 @@ function renderStructuredStageSummary(summary: StructuredStageSummary): string {
     if (candidate.run) lines.push(`Запуск: ${candidate.run.ref.id}@${candidate.run.ref.revision}; состояние: ${candidate.run.status}`,
       `Код паузы: ${candidate.run.pauseCode ?? "нет"}`,
       `Вопрос: ${candidate.run.question ? `${candidate.run.question.id}@${candidate.run.question.revision}` : "нет"}`,
+      ...(candidate.run.subjectBinding ? [logicalQuestionText(candidate.run)] : []),
       `Причина остановки: ${candidate.run.error ?? "нет"}`,
       ...candidate.run.missing.map(item => `Недостаёт: ${item}`));
     lines.push(`Дверь: ${candidate.door ?? "не зафиксирована"}`);
@@ -983,6 +993,14 @@ function renderStructuredStageSummary(summary: StructuredStageSummary): string {
   } else if (summary.candidates.length) lines.push("## Текущий кандидат", "", "Кандидат неоднозначен; укажите draftId:",
     ...summary.candidates.map(ref => `- ${ref.id}@${ref.revision}`), "");
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/** S6.9: the logical question of a saved v7 run stop — its plan-question id, the exact plan edition and its text. */
+function logicalQuestionText(run: SummaryRun): string {
+  if (!run.subject) return "Логический вопрос: не закреплён — остановка до закрепления предмета плана";
+  const basis = run.subjectBinding === "owner" ? "пауза до решения владельца" : "оплаченная пауза модели";
+  return `Логический вопрос: ${run.subject.planQuestionId}; план ${run.subject.planAnswer.id}@${run.subject.planAnswer.revision}`
+    + ` (${basis})${run.subjectText ? `: ${run.subjectText}` : ""}`;
 }
 
 export function renderStageSummary(summary: StageSummary): string {
@@ -1037,6 +1055,7 @@ export function renderStageSummary(summary: StageSummary): string {
     if (candidate.run) lines.push(`Запуск: ${candidate.run.ref.id}@${candidate.run.ref.revision}; состояние: ${candidate.run.status}`,
       `Код паузы: ${candidate.run.pauseCode ?? "нет"}`,
       `Вопрос: ${candidate.run.question ? `${candidate.run.question.id}@${candidate.run.question.revision}` : "нет"}`,
+      ...(candidate.run.subjectBinding ? [logicalQuestionText(candidate.run)] : []),
       `Причина остановки: ${candidate.run.error ?? "нет"}`,
       ...candidate.run.missing.map(item => `Недостаёт: ${item}`));
     lines.push("");
