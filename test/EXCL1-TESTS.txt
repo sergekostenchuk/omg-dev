@@ -22,13 +22,10 @@ execution.test.ts :: EX6 era: without a clarification every request is byte for 
 execution.test.ts :: AT3a rows 11, 12: era — the code before AT3a stops a task on a plan finding of strings, and the new code reads it as it wrote it; without admission the requests and outcomes stay as they were # вид 1: старая форма/маршрут
 execution.test.ts :: AT3a return №4141 P2-1: the live form of task 1 — a needs_code the code before AT3a wrote, with its candidate, a failed full check, no review and no correction left — is reviewed once as saved, with no implementation bought and no correction slot opened # вид 1: старая форма/маршрут
 om-accepted-answer.test.ts :: PF3 row 24: accepted answers and the index the base code 5929ea25 wrote prepare and read the same with the new code, warm and after reopen # вид 1: эра 5929ea25
-om-achievements.test.ts :: C5.1b genuine N3 bound work passes G7 and physical E6 history without attributing foreign fillings # вид 1: эра 9c22e4a4
-om-achievements.test.ts :: C5.1b exact old producer D2 and E6 history survives while its unbound frame cannot invent an achievement # вид 1: эра 7c7d3ccc, 9c22e4a4, b1143aa7
 om-answers-gate.test.ts :: H1.5 ERA: G4b records written by the code of the base commit are read by the new code with the same result, and the new preparation derives that very record # вид 1: эра 479b307f, 7c7d3ccc
 om-answers-gate.test.ts :: FA1 an E5 intent of the era before the verdict form is admitted and its supported verdict applied by today's E5 as saved, never assessment_source_stale # вид 1: эра 7c7d3ccc, d519a603
 om-answers-gate.test.ts :: PF1 (№2797-6 row 8, -7) a G4b batch read through one shared overlay prepares byte for byte what the base d519a60 prepares in its own process — two new sources in one batch, a late delivery mixing a stored source with a new one, and the evaluation linked with the close — result, writes, guards and their order; the written evaluation and delivery repeat without a write # вид 1: эра 7c7d3ccc, d519a603
 om-atomic-gate.test.ts :: G5 two D7 of one exact request (the older rule and today's) are one original handoff: each source's bindings are transferred from its own ledger and the works are accepted without a model call # вид 1: эра 73d95d93
-om-call-record.test.ts :: genuine E5.0 E1 and E4 records remain historical after restart while an old open E1 cannot launch E4 # вид 1: эра 3eb5dac
 om-compiler-readers.test.ts :: R3+R4 on a saved legal base the slot reproduces the base implementation exactly: compile, refinement gate, plan gate, basis, sources, context, detail and task obligations — M8, absent and substituted basis, head shift, changed dependency and legacy # вид 1: эра ee2bf80
 om-feasibility-boundary.test.ts :: G1.1 complete 3e495b1 producer preserves legacy feasibility and plans while M8 v1 is explicitly superseded without rewriting history # вид 1: эра 3e495b1
 om-feasibility.test.ts :: G1 reads unchanged feasibility stages and plan from the complete 2f2721d producer after restart and preserves positive writeGuarded results # вид 1: эра 2f2721d
@@ -86,7 +83,6 @@ om-run-part-07.test.ts :: LP8.1 (№3670) era: a pass ea207137 ended unable on a
 om-run-part-01.test.ts :: AT1 return №4124 P2-6: a group refused by a G5 of the earlier era ends under the new code by its rejection as before — no readiness question, no refusal of the era, and the new candidate is accepted # вид 1: эра e475bd59
 om-runtime-confirmation.test.ts :: D8 preserves exact observations and confirmation bytes produced by the complete ee3fd4c legacy engine # вид 1: эра ee3fd4c
 om-runtime-confirmation.test.ts :: D8 complete ee3fd4c execution preserves MachinePlan guards and frozen start/result proofs after restart # вид 1: эра ee3fd4c
-om-series-current.test.ts :: B3.0b whole 8be4a5d producer history keeps old bytes across activation and restart # вид 1: эра 8be4a5d
 om-series-current.test.ts :: B3 whole e1e87e9 producer retains applied series pointers legacy reads and exact repeats # вид 1: эра e1e87e9
 om-task-context.test.ts :: V2 unchanged legacy bytes and hashes match the complete aa8eb1d source graph in a fresh process # вид 1: эра aa8eb1d, aa8eb1d4
 om-task-neighbors.test.ts :: G3 complete base producer retains legacy plan and node hashes, context bytes, receipt compatibility and completed execution after reopen # вид 1: эра 6eb61d9, 6eb61d9e

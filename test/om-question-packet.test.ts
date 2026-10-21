@@ -3,7 +3,7 @@ import { measureAdapterWire, OM_CAPACITY_DELIVERY_CONTRACT, requireOmCapacityDel
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -37,14 +37,14 @@ import { prepareRoutes, readRoutes, writeRoutes, type RoutesRecord, type RoutesR
 import { prepareQuestionTasks, writeQuestionTasks, prepareQuestionPacket, writeQuestionPacket, readQuestionPacket,
   preparePartResult, readPartResult, readPacketResponse, partResponseId, type PartResponseRecord,
   normalizePartAnswer, readPacketAnswer, derivePartProposal, packetAnswerSchema, PACKET_CONTRACT, PACKET_ANSWER_PROTOCOL, type PartProposalBody, type QuestionTaskRequest, type QuestionPacketRequest, type QuestionPacketRecord } from '../src/om/question-packet.js';
-import { openSeries, beginAttempt, completeAttempt, type AttemptGoal, type RepairSeries } from '../src/om/series.js';
+import { openSeries, beginAttempt, completeAttempt, readCompletionBinding, completionWorkId, type BeginAttemptRequest, type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { readCall, recordCall, settleCall, type CallPurpose, type RecordCallRequest } from '../src/om/call-record.js';
 import { journalId, readJournalAt, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type JournalRow, type RefusalJournal } from '../src/om/refusal-journal.js';
-import { closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, ORIGIN_DECISION_KIND, readDefinitions } from '../src/om/repeat-gate.js';
+import { closeAttempt, prepareCloseAttempt, liftOriginHold, openAttempt, originDecisionNamespace, ORIGIN_DECISION_KIND, readDefinitions } from '../src/om/repeat-gate.js';
 import { ONE_ARTIFACT, prepareFrameProposals, readFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import type { FrameObligation, FrameRequest } from '../src/om/frame-obligations.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { runModelCall, runModelCycle, deliverModelSources, assembleModelParts, finishModelAttempt, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
+import { runModelCall, runModelCycle, readCompletionWorkAt, writeCompletionCessation, deliverModelSources, assembleModelParts, pendingCallStore, readPartAssembly, type ReadDeliveryRecord } from '../src/om/model-call.js';
 import { gardenGraph, prepareOmFixtureStages, prepareNativeLayers } from './om-fixture.js';
 // OMMC-SPLIT: the managed-cycle helpers moved to a shared fixture module; importing it registers no tests.
 import { e4Fixture, e4Node, e4NeedSource, mp2Refused, mp2Step, mp2IssuedBy, h15AtCommit } from './om-model-call-fixture.js';
@@ -64,6 +64,31 @@ function ok<T>(result: OmResult<T>): T {
   if (!result.ok) assert.fail(`${result.refusal.code}: ${result.refusal.message}`);
   return result.value;
 }
+function openPacketAttempt(store: Store, request: BeginAttemptRequest, routes: Sealed<Revision<RoutesRecord>>, batches: readonly string[]) {
+  const completion = { routes: reference(routes), batches: [...batches].sort() };
+  const opened = openAttempt(store, { ...request, completion });
+  if (opened.ok) {
+    const binding = ok(readCompletionBinding(store, request.project, reference(opened.value), request.attempt));
+    assert.ok(binding, 'A current packet attempt has an actual completion binding');
+    assert.deepEqual(binding.value.plan, completion);
+    assert.deepEqual(binding.value.goal, { ...request.goal, questions: [...request.goal.questions].sort() });
+  }
+  return opened;
+}
+
+function completionOpeningRefuses(f: { store: Store; restart(): void }, request: BeginAttemptRequest,
+  routes: Sealed<Revision<RoutesRecord>>, batches: readonly string[], field: 'batch' | 'goal') {
+  const before = snapshot(f.store);
+  for (const cold of [false, false, true]) {
+    if (cold) f.restart();
+    const refusal = rejected(openPacketAttempt(f.store, request, routes, batches), 'completion_invalid');
+    assert.equal(refusal.at.unit, 'G7');
+    assert.equal(refusal.at.target, `repair-series:${request.project}:${request.line}:${request.block}`);
+    assert.equal(refusal.at.field, field);
+    assert.deepEqual(snapshot(f.store), before, 'Refusal, repeat and cold repeat create no managed work or packet');
+  }
+}
+
 function rejected(result: OmResult<unknown>, code: string): Refusal {
   if (result.ok) assert.fail(`Expected ${code}, received a prepared question task`);
   assert.equal(result.refusal.code, code);
@@ -383,7 +408,7 @@ try {
   return output;
 }
 function packetFixture(t: TestContext, capacity: number | null = 100_000, desiredGraph = gardenGraph(), addressOwner = true, commonFactConsumer = false,
-  resultForm: Json = { type: 'string' }, routeCommit?: string, decideContract = false) {
+  resultForm: Json = { type: 'string' }, routeCommit?: string, decideContract = false, opening: 'open' | 'deferred' = 'open') {
   const f = questionFixture(t, desiredGraph, addressOwner, commonFactConsumer, routeCommit, decideContract);
   for (const question of f.request.questions) question.resultForm = resultForm;
   const tasks = ok(prepareQuestionTasks(f.store, f.request));
@@ -395,20 +420,23 @@ function packetFixture(t: TestContext, capacity: number | null = 100_000, desire
   const batch = routes.value.batches.find(batch => batch.model === 'MC1'
     && batch.items.some(item => item.target === 'discovery:encoding'))!;
   assert.ok(batch);
-  const command = { executable: process.execPath, args: ['--version'] };
+  const command = { executable: process.execPath, args: [fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url)),
+    '--scenario', join(f.root, 'packet-scenario.json'), '--trace', join(f.root, 'packet-trace.jsonl')] };
   function environment(amount: number | null) {
     return f.engine.environments.configure(f.project, { workspace: f.root,
       implementer: { actor: 'packet-researcher', model: 'fixture', effort: 'high', command },
       reviewer: { actor: 'packet-assessor', model: 'fixture', effort: 'high', command },
-      fullCheck: command, timeoutMs: 5000, ...(amount === null ? {} : { requestCapacityChars: amount }) },
+      fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, ...(amount === null ? {} : { requestCapacityChars: amount }) },
     f.store.get(`environment:${f.project}`)?.revision ?? 0);
   }
   const configured = environment(capacity), block = 'garden-consume-block';
   const goal: AttemptGoal = { key: 'packet:repository-facts',
     questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
-  ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-facts', predecessor: null, basis: null }));
-  const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }));
+  const root = ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-facts', predecessor: null, basis: null }));
+  const series = opening === 'deferred' ? root : ok(routeCommit
+    ? beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal })
+    : openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }, routes, [batch.id]));
   const request: QuestionPacketRequest = { project: f.project, routes: reference(routes), batch: batch.id,
     environment: reference(configured), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
   return { f, tasks, routes, batch, configured, block, goal, series, request, environment };
@@ -447,7 +475,9 @@ test('E2 issues native MC1 only after M6 and atomically saves the complete selec
   for (const field of ['conceptSections', 'featurePreparation', 'operationRequirements', 'mapDesign'])
     assert.equal(payload.includes(`"${field}"`), false, field);
   assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(p.request.environment)));
-  for (const search of p.routes.value.searches) assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(search.index)));
+  const owner = ok(readCompletionBinding(f.store, f.project, reference(p.series), 1));
+  assert.ok(owner); assert.deepEqual(owner.value.plan, { routes: reference(p.routes), batches: [p.batch.id] });
+  assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(owner))));
   assert.equal(prepared.writes.filter(write => write.kind === 'question').length, p.batch.items.length);
   assert.equal(prepared.writes.filter(write => write.kind === 'discovery-draft').length, p.batch.items.length);
   assert.equal(prepared.writes.filter(write => write.kind === 'mc1-question').length, p.batch.items.length);
@@ -534,23 +564,22 @@ test('E2 does not invent a capacity or accept a request override and requires th
 });
 
 test('E2 refuses a D5 requirement selector that would copy the whole input or a whole requirement section', t => {
-  const p = packetFixture(t), { f } = p;
-  let previous = p.routes;
   for (const pointer of ['', '/requirements']) {
+    const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
     const request = clone(f.request);
     request.questions = request.questions.map(item => ({ ...item, requirements: [{ pointer }] }));
     const tasks = ok(prepareQuestionTasks(f.store, request));
     const routes = ok(writeRoutes(f.store, { project: f.project, gaps: request.gaps,
       tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })),
-      catalog: { paths: ['src/format.ts'], records: [] }, previous: reference(previous) }));
+      catalog: { paths: ['src/format.ts'], records: [] }, previous: reference(p.routes) }));
     const batch = routes.value.batches.find(batch => batch.model === 'MC1'
       && batch.items.some(item => item.target === 'discovery:encoding'))!;
     assert.ok(batch);
-    const before = snapshot(f.store), packetRequest = { ...p.request, routes: reference(routes), batch: batch.id };
+    const series = ok(openPacketAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1, goal: p.goal }, routes, [batch.id]));
+    const before = snapshot(f.store), packetRequest = { ...p.request, routes: reference(routes), batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
     rejected(prepareQuestionPacket(f.store, packetRequest), 'packet_context_unbounded');
     rejected(writeQuestionPacket(f.store, packetRequest), 'packet_context_unbounded');
     assert.deepEqual(snapshot(f.store), before);
-    previous = routes;
   }
 });
 
@@ -598,8 +627,8 @@ test('E2 packet history and native task binding survive environment and source c
 test('E1 records the actual E2 purpose and whole packet fingerprint in its durable ledger before any dispatch', t => {
   const p = packetFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record.value;
   assert.ok(packet.packet && packet.fingerprint);
-  const adapter = f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.write({ id: `config:${f.project}`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  const adapter = f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const config = f.store.get(packet.request.environment.id, packet.request.environment.revision)!;
   const purpose = (packet.packet as Record<string, Json>).purpose as CallPurpose;
   const admitted = ok(recordCall(f.store, f.project, { call: String((packet.packet as Record<string, Json>).requestId), purpose, basis: null, block: p.block,
     gaps: p.batch.items.flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
@@ -611,7 +640,7 @@ test('E1 records the actual E2 purpose and whole packet fingerprint in its durab
   assert.equal(admitted.ledger.value.calls[0]!.purpose, purpose);
 });
 
-test('E2 refuses a real unaddressed question without a supported mechanism series and preserves its route', t => {
+test('G7 refuses to issue an unaddressed M5 question to a block alias and preserves its E2 route', t => {
   const p = packetFixture(t, 100_000, gardenGraph(), false), { f } = p;
   const batch = p.routes.value.batches.find(batch => batch.model === 'MC2' && batch.task === 'input-field'
     && batch.items.some(item => item.target === 'discovery:approval-owner'))!;
@@ -625,17 +654,7 @@ test('E2 refuses a real unaddressed question without a supported mechanism serie
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
   for (const block of ['packet-input-field', 'M5:addressing']) {
     ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-addressing', predecessor: null, basis: null }));
-    const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }));
-    const request: QuestionPacketRequest = { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
-    const before = snapshot(f.store);
-    for (const action of [prepareQuestionPacket, writeQuestionPacket]) {
-      const refusal = rejected(action(f.store, request), 'packet_series_unsupported');
-      assert.equal(refusal.at.target, gap.value.gap.target);
-      assert.equal(refusal.at.field, gap.value.gap.field);
-      assert.deepEqual(refusal.at.ref, reference(gap));
-      assert.ok(refusal.message.includes('M5:addressing'));
-    }
-    assert.deepEqual(snapshot(f.store), before);
+    completionOpeningRefuses(f, { project: f.project, block, line: 1, attempt: 1, goal }, p.routes, [batch.id], 'batch');
   }
   f.restart();
   const historical = ok(readRoutes(f.store, { project: f.project, record: reference(p.routes) }));
@@ -658,7 +677,7 @@ function crossedPacketGraph(sideBindings = 1): Graph {
   return graph;
 }
 
-function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1, routeCommit?: string) {
+function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1, routeCommit?: string, opening: 'open' | 'deferred' = 'open') {
   const p = packetFixture(t, capacity, crossedPacketGraph(sideBindings), true, false, { type: 'string' }, routeCommit), { f } = p;
   const batch = p.routes.value.batches.find(batch => batch.task === 'node-expansion' && batch.node === 'garden-produce-block')!;
   assert.ok(batch);
@@ -670,8 +689,10 @@ function expansionFixture(t: TestContext, capacity = 100_000, sideBindings = 1, 
     questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
   const block = batch.node!;
-  ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-expansion', predecessor: null, basis: null }));
-  const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }));
+  const root = ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-expansion', predecessor: null, basis: null }));
+  const series = opening === 'deferred' ? root : ok(routeCommit
+    ? beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal })
+    : openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }, p.routes, [batch.id]));
   const request: QuestionPacketRequest = { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
   return { ...p, batch, source, obligations, goal, block, series, request };
 }
@@ -695,9 +716,8 @@ function partResult(p: ReturnType<typeof expansionFixture>, packet: ReturnType<t
     joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
   modify?.(body);
   const adapter = f.store.get(`adapter:${f.project}`) ?? f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0,
-    value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.get(`config:${f.project}`) ?? f.store.write({ id: `config:${f.project}`, kind: 'dispatch-config', expected: 0,
-    value: { projectId: f.project, model: 'fixture' } });
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const config = f.store.get(record.value.request.environment.id, record.value.request.environment.revision)!;
   const call = ok(recordCall(f.store, f.project, { call: String((record.value.packet as Record<string, Json>).requestId), purpose: 'model-design', basis: null,
     block: p.block, gaps: p.batch.items.filter(item => ids.includes(item.target)).flatMap(item => item.consumers.map(consumer => ({
       id: item.target, goal: item.target, field: item.field, consumer }))), series: options.attempt?.series ?? reference(p.series), attempt: options.attempt?.ordinal ?? 1, goal: p.goal,
@@ -884,15 +904,20 @@ test('E2 part provenance rejects a recomputed revision of adapter raw bytes and 
   assert.deepEqual(ok(readPartResult(f.store, { project: f.project, record: reference(result.record) })), history);
 });
 
-test('E2 current MC1 admission rejects a changed native head while its issued packet remains readable history', t => {
+test('E2 managed MC1 refuses current issuance after a native head advances while exact packet history remains readable', t => {
   const p = packetFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
   const native = f.store.get(packet.value.native[0]!.engineQuestion.id)!;
   f.store.write({ id: native.id, kind: native.kind, expected: native.revision, value: native.value });
   const before = snapshot(f.store);
-  rejected(prepareQuestionPacket(f.store, p.request), 'input_stale');
-  rejected(writeQuestionPacket(f.store, p.request), 'input_stale');
-  assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
-  assert.deepEqual(snapshot(f.store), before);
+  for (const restart of [false, true]) {
+    if (restart) f.restart();
+    rejected(prepareQuestionPacket(f.store, p.request), 'input_stale');
+    assert.deepEqual(ok(writeQuestionPacket(f.store, p.request)).record, packet, 'An exact saved E2 replay retains its original native binding');
+    assert.notDeepEqual(reference(f.store.get(native.id)!), packet.value.native[0]!.engineQuestion);
+    assert.deepEqual(reference(f.store.get(native.id, packet.value.native[0]!.engineQuestion.revision)!), packet.value.native[0]!.engineQuestion);
+    assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+    assert.deepEqual(snapshot(f.store), before);
+  }
 });
 
 test('E2 reconstructs packet assignments and native bindings instead of trusting a same-id rehashed packet body', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
@@ -955,7 +980,7 @@ test('E2 counts all prior definitions before admitting the final part and persis
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(next) })), next);
 });
 
-test('E2 part-result admission rejects a foreign purpose, another declared attempt and missing or mismatched adapter response', t => {
+test('E2 part-result admission rejects a foreign purpose, another managed attempt and missing or mismatched adapter response', async t => {
   const p = expansionFixture(t), { f } = p, whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
   const environment = p.environment(packetWire(whole.packet) - 1);
   const packet = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(environment) })), result = partResult(p, packet);
@@ -963,41 +988,50 @@ test('E2 part-result admission rejects a foreign purpose, another declared attem
   const sourceRequest: RecordCallRequest = { call: 'alternative', purpose: admitted.purpose, basis: admitted.basis, block: admitted.block,
     gaps: clone(admitted.gaps), series: admitted.series, attempt: admitted.attempt, goal: admitted.goal, dispatch: admitted.dispatch,
     packet: clone(packet.record.value.packet) as Json };
-  const foreignCall = (changes: Partial<RecordCallRequest> = {}) => {
-    const configured = p.environment(environment.value.requestCapacityChars!);
-    const other = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(configured) })).record;
-    const payload = other.value.packet as Record<string, Json>;
-    return ok(recordCall(f.store, f.project, { ...sourceRequest, ...changes, call: String(payload.requestId), packet: clone(payload) })).call;
-  };
-  const anotherCall = foreignCall();
-  const foreignPurpose = foreignCall({ purpose: 'model-research' });
-  const block = 'different-attempt';
-  ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'another-attempt', predecessor: null, basis: null }));
-  const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal: p.goal }));
-  const foreignAttempt = foreignCall({ block, series: reference(series) });
-  for (const call of [anotherCall, foreignPurpose, foreignAttempt]) {
+  const next = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(environment),
+    previous: [{ packet: reference(packet.record), proposal: reference(result.proposal), result: reference(result.record) }] })).record;
+  const payload = next.value.packet as Record<string, Json>, assigned = next.value.plan!.assignments[next.value.plan!.position]!.obligations;
+  const nextRequest: RecordCallRequest = { ...sourceRequest, call: String(payload.requestId), packet: clone(payload),
+    gaps: p.batch.items.filter(item => assigned.includes(item.target)).flatMap(item => item.consumers.map(consumer =>
+      ({ id: item.target, goal: item.target, field: item.field, consumer }))),
+    dispatch: { ...sourceRequest.dispatch, config: next.value.request.environment } };
+  const beforePurpose = snapshot(f.store);
+  rejected(recordCall(f.store, f.project, { ...nextRequest, purpose: 'model-research' }), 'completion_foreign');
+  assert.deepEqual(snapshot(f.store), beforePurpose, 'E1 itself refuses a purpose that its exact managed packet does not assign');
+  const anotherCall = ok(recordCall(f.store, f.project, nextRequest)).call;
+
+  // MC1 is a second lawful work of this project, with its own completion binding and physical E4 response.
+  const foreignSeries = f.store.get<RepairSeries>(`repair-series:${f.project}:1:garden-consume-block`)!;
+  const foreignBinding = ok(readCompletionBinding(f.store, f.project, reference(foreignSeries), 1));
+  assert.ok(foreignBinding);
+  const foreignBatch = p.routes.value.batches.find(batch => batch.id === foreignBinding.value.plan.batches[0])!;
+  assert.equal(foreignBatch.model, 'MC1');
+  const configured = p.environment(100_000);
+  const adapter = f.store.write({ id: `adapter:${f.project}:foreign-result`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const foreign = await refusedByModel(f, { series: foreignSeries, ordinal: 1, batch: foreignBatch, adapter,
+    request: { ...p.request, batch: foreignBatch.id, environment: reference(configured), attempt: { series: reference(foreignSeries), ordinal: 1 } },
+    end: { code: 'cannot_answer', message: 'The independent repository question is unanswered' }, close: false });
+  const foreignResponse = f.store.get<PartResponseRecord>(partResponseId(f.project, reference(foreign.call)), 1)!;
+  assert.ok(foreignResponse, 'The foreign response is produced by the actual transport');
+  for (const [request, code] of [
+    [{ ...result.request, call: reference(anotherCall) }, 'part_result_invalid'],
+    [{ ...result.request, packet: reference(foreign.packet) }, 'part_result_invalid'],
+    [{ ...result.request, call: reference(foreign.call) }, 'part_result_invalid'],
+    [{ ...result.request, response: reference(foreignResponse) }, 'record_foreign'],
+    [{ project: f.project, packet: reference(foreign.packet), call: reference(foreign.call), response: reference(foreignResponse) }, 'part_result_invalid'],
+  ] as const) {
     const before = snapshot(f.store);
-    rejected(preparePartResult(f.store, { ...result.request, call: reference(call) }), 'part_result_invalid');
+    rejected(preparePartResult(f.store, request), code);
     assert.deepEqual(snapshot(f.store), before);
   }
-  const badEnvironment = p.environment(environment.value.requestCapacityChars!);
-  const badPacket = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(badEnvironment) })).record;
-  const badPayload = badPacket.value.packet as Record<string, Json>;
-  const wronglyBound = ok(recordCall(f.store, f.project, { ...sourceRequest, call: String(badPayload.requestId), block,
-    series: reference(series), packet: clone(badPayload) })).call;
-  rejected(preparePartResult(f.store, { project: f.project, packet: reference(badPacket), call: reference(wronglyBound),
-    response: { id: partResponseId(f.project, reference(wronglyBound)), revision: 1, hash: '0'.repeat(64) } }), 'part_result_invalid');
-  const nextEnvironment = p.environment(environment.value.requestCapacityChars!);
-  const nextPacket = ok(writeQuestionPacket(f.store, { ...p.request, environment: reference(nextEnvironment) }));
-  const nextPayload = nextPacket.record.value.packet as Record<string, Json>;
-  const unanswered = ok(recordCall(f.store, f.project, { ...sourceRequest, call: String(nextPayload.requestId), packet: clone(nextPayload) })).call;
-  const request = { ...result.request, packet: reference(nextPacket.record), call: reference(unanswered),
+  const unanswered = anotherCall;
+  const request = { ...result.request, packet: reference(next), call: reference(unanswered),
     response: { id: partResponseId(f.project, reference(unanswered)), revision: 1, hash: '0'.repeat(64) } };
-  ok(settleCall(f.store, reference(unanswered), { inputTokens: 10, outputTokens: 3, cachedInputTokens: null, reasoningOutputTokens: null }, 'succeeded'));
   rejected(preparePartResult(f.store, request), 'record_missing');
-  const requestId = nextPayload.requestId as string;
+  const requestId = (next.value.packet as Record<string, Json>).requestId as string;
   const mismatched = f.store.write<PartResponseRecord>({ id: request.response.id, kind: 'part-response', expected: 0,
-    value: { project: f.project, packet: reference(nextPacket.record), call: reference(unanswered), requestId,
+    value: { project: f.project, packet: reference(next), call: reference(unanswered), requestId,
       raw: JSON.stringify({ protocol: PACKET_ANSWER_PROTOCOL, requestId: 'not-the-sent-request', action: 'answer', proposal: result.body }) } });
   rejected(preparePartResult(f.store, { ...request, response: reference(mismatched) }), 'part_result_invalid');
   for (const section of Object.keys(result.body)) {
@@ -1012,47 +1046,71 @@ type ModelEnd = { code: string; message: string; reason?: 'refused' | 'off-form'
 /**
  * One attempt paid and ended by the model through the real producers: its E2 packet, its admitted E1 (the call of this
  * packet with the gaps it sends) and the E4 finish of the common producer, which writes the diagnostic, records its rows
- * in the journal and completes the legacy attempt claiming them. The E2.2 expectation is derived from that chain, not
+ * in the journal and explicitly closes the managed attempt claiming them. The E2.2 expectation is derived from that chain, not
  * from E2: for a refusal of the model, one element per row and per exact (target, field) of the admitted call it names.
  */
-function refusedByModel(f: ReturnType<typeof questionFixture>, spec: { series: Revision<RepairSeries>; ordinal: number; request: QuestionPacketRequest;
-  batch: { items: readonly { gap: string; target: string; field: string; consumers: readonly string[] }[] }; adapter: Revision<unknown>; config: Revision<unknown>; end: ModelEnd }) {
+async function refusedByModel(f: ReturnType<typeof questionFixture>, spec: { series: Revision<RepairSeries>; ordinal: number; request: QuestionPacketRequest;
+  batch: { items: readonly { gap: string; target: string; field: string; consumers: readonly string[] }[] }; adapter: Revision<unknown>; end: ModelEnd; close?: boolean }) {
   const { series, ordinal, end } = spec;
   const packet = ok(writeQuestionPacket(f.store, { ...spec.request, attempt: { series: reference(series), ordinal } })).record;
   const payload = packet.value.packet as Record<string, any>, assigned = new Set<string>(payload.questions.map((item: { id: string }) => item.id));
   const attempt = series.value.attempts.find(item => item.ordinal === ordinal)!;
   const gaps = spec.batch.items.filter(item => assigned.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
     id: item.target, goal: item.target, field: item.field, consumer })));
-  const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: payload.purpose, basis: null,
-    block: series.value.block, series: reference(series), attempt: ordinal, goal: attempt.goal, gaps,
-    dispatch: { adapter: reference(spec.adapter), config: reference(spec.config) }, packet: clone(payload) as Json })).call;
-  const finished = ok(finishModelAttempt(f.store, { project: f.project, packet: reference(packet), call: reference(call), response: null,
-    code: end.code, message: end.message, reason: end.reason ?? 'refused' }));
+  assert.deepEqual(attempt.goal, ok(readCompletionBinding(f.store, f.project, reference(series), ordinal))!.value.goal);
+  const reason = end.reason ?? 'refused', questionIds = payload.questions.map((item: { id: string }) => item.id);
+  const step = reason === 'interrupted' ? { rawStdout: '', exitCode: 3 }
+    : reason === 'off-form' ? { research: { malformed: true }, usage: { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 } }
+    : { research: { protocol: '$answerProtocol', requestId: '$requestId', questionIds,
+      action: reason === 'awaiting-owner' ? 'need_owner' : 'cannot_answer', reason: end.message,
+      ...(reason === 'awaiting-owner' ? { decision: 'Name the operation' } : {}) },
+      usage: { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 } };
+  const scenario = join(f.root, 'packet-scenario.json');
+  const steps: unknown[] = existsSync(scenario) ? JSON.parse(readFileSync(scenario, 'utf8')).steps : [];
+  steps.push(step);
+  writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
+  const request = { project: f.project, packet: reference(packet),
+    dispatch: { adapter: reference(spec.adapter), config: packet.value.request.environment }, role: 'implementer' as const };
+  const finished = packet.value.plan ? ok(await runModelCycle(f.store, request)).last : ok(await runModelCall(f.store, request));
+  assert.ok(finished.diagnostic, "The physical producer writes this work's terminal");
+  const call = ok(readCall(f.store, f.project, finished.call));
   const journal = f.store.get<RefusalJournal>(journalId(f.project))!;
   const rows = journal.value.rows.filter(row => same(row.source, finished.diagnostic)) as JournalRow[];
   assert.ok(rows.length >= 1, 'The finish recorded the diagnostic rows');
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(series), ordinal));
+  assert.ok(binding);
+  if (spec.close !== false) ok(closeAttempt(f.store, { project: f.project, block: series.value.block, line: series.value.line, attempt: ordinal,
+    outcome: { reason: end.reason ?? 'refused', accepting: [], cancelling: [],
+      refusals: rows.map(row => ({ row: row.id, name: row.code, goal: row.goal })) } }));
   const closed = f.store.get<RepairSeries>(series.id)!.value.attempts.find(item => item.ordinal === ordinal)!;
-  assert.deepEqual(closed.outcome?.refusals.map(link => link.row).sort(), rows.map(row => row.id).sort(), 'The attempt claims exactly the diagnostic rows');
+  if (spec.close !== false) assert.deepEqual(closed.outcome?.refusals.map(link => link.row).sort(), rows.map(row => row.id).sort(), 'The attempt claims exactly the diagnostic rows');
   const expected = end.reason && end.reason !== 'refused' ? [] : rows.flatMap(row => gaps.filter(gap => gap.goal === row.goal)
     .map(gap => ({ row: row.id, code: row.code, target: gap.goal, field: gap.field, remedy: row.remedy })))
     .filter((item, index, all) => all.findIndex(other => canonical(other) === canonical(item)) === index)
     .sort((a, b) => canonical(a) < canonical(b) ? -1 : canonical(a) > canonical(b) ? 1 : 0);
-  return { packet, call, diagnostic: finished.diagnostic, rows, gaps, expected, message: end.message };
+  return { packet, call, diagnostic: finished.diagnostic, rows, gaps, expected, message: rows[0]!.remedy };
+}
+
+async function finishedPacketRoot(p: ReturnType<typeof packetFixture>) {
+  const { f } = p;
+  const adapter = f.store.get(`adapter:${f.project}:retry`) ?? f.store.write({ id: `adapter:${f.project}:retry`,
+    kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
+  return refusedByModel(f, { series: p.series, ordinal: 1, request: p.request, batch: p.batch, adapter,
+    end: { code: 'cannot_answer', message: 'The model could not finish its exact registered work' }, close: false });
 }
 
 /**
- * E2.2: a real retry history of the packet fixture on a legacy series. Every refused attempt is refused by the model
- * itself — its E2 packet, its admitted E1 and the E4 finish through the common producer (`finishModelAttempt`), which
- * writes the diagnostic, records its rows in the journal and completes the attempt claiming them. Nothing is written
+ * E2.2: a real retry history of the packet fixture on a managed series. Every refused attempt is refused by the model
+ * itself — its E2 packet, its admitted E1 and the physical E4 through `runModelCall`, which
+ * writes the diagnostic, records its rows in the journal before explicit G7 closes the attempt claiming them. Nothing is written
  * by hand into the journal but unclaimed noise rows of another gate, to move its head.
  */
-function retryHistory(t: TestContext, ends: ModelEnd[] = [
+async function retryHistory(t: TestContext, ends: ModelEnd[] = [
   { code: 'cannot_answer', message: 'The requested value is not in the sources' },
   { code: 'cannot_answer', message: 'The requested value is still not in the sources' }]) {
   const p = packetFixture(t), { f } = p;
   const address = { project: f.project, block: p.block, line: 1 };
-  const adapter = f.store.write({ id: `adapter:${f.project}:retry`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.write({ id: `config:${f.project}:retry`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  const adapter = f.store.write({ id: `adapter:${f.project}:retry`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
   let nextSource = 0;
   /** An unclaimed row of another gate: journal noise that moves the head and is never a cause of any attempt. */
   function refusal(code: string, goal: string, store: Store = f.store) {
@@ -1063,28 +1121,28 @@ function retryHistory(t: TestContext, ends: ModelEnd[] = [
     const row = journal.value.rows.find(row => row.source.id === source.id)!;
     return { row: row.id, name: row.code, goal: row.goal };
   }
-  const refuse = (series: Revision<RepairSeries>, ordinal: number, end: ModelEnd) =>
-    refusedByModel(f, { series, ordinal, request: p.request, batch: p.batch, adapter, config, end });
-  const attempts = [] as ReturnType<typeof refuse>[];
+  const refuse = (series: Revision<RepairSeries>, ordinal: number, end: ModelEnd, close = true) =>
+    refusedByModel(f, { series, ordinal, request: p.request, batch: p.batch, adapter, end, close });
+  const attempts = [] as Awaited<ReturnType<typeof refuse>>[];
   let series = p.series as Revision<RepairSeries>;
-  ends.forEach((end, index) => {
-    if (index > 0) series = ok(beginAttempt(f.store, { ...address, attempt: index + 1, goal: p.goal }));
-    attempts.push(refuse(series, index + 1, end));
-  });
-  const running = ok(beginAttempt(f.store, { ...address, attempt: ends.length + 1, goal: p.goal }));
+  for (const [index, end] of ends.entries()) {
+    if (index > 0) series = ok(openPacketAttempt(f.store, { ...address, attempt: index + 1, goal: p.goal }, p.routes, [p.batch.id]));
+    attempts.push(await refuse(series, index + 1, end));
+  }
+  const running = ok(openPacketAttempt(f.store, { ...address, attempt: ends.length + 1, goal: p.goal }, p.routes, [p.batch.id]));
   const request: QuestionPacketRequest = { ...p.request, attempt: { series: reference(running), ordinal: ends.length + 1 } };
   return { p, f, address, refusal, refuse, attempts, older: attempts[0]!, own: attempts.at(-1)!, running, request };
 }
 
-test('E2.2 rows 5, 7, 10: the repeated packet delivers the causes of the last preceding attempt of the same goal — a genuine E4 refusal of the model, at the exact (target, field) of its admitted call, with its own code and remedy; an older attempt is never substituted; a saved packet keeps its context after the journal moved on', t => {
-  const { p, f, refusal, older, own, request } = retryHistory(t);
+test('E2.2 rows 5, 7, 10: the repeated packet delivers the causes of the last preceding attempt of the same goal — a genuine E4 refusal of the model, at the exact (target, field) of its admitted call, with its own code and remedy; an older attempt is never substituted; a saved packet keeps its context after the journal moved on', async t => {
+  const { p, f, refusal, older, own, request } = await retryHistory(t);
   assert.ok(own.expected.length >= 1); assert.notDeepEqual(own.expected, older.expected);
   const packet = ok(writeQuestionPacket(f.store, request)).record;
   const refusals = (packet.value.packet as Record<string, Json>).refusals as Json[];
   assert.deepEqual(refusals, own.expected);
   for (const item of refusals as { row: string; code: string; target: string; field: string; remedy: string }[]) {
     assert.ok(p.batch.items.some(question => question.target === item.target && question.field === item.field), 'Every delivered address is a question of this packet');
-    assert.equal(item.code, 'cannot_answer'); assert.equal(item.remedy, own.message);
+    assert.equal(item.code, 'model_cannot_answer'); assert.equal(item.remedy, own.message);
     assert.ok(own.rows.some(row => row.id === item.row), 'The row is the one the preceding attempt claimed');
   }
   assert.ok(packet.value.journal);
@@ -1098,35 +1156,42 @@ test('E2.2 rows 5, 7, 10: the repeated packet delivers the causes of the last pr
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
   f.restart();
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
-  // A changed goal on another block is not the same goal: the former attempt refusal stays (packet_attempt_invalid).
-  const other = { project: f.project, block: 'packet-new-goal', line: 1 };
+  // The complete managed batch owns its result contract; an unrelated result is refused before any attempt exists.
+  const other = { project: f.project, block: 'garden-produce-block', line: 1 };
   ok(openSeries(f.store, { ...other, slice: 'changed-goal', predecessor: null, basis: null }));
-  ok(beginAttempt(f.store, { ...other, attempt: 1, goal: p.goal }));
-  ok(completeAttempt(f.store, { ...other, attempt: 1, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: own.rows.map(row => ({ row: row.id, name: row.code, goal: row.goal })) } }));
-  const changed = ok(beginAttempt(f.store, { ...other, attempt: 2, goal: { ...p.goal, result: 'A different agreed result' } }));
-  rejected(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(changed), ordinal: 2 } }), 'packet_attempt_invalid');
+  const ownBatch = p.routes.value.batches.find(batch => batch.task === 'node-expansion' && batch.node === other.block)!;
+  assert.ok(ownBatch);
+  const lawfulGoal = { key: 'changed-goal', questions: ownBatch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
+    result: gapLineExpectedResult(f.project, ownBatch.items[0]!.target, ownBatch.items[0]!.field) };
+  completionOpeningRefuses(f, { ...other, attempt: 1, goal: { ...lawfulGoal, result: 'A different agreed result' } },
+    p.routes, [ownBatch.id], 'goal');
+  const correct = ok(openPacketAttempt(f.store, { ...other, attempt: 1, goal: lawfulGoal }, p.routes, [ownBatch.id]));
+  const ownPacket = ok(writeQuestionPacket(f.store, { ...p.request, batch: ownBatch.id,
+    attempt: { series: reference(correct), ordinal: 1 } })).record;
+  assert.deepEqual((ownPacket.value.packet as Record<string, Json>).refusals, []);
+
 });
 
-test('E2.2 row 1: no preceding attempt of the same goal, or one without refusals, gives no journal and no refusals — the older refused attempt is never substituted', t => {
-  const { p, f, address, older, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'The requested value is not in the sources' }]);
+test('E2.2 row 1: a preceding technical terminal gives no semantic cause and never substitutes an older refused attempt', async t => {
+  const { p, f, address, older, running, refuse, request } = await retryHistory(t, [{ code: 'cannot_answer', message: 'The requested value is not in the sources' }]);
   // The running attempt 2 stands after the refused attempt 1: its packet carries attempt 1's causes.
   const second = ok(writeQuestionPacket(f.store, request)).record;
   assert.deepEqual((second.value.packet as Record<string, Json>).refusals, older.expected); assert.ok(second.value.journal);
-  // Attempt 2 ends without refusals; attempt 3 has a preceding attempt of the same goal with an empty outcome.refusals.
-  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
-  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
+  // Attempt 2 keeps its physical technical diagnostic; attempt 3 gets no semantic refusal from it or from older attempt 1.
+  await refuse(running, 2, { code: 'process_lost', message: 'The second adapter process ended', reason: 'interrupted' });
+  const third = ok(openPacketAttempt(f.store, { ...address, attempt: 3, goal: p.goal }, p.routes, [p.batch.id]));
   const packet = ok(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } })).record;
-  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, []); assert.equal(packet.value.journal, null);
+  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, []); assert.ok(packet.value.journal);
   assert.equal(canonical(packet.value.packet).includes(older.message), false);
   f.restart();
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
 });
 
-test('E2.2 row 8: a technical or control end of the preceding attempt (interrupted, off-form, awaiting the owner) is kept in the history but is no task for the model — the journal stays named, the refusals are empty', t => {
+test('E2.2 row 8: a technical or control end of the preceding attempt (interrupted, off-form, awaiting the owner) is kept in the history but is no task for the model — the journal stays named, the refusals are empty', async t => {
   for (const end of [{ code: 'process_lost', message: 'The adapter process died', reason: 'interrupted' as const },
     { code: 'answer_off_form', message: 'The reply was not the agreed form', reason: 'off-form' as const },
     { code: 'need_owner', message: 'Name the operation', reason: 'awaiting-owner' as const }]) {
-    const { f, own, request } = retryHistory(t, [end]);
+    const { f, own, request } = await retryHistory(t, [end]);
     assert.deepEqual(own.expected, []); assert.ok(own.rows.length >= 1, 'The diagnostic rows stand in the journal');
     const packet = ok(writeQuestionPacket(f.store, request)).record;
     assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, [], end.reason + ': not a task for the model');
@@ -1140,45 +1205,64 @@ test('E2.2 row 8: a technical or control end of the preceding attempt (interrupt
   }
 });
 
-test('E2.2 row 6: a claimed row whose source is of no proved kind and has no saved class, or whose genuine source belongs to another attempt, is a typed refusal at the packet\'s refusals — never an empty context', t => {
+test('E2.2 row 6: an unproved other-gate row raises an unknown hold; a genuine E4 of another complete attempt is refused by new G7 before it can enter E2', async t => {
   const end = { code: 'cannot_answer', message: 'The requested value is not in the sources' };
-  // A row of another gate claimed straight into the outcome (no G7 class, no E5/E4 proof): the context is unavailable.
   {
-    const { p, f, address, refusal, own, request } = retryHistory(t, [end]);
-    assert.deepEqual((ok(writeQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected, 'The lawful packet before the claim');
-    const foreign = refusal('gate-refusal-of-another-kind', p.batch.items[0]!.target);
-    ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [foreign] } }));
-    const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
-    const before = f.store.list('question-packet').length;
-    const unplaced = rejected(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } }), 'packet_record_invalid');
-    assert.deepEqual([unplaced.at.unit, unplaced.at.target, unplaced.at.field], ['E2', foreign.row, 'refusals']);
-    assert.equal(f.store.list('question-packet').length, before, 'Nothing is written');
-  }
-  // The genuine E4 rows of attempt 1 claimed by attempt 2 of the same line and goal: a source of another attempt is
-  // foreign to the claim, however exactly its goal and address match — the typed refusal names the row.
-  {
-    const { p, f, address, own, request } = retryHistory(t, [end]);
+    const { p, f, address, refusal, own, running, refuse, request } = await retryHistory(t, [end]);
     assert.deepEqual((ok(writeQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected);
-    ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [],
-      refusals: own.rows.map(row => ({ row: row.id, name: row.code, goal: row.goal })) } }));
-    const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
-    const crossed = rejected(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } }), 'packet_record_invalid');
-    assert.deepEqual([crossed.at.unit, crossed.at.field], ['E2', 'refusals']);
-    assert.ok(own.rows.some(row => row.id === crossed.at.target), 'The refusal names the claimed row of the other attempt');
-    assert.equal(canonical(crossed).includes(own.message), false, 'No context of the foreign source leaks into the refusal');
+    const two = await refuse(running, 2, end, false);
+    const unknown = refusal('gate-refusal-of-another-kind', p.batch.items[0]!.target);
+    const claim = [...two.rows.map(row => ({ row: row.id, name: row.code, goal: row.goal })), unknown];
+    const closed = ok(closeAttempt(f.store, { ...address, attempt: 2,
+      outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: claim } }));
+    assert.deepEqual(closed.routed.filter(row => row.row === unknown.row).map(row => [row.class, row.toModel]), [['unknown', false]]);
+    assert.equal(closed.holds.length, 1);
+    const held = snapshot(f.store);
+    for (const cold of [false, true]) {
+      if (cold) f.restart();
+      rejected(openPacketAttempt(f.store, { ...address, attempt: 3, goal: p.goal }, p.routes, [p.batch.id]), 'origin_held');
+      assert.deepEqual(snapshot(f.store), held);
+    }
+    const hold = closed.holds[0]!;
+    const decision = f.store.write({ id: `${originDecisionNamespace(f.project)}allow-unproved-retry`, kind: ORIGIN_DECISION_KIND, expected: 0,
+      value: { projectId: f.project, block: p.block, attempt: 2, row: unknown.row, decided: 'Continue after reviewing the unplaced cause' } });
+    ok(liftOriginHold(f.store, { project: f.project, hold, ground: 'owner-decision', record: { ref: reference(decision) } }));
+    const third = ok(openPacketAttempt(f.store, { ...address, attempt: 3, goal: p.goal }, p.routes, [p.batch.id]));
+    const packet = ok(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } })).record;
+    assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, two.expected);
+    assert.ok(packet.value.journal);
+    const before = snapshot(f.store); f.restart();
+    assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(packet) })), packet);
+    assert.deepEqual(snapshot(f.store), before);
+  }
+  {
+    const { p, f, address, own, running, refuse, request } = await retryHistory(t, [end]);
+    assert.deepEqual((ok(writeQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected);
+    const two = await refuse(running, 2, end, false);
+    const rows = (rows: JournalRow[]) => rows.map(row => ({ row: row.id, name: row.code, goal: row.goal }));
+    const crossed = { ...address, attempt: 2, outcome: { reason: 'refused' as const, accepting: [], cancelling: [], refusals: [...rows(two.rows), ...rows(own.rows)] } };
+    const before = snapshot(f.store);
+    for (const result of [prepareCloseAttempt(f.store, crossed), closeAttempt(f.store, crossed)]) {
+      const issue = rejected(result, 'completion_foreign');
+      assert.deepEqual([issue.at.unit, issue.at.target, issue.at.field], ['E4', own.packet.id, 'packet']);
+    }
+    assert.deepEqual(snapshot(f.store), before, 'New G7 never assigns the real foreign terminal to this complete work');
+    ok(closeAttempt(f.store, { ...address, attempt: 2, outcome: { ...crossed.outcome, refusals: rows(two.rows) } }));
+    const third = ok(openPacketAttempt(f.store, { ...address, attempt: 3, goal: p.goal }, p.routes, [p.batch.id]));
+    const packet = ok(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } })).record;
+    assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, two.expected);
   }
 });
 
-test('E2.2 row 4: a part of a split node carries the causes of the questions it actually sends — the whole node\'s refusal of the preceding attempt reaches each part for its own questions only, and nothing of it is lost between the parts', t => {
+test('E2.2 row 4: a part of a split node carries the causes of the questions it actually sends — the whole node\'s refusal of the preceding attempt reaches each part for its own questions only, and nothing of it is lost between the parts', async t => {
   const p = expansionFixture(t), { f } = p;
-  const adapter = f.store.write({ id: `adapter:${f.project}:parts-retry`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.write({ id: `config:${f.project}:parts-retry`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  const adapter = f.store.write({ id: `adapter:${f.project}:parts-retry`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
   // Attempt 1: the whole node fits and the model refuses it; its E4 rows name every question of the node.
-  const one = refusedByModel(f, { series: p.series, ordinal: 1, request: p.request, batch: p.batch, adapter, config,
+  const one = await refusedByModel(f, { series: p.series, ordinal: 1, request: p.request, batch: p.batch, adapter,
     end: { code: 'cannot_answer', message: 'The requested design is not available' } });
   assert.equal(one.packet.value.plan!.mode, 'whole');
   assert.ok(new Set(one.expected.map(item => item.target)).size >= 2, 'The refused whole names several questions');
-  const series = ok(beginAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+  const series = ok(openPacketAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }, p.routes, [p.batch.id]));
   const wholeRequest = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
   const whole = ok(prepareQuestionPacket(f.store, wholeRequest)).record.value;
   assert.ok(whole.fingerprint && whole.plan!.mode === 'whole');
@@ -1213,7 +1297,7 @@ function hiding(store: Store, id: string): Store {
   } });
 }
 
-test('E2.2 rows 6–7 (return №1, P2-1): a refusal of another gate G7 classified as a proposal is delivered only while its exact sources read through the common origin reader — a hidden proposal is the reader\'s own refusal, never a delivered cause', t => {
+test('E2.2 rows 6–7 (return №1, P2-1): a refusal of another gate G7 classified as a proposal is delivered only while its exact sources read through the common origin reader — a hidden proposal is the reader\'s own refusal, never a delivered cause', async t => {
   const p = packetFixture(t), { f } = p, frame = f.request.gaps.sources.operations.frame;
   const proposal = f.store.write({ id: `om-proposal:${f.project}:e22-return-1`, kind: 'layer-proposal', expected: 0, value: {
     base: { graph: frame.graph, frame: frame.frame }, level: 2, source: 'decision', status: 'proposed', nodes: [], fills: [], localConnectors: [],
@@ -1227,14 +1311,15 @@ test('E2.2 rows 6–7 (return №1, P2-1): a refusal of another gate G7 classifi
         sources: [{ role: 'base', ref: frame.graph, context: { kind: 'frame', request: frame } }, proposalSource] } }] } });
   const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
   const row = journal.value.rows.find(item => item.source.id === source.id)!;
+  const own = await finishedPacketRoot(p);
   const closed = ok(closeAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1,
-    outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-  assert.equal(closed.routed[0]!.class, 'proposal');
-  const series = ok(beginAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+    outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [...own.rows, row].map(item => ({ row: item.id, name: item.code, goal: item.goal })) } }));
+  assert.equal(closed.routed.find(item => item.row === row.id)!.class, 'proposal');
+  const series = ok(openPacketAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }, p.routes, [p.batch.id]));
   const request = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
   const good = ok(prepareQuestionPacket(f.store, request)).record;
-  assert.deepEqual((good.value.packet as Record<string, Json>).refusals, p.batch.items.filter(item => item.target === target)
-    .map(item => ({ row: row.id, code: 'graph_invalid', target, field: item.field, remedy: 'Supply this question in the proposed design' })),
+  assert.deepEqual((good.value.packet as Record<string, Json>).refusals, [...own.expected, ...p.batch.items.filter(item => item.target === target)
+    .map(item => ({ row: row.id, code: 'graph_invalid', target, field: item.field, remedy: 'Supply this question in the proposed design' }))].sort((a, b) => canonical(a).localeCompare(canonical(b))),
   'With its sources readable the classified cause reaches the model at the addressee node G7 saved');
   // The proposal becomes unreadable (a view, no record changed): the common origin reader refuses, and E2 carries that
   // refusal as it is — code, unit, field and ref — instead of delivering the cause on the strength of the saved class.
@@ -1253,8 +1338,8 @@ test('E2.2 rows 6–7 (return №1, P2-1): a refusal of another gate G7 classifi
   assert.deepEqual(ok(prepareQuestionPacket(f.store, request)).record.value.packet, good.value.packet, 'The real Store still delivers');
 });
 
-test('E2.2 row 6 (return №1, P2-3): the typed refusal of a common reader keeps its own code, address and route through E2 — an admitted call that does not read is call_unresolved at the admission gate, not a packet refusal', t => {
-  const { f, own, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'Need specific source' }]);
+test('E2.2 row 6 (return №1, P2-3): the typed refusal of a common reader keeps its own code, address and route through E2 — an admitted call that does not read is call_unresolved at the admission gate, not a packet refusal', async t => {
+  const { f, own, request } = await retryHistory(t, [{ code: 'cannot_answer', message: 'Need specific source' }]);
   const view = hiding(f.store, own.call.id);
   const source = readCall(view, f.project, reference(own.call));
   assert.equal(source.ok, false);
@@ -1269,13 +1354,12 @@ test('E2.2 row 6 (return №1, P2-3): the typed refusal of a common reader keeps
   assert.deepEqual((ok(prepareQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected, 'The real Store delivers the cause');
 });
 
-test('E2.2 row 11 (return №1, P2-2): the next part of a split node stands on the journal of its chain root, not on today\'s head — after an unrelated row moved the head, the second part names the first part\'s journal, delivers its own share of the causes, and reads the same after a restart', t => {
+test('E2.2 row 11 (return №1, P2-2): the next part of a split node stands on the journal of its chain root, not on today\'s head — after an unrelated row moved the head, the second part names the first part\'s journal, delivers its own share of the causes, and reads the same after a restart', async t => {
   const p = expansionFixture(t), { f } = p;
-  const adapter = f.store.write({ id: `adapter:${f.project}:parts-root`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.write({ id: `config:${f.project}:parts-root`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
-  const one = refusedByModel(f, { series: p.series, ordinal: 1, request: p.request, batch: p.batch, adapter, config,
+  const adapter = f.store.write({ id: `adapter:${f.project}:parts-root`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const one = await refusedByModel(f, { series: p.series, ordinal: 1, request: p.request, batch: p.batch, adapter,
     end: { code: 'cannot_answer', message: 'Need a different node design' } });
-  const series = ok(beginAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+  const series = ok(openPacketAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }, p.routes, [p.batch.id]));
   const request = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
   const whole = ok(prepareQuestionPacket(f.store, request)).record.value;
   const environment = p.environment(packetWire(whole.packet) - 1), partRequest = { ...request, environment: reference(environment) };
@@ -1313,7 +1397,7 @@ test('E2.2 row 11 (return №1, P2-2): the next part of a split node stands on t
 
 // ---- Return №2 of E2.2 (verdict №2080): one decision per kind of journal row — exclude without readers, deliver on proved exact bases ----
 
-test('E2.2 table row «other gate, class unknown» (return №2, P2-1): a lawfully lifted unknown origin stays excluded from the retry context — no reader is applied to a role G7 does not read, the journal is kept, the packet reads the same after a restart', t => {
+test('E2.2 table row «other gate, class unknown» (return №2, P2-1): a lawfully lifted unknown origin stays excluded from the retry context — no reader is applied to a role G7 does not read, the journal is kept, the packet reads the same after a restart', async t => {
   const p = packetFixture(t), { f } = p;
   // A real G4 refusal whose only source has a role the gate does not classify (the input in the role of a workspace).
   const source = f.store.write({ id: `${unitRefusalNamespace(f.project)}g4:unknown-source`, kind: UNIT_REFUSAL_KIND, expected: 0,
@@ -1321,23 +1405,31 @@ test('E2.2 table row «other gate, class unknown» (return №2, P2-1): a lawful
       origin: { name: 'unplaced', stage: 'layer-check', subject: p.batch.items[0]!.target, sources: [{ role: 'workspace', ref: reference(f.input) }] } }] } });
   const journal = ok(recordRefusal(f.store, { project: f.project, source: reference(source) }));
   const row = journal.value.rows.find(item => item.source.id === source.id)!;
+  const own = await finishedPacketRoot(p);
   const closed = ok(closeAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1,
-    outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-  assert.equal(closed.routed[0]!.class, 'unknown'); assert.equal(closed.holds.length, 1);
+    outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [...own.rows, row].map(item => ({ row: item.id, name: item.code, goal: item.goal })) } }));
+  assert.equal(closed.routed.find(item => item.row === row.id)!.class, 'unknown'); assert.equal(closed.holds.length, 1);
+  assert.equal(closed.routed.find(item => item.row === row.id)!.toModel, false);
+  const held = snapshot(f.store);
+  for (const cold of [false, true]) {
+    if (cold) f.restart();
+    rejected(openPacketAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }, p.routes, [p.batch.id]), 'origin_held');
+    assert.deepEqual(snapshot(f.store), held);
+  }
   // The hold is lifted by the owner's decision through the regular transition; attempt 2 opens with the same goal.
   const holdRef = closed.holds[0]!, hold = f.store.get<{ attempt: number; row: string }>(holdRef.id, holdRef.revision)!.value;
   const decision = f.store.write({ id: `${originDecisionNamespace(f.project)}allow-retry`, kind: ORIGIN_DECISION_KIND, expected: 0,
     value: { projectId: f.project, block: p.block, attempt: hold.attempt, row: hold.row, decided: 'Continue this legacy series after reviewing the unplaced cause' } });
   ok(liftOriginHold(f.store, { project: f.project, hold: holdRef, ground: 'owner-decision', record: { ref: reference(decision) } }));
-  ok(openAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }));
+  ok(openPacketAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 2, goal: p.goal }, p.routes, [p.batch.id]));
   const series = f.store.get(p.series.id)!;
   const request = { ...p.request, attempt: { series: reference(series), ordinal: 2 } };
   const direct = readDefinitions(f.store, { project: f.project, source: { role: 'workspace', ref: reference(f.input) } as never });
   assert.equal(direct.ok, false, 'The origin reader does not read this role as a definition — so E2 must not ask it');
   const prepared = ok(prepareQuestionPacket(f.store, request)).record;
-  assert.deepEqual((prepared.value.packet as Record<string, Json>).refusals, [], 'A saved unknown class is excluded, not read as a map definition');
+  assert.deepEqual((prepared.value.packet as Record<string, Json>).refusals, own.expected, 'A saved unknown class is excluded, not read as a map definition');
   assert.ok(prepared.value.journal, 'The journal with the excluded row is kept');
-  assert.deepEqual(f.store.get<RefusalJournal>(prepared.value.journal!.id, prepared.value.journal!.revision)!.value.classifications.map(item => [item.row, item.class]), [[row.id, 'unknown']]);
+  assert.deepEqual(f.store.get<RefusalJournal>(prepared.value.journal!.id, prepared.value.journal!.revision)!.value.classifications.filter(item => item.row === row.id).map(item => [item.row, item.class]), [[row.id, 'unknown']]);
   const written = ok(writeQuestionPacket(f.store, request)).record;
   assert.deepEqual(written.value.packet, prepared.value.packet);
   f.restart();
@@ -1345,8 +1437,8 @@ test('E2.2 table row «other gate, class unknown» (return №2, P2-1): a lawful
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(written) })), written);
 });
 
-test('E2.2 table row «E4 refused, legacy series» (return №2, P2-2): a legacy E4 cause is delivered only with its exact E2 source readable — with the packet of the refused attempt hidden, the packet reader\'s own refusal is carried as it is by the new preparation and by the historical read of the saved retry packet', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, t => {
-  const { f, own, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'Need original source' }]);
+test('E2.2 table row «E4 refused, legacy series» (return №2, P2-2): a legacy E4 cause is delivered only with its exact E2 source readable — with the packet of the refused attempt hidden, the packet reader\'s own refusal is carried as it is by the new preparation and by the historical read of the saved retry packet', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
+  const { f, own, request } = await retryHistory(t, [{ code: 'cannot_answer', message: 'Need original source' }]);
   const good = ok(writeQuestionPacket(f.store, request)).record;
   assert.deepEqual((good.value.packet as Record<string, Json>).refusals, own.expected);
   const view = hiding(f.store, own.packet.id);
@@ -1364,19 +1456,29 @@ test('E2.2 table row «E4 refused, legacy series» (return №2, P2-2): a legacy
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(good) })), good, 'The real Store still reads the saved packet');
 });
 
-test('E2.2 table row «E4 without its packet» (return №2, masquerade): an E4-looking record of the E4 namespace claimed without the packet source of a diagnostic is E2\'s own typed refusal, never a delivered cause', t => {
-  const { p, f, address, own, request } = retryHistory(t, [{ code: 'cannot_answer', message: 'The requested value is not in the sources' }]);
+test('E2.2 table row «E4 without its packet»: new G7 returns an addressed refusal on complete work without writing an imitated cause into the next packet', async t => {
+  const end = { code: 'cannot_answer', message: 'The requested value is not in the sources' };
+  const { p, f, address, own, running, refuse, request } = await retryHistory(t, [end]);
   assert.deepEqual((ok(writeQuestionPacket(f.store, request)).record.value.packet as Record<string, Json>).refusals, own.expected);
+  const two = await refuse(running, 2, end, false);
   const imitation = f.store.write({ id: `${unitRefusalNamespace(f.project)}e4:imitation`, kind: UNIT_REFUSAL_KIND, expected: 0,
     value: { gate: 'E4', refusals: [{ code: 'cannot_answer', goal: p.batch.items[0]!.target, remedy: 'An imitated diagnostic', origin: { name: 'cannot_answer',
-      stage: 'model-call:refused', subject: own.call.value.call, sources: [{ role: 'call', ref: reference(own.call) }] } }] } });
-  const recorded = recordRefusal(f.store, { project: f.project, source: reference(imitation) });
-  if (!recorded.ok) { t.diagnostic('The journal itself refuses the imitation: ' + recorded.refusal.code); return; }
-  const row = recorded.value.value.rows.find(item => item.source.id === imitation.id)!;
-  ok(completeAttempt(f.store, { ...address, attempt: 2, outcome: { reason: 'refused', achieved: [], cancelled: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-  const third = ok(beginAttempt(f.store, { ...address, attempt: 3, goal: p.goal }));
-  const refused = rejected(prepareQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } }), 'packet_record_invalid');
-  assert.deepEqual([refused.at.unit, refused.at.target, refused.at.field], ['E2', row.id, 'refusals']);
+      stage: 'model-call:refused', subject: two.call.value.call, sources: [{ role: 'call', ref: reference(two.call) }] } }] } });
+  const recorded = ok(recordRefusal(f.store, { project: f.project, source: reference(imitation) }));
+  const row = recorded.value.rows.find(item => item.source.id === imitation.id)!;
+  const ownRows = two.rows.map(row => ({ row: row.id, name: row.code, goal: row.goal }));
+  const claim = { ...address, attempt: 2, outcome: { reason: 'refused' as const, accepting: [], cancelling: [],
+    refusals: [...ownRows, { row: row.id, name: row.code, goal: row.goal }] } };
+  const before = snapshot(f.store);
+  for (const result of [prepareCloseAttempt(f.store, claim), closeAttempt(f.store, claim)]) {
+    const issue = rejected(result, 'completion_invalid');
+    assert.deepEqual([issue.at.unit, issue.at.target, issue.at.field], ['E4', imitation.id, 'packet']);
+  }
+  assert.deepEqual(snapshot(f.store), before);
+  ok(closeAttempt(f.store, { ...address, attempt: 2, outcome: { ...claim.outcome, refusals: ownRows } }));
+  const third = ok(openPacketAttempt(f.store, { ...address, attempt: 3, goal: p.goal }, p.routes, [p.batch.id]));
+  const packet = ok(writeQuestionPacket(f.store, { ...p.request, attempt: { series: reference(third), ordinal: 3 } })).record;
+  assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, two.expected);
 });
 
 function countingReads(t: TestContext, ids: readonly string[]) {
@@ -1388,8 +1490,8 @@ function countingReads(t: TestContext, ids: readonly string[]) {
   return () => ids.reduce((sum, id) => sum + (reads.get(id) ?? 0), 0);
 }
 
-test('S1.1 E2 proves the saved journal at its exact revision once per operation; a new operation of the unchanged Store serves the kept proof, a head moved by a second Store keeps the history, a new Store proves it again', t => {
-  const { p, f, refusal, own, request } = retryHistory(t);
+test('S1.1 E2 proves the saved journal at its exact revision once per operation; a new operation of the unchanged Store serves the kept proof, a head moved by a second Store keeps the history, a new Store proves it again', async t => {
+  const { p, f, refusal, own, request } = await retryHistory(t);
   const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
   assert.deepEqual((packet.value.packet as Record<string, Json>).refusals, own.expected);
   // The head moves on after the packet was saved: the packet stands on the saved revision, never on today's head.
@@ -1435,8 +1537,8 @@ test('S1.1 E2 proves the saved journal at its exact revision once per operation;
   }
 });
 
-test('S1.1 a new preparation takes the current journal head and guards it: a head moved by a second Store before the write refuses the packet', t => {
-  const { f, refusal, request } = retryHistory(t);
+test('S1.1 a new preparation takes the current journal head and guards it: a head moved by a second Store before the write refuses the packet', async t => {
+  const { f, refusal, request } = await retryHistory(t);
   const prepared = ok(prepareQuestionPacket(f.store, request)), head = f.store.get(journalId(f.project))!;
   assert.deepEqual(prepared.record.value.journal, reference(head));
   assert.ok(prepared.guards.some(guard => canonical(guard) === canonical(reference(head))), 'The current journal head guards the write');
@@ -1460,8 +1562,8 @@ test('S1.1 a new preparation takes the current journal head and guards it: a hea
   assert.deepEqual(ok(writeQuestionPacket(f.store, request)).record.value.journal, reference(moved));
 });
 
-test('S1.1 an unavailable journal source is the former typed refusal and is never cached; a storage fault propagates and releases the proof', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, t => {
-  const { f, request } = retryHistory(t);
+test('S1.1 an unavailable journal source is the former typed refusal and is never cached; a storage fault propagates and releases the proof', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
+  const { f, request } = await retryHistory(t);
   const packet = ok(writeQuestionPacket(f.store, request)).record, journal = packet.value.journal!, project = f.project;
   const rows = f.store.get<RefusalJournal>(journal.id, journal.revision)!.value.rows, source = rows[0]!.source.id;
   let hidden: string | null = null, fault: Error | null = null;
@@ -1490,8 +1592,8 @@ test('S1.1 an unavailable journal source is the former typed refusal and is neve
   });
 });
 
-test('NR1 (№3591) a journal is read as written: the sources its rows name are not read, so no read of them can enter the journal again', t => {
-  const { f, request } = retryHistory(t);
+test('NR1 (№3591) a journal is read as written: the sources its rows name are not read, so no read of them can enter the journal again', async t => {
+  const { f, request } = await retryHistory(t);
   const packet = ok(writeQuestionPacket(f.store, request)).record, later = packet.value.journal!, project = f.project;
   const earlier = reference(f.store.history<RefusalJournal>(later.id).find(row => row.revision === later.revision - 1)!);
   const source = f.store.get<RefusalJournal>(later.id, later.revision)!.value.rows.at(-1)!.source.id;
@@ -1553,7 +1655,7 @@ function emptyPacketFixture(t: TestContext, _historicalCommit?: string) {
   return { root, database, store, project, request };
 }
 
-test('E2 does not reassign accepted refinements and writes an empty packet when native D1 has no model work', t => {
+test('E2 does not reassign accepted refinements and writes an empty packet when native D1 has no model work', async t => {
   const { store, project, request } = emptyPacketFixture(t);
   const nativeBefore = store.list('question').map(reference), prepared = ok(prepareQuestionPacket(store, request));
   assert.equal(prepared.record.value.state, 'empty'); assert.equal(prepared.record.value.packet, null);
@@ -1564,12 +1666,20 @@ test('E2 does not reassign accepted refinements and writes an empty packet when 
   assert.deepEqual(store.list('question').map(reference), nativeBefore);
 });
 
-test('E2 assigns a genuinely open outcome alone after C3 fills every connection of the upper node', t => {
-  const p = expansionFixture(t), { f } = p, whole = ok(writeQuestionPacket(f.store, p.request));
+test('E2 assigns a genuinely open outcome alone after C3 fills every connection of the upper node', async t => {
+  const p = expansionFixture(t, 100_000, 1, undefined, 'deferred'), { f } = p;
   const outcome = p.obligations.find(item => item.kind !== 'connection-end')!;
-  const partial = partResult(p, whole, body => { body.fills = body.fills.filter(fill => fill.obligation !== outcome.id); });
+  const upper = f.graph.value.nodes.find(node => node.id === p.batch.node)!, connections = p.obligations.filter(item => item.kind === 'connection-end');
+  const node: Node = { ...clone(upper), id: 'garden-connections-filled', kind: 'operation', parent: upper.id,
+    ports: connections.map((item, index) => ({ id: `filled-port-${index}`, direction: item.role === 'producer' ? 'out' : 'in',
+      contract: f.graph.value.artifacts.find(artifact => artifact.id === item.artifact)!.contract })), code: [], tests: [] };
+  const proposal: LayerProposal = { base: { graph: f.request.gaps.sources.operations.frame.graph, frame: null }, level: 2,
+    source: 'decision', status: 'proposed', nodes: [node], fills: connections.map((item, index) =>
+      ({ obligation: item.id, node: node.id, port: node.ports[index]!.id })), localConnectors: [], artifacts: [], contracts: [],
+    joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
+  const partial = f.store.write({ id: `om-proposal:${f.project}:connections-filled`, kind: 'layer-proposal', expected: 0, value: proposal });
   const sources: GapRequest = { ...f.request.gaps.sources,
-    operations: { ...f.request.gaps.sources.operations, proposals: [reference(partial.proposal)] } };
+    operations: { ...f.request.gaps.sources.operations, proposals: [reference(partial)] } };
   const applied = ok(prepareFrameProposals(f.store, sources.operations));
   assert.deepEqual(applied.gaps.filter(gap => gap.consumer === p.batch.node).map(gap => gap.target), [outcome.id]);
   const gaps = ok(writeGaps(f.store, sources));
@@ -1580,7 +1690,9 @@ test('E2 assigns a genuinely open outcome alone after C3 fills every connection 
     tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })), catalog: { paths: [], records: [] }, previous: reference(p.routes) }));
   const batch = routes.value.batches.find(batch => batch.node === p.batch.node)!;
   assert.deepEqual(batch.items.map(item => item.target), [outcome.id]);
-  const request: QuestionPacketRequest = { ...p.request, routes: reference(routes), batch: batch.id };
+  const goal = { ...p.goal, questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort() };
+  const series = ok(openPacketAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1, goal }, routes, [batch.id]));
+  const request: QuestionPacketRequest = { ...p.request, routes: reference(routes), batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
   const ready = ok(writeQuestionPacket(f.store, request)).record;
   assert.equal(ready.value.state, 'ready'); assert.deepEqual(ready.value.plan!.assignments, [{ connector: null, obligations: [outcome.id] }]);
   const expansion = (ready.value.packet as Record<string, any>).expansion;
@@ -1593,34 +1705,27 @@ test('E2 assigns a genuinely open outcome alone after C3 fills every connection 
 });
 
 for (const model of ['MC1', 'MC2'] as const) {
-  test(`E2 ${model} binds every routed assignment to the declared goal result and consumer before any writes`, async t => {
-    for (const defect of ['questions', 'result', 'consumer', 'missing-question'] as const) await t.test(defect, t => {
-      const p = model === 'MC1' ? packetFixture(t, 100_000, gardenGraph(), true, true) : expansionFixture(t);
-      const { f } = p;
-      const block = defect === 'consumer' ? 'garden-later-block' : p.block;
-      let ordinal = 1;
-      if (block === p.block) {
-        ok(completeAttempt(f.store, { project: f.project, block, line: 1, attempt: 1,
-          outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
-        ordinal = 2;
-      } else {
+  test(`G7 ${model} binds every managed assignment to its declared whole goal and consumer before any writes`, async t => {
+    for (const defect of ['questions', 'result', 'consumer', 'missing-question'] as const) await t.test(defect, async t => {
+      const p = model === 'MC1'
+        ? packetFixture(t, 100_000, gardenGraph(), true, true, { type: 'string' }, undefined, false, 'deferred')
+        : expansionFixture(t, 100_000, 1, undefined, 'deferred');
+      const { f } = p, block = defect === 'consumer' ? 'garden-later-block' : p.block;
+      if (block !== p.block)
         ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'other-consumer', predecessor: null, basis: null }));
-      }
       const goal: AttemptGoal = { ...p.goal,
         ...(defect === 'questions' ? { questions: ['different-question'] } : {}),
         ...(defect === 'missing-question' ? { questions: p.goal.questions.slice(1) } : {}),
         ...(defect === 'result' ? { result: 'Unrelated result' } : {}) };
       assert.ok(goal.questions.length);
-      const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: ordinal, goal }));
-      const request: QuestionPacketRequest = { ...p.request, attempt: { series: reference(series), ordinal } };
-      const before = snapshot(f.store);
-      for (const action of [prepareQuestionPacket, writeQuestionPacket])
-        rejected(action(f.store, request), 'packet_attempt_invalid');
-      assert.deepEqual(snapshot(f.store), before, 'A foreign goal creates neither a packet nor native questions or a result');
+      completionOpeningRefuses(f, { project: f.project, block, line: 1, attempt: 1, goal }, p.routes, [p.batch.id],
+        defect === 'consumer' ? 'batch' : 'goal');
+      if (block === p.block) ok(openPacketAttempt(f.store,
+        { project: f.project, block, line: 1, attempt: 1, goal: p.goal }, p.routes, [p.batch.id]));
     });
   });
 
-  test(`E2 ${model} rechecks the historical goal link after a rehashed packet substitution and restart`, { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
+  test(`E2 ${model} rechecks the historical goal link after a rehashed packet substitution and restart`, { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
     const p = model === 'MC1' ? packetFixture(t, 100_000, gardenGraph(), true, true) : expansionFixture(t);
     const { f } = p;
     const saved = ok(writeQuestionPacket(f.store, p.request));
@@ -1698,7 +1803,7 @@ test('E2 native MC1 answers are accepted by D5 for the same declared packet goal
   assert.deepEqual(ok(confirmResults(f.store, request)), confirmed);
 });
 
-test('E2 reaches both real fact batches with different consumers using their own declared series', t => {
+test('E2 reaches both real fact batches with different consumers using their own declared series', async t => {
   const p = packetFixture(t), { f } = p;
   const batches = p.routes.value.batches.filter(batch => batch.model === 'MC1');
   assert.equal(batches.length, 2);
@@ -1714,7 +1819,7 @@ test('E2 reaches both real fact batches with different consumers using their own
       const goal: AttemptGoal = { key: 'packet:other-consumer', questions: [gapLineKey(f.project, item.target, item.field)],
         result: gapLineExpectedResult(f.project, item.target, item.field) };
       ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'packet-other-fact', predecessor: null, basis: null }));
-      series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }));
+      series = ok(openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal }, p.routes, [batch.id]));
     }
     const request: QuestionPacketRequest = { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal: 1 } };
     const saved = ok(writeQuestionPacket(f.store, request));
@@ -1727,22 +1832,18 @@ test('E2 reaches both real fact batches with different consumers using their own
   for (const record of packets) assert.deepEqual(reference(ok(readQuestionPacket(f.store, { project: f.project, record }))), record);
 });
 
-test('E2 admits an MC2 missing input field with a proven block consumer under the common line-result goal', t => {
-  const p = packetFixture(t), { f } = p;
+test('E2 admits an MC2 missing input field with a proven block consumer under the common line-result goal', async t => {
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
   const batch = p.routes.value.batches.find(batch => batch.task === 'input-field'
     && batch.items.every(item => item.consumers.length > 0))!;
   assert.ok(batch, 'The native first pass contains missing structured fields with block consumers');
   const block = batch.items[0]!.consumers[0]!;
   assert.ok(batch.items.every(item => item.consumers.includes(block)));
-  let ordinal = 1;
-  if (block === p.block) {
-    ok(completeAttempt(f.store, { project: f.project, block, line: 1, attempt: 1,
-      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
-    ordinal = 2;
-  } else ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'input-field', predecessor: null, basis: null }));
+  const ordinal = 1;
+  if (block !== p.block) ok(openSeries(f.store, { project: f.project, block, line: 1, slice: 'input-field', predecessor: null, basis: null }));
   const goal: AttemptGoal = { key: 'input-field', questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
-  const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: ordinal, goal }));
+  const series = ok(openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: ordinal, goal }, p.routes, [batch.id]));
   const request: QuestionPacketRequest = { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal } };
   const ready = ok(writeQuestionPacket(f.store, request)).record;
   assert.equal(ready.value.state, 'ready'); assert.equal(ready.value.plan, null); assert.deepEqual(ready.value.native, []);
@@ -1857,7 +1958,12 @@ test('E2 work expansion belongs to its proven consumer block rather than the upp
   let acceptedPacket: Ref | null = null;
   for (const block of ['garden-produce-block', batch.node!]) {
     ok(openSeries(store, { project, block, line: 1, slice: 'e2-work-node-goal', predecessor: null, basis: null }));
-    const series = ok(beginAttempt(store, { project, block, line: 1, attempt: 1, goal }));
+    if (block !== 'garden-produce-block') {
+      completionOpeningRefuses({ get store() { return store; }, restart() { store.close(); store = new Store(database); } },
+        { project, block, line: 1, attempt: 1, goal }, routes, [batch.id], 'batch');
+      continue;
+    }
+    const series = ok(openPacketAttempt(store, { project, block, line: 1, attempt: 1, goal }, routes, [batch.id]));
     const request: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(environment),
       attempt: { series: reference(series), ordinal: 1 }, previous: [], works };
     const before = snapshot(store), prepared = prepareQuestionPacket(store, request);
@@ -1901,7 +2007,7 @@ async function worksPacketFixture(t: TestContext, late?: 'multiple' | 'overlap' 
     const goal: AttemptGoal = { key: `e21:${node}`, questions: batch.items.map(item => gapLineKey(base.project, item.target, item.field)),
       result: gapLineExpectedResult(base.project, batch.items[0]!.target, batch.items[0]!.field) };
     ok(openSeries(store, { project: base.project, block, line: 1, slice: `e21:${node}`, predecessor: null, basis: null }));
-    const series = ok(beginAttempt(store, { project: base.project, block, line: 1, attempt: 1, goal }));
+    const series = ok(openPacketAttempt(store, { project: base.project, block, line: 1, attempt: 1, goal }, base.routes, [batch.id]));
     return { project: base.project, routes: reference(base.routes), batch: batch.id, environment: reference(base.environment),
       attempt: { series: reference(series), ordinal: 1 }, previous: [],
       works: { producer: reference(ledger.producer), ledger: reference(ledger.record) } } satisfies QuestionPacketRequest;
@@ -2077,9 +2183,8 @@ for (const late of ['multiple', 'initial-realizes'] as const) test(`E2.1 initial
   assert.deepEqual(snapshot(f.store), before);
   const series = f.store.get<RepairSeries>(request.attempt.series.id, request.attempt.series.revision)!;
   const adapter = f.store.write({ id: `adapter:${f.project}:initial-work`, kind: 'dispatch-adapter', expected: 0,
-    value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.write({ id: `config:${f.project}:initial-work`, kind: 'dispatch-config', expected: 0,
-    value: { projectId: f.project, model: 'fixture' } });
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const config = f.store.get(packet.value.request.environment.id, packet.value.request.environment.revision)!;
   const assigned = new Set<string>(payload.questions.map((item: { id: string }) => item.id));
   const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: 'model-design', basis: null,
     block: series.value.block, series: reference(series), attempt: 1, goal: series.value.attempts[0]!.goal,
@@ -2121,8 +2226,8 @@ test('S1.1 the unwritten response and the works preview are read through the com
   const frameSource = routes.value.request.gaps.sources.works; assert.ok(!('state' in frameSource));
   const graph = frameSource.frame.graph, prior = frameSource.proposals[0]!;
   const series = f.store.get<RepairSeries>(request.attempt.series.id, request.attempt.series.revision)!;
-  const adapter = f.store.write({ id: `adapter:${f.project}:overlay`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.write({ id: `config:${f.project}:overlay`, kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
+  const adapter = f.store.write({ id: `adapter:${f.project}:overlay`, kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const config = f.store.get(packet.value.request.environment.id, packet.value.request.environment.revision)!;
   const assigned = new Set<string>(payload.questions.map((item: { id: string }) => item.id));
   const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: 'model-design', basis: null,
     block: series.value.block, series: reference(series), attempt: 1, goal: series.value.attempts[0]!.goal,
@@ -2236,7 +2341,7 @@ test('S1.1 the unwritten response and the works preview are read through the com
   assert.deepEqual(snapshot(f.store), afterSave);
 });
 
-test('E2 declares every new content and control branch before dispatch and shares its exact reply parser', t => {
+test('E2 declares every new content and control branch before dispatch and shares its exact reply parser', async t => {
   const p = expansionFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
   const payload = packet.value.packet as Record<string, any>, before = snapshot(f.store);
   assert.equal(packet.value.answerProtocol, PACKET_ANSWER_PROTOCOL);
@@ -2283,7 +2388,7 @@ test('E2 declares every new content and control branch before dispatch and share
   assert.deepEqual(snapshot(f.store), before, 'Parsing and content derivation create no calls, records or series outcomes');
 });
 
-test('E2 counts the added response branches in capacity and never silently emits the former smaller form', t => {
+test('E2 counts the added response branches in capacity and never silently emits the former smaller form', async t => {
   const p = packetFixture(t), { f } = p, prepared = ok(prepareQuestionPacket(f.store, p.request));
   const payload = clone(prepared.record.value.packet) as Record<string, any>;
   const currentChars = packetPrompt(payload).length;
@@ -2300,7 +2405,7 @@ test('E2 counts the added response branches in capacity and never silently emits
   assert.deepEqual(snapshot(f.store), before);
 });
 
-test('E2 common proposal derivation checks assignment without inventing response provenance', t => {
+test('E2 common proposal derivation checks assignment without inventing response provenance', async t => {
   const p = expansionFixture(t), { f } = p, saved = ok(writeQuestionPacket(f.store, p.request));
   const actual = partResult(p, saved), before = snapshot(f.store);
   const request = { project: f.project, packet: reference(saved.record), raw: actual.response.value.raw };
@@ -2384,7 +2489,7 @@ async function producePreWorksPacket(database: string, root: string, fixture: ty
       ...(obligation.kind === 'connection-end' ? { port: node.ports[port++]!.id } : {}) })), localConnectors: [], artifacts: [], contracts: [],
       joins: [], tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] };
     const adapter = store.write({ id: `adapter:${project}`, kind: 'dispatch-adapter', expected: 0,
-      value: { projectId: project, protocol: 'fixture' } });
+      value: { projectId: project, protocol: 'codex-stdio' } });
     const config = store.write({ id: `config:${project}`, kind: 'dispatch-config', expected: 0,
       value: { projectId: project, model: 'fixture' } });
     const questions = new Set((payload.questions as { id: string }[]).map(question => question.id));
@@ -2443,7 +2548,7 @@ export async function load(url, context, next) {
   return { database, ...JSON.parse(output) as Awaited<ReturnType<typeof producePreWorksPacket>> };
 }
 
-test('E2.1 reads the immutable pre-works L3 producer history byte-for-byte and rejects codeRef in its old answer form', t => {
+test('E2.1 reads the immutable pre-works L3 producer history byte-for-byte and rejects codeRef in its old answer form', async t => {
   const history = preWorksPacketHistory(t), store = new Store(history.database);
   try {
     const before = snapshot(store);
@@ -2469,7 +2574,7 @@ test('E2.1 reads the immutable pre-works L3 producer history byte-for-byte and r
   } finally { store.close(); }
 });
 
-test('E2 normalizes reply sets while preserving duplicate results citations reads and literal value arrays', t => {
+test('E2 normalizes reply sets while preserving duplicate results citations reads and literal value arrays', async t => {
   const p = packetFixture(t, 100_000, gardenGraph(), true, true, { type: 'array', items: { type: 'string' } }), { f } = p;
   const packet = ok(writeQuestionPacket(f.store, p.request)).record, payload = packet.value.packet as Record<string, any>;
   const source = reference(f.store.get(`source:${f.project}:brief`)!);
@@ -2516,7 +2621,7 @@ test('E2 answer schema selection refuses missing null and unknown runtime kinds'
   for (const kind of ['node', 'fact', 'field'] as const) assert.ok(packetAnswerSchema(kind));
 });
 
-test('E2 current packet admits the exact A3.3 mechanism owner and rejects a selected task from another owner', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
+test('E2 current packet admits the exact A3.3 mechanism owner and rejects a selected task from another owner', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   const p = packetFixture(t, 100_000, gardenGraph(), false), { f } = p;
   const batch = p.routes.value.batches.find(row => row.task === 'input-field' && row.items.some(item => item.field === 'address'))!;
   const owner = { kind: 'mechanism', mechanism: 'M5:addressing' } as const;
@@ -2531,7 +2636,7 @@ test('E2 current packet admits the exact A3.3 mechanism owner and rejects a sele
   assert.equal(ready.value.state, 'ready'); assert.equal(ready.value.packetContract, BRIEF_PACKET_CONTRACT);
   assert.equal((ready.value.packet as Record<string, Json>).task, 'input-field');
   const adapter = f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0,
-    value: { projectId: f.project, protocol: 'fixture' } });
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
   const config = f.store.write({ id: `config:${f.project}`, kind: 'dispatch-config', expected: 0,
     value: { projectId: f.project, model: 'fixture' } });
   const payload = ready.value.packet as Record<string, Json>, requestId = payload.requestId as string;
@@ -2565,7 +2670,7 @@ test('E2 current packet admits the exact A3.3 mechanism owner and rejects a sele
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(ready) })), ready);
 });
 
-test('E2 pending response derives the same exact result as saved response and writes one atomic triple', t => {
+test('E2 pending response derives the same exact result as saved response and writes one atomic triple', async t => {
   const p = expansionFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request));
   const prepared = partResult(p, packet, undefined, { pending: true, commit: false });
   assert.equal(f.store.get(prepared.response.id), null);
@@ -2582,15 +2687,38 @@ test('E2 pending response derives the same exact result as saved response and wr
   assert.deepEqual(saved.record, prepared.record); assert.deepEqual(duplicate.record, prepared.record);
   assert.deepEqual(saved.writes, []); assert.deepEqual(duplicate.writes, []);
   assert.deepEqual(snapshot(f.store), before);
-  ok(completeAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1,
-    outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
+  const input = reference(f.store.get(`om-input:${f.project}`)!), graph = reference(f.store.get(`graph:${f.project}`)!);
+  const replacement = ok(writeAddressing(f.store, { project: f.project, input, graph,
+    decisions: [{ pending: clone(inputDecisionWrite({ project: f.project, input, graph, layers: [],
+      decision: { target: 'garden-B1', field: 'state', value: { writer: 'garden-produce-block' } } })) as Write }] }));
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(p.series), 1))!;
+  const work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+  const root = work.assignments.find(row => row.value.kind === 'root')!;
+  const ceased = ok(writeCompletionCessation(f.store, { project: f.project, binding: reference(binding), assignment: reference(root) }));
+  assert.equal(ceased.value.disposition, 'branch-ceased');
+  assert.equal(ceased.value.remainder, 'assembly');
+  assert.equal(ceased.value.physical, null);
+  assert.equal(ceased.value.cause.kind, 'required-record-replaced');
+  if (ceased.value.cause.kind === 'required-record-replaced') assert.deepEqual(ceased.value.cause.replacement, reference(replacement));
+  for (;;) {
+    const remaining = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    const resolved = new Set([...remaining.resolved.map(row => row.id), ...remaining.cessations.map(row => row.value.assignment.id)]);
+    let moved = false;
+    for (const assignment of remaining.assignments.filter(row => !resolved.has(row.id))) {
+      const next = writeCompletionCessation(f.store, { project: f.project, binding: reference(binding), assignment: reference(assignment) });
+      if (next.ok) { moved = true; break; }
+    }
+    if (!moved) break;
+  }
+  ok(closeAttempt(f.store, { project: f.project, block: p.block, line: 1, attempt: 1,
+    outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }));
   f.restart();
   const lateBefore = snapshot(f.store), late = ok(preparePartResult(f.store, prepared.source));
   assert.deepEqual(late.record, prepared.record); assert.deepEqual(late.writes, []);
   assert.deepEqual(snapshot(f.store), lateBefore);
 });
 
-test('E2 pending response joins an already saved response without another response revision', t => {
+test('E2 pending response joins an already saved response without another response revision', async t => {
   const p = expansionFixture(t), { f } = p;
   const pending = partResult(p, ok(writeQuestionPacket(f.store, p.request)), undefined, { pending: true, commit: false });
   f.store.write(pending.responseWrite);
@@ -2602,7 +2730,7 @@ test('E2 pending response joins an already saved response without another respon
   assert.equal(f.store.history(pending.response.id).length, 1);
 });
 
-for (const conflict of ['response', 'environment'] as const) test(`E2 pending atomic triple refuses ${conflict} changing before write`, t => {
+for (const conflict of ['response', 'environment'] as const) test(`E2 pending atomic triple refuses ${conflict} changing before write`, async t => {
   const p = expansionFixture(t), { f } = p;
   const pending = partResult(p, ok(writeQuestionPacket(f.store, p.request)), undefined, { pending: true, commit: false });
   if (conflict === 'response') f.store.write({ ...pending.responseWrite,
@@ -2620,9 +2748,8 @@ function sourceContinuation(p: ReturnType<typeof packetFixture>, packet: Sealed<
   read?: ContextRead | ContextRead[]) {
   const { f } = p, payload = packet.value.packet as Record<string, any>;
   const adapter = f.store.get(`adapter:${f.project}`) ?? f.store.write({ id: `adapter:${f.project}`, kind: 'dispatch-adapter', expected: 0,
-    value: { projectId: f.project, protocol: 'fixture' } });
-  const config = f.store.get(`config:${f.project}`) ?? f.store.write({ id: `config:${f.project}`, kind: 'dispatch-config', expected: 0,
-    value: { projectId: f.project, model: 'fixture' } });
+    value: { projectId: f.project, protocol: 'codex-stdio' } });
+  const config = f.store.get(packet.value.request.environment.id, packet.value.request.environment.revision)!;
   const ids = new Set(payload.questions.map((item: { id: string }) => item.id));
   const call = ok(recordCall(f.store, f.project, { call: payload.requestId, purpose: payload.purpose, basis: null,
     block: p.block, gaps: p.batch.items.filter(item => ids.has(item.gap)).flatMap(item => item.consumers.map(consumer => ({
@@ -2639,7 +2766,7 @@ function sourceContinuation(p: ReturnType<typeof packetFixture>, packet: Sealed<
   return { continuation, call, response };
 }
 
-for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation preserves exact questions assignment and complete context across restart`, t => {
+for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation preserves exact questions assignment and complete context across restart`, async t => {
   const p = model === 'MC1' ? packetFixture(t) : expansionFixture(t), { f } = p;
   const first = ok(writeQuestionPacket(f.store, p.request)).record;
   const delivery = sourceContinuation(p, first), request = { ...p.request, continuation: delivery.continuation };
@@ -2667,7 +2794,7 @@ for (const model of ['MC1', 'MC2'] as const) test(`E2 ${model} continuation pres
   rejected(prepareQuestionPacket(f.store, wrong), 'packet_chain_invalid');
 });
 
-test('RD3: a fresh ordinary brief root and continuation keep the explicit capacity era', t => {
+test('RD3: a fresh ordinary brief root and continuation keep the explicit capacity era', async t => {
   const p = packetFixture(t, 100_000), { f } = p;
   const root = ok(writeQuestionPacket(f.store, p.request)).record;
   assert.equal(root.value.state, 'ready');
@@ -2695,7 +2822,7 @@ test('RD3: a fresh works brief root also declares capacity delivery', async t =>
 });
 
 // OBL1 (№3773) replaces the blocked overflow: the continuation fits what the read brought by showing it as its length.
-test('E2 continuation saves an exact bounded fragment without reissuing native questions', t => {
+test('E2 continuation saves an exact bounded fragment without reissuing native questions', async t => {
   const p = packetFixture(t, 50_000), { f } = p;
   // A complete addressed read can exceed capacity even though the original assignment fits.
   const source = new Evidence(f.store).document(f.project, 'large', 'delivered-information-'.repeat(6000), 'text/plain', 0);
@@ -2729,7 +2856,7 @@ test('E2 continuation saves an exact bounded fragment without reissuing native q
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(prepared.record) })), prepared.record);
 });
 
-test('E2 pre-continuation v2 blocked packets preserve their original refusal after restart', t => {
+test('E2 pre-continuation v2 blocked packets preserve their original refusal after restart', async t => {
   const history = lp1OldProducer(t, '29fa27e', { node: false, capacity: 100 })[0]!;
   const store = new Store(history.database);
   try {
@@ -2741,7 +2868,7 @@ test('E2 pre-continuation v2 blocked packets preserve their original refusal aft
   } finally { store.close(); }
 });
 
-test('E2 continuation rejects omitted evidence and foreign exact response or delivery without writes', t => {
+test('E2 continuation rejects omitted evidence and foreign exact response or delivery without writes', async t => {
   const p = packetFixture(t), { f } = p, packet = ok(writeQuestionPacket(f.store, p.request)).record;
   const delivered = sourceContinuation(p, packet), continuation = delivered.continuation;
   for (const field of ['packet', 'call', 'response', 'deliveries'] as const) {
@@ -2759,7 +2886,7 @@ test('E2 continuation rejects omitted evidence and foreign exact response or del
   assert.deepEqual(snapshot(f.store), before);
 });
 
-test('E2 next MC2 part accepts the substantive result bound to a continued preceding part', t => {
+test('E2 next MC2 part accepts the substantive result bound to a continued preceding part', async t => {
   const p = expansionFixture(t, 100_000, 4), { f } = p;
   const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
   const environment = p.environment(packetWire(whole.packet) - 1);
@@ -2781,7 +2908,7 @@ test('E2 next MC2 part accepts the substantive result bound to a continued prece
   assert.deepEqual(result.record.value.request.packet, reference(continued.record));
 });
 
-test('E2 continuation preserves duplicate read positions using the same immutable delivery', t => {
+test('E2 continuation preserves duplicate read positions using the same immutable delivery', async t => {
   const p = packetFixture(t), { f } = p, first = ok(writeQuestionPacket(f.store, p.request)).record;
   const read: ContextRead = { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' };
   const delivery = sourceContinuation(p, first, [read, read]);
@@ -2887,7 +3014,7 @@ const output = [];
   const packet = ok(writeQuestionPacket(f.store, request)).record;
   // A brief-era producer answers with its own labels; earlier packets are returned unchanged (MP3 era check of the MP1 and MP2 producers).
   const payload = packet.value.packet, raw = JSON.stringify(fixtureAnswer(payload, f.answer(packet)));
-  const adapter = f.store.write({ id: 'adapter:garden:lp1', kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'fixture' } });
+  const adapter = f.store.write({ id: 'adapter:garden:lp1', kind: 'dispatch-adapter', expected: 0, value: { projectId: f.project, protocol: 'codex-stdio' } });
   const config = f.store.write({ id: 'config:garden:lp1', kind: 'dispatch-config', expected: 0, value: { projectId: f.project, model: 'fixture' } });
   const series = f.store.get(request.attempt.series.id, request.attempt.series.revision);
   const ids = new Set(payload.questions.map(q => q.id));
@@ -2931,7 +3058,7 @@ function admissionStale(store: Store, request: QuestionPacketRequest): void {
     else assert.equal(result.refusal.code, 'route_stale');
   }
 }
-test('LP1 immutable 7dd0848 producer: v2 ordinary, works, continuations and parts retain their era across reopen and current admission', t => {
+test('LP1 immutable 7dd0848 producer: v2 ordinary, works, continuations and parts retain their era across reopen and current admission', async t => {
   const histories = lp1OldProducer(t);
   for (const history of histories) {
     let store = new Store(history.database);
@@ -2986,7 +3113,7 @@ test('LP1 immutable 7dd0848 producer: v2 ordinary, works, continuations and part
   }
 });
 
-test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambiguity and unsupported markers are addressed', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, t => {
+test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambiguity and unsupported markers are addressed', { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
   const p = packetFixture(t), { f } = p;
   const prepared = ok(prepareQuestionPacket(f.store, p.request)), packet = prepared.record;
   const ids = ['omg-answer/v2', 'omg-answer/v3'].map(protocol =>
@@ -3028,7 +3155,7 @@ test('LP1 independent v3 issuance guards both exact era addresses; repeats, ambi
   assert.deepEqual(snapshot(f.store), before);
 });
 
-test('LP1 a second Store creating an era address after preparation refuses the whole transaction', t => {
+test('LP1 a second Store creating an era address after preparation refuses the whole transaction', async t => {
   const p = expansionFixture(t), { f } = p;
   const prepared = ok(prepareQuestionPacket(f.store, p.request));
   const otherEra = `om-question-packet:${f.project}:${hashJson({ contract: PACKET_CONTRACT, protocol: 'omg-answer/v2', request: p.request })}`;
@@ -3093,7 +3220,7 @@ test('LP1 v3 end to end: relative source, continuation, independent assessment a
   assert.equal(sent().length, 3); assert.deepEqual(snapshot(f.store), before);
 });
 
-test('LP1 adapter fixture takes the answer era only from the received prompt and refuses its absence', t => {
+test('LP1 adapter fixture takes the answer era only from the received prompt and refuses its absence', async t => {
   const root = mkdtempSync(join(tmpdir(), 'omg-lp1-stub-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.ndjson');
@@ -3115,7 +3242,7 @@ test('LP1 adapter fixture takes the answer era only from the received prompt and
   });
 });
 
-test('MP1 rows 1-3,6-8,10-12,16: new brief, exact labels, catalogue repeat, source race and history', t => {
+test('MP1 rows 1-3,6-8,10-12,16: new brief, exact labels, catalogue repeat, source race and history', async t => {
   const p = packetFixture(t), { f } = p;
   const source = new Evidence(f.store).document(f.project, 'encoding-reference', 'Кодировка UTF-8 😀', 'text/plain', 0);
   const prepared = ok(prepareQuestionPacket(f.store, p.request));
@@ -3152,7 +3279,7 @@ test('MP1 rows 1-3,6-8,10-12,16: new brief, exact labels, catalogue repeat, sour
   assert.deepEqual(ok(readQuestionPacket(f.store, { project: f.project, record: reference(saved) })), saved);
 });
 
-test('MP1 node response schema is valid for both endpoint and outcome assignments', t => {
+test('MP1 node response schema is valid for both endpoint and outcome assignments', async t => {
   const p = expansionFixture(t), { f } = p;
   const saved = ok(writeQuestionPacket(f.store, p.request)).record;
   assert.equal(saved.value.state, 'ready', canonical(saved.value.refusal));
@@ -3164,7 +3291,7 @@ test('MP1 node response schema is valid for both endpoint and outcome assignment
 });
 
 test('MP1 row 3: real b595c7b and accepted LP1 producers preserve original v2/v3 packets, calls, parts and continuations', async t => {
-  for (const commit of ['b595c7b5fc4cc3360d8395dcf1b7ce1aa11feb3c', 'dcd741d7da24cfb37e858a1d6b2ff15c1823865b']) await t.test(commit, t => {
+  for (const commit of ['b595c7b5fc4cc3360d8395dcf1b7ce1aa11feb3c', 'dcd741d7da24cfb37e858a1d6b2ff15c1823865b']) await t.test(commit, async t => {
     for (const history of lp1OldProducer(t, commit)) {
       let store = new Store(history.database);
       try {
@@ -3424,7 +3551,7 @@ test('MP1 №3052 real-work joins require designed condition and explicit requir
   assert.ok(payload.brief.text.includes('structural-representative exception does not apply to model work'));
 });
 
-test('MP1 the observed material guard closes a second Store race atomically while old brief history keeps its exact source', t => {
+test('MP1 the observed material guard closes a second Store race atomically while old brief history keeps its exact source', async t => {
   const p = packetFixture(t), { f } = p, saved = ok(writeQuestionPacket(f.store, p.request)).record;
   const environment = p.environment(100_001);
   const prepared = ok(prepareQuestionPacket(f.store, { ...p.request, environment: reference(environment) }));
@@ -3446,7 +3573,7 @@ import { briefReadings } from '../src/om/packet-brief.js';
 const MP3_PRIOR_PRODUCERS = { 'MP1 5ccc463': '5ccc463e8c8520019a10e2ab52761650b4817cfd', 'MP2 08be75a': '08be75a785bac8d2cc88efe930dc05be9ffd4cc6',
   'FJ1 bed6664': 'bed666410838b0730656e08beef31be208f02719' };
 test('MP3 rows 7, 19 (era): packets, deliveries, continuations and parts of the MP1 and pre-MP1 producers keep their form and outcomes under the new code, including №57; their descendants never acquire readings', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  for (const [era, commit] of Object.entries(MP3_PRIOR_PRODUCERS)) await t.test(era, t => {
+  for (const [era, commit] of Object.entries(MP3_PRIOR_PRODUCERS)) await t.test(era, async t => {
     for (const history of lp1OldProducer(t, commit)) {
       let store = new Store(history.database);
       try {
@@ -3497,7 +3624,7 @@ function mp11Version(packet: Sealed<Revision<QuestionPacketRecord>>, era: 'om-br
   }
 }
 
-test('MP1.1 rows 1–8,20: real e88 producer preserves ready, works, parts, delivered continuation and no-progress records byte for byte; new descendants inherit v1', t => {
+test('MP1.1 rows 1–8,20: real e88 producer preserves ready, works, parts, delivered continuation and no-progress records byte for byte; new descendants inherit v1', async t => {
   const histories = lp1OldProducer(t, MP11_BASE);
   for (const history of histories) {
     let store = new Store(history.database);
@@ -3530,7 +3657,7 @@ test('MP1.1 rows 1–8,20: real e88 producer preserves ready, works, parts, deli
   }
 });
 
-test('MP1.1 rows 2–4: independent blocked packets record their version before the null payload; true legacy blocked stays unmarked on repeat', t => {
+test('MP1.1 rows 2–4: independent blocked packets record their version before the null payload; true legacy blocked stays unmarked on repeat', async t => {
   const p = packetFixture(t, 1), packet = ok(writeQuestionPacket(p.f.store, p.request)).record;
   assert.equal(packet.value.state, 'blocked'); assert.equal(packet.value.packet, null); mp11Version(packet, 'om-brief/v2');
   p.f.restart(); const before = snapshot(p.f.store);
@@ -3547,7 +3674,7 @@ test('MP1.1 rows 2–4: independent blocked packets record their version before 
   } finally { store.close(); }
 });
 
-test('MP1.1 rows 9,10,19: direct reader and current producer reject unsupported, absent and mismatched versions; exact-address race stays atomic', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
+test('MP1.1 rows 9,10,19: direct reader and current producer reject unsupported, absent and mismatched versions; exact-address race stays atomic', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   const p = packetFixture(t), f = p.f, prepared = ok(prepareQuestionPacket(f.store, p.request));
   const record = prepared.record, original = clone(record.value), { briefContract: _era, ...absent } = original;
   for (const value of [absent, { ...original, briefContract: null }, { ...original, briefContract: 'om-brief/unknown' },
@@ -3705,19 +3832,17 @@ test('MP1.1 row 10: two individually proved parts from different brief versions 
   assert.deepEqual(snapshot(f.store), before);
 });
 
-test('LP7 row 29: a joined input packet is whole — ready when the capacity holds it, otherwise the former blocked packet_too_large with every item kept; never split or cut', t => {
+test('LP7 row 29: a joined input packet is whole — ready when the capacity holds it, otherwise the former blocked packet_too_large with every item kept; never split or cut', async t => {
   for (const fits of [true, false]) {
-    const p = packetFixture(t, 400_000, crossedPacketGraph(1)), { f } = p;
+    const p = packetFixture(t, 400_000, crossedPacketGraph(1), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
     const joined = p.routes.value.batches.find(batch => batch.task === 'input-field' && new Set(batch.items.map(item => item.field)).size > 1)!;
     assert.ok(joined, "Today's routing joins the open input fields of garden-consume-block");
     assert.equal(p.routes.value.grouping, 'block-input-v1');
-    // The fixture's attempt of this line works on its facts; the next one declares the joined goal of the same block.
     const address = { project: f.project, block: p.block, line: 1 };
-    ok(completeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: 'result', achieved: [], cancelled: [], refusals: [] } } as never));
     const goal: AttemptGoal = { key: 'lp7:joined', questions: joined.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
       result: gapLineExpectedResult(f.project, joined.items[0]!.target, joined.items[0]!.field) };
-    const series = ok(beginAttempt(f.store, { ...address, attempt: 2, goal } as never));
-    const request: QuestionPacketRequest = { ...p.request, batch: joined.id, attempt: { series: reference(series), ordinal: 2 } };
+    const series = ok(openPacketAttempt(f.store, { ...address, attempt: 1, goal }, p.routes, [joined.id]));
+    const request: QuestionPacketRequest = { ...p.request, batch: joined.id, attempt: { series: reference(series), ordinal: 1 } };
     const whole = ok(prepareQuestionPacket(f.store, request)).record;
     assert.equal(whole.value.state, 'ready');
     const asked = ((whole.value.packet as Record<string, Json>).questions as unknown as { id: string }[]).map(item => item.id).sort();
@@ -4267,7 +4392,7 @@ test('SP1a №4714 §5 «доставка» node and parts: an expansion root an
   const p = expansionFixture(t), { f } = p;
   const whole = ok(prepareQuestionPacket(f.store, p.request)).record.value;
   const wholePayload = whole.packet as Record<string, any>;
-  const environment = p.environment(measureAdapterWire(wholePayload, wholePayload.requestId, 'fixture', 'high') - 1);
+  const environment = p.environment(packetWire(wholePayload) - 1);
   const request = { ...p.request, environment: reference(environment) };
   const first = ok(writeQuestionPacket(f.store, request)).record;
   assert.equal(first.value.plan!.mode, 'parts');
@@ -4293,20 +4418,16 @@ function sp1FieldRequest(p: ReturnType<typeof packetFixture>, slice: string): Qu
   const batch = p.routes.value.batches.find(batch => batch.task === 'input-field' && batch.items.some(item => item.target === 'garden-B1'))!;
   assert.ok(batch, 'B1 asks a field of the contract');
   const block = batch.items[0]!.consumers[0] ?? p.block;
-  let ordinal = 1;
-  if (block === p.block) {
-    ok(completeAttempt(f.store, { project: f.project, block, line: 1, attempt: 1,
-      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
-    ordinal = 2;
-  } else ok(openSeries(f.store, { project: f.project, block, line: 1, slice, predecessor: null, basis: null }));
+  const ordinal = 1;
+  if (block !== p.block) ok(openSeries(f.store, { project: f.project, block, line: 1, slice, predecessor: null, basis: null }));
   const goal: AttemptGoal = { key: slice, questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)),
     result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
-  const series = ok(beginAttempt(f.store, { project: f.project, block, line: 1, attempt: ordinal, goal }));
+  const series = ok(openPacketAttempt(f.store, { project: f.project, block, line: 1, attempt: ordinal, goal }, p.routes, [batch.id]));
   return { ...p.request, batch: batch.id, attempt: { series: reference(series), ordinal } };
 }
 
 test('SP1a №4714 §5 «доставка» input field: an ordinary field brief carries the selected originals of its contract', t => {
-  const p = packetFixture(t), { f } = p;
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
   const record = ok(writeQuestionPacket(f.store, sp1FieldRequest(p, 'sp1a-field'))).record;
   assert.equal((record.value.packet as Record<string, any>).task, 'input-field');
   sp1Delivered(f.store, reference(f.input), record);
@@ -4338,7 +4459,7 @@ test('SP1a №4714 §5 «расхождение представлений»: B1
 });
 
 test('SP1a №4714 §5 «бюджет»: the selected section is mandatory — where the brief fits without it but not with it, the packet is blocked before any call, nothing is cut', t => {
-  const p = packetFixture(t), { f } = p;
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p;
   const request = sp1FieldRequest(p, 'sp1a-budget');
   const ready = ok(prepareQuestionPacket(f.store, request)).record;
   const { text } = sp1Scope(ready), section = `,"selected":${canonical(sp1Scope(ready).input.selected)}`;
@@ -4372,7 +4493,7 @@ test('SP1a №4714 §5 «принадлежность источника»: a la
 
 /** v6 field projections can be exercised before DS1.2lh enables their actual producers. No Store bytes are changed. */
 function ds12BriefFixture(t: TestContext) {
-  const p = packetFixture(t), { f } = p, request = sp1FieldRequest(p, 'ds12m-bases');
+  const p = packetFixture(t, 100_000, gardenGraph(), true, false, { type: 'string' }, undefined, false, 'deferred'), { f } = p, request = sp1FieldRequest(p, 'ds12m-bases');
   const record = ok(prepareQuestionPacket(f.store, request)).record, payload = clone(record.value.packet) as Record<string, any>;
   payload.responseForm.schema = clone(packetAnswerSchema('field'));
   const input = { ...clone(f.input.value.input), sources: f.input.value.input.sources.map(source => ({ ...source, contractVersion: 6 })) };

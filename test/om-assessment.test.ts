@@ -24,7 +24,7 @@ import { writeHorizon, writeHorizonIssuance } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest, type GapReadRequest } from '../src/om/gaps.js';
 import { prepareManagedRouteBatch, writeRoutes } from '../src/om/routes.js';
 import { prepareQuestionTasks, prepareQuestionPacket, writeQuestionPacket } from '../src/om/question-packet.js';
-import { openSeries, beginAttempt, applySeriesActivation, seriesCurrentId, seriesId,
+import { openSeries, applySeriesActivation, seriesCurrentId, seriesId,
   type AttemptGoal, type RepairSeries } from '../src/om/series.js';
 import { writeSeriesTransition } from '../src/om/series-transition.js';
 import { closeAttempt } from '../src/om/repeat-gate.js';
@@ -101,7 +101,7 @@ function e5Prefix(store: Store, twoFacts: boolean) {
     catalog: { paths: ['e5-source.txt'], records: [] }, previous: null }));
   return { horizon, routes };
 }
-function fixture(t: TestContext, twoFacts = false, managed = false, completion = false, twoRoots = false, fileEvidence = false) {
+function fixture(t: TestContext, twoFacts = false, managed = false, completion = true, twoRoots = false, fileEvidence = false) {
   const seeded = seedCopy(`e5:${twoFacts}`, store => e5Prefix(store, twoFacts), 'omg-e5-');
   const { root, database: path } = seeded, { horizon, routes } = seeded.data, project = 'garden';
   let store = new Store(path);
@@ -116,7 +116,7 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
   const block = 'garden-consume-block', source = fileEvidence
     ? new Evidence(store).file(project, 'e5-file', root, 'e5-source.txt', 'application/json', 0)
     : store.get<{ content: string }>(`source:${project}:brief`)!;
-  const goal: AttemptGoal = { key: 'e5:fact', questions: rootBatches.flatMap(row => row.items.map(item => gapLineKey(project, item.target, item.field))),
+  const goal: AttemptGoal = { key: 'e5:fact', questions: rootBatches.flatMap(row => row.items.map(item => gapLineKey(project, item.target, item.field))).sort(),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   const opened = ok(openSeries(store, { project, block, line: 1, slice: 'e5-fact', predecessor: null, basis: null }));
   if (managed) {
@@ -126,8 +126,13 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
       horizon: reference(horizon.gate), transition: reference(prepared) }));
     ok(applySeriesActivation(store, { project, prepared: reference(prepared), issuance: reference(issuance) }));
   }
-  const series = ok((completion ? managedOpenAttempt : beginAttempt)(store, { project, block, line: 1, attempt: 1, goal,
-    ...(completion ? { completion: { routes: reference(routes), batches: rootBatches.map(row => row.id) } } : {}) }));
+  assert.equal(completion, true, 'Current E5 preparation always uses completion');
+  const plan = { routes: reference(routes), batches: rootBatches.map(row => row.id).sort() };
+  const series = ok(managedOpenAttempt(store, { project, block, line: 1, attempt: 1, goal, completion: plan }));
+  const binding = ok(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding, 'The E5 fixture opens actual managed work');
+  assert.deepEqual(binding.value.plan, plan);
+  assert.deepEqual(binding.value.goal, goal);
   const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl');
   const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
   const config = engine.environments.configure(project, { workspace: root,
@@ -159,30 +164,13 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
           value:'UTF-8',citations:[{source:reference(source),selector:{kind:'text-range',start:0,end:source.value.content.length}}]}))},usage}};
     },
     get store() { return store; },
-    async secondOriginal(): Promise<AssessmentIntentRequest> {
-      const prior = routes.value.request;
-      const successor = ok(writeRoutes(store, { project, gaps: structuredClone(prior.gaps) as GapReadRequest,
-        tasks: prior.tasks.map(record => ({ record })),
-        catalog: { paths: [...prior.catalog.paths], records: [...prior.catalog.records] },
-        previous: reference(routes) }));
-      const nextBatch = successor.value.batches.find(item => item.model === 'MC1'
-        && item.items.some(row => row.gap === questionId));
-      assert.ok(nextBatch);
-      const nextPacket = ok(writeQuestionPacket(store, { project, routes: reference(successor),
-        batch: nextBatch.id, environment: reference(config),
-        attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
-      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, originalStep] }));
-      const model = ok(await runModelCall(store, { project, packet: reference(nextPacket), dispatch, role: 'implementer' }));
-      assert.equal(model.outcome?.kind, 'fact-candidates');
-      return { project, modelCall: reference(model.record), questionId, dispatch };
-    },
     assessor(...verdicts: ('supported' | 'insufficient' | 'conflicting')[]) {
       const choices = verdicts.length ? verdicts : ['supported' as const];
       writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, ...choices.map(verdict =>
         ({ research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage }))] }));
     },
     assessorsForTwoOriginals(...verdicts: ('supported' | 'insufficient' | 'conflicting')[]) {
-      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, originalStep, ...verdicts.map(verdict =>
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, { research: { verdict: 'supported', reasons: [] }, usage }, originalStep, ...verdicts.map(verdict =>
         ({ research: { verdict, reasons: verdict === 'supported' ? [] : ['source not decisive'] }, usage }))] }));
     },
     sent() { return readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean); },
@@ -190,7 +178,22 @@ function fixture(t: TestContext, twoFacts = false, managed = false, completion =
   };
 }
 
-async function completedFactClosure(f: ReturnType<typeof fixture>, explicitCompletion = false) {
+function factClosingRequest(f: ReturnType<typeof fixture>, reason: 'result' | 'refused' | 'off-form' | 'interrupted' = 'result', ordinal = 1) {
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(f.store.get(f.series.id)!), ordinal));
+  assert.ok(binding);
+  const work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+  assert.equal(work.complete, true, 'All physical roots and fact children must have finished');
+  const request = { project: f.project, block: 'garden-consume-block', line: 1, attempt: ordinal,
+    outcome: { reason, accepting: work.accepting, cancelling: [], refusals: work.refusals } };
+  return request;
+}
+
+function closeFactWork(f: ReturnType<typeof fixture>, reason: 'result' | 'refused' | 'off-form' | 'interrupted' = 'result', ordinal = 1) {
+  const request = factClosingRequest(f, reason, ordinal);
+  return { request, closed: ok(closeAttempt(f.store, request)) };
+}
+
+async function completedFactClosure(f: ReturnType<typeof fixture>, explicitCompletion = true, beforeD2?: () => void) {
   const request = await f.original();
   const intent = ok(writeAssessmentIntent(f.store, request));
   const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
@@ -210,6 +213,7 @@ async function completedFactClosure(f: ReturnType<typeof fixture>, explicitCompl
   }
   const checked = ok(readAcceptedAnswer(f.store, { project: f.project, record: accepted }));
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, 'result');
+  beforeD2?.();
   const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: question.value.request.input,
     answer: accepted, question: reference(question) }));
   const graph = prior.sources.graph;
@@ -248,56 +252,37 @@ test('E5 accepted fact closes its D2 line after G7 completed the original attemp
   assert.equal(f.sent().length, 2);
 });
 
-test('either proved E5 D5 answer of one semantic achievement can close D2 after the attempt', async t => {
-  const f = fixture(t), first = await f.original(), second = await f.secondOriginal();
-  const firstIntent = ok(writeAssessmentIntent(f.store, first));
-  const question = f.store.get<Mc1QuestionRecord>(
-    ok(readAssessmentIntentAt(f.store, f.project, reference(firstIntent))).question.record.id)!;
-  const prior = question.value.request.gaps;
-  const initial = ok(writeGapLines(f.store, { project: f.project, previous: null, pass: 1,
-    gaps: prior, closures: [] }));
-  // Both original MC1 calls are admitted before either assessor terminal; the first result
-  // cannot finish the attempt while the second original response is still awaiting assessment.
-  for (const source of [first, second]) {
-    const intent = ok(writeAssessmentIntent(f.store, source));
-    const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
-    ok(recordCall(f.store, f.project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis,
-      block: admission.block, gaps: admission.gaps, series: admission.series, attempt: admission.attempt,
-      goal: admission.goal, dispatch: admission.dispatch, packet: admission.packet as Json }));
-  }
-  f.assessorsForTwoOriginals('supported', 'supported');
-  const firstResult = ok(await assessFact(f.store, first));
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
-  const secondResult = ok(await assessFact(f.store, second));
-  const answers = [firstResult.value.accepted!, secondResult.value.accepted!];
-  assert.notEqual(answers[0]!.id, answers[1]!.id);
-  const saved = f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!;
-  assert.equal(saved.reason, 'result');
-  assert.equal(saved.achieved.length, 1);
-  const alternate = answers.find(ref => ref.id !== saved.achieved[0]!.basis.id)!;
-  const checked = ok(readAcceptedAnswer(f.store, { project: f.project, record: alternate }));
-  const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: question.value.request.input,
-    answer: alternate, question: reference(question) }));
-  const graph = prior.sources.graph;
-  const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(applied), graph,
-    refinement: null, available: {}, choice: { choiceVersion: 'e5-equivalent-d2',
-      features: [{ outcome: 'garden-result' }], excluded: [] } }));
-  const sources: GapRequest = { ...structuredClone(prior.sources), input: reference(applied),
-    horizon: reference(horizon.gate), operations: { ...structuredClone(prior.sources.operations),
-      frame: { ...structuredClone(prior.sources.operations.frame), horizon: reference(horizon.gate) } } };
-  const gaps = ok(writeGaps(f.store, sources));
-  const current: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest,
-    records: gaps.records.map(reference) };
-  const attempt = { series: checked.attempt!.series, attempt: checked.attempt!.ordinal };
-  const closure = { id: checked.gap.id, reason: 'filled' as const, basis: alternate, acceptance: null,
-    attempt, answer: { record: alternate } };
-  const confirmation = { project: f.project, basis: closure.answer, target: checked.gap.target,
-    field: checked.gap.field, prior, current, attempt, currentOnly: true };
-  assert.equal(ok(confirmAnswerGapClosure(f.store, confirmation)).key, checked.key);
+test('one proved managed E5 answer closes D2 with its original attempt while M6 forbids reopening its answered question', async t => {
+  const f = fixture(t);
+  const chain = await completedFactClosure(f, true, () => {
+    const prior = f.routes.value.request;
+    const next = ok(writeRoutes(f.store, { project: f.project, gaps: structuredClone(prior.gaps) as GapReadRequest,
+      tasks: prior.tasks.map(record => ({ record })), catalog: { paths: [...prior.catalog.paths], records: [...prior.catalog.records] },
+      previous: reference(f.routes) }));
+    assert.ok(!next.value.batches.some(batch => batch.items.some(item => f.questionIds.includes(item.gap))));
+    const binding = ok(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+    const before = f.store.list().flatMap(record => f.store.history(record.id));
+    const issue = refusedWith(managedOpenAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1,
+      attempt: 2, goal: binding.value.goal, completion: binding.value.plan }), 'route_stale');
+    assert.deepEqual([issue.at.unit, issue.at.target, issue.at.field], ['M6', f.routes.id, 'searches']);
+    assert.deepEqual(f.store.list().flatMap(record => f.store.history(record.id)), before);
+  });
+  assert.equal(chain.checked.attempt!.ordinal, 1);
+  assert.equal(chain.checked.attempt!.series.id, f.series.id);
+  const originalClose = factClosingRequest(f), repeated = ok(closeAttempt(f.store, originalClose));
+  assert.equal(repeated.verdict, 'progress');
+  assert.equal(ok(confirmAnswerGapClosure(f.store, chain.confirmation)).key, chain.checked.key);
+  refusedWith(confirmAnswerGapClosure(f.store, { ...chain.confirmation,
+    attempt: { ...chain.confirmation.attempt, attempt: 2 } }), 'answer_attempt_invalid');
+  const closed = ok(writeGapLines(f.store, chain.next));
+  assert.equal(closed.value.lines.find(line => line.id === chain.checked.gap.id)?.status, 'closed');
+  const before = f.store.list().flatMap(record => f.store.history(record.id));
   f.restart();
-  const next = { project: f.project, previous: reference(initial), pass: 2, gaps: current, closures: [closure] };
-  assert.equal(ok(writeGapLines(f.store, next)).value.lines.find(line => line.id === closure.id)?.status, 'closed');
-  assert.equal(f.sent().length, 4);
+  assert.equal(ok(confirmAnswerGapClosure(f.store, chain.confirmation)).key, chain.checked.key);
+  assert.deepEqual(ok(writeGapLines(f.store, chain.next)), closed);
+  assert.deepEqual(ok(closeAttempt(f.store, originalClose)), repeated);
+  assert.deepEqual(f.store.list().flatMap(record => f.store.history(record.id)), before);
+  assert.equal(f.sent().length, 2);
 });
 
 test('E5 D2 closure keeps the original attempt of the accepted answer', async t => {
@@ -340,6 +325,7 @@ test('E5 accepts a supported physical fact with one complete D5 bundle and exact
   const f = fixture(t), request = await f.original();
   f.assessor();
   const terminal = ok(await assessFact(f.store, request));
+  closeFactWork(f);
   assert.equal(terminal.value.verdict, 'supported');
   assert.ok(terminal.value.accepted && terminal.value.index);
   const accepted = ok(readAcceptedAnswer(f.store, { project: f.project, record: terminal.value.accepted! }));
@@ -403,8 +389,10 @@ test('a direct G7 close cannot omit an unassessed fact from the original MC1 res
   assert.ok(first.value.accepted);
   const closed = closeAttempt(f.store, { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
     outcome: { reason: 'result', accepting: [first.value.accepted!], cancelling: [], refusals: [] } });
-  refusedWith(closed, 'achievement_unconfirmed');
-  if (!closed.ok) assert.equal(closed.refusal.code, 'achievement_unconfirmed');
+  const refusal = refusedWith(closed, 'completion_incomplete');
+  assert.equal(refusal.at.unit, 'gate-repeat');
+  const binding = ok(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+  assert.deepEqual([refusal.at.target, refusal.at.field], [completionWorkId(f.project, binding.id), 'work']);
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
   assert.equal(f.store.list(ASSESSMENT_RESULT_KIND).length, 1);
   assert.equal(f.sent().length, 2);
@@ -421,8 +409,8 @@ test('a direct G7 close atomically guards the complete assessed source set', asy
     return originalWrite(writes, guards);
   }) as Store['writeMany'];
   try {
-    await assert.rejects(() => assessFact(f.store, { ...request, questionId: f.questionIds[1]! }),
-      /simulated interruption before G7 write/);
+    ok(await assessFact(f.store, { ...request, questionId: f.questionIds[1]! }));
+    assert.throws(() => closeFactWork(f), /simulated interruption before G7 write/);
   } finally { f.store.writeMany = originalWrite; }
   const results = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND);
   assert.equal(results.length, 2);
@@ -458,6 +446,7 @@ test('E5 closes a multi-fact attempt after the final supported result and repeat
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
   const second = ok(await assessFact(f.store, { ...first, questionId: f.questionIds[1]! }));
   assert.equal(second.value.verdict, 'supported');
+  closeFactWork(f);
   const line = f.store.get<RepairSeries>(f.series.id)!;
   assert.equal(line.value.attempts[0]!.outcome?.reason, 'result');
   assert.equal(line.value.attempts[0]!.outcome?.achieved.length, 2);
@@ -481,6 +470,7 @@ test('E5 preserves conflicting and off-form outcomes as their own terminal state
     assert.equal(f.store.list('accepted-answer').length, 0);
     if (variant === 'off-form') assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
     else {
+      closeFactWork(f, 'refused');
       const line = f.store.get<RepairSeries>(f.series.id)!.value;
       const closed = line.attempts[0]!.outcome;
       assert.equal(closed?.reason, 'refused');
@@ -535,8 +525,9 @@ test('real technical E5 terminals permit their own G7 close and exact restart re
       outcome: { reason: variant, accepting: [], cancelling: [], refusals: [] } };
     const wrongReason = closeAttempt(f.store, { ...closing, outcome: { ...closing.outcome,
       reason: variant === 'off-form' ? 'interrupted' as const : 'off-form' as const } });
-    refusedWith(wrongReason, 'origin_unreadable');
-    if (!wrongReason.ok) assert.equal(wrongReason.refusal.code, 'origin_unreadable');
+    const refusal = refusedWith(wrongReason, 'completion_reason_invalid');
+    assert.equal(refusal.at.unit, 'gate-repeat');
+    assert.equal(refusal.at.target, f.series.id);
     const closed = ok(closeAttempt(f.store, closing));
     assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, variant);
     const before = f.store.list().map(reference), sent = f.sent().length;
@@ -558,6 +549,7 @@ test('a technical terminal retains its own verdict when a semantic E5 fact close
     assert.equal(first.value.verdict, semantic);
     const second = ok(await assessFact(f.store, { ...request, questionId: f.questionIds[1]! }));
     assert.equal(second.value.verdict, 'off-form');
+    closeFactWork(f, semantic === 'supported' ? 'result' : 'refused');
     const finalized = ok(finishAssessmentAttempt(f.store, f.project, first.value.intent));
     assert.equal(finalized.complete, true);
     assert.equal(finalized.closed, true);
@@ -719,59 +711,107 @@ test('E5 refuses intent creation if a guarded source moves between preparation a
   } finally { second.close(); }
 });
 
-test('E5 retains a paid response when a source moves before supported application', async t => {
-  const f = fixture(t), request = await f.original(), intent = ok(writeAssessmentIntent(f.store, request));
-  const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
-  const call = ok(recordCall(f.store, f.project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis,
-    block: admission.block, gaps: admission.gaps, series: admission.series, attempt: admission.attempt,
-    goal: admission.goal, dispatch: admission.dispatch, packet: admission.packet as Json }));
-  f.assessor();
-  const physical = ok(await runModelTransport(f.store, { project: f.project, call: reference(call.call),
-    packet: admission.packet as Json, role: 'reviewer' }));
-  const second = new Store(f.path);
-  try {
-    const adapter = second.get(request.dispatch.adapter.id)!;
-    second.write({ id: adapter.id, kind: adapter.kind, expected: adapter.revision, value: adapter.value });
-  } finally { second.close(); }
-  denied(applyAssessmentResult(f.store, { project: f.project, intent: reference(intent), assessor: reference(physical.record) }), 'assessment_source_stale');
-  assert.ok(f.store.get(physical.record.id));
-  assert.equal(f.store.list('accepted-answer').length, 0);
-  assert.equal(f.store.get(`om-assessment-result:${f.project}:${hashJson(intent.id)}`), null);
-  f.restart();
-  assert.ok(f.store.get(physical.record.id));
-  denied(applyAssessmentResult(f.store, { project: f.project, intent: reference(intent), assessor: reference(physical.record) }), 'assessment_source_stale');
+test('E5 retains paid physical evidence when its exact adapter or captured file ceases before application', async t => {
+  for (const change of ['adapter', 'file'] as const) await t.test(change, async child => {
+    const f = fixture(child, false, false, true, false, change === 'file');
+    const request = await f.original(), paid = await paidAssessment(f, request);
+    const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(paid.intent)))!;
+    assert.equal(ok(prepareCompletionCause(f.store, f.project, disposition.assignment)).cause, null);
+    const physical = f.store.get(paid.physical.record.id), e1 = f.store.list('call-record');
+    const exchange = paid.physical.record.value.transport.exchange;
+    const report = ok(spendReport(f.store, { project: f.project }));
+    const original = readFileSync(f.sourcePath);
+    let replacement: Ref | null = null;
+    if (change === 'file') writeFileSync(f.sourcePath, '{changed');
+    else {
+      const other = new Store(f.path);
+      try {
+        const adapter = other.get(request.dispatch.adapter.id)!;
+        replacement = reference(other.write({ id: adapter.id, kind: adapter.kind, expected: adapter.revision, value: adapter.value }));
+      } finally { other.close(); }
+    }
+    const terminal = ok(applyAssessmentResult(f.store, paid.apply));
+    assert.equal(terminal.value.contract, 'om-assessment-application-termination/v1');
+    assert.equal(terminal.value.verdict, 'application-terminated');
+    if (terminal.value.verdict !== 'application-terminated') assert.fail('A ceased application has no semantic verdict');
+    assert.equal(terminal.value.accepted, null); assert.equal(terminal.value.index, null);
+    if (change === 'file') {
+      assert.equal(terminal.value.cause.kind, 'file-observation');
+      if (terminal.value.cause.kind !== 'file-observation') assert.fail('Exact file cause required');
+      assert.deepEqual(terminal.value.cause.source, reference(f.source));
+    } else {
+      assert.equal(terminal.value.cause.kind, 'required-record-replaced');
+      if (terminal.value.cause.kind !== 'required-record-replaced') assert.fail('Exact replacement cause required');
+      assert.equal(terminal.value.cause.prerequisite.kind, 'adapter');
+      assert.deepEqual(terminal.value.cause.prerequisite.source, request.dispatch.adapter);
+      assert.deepEqual(terminal.value.cause.replacement, replacement);
+    }
+    assert.deepEqual(f.store.get(paid.physical.record.id), physical);
+    assert.deepEqual(f.store.get<typeof paid.physical.record.value>(paid.physical.record.id)!.value.transport.exchange, exchange);
+    assert.deepEqual(f.store.list('call-record'), e1);
+    assert.equal(f.store.list('accepted-answer').length, 0);
+    assert.equal(f.store.list(UNIT_REFUSAL_KIND).filter(row => (row.value as { gate: string }).gate === 'E5').length, 0);
+    assert.deepEqual(ok(spendReport(f.store, { project: f.project })).totals, report.totals);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+    writeFileSync(f.sourcePath, original);
+    f.restart();
+    const before = f.store.list().map(reference);
+    assert.deepEqual(ok(applyAssessmentResult(f.store, paid.apply)), terminal);
+    assert.deepEqual(ok(await assessFact(f.store, request)), terminal);
+    assert.deepEqual(ok(readAssessmentTerminalAt(f.store, f.project, reference(terminal))), terminal);
+    assert.deepEqual(f.store.list().map(reference), before);
+    const closed = closeFactWork(f, 'interrupted');
+    f.restart();
+    const afterClose = f.store.list().map(reference);
+    assert.deepEqual(ok(closeAttempt(f.store, closed.request)), closed.closed);
+    assert.deepEqual(ok(await assessFact(f.store, request)), terminal);
+    assert.deepEqual(f.store.list().map(reference), afterClose);
+    assert.equal(f.sent().length, 2);
+  });
 });
 
-test('E5 completion cannot close an obsolete line when a successor appears before its transaction', async t => {
+test('explicit G7 completion cannot close an obsolete line when a successor appears before its transaction', async t => {
   const f = fixture(t), request = await f.original();
   f.assessor();
+  ok(await assessFact(f.store, request));
+  const closing = factClosingRequest(f);
   const originalWrite = f.store.writeMany.bind(f.store);
   let raced = false;
+  let rivalHistory: Ref[] = [];
   f.store.writeMany = ((writes, guards) => {
     if (!raced && writes.some(write => write.kind === 'repair-series'
       && write.id === f.series.id && write.expected > 0)) {
       raced = true;
       const second = new Store(f.path);
-      try { second.write({ id: seriesId(f.project, 'garden-consume-block', 2), kind: 'repair-series', expected: 0,
-        value: { projectId: f.project, block: 'garden-consume-block', line: 2 } }); }
+      try {
+        ok(closeAttempt(second, closing));
+        ok(openSeries(second, { project: f.project, block: 'garden-consume-block', line: 2,
+          slice: 'e5-fact-successor', predecessor: reference(second.get(f.series.id)!),
+          basis: { ground: 'inputs-changed', text: 'The successor starts after the rival closed the original work' } }));
+        rivalHistory = second.list().map(reference);
+      }
       finally { second.close(); }
     }
     return originalWrite(writes, guards);
   }) as Store['writeMany'];
-  try { denied(await assessFact(f.store, request), 'input_stale'); }
+  try { refusedWith(closeAttempt(f.store, closing), 'input_stale'); }
   finally { f.store.writeMany = originalWrite; }
   assert.equal(raced, true);
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason, 'result');
+  assert.ok(f.store.get(seriesId(f.project, 'garden-consume-block', 2)));
+  assert.deepEqual(f.store.list().map(reference), rivalHistory, 'The losing close changes none of the rival records');
   assert.equal(f.store.list('accepted-answer').length, 1);
   assert.equal(f.store.list('om-assessment-result').length, 1);
   assert.equal(f.sent().length, 2);
 });
 
-test('E5 closure atomically guards every result used to prove the full source set', async t => {
+test('explicit G7 closure atomically guards every E5 result used to prove the full source set', async t => {
   const f = fixture(t, true), request = await f.original();
   f.assessor('supported', 'supported');
   ok(await assessFact(f.store, request));
   const first = f.store.list(ASSESSMENT_RESULT_KIND)[0]!;
+  ok(await assessFact(f.store, { ...request, questionId: f.questionIds[1]! }));
+  const closing = factClosingRequest(f);
   const originalWrite = f.store.writeMany.bind(f.store);
   let raced = false;
   f.store.writeMany = ((writes, guards) => {
@@ -786,7 +826,7 @@ test('E5 closure atomically guards every result used to prove the full source se
     }
     return originalWrite(writes, guards);
   }) as Store['writeMany'];
-  try { denied(await assessFact(f.store, { ...request, questionId: f.questionIds[1]! }), 'input_stale'); }
+  try { refusedWith(closeAttempt(f.store, closing), 'input_stale'); }
   finally { f.store.writeMany = originalWrite; }
   assert.equal(raced, true);
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
@@ -967,15 +1007,6 @@ test('18 H1.0a answered assessor transport is still I until its exact E5 applica
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome,null);
 });
 
-test('2 H1.0a standalone E5 keeps its accepted automatic completion and exact historical repeat',async t=>{
-  const f=fixture(t),request=await f.original();f.assessor();
-  const terminal=ok(await assessFact(f.store,request));
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome?.reason,'result');
-  assert.equal(f.store.list('om-completion-owner').length,0);
-  const saved=f.store.list().map(reference);f.restart();
-  assert.deepEqual(ok(await assessFact(f.store,request)),terminal);assert.deepEqual(f.store.list().map(reference),saved);
-  assert.equal(f.sent().length,2);
-});
 
 /** Two unique input questions share one block through the accepted L2 realizes relation. */
 function twoMc1Fixture(t: TestContext, deferredPackets = false) {
@@ -1217,10 +1248,11 @@ test('17 H1.0b missing original history and unknown observations are not file-ch
 
 
 test('31 H1.0b a different already-applied B1 fact is a required file prerequisite', async t => {
-  const f = fixture(t, true, false, false, false, true), first = await f.original();
+  const f = fixture(t, true, false, true, false, true), first = await f.original();
   f.assessor('supported', 'insufficient');
   const accepted = ok(await assessFact(f.store, first)).value.accepted!;
   ok(await assessFact(f.store, { ...first, questionId: f.questionIds[1]! }));
+  closeFactWork(f);
   const answer = ok(readAcceptedAnswer(f.store, { project: f.project, record: accepted }));
   const q = answer.question, previous = structuredClone(q.value.request.gaps) as GapReadRequest;
   const applied = ok(writeApplyAnswer(f.store, { project: f.project, input: q.value.request.input,

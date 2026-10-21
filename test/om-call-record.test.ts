@@ -2,11 +2,10 @@ import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-f
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
@@ -14,7 +13,7 @@ import { Store, type Revision, type Write, type ReadGuard } from "../src/storage
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import {
   beginAttempt, completeAttempt, openSeries, resumeSeries, escalateSeries, readSeriesAt, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
-  prepareSeriesAdmission, readMechanismAdmission,
+  prepareSeriesAdmission, readMechanismAdmission, readCompletionBinding, completionWorkId,
   type AttemptGoal, type RepairSeries, type AnyRepairSeries, type MechanismAdmission,
 } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
@@ -23,7 +22,7 @@ import {
   ORIGIN_DECISION_KIND, type OriginHold,
 } from "../src/om/repeat-gate.js";
 import {
-  callLedgerId, callRecordId, readCall, readCallLedger, prepareCallDispatch, recordCall, settleCall,
+  callLedgerId, callRecordId, readCall, prepareCallDispatch, recordCall, settleCall,
   CALL_LEDGER_KIND, CALL_PURPOSES, CALL_RECORD_CODES, CALL_RECORD_KIND,
   type CallLedger, type CallRecord, type RecordCallRequest, type MechanismRecordCallRequest, type AnyCallRecord,
 } from "../src/om/call-record.js";
@@ -33,17 +32,17 @@ import { ProductEngine } from "../src/product/engine.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import { designOf } from "../src/graph/builder.js";
 import type { Question } from "../src/discovery/discovery.js";
-import type { Source } from "../src/evidence/evidence.js";
+import { Evidence, type Source } from "../src/evidence/evidence.js";
 import { projectGraph } from "../src/graph/project.js";
 import type { Graph } from "../src/graph/model.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
-import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
+import { writeRoutes } from "../src/om/routes.js";
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
-import { readModelCallState, readModelTransport, recoverOmModelCall, runModelCall, runModelTransport } from "../src/om/model-call.js";
-import { readAssessmentIntentAt, writeAssessmentIntent } from "../src/om/assessment.js";
+import { readModelCallState, readModelTransport, recoverOmModelCall, runModelCall, runModelTransport, readCompletionWorkAt, writeCompletionCessation } from "../src/om/model-call.js";
+import { readAssessmentIntentAt, writeAssessmentIntent, assessFact } from "../src/om/assessment.js";
 import { gapLineKey, gapLineExpectedResult } from "../src/om/gap-lines.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -1414,51 +1413,7 @@ test("block origin analysis follows its inherited current hold and rejects a lif
 
 const e4FixturePath = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 
-const E50_COMMIT = "3eb5dac3c790ca988082840693969b06b5d81966";
-/**
- * Q3 (№2573-1), LP1: a historical consumer receives its series and packet from the corresponding immutable producer.
- * Every engine module comes from that commit, in its own process.
- */
-function fixtureWriteAt<T>(root: string, path: string, commit: string,
-  operation: 'openSeries' | 'writeQuestionPacket' | 'writeRoutes', request: unknown): T {
-  const repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(root, `${operation}-loader.mjs`), producer = join(root, `${operation}-producer.mjs`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/src/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', ${JSON.stringify(commit)} + ':' + relative], { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, request] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { reference } = await import(src('pipeline/contracts.js'));
-const { ${operation} } = await import(src('${operation === 'openSeries' ? 'om/series.js' : operation === 'writeRoutes' ? 'om/routes.js' : 'om/question-packet.js'}'));
-const store = new Store(database);
-try {
-  const written = ${operation}(store, JSON.parse(request));
-  if (!written.ok) throw Error(JSON.stringify(written.refusal));
-  process.stdout.write(JSON.stringify(${operation === 'openSeries' ? 'reference(written.value)' : operation === 'writeRoutes' ? 'written.value' : 'written.value.record'}));
-} finally { store.close(); }`);
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)} } });`;
-  return JSON.parse(execFileSync(process.execPath, ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, path,
-    JSON.stringify(request)], { cwd: repository, encoding: "utf8", timeout: 60_000, maxBuffer: 10_000_000 })) as T;
-}
-
-function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store, seriesCommit?: string) {
+function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store, fileEvidence = false) {
   const root = mkdtempSync(join(tmpdir(), "omg-e50-fact-")), path = join(root, "state.sqlite"), project = "garden";
   let store = new StoreType(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -1475,7 +1430,7 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
       consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false,
       resolution: "Resolve the addressed question during OM" }];
     return value;
-  }, seriesCommit);
+  });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = deliveredOf(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
   const input = deliveredOf(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
@@ -1496,19 +1451,24 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
         resultForm: { type: "string" } })) }));
   const routesRequest = { project, gaps: gapRequest, tasks: tasks.tasks.map(task => ({ pending: structuredClone(task.writes[0]!) as Write })),
     catalog: { paths: ["e50-source.txt"], records: [] }, previous: null };
-  // LP7 (№3393 §6 F2): the historical producer reads the route its own commit wrote, never a route joined by today's code.
-  const routes = seriesCommit ? fixtureWriteAt<Revision<RoutesRecord>>(root, path, seriesCommit, 'writeRoutes', routesRequest)
-    : deliveredOf(writeRoutes(store, routesRequest));
+  const routes = deliveredOf(writeRoutes(store, routesRequest));
   const batch = routes.value.batches.find(item => item.model === "MC1" && item.items.some(question => question.target === "discovery:encoding"))!;
   assert.ok(batch);
-  const block = "garden-consume-block", source = store.get<{ content: string }>(`source:${project}:brief`)!;
+  const sourcePath = join(root, "e50-source.txt");
+  writeFileSync(sourcePath, "UTF-8 is the supported encoding.");
+  const block = "garden-consume-block", source = fileEvidence
+    ? new Evidence(store).file(project, "e50-file", root, "e50-source.txt", "text/plain", 0)
+    : store.get<{ content: string }>(`source:${project}:brief`)!;
   const attemptGoal: AttemptGoal = { key: "e50:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   const opening = { project, block, line: 1, slice: "e50-fact", predecessor: null, basis: null };
-  // A historical producer continues a line of its own form: opened by its commit when the test asks for one (№2573-1).
-  if (seriesCommit) fixtureWriteAt<Ref>(root, path, seriesCommit, 'openSeries', opening);
-  else deliveredOf(openSeries(store, opening));
-  const series = deliveredOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
+  deliveredOf(openSeries(store, opening));
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const series = deliveredOf(openAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal, completion }));
+  const binding = deliveredOf(readCompletionBinding(store, project, reference(series), 1));
+  assert.ok(binding, 'Current fact assessment has a completion owner');
+  assert.deepEqual(binding.value.plan, completion);
+  assert.deepEqual(binding.value.goal, attemptGoal);
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [e4FixturePath, "--scenario", scenario, "--trace", trace] };
   const config = engine.environments.configure(project, { workspace: root,
@@ -1519,14 +1479,12 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
     value: { projectId: project, protocol: "codex-stdio" } });
   const packetRequest = { project, routes: reference(routes), batch: batch.id,
     environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] };
-  const packet = seriesCommit ? fixtureWriteAt<Revision<QuestionPacketRecord>>(root, path, seriesCommit, 'writeQuestionPacket', packetRequest)
-    : deliveredOf(writeQuestionPacket(store, packetRequest)).record;
-  if (seriesCommit) assert.equal(packet.value.answerProtocol, 'omg-answer/v2');
+  const packet = deliveredOf(writeQuestionPacket(store, packetRequest)).record;
   const questionId = batch.items[0]!.gap;
   const native = (packet as Revision<QuestionPacketRecord>).value.native.find(item => item.gap.id === `om-gap:${project}:${questionId}`)!;
   assert.ok(native);
   writeFileSync(join(root, "e50-source.txt"), "UTF-8 is the supported encoding.");
-  const originalStep = { research: { protocol: seriesCommit ? "omg-answer/v2" : "$answerProtocol", requestId: "$requestId", action: "answer",
+  const originalStep = { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: [{ questionId, value: "UTF-8", citations: [{ source: reference(source),
       selector: { kind: "text-range", start: 0, end: source.value.content.length } }] }] }, usage };
   writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep] }));
@@ -1552,11 +1510,31 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
     });
     return { model, research, basis, intent, assessment };
   }
-  return { project, block, path, root, series, packet, native, questionId, get store() { return store; }, original,
+  return { project, block, path, root, sourcePath, source, series, packet, native, questionId, get store() { return store; }, original,
     assessorScenario() { writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep,
       { research: { verdict: "supported", reasons: [] }, usage }] })); },
     sent() { return readFileSync(trace, "utf8").trim().split("\n").filter(Boolean); },
     restart() { store.close(); store = new StoreType(path); } };
+}
+
+function closeFactAssessment(f: ReturnType<typeof factAssessmentFixture>, reason: 'result' | 'interrupted', store = f.store) {
+  const binding = deliveredOf(readCompletionBinding(store, f.project, reference(store.get(f.series.id)!), 1));
+  assert.ok(binding);
+  const work = deliveredOf(readCompletionWorkAt(store, f.project, reference(store.get(completionWorkId(f.project, binding.id))!)));
+  assert.equal(work.complete, true);
+  return deliveredOf(closeAttempt(store, { project: f.project, block: f.block, line: 1, attempt: 1,
+    outcome: { reason, accepting: work.accepting, cancelling: [], refusals: work.refusals } }));
+}
+function ceaseFactBeforeAssessment(f: ReturnType<typeof factAssessmentFixture>, store = f.store) {
+  writeFileSync(f.sourcePath, 'The captured source has changed.');
+  const binding = deliveredOf(readCompletionBinding(store, f.project, reference(store.get(f.series.id)!), 1));
+  assert.ok(binding);
+  const work = deliveredOf(readCompletionWorkAt(store, f.project, reference(store.get(completionWorkId(f.project, binding.id))!)));
+  const fact = work.assignments.find(row => row.value.kind === 'fact');
+  assert.ok(fact);
+  const cessation = deliveredOf(writeCompletionCessation(store, { project: f.project, binding: reference(binding), assignment: reference(fact) }));
+  assert.equal(cessation.value.disposition, 'not-dispatched');
+  return closeFactAssessment(f, 'interrupted', store);
 }
 
 test("new direct fact E1 refuses both unmanaged and reserved names without an E5 intent", async t => {
@@ -1574,82 +1552,6 @@ test("new direct fact E1 refuses both unmanaged and reserved names without an E5
   assert.deepEqual(f.store.get<CallLedger>(callLedgerId(f.project)), beforeLedger);
 });
 
-test("genuine E5.0 E1 and E4 records remain historical after restart while an old open E1 cannot launch E4", async t => {
-  const f = factAssessmentFixture(t, Store, E50_COMMIT), origin = await f.original(), current = origin.assessment();
-  const basis = structuredClone(origin.basis);
-  delete (basis as { assessment?: Ref }).assessment;
-  const oldPacket = { questionId: f.questionId, value: "UTF-8", evidence: origin.model.response };
-  const open = { ...current, call: `e50-open-${next()}`, basis, packet: oldPacket };
-  const paid = { ...open, call: `e50-paid-${next()}` };
-  f.assessorScenario();
-  const repository = fileURLToPath(new URL("../../", import.meta.url));
-  const loader = join(f.root, "e50-loader.mjs"), producer = join(f.root, "e50-producer.mjs"), input = join(f.root, "e50-input.json");
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve("typescript")).href;
-  writeFileSync(loader, `import { execFileSync } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
-import ts from ${JSON.stringify(typescript)};
-let root;
-export function initialize(data) { root = data.root; }
-export async function load(url, context, next) {
-  const prefix = new URL('dist/src/', root).href;
-  if (url.startsWith(prefix) && /\\.js$/.test(url)) {
-    const relative = 'src/' + url.slice(prefix.length).replace(/\\.js$/, '.ts');
-    const source = execFileSync('git', ['show', '3eb5dac3c790ca988082840693969b06b5d81966:' + relative],
-      { cwd: fileURLToPath(root), encoding: 'utf8', maxBuffer: 10000000 });
-    return { format: 'module', shortCircuit: true, source: ts.transpileModule(source,
-      { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 } }).outputText };
-  }
-  return next(url, context);
-}`);
-  writeFileSync(producer, `import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-const [repository, database, input] = process.argv.slice(2);
-const src = path => pathToFileURL(join(repository, 'dist/src', path)).href;
-const { Store } = await import(src('storage/store.js'));
-const { reference } = await import(src('pipeline/contracts.js'));
-const { recordCall, callLedgerId } = await import(src('om/call-record.js'));
-const { runModelTransport } = await import(src('om/model-call.js'));
-const args = JSON.parse(readFileSync(input, 'utf8')), store = new Store(database);
-const take = result => { if (!result.ok) throw Error(JSON.stringify(result.refusal)); return result.value; };
-try {
-  const open = take(recordCall(store, args.project, args.open));
-  const paid = take(recordCall(store, args.project, args.paid));
-  const transport = take(await runModelTransport(store,
-    { project: args.project, call: reference(paid.call), packet: args.paid.packet, role: 'reviewer' }));
-  if (transport.result.kind !== 'answered') throw Error('E5.0 assessor did not answer');
-  process.stdout.write(JSON.stringify({ open: open.call, admitted: paid.call, paid: store.get(paid.call.id),
-    transport: transport.record, ledger: store.get(callLedgerId(args.project)) }));
-} finally { store.close(); }`);
-  writeFileSync(input, JSON.stringify({ project: f.project, open, paid }));
-  const bootstrap = `import { register } from 'node:module'; register(${JSON.stringify(pathToFileURL(loader).href)},
-    { data: { root: ${JSON.stringify(pathToFileURL(repository).href)} } });`;
-  const old = JSON.parse(execFileSync(process.execPath,
-    ["--import", `data:text/javascript,${encodeURIComponent(bootstrap)}`, producer, repository, f.path, input],
-    { cwd: repository, encoding: "utf8", timeout: 30_000, maxBuffer: 10_000_000 })) as {
-      open: Revision<CallRecord>; admitted: Revision<CallRecord>; paid: Revision<CallRecord>;
-      transport: Revision<Json>; ledger: Revision<CallLedger> };
-  assert.equal(old.open.value.status, "open");
-  assert.equal(old.paid.value.status, "succeeded");
-  assert.equal(old.transport.kind, "model-call");
-  assert.equal(f.sent().length, 2);
-  f.restart();
-  assert.deepEqual(deliveredOf(readCall(f.store, f.project, reference(old.open))), old.open);
-  assert.deepEqual(deliveredOf(readCall(f.store, f.project, reference(old.admitted))), old.admitted);
-  assert.deepEqual(deliveredOf(readCall(f.store, f.project, reference(old.paid))), old.paid);
-  assert.deepEqual(deliveredOf(readCallLedger(f.store, f.project)), old.ledger);
-  assert.deepEqual(deliveredOf(readModelTransport(f.store,
-    { project: f.project, record: reference(old.transport) })).record, old.transport);
-  assert.equal(deliveredOf(await runModelTransport(f.store,
-    { project: f.project, call: reference(old.admitted), packet: paid.packet, role: "reviewer" })).repeated, true);
-  const beforeCalls = f.store.list("model-call").map(reference);
-  const rejected = refusalOf(await runModelTransport(f.store,
-    { project: f.project, call: reference(old.open), packet: open.packet, role: "reviewer" }));
-  assert.equal(rejected.code, "model_call_request_invalid");
-  assert.equal(rejected.at.unit, "E4");
-  assert.deepEqual(f.store.list("model-call").map(reference), beforeCalls);
-  assert.equal(f.sent().length, 2);
-});
 
 test("fact assessment is admitted only from the applied original MC1 fact in its running attempt", async t => {
   const f = factAssessmentFixture(t), origin = await f.original(), input = origin.assessment();
@@ -1660,8 +1562,11 @@ test("fact assessment is admitted only from the applied original MC1 fact in its
   assert.equal(recorded.call.value.series.id, origin.research.value.series.id);
   assert.equal(recorded.ledger.value.calls.filter(row => row.purpose === "fact-assessment").length, 1);
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
-  deliveredOf(completeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1,
-    outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
+  f.assessorScenario();
+  const terminal = deliveredOf(await assessFact(f.store, { project: f.project, modelCall: reference(origin.model.record),
+    questionId: f.questionId, dispatch: input.dispatch }));
+  assert.equal(terminal.value.verdict, 'supported');
+  closeFactAssessment(f, 'result');
   const exact = reference(recorded.call), before = f.store.list().map(reference);
   f.restart();
   assert.deepEqual(deliveredOf(readCall(f.store, f.project, exact)), recorded.call);
@@ -1738,24 +1643,23 @@ test("fact assessment rejects a changed source identity and incomplete original 
 });
 
 test("fact assessment cannot move to another attempt or start after its original attempt completes", async t => {
-  const f = factAssessmentFixture(t), origin = await f.original();
+  const f = factAssessmentFixture(t, Store, true), origin = await f.original();
   addressed(recordCall(f.store, f.project, origin.assessment({ attempt: 2 })), "call_basis_unresolved");
   addressed(recordCall(f.store, f.project, origin.assessment({ goal: goal() })), "call_basis_unresolved");
   if ("owner" in origin.research.value) assert.fail("Original MC1 call must belong to its block attempt");
   addressed(recordCall(f.store, f.project, origin.assessment({ gaps: [
     ...origin.research.value.gaps, { id: "another-fact", goal: "encoding", field: "value", consumer: f.block },
   ] })), "call_basis_unresolved");
-  deliveredOf(completeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1,
-    outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
+  ceaseFactBeforeAssessment(f);
   const late = origin.assessment({ series: reference(f.store.get<RepairSeries>(f.series.id)!) });
   const ended = refusalOf(recordCall(f.store, f.project, late));
-  assert.equal(ended.code, "series_conflict");
-  assert.equal(ended.at.unit, "store-repairs");
+  assert.equal(ended.code, "answer_inapplicable");
+  assert.equal(ended.at.unit, "D5");
   assert.equal(f.store.get(callRecordId(f.project, late.call)), null);
 });
 
 test("fact assessment current series change between origin proof and E1 write rejects atomically", async t => {
-  const f = factAssessmentFixture(t), origin = await f.original(), input = origin.assessment();
+  const f = factAssessmentFixture(t, Store, true), origin = await f.original(), input = origin.assessment();
   const beforeCalls = f.store.list(CALL_RECORD_KIND).length, beforeLedger = f.store.get<CallLedger>(callLedgerId(f.project))!;
   const writeMany = f.store.writeMany.bind(f.store);
   let raced = false;
@@ -1765,8 +1669,7 @@ test("fact assessment current series change between origin proof and E1 write re
       raced = true;
       const other = new Store(f.path);
       try {
-        deliveredOf(completeAttempt(other, { project: f.project, block: f.block, line: 1, attempt: 1,
-          outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
+        ceaseFactBeforeAssessment(f, other);
       } finally { other.close(); }
     }
     return writeMany(writes, guards);
