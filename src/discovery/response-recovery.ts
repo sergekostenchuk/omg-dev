@@ -59,7 +59,7 @@ import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalR
   type ManagedResearchTurn, type TurnTransitionProof, type LayerDesignRefusalProof,
   type AcceptedPaidAnswerInputs, type ResearchAcceptanceBinding,
   type ContextReadIdentityInput, type ContextTurnHistoryProof } from './research-consumer-transition.js';
-import type { ResearchAction, ResearchAnswer, ResearchAssessment, ResearchRun, ResearchTurn } from './research-model.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V3, type ResearchAction, type ResearchAnswer, type ResearchAssessment, type ResearchRun, type ResearchTurn } from './research-model.js';
 import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
 import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
@@ -376,6 +376,23 @@ export function consumerIntentContext(store: Store, intent: ResearchConsumerInte
  * not contain the managed-era marker. Find the exact queue before deciding
  * which historical contract applies to a completed child search. */
 function managedSearchParent(store: Store, child: Revision<Record<string, any>>) {
+  // A direct consumer turn has its own paid intent, never a planner parent.
+  // The immutable era address selects that proof without scanning mutable heads.
+  if (child.id.startsWith('research-turn:v1:')) return null;
+  const plannedBy = child.value.plannedBy;
+  if (object(plannedBy) && typeof plannedBy.id === 'string' && plannedBy.id.startsWith('research-turn:v1:')) {
+    if (!isRef(plannedBy)) consumerInvalid(child.id, 'The planned search lost its exact managed queue');
+    const original = store.get<ResearchTurn>(plannedBy.id, plannedBy.revision);
+    const queued = store.get<ResearchTurn>(plannedBy.id, plannedBy.revision + 1);
+    const children = (queued?.value.observation as { children?: unknown } | null)?.children;
+    if (!original || original.kind !== 'research-turn' || canonical(reference(original)) !== canonical(plannedBy)
+      || !queued || queued.kind !== 'research-turn' || !Array.isArray(children)
+      || !children.some(ref => queuedChildReached(store, ref, child as Revision<ResearchTurn>)))
+      consumerInvalid(child.id, 'The planned search lost its exact managed queue');
+    return { original, queued };
+  }
+  // Older field-path records lack the exact managed marker. Preserve their
+  // historical fallback, including detection of a lost planner link.
   const matches = store.list<ResearchTurn>('research-turn').flatMap(head => {
     if (!head.id.startsWith('research-turn:v1:')) return [];
     const original = store.get<ResearchTurn>(head.id, 1);
@@ -3542,8 +3559,12 @@ async function recoverAttemptsAssessmentResponse(store: Store, project: string, 
   const paid = readResearchResponse(store, project, callRef, admission.session, draft, question, admission.role, admission.profile);
   const environment = store.get<Environment>(binding.environment.id, binding.environment.revision)!;
   const pilot = admission.profile ? store.get<ReaderPilot>(admission.profile.id, admission.profile.revision)! : undefined;
-  const restore = () => import('./research-assessment.js').then(module => module.assessAttempts(store,
-    subject.packet, subject.baseline, environment, admission.dispatch.workspace, undefined, pilot));
+  const restore = async () => {
+    const module = await import('./research-assessment.js');
+    const assess = subject.assessment!.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3
+      ? module.assessAttemptsWithRequirements : module.assessAttempts;
+    await assess(store, subject.packet, subject.baseline, environment, admission.dispatch.workspace, undefined, pilot);
+  };
   const origin = { projectId: project, declaredBy, call: callRef, request: paid.request, response: paid.response,
     archive: paid.archive, sessionBefore: sessionRef };
   const sessionHead = store.get<RecoverableContextSession>(admission.session.id);

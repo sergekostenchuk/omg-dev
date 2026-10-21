@@ -1,9 +1,9 @@
-import { packetAssessmentSubject, methodologyAssessmentTransport, assessmentQuestionContract } from './continuation-packet.js';
+import { packetAssessmentSubject, methodologyAssessmentTransport, requirementsAssessmentTransport, assessmentQuestionContract, type AssessmentTransportSubject } from './continuation-packet.js';
 import { proveAttemptPacket, checkProgressBaseline, baselineGuards, checkDiscoveryAssessmentForm,
   DISCOVERY_ASSESSMENT_KIND, type ProvenAttemptPacket } from './v7-attempt-assessment.js';
 import { resolveClaimAddress, type ClaimAddress } from './claim-address.js';
-import { DISCOVERY_ASSESSMENT_CONTRACT_V2, type V7AttemptPacket, type V7ProgressBaseline,
-  type DiscoveryAttemptsAssessmentV2 } from './research-model.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type V7AttemptPacket, type V7ProgressBaseline,
+  type DiscoveryAttemptsAssessmentV2, type DiscoveryAttemptsAssessmentV3, type PaidDiscoveryAttemptsAssessment } from './research-model.js';
 import { stageNeighbors, usesStageNeighbors, STAGE_NEIGHBOR_CONTEXT, STAGE_NEIGHBOR_INSTRUCTION } from './stage-neighbors.js';
 import { BASIS_APPLICATION_CONTRACT_ERA, contractEraOf, readDraft, readRecord, readStageArtifact } from './projection-reader.js';
 import { discoveryContext, requireDiscoveryProposal } from './discovery-outcome.js';
@@ -607,13 +607,13 @@ function attemptsCandidate(store: Store, proven: ProvenAttemptPacket, baseline: 
 }
 
 /** A derives a judgment from one exact paid terminal. P alone may apply it. */
-function attemptsAssessmentValue(store: Store, proof: AssessmentProof): DiscoveryAttemptsAssessmentV2 {
+function attemptsAssessmentValue(store: Store, proof: AssessmentProof): PaidDiscoveryAttemptsAssessment {
   const subject = packetAssessmentSubject(proof.context);
-  requireCondition(subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2,
-    'discovery_assessment_invalid', 'The paid attempts assessment must declare its v2 methodology before dispatch');
+  requireCondition(subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2
+    || subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3,
+    'discovery_assessment_invalid', 'The paid attempts assessment must declare its exact methodology before dispatch');
   const { value } = projectPaidAttemptsAssessment({ subject: subject!, session: proof.session,
     application: proof.application, assessor: proof.role.actor, environment: proof.environment, result: proof.result });
-  requireCondition(value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2, 'discovery_assessment_invalid', 'The historical assessment producer admits only its exact paid v2 declaration');
   requireCondition(same(proof.question, subject!.packet.question) && proof.dispatch.projectId === value.projectId
     && same(proof.role, proof.dispatch.reviewer), 'discovery_assessment_invalid', 'The paid assessor belongs to this exact subject and role');
   const checked = checkDiscoveryAssessmentForm(store, value);
@@ -624,16 +624,17 @@ function attemptsAssessmentValue(store: Store, proof: AssessmentProof): Discover
   return value;
 }
 
-/** Structural supported/v2 labels are insufficient: re-derive the entire saved
+/** Structural supported/version labels are insufficient: re-derive the entire saved
  * assessment from the producer's physical receipt, application and terminal. */
-export function readDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<DiscoveryAttemptsAssessmentV2> {
-  const saved = isRef(ref) ? store.get<DiscoveryAttemptsAssessmentV2>(ref.id, ref.revision) : null;
+export function readDiscoveryAssessment(store: Store, projectId: string, ref: Ref): Revision<PaidDiscoveryAttemptsAssessment> {
+  const saved = isRef(ref) ? store.get<PaidDiscoveryAttemptsAssessment>(ref.id, ref.revision) : null;
   requireCondition(saved?.kind === DISCOVERY_ASSESSMENT_KIND && saved.revision === 1 && same(reference(saved), ref)
     && saved.hash === hashJson(saved.value) && saved.value !== null && typeof saved.value === 'object'
     && saved.value.projectId === projectId,
     'discovery_assessment_invalid', 'The exact discovery assessment is absent, changed or foreign');
-  requireCondition(saved!.value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2,
-    'discovery_assessment_invalid', 'This producer proves the explicit paid v2 assessment');
+  requireCondition(saved!.value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2
+    || saved!.value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3,
+    'discovery_assessment_invalid', 'This producer proves only an explicitly declared paid assessment');
   const proof = readAssessmentSessionOutcomeAt(store, projectId, saved!.value.session, saved!.value.application);
   const derived = attemptsAssessmentValue(store, proof);
   requireCondition(saved!.id === discoveryAssessmentId(derived) && same(saved!.value, derived),
@@ -644,9 +645,10 @@ export function readDiscoveryAssessment(store: Store, projectId: string, ref: Re
 /** Assess a fixed packet. The shared session resumes its paid application before
  * admission of another call. Fresh admissions guard the current plan/baseline;
  * saving a received judgment does not apply it or update an attempt/K record. */
-export async function assessAttempts(store: Store, packet: V7AttemptPacket, baseline: V7ProgressBaseline,
-  environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>):
-  Promise<Revision<DiscoveryAttemptsAssessmentV2>> {
+async function assessDeclaredAttempts(store: Store, packet: V7AttemptPacket, baseline: V7ProgressBaseline,
+  environment: Revision<Environment>, root: string, assessment: NonNullable<AssessmentTransportSubject['assessment']>,
+  signal?: AbortSignal, pilot?: Revision<ReaderPilot>):
+  Promise<Revision<PaidDiscoveryAttemptsAssessment>> {
   requireCondition(isRef(environment) && typeof root === 'string' && root.length > 0
     && (pilot === undefined || isRef(pilot)), 'discovery_assessment_invalid', 'Exact environment and workspace are required');
   const proven = proveAttemptPacket(store, packet);
@@ -659,7 +661,7 @@ export async function assessAttempts(store: Store, packet: V7AttemptPacket, base
     'discovery_assessment_invalid', 'The assessor profile belongs to this packet project');
   requireCondition(environment.value.projectId === packet.project && realpathSync(root) === realpathSync(environment.value.workspace),
     'discovery_assessment_invalid', 'The assessor needs the packet project and its configured workspace');
-  const subject = { kind: 'attempts' as const, packet, baseline, assessment: methodologyAssessmentTransport() };
+  const subject = { kind: 'attempts' as const, packet, baseline, assessment };
   const context = { assessmentSubject: subject, value: attemptsCandidate(store, proven, baseline), observations: [] };
   const dispatch = pilot ? pilotEnvironment(environment.value, pilot.value) : environment.value;
   const delivered = await assessmentSessionWithProof(store, draft, question, environment, dispatch, pilot, context,
@@ -671,13 +673,32 @@ export async function assessAttempts(store: Store, packet: V7AttemptPacket, base
   const value = attemptsAssessmentValue(store, delivered.proof!);
   requireCondition(same(value.subject.packet, packet) && same(value.baseline, baseline),
     'discovery_assessment_invalid', 'The paid terminal belongs to another packet or baseline');
-  const id = discoveryAssessmentId(value), existing = store.get<DiscoveryAttemptsAssessmentV2>(id);
+  const id = discoveryAssessmentId(value), existing = store.get<PaidDiscoveryAttemptsAssessment>(id);
   if (existing) return readDiscoveryAssessment(store, packet.project, reference(existing));
-  try { return store.write<DiscoveryAttemptsAssessmentV2>({ id, kind: DISCOVERY_ASSESSMENT_KIND, expected: 0, value }); }
+  try { return store.write<PaidDiscoveryAttemptsAssessment>({ id, kind: DISCOVERY_ASSESSMENT_KIND, expected: 0, value }); }
   catch (error) {
     if (!(error instanceof EngineError) || error.code !== 'revision_conflict') throw error;
     const saved = store.get(id);
     if (!saved) throw error;
     return readDiscoveryAssessment(store, packet.project, reference(saved));
   }
+}
+
+/** Explicit historical entry point. Selecting v3 never upgrades a saved v2 reply. */
+export async function assessAttempts(store: Store, packet: V7AttemptPacket, baseline: V7ProgressBaseline,
+  environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>):
+  Promise<Revision<DiscoveryAttemptsAssessmentV2>> {
+  const saved = await assessDeclaredAttempts(store, packet, baseline, environment, root, methodologyAssessmentTransport(), signal, pilot);
+  requireCondition(saved.value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2,
+    'discovery_assessment_invalid', 'The selected historical producer retains its v2 contract');
+  return saved as Revision<DiscoveryAttemptsAssessmentV2>;
+}
+/** MR: choose requirements before capacity, session identity and payment. */
+export async function assessAttemptsWithRequirements(store: Store, packet: V7AttemptPacket, baseline: V7ProgressBaseline,
+  environment: Revision<Environment>, root: string, signal?: AbortSignal, pilot?: Revision<ReaderPilot>):
+  Promise<Revision<DiscoveryAttemptsAssessmentV3>> {
+  const saved = await assessDeclaredAttempts(store, packet, baseline, environment, root, requirementsAssessmentTransport(), signal, pilot);
+  requireCondition(saved.value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3,
+    'discovery_assessment_invalid', 'The selected producer retains its v3 requirements contract');
+  return saved as Revision<DiscoveryAttemptsAssessmentV3>;
 }
