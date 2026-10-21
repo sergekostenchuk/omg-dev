@@ -15,6 +15,7 @@ import { canonical, digest, hashJson } from "../canonical.js";
 import { requireCondition, EngineError } from "../errors.js";
 import { reusableReaderRanges } from './reader-reuse.js';
 import { continuationPrompt } from './continuation-packet.js';
+import { questionDispatchId } from './v7-managed-attempt.js';
 import { pilotDispatch } from './pilot-budget.js';
 import { isResearchPreview } from './research-preview.js';
 import { projectPaidReaderResult, projectReaderSelection, readerDraftEquivalent } from './research-consumer-transition.js';
@@ -969,9 +970,17 @@ export function readerApplicationAdmission(store: Store, intent: Revision<Resear
   const supplied = savedReaderSources(store, project, cursor);
   savedReaderInputBinding(store, environment, cursor, supplied);
   savedReaderPrior(store, project, supplied, cursor);
+  const dispatchId = questionDispatchId(project, question.id, null);
+  const dispatchGuards: TransactionGuard[] = [];
+  if (intent.value.guards.some(guard => guard.id === dispatchId)) {
+    // The reservation itself advanced this dispatch guard. Keep the intent's
+    // saved basis; application takes today's head through its existing refresh.
+    const dispatch = store.get(dispatchId);
+    dispatchGuards.push(dispatch ? reference(dispatch) : { id: dispatchId, absent: true });
+  }
   return uniqueTransactionGuards([question, reference(draft), reference(pilot),
     ...(cursor.consumer ? [cursor.consumer.turn] : []),
-    ...supplied.map(source => source.ref), ...cursor.reusedFrom, ...environmentGuards]);
+    ...supplied.map(source => source.ref), ...cursor.reusedFrom, ...environmentGuards, ...dispatchGuards]);
 }
 
 async function applyReaderIntent(store: Store, environment: Environment, pilot: Revision<ReaderPilot>, question: Ref,
@@ -1049,10 +1058,16 @@ function reprepareUnsentReader(store: Store, environment: Environment, pilot: Re
   const supplied = savedReaderSources(store, environment.projectId, cursor);
   savedReaderInputBinding(store, environment, cursor, supplied);
   const currentEnvironmentIds = new Set(environmentGuards.map(guard => guard.id));
+  // Another reader can advance the shared packet from initial to continuation
+  // while this operation is prepared. Its fresh dispatch basis makes the
+  // existing producer redeclare the unsent prompt and guards its reservation.
+  const dispatchId = questionDispatchId(environment.projectId, question.id, null);
+  const dispatch = store.get(dispatchId);
+  const dispatchGuard: TransactionGuard = dispatch ? reference(dispatch) : { id: dispatchId, absent: true };
   const guards = uniqueTransactionGuards([...previous.value.guards.filter(guard =>
-    guard.id !== previous.value.profile?.id && guard.id !== previous.value.draft.id
+    guard.id !== previous.value.profile?.id && guard.id !== previous.value.draft.id && guard.id !== dispatchId
     && !currentEnvironmentIds.has(guard.id)),
-    reference(draft), reference(pilot), ...environmentGuards]);
+    reference(draft), reference(pilot), ...environmentGuards, dispatchGuard]);
   const input: ResearchConsumerIntentInput = { projectId: previous.value.projectId,
     kind: 'reader', key: previous.value.key, owner: previous.value.owner, draft: reference(draft),
     question, role: pilot.value.reader, dispatch: environment, profile: reference(pilot),
