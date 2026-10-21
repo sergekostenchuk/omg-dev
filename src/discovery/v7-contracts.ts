@@ -335,6 +335,12 @@ export const DISCOVERY_CLAIMS_CONTRACT = "discovery-claims/v7";
 export const V7_ATTEMPT_KIND = "research-attempt";
 export const V7_ATTEMPT_CONTRACT = "v7-attempt/v1";
 
+/** DR2b 2b.1-F: the record kind and body contract of one exact set of material
+ * interpretations of the brief for one exact frame proposal (карта, ndisc.d1.n5)
+ * — the model's interpretations, never the owner's words or decision. */
+export const V7_FRAME_INTERPRETATIONS_KIND = "frame-interpretations";
+export const V7_FRAME_INTERPRETATIONS_CONTRACT = "frame-interpretations/v1";
+
 /** The closed list of refused/impossible end codes — the agreed minimum of
  * the DR3a packet; extending it is a DR3b review decision. */
 export const V7_ATTEMPT_END_CODES = Object.freeze(["source_unavailable",
