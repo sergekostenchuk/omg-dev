@@ -21,9 +21,9 @@ import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWr
   isResponseRecovery, prepareResearchConsumerIntent, readResearchConsumerIntent, findResearchConsumerIntent,
   listResearchConsumerIntents, prepareResearchConsumerApplication, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, captureResearchConsumerRetryPermits, projectPaidSynthesisTransition,
-  readResearchConsumerExecution, readResearchConsumerTurn, readContextIdentityAt,
+  readResearchConsumerExecution, readResearchConsumerTurn, readContextIdentityAt, subjectContextRecordHolds,
   type ResearchConsumerIntent, type ResearchConsumerIntentInput } from './response-recovery.js';
-import { admittedResearchAction, contextReadIdentity, projectSynthesisTransition, projectContextRecoveryTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES,
+import { turnAction, contextReadIdentity, projectSynthesisTransition, projectContextRecoveryTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES,
   isReservationOnlySessionStep, synthesisReservationConsumed,
   SYNTHESIS_SESSION_CONTRACT, CONTEXT_RECOVERY_SUPERSEDE_REASON, exactContextLookup, readerDraftEquivalent,
   projectResearchContextSelection,
@@ -35,7 +35,6 @@ import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-att
 import { provePlanQuestions } from './v7-plan-questions.js';
 import { planQuestionContract } from './continuation-packet.js';
 import { provenSubjectSessions } from './saved-synthesis.js';
-import { recoveryRecordSubjectHolds } from './context-recovery.js';
 
 interface Session {
   projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
@@ -194,6 +193,90 @@ function synthesisSessionInvalid(id: string, message: string): never {
   throw new EngineError('synthesis_session_invalid', `[${id}] ${message}`);
 }
 
+/** DR3a3-S5 (S5-01, решение 4): the admission of applying an already paid v3
+ * step after its plan moved on — its own exact history only: the binding's
+ * exact draft, plan Question and environment revisions. The binding need not
+ * be today's head: the step's prepare-time guards are refreshed to today's
+ * heads (as C61 refreshes mutable admission heads), so the session CAS and an
+ * unchanged state between this read and the write keep it exact; the next
+ * step still needs a current send admission. */
+function historicalAdmission(store: Store, session: Revision<SynthesisSessionState>,
+  intent: Revision<ResearchConsumerIntent> | null): TransactionGuard[] {
+  const binding = session.value.binding;
+  for (const source of [binding.draft, binding.question, binding.environment]) {
+    const exact = store.get(source.id, source.revision);
+    requireCondition(exact && canonical(reference(exact)) === canonical(source) && hashJson(exact.value) === exact.hash,
+      'synthesis_session_invalid', `[${session.id}] The paid step lost an exact basis record: ${source.id}`);
+  }
+  const heads = (intent?.value.guards ?? []).flatMap(guard => {
+    if ('absent' in guard || guard.id === session.id) return [];
+    const head = store.get(guard.id);
+    return head ? [reference(head)] : [];
+  });
+  return uniqueTransactionGuards([reference(session), ...heads]);
+}
+
+/** DR3a3-S5 (S5-02): every record a v3 session's materials name — a lookup's
+ * record, a saved finding's note and its evidence originals — passes the one
+ * subject predicate (subjectContextRecordHolds). The writer refuses before any
+ * record; the chain reader applies the same predicate to the saved basis. */
+function subjectMaterialsHold(store: Store, projectId: string, draftId: string, subject: V7PlanSubject,
+  materials: unknown): boolean {
+  const named = (value: unknown): Ref[] => !object(value) ? [] : [
+    ...(isRef(value.record) ? [value.record] : []),
+    ...(isRef(value.checkpoint) ? [value.checkpoint] : []),
+    ...(Array.isArray(value.evidence) ? value.evidence.flatMap((item: unknown) =>
+      object(item) && object(item.original) && isRef(item.original.record) ? [item.original.record] : []) : [])];
+  return Array.isArray(materials) && materials.every(material => named(object(material) ? material.value : null).every(ref => {
+    const record = store.get<Record<string, any>>(ref.id, ref.revision);
+    return !!record && canonical(reference(record)) === canonical(ref)
+      && subjectContextRecordHolds(store, projectId, draftId, subject, record);
+  }));
+}
+
+/** S5 class (решение 6): the previous proposal a v3 session stands on is its
+ * own subject's — the exact turn it names, read by that turn's own subject;
+ * an unaddressed proposal is never adopted. */
+function subjectProposalHolds(store: Store, subject: V7PlanSubject, previousProposal: unknown, previousProposalRef: unknown): boolean {
+  if (previousProposalRef === null || previousProposalRef === undefined)
+    return previousProposal === null || previousProposal === undefined;
+  const turn = isRef(previousProposalRef) ? store.get<ResearchTurn>(previousProposalRef.id, previousProposalRef.revision) : null;
+  if (!turn || turn.kind !== 'research-turn' || canonical(reference(turn)) !== canonical(previousProposalRef)) return false;
+  try { return sameSubject(planSubjectOf(turn.value), subject) && canonical(turnAction(turn.value)) === canonical(previousProposal); }
+  catch { return false; }
+}
+
+/** DR3a3-S5 (S5-04): a reserved runner position is proven, not a bare number —
+ * the research run of this project and draft whose saved history advanced its
+ * counter by one step to exactly that position. */
+function reservationReached(store: Store, projectId: string, draftId: string, delivery: unknown): boolean {
+  if (!object(delivery) || typeof delivery.run !== 'string' || !Number.isSafeInteger(delivery.turn) || delivery.turn < 1) return false;
+  const history = store.history<ResearchRun>(delivery.run);
+  return history.length > 0 && history.every(step => step.kind === 'research-run' && object(step.value)
+    && hashJson(step.value) === step.hash && step.value.projectId === projectId && step.value.draftId === draftId)
+    && history.some((step, index) => index > 0 && step.value.turns === delivery.turn
+      && history[index - 1]!.value.turns === delivery.turn - 1);
+}
+
+/** The writer half of reservationReached: a v3 delivery is written only with
+ * the caller's own one-step reservation of exactly that position of this run
+ * (the same transaction), or on a position the run's history already reached. */
+function requireReservation(store: Store, projectId: string, draftId: string, delivery: SynthesisSessionDelivery,
+  reserve: SynthesisSessionOptions['reserve']): void {
+  if (!reserve) {
+    requireCondition(reservationReached(store, projectId, draftId, delivery), 'synthesis_session_invalid',
+      'A v3 delivery names no proven reservation of its research run');
+    return;
+  }
+  const run = store.get<ResearchRun>(delivery.run);
+  const next = reserve.write.value as ResearchRun;
+  requireCondition(reserve.write.id === delivery.run && reserve.write.kind === 'research-run' && object(next)
+    && next.projectId === projectId && next.draftId === draftId && next.turns === delivery.turn
+    && run?.kind === 'research-run' && run.revision === reserve.write.expected && run.value.turns === delivery.turn - 1
+    && run.value.projectId === projectId && run.value.draftId === draftId,
+  'synthesis_session_invalid', 'A v3 delivery needs the one-step reservation of exactly its position in its research run');
+}
+
 /** Follow the saved split queue back to the child admitted by read_plan.
  * Each intermediate split must name the next child's exact first revision. */
 function plannedQueueOrigin(store: Store, child: Revision<ResearchTurn>, parent: Revision<ResearchTurn>,
@@ -264,7 +347,8 @@ function runnerWorkspaceAt(store: Store, delivery: SynthesisSessionDelivery,
           && children.some((child: unknown) => isRef(child) && child.id === queued.id
             && child.revision === 1 && canonical(child) === canonical(reference(firstChild)));
       });
-      const parentAction = completed && admittedResearchAction(completed.value.action);
+      // S5-03: a v7 turn is read by its own saved subject (turnAction); a field turn as before.
+      const parentAction = completed && turnAction(completed.value);
       requireCondition(completed?.value.status === 'completed' && parentAction?.action === 'read_plan'
         && firstChild,
         'synthesis_session_invalid', 'The planned lookup is not a child of its exact completed plan');
@@ -280,7 +364,7 @@ function runnerWorkspaceAt(store: Store, delivery: SynthesisSessionDelivery,
     }
     if (packet?.working?.deliveryContract === 'research-delivery/v1')
       workspace = recordContextPacket(workspace, packet);
-    const action = admittedResearchAction(turn.value.action);
+    const action = turnAction(turn.value);
     if (action.action !== 'read_context') {
       workspace = foldContextEvent(workspace, action.action);
       continue;
@@ -382,40 +466,6 @@ export function proveSynthesisSessionSubject(store: Store, session: { id: string
   return subject;
 }
 
-/** DR3a3-S5: the paid origin of one v2 note, proven in one step without
- * reading whole chains (a chain may itself recover another session's note):
- * the first revision of a v3 session of the subject that names the note is
- * the exact output of an applied step intent of that session and subject,
- * and that intent's paid transition re-derives the revision and the note. */
-function paidNoteOrigin(store: Store, projectId: string, draftId: string, subject: V7PlanSubject, ref: Ref): boolean {
-  const record = store.get<Record<string, any>>(ref.id, ref.revision);
-  if (!record || record.kind !== 'research-checkpoint' || canonical(reference(record)) !== canonical(ref)) return false;
-  const intents = listResearchConsumerIntents(store, projectId, draftId)
-    .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind) && intent.value.state === 'applied'
-      && Array.isArray(intent.value.outputs));
-  for (const head of store.list<SynthesisSessionState>('synthesis-session')) {
-    if (!head.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX)) continue;
-    let bound: V7PlanSubject | null;
-    try { bound = synthesisSessionSubject(head); } catch { continue; }
-    if (!sameSubject(bound, subject)) continue;
-    for (let revision = 1; revision <= head.revision; revision += 1) {
-      const step = store.get<SynthesisSessionState>(head.id, revision);
-      if (!step || !Array.isArray(step.value?.notes)
-        || !step.value.notes.some(note => canonical(note.checkpoint) === canonical(ref))) continue;
-      const intent = intents.find(item => item.value.outputs!.some(output => canonical(output) === canonical(reference(step))));
-      if (!intent) break;
-      try {
-        if (!sameSubject(synthesisStepSubject(intent.value, step), subject)) break;
-        const transition = projectPaidSynthesisTransition(store, intent);
-        if (canonical(transition.session) === canonical(step.value) && transition.checkpoint?.id === ref.id
-          && canonical(transition.checkpoint.value) === canonical(record.value)) return true;
-      } catch { /* not a lawful paid origin of this revision */ }
-      break;
-    }
-  }
-  return false;
-}
-
 /** The historical reader: proves the whole session chain on exact saved
  * bases — the initial cursor, every paid application (re-derived by the same
  * transition the producer used), one-time delivery marks and operator context
@@ -465,6 +515,16 @@ function readSynthesisSessionChain(store: Store, ref: Ref, era: string): Revisio
   if (!initial || initial.revision !== 1 || initial.kind !== head.kind || hashJson(initial.value) !== initial.hash)
     synthesisSessionInvalid(head.id, 'The initial session revision is missing');
   synthesisSessionShape(initial.value, head.id);
+  // S5-02/04: a v3 basis is proven by the writer's own predicates — material
+  // and previous proposal of its subject, a proven runner reservation.
+  if (subject) {
+    if (!subjectMaterialsHold(store, initial.value.projectId, initial.value.binding.draft.id, subject, initial.value.basis.materials)
+      || !subjectProposalHolds(store, subject, initial.value.basis.previousProposal, initial.value.basis.previousProposalRef))
+      synthesisSessionInvalid(head.id, 'The v3 basis names material of another subject or an unproven previous proposal');
+    if (initial.value.delivery != null
+      && !reservationReached(store, initial.value.projectId, initial.value.binding.draft.id, initial.value.delivery))
+      synthesisSessionInvalid(head.id, 'The v3 runner position is not a proven reservation of its research run');
+  }
   // A v3 first record is re-derived by the producer's own projector.
   const expectedInitial: Record<string, any> = subject
     ? projectSynthesisSessionV3Initial({ projectId: initial.value.projectId,
@@ -520,6 +580,8 @@ function readSynthesisSessionChain(store: Store, ref: Ref, era: string): Revisio
       // A reservation revision (№1658 К2): the next position of the same task is
       // reserved before its intent — lawful only when the previous reservation
       // was consumed by its delivery mark or never existed; nothing else moves.
+      if (subject && !reservationReached(store, head.value.projectId, bindingDraft.id, step.value.delivery))
+        synthesisSessionInvalid(head.id, 'A v3 reservation is not a proven position of its research run');
     } else if (isRef(step.value.delivered) && step.value.delivered !== null) {
       const outcome = before.value.result ?? before.value.pause ?? null;
       const turn = store.get<ResearchTurnView>(step.value.delivered.id, step.value.delivered.revision);
@@ -561,9 +623,8 @@ function readSynthesisSessionChain(store: Store, ref: Ref, era: string): Revisio
           // DR3a3-S4→S5: a v3 recovery names only its subject's own lawful
           // material — the writer's predicate, and a note's paid origin.
           const named = store.get<Record<string, any>>(recovery.selector.record.id, recovery.selector.record.revision);
-          if (subject) requireCondition(named && recoveryRecordSubjectHolds(named, subject)
-            && (named.kind !== 'research-checkpoint' || paidNoteOrigin(store, head.value.projectId, bindingDraft.id, subject,
-              recovery.selector.record)), 'context_reference_foreign', 'The recovered v3 material is not its subject\'s own paid note');
+          if (subject) requireCondition(named && subjectContextRecordHolds(store, head.value.projectId, bindingDraft.id,
+            subject, named), 'context_reference_foreign', 'The recovered v3 material is not its subject\'s own');
           valid = recovery.reason === reason && recovery.key === transition.key
             && canonical(transition.session) === canonical(step.value)
             && canonical(before.value.recoveries ?? []) === canonical(step.value.recoveries.slice(0, -1));
@@ -691,8 +752,17 @@ export function findUnfinishedSynthesisSessionV3(store: Store, projectId: string
     .filter(session => session.value.result === null || session.value.delivery != null && session.value.delivered == null);
   if (!unfinished.length) return null;
   if (unfinished.length > 1) {
-    const turns = unfinished.map(session => session.value.delivery?.turn);
-    requireCondition(turns.every(turn => Number.isSafeInteger(turn)) && new Set(turns).size === turns.length,
+    // S5-04: an order is proven only by reserved positions of one research run —
+    // each a one-step reservation its history shows, still unoccupied by a turn;
+    // bare numbers, other runs or missing runs are no order.
+    const turns = store.list<ResearchTurn>('research-turn');
+    const positions = unfinished.map(session => {
+      const delivery = session.value.delivery;
+      return object(delivery) && reservationReached(store, projectId, draftId, delivery)
+        && !turns.some(turn => turn.value.run === delivery.run && turn.value.number === delivery.turn) ? delivery : null;
+    });
+    requireCondition(positions.every(Boolean) && new Set(positions.map(position => position!.run)).size === 1
+      && new Set(positions.map(position => position!.turn)).size === positions.length,
       'research_synthesis_ambiguous', `[${unfinished[0]!.id}] Several unfinished sessions of this subject have no proven order`);
     unfinished.sort((a, b) => a.value.delivery!.turn - b.value.delivery!.turn);
   }
@@ -754,14 +824,20 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
   // edition). The v2 and address-less eras below are unchanged.
   if (Object.hasOwn(context, 'subject')) {
     const subject = requirePlanSubject(context.subject, 'synthesis-session');
-    // Currency is read from today's heads, never from the caller's revisions:
-    // a stale plan Question still answered by a replaced edition is not current.
-    const draftHead = store.get<DiscoveryDraft>(draft.id), questionHead = store.get<Question>(question.id);
-    requireCondition(draftHead?.kind === 'discovery-draft' && questionHead?.kind === 'question'
-      && canonical(reference(questionHead)) === canonical(reference(question)),
-    'research_plan_subject_invalid', 'A v3 synthesis needs the current plan Question of its subject');
-    planQuestionContract(store, draftHead, questionHead, subject);
+    // S5-01 (решение 4): the entry stands on the caller's exact basis — a plan
+    // Question revision answered by the subject's plan answer, current or
+    // historical. Only a NEW send needs today's plan (requireCurrent in the
+    // producer): a finished result returns and a paid step applies by its own history.
+    planQuestionContract(store, draft, question, subject);
     const { materials } = basis(draft, question, environment, context);
+    // S5-02: the materials and previous proposal of a new basis are its subject's
+    // own; an operator replay names its proven session and computes no basis.
+    if (!(isResponseRecovery() && typeof context.synthesisSession === 'string')) {
+      requireCondition(subjectMaterialsHold(store, draft.value.projectId, draft.id, subject, materials),
+        'context_reference_foreign', 'A v3 synthesis carries only material of its own plan subject');
+      requireCondition(subjectProposalHolds(store, subject, context.previousProposal ?? null, context.previousProposalRef ?? null),
+        'context_reference_foreign', 'A v3 synthesis stands only on a previous proposal of its own plan subject');
+    }
     const taskAddress = synthesisSessionV3Address({ projectId: draft.value.projectId, draft: reference(draft),
       question: reference(question), inputs: draft.value.inputs, subject, materials,
       previousProposal: context.previousProposal ?? null, previousProposalRef: context.previousProposalRef ?? null });
@@ -790,6 +866,25 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
   const eraPrefix = subject ? SYNTHESIS_SESSION_V3_PREFIX : 'synthesis-session:v2:';
   const readEra = (ref: Ref): Revision<SynthesisSessionState> => subject
     ? readSynthesisSessionV3(store, ref) as unknown as Revision<SynthesisSessionState> : readSynthesisSession(store, ref);
+  // S5-01 (решение 4): today's plan admits only a NEW send of a v3 task — its
+  // first record, a new reservation, a new step and the send of a prepared one.
+  // A finished result, a received paid response and a pause stand on the
+  // session's own exact history. v2 has no subject and keeps its admission.
+  const subjectCurrent = (): boolean => {
+    if (!subject) return true;
+    const draftHead = store.get<DiscoveryDraft>(draft.id), questionHead = store.get<Question>(question.id);
+    if (draftHead?.kind !== 'discovery-draft' || questionHead?.kind !== 'question'
+      || canonical(reference(questionHead)) !== canonical(reference(question))) return false;
+    try { planQuestionContract(store, draftHead, questionHead, subject); return true; }
+    catch (error) { if (error instanceof EngineError) return false; throw error; }
+  };
+  const requireCurrent = () => requireCondition(subjectCurrent(), 'research_plan_subject_invalid',
+    'A new v3 synthesis step needs the current plan Question of its subject');
+  // The application of a paid step: today's admission while its subject is
+  // current; once the plan moved on, its exact saved history and the session CAS.
+  const applicationAdmission = (head: Revision<SynthesisSessionState>, intent: Revision<ResearchConsumerIntent> | null) =>
+    subject && !subjectCurrent() ? historicalAdmission(store, head, intent)
+      : synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, intent);
   const permits = JSON.parse(canonical(opts.retryPermits
     ?? captureResearchConsumerRetryPermits(store, projectId))) as Ref[];
   // Resume-first: an unfinished operation of this task is continued before any
@@ -817,10 +912,15 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
   let previewSeed: Revision<SynthesisSessionState> | null = null;
   if (!store.get(sessionId)) {
     requireCondition(!recovering, 'response_recovery_session_stale', 'The selected recovery session is missing');
+    // A new v3 task is new work of today's plan, on a proven reservation (S5-04).
+    requireCurrent();
+    if (subject && opts.delivery) requireReservation(store, projectId, draft.id, opts.delivery, opts.reserve);
+    // S5-03: the writer derives the inherited prefix by the reader's own formula —
+    // with the subject, so a v3 task inherits only its subject's turns.
     if (opts.delivery && opts.initialWorkspace
       && (opts.initialWorkspace.entries.length || opts.initialWorkspace.deliveryCoverage?.length))
       requireCondition(canonical(opts.initialWorkspace) === canonical(runnerWorkspaceAt(store, opts.delivery,
-        question, reference(draft))),
+        question, reference(draft), subject)),
         'synthesis_session_invalid', 'The runner context changed before the synthesis session was created');
     // A previous-era unfinished operation of this same task keeps its lawful
     // recovery path (№1555 X04): the new era neither adopts its paid response
@@ -915,6 +1015,7 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
   const prepareAndDrive = async (head: Revision<SynthesisSessionState>, kind: 'synthesis' | 'consolidation',
     callContext: Record<string, any>, stepPrompt: string): Promise<SynthesisTransition | null> => {
     const value = head.value;
+    requireCurrent(); // a new step is new work of today's plan (S5-01)
     const admissionGuards = synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, null);
     const material = value.basis.materials[value.offset];
     const cursor = { sessionId, offset: value.offset, materialOffset: value.materialOffset ?? 0,
@@ -950,8 +1051,10 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     if (intent.value.state === 'prepared' || isResponseRecovery()) {
       // Current admission precedes the new send; history was already proven.
       // Recovery passes the same boundary through the operator replay in
-      // researchCall instead of a new dispatch.
-      admissionGuards ??= synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, null);
+      // researchCall instead of a new dispatch. S5-01: sending a prepared step
+      // is new work; an operator replay applies paid history.
+      if (intent.value.state === 'prepared' && !isResponseRecovery()) requireCurrent();
+      admissionGuards ??= applicationAdmission(head, null);
       if (intent.value.state === 'prepared' && !isResponseRecovery()) {
         // An unsent step may be re-prepared under a compatible new environment
         // head or profile (№1499-5): the task, materials and logical position
@@ -1015,14 +1118,14 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
         readLimit: profile?.value.maxRequestChars ?? 300000,
         // The origin of every lookup material is proven before the subject
         // write — the write path and the historical reader use one deduction.
-        proveRecord: record => { readReaderResultAt(store, projectId, reference(record)); } });
+        proveRecord: record => { readReaderResultAt(store, projectId, reference(record)); },
+        subjectRecord: (record, bound) => subjectContextRecordHolds(store, projectId, draft.id, bound, record) });
     } catch (error) {
       if (error instanceof EngineError && SYNTHESIS_TRANSITION_REFUSAL_CODES.has(error.code)) {
         // A capacity refusal is an application of the paid result too. Re-admit
         // its exact sources before writing; if its CAS races, the outer retry
         // observes the moved basis instead of looping on the old guards.
-        if (error.code === 'research_result_capacity')
-          synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, latest);
+        if (error.code === 'research_result_capacity') applicationAdmission(head, latest);
         const refused = refuseResearchConsumerIntent(store, reference(latest), error.code);
         throw new EngineError(error.code, error.message, { intent: reference(refused), refusal: refused.value.refusal });
       }
@@ -1032,7 +1135,7 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     // current admission of the application is checked (№1499-8..10). Every
     // new application re-admits: guards taken before the send do not cover
     // materials that moved while the provider was running.
-    admissionGuards = synthesisAdmission(store, head, draft, question, environment, dispatch, pilot, latest);
+    admissionGuards = applicationAdmission(head, latest);
     const writes: Write[] = [];
     if (transition.checkpoint) {
       const existing = store.get(transition.checkpoint.id);
@@ -1053,7 +1156,8 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     if (isResponseRecovery()) {
       const recovery = recoverySessionWrites(sessionWrite, writes);
       store.writeMany([sessionWrite, ...recovery.writes],
-        uniqueTransactionGuards([reference(draft), reference(question), reference(environment), ...draft.value.inputs,
+        uniqueTransactionGuards([...(subject && !subjectCurrent() ? []
+          : [reference(draft), reference(question), reference(environment), ...draft.value.inputs]),
           ...admissionGuards, ...recovery.guards]));
       markRecoveredSessionWritten(recovery);
       return transition;
@@ -1095,6 +1199,9 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     if (!previewSeed && !recovering && opts.delivery && value.result === null
       && (value.delivery == null || synthesisReservationConsumed(value))
       && canonical(value.delivery ?? null) !== canonical(opts.delivery)) {
+      // A new reservation is new work of today's plan on a proven position (S5-01/04).
+      requireCurrent();
+      if (subject) requireReservation(store, projectId, draft.id, opts.delivery, opts.reserve);
       const reservationWrite: Write = { id: sessionId, kind: 'synthesis-session', expected: head.revision,
         value: { ...value, delivery: opts.delivery } };
       try {

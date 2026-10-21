@@ -48,7 +48,7 @@ import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalR
   isReservationOnlySessionStep, turnAction, responseAction, webResearchCapability, earlyUnknownEra, EARLY_UNKNOWN,
   projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
   parseSynthesisSessionV3, synthesisSessionSubject, synthesisStepSubject, SYNTHESIS_SESSION_V3_PREFIX, SYNTHESIS_SESSION_CONTRACT_V3,
-  projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
+  researchCheckpointV2Holds, projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
   projectAddressedWorkspace, projectResearchTurnRevision, projectSourceReadingTurn, isCorrectableLayerDesignFailure,
   managedTurnId, matchAcceptedPaidAnswer, ACTION_RESPONSE_REFUSAL_CODES,
@@ -2921,7 +2921,10 @@ function synthesisTransitionProofInput(store: Store, intent: Revision<ResearchCo
     readLimit: pilot?.value.maxRequestChars ?? 300000,
     // Origin proof is mandatory on every path through this proof input:
     // the write validator, the refusal proof and the historical reader alike.
-    proveRecord: record => { readReaderResultAt(store, intent.value.projectId, reference(record)); } };
+    proveRecord: record => { readReaderResultAt(store, intent.value.projectId, reference(record)); },
+    // S5-02: a v3 lookup is proven by the same subject predicate as its writer.
+    subjectRecord: (record, subject) => subjectContextRecordHolds(store, intent.value.projectId,
+      intent.value.draft.id, subject, record) };
 }
 
 /** The saved refusal of a received synthesis reply is lawful only when the
@@ -2950,6 +2953,64 @@ export function projectPaidSynthesisTransition(store: Store, intent: Revision<Re
   const produced = (intent.value.outputs ?? []).find(output => output.id === intent.value.owner.id);
   return projectSynthesisTransition(synthesisTransitionProofInput(store, intent, paid,
     produced ? produced.revision - 1 : undefined));
+}
+
+/** DR3a3-S5: the paid origin of one v2 note, proven in one step without
+ * reading whole chains (a chain may itself look up another note): the first
+ * revision of a v3 session of the subject that names the note is the exact
+ * output of an applied step intent of that session and subject, and that
+ * intent's paid transition re-derives the revision and the note. */
+export function paidNoteOrigin(store: Store, projectId: string, draftId: string, subject: V7PlanSubject, ref: Ref): boolean {
+  const record = store.get<Record<string, any>>(ref.id, ref.revision);
+  if (!record || record.kind !== 'research-checkpoint' || canonical(reference(record)) !== canonical(ref)) return false;
+  const intents = listResearchConsumerIntents(store, projectId, draftId)
+    .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind) && intent.value.state === 'applied'
+      && Array.isArray(intent.value.outputs));
+  for (const head of store.list<SynthesisSessionState>('synthesis-session')) {
+    if (!head.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX)) continue;
+    let bound: V7PlanSubject | null;
+    try { bound = synthesisSessionSubject(head); } catch { continue; }
+    if (!sameSubject(bound, subject)) continue;
+    for (let revision = 1; revision <= head.revision; revision += 1) {
+      const step = store.get<SynthesisSessionState>(head.id, revision);
+      if (!step || !Array.isArray(step.value?.notes)
+        || !step.value.notes.some(note => canonical(note.checkpoint) === canonical(ref))) continue;
+      const intent = intents.find(item => item.value.outputs!.some(output => canonical(output) === canonical(reference(step))));
+      if (!intent) break;
+      try {
+        if (!sameSubject(synthesisStepSubject(intent.value, step), subject)) break;
+        const transition = projectPaidSynthesisTransition(store, intent);
+        if (canonical(transition.session) === canonical(step.value) && transition.checkpoint?.id === ref.id
+          && canonical(transition.checkpoint.value) === canonical(record.value)) return true;
+      } catch { /* not a lawful paid origin of this revision */ }
+      break;
+    }
+  }
+  return false;
+}
+
+/** DR3a3-S5 (S5-02/03, решение 6): the one predicate every v3 input applies
+ * to a record it carries into a session of one subject — the entry materials,
+ * an inherited or recovered context, a step lookup, and the historical proof
+ * of each. A note is a v2 note of exactly this subject with a proven paid
+ * origin; a request archive belongs to no plan subject or to exactly this one.
+ * Primary Sources and reader results keep their own readers' rules. */
+export function subjectContextRecordHolds(store: Store, projectId: string, draftId: string, subject: V7PlanSubject,
+  record: Revision<Record<string, any>>): boolean {
+  return subjectRecordFormHolds(record, subject) && (record.kind !== 'research-checkpoint'
+    || paidNoteOrigin(store, projectId, draftId, subject, reference(record)));
+}
+
+/** The form half of subjectContextRecordHolds (pure): a v2 note of exactly this
+ * subject, an archive of no or this subject; any other record kind passes. */
+export function subjectRecordFormHolds(record: Revision<Record<string, any>>, subject: V7PlanSubject): boolean {
+  if (record.kind === 'research-checkpoint')
+    return researchCheckpointV2Holds(record.value) && sameSubject(record.value.subject, subject);
+  if (record.kind === 'research-context') {
+    if (!object(record.value) || !Object.hasOwn(record.value, 'subject')) return true;
+    try { return sameSubject(planSubjectOf(record.value), subject); } catch { return false; }
+  }
+  return true;
 }
 
 /** `mode` (D8.4e §4): a live 'application' must carry the producer's era
@@ -3579,10 +3640,19 @@ export async function recoverResearchResponse(store: Store, environments: Enviro
     }
   }
   const binding = responseSessionBinding(session);
+  // S5-01: an operator replay reproduces its exact request from today's heads, so
+  // its binding stays current as in v2; for a v3 session the plan Question answered
+  // by the subject's plan answer is the norm, not a stale state. After a plan
+  // change the paid step applies by its own history through the producer path.
+  const v3Subject = isV3Synthesis ? synthesisSessionSubject(session as { id: string; value: unknown }) : null;
   const draft = store.get<DiscoveryDraft>(binding.draft.id), question = store.get<Question>(binding.question.id);
   const inputs = uniqueRefs([binding.draft, binding.question, binding.environment, ...binding.inputs]);
+  const planAnchored = (): boolean => {
+    try { planQuestionContract(store, draft!, question!, v3Subject!); return true; }
+    catch (error) { if (error instanceof EngineError) return false; throw error; }
+  };
   requireCondition(draft?.kind === 'discovery-draft' && question?.kind === 'question' && object(draft.value) && object(question.value) && draft.value.projectId === project
-    && question.value.draftId === draft.id && ['open', 'unresolved'].includes(question.value.status)
+    && question.value.draftId === draft.id && (v3Subject ? planAnchored() : ['open', 'unresolved'].includes(question.value.status))
     && canonical(draft.value.inputs) === canonical(binding.inputs) && session.value.result === null
     && inputs.every(ref => { const head = store.get(ref.id); return head && canonical(reference(head)) === canonical(ref); }),
   'response_recovery_binding_stale', 'The question, session result or research inputs changed');

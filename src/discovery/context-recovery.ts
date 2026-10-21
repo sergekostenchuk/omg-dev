@@ -11,14 +11,14 @@ import { readerPilot } from './reader-pilot.js';
 import { readResearchContext } from './research-limits.js';
 import { contextValue } from './working-context.js';
 import { parseSynthesisSessionV2, parseSynthesisSessionV3, projectContextRecoveryTransition, CONTEXT_RECOVERY_SUPERSEDE_REASON,
-  proveCheckpointRecord, researchCheckpointV2Holds, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
+  proveCheckpointRecord, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
 import { readReaderResultAt } from './reader.js';
-import { listResearchConsumerIntents, researchConsumerIntentId } from './response-recovery.js';
+import { listResearchConsumerIntents, researchConsumerIntentId, subjectContextRecordHolds,
+  subjectRecordFormHolds } from './response-recovery.js';
 import { readSynthesisSessionV3, synthesisStepKey } from './synthesis-session.js';
 import { callAddressesSubject, questionDispatchId, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { planQuestionContract } from './continuation-packet.js';
 import { EngineError } from '../errors.js';
-import { provenSubjectSessions } from './saved-synthesis.js';
 import { uniqueTransactionGuards } from '../runtime/environment.js';
 
 export interface ContextSessionBinding { draft: Ref; question: Ref; environment: Ref; inputs: Ref[] }
@@ -238,11 +238,11 @@ function writeSessionRecovery(store: Store, project: string, session: Revision<R
  * may name. A reader-result is the common reader's exact result (shared by
  * subjects of one Question); a checkpoint is only a v2 note of the session's
  * own subject — never a v1 note of the physical Question or another subject's
- * note, so the operator cannot make a foreign note this session's own. One
- * predicate for the writer below and the v3 chain reader. */
+ * note, so the operator cannot make a foreign note this session's own; an
+ * archive belongs to no or this subject. The form half of the one predicate
+ * (subjectContextRecordHolds) the writer below and the v3 chain reader apply. */
 export function recoveryRecordSubjectHolds(record: Revision<Record<string, any>>, subject: V7PlanSubject): boolean {
-  if (record.kind !== 'research-checkpoint') return true;
-  return researchCheckpointV2Holds(record.value) && sameSubject(record.value.subject, subject);
+  return subjectRecordFormHolds(record, subject);
 }
 
 /** The v3 operator context recovery: the v2 rules on the session's exact
@@ -307,13 +307,11 @@ function recoverContextSessionV3(store: Store, project: string, session: Revisio
     && hashJson(proofRecord.value) === proofRecord.hash
     && canonical(reference(proofRecord)) === canonical(selector.record),
   'context_lookup_integrity', 'The exact recovery record is missing or changed');
-  requireCondition(recoveryRecordSubjectHolds(proofRecord, subject), 'context_reference_foreign',
-    'A v3 session recovers only its own subject\'s notes; another subject\'s or a field-path note is foreign');
-  // S4-01 class: a note's form is not its origin — a recovered note must have
-  // been written by a paid transition of a proven session of this subject.
-  requireCondition(proofRecord.kind !== 'research-checkpoint'
-    || provenSubjectSessions(store, subject).notes.has(canonical(selector.record)), 'context_reference_foreign',
-    'A recovered note needs its proven paid synthesis origin of this subject');
+  // S4-01 class, S5-02: the chain reader's own predicate — a note of exactly
+  // this subject with its paid origin, an archive of no or this subject; another
+  // subject's, a field-path or an unpaid note is foreign.
+  requireCondition(subjectContextRecordHolds(store, project, draft.id, subject, proofRecord), 'context_reference_foreign',
+    'A v3 session recovers only its own subject\'s paid notes and archives');
   if (proofRecord.kind === 'reader-result') readReaderResultAt(store, project, selector.record);
   else if (proofRecord.kind === 'research-checkpoint') proveCheckpointRecord(store, proofRecord);
   const result = readResearchContext(store, draft, questionHead.id, pilot, selector.record, selector.pointer, selector.page);

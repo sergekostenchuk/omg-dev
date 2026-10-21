@@ -679,6 +679,10 @@ export interface SynthesisTransitionInput {
   /** Mandatory origin proof for lookup materials (№1658 К1) — supplied by the
    * caller because the reader-result reader lives outside this leaf. */
   proveRecord: ContextRecordProver;
+  /** DR3a3-S5 (S5-02): mandatory for a v3 session — the one subject predicate
+   * (a note of exactly this subject with its paid origin, an archive of no or
+   * this subject), supplied identically by the writer and the paid reader. */
+  subjectRecord?: (record: Revision<Record<string, any>>, subject: V7PlanSubject) => boolean;
 }
 
 export interface SynthesisTransition {
@@ -704,6 +708,8 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
   // projection for the writer and the paid-transition reader); v2 is unchanged.
   const planSubject = typeof input.sessionId === 'string' && input.sessionId.startsWith(SYNTHESIS_SESSION_V3_PREFIX)
     ? synthesisSessionSubject({ id: input.sessionId, value: before }) : null;
+  requireCondition(!planSubject || typeof input.subjectRecord === 'function',
+    'research_context_invalid', 'A v3 synthesis transition needs its subject record proof');
   const questionId = planSubject ? planSubject.planQuestionId : input.question.id;
   const checkpointOf = (proposal: CheckpointProposalInput) => planSubject
     ? projectCheckpointValueV2(projectId, input.draft, input.question, planSubject, proposal,
@@ -781,6 +787,11 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
       const bounded = archive.contextReadContract === 'research-context-read/v2';
       const original = exactContextLookup(store, draftRecord, questionRecord,
         action.record, action.pointer, bounded ? undefined : action.page, input.proveRecord);
+      // S5-02: a v3 lookup carries only its subject's own material — never
+      // another subject's note or archive on the shared plan Question.
+      if (planSubject) requireCondition(input.subjectRecord!(store.get<Record<string, any>>(action.record.id,
+        action.record.revision)!, planSubject), 'context_reference_foreign',
+      'A v3 synthesis reads only notes and archives of its own plan subject');
       const result = bounded
         ? projectResearchContextSelection(original.value, action.record, action.pointer,
           action.page, input.readLimit, 'bounded')
