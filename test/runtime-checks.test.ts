@@ -100,44 +100,39 @@ test('platform module exercises process identity and process-group signalling wi
   assert.equal(f.store.list('model-call').length,0);
 });
 
-test('compatibility needs a current successful ordinary R2 call and exact archived protocol, not old status or model cache',async t=>{
-  const f=fixture(t);assert.equal((await f.run('provider')).payload.error,'compatible_call_unavailable');
-  await f.invoke();const good=await f.run('provider');assert.equal(good.exitCode,0);
-  assert.equal(good.payload.result.calls.length,1);assert.equal(good.payload.result.calls[0].mode,'research');
-  assert.equal(f.store.list('model-call').length,1);assert.equal(readFileSync(f.log,'utf8'),'provider\n');
-  const call=f.store.list<ModelCall>('model-call')[0]!,saved=call.value.response!.record!;
-  const row=f.store.get<any>(saved.id)!;
-  f.store.write({id:row.id,kind:row.kind,expected:row.revision,value:{...row.value,text:'{"protocol":"omg-agent/v1","requestId":"foreign","research":{}}'}});
-  // Exact historical response is still available: a new unrelated head must
-  // not replace the request/response captured by this immutable call.
-  assert.equal((await f.run('provider')).exitCode,0);
-  const updated=f.store.get<ModelCall>(call.id)!;
-  f.store.write<ModelCall>({id:call.id,kind:call.kind,expected:updated.revision,
-    value:{...updated.value,response:{...updated.value.response!,record:reference(f.store.get(saved.id)!)}}});
-  assert.equal((await f.run('provider')).payload.error,'compatible_call_unavailable');
+test('a current call under a declared runtime scope keeps its paid answer, usage, request and response with exactly one physical send and no runtime telemetry of its own',async t=>{
+  // LG62: the call-runtime capture of the former R2 route is removed; this scoped fixture is where it used to run.
+  const f=fixture(t);
+  await f.invoke();
+  const calls=f.store.list<ModelCall>('model-call');assert.equal(calls.length,1);
+  const call=calls[0]!;
+  assert.equal(call.value.status,'succeeded',JSON.stringify(call.value));
+  assert.ok(call.value.usage,'the paid usage is saved');
+  assert.equal(call.value.request.hash.length,64);assert.ok(call.value.request.chars>0);
+  const response=f.store.get<any>(call.value.response!.record!.id,call.value.response!.record!.revision)!;
+  assert.equal(response.kind,'model-response');assert.equal(JSON.parse(response.value.text).protocol,'omg-agent/v1');
+  assert.equal(readFileSync(f.log,'utf8'),'provider\n','exactly one physical send');
+  assert.equal(Object.hasOwn(call.value,'runtime'),false,'the call writes no runtime field of its own');
 });
 
-test('lost native subject, missing CLI version or changed adapter cannot pass the compatibility module',async t=>{
-  const f=fixture(t);await f.invoke();const baseline=f.store.list<ModelCall>('model-call')[0]!;
-  for(const mutate of [(v:any)=>{v.runtime.snapshot.subjects=v.runtime.snapshot.subjects.filter((s:any)=>s.path!==f.native);},
-    (v:any)=>{delete v.runtime.snapshot.codex;},(v:any)=>{v.runtime.requestHash='0'.repeat(64);},(v:any)=>{v.runtime.status='unavailable';}]){
-    const value=structuredClone(baseline.value);mutate(value);
-    f.store.write({id:baseline.id,kind:baseline.kind,expected:f.store.get(baseline.id)!.revision,value});
-    assert.equal((await f.run('provider')).payload.error,'compatible_call_unavailable');
-  }
-  f.store.write({id:baseline.id,kind:baseline.kind,expected:f.store.get(baseline.id)!.revision,value:baseline.value});
-  writeFileSync(f.adapter,readFileSync(f.adapter,'utf8')+'\n// changed\n');
-  assert.equal((await f.run('provider')).payload.error,'compatible_call_unavailable');
-});
-
-test('integration requires both current declared isolation observations and leaves failed or missing evidence explicit',async t=>{
+test('integration refuses missing call-runtime evidence even after successful current isolation observations',async t=>{
+  // LG62: the call-runtime producer is removed, so a call made after it carries no runtime evidence. The positive
+  // integration with two observations and the later observation.status mutation are no longer checked here (LG84).
   const f=fixture(t);await f.invoke();
-  assert.equal((await f.run('integration')).payload.error,'isolation_observation_unavailable');
-  await f.observe('boundary-a');await f.observe('boundary-b');
-  const result=await f.run('integration');assert.equal(result.exitCode,0);assert.equal(result.payload.result.observations.length,2);
-  const observation=f.store.list<any>('runtime-observation').find(row=>row.value.requestedFor==='boundary-a')!;
-  f.store.write({id:observation.id,kind:observation.kind,expected:observation.revision,value:{...observation.value,status:'failed'}});
-  assert.equal((await f.run('integration')).payload.error,'isolation_observation_unavailable');
+  const call=f.store.list<ModelCall>('model-call')[0]!;
+  assert.equal(call.value.status,'succeeded');assert.equal(Object.hasOwn(call.value,'runtime'),false);
+  for(const obligation of ['boundary-a','boundary-b']){
+    const observed=await f.observe(obligation);
+    assert.equal(observed.observation.value.status,'observed',obligation);assert.equal(observed.observation.value.result!.exitCode,0,obligation);
+  }
+  const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]),before=history();
+  for(const mode of ['provider','integration']){
+    const refused=await f.run(mode);
+    assert.equal(refused.exitCode,1,mode);assert.equal(refused.payload.error,'compatible_call_unavailable',mode);
+    assert.equal(Object.hasOwn(refused.payload,'result'),false,`${mode} claims no positive result`);
+  }
+  assert.deepEqual(history(),before,'the script reads change no history');
+  assert.equal(readFileSync(f.log,'utf8'),'provider\n','no further physical send');
 });
 
 test('materialized imports match the public source command and the complete 34-obligation policy validator byte for byte',t=>{
@@ -170,7 +165,7 @@ test('materialized imports match the public source command and the complete 34-o
   assert.throws(()=>materialize({...matrix,runtimeAssets:null},projectRoot),/runtime_assets_missing/);
 });
 
-test('a Devin provider exercises version 2 telemetry, its own version check and an explicit sandbox refusal',async t=>{
+test('a Devin provider exercises its own version check, an explicit sandbox refusal and no Codex isolation',async t=>{
   const f=fixture(t,false,'devin');
   // The platform check probes the declared devin executable, never a codex one.
   const platform=await f.run('platform');assert.equal(platform.exitCode,0);
@@ -180,22 +175,8 @@ test('a Devin provider exercises version 2 telemetry, its own version check and 
   const refused=await f.observe('boundary-a');assert.equal(refused.observation.value.result!.exitCode,1);
   assert.equal(JSON.parse(refused.observation.value.result!.stdout).error,'sandbox_provider_unsupported');
   assert.equal(f.store.list('model-call').length,0);
-  // An ordinary version-2 call satisfies the provider check under the provider field.
-  await f.invoke();const good=await f.run('provider');assert.equal(good.exitCode,0);
-  assert.equal(good.payload.result.calls[0].provider.protocol,'devin-stdio');
-  const call=f.store.list<ModelCall>('model-call')[0]!;
-  assert.equal(call.value.runtime!.version,2);
-  // Neither a codex-era field nor an unknown version is accepted as Devin evidence.
-  const baseline=call.value;
-  for(const mutate of [(v:any)=>{v.runtime.version=3;},(v:any)=>{v.runtime.snapshot.provider.protocol='codex-stdio';},
-    (v:any)=>{const s=v.runtime.snapshot,v2={...s.codex?{}:{provider:s.provider}};delete s.provider;s.codex={executable:v2.provider.executable,args:['--version'],result:v2.provider.result};}]) {
-    const value=structuredClone(baseline);mutate(value);
-    f.store.write({id:call.id,kind:call.kind,expected:f.store.get(call.id)!.revision,value});
-    assert.equal((await f.run('provider')).payload.error,'compatible_call_unavailable');
-  }
-  f.store.write({id:call.id,kind:call.kind,expected:f.store.get(call.id)!.revision,value:baseline});
-  // A Codex canary observation is not counted as Devin isolation in the integration check.
-  const integration=await f.run('integration');assert.equal(integration.payload.error,'isolation_observation_unavailable');
+  // Without call-runtime evidence the integration check refuses at its compatibility gate (LG62); nothing is concluded about a canary.
+  const integration=await f.run('integration');assert.equal(integration.payload.error,'compatible_call_unavailable');
 });
 
 const devinModule=resolve('dist/src/adapters/devin-stdio.js');

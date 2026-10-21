@@ -224,10 +224,31 @@ test('missing corrupt foreign and downgraded Discovery bindings cannot select an
 test('two Stores racing the first v7 reservation admit exactly one physical send', async t => {
   const f = fixture(t); await f.calibrate();
   const first = f.managed(), second = f.managed(), other = f.open();
-  const outcomes = await Promise.allSettled([first.invoke(), second.invoke(other)]);
-  assert.equal(outcomes.filter(r => r.status === 'fulfilled').length, 1);
-  const failed = outcomes.find(r => r.status === 'rejected') as PromiseRejectedResult;
-  assert.ok(['revision_conflict', 'input_stale'].includes(failed.reason.code));
+  // LG62: the removed call-runtime capture await used to be the yield between the active-call check and the
+  // reservation write. The window is now driven explicitly: inside the first Store's initial batch, before its
+  // real write, the second Store reaches and commits its own reservation; the first batch then loses the CAS.
+  let secondCall: Promise<unknown> | undefined, intercepted = false;
+  const restore = inject(f.store, (writes, guards, original) => {
+    if (!intercepted && writes.some(w => w.kind === 'model-call') && writes.some(w => w.kind === 'research-budget-ledger')) {
+      intercepted = true;
+      assert.equal(f.segment(), null); assert.equal(f.ledger(), null);
+      assert.equal(f.store.list<any>('research-consumer-intent').filter(i => i.value.state === 'prepared').length, 2);
+      secondCall = second.invoke(other); secondCall.catch(() => undefined);
+      assert.equal(f.paidCalls(other).length, 1, 'the second Store committed its reservation inside the window');
+      assert.ok(f.ledger(other), 'the winner published its ledger first');
+    }
+    return original(writes, guards);
+  });
+  let outcomes: PromiseSettledResult<unknown>[];
+  try {
+    const [firstOutcome] = await Promise.allSettled([first.invoke()]);
+    outcomes = [firstOutcome!, ...(secondCall ? await Promise.allSettled([secondCall]) : [])];
+  } finally { restore(); }
+  assert.equal(intercepted, true, 'the first Store attempted its prepared batch after the winner');
+  assert.equal(outcomes.length, 2); assert.equal(outcomes[1]!.status, 'fulfilled', 'the second call is the paid one');
+  const failed = outcomes[0] as PromiseRejectedResult;
+  assert.equal(failed.status, 'rejected');
+  assert.ok(['revision_conflict', 'input_stale'].includes(failed.reason.code), String(failed.reason?.code));
   assert.equal(f.sent(), 2); assert.equal(f.paidCalls().length, 1);
   assert.equal(f.store.list('research-budget').length, 1);
   assert.equal(f.store.list('research-budget-ledger').length, 1);

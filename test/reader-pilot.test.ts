@@ -1080,7 +1080,8 @@ test("a pilot timeout override leaves the accepted source environment unchanged"
 });
 
 
-test("current replies are accepted; a historical reply-limit record replays only its exact paid bytes", async t => {
+/** A real current analyst call whose 4000-character answer exceeds the pilot reply limit. */
+async function oversizedReply(t: test.TestContext) {
   const {root,store,engine,environment,pilot,settings,draft,question}=fixture(t);
   const command=join(root,'oversized-provider.mjs');
   writeFileSync(command,`import {readFileSync,writeFileSync} from 'node:fs';const input=readFileSync(0,'utf8'),req=JSON.parse(input);writeFileSync('original-request.json',input);console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{action:'answer',question:req.subject.question.id,value:'x'.repeat(4000),citations:[]},usage:{inputTokens:10,outputTokens:1000,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
@@ -1089,36 +1090,47 @@ test("current replies are accepted; a historical reply-limit record replays only
   const context={...pilotContext(store,draft,question),inventory:new ResearchSources(store,'p',root).inventory()};
   const audit={store,draftId:draft.id,questionId:question.id,purpose:'analyst',pilot:configured};
   const accepted=await researchCall(role,environment.value,'Return JSON',context,undefined,audit) as any;
+  return {root,store,draft,question,role,configured,accepted};
+}
+
+test("current replies are accepted under the pilot reply limit", async t => {
+  const {accepted}=await oversizedReply(t);
   assert.equal(accepted.value.length,4000);
+});
+
+test("C51: a managed consumer call stays out of the legacy reply-limit replay — by its consumer namespace and by its consumerIntent marker independently", async t => {
+  const {root,store,draft,question,role,configured}=await oversizedReply(t);
   const original=store.list<ModelCall>('model-call')[0]!,input=readFileSync(join(root,'original-request.json'),'utf8');
-  store.write<ModelCall>({id:original.id,kind:original.kind,expected:original.revision,value:{...original.value,status:'failed',error:'pilot_reply_limit'}});
-  const response=await researchCall({...role,command:{executable:'/usr/bin/false',args:[]}},environment.value,'Return JSON',context,undefined,audit) as any;
-  assert.equal(response.value.length,4000);assert.equal(store.get(original.id)!.revision,original.revision+1);
-  assert.equal(store.list('model-call').length,1);assert.equal(store.list('research-response-replay').length,1);
-  const changed=JSON.parse(input);changed.prompt='Different instruction';
-  assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',JSON.stringify(changed)),null);
-  assert.equal(replayLimitedResponse(store,configured,{...role,actor:'foreign'},draft.id,question.id,'analyst',input),null);
-  assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'assessor',input),null);
-  store.write({id:question.id,kind:question.kind,expected:question.revision,value:{...question.value,spec:{...question.value.spec,prompt:'Changed basis'}}});
-  assert.throws(()=>replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',input),{code:'context_reference_stale'});
-  // C51: a managed consumer call is recovered only through its own intent
-  // chain. Both era markers independently exclude it from legacy replay.
-  const managedRequest=(requestId:string)=>{
+  // Negative counterexamples of a managed call, built from the real original request and response; the Question is unchanged.
+  const managed=(requestId:string,consumerIntent:boolean)=>{
     const raw=JSON.stringify({...JSON.parse(input),prompt:'Managed instruction',requestId});
     return {...original.value,requested:role,profile:reference(configured),status:'failed' as const,
       error:'pilot_reply_limit',requestId,request:{hash:digest(raw),chars:raw.length,bytes:Buffer.byteLength(raw)},
       response:original.value.response,startedAt:original.value.startedAt+1,finishedAt:original.value.startedAt+2,
-      consumerIntent:{id:'research-consumer-intent:managed',revision:1,hash:hashJson(['managed'])}};
+      ...(consumerIntent?{consumerIntent:{id:'research-consumer-intent:managed',revision:1,hash:hashJson(['managed'])}}:{})} as ModelCall;
   };
   const managedInput=JSON.stringify({...JSON.parse(input),prompt:'Managed instruction'});
-  store.write<ModelCall>({id:`model-call:consumer:v1:${hashJson(['managed-1'])}`,kind:'model-call',expected:0,
-    value:managedRequest('managed-1') as ModelCall});
+  const sends=()=>store.list('model-call').length;
+  store.write<ModelCall>({id:`model-call:consumer:v1:${hashJson(['managed-1'])}`,kind:'model-call',expected:0,value:managed('managed-1',false)});
   assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',managedInput),null,
-    'A consumer-namespaced call keeps its bytes out of legacy replay');
-  store.write<ModelCall>({id:`model-call:legacy-shaped:${hashJson(['managed-2'])}`,kind:'model-call',expected:0,
-    value:managedRequest('managed-2') as ModelCall});
+    'The consumer namespace alone keeps the bytes out of legacy replay');
+  store.write<ModelCall>({id:`model-call:legacy-shaped:${hashJson(['managed-2'])}`,kind:'model-call',expected:0,value:managed('managed-2',true)});
   assert.equal(replayLimitedResponse(store,configured,role,draft.id,question.id,'analyst',managedInput),null,
     'A consumerIntent marker alone excludes the call even under a legacy-shaped id');
+  assert.equal(store.list('research-response-replay').length,0,'no replay record is written');
+  assert.equal(sends(),3,'no new send: the original and the two counterexamples only');
+});
+
+test("LG62: an exact assessment session of the former unprefixed form is refused before any write or send", async t => {
+  const {store,environment,draft,question}=fixture(t);
+  // A deliberate negative counterexample of the former session form (no era prefix, no contract); its producer is not run.
+  const session=store.write({id:`assessment-session:${hashJson(['former-form'])}`,kind:'assessment-session',expected:0,
+    value:{projectId:'p',offset:0,notes:[],focus:null,result:null}});
+  const history=()=>store.list().map(row=>[row.id,row.revision,row.hash]),before=history();
+  await assert.rejects(researchCall(environment.value.reviewer,environment.value,'Assess',{assessmentSession:session.id},undefined,
+    {store,draftId:draft.id,questionId:question.id,purpose:'assessor',session:reference(session)}),{code:'research_context_application_invalid'});
+  assert.deepEqual(history(),before,'nothing is written');
+  assert.equal(store.list('model-call').length,0,'nothing is sent');
 });
 
 test("planner response is accepted regardless of the former reply and round disciplines", async t => {

@@ -37,11 +37,9 @@ import { interceptResearchPreview, isResearchPreview } from './research-preview.
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
 import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
-import { assertPilotBoundary, readerPilot } from "./reader-pilot.js";
+import { assertPilotBoundary } from "./reader-pilot.js";
 import { phasePolicy } from "./phase-policy.js";
-import { budgetSegment, budgetUsage, budgetGroups, assertQuestionBudget, reserveResearchCall, type BudgetSegment, type CallEstimate } from "../runtime/research-budget.js";
-import { planningForQuestion } from "./research-routing.js";
-import { researchScope } from "../graph/research-scope.js";
+import { budgetUsage, reserveResearchCall, type BudgetSegment, type CallEstimate } from "../runtime/research-budget.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import { randomUUID } from "node:crypto";
 import { runProcess } from "../runtime/process.js";
@@ -56,8 +54,7 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { workingContext } from "./working-context.js";
-import { replayAssessmentApplication, replayLimitedResponse } from "./response-replay.js";
-import { captureCallRuntime, finishCallRuntime } from '../runtime/call-runtime.js';
+import { replayAssessmentApplication } from "./response-replay.js";
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
   readResearchConsumerIntent, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, prepareResearchConsumerReservation, consumerIntentContext, CONSUMER_INTENT_V2,
@@ -111,11 +108,12 @@ function assessmentReservation(audit: ResearchCallAudit | undefined, role: RoleB
     const session = audit.store.get<RecoverableContextSession>(audit.session.id, audit.session.revision);
     if (!session || !recordValue(session.value) || canonical(reference(session)) !== canonical(audit.session)
       || hashJson(session.value) !== session.hash) applicationAuditInvalid('The reservation session is missing, foreign or changed');
-    const currentEra = session.kind === 'assessment-session' && assessmentSessionEra(session);
-    if (!currentEra) {
+    if (session.kind !== 'assessment-session') {
       if (explicit || namesNewSession) applicationAuditInvalid('Application reservation fields require the declared assessment session era');
       return null;
     }
+    // LG62: an assessment session without the declared era prefix is no longer dispatched.
+    if (!assessmentSessionEra(session)) applicationAuditInvalid('An assessment session without its declared era is not dispatched');
     if (namedSession !== session.id) applicationAuditInvalid('The assessment context must name its exact audited session');
     // The explicit operator replay predates the reservation callback and never
     // sends a new call. It must consume its selected response below or refuse.
@@ -245,7 +243,7 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
     : capacity.envelopeLimitChars;
   const outputLimit = researchResponseOutputLimit(audit?.pilot?.value.physicalLimits?.maxReplyChars ?? null);
   const overhead = JSON.stringify(outputLimit).length + 32 + Math.max(JSON.stringify({ ...envelope, subject: {} }).length,
-    controls?.version === 2 && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
+    controls && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subjectFor = (limit: number) => {
     const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
       limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}), continuation: !packetState.initial,
@@ -405,28 +403,9 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       'research_plan_subject_invalid', 'An accepted plan needs its exact saved plan-question subject');
   }
   const policy = audit ? phasePolicy(audit.store, environment.projectId) : null;
-  let segment = null;
-  let groups: string[] = [];
-  let protectedQuestion: Revision<Question> | null = null;
   if (audit && draft?.value.stage === "om-g2") {
     const phase = draft.value.consumer !== "compilation" && draft.value.level === "R2" ? "L3" : draft.value.level;
     assertPilotBoundary(audit.store, environment.projectId, phase);
-    if (draft.value.level === "R2" && policy) {
-      const current = readerPilot(audit.store, environment.projectId);
-      requireCondition(current && audit.pilot && hashJson(reference(current)) === hashJson(reference(audit.pilot)),
-        "phase_protections_missing", "Every R2 role must use the current protected preset");
-      const question = audit.store.get<Question>(audit.questionId ?? "");
-      requireCondition(question, "budget_question_missing", "Every R2 role needs its logical question");
-      protectedQuestion = question;
-      planningForQuestion(audit.store, draft, question, current);
-      const scope = researchScope(audit.store, environment.projectId);
-      requireCondition(scope && draft.value.inputs.some(ref => hashJson(ref) === hashJson(reference(scope))),
-        "research_scope_stale", "R2 requires its current explicit research scope");
-      segment = budgetSegment(audit.store, environment.projectId, policy.value.budgetSegment!);
-      groups = budgetGroups(audit.store, draft.id, question.id);
-      assertQuestionBudget(audit.store, segment, groups);
-      requireCondition(budgetUsage(audit.store, segment).measured <= segment.value.limit, "budget_actual_overrun", "An actual segment overrun requires an owner decision before continuation, including replay");
-    }
   }
   requireCondition(!draft || Boolean(audit?.questionId), "continuation_question_missing", "A saved research draft cannot bypass the common packer by omitting its question");
   const requestId = randomUUID();
@@ -460,21 +439,6 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   if (recovered) { audit?.onContext?.(recovered.subject); return recovered.research; }
   if (assessment?.kind === 'replay-only') applicationAuditInvalid('The operator recovery did not consume its selected response');
   interceptResearchPreview(input,{limit:requestLimit,draft:audit?.draftId??'',question:audit?.questionId??'',purpose:audit?.purpose??''});
-  if (!consumerIntent && audit?.pilot && packetState) {
-    const previous = audit.store.list<ModelCall>("model-call").filter(c => c.value.status === "failed" && c.value.error === "pilot_reply_limit"
-      && c.value.questionId === audit.questionId && c.value.purpose === audit.purpose && c.value.requested.actor === role.actor
-      && c.value.packet?.archive.hash === (subject as any).working.archive.hash && c.value.request.record);
-    for (const call of previous) {
-      const ref = call.value.request.record!;
-      const saved = audit.store.get<{text:string}>(ref.id, ref.revision);
-      requireCondition(saved?.hash === ref.hash, "research_replay_invalid", "Saved request bytes are unavailable");
-      const paid = replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId, audit.questionId, audit.purpose, saved.value.text);
-      if (paid) { audit.onContext?.(JSON.parse(saved.value.text).subject); return paid.research; }
-    }
-  }
-  const replay = !consumerIntent && audit?.pilot ? replayLimitedResponse(audit.store, audit.pilot, role, audit.draftId,
-    audit.questionId, audit.purpose, input) : null;
-  if (replay) return replay.research;
   // Budget admission is only for a NEW send: every paid-return path above is free.
   const originalDraft = audit && draft ? audit.store.get<DiscoveryDraft>(draft.id, 1) : null;
   const stageV7 = isDiscoveryV7Draft(draft?.value) || isDiscoveryV7Draft(originalDraft?.value);
@@ -513,15 +477,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
   const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor,assessmentSubject):null;
-  const runtime = audit && draft ? await captureCallRuntime(audit.store, draft.value, role, environment, digest(input), signal) : null;
-  const reservation = !segment && !stagePlan && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
-  const estimate = segment && audit ? estimateCliCall(audit.store, environment.projectId, role, audit.purpose, input.length, packetState?.initial === false ? "continuation" : "initial") : null;
-  if (segment && audit && estimate) {
-    requireCondition(input.length <= requestLimit!, "pilot_request_limit", "Complete envelope exceeds its working limit");
-    const reserved = reserveResearchCall(audit.store, segment, callId, groups, estimate);
-    reservation.writes.push(...reserved.writes);
-    reservation.guards.push(...reserved.guards, reference(policy!), reference(audit.pilot!), reference(draft!), reference(protectedQuestion!), ...draft!.value.inputs);
-  }
+  const reservation = !stagePlan && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
   if (stagePlan && stageEstimate && audit && draft) {
     // The closing-kind whitelist is empty until DR6/DR7. No caller/model field
     // (role, purpose, finalization mode or attempt end) grants completion funds.
@@ -586,7 +542,6 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
   const ownership = audit ? physicalClaim() : null;
   const callWrite: Write = { id: callId, kind: "model-call", expected: 0,
     value: { projectId: environment.projectId, draftId: audit?.draftId ?? "", purpose: audit?.purpose ?? "", requestId,
-      ...(segment && estimate ? { budget: { segment: reference(segment), groups, estimate } } : {}),
       ...(stageSegment && stageEstimate ? { budget: { segment: reference(stageSegment),
         groups: [DISCOVERY_V7_STAGE_BUDGET_KEY], estimate: stageEstimate } } : {}),
       ...(progress?{progressKey:progress.key}:{}),
@@ -598,7 +553,6 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       questionId: planSubject?.planQuestionId ?? audit?.questionId ?? null,
       ...(planSubject ? { planAnswer:planSubject.planAnswer } : {}),
       startedAt: Date.now(), finishedAt: null, status: "running", requested: role,
-      ...(runtime ? { runtime } : {}),
       confirmed: { model: null, effort: null, speed: null }, request: { chars: input.length, bytes: Buffer.byteLength(input), hash: digest(input), ...(useWireManifest
         ? { record: manifestReservationResult!.manifestRef }
         : packetState
@@ -703,8 +657,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
         patch.response = { ...patch.response!, record: { id: saved.id, revision: 1, hash: hashJson(saved.value) } };
       }
       try {
-        const terminal: ModelCall = { ...call.value, ...patch, finishedAt: Date.now(), ...(runtime?.status === 'captured'
-          ? { runtime: { ...runtime, status: 'unavailable', error: 'call_runtime_finalize_pending' } } : {}) };
+        const terminal: ModelCall = { ...call.value, ...patch, finishedAt: Date.now() };
         const linked = stopCancel && patch.status === 'failed' && patch.error === 'process_cancelled'
           ? [callStopCancelWrite(environment.projectId, { id: call.id, revision: call.revision + 1, hash: hashJson(terminal) }, stopCancel)] : [];
         // A terminal snapshot includes every charged call and the ledger head.
@@ -751,25 +704,6 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       }
       if (consumerIntent && patch.status === 'failed' && patch.error !== 'process_lost')
         refuseResearchConsumerIntent(audit.store, reference(consumerIntent));
-      if (segment && budgetUsage(audit.store, segment).measured > segment.value.limit) {
-        audit.store.write({ id: `budget-incident:${requestId}`, kind: "budget-incident", expected: 0,
-          value: { projectId: environment.projectId, segment: reference(segment), call: reference(call), reason: "Actual provider usage exceeded the experimental forecast and the owner budget; further calls are forbidden" } });
-        throw new EngineError("budget_actual_overrun", "Actual usage exceeded the owner budget; the incident is recorded and further calls are blocked");
-      }
-      if (segment) assertQuestionBudget(audit.store, segment, groups);
-      // Persist the paid response and usage before hashing runtime files. If
-      // telemetry is interrupted, accounting survives and R3 sees explicit
-      // unavailable evidence; it must never trigger another paid invocation.
-      if (runtime?.status === 'captured') {
-        const measured = await finishCallRuntime(audit.store, environment.projectId, runtime);
-        try { call = audit.store.write<ModelCall>({ id: call.id, kind: call.kind, expected: call.revision,
-          value: { ...call.value, runtime: measured } }); }
-        catch (error) {
-          if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
-          // A concurrent record update wins; the already saved paid result is
-          // not repeated solely to complete runtime telemetry.
-        }
-      }
     }
   }
 }

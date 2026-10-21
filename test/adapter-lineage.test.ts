@@ -11,7 +11,7 @@ import { reference } from '../src/pipeline/contracts.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { estimateCliCall } from '../src/adapters/codex-estimate.js';
 import { adapterLineagePath } from '../src/adapters/adapter-lineage.js';
-import type { CallRuntimeEvidence } from '../src/runtime/call-runtime.js';
+import type { CallRuntimeEvidence } from '../src/runtime/model-usage.js';
 import { runProcess } from '../src/runtime/process.js';
 
 function fixture(t: test.TestContext) {
@@ -80,8 +80,7 @@ test('a surviving file precedes lineage but a reused path cannot contradict its 
 
 test('an actual dispatch fingerprint survives removal and precedes a later file replacement; foreign telemetry cannot borrow it', t => {
   const f = fixture(t), call = f.sample();
-  // Focused data fixture for estimator identity binding. Actual OS capture and
-  // exclusion of provider-authored telemetry are tested in call-runtime.test.
+  // Focused data fixture for estimator identity binding.
   const runtime = { version: 1, status: 'observed', requestHash: call.value.request.hash,
     snapshot: { roleHash: hashJson(call.value.requested), invocation: { args: call.value.requested.command.args }, adapter: { hash: f.sha256 } } } as CallRuntimeEvidence;
   const saved = f.store.write<ModelCall>({ id: call.id, kind: call.kind, expected: call.revision, value: { ...call.value, runtime } });
