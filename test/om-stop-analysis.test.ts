@@ -12,20 +12,24 @@ import { projectGraph } from '../src/graph/project.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Environments } from '../src/runtime/environment.js';
-import { Store, type TransactionGuard, type Write } from '../src/storage/store.js';
+import { Store, type Revision, type TransactionGuard, type Write } from '../src/storage/store.js';
 import { writeOmInput } from '../src/om/input.js';
+import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
-import { writeRoutes } from '../src/om/routes.js';
+import { gapLineExpectedResult, gapLineKey } from '../src/om/gap-lines.js';
+import { prepareAnswerTask } from '../src/om/accepted-answer.js';
+import { writeRoutes, type RoutesRecord } from '../src/om/routes.js';
+import { writeQuestionPacket } from '../src/om/question-packet.js';
+import { assessFact } from '../src/om/assessment.js';
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, type OriginSource } from '../src/om/refusal-journal.js';
-import { closeAttempt, type AnyOriginHold } from '../src/om/repeat-gate.js';
-import { beginAttempt, openSeries, resumeSeries, escalateSeries, prepareSeriesAdmission, seriesAddress,
+import { closeAttempt, openAttempt, prepareManagedClaim, type AnyOriginHold } from '../src/om/repeat-gate.js';
+import { openSeries, resumeSeries, escalateSeries, prepareSeriesAdmission, seriesAddress,
   type AnySeriesRequest, type AnyRepairSeries, type AttemptGoal, type MechanismAdmission } from '../src/om/series.js';
-import { prepareStopAnalysis, runStopAnalysis, readStopAnalysis, readRecoveredStopAnalysis, stopAnalysisRecoverable, writeStopAnalysisRecovery,
-  STOP_ANALYSIS_FAILURE_KIND } from '../src/om/stop-analysis.js';
+import { prepareStopAnalysis, runStopAnalysis, readStopAnalysis } from '../src/om/stop-analysis.js';
 import { readStopReport } from '../src/om/stop-report.js';
 import { recordCall, type AnyRecordCallRequest } from '../src/om/call-record.js';
-import { runModelTransport } from '../src/om/model-call.js';
+import { runModelCall, runModelTransport } from '../src/om/model-call.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
@@ -40,7 +44,7 @@ const ok = <T>(result: OmResult<T>): T => {
   return result.value;
 };
 
-function fixture(t: TestContext, mode: 'block' | 'mechanism' = 'block', origin = false, capacity = 200_000) {
+async function fixture(t: TestContext, mode: 'block' | 'mechanism' = 'block', origin = false, capacity = 200_000) {
   const root = mkdtempSync(join(tmpdir(), 'omg-a6-')), database = join(root, 'state.sqlite');
   let store = new Store(database);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -52,62 +56,128 @@ function fixture(t: TestContext, mode: 'block' | 'mechanism' = 'block', origin =
     fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: capacity }, 0);
   const adapter = store.write({ id: `adapter:${project}:analysis`, kind: 'dispatch-adapter', expected: 0,
     value: { projectId: project, protocol: 'codex-stdio' } });
-  const address: AnySeriesRequest = mode === 'mechanism' ? { project, owner, line: 1 } : { project, block: 'analysis-block', line: 1 };
+  const block = `${project}-consume-block`, seriesBlock = mode === 'mechanism' ? null : block;
+  const address: AnySeriesRequest = mode === 'mechanism' ? { project, owner, line: 1 } : { project, block: seriesBlock!, line: 1 };
+  // The adapter consumes one scenario step per physical call: the managed cycles spend theirs first, the analysis
+  // calls append after them, and the trace keeps every call — `sent` hides the cycle calls so tests see analysis only.
+  const steps: Record<string, unknown>[] = [];
+  const pushSteps = (...next: Record<string, unknown>[]) => { steps.push(...next); writeFileSync(scenario, JSON.stringify({ database, steps })); };
+  const engine = new ProductEngine(store), { level: _level, ...l1 } = projectGraph(gardenGraph('cross', project), 1);
+  preparedFeatures(engine, project, l1 as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding',
+      question: 'Which output encoding is supported?', consumer: block, moment: 'om-pass',
+      blocksCurrentStage: false, resolution: 'Address this question before research' }];
+    return value;
+  });
+  const input = ok(writeOmInput(store, { project, expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const graph = reference(store.get(`graph:${project}`)!);
+  const horizonFor = (inRef: Ref, version: string) => ok(writeHorizon(store, { project, input: inRef, graph, refinement: null, available: {},
+    choice: { choiceVersion: version, features: [{ outcome: `${project}-result` }], excluded: [] } }));
+  const gapSources = (inRef: Ref, gate: Ref): GapRequest => ({ project, input: inRef, graph, horizon: gate,
+    operations: { proposals: [], frame: { project, level: 2, graph, horizon: gate, layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } });
   let admission: MechanismAdmission | undefined;
   let goal: AttemptGoal = { key: 'prove-workspace', questions: ['Which declared workspace condition prevents this work?'],
     result: 'A checked workspace condition allowing the declared work' };
+  let work: { routes: Ref; batch: string;
+    items: readonly { gap: string; target: string; field: string; record: Ref }[] } | null = null;
   if (mode === 'mechanism') {
-    const engine = new ProductEngine(store), { level: _level, ...l1 } = projectGraph(gardenGraph('cross', project), 1);
-    preparedFeatures(engine, project, l1 as Graph, field => {
-      const value = preparedField(project, field);
-      if (field === 'preparation') (value as Record<string, Json>).unknowns = [{ id: 'encoding',
-        question: 'Which output encoding is supported?', consumer: `${project}-consume-block`, moment: 'om-pass',
-        blocksCurrentStage: false, resolution: 'Address this question before research' }];
-      return value;
-    });
-    const input = ok(writeOmInput(store, { project, expected: 0,
-      stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
-    const graph = reference(store.get(`graph:${project}`)!);
-    const horizon = ok(writeHorizon(store, { project, input: reference(input), graph, refinement: null, available: {},
-      choice: { choiceVersion: 'analysis-fixture', features: [{ outcome: `${project}-result` }], excluded: [] } }));
-    const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
-      operations: { proposals: [], frame: { project, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
-      works: { state: 'upper-not-accepted', layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+    const horizon = horizonFor(reference(input), 'analysis-fixture');
+    const sources = gapSources(reference(input), reference(horizon.gate));
     const gaps = ok(writeGaps(store, sources)), scope = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
     const routes = ok(writeRoutes(store, { project, gaps: scope, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
     const batch = routes.value.batches.find(item => item.task === 'input-field'
       && item.items.some(member => member.target === 'discovery:encoding') && item.items.every(member => member.consumers.length === 0));
     assert.ok(batch);
     admission = { gaps: scope, routes: reference(routes), batch: batch.id };
+    work = { routes: admission.routes, batch: batch.id, items: batch.items };
     ok(openSeries(store, { project, owner, line: 1, scope, predecessor: null, basis: null }));
     goal = { key: 'address-encoding', ...ok(prepareSeriesAdmission(store, { project, owner, line: 1 }, admission)).goal };
-  } else ok(openSeries(store, { project, block: 'analysis-block', line: 1, slice: 'workspace-v1', predecessor: null, basis: null }));
+  } else {
+    // The block's own managed work: the addressed repository-fact question routed to the one whole MC1 batch of this
+    // consumer — every attempt below opens through G7 on this exact plan and closes by its real terminal products.
+    const addressed = ok(writeAddressing(store, { project, input: reference(input), graph,
+      decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(input), graph, layers: [],
+        decision: { target: 'discovery:encoding', field: 'address', value: { consumer: block, kind: 'repository-fact' } } })) as Write }] }));
+    const horizon = horizonFor(reference(addressed), 'analysis-addressed');
+    const sources = gapSources(reference(addressed), reference(horizon.gate));
+    const gaps = ok(writeGaps(store, sources)), scope = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+    const gap = gaps.records.find(row => row.value.gap.target === 'discovery:encoding' && row.value.gap.kind === 'repository-fact')!;
+    const task = ok(prepareAnswerTask(store, { project, input: reference(addressed), gaps: scope,
+      gap: reference(gap), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } }));
+    const routes = ok(writeRoutes(store, { project, gaps: scope,
+      tasks: task.writes.length ? [{ pending: structuredClone(task.writes[0]!) as Write }] : [{ record: reference(task.record) }],
+      catalog: { paths: [], records: [] }, previous: null })) as Revision<RoutesRecord>;
+    const batch = routes.value.batches.find(item => item.model === 'MC1' && item.items.some(row => row.consumers.includes(block)))!;
+    assert.ok(batch);
+    work = { routes: reference(routes), batch: batch.id, items: batch.items };
+    ok(openSeries(store, { project, block, line: 1, slice: 'workspace-v1', predecessor: null, basis: null }));
+    goal = { key: 'prove-workspace', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+      result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  }
   const originSources: OriginSource[] = [{ role: 'environment', ref: reference(environment) }];
   const source = store.write({ id: `${unitRefusalNamespace(project)}workspace`, kind: UNIT_REFUSAL_KIND, expected: 0,
     value: { gate: 'G6', refusals: [{ code: 'workspace_unavailable', goal: goal.key, remedy: 'Observe the declared workspace condition',
       origin: { name: 'workspace_unavailable', stage: 'feasibility', subject: 'workspace', sources: origin ? [] : originSources } }] } });
   const journal = ok(recordRefusal(store, { project, source: reference(source) })), row = journal.value.rows[0]!;
+  const brief = store.get<{ content: string }>(`source:${project}:brief`)!;
+  /** One managed cycle on the exact plan: E2 packet, real E1+E4 (+E5 for a fact), an off-form end keeps the gap open, G7 derives the close. */
+  const cycle = async (attempt: number, refusals: { row: string; name: string; goal: string }[],
+    work: { routes: Ref; batch: string; items: readonly { gap: string; target: string; field: string; record: Ref }[] }) => {
+    const series = mode === 'mechanism'
+      ? ok(openAttempt(store, { ...address, attempt, goal, admission: admission!,
+          completion: { routes: work.routes, batches: [work.batch] } } as never))
+      : ok(openAttempt(store, { project, block: seriesBlock!, line: 1, attempt, goal,
+          completion: { routes: work.routes, batches: [work.batch] } }));
+    const packet = ok(writeQuestionPacket(store, { project, routes: work.routes, batch: work.batch,
+      environment: reference(environment), attempt: { series: reference(series), ordinal: attempt }, previous: [] })).record;
+    // The mechanism's own M5 batch is one MC2 input-field call: an untyped reply fails its E4 unapplied, like the
+    // assessor's off-form verdict ends a fact of the block's MC1 batch — no gap is answered, the plan stays current.
+    if (mode === 'mechanism') pushSteps({ research: { answer: 'untyped reviewer reply' }, usage });
+    else pushSteps({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
+        results: work.items.map(item => ({ questionId: item.gap, value: brief.value.content.slice(0, 8),
+          citations: [{ source: reference(brief), selector: { kind: 'text-range', start: 0, end: brief.value.content.length } }] })) }, usage },
+        ...work.items.map(() => ({ research: { answer: 'untyped reviewer reply' }, usage })));
+    const dsp = { adapter: reference(adapter), config: reference(environment) };
+    const original = ok(await runModelCall(store, { project, packet: reference(packet), dispatch: dsp, role: 'implementer' }));
+    assert.equal(original.outcome?.kind, mode === 'mechanism' ? undefined : 'fact-candidates');
+    if (mode !== 'mechanism') for (const item of work.items)
+      assert.equal(ok(await assessFact(store, { project, modelCall: reference(original.record), questionId: item.gap, dispatch: dsp })).value.verdict, 'off-form');
+    const claim = ok(prepareManagedClaim(store, { ...address, attempt,
+      outcome: { reason: 'result', accepting: [], cancelling: [], refusals } }));
+    assert.equal(claim.outcome.reason, refusals.length ? 'refused' : 'off-form');
+    return ok(closeAttempt(store, { ...address, attempt, outcome: claim.outcome }));
+  };
   let hold: Ref | null = null;
   for (let attempt = 1; attempt <= (origin ? 1 : 3); attempt++) {
-    if (mode === 'mechanism') ok(beginAttempt(store, { project, owner, line: 1, attempt, goal, admission: admission! }));
-    else ok(beginAttempt(store, { project, block: 'analysis-block', line: 1, attempt, goal }));
-    const closed = ok(closeAttempt(store, { ...address, attempt,
-      outcome: { reason: 'refused', accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
+    const refusals = [{ row: row.id, name: row.code, goal: row.goal }];
+    const closed = await cycle(attempt, refusals, work!);
     if (origin) { assert.equal(closed.holds.length, 1); hold = closed.holds[0]!; }
   }
+  // The managed cycles already spent their model calls and records; analysis evidence counts only what came after.
+  const cycleIds = new Set(store.list().map(record => record.id));
+  const cycleCalls = store.list<{ calls: readonly unknown[] }>('om-call-ledger')
+    .flatMap(record => record.value.calls).length;
   const series = store.get<AnyRepairSeries>(seriesAddress(address).id)!;
   assert.equal(series.value.stop?.attempt ?? null, origin ? null : 3);
   const request: AnalysisRequest = { project, series: reference(series), hold,
     dispatch: { config: reference(environment), adapter: reference(adapter) } };
   return { root, database, project, address, goal, admission, environment, adapter, series, request, originSources, journal: reference(journal),
+    cycle: (attempt: number, refusals: { row: string; name: string; goal: string }[]) => cycle(attempt, refusals, work!),
     get store() { return store; },
     restart() { store.close(); store = new Store(database); },
-    steps(steps: Record<string, unknown>[]) { writeFileSync(scenario, JSON.stringify({ steps })); },
-    sent(): Array<{ model: string; prompt: string }> {
-      return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+    steps(next: Record<string, unknown>[]) { pushSteps(...next); },
+    list<T>(kind: string) { return store.list<T>(kind).filter(record => !cycleIds.has(record.id)); },
+    calls<T>() { return store.list<{ calls: readonly T[] }>('om-call-ledger')
+      .flatMap(record => record.value.calls).slice(cycleCalls); },
+    sent(): Array<{ model: string; prompt: string; requestId: string }> {
+      return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean)
+        .map(line => JSON.parse(line)).filter(call => typeof call.requestId === 'string' && call.requestId.startsWith('A6:')) : [];
     } };
 }
-type Fixture = ReturnType<typeof fixture>;
+type Fixture = Awaited<ReturnType<typeof fixture>>;
 function answer(f: Fixture, over: Record<string, unknown> = {}) {
   return { protocol: 'omg-stop-analysis/v1',
     cause: { kind: 'hypothesis', text: 'The same unanswered workspace question is repeated without new observations.', sources: [] },
@@ -136,7 +206,7 @@ function forbidSourceHeads(f: Fixture, refs: readonly Ref[]) {
 }
 
 test('A6 block analysis sends its bounded stop, records actual usage and replays historical success after resume and restart', async t => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const foreign = 'unrelated-series-secret-that-must-not-be-sent';
   ok(openSeries(f.store, { project: f.project, block: foreign, line: 1, slice: foreign, predecessor: null, basis: null }));
   const beforePrepare = canonical(f.store.list()), prepared = ok(prepareStopAnalysis(f.store, f.request));
@@ -154,10 +224,7 @@ test('A6 block analysis sends its bounded stop, records actual usage and replays
   assert.deepEqual(f.store.get<{ usage: unknown }>(result.value.transport.id, result.value.transport.revision)!.value.usage, usage);
   const continued = ok(resumeSeries(f.store, { ...f.address, stop: 3, ground: 'review-record', text: 'Apply this exact reviewed change', review: { ref: reference(result) } }));
   assert.equal(continued.value.stop, null);
-  for (let attempt = 4; attempt <= 6; attempt++) {
-    ok(beginAttempt(f.store, { project: f.project, block: 'analysis-block', line: 1, attempt, goal: f.goal }));
-    ok(closeAttempt(f.store, { ...f.address, attempt, outcome: { reason: 'off-form', accepting: [], cancelling: [], refusals: [] } }));
-  }
+  for (let attempt = 4; attempt <= 6; attempt++) await f.cycle(attempt, []);
   assert.equal(seriesNow(f).value.stop!.attempt, 6);
   f.restart(); const later = canonical(f.store.list());
   const restore = forbidSourceHeads(f, prepared.intent.report.guards);
@@ -170,10 +237,10 @@ test('A6 block analysis sends its bounded stop, records actual usage and replays
 });
 
 test('A6 mechanism stop uses its real saved admission and an independent reviewer without another attempt', async t => {
-  const f = fixture(t, 'mechanism'), before = preserved(f); scenario(f);
+  const f = await fixture(t, 'mechanism'), before = preserved(f); scenario(f);
   const result = ok(await runStopAnalysis(f.store, f.request));
   assert.equal(result.value.state, 'decided'); assert.equal(preserved(f), before);
-  const call = f.store.list<{ owner: unknown; purpose: string; attempt: number }>('call-record')[0]!;
+  const call = f.list<{ owner: unknown; purpose: string; attempt: number }>('call-record')[0]!;
   assert.deepEqual(call.value.owner, owner); assert.equal(call.value.purpose, 'stop-analysis'); assert.equal(call.value.attempt, 3);
   assert.equal(f.sent().length, 1);
   const resumed = ok(resumeSeries(f.store, { ...f.address, stop: 3, ground: 'review-record', text: 'Change the mechanism question', review: { ref: reference(result) } }));
@@ -182,7 +249,7 @@ test('A6 mechanism stop uses its real saved admission and an independent reviewe
 });
 
 test('A6 explicit undecided review and its owner escalation are saved in one transaction', async t => {
-  const f = fixture(t); scenario(f, answer(f, { cause: null }));
+  const f = await fixture(t); scenario(f, answer(f, { cause: null }));
   let atomic = false;
   const restore = observeWrites(f, writes => {
     if (writes.some(write => write.kind === 'om-stop-review')) {
@@ -200,7 +267,7 @@ test('A6 explicit undecided review and its owner escalation are saved in one tra
 });
 
 for (const failure of ['off-form', 'transport'] as const) test(`A6 ${failure} preserves the stop and actual usage without a usable review or another send`, async t => {
-  const f = fixture(t), before = preserved(f);
+  const f = await fixture(t), before = preserved(f);
   f.steps([failure === 'off-form' ? { research: { protocol: 'omg-stop-analysis/v1', cause: null }, usage }
     : { research: answer(f), usage, exitCode: 7, stderr: 'The local fixture stopped before completing the analysis.' }]);
   const result = ok(await runStopAnalysis(f.store, f.request));
@@ -223,7 +290,7 @@ for (const failure of ['off-form', 'transport'] as const) test(`A6 ${failure} pr
 });
 
 for (const part of ['evidence', 'change'] as const) test(`A6 a ${part} outside the bounded packet is recorded as failure, never a usable ground`, async t => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const foreign = ok(openSeries(f.store, { project: f.project, block: 'outside-the-stop', line: 1,
     slice: 'unrelated-slice', predecessor: null, basis: null }));
   const outside = reference(foreign), before = preserved(f);
@@ -238,7 +305,7 @@ for (const part of ['evidence', 'change'] as const) test(`A6 a ${part} outside t
 });
 
 test('A6 rejects identical reviewer and implementer identities before E1 or sending', async t => {
-  const f = fixture(t), value = f.environment.value;
+  const f = await fixture(t), value = f.environment.value;
   const imitation = f.store.write({ id: f.environment.id, kind: f.environment.kind, expected: f.environment.revision,
     value: { ...value, reviewer: { ...value.reviewer, actor: value.implementer.actor } } });
   const request = { ...f.request, dispatch: { ...f.request.dispatch, config: reference(imitation) } };
@@ -248,7 +315,7 @@ test('A6 rejects identical reviewer and implementer identities before E1 or send
 });
 
 test('A6 checks the actual reviewer wire against V1 before recording or sending a call', async t => {
-  const f = fixture(t, 'block', false, 200_000), value = f.environment.value;
+  const f = await fixture(t, 'block', false, 200_000), value = f.environment.value;
   const large = new Environments(f.store).configure(f.project, { ...value,
     reviewer: { ...value.reviewer, model: 'm'.repeat(200_000) } }, f.environment.revision);
   const request = { ...f.request, dispatch: { ...f.request.dispatch, config: reference(large) } };
@@ -258,7 +325,7 @@ test('A6 checks the actual reviewer wire against V1 before recording or sending 
 });
 
 test('A6 an environment without its required request capacity fails before E1 or provider dispatch', async t => {
-  const f = fixture(t), { requestCapacityChars: _capacity, ...legacy } = f.environment.value;
+  const f = await fixture(t), { requestCapacityChars: _capacity, ...legacy } = f.environment.value;
   const missing = new Environments(f.store).configure(f.project, legacy, f.environment.revision);
   const before = canonical(f.store.list());
   refusedWith(await runStopAnalysis(f.store, { ...f.request, dispatch: { ...f.request.dispatch, config: reference(missing) } }), 'capacity_missing');
@@ -266,7 +333,7 @@ test('A6 an environment without its required request capacity fails before E1 or
 });
 
 for (const mode of ['block', 'mechanism'] as const) test(`A6 ${mode} origin analysis atomically records its grounds and lets G7 establish and lift the held class`, async t => {
-  const f = fixture(t, mode, true), before = reference(seriesNow(f));
+  const f = await fixture(t, mode, true), before = reference(seriesNow(f));
   const prepared = ok(prepareStopAnalysis(f.store, f.request));
   const journal = f.store.list('om-refusal-journal');
   scenario(f, answer(f, { cause: { kind: 'evidence', text: 'This refusal concerns the saved environment.', sources: [reference(f.environment)] },
@@ -295,7 +362,7 @@ for (const mode of ['block', 'mechanism'] as const) test(`A6 ${mode} origin anal
 });
 
 test('A6 unestablished origin records the known outcome without lifting a hold or inventing a series stop', async t => {
-  const f = fixture(t, 'block', true), before = preserved(f); scenario(f, answer(f, { cause: null, change: null, origin: null }));
+  const f = await fixture(t, 'block', true), before = preserved(f); scenario(f, answer(f, { cause: null, change: null, origin: null }));
   const result = ok(await runStopAnalysis(f.store, f.request));
   assert.equal(result.value.state, 'origin-unestablished'); assert.equal(preserved(f), before);
   assert.equal(seriesNow(f).value.stop, null); assert.equal(f.store.get<AnyOriginHold>(f.request.hold!.id)!.value.lift, null);
@@ -303,16 +370,16 @@ test('A6 unestablished origin records the known outcome without lifting a hold o
 });
 
 test('A6 a claimed origin class unsupported by its exact grounds preserves the raw call and never lifts the hold', async t => {
-  const f = fixture(t, 'block', true), before = preserved(f);
+  const f = await fixture(t, 'block', true), before = preserved(f);
   scenario(f, answer(f, { origin: { class: 'derivation', basis: f.originSources } }));
   refusedWith(await runStopAnalysis(f.store, f.request), 'lift_unusable');
   assert.equal(preserved(f), before); assert.equal(f.store.list('om-origin-analysis').length, 0);
-  assert.equal(f.store.list('model-call').length, 1); assert.equal(f.sent().length, 1);
+  assert.equal(f.list('model-call').length, 1); assert.equal(f.sent().length, 1);
   f.restart(); refusedWith(await runStopAnalysis(f.store, f.request), 'lift_unusable'); assert.equal(f.sent().length, 1);
 });
 
 for (const boundary of ['admission', 'physical'] as const) test(`A6 changed report guard loses the ${boundary} transaction before provider dispatch`, async t => {
-  const f = fixture(t); scenario(f);
+  const f = await fixture(t); scenario(f);
   const other = new Store(f.database); t.after(() => other.close());
   let raced = false;
   const restore = observeWrites(f, (writes, guards) => {
@@ -325,13 +392,13 @@ for (const boundary of ['admission', 'physical'] as const) test(`A6 changed repo
     }
   });
   try { refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale'); } finally { restore(); }
-  assert.equal(raced, true); assert.equal(f.sent().length, 0); assert.equal(f.store.list('model-call').length, 0);
+  assert.equal(raced, true); assert.equal(f.sent().length, 0); assert.equal(f.list('model-call').length, 0);
   assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(seriesNow(f).value.stop!.attempt, 3);
-  assert.equal(f.store.list('call-record').length, boundary === 'admission' ? 0 : 1);
+  assert.equal(f.list('call-record').length, boundary === 'admission' ? 0 : 1);
 });
 
 test('A6 malformed request and foreign exact series fail with addressed typed errors before writing', async t => {
-  const f = fixture(t), before = canonical(f.store.list());
+  const f = await fixture(t), before = canonical(f.store.list());
   for (const request of [undefined, null, {}, { ...f.request, hold: undefined }, { ...f.request, dispatch: null }]) {
     assert.throws(() => prepareStopAnalysis(f.store, request as AnalysisRequest), (error: unknown) =>
       error instanceof EngineError && typeof error.code === 'string' && Boolean(error.details));
@@ -341,8 +408,8 @@ test('A6 malformed request and foreign exact series fail with addressed typed er
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
 });
 
-test('A6 the saved A5 source set requires its exact journal and every held origin', t => {
-  const f = fixture(t, 'block', true), prepared = ok(prepareStopAnalysis(f.store, f.request));
+test('A6 the saved A5 source set requires its exact journal and every held origin', async t => {
+  const f = await fixture(t, 'block', true), prepared = ok(prepareStopAnalysis(f.store, f.request));
   const sources = prepared.intent.sources;
   assert.deepEqual(sources.series, f.request.series); assert.ok(sources.journal);
   assert.deepEqual(sources.holds, [f.request.hold]);
@@ -358,14 +425,18 @@ test('A6 the saved A5 source set requires its exact journal and every held origi
     assert.equal((sources as { contract?: string }).contract, 'om-stop-report/v2');
     refusedWith(readStopReport(f.store, { project: f.project, sources: missing as typeof sources }), 'report_forged');
     refusedWith(readStopReport(f.store, { project: f.project, sources: { ...sources, contract: 'om-stop-report/v3' } as unknown as typeof sources }), 'report_forged');
-    const { contract: _contract, ...old } = missing as typeof sources & { contract?: string };
-    assert.throws(() => readStopReport(f.store, { project: f.project, sources: old as typeof sources }), EngineError);
+    const { contract: _contract, ...old } = sources;
+    assert.throws(() => readStopReport(f.store, { project: f.project, sources: old as typeof sources }), (error: unknown) => {
+      assert.ok(error instanceof EngineError); assert.equal(error.code, 'stop_report_invalid');
+      assert.deepEqual(error.details, { unit: 'om-stop-report', target: 'stop-report', field: 'sources' });
+      return true;
+    });
   } finally { restore(); }
   assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 0);
 });
 
 test('A6 a source moving at answer application preserves raw usage and refuses a stale review without resending', async t => {
-  const f = fixture(t), before = reference(seriesNow(f)); scenario(f);
+  const f = await fixture(t), before = reference(seriesNow(f)); scenario(f);
   const other = new Store(f.database); t.after(() => other.close());
   let raced = false;
   const restore = observeWrites(f, (writes, guards) => {
@@ -378,14 +449,14 @@ test('A6 a source moving at answer application preserves raw usage and refuses a
   try { refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale'); } finally { restore(); }
   assert.equal(raced, true); assert.deepEqual(reference(seriesNow(f)), before);
   assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(f.sent().length, 1);
-  assert.deepEqual(f.store.list<{ usage: unknown }>('model-call').map(record => record.value.usage), [usage]);
+  assert.deepEqual(f.list<{usage: unknown}>('model-call').map(record => record.value.usage), [usage]);
   f.restart(); const saved = canonical(f.store.list());
   refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale');
   assert.equal(f.sent().length, 1); assert.equal(canonical(f.store.list()), saved);
 });
 
 test('A6 sorting exact evidence preserves multiplicity of the reviewer claim', async t => {
-  const f = fixture(t), source = reference(f.environment);
+  const f = await fixture(t), source = reference(f.environment);
   scenario(f, answer(f, { cause: { kind: 'evidence', text: 'The saved workspace condition is the evidence.', sources: [source, source] } }));
   const result = ok(await runStopAnalysis(f.store, f.request));
   assert.equal(result.value.state, 'decided'); assert.deepEqual(result.value.cause!.sources, [source, source]);
@@ -404,7 +475,7 @@ test('A6 malformed response parts become failed analysis without implying an und
     f => ({ ...answer(f), accepted: true }),
   ];
   for (const response of responses) {
-    const f = fixture(t), before = preserved(f); f.steps([{ research: response(f), usage }]);
+    const f = await fixture(t), before = preserved(f); f.steps([{ research: response(f), usage }]);
     const result = ok(await runStopAnalysis(f.store, f.request));
     assert.equal(result.value.state, 'failed'); assert.equal(result.value.error?.code, 'analysis_response_invalid');
     assert.equal(preserved(f), before); assert.equal(seriesNow(f).value.ladder.rung, 1); assert.equal(f.sent().length, 1);
@@ -413,7 +484,7 @@ test('A6 malformed response parts become failed analysis without implying an und
 
 test('A6 missing mandatory intent fields refuse before E1 and physical dispatch', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const field of ['contract', 'request', 'sources', 'report', 'packet', 'call']) {
-    const f = fixture(t), prepared = ok(prepareStopAnalysis(f.store, f.request)), write = prepared.writes[0]!;
+    const f = await fixture(t), prepared = ok(prepareStopAnalysis(f.store, f.request)), write = prepared.writes[0]!;
     const value = structuredClone(write.value) as Record<string, unknown>; delete value[field];
     f.store.write({ ...write, value });
     const before = canonical(f.store.list());
@@ -424,7 +495,7 @@ test('A6 missing mandatory intent fields refuse before E1 and physical dispatch'
 
 test('A6 missing saved result fields cannot be read as a producer-checked analysis', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const field of ['contract', 'intent', 'transport', 'state', 'cause', 'error', 'goals', 'basis']) {
-    const f = fixture(t), before = preserved(f); scenario(f);
+    const f = await fixture(t), before = preserved(f); scenario(f);
     const restore = observeWrites(f, writes => {
       for (const write of writes) if (write.kind === 'om-stop-review') delete (write.value as Record<string, unknown>)[field];
     });
@@ -435,41 +506,17 @@ test('A6 missing saved result fields cannot be read as a producer-checked analys
   }
 });
 
-test('A6 history rejects a real E1 and physical response bound to a different actual dispatch', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const f = fixture(t), prepared = ok(prepareStopAnalysis(f.store, f.request));
-  const intent = f.store.write(prepared.writes[0]!);
-  const alternative = new Environments(f.store).configure(f.project, { ...f.environment.value,
-    reviewer: { ...f.environment.value.reviewer, actor: 'substituted-reviewer', model: 'substituted-model' } }, f.environment.revision);
-  const call = JSON.parse(canonical({ ...prepared.intent.call,
-    dispatch: { ...f.request.dispatch, config: reference(alternative) } })) as AnyRecordCallRequest;
-  const admitted = ok(recordCall(f.store, f.project, call));
-  scenario(f);
-  const transport = ok(await runModelTransport(f.store, { project: f.project,
-    call: reference(f.store.get(admitted.call.id, 1)!), packet: JSON.parse(canonical(prepared.intent.packet)) as Json, role: 'reviewer' }));
-  assert.equal(transport.result.kind, 'answered'); assert.equal(f.sent()[0]!.model, 'substituted-model');
-  const returned = answer(f), id = intent.id.replace('om-analysis-intent:', 'om-stop-review:');
-  const imitation = f.store.write({ id, kind: 'om-stop-review', expected: 0, value: {
-    contract: 'om-stop-analysis/v1', projectId: f.project, intent: reference(intent), transport: reference(transport.record),
-    state: 'decided', cause: returned.cause, change: returned.change, error: null, block: 'analysis-block',
-    stop: 3, goals: [...f.series.value.stop!.goals].sort(), attempt: 3, row: null, class: null, basis: [],
-  } });
-  const before = canonical(f.store.list());
-  const denied = refusedWith(readStopAnalysis(f.store, { project: f.project, record: reference(imitation) }), 'analysis_invalid');
-  assert.equal(denied.at.field, 'transport');
-  refusedWith(await runStopAnalysis(f.store, f.request), 'analysis_invalid');
-  assert.equal(canonical(f.store.list()), before); assert.equal(f.sent().length, 1);
-});
 
 test('A6 an inherited saved stop cannot acquire a second reviewer call through a successor line', async t => {
-  const f = fixture(t); scenario(f);
+  const f = await fixture(t); scenario(f);
   const original = ok(await runStopAnalysis(f.store, f.request));
-  const successor = ok(openSeries(f.store, { project: f.project, block: 'analysis-block', line: 2,
+  const successor = ok(openSeries(f.store, { project: f.project, block: `${f.project}-consume-block`, line: 2,
     slice: 'workspace-v2', predecessor: reference(seriesNow(f)),
     basis: { ground: 'inputs-changed', text: 'The next input slice retains the unaddressed stop.' } }));
   assert.deepEqual(successor.value.stop, f.series.value.stop);
   const before = canonical(f.store.list());
   refusedWith(await runStopAnalysis(f.store, { ...f.request, series: reference(successor) }), 'analysis_conflict');
-  assert.equal(canonical(f.store.list()), before); assert.equal(f.store.list('call-record').length, 1);
+  assert.equal(canonical(f.store.list()), before); assert.equal(f.list('call-record').length, 1);
   f.restart();
   assert.deepEqual(ok(await runStopAnalysis(f.store, f.request)), original);
   refusedWith(await runStopAnalysis(f.store, { ...f.request, series: reference(successor) }), 'analysis_conflict');
@@ -477,7 +524,7 @@ test('A6 an inherited saved stop cannot acquire a second reviewer call through a
 });
 
 test('A6 the exact checked intent cannot change between preparation and E1 admission', async t => {
-  const f = fixture(t), prepared = ok(prepareStopAnalysis(f.store, f.request));
+  const f = await fixture(t), prepared = ok(prepareStopAnalysis(f.store, f.request));
   const intent = f.store.write(prepared.writes[0]!), other = new Store(f.database); t.after(() => other.close());
   const original = f.store.get.bind(f.store); let raced = false;
   f.store.get = ((id: string, revision?: number) => {
@@ -490,12 +537,12 @@ test('A6 the exact checked intent cannot change between preparation and E1 admis
   }) as Store['get'];
   try { refusedWith(await runStopAnalysis(f.store, f.request), 'input_stale'); } finally { f.store.get = original; }
   assert.equal(raced, true); assert.equal(f.store.get(intent.id)!.revision, intent.revision + 1);
-  assert.equal(f.store.list('call-record').length, 0); assert.equal(f.store.list('model-call').length, 0);
+  assert.equal(f.list('call-record').length, 0); assert.equal(f.list('model-call').length, 0);
   assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(f.sent().length, 0);
 });
 
 for (const prefix of ['intent', 'E1', 'response', 'result'] as const) test(`A6 restart after the durable ${prefix} prefix completes one physical call and one result`, async t => {
-  const f = fixture(t); scenario(f);
+  const f = await fixture(t); scenario(f);
   const original = f.store.writeMany.bind(f.store); let stopped = false;
   f.store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => {
     const records = original(writes, guards);
@@ -513,18 +560,17 @@ for (const prefix of ['intent', 'E1', 'response', 'result'] as const) test(`A6 r
   f.restart();
   const result = ok(await runStopAnalysis(f.store, f.request));
   assert.equal(result.value.state, 'decided'); assert.equal(f.sent().length, 1);
-  assert.equal(f.store.list('call-record').length, 1); assert.equal(f.store.list('model-call').length, 1);
+  assert.equal(f.list('call-record').length, 1); assert.equal(f.list('model-call').length, 1);
   assert.equal(f.store.list('om-stop-review').length, 1);
-  assert.deepEqual(f.store.list<{ usage: unknown }>('model-call').map(record => record.value.usage), [usage]);
-  assert.deepEqual(f.store.list<{ calls: Array<{ usage: unknown }> }>('om-call-ledger')
-    .flatMap(record => record.value.calls.map(call => call.usage)), [usage]);
+  assert.deepEqual(f.list<{usage: unknown}>('model-call').map(record => record.value.usage), [usage]);
+  assert.deepEqual(f.calls<{ usage: unknown }>().map(call => call.usage), [usage]);
   const saved = canonical(f.store.list());
   assert.deepEqual(ok(await runStopAnalysis(f.store, f.request)), result);
   assert.equal(canonical(f.store.list()), saved); assert.equal(f.sent().length, 1);
 });
 
 test('A6 a durable running claim before spawn retains its reservation through restart and cannot resend', async t => {
-  const f = fixture(t); scenario(f);
+  const f = await fixture(t); scenario(f);
   const original = f.store.writeMany.bind(f.store); let stopped = false;
   f.store.writeMany = ((writes: Write[], guards: TransactionGuard[] = []) => {
     const records = original(writes, guards);
@@ -537,17 +583,17 @@ test('A6 a durable running claim before spawn retains its reservation through re
   try { await assert.rejects(runStopAnalysis(f.store, f.request), /fixture stopped after durable running claim/); }
   finally { f.store.writeMany = original; }
   assert.equal(stopped, true); assert.equal(f.sent().length, 0);
-  const physical = f.store.list<{ status: string; usage: unknown }>('model-call');
+  const physical = f.list<{status: string; usage: unknown}>('model-call');
   assert.equal(physical.length, 1); assert.equal(physical[0]!.value.status, 'running'); assert.equal(physical[0]!.value.usage, null);
   f.restart(); const saved = canonical(f.store.list());
   for (let repeat = 0; repeat < 2; repeat++) refusedWith(await runStopAnalysis(f.store, f.request), 'model_call_in_progress');
-  assert.equal(canonical(f.store.list()), saved); assert.equal(f.store.list('call-record').length, 1);
-  assert.equal(f.store.list('model-call').length, 1); assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(f.sent().length, 0);
+  assert.equal(canonical(f.store.list()), saved); assert.equal(f.list('call-record').length, 1);
+  assert.equal(f.list('model-call').length, 1); assert.equal(f.store.list('om-stop-review').length, 0); assert.equal(f.sent().length, 0);
 });
 
 for (const boundary of ['E1', 'E4'] as const) for (const mode of ['absent', 'contradiction'] as const)
   test(`A6 ${boundary} preserves ${mode} transaction guards without partial records`, async t => {
-    const f = fixture(t); scenario(f);
+    const f = await fixture(t); scenario(f);
     const prepared = ok(prepareStopAnalysis(f.store, f.request));
     const call = JSON.parse(canonical(prepared.intent.call)) as AnyRecordCallRequest;
     const id = 'analysis-dependency';
@@ -572,12 +618,12 @@ for (const boundary of ['E1', 'E4'] as const) for (const mode of ['absent', 'con
       assert.equal(denied.at.ref, undefined);
     } finally { restore(); }
     assert.equal(raced, true); assert.equal(f.sent().length, 0);
-    assert.equal(f.store.list('model-call').length, 0); assert.equal(f.store.list('project-dispatch').length, 0);
-    if (boundary === 'E1') { assert.equal(f.store.list('call-record').length, 0); assert.equal(f.store.list('om-call-ledger').length, 0); }
+    assert.equal(f.list('model-call').length, 0); assert.equal(f.list('project-dispatch').length, 0);
+    if (boundary === 'E1') { assert.equal(f.list('call-record').length, 0); assert.equal(f.list('om-call-ledger').length, 0); }
   });
 
 test('A6 two Stores resume one saved intent without a second physical request or charge', async t => {
-  const f = fixture(t); scenario(f);
+  const f = await fixture(t); scenario(f);
   const prepared = ok(prepareStopAnalysis(f.store, f.request)); f.store.writeMany([...prepared.writes], [...prepared.guards]);
   const other = new Store(f.database); t.after(() => other.close());
   const first = runStopAnalysis(f.store, f.request);
@@ -585,13 +631,12 @@ test('A6 two Stores resume one saved intent without a second physical request or
   if (!second.ok) assert.equal(second.refusal.code, 'model_call_in_progress');
   const result = ok(await first);
   assert.deepEqual(ok(await runStopAnalysis(other, f.request)), result);
-  assert.equal(f.sent().length, 1); assert.equal(f.store.list('model-call').length, 1);
-  assert.deepEqual(f.store.list<{ calls: Array<{ usage: unknown }> }>('om-call-ledger')
-    .flatMap(record => record.value.calls.map(call => call.usage)), [usage]);
+  assert.equal(f.sent().length, 1); assert.equal(f.list('model-call').length, 1);
+  assert.deepEqual(f.calls<{ usage: unknown }>().map(call => call.usage), [usage]);
 });
 
 test('LP6 rows 30, 31: a new intent is v2 — its packet shows the facts of every completion and a form that says the whole Ref with an example from its own sources; a declared Ref is accepted, its id as a string or a Ref outside the sources is refused, and cause and origin keep their rules', async t => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const prepared = ok(prepareStopAnalysis(f.store, f.request));
   assert.equal(prepared.intent.contract, 'om-stop-analysis/v2');
   assert.equal(prepared.intent.report.contract, 'om-stop-report/v2');
@@ -606,7 +651,7 @@ test('LP6 rows 30, 31: a new intent is v2 — its packet shows the facts of ever
     ['a Ref outside the sources', g => ({ text: 'Change another revision.', addresses: [{ ref: { ...g.request.series, revision: g.request.series.revision + 7 }, field: 'attempts' }] }), 'failed'],
   ];
   for (const [name, change, state] of changes) {
-    const g = fixture(t); g.steps([{ research: { ...answer(g), change: change(g) }, usage }]);
+    const g = await fixture(t); g.steps([{ research: { ...answer(g), change: change(g) }, usage }]);
     const result = ok(await runStopAnalysis(g.store, g.request));
     assert.equal(result.value.state, state, name);
     assert.equal(result.value.contract, 'om-stop-analysis/v2', `${name}: the result inherits the contract of its intent`);
@@ -614,103 +659,3 @@ test('LP6 rows 30, 31: a new intent is v2 — its packet shows the facts of ever
   }
 });
 
-// LP8 (№3620, №3622): a review whose physical response completed and was refused only for the wrapper of the old adapter
-// (here: `confirmed` missing from the envelope) is accepted once from its saved answer by the producer of A6.
-async function wrapperRefused(f: Fixture, research: unknown = answer(f)) {
-  f.steps([{ research, usage, confirmed: null }]);
-  const failed = ok(await runStopAnalysis(f.store, f.request));
-  assert.equal(failed.id.startsWith(`${STOP_ANALYSIS_FAILURE_KIND}:${f.project}:`), true);
-  assert.deepEqual([failed.value.state, failed.value.error?.code, failed.value.error?.at.field], ['failed', 'model_adapter_response_invalid', 'confirmed']);
-  return failed;
-}
-const recovery = (f: Fixture, failure: Ref, project = f.project) => writeStopAnalysisRecovery(f.store, { project, failure });
-
-test('LP8 a review refused only for the old adapter wrapper is accepted once from its saved answer: no model call, its refusal and transport unchanged, repeat, reopen and the next run return it', async t => {
-  const f = fixture(t), failed = await wrapperRefused(f), failure = reference(failed);
-  const kept = canonical(f.store.list().filter(record => record.kind !== 'repair-series'));
-  assert.equal(stopAnalysisRecoverable(f.store, f.project, failure), true);
-  assert.equal(readRecoveredStopAnalysis(f.store, f.project, failure), null);
-  const recovered = ok(recovery(f, failure));
-  assert.equal(recovered.value.state, 'decided');
-  assert.deepEqual([recovered.value.cause, recovered.value.change], [answer(f).cause, answer(f).change]);
-  assert.deepEqual(recovered.value.recovery!.failure, failure);
-  assert.deepEqual([recovered.value.intent, recovered.value.transport], [failed.value.intent, failed.value.transport]);
-  assert.equal(recovered.value.error, null);
-  assert.equal(f.sent().length, 1, 'The saved answer is accepted without another model call');
-  const exchange = f.store.get(recovered.value.recovery!.exchange.id, recovered.value.recovery!.exchange.revision)!;
-  assert.deepEqual(reference(exchange), recovered.value.recovery!.exchange);
-  for (const record of JSON.parse(kept) as { id: string; revision: number; hash: string }[])
-    assert.equal(f.store.get(record.id, record.revision)!.hash, record.hash, `${record.id} is not changed by the recovery`);
-  assert.deepEqual(ok(recovery(f, failure)), recovered, 'A repeat returns the saved recovery');
-  const heads = canonical(f.store.list());
-  f.restart();
-  assert.deepEqual(ok(recovery(f, failure)), recovered, 'After reopening the same recovery is returned');
-  assert.deepEqual(readRecoveredStopAnalysis(f.store, f.project, failure), recovered);
-  assert.deepEqual(ok(await runStopAnalysis(f.store, f.request)), recovered, 'The next run of the same review returns the recovery');
-  assert.equal(canonical(f.store.list()), heads); assert.equal(f.sent().length, 1);
-});
-
-test('LP8 a recovered undecided review escalates its series in the same transaction as the review', async t => {
-  const f = fixture(t), failure = reference(await wrapperRefused(f, answer(f, { cause: null })));
-  let atomic = false;
-  const restore = observeWrites(f, writes => {
-    if (writes.some(write => write.kind === 'om-stop-review')) { assert.ok(writes.some(write => write.id === f.series.id)); atomic = true; }
-  });
-  let recovered;
-  try { recovered = ok(recovery(f, failure)); } finally { restore(); }
-  assert.equal(recovered.value.state, 'undecided'); assert.equal(atomic, true);
-  assert.equal(seriesNow(f).value.ladder.rung, 2);
-  assert.deepEqual(seriesNow(f).value.escalations.map(item => item.review), [reference(recovered)]);
-  assert.equal(f.sent().length, 1);
-});
-
-test('LP8 an empty, interrupted, content-refused, unparsable or foreign answer recovers nothing: the refusal stands, nothing is written or sent', async t => {
-  const cases: { name: string; prepare(f: Fixture): Promise<Ref>; project?: string; code: string }[] = [
-    { name: 'content refused by A6', code: 'analysis_invalid', async prepare(f) {
-      f.steps([{ research: { ...answer(f), protocol: 'another-protocol' }, usage }]);
-      const failed = ok(await runStopAnalysis(f.store, f.request)); assert.equal(failed.value.error?.code, 'analysis_response_invalid'); return reference(failed);
-    } },
-    { name: 'interrupted', code: 'analysis_invalid', async prepare(f) {
-      f.steps([{ research: answer(f), usage, exitCode: 1 }]);
-      const failed = ok(await runStopAnalysis(f.store, f.request)); assert.equal(failed.value.state, 'failed'); return reference(failed);
-    } },
-    { name: 'empty', code: 'analysis_invalid', async prepare(f) {
-      f.steps([{ rawStdout: '' }]);
-      const failed = ok(await runStopAnalysis(f.store, f.request)); assert.equal(failed.value.state, 'failed'); return reference(failed);
-    } },
-    { name: 'wrapper refused, answer unparsable', code: 'analysis_response_invalid',
-      prepare: async f => reference(await wrapperRefused(f, { ...answer(f), change: { text: 'No changed address is named.', addresses: [] } })) },
-    { name: 'another project', code: 'analysis_invalid', project: 'elsewhere', prepare: async f => reference(await wrapperRefused(f)) },
-  ];
-  for (const item of cases) {
-    const f = fixture(t), failure = await item.prepare(f), heads = canonical(f.store.list()), sent = f.sent().length;
-    if (!item.project) assert.equal(stopAnalysisRecoverable(f.store, f.project, failure), false, item.name);
-    const refused = recovery(f, failure, item.project);
-    assert.equal(refused.ok, false, item.name);
-    if (!refused.ok) assert.deepEqual([refused.refusal.code, refused.refusal.at.target], [item.code, failure.id], item.name);
-    assert.equal(canonical(f.store.list()), heads, `${item.name}: nothing is written`);
-    assert.equal(f.sent().length, sent, `${item.name}: nothing is sent`);
-    assert.equal(readRecoveredStopAnalysis(f.store, item.project ?? f.project, failure), null);
-  }
-});
-
-test('LP8 a recovery request names its project and the exact refused review; a guarded head moved before the write refuses it whole', async t => {
-  const f = fixture(t), failure = reference(await wrapperRefused(f));
-  for (const request of [{ project: f.project }, { failure }, { project: '', failure }, { project: f.project, failure: { id: failure.id } },
-    { project: f.project, failure, extra: true }, null])
-    assert.throws(() => writeStopAnalysisRecovery(f.store, request as never), (error: unknown) => error instanceof EngineError && error.code === 'analysis_request_invalid');
-  assert.throws(() => writeStopAnalysisRecovery({} as never, { project: f.project, failure }), (error: unknown) => error instanceof EngineError && error.code === 'analysis_request_invalid');
-  // Т7: between the acceptance and its write another Store moves a guarded head (the review address is taken).
-  const heads = canonical(f.store.list());
-  const restore = observeWrites(f, writes => {
-    const review = writes.find(write => write.kind === 'om-stop-review');
-    if (!review) return;
-    const other = new Store(f.database);
-    try { other.write({ id: review.id, kind: review.kind, expected: 0, value: { taken: true } }); } finally { other.close(); }
-  });
-  let raced;
-  try { raced = recovery(f, failure); } finally { restore(); }
-  assert.equal(raced.ok, false);
-  const after = (JSON.parse(canonical(f.store.list())) as { id: string; kind: string }[]).filter(record => record.kind !== 'om-stop-review');
-  assert.equal(canonical(after), canonical((JSON.parse(heads) as { id: string; kind: string }[])), 'Nothing else of the recovery is written');
-});

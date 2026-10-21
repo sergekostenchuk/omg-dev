@@ -1,9 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Store, type Revision } from "../src/storage/store.js";
+import { fileURLToPath } from "node:url";
+import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
 import { hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -21,27 +22,37 @@ import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
+import { preparedField } from "./preparation-fixture.js";
+import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
+import { prepareAnswerTask } from "../src/om/accepted-answer.js";
+import { writeGaps, type GapReadRequest, type GapRecord, type GapRequest } from "../src/om/gaps.js";
+import { gapLineExpectedResult, gapLineKey } from "../src/om/gap-lines.js";
+import { assessFact } from "../src/om/assessment.js";
+import { runModelCall } from "../src/om/model-call.js";
+import { writeQuestionPacket } from "../src/om/question-packet.js";
+import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
 
 import { journalId, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND, normalizeOriginSource } from "../src/om/refusal-journal.js";
 import {
-  beginAttempt, completeAttempt, escalateSeries, openSeries, ownerDecisionNamespace, resumeSeries, seriesId, stopReviewNamespace,
+  escalateSeries, openSeries, ownerDecisionNamespace, resumeSeries, seriesId, stopReviewNamespace,
   COMPLETION_REASONS, REPAIR_SERIES_KIND, STOP_REVIEW_KIND, OWNER_DECISION_KIND,
-  type AttemptGoal, type ClaimedOutcome, type ClaimedRefusal, type RepairSeries, type SeriesRequest,
+  type AttemptGoal, type ClaimedRefusal, type RepairSeries, type SeriesRequest,
 } from "../src/om/series.js";
 import {
-  closeAttempt, liftOriginHold, openAttempt, originAnalysisNamespace, originDecisionNamespace, readStopContext, stopContext,
+  closeAttempt, liftOriginHold, openAttempt, originAnalysisNamespace, originDecisionNamespace, prepareManagedClaim,
+  readStopContext, stopContext,
   ADDRESSEE_KINDS, ORIGIN_ANALYSIS_KIND, ORIGIN_DECISION_KIND, ORIGIN_HOLD_KIND, REFUSAL_CLASSES,
   type GateOutcome, type OriginHold, type RefusalClass, type RepeatOutcome,
 } from "../src/om/repeat-gate.js";
 import {
   checkStanding, stopReport,
-  CLAIM_SUBJECTS, REMEDY_KINDS, REPORT_AUDIENCES, STOP_REPORT_CODES, STOP_SUBJECTS, STOP_SUBJECT_DECISIONS, STOP_SUBJECT_DECISIONS_V2, REMEDY_OUTCOMES,
+  CLAIM_SUBJECTS, REMEDY_KINDS, REPORT_AUDIENCES, STOP_REPORT_CODES, STOP_SUBJECTS, STOP_SUBJECT_DECISIONS, REMEDY_OUTCOMES,
   type StopFacts, type StopReport,
 } from "../src/om/stop-report.js";
 
 const UNIT = "om-stop-report";
 const PROJECT = "alpha";
-const BLOCK = "block:cart";
+const blockOf = (project: string): string => `${project}-consume-block`;
 const SLICE = "slice:cart@1";
 const SUBJECT = "artifact:cart";
 const typedDefect = (error: unknown): boolean =>
@@ -52,6 +63,7 @@ function fixture(t: test.TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-om-report-"));
   const path = join(root, "live.sqlite");
   const store = new Store(path);
+  storeRoots.set(store, { root, path });
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   return { root, path, store };
 }
@@ -84,17 +96,23 @@ const hex = (seed: string): string => seed.repeat(64).slice(0, 64);
 let unique = 0;
 const next = (): number => (unique += 1);
 
-const address = (project: string, line = 1): SeriesRequest => ({ project, block: BLOCK, line });
-const at = (project: string, line = 1): string => seriesId(project, BLOCK, line);
+const address = (project: string, line = 1): SeriesRequest => ({ project, block: blockOf(project), line });
+const at = (project: string, line = 1): string => seriesId(project, blockOf(project), line);
 
 /** Exact accepted sources: the initial L1 has no local operation artifact; accepted OM L2 does. */
-const definitionFixtures = new WeakMap<Store, Map<string, { first: FrameRequest; accepted: FrameRequest; upper: Graph; subject: string }>>();
+interface DefinitionFixture {
+  first: FrameRequest; accepted: FrameRequest; upper: Graph; subject: string;
+  project: string; input: Ref; route: Revision<RoutesRecord>; batch: RoutesRecord["batches"][number];
+  gap: Revision<GapRecord>; source: Revision<{ content: string }>; task: Ref;
+  graph: Ref; layer: Ref; frame: Ref; horizon: Ref;
+}
+const definitionFixtures = new WeakMap<Store, Map<string, DefinitionFixture>>();
 const sourceContexts = new Map<string, Record<string, unknown>>();
 function remember(ref: Ref, context: Record<string, unknown>): Ref {
   sourceContexts.set(`${ref.id}@${ref.revision}@${ref.hash}`, context); return ref;
 }
-function definitionFixture(store: Store, project: string, subject = SUBJECT) {
-  const cache = definitionFixtures.get(store) ?? new Map(); definitionFixtures.set(store, cache);
+function definitionFixture(store: Store, project: string, subject = SUBJECT): DefinitionFixture {
+  const cache = definitionFixtures.get(store) ?? new Map<string, DefinitionFixture>(); definitionFixtures.set(store, cache);
   const previous = cache.get(project); if (previous) return previous;
   const graph = gardenGraph("standard", project);
   const oldArtifact = `${project}-prep`;
@@ -102,12 +120,25 @@ function definitionFixture(store: Store, project: string, subject = SUBJECT) {
   for (const node of graph.nodes) if (node.outcome === oldArtifact) node.outcome = subject;
   for (const connector of graph.connectors) if (connector.artifact === oldArtifact) connector.artifact = subject;
   const { level: _level, ...upper } = projectGraph(graph, 1);
-  preparedFeatures(new ProductEngine(store), project, upper as Graph);
-  const input = deliveredOf(writeOmInput(store, { project, expected: 0,
+  // One repository-fact question of the block's own M6 stands behind every managed cycle of this project.
+  preparedFeatures(new ProductEngine(store), project, upper as Graph, field => {
+    const value = preparedField(project, field);
+    if (field === "preparation") (value as Record<string, Json>).unknowns =
+      ["cart-price", "price-1", "price-2", "price-3", "price-4", "price-5", "price-6", "price-7", "price-8"]
+        .map(id => ({ id, question: "which node produces the price of a cart line?", consumer: `${project}-consume-block`,
+          moment: "om-pass", blocksCurrentStage: false, resolution: "Resolve the addressed question during OM" }));
+    return value;
+  });
+  const base = deliveredOf(writeOmInput(store, { project, expected: 0,
     stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
-  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(store.get(`graph:${project}`)!),
+  const graphRef = reference(store.get<Graph>(`graph:${project}`)!);
+  const input = deliveredOf(writeAddressing(store, { project, input: reference(base), graph: graphRef,
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: reference(base), graph: graphRef, layers: [],
+      decision: { target: "discovery:cart-price", field: "address",
+        value: { consumer: `${project}-consume-block`, kind: "repository-fact" } } })) as Write }] }));
+  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: graphRef,
     refinement: null, choice: { choiceVersion: "origin-initial", features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
-  const first: FrameRequest = { project, level: 2, graph: reference(store.get(`graph:${project}`)!),
+  const first: FrameRequest = { project, level: 2, graph: graphRef,
     horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
   const read = deliveredOf(prepareFrame(store, first)), projected = projectGraph(graph, 2);
   const mapped = deliveredOf(fillObligations(read.upper as Graph, read.scope as FrameScope,
@@ -131,7 +162,29 @@ function definitionFixture(store: Store, project: string, subject = SUBJECT) {
   const accepted: FrameRequest = { ...first, graph: reference(applied.graph!), horizon: reference(nextHorizon.gate),
     layer: reference(applied.layer!), frame: reference(applied.frame!) };
   remember(first.graph, { kind: "frame", request: first }); remember(accepted.graph, { kind: "frame", request: accepted });
-  const built = { first, accepted, upper: upper as Graph, subject }; cache.set(project, built); return built;
+  // The managed work of every attempt of this project: the one MC1 batch of the addressed fact question.
+  const settledGraph = reference(applied.graph!), settledLayer = reference(applied.layer!), settledFrame = reference(applied.frame!);
+  const gapSources: GapRequest = { project, input: reference(input), graph: settledGraph, horizon: reference(nextHorizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: settledGraph, horizon: reference(nextHorizon.gate),
+      layer: settledLayer, frame: settledFrame, upper: null } },
+    works: { proposals: [], frame: { project, level: 3, graph: settledGraph, horizon: reference(nextHorizon.gate),
+      layer: null, frame: null, upper: { horizon: reference(nextHorizon.gate), frame: settledFrame } } } };
+  const gaps = deliveredOf(writeGaps(store, gapSources));
+  const gapRead: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const gap = gaps.records.find(row => row.value.gap.target === "discovery:cart-price"
+    && row.value.gap.kind === "repository-fact")!;
+  const task = deliveredOf(prepareAnswerTask(store, { project, input: reference(input), gaps: gapRead,
+    gap: reference(gap), requirements: [{ pointer: "/contracts/0" }], resultForm: { type: "string" } }));
+  const routed = deliveredOf(writeRoutes(store, { project, gaps: gapRead,
+    tasks: task.writes.length ? [{ pending: structuredClone(task.writes[0]!) as Write }] : [{ record: reference(task.record) }],
+    catalog: { paths: [], records: [] }, previous: null })) as Revision<RoutesRecord>;
+  const batch = routed.value.batches.find(item => item.model === "MC1"
+    && item.items.some(row => row.target === "discovery:cart-price"))!;
+  const source = store.get<{ content: string }>(`source:${project}:brief`)!;
+  const built: DefinitionFixture = { first, accepted, upper: upper as Graph, subject, project, input: reference(input),
+    route: routed, batch, gap: gap as Revision<GapRecord>, source, task: reference(task.record),
+    graph: settledGraph, layer: settledLayer, frame: settledFrame, horizon: reference(nextHorizon.gate) };
+  cache.set(project, built); return built;
 }
 
 /** Every named source belongs to this one explicit saved assembly, including its complete proposal set. */
@@ -228,16 +281,132 @@ const ordinalOf = (store: Store, project = PROJECT, line = 1): number => {
   return value.inherited.length + value.attempts.length + 1;
 };
 
-/** One completed cycle, closed AT THE GATE: the goal named first, then the outcome handed to G7 once. */
-function closed(store: Store, project: string, g: AttemptGoal, o: GateOutcome, line = 1): RepeatOutcome {
-  const attempt = ordinalOf(store, project, line);
-  deliveredOf(openAttempt(store, { ...address(project, line), attempt, goal: g }));
-  return deliveredOf(closeAttempt(store, { ...address(project, line), attempt, outcome: o }));
+/** The physical dispatch of this project's model cycles: one adapter and one environment on the test's workspace. */
+interface Dispatch { adapter: Ref; config: Ref; scenario: string; database: string; root: string; steps: unknown[] }
+const adapterFixture = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
+const traceUsage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
+const storeRoots = new WeakMap<Store, { root: string; path: string }>();
+const dispatches = new WeakMap<Store, Map<string, Dispatch>>();
+function dispatchOf(store: Store, project: string): Dispatch {
+  const cache = dispatches.get(store) ?? new Map<string, Dispatch>(); dispatches.set(store, cache);
+  const found = cache.get(project); if (found) return found;
+  const { root, path } = storeRoots.get(store)!, scenario = join(root, `report-scenario-${project}.json`);
+  const command = { executable: process.execPath,
+    args: [adapterFixture, "--scenario", scenario, "--trace", join(root, `report-trace-${project}.jsonl`)] };
+  const config = reference(new ProductEngine(store).environments.configure(project, {
+    workspace: root,
+    implementer: { actor: "report-implementer", model: "fixture", effort: "high", command },
+    reviewer: { actor: "report-reviewer", model: "fixture-reviewer", effort: "medium", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000, requestCapacityChars: 100_000,
+  }, store.get(`environment:${project}`)?.revision ?? 0));
+  const adapter = reference(store.write({ id: `adapter:${project}:report`, kind: "dispatch-adapter", expected: 0,
+    value: { projectId: project, protocol: "codex-stdio" } }));
+  const built = { adapter, config, scenario, database: path, root, steps: [] }; cache.set(project, built); return built;
+}
+
+/** The goal the M6 batch itself dictates: the caller keeps only the key it tracks the window by. */
+const goalOf = (project: string, batch: RoutesRecord["batches"][number], g: AttemptGoal): AttemptGoal => ({ key: g.key,
+  questions: batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+  result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) });
+
+/** The verdict the independent assessor returns so the gate derives the outcome the caller asks for. */
+const verdictOf = (o: GateOutcome): "supported" | "off-form" | "interrupted" =>
+  o.reason === "result" ? "supported" : o.reason === "interrupted" ? "interrupted" : "off-form";
+
+/**
+ * The current lawful managed plan of one project. An accepted answer closes its gap under its exact basis for good:
+ * the routing era reads the search index and no longer selects that item. Every cycle AFTER a result therefore opens
+ * the successor chain the owner decided on — a new input addressing the next named unknown, its horizon, its gaps,
+ * the tasks of every fact gap of that source and the explicit successor routes — and picks the whole MC1 batch of
+ * this consumer, which holds the still-open work only.
+ */
+interface PlanState { input: Ref; routes: Revision<RoutesRecord>; batch: RoutesRecord["batches"][number]; unknown: number; spent: boolean }
+const planStates = new WeakMap<Store, Map<string, PlanState>>();
+const UNKNOWN_IDS = ["cart-price", "price-1", "price-2", "price-3", "price-4", "price-5", "price-6", "price-7", "price-8"];
+const targetOf = (unknown: number): string => `discovery:${UNKNOWN_IDS[unknown]!}`;
+
+function advancePlan(store: Store, f: DefinitionFixture, s: PlanState): void {
+  s.unknown += 1;
+  const target = targetOf(s.unknown), project = f.project;
+  const input = deliveredOf(writeAddressing(store, { project, input: s.input, graph: f.graph,
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project, input: s.input, graph: f.graph, layers: [],
+      decision: { target, field: "address", value: { consumer: `${project}-consume-block`, kind: "repository-fact" } } })) as Write }] }));
+  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: f.graph,
+    refinement: f.layer, choice: { choiceVersion: `cycle-${project}-${s.unknown}`,
+      features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
+  const sources: GapRequest = { project, input: reference(input), graph: f.graph, horizon: reference(horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: f.graph, horizon: reference(horizon.gate),
+      layer: f.layer, frame: f.frame, upper: null } },
+    works: { proposals: [], frame: { project, level: 3, graph: f.graph, horizon: reference(horizon.gate),
+      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: f.frame } } } };
+  const gaps = deliveredOf(writeGaps(store, sources));
+  const gapRead: GapReadRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const tasks = gaps.records.filter(row => row.value.gap.kind === "repository-fact" && row.value.gap.code !== "inventory_missing" && !row.value.gap.deferral)
+    .map(row => deliveredOf(prepareAnswerTask(store, { project, input: reference(input), gaps: gapRead,
+      gap: reference(row), requirements: [{ pointer: "/contracts/0" }], resultForm: { type: "string" } })))
+    .map(task => task.writes.length ? { pending: structuredClone(task.writes[0]!) as Write } : { record: reference(task.record) });
+  const routed = deliveredOf(writeRoutes(store, { project, gaps: gapRead, tasks,
+    catalog: { paths: [], records: [] }, previous: reference(s.routes) })) as Revision<RoutesRecord>;
+  const batch = routed.value.batches.find(item => item.model === "MC1"
+    && item.items.some(row => row.consumers.includes(`${project}-consume-block`)))!;
+  s.input = reference(input); s.routes = routed; s.batch = batch; s.spent = false;
+}
+
+function planOf(store: Store, f: DefinitionFixture): PlanState {
+  const cache = planStates.get(store) ?? new Map<string, PlanState>(); planStates.set(store, cache);
+  let s = cache.get(f.project);
+  if (!s) {
+    s = { input: f.input, routes: f.route, batch: f.batch, unknown: 0, spent: false };
+    cache.set(f.project, s);
+  }
+  if (s.spent) advancePlan(store, f, s);
+  return s;
+}
+
+/**
+ * One completed cycle, closed AT THE GATE under the managed contract: the exact M6 plan opens the attempt, its real
+ * E2 packet pays E1+E4, the independent E5 verdict ends every fact of the batch, and G7 derives the outcome from that
+ * composition — never from a reason the caller hands it. The extra refusal rows of `o` travel with the close.
+ */
+async function managedCycle(store: Store, project: string, g: AttemptGoal, o: GateOutcome, line = 1): Promise<RepeatOutcome> {
+  const f = definitionFixture(store, project), d = dispatchOf(store, project), plan = planOf(store, f);
+  const attempt = ordinalOf(store, project, line), goal = goalOf(project, plan.batch, g);
+  const series = deliveredOf(openAttempt(store, { ...address(project, line), attempt, goal,
+    completion: { routes: reference(plan.routes), batches: [plan.batch.id] } }));
+  const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(plan.routes), batch: plan.batch.id,
+    environment: d.config, attempt: { series: reference(series), ordinal: attempt }, previous: [] })).record;
+  const answer = { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+    results: plan.batch.items.map(item => ({ questionId: item.gap, value: f.source.value.content.slice(0, 8),
+      citations: [{ source: reference(f.source), selector: { kind: "text-range", start: 0, end: f.source.value.content.length } }] })) };
+  const verdict = verdictOf(o);
+  const assessor = verdict === "supported" ? { research: { verdict, reasons: [] }, usage: traceUsage }
+    : verdict === "off-form" ? { research: { answer: "untyped reviewer reply" }, usage: traceUsage }
+    : { rawStdout: "{broken", exitCode: 7 };
+  d.steps.push({ research: answer, usage: traceUsage }, ...plan.batch.items.map(() => assessor));
+  writeFileSync(d.scenario, JSON.stringify({ database: d.database, steps: d.steps }));
+  const dsp = { adapter: d.adapter, config: d.config };
+  const original = deliveredOf(await runModelCall(store, { project, packet: reference(packet), dispatch: dsp, role: "implementer" }));
+  assert.equal(original.outcome?.kind, "fact-candidates");
+  for (const item of plan.batch.items) {
+    const terminal = deliveredOf(await assessFact(store, { project, modelCall: reference(original.record),
+      questionId: item.gap, dispatch: dsp }));
+    assert.equal(terminal.value.verdict, verdict);
+  }
+  const claim = deliveredOf(prepareManagedClaim(store, { ...address(project, line), attempt,
+    outcome: { reason: "result", accepting: [], cancelling: [], refusals: o.refusals } }));
+  assert.equal(claim.outcome.reason, o.reason, "the managed close derives the outcome the real composition proves");
+  const outcome = deliveredOf(closeAttempt(store, { ...address(project, line), attempt, outcome: claim.outcome }));
+  if (claim.outcome.reason === "result") plan.spent = true;
+  return outcome;
+}
+
+function closed(store: Store, project: string, g: AttemptGoal, o: GateOutcome, line = 1): Promise<RepeatOutcome> {
+  return managedCycle(store, project, g, o, line);
 }
 
 /** The record of an analysis of a stop — what A6 will write, and all this unit reads of it. */
 const reviewValue = (project: string, stop: number, goals: readonly string[], over: Record<string, unknown> = {}): Record<string, unknown> => ({
-  projectId: project, block: BLOCK, stop, goals: [...goals],
+  projectId: project, block: blockOf(project), stop, goals: [...goals],
   reviewer: { name: "a reviewer who is not the executor", independent: true },
   cause: "the same question goes to the same producer every cycle",
   change: { text: "ask M5 to address the gap before a layer is proposed", addresses: ["M5"] },
@@ -251,12 +420,12 @@ const storedReview = (store: Store, project: string, value: Record<string, unkno
   storedAs(store, STOP_REVIEW_KIND, `${stopReviewNamespace(project)}${next()}`, value);
 
 /** A series stopped after its third cycle without progress, every cycle refused by the SAME refusal of the input. */
-function stoppedAtThree(store: Store, project = PROJECT): { refusal: ClaimedRefusal; stopped: RepeatOutcome } {
+async function stoppedAtThree(store: Store, project = PROJECT): Promise<{ refusal: ClaimedRefusal; stopped: RepeatOutcome }> {
   opened(store, project);
   const refusal = artifactMissing(store, project, "input");
-  closed(store, project, goal(), refusedBy(refusal));
-  closed(store, project, goal(), refusedBy(refusal));
-  const stopped = closed(store, project, goal(), refusedBy(refusal));
+  await closed(store, project, goal(), refusedBy(refusal));
+  await closed(store, project, goal(), refusedBy(refusal));
+  const stopped = await closed(store, project, goal(), refusedBy(refusal));
   assert.equal(stopped.stop!.attempt, 3);
   return { refusal, stopped };
 }
@@ -271,14 +440,14 @@ const reportOf = (store: Store, project = PROJECT, line = 1): StopReport => deli
 
 // ---------------------------------------------------------------------------
 
-test("the explanation of a stop is assembled by code from the records, and both rungs are handed the SAME context", t => {
+test("the explanation of a stop is assembled by code from the records, and both rungs are handed the SAME context", async t => {
   const { store, path } = fixture(t);
-  const { refusal, stopped } = stoppedAtThree(store);
+  const { refusal, stopped } = await stoppedAtThree(store);
 
   const report = reportOf(store);
   assert.equal(report.series, at(PROJECT));
   assert.equal(report.project, PROJECT);
-  assert.equal(report.block, BLOCK);
+  assert.equal(report.block, blockOf(PROJECT));
   assert.equal(report.line, 1);
   // The rung and the audience are the SERIES' finding, reported here and derived again nowhere.
   assert.equal(report.rung, 1);
@@ -326,11 +495,11 @@ test("the explanation of a stop is assembled by code from the records, and both 
   assert.equal(hashJson(reportOf(back) as unknown as Json), hashJson(report as unknown as Json));
 });
 
-test("a stop the environment broke off is explained as a failure of the ENVIRONMENT, not of the product", t => {
+test("a stop the environment broke off is explained as a failure of the ENVIRONMENT, not of the product", async t => {
   const { store } = fixture(t);
   // Three cycles broken off, and not one refusal of the product recorded.
   opened(store);
-  for (let index = 0; index < 3; index += 1) closed(store, PROJECT, goal(), outcome({ reason: "interrupted" }));
+  for (let index = 0; index < 3; index += 1) await closed(store, PROJECT, goal(), outcome({ reason: "interrupted" }));
   assert.equal(heldSeries(store)!.value.stop!.attempt, 3);
 
   const broken = reportOf(store);
@@ -346,7 +515,7 @@ test("a stop the environment broke off is explained as a failure of the ENVIRONM
   // The same when the refusals themselves are refusals of the CONDITIONS — repository, workspace, executor.
   opened(store, "beta");
   const conditions = conditionsRefusal(store, "beta");
-  for (let index = 0; index < 3; index += 1) closed(store, "beta", goal(), refusedBy(conditions), 1);
+  for (let index = 0; index < 3; index += 1) await closed(store, "beta", goal(), refusedBy(conditions), 1);
   const owned = reportOf(store, "beta");
   assert.equal(owned.finding.subject, "environment");
   assert.deepEqual(owned.finding.rows, [conditions.row]);
@@ -361,13 +530,13 @@ test("a stop the environment broke off is explained as a failure of the ENVIRONM
   }
 });
 
-test("a cause the records do not establish is written down as NOT established, with the known facts", t => {
+test("a cause the records do not establish is written down as NOT established, with the known facts", async t => {
   const { store } = fixture(t);
   opened(store);
   // Two obstacles of two classes with two responsibles, and a cycle that came back off-form: nothing is singled out.
-  closed(store, PROJECT, goal(), refusedBy(artifactMissing(store, PROJECT, "input")));
-  closed(store, PROJECT, goal(), refusedBy(artifactMissing(store, PROJECT, "proposal")));
-  closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
+  await closed(store, PROJECT, goal(), refusedBy(artifactMissing(store, PROJECT, "input")));
+  await closed(store, PROJECT, goal(), refusedBy(artifactMissing(store, PROJECT, "proposal")));
+  await closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
 
   const report = reportOf(store);
   assert.equal(report.finding.subject, "unknown");
@@ -392,9 +561,9 @@ test("a cause the records do not establish is written down as NOT established, w
   // the explanation would then send the owner to the environment while an obstacle of the product stands as well.
   opened(store, "gamma");
   const conditions = conditionsRefusal(store, "gamma");
-  closed(store, "gamma", goal(), refusedBy(conditions));
-  closed(store, "gamma", goal(), refusedBy(artifactMissing(store, "gamma", "input")));
-  closed(store, "gamma", goal(), outcome({ reason: "off-form" }));
+  await closed(store, "gamma", goal(), refusedBy(conditions));
+  await closed(store, "gamma", goal(), refusedBy(artifactMissing(store, "gamma", "input")));
+  await closed(store, "gamma", goal(), outcome({ reason: "off-form" }));
   const mixed = reportOf(store, "gamma");
   assert.equal(mixed.finding.facts.classes.conditions, 1);
   assert.equal(mixed.finding.facts.classes.input, 1);
@@ -404,16 +573,16 @@ test("a cause the records do not establish is written down as NOT established, w
 
   // A window with no refusal at all and no cycle broken off is not an environment failure either.
   opened(store, "beta");
-  for (let index = 0; index < 3; index += 1) closed(store, "beta", goal(), outcome({ reason: "off-form" }));
+  for (let index = 0; index < 3; index += 1) await closed(store, "beta", goal(), outcome({ reason: "off-form" }));
   const silent = reportOf(store, "beta");
   assert.equal(silent.finding.subject, "unknown");
   assert.equal(silent.finding.facts.obstacles, 0);
   assert.ok(silent.finding.text.includes("0 obstacle(s)"));
 });
 
-test("the owner is handed the analysis that was made and why it did not help, and its cause stays a VERSION", t => {
+test("the owner is handed the analysis that was made and why it did not help, and its cause stays a VERSION", async t => {
   const { store } = fixture(t);
-  const { stopped } = stoppedAtThree(store);
+  const { stopped } = await stoppedAtThree(store);
   const first = reportOf(store);
   assert.equal(first.audience, "reviewer");
 
@@ -457,13 +626,13 @@ test("the owner is handed the analysis that was made and why it did not help, an
   assert.ok(text.includes("went to the owner"));
 
   // A window opened by a decided analysis that stopped again says exactly that, with the stop that closed it.
-  const { stopped: second } = stoppedAtThree(store, "beta");
+  const { stopped: second } = await stoppedAtThree(store, "beta");
   const decided = storedReview(store, "beta", reviewValue("beta", 3, second.stop!.goals));
   deliveredOf(resumeSeries(store, {
     ...address("beta"), stop: 3, ground: "review-record", text: "the review named a cause and a change", review: { ref: decided },
   }));
   const again = artifactMissing(store, "beta", "input");
-  for (let index = 0; index < 3; index += 1) closed(store, "beta", goal(), refusedBy(again));
+  for (let index = 0; index < 3; index += 1) await closed(store, "beta", goal(), refusedBy(again));
   const spent = reportOf(store, "beta");
   assert.equal(spent.audience, "owner");
   assert.equal(spent.remedies.length, 1);
@@ -474,12 +643,12 @@ test("the owner is handed the analysis that was made and why it did not help, an
   assert.equal(spent.proposed.length, 1);
 
   // A window that has not stopped again, where a HELD origin is what stands in the way, says that instead.
-  const { stopped: third } = stoppedAtThree(store, "gamma");
+  const { stopped: third } = await stoppedAtThree(store, "gamma");
   const allowed = storedReview(store, "gamma", reviewValue("gamma", 3, third.stop!.goals));
   deliveredOf(resumeSeries(store, {
     ...address("gamma"), stop: 3, ground: "review-record", text: "the review named a cause and a change", review: { ref: allowed },
   }));
-  closed(store, "gamma", goal(), refusedBy(unplacedRefusal(store, "gamma")));
+  await closed(store, "gamma", goal(), refusedBy(unplacedRefusal(store, "gamma")));
   const held = reportOf(store, "gamma");
   assert.equal(held.context.stop, null);
   assert.equal(held.finding.subject, "origin");
@@ -488,20 +657,20 @@ test("the owner is handed the analysis that was made and why it did not help, an
   assert.ok(held.lines.join("\n").includes("only its analysis or the owner's decision lifts the hold"));
 });
 
-test("every refusal code of this unit is produced, addressed and routed", t => {
+test("every refusal code of this unit is produced, addressed and routed", async t => {
   const { store } = fixture(t);
   const seen: string[] = [];
   const record = (refusal: Refusal, expected: string, target: string): void => { seen.push(addressed(refusal, expected, target).code); };
 
   // An analysis the series names that does not stand at the reference the series holds.
-  const { stopped } = stoppedAtThree(store, "p1");
+  const { stopped } = await stoppedAtThree(store, "p1");
   const gone = storedReview(store, "p1", reviewValue("p1", 3, stopped.stop!.goals, { cause: null }));
   deliveredOf(escalateSeries(store, { ...address("p1"), stop: 3, review: { ref: gone } }));
   forgeSeries(store, "p1", held => ({ ...held, escalations: [{ after: 3, review: { ...gone, hash: hex("d") } }] }));
   record(refusalOf(stopReport(store, address("p1"))), "analysis_unreadable", at("p1"));
 
   // An analysis that stands, and whose content is not the outcome the series placed it as.
-  const { stopped: second } = stoppedAtThree(store, "p2");
+  const { stopped: second } = await stoppedAtThree(store, "p2");
   const undecided = storedReview(store, "p2", reviewValue("p2", 3, second.stop!.goals, { cause: null }));
   deliveredOf(escalateSeries(store, { ...address("p2"), stop: 3, review: { ref: undecided } }));
   const decided = storedReview(store, "p2", reviewValue("p2", 3, second.stop!.goals));
@@ -509,19 +678,19 @@ test("every refusal code of this unit is produced, addressed and routed", t => {
   record(refusalOf(stopReport(store, address("p2"))), "analysis_invalid", at("p2"));
 
   // A report weighed again after a record it was assembled from has moved: the stop it explained is the owner's now.
-  const { stopped: third } = stoppedAtThree(store, "p3");
+  const { stopped: third } = await stoppedAtThree(store, "p3");
   const report = reportOf(store, "p3");
   const sent = storedReview(store, "p3", reviewValue("p3", 3, third.stop!.goals, { cause: null }));
   deliveredOf(escalateSeries(store, { ...address("p3"), stop: 3, review: { ref: sent } }));
   record(refusalOf(checkStanding(store, report)), "report_stale", at("p3"));
 
   // A report the unchanged records do not give.
-  stoppedAtThree(store, "p4");
+  await stoppedAtThree(store, "p4");
   const standing = reportOf(store, "p4");
   record(refusalOf(checkStanding(store, { ...standing, lines: [...standing.lines, "and the owner agreed"] })), "report_forged", at("p4"));
 
   // A journal row the series names and the journal does not hold.
-  stoppedAtThree(store, "p5");
+  await stoppedAtThree(store, "p5");
   forgeSeries(store, "p5", held => ({
     ...held,
     attempts: held.attempts.map((item, index) => (index === 0
@@ -532,12 +701,12 @@ test("every refusal code of this unit is produced, addressed and routed", t => {
   assert.deepEqual(seen.sort(), [...STOP_REPORT_CODES].sort());
 });
 
-test("an absent argument, an absent record and an absent set are typed refusals with an address (T4)", t => {
+test("an absent argument, an absent record and an absent set are typed refusals with an address (T4)", async t => {
   const { store } = fixture(t);
 
   // The shape of every argument is weighed before a field of it is touched or the store is read.
-  for (const request of [undefined, null, "alpha", 42, [], {}, { project: PROJECT }, { project: PROJECT, block: BLOCK },
-    { project: "", block: BLOCK, line: 1 }, { project: "a:b", block: BLOCK, line: 1 }, { project: PROJECT, block: BLOCK, line: "1" }]) {
+  for (const request of [undefined, null, "alpha", 42, [], {}, { project: PROJECT }, { project: PROJECT, block: blockOf(PROJECT) },
+    { project: "", block: blockOf(PROJECT), line: 1 }, { project: "a:b", block: blockOf(PROJECT), line: 1 }, { project: PROJECT, block: blockOf(PROJECT), line: "1" }]) {
     assert.throws(() => stopReport(store, request as unknown as SeriesRequest), typedDefect, String(request));
   }
   for (const broken of [undefined, null, {}, { get: () => null }]) {
@@ -550,14 +719,14 @@ test("an absent argument, an absent record and an absent set are typed refusals 
   assert.equal(missing.at.target, at(PROJECT));
   assert.ok(missing.message.length > 0);
   opened(store);
-  closed(store, PROJECT, goal(), outcome({ reason: "interrupted" }));
+  await closed(store, PROJECT, goal(), outcome({ reason: "interrupted" }));
   const quiet = refusalOf(stopReport(store, address(PROJECT)));
   assert.equal(quiet.code, "stop_absent");
   assert.equal(quiet.at.target, at(PROJECT));
 
   // A report weighed again is weighed as the report this unit assembles: a missing key, an extra one, an absent set
   // of guards and a guard that is not an exact reference are defects of the calling code, not values to read round.
-  const { stopped } = stoppedAtThree(store, "beta");
+  const { stopped } = await stoppedAtThree(store, "beta");
   assert.equal(stopped.stop!.attempt, 3);
   const report = reportOf(store, "beta");
   const { lines: _lines, ...without } = report;
@@ -570,7 +739,7 @@ test("an absent argument, an absent record and an absent set are typed refusals 
   assert.deepEqual(deliveredOf(checkStanding(store, report)), report);
 
   // An analysis whose record names no cause and no change at all is a broken record, not an outcome.
-  const { stopped: third } = stoppedAtThree(store, "p3");
+  const { stopped: third } = await stoppedAtThree(store, "p3");
   const usable = storedReview(store, "p3", reviewValue("p3", 3, third.stop!.goals, { cause: null }));
   deliveredOf(escalateSeries(store, { ...address("p3"), stop: 3, review: { ref: usable } }));
   for (const [part, value] of [["cause", undefined], ["change", undefined], ["cause", ""], ["change", []], ["change", {}]] as const) {
@@ -601,7 +770,8 @@ test("an absent argument, an absent record and an absent set are typed refusals 
 });
 
 const reportShape = (): StopReport => ({
-  project: PROJECT, block: BLOCK, line: 1, series: at(PROJECT), rung: 1, audience: "reviewer",
+  contract: "om-stop-report/v2", completionEvidence: [],
+  project: PROJECT, block: blockOf(PROJECT), line: 1, series: at(PROJECT), rung: 1, audience: "reviewer",
   context: {
     series: at(PROJECT), stop: null, holds: [], ladder: { rung: 1, goals: [], windows: [], grounds: [] },
     goals: [], accepted: [], repeated: [], endings: [], grounds: [],
@@ -611,9 +781,9 @@ const reportShape = (): StopReport => ({
   remedies: [], proposed: [], guards: [], lines: [],
 });
 
-test("a forged analysis is refused: another namespace, another kind, a changed hash, another stop, a status field", t => {
+test("a forged analysis is refused: another namespace, another kind, a changed hash, another stop, a status field", async t => {
   const { store } = fixture(t);
-  const { stopped } = stoppedAtThree(store);
+  const { stopped } = await stoppedAtThree(store);
   const goals = stopped.stop!.goals;
   const honest = storedReview(store, PROJECT, reviewValue(PROJECT, 3, goals, { cause: null }));
   deliveredOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: honest } }));
@@ -672,7 +842,7 @@ test("a forged analysis is refused: another namespace, another kind, a changed h
   }
 
   // The same the other way round: an analysis that decided nothing is not the one a stop was CONTINUED on.
-  const { stopped: second } = stoppedAtThree(store, "p2");
+  const { stopped: second } = await stoppedAtThree(store, "p2");
   const usable = storedReview(store, "p2", reviewValue("p2", 3, second.stop!.goals));
   deliveredOf(resumeSeries(store, {
     ...address("p2"), stop: 3, ground: "review-record", text: "the review named a cause and a change", review: { ref: usable },
@@ -682,16 +852,16 @@ test("a forged analysis is refused: another namespace, another kind, a changed h
     ...held,
     continuations: [{ ground: "review-record", text: "the review named a cause and a change", review: hollow, after: 3 }],
   }));
-  closed(store, "p2", goal(), refusedBy(artifactMissing(store, "p2", "input")));
-  closed(store, "p2", goal(), refusedBy(artifactMissing(store, "p2", "input")));
-  closed(store, "p2", goal(), refusedBy(artifactMissing(store, "p2", "input")));
+  await closed(store, "p2", goal(), refusedBy(artifactMissing(store, "p2", "input")));
+  await closed(store, "p2", goal(), refusedBy(artifactMissing(store, "p2", "input")));
+  await closed(store, "p2", goal(), refusedBy(artifactMissing(store, "p2", "input")));
   const found = addressed(refusalOf(stopReport(store, address("p2"))), "analysis_invalid", at("p2"));
   assert.equal(found.at.field, "continuations.3.cause");
 });
 
-test("a record that moved between this reading and a write on it is refused, never written through (T7)", t => {
+test("a record that moved between this reading and a write on it is refused, never written through (T7)", async t => {
   const { store } = fixture(t);
-  const { stopped } = stoppedAtThree(store);
+  const { stopped } = await stoppedAtThree(store);
   const report = reportOf(store);
   assert.deepEqual(deliveredOf(checkStanding(store, report)), report);
 
@@ -733,7 +903,7 @@ test("a record that moved between this reading and a write on it is refused, nev
   }
 });
 
-test("no model is called to assemble the explanation", t => {
+test("no model is called to assemble the explanation", async t => {
   const { store, path } = fixture(t);
   // The unit imports the engine's own records and nothing that could reach a vendor, a process or the network.
   const source = readFileSync(new URL("../../src/om/stop-report.ts", import.meta.url), "utf8");
@@ -748,7 +918,7 @@ test("no model is called to assemble the explanation", t => {
 
   // And the explanation is a function of the records alone: the same records, read twice and read again out of a
   // reopened base, give the same bytes. Nothing dated, random or answered by anybody enters it.
-  stoppedAtThree(store);
+  await stoppedAtThree(store);
   const first = reportOf(store);
   assert.equal(hashJson(reportOf(store) as unknown as Json), hashJson(first as unknown as Json));
   store.close();
@@ -758,7 +928,7 @@ test("no model is called to assemble the explanation", t => {
 });
 
 const facts = (over: Partial<StopFacts> = {}): StopFacts => ({
-  attempts: 3,
+  attempts: 3, transitions: 0,
   endings: counts(COMPLETION_REASONS, {}),
   obstacles: 0, repeating: 0,
   classes: counts(REFUSAL_CLASSES, {}),
@@ -773,7 +943,7 @@ function counts<Key extends string>(keys: readonly Key[], over: Partial<Record<K
 }
 
 test("the table of decision admits one subject for a tally at most, and every row of it is reachable", () => {
-  assert.deepEqual(STOP_SUBJECT_DECISIONS.map(row => row.subject), ["obstacle", "environment", "origin"]);
+  assert.deepEqual(STOP_SUBJECT_DECISIONS.map(row => row.subject), ["obstacle", "environment", "origin", "input-transition"]);
   const seen = new Set<string>();
   for (const proposal of [0, 1, 2]) for (const input of [0, 1]) for (const derivation of [0, 1]) for (const readiness of [0, 1]) {
     for (const conditions of [0, 1]) for (const unknown of [0, 1]) for (const unclassified of [0, 1]) {
@@ -794,8 +964,17 @@ test("the table of decision admits one subject for a tally at most, and every ro
       }
     }
   }
-  // LP6: the old table never says input-transition; that subject belongs to a report of the new era (below).
-  assert.deepEqual([...seen].sort(), STOP_SUBJECTS.filter(subject => subject !== "input-transition").sort());
+  for (const transitions of [0, 1, 2, 3]) for (const proposal of [0, 1]) for (const conditions of [0, 1]) for (const unknown of [0, 1])
+    for (const holds of [0, 1]) for (const addressees of [0, 1, 2]) for (const interrupted of [0, 1]) for (const refused of [0, 1]) {
+      const classes: Record<RefusalClass, number> = { proposal, input: 0, derivation: 0, readiness: 0, conditions, unknown };
+      const obstacles = REFUSAL_CLASSES.reduce((sum, item) => sum + classes[item], 0);
+      const tally = facts({ classes, holds, addressees, obstacles, repeating: obstacles, transitions,
+        attempts: transitions + interrupted + refused, endings: counts(COMPLETION_REASONS, { interrupted, refused }) });
+      const admitted = STOP_SUBJECT_DECISIONS.filter(row => row.sufficient(tally));
+      assert.ok(admitted.length <= 1, JSON.stringify(tally));
+      seen.add(admitted[0]?.subject ?? "unknown");
+    }
+  assert.deepEqual([...seen].sort(), [...STOP_SUBJECTS].sort());
 
   // The rows that matter, pinned: one responsible says a subject, two of them say nothing.
   const oneObstacle = facts({ classes: counts(REFUSAL_CLASSES, { input: 2 }), obstacles: 2, addressees: 1 });
@@ -823,7 +1002,7 @@ test("the table of decision admits one subject for a tally at most, and every ro
   })), []);
 });
 
-test("the vocabulary of this unit is closed, and what it hands out is a deep frozen copy (T11)", t => {
+test("the vocabulary of this unit is closed, and what it hands out is a deep frozen copy (T11)", async t => {
   const { store } = fixture(t);
   for (const table of [REPORT_AUDIENCES, STOP_SUBJECTS, REMEDY_KINDS, REMEDY_OUTCOMES, STOP_REPORT_CODES, CLAIM_SUBJECTS, STOP_SUBJECT_DECISIONS]) {
     assert.ok(Object.isFrozen(table));
@@ -836,7 +1015,7 @@ test("the vocabulary of this unit is closed, and what it hands out is a deep fro
   }, TypeError);
   for (const row of STOP_SUBJECT_DECISIONS) assert.ok(STOP_SUBJECTS.includes(row.subject));
 
-  stoppedAtThree(store);
+  await stoppedAtThree(store);
   const report = reportOf(store);
   assert.ok(deeplyFrozen(report));
   // A copy, sharing no object with the store or with the context the gate assembled.
@@ -849,18 +1028,17 @@ test("the vocabulary of this unit is closed, and what it hands out is a deep fro
 // ---------------------------------------------------------------------------
 // Journal record №184: history and heads, a later stop as no proof, belonging, and the content of a refusal.
 
-/** A cycle the SERIES records as having reached a new accepted result — a fixture of history: G7's providers are empty. */
-function progressed(store: Store, project: string, g: AttemptGoal, key: string, line = 1): number {
+/**
+ * A cycle the SERIES records as having reached a new accepted result: the managed MC1 answer is supported by the
+ * independent assessor, so G7 derives the 'result' outcome with the key the E5 provider itself derived for it.
+ */
+async function progressed(store: Store, project: string, g: AttemptGoal, line = 1): Promise<{ attempt: number; key: string }> {
   const attempt = ordinalOf(store, project, line);
-  const basis = reference(store.write({
-    id: `om-gap-line:${project}:${next()}`, kind: "om-gap-line", expected: 0, value: { closed: key } as Json,
-  }));
-  deliveredOf(beginAttempt(store, { ...address(project, line), attempt, goal: g }));
-  deliveredOf(completeAttempt(store, {
-    ...address(project, line), attempt,
-    outcome: { reason: "result", achieved: [{ key, basis }], cancelled: [], refusals: [] } as ClaimedOutcome,
-  }));
-  return attempt;
+  await managedCycle(store, project, g, { reason: "result", accepting: [], cancelling: [], refusals: [] }, line);
+  const achieved = heldSeries(store, project, line)!.value.attempts.find(item => item.ordinal === attempt)!
+    .outcome!.achieved;
+  assert.equal(achieved.length, 1);
+  return { attempt, key: achieved[0]!.key };
 }
 
 const onReview = (store: Store, project: string, stop: number, goals: readonly string[]) => ({
@@ -868,9 +1046,9 @@ const onReview = (store: Store, project: string, stop: number, goals: readonly s
   review: { ref: storedReview(store, project, reviewValue(project, stop, goals)) },
 });
 
-test("a historical ground is read at its exact reference: a newer revision of an analysis leaves the report standing", t => {
+test("a historical ground is read at its exact reference: a newer revision of an analysis leaves the report standing", async t => {
   const { store } = fixture(t);
-  const { stopped } = stoppedAtThree(store);
+  const { stopped } = await stoppedAtThree(store);
   const goals = stopped.stop!.goals;
   const undecided = storedReview(store, PROJECT, reviewValue(PROJECT, 3, goals, { cause: null }));
   deliveredOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: undecided } }));
@@ -889,13 +1067,13 @@ test("a historical ground is read at its exact reference: a newer revision of an
   assert.deepEqual(deliveredOf(checkStanding(store, report)), report);
 
   // The same for the analysis a CONTINUATION stands on, and the other way round: a later revision without a change.
-  const { stopped: second } = stoppedAtThree(store, "beta");
+  const { stopped: second } = await stoppedAtThree(store, "beta");
   const decided = storedReview(store, "beta", reviewValue("beta", 3, second.stop!.goals));
   deliveredOf(resumeSeries(store, {
     ...address("beta"), stop: 3, ground: "review-record", text: "the review named a cause and a change", review: { ref: decided },
   }));
   const again = artifactMissing(store, "beta", "input");
-  for (let index = 0; index < 3; index += 1) closed(store, "beta", goal(), refusedBy(again));
+  for (let index = 0; index < 3; index += 1) await closed(store, "beta", goal(), refusedBy(again));
   const spent = reportOf(store, "beta");
   assert.equal(spent.guards.some(ref => ref.id === decided.id), false);
   assert.equal(spent.remedies[0]!.outcome, "window-stopped-again");
@@ -907,20 +1085,20 @@ test("a historical ground is read at its exact reference: a newer revision of an
   assert.deepEqual(deliveredOf(checkStanding(store, spent)), spent);
 });
 
-test("the guards are every mutable head that was read, the LIFTED hold of the gate's own reading among them", t => {
+test("the guards are every mutable head that was read, the LIFTED hold of the gate's own reading among them", async t => {
   const { store } = fixture(t);
   opened(store);
   const refusal = unplacedRefusal(store, PROJECT);
-  const first = closed(store, PROJECT, goal(), refusedBy(refusal));
+  const first = await closed(store, PROJECT, goal(), refusedBy(refusal));
   const hold = first.holds[0]!;
   const raised = store.get<OriginHold>(hold.id)!.value;
   // The owner decided about that origin, so the hold is lifted and the series goes on.
   const decision = storedAs(store, ORIGIN_DECISION_KIND, `${originDecisionNamespace(PROJECT)}${next()}`, {
-    projectId: PROJECT, block: BLOCK, attempt: raised.attempt, row: raised.row,
+    projectId: PROJECT, block: blockOf(PROJECT), attempt: raised.attempt, row: raised.row,
     decided: "go on: I have read the origin and the facts, and the refusal stays where it is",
   });
   deliveredOf(liftOriginHold(store, { project: PROJECT, hold, ground: "owner-decision", record: { ref: decision } }));
-  for (let index = 0; index < 2; index += 1) closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
+  for (let index = 0; index < 2; index += 1) await closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
 
   const report = reportOf(store);
   assert.equal(report.context.stop!.attempt, 3);
@@ -960,20 +1138,21 @@ test("the guards are every mutable head that was read, the LIFTED hold of the ga
   })).length, 1);
 });
 
-test("a continuation an accepted result followed is not the remedy that failed, whatever stopped the series later", t => {
+test("a continuation an accepted result followed is not the remedy that failed, whatever stopped the series later", async t => {
   const { store } = fixture(t);
-  const { stopped } = stoppedAtThree(store);
+  const { stopped } = await stoppedAtThree(store);
   const goals = stopped.stop!.goals;
   deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...onReview(store, PROJECT, 3, goals) }));
   // Attempt 4 reaches a new accepted result of the very goal the ladder stood for: the window opened by the
   // continuation ends THERE, and the ladder goes back to its start.
-  assert.equal(progressed(store, PROJECT, goal(), "line:cart:price"), 4);
+  const reached = await progressed(store, PROJECT, goal());
+  assert.equal(reached.attempt, 4);
   const later = artifactMissing(store, PROJECT, "input");
-  for (let index = 0; index < 3; index += 1) closed(store, PROJECT, goal(), refusedBy(later));
+  for (let index = 0; index < 3; index += 1) await closed(store, PROJECT, goal(), refusedBy(later));
 
   const report = reportOf(store);
   assert.equal(report.context.stop!.attempt, 7);
-  assert.deepEqual(report.context.accepted, ["line:cart:price"]);
+  assert.deepEqual(report.context.accepted, [reached.key]);
   assert.equal(report.rung, 1);
   assert.equal(report.audience, "reviewer");
   assert.equal(report.remedies.length, 1);
@@ -983,13 +1162,13 @@ test("a continuation an accepted result followed is not the remedy that failed, 
   // window that the accepted result opened.
   assert.equal(remedy.outcome, "result-followed");
   assert.ok(remedy.explained.includes("ended at attempt 4"));
-  assert.ok(remedy.explained.includes("line:cart:price"));
+  assert.ok(remedy.explained.includes(reached.key));
   assert.ok(remedy.explained.includes("the goal the ladder stands for") === false || report.rung === 1);
   assert.equal(remedy.explained.includes("without"), false);
   assert.equal(remedy.explained.includes("closed in the stop after attempt 7"), false);
   const text = report.lines.join("\n");
   assert.ok(text.includes("not in this one"));
-  assert.ok(text.includes("Accepted results of these goals: line:cart:price."));
+  assert.ok(text.includes(`Accepted results of these goals: ${reached.key}.`));
 
   // And the same when the history is INHERITED by a successor of the series: the result is still in it.
   const predecessor = reference(heldSeries(store, PROJECT)!);
@@ -999,16 +1178,16 @@ test("a continuation an accepted result followed is not the remedy that failed, 
   }));
   const inherited = reportOf(store, PROJECT, 2);
   assert.equal(inherited.context.stop!.attempt, 7);
-  assert.deepEqual(inherited.context.accepted, ["line:cart:price"]);
+  assert.deepEqual(inherited.context.accepted, [reached.key]);
   assert.equal(inherited.remedies.length, 1);
   assert.equal(inherited.remedies[0]!.outcome, "result-followed");
   assert.ok(inherited.remedies[0]!.explained.includes("ended at attempt 4"));
 
   // A window that no accepted result followed is still reported as closed by the stop that closed it.
-  const { stopped: second } = stoppedAtThree(store, "beta");
+  const { stopped: second } = await stoppedAtThree(store, "beta");
   deliveredOf(resumeSeries(store, { ...address("beta"), stop: 3, ...onReview(store, "beta", 3, second.stop!.goals) }));
   const dry = artifactMissing(store, "beta", "input");
-  for (let index = 0; index < 3; index += 1) closed(store, "beta", goal(), refusedBy(dry));
+  for (let index = 0; index < 3; index += 1) await closed(store, "beta", goal(), refusedBy(dry));
   const nothing = reportOf(store, "beta");
   assert.equal(nothing.remedies[0]!.outcome, "window-stopped-again");
   assert.ok(nothing.remedies[0]!.explained.includes("closed in the stop after attempt 6"));
@@ -1016,19 +1195,19 @@ test("a continuation an accepted result followed is not the remedy that failed, 
 });
 
 /** A stop counted over cycles of TWO goals: the run ends at an attempt of the second one. */
-function stoppedOnTwoGoals(store: Store, project: string): RepeatOutcome {
+async function stoppedOnTwoGoals(store: Store, project: string): Promise<RepeatOutcome> {
   opened(store, project);
   const refusal = artifactMissing(store, project, "input");
-  closed(store, project, goal(), refusedBy(refusal));
-  closed(store, project, goal(), refusedBy(refusal));
-  const stopped = closed(store, project, goal({ key: "gap:cart:tax" }), refusedBy(refusal));
+  await closed(store, project, goal(), refusedBy(refusal));
+  await closed(store, project, goal(), refusedBy(refusal));
+  const stopped = await closed(store, project, goal({ key: "gap:cart:tax" }), refusedBy(refusal));
   assert.deepEqual(stopped.stop!.goals, ["gap:cart:price", "gap:cart:tax"]);
   return stopped;
 }
 
-test("an analysis of other goals is no explanation of this stop, however exact its reference", t => {
+test("an analysis of other goals is no explanation of this stop, however exact its reference", async t => {
   const { store } = fixture(t);
-  const { stopped } = stoppedAtThree(store);
+  const { stopped } = await stoppedAtThree(store);
   const goals = stopped.stop!.goals;
   const honest = storedReview(store, PROJECT, reviewValue(PROJECT, 3, goals, { cause: null }));
   deliveredOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: honest } }));
@@ -1048,7 +1227,7 @@ test("an analysis of other goals is no explanation of this stop, however exact i
   assert.equal(refusalOf(checkStanding(store, report)).code, "report_stale");
 
   // The goals of a stop are an unordered set: the same two in the other order are the same goals (T6).
-  stoppedOnTwoGoals(store, "delta");
+  await stoppedOnTwoGoals(store, "delta");
   const reversed = storedReview(store, "delta", reviewValue("delta", 3, ["gap:cart:tax", "gap:cart:price"], { cause: null }));
   deliveredOf(escalateSeries(store, { ...address("delta"), stop: 3, review: { ref: reversed } }));
   const fine = reportOf(store, "delta");
@@ -1059,11 +1238,11 @@ test("an analysis of other goals is no explanation of this stop, however exact i
   assert.equal(refusalOf(stopReport(store, address("delta"))).at.field, "escalations.3.goals");
 
   // A stop already ANSWERED keeps its exact goals in the history of the line, so the comparison stays exact there too.
-  const answered = stoppedOnTwoGoals(store, "eps");
+  const answered = await stoppedOnTwoGoals(store, "eps");
   const both = answered.stop!.goals;
   deliveredOf(resumeSeries(store, { ...address("eps"), stop: 3, ...onReview(store, "eps", 3, both) }));
   const elsewhere = artifactMissing(store, "eps", "input");
-  for (let index = 0; index < 3; index += 1) closed(store, "eps", goal({ key: "gap:cart:ship" }), refusedBy(elsewhere));
+  for (let index = 0; index < 3; index += 1) await closed(store, "eps", goal({ key: "gap:cart:ship" }), refusedBy(elsewhere));
   const continued = reportOf(store, "eps");
   assert.equal(continued.context.stop!.attempt, 6);
   assert.deepEqual(continued.context.stop!.goals, ["gap:cart:ship"]);   // the ladder says THIS stop's goals, not those
@@ -1092,7 +1271,7 @@ test("an analysis of other goals is no explanation of this stop, however exact i
   assert.deepEqual(reordered.remedies[0]!.claims.map(claim => claim.what), [...CLAIM_SUBJECTS]);
 });
 
-test("the explanation carries the content of the journal rows of the window, and a recorded remedy is not a proven cause", t => {
+test("the explanation carries the content of the journal rows of the window, and a recorded remedy is not a proven cause", async t => {
   const { store } = fixture(t);
   definitionFixture(store, PROJECT, "artifact:price");
   opened(store);
@@ -1104,7 +1283,7 @@ test("the explanation carries the content of the journal rows of the window, and
     goal: "every artifact an operation consumes is produced somewhere in the layer",
     remedy: "name the node that produces artifact:price",
   });
-  for (let index = 0; index < 3; index += 1) closed(store, PROJECT, goal(), refusedBy(refusal));
+  for (let index = 0; index < 3; index += 1) await closed(store, PROJECT, goal(), refusedBy(refusal));
 
   const report = reportOf(store);
   assert.equal(report.obstacles.length, 1);
@@ -1153,30 +1332,31 @@ test("the explanation carries the content of the journal rows of the window, and
   assert.equal(broken.at.field, "repeated.om-refusal:invented");
 });
 
-test("after a result resets the ladder no stop is lost, and every window is judged by its own boundary", t => {
+test("after a result resets the ladder no stop is lost, and every window is judged by its own boundary", async t => {
   const { store } = fixture(t);
-  const { stopped } = stoppedAtThree(store);
+  const { stopped } = await stoppedAtThree(store);
   const goals = stopped.stop!.goals;
   // Stop after attempt 3, continued on the analysis of it.
   deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...onReview(store, PROJECT, 3, goals) }));
   const dry = artifactMissing(store, PROJECT, "input");
-  for (let index = 0; index < 3; index += 1) closed(store, PROJECT, goal(), refusedBy(dry));
+  for (let index = 0; index < 3; index += 1) await closed(store, PROJECT, goal(), refusedBy(dry));
   const owners = heldSeries(store)!.value;
   assert.equal(owners.stop!.attempt, 6);
   assert.equal(owners.ladder.rung, 2);
   // The owner allows one more window, and attempt 7 reaches a new accepted result of the same goal.
   const decision = storedAs(store, OWNER_DECISION_KIND, `${ownerDecisionNamespace(PROJECT)}${next()}`, {
-    projectId: PROJECT, block: BLOCK, stop: 6, goals: [...owners.stop!.goals],
+    projectId: PROJECT, block: blockOf(PROJECT), stop: 6, goals: [...owners.stop!.goals],
     decided: "go on: I have read what was tried and I want one more window",
   });
   deliveredOf(resumeSeries(store, {
     ...address(PROJECT), stop: 6, ground: "owner-decision", text: "the owner decided to go on", decision: { ref: decision },
   }));
-  assert.equal(progressed(store, PROJECT, goal(), "line:cart:price"), 7);
+  const reached = await progressed(store, PROJECT, goal());
+  assert.equal(reached.attempt, 7);
   // That result returned the ladder to its start, and with it the windows the ladder had spent are gone from the state.
   assert.deepEqual(heldSeries(store)!.value.ladder.windows, []);
   const last = artifactMissing(store, PROJECT, "input");
-  for (let index = 0; index < 3; index += 1) closed(store, PROJECT, goal(), refusedBy(last));
+  for (let index = 0; index < 3; index += 1) await closed(store, PROJECT, goal(), refusedBy(last));
 
   const report = reportOf(store);
   assert.equal(report.context.stop!.attempt, 10);
@@ -1193,7 +1373,7 @@ test("after a result resets the ladder no stop is lost, and every window is judg
   assert.equal(second.kind, "owner-decision");
   assert.equal(second.outcome, "result-followed");
   assert.ok(second.explained.includes("ended at attempt 7"));
-  assert.ok(second.explained.includes("line:cart:price"));
+  assert.ok(second.explained.includes(reached.key));
   assert.deepEqual(second.claims, []);          // an owner's decision names no cause and no change
   const text = report.lines.join("\n");
   assert.ok(text.includes("after attempt 3, the stop was continued"));
@@ -1215,13 +1395,13 @@ test("after a result resets the ladder no stop is lost, and every window is judg
   assert.deepEqual(inherited.remedies[0]!.records, report.remedies[0]!.records);
 });
 
-test("the complete modern source context survives A2, an origin hold and analysis, A5, moved historical heads and restart", t => {
+test("the complete modern source context survives A2, an origin hold and analysis, A5, moved historical heads and restart", async t => {
   const { store, path } = fixture(t);
   opened(store);
   const observed = assembly(store, PROJECT, "first", [["artifact:tax"]], ["artifact:tax"]);
   const proposal = observed.proposalSources[0]!;
   const refused = journalled(store, PROJECT, { sources: [proposal] });
-  const stopped = closed(store, PROJECT, goal(), refusedBy(refused));
+  const stopped = await closed(store, PROJECT, goal(), refusedBy(refused));
   assert.equal(stopped.holds.length, 1);
   const hold = stopped.holds[0]!, raised = store.get<OriginHold>(hold.id)!.value;
   const original = normalizeOriginSource(proposal);
@@ -1229,13 +1409,13 @@ test("the complete modern source context survives A2, an origin hold and analysi
   assert.deepEqual(reportOf(store).obstacles[0]!.origin.sources, [original]);
   const basis = observed.sources;
   const analysis = storedAs(store, ORIGIN_ANALYSIS_KIND, `${originAnalysisNamespace(PROJECT)}${next()}`, {
-    projectId: PROJECT, block: BLOCK, attempt: raised.attempt, row: raised.row, class: "proposal", basis,
+    projectId: PROJECT, block: blockOf(PROJECT), attempt: raised.attempt, row: raised.row, class: "proposal", basis,
   });
   deliveredOf(liftOriginHold(store, { project: PROJECT, hold, ground: "origin-analysis", record: { ref: analysis } }));
   const lifted = store.get<OriginHold>(hold.id)!;
   assert.ok(lifted.value.lift!.basis.some(item => item.context?.kind === "proposal"));
   assert.ok(lifted.value.lift!.basis.some(item => item.context?.kind === "frame"));
-  for (let index = 0; index < 2; index += 1) closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
+  for (let index = 0; index < 2; index += 1) await closed(store, PROJECT, goal(), outcome({ reason: "off-form" }));
   const report = reportOf(store);
   assert.deepEqual(report.obstacles[0]!.origin.sources, [original]);
   assert.equal(report.guards.some(ref => ref.id === original.ref.id), false);
@@ -1250,26 +1430,13 @@ test("the complete modern source context survives A2, an origin hold and analysi
   assert.deepEqual(reportOf(reopened), report);
 });
 
-test("LP6 row 30: the table of the new era keeps one subject per tally — input-transition only when every cycle of the window ended by its own input moving and nothing else stands — and an interruption by a moved input is never an environment", () => {
-  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.map(row => row.subject), ["obstacle", "environment", "origin", "input-transition"]);
-  assert.ok(Object.isFrozen(STOP_SUBJECT_DECISIONS_V2));
-  const seen = new Set<string>();
-  for (const transitions of [0, 1, 2, 3]) for (const proposal of [0, 1]) for (const conditions of [0, 1]) for (const unknown of [0, 1])
-    for (const holds of [0, 1]) for (const addressees of [0, 1, 2]) for (const interrupted of [0, 1]) for (const refused of [0, 1]) {
-      const classes: Record<RefusalClass, number> = { proposal, input: 0, derivation: 0, readiness: 0, conditions, unknown };
-      const obstacles = REFUSAL_CLASSES.reduce((sum, item) => sum + classes[item], 0);
-      const tally = facts({ classes, holds, addressees, obstacles, repeating: obstacles, transitions,
-        attempts: transitions + interrupted + refused, endings: counts(COMPLETION_REASONS, { interrupted, refused }) });
-      const admitted = STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient(tally));
-      assert.ok(admitted.length <= 1, JSON.stringify(tally));
-      seen.add(admitted[0]?.subject ?? "unknown");
-    }
-  assert.deepEqual([...seen].sort(), [...STOP_SUBJECTS].sort());
+test("LP6 row 30: an input transition is said only when every cycle of the window ended by its own input moving and nothing else stands — and an interruption by a moved input is never an environment", () => {
+  assert.ok(Object.isFrozen(STOP_SUBJECT_DECISIONS));
   // Three proved input transitions and nothing else: an input transition, never an environment of three broken cycles.
   const moved = facts({ attempts: 3, transitions: 3 });
-  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient(moved)).map(row => row.subject), ["input-transition"]);
+  assert.deepEqual(STOP_SUBJECT_DECISIONS.filter(row => row.sufficient(moved)).map(row => row.subject), ["input-transition"]);
   // A mixed window keeps its real obstacle as the subject when one responsible stands behind it; two say nothing.
   const mixed = facts({ attempts: 3, transitions: 2, classes: counts(REFUSAL_CLASSES, { input: 1 }), obstacles: 1, addressees: 1 });
-  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient(mixed)).map(row => row.subject), ["obstacle"]);
-  assert.deepEqual(STOP_SUBJECT_DECISIONS_V2.filter(row => row.sufficient({ ...mixed, addressees: 2 })), []);
+  assert.deepEqual(STOP_SUBJECT_DECISIONS.filter(row => row.sufficient(mixed)).map(row => row.subject), ["obstacle"]);
+  assert.deepEqual(STOP_SUBJECT_DECISIONS.filter(row => row.sufficient({ ...mixed, addressees: 2 })), []);
 });

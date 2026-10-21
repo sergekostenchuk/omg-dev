@@ -9,7 +9,7 @@ import { delivered, refused, sealed, isPlainObject, type OmResult, type Refusal,
 import { readAnySeriesAt, seriesRequestOf, prepareSeriesLineAdmission, prepareEscalateSeries,
   readSeriesWorkAdmission, seriesRequiresAdmissionProof,
   STOP_REVIEW_KIND, stopReviewNamespace, type AnyRepairSeries, type AttemptGoal } from './series.js';
-import { stopReportOfNewEra, stopReportSources, STOP_REPORT_CONTRACT_V2, type AnyStopReport, type StopReportSources } from './stop-report.js';
+import { stopReport, stopReportSources, type AnyStopReport, type StopReportSources } from './stop-report.js';
 import { prepareLiftOriginHold, ORIGIN_ANALYSIS_KIND, originAnalysisNamespace,
   REFUSAL_CLASSES, type RefusalClass } from './repeat-gate.js';
 import { normalizeOriginSource, type OriginSource } from './refusal-journal.js';
@@ -18,10 +18,8 @@ import { adapterRequest, transportUnder, type ModelTransportOutcome } from './mo
 import { withHistoricalReads } from './input.js';
 import { RunControlGate, RunControlLost, type RunControlHold } from './run-control.js';
 
-export const STOP_ANALYSIS_CONTRACT = 'om-stop-analysis/v1';
-/** LP6 (№3325 §4): a new intent stands on the report of the new era; its results and failures inherit its contract. */
-export const STOP_ANALYSIS_CONTRACT_V2 = 'om-stop-analysis/v2';
-type AnalysisContract = typeof STOP_ANALYSIS_CONTRACT | typeof STOP_ANALYSIS_CONTRACT_V2;
+/** LP6 (№3325 §4): the only contract this unit writes — an intent stands on the report of its own era; its results and failures inherit it. */
+export const STOP_ANALYSIS_CONTRACT = 'om-stop-analysis/v2';
 export const STOP_ANALYSIS_FAILURE_KIND = 'om-stop-analysis-failure';
 export const STOP_ANALYSIS_CODES = Object.freeze(['analysis_request_invalid', 'analysis_invalid', 'analysis_conflict',
   'analysis_response_invalid', 'assessor_not_independent', 'context_too_large'] as const);
@@ -33,7 +31,7 @@ export interface AnalysisAnswer {
   origin: { class: RefusalClass; basis: OriginSource[] } | null;
 }
 export interface AnalysisIntent {
-  contract: AnalysisContract; request: StopAnalysisRequest;
+  contract: typeof STOP_ANALYSIS_CONTRACT; request: StopAnalysisRequest;
   sources: StopReportSources; report: AnyStopReport; packet: Json; call: AnyRecordCallRequest;
 }
 export interface PreparedStopAnalysis { intent: AnalysisIntent; writes: Write[]; guards: TransactionGuard[] }
@@ -42,14 +40,12 @@ interface AnalysisAdmission {
   owner: { kind: 'block'; block: string };
 }
 export interface AnalysisRecord {
-  contract: AnalysisContract; projectId: string; intent: Ref; transport: Ref;
+  contract: typeof STOP_ANALYSIS_CONTRACT; projectId: string; intent: Ref; transport: Ref;
   state: 'decided' | 'undecided' | 'origin-established' | 'origin-unestablished' | 'failed';
   cause: AnalysisCause | null; change: AnalysisChange | null; error: Refusal | null;
   block?: string; owner?: { kind: 'mechanism'; mechanism: 'M5:addressing' };
   stop: number; goals: string[]; attempt: number; row: string | null;
   class: RefusalClass | null; basis: OriginSource[];
-  /** LP8 (№3622): the first acceptance of an answer an old adapter wrapper refused — the refusal and the exchange it read. */
-  recovery?: { failure: Ref; exchange: Ref };
 }
 const object = (value: unknown): value is Record<string, unknown> => isPlainObject(value);
 const text = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
@@ -108,20 +104,16 @@ function declaredSources(report: AnyStopReport, request: StopAnalysisRequest): R
     ...report.obstacles.flatMap(row => [row.source, ...row.origin.sources.map(source => source.ref)]),
     ...report.remedies.flatMap(remedy => [...remedy.records]),
     // LP6 (№3325 §6): the exact witnesses of the completions are sources of the task, not guards of its write.
-    ...(report.completionEvidence ?? []).flatMap(item => [...(item.close === null ? [] : [item.close]),
+    ...report.completionEvidence.flatMap(item => [...(item.close === null ? [] : [item.close]),
       ...item.decisions.flatMap(decision => [decision.e4, decision.call, decision.previous, decision.input]),
       ...item.ends.flatMap(end => [end.source, ...(end.replacement === null ? [] : [end.replacement])])])]);
 }
-const form = sealed({ protocol: 'omg-stop-analysis/v1', cause: 'null or {kind:evidence|hypothesis,text,sources:Ref[]}; evidence needs sources',
-  change: 'null or {text,addresses:[{ref,field}]}', origin: 'null or {class,basis:OriginSource[]}; only origin analysis',
-  rule: 'Diagnose this saved stop. State uncertainty explicitly. A proposal changes no graph, input or readiness.' });
 /**
- * LP6 (№3325 §6): the form of an intent of the new era says the whole shape the acceptance below checks — the exact
- * Ref object, the non-empty field, origin null for a stop — with an example built from a Ref this task really declares.
- * The protocol of the answer is the same `omg-stop-analysis/v1`; only the description of its form is clearer.
+ * LP6 (№3325 §6): the form of an intent says the whole shape the acceptance below checks — the exact Ref object, the
+ * non-empty field, origin null for a stop — with an example built from a Ref this task really declares.
+ * The protocol of the answer is `omg-stop-analysis/v1` — the wire protocol of the model, not the contract of the record.
  */
-function formOf(contract: AnalysisContract, purpose: 'stop-analysis' | 'origin-analysis', example: Ref): Json {
-  if (contract === STOP_ANALYSIS_CONTRACT) return form as unknown as Json;
+function formOf(purpose: 'stop-analysis' | 'origin-analysis', example: Ref): Json {
   return json({
     protocol: 'omg-stop-analysis/v1',
     ref: 'A Ref is one whole exact object {"id":<string>,"revision":<integer>,"hash":<string>} copied unchanged from "sources" of this task. A string id, a partial object or a record outside "sources" is refused, never corrected.',
@@ -134,8 +126,7 @@ function formOf(contract: AnalysisContract, purpose: 'stop-analysis' | 'origin-a
   });
 }
 function deriveIntent(store: Store, request: StopAnalysisRequest, report: AnyStopReport): AnalysisIntent {
-  // The era of an intent is the era of the report it stands on: a saved v1 report gives back its v1 intent literally.
-  const contract: AnalysisContract = report.contract === STOP_REPORT_CONTRACT_V2 ? STOP_ANALYSIS_CONTRACT_V2 : STOP_ANALYSIS_CONTRACT;
+  const contract = STOP_ANALYSIS_CONTRACT;
   const series = seriesOf(store, request), key = identity(store, request, series.value), id = intentId(request.project, key);
   if (report.project !== request.project || report.series !== request.series.id
     || !report.guards.some(ref => same(ref, request.series))) fail('analysis_invalid', id, 'report', 'The report must name the exact saved series');
@@ -159,7 +150,7 @@ function deriveIntent(store: Store, request: StopAnalysisRequest, report: AnySto
   if (env.implementer.actor === env.reviewer.actor)
     fail('assessor_not_independent', request.dispatch.config.id, 'reviewer.actor', 'The reviewer must be a different actor from the implementer');
   take(readRecord(store, request.dispatch.adapter, { unit: 'A6', target: id, id: request.dispatch.adapter.id, kind: 'dispatch-adapter' }));
-  const packet = json({ contract, purpose, basis, goal, report, sources, form: formOf(contract, purpose, request.series) });
+  const packet = json({ contract, purpose, basis, goal, report, sources, form: formOf(purpose, request.series) });
   const callKey = `A6:${key}`;
   const wire = take(adapterRequest({ requestId: callKey, packet, model: env.reviewer.model, effort: env.reviewer.effort,
     ...(env.reviewer.speed === undefined ? {} : { speed: env.reviewer.speed }) }));
@@ -210,7 +201,7 @@ export function prepareStopAnalysis(store: Store, request: StopAnalysisRequest):
       return { intent: saved.value, writes: [], guards: originalGuards(store, reference(saved), saved.value) };
     }
     const admission = take(prepareSeriesLineAdmission(store, request.project, request.series));
-    const report = take(stopReportOfNewEra(store, seriesRequestOf(source.value))) as AnyStopReport;
+    const report = take(stopReport(store, seriesRequestOf(source.value))) as AnyStopReport;
     const intent = deriveIntent(store, request, report);
     const writes: Write[] = [{ id, kind: 'om-analysis-intent', expected: 0, value: json(intent) }];
     if (seriesRequiresAdmissionProof(source.value)) {
@@ -281,8 +272,8 @@ function resultAddress(intent: AnalysisIntent, body: AnalysisRecord, key: string
   return body.state === 'failed' ? { id: failureId(intent.request.project, key), kind: STOP_ANALYSIS_FAILURE_KIND }
     : { id: groundId(intent.request, key), kind: intent.request.hold === null ? STOP_REVIEW_KIND : ORIGIN_ANALYSIS_KIND };
 }
-/** NR (№3600): a trusted read — runStopAnalysis (or its LP8 recovery) wrote the result from the physical response and its
- * fixed context once, atomically with its escalation or lift. */
+/** NR (№3600): a trusted read — runStopAnalysis wrote the result from the physical response and its fixed context
+ * once, atomically with its escalation or lift. */
 export function readStopAnalysis(store: Store, request: { project: string; record: Ref }): OmResult<Sealed<Revision<AnalysisRecord>>> {
   requireRead(store, request);
   return result(() => {
@@ -291,93 +282,6 @@ export function readStopAnalysis(store: Store, request: { project: string; recor
     const kind = [STOP_REVIEW_KIND, ORIGIN_ANALYSIS_KIND, STOP_ANALYSIS_FAILURE_KIND][namespaces.findIndex(prefix => ref.id.startsWith(prefix))];
     if (!kind) fail('analysis_invalid', ref.id, 'id', 'This is not an analysis result address of the named project');
     return take(readRecord<AnalysisRecord>(store, ref, { unit: 'A6', target: ref.id, id: ref.id, kind })) as Revision<AnalysisRecord>;
-  });
-}
-/** The adapter wrapper fields whose absence alone refused an answer of the old adapter (LP1/LP2 fixed the adapter). */
-const WRAPPER_FIELDS: readonly string[] = ['confirmed', 'usage', 'envelope'];
-interface RecoverableAnswer { failure: Revision<AnalysisRecord>; intent: Revision<AnalysisIntent>; exchange: Ref; raw: string; key: string }
-/**
- * LP8 (№3620, №3622): a failed review whose physical response completed (exit 0, the exact request id, a research payload)
- * and was refused only for the wrapper of the old adapter — never for its content. Its saved payload is the answer the
- * reviewer gave; it has not been accepted yet. Null for any other failure: an empty, interrupted, foreign or malformed one.
- */
-function recoverableAnswer(store: Store, project: string, failureRef: Ref): RecoverableAnswer | null {
-  const prefix = `${STOP_ANALYSIS_FAILURE_KIND}:${project}:`;
-  if (!failureRef.id.startsWith(prefix)) return null;
-  const read = readStopAnalysis(store, { project, record: failureRef });
-  if (!read.ok) return null;
-  const failure = read.value as Revision<AnalysisRecord>, error = failure.value.error;
-  if (failure.value.state !== 'failed' || !error || error.code !== 'model_adapter_response_invalid' || !WRAPPER_FIELDS.includes(error.at.field ?? '')) return null;
-  const intent = readIntent(store, project, failure.value.intent);
-  const physical = store.get<{ transport?: { exchange?: unknown } }>(failure.value.transport.id, failure.value.transport.revision);
-  const exchangeRef = physical?.hash === failure.value.transport.hash ? physical.value.transport?.exchange : undefined;
-  if (!isRef(exchangeRef)) return null;
-  const exchange = store.get<{ wire?: { requestId?: unknown }; process?: { exitCode?: unknown; signal?: unknown; stdout?: unknown } | null }>(exchangeRef.id, exchangeRef.revision);
-  const process = exchange?.hash === exchangeRef.hash ? exchange.value.process : null;
-  if (!process || process.exitCode !== 0 || process.signal !== null || typeof process.stdout !== 'string') return null;
-  let envelope: unknown;
-  try { envelope = JSON.parse(process.stdout); } catch { return null; }
-  const requestId = exchange!.value.wire?.requestId;
-  if (!object(envelope) || envelope.protocol !== 'omg-agent/v1' || !text(requestId) || envelope.requestId !== requestId
-    || requestId !== intent.value.call.call || !object(envelope.research)) return null;
-  let raw: string;
-  try { raw = canonical(envelope.research as Json); } catch { return null; }
-  return { failure, intent, exchange: exchangeRef, raw, key: failureRef.id.slice(prefix.length) };
-}
-/** LP8: the review this failure was recovered into, if one is saved: the result at the review's own address naming it. */
-export function readRecoveredStopAnalysis(store: Store, project: string, failureRef: Ref): Sealed<Revision<AnalysisRecord>> | null {
-  const prefix = `${STOP_ANALYSIS_FAILURE_KIND}:${project}:`;
-  if (!failureRef.id.startsWith(prefix)) return null;
-  const read = readStopAnalysis(store, { project, record: failureRef });
-  if (!read.ok || read.value.value.state !== 'failed') return null;
-  const intent = readIntent(store, project, read.value.value.intent), key = failureRef.id.slice(prefix.length);
-  for (const id of [groundId(intent.value.request, key)]) {
-    const row = store.get<AnalysisRecord>(id);
-    if (row && object(row.value) && object(row.value.recovery) && same(row.value.recovery.failure, failureRef))
-      return take(readStopAnalysis(store, { project, record: reference(row) }));
-  }
-  return null;
-}
-export function stopAnalysisRecoverable(store: Store, project: string, failureRef: Ref): boolean {
-  const found = recoverableAnswer(store, project, failureRef);
-  return found !== null && parseAnswer(found.intent.value, found.raw).ok;
-}
-/**
- * LP8 (№3622): the one acceptance of the saved answer — by the producer of A6, as if it had just arrived: parsed against
- * the fixed request and written at the review's own address with its escalation or lift, linked to the refusal and the
- * exchange. No model is called and nothing old is changed. A repeat returns the saved recovery; an answer that does not
- * pass this first acceptance recovers nothing (the refusal stands).
- */
-export function writeStopAnalysisRecovery(store: Store, request: { project: string; failure: Ref }): OmResult<Sealed<Revision<AnalysisRecord>>> {
-  if (!(store instanceof Store) || !object(request) || !keys(request, ['project', 'failure']) || !text(request.project) || !isRef(request.failure))
-    throw new EngineError('analysis_request_invalid', 'A recovery names its project and the exact refused review');
-  return result(() => {
-    const saved = readRecoveredStopAnalysis(store, request.project, request.failure);
-    if (saved) return saved;
-    const found = recoverableAnswer(store, request.project, request.failure);
-    if (!found) fail('analysis_invalid', request.failure.id, 'recovery', 'Only a complete answer refused for the old adapter wrapper is recovered');
-    const parsed = parseAnswer(found.intent.value, found.raw);
-    if (!parsed.ok) return fail('analysis_response_invalid', request.failure.id, 'recovery', parsed.refusal.message);
-    const intent = found.intent.value, answer = parsed.value as AnalysisAnswer, failed = found.failure.value;
-    const holding = intent.request.hold === null ? null : intent.report.context.holds.find(hold => same(hold.hold, intent.request.hold))!;
-    const state = holding !== null ? answer.origin === null || answer.origin.class === 'unknown' ? 'origin-unestablished' : 'origin-established'
-      : answer.cause === null || answer.change === null ? 'undecided' : 'decided';
-    const record: AnalysisRecord = copy({ ...failed, state, cause: answer.cause, change: answer.change, error: null,
-      class: answer.origin?.class ?? null, basis: answer.origin?.basis ?? [], recovery: { failure: request.failure, exchange: found.exchange } });
-    const address = resultAddress(intent, record, found.key), write: Write = { ...address, expected: 0, value: json(record) };
-    let writes: readonly Write[] = [write];
-    let guards = uniqueTransactionGuards([request.failure, reference(found.intent), found.exchange, { id: write.id, absent: true }]);
-    if (state === 'undecided') {
-      const series = seriesOf(store, intent.request), transition = take(prepareEscalateSeries(store, { ...seriesRequestOf(series.value),
-        stop: record.stop, review: { pending: { id: write.id, kind: write.kind, value: json(write.value) } } }));
-      writes = transition.writes; guards = uniqueTransactionGuards([...guards, ...transition.guards]);
-    } else if (state === 'origin-established') {
-      const transition = take(prepareLiftOriginHold(store, { project: request.project, hold: intent.request.hold!, ground: 'origin-analysis',
-        record: { pending: { id: write.id, kind: write.kind, value: json(write.value) } } }));
-      writes = transition.writes; guards = uniqueTransactionGuards([...guards, ...transition.guards]);
-    }
-    const stored = take(writeGuarded(store, { unit: 'A6', target: write.id, writes, guards }));
-    return stored.find(row => row.id === write.id)! as unknown as Revision<AnalysisRecord>;
   });
 }
 /**
@@ -395,7 +299,6 @@ export async function runStopAnalysis(store: Store, request: StopAnalysisRequest
     const existing = [groundId(request, key), failureId(request.project, key)].flatMap(id => {
       const row = store.get(id); return row ? [row] : [];
     });
-    // LP8: a review recovered from a refused answer stands at the review address beside its refusal; it is the result.
     if (existing[0]) return readStopAnalysis(store, { project: request.project, record: reference(existing[0]) });
     const originalIntent = { id: intentId(request.project, key), revision: 1, hash: hashJson(intent) };
     const source = prepared.writes.length ? take(writeGuarded(gate.view(), { unit: 'A6', target: intentId(request.project, key),
