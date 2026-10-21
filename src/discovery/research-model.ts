@@ -176,7 +176,7 @@ export interface V7ProgressSummary {
 
 export interface V7ProgressApplication {
   contract: 'v7-progress-application/v1'; subject: V7ProgressSubject; assessment: Ref;
-  previous: Ref | null; methodologyOrigins: { claim: ClaimAddress; assessment: Ref }[];
+  previous: Ref | null; prefix: Ref[]; methodologyOrigins: { claim: ClaimAddress; assessment: Ref }[];
   reused: Ref[]; priorEvents: Ref[]; attempts: Ref[]; after: V7ProgressSummary;
 }
 export interface V7ProgressState {

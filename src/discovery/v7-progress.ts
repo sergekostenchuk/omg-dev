@@ -5,12 +5,12 @@ import { DISCOVERY_ASSESSMENT_CONTRACT_V3, type PaidDiscoveryAttemptsAssessment,
   V7_PROGRESS_BASELINE_CONTRACT, type V7ProgressBaseline, type V7ProgressState, type V7ProgressApplication,
   type V7AttemptAccount, type V7ProgressEvent, type V7ProgressSubject, type V7ProgressSummary } from './research-model.js';
 import type { Store, Revision, Write, TransactionGuard } from '../storage/store.js';
-import { historicalProof, withHistoricalReads } from '../history/proofs.js';
+import { historicalProof, pendingSnapshotView, withHistoricalReads } from '../history/proofs.js';
 import { closureFactClaims, requireMethodologyClosure } from './assessment-methodology.js';
 import { proveClaimAddress, resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import { readDiscoveryAssessment } from './research-assessment.js';
 import { readResearchConsumerTurn } from './response-recovery.js';
-import { managedTurnId, type ManagedResearchTurn } from './research-consumer-transition.js';
+import { managedTurnId } from './research-consumer-transition.js';
 import { attemptAccountKey, progressEventKey, v7ProgressStateId, baselineGuards, checkDiscoveryAssessmentForm,
   claimContentKey, constraintContentKey, transitionContentKey, type V7AssessmentSubject } from './v7-attempt-assessment.js';
 import { V7_ATTEMPT_KIND } from './v7-contracts.js';
@@ -216,28 +216,56 @@ function predicted<T>(id: string, kind: string, revision: number, value: T): Rev
 const initial = (): V7ProgressSummary => ({ cursor: null, count: 0, streak: 0, outcome: 'open',
   reason: null, nextAction: null });
 
-/** Only the new interval of the deterministic managed run is read. A missing,
- * pending or omitted earlier answer of this subject cannot be jumped over. */
+/** Walk the actual run graph: ordinary paid addresses, the exact queue of a
+ * planner and recursively split children. No list/number guess may substitute
+ * a different turn for an unknown position. Historical application supplies
+ * every selected revision; only the writer selects heads, protected by CAS. */
+function progressPrefix(store: Store, run: string, last: number, saved?: Ref[]): Revision<Record<string, any>>[] {
+  if (saved !== undefined) need(Array.isArray(saved) && saved.length === last && saved.every(isRef),
+    'prefix', 'The application fixes one exact revision for every run position');
+  const rows: Revision<Record<string, any>>[] = [], queued = new Map<number, Ref>();
+  for (let n = 1; n <= last; n++) {
+    const origin = queued.get(n), id = origin?.id ?? managedTurnId(run, n);
+    const row = saved === undefined ? store.get<Record<string, any>>(id)
+      : exact<Record<string, any>>(store, saved[n - 1]!, 'research-turn');
+    need(row && row.id === id && row.kind === 'research-turn' && hashJson(row.value) === row.hash
+      && row.value?.run === run && row.value.number === n,
+      'prefix', 'The exact managed or queued position is missing, changed or substituted');
+    if (origin) need(row.revision >= origin.revision, 'prefix', 'A queued position precedes its original revision');
+    rows.push(row);
+    for (const field of ['children', 'splitInto']) {
+      const links = row.value.observation?.[field];
+      if (links === undefined) continue;
+      need(Array.isArray(links) && links.every(isRef), 'prefix', 'Queue and split links are exact references');
+      for (const link of links as Ref[]) {
+        const child = exact<Record<string, any>>(store, link, 'research-turn'), number = child.value?.number;
+        need(child.value?.run === run && Number.isSafeInteger(number) && number > n,
+          'prefix', 'A child belongs to a later exact position of this run');
+        const known = queued.get(number);
+        need(!known || same(known, link), 'prefix', 'Two queues cannot claim the same run position');
+        queued.set(number, link);
+      }
+    }
+  }
+  return rows;
+}
+
 function orderedPrefix(store: Store, assessment: PaidDiscoveryAttemptsAssessment, before: V7ProgressSummary,
-  fresh: readonly Ref[]): void {
+  fresh: readonly Ref[], rows: Revision<Record<string, any>>[]): void {
   const packet = checkDiscoveryAssessmentForm(store, assessment).packet;
   if (before.cursor && before.cursor.run !== packet.run)
     fail('discovery_progress_order_invalid', 'cursor.run', 'The subject cannot change its saved managed run');
   const start = before.cursor?.number ?? 0;
-  const last = packet.entries.at(-1)!.number;
   if (packet.entries.some(e => fresh.some(ref => same(ref, reference(e.attempt.attempt))) && e.number <= start))
     fail('discovery_progress_order_invalid', 'cursor', 'An unaccounted attempt precedes the saved prefix');
   const included = new Set(packet.entries.map(e => e.original.id));
-  for (let n = start + 1; n <= last; n++) {
-    const turn = store.get<ManagedResearchTurn>(managedTurnId(packet.run, n));
-    if (!turn) fail('discovery_progress_order_invalid', 'cursor', 'A managed position in the prefix is missing');
+  for (const turn of rows) {
     readResearchConsumerTurn(store, reference(turn));
-    // The historical reader above proves the era-specific action; the generic
-    // legacy researchAction validator does not accept a v7 attempt answer.
+    if (turn.value.number <= start) continue;
     const subject = turn.value.subject;
-    if (turn.value.attemptContract && subject && same(subject.planAnswer, assessment.subject.packet.planAnswer)
+    if (subject && same(subject.planAnswer, assessment.subject.packet.planAnswer)
       && subject.planQuestionId === assessment.subject.packet.planQuestionId
-      && (turn.value.status !== 'completed' || (turn.value.action as { action: string }).action === 'answer'
+      && (turn.value.status !== 'completed' || turn.value.attemptContract && turn.value.action?.action === 'answer'
         && (!turn.value.attemptBinding || !included.has(turn.id))))
       fail('discovery_progress_order_invalid', 'packet', 'An earlier attempt of this subject is pending or omitted');
   }
@@ -281,14 +309,18 @@ interface Derived {
 /** The same projection builds the write batch and re-derives its immutable
  * receipts. Existing accounts/events are named exact inputs, never a scan. */
 function project(store: Store, paid: Revision<PaidDiscoveryAttemptsAssessment>,
-  previous: Revision<V7ProgressState> | null, reused: Revision<V7AttemptAccount>[], prior: Revision<V7ProgressEvent>[]): Derived {
-  const a = paid.value, checked = checkDiscoveryAssessmentForm(store, a), packet = checked.packet;
+  previous: Revision<V7ProgressState> | null, reused: Revision<V7AttemptAccount>[], prior: Revision<V7ProgressEvent>[], prefix: Ref[]): Derived {
+  const a = paid.value, packet = checkDiscoveryAssessmentForm(store, a).packet;
+  const prefixRows = progressPrefix(store, packet.run, packet.entries.at(-1)!.number, prefix);
+  // Verify all pinned bytes above before exposing them as a head snapshot to
+  // the common turn reader (queued children also read their parent's head).
+  store = pendingSnapshotView(store, prefixRows);
   const subject: V7AssessmentSubject = { project: a.projectId, planAnswer: packet.packet.planAnswer,
     planQuestionId: packet.packet.planQuestionId };
   need(same(a.baseline.state, previous ? { kind: 'state', ref: reference(previous) }
     : { kind: 'absent', id: v7ProgressStateId(subject) }), 'baseline.state', 'The assessment fixes its exact predecessor');
   orderedPrefix(store, a, previous?.value.summary ?? initial(), packet.entries
-    .filter(e => !reused.some(r => r.id === attemptAccountKey(subject, reference(e.attempt.attempt)))).map(e => reference(e.attempt.attempt)));
+    .filter(e => !reused.some(r => r.id === attemptAccountKey(subject, reference(e.attempt.attempt)))).map(e => reference(e.attempt.attempt)), prefixRows);
   const methodologyOrigins = methodology(store, paid, reused);
   // Accepted baseline materials have their own exact provenance, including
   // attempts of other questions; resolve alone is deliberately insufficient.
@@ -385,7 +417,7 @@ function project(store: Store, paid: Revision<PaidDiscoveryAttemptsAssessment>,
     summary.nextAction = summary.outcome === 'stalled' ? 'Change the accepted research basis before another dispatch' : null;
   }
   const value: V7ProgressApplication = { contract: 'v7-progress-application/v1', subject, assessment: reference(paid),
-    previous: previous ? reference(previous) : null, methodologyOrigins, reused: reused.map(reference), priorEvents: prior.map(reference),
+    previous: previous ? reference(previous) : null, prefix, methodologyOrigins, reused: reused.map(reference), priorEvents: prior.map(reference),
     attempts: accountBodies.map(b => b.attempt), after: summary };
   const application = predicted(appId(reference(paid)), PROGRESS_APPLICATION_KIND, 1, value);
   const accounts = accountBodies.map(value => predicted(attemptAccountKey(subject, value.attempt), ATTEMPT_ACCOUNT_KIND,
@@ -401,7 +433,7 @@ function readApplication(store: Store, ref: Ref): Derived {
   return historicalProof(store, { reader: 'discovery.v7-progress.application/v1', project: ref.id, ref }, source => {
     const app = exact<V7ProgressApplication>(source, ref, PROGRESS_APPLICATION_KIND), v = app.value;
     need(v?.subject && typeof v.subject.project === 'string' && v.contract === 'v7-progress-application/v1' && app.revision === 1 && isRef(v.assessment)
-      && (v.previous === null || isRef(v.previous)) && Array.isArray(v.reused) && Array.isArray(v.priorEvents) && Array.isArray(v.methodologyOrigins),
+      && (v.previous === null || isRef(v.previous)) && Array.isArray(v.reused) && Array.isArray(v.priorEvents) && Array.isArray(v.methodologyOrigins) && Array.isArray(v.prefix),
       'application', 'The application needs its complete versioned provenance');
     const paid = readDiscoveryAssessment(source, v.subject.project, v.assessment);
     const previous = v.previous ? readV7ProgressStateAt(source, v.previous) : null;
@@ -412,7 +444,7 @@ function readApplication(store: Store, ref: Ref): Derived {
       need(same(e.value.subject, v.subject) && predecessor.value.after.count <= (previous?.value.summary.count ?? 0),
         'priorEvents', 'Only earlier events of this subject suppress novelty');
     }
-    const result = project(source, paid, previous, reused, prior);
+    const result = project(source, paid, previous, reused, prior, v.prefix);
     need(same(result.application, app), 'application', 'The application differs from the paid assessment projection');
     exactMatch(source, result.state);
     for (const account of result.accounts) exactMatch(source, account);
@@ -486,10 +518,12 @@ export function applyDiscoveryAssessment(store: Store, projectId: string, ref: R
       const row = store.get<V7ProgressEvent>(progressEventKey(subject, key), 1);
       if (row) prior.push(readEvent(store, reference(row)));
     }
-    const result = project(store, paid, previous, covered, prior);
+    const packet = checkDiscoveryAssessmentForm(store, a).packet;
+    const prefix = progressPrefix(store, packet.run, packet.entries.at(-1)!.number).map(reference);
+    const result = project(store, paid, previous, covered, prior, prefix);
     const rows: Revision<unknown>[] = [result.application, ...result.accounts, ...result.events, result.state];
     const writes: Write[] = rows.map(r => ({ id: r.id, kind: r.kind, expected: r.revision - 1, value: r.value }));
-    const guards: TransactionGuard[] = [...baselineGuards(a.baseline), ...covered.map(reference), ...prior.map(reference)];
+    const guards: TransactionGuard[] = [...baselineGuards(a.baseline), ...covered.map(reference), ...prior.map(reference), ...prefix];
     try { store.writeMany(writes, guards); }
     catch (error) {
       if (error instanceof EngineError && ['input_stale', 'revision_conflict'].includes(error.code)) {

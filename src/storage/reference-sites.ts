@@ -209,7 +209,7 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   ] },
   // P.3: atomic progress records retain their exact paid and accepted origins.
   { kind: "v7-progress-application", contract: "v7-progress-application/v1", data: [], refs: [
-    ["subject", "planAnswer"], ["assessment"], ["previous"], ["methodologyOrigins", INDEX, "claim", "container"],
+    ["subject", "planAnswer"], ["assessment"], ["previous"], ["prefix", INDEX], ["methodologyOrigins", INDEX, "claim", "container"],
     ["methodologyOrigins", INDEX, "assessment"], ["reused", INDEX], ["priorEvents", INDEX], ["attempts", INDEX],
   ] },
   { kind: "v7-progress-state", contract: "v7-progress-state/v1", data: [], refs: [

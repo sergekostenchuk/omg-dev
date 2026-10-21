@@ -17,10 +17,13 @@ import { type Json } from '../src/canonical.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { prepareResearchConsumerIntent, prepareResearchConsumerApplication, readResearchConsumerExecution,
-  completeResearchAttemptTurn, type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
-import { projectPaidTurnAdmission, managedTurnId } from '../src/discovery/research-consumer-transition.js';
+  completeResearchAttemptTurn, readResearchConsumerTurn, type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { projectPaidTurnAdmission, managedTurnId, projectResearchTurnRevision, projectSourceReadingTurn } from '../src/discovery/research-consumer-transition.js';
 import { recordV7Attempt } from '../src/discovery/v7-attempts.js';
 import { attemptEndOfAction, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from '../src/discovery/v7-managed-attempt.js';
+import { queueReadingPlan, splitPlannedContextRead } from '../src/discovery/reading-plan.js';
+import { readResearchContext } from '../src/discovery/research-limits.js';
+import type { ResearchTurn, ResearchAction } from '../src/discovery/research-model.js';
 import { REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
 import { processStart } from '../src/runtime/process-identity.js';
@@ -104,13 +107,13 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
       value:{projectId:project,draftId:draft.id,environment:reference(environment),turns:0,limit:100,requestChars:0,
         owner:{pid:process.pid,started:processStart(process.pid)!},ownerQuestion:null,error:null,status:'running',inputs:draft.value.inputs}});
     runId=run.id; const number=run.value.turns+1;
-    const input={projectId:project,kind:'analyst' as const,key:hashJson([run.id,number,'analyst']),owner:reference(run),draft:reference(draft),question:reference(question),
+    const input={projectId:project,kind:context.dispatchMode==='planning'?'reading-planner' as const:'analyst' as const,key:hashJson([run.id,number,'analyst']),owner:reference(run),draft:reference(draft),question:reference(question),
       role:environment.value.implementer,dispatch:environment.value,profile:null,
-      cursor:{run:run.id,turn:number,instruction:prompt,context,subject:selected},basis:draft.value.inputs,
+      cursor:{run:run.id,turn:number,...(context.dispatchMode?{mode:context.dispatchMode}:{}),instruction:prompt,context,subject:selected},basis:draft.value.inputs,
       guards:uniqueTransactionGuards([reference(run),reference(draft),reference(question),reference(environment)])};
     const intent=prepareResearchConsumerIntent(f.store,input);
     const invoke=(store=f.store,onContext?: (c:Record<string,any>)=>void)=>researchCall(environment.value.implementer,environment.value,prompt,context,undefined,
-      {store,draftId:draft.id,questionId:question.id,purpose:'analyst',consumerIntent:reference(intent),requestContract:REQUEST_MANIFEST_CONTRACT,...(onContext?{onContext}:{})});
+      {store,draftId:draft.id,questionId:question.id,purpose:context.dispatchMode==='planning'?'reading-planner':'analyst',consumerIntent:reference(intent),requestContract:REQUEST_MANIFEST_CONTRACT,...(onContext?{onContext}:{})});
     return {run,number,intent,input,invoke,question,draft,selected,context};
   };
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').map(line=>JSON.parse(line));
@@ -429,3 +432,116 @@ for(const value of [null,{}, {contract:'v7-attempt-account/v1',accepted:[]}]) {
     assert.deepEqual(f.store.list(),before);
   });
 }
+
+
+async function plannedRead(f:Setup,split=false,complete=true) {
+  const source=f.discovery.evidence.document('p','queued','Exact child bytes','text/plain',0);
+  const draft=f.store.get<DiscoveryDraft>(f.v.draft.id)!;
+  const read=split?{action:'read_context' as const,record:reference(draft),pointer:'/stage'}:
+    {action:'read_source' as const,source:reference(source),start:0,end:source.value.content.length};
+  const action={action:'read_plan' as const,question:'q-industry',reads:[read]};
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:action}));
+  await researchCall(f.environment.value.implementer,f.environment.value,'Calibrate planner',{dispatchMode:'planning'},undefined,
+    {store:f.store,draftId:f.calibration.draft.id,questionId:f.calibration.question.id,purpose:'reading-planner'});
+  const m=f.prepare(f.subject(),{history:[],readings:[],dispatchMode:'planning'}),response=await m.invoke();
+  const execution=readResearchConsumerExecution(f.store,'p',reference(m.intent));assert.equal(execution.kind,'response');
+  const projected=projectPaidTurnAdmission(m.run.value,{runId:m.run.id,intent:reference(m.intent),response,
+    question:reference(m.question),owner:m.run.value.owner,limit:100,context:m.context,subject:m.selected,mode:'planning'});
+  const id=managedTurnId(m.run.id,m.number);
+  const application=prepareResearchConsumerApplication(f.store,reference(m.intent),reference(execution.call),[
+    {id:m.run.id,kind:m.run.kind,expected:m.run.revision,value:projected.run},
+    {id,kind:'research-turn',expected:0,value:projected.turn}],
+    [reference(m.run),reference(f.environment),{id,absent:true}]);
+  f.store.writeMany(application.writes,application.guards);
+  const parent=f.store.get<ResearchTurn>(id)!,run=f.store.get<ResearchRun>(m.run.id)!;
+  const queued=queueReadingPlan(f.store,run,parent,m.draft,m.question,action);
+  const completedParent=f.store.write<ResearchTurn>({id,kind:'research-turn',expected:parent.revision,
+    value:projectResearchTurnRevision(parent.value as any,{kind:'reading-plan-queued',children:queued.children})});
+  const child=f.store.get<ResearchTurn>(queued.children[0]!.id)!;
+  let selected=[reference(child)];
+  if(split) selected=splitPlannedContextRead(f.store,queued.run,child,m.draft,m.question).children;
+  const completed=complete?selected.map(ref=>{
+    const row=f.store.get<ResearchTurn>(ref.id,ref.revision)!;
+    const a=row.value.action as ResearchAction;
+    const value=a.action==='read_context'?{...row.value,status:'completed' as const,
+      observation:readResearchContext(f.store,m.draft,m.question.id,undefined,a.record,a.pointer,a.page)}:
+      projectSourceReadingTurn(row.value,'p',{ref:reference(source),value:source.value});
+    return f.store.write<ResearchTurn>({id:row.id,kind:row.kind,expected:row.revision,value});
+  }):[];
+  for(const row of [completedParent,...completed]) readResearchConsumerTurn(f.open(),reference(row));
+  return {run,parent:completedParent,child:f.store.get<ResearchTurn>(child.id)!,completed};
+}
+
+for(const split of [false,true]) test(`P.3-01: paid planner, real queue${split?' and split':''}, read and attempt keep one N`,async t=>{
+  const f=await setup(t),queue=await plannedRead(f,split),entry=await produce(f,hypothesis(f,'After reading'));
+  const a=await assess(f,[entry],{accept:true}),result=applyDiscoveryAssessment(f.open(),'p',reference(a.paid));
+  assert.equal(result.state.value.summary.count,1);assert.equal(result.state.value.summary.streak,0);
+  assert.equal(result.state.value.summary.cursor?.number,split?5:3);
+  assert.equal(f.store.get(managedTurnId(queue.run.id,2)),null);
+  assert.equal(f.store.list('v7-attempt-account').length,1);
+  assert.deepEqual(result.applications[0]!.value.prefix.map(ref=>f.store.get<any>(ref.id,ref.revision)!.value.number),
+    split?[1,2,3,4,5]:[1,2,3]);
+  assert.deepEqual(readV7ProgressStateAt(f.open(),reference(result.state)),result.state);
+});
+
+for(const damaged of ['attempt','planner','child','split'] as const) test(`P.3-02: exact application survives later corrupt ${damaged} head`,async t=>{
+  const f=await setup(t),queue=damaged==='attempt'?null:await plannedRead(f,damaged==='split');
+  const entry=await produce(f,hypothesis(f,'Immutable accepted basis')),a=await assess(f,[entry],{accept:true});
+  const result=applyDiscoveryAssessment(f.store,'p',reference(a.paid));
+  const selected=damaged==='planner'?queue!.parent:damaged==='child'||damaged==='split'?queue!.completed[0]!:
+    f.store.get<any>(result.applications[0]!.value.prefix.at(-1)!.id)!;
+  // Explicit negative corruption of a later revision, not a new paid producer.
+  const corrupt=f.store.write({id:selected.id,kind:selected.kind,expected:selected.revision,
+    value:{...selected.value,observation:{forged:true}}});
+  assert.throws(()=>readResearchConsumerTurn(f.open(),reference(corrupt)),EngineError);
+  const before=f.store.list(),wire=f.wires().length;
+  assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(a.paid)),a.paid);
+  assert.deepEqual(readV7ProgressStateAt(f.open(),reference(result.state)),result.state);
+  assert.equal(proveAppliedAttemptClaim(f.open(),a.claims[0]!).assessment.id,a.paid.id);
+  assert.deepEqual(f.store.list(),before);assert.equal(f.wires().length,wire);
+});
+
+for(const corrupt of [false,true]) test(`P.3-02: pinned prefix loss/substitution still refuses; substitution=${corrupt}`,async t=>{
+  const f=await setup(t);await plannedRead(f);
+  const entry=await produce(f,hypothesis(f,'Pinned basis')),a=await assess(f,[entry],{accept:true});
+  const result=applyDiscoveryAssessment(f.store,'p',reference(a.paid)),selected=result.applications[0]!.value.prefix[0]!;
+  const cold=f.open(),get=cold.get.bind(cold);
+  cold.get=((...args:Parameters<Store['get']>)=>{
+    const row=get(...args);
+    return args[0]===selected.id&&args[1]===selected.revision
+      ?corrupt&&row?{...row,value:{forged:true}}:null:row;
+  }) as Store['get'];
+  errorCode(()=>readV7ProgressStateAt(cold,reference(result.state)),'discovery_progress_conflict');
+});
+
+test('P.3-02: writer CAS refuses a prefix that changes after projection',async t=>{
+  const f=await setup(t),entry=await produce(f),a=await assess(f,[entry]),write=f.store.writeMany.bind(f.store);let changed=false;
+  f.store.writeMany=((...args:Parameters<Store['writeMany']>)=>{
+    if(!changed&&args[0].some(row=>row.kind==='v7-progress-application')){
+      changed=true;const turn=f.store.list<ResearchTurn>('research-turn')[0]!;
+      write([{id:turn.id,kind:turn.kind,expected:turn.revision,value:{...turn.value,observation:{forged:true}}}]);
+    }
+    return write(...args);
+  }) as Store['writeMany'];
+  errorCode(()=>applyDiscoveryAssessment(f.store,'p',reference(a.paid)),'discovery_progress_conflict');
+  for(const kind of ['v7-progress-application','v7-attempt-account','research-progress-event','v7-progress-state'])
+    assert.equal(f.store.list(kind).length,0);
+  assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(a.paid)),a.paid);
+});
+
+test('P.3-02: absent saved prefix is a typed refusal, never a head fallback',async t=>{
+  const f=await setup(t),entry=await produce(f),a=await assess(f,[entry]),result=applyDiscoveryAssessment(f.store,'p',reference(a.paid));
+  // Explicit negative corruption: a copied application with no prefix receipt.
+  const {prefix:_prefix,...value}=result.applications[0]!.value;
+  const application=f.store.write({id:'v7-progress-application:negative-missing-prefix',kind:'v7-progress-application',expected:0,value});
+  const state=f.store.write({id:result.state.id,kind:result.state.kind,expected:result.state.revision,
+    value:{...result.state.value,application:reference(application)}});
+  errorCode(()=>readV7ProgressStateAt(f.open(),reference(state)),'discovery_progress_conflict');
+});
+
+test('P.3-01: a known but unfinished queued split cannot be skipped',async t=>{
+  const f=await setup(t);await plannedRead(f,true,false);
+  const entry=await produce(f),a=await assess(f,[entry]),before=f.store.list();
+  errorCode(()=>applyDiscoveryAssessment(f.store,'p',reference(a.paid)),'discovery_progress_order_invalid');
+  assert.deepEqual(f.store.list(),before);
+});
