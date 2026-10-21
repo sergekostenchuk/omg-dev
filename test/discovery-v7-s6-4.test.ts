@@ -15,6 +15,8 @@ import { Researcher } from '../src/discovery/research-runner.js';
 import { readResearchConsumerTurn } from '../src/discovery/response-recovery.js';
 import { splitPlannedContextRead, v7PlannerRounds, v7DispatchMode } from '../src/discovery/reading-plan.js';
 import { listResearchConsumerIntents } from '../src/discovery/response-recovery.js';
+import { ResearchSources } from '../src/discovery/research-sources.js';
+import { readSavedReaderBundleResult } from '../src/discovery/reader.js';
 
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "omg-v7-s6-4-"));
@@ -559,6 +561,47 @@ test('S6.4-02: a different equivalent public request can borrow the exact prior 
   await f.run(2,f.open());assert.deepEqual(f.history(),history);
   assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   assert.equal(f.wires().length,2);
+});
+
+test('S6.4-02: equivalent path and Source requests borrow one outside result without reader payment', async t => {
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  writeFileSync(join(f.root,'outside.txt'),'Short source.');
+  writeFileSync(join(f.root,'foreign.txt'),'Short source.');
+  const sources=new ResearchSources(f.store,'p',f.root);
+  const source=sources.read('outside.txt','text/plain'),foreign=sources.read('foreign.txt','text/plain');
+  const range={start:999,end:1000};
+  f.configure([{...planner,reads:[
+    {action:'read_bundle',purpose:'same outside',inputs:[{path:'outside.txt',media:'text/plain',range}]},
+    {action:'read_bundle',purpose:'same outside',inputs:[{source:reference(source),range}]}
+  ]}]);
+  const result=await f.run(3),children=ownTurns(f.store).slice(1);
+  assert.equal(result.value.pauseCode,'research_v7_mode_unavailable',JSON.stringify(result.value));
+  assert.equal(children.length,2);
+  const first=children[0]!,second=children[1]!,output=first.value.observation.ref as Ref;
+  assert.deepEqual(second.value.observation.ref,output);
+  const results=f.store.list<any>('reader-result');
+  assert.equal(results.length,1);assert.equal(results[0]!.value.producer,'outside');
+  assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).filter(row=>row.value.kind==='reader').length,0);
+  assert.equal(f.wires().length,1,'only the planner calls the adapter');
+  const cold=f.open();
+  for(const child of children){
+    assert.equal(child.value.status,'completed');assert.equal(child.value.error,null);
+    assert.deepEqual(readResearchConsumerTurn(f.store,reference(child)),child);
+    assert.deepEqual(readResearchConsumerTurn(cold,reference(child)),child);
+  }
+  const consumer={run:reference(f.store.get<any>(second.value.run,1)!),
+    turn:reference(f.store.get<any>(second.id,1)!)};
+  assert.equal(readSavedReaderBundleResult(cold,'p',second.value.question,'same outside',
+    second.value.action.inputs,consumer),null,'unbound lookup cannot borrow another child result');
+  for(const input of [{source:reference(foreign),range},
+    {source:reference(source),range:{start:999,end:1001}},
+    {source:reference(source),range:{start:0,end:5}}])
+    assert.equal(readSavedReaderBundleResult(cold,'p',second.value.question,'same outside',[input],consumer,output),null);
+  const history=f.history(),calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
+  await f.run(3,cold);
+  assert.deepEqual(f.history(),history);assert.deepEqual(f.store.list('reader-result'),results);
+  assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  assert.equal(f.wires().length,1);
 });
 
 test('S6.4-02: a saved outside result finishes its exact child after disabled settings and plan reopen without a new result', async t => {

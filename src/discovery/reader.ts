@@ -779,7 +779,7 @@ export function readSavedReaderBundleResult(store: Store, project: string, quest
   const candidates = output ? [readReaderResultAt(store, project, output)] : readerResultsInScope(store, project, question);
   const matches = candidates.filter(result => {
     if (canonical(result.value.question) !== canonical(question) || result.value.purpose !== purpose) return false;
-    if (result.value.producer === 'outside') {
+    if (result.value.producer === 'outside' && !output) {
       const request = result.value.request!;
       const saved = request.consumer;
       if (request.child.length || canonical(request.inputs) !== canonical(rootInputs)
@@ -789,8 +789,10 @@ export function readSavedReaderBundleResult(store: Store, project: string, quest
       return restored.kind === 'completed' && canonical(reference(restored.result)) === canonical(reference(result));
     }
     if (!output) return false;
-    // The result proof fixes every original Source/window; reconstruct the
-    // public request against those immutable bytes, never today's file heads.
+    // Explicit outputs may be borrowed, including outside results whose
+    // original request belongs to another consumer. Their producer proof fixes
+    // every Source/window/reading; match this request against those immutable
+    // bytes, never today's file heads.
     const root = historicalReaderSources(store, project, result.value.coverage.map((entry, sourceIndex) => ({
       sourceIndex, source: entry.ref, window: entry.visibleRange, ...(entry.reading ? { reading: entry.reading } : {})
     })));
