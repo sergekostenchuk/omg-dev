@@ -356,6 +356,10 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["questions", INDEX, "answer", "managed", "heads", INDEX],
     ["questions", INDEX, "answer", "managed", "pinned", INDEX],
     ["external", INDEX, "ref"], ["external", INDEX, "basis"]] },
+  // DR9 9.1-F: the keeper check key names exactly the container records of its two addresses — the
+  // pointers, the project and the check version are data; no other Ref-like value is a reference.
+  { kind: "keeper-check-key", contract: "keeper-check-key/v1", data: [], refs: [
+    ["artifact", "container"], ["constitution", "container"]] },
 ];
 
 const object = (value: unknown): value is Record<string, unknown> =>
