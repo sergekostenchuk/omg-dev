@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtempSync,writeFileSync,readFileSync,existsSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join,dirname} from 'node:path';
+import {spawnSync} from 'node:child_process';
+import {fileURLToPath} from 'node:url';
 import {Store} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
@@ -94,4 +96,19 @@ test('the global ReaderPilot request limit applies to initial and continuation r
  const physical=configureReaderPilot(f.store,f.engine.environments,'p',{...settings,physicalLimits:{maxRequestChars:100000,maxReplyChars:10000,basis:'Fixture transport capacity'}},pilot.revision);
  await assert.rejects(previewResearch(()=>call(physical)),{code:'budget_transport_limit'});
  assert.equal(f.store.list('model-call').length,1);
+});
+
+test('the closed ordinary R2 dry-run mode refuses by name before creating any output',t=>{
+ const script=join(dirname(fileURLToPath(import.meta.url)),'..','..','scripts','r2-dry-run.mjs');
+ const root=mkdtempSync(join(tmpdir(),'omg-r2dry-'));
+ t.after(()=>rmSync(root,{recursive:true,force:true}));
+ const out=join(root,'never-created');
+ const old=spawnSync(process.execPath,[script,'source.sqlite',out],{encoding:'utf8'});
+ assert.notEqual(old.status,0,'the closed mode exits nonzero');
+ assert.ok(`${old.stderr}${old.stdout}`.includes('r2_dry_run_mode_removed'),'the closed mode refuses by a named code');
+ assert.equal(existsSync(out),false,'no output directory or copy is created');
+ const preview=spawnSync(process.execPath,[script,'source.sqlite',join(root,'never-preview'),'--preview'],{encoding:'utf8'});
+ assert.notEqual(preview.status,0);
+ assert.ok(`${preview.stderr}${preview.stdout}`.includes('Preview requires the exact prepared R2 draft ID'),'the preview branch still loads after the removal');
+ assert.equal(existsSync(join(root,'never-preview')),false);
 });

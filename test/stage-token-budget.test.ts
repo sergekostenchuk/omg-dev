@@ -210,7 +210,7 @@ test("draft replacement or recreation in the same stage retains segment and pres
     basis: [reference(draft1)],
     explanation: "first research call",
   };
-  const reservation = reserveResearchCall(store, seg, "call-1", ["shared-group"], estimate, "research");
+  const reservation = reserveResearchCall(store, { saved: seg }, "call-1", ["shared-group"], estimate, "research");
   store.writeMany(
     [
       { id: "call-1", kind: "model-call", expected: 0, value: mockModelCall("call-1", "proj-share") },

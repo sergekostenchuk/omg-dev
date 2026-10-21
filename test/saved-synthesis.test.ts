@@ -11,7 +11,6 @@ import type { DiscoveryDraft, Question } from "../src/discovery/discovery.js";
 import type { ModelCall } from "../src/runtime/model-usage.js";
 import { pilotEnvironment, type ReaderPilot, type ReaderPilotSettings } from "../src/discovery/reader-pilot.js";
 import { configurePhasePolicy } from "../src/discovery/phase-policy.js";
-import { configureBudgetSegment } from "../src/runtime/research-budget.js";
 import { configureResearchScope } from "../src/graph/research-scope.js";
 import { checkpoint } from "../src/discovery/research-continuation.js";
 import {savedSynthesisMaterials} from '../src/discovery/saved-synthesis.js';
@@ -86,7 +85,6 @@ function fixture(t: test.TestContext, scenario = "answer", level: "R1" | "R2" = 
   const enable = () => {
     const pilot = engine.execute({ type: "configure-reader-pilot", project: "p", expected: 0, settings }) as Revision<ReaderPilot>;
     if (level === "R2") {
-      configureBudgetSegment(store, "p", "saved-recovery");
       configurePhasePolicy(store, "p", "compilation", "saved-recovery", 0);
       // Explicit synthetic calibration of this deterministic local adapter only.
       const env = pilotEnvironment(engine.environments.get("p").value, pilot.value);

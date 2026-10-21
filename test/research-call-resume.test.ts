@@ -30,7 +30,6 @@ import { projectGraph } from '../src/graph/project.js';
 import { layerDesignOf } from '../src/graph/layer-design.js';
 import { layerDeltaView } from '../src/discovery/layer-delta.js';
 import { configureResearchScope } from '../src/graph/research-scope.js';
-import { configureBudgetSegment } from '../src/runtime/research-budget.js';
 import { configurePhasePolicy } from '../src/discovery/phase-policy.js';
 import { answerTechnicalFixture } from './technical-research-fixture.js';
 import { answerLayerFixture } from './layer-design-fixture.js';
@@ -3358,7 +3357,6 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
   answerTechnicalFixture(engine, 'p', r2);
   engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
   const draft = engine.refinement.prepareLayer('p', 3);
-  configureBudgetSegment(store, 'p', 'layer-refusal');
   const question = store.get<Question>(draft.value.questions[0]!)!;
   const source = engine.discovery.evidence.document('p', 'design-source',
     'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
@@ -3696,7 +3694,6 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
   answerTechnicalFixture(engine, 'p', r2);
   engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
   const draft = engine.refinement.prepareLayer('p', 3);
-  configureBudgetSegment(store, 'p', 'layer-refusal');
   const question = store.get<Question>(draft.value.questions[0]!)!;
   const source = engine.discovery.evidence.document('p', 'design-source',
     'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
@@ -3847,7 +3844,6 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
   answerTechnicalFixture(engine, 'p', r2);
   engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
   const draft = engine.refinement.prepareLayer('p', 3);
-  configureBudgetSegment(store, 'p', 'layer-refusal');
   const question = store.get<Question>(draft.value.questions[0]!)!;
   const source = engine.discovery.evidence.document('p', 'design-source',
     'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);
@@ -4406,7 +4402,6 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,
   answerTechnicalFixture(engine, 'p', r2);
   engine.refinement.finishResearch('p', 'R2', reference(store.get(r2.id)!), 0);
   const draft = engine.refinement.prepareLayer('p', 3);
-  configureBudgetSegment(store, 'p', 'layer-refusal');
   const question = store.get<Question>(draft.value.questions[0]!)!;
   const source = engine.discovery.evidence.document('p', 'design-source',
     'The accepted layer and proposed atomic work share the same product scope.', 'text/plain', 0);

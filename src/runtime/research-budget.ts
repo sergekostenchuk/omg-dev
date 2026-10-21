@@ -6,7 +6,7 @@ import type { ModelCall } from './model-usage.js';
 import type { DiscoveryDraft, Question } from '../discovery/discovery.js';
 
 export interface CallEstimate { kind: 'estimated' | 'guaranteed'; tokens: number; basis: Ref[]; explanation: string }
-export interface BudgetSegment { projectId: string; key: string; limit: number; initialGroupLimit: number; ownerGroupCeiling?: number; completionReserve?: number }
+export interface BudgetSegment { projectId: string; key: string; limit: number; initialGroupLimit: number; ownerGroupCeiling?: number; completionReserve: number }
 interface Assignment { call: string; groups: string[]; estimate: CallEstimate }
 interface Ledger { projectId: string; segment: string; assignments: Assignment[] }
 export interface Optimization {
@@ -17,17 +17,6 @@ export interface Optimization {
 interface WorkingLimit { projectId: string; segment: string; group: string; metric: string; limit: number; ceiling?: number; decisions: Optimization[] }
 const positive = (n: number) => Number.isSafeInteger(n) && n > 0;
 export const segmentId = (project: string, key: string) => `research-budget:${hashJson([project, key])}`;
-export function configureBudgetSegment(store: Store, projectId: string, key: string, limit = 10_000_000, initialGroupLimit = 700_000, ownerGroupCeiling?: number, completionReserve?: number) {
-  requireCondition(key.trim() && positive(limit) && positive(initialGroupLimit) && initialGroupLimit <= limit,
-    'budget_invalid', 'Explicit positive segment and question limits are required');
-  requireCondition(ownerGroupCeiling === undefined || (positive(ownerGroupCeiling) && initialGroupLimit <= ownerGroupCeiling && ownerGroupCeiling <= limit),
-    'budget_owner_ceiling_invalid', 'An owner block ceiling must be a positive integer between the initial group limit and segment limit');
-  requireCondition(completionReserve === undefined || (Number.isSafeInteger(completionReserve) && completionReserve >= 0 && completionReserve <= limit),
-    'budget_completion_reserve_invalid', 'A completion reserve must be a non-negative integer up to the segment limit');
-  // A segment cannot be reset by replacing a profile or recreating a draft.
-  return store.write<BudgetSegment>({ id: segmentId(projectId, key), kind: 'research-budget', expected: 0,
-    value: { projectId, key, limit, initialGroupLimit, ...(ownerGroupCeiling === undefined ? {} : { ownerGroupCeiling }), ...(completionReserve === undefined ? {} : { completionReserve }) } });
-}
 export function budgetSegment(store: Store, project: string, key: string) {
   const s = store.get<BudgetSegment>(segmentId(project, key));
   requireCondition(s?.kind === 'research-budget' && s.value.projectId === project && s.value.key === key
@@ -53,8 +42,9 @@ function segmentOwnerCeiling(store: Store, segment: Revision<BudgetSegment>): nu
   'budget_owner_ceiling_invalid', 'The saved owner block ceiling is missing or invalid');
   return ceiling;
 }
-/** New segments bind the completion reserve at creation. Its absence on an original
- * legacy segment retains that segment's existing unlimited-research policy (reserve 0). */
+/** Every readable segment binds its completion reserve at creation; the reserve
+ * is a mandatory field. A pre-DR3c segment saved without it can no longer admit
+ * new work under a silent zero reserve — reading its policy is a typed refusal. */
 export function segmentCompletionReserve(store: Store, segment: Revision<BudgetSegment>): number {
   const saved = store.get<BudgetSegment>(segment.id, segment.revision);
   const original = store.get<BudgetSegment>(segment.id, 1);
@@ -65,10 +55,10 @@ export function segmentCompletionReserve(store: Store, segment: Revision<BudgetS
   requireCondition(Object.hasOwn(original.value, 'completionReserve') === Object.hasOwn(segment.value, 'completionReserve')
     && reserve === segment.value.completionReserve,
   'budget_completion_reserve_changed', 'A segment cannot remove or replace its completion reserve');
-  requireCondition(!Object.hasOwn(original.value, 'completionReserve') || (typeof reserve === 'number' && Number.isSafeInteger(reserve)
-    && reserve >= 0 && reserve <= original.value.limit),
+  requireCondition(typeof reserve === 'number' && Number.isSafeInteger(reserve)
+    && reserve >= 0 && reserve <= original.value.limit,
   'budget_completion_reserve_invalid', 'The saved completion reserve is missing or invalid');
-  return reserve ?? 0;
+  return reserve;
 }
 /** Target identity survives question/draft regeneration and field grouping changes.
  * A call spanning several obligations is charged once to the segment and to each
@@ -155,23 +145,7 @@ export function prepareNewSegmentReservation(
 
 export function reserveResearchCall(
   store: Store,
-  segment: Revision<BudgetSegment>,
-  call: string,
-  groups: string[],
-  estimate: CallEstimate,
-  classification?: 'research' | 'completion'
-): { writes: Write[]; guards: ReadGuard[] };
-export function reserveResearchCall(
-  store: Store,
   target: BudgetSegmentTarget,
-  call: string,
-  groups: string[],
-  estimate: CallEstimate,
-  classification?: 'research' | 'completion'
-): { writes: Write[]; guards: ReadGuard[] };
-export function reserveResearchCall(
-  store: Store,
-  targetOrSegment: Revision<BudgetSegment> | BudgetSegmentTarget,
   call: string,
   groups: string[],
   estimate: CallEstimate,
@@ -184,8 +158,8 @@ export function reserveResearchCall(
   requireCondition(Array.isArray(groups) && groups.length > 0 && new Set(groups).size === groups.length,
     'budget_group_missing', 'Logical obligation groups are required');
 
-  if (typeof targetOrSegment === 'object' && targetOrSegment !== null && 'creating' in targetOrSegment) {
-    const creating = targetOrSegment.creating;
+  if (typeof target === 'object' && target !== null && 'creating' in target) {
+    const creating = target.creating;
     requireCondition(creating && typeof creating === 'object' && typeof creating.key === 'string' && creating.key.trim().length > 0
       && typeof creating.projectId === 'string' && creating.projectId.trim().length > 0
       && positive(creating.limit) && positive(creating.initialGroupLimit) && creating.initialGroupLimit <= creating.limit,
@@ -241,9 +215,10 @@ export function reserveResearchCall(
     return { writes, guards };
   }
 
-  const segment = (typeof targetOrSegment === 'object' && targetOrSegment !== null && 'saved' in targetOrSegment)
-    ? targetOrSegment.saved
-    : (targetOrSegment as Revision<BudgetSegment>);
+  requireCondition(typeof target === 'object' && target !== null && 'saved' in target
+    && target.saved !== null && target.saved !== undefined,
+    'budget_segment_invalid', 'A budget reservation requires an exact { saved } or { creating } target');
+  const segment = target.saved;
 
   requireCondition(segment && typeof segment === 'object', 'budget_segment_invalid', 'A saved budget segment revision is required');
   const ownerCeiling = segmentOwnerCeiling(store, segment);
