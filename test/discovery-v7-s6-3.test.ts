@@ -66,6 +66,7 @@ function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
 
 async function setup(t: test.TestContext, questions = [planQuestion('support','market'), planQuestion('block','industry','blocking')], calibrated = true, planning = true) {
   const f=fixture(t);f.engine.execute({type:'create-project',project:'p',title:'P'});
+  writeFileSync(join(f.root,'scope.txt'),'Exact scope for the real queued read.');
   const wire=join(f.root,'wire.ndjson'), settings=join(f.root,'reply.json'), adapter=join(f.root,'adapter.mjs');
   const configure=(replies: unknown[]=[], tokens: number | null=10)=>writeFileSync(settings,JSON.stringify({replies,tokens}));
   configure();
@@ -119,7 +120,7 @@ const planner = { action: 'read_plan', question: '$selected', reads };
 test('S6.3: a real paid planner publishes one original turn and its complete exact subject queue', async t => {
   const f = await setup(t); f.configure([planner]);
   const before = f.store.list('research-budget-ledger');
-  const result = await f.run(1);
+  const result = await f.run(2);
   assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
   const rows = f.store.list<any>('research-turn').sort((a,b) => a.value.number-b.value.number);
   assert.equal(rows.length, 3); assert.equal(result.value.turns, 3); assert.ok(result.value.requestChars > 0);
@@ -130,8 +131,9 @@ test('S6.3: a real paid planner publishes one original turn and its complete exa
   const subject: V7PlanSubject = { contract: 'v7-plan-subject/v1', planAnswer: f.v.planAnswer, planQuestionId: 'block' };
   assert.deepEqual(parent.value.subject, subject);
   assert.equal(v7PlannerRounds(f.store, 'p', subject), 1);
-  assert.deepEqual(parent.value.observation.children, rows.slice(1).map(reference));
+  assert.deepEqual(parent.value.observation.children, rows.slice(1).map(row => reference(f.store.get<any>(row.id, 1)!)));
   for (const [index, child] of rows.slice(1).entries()) {
+    assert.equal(child.value.status, 'completed'); assert.equal(child.value.error, null);
     assert.deepEqual(child.value.action, reads[index]); assert.deepEqual(child.value.subject, subject);
     assert.deepEqual(child.value.question, reference(f.v.plan)); assert.deepEqual(child.value.plannedBy, reference(original));
     assert.equal(Object.hasOwn(child.value, 'attemptContract'), false);
@@ -142,7 +144,7 @@ test('S6.3: a real paid planner publishes one original turn and its complete exa
   assert.equal(intent.value.state, 'applied');
   const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
   assert.equal(f.wires().length, 1); assert.equal(ledger.length, before.length + 1);
-  const history = f.history(); assert.deepEqual(await f.run(1, f.open(), false), result);
+  const history = f.history(); assert.deepEqual(await f.run(2, f.open()), result);
   assert.deepEqual(f.history(), history); assert.deepEqual(f.store.list('model-call'), calls);
   assert.deepEqual(f.store.list('research-budget-ledger'), ledger); assert.equal(f.wires().length, 1);
 });
@@ -176,9 +178,12 @@ for (const boundary of ['paid', 'before-queue', 'in-queue', 'after-queue'] as co
     assert.equal(paused.value.turns, boundary === 'paid' ? 0 : boundary === 'after-queue' ? 3 : 1);
     const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
     const cold = f.open(), result = await f.run(1, cold, false);
-    assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
+    assert.equal(result.value.pauseCode, 'research_contract_upgrade_required', JSON.stringify(result.value));
     assert.equal(result.value.turns, 3); assert.ok(result.value.requestChars > 0);
     const turns = cold.list<any>('research-turn'); assert.equal(turns.length, 3);
+    for (const turn of turns.filter(row => !row.id.startsWith('research-turn:v1:'))) {
+      assert.equal(turn.value.status, 'completed'); assert.equal(turn.value.error, null);
+    }
     for (const turn of turns) assert.deepEqual(readResearchConsumerTurn(cold, reference(turn)), turn);
     assert.equal(turns.filter(turn => turn.id.startsWith('research-turn:v1:')).length, 1);
     assert.deepEqual(cold.list('model-call'), calls); assert.deepEqual(cold.list('research-budget-ledger'), ledger);
@@ -210,7 +215,7 @@ test('S6.3: planner admission on the next subject preserves the existing common 
   const segments = f.store.list('research-budget'), ledger = f.store.list<any>('research-budget-ledger');
   assert.equal(segments.length, 1); assert.equal(ledger.length, 1);
   f.enablePlanning(); f.configure([ended(), planner]);
-  const result = await f.run(1, f.open());
+  const result = await f.run(2, f.open());
   assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
   assert.equal(result.value.turns, 4);
   const intent = listResearchConsumerIntents(f.store, 'p', f.v.draft.id).find(row => row.value.kind === 'reading-planner')!;
@@ -254,8 +259,8 @@ for (const boundary of ['unpaid', 'paid'] as const)
     f.engine.execute({ type: 'configure-reader-pilot', project: 'p', expected: configured.revision,
       settings: { ...settings, active: false } });
     const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
-    const cold = f.open(), result = await f.run(1, cold);
-    assert.equal(result.value.pauseCode, boundary === 'paid' ? 'research_v7_mode_unavailable' : 'reading_plan_disabled',
+    const cold = f.open(), result = await f.run(1, cold, boundary !== 'paid');
+    assert.equal(result.value.pauseCode, boundary === 'paid' ? 'research_contract_upgrade_required' : 'reading_plan_disabled',
       JSON.stringify(result.value));
     assert.equal(cold.list('research-turn').length, boundary === 'paid' ? 3 : 0);
     for (const row of cold.list('research-turn')) assert.deepEqual(readResearchConsumerTurn(cold, reference(row)), row);

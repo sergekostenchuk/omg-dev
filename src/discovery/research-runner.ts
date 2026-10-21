@@ -1306,6 +1306,106 @@ export class Researcher {
         pauseCode: error instanceof EngineError ? error.code : "research_interrupted" });
     }
   }
+  /** A queued child consumes the exact paid planner's draft, question and
+   * dispatch. The common reader owns its own reservation and paid replay. */
+  private async applyV7QueuedChild(project: string, run: Revision<ResearchRun>, child: Revision<ResearchTurn>,
+    signal?: AbortSignal): Promise<Revision<ResearchRun>> {
+    requireCondition(isRef(child.value.plannedBy), "research_consumer_intent_invalid", "A queued child needs its planner");
+    const parent = readResearchConsumerTurn(this.store, child.value.plannedBy) as Revision<ManagedResearchTurn>;
+    const producer = readResearchConsumerIntent(this.store, parent.value.consumerIntent);
+    const paid = readResearchConsumerExecution(this.store, project, reference(producer));
+    requireCondition(paid.kind === "response" && producer.value.kind === "reading-planner",
+      "research_consumer_intent_invalid", "The queued child lost its paid planner response");
+    const draft = this.store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
+    const question = this.store.get<Question>(producer.value.question.id, producer.value.question.revision)!;
+    requireCondition(draft?.kind === "discovery-draft" && question?.kind === "question"
+      && canonical(reference(draft)) === canonical(producer.value.draft)
+      && canonical(reference(question)) === canonical(child.value.question),
+      "research_consumer_intent_invalid", "The queued read lost its original draft or question");
+    const action = turnAction(child.value), sources = new ResearchSources(this.store, project, producer.value.dispatch.workspace);
+    let observation: unknown, completion: ResearchTurn;
+    const guards: Ref[] = [reference(run), reference(child)];
+    try {
+      if (action.action === "read_bundle") {
+        const attached = listResearchConsumerIntents(this.store, project, draft.id)
+          .filter(row => row.value.kind === "reader" && row.value.owner.id === child.id);
+        const originalRuns = attached.map(row => {
+          const consumer = row.value.cursor.consumer;
+          requireCondition(consumer && isRef(consumer.run) && isRef(consumer.turn)
+            && consumer.run.id === run.id && canonical(consumer.turn) === canonical(reference(child)),
+            "research_consumer_intent_invalid", "The saved reader lost its exact queued child binding");
+          return consumer.run as Ref;
+        });
+        requireCondition(new Set(originalRuns.map(canonical)).size <= 1,
+          "research_consumer_intent_invalid", "The queued bundle has incompatible saved run bindings");
+        const currentPilot = readerPilot(this.store, project);
+        const savedProfile = attached.find(row => row.value.state !== "prepared" && isRef(row.value.profile))?.value.profile;
+        const pilot = savedProfile ? this.store.get<ReaderPilot>(savedProfile.id, savedProfile.revision) : currentPilot;
+        requireCondition(pilot?.kind === "reader-pilot" && (!savedProfile || canonical(reference(pilot)) === canonical(savedProfile)),
+          "reader_pilot_required", "The queued bundle needs its current or saved paid reader profile");
+        const result = await readBundle(this.store, producer.value.dispatch, pilot, reference(question), action.purpose,
+          action.inputs, signal, { run: originalRuns[0] ?? reference(run), turn: reference(child) });
+        readReaderResultAt(this.store, project, reference(result));
+        observation = { ref: reference(result), observations: result.value.observations,
+          coverage: result.value.coverage, unresolved: result.value.unresolved };
+        guards.push(reference(result));
+      } else if (action.action === "search") {
+        const queued = this.store.get<ResearchTurn>(parent.id, parent.revision + 1)!;
+        const captured = sources.searchCaptured(action.query, child, { original: parent, queued });
+        this.store.writeMany([captured.capture,
+          { id: child.id, kind: child.kind, expected: child.revision, value: captured.turn }],
+          uniqueTransactionGuards([...guards, ...captured.guards]));
+        return run;
+      } else if (action.action === "read") {
+        const source = sources.read(action.path, action.media);
+        observation = { ref: reference(source), length: source.value.content.length,
+          excerpt: source.value.content.slice(0, 3000), truncated: source.value.content.length > 3000 };
+        guards.push(reference(source));
+      } else if (action.action === "read_source") {
+        const source = this.store.get<Source>(action.source.id, action.source.revision);
+        requireCondition(source?.kind === "source" && canonical(reference(source)) === canonical(action.source),
+          "research_consumer_intent_invalid", "The queued excerpt lost its exact source");
+        const contract = sourceReadContract(source.value, action.source);
+        new Evidence(this.store).readSource(project, action.source, { start: action.start, end: action.end }, contract);
+        completion = projectSourceReadingTurn(child.value, project, { ref: reference(source), value: source.value }, contract);
+        this.store.writeMany([{ id: child.id, kind: child.kind, expected: child.revision, value: completion }], guards);
+        return run;
+      } else if (action.action === "read_context") {
+        const settings = producer.value.basis.map(ref => this.store.get<ReaderPilot>(ref.id, ref.revision))
+          .find(row => row?.kind === "reader-pilot");
+        try {
+          observation = readResearchContext(this.store, draft, question.id, settings ?? undefined,
+            action.record, action.pointer, action.page, researchContextReadEra(this.store, paid.subject));
+        } catch (error) {
+          if (!(error instanceof EngineError) || error.code !== "context_read_limit") throw error;
+          return splitPlannedContextRead(this.store, run, child, draft, question).run;
+        }
+        const previous = repeatedContextRead(this.store, this.store.list<ResearchTurn>("research-turn")
+          .filter(row => row.value.run === run.id && row.value.number < child.value.number)
+          .sort((a,b) => a.value.number-b.value.number), question, 0, observation, action, planSubjectOf(child.value)!);
+        if (previous) {
+          const repeated = { code: "research_no_progress", previous };
+          if (canonical(child.value.observation) !== canonical(repeated)) this.store.writeMany([
+            { id: child.id, kind: child.kind, expected: child.revision,
+              value: { ...child.value, observation: repeated, status: "pending" } }], guards);
+          throw new EngineError("research_no_progress", "The same unchanged page was requested again without a checkpoint; research is paused", previous);
+        }
+      } else if (action.action === "web_search" || action.action === "web_fetch") {
+        await executeWebTurn({ store: this.store, projectId: project, stage: draft.value.stage,
+          environment: this.store.get<Environment>(`environment:${project}`)!, turn: child });
+        return run;
+      } else throw new EngineError("research_mode_invalid", "The queued planner action is not a read");
+      completion = { ...child.value, status: "completed", error: null, observation: observation as ResearchTurn['observation'] };
+    } catch (error) {
+      if (action.action === "read_bundle" || error instanceof EngineError && ["input_stale", "revision_conflict",
+        "research_consumer_intent_invalid", "research_mode_invalid", "research_no_progress", ...OBLIGATION_EVIDENCE_PAUSES].includes(error.code)) throw error;
+      completion = { ...child.value, status: "completed", error: error instanceof Error ? error.message : "The planned read failed",
+        observation: { code: error instanceof EngineError ? error.code : "research_read_failed",
+          ...(error instanceof EngineError ? { details: error.details } : {}) } };
+    }
+    this.store.writeMany([{ id: child.id, kind: child.kind, expected: child.revision, value: completion }], guards);
+    return run;
+  }
   /** The initial v7 plan traversal uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
@@ -1323,13 +1423,14 @@ export class Researcher {
         const recovery = selectV7AnalystRecovery(this.store, project, draftId, run);
         const { turns, intents, outstanding } = recovery;
         const turn = recovery.turn;
-        // S6.3 publishes a whole proved queue. Its children are connected by
-        // S6.4; keep this exact saved queue without another planner admission.
         if (turn && isRef(turn.value.plannedBy)) {
-          const error = `[${turn.id}] The saved v7 reader queue awaits child execution`;
-          if (run!.value.status === "paused" && run!.value.pauseCode === "research_v7_mode_unavailable"
-            && run!.value.error === error) return run!;
-          return this.save(run!, { status: "paused", pauseCode: "research_v7_mode_unavailable", error }, [reference(turn)]);
+          requireCondition(run, "research_consumer_intent_invalid", "The saved reader queue lost its run");
+          const repeatingContextPause = run.value.status === "paused" && run.value.pauseCode === "research_no_progress"
+            && turnAction(turn.value).action === "read_context";
+          if (run.value.status !== "running" && !repeatingContextPause) run = this.save(run,
+            { status: "running", owner, error: null, pauseCode: null }, [reference(turn)]);
+          run = await this.applyV7QueuedChild(project, run, turn, signal);
+          continue;
         }
         if (run && (turn || outstanding) && run.value.status !== "running")
           run = this.save(run, { status: "running", owner, error: null, pauseCode: null },
@@ -1527,8 +1628,6 @@ export class Researcher {
         if (!selection.next) return this.save(run, { status: "completed", error: null, pauseCode: null });
         if (used >= limit) return this.save(run, { status: "paused", pauseCode: "research_turns_exhausted",
           error: "Research turn allowance reached; paid attempts are preserved" });
-        if (run.value.status !== "running") run = this.save(run,
-          { status: "running", owner, limit, ownerQuestion: null, error: null, pauseCode: null });
         const subject: V7PlanSubject = { contract: V7_PLAN_SUBJECT_CONTRACT,
           planAnswer: selection.planAnswer, planQuestionId: selection.next.planQuestionId };
         const selectedTurns = turns.filter(row => sameSubject(planSubjectOf(row.value), subject));
@@ -1540,8 +1639,11 @@ export class Researcher {
           "A new planner intent requires its exact settings snapshot");
         const mode = planning ? v7DispatchMode(this.store, project, turns, selection.question, subject, planning) : null;
         requireCondition(mode !== "synthesis", "research_v7_mode_unavailable", "The v7 synthesis runner is not connected");
+        if (run.value.status !== "running") run = this.save(run,
+          { status: "running", owner, limit, ownerQuestion: null, error: null, pauseCode: null });
         const sources = new ResearchSources(this.store, project, effective.root);
         const workspace = addressedWorkspace(this.store, selectedTurns, selection.question, row => {
+          if (isRef(row.value.plannedBy)) return null;
           const paid = readResearchConsumerExecution(this.store, project, (row.value as ManagedResearchTurn).consumerIntent);
           return paid.kind === "response" ? paid.subject : null;
         });

@@ -30,6 +30,7 @@ import type { TechnicalReport } from '../graph/research-contracts.js';
 import type { RecoverableContextSession } from './context-recovery.js';
 import { readerPilot, pilotEnvironment, type ReaderPilot } from './reader-pilot.js';
 import { archivedContext, contextValue } from './working-context.js';
+import { researchContextReadEra } from './research-limits.js';
 import { requirePacketMaterialDelivery } from './research-delivery.js';
 import { requirePlanningNavigation } from './planning-context.js';
 import { contextWorkspace } from './context-workspace.js';
@@ -61,7 +62,7 @@ import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalR
   type ContextReadIdentityInput, type ContextTurnHistoryProof } from './research-consumer-transition.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V3, type ResearchAction, type ResearchAnswer, type ResearchAssessment, type ResearchRun, type ResearchTurn } from './research-model.js';
 import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
-import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt } from './reader.js';
+import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt, readerResumeStep } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queueOriginOf, queuedChildReached } from './reading-plan.js';
 import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRolePrompt, readAssessmentDispatchAdmission, readAssessmentApplicationOutcomeAt } from './assessment-session.js';
@@ -1170,6 +1171,86 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
       || ['attemptContract', 'attempt', 'attemptBinding'].some(field => Object.hasOwn(saved.value, field)))
       consumerInvalid(saved.id, 'A legacy turn address cannot claim a new consumer producer');
     queuedChildLineage(store, saved);
+    if (Object.hasOwn(saved.value, 'subject') && saved.value.status === 'completed' && saved.value.error === null
+      && ['read', 'read_context'].includes(saved.value.action?.action)) {
+      const before = store.get<ResearchTurn>(saved.id, saved.revision - 1);
+      if (!before || before.kind !== 'research-turn' || before.value.status !== 'pending')
+        consumerInvalid(saved.id, 'The queued read lost its exact pending revision');
+      // queuedChildLineage already proved this exact parent, including a
+      // split child's ancestry; the direct-search helper intentionally accepts
+      // only members named by the original queue.
+      const parent = store.get<ManagedResearchTurn>(before.value.plannedBy!.id, before.value.plannedBy!.revision)!;
+      const producer = readResearchConsumerIntent(store, parent.value.consumerIntent);
+      const action = turnAction(before.value);
+      let observation: unknown;
+      if (action.action === 'read') {
+        const ref = saved.value.observation?.ref;
+        const source = isRef(ref) ? store.get<Source>(ref.id, ref.revision) : null;
+        if (!source || source.kind !== 'source' || canonical(reference(source)) !== canonical(ref)
+          || source.id !== `source:${producer.value.projectId}:research-${digest(action.path).slice(0, 32)}`
+          || source.value.projectId !== producer.value.projectId || source.value.origin?.kind !== 'file'
+          || source.value.mediaType !== action.media || typeof source.value.content !== 'string'
+          || digest(source.value.content) !== source.value.sha256)
+          consumerInvalid(saved.id, 'The queued file read lost its exact source bytes');
+        observation = { ref, length: source.value.content.length,
+          excerpt: source.value.content.slice(0, 3000), truncated: source.value.content.length > 3000 };
+      } else if (action.action === 'read_context') {
+        const into = saved.value.observation?.splitInto;
+        if (Array.isArray(into)) {
+          if (into.length !== 2 || !into.every(isRef) || !into.every(ref => {
+            const part = store.get<ResearchTurn>(ref.id, ref.revision);
+            return part && canonical(reference(part)) === canonical(ref)
+              && queueOriginOf(store, part, parent);
+          })) consumerInvalid(saved.id, 'The queued context split lost its exact derived children');
+          return saved;
+        }
+        const draft = store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
+        const question = store.get<Question>(producer.value.question.id, producer.value.question.revision)!;
+        const pilot = producer.value.basis.map(ref => store.get<ReaderPilot>(ref.id, ref.revision))
+          .find(row => row?.kind === 'reader-pilot');
+        const paid = readResearchConsumerExecution(store, producer.value.projectId, reference(producer));
+        if (paid.kind !== 'response') consumerInvalid(saved.id, 'The queued context read lost its paid packet');
+        observation = readResearchContextOutcomeAt(store, draft, question, action,
+          pilot?.value.maxRequestChars ?? 300000, researchContextReadEra(store, paid.subject));
+      }
+      if (canonical(saved.value) !== canonical({ ...before.value, status: 'completed', error: null, observation }))
+        consumerInvalid(saved.id, 'The queued read does not derive from its exact original source');
+    }
+    if (Object.hasOwn(saved.value, 'subject') && saved.value.action?.action === 'read_bundle'
+      && saved.value.status === 'completed' && saved.value.error === null) {
+      const before = store.get<Record<string, any>>(saved.id, saved.revision - 1);
+      const resultRef = saved.value.observation?.ref;
+      const run = before && typeof before.value.run === 'string' ? store.get<{projectId: string; draftId: string}>(before.value.run, 1) : null;
+      if (!before || before.kind !== 'research-turn' || before.value.status !== 'pending'
+        || !run || run.kind !== 'research-run' || !isRef(resultRef))
+        consumerInvalid(saved.id, 'The queued bundle lost its exact pending action or reader result');
+      const result = readReaderResultAt(store, run.value.projectId, resultRef);
+      // Paid and combined results prove their request through the reader
+      // intents; only reused/outside results carry request inline. Let the
+      // common reader select its exact completed output for this child root.
+      const bindings = listResearchConsumerIntents(store, run.value.projectId, run.value.draftId)
+        .filter(row => row.value.kind === 'reader' && row.value.owner.id === before.id
+          && isRef(row.value.cursor.consumer?.turn) && canonical(row.value.cursor.consumer?.turn) === canonical(reference(before)))
+        .map(row => row.value.cursor.consumer);
+      if (result.value.request) bindings.push(result.value.request.consumer);
+      const consumers = [...new Map(bindings.map(binding => [canonical(binding), binding])).values()];
+      const consumer = consumers[0];
+      const originalRun = consumer && isRef(consumer.run)
+        ? store.get<{projectId: string; draftId: string}>(consumer.run.id, consumer.run.revision) : null;
+      if (consumers.length !== 1 || !consumer || !isRef(consumer.turn)
+        || canonical(consumer.turn) !== canonical(reference(before))
+        || !originalRun || originalRun.kind !== 'research-run' || !isRef(consumer.run)
+        || canonical(reference(originalRun)) !== canonical(consumer.run) || originalRun.id !== before.value.run
+        || originalRun.value.projectId !== run.value.projectId || originalRun.value.draftId !== run.value.draftId)
+        consumerInvalid(saved.id, 'The queued bundle lost its exact reader consumer root');
+      const step = readerResumeStep(store, run.value.projectId, before.value.question,
+        before.value.action.purpose, before.value.action.inputs, consumer);
+      if (step.kind !== 'completed' || canonical(reference(step.result)) !== canonical(resultRef)
+        || canonical(saved.value) !== canonical({ ...before.value, status: 'completed', error: null,
+          observation: { ref: resultRef, observations: result.value.observations,
+            coverage: result.value.coverage, unresolved: result.value.unresolved } }))
+        consumerInvalid(saved.id, 'The queued bundle result is not derived from its exact reader consumer');
+    }
     if (saved.value.action?.action === 'read_source' && object(saved.value.observation)
       && Object.hasOwn(saved.value.observation, 'contract')) {
       const before = store.get<Record<string, any>>(saved.id, saved.revision - 1);

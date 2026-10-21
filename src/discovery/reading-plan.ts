@@ -269,10 +269,15 @@ export function splitPlannedContextRead(store:Store,run:Revision<ResearchRun>,ch
   const actions=[{...action,page:{offset:start,limit:middle}},{...action,page:{offset:start+middle,limit:size-middle}}];
   const parts=projectSplitParts(run,child,actions).map(part=>({...part,kind:'research-turn',expected:0}));
   const refs=parts.map(part=>({id:part.id,revision:1,hash:hashJson(part.value)}));
+  // A proved v7 queue consumes its paid planner's immutable context after a
+  // physical-plan reopen too. No new dispatch is admitted by this split.
+  // Keep the historical field-path head guards in their own era.
+  const guards=Object.hasOwn(child.value,'subject') ? [reference(run),reference(child)]
+    : [reference(run),reference(child),reference(draft),reference(question),...draft.value.inputs,action.record];
   const saved=store.writeMany<ResearchRun|ResearchTurn>([
     {id:run.id,kind:run.kind,expected:run.revision,value:{...run.value,turns:run.value.turns+parts.length}},
     {id:child.id,kind:child.kind,expected:child.revision,value:{...child.value,status:'completed',error:null,observation:{splitInto:refs,reason:'context_read_limit'}}},
-    ...parts], [reference(run),reference(child),reference(draft),reference(question),...draft.value.inputs,action.record]);
+    ...parts], guards);
   return {run:saved[0]! as Revision<ResearchRun>,children:refs};
 }
 
