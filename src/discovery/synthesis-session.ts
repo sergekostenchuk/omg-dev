@@ -254,6 +254,9 @@ function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, que
         && canonical(value) === canonical(savedFindingMaterial(value.checkpoint, note.value).value);
     }
     if (material.kind === 'reader') {
+      // Its origin and era are the common reader's (readReaderResultAt: paid or outside producer, reader-result/v2 only).
+      if (!isRef(value.ref)) return false;
+      readReaderResultAt(store, projectId, value.ref);
       const result = exact(value.ref);
       return result?.kind === 'reader-result' && result.value.projectId === projectId
         && canonical(value) === canonical({ ref: reference(result), purpose: result.value.purpose,
@@ -261,6 +264,8 @@ function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, que
     }
     if (material.kind !== 'context') return false;
     if (Object.hasOwn(value, 'record')) {
+      // A lookup has the legacy form (no contract) or the bounded one; an unknown contract is no lookup.
+      if (Object.hasOwn(value, 'contract') && value.contract !== 'research-context-read/v2') return false;
       const record = exact(value.record);
       if (!record || typeof value.pointer !== 'string' || !subjectContextRecordHolds(store, projectId, draft.id, subject, record))
         return false;
@@ -301,6 +306,9 @@ function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, que
     }
     const source = exact(value.source);
     if (source?.kind !== 'source' || source.value.projectId !== projectId || value.projectId !== projectId) return false;
+    // A read names one of the three known read contracts; an unknown one is no reading (never "otherwise v1").
+    if (Object.hasOwn(value, 'contract')
+      && ![SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(value.contract)) return false;
     // A read of a contract is exactly that contract's projection of the pinned Source bytes.
     if ([SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(value.contract))
       return object(value.requested) && canonical(projectSourceReading(projectId, value.source, source.value as any,

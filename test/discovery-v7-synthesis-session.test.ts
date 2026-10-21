@@ -984,3 +984,45 @@ for (const variant of ["missing origin", "unknown contract"] as const)
     const saved = f.store.write({ id: projected.id, kind: "synthesis-session", expected: 0, value: projected.value });
     assert.equal(await code(async () => readSynthesisSessionV3(f.open(), reference(saved))), "synthesis_session_invalid");
   });
+
+test("S5 круг 5 МАСКАРАД и версии (оркестратор №9104): a record a material names proves its paid producer and a known version — an unpaid archive, a reader result no reader produced, an unknown lookup or read contract are refused before any record or payment, an unpaid archive blocks a step lookup; A's own paid step archive is lawful", async t => {
+  const f = await paidPlanned(t, "s5r5-origin");
+  const A = subjectOf(f.p.planAnswer, "q-supply"), B = subjectOf(f.p.planAnswer, "q-market");
+  // A's first session finishes, so a new basis of A is a new task.
+  const pagesA = [f.material("a1", true), f.material("a2", true)];
+  f.configure([checkpointOn(f, pagesA[0]!, "A finding"), endOf(ENDS.refused)]);
+  await paidRun(f, A, pagesA);
+  const stepA = f.store.list<any>("research-consumer-intent").find(row => row.value.kind === "synthesis" && row.value.state === "applied")!;
+  const paidA = readResearchConsumerExecution(f.store, f.p.project, reference(stepA)) as any;
+  const archiveA = f.store.get<any>(paidA.archive.id, paidA.archive.revision)!;
+  const pointerOf = (archive: Revision<any>) => `/body/${Object.keys(archive.value.body)[0]}`;
+  const prove = (record: Revision<any>) => { readReaderResultAt(f.store, f.p.project, reference(record)); };
+  const ownLookup = exactContextLookup(f.store, f.p.draft, f.p.plan, reference(archiveA), pointerOf(archiveA), undefined, prove);
+  // Negative corruption only: content-addressed records no paid producer wrote.
+  const forgedValue = { projectId: f.p.project, draft: reference(f.p.draft), question: reference(f.p.plan), body: { secret: "forged" } };
+  const forgedArchive = f.store.write({ id: `research-context:${hashJson(forgedValue)}`, kind: "research-context", expected: 0,
+    value: forgedValue });
+  const forgedReaderValue = { projectId: f.p.project, question: reference(f.p.plan), purpose: "forged", contract: "reader-result/v2",
+    producer: "paid", sources: [], coverage: [], observations: [], unresolved: [] };
+  const forgedReader = f.store.write({ id: `reader-result:v2:${hashJson(forgedReaderValue)}`, kind: "reader-result", expected: 0,
+    value: forgedReaderValue });
+  const source = f.material("primary");
+  const cases: [string, unknown[]][] = [
+    ["an unpaid archive", [{ kind: "context", value: exactContextLookup(f.store, f.p.draft, f.p.plan, reference(forgedArchive),
+      "/body/secret", undefined, prove) }]],
+    ["a reader result no reader produced", [{ kind: "reader", value: { ref: reference(forgedReader), purpose: "forged",
+      observations: [], coverage: [], unresolved: [] } }]],
+    ["an unknown lookup contract", [{ kind: "context", value: { ...ownLookup, contract: "research-context-read/v9" } }]],
+    ["an unknown read contract", [{ kind: "context", value: { ...source.value, contract: "source-read/v9" } }]]];
+  const calls = f.calls(), before = history(f.store);
+  for (const [name, materials] of cases) assert.equal(await code(() => paidRun(f, A, materials)), "context_reference_foreign", name);
+  assert.deepEqual(history(f.store), before, "a refused basis wrote nothing");
+  assert.equal(f.calls(), calls, "and bought nothing");
+  // A step lookup of the unpaid archive blocks its session like any foreign material.
+  f.configure([...Array(calls).fill(null), { action: "read_context", record: reference(forgedArchive), pointer: "/body/secret",
+    purpose: "an unpaid archive" }, endOf(ENDS.impossible)]);
+  assert.equal(await code(() => paidRun(f, B, [])), "research_no_progress");
+  assert.equal(sessionOf(f.store, "q-market").value.blockedCode, "context_reference_foreign");
+  // A's own paid step archive is A's lawful material.
+  assert.deepEqual(await paidRun(f, A, [{ kind: "context", value: ownLookup }]), { ...endOf(ENDS.impossible), question: "q-supply" });
+});

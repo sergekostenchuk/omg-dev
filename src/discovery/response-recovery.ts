@@ -2993,12 +2993,28 @@ export function paidNoteOrigin(store: Store, projectId: string, draftId: string,
  * to a record it carries into a session of one subject — the entry materials,
  * an inherited or recovered context, a step lookup, and the historical proof
  * of each. A note is a v2 note of exactly this subject with a proven paid
- * origin; a request archive belongs to no plan subject or to exactly this one.
+ * origin; a request archive belongs to no plan subject or to exactly this one
+ * and is the archive of a received paid execution of this draft.
  * Primary Sources and reader results keep their own readers' rules. */
 export function subjectContextRecordHolds(store: Store, projectId: string, draftId: string, subject: V7PlanSubject,
   record: Revision<Record<string, any>>): boolean {
-  return subjectRecordFormHolds(record, subject) && (record.kind !== 'research-checkpoint'
-    || paidNoteOrigin(store, projectId, draftId, subject, reference(record)));
+  if (!subjectRecordFormHolds(record, subject)) return false;
+  if (record.kind === 'research-checkpoint') return paidNoteOrigin(store, projectId, draftId, subject, reference(record));
+  if (record.kind === 'research-context') return paidArchiveOrigin(store, projectId, draftId, reference(record));
+  return true;
+}
+
+/** S5 (круг 5, проход МАСКАРАД): a request archive is lawful material only as
+ * the exact archive of a received paid consumer execution of this project and
+ * draft — a content-addressed record nobody paid for is no archive. The scan is
+ * candidate search; the proof is the common execution reader. */
+function paidArchiveOrigin(store: Store, projectId: string, draftId: string, ref: Ref): boolean {
+  return listResearchConsumerIntents(store, projectId, draftId).some(intent => {
+    try {
+      const paid = readResearchConsumerExecution(store, projectId, reference(intent));
+      return paid.kind === 'response' && canonical(paid.archive) === canonical(ref);
+    } catch (error) { if (error instanceof EngineError) return false; throw error; }
+  });
 }
 
 /** The form half of subjectContextRecordHolds (pure): a v2 note of exactly this
