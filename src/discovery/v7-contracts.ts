@@ -163,22 +163,41 @@ export function checkV7FieldAnswer(draft: DiscoveryDraft, spec: FieldSpec, value
   if (spec.field === V7_FINAL_FIELD.field) { checkV7Final(value); return; }
 }
 
-/** The D7 state of a v7 Discovery draft, read from its own saved fields:
- * absent — the draft has no D7 question (an initial D1/D2 draft: no D7 has
- * begun, so nothing is incomplete); open — the D7 question is asked and not yet
- * answered; present — the saved bundle in its proven form. A saved value that
- * fails the form is a typed refusal, never read as absent or open. */
+/** The D7 state of a v7 Discovery draft. The declaration is the draft's own
+ * question whose spec is exactly the D7 field; the field is the saved value:
+ * absent — neither (an initial D1/D2 draft: no D7 has begun, nothing is
+ * incomplete); open — the declared question with its null field; present — the
+ * saved bundle in its proven form. A declared question without its field, a
+ * field without its declared question, a question that claims the field with
+ * another spec, a lost question record or a value that fails the form is a
+ * typed refusal — never read as absent or open (7a.1-02). */
 export type V7FinalState = { state: "absent" } | { state: "open" } | { state: "present"; bundle: V7FinalBundle };
-export function v7FinalState(draft: DiscoveryDraft): V7FinalState {
-  if (!isDiscoveryV7Draft(draft) || !obj(draft.fields))
-    throw new EngineError("discovery_final_invalid", "A D7 bundle belongs to a v7 Discovery draft with its fields");
-  if (!Object.hasOwn(draft.fields, V7_FINAL_FIELD.field)) return { state: "absent" };
-  const value = draft.fields[V7_FINAL_FIELD.field];
+export interface V7DraftRecordView { get<T>(id: string, revision?: number): Revision<T> | null }
+export function v7FinalState(view: V7DraftRecordView, draft: Revision<DiscoveryDraft>): V7FinalState {
+  const fail = (message: string, details?: unknown): never => {
+    throw new EngineError("discovery_final_invalid", `[${draft?.id}] ${message}`, details);
+  };
+  if (!view || typeof view.get !== "function" || !draft || !isDiscoveryV7Draft(draft.value)
+    || !obj(draft.value.fields) || !Array.isArray(draft.value.questions))
+    fail("A D7 state belongs to a v7 Discovery draft with its questions and fields");
+  const declared = draft.value.questions.flatMap(id => {
+    const question = typeof id === "string" ? view.get<{ draftId?: unknown; spec?: { field?: unknown } }>(id) : null;
+    if (!question || question.kind !== "question" || !obj(question.value) || question.value.draftId !== draft.id)
+      fail("A question of the draft is missing or foreign", { question: id });
+    return question!.value.spec?.field === V7_FINAL_FIELD.field ? [question!] : [];
+  });
+  if (declared.length > 1) fail("The draft declares the D7 question more than once");
+  if (declared.length && canonical(declared[0]!.value.spec) !== canonical(V7_FINAL_FIELD))
+    fail("The question of the D7 field does not carry the exact D7 spec", { question: declared[0]!.id });
+  const hasField = Object.hasOwn(draft.value.fields, V7_FINAL_FIELD.field);
+  if (!declared.length && !hasField) return { state: "absent" };
+  if (!declared.length) fail("The draft carries a D7 field without its declared D7 question");
+  if (!hasField) fail("The declared D7 question lost its field");
+  const value = draft.value.fields[V7_FINAL_FIELD.field];
   if (value === null) return { state: "open" };
   try { return { state: "present", bundle: checkV7Final(value) }; }
   catch (error) {
-    if (error instanceof EngineError)
-      throw new EngineError("discovery_final_invalid", `The saved D7 bundle lost its form: ${error.message}`, error.details);
+    if (error instanceof EngineError) fail(`The saved D7 bundle lost its form: ${error.message}`, error.details);
     throw error;
   }
 }

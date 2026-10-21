@@ -1,5 +1,5 @@
 {
-  "producerDigest": "fb1c060e9dd3643a6ef4bf6552d6d9346eed396b4db2cf1eb99a2c1c0e9b6b84",
+  "producerDigest": "a569615ebdd0196380f7c171a16965500d147f98390605999588fdbf4f35a9aa",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -83,7 +83,7 @@
     },
     {
       "path": "src/discovery/assessment-methodology.ts",
-      "sha256": "a2b0a55230293a78af2c025de316fc4e7ea6c27d536043b44055e52304054c1f"
+      "sha256": "403e59c0a2de813012e0ddced475eb035f28fd43f77bf3b36db6660d82d132c7"
     },
     {
       "path": "src/discovery/assessment-session.ts",
@@ -123,7 +123,7 @@
     },
     {
       "path": "src/discovery/continuation-packet.ts",
-      "sha256": "92cc4093caf135d9d6642b7b391193a21387efb0961f851ccb1e60849eda397e"
+      "sha256": "4986b090bd4593be54fbf3ac5feb249ea6001ee87e31d23c8c2a77aeabbca05d"
     },
     {
       "path": "src/discovery/derived-draft.ts",
@@ -227,11 +227,11 @@
     },
     {
       "path": "src/discovery/research-assessment.ts",
-      "sha256": "77a1916fcb4dae5712fa9a7cda4d46dbef76f538a21c0c723aff5c71eb82e3be"
+      "sha256": "4253964e539a1fde3412da7e6d977c9b398206f9c5b288d228370ee15806ccfe"
     },
     {
       "path": "src/discovery/research-consumer-transition.ts",
-      "sha256": "44b14d0a38bede83ab6cd8235887dd76a5a9c4fe6db80bd72eccd67b3c6aaf98"
+      "sha256": "9214bc2b194ae190d3f9c7c09478d17bd806a821211631029619d57bd522eba7"
     },
     {
       "path": "src/discovery/research-context.ts",
@@ -255,7 +255,7 @@
     },
     {
       "path": "src/discovery/research-model.ts",
-      "sha256": "2d951967e2f40cda9ecbb76c8691e88fc0f0902dff3c729962eb51f646a86195"
+      "sha256": "b68d514f5e3ed7b492528496cd8e1af3fb15af0f7de1b896e71e638b5cb3facb"
     },
     {
       "path": "src/discovery/research-preview.ts",
@@ -283,7 +283,7 @@
     },
     {
       "path": "src/discovery/response-recovery.ts",
-      "sha256": "3d5714b55a5b1abc6d7c6bf19262d992b0c6dba9f2c40c13199edd036eee9aaa"
+      "sha256": "8978428b6a67858218805250e48214f2d3bd6cad55291f4ce9272fd7939016c0"
     },
     {
       "path": "src/discovery/response-replay.ts",
@@ -311,7 +311,7 @@
     },
     {
       "path": "src/discovery/v7-attempt-assessment.ts",
-      "sha256": "5d7c85aead0093fe0732398c48b1e1212e68327262ae65ae5d87592a89c47698"
+      "sha256": "07d7b9fcb511d9e2756b0056f8378e0fbce7a5c22256895056b7951d972cd591"
     },
     {
       "path": "src/discovery/v7-attempts.ts",
@@ -319,7 +319,11 @@
     },
     {
       "path": "src/discovery/v7-contracts.ts",
-      "sha256": "621c10cc3cefe0698d54e74587ce9d64cfe105dd66bd34152c2273bb36a7f3bc"
+      "sha256": "230f6685bfbd49953c225cb81977311c4db603adb6302d7c8cc786b9288d64cc"
+    },
+    {
+      "path": "src/discovery/v7-final-contracts.ts",
+      "sha256": "09a378bcd0071fa99fb57086d27cbdb149e75dbe2478d104762f23a48db681a0"
     },
     {
       "path": "src/discovery/v7-managed-attempt.ts",
@@ -328,6 +332,10 @@
     {
       "path": "src/discovery/v7-plan-questions.ts",
       "sha256": "2e1b929df3723cae68fcca916922590e4d887f8d385e75d24872b96dc9c20376"
+    },
+    {
+      "path": "src/discovery/v7-progress.ts",
+      "sha256": "b54d8f48513130978d447a71c097d15cfb9c5cff19e078c9de8f08cbffa969cb"
     },
     {
       "path": "src/discovery/variant-decision.ts",
@@ -883,7 +891,7 @@
     },
     {
       "path": "src/storage/reference-sites.ts",
-      "sha256": "ba389f1e90c8f7060dd813c225242c87a46290e3f7cb3bb6a8c9e6c5c428c249"
+      "sha256": "3aa2eed4f326ee4cee9e0fad4b976adc0365788441dfdcfcd0413623a7b9901e"
     },
     {
       "path": "src/storage/schema.ts",
@@ -939,48 +947,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "40af49ed89fff9dea83b03439a00bd5e152fa07976914245f156710ff014696e"
+      "hash": "db3cdc68743841f98132f06275976568ecbcd983d152bae859ee0b39ed456512"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "ee2afe4dc67c0af301c10bd26f7170744607f684b3bc733b8b32bb172fc6a973"
+      "hash": "73b5cb00bdc665e59f7ce6d03e10fc803287817bfd40116b5d490cce49d950c5"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "4e045321368dd825539837fe01e24310a37f438c2f381bc6a55980443e51a42f"
+      "hash": "d0ef52ada0d4fec9910664d09535a2e7b2a6d8a67649670cb5dae0c3a789ddd8"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "e76f5f917ed8153cbaddcf652af4dd84795ed182c0e29e53f2db4bab3025498e"
+      "hash": "66554192587564c7777ebae745821e3a0bc266ee3d622cf75ec1cd4f3842d389"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "b42d1b42f6feb49844236e73477d68ceb004dae650328013fb501b10e9e5482b"
+      "hash": "11e852b5741c6e774e740b66a50986b6a22592b564721fa4d5fad21f69001931"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "c2d28140ffd5c09a2e60057673b3205d8c317d84f0335c4c9f116404e49eb5de"
+      "hash": "5745afb74aa3339c96cdc197a0affad72e0adcd6fa91e1cb2d7894633585c6ca"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "8038ce3d10c1d538f8c8ed8a91fd6e57af9b7c75b3c075cacfdd4cf52445011c"
+      "hash": "c66064b28aed239d8e4993f1454cf00b6bfab277435f24d8413779621571eb07"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "fafeb549abfde0663f40d1227e3b393c8f8620662faf426d8367891845bd6ee0"
+      "hash": "cc4c8c8819f8a1b1ee15bf24d72b8fa06b807ad2c71f8bf9636fd657c58d1877"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-s6-2/.golden-build-Bw7m90/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-mr-int/.golden-build-0SANNL/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "cad06e0afa29524a8d8c1da29453defb903047037ce1df59eb2774f9abe52bdd",
-  "sqliteBytes": 14557184
+  "sqliteFileSha256": "84390b836e25f374c10ed0a96a2c913571478a1e667396ec253b12d52a224413",
+  "sqliteBytes": 14569472
 }

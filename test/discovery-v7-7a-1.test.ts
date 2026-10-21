@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Ajv } from "ajv";
 import { Discovery, type DiscoveryDraft, type FieldSpec, type Question } from "../src/discovery/discovery.js";
+import type { Revision } from "../src/storage/store.js";
 import { checkV7FieldAnswer, createPartialV7Draft, v7FinalState, V7_CONTRACT_ERA, V7_FINAL_FIELD,
   V7_REQUIREMENTS } from "../src/discovery/v7-contracts.js";
 import { checkV7Final, V7_FINAL_CONTRACT, V7_FINAL_SCHEMA } from "../src/discovery/v7-final-contracts.js";
@@ -131,7 +132,7 @@ test("7a.1 the initial D1/D2 draft is not an incomplete D7: it keeps exactly D1�
   assert.equal(canonical(specs), canonical([...V7_REQUIREMENTS.fields.discovery!]), "the initial slice is unchanged");
   assert.deepEqual(specs.map(spec => spec.field), ["brief", "objective", "frame", "plan"]);
   assert.equal(Object.hasOwn(draft.value.fields, "final"), false, "no D7 field in the initial draft");
-  assert.deepEqual(v7FinalState(draft.value), { state: "absent" }, "no D7 has begun — nothing is incomplete");
+  assert.deepEqual(v7FinalState(store, draft), { state: "absent" }, "no D7 has begun — nothing is incomplete");
   assert.deepEqual(V7_REQUIREMENTS.final, V7_FINAL_FIELD, "the D7 contract is declared beside the initial slice");
   assert.equal(V7_REQUIREMENTS.complete.discovery, false);
   assert.equal(code(() => producerRequirements("discovery", { discovery: NEXT_CONTRACT_ERA })), "discovery_v7_producer_not_ready",
@@ -145,18 +146,60 @@ test("7a.1 a draft with the D7 question reads open until answered and present wi
     [...V7_REQUIREMENTS.fields.discovery!, V7_FINAL_FIELD] as unknown as FieldSpec[], [], V7_CONTRACT_ERA);
   const finalQuestion = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === "final")!;
   assert.deepEqual(finalQuestion.value.spec, V7_FINAL_FIELD);
-  assert.deepEqual(v7FinalState(draft.value), { state: "open" }, "asked and not yet answered");
-  const withFinal = (value: unknown): DiscoveryDraft => ({ ...draft.value, fields: { ...draft.value.fields, final: value as Json } });
-  assert.deepEqual(v7FinalState(withFinal(negative("no_go"))),
+  assert.deepEqual(v7FinalState(store, draft), { state: "open" }, "asked and not yet answered");
+  // In-memory draft values over the real question records (no write).
+  const withFinal = (value: unknown): Revision<DiscoveryDraft> =>
+    ({ ...draft, value: { ...draft.value, fields: { ...draft.value.fields, final: value as Json } } });
+  assert.deepEqual(v7FinalState(store, withFinal(negative("no_go"))),
     { state: "present", bundle: JSON.parse(canonical(negative("no_go") as Json)) });
-  assert.equal(v7FinalState(withFinal(positive("go"))).state, "present");
+  assert.equal(v7FinalState(store, withFinal(positive("go"))).state, "present");
   const damaged = { ...negative("no_go"), projection: positive("go").projection };
-  assert.equal(code(() => v7FinalState(withFinal(damaged))), "discovery_final_invalid", "a damaged saved bundle is never read as open or absent");
-  assert.equal(code(() => v7FinalState(withFinal({ ...negative("no_go"), contract: "discovery-final/v9" }))), "discovery_final_invalid");
+  assert.equal(code(() => v7FinalState(store, withFinal(damaged))), "discovery_final_invalid", "a damaged saved bundle is never read as open or absent");
+  assert.equal(code(() => v7FinalState(store, withFinal({ ...negative("no_go"), contract: "discovery-final/v9" }))), "discovery_final_invalid");
   const prove = () => null;
   assert.equal(code(() => checkV7FieldAnswer(draft.value, V7_FINAL_FIELD, damaged as Json, prove)), "answer_invalid",
     "the field check of an answer refuses a negative bundle with a fabricated projection");
   assert.equal(code(() => checkV7FieldAnswer(draft.value, V7_FINAL_FIELD, negative("insufficient_evidence") as Json, prove)), "no-error");
   // Not a v7 Discovery draft: no D7 state at all.
-  assert.equal(code(() => v7FinalState({ ...draft.value, contractVersion: 6 })), "discovery_final_invalid");
+  assert.equal(code(() => v7FinalState(store, { ...draft, value: { ...draft.value, contractVersion: 6 } })), "discovery_final_invalid");
+});
+
+/* ---------- круг 2 (codex-omg №9274): owner-choice options and the D7 declaration ---------- */
+
+const ownerChoice = (options: Json[]): Json => ({ id: "c-owner", kind: "owner_choice", condition: "The owner chooses the pilot region",
+  criterion: "A recorded owner choice", options });
+const option = (optionId: string, choice: "accept" | "decline"): Json =>
+  ({ optionId, label: `Option ${optionId}`, consequences: [`Consequence of ${optionId}`], choice });
+
+test("7a.1-01 an owner condition keeps the v6 rules: distinct stable option ids and both an acceptance and a refusal; a duplicated id or a one-sided choice is refused at its options", () => {
+  assert.equal(checkV7Final(positive("conditional", [ownerChoice([option("yes", "accept"), option("no", "decline")])])).verdict.outcome,
+    "conditional", "a lawful owner choice");
+  for (const [name, options] of [["duplicated option ids", [option("same", "accept"), option("same", "decline")]],
+    ["no refusal", [option("yes-1", "accept"), option("yes-2", "accept")]],
+    ["no acceptance", [option("no-1", "decline"), option("no-2", "decline")]]] as [string, Json[]][]) {
+    const bundle = positive("conditional", [evidence, ownerChoice(options)]);
+    assert.equal(code(() => checkV7Final(bundle)), "answer_invalid", name);
+    assert.equal(field(() => checkV7Final(bundle)), "final.verdict.conditions.1.options", `${name} is refused at its options`);
+  }
+});
+
+test("7a.1-02 the D7 state follows the declared D7 question, not the presence of a value: a lost field of a declared question, a field without its question, a question claiming the field with another spec and a lost question record are typed refusals", t => {
+  const { store, discovery } = fixture(t);
+  const full = discovery.create("p-declared", "discovery", "R0", "concept",
+    [...V7_REQUIREMENTS.fields.discovery!, V7_FINAL_FIELD] as unknown as FieldSpec[], [], V7_CONTRACT_ERA);
+  const initial = createPartialV7Draft(discovery, "p-initial", "concept");
+  assert.deepEqual(v7FinalState(store, full), { state: "open" });
+  assert.deepEqual(v7FinalState(store, initial), { state: "absent" });
+  const { final: _final, ...withoutFinal } = full.value.fields;
+  const lost: Revision<DiscoveryDraft> = { ...full, value: { ...full.value, fields: withoutFinal } };
+  assert.equal(code(() => v7FinalState(store, lost)), "discovery_final_invalid", "a declared D7 question without its field");
+  const undeclared: Revision<DiscoveryDraft> = { ...initial, value: { ...initial.value, fields: { ...initial.value.fields, final: null } } };
+  assert.equal(code(() => v7FinalState(store, undeclared)), "discovery_final_invalid", "a D7 field without its declared question");
+  // A question that claims the D7 field with another spec is not the D7 declaration.
+  const forgedSpec = discovery.create("p-forged", "discovery", "R0", "concept",
+    [...V7_REQUIREMENTS.fields.discovery!, { ...V7_FINAL_FIELD, schema: { type: "object" } }] as unknown as FieldSpec[], [], V7_CONTRACT_ERA);
+  assert.equal(code(() => v7FinalState(store, forgedSpec)), "discovery_final_invalid");
+  // A lost question record is no declaration either way.
+  const lostQuestion: Revision<DiscoveryDraft> = { ...full, value: { ...full.value, questions: [...full.value.questions, "question:p-declared:lost"] } };
+  assert.equal(code(() => v7FinalState(store, lostQuestion)), "discovery_final_invalid");
 });

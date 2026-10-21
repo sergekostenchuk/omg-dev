@@ -127,6 +127,21 @@ export function checkV7Final(value: unknown): V7FinalBundle {
   const ids = conditions.map(condition => (condition as Record<string, unknown>)["id"]);
   if (!ids.every(nonempty) || new Set(ids).size !== ids.length)
     refuse("final.verdict.conditions", "every condition has its own unique id");
+  // 7a.1-01: the owner-choice rules of the v6 verdict (discovery-outcome.ts) — distinct
+  // stable options, among them an acceptance and a refusal; an ambiguous or one-sided choice is refused.
+  conditions.forEach((condition, index) => {
+    const entry = condition as Record<string, unknown>;
+    if (entry["kind"] !== "owner_choice") return;
+    const options = entry["options"];
+    const rule = `final.verdict.conditions.${index}.options`;
+    if (!Array.isArray(options) || !options.every(obj)) refuse(rule, "an owner condition lists its options");
+    const optionIds = options.map(option => (option as Record<string, unknown>)["optionId"]);
+    if (!optionIds.every(nonempty) || new Set(optionIds).size !== optionIds.length)
+      refuse(rule, "an owner condition needs distinct stable option ids");
+    for (const choice of ["accept", "decline"])
+      if (!options.some(option => (option as Record<string, unknown>)["choice"] === choice))
+        refuse(rule, `an owner condition offers both acceptance and refusal; the ${choice} option is missing`);
+  });
   const summary = value["summary"];
   if (!obj(summary)) refuse("final.summary", "the summary is an object");
   if (positive) {
