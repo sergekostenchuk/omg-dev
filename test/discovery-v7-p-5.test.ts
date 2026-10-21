@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
 import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
-import { Store, storeReads, type Revision } from '../src/storage/store.js';
+import { Store, storeReads, storeBodyCache, observeStore, type StoreObserver, type Revision } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { type Json } from '../src/canonical.js';
@@ -251,33 +251,77 @@ test('P.5: paid replay, stale apply and exact accepted proof read no additional 
   const f=await setup(t),entries=[await produce(f,hypothesis(f,'Covered claim')),await produce(f)],
     a=await assess(f,[entries[0]!],{accept:true}),both=await assess(f,entries,{accept:true,baseline:a.baseline});
   applyDiscoveryAssessment(f.store,'p',reference(a.paid));
-  const measure=async(db:Store)=>{
-    const reads:number[]=[];
-    let before=storeReads();assert.deepEqual(await replay(f,a,db),a.paid);reads.push(storeReads()-before);
-    before=storeReads();assert.equal(applyDiscoveryAssessment(db,'p',reference(a.paid)).repeated,true);reads.push(storeReads()-before);
-    before=storeReads();errorCode(()=>applyDiscoveryAssessment(db,'p',reference(both.paid)),'discovery_progress_stale');reads.push(storeReads()-before);
-    before=storeReads();proveClaimAddress(db,a.claims[0]!);reads.push(storeReads()-before);
-    return reads;
+  type Cost={calls:number;rows:number;bodies:number;foreign:string[]};
+  const measure=async(db:Store,scan=false)=>{
+    const costs:Cost[]=[],actions=[
+      async()=>assert.deepEqual(await replay(f,a,db),a.paid),
+      ()=>assert.equal(applyDiscoveryAssessment(db,'p',reference(a.paid)).repeated,true),
+      ()=>errorCode(()=>applyDiscoveryAssessment(db,'p',reference(both.paid)),'discovery_progress_stale'),
+      ()=>proveClaimAddress(db,a.claims[0]!)];
+    for(const action of actions) {
+      const beforeCalls=storeReads(),beforeBodies=storeBodyCache().parses;
+      let rows=0,previous:StoreObserver|null=null;
+      const foreign=new Set<string>();
+      // Keep the historical proof observer and its own begin/end tokens intact.
+      // Count identities as well as materialized records: one list/history call
+      // may select arbitrarily many rows even when calls stays constant.
+      previous=observeStore({
+        begin(source) { return {previous:previous?.begin(source)}; },
+        end(token,source,method,mode,id,revision,selected) {
+          if(source===db) {
+            rows+=selected.length;
+            for(const row of selected) if(row.id.startsWith('unrelated:')) foreign.add(row.id);
+          }
+          const delegated=(token as {previous?:object}).previous;
+          if(delegated) previous?.end(delegated,source,method,mode,id,revision,selected);
+        },
+        write(source) { previous?.write(source); },
+        untraced() { previous?.untraced(); }
+      });
+      try {
+        if(scan) db.list('discovery-assessment'); // Deliberate full-scan control.
+        await action();
+      } finally { observeStore(previous); }
+      costs.push({calls:storeReads()-beforeCalls,rows,bodies:storeBodyCache().parses-beforeBodies,
+        foreign:[...foreign].sort()});
+    }
+    return costs;
   };
   // Identical database images give each measurement the same cold cache;
   // measuring successive connections to one DB would warm persisted proofs.
   const image=await f.store.snapshot(join(f.root,'measurement-image')),sent=f.wires().length;
-  let before:number[]|undefined;
-  for(const size of [0,10,100]) {
-    const path=join(f.root,`measurement-${size}.sqlite`);copyFileSync(image.path,path);
+  const assertUnchanged=(measured:Cost[],baseline:Cost[])=>{
+    assert.deepEqual(measured,baseline,'calls, selected rows and decoded bodies stay independent of unrelated history');
+    for(const cost of measured) assert.deepEqual(cost.foreign,[],'No unrelated row may be selected');
+  };
+  let baseline:Cost[]|undefined,scanBaseline:Cost[]|undefined;
+  for(const size of [0,10,100]) for(const scan of [false,true]) {
+    const path=join(f.root,`measurement-${size}-${scan}.sqlite`);copyFileSync(image.path,path);
     const db=new Store(path);
     try {
-    // Explicit irrelevant negative records, including tempting same-kind heads:
-    // none is a real paid/accepted record or may be selected by these exact APIs.
-    db.writeMany(Array.from({length:size},(_,i)=>({id:`unrelated:${size}:${i}`,expected:0,
-      kind:['research-turn','discovery-assessment','v7-attempt-account','v7-progress-state','research-progress-event'][i%5]!,
-      value:{projectId:i%2?'p':'foreign',planQuestionId:'unrelated',invalid:true,i}})),[]);
-    const measured=await measure(db);
-    if(before) assert.deepEqual(measured,before,`unrelated ${size} records must add +0 Store reads`);
-    else { before=measured;assert.ok(before.every(count=>count>0)); }
+      // Explicit irrelevant negative records, including tempting same-kind heads:
+      // none is a real paid/accepted record or may be selected by these exact APIs.
+      db.writeMany(Array.from({length:size},(_,i)=>({id:`unrelated:${size}:${i}`,expected:0,
+        kind:['research-turn','discovery-assessment','v7-attempt-account','v7-progress-state','research-progress-event'][i%5]!,
+        value:{projectId:i%2?'p':'foreign',planQuestionId:'unrelated',invalid:true,i}})),[]);
+      const measured=await measure(db,scan);
+      if(!scan) {
+        if(baseline) assertUnchanged(measured,baseline);
+        else { baseline=measured;assert.ok(measured.every(cost=>cost.calls>0&&cost.rows>0&&cost.bodies>0)); }
+      } else if(!scanBaseline) scanBaseline=measured;
+      else {
+        // The former call-only criterion passes this bad implementation.
+        assert.deepEqual(measured.map(cost=>cost.calls),scanBaseline.map(cost=>cost.calls));
+        for(const [index,cost] of measured.entries()) {
+          assert.ok(cost.rows>scanBaseline[index]!.rows);
+          assert.ok(cost.bodies>scanBaseline[index]!.bodies);
+          assert.equal(cost.foreign.length,size/5);
+          assert.throws(()=>assertUnchanged([cost],[scanBaseline![index]!]),assert.AssertionError);
+        }
+      }
     } finally { db.close(); }
   }
-  t.diagnostic(`cold reads: paid replay / covered apply / stale apply / claim proof = ${before!.join(' / ')}; unrelated +10/+100 = +0`);
+  t.diagnostic(`cold costs (calls/rows/bodies): ${baseline!.map(cost=>`${cost.calls}/${cost.rows}/${cost.bodies}`).join(' | ')}; unrelated +10/+100 = +0; full-list controls refused for all four operations`);
   assert.equal(f.wires().length,sent);
 });
 
