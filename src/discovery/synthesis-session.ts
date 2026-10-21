@@ -27,7 +27,7 @@ import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWr
 import { turnAction, contextReadIdentity, projectSynthesisTransition, projectContextRecoveryTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES,
   isReservationOnlySessionStep, synthesisReservationConsumed,
   SYNTHESIS_SESSION_CONTRACT, CONTEXT_RECOVERY_SUPERSEDE_REASON, exactContextLookup, readerDraftEquivalent,
-  projectResearchContextSelection, exactObservation, projectResearchSearchObservation, projectResearchSearchObservationV2,
+  projectResearchContextSelection, exactObservation,
   SYNTHESIS_SESSION_CONTRACT_V3, SYNTHESIS_SESSION_V2_PREFIX, SYNTHESIS_SESSION_V3_PREFIX, synthesisSessionV3Address,
   projectSynthesisSessionV3Initial, synthesisSessionSubject, synthesisStepSubject, requirePlanSubject,
   type SynthesisSessionState, type SynthesisSessionStateV3, type SynthesisSessionDelivery, type SynthesisTransition } from './research-consumer-transition.js';
@@ -35,7 +35,6 @@ import { isResearchPreview } from './research-preview.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { provePlanQuestions } from './v7-plan-questions.js';
 import { planQuestionContract } from './continuation-packet.js';
-import { STRUCTURED_SEARCH_CONTRACT } from '../evidence/source-navigation.js';
 import { provenSubjectSessions, savedFindingMaterial } from './saved-synthesis.js';
 
 interface Session {
@@ -230,8 +229,8 @@ function historicalAdmission(store: Store, session: Revision<SynthesisSessionSta
  * - reader: exactly the projection of its exact reader result of this project;
  * - context lookup: exactly the lookup of its exact record (a note or archive
  *   passes subjectContextRecordHolds), as the chain reader re-derives a recovery;
- * - context search: exactly its immutable capture's observation, re-derived from the
- *   capture's exact Sources by its contract;
+ * - context search: exactly the observation of the paid search turn whose completion
+ *   produced its capture (the common turn reader proves that completion);
  * - context whole-file read: exactly its exact Source's read projection;
  * - context Source observation: exactly its pinned Source slice (exactObservation);
  * - context Source reading of a read contract: exactly that contract's projection of
@@ -274,22 +273,23 @@ function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, que
             ...(value.page.encoding === 'canonical-json' ? { encoding: value.page.encoding } : {}) } : undefined, prove);
       return canonical(lookup) === canonical(value);
     }
-    // S5-06: a search is exactly its immutable capture's observation, re-derived from the
-    // capture's exact Sources by its own contract (projectSearchTurnCompletion's form).
+    // S5-08: a search is exactly the observation of the paid search turn whose completion
+    // produced this capture — the completion directly following the capture's pending turn,
+    // proven by the common turn reader (readManagedSearchCompletion: the full
+    // projectSearchTurnCompletion formula over historical Sources, the two known contracts),
+    // in a run of this project and draft, on this plan Question and subject.
     if (Object.hasOwn(value, 'capture')) {
       const capture = exact(value.capture);
-      if (capture?.kind !== 'research-search-capture' || capture.revision !== 1 || !object(capture.value)
-        || capture.value.projectId !== projectId || capture.value.question?.id !== question.id
-        || capture.id !== `research-search-capture:${capture.value.contract === STRUCTURED_SEARCH_CONTRACT ? 'v2' : 'v1'}:${capture.hash}`
-        || !Array.isArray(capture.value.sources)) return false;
-      const sources = (capture.value.sources as unknown[]).map(exact);
-      if (!sources.every(found => found?.kind === 'source' && found.value.projectId === projectId)) return false;
-      const observe = capture.value.contract === STRUCTURED_SEARCH_CONTRACT
-        ? projectResearchSearchObservationV2 : projectResearchSearchObservation;
-      const observation = observe(capture.value.query, sources.map(found => ({ ref: reference(found!), value: found!.value as any })),
-        capture.value.process);
-      return canonical(observation) === canonical(capture.value.observation)
-        && canonical(value) === canonical({ ...capture.value.observation, capture: value.capture });
+      const pending = capture?.kind === 'research-search-capture' && object(capture.value) ? capture.value.turn : null;
+      if (!isRef(pending)) return false;
+      const completed = store.get<Record<string, any>>(pending.id, pending.revision + 1);
+      if (completed?.kind !== 'research-turn' || !object(completed.value) || completed.value.status !== 'completed'
+        || completed.value.error !== null || canonical(completed.value.observation?.capture) !== canonical(value.capture)) return false;
+      const proven = readResearchConsumerTurn(store, reference(completed));
+      const run = typeof proven.value.run === 'string' ? store.get<ResearchRun>(proven.value.run) : null;
+      return run?.kind === 'research-run' && run.value.projectId === projectId && run.value.draftId === draft.id
+        && isRef(proven.value.question) && proven.value.question.id === question.id
+        && sameSubject(planSubjectOf(proven.value), subject) && canonical(value) === canonical(proven.value.observation);
     }
     // S5-06: a whole-file read is exactly its exact Source's read projection.
     if (Object.hasOwn(value, 'ref')) {

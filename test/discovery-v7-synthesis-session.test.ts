@@ -948,3 +948,39 @@ test("S5-07 a saved finding naming a record of another kind is a typed refusal: 
   const forged = f.store.write({ id: projected.id, kind: "synthesis-session", expected: 0, value: projected.value });
   assert.equal(await code(async () => readSynthesisSessionV3(f.open(), reference(forged))), "synthesis_session_invalid");
 });
+
+/* ---------- круг 5 (codex-omg №9102): a search capture is proven by its paid turn's completion ---------- */
+
+for (const variant of ["missing origin", "unknown contract"] as const)
+  test(`S5-08 a search material whose capture has ${variant} is refused before any record or payment: the capture is proven only as the one its paid search turn's completion produced`, async t => {
+    const f = await paidPlanned(t, `s5r5-${variant.replace(" ", "-")}`);
+    const A = subjectOf(f.p.planAnswer, "q-supply");
+    f.configure([{ action: "search", query: "Exact source" }, { action: "pause", reason: "stop after the real capture" }]);
+    const run = await new Researcher(f.store, new Discovery(f.store), f.engine.environments)
+      .run(f.p.project, f.p.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
+    assert.equal(run.value.pauseCode, "research_model_paused", JSON.stringify(run.value));
+    const [material] = workingSelections(f.store, f.store.list<any>("research-turn").filter(row => row.value.run === run.id),
+      f.p.plan, A) as any[];
+    const capture = f.store.get<any>(material.value.capture.id, material.value.capture.revision)!;
+    const value = structuredClone(capture.value);
+    if (variant === "missing origin") for (const field of ["turn", "run", "consumerIntent", "plannedBy"]) delete value[field];
+    else value.contract = "research-search-capture/unknown";
+    // Negative corruption only: a re-addressed capture record no lawful producer wrote.
+    const forged = f.store.write({ id: `research-search-capture:v1:${hashJson(value)}`, kind: "research-search-capture",
+      expected: 0, value });
+    const materials = [{ ...material, value: { ...value.observation, capture: reference(forged) } }];
+    const calls = f.calls(), before = history(f.store);
+    f.configure([...Array(calls).fill(null), endOf(ENDS.refused)]);
+    assert.equal(await code(() => paidRun(f, A, materials)), "context_reference_foreign");
+    assert.equal(f.calls(), calls, "nothing bought");
+    assert.deepEqual(history(f.store), before, "nothing written");
+    // The real capture itself stays A's lawful search material.
+    f.configure([...Array(calls).fill(null), endOf(ENDS.impossible)]);
+    assert.deepEqual(await paidRun(f, A, [material]), { ...endOf(ENDS.impossible), question: "q-supply" });
+    // Negative corruption only, the reader half: the projector's first record over the forged basis.
+    const projected = projectSynthesisSessionV3Initial({ projectId: f.p.project, binding: { draft: reference(f.p.draft),
+      question: reference(f.p.plan), environment: reference(f.p.environment), inputs: f.p.draft.value.inputs, subject: A },
+      basis: { materials, previousProposal: null, previousProposalRef: null }, delivery: null });
+    const saved = f.store.write({ id: projected.id, kind: "synthesis-session", expected: 0, value: projected.value });
+    assert.equal(await code(async () => readSynthesisSessionV3(f.open(), reference(saved))), "synthesis_session_invalid");
+  });
