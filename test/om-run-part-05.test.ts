@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
@@ -24,11 +24,13 @@ import type { WorksAcceptanceRecord } from "../src/om/atomic-gate.js";
 import { runWakeChoice, WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { completionCloseId } from "../src/om/series.js";
-import { readCompletionCloseAt } from "../src/om/repeat-gate.js";
+import { openAttempt, readCompletionCloseAt, readOriginHoldAt, type OriginHold } from "../src/om/repeat-gate.js";
+import { readJournalAt } from "../src/om/refusal-journal.js";
+import { readManagedModelDiagnostic } from "../src/om/model-call.js";
 import { prepareRunBases as lp81PrepareRunBases } from "../src/om/run-bases.js";
 import type { OmModelCall } from "../src/om/model-call.js";
 import { gardenGraph } from "./om-fixture.js";
-import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Reopened, unavailableReview, sameEnd, regatedHold, defectedWork, managedAwaitOwner } from "./om-run-fixture.js";
+import { project, ok, refusal, runFixture, type Fixture, usage, mechanismSeries, blockSeries, actions, ends, driveTo, drive, reasonsOf, blockBases, stopAnswer, cannotAnswer, untouched, secondRung, until, regatePolicy, worksFixture, worksAcceptance, heldAfterClaim, addressQuestions, openPlanned, advanceRun, lp4Questions, lp4Sent, mp2WorkAnswer, twoArtifacts, lp5ReplaceB1, lp5Kind, type Reopened, unavailableReview, sameEnd, regatedHold, defectedWork } from "./om-run-fixture.js";
 
 test("H1.2 R9 R5a a live reviewer keeps the pass waiting; once its loss is proved by the common recovery the failed review ends the pass, and nothing is sent twice", async t => {
   const f = runFixture(t, ["encoding"], "executed");
@@ -189,43 +191,66 @@ test("6 C54 H1 a lawfully changed required condition of an unfinished assignment
 test("H1.2 R6 R7 C32 a standing hold and the goal's own owner-control are both grounds: each is named once with its own records, and nothing else is paid", async t => {
   const f = runFixture(t, [], "executed");
   ok(startRun(f.store, { project }));
-  // The managed regate reopens both works. The produce answer loses its write access — a real G5 refusal whose row
-  // has no placeable origin, so G7 raises the hold; the consume answer is lawful and impact-decided, but the group's
-  // common acceptance rejects the whole D1 scope with produce's proposal — consume's attempt ends interrupted.
+  // The regated consume line first asks its owner. Before any hold exists, an explicit public openAttempt starts
+  // its next managed attempt on the same exact plan; that answer is refused at G5. No attempt opens past a hold.
   const held = await regatedHold(f, {
-    files: { "produce.txt": "produced\n", "produce.test.mjs": "import \"./produce.txt\";\n",
-      "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" },
-    cycle: (packet, batch) => {
-      if (batch.task !== "node-expansion" || batch.level !== 3) return null;
-      if (batch.node === "garden-consume-operation") {
-        const answer = mp2WorkAnswer({ store: f.store, desired: gardenGraph() }, reference(packet));
-        const proposal = answer.research.proposal as unknown as { nodes: { id: string; impact?: unknown[] }[]; removes?: string[] };
-        proposal.nodes[0]!.impact = [{ entry: { file: "regate.test.mjs" }, decision: "keep", requirement: "garden-contract" }];
-        proposal.removes = [...new Set([...(proposal.removes ?? []), "garden-consume-work"])];
-        return { research: answer.research, usage };
-      }
-      return defectedWork(f, reference(packet), false);
-    },
+    cycle: (packet, batch) => batch.task === "node-expansion" && batch.level === 3
+      ? defectedWork(f, reference(packet), false) : null,
     analyze: () => ({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage }),
-    pause: { step: "analyze" } });
-  const hold = f.store.list<{ lift: { class: string } | null }>("om-origin-hold" as never).map(reference);
-  assert.equal(hold.length, 1, "G7 raised the hold of an unknown origin");
-  // The pass stands at the saved review step: rebuilt bases make consume's reopened batch live again, and its next
-  // managed attempt asks the owner on it — a real awaiting-owner close standing beside the hold at the end.
-  const bases = f.bases();
-  const routes = f.store.get<RoutesRecord>(bases.routes.id, bases.routes.revision)!;
-  const consumeBatch = routes.value.batches.find(batch => batch.task === "node-expansion" && batch.level === 3
-    && batch.items.every(item => item.consumers.includes("garden-consume-block")))!;
-  const series = blockSeries(f);
-  await managedAwaitOwner(f, bases, "garden-consume-block", series.value.attempts.length + 1, [consumeBatch]);
+    pause: { step: "cycle" } });
+  const packetRef = (held.second!.step!.request as { packet: Ref }).packet;
+  const packet = f.store.get<QuestionPacketRecord>(packetRef.id, packetRef.revision)!;
+  const replies = JSON.parse(readFileSync(join(f.root, "scenario.json"), "utf8")).steps as Record<string, unknown>[];
+  replies.splice(f.sent().length, 1, { research: { protocol: "$answerProtocol", requestId: "$requestId",
+    questionIds: (packet.value.packet as { questions: { id: string }[] }).questions.map(row => row.id),
+    action: "need_owner", reason: "The owner must settle this question", decision: "Decide it" }, usage });
+  f.steps(replies);
+  await driveTo(f, f.request(), "close", 50);
+  const waitingSeries = blockSeries(f);
+  assert.equal(waitingSeries.value.attempts[0]!.outcome!.reason, "awaiting-owner");
+  const waitingBinding = ok(readCompletionBinding(f.store, project, reference(waitingSeries), 1))!;
+  const waitingRecord = f.store.get(completionCloseId(project, waitingBinding.id))!;
+  const waitingClose = ok(readCompletionCloseAt(f.store, project, reference(waitingRecord)));
+  assert.deepEqual([waitingBinding.value.owner, waitingBinding.value.series.id, waitingBinding.value.attempt],
+    [{ kind: "block", block: "garden-consume-block" }, waitingSeries.id, 1]);
+  assert.deepEqual(waitingClose.binding, reference(waitingBinding));
+  assert.equal(waitingClose.series.id, waitingSeries.id);
+  assert.equal(waitingClose.waiting.length, 1);
+  const waiting = ok(readManagedModelDiagnostic(f.store, waitingBinding, waitingClose.waiting[0]!));
+  assert.deepEqual([waiting.reason, waiting.request.code, waiting.request.packet], ["awaiting-owner", "model_need_owner", packetRef]);
+  assert.deepEqual(f.store.list("om-origin-hold"), [], "No standing hold is bypassed by the second opening");
+  ok(openAttempt(f.store, { project, block: "garden-consume-block", line: 1, attempt: 2,
+    goal: waitingSeries.value.attempts[0]!.goal, completion: waitingBinding.value.plan }));
+  const reviewing = await held.resume({ pause: { step: "analyze" } });
+  assert.equal(reviewing!.step!.action, "analyze");
+  const series = blockSeries(f), holds = f.store.list<OriginHold>("om-origin-hold");
+  assert.equal(holds.length, 1);
+  const hold = holds[0]!;
+  assert.deepEqual([hold.value.block, hold.value.series, hold.value.attempt, hold.value.lift],
+    ["garden-consume-block", reference(series), 2, null]);
+  const binding = ok(readCompletionBinding(f.store, project, reference(series), 2))!;
+  const close = ok(readCompletionCloseAt(f.store, project, reference(f.store.get(completionCloseId(project, binding.id))!)));
+  assert.equal(close.outcome.reason, "refused");
+  assert.ok(close.claim.refusals.some(row => row.row === hold.value.row));
+  const journal = ok(readJournalAt(f.store, project, close.journal!));
+  const row = journal.value.rows.find(row => row.id === hold.value.row)!;
+  assert.deepEqual([row.gate, row.code, row.goal], ["G5", "work_write_scope_unbounded", "garden-consume-work"]);
+  assert.deepEqual(reference(ok(readOriginHoldAt(f.store, project, reference(hold), close.journal!))), reference(hold));
+  assert.deepEqual((reviewing!.step!.request as { series: Ref; hold: Ref }).series, reference(series));
+  assert.deepEqual((reviewing!.step!.request as { series: Ref; hold: Ref }).hold, reference(hold));
   const paid = f.sent().length;
-  const end = await held.resume();
+  const end = await held.resume({ pause: { step: "analyze" } });
   const reasons = reasonsOf(end!.state);
   assert.deepEqual(reasons.map(entry => [entry.kind, entry.code, entry.target, entry.field]), [
-    ["hold-origin-unestablished", "origin_hold", hold[0]!.id, "hold"],
-    ["owner-control", "model_need_owner", series.id, "attempt.2"]]);
+    ["hold-origin-unestablished", "origin_hold", hold.id, "hold"],
+    ["owner-control", "model_need_owner", series.id, "attempt.1"]]);
+  assert.deepEqual(reasons[1]!.basis.map(ref => canonical(ref)).sort(),
+    [reference(series), reference(waitingRecord), waitingClose.waiting[0]!].map(ref => canonical(ref)).sort(),
+    "Owner-control names this line's exact close and its own waiting diagnostic");
   assert.deepEqual(end!.performed, ["analyze"], "Only the review of the hold was paid");
   assert.equal(f.sent().length, paid + 1, "A6 ends its one held call; nothing else is paid");
+  assert.equal(blockSeries(f).value.attempts.length, 2, "The standing hold opens no further attempt");
+  await sameEnd(f, f.request(), paid + 1);
 });
 
 // OWN1 (№3711): the H1.5 tests of a blocking batch no producer serves are gone with it — a design or owner question of the

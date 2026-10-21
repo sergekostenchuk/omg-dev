@@ -16,7 +16,9 @@ import { readPreparedSeriesTransition } from "../src/om/series-transition.js";
 import { openSeries, readAnySeriesAt, readAppliedSeriesTransition, readCurrentSeriesPointer, readSeriesMembership, resumeSeries, seriesRequestOf, ownerDecisionNamespace, OWNER_DECISION_KIND } from "../src/om/series.js";
 import { type RoutesRecord } from "../src/om/routes.js";
 import type { AnyRepairSeries, RepairSeries } from "../src/om/series.js";
-import { runStopAnalysis } from "../src/om/stop-analysis.js";
+import { runStopAnalysis, type AnalysisIntent } from "../src/om/stop-analysis.js";
+import { readOriginHoldAt, type OriginHold } from "../src/om/repeat-gate.js";
+import { normalizeOriginSource, type RefusalJournal, type UnitRefusalRecord } from "../src/om/refusal-journal.js";
 import { readRun, startRun, runId, type RunRecord, type RunStep, type RunWait } from "../src/om/run.js";
 import { prepareRunBases, writeRunBases } from "../src/om/run-bases.js";
 // ---- LP5 (№3278): after a replaced B1 the old work ends by its own products, the new bases are built, paid assemblies answer again ----
@@ -282,17 +284,50 @@ test("H1.2 R6 R6a 12 21 H1 stop and origin holds together: the origin route goes
   const series = blockSeries(f);
   assert.ok(series.value.stop, "A3 stopped the series");
   assert.deepEqual(series.value.attempts.map(attempt => attempt.outcome?.reason), ["off-form", "off-form", "refused"], "Three real terminals of the regated line");
-  const holds = f.store.list<{ lift: { class: string } | null }>("om-origin-hold" as never).map(reference);
-  assert.ok(holds.length > 0, "G7 raised the origin holds");
+  const holds = f.store.list<OriginHold>("om-origin-hold").sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  assert.equal(holds.length, 2, "Two independent G5 findings keep two standing holds");
+  for (const hold of holds) {
+    assert.deepEqual([hold.value.block, hold.value.series, hold.value.attempt, hold.value.lift],
+      ["garden-consume-block", reference(series), 3, null]);
+    assert.deepEqual(reference(ok(readOriginHoldAt(f.store, project, reference(hold)))), reference(hold));
+  }
+  const journal = f.store.get<RefusalJournal>(`om-refusal-journal:${project}`)!.value;
+  const rows = holds.map(hold => journal.rows.find(row => row.id === hold.value.row)!);
+  assert.equal(new Set(rows.map(row => row.id)).size, 2, "Each hold has its own real journal row");
+  assert.deepEqual(rows.map(row => [row.gate, row.code, row.goal]).sort(), [
+    ["G5", "work_integration_unproven", "garden-consume-work"],
+    ["G5", "work_write_scope_unbounded", "garden-consume-work"]]);
+  // One atomic G5 rejection publishes both independent findings; verify each source entry, not just the hold count.
+  for (const row of rows) {
+    const diagnostic = f.store.get<UnitRefusalRecord>(row.source.id, row.source.revision)!;
+    assert.deepEqual(reference(diagnostic), row.source);
+    assert.equal(diagnostic.value.gate, "G5");
+    const sources = diagnostic.value.refusals.filter(item => item.code === row.code && item.goal === row.goal);
+    assert.equal(sources.length, 1);
+    const source = sources[0]!;
+    assert.deepEqual([source.remedy, source.origin.name, source.origin.stage, source.origin.subject],
+      [row.remedy, row.origin.name, row.origin.stage, row.origin.subject]);
+    assert.deepEqual(source.origin.sources.map(item => canonical(normalizeOriginSource(item))).sort(),
+      row.origin.sources.map(item => canonical(item)).sort());
+  }
+  assert.deepEqual((held.second!.step!.request as { hold: Ref; series: Ref }).hold, reference(holds[0]!));
+  assert.deepEqual((held.second!.step!.request as { hold: Ref; series: Ref }).series, reference(series));
+  const paid = f.sent().length;
   const driven = await held.resume();
   assert.deepEqual(driven?.performed, ["analyze"], "The origin route first; nothing else of the line is paid once a hold stands unlifted");
+  assert.equal(f.sent().length, paid + 1, "Only the first hold is paid for");
   const reasons = reasonsOf(driven!.state);
-  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.field]), [["hold-origin-unestablished", "origin_hold", "hold"]]);
-  assert.ok(holds.some(hold => hold.id === reasons[0]!.target), "The reason names the exact hold");
-  const analyses = f.store.list().filter(row => row.kind === "om-origin-analysis");
-  assert.equal(analyses.length, 1, "R6a: the other holds and the stop are not reviewed just to fill the report");
-  assert.equal((analyses[0]!.value as { state: string }).state, "origin-unestablished");
-  assert.ok(reasons[0]!.basis.some(ref => ref.id === analyses[0]!.id), "The review of this very hold is a Ref of the reason");
+  assert.deepEqual(reasons.map(row => [row.kind, row.code, row.target, row.field]),
+    [["hold-origin-unestablished", "origin_hold", holds[0]!.id, "hold"]]);
+  const analyses = f.store.list<{ state: string; intent: Ref }>("om-origin-analysis");
+  assert.equal(analyses.length, 1, "R6a: the other hold and the stop are not reviewed just to fill the report");
+  assert.equal(analyses[0]!.value.state, "origin-unestablished");
+  const intents = f.store.list<AnalysisIntent>("om-analysis-intent");
+  assert.equal(intents.length, 1);
+  assert.deepEqual(intents[0]!.value.request.hold, reference(holds[0]!));
+  assert.deepEqual(analyses[0]!.value.intent, reference(intents[0]!));
+  assert.deepEqual(f.store.get<OriginHold>(holds[1]!.id), holds[1], "The other hold is neither analyzed nor lifted");
+  assert.ok(reasons[0]!.basis.some(ref => canonical(ref) === canonical(reference(analyses[0]!))), "The review of this very hold is a Ref of the reason");
   assert.equal(blockSeries(f).value.attempts.length, 3, "No new attempt while the stop and the hold stand");
   const before = f.store.list().map(reference), sends = f.sent().length, request = f.request();
   f.restart();
