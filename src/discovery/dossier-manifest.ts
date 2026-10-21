@@ -129,7 +129,9 @@ export function decodeDossierManifest(value: unknown): DossierManifest {
     const at = `unknowns.${i}`;
     shape(unknown, ['claim', 'unknownId', 'consumer', 'moment', 'blocksCurrentStage'], at);
     claimAddress(unknown.claim, `${at}.claim`, project);
-    if (!claims.has(addressKey(unknown.claim))) invalid(`${at}.claim`, 'An unknown names a claim of the snapshot axes');
+    const named = claims.get(addressKey(unknown.claim));
+    if (!named || canonical(named) !== canonical(unknown.claim))
+      invalid(`${at}.claim`, 'An unknown names a claim of the snapshot axes by its full address');
     if (unknownClaims.has(addressKey(unknown.claim))) invalid(`${at}.claim`, 'An unknown claim is listed once');
     unknownClaims.add(addressKey(unknown.claim));
     text(unknown.unknownId, `${at}.unknownId`);

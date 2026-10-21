@@ -148,3 +148,29 @@ test("6.1 reference sites: the snapshot declares exactly its references — draf
   const withUnknown = complete();
   assert.ok(referenceSites(DOSSIER_MANIFEST_KIND, withUnknown).some(site => site.field === "unknowns[0].claim.container"));
 });
+
+test("6.1-01 an unknown names its axis claim by the full address: the same container, pointer and id under the other container kind is not that claim — on the decoder, the projector and the exact structural reader; both lawful kinds pass", () => {
+  const snapshot = (kind: string): Record<string, any> => {
+    const address = { ...claim(0), containerKind: kind };
+    return { ...complete(), axes: axesWith((axis, index) => [axis === "market" ? address : claim(index + 100)]),
+      unknowns: [{ claim: structuredClone(address), unknownId: "u-0", consumer: "operation-map", moment: "om-pass", blocksCurrentStage: false }] };
+  };
+  const structural = (value: Record<string, any>) => {
+    const id = `${DOSSIER_MANIFEST_KIND}:p:${hashJson(value as Json)}`;
+    return readDossierManifestStructural(view([row(id, value)]), "p", { id, revision: 1, hash: hashJson(value as Json) });
+  };
+  const readers: [string, (value: Record<string, any>) => unknown][] = [
+    ["decoder", decodeDossierManifest], ["projector", projectDossierManifest], ["structural reader", structural]];
+  for (const kind of ["research-answer", "research-attempt"]) {
+    const lawful = snapshot(kind);
+    assert.deepEqual(decodeDossierManifest(lawful), JSON.parse(canonical(lawful as Json)), `${kind} passes the decoder`);
+    assert.deepEqual(projectDossierManifest(lawful).value, JSON.parse(canonical(lawful as Json)), `${kind} passes the projector`);
+    assert.equal(structural(lawful).verification, "structural", `${kind} passes the structural reader`);
+    for (const [name, read] of readers) {
+      const swapped = snapshot(kind);
+      swapped.unknowns[0].claim.containerKind = kind === "research-answer" ? "research-attempt" : "research-answer";
+      assert.equal(code(() => read(swapped)), "discovery_dossier_invalid", `${name}: ${kind} swapped`);
+      assert.equal(field(() => read(swapped)), "unknowns.0.claim", `${name}: ${kind} swapped is refused at the unknown claim`);
+    }
+  }
+});
