@@ -305,6 +305,12 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // DRS1a2: the v2 intent is the v1 form without cursor.context — every other
   // field keeps the structural scan (preparation, guards, subject, capacity data).
   { kind: "research-consumer-intent", contract: "research-consumer-intent/v2", data: capacityData(["cursor", "resultCapacity"]) },
+  // DR6 6.1: the structural dossier snapshot declares its exact references only — the draft, the accepted frame
+  // and plan answers, the grounds of each partial reason and every claim container of the axes and unknowns.
+  // Texts are data; the record proves no paid producer, accepted claim or acceptance.
+  { kind: "discovery-dossier-manifest", contract: "discovery-dossier-manifest/v1", data: [], refs: [
+    ["draft"], ["frame"], ["plan"], ["reasons", INDEX, "grounds", INDEX],
+    ["axes", KEY, "claims", INDEX, "container"], ["unknowns", INDEX, "claim", "container"]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
