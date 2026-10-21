@@ -64,7 +64,7 @@ import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEr
   type ResearchConsumerIntent } from './response-recovery.js';
 import { ARCHIVE_PARTS_CONTRACT } from './request-parts.js';
 import type { RecoverableContextSession } from './context-recovery.js';
-import { projectResearchPhysicalReply } from './research-consumer-transition.js';
+import { projectResearchPhysicalReply, SYNTHESIS_SESSION_V3_PREFIX } from './research-consumer-transition.js';
 import { earlyResearchStage, researchCapacityProjection, researchResponseOutputLimit, DEFAULT_RESEARCH_REQUEST_CHARS, RESULT_CAPACITY } from './early-research-outcome.js';
 import { RunControlGate, RunControlLost, RUN_CONTROL_MOVED, callStopCancelWrite } from '../om/run-control.js';
 import { REQUEST_MANIFEST_CONTRACT, prepareRequestPartsAndManifest, partitionResearchWire } from './request-parts.js';
@@ -331,8 +331,16 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       && canonical(consumerIntent.value.profile) === canonical(audit.pilot ? reference(audit.pilot) : null),
     'research_consumer_intent_invalid', 'The saved consumer operation differs from the selected role, project, question or environment');
     planSubject = planSubjectOf(consumerIntent.value.cursor);
-    requireCondition(!planSubject || consumerIntent.value.kind === 'analyst' && audit.purpose === 'analyst',
-      'research_v7_mode_unavailable', 'The v7 planner and synthesis consumers are not connected');
+    // DR3a3-S5: a plan subject travels only with the role its intent fixed — the
+    // analyst and the reading planner by their own purpose, a synthesis or
+    // consolidation step as the analyst call of exactly its own v3 session.
+    // Any other consumer, purpose or session with a subject stays closed.
+    const stepOfOwnV3Session = ['synthesis', 'consolidation'].includes(consumerIntent.value.kind)
+      && audit.purpose === 'analyst' && isRef(audit.session) && audit.session.id === consumerIntent.value.owner.id
+      && audit.session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX);
+    requireCondition(!planSubject || consumerIntent.value.kind === 'analyst' && audit.purpose === 'analyst'
+      || consumerIntent.value.kind === 'reading-planner' && audit.purpose === 'reading-planner' || stepOfOwnV3Session,
+      'research_v7_mode_unavailable', 'A plan subject travels only with its own connected v7 role');
     if (consumerIntent.value.state !== 'prepared' && !isResponseRecovery()) {
       if (consumerIntent.value.state === 'applied') throw new EngineError('research_consumer_intent_applied', 'The completed consumer operation must return its saved output');
       const paid = resumeResearchConsumerExecution(audit.store, environment.projectId, reference(consumerIntent));
@@ -366,7 +374,8 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       `Unsupported or unknown request contract: ${String(requestContract)}`
     );
     requireCondition(
-      consumerIntent !== null && consumerIntent.value.kind === 'analyst' || assessmentSubject !== null && assessment?.kind === 'application',
+      consumerIntent !== null && (consumerIntent.value.kind === 'analyst' || planSubject !== null)
+        || assessmentSubject !== null && assessment?.kind === 'application',
       'request_contract_unsupported',
       'The wire manifest requires a managed analyst or an exact assessment application'
     );
@@ -384,9 +393,13 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
       && draft.value.projectId === environment.projectId && Array.isArray(draft.value.questions)
       && Array.isArray(draft.value.inputs), 'discovery_draft_invalid', 'The call needs its saved project draft');
   if (draft && isDiscoveryV7Draft(draft.value)) {
-    requireCondition(!['reading-planner','synthesis','consolidation'].includes(consumerIntent?.value.kind ?? audit!.purpose)
-      && !(context as any)?.synthesisSession && !['planning','consolidation'].includes((context as any)?.dispatchMode),
-      'research_v7_mode_unavailable', 'The v7 planner and synthesis consumers are not connected');
+    // DR3a3-S5: on a v7 draft the planner, synthesis and consolidation roles are
+    // admitted only through their proven subject intent (checked above); an
+    // unmanaged or subject-less call of these roles stays closed.
+    const plannerOrSynthesis = ['reading-planner','synthesis','consolidation'].includes(consumerIntent?.value.kind ?? audit!.purpose)
+      || Boolean((context as any)?.synthesisSession) || ['planning','consolidation'].includes((context as any)?.dispatchMode);
+    requireCondition(!plannerOrSynthesis || consumerIntent !== null && planSubject !== null,
+      'research_v7_mode_unavailable', 'The v7 planner and synthesis roles need their proven subject intent');
     const question = audit!.questionId ? audit!.store.get<Question>(audit!.questionId) : null;
     requireCondition(!(audit!.purpose === 'analyst' && question?.value.spec.field === 'plan' && question.value.status === 'answered') || planSubject,
       'research_plan_subject_invalid', 'An accepted plan needs its exact saved plan-question subject');

@@ -1,5 +1,5 @@
 {
-  "producerDigest": "e8e04877d7137ad2609c1ded4e5d9b6320d3bef811c1eed0f40ba1692f04e85c",
+  "producerDigest": "e29289d7c804b09bc6377e4110fde75fccf53c9cfb6f93eacb6445ec223d82b4",
   "inputs": [
     {
       "path": "package-lock.json",
@@ -231,7 +231,7 @@
     },
     {
       "path": "src/discovery/research-consumer-transition.ts",
-      "sha256": "98e5515dddcb64e9f8a6a9b158d52ba0ac0277552d53ea75c5b7eb7f3bd259f0"
+      "sha256": "03e8da4c751bd1de330f561dae8f0e17348b87419db00fd51590579815d23418"
     },
     {
       "path": "src/discovery/research-context.ts",
@@ -263,7 +263,7 @@
     },
     {
       "path": "src/discovery/research-protocol.ts",
-      "sha256": "bbe9b926d7e0f9d2c527929006ac2aa8db9b0b4f0d9237ed96af4d4cb41599fc"
+      "sha256": "74fde63c5714967c1960146d081dfb0ec9968effd6e2de83759228198746f42a"
     },
     {
       "path": "src/discovery/research-reuse.ts",
@@ -283,7 +283,7 @@
     },
     {
       "path": "src/discovery/response-recovery.ts",
-      "sha256": "6da41433f90351688cd1d47e34748edc7ce6472df37d2a2b004aa6481b77c2f8"
+      "sha256": "2b9f780b6e81ed0d56dc918e3767c82ea16f2087b27e82913740b29774ab2833"
     },
     {
       "path": "src/discovery/response-replay.ts",
@@ -939,48 +939,48 @@
     "discovery": {
       "id": "stage:golden:discovery",
       "revision": 2,
-      "hash": "dfa4aa4094b22fbd9d1c37f2117b3058dfcc9aa43b80705202eb76192354e40f"
+      "hash": "f06f61ff9d1ab14c40ed92945791ab5548c331155ab48cfecf0bac9ff8343afd"
     },
     "concept": {
       "id": "stage:golden:concept",
       "revision": 2,
-      "hash": "da79b087006ddbe875050cda3e892793b64cdc4538adc43efefe2a5c1db851dd"
+      "hash": "7aee958c6f73b0a2c4423d24f0151238f3c0f0c33387945d6edc38e399d2e5b8"
     },
     "operation-map": {
       "id": "stage:golden:operation-map",
       "revision": 2,
-      "hash": "4d3277dacb1c6762fc297678ad1e75381ada52b31a9b5f88ca180f1814d34f64"
+      "hash": "af0dd322a88359f8a09a9bf65fb29a2b859448c86776f2041853c2bf16769c34"
     },
     "specification": {
       "id": "stage:golden:specification",
       "revision": 2,
-      "hash": "a36c7af044515a9c37631ef58d47e8a3a253791c53a7dfe35188a0b82b099c5b"
+      "hash": "8faabf4258d144ec2fc6faec404e5949846b9c07dc3ff5092701121d301e896d"
     },
     "features": {
       "id": "stage:golden:features",
       "revision": 2,
-      "hash": "b9a0007a9f06707cdbf3666bd954d27a3c4081bc510c6cb658f1385a0719ab8c"
+      "hash": "f7210b34a3fac41ca9ebeb8e423f95fa71fff46e1fd9e4baeeaff04792ad0ce3"
     },
     "om-g2": {
       "id": "stage:golden:om-g2",
       "revision": 1,
-      "hash": "7f70f4a4884c3b8610abca77b19cb97e5881414e00d7e060b28b5e46d173bdd7"
+      "hash": "64bfbb1038b93decbfd7045cabe173fc8ebe7634716be993e2b1e263111026a6"
     },
     "compilation": {
       "id": "stage:golden:compilation",
       "revision": 2,
-      "hash": "55233388085492ebee01b5465797c9d5b51ba2331def5523a04549330f52111d"
+      "hash": "a1d7b003924c5a040a2ac07c9472568ebcfa25b76b1c29d35a90156ca2e8661b"
     },
     "execution": {
       "id": "stage:golden:execution",
       "revision": 1,
-      "hash": "98b26f2d5e1f9e27e6ffeeacd20c1c1afc208160eac4ab0d12f688325f26cefd"
+      "hash": "8e01038970f77b93acd8c9cace14804097143bfcee1be1d4525f76e9e255b481"
     }
   },
   "databaseId": "089133aa-dc16-4529-a3b9-be5ba223092f",
   "proofCache": "empty",
-  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-s5-int/.golden-build-yDAcAb/",
+  "externalRoot": "/Users/kostenchuksergey/omg-wt/omg-s5-int/.golden-build-p4pXqC/",
   "format": "golden-sample/v1",
-  "sqliteFileSha256": "f86aee81a03cb09fc9913744018e08ce53a03833c042d8f9e53cb2ba545878bf",
+  "sqliteFileSha256": "a90bfaab535e6266aaa0dd363639df9ce1088828d7aaae846365f9baf5ee4587",
   "sqliteBytes": 14573568
 }

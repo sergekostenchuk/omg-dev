@@ -698,7 +698,17 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
   'research_context_invalid', 'The synthesis transition needs its exact saved state, packet and archive');
   const capacityFailure = researchResultFailure(archive.resultCapacity, input.payload);
   if (capacityFailure) throw capacityFailure;
-  const questionId = input.question.id;
+  // DR3a3-S5: a v3 session answers its exact plan-question — its actions address
+  // the plan-question id, its notes are subject-bound v2 checkpoints and its end
+  // is a V7AttemptEnd. The subject is the session's own saved binding (one
+  // projection for the writer and the paid-transition reader); v2 is unchanged.
+  const planSubject = typeof input.sessionId === 'string' && input.sessionId.startsWith(SYNTHESIS_SESSION_V3_PREFIX)
+    ? synthesisSessionSubject({ id: input.sessionId, value: before }) : null;
+  const questionId = planSubject ? planSubject.planQuestionId : input.question.id;
+  const checkpointOf = (proposal: CheckpointProposalInput) => planSubject
+    ? projectCheckpointValueV2(projectId, input.draft, input.question, planSubject, proposal,
+      (source, selector) => exactObservation(store, projectId, source, selector))
+    : exactCheckpoint(projectId, input.draft, input.question, proposal, store);
   const workspace = contextWorkspace(before.workspace, before.focus);
   requireCondition(!workspace.blocked, 'research_no_progress', workspace.blocked ?? 'Saved context session is blocked');
 
@@ -716,9 +726,9 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
       ? partialConsolidatedProposal(action, questionId, fragment.original, fragment.previous,
           fragment.delivery, fragment.complete)
       : consolidatedProposal(action, questionId, before.notes, selected!);
-    const checkpoint = exactCheckpoint(projectId, input.draft, input.question, {
+    const checkpoint = checkpointOf({
       question: questionId, value: proposal as unknown as Json,
-      citations: proposal.citations, unresolved: proposal.unresolved }, store);
+      citations: proposal.citations, unresolved: proposal.unresolved });
     const note: SynthesisNote = {
       checkpoint: { id: checkpoint.id, revision: 1, hash: hashJson(checkpoint.value) }, proposal,
       page: { offset: before.offset, end: before.offset },
@@ -739,9 +749,11 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
   const materials = archive.synthesisMaterials;
   requireCondition(Array.isArray(materials) && materials.every(recordValue),
     'research_context_invalid', 'The archived synthesis materials are missing');
-  const action = researchAction(input.payload);
+  // A v3 answer is read by its subject: exactly one attempt end, citations:[].
+  const action = planSubject ? admittedResearchAction(input.payload, planSubject) : researchAction(input.payload);
   const page = subject.synthesisPage;
-  requireCondition(['answer', 'answer_delta', 'checkpoint', 'read_context', 'need_research', 'need_owner', 'pause'].includes(action.action),
+  requireCondition((planSubject ? ['answer', 'checkpoint', 'read_context', 'need_research', 'need_owner', 'pause']
+    : ['answer', 'answer_delta', 'checkpoint', 'read_context', 'need_research', 'need_owner', 'pause']).includes(action.action),
     'research_mode_invalid', 'Synthesis must answer, checkpoint, or identify missing information');
   requireCondition(!('question' in action) || action.question === questionId,
     'research_question_foreign', 'Synthesis must target its bound question');
@@ -806,7 +818,9 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
       workspace: contextProgress(workspace, subject), result: action,
       ...(before.contextCorrection ? { contextCorrection: null } : {}), ...outcomeDelivery } };
   }
-  requireCondition(['checkpoint', 'answer', 'answer_delta'].includes(action.action),
+  // Decision 2: in v3 an early answer is not turned into a note — undelivered
+  // materials need a checkpoint first; the paid payload stays with its refusal.
+  requireCondition((planSubject ? ['checkpoint'] : ['checkpoint', 'answer', 'answer_delta']).includes(action.action),
     'synthesis_checkpoint_required', 'Save partial findings before continuing the remaining already-read materials');
   const proposal = action as Extract<ResearchAction, { action: 'checkpoint' | 'answer' | 'answer_delta' }>;
   const deliveredKeys = (Array.isArray(subject.contextWorkspace) ? subject.contextWorkspace as ContextLookup[] : [])
@@ -816,10 +830,10 @@ export function projectSynthesisTransition(input: SynthesisTransitionInput): Syn
   requireCondition(page.end > before.offset || (page.nextMaterialOffset ?? 0) > (before.materialOffset ?? 0) || newContext,
     'synthesis_no_progress', 'A checkpoint must advance material or record newly delivered context; repeated prose is not progress');
   requireCondition(proposal.question === questionId, 'research_question_foreign', 'Partial synthesis must target its bound question');
-  const checkpoint = exactCheckpoint(projectId, input.draft, input.question, {
+  const checkpoint = checkpointOf({
     question: questionId, value: proposal as unknown as Json, citations: proposal.citations,
     unresolved: proposal.action === 'checkpoint' ? proposal.unresolved
-      : ['Complete the remaining material pages before accepting this proposal'] }, store);
+      : ['Complete the remaining material pages before accepting this proposal'] });
   const note: SynthesisNote = { checkpoint: { id: checkpoint.id, revision: 1, hash: hashJson(checkpoint.value) },
     proposal, page: { offset: before.offset, end: page.end } };
   return { kind: 'page', checkpoint, session: { ...before, offset: page.end, materialOffset: page.nextMaterialOffset ?? 0,

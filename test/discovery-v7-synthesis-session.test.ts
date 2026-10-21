@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
@@ -8,9 +8,22 @@ import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/di
 import { findUnfinishedSynthesisSession, findUnfinishedSynthesisSessionV3, readSynthesisSessionV3,
   synthesisSession } from "../src/discovery/synthesis-session.js";
 import { projectSynthesisSessionV3Initial } from "../src/discovery/research-consumer-transition.js";
-import { readerPilot } from "../src/discovery/reader-pilot.js";
+import { pilotEnvironment, readerPilot } from "../src/discovery/reader-pilot.js";
+import { researchCall } from "../src/discovery/research-protocol.js";
+import { DISCOVERY_CLAIMS_CONTRACT } from "../src/discovery/v7-contracts.js";
 import { V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "../src/discovery/v7-managed-attempt.js";
 import { checkStoreIntegrity } from "../src/storage/fsck.js";
+import { configureV7SavedSynthesis, savedV7SynthesisMaterials } from "../src/discovery/saved-synthesis.js";
+import { recoverContextSession } from "../src/discovery/context-recovery.js";
+import { questionDispatchId } from "../src/discovery/v7-managed-attempt.js";
+import type { Write } from "../src/storage/store.js";
+import { Researcher } from "../src/discovery/research-runner.js";
+import { prepareResearchConsumerIntent } from "../src/discovery/response-recovery.js";
+import { PLANNING_INSTRUCTION } from "../src/discovery/reading-plan.js";
+import { hashJson } from "../src/canonical.js";
+import { uniqueRefs } from "../src/pipeline/contracts.js";
+import { uniqueTransactionGuards } from "../src/runtime/environment.js";
+import type { ModelCall } from "../src/runtime/model-usage.js";
 import { EngineError } from "../src/errors.js";
 import type { Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
@@ -94,10 +107,10 @@ const run = (f: Fixture, p: Planned, context: Record<string, any>) => synthesisS
   p.environment, p.dispatch, p.pilot, context, "Synthesize the exact plan-question");
 const history = (store: Store) => store.list().map(row => [row.id, row.revision, row.hash]);
 
-test("S5 creation (S1→S5): the real producer writes exactly the v3 projector's first record at its address, prepares its subject's step and stays unpaid while paid admission is closed", async t => {
+test("S5 creation (S1→S5): the real producer writes exactly the v3 projector's first record at its address, prepares its subject's step, and without a calibrated estimate stops at the budget boundary before any call", async t => {
   const f = fixture(t), p = planned(f, "s5-create");
   const A = subjectOf(p.planAnswer, "q-supply");
-  assert.equal(await code(() => run(f, p, contextOf(A))), "research_v7_mode_unavailable");
+  assert.equal(await code(() => run(f, p, contextOf(A))), "budget_estimate_missing");
   const sessions = f.store.list<any>("synthesis-session");
   const expected = projectSynthesisSessionV3Initial({ projectId: p.project, binding: { draft: reference(p.draft),
     question: reference(p.plan), environment: reference(p.environment), inputs: p.draft.value.inputs, subject: A },
@@ -110,7 +123,7 @@ test("S5 creation (S1→S5): the real producer writes exactly the v3 projector's
   assert.deepEqual(intents[0]!.value.cursor.subject, A, "the step names exactly its session's subject");
   for (const kind of ["model-call", "model-request", "research-budget-ledger"]) assert.deepEqual(f.store.list(kind), [], `no ${kind}`);
   // A repeat continues the same unfinished session of the subject: no second session, no second step, no payment.
-  assert.equal(await code(() => run(f, p, contextOf(A))), "research_v7_mode_unavailable");
+  assert.equal(await code(() => run(f, p, contextOf(A))), "budget_estimate_missing");
   assert.equal(f.store.list("synthesis-session").length, 1);
   assert.equal(f.store.list("research-consumer-intent").length, 1);
 });
@@ -155,4 +168,343 @@ test("S5 subject isolation: A and B keep separate sessions and unfinished lookup
   const forged = f.store.write({ id: head.id, kind: head.kind, expected: head.revision,
     value: { ...head.value, binding: { ...head.value.binding, subject: B } } });
   assert.equal(await code(async () => readSynthesisSessionV3(f.open(), reference(forged))), "synthesis_session_invalid");
+});
+
+/* ---------- paid chains on the real researchCall with a controlled adapter ---------- */
+
+/** One v7 project whose adapter answers from a queue of replies, with both the
+ * analyst and the reading-planner purposes calibrated by real calls (a4). */
+async function paidPlanned(t: { after(fn: () => void): void }, project: string, ids = ["q-supply", "q-market"],
+  options: { calibrationTokens?: number; conclusionShare?: number } = {}) {
+  const f = fixture(t);
+  const wire = join(f.root, "wire.ndjson"), replies = join(f.root, "replies.json"), adapter = join(f.root, "adapter.mjs");
+  const tokensFile = join(f.root, "tokens.json");
+  const configure = (queue: unknown[] = []) => writeFileSync(replies, JSON.stringify(queue));
+  const usage = (tokens: number) => writeFileSync(tokensFile, JSON.stringify(tokens));
+  configure(); usage(options.calibrationTokens ?? 10);
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),queue=JSON.parse(readFileSync(${JSON.stringify(replies)},'utf8'));
+let seen=[];try{seen=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
+appendFileSync(${JSON.stringify(wire)},raw.replace(/\\n/g,' ')+'\\n');
+const c=r.subject??{},tokens=JSON.parse(readFileSync(${JSON.stringify(tokensFile)},'utf8'));
+const position=seen.filter(line=>JSON.parse(line).subject?.dispatchMode!=='consolidation').length;
+let research=c.dispatchMode==='consolidation'
+  ?{action:'checkpoint',question:c.question.id,value:{summaries:c.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
+  :queue[position]??{action:'pause',reason:'calibration'};
+research=JSON.parse(JSON.stringify(research).replaceAll('$q',c.question?.id??'probe'));
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  f.engine.execute({ type: "create-project", project, title: project });
+  const command = { executable: process.execPath, args: [adapter] };
+  const environment = f.engine.environments.configure(project, { workspace: f.root,
+    implementer: { actor: "author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 30000 }, 0);
+  f.engine.execute({ type: "configure-reader-pilot", project, expected: 0, settings: { experimental: true, active: true,
+    stopAfter: "L2", reader: { actor: "reader", model: "fixture", effort: "high", speed: "inherited", command }, agentCommand: command,
+    maxRequestChars: 200000, maxReadChars: 20000, maxReplyChars: 200000, maxCalls: 50, maxReportedTokens: 100000000,
+    ...(options.conclusionShare ? { conclusionShare: options.conclusionShare } : {}) } });
+  // Real calibration calls of both purposes on a field-path draft (no plan subject, no stage budget).
+  const calibration = f.discovery.create(project, "discovery", "R0", "concept",
+    [{ field: "probe", kind: "fact", prompt: "Calibrate", risk: "unknown", schema: { type: "object" } }], [], 6);
+  for (const purpose of ["analyst", "reading-planner"])
+    await researchCall(environment.value.implementer, environment.value, "Calibrate", {}, undefined,
+      { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose });
+  writeFileSync(wire, ""); usage(10);
+  const base = createPartialV7Draft(f.discovery, project, "concept");
+  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
+  const frame = questionOf(f.store, base, "frame");
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
+  const planQ = questionOf(f.store, base, "plan");
+  answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, ids), src);
+  const plan = f.store.get<Question>(planQ.id)!, pilot = readerPilot(f.store, project)!;
+  // A "large" material takes a page of its own (as the v2 fixture's small layout): delivery stays incomplete after page one.
+  const material = (name: string, large = false) => {
+    const document = f.discovery.evidence.document(project, `material-${name}`, `Material ${name}: a condition with its exception. `
+      + (large ? "detail ".repeat(Math.floor(200000 * 0.55 / 7)) : ""), "text/plain", 0);
+    return { kind: "context", value: f.discovery.evidence.observe(project, reference(document),
+      { kind: "text-range", start: 0, end: document.value.content.length }) };
+  };
+  const citation = (selection: { value: any }) => ({ source: selection.value.source, selector: selection.value.selector });
+  const calls = () => readFileSync(wire, "utf8").trim().split("\n").filter(Boolean).length;
+  const p = { project, draft: f.store.get<DiscoveryDraft>(base.id)!, plan, planAnswer: plan.value.answer!, frameRef, environment,
+    pilot, dispatch: pilotEnvironment(environment.value, pilot.value) };
+  return { ...f, p, configure, usage, material, citation, calls };
+}
+type Paid = Awaited<ReturnType<typeof paidPlanned>>;
+const paidRun = (f: Paid, subject: V7PlanSubject, materials: unknown[], extra: Record<string, any> = {}) =>
+  synthesisSession(f.store, f.p.draft, f.p.plan, f.p.environment, f.p.dispatch, f.p.pilot,
+    { ...contextOf(subject), workingSelections: materials, ...extra }, "Synthesize the exact plan-question");
+const endOf = (value: unknown) => ({ action: "answer", question: "$q", value, citations: [] });
+const ENDS: Record<string, unknown> = {
+  submitted: { type: "submitted", contract: DISCOVERY_CLAIMS_CONTRACT, value: { claims: [] } },
+  refused: { type: "refused", code: "source_unavailable", evidence: [], text: "No accessible source" },
+  impossible: { type: "impossible", code: "source_unavailable", evidence: [], text: "Cannot be established" },
+  duplicate: { type: "duplicate", of: { id: "research-attempt:original", revision: 1, hash: "0".repeat(64) } },
+};
+
+test("S5 paid chain: initial page → v2 checkpoint → final page → each of the four attempt ends as the session result, with exact counts and no attempt", async t => {
+  const ids = ["q-a", "q-b", "q-c", "q-d"];
+  const f = await paidPlanned(t, "s5-chain", ids);
+  const [first, second] = [f.material("one"), f.material("two")];
+  for (const [index, kind] of Object.keys(ENDS).entries()) {
+    const subject = subjectOf(f.p.planAnswer, ids[index]!);
+    const before = f.calls();
+    f.configure([...Array(before).fill(null), { action: "checkpoint", question: "$q", value: { finding: `page one of ${kind}` },
+      citations: [f.citation(first)], unresolved: [] }, endOf(ENDS[kind])]);
+    const result = await paidRun(f, subject, [first, second]);
+    assert.deepEqual(result, { ...endOf(ENDS[kind]), question: ids[index] }, `${kind}: the session result is the attempt end`);
+    assert.equal(f.calls() - before, 2, `${kind}: two paid pages`);
+    const session = f.store.list<any>("synthesis-session").find(row => row.value.binding.subject.planQuestionId === ids[index])!;
+    const proven = readSynthesisSessionV3(f.open(), reference(session));
+    assert.equal(proven.value.notes.length, 1);
+    const note = f.store.get<any>(proven.value.notes[0]!.checkpoint.id)!;
+    assert.ok(note.id.startsWith("research-checkpoint:v2:"));
+    assert.deepEqual(note.value.subject, subject, `${kind}: the note is bound to its own subject`);
+    assert.equal(note.value.question.id, f.p.plan.id, "the note keeps the real plan Question");
+  }
+  assert.deepEqual(f.store.list("research-attempt"), [], "S5 records no attempt: the end is handed off by the runner (S6)");
+});
+
+test("S5 early answer: an answer before all pages are delivered is synthesis_checkpoint_required with its paid payload kept, no note and no repurchase", async t => {
+  const f = await paidPlanned(t, "s5-early");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  f.configure([endOf(ENDS.impossible)]);
+  const pages = [f.material("one", true), f.material("two", true)];
+  assert.equal(await code(() => paidRun(f, A, pages)), "synthesis_checkpoint_required");
+  assert.equal(f.calls(), 1);
+  assert.deepEqual(f.store.list("research-checkpoint"), [], "an early end is never turned into a note");
+  const intent = f.store.list<any>("research-consumer-intent").find(row => row.value.kind === "synthesis")!;
+  assert.equal(intent.value.state, "refused");
+  assert.equal(intent.value.refusal.code, "synthesis_checkpoint_required");
+  assert.equal(await code(() => paidRun(f, A, pages)), "synthesis_checkpoint_required",
+    "the saved refusal repeats as itself");
+  assert.equal(f.calls(), 1, "no new payment");
+});
+
+test("S5 not ends: answer_delta is refused by the subject's action reader; need_research and need_owner before full delivery need a checkpoint and after it stay control results; pause pauses", async t => {
+  const f = await paidPlanned(t, "s5-control", ["q-a", "q-b", "q-c", "q-d"]);
+  const delta = { action: "answer_delta", question: "$q", upserts: [], citations: [] };
+  f.configure([delta]);
+  // An answer_delta is no end of an attempt: the subject's own action reader refuses it with its paid payload kept.
+  assert.equal(await code(() => paidRun(f, subjectOf(f.p.planAnswer, "q-a"), [f.material("x")])), "research_response_invalid");
+  assert.deepEqual(f.store.list("research-checkpoint"), []);
+  const needResearch = { action: "need_research", question: "$q", missing: ["the exact clause"] };
+  f.configure([...Array(f.calls()).fill(null), needResearch]);
+  assert.equal(await code(() => paidRun(f, subjectOf(f.p.planAnswer, "q-b"), [f.material("y", true), f.material("z", true)])),
+    "synthesis_checkpoint_required", "an incomplete page cannot ask for new research");
+  const consulted = f.material("consulted");
+  const needOwner = { action: "need_owner", question: "$q", reason: "owner-only scope", searched: [consulted.value.source] };
+  f.configure([...Array(f.calls()).fill(null), needOwner]);
+  assert.deepEqual(await paidRun(f, subjectOf(f.p.planAnswer, "q-c"), [consulted]), { ...needOwner, question: "q-c" },
+    "after full delivery need_owner is a control result, not an end");
+  f.configure([...Array(f.calls()).fill(null), { action: "pause", reason: "operator" }]);
+  assert.deepEqual(await paidRun(f, subjectOf(f.p.planAnswer, "q-d"), []), { action: "pause", reason: "operator" });
+  assert.deepEqual(f.store.list("research-attempt"), []);
+});
+
+test("S5 cold replay: a finished session returns its saved result from a new Store without calling the adapter or adding a ledger", async t => {
+  const f = await paidPlanned(t, "s5-replay");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  f.configure([endOf(ENDS.refused)]);
+  const result = await paidRun(f, A, []);
+  const calls = f.calls(), ledgers = f.store.list("research-budget-ledger").length, before = history(f.store);
+  const cold = f.open();
+  const replay = await synthesisSession(cold, f.p.draft, f.p.plan, f.p.environment, f.p.dispatch, f.p.pilot,
+    { ...contextOf(A), workingSelections: [] }, "Synthesize the exact plan-question");
+  assert.deepEqual(replay, result);
+  assert.equal(f.calls(), calls, "no adapter call");
+  assert.equal(cold.list("research-budget-ledger").length, ledgers, "no new ledger");
+  assert.deepEqual(history(cold), before, "no write at all");
+});
+
+const checkpointOn = (f: Paid, selection: { value: any }, finding: string) => ({ action: "checkpoint", question: "$q",
+  value: { finding }, citations: [f.citation(selection)], unresolved: [] });
+const runIn = (f: Paid, store: Store, subject: V7PlanSubject, materials: unknown[]) => synthesisSession(store, f.p.draft, f.p.plan,
+  f.p.environment, f.p.dispatch, f.p.pilot, { ...contextOf(subject), workingSelections: materials }, "Synthesize the exact plan-question");
+
+test("S5 crash after payment: an interrupted application keeps the paid answer and a second Store applies it without a new call or ledger", async t => {
+  const f = await paidPlanned(t, "s5-crash");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  f.configure([endOf(ENDS.refused)]);
+  const write = f.store.writeMany.bind(f.store); let cut = false;
+  f.store.writeMany = ((writes: Write[], guards = []) => {
+    if (!cut && writes.some(item => item.kind === "synthesis-session" && item.expected > 0)) {
+      cut = true; throw new Error("crash after payment"); }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  await assert.rejects(paidRun(f, A, []), /crash after payment/);
+  f.store.writeMany = write;
+  assert.equal(f.calls(), 1);
+  const ledgers = f.store.list("research-budget-ledger").length;
+  const second = f.open();
+  assert.deepEqual(await runIn(f, second, A, []), { ...endOf(ENDS.refused), question: "q-supply" });
+  assert.equal(f.calls(), 1, "the paid answer is applied, not bought again");
+  assert.equal(second.list("research-budget-ledger").length, ledgers, "no new ledger");
+});
+
+test("S5 finalization never spends the completion reserve: a final page whose estimate exceeds the research remainder pauses before any call", async t => {
+  const f = await paidPlanned(t, "s5-reserve", ["q-supply", "q-market"], { calibrationTokens: 19_000_000 });
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  f.configure([endOf(ENDS.refused)]);
+  const before = f.store.list("model-call").length;
+  let failure: EngineError | null = null;
+  try { await paidRun(f, A, []); } catch (error) { failure = error as EngineError; }
+  assert.equal(failure?.code, "discovery_budget_reserve", String(failure?.message));
+  const details = failure!.details as { remaining: number; class: string; estimate: { tokens: number } };
+  assert.equal(details.class, "research");
+  assert.equal(details.remaining, 18_000_000, "the research remainder excludes the 2 000 000 completion reserve");
+  assert.ok(details.estimate.tokens > details.remaining, JSON.stringify(details.estimate));
+  assert.equal(f.store.list("model-call").length, before);
+  assert.equal(f.calls(), 0);
+});
+
+test("S5 overrun: a paid page whose actual usage passes the stage limit keeps its note, and the next send pauses with discovery_budget_overrun", async t => {
+  const f = await paidPlanned(t, "s5-overrun");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  const [first, second] = [f.material("one", true), f.material("two", true)];
+  f.configure([checkpointOn(f, first, "page one"), endOf(ENDS.refused)]);
+  f.usage(21_000_000);
+  assert.equal(await code(() => paidRun(f, A, [first, second])), "discovery_budget_overrun");
+  assert.equal(f.calls(), 1, "the overrun stops the next send");
+  const session = f.store.list<any>("synthesis-session")[0]!;
+  assert.equal(session.value.notes.length, 1, "the paid page keeps its note");
+});
+
+test("S5 consolidation: after a real profile change leaves the notes no room, a paid consolidation step writes a v2 note of the same subject and the session reaches its end", async t => {
+  const f = await paidPlanned(t, "s5-consolidation");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  const pages = [f.material("one", true), f.material("two", true), f.material("three")];
+  // Produce two large lawful notes under the setup profile, then pause on the third (small) page.
+  f.configure([checkpointOn(f, pages[0]!, "x".repeat(30000)), checkpointOn(f, pages[1]!, "y".repeat(30000)),
+    { action: "pause", reason: "hold before the measured profile" }, endOf(ENDS.impossible)]);
+  assert.deepEqual(await paidRun(f, A, pages), { action: "pause", reason: "hold before the measured profile" });
+  // The measured pressure: the owner's next profile revision (the real command) gives the carried notes no room.
+  const { projectId: _project, ...settings } = f.p.pilot.value;
+  f.engine.execute({ type: "configure-reader-pilot", project: f.p.project, expected: f.p.pilot.revision,
+    settings: { ...settings, maxRequestChars: 60000, conclusionShare: 0.35 } });
+  const pilot = readerPilot(f.store, f.p.project)!, dispatch = pilotEnvironment(f.p.environment.value, pilot.value);
+  const result = await synthesisSession(f.store, f.p.draft, f.p.plan, f.p.environment, dispatch, pilot,
+    { ...contextOf(A), workingSelections: pages }, "Synthesize the exact plan-question");
+  assert.deepEqual(result, { ...endOf(ENDS.impossible), question: "q-supply" });
+  const session = readSynthesisSessionV3(f.open(), reference(f.store.list<any>("synthesis-session")[0]!));
+  const consolidated = session.value.notes.filter(note => note.consolidated);
+  assert.ok(consolidated.length >= 1, "a paid consolidation step ran");
+  for (const note of consolidated) {
+    const record = f.store.get<any>(note.checkpoint.id)!;
+    assert.ok(record.id.startsWith("research-checkpoint:v2:"));
+    assert.deepEqual(record.value.subject, A, "the consolidated note is the same subject's note");
+  }
+});
+
+test("S4→S5 saved-only on a lawful v3 session: the choice takes its proven notes in order and reads them back; a mismatched expected changes nothing", async t => {
+  const f = await paidPlanned(t, "s5-saved");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  const [first, second] = [f.material("one", true), f.material("two", true)];
+  f.configure([checkpointOn(f, first, "page one"), { action: "pause", reason: "hold for saved-only" }]);
+  await paidRun(f, A, [first, second]);
+  const saved = configureV7SavedSynthesis(f.store, f.p.project, A, 0);
+  const session = f.store.list<any>("synthesis-session")[0]!;
+  assert.deepEqual(saved.value.checkpoints, session.value.notes.map((note: any) => note.checkpoint));
+  const draft = f.store.get<DiscoveryDraft>(f.p.draft.id)!, plan = f.store.get<Question>(f.p.plan.id)!;
+  const materials = savedV7SynthesisMaterials(f.store, draft, plan, A)!;
+  assert.equal(materials.length, 1);
+  assert.deepEqual((materials[0]!.value as any).proposal.value, { finding: "page one" }, "the note keeps its paid checkpoint");
+  const before = history(f.store);
+  assert.equal(await code(async () => configureV7SavedSynthesis(f.store, f.p.project, A, 0)), "revision_conflict");
+  assert.deepEqual(history(f.store), before);
+});
+
+test("S4→S5 cold v3 context recovery: a lawfully blocked session gets one operator revision its chain reader proves; a dispatch of either counter racing the write conflicts; another subject's note is foreign", async t => {
+  const f = await paidPlanned(t, "s5-recover");
+  const A = subjectOf(f.p.planAnswer, "q-supply"), B = subjectOf(f.p.planAnswer, "q-market");
+  // B's lawful note, to be refused as A's recovery material.
+  const [b1, b2] = [f.material("b1", true), f.material("b2", true)];
+  f.configure([checkpointOn(f, b1, "B's page"), { action: "pause", reason: "hold B" }]);
+  await paidRun(f, B, [b1, b2]);
+  const noteB = f.store.list<any>("synthesis-session").find(row => row.value.binding.subject.planQuestionId === "q-market")!.value.notes[0].checkpoint;
+  // A blocks lawfully: its paid final-page lookup names a pointer its exact bound draft does not have.
+  f.configure([...Array(f.calls()).fill(null), { action: "read_context", record: reference(f.p.draft), pointer: "/no-such-field",
+    purpose: "the missing clause" }]);
+  assert.equal(await code(() => paidRun(f, A, [])), "research_no_progress");
+  const headOf = () => f.store.list<any>("synthesis-session").find(row => row.value.binding.subject.planQuestionId === "q-supply")!;
+  const blocked = headOf();
+  assert.ok(blocked.value.workspace.blocked);
+  const selector = { record: reference(f.store.get<DiscoveryDraft>(f.p.draft.id)!), pointer: "/stage" };
+  assert.equal(await code(async () => recoverContextSession(f.store, f.p.project, reference(blocked), { record: noteB, pointer: "/proposal" })),
+    "context_reference_foreign", "another subject's lawful note is not A's material");
+  for (const scope of [A, null]) {
+    const write = f.store.writeMany.bind(f.store); let raced = false;
+    f.store.writeMany = ((writes: Write[], guards = []) => {
+      if (!raced && writes.some(item => item.id === blocked.id)) {
+        raced = true;
+        const id = questionDispatchId(f.p.project, f.p.plan.id, scope), current = f.store.get<any>(id);
+        write([{ id, kind: "question-dispatch", expected: current?.revision ?? 0, value: { projectId: f.p.project, question: f.p.plan.id,
+          ...(scope ? { subject: scope } : {}), serial: (current?.value.serial ?? 0) + 1 } }]);
+      }
+      return write(writes, guards);
+    }) as typeof f.store.writeMany;
+    assert.equal(await code(async () => recoverContextSession(f.store, f.p.project, reference(blocked), selector)), "input_stale",
+      scope ? "a subject dispatch racing the write" : "a common reader dispatch racing the write");
+    f.store.writeMany = write;
+    assert.deepEqual(headOf(), blocked, "no half write");
+  }
+  const recovered = recoverContextSession(f.store, f.p.project, reference(blocked), selector);
+  assert.equal(recovered.revision, blocked.revision + 1);
+  const cold = f.open();
+  assert.deepEqual(readSynthesisSessionV3(cold, reference(recovered)), recovered, "the chain reader proves the operator revision");
+  assert.equal(recovered.value.workspace?.blocked, undefined);
+});
+
+test("S5 planner admission (S3 intent): a lawful saved planner intent passes the subject role and budget admission and stops only at the run-ownership boundary the runner (S6) holds, without a call", async t => {
+  const f = await paidPlanned(t, "s5-planner");
+  const B = subjectOf(f.p.planAnswer, "q-market");
+  // A lawful v7 run of the real runner: one paid analyst turn for the blocking plan-question, then the allowance pauses.
+  f.configure([endOf(ENDS.refused)]);
+  const paused = await new Researcher(f.store, new Discovery(f.store), f.engine.environments)
+    .run(f.p.project, f.p.draft.id, 1, undefined, { producerPolicy: { discovery: 7 } });
+  assert.equal(paused.value.pauseCode, "research_turns_exhausted", JSON.stringify(paused.value));
+  const run = f.store.get<any>(paused.id)!, calls = f.calls();
+  const dispatch = { ...f.p.environment.value, workspace: f.root };
+  const context = { role: "research", stage: "discovery", subject: B, inventory: { sources: [] }, history: [],
+    contextWorkspace: [], dispatchMode: "planning" };
+  const intent = prepareResearchConsumerIntent(f.store, { projectId: f.p.project, kind: "reading-planner",
+    key: hashJson([run.id, run.value.turns + 1, "reading-planner"]), owner: reference(run),
+    draft: reference(f.p.draft), question: reference(f.p.plan), role: dispatch.implementer, dispatch, profile: null,
+    cursor: { run: run.id, turn: run.value.turns + 1, mode: "planning", instruction: PLANNING_INSTRUCTION, context, subject: B },
+    basis: uniqueRefs([...f.p.draft.value.inputs, f.p.planAnswer]),
+    guards: uniqueTransactionGuards([reference(run), reference(f.p.draft), reference(f.p.plan), ...f.p.draft.value.inputs, f.p.planAnswer]) });
+  const before = f.store.list<ModelCall>("model-call").length;
+  // The paid planner reply itself is applied by the runner's planner connection (S6): there, a running run owns the turn.
+  assert.equal(await code(() => researchCall(intent.value.role, intent.value.dispatch, PLANNING_INSTRUCTION, context, undefined,
+    { store: f.store, draftId: f.p.draft.id, questionId: f.p.plan.id, purpose: "reading-planner", consumerIntent: reference(intent) })),
+  "research_consumer_intent_invalid", "past the role and budget admission, only the run's ownership is left");
+  assert.equal(f.store.list<ModelCall>("model-call").length, before, "no call");
+  assert.equal(f.calls(), calls);
+  // Without its subject the same planner role stays closed on a v7 draft.
+  assert.equal(await code(() => researchCall(dispatch.implementer, dispatch, PLANNING_INSTRUCTION, { ...context, subject: undefined }, undefined,
+    { store: f.store, draftId: f.p.draft.id, questionId: f.p.plan.id, purpose: "reading-planner" })), "research_v7_mode_unavailable");
+});
+
+test("S5 no result from a damaged session: a swapped offset or subject is refused by the chain reader, and no new step is bought over it", async t => {
+  // A fourth plan-question is the swap target only: a session that falsely claims a subject blocks that subject's work.
+  const ids = ["q-a", "q-b", "q-c", "q-d"];
+  const f = await paidPlanned(t, "s5-damage", ids);
+  const other = subjectOf(f.p.planAnswer, "q-d");
+  // Negative corruption only: each lawful session gets one forged later revision; no new step is bought over it.
+  for (const [index, [name, damage, expected]] of ([["offset", (value: any) => ({ ...value, offset: 0 }), "synthesis_session_invalid"],
+    // Another lawful plan-question of the same plan passes the subject proof; the chain (address, steps) refuses it.
+    ["subject", (value: any) => ({ ...value, binding: { ...value.binding, subject: other } }), "synthesis_session_invalid"],
+    ["null subject", (value: any) => ({ ...value, binding: { ...value.binding, subject: null } }), "research_plan_subject_invalid"]] as
+    [string, (value: any) => unknown, string][]).entries()) {
+    const subject = subjectOf(f.p.planAnswer, ids[index]!);
+    const pages = [f.material(`${name}-one`, true), f.material(`${name}-two`, true)];
+    f.configure([...Array(f.calls()).fill(null), checkpointOn(f, pages[0]!, `${name} page`), { action: "pause", reason: "hold" }]);
+    await paidRun(f, subject, pages);
+    const head = f.store.list<any>("synthesis-session").find(row => row.value.binding.subject.planQuestionId === ids[index])!;
+    const calls = f.calls();
+    const forged = f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: damage(head.value) });
+    assert.equal(await code(async () => readSynthesisSessionV3(f.open(), reference(forged))), expected, name);
+    assert.notEqual(await code(() => paidRun(f, subject, pages)), "no-error", name);
+    assert.equal(f.calls(), calls, `${name}: no new payment`);
+  }
 });

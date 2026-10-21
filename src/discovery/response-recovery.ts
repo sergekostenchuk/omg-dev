@@ -1,4 +1,4 @@
-import { packetAssessmentSubject, proveAssessmentTransportSubject, assessmentQuestionContract, assessmentTransportPrompt, continuationPrompt } from './continuation-packet.js';
+import { packetAssessmentSubject, proveAssessmentTransportSubject, assessmentQuestionContract, assessmentTransportPrompt, continuationPrompt, planQuestionContract } from './continuation-packet.js';
 import { prepareResearchEnvelope } from './research-protocol.js';
 import { readRequestWire, readArchiveBody, prepareContextPreparation, readPreparationRecord, readPreparedContext,
   CONTEXT_PREPARATION_CONTRACT, ARCHIVE_PARTS_CONTRACT, type ContextPreparationBinding } from './request-parts.js';
@@ -47,7 +47,7 @@ import { isResearchPreview } from './research-preview.js';
 import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalReply,
   isReservationOnlySessionStep, turnAction, responseAction, webResearchCapability, earlyUnknownEra, EARLY_UNKNOWN,
   projectSynthesisTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES, parseSynthesisSessionV2,
-  parseSynthesisSessionV3, synthesisSessionSubject, synthesisStepSubject, SYNTHESIS_SESSION_V3_PREFIX,
+  parseSynthesisSessionV3, synthesisSessionSubject, synthesisStepSubject, SYNTHESIS_SESSION_V3_PREFIX, SYNTHESIS_SESSION_CONTRACT_V3,
   projectResearchContextRead, assertResearchTurnTransition, projectPaidTurnAdmission,
   projectPaidOwnerReview, projectPaidLocalRefusal, projectSearchTurnCompletion,
   projectAddressedWorkspace, projectResearchTurnRevision, projectSourceReadingTurn, isCorrectableLayerDesignFailure,
@@ -2894,15 +2894,14 @@ function synthesisTransitionProofInput(store: Store, intent: Revision<ResearchCo
   paid: ResearchConsumerExecution, beforeRevision?: number): SynthesisTransitionInput {
   const cursor = intent.value.cursor;
   const session = store.get<SynthesisSessionState>(intent.value.owner.id, beforeRevision ?? intent.value.owner.revision);
-  // DR3a3-S1: the v3 transition (actions parsed by the saved subject) is
-  // connected with its producer in S5; until then it is an addressed refusal.
-  if (session?.kind === 'synthesis-session' && session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX))
-    throw new EngineError('research_v7_mode_unavailable',
-      `[${intent.id}] The v3 synthesis transition is not connected yet`, { session: reference(session) });
+  // DR3a3-S5: the v3 transition is connected with its producer — the contract
+  // follows the address era (v3 prefix ↔ synthesis-session/v3), and the shared
+  // transition reads the actions by the session's own saved subject.
+  const v3 = session?.kind === 'synthesis-session' && session.id.startsWith(SYNTHESIS_SESSION_V3_PREFIX);
   if (!session || session.kind !== 'synthesis-session' || !object(session.value)
     || hashJson(session.value) !== session.hash
     || (beforeRevision === undefined && canonical(reference(session)) !== canonical(intent.value.owner))
-    || session.value.contract !== 'synthesis-session/v2')
+    || session.value.contract !== (v3 ? SYNTHESIS_SESSION_CONTRACT_V3 : 'synthesis-session/v2'))
     consumerInvalid(intent.id, 'The synthesis step lost its exact original session state');
   const archive = store.get<Record<string, any>>(paid.archive.id, paid.archive.revision);
   if (!archive || archive.kind !== 'research-context' || !object(archive.value) || !object(archive.value.body)
@@ -3181,9 +3180,15 @@ function researchExecution(store: Store, project: string, callRef: Ref,
     }), 'response_recovery_binding_stale', 'The archived session must retain its exact research binding');
   const synthesis = session.kind === 'synthesis-session', purpose = synthesis ? 'analyst' : 'assessor';
   const call = store.get<ModelCall>(callRef.id, callRef.revision);
+  // DR3a3-S5: a v3 step's call is addressed to its session's plan-question and
+  // plan answer (the formula C writes); a v2 step's to its Question id with no
+  // plan answer; an assessment's keeps its own Question rule.
+  const sessionSubject = synthesis ? synthesisSessionSubject(session) : null;
   requireCondition(call?.kind === 'model-call' && object(call.value) && canonical(reference(call)) === canonical(callRef)
     && (!onlyResponse || call.value.status === 'succeeded')
-    && call.value.projectId === project && call.value.draftId === draft.id && call.value.questionId === question.id
+    && call.value.projectId === project && call.value.draftId === draft.id
+    && (synthesis ? callAddressesSubject(call.value as unknown as Record<string, unknown>, reference(question), sessionSubject)
+      : call.value.questionId === question.id)
     && call.value.purpose === purpose && object(call.value.requested) && canonical(call.value.requested) === canonical(role)
     && canonical(call.value.profile ?? null) === canonical(profile),
   'response_recovery_call_foreign', 'The succeeded call must belong to this exact consumer, profile and role');
@@ -3324,6 +3329,11 @@ function researchExecution(store: Store, project: string, callRef: Ref,
       consumerInvalid(call.id, 'The new physical producer belongs to another synthesis cursor');
     consumerIntent = intent;
   }
+  // DR3a3-S5: a v3 packet carries its plan-question contract (S2 transport),
+  // derived on the session's exact saved binding; a v2 packet its field spec.
+  const v3Question = synthesis ? synthesisSessionSubject(session) : null;
+  const boundQuestion = v3Question ? planQuestionContract(store, draft, question, v3Question)
+    : { id: question.id, ...question.value.spec };
   if (synthesis && body.dispatchMode === 'consolidation') {
     const bounded = request.subject?.consolidation?.deliveryContract === CONSOLIDATION_DELIVERY;
     const fragment = request.subject?.consolidation?.deliveryContract === CONSOLIDATION_FRAGMENT;
@@ -3333,7 +3343,7 @@ function researchExecution(store: Store, project: string, callRef: Ref,
       && request.subject.dispatchMode === 'consolidation'
       && canonical(request.subject.synthesisState) === canonical(state)
       && request.subject.synthesisSession === session.id
-      && canonical(request.subject.question) === canonical({ id: question.id, ...question.value.spec })
+      && canonical(request.subject.question) === canonical(boundQuestion)
       && (bounded || fragment || canonical(request.subject.consolidation) === canonical({...consolidationInput(body.synthesisNotes, body.consolidation.targetChars, body.consolidation.format === 2 ? 2 : 1),
         ...(body.consolidation.tightening?{tightening:body.consolidation.tightening}:{})}))
       && !request.subject.synthesisPage && !request.subject.materialPage && !request.subject.selectedContext && !request.subject.readings,

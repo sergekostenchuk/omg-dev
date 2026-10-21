@@ -332,7 +332,7 @@ test("S3 rounds: planner rounds count per project+subject from saved planner tur
       "reader_pilot_invalid");
 });
 
-test("S3 boundary: a lawful planner intent is saved, its paid admission stays closed, and no queue is written without a lawful paid parent", async t => {
+test("S3 boundary: a lawful planner intent is saved, its paid admission reaches the exact budget boundary without a call, and no queue is written without a lawful paid parent", async t => {
   const f = fixture(t), p = planned(f, "s3-boundary");
   const A = subjectOf(p.planAnswer, "q-supply");
   // The real v7 runner writes the run; with no calibrated estimate it pauses before any payment.
@@ -355,7 +355,9 @@ test("S3 boundary: a lawful planner intent is saved, its paid admission stays cl
   const before = f.store.list().map(row => [row.id, row.revision, row.hash]);
   await assert.rejects(researchCall(intent.value.role, intent.value.dispatch, PLANNING_INSTRUCTION, context, undefined,
     { store: f.store, draftId: p.draft.id, questionId: p.plan.id, purpose: "reading-planner", consumerIntent: reference(intent) }),
-  { code: "research_v7_mode_unavailable" });
+  // DR3a3-S5 (№7690 §3 S5) connected the planner's paid admission: the lawful S3 intent now passes the role
+  // admission and stops at the next exact boundary — no calibrated estimate — before any adapter or ledger.
+  { code: "budget_estimate_missing" });
   for (const kind of ["model-call", "model-request", "research-budget-ledger", "research-turn"])
     assert.deepEqual(f.store.list(kind), [], `no ${kind}`);
   assert.deepEqual(f.store.list().map(row => [row.id, row.revision, row.hash]), before, "the refused admission wrote nothing");
