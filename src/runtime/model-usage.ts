@@ -2,34 +2,9 @@ import type { Store, Revision } from "../storage/store.js";
 import type { RoleBinding } from "./environment.js";
 import { requireCondition } from "../errors.js";
 import type { Ref } from "../pipeline/contracts.js";
-import type { Json } from "../canonical.js";
-import type { ProcessResult } from "./process.js";
-import type { runtimeExecutableIdentity } from "./runtime-observation.js";
 import { budgetUsage, workingLimit, type BudgetSegment } from './research-budget.js';
 import { readModelCallRecovery } from '../discovery/model-call-recovery.js';
 import { reference } from '../pipeline/contracts.js';
-
-/* LG62: the historical call-runtime telemetry forms, kept unchanged for their
- * readers (LG84) after their producer runtime/call-runtime.ts was removed. */
-interface RuntimeFile { requested: string; kind: 'file' | 'executable'; path: string; hash: string; identity: ReturnType<typeof runtimeExecutableIdentity> }
-interface CallRuntimeProbe { executable: string; args: ['--version']; result: ProcessResult }
-interface CallRuntimeSnapshotBase {
-  root: string; binding: Json; roleHash: string; invocation: RoleBinding['command'];
-  interpreter: RuntimeFile; adapter: RuntimeFile; subjects: RuntimeFile[];
-}
-/** Version 1 is exactly the historical Codex era: the probe lives in `codex`. */
-export interface CallRuntimeSnapshotV1 extends CallRuntimeSnapshotBase { codex: CallRuntimeProbe }
-/** Version 2 names its provider explicitly instead of reusing the Codex field. */
-export interface CallRuntimeSnapshotV2 extends CallRuntimeSnapshotBase { provider: CallRuntimeProbe & { protocol: string } }
-export type CallRuntimeSnapshot = CallRuntimeSnapshotV1 | CallRuntimeSnapshotV2;
-interface CallRuntimeEvidenceBase {
-  declaration: Ref; requestHash: string;
-  status: 'captured' | 'observed' | 'unavailable' | 'stale';
-  startedAt: number; finishedAt: number | null; error: string | null;
-}
-export interface CallRuntimeEvidenceV1 extends CallRuntimeEvidenceBase { version: 1; snapshot: CallRuntimeSnapshotV1 | null }
-export interface CallRuntimeEvidenceV2 extends CallRuntimeEvidenceBase { version: 2; snapshot: CallRuntimeSnapshotV2 | null }
-export type CallRuntimeEvidence = CallRuntimeEvidenceV1 | CallRuntimeEvidenceV2;
 
 export interface TokenUsage {
   inputTokens: number; outputTokens: number;
@@ -47,7 +22,6 @@ export interface ModelExecution {
 export interface ModelCall {
   execution?: ModelExecution;
   recovery?: Ref;
-  runtime?: CallRuntimeEvidence;
   projectId: string; draftId: string; purpose: string; requestId: string;
   profile?: Ref | null;
   progressKey?: string;

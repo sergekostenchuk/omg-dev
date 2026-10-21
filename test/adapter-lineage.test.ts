@@ -11,7 +11,6 @@ import { reference } from '../src/pipeline/contracts.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { estimateCliCall } from '../src/adapters/codex-estimate.js';
 import { adapterLineagePath } from '../src/adapters/adapter-lineage.js';
-import type { CallRuntimeEvidence } from '../src/runtime/model-usage.js';
 import { runProcess } from '../src/runtime/process.js';
 
 function fixture(t: test.TestContext) {
@@ -24,12 +23,11 @@ function fixture(t: test.TestContext) {
   const role = { actor: 'author', model: 'fixture-model', effort: 'high' as const, command: { executable: process.execPath, args: [current, '--compact-research'] } };
   const declaration = { type: 'declare-adapter-lineage', project: 'p', path: old, sha256, basis: ['Verified byte-identical relocation before the old directory was removed'] };
   const declare = (overrides: Record<string, unknown> = {}) => engine.execute({ ...declaration, ...overrides }) as ReturnType<Store['write']>;
-  const sample = (id = 'sample', input = 200, output = 100, chars = 1000, runtime?: CallRuntimeEvidence) => {
+  const sample = (id = 'sample', input = 200, output = 100, chars = 1000) => {
     const value: ModelCall = { projectId: 'p', draftId: 'fixture-draft', purpose: 'reading-planner', requestId: id,
       startedAt: 1, finishedAt: 2, status: 'succeeded', requested: { ...role, command: { ...role.command, args: [old, '--compact-research'] } },
       confirmed: { model: null, effort: null, speed: null }, request: { chars, bytes: chars, hash: digest(id) }, response: null,
-      usage: { inputTokens: input, outputTokens: output, cachedInputTokens: null, reasoningOutputTokens: null }, usageSource: 'adapter', error: null,
-      ...(runtime ? { runtime } : {}) };
+      usage: { inputTokens: input, outputTokens: output, cachedInputTokens: null, reasoningOutputTokens: null }, usageSource: 'adapter', error: null };
     return store.write<ModelCall>({ id, kind: 'model-call', expected: 0, value });
   };
   const estimate = (chars = 1000) => estimateCliCall(store, 'p', role, 'reading-planner', chars);
@@ -78,25 +76,20 @@ test('a surviving file precedes lineage but a reused path cannot contradict its 
   assert.throws(() => f.estimate(), { code: 'budget_estimate_missing' });
 });
 
-test('an actual dispatch fingerprint survives removal and precedes a later file replacement; foreign telemetry cannot borrow it', t => {
+test('a saved call-runtime snapshot no longer identifies an adapter: only surviving bytes or an explicit lineage do', t => {
   const f = fixture(t), call = f.sample();
-  // Focused data fixture for estimator identity binding.
+  // LG84: a negative counterexample of the retired telemetry field — its snapshot claims the current adapter bytes.
   const runtime = { version: 1, status: 'observed', requestHash: call.value.request.hash,
-    snapshot: { roleHash: hashJson(call.value.requested), invocation: { args: call.value.requested.command.args }, adapter: { hash: f.sha256 } } } as CallRuntimeEvidence;
-  const saved = f.store.write<ModelCall>({ id: call.id, kind: call.kind, expected: call.revision, value: { ...call.value, runtime } });
-  assert.equal(f.estimate().tokens, 330);
-  writeFileSync(f.old, '// replaced after dispatch'); assert.equal(f.estimate().tokens, 330);
-  for (const mutate of [
-    (value: any) => { value.runtime.requestHash = '0'.repeat(64); },
-    (value: any) => { value.runtime.snapshot.roleHash = '0'.repeat(64); },
-    (value: any) => { value.runtime.snapshot.invocation.args = ['foreign']; },
-    (value: any) => { value.runtime.snapshot.adapter.hash = 'bad'; },
-    (value: any) => { value.runtime.status = 'stale'; },
-  ]) {
-    const value = structuredClone(saved.value); mutate(value);
-    f.store.write({ id: saved.id, kind: saved.kind, expected: f.store.get(saved.id)!.revision, value });
-    assert.throws(() => f.estimate(), { code: 'budget_estimate_missing' });
-  }
+    snapshot: { roleHash: hashJson(call.value.requested), invocation: { args: call.value.requested.command.args }, adapter: { hash: f.sha256 } } };
+  const saved = f.store.write<ModelCall>({ id: call.id, kind: call.kind, expected: call.revision, value: { ...call.value, runtime } as any });
+  assert.throws(() => f.estimate(), { code: 'budget_estimate_missing' }, 'a missing old file without lineage is not identified by the snapshot');
+  writeFileSync(f.old, '// replaced after dispatch');
+  assert.throws(() => f.estimate(), { code: 'budget_estimate_missing' }, 'differing old bytes are not rescued by the snapshot');
+  unlinkSync(f.old);
+  const lineage = f.declare(), estimate = f.estimate();
+  assert.equal(estimate.tokens, 330, 'a lawful declaration with the current adapter hash restores the estimate');
+  assert.ok(estimate.basis.some(ref => ref.hash === lineage.hash));
+  assert.deepEqual(f.store.get(saved.id), saved, 'the saved call is not rewritten');
 });
 
 test('same adapter bytes do not erase model, effort, speed or invocation flags from the forecast identity', t => {

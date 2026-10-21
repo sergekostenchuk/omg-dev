@@ -25,7 +25,6 @@ function hashFile(path) {
 }
 const refOf = row => ({ id: row.id, revision: row.revision, hash: row.hash });
 const validRef = ref => ref && typeof ref.id === 'string' && Number.isSafeInteger(ref.revision) && ref.revision > 0 && /^[a-f0-9]{64}$/.test(ref.hash);
-function identity(path) { const s = statSync(path); requireThat(s.isFile(), 'subject_not_file'); return Object.fromEntries(['dev','ino','size','mtimeMs','ctimeMs'].map(key => [key,s[key]])); }
 function executable(name, cwd) {
   const paths = name.includes('/') ? [resolve(cwd, name)] : (process.env.PATH ?? '').split(delimiter).map(path => resolve(cwd, path || '.', name));
   for (const path of paths) try { if (statSync(path).isFile() && statSync(path).mode & 0o111) return realpathSync(path); } catch {}
@@ -184,7 +183,7 @@ export async function platformReadiness(input, run = runCommand) {
   const group = await run({ executable: process.execPath, args: ['-e',groupProgram] }, runtime.root);
   requireThat(group.exitCode === 0 && group.signal === null && JSON.parse(group.stdout).signal === 'SIGTERM', 'process_group_unavailable');
   return { kind:'runtime-readiness',completed:true,platform:{os:platform(),release:release(),arch:arch(),node:process.version},versions,ps,group,
-    limits:['This is the observed platform, not a supported OS/browser matrix.','Model compatibility is checked separately against an actual bound ordinary call.'] };
+    limits:['This is the observed platform, not a supported OS/browser matrix.','Model compatibility is not provable by this module: its call-runtime evidence was retired (LG84).'] };
 }
 
 function openEvidenceDatabase(path, project) {
@@ -200,44 +199,7 @@ function openEvidenceDatabase(path, project) {
     const row = current ? db.prepare('SELECT r.* FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.entity_id=?').get(ref.id)
       : db.prepare('SELECT * FROM revisions WHERE entity_id=? AND revision=?').get(ref.id,ref.revision);
     const record = decode(row); requireThat(record && same(refOf(record),ref), 'evidence_reference_stale'); return record;
-  }, calls:()=>db.prepare("SELECT r.* FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.kind='model-call' AND json_extract(r.body,'$.projectId')=? AND json_extract(r.body,'$.runtime.status')='observed' AND json_extract(r.body,'$.status')='succeeded' ORDER BY json_extract(r.body,'$.finishedAt') DESC,r.entity_id").all(project).map(decode),
-  observations:()=>db.prepare("SELECT r.* FROM revisions r JOIN heads h USING(entity_id,revision) WHERE r.kind='runtime-observation' AND json_extract(r.body,'$.projectId')=? ORDER BY json_extract(r.body,'$.startedAt') DESC,r.entity_id").all(project).map(decode) };
-}
-
-function expectedSubjects(scope) {
-  const checks=scope.policy.assignments.flatMap(item=>item.runtimeCheck?[item.runtimeCheck]:[]);
-  return [...[...new Set(checks.flatMap(check=>check.subjects))].sort().map(requested=>({requested,kind:'file'})),
-    ...[...new Set(checks.flatMap(check=>check.executables))].sort().map(requested=>({requested,kind:'executable'}))];
-}
-function currentFiles(snapshot, runtime, scope, version) {
-  requireThat(snapshot && same(snapshot.binding,runtime) && snapshot.root === runtime.root, 'call_runtime_foreign');
-  requireThat(Array.isArray(snapshot.subjects) && same(snapshot.subjects.map(({requested,kind})=>({requested,kind})),expectedSubjects(scope)),
-    'call_subject_set_incomplete');
-  const files = [snapshot.interpreter,...snapshot.subjects];
-  requireThat(snapshot.adapter && snapshot.subjects.some(file=>same(file,snapshot.adapter)), 'call_adapter_missing');
-  if (version===2) {
-    // The provider field must name the adapter's own classified protocol; a Codex-era record never proves Devin.
-    const provider=KNOWN_ADAPTERS[basename(snapshot.adapter.path)];
-    requireThat(provider && provider.protocol!=='codex-stdio' && snapshot.provider?.protocol===provider.protocol
-      && same(snapshot.provider.args,['--version'])
-      && snapshot.provider.result?.exitCode===0 && snapshot.provider.result.signal===null
-      && typeof snapshot.provider.result.stdout==='string' && snapshot.provider.result.stdout.length<=4096
-      && new RegExp(provider.versionPattern.source, provider.versionPattern.flags).test(snapshot.provider.result.stdout),'call_version_missing');
-    const probe=snapshot.subjects.find(file=>file.kind==='executable'&&file.requested===provider.executable);
-    requireThat(probe && snapshot.provider.executable===probe.path,'call_version_missing');
-  } else {
-    const codex=snapshot.subjects.find(file=>file.kind==='executable'&&file.requested==='codex');
-    const codexPattern=KNOWN_ADAPTERS['codex-stdio.js'].versionPattern;
-    requireThat(codex && snapshot.codex?.executable===codex.path && same(snapshot.codex.args,['--version'])
-      && snapshot.codex.result?.exitCode===0 && snapshot.codex.result.signal===null
-      && typeof snapshot.codex.result.stdout==='string' && snapshot.codex.result.stdout.length<=4096
-      && new RegExp(codexPattern.source, codexPattern.flags).test(snapshot.codex.result.stdout),'call_version_missing');
-  }
-  for (const file of files) {
-    const actual = file.kind === 'executable' ? executable(file.requested,runtime.root) : realpathSync(resolve(runtime.root,file.requested));
-    requireThat(actual === file.path && same(identity(actual),file.identity) && hashFile(actual) === file.hash
-      && same(identity(actual),file.identity), 'call_runtime_stale');
-  }
+  } };
 }
 
 export function providerCompatibility(input, database) {
@@ -248,85 +210,15 @@ export function providerCompatibility(input, database) {
     // exact stored declaration — a caller cannot relabel which providers were declared.
     const declared = [...new Set(scope.value.policy.assignments.flatMap(item => item.runtimeCheck ? item.runtimeCheck.executables : []))].sort();
     requireThat(same([...new Set(input.executables)].sort(), declared), 'runtime_input_invalid');
-    const required = [runtime.environment.implementer, runtime.environment.reviewer].map(role=>({...role,command:runtime.pilot?.agentCommand??role.command}));
-    if(runtime.pilot?.reader)required.push(runtime.pilot.reader);
-    const settings = [...new Map(required.map(role=>[canonical([role.model,role.effort,role.speed??'inherited']),{model:role.model,effort:role.effort,speed:role.speed??'inherited'}])).values()];
-    const found = [];
-    for (const setting of settings) {
-      let matching = null;
-      for (const row of db.calls()) try {
-        const call = row.value, evidence = call.runtime, snapshot = evidence.snapshot;
-        requireThat((evidence.version === 1 || evidence.version === 2) && same(evidence.declaration,input.scope) && evidence.error === null
-          && same(setting,{model:call.requested.model,effort:call.requested.effort,speed:call.requested.speed??'inherited'})
-          && snapshot.roleHash === hash(canonical(call.requested)) && evidence.requestHash === call.request.hash, 'call_binding_foreign');
-        requireThat(required.some(role=>role.model===call.requested.model && role.effort===call.requested.effort
-          && (role.speed??'inherited')===(call.requested.speed??'inherited') && same(role.command,call.requested.command))
-          && same(snapshot.invocation.args,call.requested.command.args)
-          && snapshot.invocation.executable===executable(call.requested.command.executable,runtime.root)
-          && snapshot.adapter.path===realpathSync(resolve(runtime.root,call.requested.command.args[0])), 'call_command_foreign');
-        currentFiles(snapshot,runtime,scope.value,evidence.version);
-        const requestRow = db.get(call.request.record), responseRow = db.get(call.response.record);
-        requireThat(requestRow.kind === 'model-request' && responseRow.kind === 'model-response'
-          && requestRow.value.draftId === call.draftId && responseRow.value.draftId === call.draftId
-          && hash(requestRow.value.text) === call.request.hash && requestRow.value.text.length === call.request.chars
-          && Buffer.byteLength(requestRow.value.text) === call.request.bytes && responseRow.value.text.length === call.response.chars
-          && Buffer.byteLength(responseRow.value.text) === call.response.bytes, 'call_wire_foreign');
-        const request = JSON.parse(requestRow.value.text), response = JSON.parse(responseRow.value.text);
-        const context=db.get(call.packet?.archive),draft=db.get(context.value.draft);
-        requireThat(context.kind==='research-context' && context.value.draft.id===call.draftId
-          && draft.kind==='discovery-draft' && draft.value.stage==='om-g2' && draft.value.level==='R2'
-          && draft.value.inputs.some(ref=>same(ref,input.scope)) && same(request.subject?.working?.archive,call.packet.archive),
-          'call_research_basis_foreign');
-        requireThat(request.protocol === 'omg-agent/v1' && response.protocol === request.protocol && request.requestId === call.requestId
-          && response.requestId === call.requestId && request.mode === 'research' && Object.hasOwn(response,'research')
-          && response.research && typeof response.research==='object' && !Array.isArray(response.research)
-          && request.model === setting.model && request.effort === setting.effort && (request.speed??'inherited') === setting.speed,
-        'call_protocol_foreign');
-        matching = { call:refOf(row),request:refOf(requestRow),response:refOf(responseRow),requested:setting,confirmed:call.confirmed,
-          startedAt:call.startedAt,finishedAt:call.finishedAt,command:call.requested.command,adapter:snapshot.adapter,
-          provider:{protocol:evidence.version===2?snapshot.provider?.protocol:'codex-stdio',...(snapshot.provider??snapshot.codex)},mode:request.mode };
-        break;
-      } catch { /* A foreign or incomplete call cannot fill this setting. */ }
-      requireThat(matching, 'compatible_call_unavailable'); found.push(matching);
-    }
-    return {kind:'provider-compatibility',completed:true,calls:found,
-      limits:['Only the recorded ordinary research mode and requested settings were exercised.','Null confirmed model/effort/speed remain unknown.','No extra paid probe, implementation or review execution was performed by this check.']};
+    // LG84: the call-runtime evidence this check read is retired. No recorded call — old or new —
+    // proves provider compatibility here any more, and the absence of evidence is never an admission.
+    requireThat(false, 'compatible_call_unavailable');
   } finally { db.close(); }
 }
 
 export function integrationReadiness(input, database) {
-  const compatibility = providerCompatibility(input,database), runtime = runtimeInput(input), db = openEvidenceDatabase(database,runtime.environment.projectId);
-  try {
-    const scope = db.get(input.scope,true), assignment = scope.value.policy.assignments.find(item=>same(item.original,input.obligation));
-    requireThat(assignment, 'obligation_foreign');
-    const observations = [];
-    for (const target of scope.value.policy.assignments.filter(item=>item.kind==='environment-confirmation' && item.moment==='R2' && item.runtimeCheck)) {
-      const latest = db.observations().find(row=>same(row.value.scope,input.scope) && same(row.value.check,target.runtimeCheck));
-      requireThat(latest && latest.value.status === 'observed' && latest.value.result?.exitCode === 0 && latest.value.result.signal === null
-        && same(latest.value.runtimeBinding,runtime), 'isolation_observation_unavailable');
-      const observation=latest.value;
-      requireThat(observation.version===1 && observation.root===runtime.root && observation.executable.path===realpathSync(process.execPath)
-        && same(identity(observation.executable.path),observation.executable.identity)
-        && hashFile(observation.executable.path)===observation.executable.hash, 'isolation_runtime_stale');
-      const wanted=[...target.runtimeCheck.subjects.map(requested=>({requested,kind:'file'})),...target.runtimeCheck.executables.map(requested=>({requested,kind:'executable'}))];
-      requireThat(same(observation.subjects.map(({requested,kind})=>({requested,kind})),wanted),'isolation_subject_set_incomplete');
-      for(const subject of observation.subjects){
-        const path=subject.kind==='executable'?executable(subject.requested,runtime.root):realpathSync(resolve(runtime.root,subject.requested));
-        requireThat(path===subject.path && same(identity(path),subject.identity) && hashFile(path)===subject.hash
-          && same(identity(path),subject.identity),'isolation_runtime_stale');
-      }
-      for(const ref of [target.runtimeCheck.script,...target.runtimeCheck.dependencies]){
-        const source=db.get(ref,true);requireThat(source.kind==='source' && hash(source.value.content)===source.value.sha256,'isolation_code_stale');
-      }
-      const report = JSON.parse(latest.value.result.stdout);
-      requireThat(report.protocol === 'omg-runtime-check/v1' && report.result?.kind === 'isolation-observation' && report.result.completed === true,
-        'isolation_observation_foreign');
-      observations.push({obligation:target.obligation,observation:refOf(latest),matrix:report.result.matrix,limits:report.result.limits});
-    }
-    requireThat(observations.length > 0, 'isolation_declaration_missing');
-    return {kind:'runtime-integration',completed:true,configuration:runtime,configurationHash:hash(canonical(runtime)),compatibility,observations,
-      limits:['R2 research must interpret the observed sandbox limits; this check does not invent denied accesses.','Future implementation-result obligations remain open until their own task acceptance.']};
-  } finally { db.close(); }
+  // LG84: integration requires provider compatibility first, which this module can no longer prove.
+  return providerCompatibility(input,database);
 }
 
 export async function runCheck(input,args,run=runCommand) {

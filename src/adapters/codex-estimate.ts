@@ -3,10 +3,10 @@ import type { Store } from '../storage/store.js';
 import type { RoleBinding } from '../runtime/environment.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import type { CallEstimate } from '../runtime/research-budget.js';
-import { canonical, hashJson } from '../canonical.js';
+import { canonical } from '../canonical.js';
 import { reference, uniqueRefs, type Ref } from '../pipeline/contracts.js';
 import { requireCondition } from '../errors.js';
-import { adapterFileHash, adapterLineage, adapterLineagePath, validAdapterHash } from './adapter-lineage.js';
+import { adapterFileHash, adapterLineage, adapterLineagePath } from './adapter-lineage.js';
 import { stdioProviderByModule } from './stdio-providers.js';
 
 /** Empirical CLI prediction includes all reported input/output, including wrapper
@@ -15,26 +15,18 @@ function comparableRole(store: Store, project: string, role: RoleBinding, call?:
   const entry = role.command.args[0];
   if (!entry || stdioProviderByModule(basename(entry)) === null) return { key: canonical({ commandRole: role }), basis: [] };
   let hash: string | null = null; const basis: Ref[] = [];
-  const snapshot = call?.runtime?.snapshot;
-  if (snapshot?.adapter?.hash !== undefined) {
-    // An actual dispatch snapshot precedes a later replacement of the file.
-    // Inconsistent telemetry must not fall back to a weaker declaration.
-    if (!call || (call.runtime?.version !== 1 && call.runtime?.version !== 2) || !['captured', 'observed'].includes(call.runtime.status)
-      || call.runtime.requestHash !== call.request.hash || snapshot.roleHash !== hashJson(role)
-      || canonical(snapshot.invocation.args) !== canonical(role.command.args) || !validAdapterHash(snapshot.adapter.hash)) return null;
-    hash = snapshot.adapter.hash;
-  } else {
-    try {
-      hash = adapterFileHash(entry);
-      if (call && isAbsolute(entry)) {
-        const lineage = adapterLineage(store, project, adapterLineagePath(entry));
-        if (lineage) {
-          if (hash !== null && hash !== lineage.value.sha256) return null; // A reused path contradicts the historical assertion.
-          if (hash === null) { hash = lineage.value.sha256; basis.push(reference(lineage)); }
-        }
+  // LG84: the adapter is identified by its surviving bytes or an explicit lineage only;
+  // the former call-runtime snapshot is no longer read.
+  try {
+    hash = adapterFileHash(entry);
+    if (call && isAbsolute(entry)) {
+      const lineage = adapterLineage(store, project, adapterLineagePath(entry));
+      if (lineage) {
+        if (hash !== null && hash !== lineage.value.sha256) return null; // A reused path contradicts the historical assertion.
+        if (hash === null) { hash = lineage.value.sha256; basis.push(reference(lineage)); }
       }
-    } catch { return null; }
-  }
+    }
+  } catch { return null; }
   if (hash === null) return null;
   return { key: canonical({ adapter: hash, flags: role.command.args.slice(1), model: role.model, effort: role.effort, speed: role.speed ?? 'inherited' }), basis };
 }
@@ -62,5 +54,5 @@ export function estimateCliCall(store: Store, project: string, role: RoleBinding
     const usage = c.value.usage!;
     return (usage.inputTokens + usage.outputTokens) * Math.max(1, chars / c.value.request.chars);
   })));
-  return { kind: 'estimated', tokens, basis, explanation: 'Maximum comparable full input+output usage, scaled upward for the complete envelope size, plus 10%. Adapter identity uses its dispatch fingerprint, surviving file, or explicit immutable operator lineage. Wrapper/reasoning included in reported usage; future provider variance and hidden calls are not bounded.' };
+  return { kind: 'estimated', tokens, basis, explanation: 'Maximum comparable full input+output usage, scaled upward for the complete envelope size, plus 10%. Adapter identity uses its surviving file bytes or an explicit immutable operator lineage. Wrapper/reasoning included in reported usage; future provider variance and hidden calls are not bounded.' };
 }

@@ -103,14 +103,25 @@ test('platform module exercises process identity and process-group signalling wi
 test('a current call under a declared runtime scope keeps its paid answer, usage, request and response with exactly one physical send and no runtime telemetry of its own',async t=>{
   // LG62: the call-runtime capture of the former R2 route is removed; this scoped fixture is where it used to run.
   const f=fixture(t);
-  await f.invoke();
+  const returned=await f.invoke();
   const calls=f.store.list<ModelCall>('model-call');assert.equal(calls.length,1);
   const call=calls[0]!;
   assert.equal(call.value.status,'succeeded',JSON.stringify(call.value));
-  assert.ok(call.value.usage,'the paid usage is saved');
-  assert.equal(call.value.request.hash.length,64);assert.ok(call.value.request.chars>0);
-  const response=f.store.get<any>(call.value.response!.record!.id,call.value.response!.record!.revision)!;
-  assert.equal(response.kind,'model-response');assert.equal(JSON.parse(response.value.text).protocol,'omg-agent/v1');
+  // The exact usage, request and response the fixture adapter produced (P3 №9831).
+  assert.deepEqual(call.value.usage,{inputTokens:10,outputTokens:2,cachedInputTokens:0,reasoningOutputTokens:0},'the exact paid usage is saved');
+  const requestRef=call.value.request.record!,request=f.store.get<any>(requestRef.id,requestRef.revision)!;
+  assert.deepEqual(reference(request),requestRef,'the request record is the exact saved Ref');
+  assert.equal(request.kind,'model-request');
+  assert.equal(digest(request.value.text),call.value.request.hash);
+  assert.equal(request.value.text.length,call.value.request.chars);assert.equal(Buffer.byteLength(request.value.text),call.value.request.bytes);
+  const responseRef=call.value.response!.record!,response=f.store.get<any>(responseRef.id,responseRef.revision)!;
+  assert.deepEqual(reference(response),responseRef,'the response record is the exact saved Ref');
+  assert.equal(response.kind,'model-response');
+  assert.equal(response.value.text.length,call.value.response!.chars);assert.equal(Buffer.byteLength(response.value.text),call.value.response!.bytes);
+  const reply=JSON.parse(response.value.text);
+  assert.equal(reply.protocol,'omg-agent/v1');assert.equal(reply.requestId,call.value.requestId);
+  assert.deepEqual(reply.research,{action:'pause',reason:'Fixture'},'the saved reply is the adapter answer');
+  assert.deepEqual(returned,reply.research,'the call returns exactly the saved answer');
   assert.equal(readFileSync(f.log,'utf8'),'provider\n','exactly one physical send');
   assert.equal(Object.hasOwn(call.value,'runtime'),false,'the call writes no runtime field of its own');
 });
