@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
-import { canonical, type Json } from "../src/canonical.js";
+import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { Graph } from "../src/graph/model.js";
 import type { QuestionPacketRecord } from "../src/om/question-packet.js";
@@ -21,7 +21,7 @@ import { checkAnswerForm } from "../src/om/answer-form.js";
 import { AREA_INPUT_VARIANT, COMPLETION_FINALIZATION_KIND, COMPLETION_REUSE_KIND, type CompletionCessation, type CompletionReuse } from "../src/om/model-call.js";
 import type { WorksAcceptanceRecord } from "../src/om/atomic-gate.js";
 // ---- G5.1 (№3833, №3847, №3851): the wake choice of a producer end answered before the wake-test era ----
-import { runWakeChoice, WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
+import { runWakeChoice, wakeStanding, WAKE_CHOICE_KIND, WAKE_INTENT_KIND } from "../src/om/wake-choice.js";
 // ---- LP6 (№3325 §4–§5): stops saved by e7db0ba8 under the old rules, read literally and reconciled by the new era ----
 import { completionCloseId } from "../src/om/series.js";
 import { openAttempt, readCompletionCloseAt, readOriginHoldAt, type OriginHold } from "../src/om/repeat-gate.js";
@@ -357,6 +357,22 @@ test("G6.1 a shared file with one lawful write order gets its producer_committed
     assert.deepEqual(choices.sort(), variant === "chosen" ? ["chosen"] : ["chosen", "refused"], text);
     assert.deepEqual([reentered, f.store.list(WAKE_INTENT_KIND).length], [choices.length, choices.length], "One intent per call; every step re-entered without a call");
   });
+});
+
+test("LG10 a complete wake request of the retired wake-test shape is refused before any intent, E1 or transport", async t => {
+  const f = runFixture(t, ["encoding"], "executed");
+  const ref = (id: string): Ref => ({ id, revision: 1, hash: hashJson(id) });
+  // Every field of the retired form is well-formed — the only ground of the refusal is the removed task itself.
+  const legacy = { project, proposal: ref("om-proposal:garden:x"), work: "garden-produce-work", connector: "garden-flow",
+    accepting: { series: ref("om-attempt-series:garden:x"), attempt: 1 },
+    dispatch: { adapter: ref("om-adapter:garden:x"), config: ref("om-config:garden:x") } };
+  const before = untouched(f.store), sent = f.sent().length;
+  const refused = (error: unknown) => (error as EngineError).code === "wake_request_invalid";
+  assert.throws(() => wakeStanding(f.store, legacy as never), refused);
+  await assert.rejects(runWakeChoice(f.store, legacy as never, 1), refused);
+  assert.deepEqual(untouched(f.store), before, "No record is written: no intent and no E1");
+  assert.equal(f.store.list(WAKE_INTENT_KIND).length, 0, "No intent is created");
+  assert.equal(f.sent().length, sent, "Nothing is sent");
 });
 
 test("MP2 (№2968 rows 8, 18) through the pass a refused works answer is corrected once; G7 closes the block attempt with its result, every physical call sent once, the first refusal kept in its history", async t => {

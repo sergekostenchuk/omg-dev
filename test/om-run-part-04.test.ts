@@ -473,6 +473,7 @@ test("G6.2 a G5 finding of one work's own content rejects only its proposal: its
 
 test("G5.1 row 9 a producer end answered in the wake-test era names its wake test itself: the group takes it and no supplement is asked or paid", async t => {
   const f = worksFixture(t), scenario = join(f.root, "scenario.json"), steps: unknown[] = [], answered = new Set<string>(), trail: string[] = [];
+  const chosen = new Set<string>();
   ok(startRun(f.store, { project }));
   for (let index = 0; index < 200 && !trail.some(row => row.includes(":works")); index++) {
     const advanced = ok(await advanceRun(f.store, f.request));
@@ -487,13 +488,21 @@ test("G5.1 row 9 a producer end answered in the wake-test era names its wake tes
       const obligation = payload.expansion.obligations.find(item => item.id === fill.obligation);
       if (obligation?.kind !== "connection-end" || obligation.role !== "producer") continue;
       const covering = answer.research.proposal.tests.filter(test => test.covers.includes(obligation.connector!)).map(test => test.id).sort();
-      if (covering.length > 1) fill.wakeTest = covering[covering.length - 1]!;
+      if (covering.length > 1) { fill.wakeTest = covering[covering.length - 1]!; chosen.add(fill.wakeTest); }
     }
     steps.push({ research: answer.research, usage }); writeFileSync(scenario, JSON.stringify({ database: f.database, steps }));
   }
   assert.ok(trail.some(row => row.includes(":works")), `The works are accepted on the work's own choice: ${trail.join(",")}`);
   assert.equal(f.store.list(WAKE_INTENT_KIND).length, 0, "No supplement is asked");
   assert.ok(!trail.some(row => row.includes("wake")));
+  // The named wake test is actually anchored: every sleeping delivery of the accepted works carries the test the work chose.
+  const candidate = f.store.list<{ level: number; graph: { anchors: { id: string; test: string }[];
+    connectors: { bindings: { anchor: string | null }[] }[] } }>("frame-candidate").map(row => row.value).find(value => value.level === 3)!;
+  const sleeping = candidate.graph.connectors.flatMap(row => row.bindings).filter(binding => binding.anchor !== null);
+  assert.ok(sleeping.length > 0, "The fixture keeps a sleeping flow");
+  for (const binding of sleeping)
+    assert.ok(chosen.has(candidate.graph.anchors.find(anchor => anchor.id === binding.anchor)!.test),
+      "The sleeping anchor carries the wake test the work itself named");
 });
 
 test("LP8.1 the reopening is guarded by the exact unable revision: another store moving the pass between the weighing and the write leaves its record, nothing is written over it", async t => {

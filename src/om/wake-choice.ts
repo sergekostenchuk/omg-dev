@@ -96,22 +96,16 @@ const text = (value: unknown): value is string => typeof value === 'string' && v
 const json = (value: unknown): Json => JSON.parse(canonical(value as Json)) as Json;
 const same = (a: unknown, b: unknown): boolean => canonical(a as Json) === canonical(b as Json);
 function requireRequest(store: Store, request: unknown): asserts request is ChoiceRequest {
-  if (object(request) && request.task === 'write-order') {
-    if (!(store instanceof Store) || !same(Object.keys(request).sort(), ['accepting', 'dispatch', 'path', 'project', 'proposals', 'results', 'task'])
-      || !text(request.project) || !text(request.path) || !Array.isArray(request.proposals) || !request.proposals.length || !request.proposals.every(isRef)
-      || !Array.isArray(request.results) || !request.results.every(row => object(row) && text(row.kind) && isRef(row.record))
-      || !object(request.accepting) || !same(Object.keys(request.accepting).sort(), ['attempt', 'series']) || !isRef(request.accepting.series)
-      || !Number.isSafeInteger(request.accepting.attempt) || request.accepting.attempt < 1
-      || !object(request.dispatch) || !isRef(request.dispatch.adapter) || !isRef(request.dispatch.config))
-      throw new EngineError('wake_request_invalid', 'A write-order choice names its proposals, file, results, paying attempt and dispatch');
-    return;
-  }
-  if (!(store instanceof Store) || !object(request) || !same(Object.keys(request).sort(), ['accepting', 'connector', 'dispatch', 'project', 'proposal', 'work'])
-    || !text(request.project) || !isRef(request.proposal) || !text(request.work) || !text(request.connector)
+  // Only the write-order task of G6.1 runs; a request of the retired wake-test task is refused at the boundary,
+  // before any intent, E1 or transport. Saved wake choices stay readable through the NR trusted reads.
+  if (!(store instanceof Store) || !object(request) || request.task !== 'write-order'
+    || !same(Object.keys(request).sort(), ['accepting', 'dispatch', 'path', 'project', 'proposals', 'results', 'task'])
+    || !text(request.project) || !text(request.path) || !Array.isArray(request.proposals) || !request.proposals.length || !request.proposals.every(isRef)
+    || !Array.isArray(request.results) || !request.results.every(row => object(row) && text(row.kind) && isRef(row.record))
     || !object(request.accepting) || !same(Object.keys(request.accepting).sort(), ['attempt', 'series']) || !isRef(request.accepting.series)
     || !Number.isSafeInteger(request.accepting.attempt) || request.accepting.attempt < 1
     || !object(request.dispatch) || !isRef(request.dispatch.adapter) || !isRef(request.dispatch.config))
-    throw new EngineError('wake_request_invalid', 'A wake choice names its proposal, work, connection, paying attempt and dispatch');
+    throw new EngineError('wake_request_invalid', 'A write-order choice names its proposals, file, results, paying attempt and dispatch');
 }
 /** One key per producer end: the exact proposal, its work and the connection; per shared file: the exact proposals and the file. */
 function keyOf(request: Pick<WakeChoiceRequest, 'project' | 'proposal' | 'work' | 'connector'> | WriteOrderRequest): string {

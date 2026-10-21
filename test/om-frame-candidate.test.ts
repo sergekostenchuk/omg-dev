@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson } from "../src/canonical.js";
@@ -12,7 +12,7 @@ import { validateGraph } from "../src/graph/validate.js";
 import { reference, type Finding, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store } from "../src/storage/store.js";
-import { fillObligations, prepareFrame, readFrame, type FrameRead, type FrameRequest, type FrameScope, type ConnectionFrame } from "../src/om/frame-obligations.js";
+import { fillObligations, prepareFrame, readFrame, representativeId, representativeJoinId, type FrameRead, type FrameRequest, type FrameScope, type ConnectionFrame } from "../src/om/frame-obligations.js";
 import { type LayerProposal, type ProposalObservation, type ProposalRequest } from "../src/om/frame-proposals.js";
 import { assembleCandidate, observeCandidate, prepareCandidate, writeCandidate, readCandidate, gateCandidate,
   CANDIDATE_REFUSAL_CODES, type FrameCandidateRecord, type CandidateRequest, JOIN_ASSEMBLY } from "../src/om/frame-candidate.js";
@@ -116,24 +116,6 @@ function firstPass(t: TestContext, variant: "standard" | "cross" = "standard") {
 }
 
 
-/** NR1 (№3600): eras differ only in `references` (a checked trail before, the records read since); the rest is equal and the
- * trusted references are a subset of the trail. Local, because FJ1 runs this file's declarations under an old revision. */
-function sameButReferences(actual: unknown, expected: string, message?: string): void {
-  const sortedRef = (ref: unknown) => JSON.stringify(Object.fromEntries(Object.entries(ref as Record<string, unknown>).sort(([a], [b]) => a < b ? -1 : 1)));
-  const collect = (value: unknown, into: Set<string>): unknown => {
-    if (Array.isArray(value)) return value.map(item => collect(item, into));
-    if (value === null || typeof value !== "object") return value;
-    const result: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
-      if (key === "references" && Array.isArray(item)) { for (const ref of item) into.add(sortedRef(ref)); continue; }
-      result[key] = collect(item, into);
-    }
-    return result;
-  };
-  const mine = new Set<string>(), theirs = new Set<string>();
-  assert.deepEqual(collect(JSON.parse(JSON.stringify(actual)), mine), collect(JSON.parse(expected), theirs), message);
-  assert.deepEqual([...mine].filter(ref => !theirs.has(ref)), [], `${message ?? "references"}: only records of the checked trail`);
-}
 
 test('candidate observation reads a self-consistent failed assembly without accepting its lost definition', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, t => {
   const f = firstPass(t), peer = put(f.store, emptyProposal(f.frame, 'observation-peer'));
@@ -693,6 +675,29 @@ test("accepted and rejected proposal status masquerades are refused by current c
 });
 
 
+test("LG10 an L2 join of an external block is derived by fillObligations and carried by assembly", () => {
+  const graph = gardenGraph();
+  const join: Graph["joins"][number] = { id: "outside-join", consumer: "garden-consume-block", connectors: ["garden-flow"],
+    required: ["garden-flow"], optional: [], condition: "the outside block takes the flow",
+    failures: { missing: "missing", extra: "extra", foreign: "foreign", stale: "stale", duplicate: "duplicate",
+      returnsTo: "garden-consume-block" } };
+  graph.joins.push(join);
+  // garden-consume-block stays outside the horizon: its consumer slot is met by an identity representative.
+  const frame = pureFrame(graph, false, []);
+  const consumer = representativeId("garden-consume-block", 2);
+  const derived = frame.result.joins.find(item => item.id === representativeJoinId("outside-join", "garden-consume-block", 2))!;
+  assert.ok(derived, "fillObligations derives the join of the representative");
+  assert.deepEqual({ ...derived, id: undefined, consumer: undefined },
+    { connectors: join.connectors, required: join.required, optional: join.optional, condition: join.condition,
+      failures: join.failures, id: undefined, consumer: undefined });
+  assert.equal(derived.consumer, consumer);
+  const built = delivered(assembleCandidate(frame, []));
+  assert.equal(built.state, "candidate"); if (built.state !== "candidate") return;
+  const carried = built.candidate.graph.joins.find(item => item.id === derived.id)!;
+  assert.deepEqual(carried, derived, "assembleCandidate carries the derived join unchanged");
+  assert.ok(built.candidate.graph.nodes.some(node => node.id === consumer), "The representative itself is assembled");
+});
+
 test("retiring an accepted identity preserves its dependent join until explicitly redefined", () => {
   const garden = gardenGraph(), outside = pureFrame(garden, false, []);
   const first = delivered(assembleCandidate(outside, []));
@@ -950,21 +955,14 @@ test("L3 outcome and connector dependencies remain protected while unrelated typ
   assert.deepEqual(revisions(f.store).filter(item => item.head.id !== written.record.id), before);
 });
 
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { Write } from '../src/storage/store.js';
-import { settleCandidate, readAcceptedFrame, rebaseFrame } from '../src/om/frame-accept.js';
+import { settleCandidate } from '../src/om/frame-accept.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { writeGapLines } from '../src/om/gap-lines.js';
 import { writeOmObligations } from '../src/om/obligations.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { prepareWorksFrame, writeWorksFrame, readWorksFrame } from '../src/om/works-frame.js';
 import { preparedField } from './preparation-fixture.js';
-import { Evidence } from '../src/evidence/evidence.js';
-import { writeNeighbors } from '../src/om/neighbors.js';
-import { writeAtomicGate, readAtomicGate } from '../src/om/atomic-gate.js';
-import { readFrameProposals } from '../src/om/frame-proposals.js';
 
 function fjPut(store: Store, id: string, proposal: LayerProposal) { return reference(store.write({ id: `om-proposal:garden:${id}`, kind: 'layer-proposal', expected: 0, value: proposal })); }
 function fjProposalFor(frame: FrameRead, graph: Graph): LayerProposal {
@@ -1414,6 +1412,26 @@ export async function load(url, context, next) {
     assert.equal(next.record.value.graphHash, old.value.graphHash); assert.notEqual(next.record.id, old.id);
     assert.deepEqual(delivered(writeCandidate(plain, request)), { state: 'candidate', record: old });
   } finally { plain.close(); }
+});
+
+test('FJ1 markers: an L3 candidate missing both assembly markers, or naming an unknown or inconsistent one, is refused without writes', t => {
+  const f = fjFirstWorks(t), written = delivered(writeWorksFrame(f.store, f.request));
+  assert.equal(written.state, 'candidate'); if (written.state !== 'candidate') return;
+  const saved = clone(written.record.value) as FrameCandidateRecord;
+  const { joinAssembly: _record, ...recordUnmarked } = saved;
+  const { joinAssembly: _request, ...requestUnmarked } = saved.request as unknown as Record<string, unknown>;
+  const forged = [
+    { ...recordUnmarked, request: requestUnmarked },                                            // both markers absent
+    { ...saved, joinAssembly: 'identity-joins/v9', request: { ...saved.request, joinAssembly: 'identity-joins/v9' } },
+    { ...saved, request: requestUnmarked },                                                     // record marked, request unmarked
+    { ...recordUnmarked, request: saved.request },                                              // record unmarked, request marked
+  ].map((value, index) => f.store.write({ id: `${written.record.id}-era-${index}`, kind: 'frame-candidate',
+    expected: 0, value: value as FrameCandidateRecord }));
+  const before = revisions(f.store);
+  for (const row of forged)
+    assert.equal(refusedAs(observeCandidate(f.store, { project: 'garden', candidate: reference(row) }),
+      'candidate_graph_mismatch').at.field, 'joinAssembly');
+  assert.deepEqual(revisions(f.store), before);
 });
 
 // G6.1 (№3857 п.4, №3891): the write order of a shared file at the assembly of a works candidate, on small graphs. This file

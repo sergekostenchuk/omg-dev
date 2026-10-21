@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { canonical, hashJson, type Json } from '../src/canonical.js';
+import { canonical, canonicalSorted, hashJson, type Json } from '../src/canonical.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import type { Graph, Node } from '../src/graph/model.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
@@ -18,7 +18,8 @@ import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { assembleCandidate, gateCandidate, prepareCandidate, readCandidate, writeCandidate,
   type CandidateRequest } from '../src/om/frame-candidate.js';
-import { fillObligations, prepareFrame, type FrameRead, type FrameRequest } from '../src/om/frame-obligations.js';
+import { fillObligations, flowKey, prepareFrame, workAnchorId, WORKS_FRAME_CONTRACT,
+  type FrameFill, type FrameRead, type FrameRequest } from '../src/om/frame-obligations.js';
 import { prepareFrameProposals, type LayerProposal, type ProposalRequest } from '../src/om/frame-proposals.js';
 import { writeGapLines, gapLinesId } from '../src/om/gap-lines.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
@@ -422,7 +423,7 @@ test('F2 carries an actually accepted OM L3 and reads its candidate after source
   denied(prepareWorksFrame(f.store, request), 'input_stale');
 });
 
-test('F2 legacy carry resolves different code addresses of one consumer port by its exact upper flow', () => {
+test('F2 recorded carry resolves different code addresses of one consumer port by its exact upper flow', () => {
   // This is the pure C2/C4 boundary. The stored D7 admission is exercised by the fixtures above.
   const graph = gardenGraph('cross'), consumer = graph.nodes.find(node => node.id === 'garden-consume-work')!;
   const first = clone(consumer.code[0]!);
@@ -435,20 +436,49 @@ test('F2 legacy carry resolves different code addresses of one consumer port by 
     if (endpoint.node === outside.id) endpoint.codeRef = clone(outside.code[0]!);
     if (endpoint.node === consumer.id && endpoint.port === 'in') endpoint.codeRef = clone(binding.producer.port === 'out-alt' ? second : first);
   }
+  // The recorded works frame keeps the mechanically derived anchor address of the sleeping delivery.
+  const { level: _l0, ...preUpper } = projectGraph(graph, 2);
+  const upperOut = (preUpper as Graph).connectors.find(item => item.id === 'garden-flow')!.bindings
+    .find(item => item.level === 2 && item.producer.port === 'out')!;
+  const anchor = workAnchorId('garden-flow', flowKey(upperOut), { node: 'garden-produce-work', port: 'out' });
+  graph.anchors.find(item => item.id === 'anchor-garden-flow')!.id = anchor;
+  connector.bindings.find(item => item.level === 3 && item.anchor === 'anchor-garden-flow')!.anchor = anchor;
   assert.deepEqual(validateGraph(graph).findings, []);
   const { level: _level, ...projection } = projectGraph(graph, 2), upper = projection as Graph;
   const ref = (id: string): Ref => ({ id, revision: 1, hash: hashJson(id) });
   const graphRef = { ...ref('graph:garden'), hash: hashJson(graph) }, upperRef = ref('graph-layer:garden:2');
   const scope = { nodes: ['garden-consume-operation', 'garden-prep-operation', 'garden-produce-operation'], excluded: [], hash: hashJson('legacy-cross-scope') };
-  const accepted = { graph, reference: graphRef, frame: null };
+  const base = { graph, reference: graphRef, frame: null };
+  // Derive the full fill set, then record it in the worksContract ConnectionFrame with the code reference
+  // each real end already carries on its exact lower flow. No code is derived from history at assembly.
+  const skeleton = ok(fillObligations(upper, scope, base, upperRef, 3));
+  const endpointCode = (fill: FrameFill) => {
+    const obligation = skeleton.obligations.find(item => item.id === fill.obligation)!;
+    if (fill.source !== 'accepted' || obligation.kind !== 'connection-end') return undefined;
+    const upperBinding = upper.connectors.find(item => item.id === obligation.connector)!.bindings
+      .find(item => item.level === 2 && flowKey(item) === obligation.flow)!;
+    const endpoints = graph.connectors.find(item => item.id === obligation.connector)!.bindings
+      .filter(item => item.level === 3 && item.producer.port === upperBinding.producer.port)
+      .flatMap(item => [item.producer, ...item.consumers]);
+    return clone(endpoints.find(item => item.node === fill.node && item.port === fill.port)!.codeRef!);
+  };
+  const fills = canonicalSorted(skeleton.fills.map(fill => {
+    const codeRef = endpointCode(fill);
+    return { ...fill, ...(codeRef ? { codeRef } : {}) } as FrameFill;
+  }));
+  const frameValue = { project: 'garden', level: 3 as const, candidateHash: '0'.repeat(64),
+    layerHash: hashJson(projectGraph(graph, 3)), worksContract: WORKS_FRAME_CONTRACT, fills };
+  const frameRef = { ...ref('om-frame:garden:3'), hash: hashJson(frameValue) };
+  const accepted = { graph, reference: graphRef, frame: { reference: frameRef, value: frameValue } };
   const result = clone(ok(fillObligations(upper, scope, accepted, upperRef, 3))) as FrameRead['result'];
   const rows = result.fills.filter(fill => fill.node === consumer.id && fill.port === 'in');
-  assert.equal(rows.length, 2); assert.ok(rows.every(fill => !Object.hasOwn(fill, 'codeRef')));
+  assert.equal(rows.length, 2); assert.ok(rows.every(fill => Object.hasOwn(fill, 'codeRef')));
   const frame: FrameRead = { request: { project: 'garden', level: 3, graph: graphRef, horizon: ref('om-horizon:garden:legacy-cross'),
-    layer: ref('graph-layer:garden:3'), frame: null, upper: { horizon: ref('om-horizon:garden:legacy-cross'), frame: null } },
+    layer: ref('graph-layer:garden:3'), frame: frameRef, upper: { horizon: ref('om-horizon:garden:legacy-cross'), frame: null } },
     upper, upperRef, scope, accepted, result, references: [graphRef, upperRef] };
-  const built = ok(assembleCandidate(frame, [], { contract: 'works-frame/v1', producer: ref('om-obligation-basis:garden:cross'),
-    ledger: ref('om-obligations:garden:cross'), bindings: [] }));
+  const works = { contract: 'works-frame/v1' as const, producer: ref('om-obligation-basis:garden:cross'),
+    ledger: ref('om-obligations:garden:cross'), bindings: [] };
+  const built = ok(assembleCandidate(frame, [], works));
   assert.equal(built.state, 'candidate'); if (built.state !== 'candidate') return;
   const flows = built.candidate.graph.connectors.find(item => item.id === connector.id)!.bindings.filter(binding => binding.level === 3);
   for (const [port, code] of [['out', first], ['out-alt', second]] as const) {
@@ -456,4 +486,15 @@ test('F2 legacy carry resolves different code addresses of one consumer port by 
     assert.deepEqual(flow.consumers.find(endpoint => endpoint.node === consumer.id && endpoint.port === 'in')!.codeRef, code);
   }
   assert.deepEqual(projectGraph(built.candidate.graph as Graph, 2), projectGraph(upper, 2));
+  // An inherited end of a frame recorded before the works contract has no code reference and cannot be revived:
+  // assembly refuses it at the candidate boundary (foreign code is refused on local connectors above).
+  const legacy = { project: 'garden', level: 3 as const, candidateHash: '0'.repeat(64),
+    layerHash: frameValue.layerHash, fills: clone(skeleton.fills) as FrameFill[] };
+  const legacyRef = { ...frameRef, hash: hashJson(legacy) };
+  const legacyAccepted = { graph, reference: graphRef, frame: { reference: legacyRef, value: legacy } };
+  const legacyResult = clone(ok(fillObligations(upper, scope, legacyAccepted, upperRef, 3))) as FrameRead['result'];
+  assert.ok(legacyResult.fills.some(fill => fill.source === 'accepted' && !Object.hasOwn(fill, 'codeRef')));
+  const legacyFrame: FrameRead = { ...clone(frame), accepted: legacyAccepted,
+    request: { ...clone(frame.request), frame: legacyRef }, result: legacyResult };
+  denied(assembleCandidate(legacyFrame, [], works), 'works_code_missing');
 });
