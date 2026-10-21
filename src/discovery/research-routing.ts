@@ -51,10 +51,11 @@ export function planningForQuestion(store: Store, draft: Revision<DiscoveryDraft
  * never calls this selector. Absence of an explicit policy or setting leaves
  * the analyst route, and planning.fields cannot opt dynamic questions in. */
 export function planningForPlanSubject(store: Store, project: string, draftRef: Ref,
-  subject: V7PlanSubject, producerPolicy?: ProducerPolicy): V7PlanningSettings | null {
-  // Read through the pilot's validator: a malformed setting is not absence,
-  // including on an inactive pilot or when the producer is still disabled.
-  const pilot = readerPilot(store, project);
+  subject: V7PlanSubject, producerPolicy?: ProducerPolicy,
+  pilot: Revision<ReaderPilot> | null = readerPilot(store, project)): V7PlanningSettings | null {
+  // The default reads through the pilot validator, including inactive settings.
+  // A caller publishing new work passes its single validated snapshot so its
+  // decision and transaction guards cannot refer to different settings.
   const selected = packetPlanSubject({ subject });
   requireCondition(selected, 'research_plan_subject_invalid', 'Planning requires an explicit plan subject');
   const draft = isRef(draftRef) ? store.get<DiscoveryDraft>(draftRef.id) : null;

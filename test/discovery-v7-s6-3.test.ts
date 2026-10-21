@@ -15,6 +15,7 @@ import { Researcher } from '../src/discovery/research-runner.js';
 import type { V7PlanSubject } from '../src/discovery/v7-managed-attempt.js';
 import { readResearchConsumerTurn } from '../src/discovery/response-recovery.js';
 import { v7PlannerRounds } from '../src/discovery/reading-plan.js';
+import type { ReaderPilot } from '../src/discovery/reader-pilot.js';
 import { listResearchConsumerIntents, consumerIntentContext } from '../src/discovery/response-recovery.js';
 
 function fixture(t: { after(fn: () => void): void }) {
@@ -277,4 +278,77 @@ for (const action of [{ action: 'synthesize', question: '$selected' }, { action:
     await f.run(1, f.open(), false);
     assert.deepEqual(f.store.list('model-call'), calls); assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
     assert.equal(f.wires().length, 1);
+  });
+
+
+for (const boundary of ['settings-snapshot', 'intent-publication', 'reservation', 'unpaid-resume'] as const)
+  test(`S6.3-01: a second Store disabling settings at ${boundary} cannot lose the planner reservation guard`, async t => {
+    const f = await setup(t); f.configure([planner]);
+    const other = f.open(), otherEngine = new ProductEngine(other);
+    const initialPilot = other.get<ReaderPilot>('reader-pilot:p')!;
+    const toggle = (active: boolean) => {
+      const pilot = other.get<ReaderPilot>(initialPilot.id)!;
+      const { projectId: _projectId, ...settings } = pilot.value;
+      otherEngine.execute({ type: 'configure-reader-pilot', project: 'p', expected: pilot.revision,
+        settings: { ...settings, active } });
+    };
+    const get = f.store.get.bind(f.store), write = f.store.writeMany.bind(f.store);
+    if (boundary === 'unpaid-resume') {
+      let prepared = false;
+      f.store.writeMany = ((writes, guards = []) => {
+        if (writes.some(row => row.kind === 'model-call' && row.expected === 0)) {
+          prepared = true; throw new Error('S6.3-01 cut before the unpaid reservation');
+        }
+        return write(writes, guards);
+      }) as Store['writeMany'];
+      await f.run(1); f.store.writeMany = write;
+      assert.equal(prepared, true);
+    }
+    const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+    let changed = false, published = false, reserved = false;
+    f.store.get = ((id, revision) => {
+      const row = get(id, revision);
+      if (!changed && ['settings-snapshot', 'unpaid-resume'].includes(boundary)
+        && revision === undefined && row?.kind === 'reader-pilot'
+        && new Error().stack?.includes('runPlanAttempts')) {
+        changed = true; toggle(false);
+      }
+      return row;
+    }) as Store['get'];
+    f.store.writeMany = ((writes, guards = []) => {
+      const intent = writes.find(row => row.kind === 'research-consumer-intent'
+        && row.expected === 0 && (row.value as { kind?: string }).kind === 'reading-planner');
+      if (intent && boundary === 'intent-publication' && !changed) { changed = true; toggle(false); }
+      if (writes.some(row => row.kind === 'model-call' && row.expected === 0)) {
+        reserved = true;
+        if (boundary === 'reservation' && !changed) { changed = true; toggle(false); }
+        // Reproduce the review's whole unsafe chain if the snapshot lost its
+        // Ref: re-enable after publication, then disable after admission.
+        if (boundary === 'settings-snapshot' && published) toggle(false);
+      }
+      const result = write(writes, guards);
+      if (intent) {
+        published = true;
+        if (boundary === 'settings-snapshot') toggle(true);
+      }
+      return result;
+    }) as Store['writeMany'];
+    let result;
+    try { result = await f.run(1); }
+    finally { f.store.get = get; f.store.writeMany = write; }
+    assert.equal(changed, true, 'the real configuration command reached the named window');
+    assert.equal(result.value.pauseCode, 'input_stale', JSON.stringify(result.value));
+    assert.equal(f.wires().length, 0);
+    assert.deepEqual(f.store.list('model-call'), calls);
+    assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
+    assert.equal(f.store.list('research-turn').length, 0);
+    const intents = listResearchConsumerIntents(f.store, 'p', f.v.draft.id);
+    if (boundary === 'settings-snapshot' || boundary === 'intent-publication') {
+      assert.equal(published, false); assert.equal(intents.length, 0);
+    } else {
+      assert.equal(reserved, true); assert.equal(intents.length, 1);
+      assert.equal(intents[0]!.value.state, 'prepared');
+      for (const refs of [intents[0]!.value.basis, intents[0]!.value.guards])
+        assert.equal(refs.filter(ref => canonical(ref) === canonical(reference(initialPilot))).length, 1);
+    }
   });

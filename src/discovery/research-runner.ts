@@ -1532,8 +1532,12 @@ export class Researcher {
         const subject: V7PlanSubject = { contract: V7_PLAN_SUBJECT_CONTRACT,
           planAnswer: selection.planAnswer, planQuestionId: selection.next.planQuestionId };
         const selectedTurns = turns.filter(row => sameSubject(planSubjectOf(row.value), subject));
-        const planning = planningForPlanSubject(this.store, project, reference(selection.draft), subject, options.producerPolicy);
-        const planningPilot = planning ? readerPilot(this.store, project) : null;
+        const settingsPilot = readerPilot(this.store, project);
+        const planning = planningForPlanSubject(this.store, project, reference(selection.draft), subject,
+          options.producerPolicy, settingsPilot);
+        const planningPilot = planning ? settingsPilot : null;
+        requireCondition(!planning || planningPilot, "reading_plan_settings_missing",
+          "A new planner intent requires its exact settings snapshot");
         const mode = planning ? v7DispatchMode(this.store, project, turns, selection.question, subject, planning) : null;
         requireCondition(mode !== "synthesis", "research_v7_mode_unavailable", "The v7 synthesis runner is not connected");
         const sources = new ResearchSources(this.store, project, effective.root);
