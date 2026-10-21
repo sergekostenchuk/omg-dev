@@ -1,9 +1,13 @@
+import { withHistoricalReads } from '../history/proofs.js';
+import type { DiscoveryDraft } from './discovery.js';
+import type { ResearchAnswer } from './research-model.js';
+import { provePlanQuestions } from './v7-plan-questions.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
-import type { Revision } from '../storage/store.js';
+import type { Store, Revision } from '../storage/store.js';
 import type { ClaimAddress } from './claim-address.js';
-import { decodeDossierContradictions, type DossierContradiction } from './dossier-contradictions.js';
+import { decodeDossierContradictions, checkDossierContradictionEvidence, type DossierClassificationGrounds, type ProvenDossierContradiction, type DossierContradiction } from './dossier-contradictions.js';
 import { V7_ATTEMPT_KIND, V7_AXES, V7_DEPTHS, V7_UNKNOWN_MOMENTS, V7_CLAIM_POINTER, type V7Axis } from './v7-contracts.js';
 
 /** DR6 6.1 (codex-omg №9189, раздел DR6): the closed structural form of the
@@ -176,4 +180,29 @@ export function readDossierManifestStructural(view: DossierRecordView, project: 
   if (value.projectId !== project || row.id !== dossierManifestId(value) || row.revision !== 1)
     invalid('record', 'Foreign project or noncanonical snapshot address', 'discovery_dossier_invalid', at);
   return { verification: 'structural', record: { ...row, value } };
+}
+
+
+export interface ProvenDossierContradictions {
+  verification: 'contradictions'; manifestRef: Ref; assessments: Ref[];
+  record: Revision<DossierManifest>; contradictions: ProvenDossierContradiction[];
+}
+/** Proves only the presented contradictions against this exact manifest AND
+ * this explicit assessment set. No manifest-only cache, writes, dispatch,
+ * completeness decision or acceptance of the dossier is implied. */
+export function readDossierContradictionsAt(store: Store, project: string, manifestRef: Ref,
+  grounds: DossierClassificationGrounds): ProvenDossierContradictions {
+  return withHistoricalReads(() => {
+    const { record } = readDossierManifestStructural(store, project, manifestRef);
+    const value = record.value, draft = store.get<DiscoveryDraft>(value.draft.id,value.draft.revision);
+    if (!draft || draft.kind !== 'discovery-draft' || draft.hash !== value.draft.hash
+      || hashJson(draft.value as never) !== draft.hash || draft.value.projectId !== project)
+      invalid('draft','The snapshot needs its exact project draft');
+    const questions = provePlanQuestions(store,draft,value.plan);
+    const plan = store.get<ResearchAnswer>(value.plan.id,value.plan.revision)!;
+    if (canonical((plan.value.value as Record<string,unknown>).frame) !== canonical(value.frame))
+      invalid('frame','The snapshot frame is the frame of its exact proven plan');
+    const contradictions = checkDossierContradictionEvidence(store,value,questions.map(q=>q.planQuestionId),grounds);
+    return {verification:'contradictions',manifestRef:{...manifestRef},assessments:structuredClone(grounds.assessments),record,contradictions};
+  });
 }

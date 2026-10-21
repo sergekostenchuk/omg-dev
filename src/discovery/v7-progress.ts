@@ -543,10 +543,12 @@ export function applyDiscoveryAssessment(store: Store, projectId: string, ref: R
   });
 }
 
-/** An attempt claim is usable only at the deterministic first-account address,
- * and only if that exact pointer occurs in the re-derived paid application. */
-export function proveAppliedAttemptClaim(store: Store, address: ClaimAddress): {
-  application: Revision<V7ProgressApplication>; assessment: Revision<PaidDiscoveryAttemptsAssessment> } {
+/** Read-only classification at the deterministic first account. Both accepted
+ * and rejected require the same complete atomic application and its original
+ * paid assessment; absence is not a classification. */
+export function proveAppliedAttemptClassification(store: Store, address: ClaimAddress): {
+  status: 'accepted' | 'rejected'; application: Revision<V7ProgressApplication>;
+  assessment: Revision<PaidDiscoveryAttemptsAssessment> } {
   return withHistoricalReads(() => {
     const resolved = resolveClaimAddress(store, address);
     need(resolved.container.kind === V7_ATTEMPT_KIND, 'claim', 'An attempt proof needs an attempt container');
@@ -555,11 +557,23 @@ export function proveAppliedAttemptClaim(store: Store, address: ClaimAddress): {
     const account = store.get<V7AttemptAccount>(attemptAccountKey(subject, address.container), 1);
     if (!account) fail('claim_attempt_not_accepted', 'application', 'The exact attempt has not been applied');
     const proven = readAccount(store, reference(account));
-    if (!proven.value.accepted.some(c => same(c, address)))
-      fail('claim_attempt_not_accepted', 'claim', 'This exact claim pointer was not accepted by the first application');
     const app = readApplication(store, proven.value.application).application;
-    return { application: app, assessment: readDiscoveryAssessment(store, address.project, app.value.assessment) };
+    const assessment = readDiscoveryAssessment(store, address.project, app.value.assessment);
+    const accepted = proven.value.accepted.some(c => same(c, address));
+    const rejected = assessment.value.novelty.rejected.some(c => same(c.claim, address));
+    need(accepted !== rejected, 'claim', 'The first applied assessment must classify this exact claim once');
+    return { status: accepted ? 'accepted' : 'rejected', application: app, assessment };
   });
+}
+
+/** Acceptance retains its public contract; the read-only classification above
+ * shares the existing first-account proof without changing application. */
+export function proveAppliedAttemptClaim(store: Store, address: ClaimAddress): {
+  application: Revision<V7ProgressApplication>; assessment: Revision<PaidDiscoveryAttemptsAssessment> } {
+  const { status, ...proof } = proveAppliedAttemptClassification(store, address);
+  if (status !== 'accepted')
+    fail('claim_attempt_not_accepted', 'claim', 'This exact claim pointer was not accepted by the first application');
+  return proof;
 }
 
 /** A caller can request a comparison snapshot; no caller field manufactures a

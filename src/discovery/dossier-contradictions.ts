@@ -1,7 +1,15 @@
-import { canonical } from '../canonical.js';
+import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import { isRef, type Ref } from '../pipeline/contracts.js';
-import type { ClaimAddress } from './claim-address.js';
+import { isRef, reference, type Ref } from '../pipeline/contracts.js';
+import { proveClaimAddress, resolveClaimAddress, type ClaimAddress } from './claim-address.js';
+import type { Store, Revision } from '../storage/store.js';
+import type { DossierManifest } from './dossier-manifest.js';
+import { proveAppliedAttemptClassification } from './v7-progress.js';
+import { V7_ATTEMPT_KIND, V7_CLAIM_KINDS } from './v7-contracts.js';
+import { readDiscoveryAssessment, directAssessmentBasis } from './research-assessment.js';
+import { readAcceptedResearchAnswer, type DiscoveryDraft, type Question } from './discovery.js';
+import { proveIssuedAnswer, issuedAnswerSchemaHolds } from './projection-reader.js';
+import type { PaidDiscoveryAttemptsAssessment, ResearchAnswer, ResearchAssessment } from './research-model.js';
 
 /** DR6 6.2-F (codex-omg №9189, №9412): the closed structural form of the
  * contradictions of one dossier snapshot (карта, ndisc.d6.n2 — sources disagree,
@@ -128,4 +136,189 @@ export function decodeDossierContradictions(value: unknown, context: DossierCont
       invalid(`${at}.blocking`, 'A difference of time, version or area is no conflict and blocks nothing');
   });
   return value as DossierContradiction[];
+}
+
+/* 6.2-D: proof of the presented contradictions, not acceptance or completeness
+ * of the dossier. The explicit assessment set belongs to the snapshot input;
+ * it is never reconstructed by scanning current heads. */
+export interface DossierClassificationGrounds { assessments: Ref[] }
+export interface ProvenDossierSide extends DossierContradictionSide { application: Ref | null }
+export interface ProvenDossierContradiction { contradiction: DossierContradiction;
+  sides: [ProvenDossierSide, ProvenDossierSide] }
+
+/** The exact reader supplies the already proven manifest and plan-question set.
+ * This helper checks their presented evidence; it grants no dossier acceptance. */
+export function checkDossierContradictionEvidence(store: Store, manifest: DossierManifest,
+  planQuestions: readonly string[], input: DossierClassificationGrounds): ProvenDossierContradiction[] {
+  shape(input, ['assessments'], 'grounds');
+  if (!Array.isArray(input.assessments)) invalid('grounds.assessments', 'The snapshot needs an explicit assessment set');
+  const seen = new Set<string>();
+  for (const [i,item] of input.assessments.entries()) {
+    ref(item, `grounds.assessments.${i}`);
+    if (seen.has(canonical(item))) invalid(`grounds.assessments.${i}`, 'Duplicate exact assessment');
+    seen.add(canonical(item));
+  }
+  const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
+  const at = <T>(link: Ref, kind: string, field: string): Revision<T> => {
+    const row = store.get<T>(link.id, link.revision);
+    if (!row || row.kind !== kind || row.hash !== link.hash || !object(row.value) || hashJson(row.value as never) !== row.hash)
+      invalid(field, 'The exact ground is missing, changed or of another kind');
+    return row;
+  };
+  const addresses = new Map<string, { address: ClaimAddress; claim: Record<string, unknown>; field: string }>();
+  for (const [axis, entry] of Object.entries(manifest.axes)) for (const [i, address] of entry.claims.entries()) {
+    const field = `axes.${axis}.claims.${i}`, resolved = resolveClaimAddress(store, address);
+    if (!object(resolved.claim) || !(V7_CLAIM_KINDS as readonly unknown[]).includes(resolved.claim.kind)
+      || resolved.claim.axis !== axis) invalid(field, 'A known claim belongs to its stated axis');
+    addresses.set(canonical(address), { address, claim: resolved.claim, field });
+  }
+  // Historical answers retain the common provenance interpretation of their
+  // own era. This does not manufacture an attempts classification for them.
+  const answers = new Map<string, ReturnType<typeof answerGround>>();
+  function answerGround(answerRef: Ref) {
+    at<ResearchAnswer>(answerRef, 'research-answer', 'assessment.answer');
+    const own = readAcceptedResearchAnswer(store, manifest.projectId, answerRef);
+    const value = own.answer.value;
+    const assessment = own.assessment;
+    if (assessment) at(reference(assessment), 'research-assessment', 'assessment');
+    const question = assessment && isRef(assessment.value.question)
+      ? at<Question>(assessment.value.question, 'question', 'assessment.question')
+      : store.get<Question>(value.question);
+    if (!question || question.kind !== 'question' || question.value.projectId !== manifest.projectId)
+      invalid('assessment.question', 'The historical answer needs its own issued question');
+    const draft = store.get<DiscoveryDraft>(question.value.draftId);
+    if (!draft || draft.kind !== 'discovery-draft' || draft.value.projectId !== manifest.projectId
+      || !draft.value.questions.includes(question.id)) invalid('assessment.question', 'The answer belongs to its own draft');
+    const proof = proveIssuedAnswer(store, draft, {question, foreign:false, answered:true,
+      answerRef, field:question.value.spec.field},
+      own.answer as unknown as Revision<Record<string, unknown>>, {verifyIssuedQuestion:true});
+    if (!proof.ok || proof.proof.provenance.kind !== 'research-answer')
+      invalid('assessment', 'The historical answer has no research provenance');
+    const p = proof.proof.provenance;
+    if (!p.wellFormed || !p.independent || !p.valueMatches || !p.bindsQuestion || !p.hasObservations
+      || !issuedAnswerSchemaHolds(question, proof.proof.value) || !assessment
+      || !['supported','insufficient','conflicting'].includes(assessment.value.verdict))
+      invalid('assessment', 'The historical classification must prove this exact answer and question');
+    directAssessmentBasis(store, assessment);
+    return {assessment, status:assessment.value.verdict === 'supported' ? 'accepted' as const : 'rejected' as const};
+  }
+  const attempts = new Map<string, Revision<PaidDiscoveryAttemptsAssessment>>();
+  const historical = new Map<string, Revision<ResearchAssessment>>();
+  for (const [i, link] of input.assessments.entries()) {
+    const field = `grounds.assessments.${i}`;
+    try {
+      const row = store.get(link.id, link.revision);
+      if (!row || row.hash !== link.hash || !object(row.value) || row.value.projectId !== manifest.projectId
+        || hashJson(row.value as never) !== row.hash) invalid(field, 'The exact assessment is missing, malformed, foreign or changed');
+      if (row.kind === 'discovery-assessment') attempts.set(canonical(link), readDiscoveryAssessment(store, manifest.projectId, link));
+      else if (row.kind === 'research-assessment') {
+        // Use its answer's own historical reader. A set may also name an
+        // unrelated historical answer: the exact issued question's successor
+        // fixes that answer without scanning today's heads.
+        const candidates = [...addresses.values()].filter(item => item.address.containerKind === 'research-answer'
+          && same((resolveClaimAddress(store, item.address).container.value as unknown as ResearchAnswer).assessment, link));
+        const links = candidates.map(candidate => candidate.address.container);
+        if (!links.length) {
+          const assessment = at<ResearchAssessment>(link, 'research-assessment', field);
+          if (!isRef(assessment.value.question)) invalid(field, 'A historical assessment names its exact issued question');
+          const issued = at<Question>(assessment.value.question, 'question', field);
+          const next = store.get<Question>(issued.id, issued.revision + 1);
+          if (!next || next.kind !== 'question' || !object(next.value) || !isRef(next.value.answer))
+            invalid(field, 'The historical assessment has no exact saved answer to prove its origin');
+          links.push(next.value.answer);
+        }
+        for (const answerRef of links) {
+          const proof = answerGround(answerRef);
+          if (!same(reference(proof.assessment), link)) invalid(field, 'The answer has another historical assessment');
+          historical.set(canonical(link), proof.assessment);
+          for (const candidate of candidates) if (same(candidate.address.container, answerRef))
+            answers.set(canonical(candidate.address), proof);
+        }
+      } else invalid(field, 'Only proven attempts assessments and historical answer assessments are supported');
+    } catch (error) {
+      if (!(error instanceof EngineError) || error.code === 'discovery_dossier_invalid') throw error;
+      throw new EngineError('discovery_dossier_invalid', `[${field}] The exact assessment is not provable: ${error.message}`,
+        {field, ref:link, cause:error.code});
+    }
+  }
+  const selected = (address: ClaimAddress) => [...attempts.values()].filter(a =>
+    [...a.value.novelty.accepted, ...a.value.novelty.rejected].some(c => same(c.claim, address)));
+  const evidence = new Map<string, { assessment: Ref | null; application: Ref | null; status: 'accepted'|'rejected' }>();
+  function proveSide(side: DossierContradictionSide, field: string): ProvenDossierSide {
+    const key = canonical(side.claim);
+    if (side.status === 'unassessed') {
+      const answer = side.claim.containerKind === 'research-answer'
+        ? resolveClaimAddress(store, side.claim).container.value as unknown as ResearchAnswer : null;
+      const classified = answer ? historical.has(canonical(answer.assessment)) : selected(side.claim).length > 0;
+      if (classified) invalid(`${field}.status`, 'The exact claim is classified in the presented snapshot grounds');
+      return {...side, application:null};
+    }
+    if (side.assessment !== null && !seen.has(canonical(side.assessment)))
+      invalid(`${field}.assessment`, 'The side assessment is not in the exact snapshot set');
+    let origin: {assessment: Ref|null; application:Ref|null; status:'accepted'|'rejected'};
+    if (side.claim.containerKind === V7_ATTEMPT_KIND) {
+      const proof = proveAppliedAttemptClassification(store, side.claim);
+      origin = {assessment:reference(proof.assessment), application:reference(proof.application), status:proof.status};
+      if (!same(side.assessment, origin.assessment)) invalid(`${field}.assessment`, 'Only the original first applied assessment classifies this claim');
+    } else {
+      const proof = answers.get(key) ?? answerGround(side.claim.container);
+      origin = {assessment:reference(proof.assessment), application:null, status:proof.status};
+      if (side.assessment !== null && !same(side.assessment, origin.assessment))
+        invalid(`${field}.assessment`, 'The answer keeps its original historical assessment');
+    }
+    if (origin.status !== side.status) invalid(`${field}.status`, 'The declared status differs from its proven classification');
+    if (side.status === 'accepted') proveClaimAddress(store, side.claim);
+    evidence.set(key, origin);
+    return {...side, application:origin.application};
+  }
+  const pair = (relation: DossierContradiction['relation'], a: ClaimAddress, b: ClaimAddress) =>
+    canonical([relation, ...(relation === 'contradicts' ? [canonical(a),canonical(b)].sort() : [canonical(a),canonical(b)])]);
+  const declared = new Set(manifest.contradictions.map(c => pair(c.relation,c.sides[0].claim,c.sides[1].claim)));
+  for (const item of addresses.values()) for (const link of ['contradicts','refutedBy'] as const) {
+    const targets = item.claim[link];
+    if (targets === undefined) continue;
+    if (!Array.isArray(targets)) invalid(`${item.field}.${link}`, 'An explicit claim relation is a list of full addresses');
+    for (const [i,target] of targets.entries()) {
+      const field = `${item.field}.${link}.${i}`, other = addresses.get(canonical(target));
+      if (!other || same(item.address,other.address)) invalid(field, 'Every explicit relation keeps its distinct exact target inside the axes');
+      const key = link === 'contradicts' ? pair('contradicts',item.address,other.address) : pair('refutes',other.address,item.address);
+      if (!declared.has(key)) invalid(field, 'The snapshot omitted this explicit claim relation or reversed its direction');
+    }
+  }
+  return manifest.contradictions.map((c,i) => {
+    const field = `contradictions.${i}`;
+    for (const [j,id] of c.planQuestionIds.entries()) if (!planQuestions.includes(id))
+      invalid(`${field}.planQuestionIds.${j}`, 'The contradiction names a question of the exact accepted plan');
+    const sides = c.sides.map((s,j) => proveSide(s, `${field}.sides.${j}`)) as [ProvenDossierSide,ProvenDossierSide];
+    const resolution = c.resolution;
+    if (resolution.state !== 'open') {
+      const covered = new Set<number>();
+      for (const [j,link] of resolution.grounds.entries()) {
+        const atField = `${field}.resolution.grounds.${j}`, row = store.get(link.id,link.revision);
+        if (!row || row.hash !== link.hash || hashJson(row.value as never) !== row.hash) invalid(atField, 'The exact resolution ground is missing or changed');
+        let related = false;
+        for (const [k,side] of sides.entries()) {
+          const origin = evidence.get(canonical(side.claim));
+          if (['discovery-assessment','research-assessment'].includes(row.kind)) {
+            if (origin?.assessment && same(origin.assessment,link) && seen.has(canonical(link))) {covered.add(k);related=true;}
+          } else if ([V7_ATTEMPT_KIND,'research-answer'].includes(row.kind) && side.status === 'accepted'
+            && same(side.claim.container,link)) {
+            proveClaimAddress(store,side.claim);covered.add(k);related=true;
+          }
+        }
+        if (!related) invalid(atField, 'A supported ground proves a presented side through its original assessment or accepted claim container');
+      }
+      if (resolution.state === 'side') {
+        if (sides[resolution.holds].status !== 'accepted' || !covered.has(resolution.holds))
+          invalid(`${field}.resolution.holds`, 'The standing side needs acceptance and its own proven resolution ground');
+      } else {
+        const scopes = sides.map(s => addresses.get(canonical(s.claim))!.claim.scope);
+        if (!covered.has(0) || !covered.has(1) || !scopes.every(object)
+          || scopes.some(s => s[resolution.dimension] === undefined)
+          || same(scopes[0]![resolution.dimension],scopes[1]![resolution.dimension]))
+          invalid(`${field}.resolution.dimension`, 'A scoped classification names a real difference and proven grounds of both retained sides');
+      }
+    }
+    return {contradiction:c,sides};
+  });
 }
