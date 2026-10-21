@@ -16,7 +16,7 @@ import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { fillObligations, prepareFrame, readFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
-import { l3ReopenId, L3_REOPEN_CONTRACT, L3_REOPEN_KIND, observeProposal, readProvenFrame, type FrameReopen } from "../src/om/frame-proposals.js";
+import { observeProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate, readCandidate, gateCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeOmInput } from "../src/om/input.js";
@@ -57,6 +57,8 @@ import {
   type CloseAttemptRequest, type GateOutcome, type LiftOriginHoldRequest, type OriginHold, type RefusalClass,
   type OriginTally, type RepeatOutcome, type RoutedRefusal,
 } from "../src/om/repeat-gate.js";
+import { readRun, regateRun, type RunStep } from "../src/om/run.js";
+import { gardenPass, project, usage } from "./om-run-fixture.js";
 
 const UNIT = "gate-repeat";
 const PROJECT = "alpha";
@@ -1985,83 +1987,88 @@ test("G7 observes real first-pass and accepted bases of both producers through t
 });
 
 test("RJ1: a saved base or proposal context proves the exact reopening it names — absent, foreign or mismatched refuses; a moved head and a cold store change nothing", async t => {
-  const project = "rj1context";
-  const f = await createOmFixture(t, "standard", project, { mode: "executed" });
-  const store = f.store;
-  // The works frame request in the exact form D1 saves it after the L3 acceptance (run-bases.ts gapRequest), now
-  // naming the accepted frame — the shape a regated pass re-derives.
-  const candidate = store.list<FrameCandidateRecord>("frame-candidate").find(row => row.value.level === 3)!;
-  const saved = candidate.value.request;
-  const head = reference(store.get(`graph:${project}`)!);
-  const worksFrame = reference(store.get(`om-frame:${project}:3`)!);
-  const worksLayer = reference(store.get(`graph-layer:${project}:3`)!);
-  const basis = deliveredOf(readProvenFrame(store,
-    { ...saved.frame, graph: head, layer: worksLayer, frame: worksFrame, workZoneContract: "accepted-l2-v1" } as FrameRequest));
-  const zone = new Map(basis.result.obligations.map(item => [item.id, item.zone] as const));
-  const works = [...new Set(basis.result.fills
-    .filter(fill => fill.source === "accepted" && zone.get(fill.obligation) === "horizon"
-      && basis.accepted!.graph.nodes.some(node => node.id === fill.node && node.kind === "work"))
-    .map(fill => fill.node))].sort();
-  assert.ok(works.length > 0);
-  // The record an om-regate writes, in its exact contract (L3Reopen): every reopened work carries a finding of the door.
-  const snapshot = { commit: "a".repeat(40), tree: "b".repeat(40) };
-  const reopenRecord = store.write({ id: l3ReopenId(project), kind: L3_REOPEN_KIND, expected: 0, value: {
-    contract: L3_REOPEN_CONTRACT, project,
-    run: head, frame: worksFrame, graph: head,
-    input: reference(store.get(`om-input:${project}`)!), environment: head,
-    snapshot, findings: works.map(work => ({ code: "work_impact_undecided", field: "impact", message: "The door left this transition to the model", target: work })),
-    works: works.map(work => ({ work, definition: hashJson(work) })),
-    impact: { snapshot: structuredClone(snapshot), works: [] },
-    decision: { actor: "owner", command: "om-regate" },
-  } as unknown as Json });
-  const named: FrameReopen = { record: reference(reopenRecord), works };
-  const request = { ...saved.frame, graph: head, layer: worksLayer, frame: worksFrame,
-    workZoneContract: "accepted-l2-v1", reopen: named } as unknown as FrameRequest;
-  const base = (frame: unknown): OriginSource =>
-    ({ role: "base", ref: (frame as FrameRequest).graph, context: { kind: "frame", request: frame } }) as unknown as OriginSource;
-  const read = (frame: unknown) => readDefinitions(store, { project, source: base(frame) });
+  // A real regated pass: the accepted L3 of a completed garden pass is reopened by the owner's om-regate after the
+  // workspace gained a test reaching the consumed result, and the regated works are refused at G5 — the refusal's
+  // journal row carries the exact base and proposal contexts the assembly was weighed on (part-03's producers).
+  const g = await gardenPass(t);
+  const { store, desired, commit, respond, drive, cycle } = g;
+  const stepOf = () => (deliveredOf(readRun(store, { project }))!.value.state as { step: RunStep }).step;
+  await drive(cycle);
+  respond(stepOf(), structuredClone(desired.nodes.find(node => node.id === "garden-consume-work")!), []);
+  await drive(state => state.phase === "complete");
+  const frame1 = reference(store.get(`om-frame:${project}:3`)!);
+  commit("a test reaches the consumed result", { "consume.txt": "consumed\n", "regate.test.mjs": "import \"./consume.txt\";\n" });
+  const reopen = deliveredOf(regateRun(store, { project })).reopen!;
+  assert.deepEqual(await drive(cycle), ["bases", "open", "register", "lines", "obligations", "packet"]);
+  respond(stepOf(), structuredClone(desired.nodes.find(node => node.id === "garden-consume-work")!), []);
+  g.answer({ research: { protocol: "omg-stop-analysis/v1", cause: null, change: null, origin: null }, usage } as unknown as Json);
+  assert.deepEqual(await drive(state => state.phase === "unable"), ["cycle", "evaluate", "works", "finalize", "close", "bases", "analyze"]);
+  // The saved contexts of that real assembly: the base's frame request and the proposal's request both name the
+  // record om-regate wrote and the exact works it reopened.
+  type Reopened = FrameRequest & { reopen?: { record: Ref; works: string[] } };
+  interface Row { id: string; code: string; origin: { name: string; subject: string;
+    sources: { role: string; ref: Ref; context?: { kind: string; request: Reopened | { frame: Reopened; proposals: Ref[] } } }[] } }
+  const journal = store.get<{ rows: Row[] }>(`om-refusal-journal:${project}`)!.value;
+  const row = journal.rows.find(item => item.code === "work_impact_undecided" && item.origin.subject === "garden-consume-work")!;
+  const named = { record: reference(reopen), works: ["garden-consume-work"] };
+  const base = row.origin.sources.find(item => item.role === "base")!;
+  assert.equal(base.context!.kind, "frame");
+  const context = base.context!.request as Reopened;
+  assert.deepEqual(context.reopen, named, "The saved base context names the exact reopening it was weighed against");
+  const proposal = row.origin.sources.find(item => item.role === "proposal")!;
+  assert.equal(proposal.context!.kind, "proposal");
+  const proposalRequest = proposal.context!.request as { frame: Reopened; proposals: Ref[] };
+  assert.deepEqual(proposalRequest.frame.reopen, named, "The saved proposal context names the same reopening");
 
+  const baseSource = (frame: unknown) => ({ ...base, context: { kind: "frame", request: frame } }) as unknown as OriginSource;
+  const read = (frame: unknown) => readDefinitions(store, { project, source: baseSource(frame) });
   // A context naming no reopening derives exactly as its era did; the one naming the exact record reads it.
-  const { reopen: _absent, ...bare } = request as FrameRequest & { reopen: FrameReopen };
+  const { reopen: _absent, ...bare } = context;
   assert.ok(read(bare).ok, "A context naming no reopening reads as its own era did");
-  const named_read = read(request);
+  const named_read = read(context);
   assert.ok(named_read.ok, `The saved context reads the exact reopening it names: ${named_read.ok ? "" : JSON.stringify(named_read.refusal)}`);
 
   const before = store.list().map(reference);
   const check = (frame: unknown) => {
-    const found = refusalOf(readDefinitions(store, { project, source: base(frame) }));
+    const found = refusalOf(read(frame));
     assert.ok(found.at.target.length > 0);
   };
   // Absent exact reopen: no record stands at the named reference.
-  check({ ...request, reopen: { ...named, record: { ...named.record, hash: hashJson("absent") } } });
+  check({ ...context, reopen: { ...named, record: { ...named.record, hash: hashJson("absent") } } });
   // A foreign record of another kind is no reopening of this frame.
-  check({ ...request, reopen: { ...named, record: worksFrame } });
+  check({ ...context, reopen: { ...named, record: frame1 } });
   // The named works differ from the record's own.
-  check({ ...request, reopen: { ...named, works: [...works, "zz-foreign-work"] } });
+  check({ ...context, reopen: { ...named, works: ["garden-produce-work"] } });
   assert.deepEqual(store.list().map(reference), before, "Every damaged context refuses without a write");
 
-  // A second revision naming ANOTHER frame moves the head; the saved context still reads its own named record.
-  const moved = store.write({ id: l3ReopenId(project), kind: L3_REOPEN_KIND, expected: reopenRecord.revision,
-    value: { ...(reopenRecord.value as Record<string, unknown>), frame: reference(store.get(`om-frame:${project}:2`)!) } as unknown as Json });
-  check({ ...request, reopen: { ...named, record: reference(moved) } });
-  assert.ok(read(request).ok, "A moved head never substitutes for the named record");
+  // A newer revision of the real record moves the head; the saved context still reads its own named record.
+  const bumped = store.write({ id: reopen.id, kind: reopen.kind, expected: reopen.revision, value: reopen.value as unknown as Json });
+  assert.ok(read(context).ok, "A moved head never substitutes for the named record");
 
-  // The proposal context of the same assembly proves the same reopening through its own reader.
-  const proposal = reference(store.write({ id: `om-proposal:${project}:reopened`, kind: "layer-proposal", expected: 0,
-    value: { base: { graph: head, frame: worksFrame }, level: 3, source: "decision", status: "proposed",
-      worksContract: "works-frame/v1", nodes: [], fills: [], localConnectors: [], artifacts: [], contracts: [], joins: [],
-      tests: [], edges: [], journeys: [], packets: [], transfers: [], anchors: [], removes: [], replaces: [], redefines: [] } as unknown as Json }));
-  const proposalContext = { frame: request, proposals: [proposal] };
-  assert.ok(observeProposal(store, { project, proposal, request: proposalContext }).ok,
+  // A damaged next revision naming ANOTHER frame is no reopening of this one: its explicit presentation refuses
+  // exactly, while the saved context keeps reading its own named revision — for base and proposal alike.
+  const mutated = store.write({ id: reopen.id, kind: reopen.kind, expected: bumped.revision,
+    value: { ...(reopen.value as Record<string, unknown>), frame: reference(store.get(`om-frame:${project}:2`)!) } as unknown as Json });
+  const moved = refusalOf(read({ ...context, reopen: { ...named, record: reference(mutated) } }));
+  assert.equal(moved.code, "proposal_invalid");
+  assert.equal(moved.at.field, "frame.reopen");
+  assert.equal(moved.at.target, reopen.id);
+  const heads = store.list().map(reference);
+  assert.ok(read(context).ok, "The old exact reference reads its own revision, never today's head");
+
+  // The proposal context of the same assembly proves the same reopening through its own reader, under the moved head.
+  assert.ok(observeProposal(store, { project, proposal: proposal.ref, request: proposalRequest } as never).ok,
     "A proposal context reads the reopening its frame names");
-  refusalOf(observeProposal(store, { project, proposal,
-    request: { frame: { ...request, reopen: { ...named, works: ["zz-foreign-work"] } } as unknown as FrameRequest,
-      proposals: [proposal] } }));
+  refusalOf(observeProposal(store, { project, proposal: proposal.ref,
+    request: { ...proposalRequest, frame: { ...proposalRequest.frame, reopen: { ...named, works: ["garden-produce-work"] } } } as never }));
+  assert.deepEqual(store.list().map(reference), heads, "The damaged presentation and both proven reads write nothing");
 
-  // A cold store reads the saved context and its reopening the same way.
-  const engine = f.reopen();
-  assert.ok(readDefinitions(engine.store, { project, source: base(request) }).ok, "A cold store proves the named record");
-  assert.ok(observeProposal(engine.store, { project, proposal, request: proposalContext }).ok);
+  // A cold store reads the saved context and its reopening the same way, under the moved head.
+  const cold = new Store(g.f.database);
+  try {
+    assert.ok(readDefinitions(cold, { project, source: baseSource(context) }).ok, "A cold store proves the named record");
+    assert.ok(observeProposal(cold, { project, proposal: proposal.ref, request: proposalRequest } as never).ok);
+  } finally { cold.close(); }
 });
 
 test("G7 refuses missing or alien observation contexts and unreadable modern sections without falling back to defines", t => {
