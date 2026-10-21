@@ -815,7 +815,8 @@ function unfinishedOperation(store: Store, projectId: string, draftId: string,
   }
   const pendingDelivery = listResearchConsumerIntents(store, projectId, draftId)
     .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind)
-      && intent.value.owner.id === first.id && intent.value.owner.revision === ownerRevision
+      && intent.value.owner.id === first.id && intent.value.owner.revision >= ownerRevision
+      && intent.value.owner.revision <= first.revision
       && ['prepared', 'running', 'refused'].includes(intent.value.state))
     .sort((a, b) => b.revision - a.revision)
     .map(intent => intent.value.cursor.delivery)
@@ -889,6 +890,8 @@ export function synthesisDeliveryMarks(session: Revision<SynthesisSessionState>,
 }
 
 export interface SynthesisSessionOptions {
+  /** Restore paid work without preparing or dispatching a new logical step. */
+  restoreOnly?: boolean;
   retryPermits?: readonly Ref[];
   delivery?: SynthesisSessionDelivery | null;
   initialWorkspace?: ContextWorkspace;
@@ -980,8 +983,17 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     try { planQuestionContract(store, draftHead, questionHead, subject); return true; }
     catch (error) { if (error instanceof EngineError) return false; throw error; }
   };
-  const requireCurrent = () => requireCondition(subjectCurrent(), 'research_plan_subject_invalid',
-    'A new v3 synthesis step needs the current plan Question of its subject');
+  const requireCurrent = () => {
+    requireCondition(!opts.restoreOnly, 'research_restore_complete', 'Saved synthesis is restored; a new step needs explicit current admission');
+    requireCondition(subjectCurrent(), 'research_plan_subject_invalid',
+      'A new v3 synthesis step needs the current plan Question of its subject');
+    if (subject) {
+      const currentPilot = store.get<ReaderPilot>(pilot.id);
+      requireCondition(currentPilot?.kind === 'reader-pilot' && currentPilot.value.active
+        && canonical(reference(currentPilot)) === canonical(reference(pilot)),
+      'reader_pilot_stale', 'A new v3 synthesis step requires the current active reader profile');
+    }
+  };
   // The application of a paid step: today's admission while its subject is
   // current; once the plan moved on, its exact saved history and the session CAS.
   const applicationAdmission = (head: Revision<SynthesisSessionState>, intent: Revision<ResearchConsumerIntent> | null) =>
@@ -1314,8 +1326,9 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
       }
       continue; // re-read the head with the proven reservation in place
     }
-    // Pending steps bind the head reached by walking back reservation-only
-    // revisions (№1658 К2): a reservation never orphans a proven pending step.
+    // A step may be prepared before or after a reservation-only revision.
+    // Both exact owners share the same logical state; a reservation must not
+    // orphan either producer when its paid response is resumed.
     let ownerRevision = head.revision;
     for (let revision = head.revision; revision > 1; revision -= 1) {
       const step = store.get<SynthesisSessionState>(sessionId, revision)!;
@@ -1325,7 +1338,8 @@ async function synthesisSessionV2(store: Store, draft: Revision<DiscoveryDraft>,
     }
     const pending = listResearchConsumerIntents(store, projectId, draft.id)
       .filter(intent => ['synthesis', 'consolidation'].includes(intent.value.kind)
-        && intent.value.owner.id === head.id && intent.value.owner.revision === ownerRevision
+        && intent.value.owner.id === head.id && intent.value.owner.revision >= ownerRevision
+        && intent.value.owner.revision <= head.revision
         && ['prepared', 'running'].includes(intent.value.state));
     const pendingConsolidation = pending.find(intent => intent.value.kind === 'consolidation') ?? null;
     const pendingSynthesis = pending.find(intent => intent.value.kind === 'synthesis') ?? null;

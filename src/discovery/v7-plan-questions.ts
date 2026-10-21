@@ -1,3 +1,4 @@
+import { readSynthesisSessionV3 } from "./synthesis-session.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
@@ -7,7 +8,7 @@ import type { ResearchAnswer, ResearchRun } from "./research-model.js";
 import { consumerIntentContext, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { planSubjectOf, type V7PlanSubject } from "./v7-managed-attempt.js";
-import { turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
+import { synthesisReservationConsumed, turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
 import { issuedAnswerSchemaHolds, orderedQuestions, proveIssuedAnswer, readExact,
   savedAcceptanceAct } from "./projection-reader.js";
 import { DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_CONTRACT,
@@ -172,9 +173,10 @@ export function planAttemptSelection(store: Store, projectId: string): CurrentPl
 
 /** S6.2: recovery of the connected analyst/planner/owner-review turn branches only. The
  * exact saved position is selected before consulting today's accepted plan.
- * Synthesis session recovery is deliberately not admitted by this selector. */
+ * An exact unfilled v3 reservation may account for the last run position;
+ * synthesis selection and execution remain with the runner. */
 export function selectV7AnalystRecovery(store: Store, projectId: string, draftId: string,
-  run: Revision<ResearchRun> | null): {
+  run: Revision<ResearchRun> | null, reservedSynthesis?: Ref): {
     turns: Revision<ManagedResearchTurn>[]; intents: Revision<ResearchConsumerIntent>[];
     turn: Revision<ManagedResearchTurn> | undefined;
     outstanding: Revision<ResearchConsumerIntent> | undefined;
@@ -195,7 +197,13 @@ export function selectV7AnalystRecovery(store: Store, projectId: string, draftId
   const pending = turns.filter(row => row.value.status === "pending");
   const unfinished = intents.filter(row => row.value.state === "prepared" || row.value.state === "running");
   if ((turns.length || unfinished.length) && !run) invalid("The unfinished analyst work lost its run");
-  if (run && (turns.length !== run.value.turns
+  const session = reservedSynthesis ? readSynthesisSessionV3(store, reservedSynthesis) : null;
+  if (session && (!run || session.value.projectId !== projectId || session.value.binding.draft.id !== draftId
+    || session.value.delivery?.run !== runId || session.value.delivery.turn !== run.value.turns
+    || run.value.turns !== turns.length + 1 || synthesisReservationConsumed(session.value)
+    || pending.length || unfinished.length))
+    invalid("The reserved synthesis position conflicts with another run operation");
+  if (run && (turns.length !== run.value.turns - (session ? 1 : 0)
     || turns.some((row, index) => row.value.number !== index + 1)))
     invalid("The analyst turns do not prove one complete run position");
   const queued = pending.some(row => isRef(row.value.plannedBy));

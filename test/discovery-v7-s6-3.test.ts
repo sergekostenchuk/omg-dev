@@ -117,11 +117,30 @@ const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{t
 const reads = [{ action: 'search', query: 'one exact symbol' }, { action: 'read', path: 'scope.txt', media: 'text/plain' }];
 const planner = { action: 'read_plan', question: '$selected', reads };
 
+// A queue-only entry must leave synthesis to a separately admitted run.
+function queueProducts(f: Awaited<ReturnType<typeof setup>>) {
+  assert.deepEqual(f.store.list('synthesis-session'), []);
+  const intents = listResearchConsumerIntents(f.store, 'p', f.v.draft.id);
+  assert.deepEqual(intents.filter(row => ['synthesis', 'consolidation'].includes(row.value.kind)), []);
+  assert.deepEqual(f.store.list<any>('model-call').filter(row => row.value.consumerIntent
+    && ['synthesis', 'consolidation'].includes(f.store.get<any>(row.value.consumerIntent.id)?.value.kind)), []);
+  // Includes queue/result/intent/call/ledger and every other product record.
+  // Only the run may gain a new pause reason at the public admission door.
+  return f.store.list().filter(row => row.kind !== 'research-run').map(reference);
+}
+async function refuseNewWork(f: Awaited<ReturnType<typeof setup>>, store = f.open()) {
+  const before = queueProducts(f);
+  const stopped = await f.run(1, store, false);
+  assert.equal(stopped.value.pauseCode, 'research_contract_upgrade_required', JSON.stringify(stopped.value));
+  assert.deepEqual(queueProducts(f), before);
+  return stopped;
+}
+
 test('S6.3: a real paid planner publishes one original turn and its complete exact subject queue', async t => {
   const f = await setup(t); f.configure([planner]);
   const before = f.store.list('research-budget-ledger');
-  const result = await f.run(2);
-  assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
+  const result = await f.run(1);
+  assert.equal(result.value.pauseCode, 'research_turns_exhausted', JSON.stringify(result.value));
   const rows = f.store.list<any>('research-turn').sort((a,b) => a.value.number-b.value.number);
   assert.equal(rows.length, 3); assert.equal(result.value.turns, 3); assert.ok(result.value.requestChars > 0);
   const parent = rows[0]!, original = f.store.get<any>(parent.id, 1)!;
@@ -144,7 +163,8 @@ test('S6.3: a real paid planner publishes one original turn and its complete exa
   assert.equal(intent.value.state, 'applied');
   const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
   assert.equal(f.wires().length, 1); assert.equal(ledger.length, before.length + 1);
-  const history = f.history(); assert.deepEqual(await f.run(2, f.open()), result);
+  const paused = await refuseNewWork(f);
+  const history = f.history(); assert.deepEqual(await refuseNewWork(f), paused);
   assert.deepEqual(f.history(), history); assert.deepEqual(f.store.list('model-call'), calls);
   assert.deepEqual(f.store.list('research-budget-ledger'), ledger); assert.equal(f.wires().length, 1);
 });
@@ -215,8 +235,8 @@ test('S6.3: planner admission on the next subject preserves the existing common 
   const segments = f.store.list('research-budget'), ledger = f.store.list<any>('research-budget-ledger');
   assert.equal(segments.length, 1); assert.equal(ledger.length, 1);
   f.enablePlanning(); f.configure([ended(), planner]);
-  const result = await f.run(2, f.open());
-  assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
+  const result = await f.run(1, f.open());
+  assert.equal(result.value.pauseCode, 'research_turns_exhausted', JSON.stringify(result.value));
   assert.equal(result.value.turns, 4);
   const intent = listResearchConsumerIntents(f.store, 'p', f.v.draft.id).find(row => row.value.kind === 'reading-planner')!;
   assert.equal(result.value.requestChars, first.value.requestChars + canonical(consumerIntentContext(f.store, intent.value)).length);
@@ -231,6 +251,7 @@ test('S6.3: planner admission on the next subject preserves the existing common 
   }
   assert.deepEqual(f.store.list('research-budget-ledger').map(row => row.id), ledger.map(row => row.id));
   assert.deepEqual(f.wires().map(wire => wire.subject.question.id), ['block', 'support']);
+  queueProducts(f);
 });
 
 test('S6.3: the explicit complete planner request limit refuses before reservation or payment', async t => {
@@ -271,8 +292,8 @@ for (const boundary of ['unpaid', 'paid'] as const)
 for (const action of [{ action: 'synthesize', question: '$selected' }, { action: 'pause', reason: 'Planner stopped' }])
   test(`S6.3: a paid planner ${action.action} keeps its exact terminal turn without starting another consumer`, async t => {
     const f = await setup(t); f.configure([action]);
-    const result = await f.run(2);
-    assert.equal(result.value.pauseCode, action.action === 'pause' ? 'research_model_paused' : 'research_v7_mode_unavailable',
+    const result = await f.run(1);
+    assert.equal(result.value.pauseCode, action.action === 'pause' ? 'research_model_paused' : 'research_turns_exhausted',
       JSON.stringify(result.value));
     const turns = f.store.list<any>('research-turn'); assert.equal(turns.length, 1);
     assert.equal(turns[0]!.value.status, 'completed');

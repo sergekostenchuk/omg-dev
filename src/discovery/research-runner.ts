@@ -8,7 +8,7 @@ import { earlyResearchStage, earlyResearchFailure, earlyResearchCorrection, deli
   requireEscalationReply, EARLY_RESEARCH_OUTCOME } from './early-research-outcome.js';
 import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './requirements.js';
 import { discoveryContext, discoveryInspection, type DiscoveryOutcome } from './discovery-outcome.js';
-import { savedSynthesisMaterials } from "./saved-synthesis.js";
+import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
@@ -53,12 +53,13 @@ import { readBundle, readSavedReaderBundleResult, readReaderResultAt, resumeRead
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead,
   addressedWorkspace, findAcceptedPaidAnswerChain } from "./research-continuation.js";
-import { addContextLookup, requireCompleteContextPacket } from './context-workspace.js';
+import { addContextLookup, contextWorkspace, requireCompleteContextPacket } from './context-workspace.js';
 import { dispatchMode, v7DispatchMode, projectReadingQueue, queueReadingPlan, queuedChildReached, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
 import { replayableLegacyCall } from "./response-replay.js";
 import { pendingSynthesis, synthesisSession, findUnfinishedSynthesisSession, synthesisOutcomeDelivery,
-  synthesisDeliveryMarks } from "./synthesis-session.js";
+  synthesisDeliveryMarks, findUnfinishedSynthesisSessionV3, readSynthesisSessionV3,
+  type UnfinishedSynthesisOperation } from "./synthesis-session.js";
 
 const PILOT_INSTRUCTION = `\nThis is the bounded R1/L2 reader experiment. Work only on context.question. The core preserves product intent and constraints; the catalogues identify exact additional context. For semantic source investigation prefer one related bundle: {"action":"read_bundle","purpose":"what to establish, including exceptions","inputs":[{"path":"relative/file","media":"text/plain"}]} or inputs [{"source":{"id":"...","revision":1,"hash":"..."}}]. Each bundle input may include range:{start,end} with original character offsets for a large source; partial windows are marked explicitly. The configured reader selects coordinates and the engine returns original text, never a paraphrase. For exact accepted map/stage/research data use {"action":"read_context","record":{"id":"...","revision":1,"hash":"..."},"pointer":"/projection/nodes/0"}; use the provided catalogue references and pointers. For original source verification read_source remains available. Source and context records are different: citations must use source references, not graph/stage record references. Retained readings and unresolved information are in the current packet. Do not re-read them without a concrete missing detail. Return a complete answer to this technical field; do not regenerate other answered fields or the project history. Missing contextual detail requires addressed reading, not an invented answer or a question to the owner.`;
 const SOURCE_READ_INSTRUCTION = `\nSource inventory names each saved read contract. Historical and unstructured source-read/v2 returns at most ${SOURCE_READ_MAX_CHARS} UTF-16 code units per action; outcome=clipped covers only served, not all requested. Never treat a clipped result as having read all of requested. Structured source-read/v3 gives a document of at most 60000 UTF-16 units in one read. For a larger structured source, first use its TOC and search {query}, then read_source at an addressed section range; a non-addressed whole-document request returns only overview and is not body evidence. Addressed windows end at paragraph boundaries, may fetch a tail shorter than 10000, and never cross the selected section. The result preserves requested and gives exact served, requestedCovered and documentComplete separately. Continue with another read_source using start=served.end when needed. Search returns at most 10 fragments and 50000 UTF-16 units including headings, section paths and repository navigation. It uses the matching paragraph plus one neighbour each side (two inward at an edge), merges text blocks shorter than 200 within the section, and bounds a paragraph longer than 5000 to 2000 units before and after the match. Overlaps are merged; truncated/hasMore signal omitted material. Fragments carry exact Source ranges and section paths; headings are navigation, not body proof.`;
@@ -1306,6 +1307,69 @@ export class Researcher {
         pauseCode: error instanceof EngineError ? error.code : "research_interrupted" });
     }
   }
+  /** Discover all subjects/editions before current-plan selection; positions,
+   * rather than record order or the answered plan anchor, order their work. */
+  private v7SynthesisRecovery(project: string, draftId: string): UnfinishedSynthesisOperation | null {
+    const subjects = new Map<string, V7PlanSubject>();
+    for (const head of this.store.list<any>("synthesis-session")) {
+      if (!head.id.startsWith("synthesis-session:v3:") || head.value.projectId !== project) continue;
+      const session = readSynthesisSessionV3(this.store, reference(head));
+      if (session.value.binding.draft.id === draftId) subjects.set(canonical(session.value.binding.subject), session.value.binding.subject);
+    }
+    const pending = [...subjects.values()].flatMap(subject => {
+      const operation = findUnfinishedSynthesisSessionV3(this.store, project, draftId, subject);
+      // A just-delivered pause still has its own pending turn to consume.
+      const delivered = operation?.session.value.delivered;
+      const pendingTurn = delivered ? this.store.get<ResearchTurn>(delivered.id) : null;
+      return operation && pendingTurn?.value.status !== "pending" ? [operation] : [];
+    });
+    if (pending.length > 1) {
+      const occupied = this.store.list<ResearchTurn>("research-turn");
+      requireCondition(pending.every(operation => operation.deliveryTurn !== null
+        && !occupied.some(turn => turn.value.run === operation.session.value.delivery?.run
+          && turn.value.number === operation.deliveryTurn))
+        && new Set(pending.map(operation => operation.session.value.delivery?.run)).size === 1
+        && new Set(pending.map(operation => operation.deliveryTurn)).size === pending.length,
+      "research_synthesis_ambiguous", "Several unfinished v3 subjects have no proven run order");
+      pending.sort((a, b) => a.deliveryTurn! - b.deliveryTurn!);
+    }
+    return pending[0] ?? null;
+  }
+
+  private async applyV7Synthesis(project: string, run: Revision<ResearchRun>, draft: Revision<DiscoveryDraft>,
+    question: Revision<Question>, environment: Revision<Environment>, context: Record<string, any>,
+    owner: ResearchRun["owner"], signal: AbortSignal | undefined, restoreOnly: boolean,
+    operation: UnfinishedSynthesisOperation | null,
+    workspace?: ReturnType<typeof addressedWorkspace>, workspaceGuards: Ref[] = []): Promise<Revision<ResearchRun>> {
+    const attached = operation ? listResearchConsumerIntents(this.store, project, draft.id)
+      .filter(intent => intent.value.owner.id === operation.session.id) : [];
+    const paid = attached.find(intent => intent.value.state === "running")
+      ?? (operation?.outcomePending ? attached.findLast(intent => intent.value.state === "applied") : undefined);
+    const savedProfile = paid?.value.profile;
+    const pilot = savedProfile ? this.store.get<ReaderPilot>(savedProfile.id, savedProfile.revision)
+      : readerPilot(this.store, project);
+    requireCondition(pilot?.kind === "reader-pilot" && (!savedProfile || canonical(reference(pilot)) === canonical(savedProfile)),
+      "reader_pilot_required", "The v3 session needs its exact paid or current reader profile");
+    const dispatch = paid?.value.dispatch ?? pilotEnvironment(environment.value, pilot.value);
+    const unboundPaid = operation && operation.deliveryTurn === null && attached.some(intent =>
+      ["prepared", "running"].includes(intent.value.state) && intent.value.cursor.delivery == null);
+    const number = operation?.deliveryTurn ?? run.value.turns + 1;
+    const reserve = operation?.deliveryTurn != null || unboundPaid ? undefined
+      : { write: { id: run.id, kind: run.kind, expected: run.revision,
+        value: { ...run.value, turns: number, requestChars: run.value.requestChars + canonical(context).length } },
+        guards: [reference(run)] };
+    const action = await synthesisSession(this.store, draft, question, environment, dispatch, pilot, context,
+      "Research the exact selected plan-question; preserve the exact subject and return its lawful attempt end.", signal,
+      { restoreOnly, ...(unboundPaid ? {} : { delivery: { run: run.id, turn: number } }),
+        ...(reserve ? { reserve } : {}), ...(workspace ? { initialWorkspace: workspace, initialWorkspaceGuards: workspaceGuards } : {}) });
+    run = this.store.get<ResearchRun>(run.id)!;
+    if (unboundPaid) return this.save(run, { status: "paused", pauseCode: "research_restore_complete",
+      error: "The direct v3 result is restored by its own history; it has no runner reservation" });
+    const applied = this.synthesisResultIntent(project, draft.id, run.id, number, action);
+    requireCondition(applied, "research_consumer_intent_invalid", "The v3 outcome lost its reserved producer");
+    return this.handoffSynthesis(applied, run, action, owner).run;
+  }
+
   /** A queued child consumes the exact paid planner's draft, question and
    * dispatch. The common reader owns its own reservation and paid replay. */
   private async applyV7QueuedChild(project: string, run: Revision<ResearchRun>, child: Revision<ResearchTurn>,
@@ -1425,8 +1489,36 @@ export class Researcher {
       "research_busy", "This draft already has an active researcher");
     try {
       for (;;) {
-        const recovery = selectV7AnalystRecovery(this.store, project, draftId, run);
+        const synthesis = this.v7SynthesisRecovery(project, draftId);
+        const reserved = synthesis?.deliveryTurn != null ? reference(synthesis.session) : undefined;
+        if (reserved) requireCondition(run && synthesis!.session.value.delivery?.run === id
+          && synthesis!.deliveryTurn === run.value.turns, "research_synthesis_ambiguous",
+          "The unfinished synthesis does not own this run position");
+        const recovery = selectV7AnalystRecovery(this.store, project, draftId, run, reserved);
         const { turns, intents, outstanding } = recovery;
+        if (synthesis) {
+          requireCondition(!recovery.turn && !outstanding, "research_synthesis_ambiguous",
+            "Saved synthesis conflicts with another unfinished run operation");
+          const binding = synthesis.session.value.binding;
+          const draft = this.store.get<DiscoveryDraft>(binding.draft.id, binding.draft.revision)!;
+          const question = this.store.get<Question>(binding.question.id, binding.question.revision)!;
+          const environment = this.store.get<Environment>(binding.environment.id, binding.environment.revision)!;
+          if (!run) run = this.store.write<ResearchRun>({ id, kind: "research-run", expected: 0,
+            value: { projectId: project, draftId, environment: reference(environment), status: "paused", turns: 0,
+              limit, inputs: draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null, owner, requestChars: 0 } });
+          if (run.value.status !== "running") run = this.save(run,
+            { status: "running", owner, error: null, pauseCode: null }, [reference(synthesis.session)]);
+          const context = { role: "research", stage: "discovery", subject: synthesis.subject!,
+            savedMaterials: synthesis.session.value.basis.materials,
+            previousProposal: synthesis.session.value.basis.previousProposal,
+            previousProposalRef: synthesis.session.value.basis.previousProposalRef, inventory: { sources: [] }, history: [] };
+          run = await this.applyV7Synthesis(project, run, draft, question, environment, context, owner, signal,
+            options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7 || used >= limit,
+            synthesis);
+          if (run.value.status === "paused") return run;
+          used++;
+          continue;
+        }
         const turn = recovery.turn;
         if (turn && isRef(turn.value.plannedBy)) {
           requireCondition(run, "research_consumer_intent_invalid", "The saved reader queue lost its run");
@@ -1525,10 +1617,13 @@ export class Researcher {
           }
           if (action.action === "answer") {
             if (paid.subject.working?.deliveryContract === "research-delivery/v1") {
-              const workspace = addressedWorkspace(this.store, sameTurns, question, row => {
-                const execution = readResearchConsumerExecution(this.store, project, (row.value as ManagedResearchTurn).consumerIntent);
-                return execution.kind === "response" ? execution.subject : null;
-              });
+              const session = producer.value.kind === "synthesis" || producer.value.kind === "consolidation"
+                ? readSynthesisSessionV3(this.store, producer.value.owner) : null;
+              const workspace = session ? contextWorkspace(session.value.workspace, session.value.focus)
+                : addressedWorkspace(this.store, sameTurns, question, row => {
+                  const execution = readResearchConsumerExecution(this.store, project, (row.value as ManagedResearchTurn).consumerIntent);
+                  return execution.kind === "response" ? execution.subject : null;
+                });
               requireCompleteContextPacket(workspace, paid.subject);
             }
             // The door repeats an existing immutable attempt before checking today's plan.
@@ -1642,8 +1737,9 @@ export class Researcher {
         const planningPilot = planning ? settingsPilot : null;
         requireCondition(!planning || planningPilot, "reading_plan_settings_missing",
           "A new planner intent requires its exact settings snapshot");
-        const mode = planning ? v7DispatchMode(this.store, project, turns, selection.question, subject, planning) : null;
-        requireCondition(mode !== "synthesis", "research_v7_mode_unavailable", "The v7 synthesis runner is not connected");
+        const savedMaterials = savedV7SynthesisMaterials(this.store, selection.draft, selection.question, subject);
+        const mode = savedMaterials ? "synthesis" : planning
+          ? v7DispatchMode(this.store, project, turns, selection.question, subject, planning) : null;
         if (run.value.status !== "running") run = this.save(run,
           { status: "running", owner, limit, ownerQuestion: null, error: null, pauseCode: null });
         const sources = new ResearchSources(this.store, project, effective.root);
@@ -1657,6 +1753,15 @@ export class Researcher {
           history: selectedTurns.map(row => row.value), contextWorkspace: workspace.entries.map(entry => entry.result),
           ...(webResearchCapability("discovery", "analyst", dispatch)
             ? { webResearch: webResearchGuide(webBudgetView(this.store, project, "discovery", dispatch.webResearch!)) } : {}) };
+        if (mode === "synthesis") {
+          Object.assign(context, savedMaterials
+            ? { savedMaterials, savedOnly: true, history: [] }
+            : { workingSelections: workingSelections(this.store, selectedTurns, selection.question, subject) });
+          run = await this.applyV7Synthesis(project, run, selection.draft, selection.question, environment,
+            context, owner, signal, false, null, workspace, selectedTurns.map(reference));
+          used++;
+          continue;
+        }
         const instruction = mode === "planning" ? PLANNING_INSTRUCTION + SOURCE_READ_INSTRUCTION : "Research the exact selected plan-question. Return an ordinary ResearchAction. An answer has question equal to the plan-question id, value equal to one of the four attempt ends in the supplied schema, and citations: []; claim evidence belongs inside the end. An attempt does not accept claims or close the stage. Read sources and context when needed; never invent evidence." + SOURCE_READ_INSTRUCTION;
         prepareResearchConsumerIntent(this.store, { projectId: project, kind: mode === "planning" ? "reading-planner" : "analyst",
           key: hashJson([id, run.value.turns + 1, mode === "planning" ? "reading-planner" : "analyst"]), owner: reference(run),
@@ -1952,7 +2057,8 @@ export class Researcher {
     // D8.4e: the second producer of O uses the shared projection, so the
     // acceptance era marker is fixed identically by both producers.
     const turnValue = projectSynthesisHandoffTurn({ intent: reference(original), runId: run.id,
-      number: run.value.turns, action, question: current.value.question });
+      number: run.value.turns, action, question: current.value.question,
+      ...(planSubjectOf(current.value.cursor) ? { subject: planSubjectOf(current.value.cursor)! } : {}) });
     const turnRef: Ref = { id: turnId, revision: 1, hash: hashJson(turnValue) };
     const writes: Write[] = [
       { id: run.id, kind: run.kind, expected: run.revision,
