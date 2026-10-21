@@ -10,7 +10,7 @@ import { producerContractEra, type ProducerPolicy, type UpstreamStage } from './
 import { discoveryContext, discoveryInspection, type DiscoveryOutcome } from './discovery-outcome.js';
 import { savedSynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
-import { planningForQuestion } from "./research-routing.js";
+import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
 import { Store, type Revision, type Write } from "../storage/store.js";
 import { Environments, uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
 import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
@@ -18,7 +18,7 @@ import { canonical, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { Discovery, type Decision, type DiscoveryDraft, type Question } from "./discovery.js";
 import type { EarlyUnknown, ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
-import { researchAction, researchCall } from "./research-protocol.js";
+import { researchAction, researchCall, prepareResearchEnvelope } from "./research-protocol.js";
 import { turnAction, projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectResearchTurnRevision, projectSourceReadingTurn, projectPaidLocalRefusal, projectRepeatedContextRead,
   projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES, webResearchCapability, admittedResearchAction,
@@ -54,7 +54,7 @@ import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta 
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead,
   addressedWorkspace, findAcceptedPaidAnswerChain } from "./research-continuation.js";
 import { addContextLookup, requireCompleteContextPacket } from './context-workspace.js';
-import { dispatchMode, queueReadingPlan, queuedChildReached, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
+import { dispatchMode, v7DispatchMode, projectReadingQueue, queueReadingPlan, queuedChildReached, splitPlannedContextRead, PLANNING_INSTRUCTION, SYNTHESIS_INSTRUCTION } from "./reading-plan.js";
 import { recoverableReadingPlan } from "./planning-recovery.js";
 import { replayableLegacyCall } from "./response-replay.js";
 import { pendingSynthesis, synthesisSession, findUnfinishedSynthesisSession, synthesisOutcomeDelivery,
@@ -1323,6 +1323,14 @@ export class Researcher {
         const recovery = selectV7AnalystRecovery(this.store, project, draftId, run);
         const { turns, intents, outstanding } = recovery;
         const turn = recovery.turn;
+        // S6.3 publishes a whole proved queue. Its children are connected by
+        // S6.4; keep this exact saved queue without another planner admission.
+        if (turn && isRef(turn.value.plannedBy)) {
+          const error = `[${turn.id}] The saved v7 reader queue awaits child execution`;
+          if (run!.value.status === "paused" && run!.value.pauseCode === "research_v7_mode_unavailable"
+            && run!.value.error === error) return run!;
+          return this.save(run!, { status: "paused", pauseCode: "research_v7_mode_unavailable", error }, [reference(turn)]);
+        }
         if (run && (turn || outstanding) && run.value.status !== "running")
           run = this.save(run, { status: "running", owner, error: null, pauseCode: null },
             [...(turn ? [reference(turn)] : []), ...(outstanding ? [reference(outstanding)] : [])]);
@@ -1336,16 +1344,27 @@ export class Researcher {
             const effective = this.environments.effective(project);
             requireCondition(canonical(outstanding.value.dispatch) === canonical({ ...effective.environment.value, workspace: effective.root }),
               "research_consumer_context_stale", "The unpaid research environment changed");
-            if (outstanding.value.kind === "analyst") requireCondition(selected
+            if (outstanding.value.kind !== "escalation-assessor") requireCondition(selected
               && canonical(current.planAnswer) === canonical(selected.planAnswer),
               "research_consumer_context_stale", "The unpaid intent belongs to another plan edition");
+            if (outstanding.value.kind === "reading-planner") {
+              const planning = planningForPlanSubject(this.store, project, reference(current.draft), selected!, options.producerPolicy);
+              requireCondition(planning, "reading_plan_disabled", "A new planner send requires its current explicit v7 settings");
+              const cursor = outstanding.value.cursor;
+              const envelope = prepareResearchEnvelope(outstanding.value.role, outstanding.value.dispatch, cursor.instruction,
+                consumerIntentContext(this.store, outstanding.value, outstanding.id),
+                { store: this.store, draftId, questionId: outstanding.value.question.id, purpose: 'reading-planner' },
+                cursor.resultCapacity, undefined, REQUEST_MANIFEST_CONTRACT);
+              requireCondition(envelope.input.length <= planning.maxRequestChars, "pilot_request_limit",
+                "The complete planner request exceeds its explicit v7 planning limit");
+            }
           }
           if (outstanding.value.kind === "escalation-assessor") {
             run = await this.applyEscalationIntent(outstanding, run, outstanding.value.dispatch, null, owner, limit, signal);
             if (run.value.status === "needs_owner") return run;
           } else {
-            requireCondition(outstanding.value.kind === "analyst", "research_v7_mode_unavailable",
-              "The v7 planner and synthesis consumers are not connected");
+            requireCondition(outstanding.value.kind === "analyst" || outstanding.value.kind === "reading-planner", "research_v7_mode_unavailable",
+              "The v7 synthesis consumers are not connected");
             if (outstanding.value.state === "prepared") {
               if (used >= limit) return this.save(run, { status: "paused", pauseCode: "research_turns_exhausted",
                 error: "Research turn allowance reached; paid attempts are preserved" }, [reference(outstanding)]);
@@ -1366,11 +1385,38 @@ export class Researcher {
           requireCondition(applied.value.state === "applied" && isRef(applied.value.call),
             "research_consumer_intent_invalid", "The paid turn lost its applied reservation");
           const action = turnAction(turn.value);
+          if (turn.value.dispatchMode === "planning") requireCondition(
+            ["read_plan", "synthesize", "pause"].includes(action.action), "research_mode_invalid",
+            "Planning selects reads or a synthesis transition, never an attempt answer");
           const paid = readResearchConsumerExecution(this.store, project, reference(producer));
           requireCondition(paid.kind === "response", "research_consumer_execution_failed", "The paid turn lost its response");
           const draft = this.store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
           const question = this.store.get<Question>(producer.value.question.id, producer.value.question.revision)!;
           const sameTurns = turns.filter(row => sameSubject(planSubjectOf(row.value), subject));
+          if (action.action === "read_plan") {
+            requireCondition(producer.value.kind === "reading-planner" && turn.value.dispatchMode === "planning",
+              "research_mode_invalid", "Only a paid planner may publish a v7 reading queue");
+            const children = projectReadingQueue(run, turn, question, action);
+            const refs = children.map(child => ({ id: child.id, revision: 1, hash: hashJson(child.value) }));
+            // Parent completion and every child appear together: no child can
+            // escape without the queued revision that proves its paid origin.
+            run = this.store.writeMany<ResearchRun | ResearchTurn>([
+              { id: run.id, kind: run.kind, expected: run.revision,
+                value: { ...run.value, turns: run.value.turns + children.length } },
+              { id: turn.id, kind: turn.kind, expected: turn.revision,
+                value: projectResearchTurnRevision(turn.value, { kind: 'reading-plan-queued', children: refs }) },
+              ...children.map(child => ({ ...child, kind: 'research-turn', expected: 0 }))
+            ], uniqueTransactionGuards([reference(run), reference(turn), reference(draft), reference(question),
+              ...draft.value.inputs, ...children.map(child => ({ id: child.id, absent: true as const }))]))[0] as Revision<ResearchRun>;
+            continue;
+          }
+          if (action.action === "synthesize") {
+            requireCondition(producer.value.kind === "reading-planner" && turn.value.dispatchMode === "planning",
+              "research_mode_invalid", "Only a paid planner may select a v7 synthesis transition");
+            this.store.writeMany([{ id: turn.id, kind: turn.kind, expected: turn.revision,
+              value: projectResearchTurnRevision(turn.value, { kind: 'reading-mode' }) }], [reference(run), reference(turn)]);
+            continue;
+          }
           if (action.action === "answer") {
             if (paid.subject.working?.deliveryContract === "research-delivery/v1") {
               const workspace = addressedWorkspace(this.store, sameTurns, question, row => {
@@ -1486,28 +1532,33 @@ export class Researcher {
         const subject: V7PlanSubject = { contract: V7_PLAN_SUBJECT_CONTRACT,
           planAnswer: selection.planAnswer, planQuestionId: selection.next.planQuestionId };
         const selectedTurns = turns.filter(row => sameSubject(planSubjectOf(row.value), subject));
+        const planning = planningForPlanSubject(this.store, project, reference(selection.draft), subject, options.producerPolicy);
+        const planningPilot = planning ? readerPilot(this.store, project) : null;
+        const mode = planning ? v7DispatchMode(this.store, project, turns, selection.question, subject, planning) : null;
+        requireCondition(mode !== "synthesis", "research_v7_mode_unavailable", "The v7 synthesis runner is not connected");
         const sources = new ResearchSources(this.store, project, effective.root);
         const workspace = addressedWorkspace(this.store, selectedTurns, selection.question, row => {
           const paid = readResearchConsumerExecution(this.store, project, (row.value as ManagedResearchTurn).consumerIntent);
           return paid.kind === "response" ? paid.subject : null;
         });
         const dispatch = { ...environment.value, workspace: effective.root };
-        const context = { role: "research", stage: "discovery", subject, inventory: sources.inventory(),
+        const context = { role: "research", stage: "discovery", subject, ...(mode ? { dispatchMode: mode } : {}), inventory: sources.inventory(),
           history: selectedTurns.map(row => row.value), contextWorkspace: workspace.entries.map(entry => entry.result),
           ...(webResearchCapability("discovery", "analyst", dispatch)
             ? { webResearch: webResearchGuide(webBudgetView(this.store, project, "discovery", dispatch.webResearch!)) } : {}) };
-        const instruction = "Research the exact selected plan-question. Return an ordinary ResearchAction. An answer has question equal to the plan-question id, value equal to one of the four attempt ends in the supplied schema, and citations: []; claim evidence belongs inside the end. An attempt does not accept claims or close the stage. Read sources and context when needed; never invent evidence." + SOURCE_READ_INSTRUCTION;
-        prepareResearchConsumerIntent(this.store, { projectId: project, kind: "analyst",
-          key: hashJson([id, run.value.turns + 1, "analyst"]), owner: reference(run),
+        const instruction = mode === "planning" ? PLANNING_INSTRUCTION + SOURCE_READ_INSTRUCTION : "Research the exact selected plan-question. Return an ordinary ResearchAction. An answer has question equal to the plan-question id, value equal to one of the four attempt ends in the supplied schema, and citations: []; claim evidence belongs inside the end. An attempt does not accept claims or close the stage. Read sources and context when needed; never invent evidence." + SOURCE_READ_INSTRUCTION;
+        prepareResearchConsumerIntent(this.store, { projectId: project, kind: mode === "planning" ? "reading-planner" : "analyst",
+          key: hashJson([id, run.value.turns + 1, mode === "planning" ? "reading-planner" : "analyst"]), owner: reference(run),
           draft: reference(selection.draft), question: reference(selection.question),
           role: dispatch.implementer, dispatch, profile: null,
-          cursor: { run: id, turn: run.value.turns + 1, mode: null, instruction, context, subject },
-          basis: uniqueRefs([...selection.draft.value.inputs, selection.planAnswer, ...selectedTurns.map(reference), ...sources.list().map(reference)]),
+          cursor: { run: id, turn: run.value.turns + 1, mode, instruction, context, subject },
+          basis: uniqueRefs([...selection.draft.value.inputs, selection.planAnswer, ...(planningPilot ? [reference(planningPilot)] : []),
+            ...selectedTurns.map(reference), ...sources.list().map(reference)]),
           guards: uniqueTransactionGuards([reference(run), reference(selection.draft), reference(selection.question),
             reference(environment), ...effective.guards, ...selection.draft.value.inputs, selection.planAnswer,
-            ...selectedTurns.map(reference), ...sources.list().map(reference),
+            ...(planningPilot ? [reference(planningPilot)] : []), ...selectedTurns.map(reference), ...sources.list().map(reference),
             { id: paidTurnId(id, run.value.turns + 1), absent: true }]) }, [],
-          options.contextContract ? { contextContract: options.contextContract } : {});
+          options.contextContract && mode !== "planning" ? { contextContract: options.contextContract } : {});
       }
     } catch (error) {
       const current = this.store.get<ResearchRun>(id) ?? run;
@@ -1688,9 +1739,12 @@ export class Researcher {
     // prepare-time pins for them would otherwise stale a lawfully saved paid
     // response after a later profile change.
     const environmentHead = this.store.get<Environment>(`environment:${intent.value.projectId}`);
+    const planningHead = subject && intent.value.kind === "reading-planner"
+      ? this.store.get<ReaderPilot>(`reader-pilot:${intent.value.projectId}`) : null;
     const prepared = prepareResearchConsumerApplication(this.store, reference(intent), reference(paid.call), writes,
       uniqueTransactionGuards([reference(run), { id: turnId, absent: true },
         ...(environmentHead ? [reference(environmentHead)] : []),
+        ...(planningHead ? [reference(planningHead)] : []),
         ...(pilot ? [reference(pilot)] : [])]));
     const saved = this.store.writeMany<ResearchRun | ResearchTurn>(prepared.writes, prepared.guards);
     return { run: saved[0]! as Revision<ResearchRun>, turn: saved[1]! as Revision<ResearchTurn>, sent: paid.subject };

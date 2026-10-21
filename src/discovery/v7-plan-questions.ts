@@ -170,9 +170,9 @@ export function planAttemptSelection(store: Store, projectId: string): CurrentPl
     next: open.find(question => (question.question as Record<string, Json>)["class"] === "blocking") ?? open[0] ?? null };
 }
 
-/** S6.2: recovery of the connected analyst/owner-review branches only. The
+/** S6.2: recovery of the connected analyst/planner/owner-review turn branches only. The
  * exact saved position is selected before consulting today's accepted plan.
- * Planner and synthesis recovery are deliberately not admitted by this selector. */
+ * Synthesis session recovery is deliberately not admitted by this selector. */
 export function selectV7AnalystRecovery(store: Store, projectId: string, draftId: string,
   run: Revision<ResearchRun> | null): {
     turns: Revision<ManagedResearchTurn>[]; intents: Revision<ResearchConsumerIntent>[];
@@ -198,15 +198,19 @@ export function selectV7AnalystRecovery(store: Store, projectId: string, draftId
   if (run && (turns.length !== run.value.turns
     || turns.some((row, index) => row.value.number !== index + 1)))
     invalid("The analyst turns do not prove one complete run position");
-  if (pending.length > 1 || unfinished.length > 1)
+  const queued = pending.some(row => isRef(row.value.plannedBy));
+  if (queued && (unfinished.length || pending.some(row => !isRef(row.value.plannedBy))
+    || new Set(pending.map(row => canonical(row.value.plannedBy))).size !== 1))
+    invalid("The saved reader queue conflicts with another run operation");
+  if (pending.length > 1 && !queued || unfinished.length > 1)
     invalid("Several incompatible analyst operations claim this run position");
   const turn = pending[0], outstanding = unfinished[0];
-  if (turn && turn.value.number !== run!.value.turns)
+  if (turn && !queued && turn.value.number !== run!.value.turns)
     invalid("The unfinished analyst turn is not at its saved run position");
   if (outstanding) {
     const value = outstanding.value;
-    if (value.kind !== "analyst" && value.kind !== "escalation-assessor")
-      refuse("research_v7_mode_unavailable", outstanding.id, "The v7 planner and synthesis consumers are not connected");
+    if (value.kind !== "analyst" && value.kind !== "reading-planner" && value.kind !== "escalation-assessor")
+      refuse("research_v7_mode_unavailable", outstanding.id, "The v7 synthesis consumers are not connected");
     const owner = readExact<ResearchRun>(store, value.owner);
     const position = value.cursor.turn as number;
     const ownerPosition = value.kind === "escalation-assessor" ? position : position - 1;
@@ -217,6 +221,7 @@ export function selectV7AnalystRecovery(store: Store, projectId: string, draftId
     if (!owner || owner.kind !== "research-run" || !obj(owner.value) || owner.id !== runId
       || owner.value.projectId !== projectId || owner.value.draftId !== draftId || hashJson(owner.value) !== owner.hash
       || owner.value.turns !== ownerPosition || run!.value.turns !== ownerPosition
+      || value.kind === "reading-planner" && value.cursor.mode !== "planning"
       || !subject || !draft || draft.kind !== "discovery-draft" || draft.id !== draftId
       || !obj(draft.value) || !Array.isArray(draft.value.questions) || draft.value.projectId !== projectId
       || !question || question.kind !== "question" || !obj(question.value)
@@ -233,7 +238,7 @@ export function selectV7AnalystRecovery(store: Store, projectId: string, draftId
       invalid("The owner review does not own this exact pending analyst turn");
     // An already-paid turn N is older than an admitted next call N+1. Its
     // application precedes even the current-plan admission of that new send.
-    if (turn && value.kind === "analyst") return { turns, intents, turn, outstanding: undefined };
+    if (turn && value.kind !== "escalation-assessor") return { turns, intents, turn, outstanding: undefined };
   }
   return { turns, intents, turn, outstanding };
 }

@@ -1,0 +1,280 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
+import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
+import { Store, type Revision } from '../src/storage/store.js';
+import { ProductEngine } from '../src/product/engine.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
+import { canonical, type Json } from '../src/canonical.js';
+import { answerDiscoveryFixture } from './product-fixture.js';
+import { researchCall } from '../src/discovery/research-protocol.js';
+import { Researcher } from '../src/discovery/research-runner.js';
+import type { V7PlanSubject } from '../src/discovery/v7-managed-attempt.js';
+import { readResearchConsumerTurn } from '../src/discovery/response-recovery.js';
+import { v7PlannerRounds } from '../src/discovery/reading-plan.js';
+import { listResearchConsumerIntents, consumerIntentContext } from '../src/discovery/response-recovery.js';
+
+function fixture(t: { after(fn: () => void): void }) {
+  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3k-"));
+  const path = join(root, "state.sqlite"), stores: Store[] = [];
+  const open = () => { const db = new Store(path); stores.push(db); return db; };
+  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  return { root, path, store, engine, discovery, open };
+}
+type Fixture = ReturnType<typeof fixture>;
+
+const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
+
+function validFrame(): Json {
+  return { productType: "internal", scale: "30 users across 10 sites",
+    industries: ["construction"], domains: ["materials supply", "equipment accounting"],
+    axes: allAxes("deep"),
+    budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
+}
+type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
+  criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
+function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
+  return { id, axis, domain: "construction", text: `What covers ${id}?`,
+    class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
+    roles: ["domain expert"], searchPlaces: ["domain documents"] };
+}
+function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
+  return { edition, frame: frameRef, previous, questions } as unknown as Json;
+}
+function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
+  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
+  assert.ok(question, `question for ${field}`);
+  return question;
+}
+/** The real plan acceptance chain (frame and plan through #answer). */
+function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
+  const base = createPartialV7Draft(f.discovery, project, "concept");
+  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
+  const frame = questionOf(f.store, base, "frame");
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
+  const planQ = questionOf(f.store, base, "plan");
+  answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
+  const plan = f.store.get<Question>(planQ.id)!;
+  return { draft: f.store.get<DiscoveryDraft>(base.id)!, plan, planAnswer: plan.value.answer!, frameRef };
+}
+
+async function setup(t: test.TestContext, questions = [planQuestion('support','market'), planQuestion('block','industry','blocking')], calibrated = true, planning = true) {
+  const f=fixture(t);f.engine.execute({type:'create-project',project:'p',title:'P'});
+  const wire=join(f.root,'wire.ndjson'), settings=join(f.root,'reply.json'), adapter=join(f.root,'adapter.mjs');
+  const configure=(replies: unknown[]=[], tokens: number | null=10)=>writeFileSync(settings,JSON.stringify({replies,tokens}));
+  configure();
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
+let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
+appendFileSync(${JSON.stringify(wire)},raw+'\\n');
+let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+if(research.question==='$selected')research.question=r.subject.question.id;
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
+  const command={executable:process.execPath,args:[adapter]};
+  const environment=f.engine.environments.configure('p',{workspace:f.root,
+    implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},
+    fullCheck:command,timeoutMs:5000},0);
+  const calibration=f.discovery.create('p','discovery','R0','concept',[
+    {field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'object'}}],[],6);
+  const calibrate = async (tokens = 10) => {
+    configure([], tokens);
+    await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'analyst'});
+    configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    configure([ended(), {necessary:true,reason:'Calibration review'}, {action:'read_plan',question:'$selected',reads}], tokens);
+    await researchCall(environment.value.implementer,environment.value,'Calibrate planner',{dispatchMode:'planning'},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'reading-planner'});
+    configure();writeFileSync(wire,'');
+  };
+  if (calibrated) await calibrate();
+  configure();writeFileSync(wire,'');
+  const v=acceptPlan(f,'p',questions);
+  const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
+    .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
+  const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
+  const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]);
+  const commandForPilot = { executable: process.execPath, args: [adapter] };
+  const enablePlanning = (maxRequestChars = 100000) => f.engine.execute({ type: 'configure-reader-pilot', project: 'p', expected: 0, settings: { experimental: true, active: true,
+    stopAfter: 'L2', reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command: commandForPilot },
+    agentCommand: commandForPilot, maxRequestChars: 100000, maxReadChars: 20000, maxReplyChars: 10000,
+    maxCalls: 20, maxReportedTokens: 100000,
+    v7Planning: { contract: 'v7-plan-planning/v1', maxRequestChars, maxRounds: 3 } } });
+  if (planning) enablePlanning();
+  return {...f,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
+}
+
+const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
+
+const reads = [{ action: 'search', query: 'one exact symbol' }, { action: 'read', path: 'scope.txt', media: 'text/plain' }];
+const planner = { action: 'read_plan', question: '$selected', reads };
+
+test('S6.3: a real paid planner publishes one original turn and its complete exact subject queue', async t => {
+  const f = await setup(t); f.configure([planner]);
+  const before = f.store.list('research-budget-ledger');
+  const result = await f.run(1);
+  assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
+  const rows = f.store.list<any>('research-turn').sort((a,b) => a.value.number-b.value.number);
+  assert.equal(rows.length, 3); assert.equal(result.value.turns, 3); assert.ok(result.value.requestChars > 0);
+  const parent = rows[0]!, original = f.store.get<any>(parent.id, 1)!;
+  assert.equal(original.value.dispatchMode, 'planning'); assert.equal(original.value.status, 'pending');
+  assert.equal(parent.revision, 2); assert.equal(parent.value.status, 'completed');
+  assert.deepEqual(parent.value.action, { ...planner, question: 'block' });
+  const subject: V7PlanSubject = { contract: 'v7-plan-subject/v1', planAnswer: f.v.planAnswer, planQuestionId: 'block' };
+  assert.deepEqual(parent.value.subject, subject);
+  assert.equal(v7PlannerRounds(f.store, 'p', subject), 1);
+  assert.deepEqual(parent.value.observation.children, rows.slice(1).map(reference));
+  for (const [index, child] of rows.slice(1).entries()) {
+    assert.deepEqual(child.value.action, reads[index]); assert.deepEqual(child.value.subject, subject);
+    assert.deepEqual(child.value.question, reference(f.v.plan)); assert.deepEqual(child.value.plannedBy, reference(original));
+    assert.equal(Object.hasOwn(child.value, 'attemptContract'), false);
+    assert.deepEqual(readResearchConsumerTurn(f.store, reference(child)), child);
+  }
+  assert.deepEqual(readResearchConsumerTurn(f.store, reference(parent)), parent);
+  const intent = listResearchConsumerIntents(f.store, 'p', f.v.draft.id).find(row => row.value.kind === 'reading-planner')!;
+  assert.equal(intent.value.state, 'applied');
+  const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+  assert.equal(f.wires().length, 1); assert.equal(ledger.length, before.length + 1);
+  const history = f.history(); assert.deepEqual(await f.run(1, f.open(), false), result);
+  assert.deepEqual(f.history(), history); assert.deepEqual(f.store.list('model-call'), calls);
+  assert.deepEqual(f.store.list('research-budget-ledger'), ledger); assert.equal(f.wires().length, 1);
+});
+
+for (const boundary of ['paid', 'before-queue', 'in-queue', 'after-queue'] as const)
+  test(`S6.3: cold continuation after ${boundary} keeps one planner payment and an atomic complete queue`, async t => {
+    const f = await setup(t); f.configure([planner]);
+    const write = f.store.writeMany.bind(f.store);
+    let cut = false;
+    f.store.writeMany = ((writes, guards = []) => {
+      const parent = writes.some(row => row.kind === 'research-turn' && row.id.startsWith('research-turn:v1:')
+        && row.expected === (boundary === 'paid' ? 0 : 1));
+      const queued = writes.filter(row => row.kind === 'research-turn' && row.expected === 0 && !row.id.startsWith('research-turn:v1:'));
+      if (!cut && parent && (boundary === 'paid' || queued.length === 2)) {
+        cut = true;
+        if (boundary === 'after-queue') write(writes, guards);
+        if (boundary === 'in-queue') {
+          // A real conflict at the last child must roll back the preceding run,
+          // parent and first child writes in the same Store transaction.
+          const damaged = writes.map(row => row.id === queued[1]!.id ? { ...row, expected: 1 } : row);
+          return write(damaged, guards);
+        }
+        throw new Error(`S6.3 cut ${boundary}`);
+      }
+      return write(writes, guards);
+    }) as Store['writeMany'];
+    const paused = await f.run(1); f.store.writeMany = write;
+    assert.equal(cut, true, JSON.stringify(paused.value)); assert.equal(paused.value.status, 'paused');
+    const saved = f.store.list<any>('research-turn');
+    assert.equal(saved.length, boundary === 'paid' ? 0 : boundary === 'after-queue' ? 3 : 1);
+    assert.equal(paused.value.turns, boundary === 'paid' ? 0 : boundary === 'after-queue' ? 3 : 1);
+    const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+    const cold = f.open(), result = await f.run(1, cold, false);
+    assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
+    assert.equal(result.value.turns, 3); assert.ok(result.value.requestChars > 0);
+    const turns = cold.list<any>('research-turn'); assert.equal(turns.length, 3);
+    for (const turn of turns) assert.deepEqual(readResearchConsumerTurn(cold, reference(turn)), turn);
+    assert.equal(turns.filter(turn => turn.id.startsWith('research-turn:v1:')).length, 1);
+    assert.deepEqual(cold.list('model-call'), calls); assert.deepEqual(cold.list('research-budget-ledger'), ledger);
+    assert.equal(f.wires().length, 1);
+    const before = f.history(); assert.deepEqual(await f.run(1, f.open(), false), result);
+    assert.deepEqual(f.history(), before);
+  });
+
+for (const invalid of ['foreign-question', 'attempt-answer'] as const)
+  test(`S6.3: ${invalid} preserves the paid response without publishing a queue or attempt`, async t => {
+    const f = await setup(t);
+    f.configure([invalid === 'foreign-question' ? { ...planner, question: 'foreign' } : ended()]);
+    const result = await f.run(1);
+    assert.equal(result.value.pauseCode, invalid === 'foreign-question' ? 'reading_plan_invalid' : 'research_mode_invalid',
+      JSON.stringify(result.value));
+    const turns = f.store.list<any>('research-turn'); assert.equal(turns.length, 1);
+    assert.equal(turns[0]!.value.status, 'pending'); assert.equal(turns[0]!.value.dispatchMode, 'planning');
+    assert.equal(f.store.list('research-attempt').length, 0);
+    const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+    await f.run(1, f.open(), false);
+    assert.deepEqual(f.store.list('model-call'), calls); assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
+    assert.equal(f.wires().length, 1);
+  });
+
+test('S6.3: planner admission on the next subject preserves the existing common budget and run counters', async t => {
+  const f = await setup(t, undefined, true, false);
+  const first = await f.run(1);
+  assert.equal(first.value.pauseCode, 'research_turns_exhausted'); assert.equal(first.value.turns, 1);
+  const segments = f.store.list('research-budget'), ledger = f.store.list<any>('research-budget-ledger');
+  assert.equal(segments.length, 1); assert.equal(ledger.length, 1);
+  f.enablePlanning(); f.configure([ended(), planner]);
+  const result = await f.run(1, f.open());
+  assert.equal(result.value.pauseCode, 'research_v7_mode_unavailable', JSON.stringify(result.value));
+  assert.equal(result.value.turns, 4);
+  const intent = listResearchConsumerIntents(f.store, 'p', f.v.draft.id).find(row => row.value.kind === 'reading-planner')!;
+  assert.equal(result.value.requestChars, first.value.requestChars + canonical(consumerIntentContext(f.store, intent.value)).length);
+  assert.deepEqual(f.store.list('research-budget').map(row => row.id), segments.map(row => row.id));
+  for (const row of ledger) {
+    assert.deepEqual(f.store.get(row.id, row.revision), row);
+    const next = f.store.get<any>(row.id)!;
+    assert.equal(next.value.assignments.length, row.value.assignments.length + 1);
+    assert.deepEqual(next.value.assignments.slice(0, row.value.assignments.length), row.value.assignments);
+    const calls = f.store.list<any>('model-call').filter(call => call.value.draftId === f.v.draft.id);
+    assert.deepEqual(new Set(next.value.assignments.map((item: any) => item.call)), new Set(calls.map(call => call.id)));
+  }
+  assert.deepEqual(f.store.list('research-budget-ledger').map(row => row.id), ledger.map(row => row.id));
+  assert.deepEqual(f.wires().map(wire => wire.subject.question.id), ['block', 'support']);
+});
+
+test('S6.3: the explicit complete planner request limit refuses before reservation or payment', async t => {
+  const f = await setup(t, undefined, true, false); f.enablePlanning(1); f.configure([planner]);
+  const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+  const result = await f.run(1);
+  assert.equal(result.value.pauseCode, 'pilot_request_limit', JSON.stringify(result.value));
+  assert.deepEqual(f.store.list('model-call'), calls); assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
+  assert.equal(f.store.list('research-turn').length, 0); assert.equal(f.wires().length, 0);
+});
+
+for (const boundary of ['unpaid', 'paid'] as const)
+  test(`S6.3: disabling planning after ${boundary} admission cannot send anew or discard paid work`, async t => {
+    const f = await setup(t); f.configure([planner]);
+    const write = f.store.writeMany.bind(f.store); let cut = false;
+    f.store.writeMany = ((writes, guards = []) => {
+      if (!cut && writes.some(row => row.expected === 0 && row.kind ===
+        (boundary === 'unpaid' ? 'model-call' : 'research-turn'))) {
+        cut = true; throw new Error(`S6.3 settings ${boundary}`);
+      }
+      return write(writes, guards);
+    }) as Store['writeMany'];
+    await f.run(1); f.store.writeMany = write; assert.equal(cut, true);
+    const configured = f.store.list<any>('reader-pilot')[0]!;
+    const { projectId: _project, ...settings } = configured.value;
+    f.engine.execute({ type: 'configure-reader-pilot', project: 'p', expected: configured.revision,
+      settings: { ...settings, active: false } });
+    const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+    const cold = f.open(), result = await f.run(1, cold);
+    assert.equal(result.value.pauseCode, boundary === 'paid' ? 'research_v7_mode_unavailable' : 'reading_plan_disabled',
+      JSON.stringify(result.value));
+    assert.equal(cold.list('research-turn').length, boundary === 'paid' ? 3 : 0);
+    for (const row of cold.list('research-turn')) assert.deepEqual(readResearchConsumerTurn(cold, reference(row)), row);
+    assert.deepEqual(cold.list('model-call'), calls); assert.deepEqual(cold.list('research-budget-ledger'), ledger);
+    assert.equal(f.wires().length, boundary === 'paid' ? 1 : 0);
+  });
+
+for (const action of [{ action: 'synthesize', question: '$selected' }, { action: 'pause', reason: 'Planner stopped' }])
+  test(`S6.3: a paid planner ${action.action} keeps its exact terminal turn without starting another consumer`, async t => {
+    const f = await setup(t); f.configure([action]);
+    const result = await f.run(2);
+    assert.equal(result.value.pauseCode, action.action === 'pause' ? 'research_model_paused' : 'research_v7_mode_unavailable',
+      JSON.stringify(result.value));
+    const turns = f.store.list<any>('research-turn'); assert.equal(turns.length, 1);
+    assert.equal(turns[0]!.value.status, 'completed');
+    assert.deepEqual(readResearchConsumerTurn(f.store, reference(turns[0]!)), turns[0]);
+    assert.equal(listResearchConsumerIntents(f.store, 'p', f.v.draft.id).length, 1);
+    assert.equal(f.store.list('synthesis-session').length, 0); assert.equal(f.wires().length, 1);
+    const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+    await f.run(1, f.open(), false);
+    assert.deepEqual(f.store.list('model-call'), calls); assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
+    assert.equal(f.wires().length, 1);
+  });
