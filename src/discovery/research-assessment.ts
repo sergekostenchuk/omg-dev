@@ -613,6 +613,7 @@ function attemptsAssessmentValue(store: Store, proof: AssessmentProof): Discover
     'discovery_assessment_invalid', 'The paid attempts assessment must declare its v2 methodology before dispatch');
   const { value } = projectPaidAttemptsAssessment({ subject: subject!, session: proof.session,
     application: proof.application, assessor: proof.role.actor, environment: proof.environment, result: proof.result });
+  requireCondition(value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2, 'discovery_assessment_invalid', 'The historical assessment producer admits only its exact paid v2 declaration');
   requireCondition(same(proof.question, subject!.packet.question) && proof.dispatch.projectId === value.projectId
     && same(proof.role, proof.dispatch.reviewer), 'discovery_assessment_invalid', 'The paid assessor belongs to this exact subject and role');
   const checked = checkDiscoveryAssessmentForm(store, value);

@@ -1,5 +1,5 @@
 import type { AssessmentTransportSubject } from './continuation-packet.js';
-import { DISCOVERY_ASSESSMENT_CONTRACT_V2, type DiscoveryAttemptsAssessmentV2 } from './research-model.js';
+import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type DiscoveryAttemptsAssessmentV2, type DiscoveryAttemptsAssessmentV3, type PaidDiscoveryAttemptsAssessment } from './research-model.js';
 import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME, researchResultFailure, requireAttemptsAssessmentReply,
   type EarlyUnknownAdmission } from './early-research-outcome.js';
 import { Ajv, type ValidateFunction } from 'ajv';
@@ -2290,20 +2290,31 @@ export function projectPaidOwnerReview(beforeRun: ResearchRun, beforeTurn: Manag
  * structural and provenance checks before exposing the resulting assessment. */
 export function projectPaidAttemptsAssessment(input: { subject: AssessmentTransportSubject;
   session: Ref; application: Ref; environment: Ref; assessor: string; result: unknown }):
-  { id: string; value: DiscoveryAttemptsAssessmentV2 } {
-  requireCondition(input.subject?.assessment?.contract === DISCOVERY_ASSESSMENT_CONTRACT_V2
+  { id: string; value: PaidDiscoveryAttemptsAssessment } {
+  const contract = input.subject?.assessment?.contract;
+  requireCondition((contract === DISCOVERY_ASSESSMENT_CONTRACT_V2 || contract === DISCOVERY_ASSESSMENT_CONTRACT_V3)
     && isRef(input.session) && isRef(input.application) && isRef(input.environment)
     && typeof input.assessor === 'string' && input.assessor.trim().length > 0,
-    'discovery_assessment_invalid', 'A projected assessment needs its exact paid inputs and explicit v2 subject');
+    'discovery_assessment_invalid', 'A projected assessment needs its exact paid inputs and explicit versioned subject');
   requireAttemptsAssessmentReply(input.result, input.subject);
   requireCondition(input.result !== null && typeof input.result === 'object' && !Object.hasOwn(input.result, 'action'),
     'discovery_assessment_invalid', 'A continuation is not a terminal packet assessment');
-  const result = input.result as Pick<DiscoveryAttemptsAssessmentV2, 'verdict'|'reasons'|'return'|'novelty'|'methodology'>;
-  const value: DiscoveryAttemptsAssessmentV2 = { contract: DISCOVERY_ASSESSMENT_CONTRACT_V2,
-    projectId: input.subject.packet.project, subject: { kind: 'attempts', packet: input.subject.packet }, baseline: input.subject.baseline,
-    session: input.session, application: input.application, assessor: input.assessor, environment: input.environment,
-    verdict: result.verdict, reasons: result.reasons, return: result.return, novelty: result.novelty, methodology: result.methodology };
+  const origin = { projectId: input.subject.packet.project,
+    subject: { kind: 'attempts' as const, packet: input.subject.packet }, baseline: input.subject.baseline,
+    session: input.session, application: input.application, assessor: input.assessor, environment: input.environment };
+  // The exact declared wire schema above proves the correlated policy/novelty
+  // form. A saved v2 response always retains its original form and address.
+  let value: PaidDiscoveryAttemptsAssessment;
+  if (contract === DISCOVERY_ASSESSMENT_CONTRACT_V3) {
+    const result = input.result as Pick<DiscoveryAttemptsAssessmentV3, 'verdict'|'reasons'|'return'|'novelty'|'methodology'>;
+    value = { ...origin, contract, verdict: result.verdict, reasons: result.reasons, return: result.return,
+      novelty: result.novelty, methodology: result.methodology };
+  } else {
+    const result = input.result as Pick<DiscoveryAttemptsAssessmentV2, 'verdict'|'reasons'|'return'|'novelty'|'methodology'>;
+    value = { ...origin, contract, verdict: result.verdict, reasons: result.reasons, return: result.return,
+      novelty: result.novelty, methodology: result.methodology };
+  }
   return { id: discoveryAssessmentId(value), value };
 }
-export const discoveryAssessmentId = (value: Pick<DiscoveryAttemptsAssessmentV2, 'projectId'|'session'|'application'>) =>
-  `discovery-assessment:v2:${hashJson({ projectId: value.projectId, session: value.session, application: value.application })}`;
+export const discoveryAssessmentId = (value: Pick<PaidDiscoveryAttemptsAssessment, 'contract'|'projectId'|'session'|'application'>) =>
+  `discovery-assessment:${value.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3 ? 'v3' : 'v2'}:${hashJson({ projectId: value.projectId, session: value.session, application: value.application })}`;
