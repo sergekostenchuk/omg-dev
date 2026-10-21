@@ -40,7 +40,7 @@ import { assessFact, assessmentAttemptReason, assessmentRefusalId,
   readAssessmentSet, readCurrentAssessmentAttemptClosure, ASSESSMENT_RESULT_KIND,
   type AssessmentIntentRequest, type AssessmentResultRecord } from "../src/om/assessment.js";
 import {
-  classifyRefusal, journalId, normalizeOriginSource, originSourceKey, readJournal, recordRefusal, unitRefusalNamespace,
+  classifyRefusal, journalId, normalizeOriginSource, originSourceKey, readJournal, readJournalAt, recordRefusal, unitRefusalNamespace,
   REFUSAL_JOURNAL_KIND, UNIT_REFUSAL_KIND, type RefusalJournal, type OriginSource,
 } from "../src/om/refusal-journal.js";
 import {
@@ -4829,4 +4829,95 @@ test("G7FIX own semantic and technical E4 terminals remain admissible and unknow
   const before = mechanismSnapshot(f.store);
   assert.equal(refusalOf(openAttempt(f.store, { ...f.address, attempt: 2, goal: round.goal, completion: binding.value.plan } as never)).code, "origin_held");
   assert.deepEqual(mechanismSnapshot(f.store), before);
+});
+
+
+test("G7CTX first managed close retains prior classifications from its exact journal through warm and cold replay", async t => {
+  const f = m5Fixture(t, true);
+  f.steps([{ research: {}, usage: lp6Usage }, { research: {}, usage: lp6Usage }]);
+  const firstCall = f.call();
+  const configuration = f.store.get<import("../src/runtime/environment.js").Environment>(firstCall.dispatch.config.id)!;
+  const open = (ordinal: number) => deliveredOf(openAttempt(f.store, { ...f.address, attempt: ordinal,
+    goal: f.goal, admission: f.admission, completion: { routes: reference(f.routes), batches: [f.batch.id] } } as never));
+  const callFor = (series: Revision<unknown>, ordinal: number) => ({ ...firstCall,
+    packet: reference(deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.routes),
+      batch: f.batch.id, environment: reference(configuration), attempt: { series: reference(series), ordinal }, previous: [] })).record) });
+  const requestFor = (attempt: number) => ({ ...f.address, attempt, outcome: deliveredOf(prepareManagedClaim(f.store,
+    { ...f.address, attempt, outcome: outcome() })).outcome });
+  for (let ordinal = 1; ordinal <= 2; ordinal++) {
+    const call = ordinal === 1 ? firstCall : callFor(open(ordinal), ordinal);
+    deliveredOf(await runModelCall(f.store, call));
+    const request = requestFor(ordinal);
+    assert.equal(request.outcome.reason, "off-form");
+    assert.ok(request.outcome.refusals.length > 0);
+    deliveredOf(closeAttempt(f.store, request));
+  }
+  const third = open(3);
+  callFor(third, 3);
+  const binding = deliveredOf(readCompletionBinding(f.store, f.project, reference(third), 3))!;
+  const input = reference(f.store.get(`om-input:${f.project}`)!), graph = reference(f.store.get(`graph:${f.project}`)!);
+  deliveredOf(writeAddressing(f.store, { project: f.project, input, graph,
+    decisions: [{ pending: structuredClone(inputDecisionWrite({ project: f.project, input, graph, layers: [],
+      decision: { target: "garden-B1", field: "state", value: { writer: "garden-produce-block" } } })) as Write }] }));
+  const ceased = [];
+  for (;;) {
+    const work = deliveredOf(readCompletionWorkAt(f.store, f.project,
+      reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    const resolved = new Set(work.resolved.map(row => row.id));
+    let moved = false;
+    for (const assignment of work.assignments.filter(row => !resolved.has(row.id))) {
+      const next = writeCompletionCessation(f.store, { project: f.project, binding: reference(binding), assignment: reference(assignment) });
+      if (next.ok) { ceased.push(next.value); moved = true; break; }
+    }
+    if (!moved) break;
+  }
+  assert.ok(ceased.length > 0);
+  const request = requestFor(3);
+  assert.equal(request.outcome.reason, "interrupted");
+  assert.deepEqual(request.outcome.refusals, [], "The third close adds no refusal classifications");
+  const prepared = deliveredOf(prepareCloseAttempt(f.store, request));
+  const first = deliveredOf(closeAttempt(f.store, request));
+  assert.deepEqual(first, prepared.value);
+  assert.equal(first.withoutProgress, 3);
+  assert.deepEqual(first.stop?.attempts, [1, 2, 3]);
+  const saved = deliveredOf(readCompletionCloseAt(f.store, f.project,
+    reference(f.store.get(completionCloseId(f.project, binding.id))!)));
+  assert.ok(saved.journal);
+  const exact = deliveredOf(readJournalAt(f.store, f.project, saved.journal));
+  assert.ok(first.context && first.context.repeated.length > 0);
+  for (const row of first.context.repeated) {
+    const classified = exact.value.classifications.find(item => item.row === row.row)!;
+    assert.ok(classified);
+    assert.deepEqual([row.class, row.addressee], [classified.class, classified.addressee]);
+    assert.deepEqual([row.class, row.addressee], ["conditions", `owner:${f.series.id}`]);
+  }
+  const sends = readFileSync(join(f.root, "trace.jsonl"), "utf8");
+  assert.equal(sends.trim().split("\n").length, 2, "The ceased third attempt sends no model call");
+  const repeat = () => {
+    const before = mechanismSnapshot(f.store);
+    const get = f.store.get.bind(f.store);
+    f.store.get = ((id: string, revision?: number) => {
+      if (id === saved.journal!.id) assert.equal(revision, saved.journal!.revision, "Replay reads the exact close journal, never its current head");
+      return get(id, revision);
+    }) as Store["get"];
+    try {
+      const again = deliveredOf(prepareCloseAttempt(f.store, request));
+      assert.deepEqual(again.writes, []);
+      assert.deepEqual(again.value, first);
+      assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), first);
+    } finally { f.store.get = get; }
+    assert.deepEqual(mechanismSnapshot(f.store), before);
+    assert.equal(readFileSync(join(f.root, "trace.jsonl"), "utf8"), sends);
+  };
+  repeat();
+  f.restart();
+  repeat();
+  const late = journalled(f.store, f.project, { sources: [] }, { goal: "later unrelated refusal" });
+  deliveredOf(classifyRefusal(f.store, { project: f.project, row: late.row,
+    class: "derivation", addressee: "code:later", basis: [] }));
+  assert.ok(f.store.get(journalId(f.project))!.revision > saved.journal.revision);
+  assert.deepEqual(deliveredOf(readJournalAt(f.store, f.project, saved.journal)), exact);
+  repeat();
+  f.restart();
+  repeat();
 });

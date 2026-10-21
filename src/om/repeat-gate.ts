@@ -2418,7 +2418,8 @@ function managedCloseBundle(store: Store, request: AnyCloseAttemptRequest, heads
   const writes: GateWrite[] = [...(linked?.writes ?? []), ...extra, closeWrite, ...completed.writes];
   const guards: TransactionGuard[] = [reference(heads.series), reference(workHead),
     heads.ledger ?? { id: callLedgerId(project), absent: true }, ...heads.products, ...completed.guards, ...first.guards, ...extraGuards];
-  const decided: readonly RefusalClassification[] = first.classifications.length && batch ? batch.value.classifications : [];
+  const decided: readonly RefusalClassification[] = batch ? batch.value.classifications
+    : journal ? managedTake(readJournalAt(base, project, journal)).value.classifications : [];
   if (batch) { writes.push(...batch.writes); guards.push(...batch.guards); }
   guards.push(journalGuard);
   const raised: HoldContext[] = [];
