@@ -1,5 +1,5 @@
 import { hashJson } from '../src/canonical.js';
-import { DISCOVERY_CLAIMS_CONTRACT } from '../src/discovery/v7-contracts.js';
+import { DISCOVERY_CLAIMS_CONTRACT, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from '../src/discovery/v7-contracts.js';
 import { assessAttempts, assessAttemptsWithRequirements } from '../src/discovery/research-assessment.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -61,7 +61,7 @@ function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string
 /** The real plan acceptance chain (frame and plan through #answer). */
 function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, "concept");
-  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
+  const src = f.discovery.evidence.document(project, `basis:${base.id}`, `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(f.store, base, "frame");
   answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
@@ -366,4 +366,39 @@ test('6.2-D: applied v2 classifications keep their own contract beside v3',async
   const m=save(f,snapshot(f,p.claims,[contradiction([
     side(p.claims[0]!,'accepted',p.refs[0]!),side(p.claims[1]!,'rejected',p.refs[0]!)])]));
   assert.deepEqual(readDossierContradictionsAt(f.open(),'p',m,{assessments:p.refs}).contradictions[0]!.sides.map(s=>s.status),['accepted','rejected']);
+});
+
+
+test('6.2-D-01: historical grounds retain exact draft membership after corrupt later heads, including another draft',async t=>{
+  const f=await setup(t),other=acceptPlan(f,'p',[planQuestion('other-question','industry')]);
+  const m=save(f,snapshot(f,[],[]));
+  const answers=[f.v.frameRef,other.frameRef];
+  const grounds={assessments:answers.map(a=>f.store.get<any>(a.id,a.revision)!.value.assessment as Ref)};
+  const before=readDossierContradictionsAt(f.open(),'p',m,grounds);
+  for(const draft of [f.v.draft,other.draft]) {
+    const head=f.store.get<DiscoveryDraft>(draft.id)!;
+    f.store.write({id:head.id,kind:head.kind,expected:head.revision,value:{...head.value,questions:[]}});
+  }
+  const frame=f.store.get<any>(f.v.frameRef.id,f.v.frameRef.revision)!;
+  const q=f.store.get<any>(frame.value.question)!;
+  const actId=discoveryAcceptanceActId('p',f.v.draft.id,q.value.spec.field,f.v.frameRef);
+  const act=f.store.get<DiscoveryAcceptanceAct>(actId,1)!;
+  f.store.write({id:act.id,kind:act.kind,expected:act.revision,value:{broken:true}});
+  const records=f.store.list(),calls=f.wires().length;
+  assert.equal(readDossierManifestStructural(f.open(),'p',m).verification,'structural');
+  assert.deepEqual(readDossierContradictionsAt(f.open(),'p',m,grounds),before);
+  assert.deepEqual(f.store.list(),records);assert.equal(f.wires().length,calls);
+  for(const mode of ['missing-draft','substituted-draft','missing-act'] as const) {
+    const cold=f.open(),get=cold.get.bind(cold),link=act.value.draftBefore;
+    cold.get=((id:string,revision?:number)=>{
+      if(mode==='missing-act' && id===act.id && revision===1)return null;
+      if(id===link.id && revision===link.revision) {
+        if(mode==='missing-draft')return null;
+        if(mode==='substituted-draft')return {...get(id,revision)!,hash:hashJson('substituted')};
+      }
+      return get(id,revision);
+    }) as typeof cold.get;
+    refused(()=>readDossierContradictionsAt(cold,'p',m,grounds));
+  }
+  assert.deepEqual(f.store.list(),records);assert.equal(f.wires().length,calls);
 });

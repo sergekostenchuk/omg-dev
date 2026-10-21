@@ -1,3 +1,4 @@
+import { pendingSnapshotView } from '../history/proofs.js';
 import { canonical, hashJson } from '../canonical.js';
 import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
@@ -5,10 +6,11 @@ import { proveClaimAddress, resolveClaimAddress, type ClaimAddress } from './cla
 import type { Store, Revision } from '../storage/store.js';
 import type { DossierManifest } from './dossier-manifest.js';
 import { proveAppliedAttemptClassification } from './v7-progress.js';
-import { V7_ATTEMPT_KIND, V7_CLAIM_KINDS } from './v7-contracts.js';
+import { V7_ATTEMPT_KIND, V7_CLAIM_KINDS, V7_CONTRACT_ERA, DISCOVERY_ACCEPTANCE_ACT_KIND,
+  discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from './v7-contracts.js';
 import { readDiscoveryAssessment, directAssessmentBasis } from './research-assessment.js';
 import { readAcceptedResearchAnswer, type DiscoveryDraft, type Question } from './discovery.js';
-import { proveIssuedAnswer, issuedAnswerSchemaHolds } from './projection-reader.js';
+import { proveIssuedAnswer, issuedAnswerSchemaHolds, savedAcceptanceAct } from './projection-reader.js';
 import type { PaidDiscoveryAttemptsAssessment, ResearchAnswer, ResearchAssessment } from './research-model.js';
 
 /** DR6 6.2-F (codex-omg №9189, №9412): the closed structural form of the
@@ -181,15 +183,41 @@ export function checkDossierContradictionEvidence(store: Store, manifest: Dossie
     const value = own.answer.value;
     const assessment = own.assessment;
     if (assessment) at(reference(assessment), 'research-assessment', 'assessment');
-    const question = assessment && isRef(assessment.value.question)
-      ? at<Question>(assessment.value.question, 'question', 'assessment.question')
-      : store.get<Question>(value.question);
-    if (!question || question.kind !== 'question' || question.value.projectId !== manifest.projectId)
+    if (!assessment || !isRef(assessment.value.question))
+      invalid('assessment.question', 'The historical answer needs its exact assessed question');
+    const question = at<Question>(assessment.value.question, 'question', 'assessment.question');
+    if (question.value.projectId !== manifest.projectId || question.id !== value.question)
       invalid('assessment.question', 'The historical answer needs its own issued question');
-    const draft = store.get<DiscoveryDraft>(question.value.draftId);
-    if (!draft || draft.kind !== 'discovery-draft' || draft.value.projectId !== manifest.projectId
-      || !draft.value.questions.includes(question.id)) invalid('assessment.question', 'The answer belongs to its own draft');
-    const proof = proveIssuedAnswer(store, draft, {question, foreign:false, answered:true,
+    const field = question.value.spec.field;
+    const actId = discoveryAcceptanceActId(manifest.projectId, question.value.draftId, field, answerRef);
+    const act = store.get<DiscoveryAcceptanceAct>(actId,1);
+    let draft: Revision<DiscoveryDraft>;
+    const pinned: Revision<unknown>[] = [question];
+    if (act) {
+      at(reference(act), DISCOVERY_ACCEPTANCE_ACT_KIND, 'assessment.acceptance');
+      if (!isRef(act.value.draftBefore) || !isRef(act.value.draftAfter))
+        invalid('assessment.draft', 'The saved acceptance fixes its own draft revisions');
+      draft = at<DiscoveryDraft>(act.value.draftBefore, 'discovery-draft', 'assessment.draft');
+      const after = at<DiscoveryDraft>(act.value.draftAfter, 'discovery-draft', 'assessment.draft');
+      if (![draft,after].every(d => d.id === question.value.draftId && d.value.projectId === manifest.projectId
+        && Array.isArray(d.value.questions) && d.value.questions.includes(question.id)))
+        invalid('assessment.question', 'The question belongs to both exact draft revisions of its saved acceptance');
+      pinned.push(act,draft);
+      if (!savedAcceptanceAct(pendingSnapshotView(store,pinned),draft,question,field,answerRef,value.value))
+        invalid('assessment.acceptance', 'The exact saved acceptance does not bind this answer and question');
+    } else {
+      // A legacy/rejected classification may have no acceptance. Its question
+      // must still belong to an explicitly pinned draft of its own era.
+      const ownDraft = own.binding?.value.draftBefore ?? manifest.draft;
+      draft = at<DiscoveryDraft>(ownDraft, 'discovery-draft', 'assessment.draft');
+      if (draft.id !== question.value.draftId || draft.value.projectId !== manifest.projectId
+        || !Array.isArray(draft.value.questions) || !draft.value.questions.includes(question.id)
+        || (draft.value.contractVersion === V7_CONTRACT_ERA && assessment.value.verdict === 'supported'))
+        invalid('assessment.question', 'The answer needs exact question membership and the acceptance of its own era');
+      pinned.push(draft);
+    }
+    const view = pendingSnapshotView(store,pinned);
+    const proof = proveIssuedAnswer(view, draft, {question, foreign:false, answered:true,
       answerRef, field:question.value.spec.field},
       own.answer as unknown as Revision<Record<string, unknown>>, {verifyIssuedQuestion:true});
     if (!proof.ok || proof.proof.provenance.kind !== 'research-answer')
@@ -199,8 +227,8 @@ export function checkDossierContradictionEvidence(store: Store, manifest: Dossie
       || !issuedAnswerSchemaHolds(question, proof.proof.value) || !assessment
       || !['supported','insufficient','conflicting'].includes(assessment.value.verdict))
       invalid('assessment', 'The historical classification must prove this exact answer and question');
-    directAssessmentBasis(store, assessment);
-    return {assessment, status:assessment.value.verdict === 'supported' ? 'accepted' as const : 'rejected' as const};
+    directAssessmentBasis(view, assessment);
+    return {assessment, view, status:assessment.value.verdict === 'supported' ? 'accepted' as const : 'rejected' as const};
   }
   const attempts = new Map<string, Revision<PaidDiscoveryAttemptsAssessment>>();
   const historical = new Map<string, Revision<ResearchAssessment>>();
@@ -256,18 +284,20 @@ export function checkDossierContradictionEvidence(store: Store, manifest: Dossie
     if (side.assessment !== null && !seen.has(canonical(side.assessment)))
       invalid(`${field}.assessment`, 'The side assessment is not in the exact snapshot set');
     let origin: {assessment: Ref|null; application:Ref|null; status:'accepted'|'rejected'};
+    let proofStore = store;
     if (side.claim.containerKind === V7_ATTEMPT_KIND) {
       const proof = proveAppliedAttemptClassification(store, side.claim);
       origin = {assessment:reference(proof.assessment), application:reference(proof.application), status:proof.status};
       if (!same(side.assessment, origin.assessment)) invalid(`${field}.assessment`, 'Only the original first applied assessment classifies this claim');
     } else {
       const proof = answers.get(key) ?? answerGround(side.claim.container);
+      proofStore = proof.view;
       origin = {assessment:reference(proof.assessment), application:null, status:proof.status};
       if (side.assessment !== null && !same(side.assessment, origin.assessment))
         invalid(`${field}.assessment`, 'The answer keeps its original historical assessment');
     }
     if (origin.status !== side.status) invalid(`${field}.status`, 'The declared status differs from its proven classification');
-    if (side.status === 'accepted') proveClaimAddress(store, side.claim);
+    if (side.status === 'accepted') proveClaimAddress(proofStore, side.claim);
     evidence.set(key, origin);
     return {...side, application:origin.application};
   }
@@ -303,7 +333,9 @@ export function checkDossierContradictionEvidence(store: Store, manifest: Dossie
             if (origin?.assessment && same(origin.assessment,link) && seen.has(canonical(link))) {covered.add(k);related=true;}
           } else if ([V7_ATTEMPT_KIND,'research-answer'].includes(row.kind) && side.status === 'accepted'
             && same(side.claim.container,link)) {
-            proveClaimAddress(store,side.claim);covered.add(k);related=true;
+            // proveSide already ran the common accepted proof, including the
+            // historical answer's pinned draft/question view.
+            if (origin?.status === 'accepted') {covered.add(k);related=true;}
           }
         }
         if (!related) invalid(atField, 'A supported ground proves a presented side through its original assessment or accepted claim container');
