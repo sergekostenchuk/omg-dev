@@ -173,3 +173,22 @@ export interface V7ProgressSummary {
   count: number; streak: number; outcome: 'open' | 'closed' | 'unknown' | 'stalled';
   reason: string | null; nextAction: string | null;
 }
+
+export interface V7ProgressApplication {
+  contract: 'v7-progress-application/v1'; subject: V7ProgressSubject; assessment: Ref;
+  previous: Ref | null; methodologyOrigins: { claim: ClaimAddress; assessment: Ref }[];
+  reused: Ref[]; priorEvents: Ref[]; attempts: Ref[]; after: V7ProgressSummary;
+}
+export interface V7ProgressState {
+  contract: 'v7-progress-state/v1'; subject: V7ProgressSubject; application: Ref; summary: V7ProgressSummary;
+}
+export interface V7AttemptAccount {
+  contract: 'v7-attempt-account/v1'; subject: V7ProgressSubject; application: Ref; attempt: Ref;
+  number: number; accepted: ClaimAddress[]; eventIds: string[]; streak: number;
+}
+export interface V7ProgressEvent {
+  contract: 'research-progress-event/v1'; id: string; subject: V7ProgressSubject; application: Ref; attempt: Ref;
+  contentKey: string; type: 'claim' | 'constraint' | 'transition';
+  basis: { claim: ClaimAddress } | { constraint: Ref }
+    | { transition: { from: V7ProgressSummary['outcome']; to: string; bases: V7TransitionBasis[] } };
+}

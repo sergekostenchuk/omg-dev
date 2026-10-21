@@ -1,12 +1,19 @@
-import { canonical, HASH_RE } from '../canonical.js';
+import { canonical, hashJson, HASH_RE } from '../canonical.js';
 import { EngineError } from '../errors.js';
-import { isRef, type Ref } from '../pipeline/contracts.js';
+import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V3, type PaidDiscoveryAttemptsAssessment,
-  type V7ProgressSubject, type V7ProgressSummary } from './research-model.js';
-import type { Store } from '../storage/store.js';
-import { requireMethodologyClosure } from './assessment-methodology.js';
-import type { ClaimAddress } from './claim-address.js';
+  V7_PROGRESS_BASELINE_CONTRACT, type V7ProgressBaseline, type V7ProgressState, type V7ProgressApplication,
+  type V7AttemptAccount, type V7ProgressEvent, type V7ProgressSubject, type V7ProgressSummary } from './research-model.js';
+import type { Store, Revision, Write, TransactionGuard } from '../storage/store.js';
+import { historicalProof, withHistoricalReads } from '../history/proofs.js';
+import { closureFactClaims, requireMethodologyClosure } from './assessment-methodology.js';
+import { proveClaimAddress, resolveClaimAddress, type ClaimAddress } from './claim-address.js';
 import { readDiscoveryAssessment } from './research-assessment.js';
+import { readResearchConsumerTurn } from './response-recovery.js';
+import { managedTurnId, type ManagedResearchTurn } from './research-consumer-transition.js';
+import { attemptAccountKey, progressEventKey, v7ProgressStateId, baselineGuards, checkDiscoveryAssessmentForm,
+  claimContentKey, constraintContentKey, transitionContentKey, type V7AssessmentSubject } from './v7-attempt-assessment.js';
+import { V7_ATTEMPT_KIND } from './v7-contracts.js';
 
 export type V7ProgressCounters = Pick<V7ProgressSummary, 'cursor' | 'count' | 'streak'>;
 export interface V7FoldAttempt { attempt: Ref; number: number; contentKeys: readonly string[] }
@@ -179,4 +186,357 @@ export function checkV7AssessmentClosure(store: Store, project: string, assessme
     used.push({ claim: structuredClone(row.claim), assessment: { ...ref } });
   }
   return { assessment: { ...assessment }, transition: structuredClone(transition), methodologyOrigins: used };
+}
+
+export const PROGRESS_APPLICATION_KIND = 'v7-progress-application';
+export const ATTEMPT_ACCOUNT_KIND = 'v7-attempt-account';
+export const PROGRESS_EVENT_KIND = 'research-progress-event';
+const STATE_KIND = 'v7-progress-state';
+const same = (a: unknown, b: unknown) => canonical(a) === canonical(b);
+const appId = (ref: Ref) => `v7-progress-application:${hashJson(ref)}`;
+function fail(code: string, field: string, reason: string): never {
+  throw new EngineError(code, `[${field}] ${reason}`, { field, reason });
+}
+function need(ok: unknown, field: string, reason: string): asserts ok {
+  if (!ok) fail('discovery_progress_conflict', field, reason);
+}
+function exact<T>(store: Store, ref: Ref, kind: string): Revision<T> {
+  const row = isRef(ref) ? store.get<T>(ref.id, ref.revision) : null;
+  need(row && row.kind === kind && row.hash === ref.hash && hashJson(row.value) === ref.hash,
+    kind, 'The exact historical record is absent, changed or foreign');
+  return row;
+}
+function acceptedAt(a: PaidDiscoveryAttemptsAssessment, attempt: Ref): ClaimAddress[] {
+  return a.novelty.accepted.filter(c => same(c.claim.container, attempt)).map(c => c.claim)
+    .sort((x, y) => Number(x.pointer.slice(8)) - Number(y.pointer.slice(8)));
+}
+function predicted<T>(id: string, kind: string, revision: number, value: T): Revision<T> {
+  return { id, kind, revision, hash: hashJson(value), value };
+}
+const initial = (): V7ProgressSummary => ({ cursor: null, count: 0, streak: 0, outcome: 'open',
+  reason: null, nextAction: null });
+
+/** Only the new interval of the deterministic managed run is read. A missing,
+ * pending or omitted earlier answer of this subject cannot be jumped over. */
+function orderedPrefix(store: Store, assessment: PaidDiscoveryAttemptsAssessment, before: V7ProgressSummary,
+  fresh: readonly Ref[]): void {
+  const packet = checkDiscoveryAssessmentForm(store, assessment).packet;
+  if (before.cursor && before.cursor.run !== packet.run)
+    fail('discovery_progress_order_invalid', 'cursor.run', 'The subject cannot change its saved managed run');
+  const start = before.cursor?.number ?? 0;
+  const last = packet.entries.at(-1)!.number;
+  if (packet.entries.some(e => fresh.some(ref => same(ref, reference(e.attempt.attempt))) && e.number <= start))
+    fail('discovery_progress_order_invalid', 'cursor', 'An unaccounted attempt precedes the saved prefix');
+  const included = new Set(packet.entries.map(e => e.original.id));
+  for (let n = start + 1; n <= last; n++) {
+    const turn = store.get<ManagedResearchTurn>(managedTurnId(packet.run, n));
+    if (!turn) fail('discovery_progress_order_invalid', 'cursor', 'A managed position in the prefix is missing');
+    readResearchConsumerTurn(store, reference(turn));
+    // The historical reader above proves the era-specific action; the generic
+    // legacy researchAction validator does not accept a v7 attempt answer.
+    const subject = turn.value.subject;
+    if (turn.value.attemptContract && subject && same(subject.planAnswer, assessment.subject.packet.planAnswer)
+      && subject.planQuestionId === assessment.subject.packet.planQuestionId
+      && (turn.value.status !== 'completed' || (turn.value.action as { action: string }).action === 'answer'
+        && (!turn.value.attemptBinding || !included.has(turn.id))))
+      fail('discovery_progress_order_invalid', 'packet', 'An earlier attempt of this subject is pending or omitted');
+  }
+}
+
+/** P.3's internal accepted-claim route uses the first atomic account. P.4
+ * connects the public claim-address router to this same proof, not a new flag. */
+function acceptedPremise(store: Store, address: ClaimAddress): ReturnType<typeof proveAppliedAttemptClaim> | null {
+  if (address.containerKind === V7_ATTEMPT_KIND) return proveAppliedAttemptClaim(store, address);
+  proveClaimAddress(store, address);return null;
+}
+function methodology(store: Store, paid: Revision<PaidDiscoveryAttemptsAssessment>, reused: Revision<V7AttemptAccount>[]): V7MethodologyOrigin[] {
+  const assessment = paid.value, transition = assessment.novelty.transition;
+  const origins: V7MethodologyOrigin[] = [];
+  if (transition?.outcome === 'closed') for (const claim of closureFactClaims(store, transition.bases, assessment.projectId)) {
+    if (assessment.methodology.facts.some(fact => same(fact.claim, claim))) continue;
+    const proof = acceptedPremise(store, claim);
+    if (!proof) fail('discovery_novelty_invalid', 'methodologyOrigins', 'The accepted premise has no original paid attempts methodology');
+    origins.push({ claim, assessment: reference(proof.assessment) });
+  }
+  const checked = checkV7AssessmentClosure(store, assessment.projectId, reference(paid), origins);
+  // A covered attempt can occur in this packet again. Its new paid annotation
+  // is not the original methodology of an already accepted fact.
+  return checked.methodologyOrigins.map(origin => {
+    if (!reused.some(account => same(account.value.attempt, origin.claim.container))) return origin;
+    const proof = proveAppliedAttemptClaim(store, origin.claim);
+    const original = proof.assessment.value.methodology.facts.find(fact => same(fact.claim, origin.claim));
+    const requirement = assessment.contract === DISCOVERY_ASSESSMENT_CONTRACT_V3
+      ? assessment.novelty.transition?.sufficiency?.methodologyRequirements.find(row => same(row.claim, origin.claim)) : null;
+    if (!original || !requirement) fail('discovery_novelty_invalid', 'methodologyOrigins',
+      'The reused fact requires its original accepted methodology and explicit closure requirement');
+    requireMethodologyClosure(original, requirement, 'methodologyOrigins');
+    return { claim: origin.claim, assessment: reference(proof.assessment) };
+  });
+}
+
+interface Derived {
+  application: Revision<V7ProgressApplication>; state: Revision<V7ProgressState>;
+  accounts: Revision<V7AttemptAccount>[]; events: Revision<V7ProgressEvent>[];
+}
+/** The same projection builds the write batch and re-derives its immutable
+ * receipts. Existing accounts/events are named exact inputs, never a scan. */
+function project(store: Store, paid: Revision<PaidDiscoveryAttemptsAssessment>,
+  previous: Revision<V7ProgressState> | null, reused: Revision<V7AttemptAccount>[], prior: Revision<V7ProgressEvent>[]): Derived {
+  const a = paid.value, checked = checkDiscoveryAssessmentForm(store, a), packet = checked.packet;
+  const subject: V7AssessmentSubject = { project: a.projectId, planAnswer: packet.packet.planAnswer,
+    planQuestionId: packet.packet.planQuestionId };
+  need(same(a.baseline.state, previous ? { kind: 'state', ref: reference(previous) }
+    : { kind: 'absent', id: v7ProgressStateId(subject) }), 'baseline.state', 'The assessment fixes its exact predecessor');
+  orderedPrefix(store, a, previous?.value.summary ?? initial(), packet.entries
+    .filter(e => !reused.some(r => r.id === attemptAccountKey(subject, reference(e.attempt.attempt)))).map(e => reference(e.attempt.attempt)));
+  const methodologyOrigins = methodology(store, paid, reused);
+  // Accepted baseline materials have their own exact provenance, including
+  // attempts of other questions; resolve alone is deliberately insufficient.
+  for (const material of a.baseline.materials) acceptedPremise(store, material);
+  const previousSummary = previous?.value.summary ?? initial();
+  const summary: V7ProgressSummary = structuredClone(previousSummary);
+  const reusedById = new Map(reused.map(r => [r.id, r]));
+  need(reusedById.size === reused.length && reused.every(r => packet.entries.some(e =>
+    r.id === attemptAccountKey(subject, reference(e.attempt.attempt)))), 'reused', 'Only unique accounts of this packet may be reused');
+  need(new Set(prior.map(r => r.id)).size === prior.length, 'priorEvents', 'Each prior event is named once');
+  const seen = new Map(prior.map(e => [e.id, e]));
+  const counting = new Map<string, V7FoldAttempt>(packet.entries.map(entry => {
+    const attempt = reference(entry.attempt.attempt);return [attempt.id, { attempt, number: entry.number, contentKeys: [] }];
+  }));
+  const accountBodies: Omit<V7AttemptAccount, 'application'>[] = [];
+  const eventBodies: Omit<V7ProgressEvent, 'application'>[] = [];
+  const accepted = new Set(a.novelty.accepted.map(c => canonical(c.claim)));
+  for (const entry of packet.entries) {
+    const attempt = reference(entry.attempt.attempt), id = attemptAccountKey(subject, attempt);
+    const old = reusedById.get(id);
+    const claims = acceptedAt(a, attempt);
+    if (old) {
+      need(same(old.value.subject, subject) && same(old.value.attempt, attempt), 'account', 'A reused account belongs to its exact attempt');
+      need(same(old.value.accepted, claims), 'account.accepted', 'A second judgment cannot revise the first claim acceptance');
+      continue;
+    }
+    const keys: { key: string; basis: { claim: ClaimAddress } | { constraint: Ref }; type: 'claim' | 'constraint' }[] = [];
+    const premise = (address: ClaimAddress) => {
+      if (!accepted.has(canonical(address))) acceptedPremise(store, address);
+    };
+    for (const claim of claims) {
+      // Source bytes, ranges, inference premises and owner authority are proved
+      // even for duplicates. An accepted claim does not upgrade its kind.
+      const key = claimContentKey(store, claim, { premise });
+      const duplicate = a.novelty.duplicates.find(c => same(c.claim, claim));
+      if (duplicate) {
+        premise(duplicate.of);
+        // Semantic duplication is the paid assessor's decision. Distinct
+        // captures/locations may have different code keys for the same fact.
+        claimContentKey(store, duplicate.of, { premise });
+      } else keys.push({ key, basis: { claim }, type: 'claim' });
+    }
+    const transition = a.novelty.transition;
+    const constraints = (transition?.bases ?? []).filter((b): b is { constraint: Ref } => 'constraint' in b && same(b.constraint, attempt));
+    if (transition && constraints.length) {
+      const key = constraintContentKey(store, attempt);
+      // Repeated evidence cannot become new through a renamed attempt.
+      keys.push({ key, basis: { constraint: attempt }, type: 'constraint' });
+    }
+    counting.get(attempt.id)!.contentKeys = keys.map(item => item.key);
+    const emitted: string[] = [];
+    for (const item of keys) {
+      const eventId = progressEventKey(subject, item.key);
+      if (seen.has(eventId) || eventBodies.some(e => e.id === eventId)) continue;
+      emitted.push(eventId);
+      eventBodies.push({ contract: 'research-progress-event/v1', id: eventId, subject, attempt,
+        contentKey: item.key, type: item.type, basis: item.basis });
+    }
+
+    accountBodies.push({ contract: 'v7-attempt-account/v1', subject, attempt,
+      number: entry.number, accepted: claims, eventIds: emitted, streak: 0 });
+  }
+  const fold = foldV7Progress({ subject, run: packet.run,
+    previous: previous ? { subject: previous.value.subject, counters: {
+      cursor: previousSummary.cursor, count: previousSummary.count, streak: previousSummary.streak } } : null,
+    attempts: [...counting.values()], accounted: reused.map(account => account.value.attempt),
+    knownContentKeys: prior.map(event => event.value.contentKey) });
+  Object.assign(summary, fold.counters);
+  for (const row of fold.fresh) accountBodies.find(account => same(account.attempt, row.attempt))!.streak = row.streak;
+  const transition = a.novelty.transition;
+  if (transition) {
+    const newlyAccepted = eventBodies.filter(e => transition.bases.some(b => same(b, e.basis)));
+    if (newlyAccepted.length) {
+      const key = transitionContentKey(previousSummary.outcome, transition.outcome, newlyAccepted.map(e => e.contentKey));
+      const id = progressEventKey(subject, key), cause = newlyAccepted.at(-1)!;
+      if (!seen.has(id)) {
+        eventBodies.push({ contract: 'research-progress-event/v1', id, subject, attempt: cause.attempt,
+          contentKey: key, type: 'transition', basis: { transition: { from: previousSummary.outcome,
+            to: transition.outcome, bases: newlyAccepted.map(e => e.basis as { claim: ClaimAddress } | { constraint: Ref }) } } });
+        accountBodies.find(b => same(b.attempt, cause.attempt))!.eventIds.push(id);
+      }
+    }
+  }
+  need(accountBodies.length > 0, 'application', 'An application must account for a previously unaccounted attempt');
+  if (a.novelty.transition) {
+    summary.outcome = a.novelty.transition.outcome;
+    summary.reason = a.novelty.transition.reason;
+    summary.nextAction = a.novelty.transition.nextAction ?? null;
+  }
+  if (summary.outcome === 'open' || summary.outcome === 'stalled') {
+    summary.outcome = summary.streak >= 3 ? 'stalled' : 'open';
+    summary.reason = summary.outcome === 'stalled' ? 'Three distinct assessed attempts produced no new accepted basis'
+      : a.novelty.transition?.outcome === 'open' ? a.novelty.transition.reason : null;
+    summary.nextAction = summary.outcome === 'stalled' ? 'Change the accepted research basis before another dispatch' : null;
+  }
+  const value: V7ProgressApplication = { contract: 'v7-progress-application/v1', subject, assessment: reference(paid),
+    previous: previous ? reference(previous) : null, methodologyOrigins, reused: reused.map(reference), priorEvents: prior.map(reference),
+    attempts: accountBodies.map(b => b.attempt), after: summary };
+  const application = predicted(appId(reference(paid)), PROGRESS_APPLICATION_KIND, 1, value);
+  const accounts = accountBodies.map(value => predicted(attemptAccountKey(subject, value.attempt), ATTEMPT_ACCOUNT_KIND,
+    1, { ...value, application: reference(application) }));
+  const events = eventBodies.map(value => predicted(value.id, PROGRESS_EVENT_KIND, 1,
+    { ...value, application: reference(application) }));
+  const state = predicted(v7ProgressStateId(subject), STATE_KIND, (previous?.revision ?? 0) + 1,
+    { contract: 'v7-progress-state/v1' as const, subject, application: reference(application), summary });
+  return { application, state, accounts, events };
+}
+
+function readApplication(store: Store, ref: Ref): Derived {
+  return historicalProof(store, { reader: 'discovery.v7-progress.application/v1', project: ref.id, ref }, source => {
+    const app = exact<V7ProgressApplication>(source, ref, PROGRESS_APPLICATION_KIND), v = app.value;
+    need(v?.subject && typeof v.subject.project === 'string' && v.contract === 'v7-progress-application/v1' && app.revision === 1 && isRef(v.assessment)
+      && (v.previous === null || isRef(v.previous)) && Array.isArray(v.reused) && Array.isArray(v.priorEvents) && Array.isArray(v.methodologyOrigins),
+      'application', 'The application needs its complete versioned provenance');
+    const paid = readDiscoveryAssessment(source, v.subject.project, v.assessment);
+    const previous = v.previous ? readV7ProgressStateAt(source, v.previous) : null;
+    const reused = v.reused.map(r => readAccount(source, r));
+    const prior = v.priorEvents.map(r => readEvent(source, r));
+    for (const e of prior) {
+      const predecessor = exact<V7ProgressApplication>(source, e.value.application, PROGRESS_APPLICATION_KIND);
+      need(same(e.value.subject, v.subject) && predecessor.value.after.count <= (previous?.value.summary.count ?? 0),
+        'priorEvents', 'Only earlier events of this subject suppress novelty');
+    }
+    const result = project(source, paid, previous, reused, prior);
+    need(same(result.application, app), 'application', 'The application differs from the paid assessment projection');
+    exactMatch(source, result.state);
+    for (const account of result.accounts) exactMatch(source, account);
+    for (const event of result.events) exactMatch(source, event);
+    return result;
+  }, () => fail('discovery_progress_conflict', 'application', 'Cyclic progress provenance'));
+}
+function exactMatch<T>(store: Store, expected: Revision<T>): void {
+  need(same(exact(store, reference(expected), expected.kind), expected), expected.kind,
+    'The atomic result is absent or differs from its exact application');
+}
+function readAccount(store: Store, ref: Ref): Revision<V7AttemptAccount> {
+  const account = exact<V7AttemptAccount>(store, ref, ATTEMPT_ACCOUNT_KIND);
+  need(account.value?.contract === 'v7-attempt-account/v1' && isRef(account.value.application),
+    'account', 'The account needs its exact atomic application');
+  const proof = readApplication(store, account.value.application);
+  need(proof.accounts.some(r => same(r, account)), 'account', 'The account is not a derived atomic result');
+  return account;
+}
+function readEvent(store: Store, ref: Ref): Revision<V7ProgressEvent> {
+  const event = exact<V7ProgressEvent>(store, ref, PROGRESS_EVENT_KIND);
+  need(event.value?.contract === 'research-progress-event/v1' && isRef(event.value.application),
+    'event', 'The event needs its exact atomic application');
+  const proof = readApplication(store, event.value.application);
+  need(proof.events.some(r => same(r, event)), 'event', 'The event is not a derived atomic result');
+  return event;
+}
+export function readV7ProgressStateAt(store: Store, ref: Ref): Revision<V7ProgressState> {
+  const state = exact<V7ProgressState>(store, ref, STATE_KIND);
+  need(state.value?.contract === 'v7-progress-state/v1' && isRef(state.value.application), 'state', 'The state needs its exact application');
+  const proof = readApplication(store, state.value.application);
+  need(same(proof.state, state), 'state', 'The state differs from its atomic application');
+  return state;
+}
+
+export interface ProgressApplicationResult { state: Revision<V7ProgressState>;
+  applications: Revision<V7ProgressApplication>[]; repeated: boolean }
+
+/** Current heads are used only for CAS admission. The selected paid result and
+ * all proof readers retain their original exact packet/baseline. */
+export function applyDiscoveryAssessment(store: Store, projectId: string, ref: Ref): ProgressApplicationResult {
+  return withHistoricalReads(() => {
+    const paid = readDiscoveryAssessment(store, projectId, ref), a = paid.value;
+    const subject = a.subject.packet, stateId = v7ProgressStateId(subject);
+    const covered: Revision<V7AttemptAccount>[] = [], fresh: Ref[] = [];
+    for (const entry of subject.entries) {
+      const saved = store.get<V7AttemptAccount>(attemptAccountKey(subject, entry.attempt), 1);
+      if (saved) covered.push(readAccount(store, reference(saved))); else fresh.push(entry.attempt);
+    }
+    const head = store.get<V7ProgressState>(stateId);
+    const previous = head ? readV7ProgressStateAt(store, reference(head)) : null;
+    if (!fresh.length) {
+      for (const r of covered) need(same(r.value.accepted, acceptedAt(a, r.value.attempt)),
+        'account.accepted', 'A second judgment cannot rewrite the accepted claims');
+      need(previous, 'state', 'Accounted attempts need their derived state');
+      const apps = [...new Map(covered.map(r => [r.value.application.id, r.value.application])).values()];
+      return { state: previous, applications: apps.map(r => readApplication(store, r).application), repeated: true };
+    }
+    const expected = previous ? { kind: 'state', ref: reference(previous) } : { kind: 'absent', id: stateId };
+    if (!same(a.baseline.state, expected)) fail('discovery_progress_stale', 'baseline.state',
+      'The unaccounted paid result names a moved baseline; preserve it and select an addressed recovery');
+    // Probe only keys this packet can emit. Historical derivation uses these
+    // exact receipts, so later events cannot change the saved application.
+    const prior: Revision<V7ProgressEvent>[] = [];
+    const keys = a.novelty.newContent.map(c => claimContentKey(store, c.claim, { premise: address => {
+      if (!a.novelty.accepted.some(c => same(c.claim, address))) acceptedPremise(store, address);
+    } }));
+    for (const b of a.novelty.transition?.bases ?? []) if ('constraint' in b)
+      keys.push(constraintContentKey(store, b.constraint));
+    for (const key of [...new Set(keys)]) {
+      const row = store.get<V7ProgressEvent>(progressEventKey(subject, key), 1);
+      if (row) prior.push(readEvent(store, reference(row)));
+    }
+    const result = project(store, paid, previous, covered, prior);
+    const rows: Revision<unknown>[] = [result.application, ...result.accounts, ...result.events, result.state];
+    const writes: Write[] = rows.map(r => ({ id: r.id, kind: r.kind, expected: r.revision - 1, value: r.value }));
+    const guards: TransactionGuard[] = [...baselineGuards(a.baseline), ...covered.map(reference), ...prior.map(reference)];
+    try { store.writeMany(writes, guards); }
+    catch (error) {
+      if (error instanceof EngineError && ['input_stale', 'revision_conflict'].includes(error.code)) {
+        const won = store.get<V7ProgressApplication>(result.application.id, 1);
+        if (won && same(won, result.application)) {
+          const saved = readApplication(store, reference(won));
+          return { state: saved.state, applications: [saved.application], repeated: true };
+        }
+        const now = store.get<V7ProgressState>(stateId);
+        if (now && (!previous || !same(reference(previous), reference(now))))
+          fail('discovery_progress_stale', 'baseline.state', 'The subject changed before atomic application');
+        fail('discovery_progress_conflict', 'application', 'The atomic application conflicted; the paid result is retained');
+      }
+      throw error;
+    }
+    return { state: result.state, applications: [result.application], repeated: false };
+  });
+}
+
+/** An attempt claim is usable only at the deterministic first-account address,
+ * and only if that exact pointer occurs in the re-derived paid application. */
+export function proveAppliedAttemptClaim(store: Store, address: ClaimAddress): {
+  application: Revision<V7ProgressApplication>; assessment: Revision<PaidDiscoveryAttemptsAssessment> } {
+  return withHistoricalReads(() => {
+    const resolved = resolveClaimAddress(store, address);
+    need(resolved.container.kind === V7_ATTEMPT_KIND, 'claim', 'An attempt proof needs an attempt container');
+    const value = resolved.container.value as unknown as { project: string; planAnswer: Ref; planQuestionId: string };
+    const subject = { project: value.project, planAnswer: value.planAnswer, planQuestionId: value.planQuestionId };
+    const account = store.get<V7AttemptAccount>(attemptAccountKey(subject, address.container), 1);
+    if (!account) fail('claim_attempt_not_accepted', 'application', 'The exact attempt has not been applied');
+    const proven = readAccount(store, reference(account));
+    if (!proven.value.accepted.some(c => same(c, address)))
+      fail('claim_attempt_not_accepted', 'claim', 'This exact claim pointer was not accepted by the first application');
+    const app = readApplication(store, proven.value.application).application;
+    return { application: app, assessment: readDiscoveryAssessment(store, address.project, app.value.assessment) };
+  });
+}
+
+/** A caller can request a comparison snapshot; no caller field manufactures a
+ * state or accepted material. The paid producer will guard this exact snapshot. */
+export function v7ProgressBaseline(store: Store, subject: V7AssessmentSubject, materials: ClaimAddress[] = []): V7ProgressBaseline {
+  if (!subject || typeof subject.project !== 'string' || !subject.project.trim() || !isRef(subject.planAnswer)
+    || typeof subject.planQuestionId !== 'string' || !subject.planQuestionId.trim() || !Array.isArray(materials))
+    fail('discovery_assessment_subject_invalid', 'baseline', 'A baseline needs its exact subject and materials list');
+  const head = store.get<V7ProgressState>(v7ProgressStateId(subject));
+  if (head) readV7ProgressStateAt(store, reference(head));
+  for (const material of materials) acceptedPremise(store, material);
+  return { contract: V7_PROGRESS_BASELINE_CONTRACT,
+    state: head ? { kind: 'state', ref: reference(head) } : { kind: 'absent', id: v7ProgressStateId(subject) }, materials };
 }

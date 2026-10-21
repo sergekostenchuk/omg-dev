@@ -207,6 +207,21 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
     ["methodology", "facts", INDEX, "refutation", "traces", INDEX, "capture"],
     ["methodology", "facts", INDEX, "refutation", "counterarguments", INDEX, "source"],
   ] },
+  // P.3: atomic progress records retain their exact paid and accepted origins.
+  { kind: "v7-progress-application", contract: "v7-progress-application/v1", data: [], refs: [
+    ["subject", "planAnswer"], ["assessment"], ["previous"], ["methodologyOrigins", INDEX, "claim", "container"],
+    ["methodologyOrigins", INDEX, "assessment"], ["reused", INDEX], ["priorEvents", INDEX], ["attempts", INDEX],
+  ] },
+  { kind: "v7-progress-state", contract: "v7-progress-state/v1", data: [], refs: [
+    ["subject", "planAnswer"], ["application"],
+  ] },
+  { kind: "v7-attempt-account", contract: "v7-attempt-account/v1", data: [], refs: [
+    ["subject", "planAnswer"], ["application"], ["attempt"], ["accepted", INDEX, "container"],
+  ] },
+  { kind: "research-progress-event", contract: "research-progress-event/v1", data: [], refs: [
+    ["subject", "planAnswer"], ["application"], ["attempt"], ["basis", "claim", "container"], ["basis", "constraint"],
+    ["basis", "transition", "bases", INDEX, "claim", "container"], ["basis", "transition", "bases", INDEX, "constraint"],
+  ] },
   // MR: explicit paid closing requirements retain their exact claim addresses.
   { kind: "discovery-assessment", contract: "discovery-assessment/v3", data: [], refs: [
     ["subject", "packet", "planAnswer"], ["subject", "packet", "question"],
