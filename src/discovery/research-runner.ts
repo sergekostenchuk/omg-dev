@@ -1431,7 +1431,7 @@ export class Researcher {
             const result = readResearchContext(this.store, draft, question.id, undefined,
               action.record, action.pointer, action.page, readMode);
             const workspace = projectAddressedWorkspace(turn.value,
-              readContextTurnHistoryAt(this.store, project, draft, reference(question), sameTurns, turn.value.number), reference(question));
+              readContextTurnHistoryAt(this.store, project, draft, reference(question), turns, turn.value.number), reference(question));
             addContextLookup(workspace, result, paid.subject.contextWorkspace);
             const record = readResearchContextRecordAt(this.store, draft, action);
             proof = { kind: "read-context", recordValue: contextRecordValue(this.store, record), record: action.record, maxChars: 300000 };

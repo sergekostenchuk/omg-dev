@@ -1,0 +1,147 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
+import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
+import { Store, type Revision } from '../src/storage/store.js';
+import { ProductEngine } from '../src/product/engine.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
+import type { Json } from '../src/canonical.js';
+import { answerDiscoveryFixture } from './product-fixture.js';
+import { researchCall } from '../src/discovery/research-protocol.js';
+import { Researcher } from '../src/discovery/research-runner.js';
+import type { ResearchTurn } from '../src/discovery/research-model.js';
+import { proveAttempt } from '../src/discovery/v7-plan-questions.js';
+import { readResearchConsumerTurn, readContextTurnHistoryAt } from '../src/discovery/response-recovery.js';
+
+function fixture(t: { after(fn: () => void): void }) {
+  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3k-"));
+  const path = join(root, "state.sqlite"), stores: Store[] = [];
+  const open = () => { const db = new Store(path); stores.push(db); return db; };
+  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  return { root, path, store, engine, discovery, open };
+}
+type Fixture = ReturnType<typeof fixture>;
+
+const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
+
+function validFrame(): Json {
+  return { productType: "internal", scale: "30 users across 10 sites",
+    industries: ["construction"], domains: ["materials supply", "equipment accounting"],
+    axes: allAxes("deep"),
+    budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
+}
+type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
+  criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
+function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
+  return { id, axis, domain: "construction", text: `What covers ${id}?`,
+    class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
+    roles: ["domain expert"], searchPlaces: ["domain documents"] };
+}
+function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
+  return { edition, frame: frameRef, previous, questions } as unknown as Json;
+}
+function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
+  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
+  assert.ok(question, `question for ${field}`);
+  return question;
+}
+/** The real plan acceptance chain (frame and plan through #answer). */
+function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
+  const base = createPartialV7Draft(f.discovery, project, "concept");
+  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
+  const frame = questionOf(f.store, base, "frame");
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
+  const planQ = questionOf(f.store, base, "plan");
+  answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
+  const plan = f.store.get<Question>(planQ.id)!;
+  return { draft: f.store.get<DiscoveryDraft>(base.id)!, plan, planAnswer: plan.value.answer!, frameRef };
+}
+
+async function setup(t: test.TestContext, questions = [planQuestion('support','market'), planQuestion('block','industry','blocking')], calibrated = true) {
+  const f=fixture(t);f.engine.execute({type:'create-project',project:'p',title:'P'});
+  const wire=join(f.root,'wire.ndjson'), settings=join(f.root,'reply.json'), adapter=join(f.root,'adapter.mjs');
+  const configure=(replies: unknown[]=[], tokens: number | null=10)=>writeFileSync(settings,JSON.stringify({replies,tokens}));
+  configure();
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
+let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
+appendFileSync(${JSON.stringify(wire)},raw+'\\n');
+let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+if(research.question==='$selected')research.question=r.subject.question.id;
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
+  const command={executable:process.execPath,args:[adapter]};
+  const environment=f.engine.environments.configure('p',{workspace:f.root,
+    implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},
+    fullCheck:command,timeoutMs:5000},0);
+  const calibration=f.discovery.create('p','discovery','R0','concept',[
+    {field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'object'}}],[],6);
+  const calibrate = async (tokens = 10) => {
+    configure([], tokens);
+    await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'analyst'});
+    configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    configure();writeFileSync(wire,'');
+  };
+  if (calibrated) await calibrate();
+  configure();writeFileSync(wire,'');
+  const v=acceptPlan(f,'p',questions);
+  const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
+    .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
+  const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
+  const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]);
+  return {...f,v,questions,run,wires,history,configure,environment,calibrate};
+}
+
+const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
+
+test('S6.1: paid context reads keep the complete run prefix across plan subjects', async t => {
+  const f = await setup(t, [planQuestion('q-supply', 'industry', 'blocking'), planQuestion('q-market', 'market')]);
+  const supplyRead = { action: 'read_context', record: reference(f.v.draft), pointer: '/fields/frame' };
+  const marketRead = { action: 'read_context', record: reference(f.v.draft), pointer: '/fields/plan' };
+  f.configure([supplyRead, ended(), marketRead, ended()]);
+  const run = await f.run();
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  assert.equal(run.value.pauseCode, null);
+  assert.deepEqual(f.wires().map(wire => wire.subject.question.id), ['q-supply', 'q-supply', 'q-market', 'q-market']);
+  const wires = f.wires();
+  assert.deepEqual(wires[1]!.subject.contextWorkspace.map((entry: { pointer: string }) => entry.pointer), ['/fields/frame']);
+  assert.deepEqual(wires[2]!.subject.contextWorkspace, [], 'the new subject receives none of the prior subject workspace');
+  assert.deepEqual(wires[3]!.subject.contextWorkspace.map((entry: { pointer: string }) => entry.pointer), ['/fields/plan']);
+  const attempts = f.store.list('research-attempt');
+  assert.equal(attempts.length, 2);
+  assert.deepEqual(attempts.map(row => proveAttempt(f.store, reference(row)).attempt.value.planQuestionId).sort(),
+    ['q-market', 'q-supply']);
+  const turns = f.store.list<ResearchTurn>('research-turn').filter(row => row.value.run === run.id)
+    .sort((left, right) => left.value.number - right.value.number);
+  assert.deepEqual(turns.map(row => row.value.number), [1, 2, 3, 4]);
+  for (const turn of turns) {
+    const proved = readResearchConsumerTurn(f.store, reference(turn));
+    assert.equal(proved.value.status, 'completed');
+    assert.equal(proved.value.error, null);
+  }
+  const question = reference(f.v.plan);
+  const prefix = readContextTurnHistoryAt(f.store, 'p', f.v.draft, question, turns, 3);
+  assert.deepEqual(prefix.map(proof => reference(proof.turn)), turns.slice(0, 2).map(reference));
+  const before = f.history();
+  assert.throws(() => readContextTurnHistoryAt(f.store, 'p', f.v.draft, question, turns.slice(1), 3),
+    { code: 'research_consumer_intent_invalid',
+      message: `[${f.v.draft.id}] The addressed read lost its complete earlier run history` });
+  assert.deepEqual(f.history(), before);
+  const paid = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
+  assert.equal(paid.filter(row => (row.value as { draftId?: string }).draftId === f.v.draft.id).length, 4);
+  const cold = f.open();
+  assert.notEqual(cold, f.store);
+  assert.deepEqual(readContextTurnHistoryAt(cold, 'p', f.v.draft, question, turns, 3), prefix);
+  assert.deepEqual(await f.run(1, cold, false), run);
+  assert.deepEqual(f.history(), before);
+  assert.deepEqual(cold.list('model-call'), paid);
+  assert.deepEqual(cold.list('research-budget-ledger'), ledger);
+  assert.equal(f.wires().length, 4);
+});
