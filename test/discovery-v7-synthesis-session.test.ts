@@ -7,7 +7,9 @@ import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/
 import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
 import { findUnfinishedSynthesisSession, findUnfinishedSynthesisSessionV3, readSynthesisSessionV3,
   synthesisSession } from "../src/discovery/synthesis-session.js";
-import { projectSynthesisSessionV3Initial } from "../src/discovery/research-consumer-transition.js";
+import { exactContextLookup, projectSynthesisSessionV3Initial, projectSynthesisTransition, turnAction } from "../src/discovery/research-consumer-transition.js";
+import { addContextLookup, contextWorkspace, packContextWorkspace } from "../src/discovery/context-workspace.js";
+import { readReaderResultAt } from "../src/discovery/reader.js";
 import { pilotEnvironment, readerPilot } from "../src/discovery/reader-pilot.js";
 import { researchCall } from "../src/discovery/research-protocol.js";
 import { DISCOVERY_CLAIMS_CONTRACT } from "../src/discovery/v7-contracts.js";
@@ -18,7 +20,8 @@ import { recoverContextSession } from "../src/discovery/context-recovery.js";
 import { questionDispatchId } from "../src/discovery/v7-managed-attempt.js";
 import type { Write } from "../src/storage/store.js";
 import { Researcher } from "../src/discovery/research-runner.js";
-import { prepareResearchConsumerIntent, readResearchConsumerExecution, recoverResearchResponse } from "../src/discovery/response-recovery.js";
+import { prepareResearchConsumerIntent, readResearchConsumerExecution, recoverResearchResponse,
+  subjectContextRecordHolds } from "../src/discovery/response-recovery.js";
 import { addressedWorkspace } from "../src/discovery/research-continuation.js";
 import { PLANNING_INSTRUCTION } from "../src/discovery/reading-plan.js";
 import { digest, hashJson } from "../src/canonical.js";
@@ -741,4 +744,148 @@ test("S5 source substitution: a material source replaced in another Store at the
   assert.equal(f.calls(), 1, "the paid page is kept and nothing else is bought");
   assert.equal(await code(() => paidRun(f, A, pages)), "synthesis_evidence_stale", "a repeat refuses the same way");
   assert.equal(f.calls(), 1, "still no second payment");
+});
+
+/* ---------- круг 3 (codex-omg №8931, оркестратор №8933): absence is a typed refusal, content is re-derived ---------- */
+
+test("S5 круг 3 ОТСУТСТВИЕ: a v3 basis material proves its kind's form and exact content — a missing note reference or evidence original, a changed own note, a reader view without its result, a context value without a record or Source, a changed lookup or Source slice, an unknown kind and a non-object are refused before any record or payment; the exact forms pay", async t => {
+  const f = await paidPlanned(t, "s5r3-absence");
+  const A = subjectOf(f.p.planAnswer, "q-supply"), B = subjectOf(f.p.planAnswer, "q-market");
+  // Real paid notes of A and B and their saved-only projections (the real command and reader).
+  const pagesA = [f.material("a1", true), f.material("a2", true)], pagesB = [f.material("b1", true), f.material("b2", true)];
+  // A's first session finishes (its note, then an end), so a new basis of A is a new task, not a resumed one.
+  f.configure([checkpointOn(f, pagesA[0]!, "A finding"), endOf(ENDS.refused),
+    checkpointOn(f, pagesB[0]!, "B finding"), { action: "pause", reason: "hold B" }]);
+  await paidRun(f, A, pagesA);
+  await paidRun(f, B, pagesB);
+  configureV7SavedSynthesis(f.store, f.p.project, A, 0);
+  configureV7SavedSynthesis(f.store, f.p.project, B, 0);
+  const savedA = savedV7SynthesisMaterials(f.store, f.p.draft, f.p.plan, A)!;
+  const savedB = savedV7SynthesisMaterials(f.store, f.p.draft, f.p.plan, B)!;
+  const noteA = sessionOf(f.store, "q-supply").value.notes[0].checkpoint;
+  const lookupA = exactContextLookup(f.store, f.p.draft, f.p.plan, noteA, "/proposal", undefined,
+    record => { readReaderResultAt(f.store, f.p.project, reference(record)); });
+  const source = f.material("primary");
+  const omitted = structuredClone(savedB) as any[];
+  delete omitted[0].value.checkpoint;
+  for (const item of omitted[0].value.evidence) delete item.original;
+  const changedOwn = structuredClone(savedA) as any[];
+  changedOwn[0].value.proposal = { finding: "a different finding beside A's exact reference" };
+  const cases: [string, unknown[], Record<string, any>][] = [
+    ["saved findings without note reference and evidence originals", [], { savedOnly: true, savedMaterials: omitted }],
+    ["own note reference beside other content", [], { savedOnly: true, savedMaterials: changedOwn }],
+    ["reader view without its result", [{ kind: "reader", value: { purpose: "x", observations: [], coverage: [], unresolved: [] } }], {}],
+    ["context value without a record or Source", [{ kind: "context", value: { pointer: "/proposal", value: { finding: "B finding" } } }], {}],
+    ["own lookup with another value", [{ kind: "context", value: { ...lookupA, value: { finding: "B finding" } } }], {}],
+    ["Source slice with another value", [{ kind: "context", value: { ...source.value, value: "a forged slice" } }], {}],
+    ["unknown kind", [{ kind: "notes", value: { finding: "B finding" } }], {}],
+    ["non-object material", [null], {}]];
+  const calls = f.calls(), before = history(f.store);
+  for (const [name, materials, extra] of cases)
+    assert.equal(await code(() => paidRun(f, A, materials, extra)), "context_reference_foreign", name);
+  assert.deepEqual(history(f.store), before, "a refused basis wrote nothing");
+  assert.equal(f.calls(), calls, "and bought nothing");
+  // The exact forms are lawful: A's own saved findings, A's own exact lookup with a primary Source slice.
+  f.configure([...Array(calls).fill(null), endOf(ENDS.duplicate), endOf(ENDS.impossible)]);
+  assert.deepEqual(await paidRun(f, A, [], { savedOnly: true, savedMaterials: savedA }), { ...endOf(ENDS.duplicate), question: "q-supply" },
+    "A's own exact saved findings pay");
+  assert.deepEqual(await paidRun(f, A, [{ kind: "context", value: lookupA }, source]), { ...endOf(ENDS.impossible), question: "q-supply" },
+    "A's exact lookup of its own note and an exact Source slice are A's lawful basis");
+});
+
+test("S5-05 the previous proposal of a v3 basis is a paid turn proven by the common turn reader: a forged same-subject turn is refused before any record or payment; A's own paid turn from the real runner is accepted", async t => {
+  const f = await paidPlanned(t, "s5r3-proposal");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  f.configure([endOf(ENDS.refused), { action: "pause", reason: "hold B" }]);
+  const run = await new Researcher(f.store, new Discovery(f.store), f.engine.environments)
+    .run(f.p.project, f.p.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
+  assert.equal(run.value.pauseCode, "research_model_paused", JSON.stringify(run.value));
+  const paidTurn = f.store.list<any>("research-turn").find(row => row.value.run === run.id && row.value.subject?.planQuestionId === "q-supply")!;
+  const material = f.material("a");
+  const action = { ...checkpointOn(f, material, "unpaid fabricated previous finding"), question: "q-supply" };
+  // Negative corruption only: a same-subject turn record with no producer, paid intent or run.
+  const forged = f.store.write({ id: "research-turn:forged-proposal", kind: "research-turn", expected: 0,
+    value: { run: "research-run:missing", number: 1, question: reference(f.p.plan), subject: A, action, status: "completed",
+      assessment: null, observation: null, error: null } });
+  const calls = f.calls(), before = history(f.store);
+  assert.equal(await code(() => paidRun(f, A, [], { previousProposal: action, previousProposalRef: reference(forged) })),
+    "context_reference_foreign", "the form of a turn is not its paid origin");
+  assert.equal(await code(() => paidRun(f, A, [], { previousProposal: action, previousProposalRef: reference(paidTurn) })),
+    "context_reference_foreign", "a proven turn does not carry another proposal");
+  assert.deepEqual(history(f.store), before);
+  assert.equal(f.calls(), calls);
+  f.configure([...Array(calls).fill(null), endOf(ENDS.impossible)]);
+  assert.deepEqual(await paidRun(f, A, [], { previousProposal: turnAction(paidTurn.value), previousProposalRef: reference(paidTurn) }),
+    { ...endOf(ENDS.impossible), question: "q-supply" }, "A's own paid turn is a lawful previous proposal");
+});
+
+test("S5 loss of a required page (projector): a final answer over an addressed value whose packet delivered only part of it is context-incomplete — no result, the exact address and next kept; the complete delivery is the result", async t => {
+  const f = await paidPlanned(t, "s5r3-incomplete");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  const page = f.material("only");
+  // A real paid note of A with a large exact value, on A's final page; the session then pauses.
+  f.configure([checkpointOn(f, page, "x".repeat(9000)), { action: "pause", reason: "hold the final page" }]);
+  await paidRun(f, A, [page]);
+  const head = f.store.get<any>(sessionOf(f.store, "q-supply").id)!;
+  const noteA = head.value.notes[0].checkpoint;
+  const pauseIntent = f.store.list<any>("research-consumer-intent").filter(row => row.value.kind === "synthesis")
+    .sort((a, b) => b.value.cursor.offset - a.value.cursor.offset || b.revision - a.revision)[0]!;
+  const paid = readResearchConsumerExecution(f.store, f.p.project, reference(pauseIntent));
+  assert.equal(paid.kind, "response");
+  const archive = f.store.get<any>((paid as any).archive.id, (paid as any).archive.revision)!.value.body;
+  const lookup = exactContextLookup(f.store, f.p.draft, f.p.plan, noteA, "/proposal/value/finding", undefined,
+    record => { readReaderResultAt(f.store, f.p.project, reference(record)); });
+  const before = { ...head.value, workspace: addContextLookup(contextWorkspace(), lookup), focus: null };
+  const transition = (maxChars: number, keepChars: number) => {
+    // The delivery of the addressed value is packed alone (as RD2b packs it) and carried by the step's real packet.
+    const delivered: Record<string, any> = { contextWorkspace: [lookup],
+      working: { archive: lookup.record, deliveryContract: "research-delivery/v1" } };
+    packContextWorkspace(delivered, maxChars, keepChars);
+    const packet: Record<string, any> = { ...structuredClone((paid as any).subject),
+      working: { ...(paid as any).subject.working, deliveryContract: "research-delivery/v1" } };
+    for (const key of ["contextWorkspace", "contextDelivery", "contextIndex"])
+      if (Object.hasOwn(delivered, key)) packet[key] = delivered[key];
+    return projectSynthesisTransition({ store: f.store, projectId: f.p.project, kind: "synthesis", sessionId: head.id, before,
+      draft: reference(f.p.draft), question: reference(f.p.plan), delivery: null, subject: packet,
+      payload: { ...endOf(ENDS.refused), question: "q-supply" }, archive, readLimit: 200000,
+      proveRecord: record => { readReaderResultAt(f.store, f.p.project, reference(record)); },
+      subjectRecord: (record, bound) => subjectContextRecordHolds(f.store, f.p.project, f.p.draft.id, bound, record) });
+  };
+  const partial = transition(4000, 3000);
+  assert.equal(partial.kind, "context-incomplete");
+  assert.equal(partial.session.result, null, "no result over an undelivered required page");
+  assert.equal((partial.session as any).contextCorrection.code, "research_context_incomplete");
+  assert.deepEqual((partial.session as any).contextCorrection.record, noteA, "the exact address is kept");
+  assert.ok((partial.session as any).contextCorrection.next > 0 && (partial.session as any).contextCorrection.next < 9000,
+    "and the exact next position");
+  const complete = transition(40000, 30000);
+  assert.equal(complete.kind, "result");
+  assert.deepEqual(complete.session.result, { ...endOf(ENDS.refused), question: "q-supply" });
+});
+
+test("S5 terminal/application conflict: two Stores apply one paid response — another Store's identical application commits first, the loser's write conflicts and returns the winner's result; one application, one call, no new ledger", async t => {
+  const f = await paidPlanned(t, "s5r3-race");
+  const A = subjectOf(f.p.planAnswer, "q-supply");
+  f.configure([endOf(ENDS.refused)]);
+  await crashAfterPayment(f, A, []);
+  const loser = f.open(), competitor = f.open();
+  const write = loser.writeMany.bind(loser); let raced = false;
+  loser.writeMany = ((writes: Write[], guards = []) => {
+    if (!raced && writes.some(item => item.kind === "research-consumer-intent" && (item.value as any).state === "applied")) {
+      raced = true;
+      competitor.writeMany(writes, guards); // the same lawful application, committed by another Store first
+    }
+    return write(writes, guards);
+  }) as typeof loser.writeMany;
+  const calls = f.calls(), ledgers = f.store.list("research-budget-ledger").length;
+  assert.deepEqual(await runIn(f, loser, A, []), { ...endOf(ENDS.refused), question: "q-supply" });
+  assert.equal(raced, true, "the competing application really raced the write");
+  const intent = f.store.list<any>("research-consumer-intent").find(row => row.value.kind === "synthesis")!;
+  assert.deepEqual(f.store.history<any>(intent.id).map(step => step.value.state), ["prepared", "running", "applied"],
+    "the paid step is applied once");
+  const session = sessionOf(f.store, "q-supply");
+  assert.equal(session.revision, 2, "one application of the session");
+  assert.equal(f.calls(), calls, "no new call");
+  assert.equal(f.store.list("research-budget-ledger").length, ledgers, "no new ledger");
+  assert.deepEqual(readSynthesisSessionV3(f.open(), reference(session)), session);
 });

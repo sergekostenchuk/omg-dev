@@ -26,7 +26,7 @@ import { recoveredResponseBoundary, recoveryConsolidationMode, recoverySessionWr
 import { turnAction, contextReadIdentity, projectSynthesisTransition, projectContextRecoveryTransition, SYNTHESIS_TRANSITION_REFUSAL_CODES,
   isReservationOnlySessionStep, synthesisReservationConsumed,
   SYNTHESIS_SESSION_CONTRACT, CONTEXT_RECOVERY_SUPERSEDE_REASON, exactContextLookup, readerDraftEquivalent,
-  projectResearchContextSelection,
+  projectResearchContextSelection, exactObservation,
   SYNTHESIS_SESSION_CONTRACT_V3, SYNTHESIS_SESSION_V2_PREFIX, SYNTHESIS_SESSION_V3_PREFIX, synthesisSessionV3Address,
   projectSynthesisSessionV3Initial, synthesisSessionSubject, synthesisStepSubject, requirePlanSubject,
   type SynthesisSessionState, type SynthesisSessionStateV3, type SynthesisSessionDelivery, type SynthesisTransition } from './research-consumer-transition.js';
@@ -34,7 +34,7 @@ import { isResearchPreview } from './research-preview.js';
 import { planSubjectOf, sameSubject, type V7PlanSubject } from './v7-managed-attempt.js';
 import { provePlanQuestions } from './v7-plan-questions.js';
 import { planQuestionContract } from './continuation-packet.js';
-import { provenSubjectSessions } from './saved-synthesis.js';
+import { provenSubjectSessions, savedFindingMaterial } from './saved-synthesis.js';
 
 interface Session {
   projectId: string; offset: number; materialOffset?: number; focus?: unknown; workspace?: ContextWorkspace;
@@ -208,42 +208,91 @@ function historicalAdmission(store: Store, session: Revision<SynthesisSessionSta
     requireCondition(exact && canonical(reference(exact)) === canonical(source) && hashJson(exact.value) === exact.hash,
       'synthesis_session_invalid', `[${session.id}] The paid step lost an exact basis record: ${source.id}`);
   }
-  const heads = (intent?.value.guards ?? []).flatMap(guard => {
+  // No intent (an operator pre-send admission) has no step guards; a guarded
+  // record of the paid step that is missing is a typed refusal, never a dropped guard.
+  const heads = (intent ? intent.value.guards : []).flatMap(guard => {
     if ('absent' in guard || guard.id === session.id) return [];
     const head = store.get(guard.id);
-    return head ? [reference(head)] : [];
+    if (!head) synthesisSessionInvalid(session.id, `A guarded basis record of the paid step is missing: ${guard.id}`);
+    return [reference(head)];
   });
   return uniqueTransactionGuards([reference(session), ...heads]);
 }
 
-/** DR3a3-S5 (S5-02): every record a v3 session's materials name — a lookup's
- * record, a saved finding's note and its evidence originals — passes the one
- * subject predicate (subjectContextRecordHolds). The writer refuses before any
- * record; the chain reader applies the same predicate to the saved basis. */
-function subjectMaterialsHold(store: Store, projectId: string, draftId: string, subject: V7PlanSubject,
-  materials: unknown): boolean {
-  const named = (value: unknown): Ref[] => !object(value) ? [] : [
-    ...(isRef(value.record) ? [value.record] : []),
-    ...(isRef(value.checkpoint) ? [value.checkpoint] : []),
-    ...(Array.isArray(value.evidence) ? value.evidence.flatMap((item: unknown) =>
-      object(item) && object(item.original) && isRef(item.original.record) ? [item.original.record] : []) : [])];
-  return Array.isArray(materials) && materials.every(material => named(object(material) ? material.value : null).every(ref => {
-    const record = store.get<Record<string, any>>(ref.id, ref.revision);
-    return !!record && canonical(reference(record)) === canonical(ref)
-      && subjectContextRecordHolds(store, projectId, draftId, subject, record);
-  }));
+/** DR3a3-S5 (S5-02, круг 3; проход ОТСУТСТВИЕ): the one historical proof of
+ * every v3 basis material, by its kind — a missing or damaged reference is
+ * never a material without a subject. A material is lawful only in a form its
+ * producers write, re-derived from its proven source:
+ * - saved-findings: exactly the projection of a paid note of this subject
+ *   (savedFindingMaterial over a note that passes subjectContextRecordHolds);
+ * - reader: exactly the projection of its exact reader result of this project;
+ * - context lookup: exactly the lookup of its exact record (a note or archive
+ *   passes subjectContextRecordHolds), as the chain reader re-derives a recovery;
+ * - context Source observation: exactly its pinned Source slice (exactObservation);
+ * - context Source reading of a read contract: its exact Source of this project —
+ *   the slice is the evidence reader's, checked by every send/application admission.
+ * Any other kind or form refuses. The writer applies it before any record, the
+ * chain reader to the saved first record. */
+function subjectMaterialsHold(store: Store, draft: Revision<DiscoveryDraft>, question: Revision<Question>,
+  subject: V7PlanSubject, materials: unknown): boolean {
+  const projectId = draft.value.projectId;
+  const exact = (ref: unknown): Revision<Record<string, any>> | null => {
+    const record = isRef(ref) ? store.get<Record<string, any>>(ref.id, ref.revision) : null;
+    return record && canonical(reference(record)) === canonical(ref) && hashJson(record.value) === record.hash ? record : null;
+  };
+  const holds = (material: unknown): boolean => {
+    if (!object(material) || !object(material.value)) return false;
+    const value = material.value;
+    if (material.kind === 'saved-findings') {
+      const note = exact(value.checkpoint);
+      return !!note && subjectContextRecordHolds(store, projectId, draft.id, subject, note)
+        && canonical(value) === canonical(savedFindingMaterial(value.checkpoint, note.value).value);
+    }
+    if (material.kind === 'reader') {
+      const result = exact(value.ref);
+      return result?.kind === 'reader-result' && result.value.projectId === projectId
+        && canonical(value) === canonical({ ref: reference(result), purpose: result.value.purpose,
+          observations: result.value.observations, coverage: result.value.coverage, unresolved: result.value.unresolved });
+    }
+    if (material.kind !== 'context') return false;
+    if (Object.hasOwn(value, 'record')) {
+      const record = exact(value.record);
+      if (!record || typeof value.pointer !== 'string' || !subjectContextRecordHolds(store, projectId, draft.id, subject, record))
+        return false;
+      const prove = (found: Revision<Record<string, any>>) => { readReaderResultAt(store, projectId, reference(found)); };
+      const lookup = value.contract === 'research-context-read/v2'
+        ? projectResearchContextSelection(exactContextLookup(store, draft, question, value.record, value.pointer, undefined, prove).value,
+          value.record, value.pointer, value.requested, value.envelopeLimitChars ?? 0, 'bounded')
+        : exactContextLookup(store, draft, question, value.record, value.pointer, object(value.page)
+          ? { offset: value.page.offset, limit: value.page.end - value.page.offset,
+            ...(value.page.encoding === 'canonical-json' ? { encoding: value.page.encoding } : {}) } : undefined, prove);
+      return canonical(lookup) === canonical(value);
+    }
+    const source = exact(value.source);
+    if (source?.kind !== 'source' || source.value.projectId !== projectId || value.projectId !== projectId) return false;
+    if ([SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(value.contract)) return true;
+    return object(value.selector) && canonical(exactObservation(store, projectId, value.source,
+      value.selector as Parameters<typeof exactObservation>[3])) === canonical(value);
+  };
+  try { return Array.isArray(materials) && materials.every(holds); }
+  catch (error) { if (error instanceof EngineError) return false; throw error; }
 }
 
-/** S5 class (решение 6): the previous proposal a v3 session stands on is its
- * own subject's — the exact turn it names, read by that turn's own subject;
- * an unaddressed proposal is never adopted. */
-function subjectProposalHolds(store: Store, subject: V7PlanSubject, previousProposal: unknown, previousProposalRef: unknown): boolean {
+/** S5 class (решение 6; S5-05): the previous proposal a v3 session stands on is
+ * its own subject's paid turn — the exact turn proven by the common turn reader,
+ * of a research run of this project and draft, read by its own subject; an
+ * unaddressed proposal is never adopted. */
+function subjectProposalHolds(store: Store, projectId: string, draftId: string, subject: V7PlanSubject,
+  previousProposal: unknown, previousProposalRef: unknown): boolean {
   if (previousProposalRef === null || previousProposalRef === undefined)
     return previousProposal === null || previousProposal === undefined;
-  const turn = isRef(previousProposalRef) ? store.get<ResearchTurn>(previousProposalRef.id, previousProposalRef.revision) : null;
-  if (!turn || turn.kind !== 'research-turn' || canonical(reference(turn)) !== canonical(previousProposalRef)) return false;
-  try { return sameSubject(planSubjectOf(turn.value), subject) && canonical(turnAction(turn.value)) === canonical(previousProposal); }
-  catch { return false; }
+  if (!isRef(previousProposalRef)) return false;
+  try {
+    const turn = readResearchConsumerTurn(store, previousProposalRef);
+    const run = typeof turn.value.run === 'string' ? store.get<ResearchRun>(turn.value.run) : null;
+    return run?.kind === 'research-run' && run.value.projectId === projectId && run.value.draftId === draftId
+      && sameSubject(planSubjectOf(turn.value), subject) && canonical(turnAction(turn.value)) === canonical(previousProposal);
+  } catch (error) { if (error instanceof EngineError) return false; throw error; }
 }
 
 /** DR3a3-S5 (S5-04): a reserved runner position is proven, not a bare number —
@@ -518,8 +567,11 @@ function readSynthesisSessionChain(store: Store, ref: Ref, era: string): Revisio
   // S5-02/04: a v3 basis is proven by the writer's own predicates — material
   // and previous proposal of its subject, a proven runner reservation.
   if (subject) {
-    if (!subjectMaterialsHold(store, initial.value.projectId, initial.value.binding.draft.id, subject, initial.value.basis.materials)
-      || !subjectProposalHolds(store, subject, initial.value.basis.previousProposal, initial.value.basis.previousProposalRef))
+    const bound = { draft: store.get<DiscoveryDraft>(initial.value.binding.draft.id, initial.value.binding.draft.revision)!,
+      question: store.get<Question>(initial.value.binding.question.id, initial.value.binding.question.revision)! };
+    if (!subjectMaterialsHold(store, bound.draft, bound.question, subject, initial.value.basis.materials)
+      || !subjectProposalHolds(store, initial.value.projectId, initial.value.binding.draft.id, subject,
+        initial.value.basis.previousProposal, initial.value.basis.previousProposalRef))
       synthesisSessionInvalid(head.id, 'The v3 basis names material of another subject or an unproven previous proposal');
     if (initial.value.delivery != null
       && !reservationReached(store, initial.value.projectId, initial.value.binding.draft.id, initial.value.delivery))
@@ -829,13 +881,19 @@ export async function synthesisSession(store: Store, draft: Revision<DiscoveryDr
     // historical. Only a NEW send needs today's plan (requireCurrent in the
     // producer): a finished result returns and a paid step applies by its own history.
     planQuestionContract(store, draft, question, subject);
+    // ОТСУТСТВИЕ (круг 3): every material list of a v3 basis is a list of material
+    // objects; a missing or non-object item is a typed refusal, never a crash or a skip.
+    requireCondition(['savedMaterials', 'workingSelections', 'readings'].every(field => context[field] === undefined
+      || Array.isArray(context[field]) && context[field].every(object)), 'context_reference_foreign',
+    'A v3 synthesis basis lists only material objects');
     const { materials } = basis(draft, question, environment, context);
     // S5-02: the materials and previous proposal of a new basis are its subject's
     // own; an operator replay names its proven session and computes no basis.
     if (!(isResponseRecovery() && typeof context.synthesisSession === 'string')) {
-      requireCondition(subjectMaterialsHold(store, draft.value.projectId, draft.id, subject, materials),
+      requireCondition(subjectMaterialsHold(store, draft, question, subject, materials),
         'context_reference_foreign', 'A v3 synthesis carries only material of its own plan subject');
-      requireCondition(subjectProposalHolds(store, subject, context.previousProposal ?? null, context.previousProposalRef ?? null),
+      requireCondition(subjectProposalHolds(store, draft.value.projectId, draft.id, subject,
+        context.previousProposal ?? null, context.previousProposalRef ?? null),
         'context_reference_foreign', 'A v3 synthesis stands only on a previous proposal of its own plan subject');
     }
     const taskAddress = synthesisSessionV3Address({ projectId: draft.value.projectId, draft: reference(draft),

@@ -167,11 +167,14 @@ export function savedV7SynthesisMaterials(store: Store, draft: Revision<Discover
   requireCondition(provenSubjectSessions(store, exact).sessions
     .some(session => notesInProvenOrder(session.value.notes.map(note => note.checkpoint), saved.value.checkpoints)), 'saved_synthesis_stale',
     'The chosen notes are not the paid notes of one proven session of this subject in their proven order');
-  return saved.value.checkpoints.map(ref => {
-    const record = savedNoteV2(store, draft.value.projectId, question, exact, ref);
-    return { kind: 'saved-findings', value: { checkpoint: ref, proposal: record.value.proposal, unresolved: record.value.unresolved,
-      evidence: record.value.observations.map((o: any, index: number) => ({ source: o.source, selector: o.selector,
-        original: { record: ref, pointer: `/observations/${index}` } })),
-      instruction: 'Already paid proposed findings of this exact plan-question; reconcile all saved pieces. Page-pending notices are not new research questions.' } };
-  });
+  return saved.value.checkpoints.map(ref => savedFindingMaterial(ref, savedNoteV2(store, draft.value.projectId, question, exact, ref).value));
+}
+
+/** DR3a3-S5 (круг 3): the one projection of a paid v2 note into its saved-only
+ * material — the producer above and the v3 session's basis proof compare it. */
+export function savedFindingMaterial(ref: Ref, note: Record<string, any>) {
+  return { kind: 'saved-findings', value: { checkpoint: ref, proposal: note.proposal, unresolved: note.unresolved,
+    evidence: (note.observations as any[]).map((o: any, index: number) => ({ source: o.source, selector: o.selector,
+      original: { record: ref, pointer: `/observations/${index}` } })),
+    instruction: 'Already paid proposed findings of this exact plan-question; reconcile all saved pieces. Page-pending notices are not new research questions.' } };
 }

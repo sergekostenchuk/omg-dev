@@ -463,7 +463,9 @@ const LOOKUP_BLOCKED_CODES: ReadonlySet<string> = new Set([
   'context_reference_stale', 'selector_invalid', 'context_missing', 'context_page_invalid',
   'research_no_progress', 'research_context_invalid']);
 
-function exactObservation(store: Store, projectId: string, sourceRef: Ref, selector: Selector): Observation {
+/** Exported (DR3a3-S5, круг 3): the v3 basis proof re-derives a Source
+ * observation material by the same historical formula as a note's evidence. */
+export function exactObservation(store: Store, projectId: string, sourceRef: Ref, selector: Selector): Observation {
   requireCondition(isRef(sourceRef) && selector && typeof selector === 'object',
     'evidence_input_invalid', 'Evidence needs a versioned source reference and selector');
   const source = store.get<Source>(sourceRef.id, sourceRef.revision);
