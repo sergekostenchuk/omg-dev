@@ -14,7 +14,7 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import { writeGuarded } from "../src/om/refs.js";
 import {
-  classifyRefusal, readJournal, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND,
+  readJournal, recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND,
 } from "../src/om/refusal-journal.js";
 import {
   beginAttempt, completeAttempt, escalateSeries, openSeries, readSeries, readSeriesAt, readStopHistory, resumeSeries, seriesId,
@@ -26,10 +26,15 @@ import {
   type CompleteAttemptRequest, type Continuation, type EscalateSeriesRequest, type OpenSeriesRequest, type RepairSeries,
   type GroundRecord, type ResumeSeriesRequest, type SeriesRequest, type SeriesTransition,
 } from "../src/om/series.js";
+import { closeAttempt, openAttempt, prepareCloseAttempt, prepareManagedClaim, prepareOpenAttempt } from "../src/om/repeat-gate.js";
+import { acceptedAnswerNamespace, readAcceptedAnswer } from "../src/om/accepted-answer.js";
+import { managedBlock, MANAGED_SUBJECT, type ManagedBlock } from "./om-managed-block.js";
 
 const UNIT = "store-repairs";
 const PROJECT = "alpha";
-const BLOCK = "block:cart";
+// A block of the garden graph: a managed attempt is planned for the block that consumes the addressed question.
+const blockOf = (project: string): string => `${project}-consume-block`;
+const BLOCK = blockOf(PROJECT);
 const SLICE = "slice:cart@1";
 const code = (expected: string) => (error: unknown): boolean => error instanceof EngineError && error.code === expected;
 
@@ -56,7 +61,7 @@ function deeplyFrozen(value: unknown): boolean {
   return Object.isFrozen(value) && Object.values(value as Record<string, unknown>).every(deeplyFrozen);
 }
 
-function addressed(refusal: Refusal, expected: string, project = PROJECT, line = 1, block = BLOCK): Refusal {
+function addressed(refusal: Refusal, expected: string, project = PROJECT, line = 1, block = blockOf(project)): Refusal {
   assert.equal(refusal.code, expected);
   assert.equal(refusal.at.unit, UNIT);
   assert.equal(refusal.at.target, seriesId(project, block, line));
@@ -116,7 +121,7 @@ function journalled(store: Store, project: string, over: Record<string, unknown>
  * "independent" is in it on purpose: the series must not lift a stop because a record says so about itself.
  */
 const review = (project: string, stop: number, goals: readonly string[] = ["gap:cart:price"], over: Record<string, unknown> = {}) => ({
-  projectId: project, block: BLOCK, stop, goals: [...goals],
+  projectId: project, block: blockOf(project), stop, goals: [...goals],
   reviewer: { name: "a reviewer who is not the executor", independent: true },
   context: { attempts: [stop - 2, stop - 1, stop], refusals: ["graph_invalid"] },
   cause: "the same question goes to the same producer every cycle, and its answer is refused for the same reason",
@@ -147,7 +152,7 @@ const byReview = (store: Store, project: string, stop: number, goals?: readonly 
  * "taken" is in it on purpose: the series must not continue because a record says of itself that the owner approved.
  */
 const decision = (project: string, stop: number, goals: readonly string[] = ["gap:cart:price"], over: Record<string, unknown> = {}) => ({
-  projectId: project, block: BLOCK, stop, goals: [...goals],
+  projectId: project, block: blockOf(project), stop, goals: [...goals],
   decided: "go on: I have read what was tried and I want one more window",
   taken: { by: "the owner", through: "the command API", approved: true },
   ...over,
@@ -236,7 +241,7 @@ const refusedBy = (store: Store, project: string, over: Record<string, unknown> 
 
 const win = (store: Store, key: string) => ({ key, basis: accepted(store, key) });
 
-const address = (project: string, line = 1): SeriesRequest => ({ project, block: BLOCK, line });
+const address = (project: string, line = 1): SeriesRequest => ({ project, block: blockOf(project), line });
 
 function opened(store: Store, project = PROJECT, over: Partial<OpenSeriesRequest> = {}) {
   return deliveredOf(openSeries(store, {
@@ -245,7 +250,7 @@ function opened(store: Store, project = PROJECT, over: Partial<OpenSeriesRequest
 }
 
 const held = (store: Store, project = PROJECT, line = 1): Revision<RepairSeries> | null =>
-  store.get<RepairSeries>(seriesId(project, BLOCK, line));
+  store.get<RepairSeries>(seriesId(project, blockOf(project), line));
 
 const ordinal = (store: Store, project = PROJECT, line = 1): number => {
   const value = held(store, project, line)!.value;
@@ -269,8 +274,25 @@ function forge(store: Store, project: string, build: (value: RepairSeries) => Re
   store.write({ id: current.id, kind: REPAIR_SERIES_KIND, expected: current.revision, value: build(current.value) });
 }
 
-test("a series keeps the cycle it was given: the goal named first, the outcome once, and the progress it derived", t => {
-  const { store } = fixture(t);
+/** A fixture whose block is managed: its attempts open, are paid for and close only through their producers (LG07). */
+function managedFixture(t: test.TestContext, project = PROJECT, options: Parameters<typeof managedBlock>[3] = {}):
+  ReturnType<typeof fixture> & { m: ManagedBlock } {
+  const f = fixture(t);
+  return { ...f, m: managedBlock(f.store, f, project, options) };
+}
+const prepareManagedClaimOf = (store: Store, attempt: number, refusals: readonly ClaimedRefusal[], project = PROJECT) =>
+  prepareManagedClaim(store, { ...address(project), attempt, outcome: { reason: "result", accepting: [], cancelling: [], refusals: [...refusals] } });
+/** A cycle that delivered a candidate the independent assessor did not accept: a cycle all the same, and no progress. */
+const FRUITLESS = "insufficient" as const;
+
+/** The keys a closed attempt achieved, each read back from its accepted answer through the answer's own reader. */
+const answeredKeys = (store: Store, project: string, attempt: Attempt): string[] => attempt.outcome!.achieved.map(item => {
+  assert.ok(item.basis.id.startsWith(acceptedAnswerNamespace(project)), "A result stands on the answer E5 accepted");
+  return deliveredOf(readAcceptedAnswer(store, { project, record: item.basis })).key;
+});
+
+test("a series keeps the cycle it was given: the goal named first, the outcome once, and the progress it derived", async t => {
+  const { store, m } = managedFixture(t);
   const series = opened(store);
   assert.equal(series.id, seriesId(PROJECT, BLOCK, 1));
   assert.equal(series.kind, REPAIR_SERIES_KIND);
@@ -287,36 +309,45 @@ test("a series keeps the cycle it was given: the goal named first, the outcome o
   assert.equal(series.value.withoutProgress, 0);
   assert.equal(series.value.stop, null);
 
-  const begun = deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
+  // The goal is the one the M6 batch dictates; the key is the caller's, the questions and the result are the plan's.
+  const planned = m.goal();
+  const begun = m.open(1);
   assert.equal(begun.value.attempts.length, 1);
   const open = begun.value.attempts[0]!;
   assert.equal(open.ordinal, 1);
   assert.equal(open.goal.key, "gap:cart:price");
-  assert.deepEqual(open.goal.questions, ["which node produces the price of a cart line?"]);
-  assert.ok(open.goal.result.length > 0);
+  assert.deepEqual(open.goal.questions, planned.questions);
+  assert.ok(open.goal.questions.length > 0);
+  assert.equal(open.goal.result, planned.result);
   // An attempt still running has no outcome and no verdict, and it moves no count.
   assert.equal(open.outcome, null);
   assert.equal(open.verdict, null);
   assert.equal(begun.value.withoutProgress, 0);
 
-  const done = deliveredOf(completeAttempt(store, {
-    ...address(PROJECT), attempt: 1, outcome: outcome({ achieved: [win(store, "line:cart:price")] }),
-  }));
+  await m.pay(1, "supported");
+  const claim = m.claim(1);
+  assert.equal(claim.reason, "result");
+  const gate = m.close(1, claim);
+  const done = held(store)!;
   assert.equal(done.revision, 3);
   const closed = done.value.attempts[0]!;
   assert.equal(closed.outcome!.reason, "result");
-  assert.deepEqual(closed.outcome!.achieved.map(item => item.key), ["line:cart:price"]);
+  // The results are named by the answers E5 accepted, and their keys are the ones those answers carry.
+  assert.equal(closed.outcome!.achieved.length, claim.accepting.length);
+  assert.ok(closed.outcome!.achieved.length > 0);
+  assert.deepEqual(closed.outcome!.achieved.map(item => item.key), answeredKeys(store, PROJECT, closed));
   assert.deepEqual(closed.outcome!.cancelled, []);
   assert.deepEqual(closed.outcome!.refusals, []);
   // The verdict is the series' own: a new accepted result for this goal is progress, and progress clears the count.
   assert.equal(closed.verdict, "progress");
+  assert.equal(gate.verdict, "progress");
   assert.equal(done.value.withoutProgress, 0);
   assert.equal(done.value.stop, null);
 
-  // What was handed out is what was written: the copy hashes as the stored record does.
-  assert.equal(hashJson(done.value), held(store)!.hash);
-  assert.ok(deeplyFrozen(done));
+  // What is handed out is what was written: the copy hashes as the stored record does, and is not the store's own.
   const read = deliveredOf(readSeries(store, address(PROJECT)));
+  assert.equal(hashJson(read.value), done.hash);
+  assert.ok(deeplyFrozen(read));
   assert.deepEqual(read.value, done.value);
   assert.notEqual(read.value, done.value);
   assert.equal(store.history(seriesId(PROJECT, BLOCK, 1)).length, 3);
@@ -338,7 +369,7 @@ test("every refusal code of this unit is produced, addressed and routed", { todo
   forge(store, "p3", value => ({ ...value, slice: "slice:rewritten", withoutProgress: 7 }));
   record(refusalOf(readSeries(store, address("p3"))), "series_invalid", "p3");
 
-  store.write({ id: seriesId("p4", BLOCK, 1), kind: REPAIR_SERIES_KIND, expected: 0, value: {
+  store.write({ id: seriesId("p4", blockOf("p4"), 1), kind: REPAIR_SERIES_KIND, expected: 0, value: {
     ...opened(store, "p4x").value, projectId: "p4", block: "block:other",
   } as unknown as Json });
   record(refusalOf(readSeries(store, address("p4"))), "series_foreign", "p4");
@@ -510,7 +541,7 @@ test("a forged input is refused: a foreign namespace, a substituted hash and an 
     ...address("beta", 2), slice: "slice:cart@2", predecessor: reference(one),
     basis: { ground: "inputs-changed", text: "the closure of the block's dependencies moved" },
   }));
-  assert.equal(two.value.predecessor!.id, seriesId("beta", BLOCK, 1));
+  assert.equal(two.value.predecessor!.id, seriesId("beta", blockOf("beta"), 1));
 
   // A predecessor of another block, at a hash it does not hold, at a revision it never reached, or absent.
   // The refusal is addressed to the record that was wrong — the predecessor being read, not the series being opened.
@@ -522,12 +553,12 @@ test("a forged input is refused: a foreign namespace, a substituted hash and an 
   assert.equal(refuse(reference(foreign), "record_foreign").at.field, "id");
   assert.equal(refuse({ ...reference(two), hash: hex("d") }, "record_forged").at.field, "hash");
   assert.equal(refuse({ ...reference(two), revision: 9 }, "record_missing").at.ref!.revision, 9);
-  assert.equal(refuse({ id: seriesId("beta", BLOCK, 2), revision: 1 }, "reference_invalid").at.field, "hash");
+  assert.equal(refuse({ id: seriesId("beta", blockOf("beta"), 2), revision: 1 }, "reference_invalid").at.field, "hash");
   // A predecessor two lines back is not this line's predecessor, however genuine it is.
   assert.equal(refuse(reference(one), "record_foreign").at.field, "id");
 
   // A record of another kind standing at a series' own address is not a series.
-  store.write({ id: seriesId("delta", BLOCK, 1), kind: "gate-pass", expected: 0, value: { projectId: "delta" } });
+  store.write({ id: seriesId("delta", blockOf("delta"), 1), kind: "gate-pass", expected: 0, value: { projectId: "delta" } });
   assert.equal(addressed(refusalOf(readSeries(store, address("delta"))), "record_foreign", "delta").at.field, "kind");
 
   // A verdict, a count, a stop and a canonical order imitated in place: the record agrees with itself and nothing else.
@@ -609,24 +640,35 @@ test("a forged input is refused: a foreign namespace, a substituted hash and an 
 // only way to stand in that window is to write from another connection while the read is being answered.
 class RacingStore extends Store {
   armed = false;
+  /**
+   * Where the rival runs: at the first read of the target, or after every read of a prepared change and just before
+   * its transaction writes the target — the window a managed change, which reads the series more than once, has left.
+   */
+  atWrite = false;
   target = "";
   run: ((store: Store) => void) | null = null;
+  private rival(): void {
+    this.armed = false;
+    const other = new Store(this.path);
+    try { this.run!(other); } finally { other.close(); }
+  }
   override get<T = Json>(id: string, revision?: number): Revision<T> | null {
     const found = super.get<T>(id, revision);
-    if (this.armed && id === this.target && this.run) {
-      this.armed = false;
-      const other = new Store(this.path);
-      try { this.run(other); } finally { other.close(); }
-    }
+    if (this.armed && !this.atWrite && id === this.target && this.run) this.rival();
     return found;
+  }
+  override writeMany<T = Json>(inputs: Write[], guards: Parameters<Store["writeMany"]>[1] = []): Revision<T>[] {
+    if (this.armed && this.atWrite && this.run && inputs.some(input => input.id === this.target)) this.rival();
+    return super.writeMany<T>(inputs, guards);
   }
 }
 
-test("a series written to by someone else between the read and the write is refused, and nothing is lost (T7)", t => {
+test("a series written to by someone else between the read and the write is refused, and nothing is lost (T7)", async t => {
   const root = mkdtempSync(join(tmpdir(), "omg-om-series-race-"));
   const path = join(root, "live.sqlite");
   const store = new RacingStore(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const m = managedBlock(store, { root, path }, PROJECT);
   store.target = seriesId(PROJECT, BLOCK, 1);
 
   // The series does not exist yet: the competitor opens it while this call believes there is nothing there.
@@ -637,30 +679,44 @@ test("a series written to by someone else between the read and the write is refu
   assert.equal(created.revision, 1);
   assert.equal(created.value.slice, SLICE);
 
-  // The series exists: the competitor begins an attempt while this call holds the head it read.
+  // The series exists: the competitor opens an attempt through G7 after this call has read everything its managed
+  // opening stands on and before it writes. The guard of the head it read stops it; the competitor's attempt stands.
   store.armed = true;
-  store.run = other => { deliveredOf(beginAttempt(other, { ...address(PROJECT), attempt: 1, goal: goal({ key: "gap:cart:tax" }) })); };
-  const refusal = addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() })), "input_stale");
-  assert.deepEqual(refusal.at.ref, reference(created));
+  store.atWrite = true;
+  store.run = other => { m.on(other).open(1, "gap:cart:tax"); };
+  const lost = refusalOf(openAttempt(store, m.opening(1)));
+  assert.equal(lost.code, "input_stale");
+  assert.equal(lost.at.target, created.id);
+  assert.deepEqual(lost.at.ref, reference(created));
   assert.equal(held(store)!.value.attempts[0]!.goal.key, "gap:cart:tax");
+  assert.equal(held(store)!.value.attempts.length, 1);
 
-  // The competitor closes that attempt while this call is closing it too: the outcome is counted once.
+  // The competitor closes that attempt at the gate while this call is closing it too: the outcome is counted once.
+  store.armed = false;
+  await m.pay(1, "supported");
+  const claim = m.claim(1), before = held(store)!;
   store.armed = true;
-  store.run = other => {
-    deliveredOf(completeAttempt(other, { ...address(PROJECT), attempt: 1, outcome: outcome({ achieved: [win(other, "line:cart:tax")] }) }));
-  };
-  addressed(refusalOf(completeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: fruitless() })), "input_stale");
+  store.run = other => { m.on(other).close(1, m.on(other).claim(1)); };
+  const twice = refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: claim }));
+  assert.equal(twice.code, "input_stale");
+  assert.ok(twice.at.ref !== undefined && store.get(twice.at.ref.id)!.revision > twice.at.ref.revision,
+    "The refusal names a head this call read and the competitor moved");
   const after = held(store)!;
+  assert.equal(after.revision, before.revision + 1);
   assert.equal(after.value.attempts[0]!.verdict, "progress");
   assert.equal(after.value.attempts.length, 1);
-
-  // Nothing was lost: the refused attempt is begun once the current head is read again.
+  // Read again, the same close is a repeat of the one that stands, and it writes nothing.
   store.armed = false;
-  const grown = deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 2, goal: goal() }));
+  m.close(1, claim);
+  assert.equal(held(store)!.revision, after.revision);
+
+  // Nothing was lost: the refused attempt is opened once the current head is read again.
+  const grown = m.open(2);
   assert.deepEqual(grown.value.attempts.map(item => item.goal.key), ["gap:cart:tax", "gap:cart:price"]);
   assert.equal(grown.value.withoutProgress, 0);
-  deliveredOf(completeAttempt(store, { ...address(PROJECT), attempt: 2, outcome: fruitless() }));
-  for (let round = 0; round < 2; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  await m.pay(2, "insufficient");
+  m.close(2, m.claim(2));
+  for (let round = 0; round < 2; round += 1) await m.cycle("gap:cart:price", "insufficient");
   assert.equal(standingStop(store), 4);
 
   // The competitor continues the stopped series while this call is continuing it on another ground. The review this
@@ -668,6 +724,7 @@ test("a series written to by someone else between the read and the write is refu
   const contested = byReview(store, PROJECT, 4);
   const rival = byOwner(store, PROJECT, 4);
   store.armed = true;
+  store.atWrite = false;
   store.run = other => { deliveredOf(resumeSeries(other, { ...address(PROJECT), stop: 4, ...rival })); };
   addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 4, ...contested })), "input_stale");
   assert.deepEqual(held(store)!.value.continuations.map(item => item.ground), ["owner-decision"]);
@@ -677,7 +734,7 @@ test("a series written to by someone else between the read and the write is refu
   store.armed = false;
   const done = deliveredOf(readSeries(store, address(PROJECT)));
   store.armed = true;
-  store.run = other => { deliveredOf(beginAttempt(other, { ...address(PROJECT), attempt: 5, goal: goal({ key: "gap:cart:tax" }) })); };
+  store.run = other => { m.on(other).open(5, "gap:cart:tax"); };
   addressed(refusalOf(openSeries(store, {
     ...address(PROJECT, 2), slice: "slice:cart@2", predecessor: reference(done),
     basis: { ground: "inputs-changed", text: "the slice moved" },
@@ -685,16 +742,16 @@ test("a series written to by someone else between the read and the write is refu
   assert.equal(held(store, PROJECT, 2), null);
 });
 
-test("every change names the state it comes from, so a late delivery finds its own and changes nothing (T5)", t => {
-  const { path, store } = fixture(t);
+test("every change names the state it comes from, so a late delivery finds its own and changes nothing (T5)", async t => {
+  const { path, store, m } = managedFixture(t);
   // THE STOP. Three attempts without progress, a review recorded for that stop, and three more before it stops again.
   opened(store);
-  for (let round = 0; round < 3; round += 1) cycle(store, PROJECT, goal(), fruitless());
+  for (let round = 0; round < 3; round += 1) await m.cycle("gap:cart:price", FRUITLESS);
   const ground = byReview(store, PROJECT, 3);
   deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
-  for (let round = 0; round < 2; round += 1) assert.equal(cycle(store, PROJECT, goal(), fruitless()).value.stop, null);
-  const sixth = cycle(store, PROJECT, goal(), fruitless());
-  assert.equal(sixth.value.stop!.attempt, 6);
+  for (let round = 0; round < 2; round += 1) assert.equal((await m.cycle("gap:cart:price", FRUITLESS)).stop, null);
+  assert.equal((await m.cycle("gap:cart:price", FRUITLESS)).stop!.attempt, 6);
+  const sixth = held(store)!;
 
   // The SAME continuation delivered again is about the stop after attempt three, which is continued already. It
   // changes nothing and it does not lift the stop saved after attempt six.
@@ -703,28 +760,31 @@ test("every change names the state it comes from, so a late delivery finds its o
   assert.deepEqual(late.value, sixth.value);
   assert.equal(late.value.stop!.attempt, 6);
   assert.deepEqual(late.value.continuations.map(item => item.after), [3]);
-  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 7, goal: goal() })), "series_stopped");
+  addressed(refusalOf(openAttempt(store, m.opening(7))), "series_stopped");
   // A ground given for a stop that never stood is refused, and so is a second ground for one already continued.
   addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 2, ...byOwner(store, PROJECT, 2) })), "stop_absent");
   addressed(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...byOwner(store, PROJECT, 3) })), "continuation_conflict");
   assert.equal(store.history(seriesId(PROJECT, BLOCK, 1)).length, sixth.revision);
 
-  // THE ATTEMPT. A "begin" that arrives late finds the attempt it was about, closed long since, and opens nothing.
+  // THE ATTEMPT. An opening that arrives late finds the attempt it was about, closed long since, and opens nothing.
   deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...byOwner(store, PROJECT, 6) }));
-  const moved = cycle(store, PROJECT, goal(), outcome({ achieved: [win(store, "line:A")] }));
+  assert.equal((await m.cycle("gap:cart:price", "supported")).verdict, "progress");
+  const moved = held(store)!;
   assert.equal(moved.value.attempts.length, 7);
-  const echo = deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
+  const echo = deliveredOf(openAttempt(store, m.opening(1)));
   assert.equal(echo.revision, moved.revision);
   assert.equal(echo.value.attempts.length, 7);
   // The same ordinal under another goal is a conflict, not a second attempt and not a rewriting of the first.
-  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal({ key: "gap:cart:tax" }) })), "attempt_conflict");
+  const first = m.opening(1);
+  addressed(refusalOf(openAttempt(store, { ...first, goal: { ...first.goal, key: "gap:cart:tax" } })), "attempt_conflict");
   // An ordinal that is neither held nor next opens nothing either.
-  addressed(refusalOf(beginAttempt(store, { ...address(PROJECT), attempt: 9, goal: goal() })), "attempt_unknown");
+  addressed(refusalOf(openAttempt(store, m.opening(9))), "attempt_unknown");
 
-  // THE OUTCOME. A closed attempt keeps its outcome however many attempts were begun and closed after it.
-  const back = deliveredOf(completeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: fruitless() }));
-  assert.equal(back.revision, moved.revision);
-  assert.deepEqual(back.value, moved.value);
+  // THE OUTCOME. A closed attempt keeps its outcome however many attempts were opened and closed after it: its own
+  // close delivered again is a repeat that writes nothing.
+  m.close(1, m.claimed(1));
+  assert.equal(held(store)!.revision, moved.revision);
+  assert.deepEqual(held(store)!.value, moved.value);
 
   // THE SERIES. Opening it again is a repeat whatever has happened in it since.
   const again = deliveredOf(openSeries(store, { ...address(PROJECT), slice: SLICE, predecessor: null, basis: null }));
@@ -736,18 +796,20 @@ test("every change names the state it comes from, so a late delivery finds its o
   store.close();
   const reopened = new Store(path);
   t.after(() => reopened.close());
+  const r = m.on(reopened);
   const cold = deliveredOf(readSeries(reopened, address(PROJECT)));
   assert.deepEqual(cold.value, moved.value);
   assert.deepEqual(deliveredOf(resumeSeries(reopened, { ...address(PROJECT), stop: 3, ...ground })).value, moved.value);
-  assert.deepEqual(deliveredOf(beginAttempt(reopened, { ...address(PROJECT), attempt: 1, goal: goal() })).value, moved.value);
-  assert.deepEqual(deliveredOf(completeAttempt(reopened, { ...address(PROJECT), attempt: 1, outcome: fruitless() })).value, moved.value);
+  assert.deepEqual(deliveredOf(openAttempt(reopened, r.opening(1))).value, moved.value);
+  r.close(1, r.claimed(1));
+  assert.deepEqual(held(reopened)!.value, moved.value);
   assert.equal(reopened.history(seriesId(PROJECT, BLOCK, 1)).length, moved.revision);
 
   // A successor, too, is opened once: the repeat is recognised after the successor has a history of its own.
   const successor = deliveredOf(openSeries(reopened, {
     ...address(PROJECT, 2), slice: "slice:cart@2", predecessor: reference(cold), basis: { ground: "inputs-changed", text: "the slice moved" },
   }));
-  cycle(reopened, PROJECT, goal(), fruitless(), 2);
+  await r.cycle("gap:cart:price", FRUITLESS, [], 2);
   const reopenedSuccessor = deliveredOf(openSeries(reopened, {
     ...address(PROJECT, 2), slice: "slice:cart@2", predecessor: reference(cold), basis: { ground: "inputs-changed", text: "the slice moved" },
   }));
@@ -755,132 +817,154 @@ test("every change names the state it comes from, so a late delivery finds its o
   assert.equal(reopenedSuccessor.revision, successor.revision + 2);
 });
 
-test("the order of an unordered set does not change what an outcome is (T5, T6)", t => {
-  const { store } = fixture(t);
+test("the order of an unordered set does not change what an outcome is (T5, T6)", async t => {
+  // One batch of two facts: one attempt asks two questions and two accepted answers name its results.
+  const { store, m } = managedFixture(t, PROJECT, { facts: 2 });
   opened(store);
-  const one = win(store, "line:A");
-  const two = win(store, "line:B");
-  const first = journalled(store, PROJECT);
-  const second = journalled(store, PROJECT, { code: "layer_port_unbound", goal: "every port of an operation is bound" });
-  const questions = ["address the second question", "address the first question"];
+  const first = m.refusal("proposal");
+  const second = m.refusal("input", { code: "layer_port_unbound", goal: "every port of an operation is bound" });
 
-  const attempt = ordinal(store, PROJECT);
-  deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt, goal: goal({ questions }) }));
-  const closed = deliveredOf(completeAttempt(store, {
-    ...address(PROJECT), attempt,
-    outcome: outcome({ reason: "refused", achieved: [one, two], refusals: [first, second, first] }),
-  }));
+  const attempt = m.ordinal();
+  const opening = m.opening(attempt);
+  assert.equal(opening.goal.questions.length, 2);
+  const questions = [...opening.goal.questions].reverse();
+  m.open(attempt, opening.goal.key, 1, request => ({ ...request, goal: { ...request.goal, questions } }));
   // Written canonically whichever order it arrived in, and the package of questions with it.
-  assert.deepEqual(closed.value.attempts[0]!.goal.questions, [...questions].sort());
-  assert.deepEqual(closed.value.attempts[0]!.outcome!.achieved.map(item => item.key), ["line:A", "line:B"]);
-  // Multiplicity is kept: two refusals are two, even when they are the same refusal named twice.
-  assert.equal(closed.value.attempts[0]!.outcome!.refusals.length, 3);
-  assert.deepEqual(closed.value.attempts[0]!.outcome!.refusals, [first, second, first].map(item => ({ row: item.row })).sort((l, r) => (l.row < r.row ? -1 : 1)));
+  assert.deepEqual(held(store)!.value.attempts[0]!.goal.questions, [...questions].sort());
+  await m.pay(attempt, "supported");
+  const claim = m.claim(attempt, [first, second, first]);
+  assert.equal(claim.accepting.length, 2);
+  m.close(attempt, claim);
+  const closed = held(store)!;
+  const outcome = closed.value.attempts[0]!.outcome!;
+  assert.equal(outcome.reason, "result");
+  assert.deepEqual(outcome.achieved.map(item => item.key), answeredKeys(store, PROJECT, closed.value.attempts[0]!));
+  assert.equal(outcome.achieved.length, 2);
+  // The claim of the gate is a set of journal rows: the same row named twice is one refusal, two rows are two.
+  assert.deepEqual(outcome.refusals, [first, second].map(item => ({ row: item.row })).sort((l, r) => (l.row < r.row ? -1 : 1)));
 
-  // The same results, cancellations, refusals and questions in another order are the same outcome: no revision.
-  const again = deliveredOf(completeAttempt(store, {
-    ...address(PROJECT), attempt,
-    outcome: outcome({ reason: "refused", achieved: [two, one], refusals: [second, first, first] }),
-  }));
-  assert.equal(again.revision, closed.revision);
-  assert.deepEqual(again.value, closed.value);
+  // The same results, refusals and questions in another order are the same outcome: no revision.
+  m.close(attempt, { ...claim, accepting: [...claim.accepting].reverse(), refusals: [second, first, first] });
+  assert.equal(held(store)!.revision, closed.revision);
   // And the goal, too: a package of questions named in another order is the same attempt, not a conflicting one.
-  const sameGoal = deliveredOf(beginAttempt(store, {
-    ...address(PROJECT), attempt, goal: goal({ questions: [...questions].reverse() }),
-  }));
+  const sameGoal = deliveredOf(openAttempt(store, { ...opening, goal: { ...opening.goal, questions: [...questions].reverse() } }));
   assert.equal(sameGoal.revision, closed.revision);
 
-  // A cancellation set is normalised too, and dropping a refusal really is a different outcome.
-  const later = ordinal(store, PROJECT);
-  deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt: later, goal: goal() }));
-  const cancels = deliveredOf(completeAttempt(store, {
-    ...address(PROJECT), attempt: later, outcome: outcome({ reason: "interrupted", cancelled: ["line:B", "line:A"] }),
-  }));
-  assert.deepEqual(cancels.value.attempts[1]!.outcome!.cancelled, ["line:A", "line:B"]);
-  assert.deepEqual(deliveredOf(completeAttempt(store, {
-    ...address(PROJECT), attempt: later, outcome: outcome({ reason: "interrupted", cancelled: ["line:A", "line:B"] }),
-  })).value, cancels.value);
-  addressed(refusalOf(completeAttempt(store, {
-    ...address(PROJECT), attempt: later, outcome: outcome({ reason: "interrupted", cancelled: ["line:A"] }),
-  })), "outcome_conflict");
-  addressed(refusalOf(completeAttempt(store, {
-    ...address(PROJECT), attempt, outcome: outcome({ reason: "refused", achieved: [one, two], refusals: [first, second] }),
-  })), "outcome_conflict");
+  // Dropping a refusal really is a different outcome, and so is naming a cancellation the close did not hold.
+  const conflict = (refusal: Refusal): void => {
+    assert.equal(refusal.code, "outcome_conflict");
+    assert.equal(refusal.at.field, "outcome");
+  };
+  conflict(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt, outcome: { ...claim, refusals: [first] } })));
+  conflict(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt, outcome: { ...claim, cancelling: [claim.accepting[0]!] } })));
+  assert.equal(held(store)!.revision, closed.revision);
+
+  // A cancellation set is weighed whatever its order — and today no provider confirms a cancellation of any kind,
+  // so a cycle that names one is refused before anything is written, and its attempt stays open.
+  const later = m.ordinal();
+  m.open(later);
+  await m.pay(later, "interrupted");
+  const ended = m.claim(later);
+  const running = held(store)!;
+  for (const order of [[...claim.accepting], [...claim.accepting].reverse()]) {
+    const refused = refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: later, outcome: { ...ended, cancelling: order } }));
+    assert.equal(refused.code, "cancellation_unconfirmed");
+    assert.equal(refused.at.field, "outcome.cancelling.0.kind");
+  }
+  assert.equal(held(store)!.revision, running.revision);
+  assert.equal(held(store)!.value.attempts[1]!.outcome, null);
+  m.close(later, ended);
+  assert.deepEqual(held(store)!.value.attempts[1]!.outcome!.cancelled, []);
+  assert.equal(held(store)!.value.attempts[1]!.verdict, "none");
 });
 
-test("a refusal keeps the link that tells it from another of the same name and goal", t => {
-  const { store } = fixture(t);
+test("a refusal keeps the link that tells it from another of the same name and goal", async t => {
+  const { store, root, path, m } = managedFixture(t);
   opened(store);
   // Two legitimate events of A2 with the SAME name and goal, from different origins: the proposal's own error, and
-  // a definition lost by the assembler. G7 classifies them differently, and the series must keep them apart.
-  const fromProposal = journalled(store, PROJECT, { stage: "layer-design", subject: "artifact:cart" });
-  const fromAssembly = journalled(store, PROJECT, { stage: "candidate-assembly", subject: "artifact:cart" });
+  // a definition lost on the way from the proposals to the candidate. G7 classifies them differently, and the series
+  // must keep them apart.
+  const same = { code: "graph_invalid", goal: "every artifact an operation consumes is produced somewhere in the layer" };
+  const fromProposal = m.refusal("proposal", same);
+  const fromAssembly = m.refusal("derivation", same);
   assert.equal(fromProposal.name, fromAssembly.name);
   assert.equal(fromProposal.goal, fromAssembly.goal);
   assert.notEqual(fromProposal.row, fromAssembly.row);
 
-  deliveredOf(classifyRefusal(store, { project: PROJECT, row: fromProposal.row, class: "design", addressee: "MC2", basis: [] }));
-  deliveredOf(classifyRefusal(store, { project: PROJECT, row: fromAssembly.row, class: "derivation", addressee: "code-producer", basis: [] }));
-
-  const one = cycle(store, PROJECT, goal(), outcome({ reason: "refused", refusals: [fromProposal] }));
-  const two = cycle(store, PROJECT, goal(), outcome({ reason: "refused", refusals: [fromAssembly] }));
-  const rows = [...two.value.attempts].map(item => item.outcome!.refusals[0]!.row);
+  const one = await m.cycle("gap:cart:price", "off-form", [fromProposal]);
+  const two = await m.cycle("gap:cart:price", "off-form", [fromAssembly]);
+  const series = held(store)!;
+  const rows = series.value.attempts.map(item => item.outcome!.refusals[0]!.row);
   assert.deepEqual(rows, [fromProposal.row, fromAssembly.row]);
   assert.notEqual(rows[0], rows[1]);
-  assert.ok(one.revision < two.revision);
+  assert.deepEqual(series.value.attempts.map(item => item.outcome!.reason), ["refused", "refused"]);
 
   // From the series alone the addressee of each attempt is found, because the link resolves to one row and one class.
   const journal = deliveredOf(readJournal(store, { project: PROJECT }));
-  const addresseeOf = (row: string): string => journal.value.classifications.find(item => item.row === row)!.addressee;
-  assert.deepEqual(rows.map(addresseeOf), ["MC2", "code-producer"]);
-  const originOf = (row: string): string => journal.value.rows.find(item => item.id === row)!.origin.stage;
-  assert.deepEqual(rows.map(originOf), ["layer-design", "candidate-assembly"]);
+  const classOf = (row: string) => journal.value.classifications.find(item => item.row === row)!;
+  assert.deepEqual(rows.map(row => classOf(row).class), ["proposal", "derivation"]);
+  assert.equal(classOf(rows[0]!).addressee, `node:${MANAGED_SUBJECT}`);
+  assert.ok(classOf(rows[1]!).addressee.startsWith(`code:om-candidate:${PROJECT}:`));
+  assert.deepEqual([...one.routed, ...two.routed].map(item => [item.row, item.class, item.addressee]),
+    rows.map(row => [row, classOf(row).class, classOf(row).addressee]));
 
   // A link is weighed against the journal of THIS project when the cycle is closed: a row that stands nowhere, a row
-  // of another project, and a row whose refusal is not the one the cycle reports are all refused.
+  // of another project, and a row whose refusal is not the one the cycle reports are all refused — whether the claim
+  // is derived by G7 or handed to the close directly.
   const elsewhere = journalled(store, "beta");
-  const attempt = ordinal(store, PROJECT);
-  deliveredOf(beginAttempt(store, { ...address(PROJECT), attempt, goal: goal() }));
+  const attempt = m.ordinal();
+  m.open(attempt);
+  await m.pay(attempt, "off-form");
+  const unlinkedRow = (refusal: Refusal, project = PROJECT): void => {
+    assert.equal(refusal.code, "completion_invalid");
+    assert.equal(refusal.at.target, seriesId(project, blockOf(project), 1));
+    assert.equal(refusal.at.field, "refusals");
+  };
   for (const broken of [
     { ...fromProposal, row: "om-refusal:invented" },
     { ...elsewhere },
     { ...fromProposal, name: "work_not_atomic" },
     { ...fromProposal, goal: "a goal the row does not hold" },
   ]) {
-    addressed(refusalOf(completeAttempt(store, {
-      ...address(PROJECT), attempt, outcome: outcome({ reason: "refused", refusals: [broken] }),
-    })), "refusal_unlinked");
+    unlinkedRow(refusalOf(prepareManagedClaimOf(store, attempt, [broken])));
+    unlinkedRow(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt,
+      outcome: { reason: "refused", accepting: [], cancelling: [], refusals: [broken] } })));
   }
   assert.equal(held(store)!.value.attempts[2]!.outcome, null);
 
-  // A project with no journal at all has no refusal a cycle could stand on.
+  // A project with no journal at all has no refusal a cycle could stand on, even after its attempt was paid for.
+  const silent = managedBlock(store, { root, path }, "silent");
   opened(store, "silent");
-  deliveredOf(beginAttempt(store, { ...address("silent"), attempt: 1, goal: goal() }));
-  addressed(refusalOf(completeAttempt(store, {
-    ...address("silent"), attempt: 1, outcome: outcome({ reason: "refused", refusals: [fromProposal] }),
-  })), "refusal_unlinked", "silent");
-  // The classification is not required at the time the cycle closes: G7 derives it later, and the link finds it then.
-  const unclassified = journalled(store, PROJECT, { code: "work_not_atomic", goal: "each work owns one artifact" });
-  deliveredOf(completeAttempt(store, {
-    ...address(PROJECT), attempt, outcome: outcome({ reason: "refused", refusals: [unclassified] }),
-  }));
+  silent.open(1);
+  await silent.pay(1, "off-form");
+  assert.equal(refusalOf(readJournal(store, { project: "silent" })).code, "journal_missing");
+  unlinkedRow(refusalOf(prepareManagedClaimOf(store, 1, [fromProposal], "silent")), "silent");
+  assert.equal(held(store, "silent")!.value.attempts[0]!.outcome, null);
+
+  // The classification is not required before the cycle closes: G7 derives it at the close, and the link finds it then.
+  const unclassified = m.refusal("input", { code: "work_not_atomic", goal: "each work owns one artifact" });
+  assert.equal(deliveredOf(readJournal(store, { project: PROJECT })).value.classifications.some(item => item.row === unclassified.row), false);
+  m.close(attempt, m.claim(attempt, [unclassified]));
   assert.equal(held(store)!.value.attempts[2]!.outcome!.refusals[0]!.row, unclassified.row);
+  const derived = deliveredOf(readJournal(store, { project: PROJECT })).value.classifications.find(item => item.row === unclassified.row)!;
+  assert.deepEqual([derived.class, derived.addressee], ["input", `producer:graph:${PROJECT}`]);
 });
 
-test("prepared changes of several series are applied by one transaction, or by none of them", t => {
-  const { store } = fixture(t);
-  const other = "block:checkout";
-  const at = (block: string, line: number): SeriesRequest => ({ project: PROJECT, block, line });
-  const first = deliveredOf(openSeries(store, { ...at(BLOCK, 1), slice: SLICE, predecessor: null, basis: null }));
-  const second = deliveredOf(openSeries(store, { ...at(other, 1), slice: SLICE, predecessor: null, basis: null }));
+test("prepared changes of several series are applied by one transaction, or by none of them", async t => {
+  const { store, root, path, m } = managedFixture(t);
+  // The other participant is the managed block of a second project, so each has an attempt its own M6 plan can open.
+  const other = managedBlock(store, { root, path }, "beta");
+  const ours = (line: number): SeriesRequest => m.address(line), theirs = (line: number): SeriesRequest => other.address(line);
+  const first = deliveredOf(openSeries(store, { ...ours(1), slice: SLICE, predecessor: null, basis: null }));
+  const second = deliveredOf(openSeries(store, { ...theirs(1), slice: SLICE, predecessor: null, basis: null }));
   const ground = { ground: "inputs-changed", text: "the horizon was accepted anew" } as const;
 
-  const prepare = (block: string, from: Revision<RepairSeries>) => deliveredOf(prepareOpenSeries(store, {
-    ...at(block, 2), slice: "slice:cart@2", predecessor: reference(from), basis: { ...ground },
+  const prepare = (at: (line: number) => SeriesRequest, from: Revision<RepairSeries>) => deliveredOf(prepareOpenSeries(store, {
+    ...at(2), slice: "slice:cart@2", predecessor: reference(from), basis: { ...ground },
   }));
   // A prepared change is a write and its guards, and nothing has been written yet.
-  const one = prepare(BLOCK, first);
-  const two = prepare(other, second);
+  const one = prepare(ours, first);
+  const two = prepare(theirs, second);
   assert.equal(one.writes.length, 2);
   assert.equal(one.writes[0]!.kind, REPAIR_SERIES_KIND);
   assert.equal(one.writes[0]!.expected, 0);
@@ -888,7 +972,7 @@ test("prepared changes of several series are applied by one transaction, or by n
   assert.deepEqual(one.guards, [reference(first)]);
   assert.deepEqual(one.value.inherited, []);
   assert.equal(store.get(seriesId(PROJECT, BLOCK, 2)), null);
-  assert.equal(store.get(seriesId(PROJECT, other, 2)), null);
+  assert.equal(store.get(seriesId("beta", other.block, 2)), null);
 
   // B3's own record of the transition joins the same transaction, guarded by the exact result of G2 it applies.
   const g2 = store.write({ id: "om-horizon:alpha:7", kind: "om-horizon", expected: 0, value: { state: "accepted" } });
@@ -900,16 +984,18 @@ test("prepared changes of several series are applied by one transaction, or by n
     guards: [...parts.flatMap(part => [...part.guards]), ...guards],
   });
 
-  // One participant's guard has moved: the transaction commits nothing, and NO successor is left applied.
-  deliveredOf(beginAttempt(store, { ...at(other, 1), attempt: 1, goal: goal() }));
+  // One participant's guard has moved: its managed attempt opened. The transaction commits nothing, and NO successor
+  // is left applied.
+  other.open(1);
   assert.equal(refusalOf(apply([one, two], [reference(g2)])).code, "input_stale");
   assert.equal(store.get(seriesId(PROJECT, BLOCK, 2)), null);
-  assert.equal(store.get(seriesId(PROJECT, other, 2)), null);
+  assert.equal(store.get(seriesId("beta", other.block, 2)), null);
   assert.equal(store.get("om-series-transition:alpha:7"), null);
 
   // The same when it is the result of G2 that moved between the preparation and the write.
-  deliveredOf(completeAttempt(store, { ...at(other, 1), attempt: 1, outcome: fruitless() }));
-  const ready = prepare(other, store.get<RepairSeries>(seriesId(PROJECT, other, 1))!);
+  await other.pay(1, FRUITLESS);
+  other.close(1, other.claim(1));
+  const ready = prepare(theirs, store.get<RepairSeries>(seriesId("beta", other.block, 1))!);
   const stale = reference(g2);
   store.write({ id: g2.id, kind: "om-horizon", expected: 1, value: { state: "accepted", again: true } });
   assert.equal(refusalOf(apply([one, ready], [stale])).code, "input_stale");
@@ -919,23 +1005,24 @@ test("prepared changes of several series are applied by one transaction, or by n
   const done = deliveredOf(apply([one, ready], [reference(store.get(g2.id)!)]));
   assert.equal(done.length, 5);
   assert.deepEqual(done.map(record => record.id),
-    [seriesId(PROJECT, BLOCK, 2), first.id, seriesId(PROJECT, other, 2), second.id, "om-series-transition:alpha:7"]);
+    [seriesId(PROJECT, BLOCK, 2), first.id, seriesId("beta", other.block, 2), second.id, "om-series-transition:alpha:7"]);
   // What was written is a series this unit reads back as its own, history and all.
-  const carried = deliveredOf(readSeries(store, at(other, 2)));
+  const carried = deliveredOf(readSeries(store, theirs(2)));
   assert.equal(carried.value.inherited.length, 1);
   assert.equal(carried.value.withoutProgress, 1);
   assert.deepEqual(carried.value.basis, { ...ground });
-  assert.deepEqual(deliveredOf(readSeries(store, at(BLOCK, 2))).value.inherited, []);
+  assert.deepEqual(deliveredOf(readSeries(store, ours(2))).value.inherited, []);
 
   // A prepared change that is a repeat carries no write at all, so a caller adds nothing to its transaction.
-  const repeat = prepare(BLOCK, first);
+  const repeat = prepare(ours, first);
   assert.deepEqual(repeat.writes, []);
   assert.deepEqual(repeat.guards, []);
-  assert.deepEqual(repeat.value, deliveredOf(readSeries(store, at(BLOCK, 2))).value);
+  assert.deepEqual(repeat.value, deliveredOf(readSeries(store, ours(2))).value);
   // And a prepared change that cannot be made is refused at preparation, before anything is written.
-  assert.equal(refusalOf(prepareBeginAttempt(store, { ...at(BLOCK, 2), attempt: 9, goal: goal() })).code, "attempt_unknown");
-  assert.equal(refusalOf(prepareResumeSeries(store, { ...at(BLOCK, 2), stop: 1, ...byOwner(store, PROJECT, 1) })).code, "stop_absent");
-  assert.equal(refusalOf(prepareCompleteAttempt(store, { ...at(BLOCK, 2), attempt: 1, outcome: outcome() })).code, "attempt_unknown");
+  addressed(refusalOf(prepareOpenAttempt(store, m.opening(9, "gap:cart:price", 2))), "attempt_unknown", PROJECT, 2);
+  assert.equal(refusalOf(prepareResumeSeries(store, { ...ours(2), stop: 1, ...byOwner(store, PROJECT, 1) })).code, "stop_absent");
+  addressed(refusalOf(prepareCloseAttempt(store, { ...ours(2), attempt: 1,
+    outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } })), "attempt_unknown", PROJECT, 2);
 });
 
 test("alternation A → B → A is no progress, and neither is re-taking a result that was lost", t => {
@@ -2167,7 +2254,7 @@ test("an escalation racing another change is refused rather than written over it
   // The owner answers the stop between our read and our escalation of it on yet another review: nothing is escalated
   // over a stop that no longer stands, and read again it is simply gone.
   opened(store, "other");
-  store.target = seriesId("other", BLOCK, 1);
+  store.target = seriesId("other", blockOf("other"), 1);
   for (let round = 0; round < 3; round += 1) cycle(store, "other", goal(), fruitless());
   const owner = byOwner(store, "other", 3);
   const late = undecided(store, "other", 3);
@@ -2375,14 +2462,14 @@ test("a review, a confirmation of a fix and a decision of the owner, each writte
     ...address("race"), stop: 3, ground: "owner-decision", text: "the owner decided",
     decision: onItsWay(lateId, OWNER_DECISION_KIND, decision("race", 3)),
   }));
-  assert.deepEqual(transition.writes.map(write => write.id), [seriesId("race", BLOCK, 1), lateId]);
+  assert.deepEqual(transition.writes.map(write => write.id), [seriesId("race", blockOf("race"), 1), lateId]);
   assert.equal(transition.writes[1]!.expected, 0);
   assert.equal(store.get(lateId), null);
   // Another decision answers that stop first; the prepared set is stale, and nothing of it is applied.
   deliveredOf(resumeSeries(store, { ...address("race"), stop: 3, ...byOwner(store, "race", 3) }));
   const before = held(store, "race")!;
   assert.equal(refusalOf(writeGuarded(store, {
-    unit: "a6", target: seriesId("race", BLOCK, 1), writes: [...transition.writes], guards: [...transition.guards],
+    unit: "a6", target: seriesId("race", blockOf("race"), 1), writes: [...transition.writes], guards: [...transition.guards],
   })).code, "input_stale");
   assert.equal(store.get(lateId), null);
   assert.equal(held(store, "race")!.revision, before.revision);
