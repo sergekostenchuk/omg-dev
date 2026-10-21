@@ -322,6 +322,10 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // plan-question id, depth and criterion are data; the cell confirms no coverage.
   { kind: "discovery-coverage-cell", contract: "discovery-coverage-cell/v1", data: [], refs: [
     ["subject", "planAnswer"], ["variant", "set"], ["variant", "member"]] },
+  // DR5 5.2-F: the deep preparation names exactly the references of its cell and its exact variant scope —
+  // the cell texts are data; the preparation permits no dispatch.
+  { kind: "discovery-deep-preparation", contract: "discovery-deep-preparation/v1", data: [], refs: [
+    ["cell", "subject", "planAnswer"], ["cell", "variant", "set"], ["cell", "variant", "member"], ["scope"]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
