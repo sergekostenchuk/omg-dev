@@ -305,7 +305,7 @@ export function prepareNativeLayers(engine: ProductEngine, project: string, desi
   const horizon = take(writeHorizon(store, { project, input: reference(input), graph, refinement: layer, available: {},
     choice: { choiceVersion: "fixture-works", features: [{ outcome: `${project}-result` }], excluded: [] } }));
   const frame3: FrameRequest = { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
-    upper: { horizon: reference(horizon.gate), frame: upperFrame } };
+    upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" };
   const works: ProposalRequest = { frame: frame3, proposals: [proposal(structuredClone(take(prepareFrame(store, frame3))) as unknown as FrameRead)] };
   acceptNativeWorks(engine, project,
     { frame: { ...frame2, graph, layer, frame: upperFrame, horizon: reference(horizon.gate) }, proposals: [] }, works, options.obligations);

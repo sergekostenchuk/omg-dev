@@ -107,7 +107,8 @@ function acceptedHorizon(store: Store, refinement: Ref | null) {
 function acceptedRequest(f: OmFixture, horizon: Ref, level: FrameLevel): FrameRequest {
   return { project: f.project, level, horizon, graph: reference(f.graphRevision), layer: reference(f.layers[level]),
     frame: reference(f.store.get(`om-frame:garden:${level}`)!),
-    upper: level === 2 ? null : { horizon, frame: reference(f.store.get("om-frame:garden:2")!) } };
+    upper: level === 2 ? null : { horizon, frame: reference(f.store.get("om-frame:garden:2")!) },
+    ...(level === 3 ? { workZoneContract: "accepted-l2-v1" as const } : {}) };
 }
 function put(store: Store, proposal: ProposalObservation): Ref {
   return reference(store.write({ id: proposal.reference.id, kind: "layer-proposal", expected: 0, value: proposal.value }));

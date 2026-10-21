@@ -521,7 +521,7 @@ test('LP5 (№3278 rows 17, 19) a reuse carries a non-empty D7 to today\'s hando
   const sources: GapRequest = { project, input: reference(input), graph: f.graph, horizon: reference(horizon.gate),
     operations: { proposals: [], frame: { ...f.frame2, graph: f.graph, horizon: reference(horizon.gate), layer: f.layer2, frame: f.upperFrame } },
     works: { proposals: [], frame: { project, level: 3, graph: f.graph, horizon: reference(horizon.gate), layer: null, frame: null,
-      upper: { horizon: reference(horizon.gate), frame: f.upperFrame } } } };
+      upper: { horizon: reference(horizon.gate), frame: f.upperFrame }, workZoneContract: "accepted-l2-v1" } } };
   const gaps = valueOf(writeGaps(f.store, sources)), gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = valueOf(writeGapLines(f.store, { project, previous: reference(f.store.get(f.lines.id)!), pass: 2, gaps: gapRead, closures: [] }));
   const late = gaps.records.find(row => row.value.gap.target === 'discovery:late-proof')!;

@@ -1,6 +1,6 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
@@ -8,11 +8,8 @@ import { EngineError } from "../src/errors.js";
 import { LEVEL, type Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { composeLayer, layerDesignOf } from "../src/graph/layer-design.js";
-import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
+import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
-import type { ResearchAnswer, ResearchAssessment } from "../src/discovery/research-model.js";
-import type { Question } from "../src/discovery/discovery.js";
-import type { Source } from "../src/evidence/evidence.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store } from "../src/storage/store.js";
 import { historicalTrace, withHistoricalReads, writeOmInput } from "../src/om/input.js";
@@ -727,19 +724,14 @@ const revisions = (store: Store) => store.list().map(row => ({ head: reference(r
 function branchStore(f: OmFixture, snapshot: string, name: string): Store {
   const path = join(f.root, `${name}.sqlite`); copyFileSync(snapshot, path); return new Store(path);
 }
-function replaceExact(value: unknown, replacements: Map<string, Ref>): unknown {
-  if (isRef(value) && replacements.has(canonical(value))) return replacements.get(canonical(value))!;
-  if (Array.isArray(value)) return value.map(item => replaceExact(item, replacements));
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, replaceExact(item, replacements)]));
-  return value;
-}
+
 
 test("C2 reads both accepted garden layers with exact OM frames and never writes the database", async t => {
   const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
   const horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   assert.ok(!f.layers[1].value.layerProofs?.some(proof => proof.level === 1));
   for (const level of levels) {
-    const request = requestFor(f, reference(horizon.gate), level), before = revisions(f.store);
+    const request: FrameRequest = level === 3 ? { ...requestFor(f, reference(horizon.gate), level), workZoneContract: "accepted-l2-v1" } : requestFor(f, reference(horizon.gate), level), before = revisions(f.store);
     const historical = delivered(readFrame(f.store, request));
     const current = delivered(prepareFrame(f.store, request));
     assert.deepEqual(current.result, historical.result);
@@ -778,7 +770,7 @@ test("the work scope excludes recorded operation identities after their blocks e
   const identity = representativeId(later, 2);
   assert.ok(settled.frame!.value.fills.some(fill => fill.node === identity && fill.source === "identity"));
   const request: FrameRequest = { project: "garden", level: 3, graph: acceptedGraph, horizon: reference(horizon.gate),
-    layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: acceptedFrame } };
+    layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: acceptedFrame }, workZoneContract: "accepted-l2-v1" };
   const before = revisions(store);
   for (const action of [readFrame, prepareFrame]) {
     const current = delivered(action(store, request));
@@ -866,7 +858,7 @@ test("a prepared frame guards every mutable dependency before a neighbor can wri
 });
 
 test("accepted upper bases come from saved acceptance rather than the latest projection or a status claim", { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const request = requestFor(f, reference(horizon.gate), 2), snapshot = await f.store.snapshot(join(f.root, "frame-acceptance"));
   const cases: { code: string; field: string; change: (store: Store, current: FrameRequest) => void }[] = [
     { code: "frame_basis_unproven", field: "layerProofs", change: (store, current) => {
@@ -920,136 +912,6 @@ test("accepted upper bases come from saved acceptance rather than the latest pro
   }
 });
 
-test("self-consistent lower proofs cannot replace saved layer research on either public path or level", { todo: "NR1 №3591/№3646: записанное читается доверенно; эту порчу базы ловит om-fsck на старте (test/om-fsck.test.ts)" }, async t => {
-  const f = await createOmFixture(t), horizon = acceptedHorizon(f.store, reference(f.store.get("phase:garden:L2")!));
-  const snapshot = await f.store.snapshot(join(f.root, "frame-lower-research")), untouched = revisions(f.store);
-  for (const level of levels) for (const evidence of ["missing", "for-another-result", "guard-envelope"] as const) {
-    let store = branchStore(f, snapshot.path, `frame-lower-${level}-${evidence}`);
-    try {
-      const historicalRequest = requestFor(f, reference(horizon.gate), level);
-      const historical = delivered(readFrame(store, historicalRequest));
-      assert.deepEqual(delivered(prepareFrame(store, historicalRequest)).result, historical.result);
-      const graph = store.get<Graph>(historicalRequest.graph.id)!, changed = clone(graph.value);
-      const node = changed.nodes.find(item => item.id === (level === 2 ? "garden-consume-operation" : "garden-consume-work"))!;
-      if (evidence !== "guard-envelope") node.title += " unresearched change";
-      const forgedGraph = evidence === "guard-envelope" ? graph
-        : store.write({ id: graph.id, kind: graph.kind, expected: graph.revision, value: changed });
-      const layer = store.get<FixtureLayer>(historicalRequest.layer!.id)!;
-      const projection = projectGraph(changed, level), value = clone(layer.value);
-      value.projection = projection;
-      if (evidence === "missing") {
-        value.inputs = [historical.upperRef]; value.obligations = [];
-        value.layerProofs = [{ level, hash: hashJson(projection), inputs: [historical.upperRef] }];
-      } else if (evidence === "guard-envelope") value.inputs = [];
-      else value.layerProofs = value.layerProofs!.map(proof => proof.level === level ? { ...proof, hash: hashJson(projection) } : proof);
-      const forgedLayer = store.write({ id: layer.id, kind: layer.kind, expected: layer.revision, value });
-      const current: FrameRequest = { ...historicalRequest, graph: reference(forgedGraph), layer: reference(forgedLayer) };
-      assert.equal(value.layerProofs!.find(proof => proof.level === level)!.hash, hashJson(value.projection));
-      assert.deepEqual(projectGraph(changed, level === 2 ? 1 : 2), projectGraph(graph.value, level === 2 ? 1 : 2));
-      const before = revisions(store);
-      for (const action of [readFrame, prepareFrame]) refusedAs(action(store, current), "frame_basis_unproven");
-      assert.deepEqual(revisions(store), before);
-      assert.deepEqual(delivered(readFrame(store, historicalRequest)), historical);
-      const path = store.path; store.close(); store = new Store(path);
-      assert.deepEqual(delivered(readFrame(store, historicalRequest)), historical);
-      for (const action of [readFrame, prepareFrame]) refusedAs(action(store, current), "frame_basis_unproven");
-      assert.deepEqual(revisions(store), before);
-    } finally { store.close(); }
-  }
-  for (const level of levels) {
-    let store = branchStore(f, snapshot.path, `frame-layer-source-${level}`);
-    try {
-      const request = requestFor(f, reference(horizon.gate), level), historical = delivered(readFrame(store, request));
-      delivered(prepareFrame(store, request));
-      const own = f.layers[level].value.layerProofs!.find(proof => proof.level === level)!;
-      const assessmentRef = own.inputs.find(ref => store.get(ref.id, ref.revision)?.kind === "research-assessment");
-      assert.ok(assessmentRef);
-      const assessment = store.get<ResearchAssessment>(assessmentRef.id, assessmentRef.revision)!;
-      const observed = assessment.value.observations.find(observation => observation.source.id !== "source:garden:brief"
-        && own.inputs.some(ref => canonical(ref) === canonical(observation.source)));
-      assert.ok(observed);
-      const source = store.get<Source>(observed.source.id, observed.source.revision)!;
-      assert.ok(source.value.origin.kind === "owner-document" || source.value.origin.kind === "file");
-      if (source.value.origin.kind === "file") {
-        const capturedFile = source.value.origin.location, bytes = readFileSync(capturedFile);
-        let fileStore = branchStore(f, snapshot.path, `frame-layer-file-${level}`);
-        try {
-          const beforeFile = revisions(fileStore);
-          delivered(prepareFrame(fileStore, request));
-          writeFileSync(capturedFile, Buffer.concat([bytes, Buffer.from("\nChanged after capture\n")]));
-          assert.deepEqual(delivered(readFrame(fileStore, request)), historical);
-          refusedAs(prepareFrame(fileStore, request), "frame_basis_unproven");
-          assert.deepEqual(revisions(fileStore), beforeFile);
-          const path = fileStore.path; fileStore.close(); fileStore = new Store(path);
-          assert.deepEqual(delivered(readFrame(fileStore, request)), historical);
-          refusedAs(prepareFrame(fileStore, request), "frame_basis_unproven");
-          assert.deepEqual(revisions(fileStore), beforeFile);
-        } finally { writeFileSync(capturedFile, bytes); fileStore.close(); }
-      }
-      store.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
-      const before = revisions(store);
-      assert.deepEqual(delivered(readFrame(store, request)), historical);
-      refusedAs(prepareFrame(store, request), "frame_basis_unproven");
-      assert.deepEqual(revisions(store), before);
-      const path = store.path; store.close(); store = new Store(path);
-      assert.deepEqual(delivered(readFrame(store, request)), historical);
-      refusedAs(prepareFrame(store, request), "frame_basis_unproven");
-      assert.deepEqual(revisions(store), before);
-    } finally { store.close(); }
-  }
-  for (const level of levels) for (const corrupt of ["environment", "origin-kind", "media-type"] as const) {
-    const store = branchStore(f, snapshot.path, `frame-layer-malformed-${level}-${corrupt}`);
-    try {
-      const originalRequest = requestFor(f, reference(horizon.gate), level), request = clone(originalRequest);
-      const historical = delivered(readFrame(store, originalRequest));
-      const layer = store.get<FixtureLayer>(request.layer!.id)!;
-      const own = layer.value.layerProofs!.find(proof => proof.level === level)!;
-      const assessmentRef = own.inputs.find(ref => store.get(ref.id, ref.revision)?.kind === "research-assessment");
-      assert.ok(assessmentRef);
-      const assessment = store.get<ResearchAssessment>(assessmentRef.id, assessmentRef.revision)!;
-      const replacements = new Map<string, Ref>();
-      if (corrupt === "environment") {
-        const target = store.get(assessment.value.environment.id)!;
-        const malformed = store.write({ id: target.id, kind: target.kind, expected: target.revision, value: null });
-        replacements.set(canonical(assessment.value.environment), reference(malformed));
-      } else {
-        const observation = assessment.value.observations.find(item => own.inputs.some(ref => canonical(ref) === canonical(item.source)));
-        assert.ok(observation);
-        const target = store.get<Source>(observation.source.id)!;
-        const value = corrupt === "origin-kind"
-          ? { ...target.value, origin: { ...target.value.origin, kind: [target.value.origin.kind] } }
-          : { ...target.value, mediaType: [target.value.mediaType] };
-        const malformed = store.write({ id: target.id, kind: target.kind, expected: target.revision, value });
-        replacements.set(canonical(observation.source), reference(malformed));
-      }
-      const assessmentValue = replaceExact(assessment.value, replacements);
-      const changedAssessment = store.write({ id: assessment.id, kind: assessment.kind, expected: assessment.revision, value: assessmentValue });
-      replacements.set(canonical(reference(assessment)), reference(changedAssessment));
-      const answerRef = own.inputs.find(ref => {
-        const record = store.get<ResearchAnswer>(ref.id, ref.revision);
-        return record?.kind === "research-answer" && canonical(record.value.assessment) === canonical(reference(assessment));
-      });
-      assert.ok(answerRef);
-      const answer = store.get<ResearchAnswer>(answerRef.id, answerRef.revision)!;
-      const changedAnswer = store.write({ id: answer.id, kind: answer.kind, expected: answer.revision, value: replaceExact(answer.value, replacements) });
-      replacements.set(canonical(reference(answer)), reference(changedAnswer));
-      const questionRef = own.inputs.find(ref => {
-        const record = store.get<Question>(ref.id, ref.revision);
-        return record?.kind === "question" && canonical(record.value.answer) === canonical(reference(answer));
-      });
-      assert.ok(questionRef);
-      const question = store.get<Question>(questionRef.id, questionRef.revision)!;
-      const changedQuestion = store.write({ id: question.id, kind: question.kind, expected: question.revision, value: replaceExact(question.value, replacements) });
-      replacements.set(canonical(reference(question)), reference(changedQuestion));
-      request.layer = reference(store.write({ id: layer.id, kind: layer.kind, expected: layer.revision, value: replaceExact(layer.value, replacements) }));
-      const before = revisions(store);
-      for (const action of [readFrame, prepareFrame]) refusedAs(action(store, request), "frame_basis_unproven");
-      assert.deepEqual(revisions(store), before);
-      assert.deepEqual(delivered(readFrame(store, originalRequest)), historical);
-    } finally { store.close(); }
-  }
-  assert.deepEqual(revisions(f.store), untouched);
-});
 
 test("frame storage boundaries reject malformed refs and preserve unexpected engine exceptions without writes", async t => {
   const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
@@ -1133,7 +995,7 @@ test("OM acceptance from L1 is consumed by C2, B2 and D1 with historical sources
   assert.ok(Object.values(horizon.horizon.value.result.horizon.refinement).every(value => value === "accepted"));
   const operations: FrameRequest = { ...request, horizon: reference(horizon.gate) };
   const works: FrameRequest = { ...operations, level: 3, layer: null, frame: null,
-    upper: { horizon: reference(horizon.gate), frame: request.frame } };
+    upper: { horizon: reference(horizon.gate), frame: request.frame }, workZoneContract: "accepted-l2-v1" };
   const gapsRequest: GapRequest = { project: "garden", input, graph: request.graph, horizon: reference(horizon.gate),
     operations: { frame: operations, proposals: [] }, works: { frame: works, proposals: [] } };
   const gaps = delivered(writeGaps(store, gapsRequest));
@@ -1279,28 +1141,38 @@ test("C2 and F1 share the accepted operation zone across realizes roles, newly s
 test("C2 work-zone contracts are explicit in history and unknown contracts never become current work", async t => {
   const f = await createOmFixture(t, "standard", "garden", { mode: "executed" }), horizon = acceptedHorizon(f.store, reference(f.layers[2]));
   const legacy = requestFor(f, reference(horizon.gate), 3), original = clone(legacy);
-  const historical = delivered(readFrame(f.store, legacy));
-  assert.ok(!Object.hasOwn(historical.request, "workZoneContract"));
   const prepared = delivered(prepareFrame(f.store, legacy));
   assert.deepEqual(legacy, original);
   assert.equal(prepared.request.workZoneContract, "accepted-l2-v1");
-  assert.deepEqual(delivered(readFrame(f.store, prepared.request)).result, prepared.result);
+  const historical = delivered(readFrame(f.store, prepared.request)), basis = delivered(readFrameBasis(f.store, prepared.request));
+  assert.deepEqual(historical.result, prepared.result);
+  assert.deepEqual(basis.references, historical.references);
+  assert.deepEqual(basis.obligations, historical.result.obligations);
+  const unmarkedRefusal = (error: unknown) => {
+    if (!(error instanceof EngineError && error.code === "frame_request_invalid")) return false;
+    assert.deepEqual(error.details, { unit: "F4", target: "frame", field: "workZoneContract" });
+    return true;
+  };
   const before = revisions(f.store);
+  for (const action of [readFrame, readFrameBasis]) {
+    assert.throws(() => action(f.store, legacy), unmarkedRefusal);
+  }
   for (const contract of [undefined, null, "unknown", 1]) {
     for (const action of [readFrame, readFrameBasis, prepareFrame]) {
-      assert.throws(() => action(f.store, { ...legacy, workZoneContract: contract } as unknown as FrameRequest),
-        (error: unknown) => error instanceof EngineError && error.code === "frame_request_invalid"
-          && (error.details as { field?: string }).field === "workZoneContract");
+      assert.throws(() => action(f.store, { ...legacy, workZoneContract: contract } as unknown as FrameRequest), unmarkedRefusal);
     }
   }
   for (const action of [readFrame, readFrameBasis, prepareFrame]) {
-    assert.throws(() => action(f.store, { ...requestFor(f, reference(horizon.gate), 2), workZoneContract: "accepted-l2-v1" }),
-      (error: unknown) => error instanceof EngineError && error.code === "frame_request_invalid");
+    assert.throws(() => action(f.store, { ...requestFor(f, reference(horizon.gate), 2), workZoneContract: "accepted-l2-v1" }), unmarkedRefusal);
   }
   assert.deepEqual(revisions(f.store), before);
   f.reopen();
-  assert.deepEqual(delivered(readFrame(f.store, legacy)), historical);
+  for (const action of [readFrame, readFrameBasis]) {
+    assert.throws(() => action(f.store, legacy), unmarkedRefusal);
+  }
   assert.deepEqual(delivered(readFrame(f.store, prepared.request)).result, prepared.result);
+  assert.deepEqual(delivered(readFrameBasis(f.store, prepared.request)).references, basis.references);
+  assert.deepEqual(revisions(f.store), before);
 });
 
 function historicalFrameFixture(t: TestContext) {

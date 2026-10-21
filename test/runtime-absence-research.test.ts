@@ -763,6 +763,8 @@ test('D8.2 genuine gates preserve positive acceptance sources and new OM prepara
   const layerRequestN = { project: 'p', graph: graphN, level: 2 as const, layer: layerN };
   const beforeN2 = canonical(n2.store.list().flatMap(head => n2.store.history(head.id)));
   const currentLayer = value(prepareLayerAcceptance(n2.store, layerRequestN));
+  for (const guard of currentLayer.guards.filter(isRef))
+    assert.deepEqual(guard, reference(n2.store.get(guard.id, guard.revision)!));
   const historicalLayer = value(readLayerAcceptance(n2.store, layerRequestN));
   const { guards: _guards, ...historicalBody } = currentLayer;
   assert.deepEqual(historicalBody, historicalLayer, 'Adding current admission never changes the checked accepted layer content or source references');

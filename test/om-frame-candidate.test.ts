@@ -486,7 +486,7 @@ test("unbound operation input ports are refused and graph semantic findings keep
 test("N3 without its works contract is refused on assembly and storage paths, never a partial candidate", t => {
   const f = firstPass(t), level3 = clone(f.frame); level3.request.level = 3;
   refusedAs(assembleCandidate(level3, []), "works_contract_invalid");
-  const request = { ...f.request, frame: { ...f.request.frame, level: 3 as const, upper: { horizon: f.request.frame.horizon, frame: null } } }, before = revisions(f.store);
+  const request = { ...f.request, frame: { ...f.request.frame, level: 3 as const, workZoneContract: 'accepted-l2-v1' as const, upper: { horizon: f.request.frame.horizon, frame: null } } }, before = revisions(f.store);
   refusedAs(prepareCandidate(f.store, request), "works_contract_invalid");
   refusedAs(writeCandidate(f.store, request), "works_contract_invalid");
   assert.deepEqual(revisions(f.store), before);

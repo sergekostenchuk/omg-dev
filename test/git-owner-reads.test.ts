@@ -279,7 +279,7 @@ async function upgrade(f: ReturnType<typeof executionFixture>, original: Revisio
     refinement: reference(accepted.layer), available, choice: { choiceVersion: "upgrade-works", features: [{ outcome: "p-upgraded-result" }], excluded: [] } }));
   const frame3: FrameRequest = { project: "p", level: 3, graph: graphRef, horizon: reference(horizon3.gate),
     layer: reference(store.get("graph-layer:p:3")!), frame: reference(store.get("om-frame:p:3")!),
-    upper: { frame: reference(accepted.frame), horizon: reference(horizon3.gate) } };
+    upper: { frame: reference(accepted.frame), horizon: reference(horizon3.gate) }, workZoneContract: "accepted-l2-v1" };
   const p3 = store.write({ id: "om-proposal:p:upgrade-works", kind: "layer-proposal", expected: 0, value: proposal(frame3, successors) });
   acceptNativeWorks(f.engine, "p", { frame: { project: "p", level: 2, upper: null, graph: graphRef, horizon: frame3.horizon,
     layer: reference(accepted.layer), frame: reference(accepted.frame) }, proposals: [] }, { frame: frame3, proposals: [reference(p3)] });

@@ -320,7 +320,7 @@ test('F1 excludes ready blocks using real receipts with accepted OM L2 and L3 ac
   assert.deepEqual(read.operations, [prepOp, produceOp]);
   assert.deepEqual(prepared.operations, read.operations);
   assert.deepEqual(ok(readFrameBasis(store, { project: f.project, level: 3, graph: request.graph, horizon: request.horizon,
-    layer: null, frame: null, upper: { horizon: request.horizon, frame: request.frame } })).scope.nodes, read.operations);
+    layer: null, frame: null, upper: { horizon: request.horizon, frame: request.frame }, workZoneContract: 'accepted-l2-v1' } )).scope.nodes, read.operations);
   assert.ok(prepared.guards.some(ref => canonical(ref) === canonical(reference(f.receipts['garden-result']!))));
   const layer3 = store.get('graph-layer:garden:3')!;
   store.write({ id: layer3.id, kind: layer3.kind, expected: layer3.revision, value: layer3.value });

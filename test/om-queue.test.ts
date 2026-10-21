@@ -630,7 +630,7 @@ test('the extracted horizon admission retains the existing frame layer and upper
     refinement: reference(accepted.layer), available: {},
     choice: { choiceVersion: 'queue-frame-upper', features: [{ outcome: 'garden-result' }], excluded: [] } }));
   const works: FrameRequest = { project, level: 3, graph: reference(accepted.graph), horizon: reference(witness.gate),
-    layer: null, frame: null, upper: { horizon: reference(witness.gate), frame: reference(accepted.frame) } };
+    layer: null, frame: null, upper: { horizon: reference(witness.gate), frame: reference(accepted.frame) }, workZoneContract: 'accepted-l2-v1' };
   const worksRead = ok(readFrame(f.store, works)), worksPrepared = ok(prepareFrame(f.store, works));
   assert.deepEqual(worksPrepared.result, worksRead.result);
   refusedWith(prepareFrame(f.store, { ...works, upper: { horizon: f.request.horizon, frame: reference(accepted.frame) } }), 'frame_basis_unproven');

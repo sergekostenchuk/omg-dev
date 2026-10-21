@@ -43,7 +43,7 @@ async function rebaseFixture(t: TestContext, change: 'port' | 'outcome' = 'port'
   const operations: FrameRequest = { project: 'garden', level: 2, graph: reference(f.graphRevision),
     horizon: reference(horizon.gate), layer: reference(f.layers[2]), frame: reference(store.get('om-frame:garden:2')!), upper: null };
   const from: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]), frame: reference(store.get('om-frame:garden:3')!),
-    upper: { horizon: reference(horizon.gate), frame: operations.frame } };
+    upper: { horizon: reference(horizon.gate), frame: operations.frame }, workZoneContract: 'accepted-l2-v1' };
   const original = ok(readFrame(store, from));
   const oldFrame = store.get<ConnectionFrame>(from.frame!.id, from.frame!.revision)!.value;
   const before = ok(readFrame(store, operations)), connector = structuredClone(f.graph.connectors.find(item => item.id === 'garden-prep-flow')!);
@@ -83,10 +83,10 @@ test('C5 explicitly rebases accepted works, carries surviving fills and retires 
   assert.equal(moved.carried + moved.retired, f.oldFrame.fills.length);
   assert.deepEqual(moved.frame.value.rebasedFrom, f.from.frame);
   assert.deepEqual(moved.frame.value.rebase, { from: f.from, to: { ...f.to, workZoneContract: 'accepted-l2-v1' } });
-  assert.ok(!Object.hasOwn(moved.frame.value.rebase.from, 'workZoneContract'));
+  assert.equal(moved.frame.value.rebase.from.workZoneContract, 'accepted-l2-v1');
   assert.ok(!Object.hasOwn(f.to, 'workZoneContract'));
   assert.deepEqual(reference(f.store.get('graph:garden')!), f.to.graph);
-  const current = { ...f.to, layer: reference(moved.layer), frame: reference(moved.frame) };
+  const current = { ...f.to, layer: reference(moved.layer), frame: reference(moved.frame), workZoneContract: 'accepted-l2-v1' as const };
   for (const read of [readFrame, prepareFrame]) {
     const result = ok(read(f.store, current));
     assert.ok(result.result.open.length > 0);
@@ -220,7 +220,7 @@ test('C5 retires a work fill when an accepted operation outcome changes under th
   assert.ok(prepared.result.frame.value.fills.every(fill => fill.obligation !== oldObligation.id));
   const moved = ok(rebaseFrame(f.store, f.request));
   assert.deepEqual(moved, prepared.result);
-  const current: FrameRequest = { ...f.to, layer: reference(moved.layer), frame: reference(moved.frame) };
+  const current: FrameRequest = { ...f.to, layer: reference(moved.layer), frame: reference(moved.frame), workZoneContract: 'accepted-l2-v1' };
   for (const read of [readFrame, prepareFrame]) {
     const result = ok(read(f.store, current)).result;
     const changed = result.obligations.find(item => item.id === oldObligation.id)!;
@@ -561,7 +561,7 @@ test('C5 cannot reject successful assemblies, gaps, foreign sources, nonproposed
   for (const [ref, code] of [[{ ...f.proposalRef, id: f.proposalRef.id.replace(':garden:', ':foreign:') }, 'record_foreign'],
     [{ ...f.proposalRef, hash: '0'.repeat(64) }, 'record_forged']] as const)
     refusedWith(rejectProposals(f.store, { frame: f.frame, proposals: [ref] }), code);
-  refusedWith(rejectProposals(f.store, { frame: { ...f.frame, level: 3, upper: { horizon: f.frame.horizon, frame: null } },
+  refusedWith(rejectProposals(f.store, { frame: { ...f.frame, level: 3, workZoneContract: 'accepted-l2-v1', upper: { horizon: f.frame.horizon, frame: null } },
     proposals: [f.proposalRef] }), 'candidate_level_unsupported');
   refusedWith(rejectProposals(f.store, { frame: f.frame, proposals: [f.proposalRef, f.proposalRef] }), 'proposal_rejection_invalid');
   for (const value of [undefined, null, [], {}, { proposals: [] }, { frame: f.frame }])
@@ -666,7 +666,7 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
   const operations: FrameRequest = { project, level: 2, graph: reference(f.graphRevision), horizon: reference(horizon.gate),
     layer: reference(f.layers[2]), frame: reference(store.get('om-frame:garden:2')!), upper: null };
   const nativeRequest: FrameRequest = { ...operations, level: 3, layer: reference(f.layers[3]), frame: reference(store.get('om-frame:garden:3')!),
-    upper: { horizon: reference(horizon.gate), frame: operations.frame } };
+    upper: { horizon: reference(horizon.gate), frame: operations.frame }, workZoneContract: 'accepted-l2-v1' };
   const nativeFrame = store.get<ConnectionFrame>(nativeRequest.frame!.id, nativeRequest.frame!.revision)!;
   assert.equal(nativeFrame.value.worksContract, WORKS_FRAME_CONTRACT);
   const from = { ...nativeRequest, frame: reference(nativeFrame) };
@@ -678,7 +678,7 @@ test('G5 result identity traverses a proved rebase to native L3 fills without tr
   const next = ok(writeHorizon(store, { project, input: reference(input), graph: reference(upper.graph!), refinement: reference(upper.layer!),
     choice: { ...choice, choiceVersion: 'identity-rebased' }, available: {} }));
   const to: FrameRequest = { project, level: 3, graph: reference(upper.graph!), horizon: reference(next.gate), layer: null,
-    frame: null, upper: { horizon: reference(next.gate), frame: reference(upper.frame!) } };
+    frame: null, upper: { horizon: reference(next.gate), frame: reference(upper.frame!) }, workZoneContract: 'accepted-l2-v1' };
   const rebased = ok(rebaseFrame(store, { from, to }));
   assert.ok(rebased.carried > 0); assert.equal(rebased.retired, 0);
   assert.equal(rebased.frame.value.worksContract, WORKS_FRAME_CONTRACT);

@@ -382,7 +382,7 @@ function acceptOperations(f: ReturnType<typeof firstPassFixture>) {
     layer: acceptance.layer, frame: acceptance.frame, upper: null };
   const sources: GapRequest = { project: "garden", input: f.input, graph: acceptance.graph, horizon: reference(next.gate),
     operations: { frame: operations, proposals: [] }, works: { proposals: [], frame: { ...operations, level: 3, layer: null, frame: null,
-      upper: { horizon: reference(next.gate), frame: acceptance.frame } } } };
+      upper: { horizon: reference(next.gate), frame: acceptance.frame }, workZoneContract: "accepted-l2-v1" } } };
   const saved = ok(writeGaps(store, sources));
   const gaps: GapReadRequest = { sources: structuredClone(saved.sources) as GapRequest, records: saved.records.map(reference) };
   const line = f.gaps.collection.gaps.find(item => item.field === "fill" && item.evidence.some(evidence => evidence.origin === "operations"))!;
@@ -734,7 +734,7 @@ function replaceOperationResult(f: ReturnType<typeof firstPassFixture>, frame: F
   const operations: FrameRequest = { ...acceptance, horizon: reference(horizon.gate), upper: null };
   const sources: GapRequest = { project: "garden", input: f.input, graph: acceptance.graph, horizon: operations.horizon,
     operations: { frame: operations, proposals: [] }, works: { proposals: [], frame: { ...operations, level: 3, layer: null, frame: null,
-      upper: { horizon: operations.horizon, frame: acceptance.frame } } } };
+      upper: { horizon: operations.horizon, frame: acceptance.frame }, workZoneContract: "accepted-l2-v1" } } };
   const saved = ok(writeGaps(f.store, sources));
   assert.ok(!saved.collection.gaps.some(gap => gap.target === obligation && gap.field === "fill"));
   return { acceptance, gaps: { sources: structuredClone(saved.sources) as GapRequest, records: saved.records.map(reference) } as GapReadRequest };

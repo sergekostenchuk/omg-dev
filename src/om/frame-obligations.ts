@@ -7,17 +7,16 @@ import { projectGraph } from "../graph/project.js";
 import { RefinementRelations } from "../graph/relations.js";
 import { workZone } from "./work-zone.js";
 import { graphSchema, graphV2Schema } from "../graph/schema.js";
-import { isRef, reference, type GateResult, type Ref, type StageArtifact } from "../pipeline/contracts.js";
+import { isRef, reference, type Ref, type StageArtifact } from "../pipeline/contracts.js";
 import { delivered, refused, sealed, type OmResult, type Refusal, type RefusalRoute, type Sealed } from "./refusal.js";
 import { Store, storeObserved, type Revision, type TransactionGuard, type HeadsMatch, type HeadsMatchMismatch } from "../storage/store.js";
 import { provenStore } from "../storage/store-view.js";
 import { withGraphRead } from "../graph/repository.js";
 import { uniqueTransactionGuards } from "../runtime/environment.js";
-import { StageChecks } from "../product/stage-checks.js";
 import { readHorizon, type HorizonRecords } from "./horizon.js";
-import { historicalProof, withHistoricalReads, prepareExistingOmInput, readOmAdmissionGuards, readOmInput } from "./input.js";
+import { historicalProof, withHistoricalReads, prepareExistingOmInput, readOmInput } from "./input.js";
 import { readRecord } from "./refs.js";
-import { readLayerAcceptance, readLayerBasis, type HistoricalLayerBasis, type LayerAcceptanceRequest, type LayerBasis } from "./layer-basis.js";
+import { readLayerAcceptance, type HistoricalLayerBasis, type LayerAcceptanceRequest, type LayerBasis } from "./layer-basis.js";
 
 export const FRAME_REFUSAL_CODES = Object.freeze([
   "frame_request_invalid", "upper_binding_ambiguous", "accepted_binding_ambiguous", "frame_upper_drift",
@@ -742,16 +741,13 @@ function frameSources(store: Store, request: FrameRequest, fresh: boolean): Fram
       frameReject("frame_basis_unproven", request.upper.horizon.id, "input", "The accepted L2 must belong to this OM input");
     const phaseRef = witness.horizon.value.request.refinement;
     if (!phaseRef) frameReject("frame_basis_unproven", request.upper.horizon.id, "refinement", "The upper witness must prove accepted L2");
-    if (phaseRef.id === `graph-layer:${request.project}:2`) {
-      const basis = frameLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: phaseRef });
-      if (basis.producer !== "om" || canonical(basis.frame) !== canonical(request.upper.frame))
-        frameReject("frame_basis_unproven", phaseRef.id, "upper.frame", "The OM upper layer needs its exact accepted connection frame");
-      refs.push(...basis.references);
-      upperRef = phaseRef;
-    } else {
-      const phase = frameReadRecord<{ layer: Ref }>(store, phaseRef, `phase:${request.project}:L2`, "phase", refs);
-      upperRef = phase.value.layer;
-    }
+    if (phaseRef.id !== `graph-layer:${request.project}:2`)
+      frameReject("frame_basis_unproven", phaseRef.id, "refinement", "The upper witness must prove the accepted OM layer");
+    const basis = frameLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: phaseRef });
+    if (basis.producer !== "om" || canonical(basis.frame) !== canonical(request.upper.frame))
+      frameReject("frame_basis_unproven", phaseRef.id, "upper.frame", "The OM upper layer needs its exact accepted connection frame");
+    refs.push(...basis.references);
+    upperRef = phaseRef;
     const l2 = frameReadLayer(store, upperRef, request.project, 2, refs, fresh);
     const upperFrame = frameReadConnection(store, request.project, 2, request.upper.frame, refs);
     if (fresh) {
@@ -762,54 +758,21 @@ function frameSources(store: Store, request: FrameRequest, fresh: boolean): Fram
     // Entering the new block horizon reopens identity obligations; it does not turn the saved identity into
     // a real operation. Read that classification from the validated accepted frame before zone filtering.
     const identities = new Set((upperFrame?.value.fills ?? []).filter(fill => fill.source === "identity").map(fill => fill.node));
-    // Unmarked saved requests retain the full-graph derivation of their producer's era.
-    const relations = request.workZoneContract === undefined ? new RefinementRelations(graph) : null;
-    const nodes = relations
-      ? graph.nodes.filter(node => node.kind === "operation" && !identities.has(node.id)
-        && ownerScope.nodes.some(block => ownerScope.execution[block]?.state === "needed" && relations.refines(node.id, block)))
-        .map(node => node.id).sort(frameOrder)
-      : [...frameTake(workZone(frameProjection(graph, 2), ownerScope, [...identities]))];
+    const nodes = [...frameTake(workZone(frameProjection(graph, 2), ownerScope, [...identities]))];
     scope = { nodes, excluded: ownerScope.excluded, hash: hashJson([ownerScope.hash, 3, nodes]) };
   }
   let accepted: AcceptedFrame | null = null;
   let permittedOpen: string[] = [];
   if (request.layer) {
-    const lower = frameReadLayer(store, request.layer, request.project, request.level, refs, fresh);
-    const omBasis = lower.value.acceptance !== undefined ? frameLayerAcceptance(store,
-      { project: request.project, level: request.level, graph: request.graph, layer: request.layer }) : null;
-    if (omBasis) {
-      // The request names its layer, upper and frame: they must be the ones this layer's acceptance names (O(1), every read).
-      if (omBasis.producer !== "om" || canonical(omBasis.upper) !== canonical(upperRef)
-        || canonical(omBasis.frame) !== canonical(request.frame))
-        frameReject("frame_basis_unproven", request.layer.id, "frame", "The OM layer needs its exact accepted upper and connection frame");
-      refs.push(...omBasis.references);
-      permittedOpen = [...omBasis.open];
-    } else {
-      const own = (lower.value.layerProofs ?? []).filter(proof => proof.level === request.level);
-      if (own.length !== 1) frameReject("frame_basis_unproven", request.layer.id, "layerProofs", "An accepted lower layer needs its own derivation proof");
-      const proof = own[0]!;
-      const upperBases = new Map(proof.inputs.filter(ref => ref.id === `graph-layer:${request.project}:${request.level - 1}`)
-        .map(ref => [canonical(ref), ref]));
-      if (upperBases.size !== 1) frameReject("frame_basis_unproven", request.layer.id, "inputs", "The lower proof must retain its exact upper basis");
-      const savedBase = [...upperBases.values()][0]!;
-      const base = frameReadLayer(store, savedBase, request.project, (request.level - 1) as 1 | 2, refs, fresh);
-      if (canonical(savedBase) !== canonical(upperRef))
-        frameReject("frame_basis_unproven", request.layer.id, "upper", "The saved upper basis is not the named accepted upper revision");
-      if (fresh) {
-        frameCompareUpper(base.value, graph, (request.level - 1) as 1 | 2, request.layer.id);
-
-        for (const upperProof of (lower.value.layerProofs ?? []).filter(item => item.level === request.level - 1))
-          if (upperProof.hash !== hashJson(projectGraph(graph, upperProof.level)))
-            frameReject("frame_upper_drift", request.layer.id, "layerProofs", "The present upper proof cannot be replaced by a fallback", "owner");
-        if (canonical(lower.value.projection) !== canonical(projectGraph(graph, request.level))
-          || proof.hash !== hashJson(projectGraph(graph, request.level)))
-          frameReject("frame_layer_drift", request.layer.id, "projection", "The accepted lower layer no longer matches this graph", "owner");
-      }
-      const basis = readLayerBasis(store, { project: request.project, level: request.level,
-        graph: request.graph, layer: request.layer, upper: savedBase });
-      if (!basis.ok) frameReject("frame_basis_unproven", basis.refusal.at.target, basis.refusal.at.field ?? "research", basis.refusal.message);
-      refs.push(...basis.value.references);
-    }
+    frameReadLayer(store, request.layer, request.project, request.level, refs, fresh);
+    const omBasis = frameLayerAcceptance(store,
+      { project: request.project, level: request.level, graph: request.graph, layer: request.layer });
+    // The request names its layer, upper and frame: they must be the ones this layer's acceptance names (O(1), every read).
+    if (omBasis.producer !== "om" || canonical(omBasis.upper) !== canonical(upperRef)
+      || canonical(omBasis.frame) !== canonical(request.frame))
+      frameReject("frame_basis_unproven", request.layer.id, "frame", "The OM layer needs its exact accepted upper and connection frame");
+    refs.push(...omBasis.references);
+    permittedOpen = [...omBasis.open];
     accepted = { graph, reference: request.graph, frame: frameReadConnection(store, request.project, request.level, request.frame, refs) };
   } else if (request.frame) frameReject("frame_basis_unproven", request.frame.id, "layer", "A connection frame requires an accepted lower layer");
   const upper = frameProjection(graph, (request.level - 1) as 1 | 2);
@@ -821,6 +784,7 @@ function frameSources(store: Store, request: FrameRequest, fresh: boolean): Fram
 export function readFrameBasis(store: Store, request: FrameRequest): OmResult<Sealed<FrameBasis>> {
   if (!(store instanceof Store)) frameInvalid("store");
   requireFrameRequest(request);
+  if (request.level === 3 && !Object.hasOwn(request, "workZoneContract")) frameInvalid("workZoneContract");
   return frameResult(() => frameBasis(store, frameCopy(request), false));
 }
 /** The same basis for a new combination prepared by its producer: every source relation is checked. */
@@ -848,6 +812,7 @@ function frameReading(store: Store, request: FrameRequest, fresh: boolean): Fram
 export function readFrame(store: Store, request: FrameRequest): OmResult<Sealed<FrameRead>> {
   if (!(store instanceof Store)) frameInvalid("store");
   requireFrameRequest(request);
+  if (request.level === 3 && !Object.hasOwn(request, "workZoneContract")) frameInvalid("workZoneContract");
   return frameResult(() => frameReading(store, frameCopy(request), false));
 }
 function frameCurrentSources(store: Store) {
@@ -888,15 +853,7 @@ function frameCurrentSources(store: Store) {
     for (const ref of refs) remember(ref);
   };
   const current = (ref: Ref) => checkHeads([ref]);
-  const acceptGate = (gate: GateResult, name: string) => {
-    const admission = frameTake(readOmAdmissionGuards(gate.admissionGuards, name, "F4"));
-    if (gate.findings.length) {
-      const finding = gate.findings[0]!;
-      frameReject("frame_basis_unproven", finding.target, finding.code, finding.message);
-    }
-    for (const guard of [...gate.guards, ...admission]) remember(guard);
-  };
-  return { guards, remember, checkHeads, current, acceptGate };
+  return { guards, remember, checkHeads, current };
 }
 /** Admit a saved horizon against today's graph without requiring its historical graph or refinement heads. */
 export function prepareHorizonBasis(store: Store, request: HorizonBasisRequest): OmResult<Sealed<PreparedHorizonBasis>> {
@@ -942,7 +899,7 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
   request = currentFrameRequest(request);
   return frameResult(() => withGraphRead(() => {
     const read = frameReading(store, request, true);
-    const { guards, remember, checkHeads, acceptGate } = frameCurrentSources(store);
+    const { guards, remember, checkHeads } = frameCurrentSources(store);
     const horizonBasis = frameTake(prepareHorizonBasis(store, { project: request.project, graph: request.graph, horizon: request.horizon }));
     for (const guard of horizonBasis.guards) remember(guard);
     const frameHeads = [...(request.layer ? [request.layer] : []),
@@ -962,24 +919,18 @@ export function prepareFrame(store: Store, request: FrameRequest): OmResult<Seal
     remember(layerHead ? reference(layerHead) : { id: layerId, absent: true });
     if (!request.layer && (layerHead?.value.acceptance !== undefined || layerHead?.value.layerProofs?.some(proof => proof.level === request.level)))
       frameReject("frame_basis_unproven", layerHead.id, "layer", "An accepted lower layer cannot be omitted");
-    const engine = new StageChecks(store);
     if (request.layer) {
       const admission = frameTake(prepareLayerAcceptance(store,
         { project: request.project, level: request.level, graph: request.graph, layer: request.layer }));
       for (const guard of admission.guards) remember(guard);
     }
-    const gates: { name: string; gate: GateResult }[] = [];
     if (request.upper) {
       const witness = frameTake(readHorizon(store, request.project, request.upper.horizon));
       const upperRefs = [reference(witness.horizon), witness.horizon.value.request.refinement!];
       checkHeads(upperRefs);
-      if (witness.horizon.value.request.refinement!.id === `graph-layer:${request.project}:2`) {
-        const upper = frameLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: read.upperRef });
-        checkHeads(upper.currentReferences);
-      } else gates.push({ name: "refinement.L2", gate: engine.refinement.gate(request.project, "L2") },
-        { name: "layer.2", gate: engine.graphs.layerGate(request.project, 2, read.upperRef) });
+      const upper = frameLayerAcceptance(store, { project: request.project, level: 2, graph: request.graph, layer: read.upperRef });
+      checkHeads(upper.currentReferences);
     }
-    for (const { name, gate } of gates) acceptGate(gate, name);
     return { ...read, guards: frameSorted(uniqueTransactionGuards([...guards.values()])),
       expected: { graph: request.graph.revision, layer: layerHead?.revision ?? 0, frame: frameHead?.revision ?? 0 } };
   }));

@@ -53,7 +53,8 @@ function basisRequest(f: OmFixture, level: 2 | 3): LayerBasisRequest {
 function frameRequest(f: OmFixture, horizon: Ref, level: 2 | 3): FrameRequest {
   return { project: f.project, level, graph: reference(f.graphRevision), layer: reference(f.layers[level]),
     horizon, frame: reference(f.store.get(`om-frame:${f.project}:${level}`)!),
-    upper: level === 2 ? null : { horizon, frame: reference(f.store.get(`om-frame:${f.project}:2`)!) } };
+    upper: level === 2 ? null : { horizon, frame: reference(f.store.get(`om-frame:${f.project}:2`)!) },
+    ...(level === 3 ? { workZoneContract: "accepted-l2-v1" as const } : {}) };
 }
 async function fixture(t: test.TestContext, fileBrief = false) {
   // The history scenario needs an actual file source in the upstream accepted proof.
@@ -428,7 +429,8 @@ async function nativeRebaseFixture(t: test.TestContext, forgedRetired = false) {
   const currentHorizon = delivered(writeHorizon(f.store, { ...horizonRequest, graph: reference(accepted.graph), refinement: reference(accepted.layer),
     choice: { ...horizonRequest.choice, choiceVersion: "rebase-retired-injection" } }));
   const to: FrameRequest = { project: f.project, level: 3, graph: reference(accepted.graph), horizon: reference(currentHorizon.gate),
-    layer: null, frame: null, upper: { horizon: reference(currentHorizon.gate), frame: reference(accepted.frame) } };
+    layer: null, frame: null, upper: { horizon: reference(currentHorizon.gate), frame: reference(accepted.frame) },
+    workZoneContract: "accepted-l2-v1" };
   return { f, from, to, accepted };
 }
 

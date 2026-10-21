@@ -766,7 +766,7 @@ test('G4b passes a complete accepted graph with no blocking answer and survives 
     operations: { proposals: [], frame: { project: f.project, level: 2, graph: reference(f.graphRevision), horizon,
       layer: reference(f.layers[2]), frame: upperFrame, upper: null } },
     works: { proposals: [], frame: { project: f.project, level: 3, graph: reference(f.graphRevision), horizon,
-      layer: reference(f.layers[3]), frame: worksFrame, upper: { horizon, frame: upperFrame } } } });
+      layer: reference(f.layers[3]), frame: worksFrame, upper: { horizon, frame: upperFrame }, workZoneContract: "accepted-l2-v1" } } });
   const horizon = ok(writeHorizon(f.store, { project: f.project, input: reference(input),
     graph: reference(f.graphRevision), refinement: reference(f.layers[2]), available: {},
     choice: { choiceVersion: 'answers-gate-complete', features: [{ outcome: 'garden-result' }], excluded: [] } }));
@@ -1113,7 +1113,7 @@ test('G4b discovers an N3 batch only after a real C5 upper-frame acceptance', t 
     operations: { proposals: [], frame: { project: f.project, level: 2, graph, horizon: reference(horizon.gate),
       layer, frame: upperFrame, upper: null } },
     works: { proposals: [], frame: { project: f.project, level: 3, graph, horizon: reference(horizon.gate),
-      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame } } } };
+      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" } } };
   const gaps = ok(writeGaps(f.store, sources));
   const gapRead: GapReadRequest = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = ok(writeGapLines(f.store, { project: f.project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
@@ -1768,7 +1768,7 @@ function worksAssembly(t: TestContext) {
     operations: { proposals: [], frame: { project: f.project, level: 2, graph, horizon: reference(horizon.gate),
       layer, frame: upperFrame, upper: null } },
     works: { proposals: [], frame: { project: f.project, level: 3, graph, horizon: reference(horizon.gate),
-      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame } } } };
+      layer: null, frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" } } };
   const gaps = ok(writeGaps(f.store, sources));
   const gapRead: GapReadRequest = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = ok(writeGapLines(f.store, { project: f.project, previous: null, pass: 1, gaps: gapRead, closures: [] }));

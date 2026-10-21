@@ -170,7 +170,7 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, era 
   const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
     operations: { proposals: [], frame: { ...frame2, graph, horizon: reference(horizon.gate), layer: layer2, frame: upperFrame } },
     works: { proposals: [], frame: { project, level: 3, graph, horizon: reference(horizon.gate), layer: null, frame: null,
-      upper: { horizon: reference(horizon.gate), frame: upperFrame } } } };
+      upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" } } };
   const gaps = ok(writeGaps(store, sources)), gapRead = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const lines = ok(writeGapLines(store, { project, previous: null, pass: 1, gaps: gapRead, closures: [] }));
   const late = gaps.records.find(row => row.value.gap.target === 'discovery:atomic-proof')!;
