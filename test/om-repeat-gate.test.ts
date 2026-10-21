@@ -2049,11 +2049,11 @@ test("RJ1: a saved base or proposal context proves the exact reopening it names 
   // exactly, while the saved context keeps reading its own named revision — for base and proposal alike.
   const mutated = store.write({ id: reopen.id, kind: reopen.kind, expected: bumped.revision,
     value: { ...(reopen.value as Record<string, unknown>), frame: reference(store.get(`om-frame:${project}:2`)!) } as unknown as Json });
+  const heads = store.list().map(reference);
   const moved = refusalOf(read({ ...context, reopen: { ...named, record: reference(mutated) } }));
   assert.equal(moved.code, "proposal_invalid");
   assert.equal(moved.at.field, "frame.reopen");
   assert.equal(moved.at.target, reopen.id);
-  const heads = store.list().map(reference);
   assert.ok(read(context).ok, "The old exact reference reads its own revision, never today's head");
 
   // The proposal context of the same assembly proves the same reopening through its own reader, under the moved head.
@@ -2063,11 +2063,12 @@ test("RJ1: a saved base or proposal context proves the exact reopening it names 
     request: { ...proposalRequest, frame: { ...proposalRequest.frame, reopen: { ...named, works: ["garden-produce-work"] } } } as never }));
   assert.deepEqual(store.list().map(reference), heads, "The damaged presentation and both proven reads write nothing");
 
-  // A cold store reads the saved context and its reopening the same way, under the moved head.
+  // A cold store reads the saved context and its reopening the same way, under the moved head — and writes nothing either.
   const cold = new Store(g.f.database);
   try {
     assert.ok(readDefinitions(cold, { project, source: baseSource(context) }).ok, "A cold store proves the named record");
     assert.ok(observeProposal(cold, { project, proposal: proposal.ref, request: proposalRequest } as never).ok);
+    assert.deepEqual(cold.list().map(reference), heads, "The cold reads write nothing");
   } finally { cold.close(); }
 });
 
