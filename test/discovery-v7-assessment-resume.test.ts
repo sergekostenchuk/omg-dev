@@ -17,7 +17,7 @@ import { prepareResearchConsumerIntent, prepareResearchConsumerApplication, read
 import { projectPaidTurnAdmission, managedTurnId } from '../src/discovery/research-consumer-transition.js';
 import { recordV7Attempt } from '../src/discovery/v7-attempts.js';
 import { attemptEndOfAction, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from '../src/discovery/v7-managed-attempt.js';
-import { REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
+import { REQUEST_MANIFEST_CONTRACT, readArchiveBody } from '../src/discovery/request-parts.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
@@ -78,7 +78,7 @@ async function setup(t: test.TestContext) {
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),settings=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
 const queued=settings.replies?.shift();if(queued)writeFileSync(${JSON.stringify(settings)},JSON.stringify(settings));
-const research=queued??settings.reply??{action:'answer',question:r.subject.question?.id??'reader',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+const research=settings.readArchive?{action:'read_context',record:settings.corruptReadArchive?{...r.subject.working.archive,hash:'0'.repeat(64)}:r.subject.working.archive,pointer:'/body/value'}:queued??settings.reply??{action:'answer',question:r.subject.question?.id??'reader',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:settings.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const command = {executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure(project,{workspace:f.root,
@@ -256,6 +256,20 @@ function selectedAssessmentStep(f: Awaited<ReturnType<typeof packetFixture>>) {
   return {call,application,session};
 }
 
+async function interruptPaidAssessment(f: Awaited<ReturnType<typeof packetFixture>>, reply: Record<string,unknown>) {
+  writeFileSync(f.settings,JSON.stringify({tokens:10,...reply}));
+  const write=f.store.writeMany.bind(f.store),stop=new Error('intermediate paid');let hit=false;
+  f.store.writeMany=((writes,guards=[])=>{
+    const result=write(writes,guards);
+    if(!hit&&writes.some(w=>w.kind==='model-call'&&(w.value as any).purpose==='assessor'&&(w.value as any).status==='succeeded')){
+      hit=true;throw stop;
+    }return result;
+  }) as typeof f.store.writeMany;
+  try{await assert.rejects(assessmentRequest(f),error=>error===stop);}finally{f.store.writeMany=write;}
+  assert.ok(hit);
+  return selectedAssessmentStep(f);
+}
+
 for (const boundary of ['paid','applied','saved'] as const) {
   test(`A: operator recovery at ${boundary} proves its original paid step after plan and baseline heads move`,async t=>{
     const f=await packetFixture(t),reply=assessmentReply(f);
@@ -299,30 +313,105 @@ for (const boundary of ['paid','applied','saved'] as const) {
   });
 }
 
-test('A: operator recovery of a paid checkpoint cannot send the next assessment request',async t=>{
+for (const action of ['assessment_checkpoint','read_context'] as const) {
+  for (const resume of ['operator','cold'] as const) {
+    for (const move of ['none','reopen','corrupt-baseline'] as const) {
+      const name=action==='assessment_checkpoint'&&resume==='operator'&&move==='none'
+        ?'A: operator recovery of a paid checkpoint cannot send the next assessment request'
+        :`A: ${resume} applies a paid ${action} on its historical basis after ${move}`;
+      test(name,async t=>{
+        const f=await packetFixture(t);
+        const checkpoint={action:'assessment_checkpoint',notes:['Exact attempt needs another page']};
+        const selected=await interruptPaidAssessment(f,action==='read_context'?{readArchive:true}:{reply:checkpoint});
+        const sent=f.wires().length,ledgers=f.store.list('research-budget-ledger');
+        if(move==='reopen') f.discovery.reopen(f.m.question.id,f.m.question.revision);
+        // A negative address corruption; lawful progress-state production remains P.
+        if(move==='corrupt-baseline') f.store.write({id:v7ProgressStateId(f.subject.packet),kind:'corrupt-baseline-address',expected:0,value:null});
+        writeFileSync(f.settings,JSON.stringify({tokens:10,reply:assessmentReply(f)}));
+        let receipt: Awaited<ReturnType<typeof recoverResearchResponse>> | undefined;
+        if(resume==='operator') receipt=await recoverResearchResponse(f.open(),f.engine.environments,'p',reference(selected.call),reference(selected.session),'owner');
+        else if(move==='none') {
+          const saved=await assessmentRequest(f,f.open());
+          assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(saved)),saved);
+        } else await assert.rejects(assessmentRequest(f,f.open()),{code:'input_stale'});
+        const applied=f.store.get<any>(selected.application.id)!;
+        assert.equal(applied.value.state,'applied');
+        assert.deepEqual(applied.value.received,reference(selected.call));
+        const after=f.store.get<any>(applied.value.after.id,applied.value.after.revision)!;
+        assert.equal(after.revision,selected.session.revision+1);assert.equal(after.value.result,null);
+        if(action==='assessment_checkpoint') {
+          assert.deepEqual(after.value.notes,[{evidence:{offset:0,end:2},packet:selected.call.value.packet.archive,response:checkpoint}]);
+        } else {
+          assert.deepEqual(after.value.notes,[]);
+          const entries=after.value.workspace.entries;
+          assert.equal(entries.length,1);
+          assert.deepEqual(entries[0].result.record,selected.call.value.packet.archive);
+          assert.equal(entries[0].result.pointer,'/body/value');
+          const archive=f.store.get(selected.call.value.packet.archive.id,selected.call.value.packet.archive.revision)!;
+          assert.deepEqual(entries[0].result.value,readArchiveBody(f.store,archive).body.value);
+          assert.equal(after.value.workspace.blocked,undefined);
+        }
+        const terminal=resume==='cold'&&move==='none';
+        assert.equal(f.wires().length,sent+(terminal?1:0));
+        if(!terminal) assert.deepEqual(f.store.list('research-budget-ledger'),ledgers);
+        assert.equal(f.store.list('discovery-assessment').length,terminal?1:0);
+        // A cold normal resume may have applied the checkpoint without an operator
+        // receipt. The operator proves that exact step without applying it twice.
+        receipt??=await recoverResearchResponse(f.open(),f.engine.environments,'p',reference(selected.call),reference(selected.session),'owner');
+        assert.deepEqual(receipt.value.sessionAfter,reference(after));
+        const snapshot=f.store.list().flatMap(row=>f.store.history(row.id));
+        assert.deepEqual(await recoverResearchResponse(f.open(),f.engine.environments,'p',reference(selected.call),reference(selected.session),'owner'),receipt);
+        assert.deepEqual(f.store.list().flatMap(row=>f.store.history(row.id)),snapshot);
+        if(move==='none') {
+          if(!terminal) {
+            const saved=await assessmentRequest(f,f.open());
+            assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(saved)),saved);
+            assert.equal(f.wires().length,sent+1);
+          }
+        } else {
+          // Fresh dispatch keeps current plan/baseline guards. A stale retry
+          // cannot rewrite the paid application, create its next application,
+          // change the cursor, or reserve another ledger entry.
+          for(let repeat=0;repeat<2;repeat++) await assert.rejects(assessmentRequest(f,f.open()),{code:'input_stale'});
+          assert.deepEqual(f.store.list().flatMap(row=>f.store.history(row.id)),snapshot);
+          assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledgers);
+          assert.equal(f.store.get(after.value.application),null);
+        }
+      });
+    }
+  }
+}
+
+test('A: a missing next application is not authority for an invented attempts cursor',async t=>{
   const f=await packetFixture(t);
-  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{action:'assessment_checkpoint',notes:['Exact attempt needs another page']}}));
-  const write=f.store.writeMany.bind(f.store),stop=new Error('checkpoint paid');let hit=false;
-  f.store.writeMany=((writes,guards=[])=>{
-    const result=write(writes,guards);
-    if(!hit&&writes.some(w=>w.kind==='model-call'&&(w.value as any).purpose==='assessor'&&(w.value as any).status==='succeeded')){
-      hit=true;throw stop;
-    }return result;
-  }) as typeof f.store.writeMany;
-  try{await assert.rejects(assessmentRequest(f),error=>error===stop);}finally{f.store.writeMany=write;}
-  assert.ok(hit);
-  const selected=selectedAssessmentStep(f),sent=f.wires().length,ledgers=f.store.list('research-budget-ledger');
+  const selected=await interruptPaidAssessment(f,{reply:{action:'assessment_checkpoint',notes:['Saved intermediate judgment']}});
   const receipt=await recoverResearchResponse(f.open(),f.engine.environments,'p',reference(selected.call),reference(selected.session),'owner');
-  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledgers);
-  assert.equal(f.store.list('discovery-assessment').length,0);
   const after=f.store.get<any>(receipt.value.sessionAfter.id,receipt.value.sessionAfter.revision)!;
-  assert.equal(after.value.result,null);
-  assert.deepEqual(after.value.notes,[{evidence:{offset:0,end:2},packet:selected.call.value.packet.archive,
-    response:{action:'assessment_checkpoint',notes:['Exact attempt needs another page']}}]);
-  const snapshot=f.store.list().flatMap(row=>f.store.history(row.id));
-  assert.deepEqual(await recoverResearchResponse(f.open(),f.engine.environments,'p',reference(selected.call),reference(selected.session),'owner'),receipt);
-  assert.deepEqual(f.store.list().flatMap(row=>f.store.history(row.id)),snapshot);
-  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:assessmentReply(f)}));
-  const assessment=await assessmentRequest(f,f.open());
-  assert.deepEqual(readDiscoveryAssessment(f.open(),'p',reference(assessment)),assessment);assert.equal(f.wires().length,sent+1);
+  const sent=f.wires().length,ledgers=f.store.list('research-budget-ledger');
+  const {application:_application,...withoutApplication}=after.value;
+  // Deliberately corrupt the cursor; none of these writes is positive proof.
+  for(const value of [withoutApplication,{...after.value,application:['not-a-string']},
+    {...after.value,application:'invented-next-application'},after.value]) {
+    const head=f.store.get(after.id)!;
+    f.store.write({id:after.id,kind:after.kind,expected:head.revision,value});
+    const snapshot=f.store.list().flatMap(row=>f.store.history(row.id));
+    await assert.rejects(assessmentRequest(f,f.open()),{code:'research_context_application_invalid'});
+    assert.deepEqual(f.store.list().flatMap(row=>f.store.history(row.id)),snapshot);
+  }
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledgers);
+});
+
+test('A: historical application of read_context rejects a corrupted archive address',async t=>{
+  const f=await packetFixture(t);
+  const selected=await interruptPaidAssessment(f,{readArchive:true,corruptReadArchive:true});
+  f.discovery.reopen(f.m.question.id,f.m.question.revision);
+  const sent=f.wires().length,ledgers=f.store.list('research-budget-ledger');
+  await assert.rejects(recoverResearchResponse(f.open(),f.engine.environments,'p',reference(selected.call),reference(selected.session),'owner'),
+    {code:'research_context_application_refused'});
+  const application=f.store.get<any>(selected.application.id)!;
+  assert.equal(application.value.state,'refused');assert.equal(application.value.refusal.kind,'response');
+  assert.deepEqual(application.value.received,reference(selected.call));
+  assert.equal(f.store.list('research-response-recovery').length,0);
+  assert.equal(f.store.list('discovery-assessment').length,0);
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledgers);
 });

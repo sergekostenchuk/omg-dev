@@ -25,7 +25,7 @@ import { stopCancelledCall } from "../om/run-control.js";
 import { researchAction, researchCall } from "./research-protocol.js";
 import { readResearchContext, researchContextReadEra, requireCurrentPriorContext } from "./research-limits.js";
 import { recoveredResponseBoundary, recoveryAssessmentSessionId, recoverySessionWrites, markRecoveredSessionWritten,
-  readResearchExecution, isResponseRecovery, markApplicationResponseRecovered, assessmentReadView, assessmentSessionEra,
+  readResearchExecution, readResearchContextOutcomeAt, isResponseRecovery, markApplicationResponseRecovered, assessmentReadView, assessmentSessionEra,
   proposalRefusalId, readLimitedCallRetryPermit, readResearchConsumerIntent, type AssessmentReadProof } from './response-recovery.js';
 
 /** The packet's producers are the proven K intents, never the current implementer
@@ -111,7 +111,12 @@ function advanceAssessment(store: Store, draft: Revision<DiscoveryDraft>, questi
     requireCondition(action.action === "read_context", "assessment_invalid", "Expected an addressed read");
     try {
       const mode = historicalReadEra ?? researchContextReadEra(store, sent);
-      const result = readResearchContext(store, draft, question.id, pilot, action.record, action.pointer, action.page, mode);
+      // Applying a paid attempts read uses the common historical material
+      // reader (archive parts, exact producer and source bytes), never today's
+      // Question or filesystem admission. The next dispatch checks its guards.
+      const result = assessmentSubject?.assessment
+        ? readResearchContextOutcomeAt(store, draft, question, action, pilot?.value.maxRequestChars ?? 300000, mode)
+        : readResearchContext(store, draft, question.id, pilot, action.record, action.pointer, action.page, mode);
       return { value: { ...current, focus: null, workspace: addContextLookup(workspace, result, sent!.contextWorkspace, pilot?.value.contextLimits?.maxLookups, sent) } };
     } catch (error) {
       return { value: { ...current, workspace: { ...workspace, blocked: error instanceof Error ? error.message : 'Context lookup refused' } }, failure: error };
@@ -373,10 +378,18 @@ export function readAssessmentPaidOrigin(store: Store, projectId: string, pendin
     applicationInvalid(id, 'The paid origin lost an original transaction dependency');
   return record;
 }
-function readApplication(store: Store, session: Revision<ApplicationSession>, saved?: Ref): Revision<Application> {
+function applicationPointer(session: Revision<ApplicationSession>): string {
   const value = session.value;
-  if (!object(value) || value.contract !== APPLICATION || typeof value.application !== 'string') applicationInvalid(session.id, 'The new session must retain its application contract');
-  const record = saved ? exact<Application>(store, saved, 'assessment-application') : store.get<Application>(value.application);
+  if (!object(value) || value.contract !== APPLICATION || typeof value.application !== 'string' || !value.application)
+    applicationInvalid(session.id, 'The new session must retain its application contract');
+  return value.application;
+}
+function readApplication(store: Store, session: Revision<ApplicationSession>, saved: undefined, allowMissing: true): Revision<Application> | null;
+function readApplication(store: Store, session: Revision<ApplicationSession>, saved?: Ref): Revision<Application>;
+function readApplication(store: Store, session: Revision<ApplicationSession>, saved?: Ref, allowMissing = false): Revision<Application> | null {
+  const value = session.value, pointer = applicationPointer(session);
+  const record = saved ? exact<Application>(store, saved, 'assessment-application') : store.get<Application>(pointer);
+  if (!record && allowMissing) return null;
   if (!record || !object(record.value) || record.kind !== 'assessment-application') applicationInvalid(value.application, 'The required application state is missing');
   const app = record.value, origin = exact<Application>(store, { id: record.id, revision: 1, hash: store.get(record.id, 1)?.hash ?? '' }, record.kind);
   const paid = session.id.startsWith('assessment-session:v2:');
@@ -1019,7 +1032,9 @@ export function readDirectAssessmentMaterials(store: Store, draft: Revision<Disc
       && same(binding.question, reference(question)) && same(binding.environment, reference(environment))
       && same(binding.inputs, draft.value.inputs);
   }).flatMap<DirectAssessmentMaterials>(session => {
-    const app = readApplication(store, session).value;
+    const current = readApplication(store, session, undefined, true);
+    if (!current) { pendingAttemptsContinuation(store, session); return []; }
+    const app = current.value;
     // Only an unfinished attempt can select the recovery branch. Completed
     // applications are selected by the caller's full current context instead.
     if (app.state === 'applied') return [];
@@ -1120,13 +1135,18 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
     }
     session = store.get<ApplicationSession>(id)!;
   }
-  const admittedApplication = readApplication(store, session);
-  const modelRetryPermit = admittedApplication.value.state === 'model-refused' ? reference(admittedApplication) : null;
+  const admittedApplication = readApplication(store, session, undefined, true);
+  const modelRetryPermit = admittedApplication?.value.state === 'model-refused' ? reference(admittedApplication) : null;
   for (;;) {
     recoveredResponseBoundary();
     session = store.get<ApplicationSession>(id)!;
     if (!session) applicationInvalid(id, 'The session disappeared');
-    const application = readApplication(store, session), app = application.value;
+    const application = readApplication(store, session, undefined, true);
+    if (!application) {
+      prepareAttemptsContinuation(store, session);
+      continue;
+    }
+    const app = application.value;
     if (app.state === 'refused') {
       if (continueRefusedAssessmentRead(store, application, session)) continue;
       throwApplicationRefusal(application);
@@ -1228,7 +1248,7 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
       const binding = session.value.binding!;
       const sourceDraft = exact<DiscoveryDraft>(store, binding.draft, 'discovery-draft'), sourceQuestion = exact<Question>(store, binding.question, 'question');
       const response = applicationResponse(store, app, reference(call));
-      // An attempts verdict is a saved judgment of immutable packet/baseline bytes.
+      // A paid attempts step judges or reads immutable packet/baseline bytes.
       // Today's admission controls another dispatch and P, not retention of this paid result.
       const attempts = packetAssessmentSubject(app.context)?.assessment !== undefined;
       const changed = attempts ? null : changedDependency(store, app.guards);
@@ -1270,9 +1290,9 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
         ? [{ id: barrier.id, kind: barrier.kind, expected: barrier.revision,
           value: { ...barrier.value, completion: pendingRef(applied) } } satisfies Write] : [];
       store.writeMany([write, applied, ...release,
-        ...(!terminal ? [applicationWrite(store, write, app.context, app.prompt, app.role, app.dispatch, app.profile, uniqueTransactionGuards([...app.guards, ...advanced.guards]), pendingRef(applied), app.origin, application)] : []), ...recovered.writes],
+        ...(!terminal && !attempts ? [applicationWrite(store, write, app.context, app.prompt, app.role, app.dispatch, app.profile, uniqueTransactionGuards([...app.guards, ...advanced.guards]), pendingRef(applied), app.origin, application)] : []), ...recovered.writes],
       uniqueTransactionGuards([reference(session), reference(application),
-        ...(attempts && terminal ? [reference(call)] : [...app.guards, ...response.guards]),
+        ...(attempts ? [reference(call)] : [...app.guards, ...response.guards]),
         ...advanced.guards, ...recovered.guards]));
       markRecoveredSessionWritten(recovered);
       if (terminal) return { result: nextValue.result, terminal: pendingRef(write), applied: pendingRef(applied) };
@@ -1280,6 +1300,10 @@ async function assessmentSessionInternal(store: Store, draft: Revision<Discovery
       if (!(error instanceof EngineError) || !['revision_conflict', 'input_stale'].includes(error.code)) throw error;
       const latest = store.get<Application>(application.id), currentSession = store.get(id);
       if (latest && (!same(reference(latest), reference(application)) || currentSession && !same(reference(currentSession), reference(session)))) continue;
+      // A failed application CAS must not turn a paid attempts response into
+      // a refusal merely because today's admission changed. Retry only an
+      // observed cursor change above; otherwise retain the exact paid step.
+      if (packetAssessmentSubject(app.context)?.assessment && app.state === 'running') throw error;
       const changed = changedDependency(store, app.guards);
       if (changed) {
         const call = app.call ? store.get<ModelCall>(app.call.id) : null;
@@ -1428,6 +1452,35 @@ function proveAppliedAssessment(store: Store, application: Revision<Application>
   if (advanced.failure || !next || !same(after.value, next))
     applicationInvalid(application.id, 'The saved result differs from the exact paid response');
   return advanced;
+}
+/** A paid intermediate attempts step commits before admitting another request.
+ * Absence of the next application is legal only with this exact proven parent;
+ * a missing initial application or an invented cursor remains a typed refusal. */
+function pendingAttemptsContinuation(store: Store, session: Revision<ApplicationSession>) {
+  if (session.kind !== 'assessment-session' || session.revision < 2 || !object(session.value) || session.value.contract !== APPLICATION
+    || session.value.result !== null || session.value.application !== applicationId(session.id, session.revision))
+    applicationInvalid(session.id, 'The missing application is not a pending attempts continuation');
+  const previous = store.get<Application>(applicationId(session.id, session.revision - 1));
+  if (!previous || !object(previous.value) || previous.value.state !== 'applied' || !packetAssessmentSubject(previous.value.context)?.assessment)
+    applicationInvalid(session.id, 'The pending continuation lost its exact paid attempts parent');
+  readApplication(store, session, reference(previous));
+  const advanced = proveAppliedAssessment(store, previous, session);
+  return { previous, guards: uniqueTransactionGuards([...previous.value.guards, ...advanced.guards]) };
+}
+function prepareAttemptsContinuation(store: Store, session: Revision<ApplicationSession>): void {
+  const { previous, guards } = pendingAttemptsContinuation(store, session), app = previous.value;
+  // Fresh admission is separate from paid application. Both this early check
+  // and the atomic write protect the original plan/baseline; stale admission
+  // never rewrites the preceding paid application or sends another call.
+  requireCondition(transactionGuardsCurrent(store, guards), 'input_stale',
+    `[${session.id}] The next assessment request needs its current original plan and baseline`);
+  // applicationWrite uses this already-proven cursor for preflight only; the
+  // existing session is neither reconstructed as authority nor written again.
+  const cursor: Write = { id: session.id, kind: session.kind, expected: session.revision - 1, value: session.value };
+  const next = applicationWrite(store, cursor, app.context, app.prompt, app.role, app.dispatch, app.profile,
+    guards, reference(previous), app.origin, previous);
+  store.writeMany([next], uniqueTransactionGuards([reference(session), reference(previous),
+    { id: next.id, absent: true }, ...guards]));
 }
 function proveSessionOrigin(store: Store, record: Revision<Application>, before: Revision<ApplicationSession>): void {
   const app = record.value;
