@@ -326,6 +326,10 @@ const RECORD_REFERENCE_SEMANTICS: readonly RecordReferenceSemantics[] = [
   // the cell texts are data; the preparation permits no dispatch.
   { kind: "discovery-deep-preparation", contract: "discovery-deep-preparation/v1", data: [], refs: [
     ["cell", "subject", "planAnswer"], ["cell", "variant", "set"], ["cell", "variant", "member"], ["scope"]] },
+  // DR7 7b.2-F: the manifest of the final bundle names exactly its draft, bundle, assessment, admission record,
+  // previous manifest and condition resolution records; the admission kind is data and proves no authority.
+  { kind: "discovery-manifest", contract: "discovery-manifest/v7", data: [], refs: [
+    ["draft"], ["bundle"], ["assessment"], ["admission", "record"], ["previous"], ["resolutions", INDEX]] },
   // DR4-M: structural reference sites only. These records do not prove paid or owner provenance.
   { kind: "discovery-variant-snapshot", contract: "discovery-variant-snapshot/v1", data: [], refs: [
     ["draft"], ["frame"], ["plan"], ["questions", INDEX, "question"], ["questions", INDEX, "progress"],
