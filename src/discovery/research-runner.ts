@@ -1,5 +1,5 @@
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
-import { currentPlan, planAttemptSelection, planOwnerSubject, provePlanQuestions } from "./v7-plan-questions.js";
+import { currentPlan, planAttemptSelection, planOwnerSubject, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
 import { recordV7Attempt } from "./v7-attempts.js";
 import { planSubjectOf, sameSubject, attemptEndOfAction, addressedQuestionId, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { isResearchPreview } from './research-preview.js';
@@ -1320,16 +1320,9 @@ export class Researcher {
       "research_busy", "This draft already has an active researcher");
     try {
       for (;;) {
-        const turns = this.store.list<ManagedResearchTurn>("research-turn").filter(row => row.value.run === id)
-          .map(row => readResearchConsumerTurn(this.store, reference(row)) as Revision<ManagedResearchTurn>)
-          .sort((a, b) => a.value.number - b.value.number);
-        const pending = turns.filter(row => row.value.status === "pending");
-        requireCondition(pending.length <= 1, "research_consumer_intent_invalid", "Several paid turns are unfinished");
-        const intents = listResearchConsumerIntents(this.store, project, draftId).filter(row => row.value.cursor.run === id);
-        const unfinished = intents.filter(row => row.value.state === "prepared" || row.value.state === "running");
-        requireCondition(unfinished.length <= 1, "research_consumer_intent_invalid", "Several calls own this run position");
-        let turn = pending[0];
-        const outstanding = unfinished[0];
+        const recovery = selectV7AnalystRecovery(this.store, project, draftId, run);
+        const { turns, intents, outstanding } = recovery;
+        const turn = recovery.turn;
         if (run && (turn || outstanding) && run.value.status !== "running")
           run = this.save(run, { status: "running", owner, error: null, pauseCode: null },
             [...(turn ? [reference(turn)] : []), ...(outstanding ? [reference(outstanding)] : [])]);

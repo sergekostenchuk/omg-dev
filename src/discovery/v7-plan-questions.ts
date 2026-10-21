@@ -4,7 +4,8 @@ import { EngineError } from "../errors.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { ResearchAnswer, ResearchRun } from "./research-model.js";
-import { readResearchConsumerTurn } from "./response-recovery.js";
+import { consumerIntentContext, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn,
+  type ResearchConsumerIntent } from "./response-recovery.js";
 import { planSubjectOf, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
 import { issuedAnswerSchemaHolds, orderedQuestions, proveIssuedAnswer, readExact,
@@ -167,6 +168,74 @@ export function planAttemptSelection(store: Store, projectId: string): CurrentPl
   const open = plan.questions.filter(question => !ended.has(question.planQuestionId));
   return { ...plan, attempts,
     next: open.find(question => (question.question as Record<string, Json>)["class"] === "blocking") ?? open[0] ?? null };
+}
+
+/** S6.2: recovery of the connected analyst/owner-review branches only. The
+ * exact saved position is selected before consulting today's accepted plan.
+ * Planner and synthesis recovery are deliberately not admitted by this selector. */
+export function selectV7AnalystRecovery(store: Store, projectId: string, draftId: string,
+  run: Revision<ResearchRun> | null): {
+    turns: Revision<ManagedResearchTurn>[]; intents: Revision<ResearchConsumerIntent>[];
+    turn: Revision<ManagedResearchTurn> | undefined;
+    outstanding: Revision<ResearchConsumerIntent> | undefined;
+  } {
+  const runId = `research-run:${hashJson([projectId, draftId])}`;
+  const invalid = (reason: string): never => refuse("research_consumer_intent_invalid", runId, reason);
+  if (run && (run.id !== runId || run.kind !== "research-run" || !obj(run.value)
+    || run.value.projectId !== projectId || run.value.draftId !== draftId
+    || !Number.isSafeInteger(run.value.turns) || run.value.turns < 0
+    || hashJson(run.value) !== run.hash || readExact<ResearchRun>(store, reference(run)) === null))
+    invalid("The saved analyst run lost its exact project, draft or position");
+  const turns = store.list<ManagedResearchTurn>("research-turn")
+    .filter(row => row.value.run === runId)
+    .map(row => readResearchConsumerTurn(store, reference(row)) as Revision<ManagedResearchTurn>)
+    .sort((a, b) => a.value.number - b.value.number);
+  const intents = listResearchConsumerIntents(store, projectId, draftId)
+    .filter(row => row.value.cursor.run === runId);
+  const pending = turns.filter(row => row.value.status === "pending");
+  const unfinished = intents.filter(row => row.value.state === "prepared" || row.value.state === "running");
+  if ((turns.length || unfinished.length) && !run) invalid("The unfinished analyst work lost its run");
+  if (run && (turns.length !== run.value.turns
+    || turns.some((row, index) => row.value.number !== index + 1)))
+    invalid("The analyst turns do not prove one complete run position");
+  if (pending.length > 1 || unfinished.length > 1)
+    invalid("Several incompatible analyst operations claim this run position");
+  const turn = pending[0], outstanding = unfinished[0];
+  if (turn && turn.value.number !== run!.value.turns)
+    invalid("The unfinished analyst turn is not at its saved run position");
+  if (outstanding) {
+    const value = outstanding.value;
+    if (value.kind !== "analyst" && value.kind !== "escalation-assessor")
+      refuse("research_v7_mode_unavailable", outstanding.id, "The v7 planner and synthesis consumers are not connected");
+    const owner = readExact<ResearchRun>(store, value.owner);
+    const position = value.cursor.turn as number;
+    const ownerPosition = value.kind === "escalation-assessor" ? position : position - 1;
+    const subject = planSubjectOf(value.kind === "escalation-assessor"
+      ? consumerIntentContext(store, value, outstanding.id) : value.cursor);
+    const draft = readExact<DiscoveryDraft>(store, value.draft);
+    const question = readExact<Question>(store, value.question);
+    if (!owner || owner.kind !== "research-run" || !obj(owner.value) || owner.id !== runId
+      || owner.value.projectId !== projectId || owner.value.draftId !== draftId || hashJson(owner.value) !== owner.hash
+      || owner.value.turns !== ownerPosition || run!.value.turns !== ownerPosition
+      || !subject || !draft || draft.kind !== "discovery-draft" || draft.id !== draftId
+      || !obj(draft.value) || !Array.isArray(draft.value.questions) || draft.value.projectId !== projectId
+      || !question || question.kind !== "question" || !obj(question.value)
+      || !draft.value.questions.includes(question.id) || question.value.projectId !== projectId || question.value.draftId !== draftId
+      || question.value.spec?.field !== "plan" || !isRef(question.value.answer)
+      || canonical(question.value.answer) !== canonical(subject.planAnswer)
+      || !provePlanQuestions(store, draft, subject.planAnswer).some(item => item.planQuestionId === subject.planQuestionId))
+      invalid("The unfinished analyst intent lost its exact owner, subject or run position");
+    if (value.state === "running") readResearchConsumerExecution(store, projectId, reference(outstanding));
+    if (value.kind === "escalation-assessor" && (!turn || position !== turn.value.number
+      || canonical(value.cursor.pendingTurn) !== canonical(reference(turn))
+      || canonical(value.question) !== canonical(turn.value.question)
+      || canonical(subject) !== canonical(planSubjectOf(turn.value))))
+      invalid("The owner review does not own this exact pending analyst turn");
+    // An already-paid turn N is older than an admitted next call N+1. Its
+    // application precedes even the current-plan admission of that new send.
+    if (turn && value.kind === "analyst") return { turns, intents, turn, outstanding: undefined };
+  }
+  return { turns, intents, turn, outstanding };
 }
 
 /** A saved owner pause belongs to the paid turn, never to the plan field's answered flag. */
