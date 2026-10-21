@@ -3,6 +3,7 @@ import { EngineError } from '../errors.js';
 import { isRef, reference, type Ref } from '../pipeline/contracts.js';
 import type { Revision } from '../storage/store.js';
 import type { ClaimAddress } from './claim-address.js';
+import { decodeDossierContradictions, type DossierContradiction } from './dossier-contradictions.js';
 import { V7_ATTEMPT_KIND, V7_AXES, V7_DEPTHS, V7_UNKNOWN_MOMENTS, V7_CLAIM_POINTER, type V7Axis } from './v7-contracts.js';
 
 /** DR6 6.1 (codex-omg №9189, раздел DR6): the closed structural form of the
@@ -31,7 +32,7 @@ export interface DossierReason { code: DossierPartialReason; message: string; gr
 export interface DossierManifest {
   contract: typeof DOSSIER_MANIFEST_CONTRACT; projectId: string; draft: Ref; frame: Ref; plan: Ref;
   completeness: 'complete' | 'partial'; reasons: DossierReason[];
-  axes: Record<V7Axis, DossierAxis>; unknowns: DossierUnknown[];
+  axes: Record<V7Axis, DossierAxis>; unknowns: DossierUnknown[]; contradictions: DossierContradiction[];
 }
 export interface DossierRecordView { get<T = unknown>(id: string, revision?: number): Revision<T> | null }
 /** A structural read result — deliberately not a proven or accepted dossier. */
@@ -78,11 +79,12 @@ const addressKey = (address: DossierClaimAddress) => canonical([address.containe
  * axis. Every unknown is addressed — what (its claim and id), to which consumer,
  * by which moment, whether it blocks the stage — and names a claim of the axes.
  * A complete snapshot has no partial reasons; a partial one names at least one,
- * each with its code, message and exact grounds. An unknown contract is refused. */
+ * each with its code, message and exact grounds. Contradictions keep both sides
+ * by their full axis addresses (dossier-contradictions). An unknown contract is refused. */
 export function decodeDossierManifest(value: unknown): DossierManifest {
   if (!object(value) || value.contract !== DOSSIER_MANIFEST_CONTRACT)
     invalid('contract', `Only ${DOSSIER_MANIFEST_CONTRACT} is a known dossier form; another version is never read as this one`);
-  shape(value, ['contract', 'projectId', 'draft', 'frame', 'plan', 'completeness', 'reasons', 'axes', 'unknowns'], 'dossier');
+  shape(value, ['contract', 'projectId', 'draft', 'frame', 'plan', 'completeness', 'reasons', 'axes', 'unknowns', 'contradictions'], 'dossier');
   text(value.projectId, 'projectId');
   const project = value.projectId;
   ref(value.draft, 'draft'); ref(value.frame, 'frame'); ref(value.plan, 'plan');
@@ -123,17 +125,21 @@ export function decodeDossierManifest(value: unknown): DossierManifest {
       claims.set(key, address);
     });
   }
+  /** The identity key of a claim of the axes named by its full address, containerKind included (6.1-01). */
+  const axisClaim = (address: unknown, at: string, whose: string): string => {
+    claimAddress(address, at, project);
+    const key = addressKey(address), named = claims.get(key);
+    if (!named || canonical(named) !== canonical(address)) invalid(at, `${whose} names a claim of the snapshot axes by its full address`);
+    return key;
+  };
   if (!Array.isArray(value.unknowns)) invalid('unknowns', 'Expected the list of addressed unknowns');
   const unknownIds = new Set<unknown>(), unknownClaims = new Set<string>();
   value.unknowns.forEach((unknown: unknown, i: number) => {
     const at = `unknowns.${i}`;
     shape(unknown, ['claim', 'unknownId', 'consumer', 'moment', 'blocksCurrentStage'], at);
-    claimAddress(unknown.claim, `${at}.claim`, project);
-    const named = claims.get(addressKey(unknown.claim));
-    if (!named || canonical(named) !== canonical(unknown.claim))
-      invalid(`${at}.claim`, 'An unknown names a claim of the snapshot axes by its full address');
-    if (unknownClaims.has(addressKey(unknown.claim))) invalid(`${at}.claim`, 'An unknown claim is listed once');
-    unknownClaims.add(addressKey(unknown.claim));
+    const key = axisClaim(unknown.claim, `${at}.claim`, 'An unknown');
+    if (unknownClaims.has(key)) invalid(`${at}.claim`, 'An unknown claim is listed once');
+    unknownClaims.add(key);
     text(unknown.unknownId, `${at}.unknownId`);
     if (unknownIds.has(unknown.unknownId)) invalid(`${at}.unknownId`, 'Each unknown has its own id');
     unknownIds.add(unknown.unknownId);
@@ -142,6 +148,7 @@ export function decodeDossierManifest(value: unknown): DossierManifest {
       invalid(`${at}.moment`, `A moment is one of ${V7_UNKNOWN_MOMENTS.join(', ')}`);
     if (typeof unknown.blocksCurrentStage !== 'boolean') invalid(`${at}.blocksCurrentStage`, 'An unknown states whether it blocks the stage');
   });
+  decodeDossierContradictions(value.contradictions, { axisClaim: (address, at) => axisClaim(address, at, 'A side') });
   return structuredClone(value) as unknown as DossierManifest;
 }
 

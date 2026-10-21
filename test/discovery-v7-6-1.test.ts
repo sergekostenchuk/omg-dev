@@ -23,7 +23,8 @@ const axesWith = (claimsOf: (axis: string, index: number) => unknown[]) => Objec
 const complete = (): Record<string, any> => ({ contract: DOSSIER_MANIFEST_CONTRACT, projectId: "p",
   draft: at("discovery:p:draft"), frame: at("research-answer:frame"), plan: at("research-answer:plan"),
   completeness: "complete", reasons: [], axes: axesWith((_axis, index) => [claim(index)]),
-  unknowns: [{ claim: claim(2), unknownId: "u-1", consumer: "operation-map", moment: "om-pass", blocksCurrentStage: false }] });
+  unknowns: [{ claim: claim(2), unknownId: "u-1", consumer: "operation-map", moment: "om-pass", blocksCurrentStage: false }],
+  contradictions: [] });
 const partial = (): Record<string, any> => ({ ...complete(), completeness: "partial",
   reasons: [{ code: "reject_all", message: "The owner rejected every variant", grounds: [at("discovery-variant-owner-decision:d1")] }],
   axes: axesWith((_axis, index) => index < 3 ? [claim(index)] : []), unknowns: [] });
