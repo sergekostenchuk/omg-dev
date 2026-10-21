@@ -49,7 +49,7 @@ import { consumerFeedback } from "./consumer-feedback.js";
 import { researchHistory } from "./research-history.js";
 import { assertPilotBoundary, readerPilot, pilotEnvironment, type ReaderPilot } from "./reader-pilot.js";
 import { pilotContext, retainPilotRead } from "./pilot-context.js";
-import { readBundle, readReaderResultAt, resumeReadBundleIntent } from "./reader.js";
+import { readBundle, readSavedReaderBundleResult, readReaderResultAt, resumeReadBundleIntent } from "./reader.js";
 import { expandLayerDelta, layerDeltaCandidate, layerDeltaView, type LayerDelta } from "./layer-delta.js";
 import { checkpoint, latestFocus, latestProposal, recoverableAnswer, workingSelections, repeatedContextRead,
   addressedWorkspace, findAcceptedPaidAnswerChain } from "./research-continuation.js";
@@ -1338,13 +1338,18 @@ export class Researcher {
         });
         requireCondition(new Set(originalRuns.map(canonical)).size <= 1,
           "research_consumer_intent_invalid", "The queued bundle has incompatible saved run bindings");
-        const currentPilot = readerPilot(this.store, project);
-        const savedProfile = attached.find(row => row.value.state !== "prepared" && isRef(row.value.profile))?.value.profile;
-        const pilot = savedProfile ? this.store.get<ReaderPilot>(savedProfile.id, savedProfile.revision) : currentPilot;
-        requireCondition(pilot?.kind === "reader-pilot" && (!savedProfile || canonical(reference(pilot)) === canonical(savedProfile)),
-          "reader_pilot_required", "The queued bundle needs its current or saved paid reader profile");
-        const result = await readBundle(this.store, producer.value.dispatch, pilot, reference(question), action.purpose,
-          action.inputs, signal, { run: originalRuns[0] ?? reference(run), turn: reference(child) });
+        const consumer = { run: originalRuns[0] ?? reference(run), turn: reference(child) };
+        const saved = readSavedReaderBundleResult(this.store, project, reference(question), action.purpose, action.inputs, consumer);
+        let result = saved?.result;
+        if (!result) {
+          const currentPilot = readerPilot(this.store, project);
+          const savedProfile = attached.find(row => row.value.state !== "prepared" && isRef(row.value.profile))?.value.profile;
+          const pilot = savedProfile ? this.store.get<ReaderPilot>(savedProfile.id, savedProfile.revision) : currentPilot;
+          requireCondition(pilot?.kind === "reader-pilot" && (!savedProfile || canonical(reference(pilot)) === canonical(savedProfile)),
+            "reader_pilot_required", "The queued bundle needs its current or saved paid reader profile");
+          result = await readBundle(this.store, producer.value.dispatch, pilot, reference(question), action.purpose,
+            action.inputs, signal, consumer);
+        }
         readReaderResultAt(this.store, project, reference(result));
         observation = { ref: reference(result), observations: result.value.observations,
           coverage: result.value.coverage, unresolved: result.value.unresolved };

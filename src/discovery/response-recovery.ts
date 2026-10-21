@@ -62,7 +62,7 @@ import { projectReaderSelection, readerDraftEquivalent, projectResearchPhysicalR
   type ContextReadIdentityInput, type ContextTurnHistoryProof } from './research-consumer-transition.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V3, type ResearchAction, type ResearchAnswer, type ResearchAssessment, type ResearchRun, type ResearchTurn } from './research-model.js';
 import { expandLayerDelta, type LayerDelta } from './layer-delta.js';
-import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt, readerResumeStep } from './reader.js';
+import { derivePaidReaderResult, readerApplicationAdmission, readReaderResultAt, readSavedReaderBundleResult } from './reader.js';
 import { findAcceptedPaidAnswerChain } from './research-continuation.js';
 import { queueOriginOf, queuedChildReached } from './reading-plan.js';
 import { paidOriginId, paidSessionId, limitedAssessmentRetryScope, assessmentRolePrompt, readAssessmentDispatchAdmission, readAssessmentApplicationOutcomeAt } from './assessment-session.js';
@@ -1197,11 +1197,19 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
       } else if (action.action === 'read_context') {
         const into = saved.value.observation?.splitInto;
         if (Array.isArray(into)) {
-          if (into.length !== 2 || !into.every(isRef) || !into.every(ref => {
-            const part = store.get<ResearchTurn>(ref.id, ref.revision);
-            return part && canonical(reference(part)) === canonical(ref)
-              && queueOriginOf(store, part, parent);
-          })) consumerInvalid(saved.id, 'The queued context split lost its exact derived children');
+          if (into.length !== 2 || !into.every(isRef) || into[0]!.id === into[1]!.id
+            || canonical(saved.value) !== canonical({ ...before.value, status: 'completed', error: null,
+              observation: { splitInto: into, reason: 'context_read_limit' } })
+            || !into.every(ref => {
+              const part = ref.revision === 1 ? store.get<ResearchTurn>(ref.id, 1) : null;
+              return part && canonical(reference(part)) === canonical(ref)
+                && isRef(part.value.splitFrom) && isRef(part.value.replayedFrom)
+                && canonical(part.value.splitFrom) === canonical(reference(before))
+                && canonical(part.value.replayedFrom) === canonical(reference(before))
+                // queueOriginOf recomputes BOTH ordered halves and their @1
+                // addresses from this exact source read's historical bytes.
+                && queueOriginOf(store, part, parent);
+            })) consumerInvalid(saved.id, 'The queued context split lost its exact derived children');
           return saved;
         }
         const draft = store.get<DiscoveryDraft>(producer.value.draft.id, producer.value.draft.revision)!;
@@ -1225,39 +1233,23 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
         || !run || run.kind !== 'research-run' || !isRef(resultRef))
         consumerInvalid(saved.id, 'The queued bundle lost its exact pending action or reader result');
       const result = readReaderResultAt(store, run.value.projectId, resultRef);
-      // Paid and combined results prove their request through the reader
-      // intents; only reused/outside results carry request inline. Let the
-      // common reader select its exact completed output for this child root.
-      const bindings = listResearchConsumerIntents(store, run.value.projectId, run.value.draftId)
-        .filter(row => row.value.kind === 'reader' && row.value.owner.id === before.id
-          && isRef(row.value.cursor.consumer?.turn) && canonical(row.value.cursor.consumer?.turn) === canonical(reference(before)))
-        .map(row => row.value.cursor.consumer);
-      if (result.value.request) bindings.push(result.value.request.consumer);
-      const consumers = [...new Map(bindings.map(binding => [canonical(binding), binding])).values()];
-      const consumer = consumers[0];
-      const originalRun = consumer && isRef(consumer.run)
-        ? store.get<{projectId: string; draftId: string}>(consumer.run.id, consumer.run.revision) : null;
-      if (consumers.length !== 1 || !consumer || !isRef(consumer.turn)
-        || canonical(consumer.turn) !== canonical(reference(before))
-        || !originalRun || originalRun.kind !== 'research-run' || !isRef(consumer.run)
-        || canonical(reference(originalRun)) !== canonical(consumer.run) || originalRun.id !== before.value.run
-        || originalRun.value.projectId !== run.value.projectId || originalRun.value.draftId !== run.value.draftId)
-        consumerInvalid(saved.id, 'The queued bundle lost its exact reader consumer root');
-      const step = readerResumeStep(store, run.value.projectId, before.value.question,
-        before.value.action.purpose, before.value.action.inputs, consumer);
-      if (step.kind !== 'completed' || canonical(reference(step.result)) !== canonical(resultRef)
-        || canonical(saved.value) !== canonical({ ...before.value, status: 'completed', error: null,
-          observation: { ref: resultRef, observations: result.value.observations,
-            coverage: result.value.coverage, unresolved: result.value.unresolved } }))
-        consumerInvalid(saved.id, 'The queued bundle result is not derived from its exact reader consumer');
+      const proved = readSavedReaderBundleResult(store, run.value.projectId, before.value.question,
+        before.value.action.purpose, before.value.action.inputs,
+        { run: reference(run), turn: reference(before) }, resultRef);
+      if (!proved || canonical(saved.value) !== canonical({ ...before.value, status: 'completed', error: null,
+        observation: { ref: resultRef, observations: result.value.observations,
+          coverage: result.value.coverage, unresolved: result.value.unresolved } }))
+        consumerInvalid(saved.id, 'The queued bundle result is not derived from its exact reader request');
     }
-    if (saved.value.action?.action === 'read_source' && object(saved.value.observation)
-      && Object.hasOwn(saved.value.observation, 'contract')) {
+    if (saved.value.action?.action === 'read_source'
+      && (Object.hasOwn(saved.value, 'subject') && saved.value.status === 'completed' && saved.value.error === null
+        || object(saved.value.observation) && Object.hasOwn(saved.value.observation, 'contract'))) {
       const before = store.get<Record<string, any>>(saved.id, saved.revision - 1);
       const sourceRef = saved.value.action.source;
       const source = isRef(sourceRef) ? store.get<Source>(sourceRef.id, sourceRef.revision) : null;
       const run = before && typeof before.value.run === 'string' ? store.get<{projectId: string}>(before.value.run, 1) : null;
-      if (![SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(saved.value.observation.contract) || !before
+      if (!object(saved.value.observation)
+        || ![SOURCE_READ_CONTRACT, SOURCE_READ_CONTRACT_V2, SOURCE_READ_CONTRACT_V3].includes(saved.value.observation.contract) || !before
         || before.kind !== 'research-turn' || hashJson(before.value) !== before.hash
         || !run || run.kind !== 'research-run' || hashJson(run.value) !== run.hash
         || !source || source.kind !== 'source' || canonical(reference(source)) !== canonical(sourceRef))

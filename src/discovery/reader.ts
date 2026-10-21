@@ -759,6 +759,57 @@ export function readerResumeStep(store: Store, project: string, question: Ref, p
   return { ...base, ...position };
 }
 
+
+/** Historical proof for the queued consumer. Own intent trees keep their
+ * exact result; an outside request retains its saved consumer even if run HEAD
+ * advanced. A completed child may also borrow a proved matching bundle, just
+ * as readBundlePart does, without inventing a new intent for reused material.
+ * Without an output Ref only already-bound saved work is selected: new reuse
+ * still passes readBundlePart's current admission and source checks. */
+export function readSavedReaderBundleResult(store: Store, project: string, question: Ref, purpose: string,
+  rootInputs: BundleInput[], consumer: ReaderConsumerBinding | null, output?: Ref):
+  { result: Revision<ReaderResult>; consumer: ReaderConsumerBinding | null } | null {
+  const step = readerResumeStep(store, project, question, purpose, rootInputs, consumer);
+  if (step.kind === 'completed') {
+    if (output && canonical(reference(step.result)) !== canonical(output)) return null;
+    const saved = step.children[0]?.value.cursor.consumer as ReaderConsumerBinding | null | undefined;
+    return { result: step.result, consumer: saved ?? step.result.value.request?.consumer ?? consumer };
+  }
+  if (step.kind !== 'none') return null;
+  const candidates = output ? [readReaderResultAt(store, project, output)] : readerResultsInScope(store, project, question);
+  const matches = candidates.filter(result => {
+    if (canonical(result.value.question) !== canonical(question) || result.value.purpose !== purpose) return false;
+    if (result.value.producer === 'outside') {
+      const request = result.value.request!;
+      const saved = request.consumer;
+      if (request.child.length || canonical(request.inputs) !== canonical(rootInputs)
+        || (consumer === null ? saved !== null : !saved
+          || canonical(saved.turn) !== canonical(consumer.turn) || saved.run.id !== consumer.run.id)) return false;
+      const restored = readerResumeStep(store, project, question, purpose, rootInputs, saved);
+      return restored.kind === 'completed' && canonical(reference(restored.result)) === canonical(reference(result));
+    }
+    if (!output) return false;
+    // The result proof fixes every original Source/window; reconstruct the
+    // public request against those immutable bytes, never today's file heads.
+    const root = historicalReaderSources(store, project, result.value.coverage.map((entry, sourceIndex) => ({
+      sourceIndex, source: entry.ref, window: entry.visibleRange, ...(entry.reading ? { reading: entry.reading } : {})
+    })));
+    try {
+      const requested = requestedReaderOrder(store, project, rootInputs, root);
+      const unique = [...new Map(requested.map(entry => [entry.source.id, entry])).values()];
+      return requested.every(entry => canonical(unique.find(item => item.source.id === entry.source.id)) === canonical(entry))
+        && canonical(unique) === canonical(readerSourceOrder(root).map(({ source, window, reading }) =>
+          ({ source, window, ...(reading ? { reading } : {}) })));
+    } catch (error) {
+      if (error instanceof EngineError) return false;
+      throw error;
+    }
+  });
+  requireCondition(matches.length <= 1, 'reader_result_invalid', 'One saved consumer has incompatible result proofs');
+  const result = matches[0];
+  return result ? { result, consumer: result.value.producer === 'outside' ? result.value.request!.consumer : consumer } : null;
+}
+
 function saveReaderAssembly(store: Store, project: string,
   step: { result: Revision<ReaderResult>; writes: Write[]; guards: TransactionGuard[] }): Revision<ReaderResult> {
   try { store.writeMany(step.writes, step.guards); }

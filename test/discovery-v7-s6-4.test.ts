@@ -462,3 +462,152 @@ test('S6.4: a paid context child still splits from its immutable context after t
   assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   assert.equal(f.wires().length,1);
 });
+
+for (const damage of ['null', 'missing-contract', 'unknown-contract'] as const) {
+  test(`S6.4-01: ${damage} cannot hide the result proof of a real read_source child`, async t => {
+    const f=await setup(t,[planQuestion('block','industry','blocking')]);
+    const source=f.store.list<any>('source').find(row=>row.value.origin.kind==='owner-document')!;
+    f.configure([{...planner,reads:[{action:'read_source',source:reference(source),start:0,end:5}]}]);
+    const write=f.store.writeMany.bind(f.store);let damaged='';
+    f.store.writeMany=((writes,guards=[])=>{
+      const child=writes.find(row=>row.kind==='research-turn' && row.expected===1
+        && (row.value as any).action?.action==='read_source' && (row.value as any).status==='completed');
+      if(child && !damaged) {
+        damaged=child.id;
+        const observation={...(child.value as any).observation};
+        if(damage==='missing-contract')delete observation.contract;
+        else observation.contract='source-read/unknown';
+        return write(writes.map(row=>row.id===child.id?{...row,value:{...row.value as object,
+          observation:damage==='null'?null:observation}}:row),guards);
+      }
+      return write(writes,guards);
+    }) as Store['writeMany'];
+    const result=await f.run(2);f.store.writeMany=write;
+    assert.ok(damaged,JSON.stringify(result.value));
+    assert.equal(result.value.pauseCode,'research_consumer_intent_invalid');
+    assert.throws(()=>readResearchConsumerTurn(f.store,reference(f.store.get<any>(damaged)!)),{code:'research_consumer_intent_invalid'});
+    const calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger'),cold=f.open();
+    assert.throws(()=>readResearchConsumerTurn(cold,reference(cold.get<any>(damaged)!)),{code:'research_consumer_intent_invalid'});
+    assert.equal((await f.run(2,cold)).value.pauseCode,'research_consumer_intent_invalid');
+    assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+    assert.equal(f.wires().length,1);
+  });
+}
+
+test('S6.4-03: two real sibling queue members cannot masquerade as a child split', async t => {
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  const action={action:'read_context',record:reference(f.v.draft),pointer:'/fields/frame/domains'};
+  f.configure([{...planner,reads:[action,{...action,page:{offset:0,limit:1}},{...action,page:{offset:1,limit:1}}]}]);
+  const write=f.store.writeMany.bind(f.store);let changed=false,damaged='';
+  f.store.writeMany=((writes,guards=[])=>{
+    const child=writes.find(row=>row.kind==='research-turn' && row.expected===1
+      && (row.value as any).action?.action==='read_context' && (row.value as any).status==='completed');
+    if(child&&!changed) {
+      const neighbours=ownTurns(f.store).filter(row=>row.id!==child.id && !row.id.startsWith('research-turn:v1:'));
+      assert.equal(neighbours.length,2);changed=true;damaged=child.id;
+      return write(writes.map(row=>row.id===child.id?{...row,value:{...row.value as object,
+        observation:{splitInto:neighbours.map(reference),reason:'context_read_limit'}}}:row),guards);
+    }
+    return write(writes,guards);
+  }) as Store['writeMany'];
+  const result=await f.run(2);f.store.writeMany=write;
+  assert.equal(changed,true);assert.equal(result.value.pauseCode,'research_consumer_intent_invalid');
+  const cold=f.open(),calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
+  assert.throws(()=>readResearchConsumerTurn(cold,reference(cold.get<any>(damaged)!)),{code:'research_consumer_intent_invalid'});
+  assert.equal((await f.run(2,cold)).value.pauseCode,'research_consumer_intent_invalid');
+  assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  assert.equal(f.wires().length,1);
+});
+
+test('S6.4-02: a second purpose reuses full reader coverage without another intent or payment', async t => {
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  writeFileSync(join(f.root,'scope.txt'),'Exact condition.\nApplicable exception.\n');
+  f.configure([{...planner,reads:['first','second'].map(purpose=>({action:'read_bundle',purpose,
+    inputs:[{path:'scope.txt',media:'text/plain'}]}))},readerReply]);
+  const result=await f.run(3);
+  assert.equal(result.value.pauseCode,'research_v7_mode_unavailable',JSON.stringify(result.value));
+  const children=ownTurns(f.store).slice(1);
+  assert.equal(children.length,2);
+  const first=f.store.get<any>(children[0]!.value.observation.ref.id)!;
+  const reused=f.store.get<any>(children[1]!.value.observation.ref.id)!;
+  assert.equal(first.value.producer,'paid');assert.equal(reused.value.producer,'reused');
+  assert.equal(reused.value.purpose,'second');assert.deepEqual(reused.value.reusedFrom,[reference(first)]);
+  assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).filter(row=>row.value.kind==='reader').length,1);
+  for(const child of children)assert.deepEqual(readResearchConsumerTurn(f.store,reference(child)),child);
+  assert.equal(f.wires().length,2,'only planner and first reader pay');
+  const history=f.history(),calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
+  await f.run(2,f.open());assert.deepEqual(f.history(),history);
+  assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+});
+
+test('S6.4-02: a different equivalent public request can borrow the exact prior paid bundle directly', async t => {
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  const source=f.store.list<any>('source').find(row=>row.value.origin.kind==='owner-document')!;
+  f.configure([{...planner,reads:[
+    {action:'read_bundle',purpose:'same',inputs:[{source:reference(source)}]},
+    {action:'read_bundle',purpose:'same',inputs:[{source:reference(source),range:{start:0,end:source.value.content.length}}]}
+  ]},{selections:[{sourceIndex:0,firstLine:1,lastLine:1}],unresolved:[]}]);
+  const result=await f.run(3);
+  assert.equal(result.value.pauseCode,'research_v7_mode_unavailable',JSON.stringify(result.value));
+  const children=ownTurns(f.store).slice(1);
+  assert.equal(children.length,2);
+  assert.deepEqual(children[1]!.value.observation.ref,children[0]!.value.observation.ref);
+  assert.equal(f.store.get<any>(children[0]!.value.observation.ref.id)!.value.producer,'paid');
+  assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).filter(row=>row.value.kind==='reader').length,1);
+  for(const child of children)assert.deepEqual(readResearchConsumerTurn(f.store,reference(child)),child);
+  const history=f.history(),calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
+  await f.run(2,f.open());assert.deepEqual(f.history(),history);
+  assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  assert.equal(f.wires().length,2);
+});
+
+test('S6.4-02: a saved outside result finishes its exact child after disabled settings and plan reopen without a new result', async t => {
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  writeFileSync(join(f.root,'scope.txt'),'A short source.');
+  f.configure([{...planner,reads:[{action:'read_bundle',purpose:'Outside window',
+    inputs:[{path:'scope.txt',media:'text/plain',range:{start:999,end:1000}}]}]}]);
+  const write=f.store.writeMany.bind(f.store);let cut=false;
+  f.store.writeMany=((writes,guards=[])=>{
+    if(!cut && writes.some(row=>row.kind==='research-turn' && row.expected===1
+      && (row.value as any).action?.action==='read_bundle' && (row.value as any).status==='completed')) {
+      cut=true;throw new Error('S6.4-02 cut after a real outside result');
+    }
+    return write(writes,guards);
+  }) as Store['writeMany'];
+  await f.run(2);f.store.writeMany=write;assert.equal(cut,true);
+  const child=ownTurns(f.store)[1]!,results=f.store.list<any>('reader-result');
+  assert.equal(results.length,1);assert.equal(results[0]!.value.producer,'outside');
+  assert.deepEqual(results[0]!.value.request.consumer.turn,reference(child));
+  assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).filter(row=>row.value.kind==='reader').length,0);
+  changePilot(f,{active:false});const plan=f.store.get<Question>(f.v.plan.id)!;
+  f.discovery.reopen(plan.id,plan.revision);
+  const calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
+  await f.run(2,f.open(),false);
+  const completed=f.store.get<any>(child.id)!;
+  assert.equal(completed.value.status,'completed');assert.equal(completed.value.error,null);
+  assert.deepEqual(completed.value.observation.ref,reference(results[0]!));
+  assert.deepEqual(readResearchConsumerTurn(f.open(),reference(completed)),completed);
+  assert.deepEqual(f.store.list('reader-result'),results);assert.deepEqual(f.store.list('model-call'),calls);
+  assert.deepEqual(f.store.list('research-budget-ledger'),ledger);assert.equal(f.wires().length,1);
+  const history=f.history();await f.run(2,f.open(),false);assert.deepEqual(f.history(),history);
+});
+
+test('S6.4-02: a real combined reader tree and its reused coverage finish both queued children without extra payment', async t => {
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  for(const name of ['a','b'])writeFileSync(join(f.root,`${name}.txt`),`${name.repeat(18000)}\n${name.repeat(18000)}\n`);
+  changePilot(f,{maxRequestChars:60000});
+  const inputs=['a','b'].map(name=>({path:`${name}.txt`,media:'text/plain'}));
+  f.configure([{...planner,reads:['combined','reuse combined'].map(purpose=>({action:'read_bundle',purpose,inputs}))},readerReply,readerReply]);
+  const result=await f.run(4);
+  assert.equal(result.value.pauseCode,'research_v7_mode_unavailable',JSON.stringify(result.value));
+  const children=ownTurns(f.store).slice(1),combined=f.store.get<any>(children[0]!.value.observation.ref.id)!;
+  const reused=f.store.get<any>(children[1]!.value.observation.ref.id)!;
+  assert.equal(combined.value.producer,'combined');assert.equal(combined.value.parts.length,2);
+  assert.equal(reused.value.producer,'reused');assert.ok(reused.value.reusedFrom.length>0);
+  assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).filter(row=>row.value.kind==='reader').length,2);
+  for(const child of children)assert.deepEqual(readResearchConsumerTurn(f.store,reference(child)),child);
+  assert.equal(f.wires().length,3,'planner and two reader parts, no call for reuse');
+  const history=f.history(),calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
+  await f.run(4,f.open());assert.deepEqual(f.history(),history);
+  assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+});
