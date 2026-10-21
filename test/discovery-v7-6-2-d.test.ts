@@ -1,6 +1,6 @@
 import { hashJson } from '../src/canonical.js';
 import { DISCOVERY_CLAIMS_CONTRACT, discoveryAcceptanceActId, type DiscoveryAcceptanceAct } from '../src/discovery/v7-contracts.js';
-import { assessAttempts, assessAttemptsWithRequirements } from '../src/discovery/research-assessment.js';
+import { assessAnswer, assessAttempts, assessAttemptsWithRequirements } from '../src/discovery/research-assessment.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
@@ -399,6 +399,49 @@ test('6.2-D-01: historical grounds retain exact draft membership after corrupt l
       return get(id,revision);
     }) as typeof cold.get;
     refused(()=>readDossierContradictionsAt(cold,'p',m,grounds));
+  }
+  assert.deepEqual(f.store.list(),records);assert.equal(f.wires().length,calls);
+});
+
+
+test('6.2-D-02: a real paid legacy assessment keeps its own draft issuance outside the v7 dossier',async t=>{
+  const f=await setup(t);
+  const legacy=f.discovery.create('p','discovery','R0','concept',[
+    {field:'probe',kind:'fact',prompt:'Historical question',risk:'unknown',schema:{type:'object'}}],[],4);
+  const question=f.store.get<Question>(legacy.value.questions[0]!)!;
+  const source=f.discovery.evidence.document('p','legacy-source','Actual old basis','text/plain',0);
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{verdict:'supported',reasons:[]}}));
+  const paid=await assessAnswer(f.store,question,{action:'answer',question:question.id,value:{historical:'supported'},
+    citations:[{source:reference(source),selector:{kind:'text-range',start:0,end:source.value.content.length}}]},f.environment,f.root);
+  f.discovery.researched(question.id,question.revision,reference(paid));
+  const answerRef=f.store.get<Question>(question.id)!.value.answer!;
+  assert.notEqual(legacy.id,f.v.draft.id);assert.equal(legacy.value.contractVersion,4);
+  assert.equal(f.store.get(discoveryAcceptanceActId('p',legacy.id,'probe',answerRef)),null);
+  const m=save(f,snapshot(f,[],[])),grounds={assessments:[reference(paid)]};
+  const before=readDossierContradictionsAt(f.open(),'p',m,grounds);
+  assert.deepEqual(before.assessments,grounds.assessments);
+  for(const id of [legacy.id,question.id,answerRef.id,paid.id]) {
+    const head=f.store.get<any>(id)!;
+    f.store.write({id,kind:head.kind,expected:head.revision,value:id===legacy.id?{...head.value,questions:[]}:{broken:true}});
+  }
+  const records=f.store.list(),calls=f.wires().length,cold=f.open(),get=cold.get.bind(cold);
+  const legacyIds=new Set([legacy.id,question.id,answerRef.id,paid.id]);
+  cold.get=((id:string,revision?:number)=>{
+    if(legacyIds.has(id))assert.notEqual(revision,undefined,'Historical legacy proof must not read a current head');
+    return get(id,revision);
+  }) as typeof cold.get;
+  assert.deepEqual(readDossierContradictionsAt(cold,'p',m,grounds),before);
+  for(const mode of ['missing-draft','substituted-draft','missing-question'] as const) {
+    const lost=f.open(),read=lost.get.bind(lost);
+    lost.get=((id:string,revision?:number)=>{
+      if(mode==='missing-question' && id===question.id && revision===question.revision)return null;
+      if(id===legacy.id && revision===legacy.revision) {
+        if(mode==='missing-draft')return null;
+        if(mode==='substituted-draft')return {...read(id,revision)!,hash:hashJson('substituted legacy issuance')};
+      }
+      return read(id,revision);
+    }) as typeof lost.get;
+    refused(()=>readDossierContradictionsAt(lost,'p',m,grounds));
   }
   assert.deepEqual(f.store.list(),records);assert.equal(f.wires().length,calls);
 });

@@ -206,9 +206,13 @@ export function checkDossierContradictionEvidence(store: Store, manifest: Dossie
       if (!savedAcceptanceAct(pendingSnapshotView(store,pinned),draft,question,field,answerRef,value.value))
         invalid('assessment.acceptance', 'The exact saved acceptance does not bind this answer and question');
     } else {
-      // A legacy/rejected classification may have no acceptance. Its question
-      // must still belong to an explicitly pinned draft of its own era.
-      const ownDraft = own.binding?.value.draftBefore ?? manifest.draft;
+      // Before v7, unmanaged acceptance has no act. Discovery.create issues
+      // the fixed question cohort in draft@1; later revisions change answers,
+      // not that issuance. Read its own first revision, never another dossier
+      // draft or today's head. Managed history retains its exact binding.
+      const issued = own.binding ? null : store.get<DiscoveryDraft>(question.value.draftId,1);
+      if (!own.binding && !issued) invalid('assessment.draft', 'The historical draft issuance is missing');
+      const ownDraft = own.binding?.value.draftBefore ?? reference(issued!);
       draft = at<DiscoveryDraft>(ownDraft, 'discovery-draft', 'assessment.draft');
       if (draft.id !== question.value.draftId || draft.value.projectId !== manifest.projectId
         || !Array.isArray(draft.value.questions) || !draft.value.questions.includes(question.id)
