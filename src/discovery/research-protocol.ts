@@ -35,7 +35,7 @@ import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowa
 import { requireContextDelivery } from './context-workspace.js';
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
-import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject, packetVariantSubject } from "./continuation-packet.js";
+import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject, packetVariantSubject, requireVariantContext, variantTransportSubject } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary } from "./reader-pilot.js";
 import { phasePolicy } from "./phase-policy.js";
@@ -313,6 +313,15 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
   const roleName = role.actor === environment.implementer.actor ? 'implementer'
     : role.actor === environment.reviewer.actor ? 'reviewer' : 'reader';
   role = resolveRoleMode(roleName, role, 'research');
+  // 4T.3 (№11174 4T3-02): the variant branch and its purpose are told apart before EVERY early return — a paid consumer
+  // intent, a paid assessment application and a paid variant replay alike. The checks are pure: a free replay of a
+  // historical identity needs no head of today's mode or state.
+  const contextVariant = packetVariantSubject(context);
+  if (contextVariant || audit?.purpose === 'variant-proposal' || audit?.purpose === 'variant-decision') {
+    requireCondition(audit && !audit.consumerIntent && !audit.previewIntent && !audit.application && !audit.prepareCall,
+      'discovery_variant_subject_invalid', 'A variant call travels on its own branch, without a consumer intent or an assessment reservation');
+    requireVariantContext(context, variantTransportSubject(audit.purpose, role.actor, contextVariant, null, null));
+  }
   let consumerIntent: Revision<ResearchConsumerIntent> | null = null;
   let planSubject: V7PlanSubject | null = null;
   // Preview bypasses only the unsaved intent it synthesized for a prospective

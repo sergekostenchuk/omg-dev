@@ -1,9 +1,8 @@
 import { researchCapacityProjection } from './early-research-outcome.js';
 import { readResearchExecution } from './response-recovery.js';
 import type { RecoverableContextSession } from './context-recovery.js';
-import { packetAssessmentSubject, sameAssessmentSubject, assessmentSubjectKey, packetVariantSubject, variantCallMatches } from './continuation-packet.js';
+import { packetAssessmentSubject, sameAssessmentSubject, assessmentSubjectKey, packetVariantSubject, variantCallMatches, variantTransportFields } from './continuation-packet.js';
 import type { VariantSubject } from './discovery-variants.js';
-import { readArchiveBody } from './request-parts.js';
 import type { Store, Revision } from "../storage/store.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import type { ModelCall } from "../runtime/model-usage.js";
@@ -159,7 +158,7 @@ export function replayAssessmentApplication(store: Store, session: Revision<Reco
  * saved identity is compared: today's mode or state heads never select or replace it, and another identity never
  * receives this answer. A running call recovers first; several paid matches are a typed refusal, never a pick. */
 export function replayVariantResponse(store: Store, projectId: string, draftId: string, questionId: string,
-  purpose: string, actor: string, variant: VariantSubject): { research: unknown; subject: Record<string, any>; call: Ref; response: Ref } | null {
+  purpose: string, actor: string, variant: VariantSubject): { research: unknown; subject: Record<string, any>; call: Ref; request: Ref; response: Ref } | null {
   const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
   if (draft?.kind !== 'discovery-draft' || question?.kind !== 'question') return null;
   const own = store.list<ModelCall>('model-call').filter(call => call.value.projectId === projectId && call.value.purpose === purpose
@@ -179,6 +178,27 @@ export function replayVariantResponse(store: Store, projectId: string, draftId: 
   const payload = JSON.parse(response.value.text);
   requireCondition(payload?.protocol === 'omg-agent/v1' && payload.requestId === call.value.requestId && Object.hasOwn(payload, 'research'),
     'research_replay_invalid', 'The saved variant response has a foreign request envelope');
-  const archive = store.get<Record<string, any>>(call.value.packet!.archive.id, call.value.packet!.archive.revision)!;
-  return { research: payload.research, subject: readArchiveBody(store, archive).body, call: reference(call), response: reference(response) };
+  // 4T3-01 (№11174): what this call actually sent is read back from its own saved request bytes — the exact Ref, the
+  // digest, chars and bytes of its audit record, the same envelope and archive, and the very transport identity the
+  // call was matched by. The archive stays the ground of the call; it is never handed out as its wire.
+  const requestRef = call.value.request?.record;
+  const request = isRef(requestRef) ? store.get<{ projectId: string; draftId: string; text: string }>(requestRef.id, requestRef.revision) : null;
+  requireCondition(request?.kind === 'model-request' && canonical(reference(request)) === canonical(requestRef)
+    && request.hash === hashJson(request.value) && request.value.projectId === projectId && request.value.draftId === draftId
+    && typeof request.value.text === 'string' && digest(request.value.text) === call.value.request.hash
+    && request.value.text.length === call.value.request.chars && Buffer.byteLength(request.value.text) === call.value.request.bytes,
+  'research_replay_invalid', 'The paid variant call lost the exact saved bytes of its request');
+  let wire: Record<string, any> | null;
+  try { wire = JSON.parse(request.value.text); } catch { wire = null; }
+  const fields = variantTransportFields(projectId, reference(draft), reference(question), purpose, actor, variant);
+  const sent = wire?.subject;
+  requireCondition(wire?.protocol === 'omg-agent/v1' && wire.mode === 'research' && wire.requestId === call.value.requestId
+    && wire.model === call.value.requested.model && wire.effort === call.value.requested.effort
+    && (wire.speed ?? 'inherited') === (call.value.requested.speed ?? 'inherited')
+    && sent !== null && typeof sent === 'object' && !Array.isArray(sent)
+    && canonical(sent.working?.archive ?? null) === canonical(call.value.packet!.archive)
+    && Object.entries(fields).every(([key, value]) => Object.hasOwn(sent, key) && canonical(sent[key]) === canonical(value))
+    && !Object.hasOwn(sent, 'subject') && !Object.hasOwn(sent, 'assessmentSubject'),
+  'research_replay_invalid', 'The saved variant request belongs to another envelope or transport identity');
+  return { research: payload.research, subject: sent, call: reference(call), request: reference(request), response: reference(response) };
 }

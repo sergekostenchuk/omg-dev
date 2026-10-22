@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { canonical, type Json } from '../src/canonical.js';
+import { canonical, digest, type Json } from '../src/canonical.js';
 import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
 import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
 import { Store, type Revision } from '../src/storage/store.js';
@@ -15,6 +15,12 @@ import { VARIANT_CRITERIA, VARIANT_SUBJECT_CONTRACT, decodeVariantGeneration, ty
 import { stageBudgetSegmentId } from '../src/discovery/stage-token-budget.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { EngineError } from '../src/errors.js';
+import { readArchiveBody, REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
+import { prepareResearchConsumerIntent } from '../src/discovery/response-recovery.js';
+import { V7_PLAN_SUBJECT_CONTRACT } from '../src/discovery/v7-managed-attempt.js';
+import type { ResearchRun } from '../src/discovery/research-model.js';
+import { processStart } from '../src/runtime/process-identity.js';
+import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 
 // 4T.3 (codex-omg №11060 п.1): the real common researchCall carries a variant generation or decision. The snapshot,
 // set and mode rows below are TRANSPORT FIXTURES ONLY: their producers (4T.1 snapshot, 4B set, 4O mode) prove them;
@@ -80,9 +86,10 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:s
     : { contract: VARIANT_SUBJECT_CONTRACT, kind, set: basis, mode, expectedSelection: null };
   const body = (v: VariantSubject, question: Revision<Question>) => ({ variantSubject: v, question: { id: question.id, ...question.value.spec },
     core: { objective: 'Generate the variants of the saved snapshot' }, map: { nodes: [] }, history: [], readings: [] });
-  const call = (v: VariantSubject, draftId: string, question: Revision<Question>, role = environment.value.implementer, store = f.store) =>
+  const call = (v: VariantSubject, draftId: string, question: Revision<Question>, role = environment.value.implementer, store = f.store,
+    onContext?: (context: Record<string, any>) => void) =>
     researchCall(role, environment.value, 'Propose the variants of the saved snapshot', body(v, question), undefined,
-      { store, draftId, questionId: question.id, purpose: `variant-${v.kind}` });
+      { store, draftId, questionId: question.id, purpose: `variant-${v.kind}`, ...(onContext ? { onContext } : {}) });
   // The ordinary estimate needs comparable measured calls of each variant purpose: calibrate once on a legacy draft.
   const old = f.discovery.create('p', 'discovery', 'R0', 'concept', [
     { field: 'probe', kind: 'fact', prompt: 'Calibrate', risk: 'unknown', schema: { type: 'object' } }], [], 6);
@@ -93,7 +100,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:s
   const v = acceptPlan(f);
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
   const snapshot = (store: Store) => store.list().map(row => [row.id, row.revision, row.hash]);
-  return { ...f, v, environment, configure, transport, subject, call, wires, snapshot };
+  return { ...f, v, environment, configure, transport, subject, body, call, wires, snapshot };
 }
 type Setup = Awaited<ReturnType<typeof setup>>;
 const variantCalls = (f: Setup, store = f.store) => store.list<ModelCall>('model-call').filter(row => row.value.draftId === f.v.draft.id);
@@ -263,5 +270,102 @@ test('4T.3: an off-form paid generation answer is kept as paid and refused on ev
   await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan), errorCode('discovery_variant_answer_invalid'));
   await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, f.open()), errorCode('discovery_variant_answer_invalid'));
   assert.deepEqual(f.snapshot(f.store), saved);
+  assert.equal(f.wires().length, sent);
+});
+
+test('4T3-01: the first send and both replays hand onContext the subject of the saved model-request, never the archive body', async t => {
+  const f = await setup(t), v = f.subject('proposal', f.transport('snapshot'), f.transport('mode'));
+  const seen: Record<string, any>[] = [], see = (context: Record<string, any>) => { seen.push(JSON.parse(JSON.stringify(context))); };
+  f.configure(generation('first'));
+  await f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, f.store, see);
+  const [call] = variantCalls(f);
+  const request = f.store.get<{ text: string }>(call!.value.request.record!.id, call!.value.request.record!.revision)!;
+  const sent = JSON.parse(request.value.text).subject;
+  f.configure(generation('never-sent'));
+  const before = f.snapshot(f.store), wires = f.wires().length;
+  await f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, f.store, see);
+  await f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, f.open(), see);
+  assert.equal(seen.length, 3);
+  for (const context of seen) assert.deepEqual(context, sent);
+  // The archive stays the ground of the call: its body is not what was sent.
+  const archive = f.store.get<Record<string, any>>(call!.value.packet!.archive.id, call!.value.packet!.archive.revision)!;
+  assert.notDeepEqual(readArchiveBody(f.store, archive).body, sent);
+  assert.deepEqual(f.snapshot(f.store), before);
+  assert.equal(f.wires().length, wires);
+});
+
+test('4T3-01: a lost or forged request record of a paid variant call is a typed refusal with no record and no send', async t => {
+  const f = await setup(t), v = f.subject('proposal', f.transport('snapshot'), f.transport('mode'));
+  await f.call(v, f.v.draft.id, f.v.plan);
+  const [call] = variantCalls(f);
+  const ref = call!.value.request.record!, original = f.store.get<{ projectId: string; draftId: string; text: string }>(ref.id, ref.revision)!;
+  const envelope = JSON.parse(original.value.text);
+  const forged = (label: string, text: string) => reference(f.store.write({ id: `model-request:forged-${label}`, kind: 'model-request',
+    expected: 0, value: { ...original.value, text } }));
+  const audited = (label: string, text: string) => ({ chars: text.length, bytes: Buffer.byteLength(text), hash: digest(text), record: forged(label, text) });
+  const { record: _record, ...bare } = call!.value.request;
+  const otherEnvelope = JSON.stringify({ ...envelope, requestId: 'another-request' });
+  const otherIdentity = JSON.stringify({ ...envelope, subject: { ...envelope.subject, actor: 'reviewer' } });
+  const otherArchive = JSON.stringify({ ...envelope, subject: { ...envelope.subject, working: { ...envelope.subject.working,
+    archive: f.transport('archive') } } });
+  const cases: [string, Record<string, unknown>][] = [
+    ['no saved request record', bare],
+    ['other bytes under the audit of the original', { ...call!.value.request, record: forged('bytes', `${original.value.text} `) }],
+    ['bytes of another envelope with their own matching audit', audited('envelope', otherEnvelope)],
+    ['consistent bytes of another transport identity', audited('identity', otherIdentity)],
+    ['consistent bytes naming another archive', audited('archive', otherArchive)],
+  ];
+  let head: Revision<unknown> = call!;
+  for (const [note, request] of cases) {
+    head = f.store.write({ id: call!.id, kind: 'model-call', expected: head.revision, value: { ...call!.value, request } as unknown as Json });
+    const before = f.snapshot(f.store), sent = f.wires().length;
+    await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan), errorCode('research_replay_invalid'), note);
+    assert.deepEqual(f.snapshot(f.store), before, note);
+    assert.equal(f.wires().length, sent, note);
+  }
+});
+
+test('4T3-02: no early paid return crosses branches — a paid analyst intent never answers a variant, a paid variant never a mixed context', async t => {
+  const f = await setup(t), v = f.subject('proposal', f.transport('snapshot'), f.transport('mode'));
+  await f.call(v, f.v.draft.id, f.v.plan);
+  // A lawfully paid managed analyst intent on the accepted plan (the ordinary estimate needs a measured analyst call).
+  const old = f.discovery.create('p', 'discovery', 'R0', 'concept', [
+    { field: 'probe', kind: 'fact', prompt: 'Calibrate', risk: 'unknown', schema: { type: 'object' } }], [], 6);
+  await researchCall(f.environment.value.implementer, f.environment.value, 'Calibrate', {}, undefined,
+    { store: f.store, draftId: old.id, questionId: old.value.questions[0]!, purpose: 'analyst' });
+  const environment = f.store.get(`environment:p`)!, draft = f.store.get<DiscoveryDraft>(f.v.draft.id)!, plan = f.store.get<Question>(f.v.plan.id)!;
+  const run = f.store.write<ResearchRun>({ id: 'research-run:4t3-02', kind: 'research-run', expected: 0,
+    value: { projectId: 'p', draftId: draft.id, environment: reference(environment), turns: 0, limit: 1, requestChars: 0,
+      owner: { pid: process.pid, started: processStart(process.pid)! }, ownerQuestion: null, error: null, status: 'running', inputs: draft.value.inputs } });
+  const prompt = 'Research the selected plan question', context = { history: [], readings: [] };
+  const intent = prepareResearchConsumerIntent(f.store, { projectId: 'p', kind: 'analyst', key: run.id, owner: reference(run),
+    draft: reference(draft), question: reference(plan), role: f.environment.value.implementer, dispatch: f.environment.value, profile: null,
+    cursor: { run: run.id, turn: 1, instruction: prompt, context,
+      subject: { contract: V7_PLAN_SUBJECT_CONTRACT, planAnswer: plan.value.answer!, planQuestionId: 'q-industry' } },
+    basis: draft.value.inputs, guards: uniqueTransactionGuards([reference(run), reference(draft), reference(plan), reference(environment)]) });
+  const analyst = { action: 'answer', question: 'q-industry', value: { type: 'impossible', code: 'source_unavailable', evidence: [], text: 'None' }, citations: [] };
+  f.configure(analyst);
+  const managed = (purpose: string, given: Record<string, unknown>) => researchCall(f.environment.value.implementer, f.environment.value,
+    prompt, given, undefined, { store: f.store, draftId: draft.id, questionId: plan.id, purpose, consumerIntent: reference(intent),
+      requestContract: REQUEST_MANIFEST_CONTRACT });
+  const paid = await managed('analyst', context);
+  f.configure(generation('never-sent'));
+  const before = f.snapshot(f.store), sent = f.wires().length;
+  const mixed: [string, () => Promise<unknown>][] = [
+    ['the paid analyst intent asked again with a variant subject in its context', () => managed('analyst', { ...context, variantSubject: v })],
+    ['the paid analyst intent asked again under a variant purpose', () => managed('variant-proposal', context)],
+    ['the paid variant asked again with a plan subject beside it', () => researchCall(f.environment.value.implementer, f.environment.value,
+      'Propose the variants of the saved snapshot', { ...f.body(v, f.v.plan), subject: intent.value.cursor.subject }, undefined,
+      { store: f.store, draftId: f.v.draft.id, questionId: f.v.plan.id, purpose: 'variant-proposal' })],
+  ];
+  for (const [note, attempt] of mixed) {
+    await assert.rejects(attempt, errorCode('discovery_variant_subject_invalid'), note);
+    assert.deepEqual(f.snapshot(f.store), before, note);
+    assert.equal(f.wires().length, sent, note);
+  }
+  // Each branch keeps its own free replay by its historical identity.
+  assert.deepEqual(await managed('analyst', context), paid);
+  assert.deepEqual(decodeVariantGeneration(await f.call(v, f.v.draft.id, f.v.plan)).action, 'variants');
+  assert.deepEqual(f.snapshot(f.store), before);
   assert.equal(f.wires().length, sent);
 });
