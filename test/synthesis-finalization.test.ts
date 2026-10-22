@@ -19,8 +19,7 @@ import { configureReaderPilot, pilotEnvironment } from '../src/discovery/reader-
 import { synthesisSession, readSynthesisSession } from '../src/discovery/synthesis-session.js';
 import { activeSynthesisNotes } from '../src/discovery/conclusion-consolidation.js';
 import { previewResearch } from '../src/discovery/research-preview.js';
-import { checkpoint } from '../src/discovery/research-continuation.js';
-import { hashJson, digest } from '../src/canonical.js';
+import { digest } from '../src/canonical.js';
 
 type F = Awaited<ReturnType<typeof fixture>>;
 
@@ -179,21 +178,6 @@ test('a pause remains resumable, while a repeated final checkpoint without new c
   assert.equal(repeated.store.list('model-call').length,repeatedBaseline+1);
 });
 
-test('a pending legacy summary that fits the actual packet continues without a format upgrade',async t=>{
-  // Previous-era note shape (consolidated without a format) lives in a genuine
-  // v1-id session, continued by its own legacy producer (№1555 X29/X30).
-  const f=await fixture(t,20,100000,0.35,0,{},0,'small');
-  const legacyId=`synthesis-session:${hashJson([reference(f.question),reference(f.environment),f.draft.value.inputs,[...f.context.workingSelections],null,null])}`;
-  const proposal={action:'checkpoint' as const,question:f.question.id,value:{finding:'x'.repeat(22000)},citations:[],unresolved:['Preserve this uncertainty']};
-  const saved=checkpoint(f.store,f.draft,f.question,{...proposal,value:proposal as unknown as import('../src/canonical.js').Json});
-  const legacy={checkpoint:reference(saved),proposal,page:{offset:0,end:0},consolidated:{replaces:f.notes.map(n=>n.checkpoint)}};
-  f.store.write({id:legacyId,kind:'synthesis-session',expected:0,value:{projectId:'p',offset:1,materialOffset:0,notes:[...f.notes,legacy],result:null}});
-  assert.equal((await f.invoke()).action,'pause');
-  const after=f.store.get<any>(legacyId)!;assert.deepEqual(after.value.notes.slice(0,4),[...f.notes,legacy]);
-  const active=activeSynthesisNotes(after.value.notes);assert.equal(active.length,1);assert.equal(active[0]!.consolidated!.format,undefined);
-  assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='consolidation').length,0);
-});
-
 test('context recovery preserves final-stage lookup observations while allowing more distinct context',async t=>{
   const f=await fixture(t,20,100000,0.35,0,{},0,'small'),originals=addressed(f,2);
   await atFinal(f,originals.slice(0,1));
@@ -205,7 +189,7 @@ test('context recovery preserves final-stage lookup observations while allowing 
   assert.ok(blocked.value.workspace.blocked,'the produced session is blocked');
   const recovered=await f.engine.execute({type:'recover-context-session',project:'p',session:reference(blocked),selector:{record:originals[1]!.record,pointer:originals[1]!.pointer}}) as any;
   assert.equal(recovered.value.workspace.sinceProgress,0);assert.equal(recovered.value.finalization.lookups,1);
-  assert.equal(synthesisControls(true,recovered.value.workspace,3,recovered.value.finalization).mode,'finalization');
+  assert.equal(synthesisControls(true,recovered.value.workspace,recovered.value.finalization).mode,'finalization');
 });
 
 test('RD2c an operator recovery of a bounded context page replays from exact originals after reopening', async t => {

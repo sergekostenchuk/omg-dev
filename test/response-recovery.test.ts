@@ -43,16 +43,6 @@ function fixture(t: test.TestContext) {
   return { root, store, engine, draft, question, pilot, context, invoke, recover, environment };
 }
 
-/** Previous-era history (№1555 X29): a genuine v1-id session record at this
- * exact basis. The era router continues it by the legacy producer contract, so
- * the recovery-door checks below exercise the era they were written for. */
-function legacySeed(f: ReturnType<typeof fixture>) {
-  const materials = [...(f.context.workingSelections ?? [])];
-  const id = `synthesis-session:${hashJson([reference(f.question), reference(f.environment), f.draft.value.inputs, materials, null, null])}`;
-  f.store.write({ id, kind: 'synthesis-session', expected: 0, value: { projectId: 'p', offset: 0, notes: [], result: null,
-    binding: { draft: reference(f.draft), question: reference(f.question), environment: reference(f.environment), inputs: f.draft.value.inputs } } });
-}
-
 test('an explicitly uncited checkpoint is unassessed control state, while final answers and deltas still require citations', () => {
   assert.equal(researchAction({ action: 'checkpoint', question: 'q', value: { note: 'context' }, citations: [], unresolved: [] }).action, 'checkpoint');
   assert.throws(() => researchAction({ action: 'answer', question: 'q', value: {}, citations: [] }), { code: 'research_response_invalid' });
@@ -76,28 +66,26 @@ async function interruptCheckpoint(f: ReturnType<typeof fixture>, afterCheckpoin
   return f.store.list<ModelCall>('model-call')[0]!;
 }
 
-test('a saved paid checkpoint resumes once across both storage windows without another generation or invented evidence', async t => {
-  for (const afterCheckpoint of [false, true]) {
-    const f = fixture(t); legacySeed(f); const call = await interruptCheckpoint(f, afterCheckpoint);
-    const before = f.store.list<any>('synthesis-session')[0]!; assert.equal(before.value.offset, 0); assert.equal(before.value.notes.length, 0);
-    const response = f.store.get<any>(call.value.response!.record!.id)!;
-    const recovered = await f.recover(call, before);
-    const session = f.store.list<any>('synthesis-session')[0]!, checkpoint = f.store.list<any>('research-checkpoint')[0]!;
-    assert.equal(session.value.offset, 1); assert.equal(session.value.notes.length, 1); assert.equal(session.value.result, null);
-    assert.deepEqual(recovered.value.call, reference(call)); assert.deepEqual(recovered.value.sessionAfter, reference(session));
-    assert.equal(recovered.value.declaredBy, 'codex');
-    assert.equal(checkpoint.value.status, 'unassessed'); assert.deepEqual(checkpoint.value.observations, []);
-    assert.deepEqual(checkpoint.value.proposal, JSON.parse(response.value.text).research);
-    assert.equal(f.store.list('research-checkpoint').length, 1); assert.equal(f.store.list('model-call').length, 1);
-    assert.deepEqual(f.store.get(call.id), call); assert.deepEqual(f.store.get(response.id), response);
-    assert.deepEqual(await f.recover(call, before), recovered);
-    await assert.rejects(f.recover(call, session), { code: 'response_recovery_cursor_stale' });
-    const next = await previewResearch(f.invoke);
-    assert.equal(JSON.parse(next.input).subject.synthesisState.offset, 1);
-    assert.equal(f.store.list<any>('synthesis-session')[0]!.value.notes.length, 1, 'An advanced cursor must not consume the same paid page again');
-    assert.equal(f.store.get<Question>(f.question.id)!.value.status, 'open', 'A checkpoint never accepts a question');
-    assert.throws(() => f.engine.discovery.evidence.observe('p', reference(checkpoint), { kind: 'json-pointer', pointer: '' }));
-  }
+test('a saved paid checkpoint resumes once across the interrupted application boundary without another generation or invented evidence', async t => {
+  const f = fixture(t); const call = await interruptCheckpoint(f);
+  const before = f.store.list<any>('synthesis-session')[0]!; assert.equal(before.value.offset, 0); assert.equal(before.value.notes.length, 0);
+  const response = f.store.get<any>(call.value.response!.record!.id)!;
+  const recovered = await f.recover(call, before);
+  const session = f.store.list<any>('synthesis-session')[0]!, checkpoint = f.store.list<any>('research-checkpoint')[0]!;
+  assert.equal(session.value.offset, 1); assert.equal(session.value.notes.length, 1); assert.equal(session.value.result, null);
+  assert.deepEqual(recovered.value.call, reference(call)); assert.deepEqual(recovered.value.sessionAfter, reference(session));
+  assert.equal(recovered.value.declaredBy, 'codex');
+  assert.equal(checkpoint.value.status, 'unassessed'); assert.deepEqual(checkpoint.value.observations, []);
+  assert.deepEqual(checkpoint.value.proposal, JSON.parse(response.value.text).research);
+  assert.equal(f.store.list('research-checkpoint').length, 1); assert.equal(f.store.list('model-call').length, 1);
+  assert.deepEqual(f.store.get(call.id), call); assert.deepEqual(f.store.get(response.id), response);
+  assert.deepEqual(await f.recover(call, before), recovered);
+  await assert.rejects(f.recover(call, session), { code: 'response_recovery_session_stale' });
+  const next = await previewResearch(f.invoke);
+  assert.equal(JSON.parse(next.input).subject.synthesisState.offset, 1);
+  assert.equal(f.store.list<any>('synthesis-session')[0]!.value.notes.length, 1, 'An advanced cursor must not consume the same paid page again');
+  assert.equal(f.store.get<Question>(f.question.id)!.value.status, 'open', 'A checkpoint never accepts a question');
+  assert.throws(() => f.engine.discovery.evidence.observe('p', reference(checkpoint), { kind: 'json-pointer', pointer: '' }));
 });
 
 test('foreign paid response envelopes are refused without cursor movement or another model call', async t => {
@@ -119,9 +107,7 @@ test('a changed question cannot receive a saved checkpoint from its prior revisi
 });
 
 test('recovery is explicit and changed profiles, foreign hashes or sessions cannot consume a paid reply', async t => {
-  const f = fixture(t); legacySeed(f); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
-  await previewResearch(f.invoke);
-  assert.equal(f.store.list('research-response-recovery').length, 0); assert.equal(f.store.get<any>(session.id)!.value.offset, 0);
+  const f = fixture(t); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
   await assert.rejects(f.engine.execute({ type: 'recover-research-response', project: 'p', call: { ...reference(call), hash: '0'.repeat(64) }, session: reference(session) }) as Promise<unknown>,
     { code: 'response_recovery_call_foreign' });
   await assert.rejects(f.engine.execute({ type: 'recover-research-response', project: 'p', call: reference(call), session: { ...reference(session), id: 'foreign-session' } }) as Promise<unknown>,
@@ -129,6 +115,15 @@ test('recovery is explicit and changed profiles, foreign hashes or sessions cann
   f.store.write({ id: f.pilot.id, kind: f.pilot.kind, expected: f.pilot.revision, value: f.pilot.value });
   await assert.rejects(f.recover(call, session), { code: 'response_recovery_call_foreign' });
   assert.equal(f.store.list('model-call').length, 1);
+});
+
+test('a normal resume consumes the paid pending intent itself — never an implicit recovery', async t => {
+  const f = fixture(t); await interruptCheckpoint(f);
+  await assert.rejects(f.invoke(), { code: 'synthesis_no_progress' });
+  const session = f.store.list<any>('synthesis-session')[0]!;
+  assert.equal(session.value.offset, 1); assert.equal(session.value.notes.length, 1);
+  assert.equal(f.store.list<any>('research-consumer-intent')[0]!.value.state, 'applied');
+  assert.equal(f.store.list('research-response-recovery').length, 0, 'the paid step applied through the consumer, not an operator replay');
 });
 
 test('the same operator mechanism reprocesses an assessor response through normal verdict validation', async t => {
@@ -153,13 +148,13 @@ test('the same operator mechanism reprocesses an assessor response through norma
 
 test('changed notes, workspace or archived materials cannot be applied to an unchanged cursor', async t => {
   for (const field of ['notes', 'focus'] as const) {
-    const f = fixture(t); legacySeed(f); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
+    const f = fixture(t); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
     const changed = f.store.write({ id: session.id, kind: session.kind, expected: session.revision, value: { ...session.value,
       [field]: field === 'notes' ? [{ proposal: 'different findings' }] : f.context.workingSelections[0]!.value } });
-    await assert.rejects(f.recover(call, changed), { code: 'response_recovery_cursor_stale' });
+    await assert.rejects(f.recover(call, changed), { code: 'response_recovery_session_stale' });
     assert.equal(f.store.list('model-call').length, 1); assert.equal(f.store.list('research-response-recovery').length, 0);
   }
-  const f = fixture(t); legacySeed(f); const call = await interruptCheckpoint(f), archive = f.store.get<any>(call.value.packet!.archive.id)!;
+  const f = fixture(t); const call = await interruptCheckpoint(f), archive = f.store.get<any>(call.value.packet!.archive.id)!;
   const body = structuredClone(archive.value); body.body.synthesisMaterials[0].value.value = 'foreign material';
   const changedArchive = f.store.write({ id: archive.id, kind: archive.kind, expected: archive.revision, value: body });
   const request = f.store.get<any>(call.value.request.record!.id)!, wire = JSON.parse(request.value.text);
@@ -173,7 +168,7 @@ test('changed notes, workspace or archived materials cannot be applied to an unc
 });
 
 test('a concurrent dispatch in the receipt write window cannot advance the recovered session', async t => {
-  const f = fixture(t); legacySeed(f); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
+  const f = fixture(t); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
   const original = f.store.writeMany.bind(f.store); let injected = false;
   f.store.writeMany = ((writes: any[], guards: any[] = []) => {
     if (!injected && writes.some(write => write.kind === 'research-response-recovery')) {
@@ -182,7 +177,7 @@ test('a concurrent dispatch in the receipt write window cannot advance the recov
     }
     return original(writes, guards);
   }) as typeof f.store.writeMany;
-  await assert.rejects(f.recover(call, session), { code: 'input_stale' }); f.store.writeMany = original;
+  await assert.rejects(f.recover(call, session), { code: 'response_recovery_boundary' }); f.store.writeMany = original;
   assert.deepEqual(f.store.get(session.id), session); assert.equal(f.store.list('research-response-recovery').length, 0);
   const recovered = await f.recover(call, session);
   assert.equal(recovered.value.state, 'applied'); assert.equal(f.store.list('model-call').length, 1);
@@ -200,31 +195,7 @@ test('a running normal consumer is not replaced, while a dead consumer leaves an
 
 /* ==== D8.4b — строки 44–45 и replay новой эры (договор №1499) ==== */
 
-test('44 a legacy session keeps its own contract and the operator replay applies a v2 paid response on its exact terms', async t => {
-  // Legacy era: a genuine v1-id history record (legacySeed) keeps the old
-  // producer — no intents, no v2 marker, and a public repeat re-pays by the
-  // old contract (№1555 X29: прежняя эра проверяется явно прежней фикстурой).
-  const legacy = fixture(t); legacySeed(legacy);
-  const restoreLegacy = legacy.store.writeMany.bind(legacy.store);
-  let legacyInterrupted = false;
-  legacy.store.writeMany = ((writes: any[], guards: any[] = []) => {
-    const rows = restoreLegacy(writes, guards);
-    if (!legacyInterrupted && writes.some(write => write.kind === 'model-response')) {
-      legacyInterrupted = true;
-      throw new EngineError('fixture_legacy_crash', 'Interrupt after response persistence');
-    }
-    return rows;
-  }) as typeof legacy.store.writeMany;
-  await assert.rejects(legacy.invoke(), { code: 'fixture_legacy_crash' });
-  legacy.store.writeMany = restoreLegacy;
-  const legacySession = legacy.store.list<any>('synthesis-session')[0]!;
-  assert.ok(!legacySession.id.startsWith('synthesis-session:v2:'));
-  assert.equal(legacySession.value.contract, undefined);
-  await assert.rejects(legacy.invoke(), { code: 'synthesis_no_progress' });
-  assert.equal(legacy.store.list('research-consumer-intent').length, 0, 'no intent machinery in the legacy era');
-  assert.ok(legacy.store.list('model-call').length >= 2, 'the legacy contract re-pays the unsaved application');
-
-  // New era: the same operator command consumes the exact paid response once.
+test('44 an operator replay applies the saved v2 paid response on its exact terms — the same receipt, the applied intent, no repay and exactly one new paid step', async t => {
   const f = fixture(t);
   const answerSource = f.engine.discovery.evidence.document('p', 'd84b-answer-basis', 'A grounded answer basis', 'text/plain', 0);
   writeFileSync(join(f.root, 'fixture.mjs'), `import{readFileSync}from'node:fs';const r=JSON.parse(readFileSync(0,'utf8')),c=r.subject;

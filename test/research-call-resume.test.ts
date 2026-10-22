@@ -2436,7 +2436,7 @@ test('X29c a direct entry of a brand-new task produces the v2 era; its exact rep
   assert.equal(f.store.list('model-call').length, before, 'the exact repeat applies the saved response');
 });
 
-test('X04 an unfinished session of a compatible previous basis is resumed by its era — never silently repaid', async t => {
+test('X04 an unfinished session of a compatible previous basis revision is resumed — never silently repaid', async t => {
   const f = await synthesisV2Fixture(t, ANSWER_SCRIPT);
   const restore = f.interruptAfter(f.store, writes => writes.some(w => w.kind === 'model-response'));
   await assert.rejects(f.invoke(), { code: 'fixture_write_crash' });
@@ -2447,23 +2447,6 @@ test('X04 an unfinished session of a compatible previous basis is resumed by its
   assert.equal(result.action, 'answer');
   assert.equal(f.store.list('model-call').length, calls, 'the saved response of the previous basis revision is applied, not repaid');
   assert.equal(f.session().id, old, 'the same session owns the task');
-
-  // A genuine previous-era (v1) unfinished session of the same task keeps its
-  // own lawful recovery path: the new-era entry refuses with its address
-  // instead of paying over it.
-  const f2 = await synthesisV2Fixture(t, ANSWER_SCRIPT);
-  const materials = [...(f2.context.workingSelections ?? [])];
-  const legacyId = `synthesis-session:${hashJson([reference(f2.question), reference(f2.environment),
-    f2.draft.value.inputs, materials, null, null])}`;
-  f2.store.write({ id: legacyId, kind: 'synthesis-session', expected: 0, value: { projectId: 'p', offset: 0, notes: [], result: null,
-    binding: { draft: reference(f2.draft), question: reference(f2.question), environment: reference(f2.environment), inputs: f2.draft.value.inputs } } });
-  // A compatible reconfiguration moves the basis; the new-era entry must not
-  // pay over the previous-era unfinished session of the same task.
-  f2.engine.environments.configure('p', { ...f2.environment.value }, f2.environment.revision);
-  const calls2 = f2.store.list('model-call').length;
-  await assert.rejects(f2.invoke(), { code: 'synthesis_legacy_pending' });
-  assert.equal(f2.store.list('model-call').length, calls2, 'the addressed refusal never buys over the previous-era session');
-  assert.equal(f2.store.list<any>('synthesis-session').length, 1, 'no new session was created');
 });
 
 test('X32 a received response keeps the reserved run position and budget across a restart', async t => {

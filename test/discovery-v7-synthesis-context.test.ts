@@ -92,7 +92,7 @@ function synthesisContext(p: Planned, subject: V7PlanSubject, mode: "synthesis" 
   const workspace = contextWorkspace(undefined, undefined);
   return { dispatchMode: mode === "consolidation" ? "consolidation" : "synthesis", synthesisMaterials: p.materials,
     synthesisSession: session.id, synthesisState: { offset: mode === "final" ? 1 : 0, materialOffset: 0 }, synthesisNotes: [],
-    contextWorkspace: [], focus: null, contextControls: synthesisControls(mode === "final", workspace, 3, undefined),
+    contextWorkspace: [], focus: null, contextControls: synthesisControls(mode === "final", workspace, undefined),
     contextCheckpointedKeys: [],
     ...(mode === "consolidation" ? { consolidation: { targetChars: 4000, fullTargetChars: 8000, format: 2 } } : {}) };
 }

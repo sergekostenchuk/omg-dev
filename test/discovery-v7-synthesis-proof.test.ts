@@ -114,7 +114,7 @@ const stepContext = (sessionId: string, materials: Record<string, any>[]) => {
   const workspace = contextWorkspace(undefined, undefined);
   return { dispatchMode: "synthesis", synthesisMaterials: materials, synthesisSession: sessionId,
     synthesisState: { offset: 0, materialOffset: 0 }, synthesisNotes: [], contextWorkspace: [], focus: null,
-    contextControls: synthesisControls(false, workspace, 3, undefined), contextCheckpointedKeys: [] };
+    contextControls: synthesisControls(false, workspace, undefined), contextCheckpointedKeys: [] };
 };
 const snapshot = (store: Store) => canonical(store.list().map(reference));
 

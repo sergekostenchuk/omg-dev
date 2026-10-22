@@ -6,7 +6,7 @@ export interface SynthesisControls {
   version: 2; stage: 'materials' | 'final'; mode: 'research' | 'finalization';
   remainingLookups: number | null; instruction: string;
 }
-export function synthesisControls(final: boolean, _workspace: ContextWorkspace, _legacyLimit: number, saved?: FinalizationState): SynthesisControls {
+export function synthesisControls(final: boolean, _workspace: ContextWorkspace, saved?: FinalizationState): SynthesisControls {
   requireCondition(saved === undefined || saved && Number.isSafeInteger(saved.lookups) && saved.lookups >= 0,
     'synthesis_controls_invalid', 'Finalization must preserve the number of requested lookups');
   return { version: 2, stage: final ? 'final' : 'materials', mode: final ? 'finalization' : 'research', remainingLookups: null,
