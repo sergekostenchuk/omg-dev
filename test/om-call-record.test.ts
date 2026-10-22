@@ -18,8 +18,8 @@ import {
 } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import {
-  closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace,
-  ORIGIN_DECISION_KIND, type OriginHold,
+  closeAttempt, liftOriginHold, openAttempt, originDecisionNamespace, prepareManagedClaim,
+  ORIGIN_DECISION_KIND, type GateOutcome, type OriginHold,
 } from "../src/om/repeat-gate.js";
 import {
   callLedgerId, callRecordId, readCall, prepareCallDispatch, recordCall, settleCall,
@@ -1225,22 +1225,167 @@ test("E1 guards the full mechanism admission through the transaction and propaga
   assert.equal(store.get(callRecordId(PROJECT, input.call)), null);
 });
 
-test("E1 mechanism stop and origin analyses preserve their own exact grounds after settlement and lifting", t => {
-  const f = mechanismFixture(t, "mechanism-stop-analysis"), ordinary = f.call();
-  for (const attempt of [1, 2, 3]) {
-    if (attempt > 1) deliveredOf(beginAttempt(f.store, { ...f.ownerAddress, attempt, goal: ordinary.goal, admission: f.initial.admission }));
-    deliveredOf(completeAttempt(f.store, { ...f.ownerAddress, attempt,
-      outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
+/**
+ * LG07 m3c (№10309): the M5 mechanism of this project on the managed path. Unlike mechanismFixture it opens no block line
+ * at all: its attempts are opened with their own admission and the exact completion of their MC2 batch, paid by the
+ * implementer's answer off its form (E2, then E1+E4) and closed by G7 with the claim it derives. The raw dispatch records
+ * are the ones a direct analysis call is sent through, as the shared fixture writes them.
+ */
+function managedMechanismFixture(t: test.TestContext, label: string, StoreType: typeof Store = Store, questions = ["encoding", "transport"]) {
+  const root = mkdtempSync(join(tmpdir(), `omg-om-call-${label}-`)), path = join(root, "state.sqlite");
+  const store = new StoreType(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const adapter = store.write({ id: `adapter:${PROJECT}`, kind: "dispatch-adapter", expected: 0,
+    value: { projectId: PROJECT, protocol: "codex-stdio", status: "configured-not-accepted" } });
+  const config = store.write({ id: `config:${PROJECT}`, kind: "dispatch-config", expected: 0,
+    value: { projectId: PROJECT, model: "fixture", transport: "stdio", status: "configured-not-accepted" } });
+  const engine = new ProductEngine(store);
+  const { level: _level, ...l1 } = projectGraph(gardenGraph("cross", PROJECT), 1);
+  preparedFeatures(engine, PROJECT, l1 as Graph, field => {
+    const value = preparedField(PROJECT, field);
+    if (field === "preparation") (value as Record<string, Json>).unknowns = questions.map(mechanismQuestion);
+    return value;
+  });
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${PROJECT}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  let graph = store.get<Graph>(`graph:${PROJECT}`)!;
+  let input = deliveredOf(writeOmInput(store, { project: PROJECT, expected: 0, stages }));
+  let questionCount = questions.length;
+  function task() {
+    graph = store.get<Graph>(`graph:${PROJECT}`)!;
+    const horizon = deliveredOf(writeHorizon(store, { project: PROJECT, input: reference(input), graph: reference(graph),
+      refinement: null, available: {}, choice: { choiceVersion: `mechanism-call-${input.revision}`, features: [{ outcome: `${PROJECT}-result` }], excluded: [] } }));
+    const sources: GapRequest = { project: PROJECT, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
+      operations: { proposals: [], frame: { project: PROJECT, level: 2, graph: reference(graph), horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
+      works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${PROJECT}:2`)!) } };
+    const gaps = deliveredOf(writeGaps(store, sources)), gapSet = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+    const routes = deliveredOf(writeRoutes(store, { project: PROJECT, gaps: gapSet, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+    const batch = routes.value.batches.find(batch => batch.task === "input-field" && batch.items.every(item => item.target.startsWith("discovery:") && item.consumers.length === 0))!;
+    assert.ok(batch); assert.equal(batch.items.length, questionCount);
+    const admission: MechanismAdmission = { gaps: gapSet, routes: reference(routes), batch: batch.id };
+    return { admission, routes, gaps };
   }
-  const stopped = f.store.get(f.mechanismSeries.id)!, wanted = analysisGoal("mechanism stop");
+  // The paid work of an attempt — its E2 packet and the E1+E4 call — runs through the scenario adapter.
+  const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl"), steps: unknown[] = [];
+  const command = { executable: process.execPath, args: [e4FixturePath, "--scenario", scenario, "--trace", trace] };
+  const environment = reference(engine.environments.configure(PROJECT, { workspace: root,
+    implementer: { actor: "mechanism-implementer", model: "fixture", effort: "high", command },
+    reviewer: { actor: "mechanism-reviewer", model: "fixture-reviewer", effort: "medium", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000, requestCapacityChars: 100_000 },
+  store.get(`environment:${PROJECT}`)?.revision ?? 0));
+  const paidAdapter = reference(store.write({ id: `adapter:${PROJECT}:mechanism`, kind: "dispatch-adapter", expected: 0,
+    value: { projectId: PROJECT, protocol: "codex-stdio" } }));
+  const initial = task(), ownerAddress = { project: PROJECT, owner: mechanismOwner, line: 1 };
+  deliveredOf(openSeries(store, { ...ownerAddress, scope: initial.admission.gaps, predecessor: null, basis: null }));
+  const proof = deliveredOf(prepareSeriesAdmission(store, ownerAddress, initial.admission));
+  const attemptGoal = { key: "address-missing-fields", ...proof.goal };
+  let mechanismSeries: Revision<AnyRepairSeries> | null = null;
+  /** One managed M5 attempt: opened, paid off its form, claimed as G7 derives it and closed at the gate. */
+  async function cycle(attempt: number): Promise<Revision<AnyRepairSeries>> {
+    const opened = deliveredOf(openAttempt(store, { ...ownerAddress, attempt, goal: attemptGoal, admission: initial.admission,
+      completion: { routes: initial.admission.routes, batches: [initial.admission.batch] } } as never)) as Revision<AnyRepairSeries>;
+    mechanismSeries ??= opened;
+    const packet = deliveredOf(writeQuestionPacket(store, { project: PROJECT, routes: initial.admission.routes, batch: initial.admission.batch,
+      environment, attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record;
+    steps.push({ research: {}, usage });
+    writeFileSync(scenario, JSON.stringify({ database: path, steps }));
+    deliveredOf(await runModelCall(store, { project: PROJECT, packet: reference(packet), dispatch: { adapter: paidAdapter, config: environment }, role: "implementer" }));
+    const claim: GateOutcome = deliveredOf(prepareManagedClaim(store, { ...ownerAddress, attempt,
+      outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } } as never)).outcome;
+    deliveredOf(closeAttempt(store, { ...ownerAddress, attempt, outcome: claim } as never));
+    return store.get<AnyRepairSeries>(opened.id)!;
+  }
+  /** Three managed attempts without progress: the real first-rung stop of the line. */
+  async function stop(): Promise<Revision<AnyRepairSeries>> {
+    for (const attempt of [1, 2, 3]) await cycle(attempt);
+    const stopped = store.get<AnyRepairSeries>(mechanismSeries!.id)!;
+    assert.deepEqual(stopped.value.stop?.attempts, [1, 2, 3]);
+    assert.equal(stopped.value.ladder.rung, 1);
+    assert.deepEqual(stopped.value.attempts.map(item => item.outcome?.reason), ["off-form", "off-form", "off-form"]);
+    return stopped;
+  }
+  function call(admission = initial.admission, name = "mechanism-call"): MechanismRecordCallRequest {
+    const read = deliveredOf(readMechanismAdmission(store, { project: PROJECT, series: reference(mechanismSeries!), attempt: 1, admission, current: false }));
+    return { call: name, purpose: "model-design", basis: null, owner: mechanismOwner, admission,
+      gaps: read.gaps.map(gap => ({ id: gap.id, goal: gap.target, field: gap.field, consumer: mechanismOwner })),
+      series: reference(mechanismSeries!), attempt: 1, goal: attemptGoal,
+      dispatch: { adapter: reference(adapter), config: reference(config) }, packet: { task: "address-questions", questions: [...attemptGoal.questions] } };
+  }
+  function refreshInventory() {
+    const inventory = store.write({ id: `repo-inventory:${PROJECT}`, kind: "repo-inventory", expected: 0, value: { projectId: PROJECT, paths: [] } });
+    input = deliveredOf(writeOmInput(store, { project: PROJECT, expected: input.revision, stages, inventory: reference(inventory) }));
+    return task();
+  }
+  function addressOne() {
+    input = deliveredOf(writeAddressing(store, { project: PROJECT, input: reference(input), graph: reference(graph),
+      decisions: [{ pending: inputDecisionWrite({ project: PROJECT, input: reference(input), graph: reference(graph), layers: [],
+        decision: { target: "discovery:encoding", field: "address", value: { consumer: `${PROJECT}-consume-block`, kind: "repository-fact" } } }) as Write }] }));
+  }
+  function replaceProducerQuestions(ids: string[]) {
+    const source = store.get<Source>(`source:${PROJECT}:brief`)!;
+    for (const stage of UPSTREAM_STAGES) {
+      const draft = engine.prepare(PROJECT, stage);
+      for (const id of draft.value.questions) {
+        const question = store.get<Question>(id)!;
+        if (question.value.spec.kind === "fact")
+          engine.discovery.fact(id, question.revision, reference(source), { kind: "text-range", start: 0, end: source.value.content.length });
+        else {
+          const field = question.value.spec.field;
+          const value = currentUpstreamFixtureValue(engine, PROJECT, field,
+            field === "mapDesign" ? designOf(store.get<Graph>(`graph:${PROJECT}`)!.value) as unknown as Json : preparedField(PROJECT, field));
+          if (field === "preparation") (value as Record<string, Json>).unknowns = ids.map(mechanismQuestion);
+          if (stage === 'discovery' && (draft.value.contractVersion ?? 0) >= 5 && ['researchPlan','researchReport','verdict','preparation'].includes(field))
+            answerDiscoveryFixture(engine, PROJECT, engine.store.get<import('../src/discovery/discovery.js').DiscoveryDraft>(draft.id)!, question, value, source);
+          else engine.discovery.decision(id, question.revision, "owner", value);
+        }
+      }
+      const previous = store.get(`stage:${PROJECT}:${stage}`)!;
+      const produced = engine.draft(PROJECT, stage, draft.id, previous.revision);
+      stages[stage] = reference(engine.pipeline.accept(PROJECT, stage, produced.revision));
+    }
+    assert.equal(engine.pipeline.inspect(PROJECT, "features").state, "accepted");
+    input = deliveredOf(writeOmInput(store, { project: PROJECT, stages, expected: input.revision }));
+    questionCount = ids.length;
+    return task();
+  }
+  return { root, path, store, adapter, config, initial, ownerAddress, attemptGoal, cycle, stop, call, refreshInventory, addressOne,
+    replaceProducerQuestions, get mechanismSeries() { return mechanismSeries!; } };
+}
+
+/** LG07 m3c (№10309): every record's exact head — a refusal or a repeat after real paid work hides no partial write. */
+const fullSnapshot = (store: Store): Ref[] => store.list().map(reference);
+
+test("E1 mechanism stop analysis preserves its own exact ground after a real managed stop, D3 and settlement", async t => {
+  const f = managedMechanismFixture(t, "mechanism-stop-analysis"), stopped = await f.stop();
+  const ordinary = f.call(), wanted = analysisGoal("mechanism stop");
+  const paid = f.store.get<CallLedger>(callLedgerId(PROJECT))!;
+  assert.equal(paid.value.calls.length, 3, "one paid E1 for each managed attempt");
   const stopCall: MechanismRecordCallRequest = { ...ordinary, call: "mechanism-stop", purpose: "stop-analysis",
     basis: { kind: "series-stop", series: reference(stopped), attempt: 3 }, series: reference(stopped), attempt: 3,
     goal: wanted, gaps: [{ id: stopped.id, goal: wanted.key, field: "stop", consumer: mechanismOwner }] };
   const admitted = deliveredOf(recordCall(f.store, PROJECT, stopCall));
-  f.addressOne();
+  assert.equal(admitted.call.value.purpose, "stop-analysis");
+  assert.deepEqual(admitted.call.value.basis, stopCall.basis);
+  assert.deepEqual("owner" in admitted.call.value && admitted.call.value.owner, mechanismOwner);
+  assert.deepEqual("admission" in admitted.call.value && admitted.call.value.admission, f.initial.admission);
+  assert.equal(admitted.ledger.value.calls.length, paid.value.calls.length + 1);
+  assert.deepEqual(f.store.get(stopped.id), stopped, "the analysis opens no attempt four");
+  f.addressOne(); // D3 answers the question before accounting closes the admitted call.
   const settled = deliveredOf(settleCall(f.store, reference(admitted.call), usage, "succeeded"));
+  assert.deepEqual(deliveredOf(readCall(f.store, PROJECT, reference(admitted.call))), admitted.call);
   assert.deepEqual(deliveredOf(readCall(f.store, PROJECT, reference(settled.call))), settled.call);
+  const before = fullSnapshot(f.store);
+  const reopened = new Store(f.path);
+  try {
+    assert.deepEqual(deliveredOf(readCall(reopened, PROJECT, reference(settled.call))), settled.call);
+    const repeat = deliveredOf(recordCall(reopened, PROJECT, stopCall));
+    assert.equal(repeat.repeated, true);
+    assert.deepEqual(reference(repeat.call), reference(settled.call));
+    assert.deepEqual(fullSnapshot(reopened), before);
+  } finally { reopened.close(); }
+});
 
+test("E1 mechanism origin analysis preserves its own exact ground after settlement and lifting", t => {
+  // LG07 m3c (№10309 п.1): the origin half of the former mixed test, with its own preparation; its migration waits for G5.
   const h = mechanismFixture(t, "mechanism-origin-analysis"), before = h.call();
   const refusal = unknownRefusal(h.store, PROJECT);
   const closed = deliveredOf(closeAttempt(h.store, { ...h.ownerAddress, attempt: 1,
@@ -1266,14 +1411,10 @@ test("E1 mechanism stop and origin analyses preserve their own exact grounds aft
 });
 
 
-function inheritedStopFixture(t: test.TestContext, label: string) {
-  const f = mechanismFixture(t, label, MechanismCommitRaceStore, ["encoding"]), ordinary = f.call();
-  for (const attempt of [1, 2, 3]) {
-    if (attempt > 1) deliveredOf(beginAttempt(f.store, { ...f.ownerAddress, attempt, goal: ordinary.goal, admission: f.initial.admission }));
-    deliveredOf(completeAttempt(f.store, { ...f.ownerAddress, attempt,
-      outcome: { reason: "off-form", achieved: [], cancelled: [], refusals: [] } }));
-  }
-  const stopped = f.store.get<AnyRepairSeries>(f.mechanismSeries.id)!;
+async function inheritedStopFixture(t: test.TestContext, label: string) {
+  // LG07 m3c (№10309): the stop is the real one of three managed M5 attempts; the successor is the real A → A+B change.
+  const f = managedMechanismFixture(t, label, MechanismCommitRaceStore, ["encoding"]), stopped = await f.stop();
+  const ordinary = f.call();
   const fresh = f.replaceProducerQuestions(["encoding", "transport"]), successorAddress = { ...f.ownerAddress, line: 2 };
   const successor = deliveredOf(openSeries(f.store, { ...successorAddress, scope: fresh.admission.gaps,
     predecessor: reference(stopped), basis: { ground: "inputs-changed", text: "Accepted producer added the transport question" } }));
@@ -1294,16 +1435,19 @@ function inheritedStopFixture(t: test.TestContext, label: string) {
         cause: "The addressing attempts still lack a verified decision",
         change: undecided ? null : { text: "Change the addressed question before the next attempt", addresses: ["M5:addressing"] } } }));
   }
-  return { ...f, ordinary, stopped, fresh, successor, successorAddress, analysis, review };
+  const paid = f.store.get<CallLedger>(callLedgerId(PROJECT))!;
+  assert.equal(paid.value.calls.length, 3, "one paid E1 for each managed attempt");
+  return { ...f, ordinary, stopped, fresh, successor, successorAddress, analysis, review, paid };
 }
 
 const accountingSnapshot = (store: Store) => ({ calls: store.list(CALL_RECORD_KIND).map(reference), ledger: store.get(callLedgerId(PROJECT)) });
 
-test("E1 analyses an inherited stop after a real A to A+B successor and guards continuation while original tasks remain history", t => {
-  const f = inheritedStopFixture(t, "inherited-stop"), store = f.store as MechanismCommitRaceStore;
+test("E1 analyses an inherited stop after a real A to A+B successor and guards continuation while original tasks remain history", async t => {
+  const f = await inheritedStopFixture(t, "inherited-stop"), store = f.store as MechanismCommitRaceStore;
   const input = f.analysis("inherited-stop-original"), extra = f.analysis("inherited-stop-fresh", f.fresh.admission);
-  const beforeInvalid = accountingSnapshot(store);
+  const beforeInvalid = fullSnapshot(store);
   addressed(recordCall(store, PROJECT, f.analysis("new-analysis-on-old-line", f.initial.admission, reference(f.stopped))), "call_series_unresolved");
+  assert.deepEqual(fullSnapshot(store), beforeInvalid);
   const invalidSources: [string, MechanismAdmission][] = [
     ["forged-extra-route", { ...f.fresh.admission, routes: { ...f.fresh.admission.routes, hash: "0".repeat(64) } }],
     ["foreign-extra-batch", { ...f.fresh.admission, batch: "batch:absent" }],
@@ -1312,30 +1456,35 @@ test("E1 analyses an inherited stop after a real A to A+B successor and guards c
   for (const [name, admission] of invalidSources) {
     addressed(recordCall(store, PROJECT, f.analysis(name, admission)), "call_series_unresolved");
     assert.equal(store.get(callRecordId(PROJECT, name)), null);
-    assert.deepEqual(accountingSnapshot(store), beforeInvalid);
+    assert.deepEqual(fullSnapshot(store), beforeInvalid, name);
   }
   const admitted = deliveredOf(recordCall(store, PROJECT, input));
   const fresh = deliveredOf(recordCall(store, PROJECT, extra));
   assert.deepEqual("admission" in admitted.call.value && admitted.call.value.admission, f.initial.admission);
   assert.deepEqual("admission" in fresh.call.value && fresh.call.value.admission, f.fresh.admission);
+  assert.equal(fresh.ledger.value.calls.length, f.paid.value.calls.length + 2);
+  const beforeOrdinary = fullSnapshot(store);
   addressed(recordCall(store, PROJECT, { ...f.ordinary, call: "ordinary-after-successor", series: reference(f.successor), attempt: 3 }), "call_series_unresolved");
+  assert.deepEqual(fullSnapshot(store), beforeOrdinary);
   f.refreshInventory();
   assert.deepEqual(deliveredOf(prepareCallDispatch(store, PROJECT, reference(admitted.call))).call, admitted.call,
     "The inherited stop uses its historical assignment after the producer changed");
   addressed(prepareCallDispatch(store, PROJECT, reference(fresh.call)), "call_series_unresolved");
-  const beforeStale = accountingSnapshot(store);
+  const beforeStale = fullSnapshot(store);
   addressed(recordCall(store, PROJECT, { ...extra, call: "stale-additional-analysis-sources" }), "call_series_unresolved");
-  assert.deepEqual(accountingSnapshot(store), beforeStale);
+  assert.deepEqual(fullSnapshot(store), beforeStale);
   const review = f.review();
   const continuation = { ...f.successorAddress, stop: 3, ground: "review-record" as const,
     text: "The reviewer supplied an addressed change", review: { ref: review } };
-  const beforeRace = accountingSnapshot(store);
-  store.race = other => { deliveredOf(resumeSeries(other, continuation)); };
+  let afterWinner: Ref[] = [];
+  store.race = other => { deliveredOf(resumeSeries(other, continuation)); afterWinner = fullSnapshot(other); };
   addressed(recordCall(store, PROJECT, { ...input, call: "analysis-racing-continuation" }), "input_stale");
-  assert.deepEqual(accountingSnapshot(store), beforeRace, "A continuation wins without a partial call or ledger row");
+  assert.ok(afterWinner.length > 0, "the continuation ran in the write window");
+  assert.deepEqual(fullSnapshot(store), afterWinner, "A continuation wins without a partial call or ledger row");
   const continued = store.get<AnyRepairSeries>(f.successor.id)!;
   assert.equal(continued.value.stop, null);
   addressed(recordCall(store, PROJECT, f.analysis("analysis-after-continuation", f.initial.admission, reference(continued))), "call_basis_unresolved");
+  assert.deepEqual(fullSnapshot(store), afterWinner);
   const settled = deliveredOf(settleCall(store, reference(admitted.call), usage, "succeeded"));
   deliveredOf(settleCall(store, reference(fresh.call), usage, "failed"));
   const reopened = new Store(f.path);
@@ -1343,39 +1492,44 @@ test("E1 analyses an inherited stop after a real A to A+B successor and guards c
     assert.deepEqual(deliveredOf(readCall(reopened, PROJECT, reference(admitted.call))), admitted.call);
     assert.deepEqual(deliveredOf(readCall(reopened, PROJECT, reference(fresh.call))), fresh.call);
     assert.deepEqual(deliveredOf(readCall(reopened, PROJECT, reference(settled.call))), settled.call);
-    const snapshot = accountingSnapshot(reopened);
+    const snapshot = fullSnapshot(reopened);
     assert.equal(deliveredOf(recordCall(reopened, PROJECT, input)).repeated, true);
     assert.equal(deliveredOf(recordCall(reopened, PROJECT, extra)).repeated, true);
-    assert.deepEqual(accountingSnapshot(reopened), snapshot);
+    assert.deepEqual(fullSnapshot(reopened), snapshot);
   } finally { reopened.close(); }
 });
 
-test("E1 inherited stop analysis guards extra fresh sources and refuses the owner's rung without altering admission history", t => {
-  const f = inheritedStopFixture(t, "inherited-stop-rung"), store = f.store as MechanismCommitRaceStore;
+test("E1 inherited stop analysis guards extra fresh sources and refuses the owner's rung without altering admission history", async t => {
+  const f = await inheritedStopFixture(t, "inherited-stop-rung"), store = f.store as MechanismCommitRaceStore;
   const fresh = f.analysis("analysis-racing-extra-source", f.fresh.admission);
-  const before = accountingSnapshot(store);
+  let afterRival: Ref[] = [];
   store.race = other => {
     const input = other.get(f.fresh.admission.gaps.sources.input.id)!;
     other.write({ id: input.id, kind: input.kind, expected: input.revision, value: input.value });
+    afterRival = fullSnapshot(other);
   };
   addressed(recordCall(store, PROJECT, fresh), "input_stale");
-  assert.deepEqual(accountingSnapshot(store), before);
+  assert.ok(afterRival.length > 0, "the source moved in the write window");
+  assert.deepEqual(fullSnapshot(store), afterRival);
   const input = f.analysis("original-history-after-extra-source-moved");
   const admitted = deliveredOf(recordCall(store, PROJECT, input));
+  assert.equal(admitted.ledger.value.calls.length, f.paid.value.calls.length + 1);
   const review = f.review(true);
   const escalated = deliveredOf(escalateSeries(store, { ...f.successorAddress, stop: 3,
     review: { ref: review } }));
   assert.equal(escalated.value.ladder.rung, 2);
   assert.ok(escalated.value.stop);
-  const snapshot = accountingSnapshot(store);
+  const snapshot = fullSnapshot(store);
   addressed(recordCall(store, PROJECT, f.analysis("analysis-on-owner-rung", f.initial.admission, reference(escalated))), "call_basis_unresolved");
-  assert.deepEqual(accountingSnapshot(store), snapshot);
+  assert.deepEqual(fullSnapshot(store), snapshot);
   const settled = deliveredOf(settleCall(store, reference(admitted.call), usage, "succeeded"));
   const reopened = new Store(f.path);
   try {
     assert.deepEqual(deliveredOf(readCall(reopened, PROJECT, reference(settled.call))), settled.call);
+    const cold = fullSnapshot(reopened);
     assert.equal(deliveredOf(recordCall(reopened, PROJECT, input)).repeated, true);
     addressed(recordCall(reopened, PROJECT, f.analysis("analysis-owner-rung-after-restart", f.initial.admission, reference(escalated))), "call_basis_unresolved");
+    assert.deepEqual(fullSnapshot(reopened), cold);
   } finally { reopened.close(); }
 });
 
