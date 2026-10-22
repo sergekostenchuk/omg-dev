@@ -5,7 +5,8 @@ import {projectPaidTurnAdmission,managedTurnId} from '../src/discovery/research-
 import {recordV7Attempt} from '../src/discovery/v7-attempts.js';
 import {attemptEndOfAction,V7_PLAN_SUBJECT_CONTRACT} from '../src/discovery/v7-managed-attempt.js';
 import {projectAttemptPacket,attemptAccountKey} from '../src/discovery/v7-attempt-assessment.js';
-import {REQUEST_MANIFEST_CONTRACT} from '../src/discovery/request-parts.js';
+import {REQUEST_MANIFEST_CONTRACT,readArchiveBody} from '../src/discovery/request-parts.js';
+import {configureV7SavedSynthesis} from '../src/discovery/saved-synthesis.js';
 import {uniqueTransactionGuards} from '../src/runtime/environment.js';
 import type {ResearchRun} from '../src/discovery/research-model.js';
 import {v7CheckpointPrefixes} from '../src/discovery/v7-plan-questions.js';
@@ -493,4 +494,64 @@ test(`R.1: replacement edition leaves ${boundary} old assessment uncounted and c
  assert.ok(paid.value.subject.packet.entries.every(e=>canonical(e.attempt)!==canonical(oldRef)));
  const before=counters(f),history=f.history();const cold=await f.run(1,f.open(),false);
  assert.deepEqual(cold,done);assert.deepEqual(counters(f),before);assert.deepEqual(f.history(),history);
+});
+
+
+for (const cutSession of [false,true])
+test(`R.1/S6.8: saved-only recovery retains the exact negative owner review${cutSession?' after its session-only cut':''} and applies the final attempt`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ f.engine.execute({type:'configure-reader-pilot',project:'p',expected:0,settings:{experimental:true,active:true,stopAfter:'L2',
+  reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command:f.command},agentCommand:f.command,
+  maxRequestChars:100000,maxReadChars:20000,maxReplyChars:200000,maxCalls:50,maxReportedTokens:100000,
+  v7Planning:{contract:'v7-plan-planning/v1',maxRequestChars:100000,maxRounds:3}}});
+ const pieces=['a','b'].map(name=>{
+  const source=f.discovery.evidence.document('p','note-'+name,'A finding and its exception '+name,'text/plain',0);
+  return {kind:'context',value:f.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:0,end:source.value.content.length})};
+ });
+ const subject={contract:V7_PLAN_SUBJECT_CONTRACT,planAnswer:f.v.planAnswer,planQuestionId:'block'},pilot=readerPilot(f.store,'p')!;
+ f.configure([{action:'checkpoint',question:'$selected',value:{finding:'The finding retains its exception'},
+  citations:[{source:pieces[0]!.value.source,selector:pieces[0]!.value.selector}],unresolved:[]},ended()]);
+ assert.equal((await synthesisSession(f.store,f.v.draft,f.v.plan,f.environment,pilotEnvironment(f.environment.value,pilot.value),pilot,
+  {role:'research',stage:'discovery',subject,workingSelections:pieces,inventory:{sources:[]},history:[]},'Synthesize',undefined,{})).action,'answer');
+ const prior=f.wires().length,source=f.discovery.evidence.document('p','jurisdiction','Only the owner can select a jurisdiction.','text/plain',0);
+ f.configure([...Array.from({length:prior},()=>ended()),
+  {action:'read_plan',question:'$selected',reads:[{action:'read_source',source:reference(source),start:0,end:source.value.content.length}]},
+  {action:'need_owner',question:'$selected',reason:'Choose this subject jurisdiction',searched:[reference(source)]},
+  {necessary:false,reason:'The cited source already answers the subject'},ended()]);
+ const write=f.store.writeMany.bind(f.store);let paidCut=false;
+ f.store.writeMany=((writes,guards=[])=>{const rows=write(writes,guards);
+  if(!paidCut&&writes.some(row=>row.kind==='model-call'&&(row.value as any).purpose==='escalation-assessor'&&(row.value as any).status==='succeeded')){
+   paidCut=true;throw new Error('R1/S6.8 cut after paid owner review');
+  }return rows;}) as Store['writeMany'];
+ try{await f.run(3);}finally{f.store.writeMany=write;}
+ assert.ok(paidCut);const choice=configureV7SavedSynthesis(f.store,'p',subject,0);
+ const before=f.wires().length,reviews=f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference);
+ let sessionCut=false;
+ if(cutSession)f.store.writeMany=((writes,guards=[])=>{const rows=write(writes,guards);
+  if(!sessionCut&&writes.some(row=>row.kind==='synthesis-session'&&row.expected===0&&(row.value as any).basis.previousProposalRef)){
+   sessionCut=true;throw new Error('R1/S6.8 cut before the first saved-only intent');
+  }return rows;}) as Store['writeMany'];
+ let result;
+ try{result=await f.run(4);}finally{f.store.writeMany=write;}
+ if(cutSession){
+  assert.ok(sessionCut);assert.equal(result.value.pauseCode,'research_interrupted');assert.equal(f.wires().length,before);
+  const cold=await f.run(1,f.open(),false);assert.equal(cold.value.pauseCode,'research_restore_complete');
+  const fixed=f.history(),snapshot=counters(f);assert.deepEqual(await f.run(1,f.open(),false),cold);
+  assert.deepEqual(f.history(),fixed);assert.deepEqual(counters(f),snapshot);
+  result=await f.run(4,f.open());
+ }
+ assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+ const reviewed=f.store.list<any>('research-turn').find(row=>row.value.action?.action==='need_owner')!;
+ assert.equal(reviewed.value.status,'completed');assert.equal(reviewed.value.observation.necessary,false);
+ const fresh=f.wires().slice(before),sends=fresh.filter(row=>!row.subject.assessmentSubject);
+ assert.equal(fresh.length,2);assert.equal(sends.length,1);assert.equal(assessmentWires(f).length,1);
+ assert.deepEqual(sends[0].subject.previousProposalRef,reference(reviewed));
+ const archive=sends[0].subject.working.archive,body=readArchiveBody(f.open(),f.store.get(archive.id,archive.revision)!).body;
+ assert.deepEqual(body.subject,subject);assert.deepEqual(body.history,[{...reviewed.value,ref:reference(reviewed)}]);
+ assert.deepEqual(body.savedMaterials.map((piece:any)=>piece.value.checkpoint),choice.value.checkpoints);
+ assert.deepEqual(f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference),reviews);
+ assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.store.list('v7-attempt-account').length,1);
+ assert.equal(readV7ProgressStateAt(f.open(),reference(f.store.list<any>('v7-progress-state')[0]!)).value.summary.count,1);
+ const fixed=f.history(),snapshot=counters(f);assert.deepEqual(await f.run(1,f.open(),false),result);
+ assert.deepEqual(f.history(),fixed);assert.deepEqual(counters(f),snapshot);
 });

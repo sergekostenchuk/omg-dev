@@ -1,3 +1,4 @@
+import { readV7ProgressStateAt } from '../src/discovery/v7-progress.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
@@ -75,11 +76,15 @@ async function setup(t: test.TestContext, questions = [planQuestion('support','m
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-const position=previous.filter(line=>JSON.parse(line).subject?.dispatchMode!=='consolidation').length;
+const position=previous.map(line=>JSON.parse(line)).filter(row=>row.subject?.dispatchMode!=='consolidation'&&!row.subject.assessmentSubject).length;
 let research=r.subject?.dispatchMode==='consolidation'
  ?{action:'checkpoint',question:r.subject.question.id,value:{summaries:r.subject.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:r.subject.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
  :s.replies[position]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ research={verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected:[],newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+}
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure('p',{workspace:f.root,
@@ -94,6 +99,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
     await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
       {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate assessor',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'assessor'});
     configure([ended(), {necessary:true,reason:'Calibration review'}, {action:'read_plan',question:'$selected',reads}], tokens);
     await researchCall(environment.value.implementer,environment.value,'Calibrate planner',{dispatchMode:'planning'},undefined,
       {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'reading-planner'});
@@ -129,6 +136,20 @@ const reads = [{action:'read_context',record:{id:'unused',revision:1,hash:'0'.re
 type Ready=Awaited<ReturnType<typeof setup>>;
 const snapshot=(f:Ready)=>({calls:f.store.list('model-call'),ledger:f.store.list('research-budget-ledger'),wire:f.wires()});
 const history=(f:Ready)=>f.store.list().map(row=>f.store.history(row.id).map(reference));
+function proveAssessments(f:Ready, subjects:string[]) {
+ const requests=f.wires().filter(row=>row.subject.assessmentSubject);
+ assert.deepEqual(requests.map(row=>row.subject.assessmentSubject.packet.planQuestionId),subjects);
+ assert.equal(f.store.list('v7-progress-application').length,subjects.length);
+ for(const request of requests){
+  const packet=request.subject.assessmentSubject.packet;
+  assert.deepEqual(packet.planAnswer,f.v.planAnswer);
+  assert.deepEqual(packet.entries.map((entry:any)=>entry.attempt),f.store.list<any>('research-attempt')
+   .filter(row=>row.value.planQuestionId===packet.planQuestionId).map(reference));
+  const state=f.store.list<any>('v7-progress-state').find(row=>row.value.subject.planQuestionId===packet.planQuestionId)!;
+  assert.ok(state);const proof=readV7ProgressStateAt(f.open(),reference(state));
+  assert.deepEqual(proof.value.subject.planAnswer,f.v.planAnswer);assert.equal(proof.value.summary.count,packet.entries.length);
+ }
+}
 const verdict=(necessary:boolean)=>({necessary,reason:necessary?'Only the owner can choose this jurisdiction':'The cited source already answers this subject'});
 function scenario(f:Ready,necessary:boolean) {
  const source=f.discovery.evidence.document('p','jurisdiction','Only the owner can select a jurisdiction for this subject.','text/plain',0);
@@ -177,7 +198,9 @@ for(const necessary of [true,false])
  test(`S6.8: synthesis need_owner uses the logical subject and the real ${necessary?'necessary':'unnecessary'} review`,async t=>{
  const f=await setup(t,[planQuestion('block','industry','blocking')]),source=scenario(f,necessary);
  const result=await f.run(3);assert.equal(result.value.status,necessary?'needs_owner':'completed',JSON.stringify(result.value));
- const reviewed=proveOwner(f,necessary,source);assert.equal(f.wires().length,necessary?3:4);
+ const reviewed=proveOwner(f,necessary,source);assert.equal(f.wires().length,necessary?3:5);
+ proveAssessments(f,necessary?[]:['block']);
+ assert.equal(f.wires().filter(row=>!row.subject.assessmentSubject).length,necessary?3:4);
  if(!necessary){
   const continuation=f.wires()[3].subject;
   assert.deepEqual(continuation.previousProposalRef,reference(reviewed));
@@ -232,7 +255,7 @@ test('S6.8: another subject read cannot authorize a synthesis owner review',asyn
   ended(),{action:'synthesize',question:'$selected'},
   {action:'need_owner',question:'$selected',reason:'Try using A history for B',searched:[ref]}]);
  const result=await f.run(8);assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'owner_escalation_premature',JSON.stringify(result.value));
- assert.equal(f.wires().length,4);assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).some(row=>row.value.kind==='escalation-assessor'),false);
+ assert.equal(f.wires().length,5);assert.equal(f.wires().filter(row=>!row.subject.assessmentSubject).length,4);proveAssessments(f,['a']);assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).some(row=>row.value.kind==='escalation-assessor'),false);
  const before=snapshot(f);await f.run(1,f.open(),false);assert.deepEqual(snapshot(f),before);
 });
 
@@ -314,7 +337,8 @@ for (const cutSession of [false,true])
  const reviewed=proveOwner(f,false,source);
  assert.deepEqual(reviewed.value.subject,subject);
  const requests=f.wires().slice(before.wire.length);
- assert.equal(requests.length,1);const request=requests[0]!.subject;
+ assert.equal(requests.length,2);const sends=requests.filter(row=>!row.subject.assessmentSubject);
+ assert.equal(sends.length,1);proveAssessments(f,['block']);const request=sends[0]!.subject;
  assert.equal(request.dispatchMode,'synthesis');assert.deepEqual(request.previousProposalRef,reference(reviewed));
  const archive=request.working.archive;
  const body=readArchiveBody(f.open(),f.store.get(archive.id,archive.revision)!).body;
@@ -327,7 +351,7 @@ for (const cutSession of [false,true])
  assert.deepEqual((lookup.value as any).observation,verdict(false));
  assert.ok(request.working.sections.some((section:any)=>section.pointer==='/body/history'));
  assert.deepEqual(f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference),reviewCalls);
- assert.equal(f.store.list('model-call').length,before.calls.length+1);
+ assert.equal(f.store.list('model-call').length,before.calls.length+2);
  const fixed=history(f),paid=snapshot(f);
  assert.deepEqual(await f.run(1,f.open(),false),result);assert.deepEqual(history(f),fixed);assert.deepEqual(snapshot(f),paid);
 });
