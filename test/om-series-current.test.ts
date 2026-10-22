@@ -81,7 +81,7 @@ function rewrite<T>(store: Store, record: Revision<T>, value: T): Revision<T> {
   } finally { database.close(); }
   return { ...record, hash, value };
 }
-function fixture(t: TestContext, includeLater = true, questions = 1) {
+function fixture(t: TestContext, includeLater = true, questions = 1, laterFact = false) {
   const root = mkdtempSync(join(tmpdir(), "omg-series-transition-")), path = join(root, "state.sqlite");
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -93,9 +93,14 @@ function fixture(t: TestContext, includeLater = true, questions = 1) {
   }
   preparedFeatures(engine, project, upper as Graph, field => {
     const value = preparedField(project, field);
-    if (field === "preparation") (value as Record<string, Json>).unknowns = Array.from({ length: questions }, (_, i) => ({ id: i ? `encoding-${i}` : "encoding",
-      question: questions === 1 ? "What encoding is supported?" : `What encoding is supported for channel ${i}?`, consumer: block, moment: "om-pass", blocksCurrentStage: false,
-      resolution: "Read repository facts during OM" }));
+    if (field === "preparation") {
+      const unknowns = Array.from({ length: questions }, (_, i) => ({ id: i ? `encoding-${i}` : "encoding",
+        question: questions === 1 ? "What encoding is supported?" : `What encoding is supported for channel ${i}?`, consumer: block, moment: "om-pass", blocksCurrentStage: false,
+        resolution: "Read repository facts during OM" }));
+      if (laterFact) unknowns.push({ id: "later-encoding", question: "What encoding does the later block support?",
+        consumer: independent, moment: "om-pass", blocksCurrentStage: false, resolution: "Read repository facts during OM" });
+      (value as Record<string, Json>).unknowns = unknowns;
+    }
     if (includeLater && field === "preparation") {
       const rows = (value as Record<string, Json>).outcomes as Record<string, Json>[];
       rows.push({ ...clone(rows[0]!), id: "garden-later", result: "The later result" });
@@ -123,9 +128,11 @@ function fixture(t: TestContext, includeLater = true, questions = 1) {
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
     reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
-  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: Array.from({ length: questions }, (_, i) => ({ pending:
+  const input = ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph), decisions: [...Array.from({ length: questions }, (_, i) => ({ pending:
     clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
-      decision: { target: i ? `discovery:encoding-${i}` : 'discovery:encoding', field: 'address', value: { consumer: block, kind: 'repository-fact' } } })) as Write })) }));
+      decision: { target: i ? `discovery:encoding-${i}` : 'discovery:encoding', field: 'address', value: { consumer: block, kind: 'repository-fact' } } })) as Write })),
+    ...(laterFact ? [{ pending: clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: 'discovery:later-encoding', field: 'address', value: { consumer: independent, kind: 'repository-fact' } } })) as Write }] : [])] }));
   const horizon = (version: string, extra: Partial<HorizonRequest['choice']> = {}) => ok(writeHorizon(store, {
     project, input: reference(store.get(input.id)!), graph: reference(store.get(graph.id)!), refinement: null, available: {},
     choice: { choiceVersion: version, features: [{ outcome: "garden-result" }], excluded: [], ...extra },
@@ -234,6 +241,36 @@ async function completeTechnicalAttempts(f: ReturnType<typeof product>, count: n
   }
   assert.equal(f.sent().length, count, 'Each prior technical attempt has its own physical producer');
   return head(f);
+}
+
+/** LG07 sc-b: the independent participant's own MC1 work — its repository-fact question through the real
+ * D1 → E2 tasks → M6 producers on the given current sources, plus the dispatch environment of its own. */
+function laterCarrier(f: Fixture, sources: GapRequest) {
+  const target = 'discovery:later-encoding', gaps = ok(writeGaps(f.store, sources));
+  const gapRequest = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const gap = gaps.records.find(row => row.value.gap.kind === 'repository-fact' && row.value.gap.target === target);
+  assert.ok(gap, 'The later repository-fact question must produce a D1 gap');
+  const tasks = ok(prepareQuestionTasks(f.store, { project, gaps: gapRequest,
+    questions: gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
+      .map(row => ({ gap: reference(row), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) }));
+  const routes = ok(writeRoutes(f.store, { project, gaps: gapRequest,
+    tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })), catalog: { paths: ['later-e4.txt'], records: [] }, previous: null }));
+  writeFileSync(join(f.root, 'later-e4.txt'), 'UTF-8 is supported.');
+  const batch = routes.value.batches.find(row => row.model === 'MC1' && row.items.length > 0
+    && row.items.every(item => item.target === target));
+  assert.ok(batch, 'The later repository fact must own a whole MC1 batch');
+  const goal = { key: 'later:fact', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const scenario = join(f.root, 'later-scenario.json'), trace = join(f.root, 'later-trace.jsonl');
+  const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
+  const environment = f.engine.environments.configure(project, { workspace: f.root,
+    implementer: { actor: 'later-worker', model: 'fixture', effort: 'high', speed: 'fast', command },
+    reviewer: { actor: 'later-reviewer', model: 'fixture-reviewer', effort: 'medium', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: 100000 }, 0);
+  const adapter = f.store.write({ id: `adapter:${project}:later`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: project, protocol: 'codex-stdio' } });
+  return { routes, batch, goal, completion, environment, adapter, scenario };
 }
 
 test('B3.0b real P G activation preserves legacy attempts stops and ladder across continue exclusion and return', async t => {
@@ -1364,39 +1401,81 @@ function changedPair(f: Fixture, acceptance: AcceptedFrameRequest, choiceVersion
   return appliedPair(f, reference(horizon.gate), choiceVersion);
 }
 
-test('B3 one running participant refuses the whole new-work application and only a fresh pair proceeds', t => {
-  const f = fixture(t); f.series(); f.series(independent);
+test('B3 one running participant refuses the whole new-work application and only a fresh pair proceeds', async t => {
+  const f = fixture(t, true, 1, true); f.series(); f.series(independent);
   const first = transition(f, 'multi-base', { features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }] });
   ok(applySeriesActivation(f.store, first.request));
-  ok(beginAttempt(f.store, { project, block: independent, line: 1, attempt: 1, goal: workGoal }));
+  const activated = head(f, independent);
+  // The independent participant's own MC1 plan on the current sources — its own question, batch, goal and completion.
+  const carrier = laterCarrier(f, { project, input: reference(f.input), graph: reference(f.graph), horizon: reference(first.horizon.gate),
+    operations: { proposals: [], frame: { project, level: 2, graph: reference(f.graph), horizon: reference(first.horizon.gate), layer: null, frame: null, upper: null } },
+    works: { state: 'upper-not-accepted', layer: reference(f.store.get(`graph-layer:${project}:2`)!) } });
+  const opened = ok(managedOpenAttempt(f.store, { project, block: independent, line: 1, attempt: 1, goal: carrier.goal, completion: carrier.completion }));
+  assert.ok(opened.revision > activated.revision, 'the managed opening advances the independent series head');
+  const binding = ok(readCompletionBinding(f.store, project, reference(opened), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, carrier.completion); assert.deepEqual(binding.value.goal, carrier.goal);
+  const packet = ok(writeQuestionPacket(f.store, { project, routes: reference(carrier.routes), batch: carrier.batch.id,
+    environment: reference(carrier.environment), attempt: { series: reference(opened), ordinal: 1 }, previous: [] })).record;
+  writeFileSync(carrier.scenario, JSON.stringify({ database: f.store.path, steps: [{ research: { malformed: true }, usage }] }));
+  const physical = ok(await runModelCall(f.store, { project, packet: reference(packet),
+    dispatch: { adapter: reference(carrier.adapter), config: reference(carrier.environment) }, role: 'implementer' }));
+  assert.ok(physical.diagnostic);
+  const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+  assert.equal(work.complete, true);
+  assert.equal(head(f, independent).value.attempts.find(item => item.ordinal === 1)!.outcome, null,
+    'the paid attempt stays running until the managed close — E4 does not finish it');
   const accepted = acceptMappedFrame(f, { project, level: 2, graph: reference(f.graph), horizon: reference(first.horizon.gate), layer: null, frame: null, upper: null });
   const pair = changedPair(f, accepted, 'multi-running'), before = snapshot(f.store);
   refusedWith(prepareSeriesActivation(f.store, pair), 'attempt_running');
   refusedWith(applySeriesActivation(f.store, pair), 'attempt_running');
   assert.deepEqual(snapshot(f.store), before); assert.deepEqual(f.store.list('om-series-discarded'), []);
-  ok(completeAttempt(f.store, { project, block: independent, line: 1, attempt: 1,
-    outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  ok(closeAttempt(f.store, { project, block: independent, line: 1, attempt: 1,
+    outcome: { reason: 'off-form', accepting: [], cancelling: [], refusals: work.refusals } }));
   const afterClose = snapshot(f.store); refusedWith(applySeriesActivation(f.store, pair), 'series_invalid'); assert.deepEqual(snapshot(f.store), afterClose);
   const applied = ok(applySeriesActivation(f.store, changedPair(f, accepted, 'multi-closed')));
   assert.equal(applied.series.length, 2); assert.ok(applied.record.value.decisions.every(row => row.outcome === 'new-work'));
   assert.ok(applied.series.every(row => row.value.line === 2)); assert.deepEqual(f.store.list('om-series-discarded'), []);
 });
 
-test('B3 a second Store moving one participant defeats all prepared writes with no changes beyond the rival', t => {
-  const f = fixture(t); f.series(); f.series(independent);
+test('B3 a second Store moving one participant defeats all prepared writes with no changes beyond the rival', async t => {
+  const f = fixture(t, true, 1, true); f.series(); f.series(independent);
   const first = transition(f, 'CAS-base', { features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }] });
   ok(applySeriesActivation(f.store, first.request));
   const accepted = acceptMappedFrame(f, { project, level: 2, graph: reference(f.graph), horizon: reference(first.horizon.gate), layer: null, frame: null, upper: null });
+  // The current horizon that proves the accepted L2 — the works upper witness must name a refinement-bearing gate.
+  const witness = ok(writeHorizon(f.store, { project, input: reference(f.input), graph: accepted.graph, refinement: accepted.layer,
+    available: {}, choice: { choiceVersion: 'CAS-carrier', features: [{ outcome: 'garden-result' }, { outcome: 'garden-later' }], excluded: [] } }));
+  // The independent participant's own MC1 plan and environment are prepared on the CURRENT accepted frame —
+  // the exact accepted sources, not the old upper-not-accepted — before the pair is even built.
+  const operations: FrameRequest = { project, level: 2, graph: accepted.graph, horizon: reference(witness.gate),
+    layer: accepted.layer, frame: accepted.frame, upper: null };
+  const carrier = laterCarrier(f, { project, input: reference(f.input), graph: accepted.graph, horizon: reference(witness.gate),
+    operations: { frame: operations, proposals: [] },
+    works: { proposals: [], frame: { ...operations, level: 3, layer: null, frame: null,
+      upper: { horizon: reference(witness.gate), frame: accepted.frame } } } });
   const pair = changedPair(f, accepted, 'CAS-prepared'), prepared = ok(prepareSeriesActivation(f.store, pair)), other = new Store(f.path);
   t.after(() => other.close());
   assert.equal(prepared.series.length, 2); assert.ok(prepared.series.every(row => row.value.line === 2));
-  ok(beginAttempt(other, { project, block: independent, line: 1, attempt: 1, goal: workGoal }));
+  const beforeRival = head(f, independent).revision;
+  const rival = ok(managedOpenAttempt(other, { project, block: independent, line: 1, attempt: 1, goal: carrier.goal, completion: carrier.completion }));
+  assert.ok(rival.revision > beforeRival, 'the rival managed opening advances the independent series head');
   const afterRival = snapshot(f.store);
   refusedWith(commit(f.store, prepared), 'input_stale'); assert.deepEqual(snapshot(f.store), afterRival);
   assert.equal(f.store.get(prepared.record.id), null); assert.deepEqual(f.store.list('om-series-discarded'), []);
   for (const owner of [block, independent]) assert.equal(f.store.get(`repair-series:${project}:2:${owner}`), null);
-  ok(completeAttempt(other, { project, block: independent, line: 1, attempt: 1,
-    outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+  // The rival pays and closes its own work through the second Store — own E2, real E4, managed G7 close.
+  const binding = ok(readCompletionBinding(other, project, reference(rival), 1))!;
+  assert.deepEqual(binding.value.plan, carrier.completion); assert.deepEqual(binding.value.goal, carrier.goal);
+  const packet = ok(writeQuestionPacket(other, { project, routes: reference(carrier.routes), batch: carrier.batch.id,
+    environment: reference(carrier.environment), attempt: { series: reference(rival), ordinal: 1 }, previous: [] })).record;
+  writeFileSync(carrier.scenario, JSON.stringify({ database: f.store.path, steps: [{ research: { malformed: true }, usage }] }));
+  const physical = ok(await runModelCall(other, { project, packet: reference(packet),
+    dispatch: { adapter: reference(carrier.adapter), config: reference(carrier.environment) }, role: 'implementer' }));
+  assert.ok(physical.diagnostic);
+  const work = ok(readCompletionWorkAt(other, project, reference(other.get(completionWorkId(project, binding.id))!)));
+  assert.equal(work.complete, true);
+  ok(closeAttempt(other, { project, block: independent, line: 1, attempt: 1,
+    outcome: { reason: 'off-form', accepting: [], cancelling: [], refusals: work.refusals } }));
   const applied = ok(applySeriesActivation(f.store, changedPair(f, accepted, 'CAS-fresh')));
   assert.ok(applied.series.every(row => row.value.line === 2)); assert.deepEqual(f.store.list('om-series-discarded'), []);
 });
