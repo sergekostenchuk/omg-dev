@@ -7,8 +7,10 @@ import { provePlanQuestions } from './v7-plan-questions.js';
 import { DISCOVERY_CLAIMS_CONTRACT, V7_ATTEMPT_END_CODES, isDiscoveryV7Draft } from './v7-contracts.js';
 import { contextTable } from './context-tables.js';
 import { readArchiveBody } from './request-parts.js';
+import { decodeVariantSubject, type VariantSubject } from './discovery-variants.js';
+import { variantStateId } from './variant-decision.js';
 import { Evidence, type Source } from "../evidence/evidence.js";
-import type { Store, Revision, Write, ReadGuard } from '../storage/store.js';
+import type { Store, Revision, Write, ReadGuard, TransactionGuard } from '../storage/store.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
 import type { ModelCall } from '../runtime/model-usage.js';
 import { reference, isRef, type Ref } from '../pipeline/contracts.js';
@@ -76,6 +78,52 @@ export function assessmentSubjectKey(subject: AssessmentTransportSubject | null)
 }
 export function sameAssessmentSubject(a: unknown, b: unknown): boolean {
   return canonical(packetAssessmentSubject(a)) === canonical(packetAssessmentSubject(b));
+}
+
+/** 4T.2-T transports identity only. These checks do not prove a snapshot,
+ * a generated set, or authority to use a mode; the producer owns that proof. */
+export function packetVariantSubject(container: unknown): VariantSubject | null {
+  if (!container || typeof container !== 'object' || !Object.hasOwn(container, 'variantSubject')) return null;
+  return decodeVariantSubject((container as Record<string, unknown>).variantSubject);
+}
+export function variantTransportSubject(purpose: string, actor: string | undefined,
+  value: VariantSubject | null, subject: V7PlanSubject | null, assessment: AssessmentTransportSubject | null) {
+  const variant = value === null ? null : decodeVariantSubject(value);
+  const requested = purpose === 'variant-proposal' || purpose === 'variant-decision';
+  requireCondition(requested === !!variant && (!variant || !subject && !assessment
+    && typeof actor === 'string' && actor.trim().length > 0 && purpose === `variant-${variant.kind}`),
+  'discovery_variant_subject_invalid', 'A variant transport needs its separate complete subject, purpose and actor');
+  return variant;
+}
+export function requireVariantContext(container: unknown, variant: VariantSubject | null) {
+  requireCondition(canonical(packetVariantSubject(container)) === canonical(variant)
+    && (!variant || !Object.hasOwn(container as object, 'subject') && !Object.hasOwn(container as object, 'assessmentSubject')),
+  'discovery_variant_subject_invalid', 'The context must retain its separate variant subject without mixing transport branches');
+}
+export function variantTransportFields(projectId: string, draft: Ref, question: Ref,
+  purpose: string, actor: string, variantSubject: VariantSubject) {
+  return {projectId, draftRef:draft, questionRef:question, purpose, actor, variantSubject};
+}
+export function variantTransportGuards(projectId: string, draftId: string, variant: VariantSubject): TransactionGuard[] {
+  const id = variantStateId(projectId, draftId);
+  requireCondition(variant.expectedSelection === null || variant.expectedSelection.id === id,
+    'discovery_variant_subject_invalid', 'Expected selection must address the canonical state of this project and draft');
+  return [variant.kind === 'proposal' ? variant.snapshot : variant.set, variant.mode,
+    variant.expectedSelection ?? {id, absent:true}];
+}
+export function requireVariantArchive(store: Store, ref: Ref, projectId: string, draft: Ref, question: Ref,
+  purpose: string, actor: string, variant: VariantSubject) {
+  const archive = store.get<any>(ref.id, ref.revision);
+  requireCondition(archive?.kind === 'research-context' && archive.hash === ref.hash
+    && archive.value.projectId === projectId && isRef(archive.value.draft) && canonical(archive.value.draft) === canonical(draft)
+    && isRef(archive.value.question) && canonical(archive.value.question) === canonical(question) && archive.value.purpose === purpose
+    && archive.value.actor === actor && canonical(packetVariantSubject(archive.value)) === canonical(variant),
+  'continuation_foreign', 'A variant archive must retain the exact invocation identity');
+  const body = readArchiveBody(store, archive).body;
+  const fields = variantTransportFields(projectId, draft, question, purpose, actor, variant);
+  requireCondition(Object.entries(fields).every(([key,value]) => Object.hasOwn(body,key)
+    && canonical(body[key]) === canonical(value)) && !Object.hasOwn(body,'subject') && !Object.hasOwn(body,'assessmentSubject'),
+  'continuation_foreign', 'A variant archive body must retain its exact transport identity');
 }
 
 /** This is the response shape transported by T. The paid producer A proves
@@ -242,27 +290,45 @@ export const FOUNDATION_FIELDS = ['core','map','researchScope','mapStatus','allo
   'fields','sourceCatalogue','inventory','catalogue','prerequisites','operationMap','objective','problem','actors',
   'constraints','specificationConstraints','concept','requirements','nodes','files','records','value','previousProposal','currentProposal'] as const;
 // This row serializes attempts; successful model-call records establish delivery.
-interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string }
+interface ContinuationState { projectId: string; question: string; purpose: string; actor: string; activeCall: string; attempts: number; subject?: V7PlanSubject; assessmentKey?: string; variantSubject?: VariantSubject; draft?: Ref; questionRef?: Ref }
 export interface ContinuationPacketState {
   initial: boolean; state: Revision<ContinuationState> | null; id: string; priorCalls: number;
   basis: Ref | null; latest: Ref | null; callGuards: ReadGuard[]; attempts: number;
-  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null;
+  projectId: string; question: Revision<Question>; draft: Revision<DiscoveryDraft>; purpose: string; actor: string; subject: V7PlanSubject | null; assessmentSubject: AssessmentTransportSubject | null; variantSubject?: VariantSubject | null;
 }
-export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null): ContinuationPacketState {
+type LegacyContinuationPacketState = Omit<ContinuationPacketState, 'variantSubject'> & {variantSubject?: null};
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
+  actor: string, subject?: V7PlanSubject | null, assessmentSubject?: AssessmentTransportSubject | null,
+  variantSubject?: null): LegacyContinuationPacketState;
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
+  actor: string, subject: V7PlanSubject | null, assessmentSubject: AssessmentTransportSubject | null,
+  variantSubject: VariantSubject | null): ContinuationPacketState;
+export function continuationState(store: Store, projectId: string, draftId: string, questionId: string, purpose: string, actor: string, subject: V7PlanSubject | null = null, assessmentSubject: AssessmentTransportSubject | null = null, variantSubject: VariantSubject | null = null): ContinuationPacketState {
   const draft=store.get<DiscoveryDraft>(draftId),question=store.get<Question>(questionId);
   requireCondition(draft?.kind==='discovery-draft' && question?.kind==='question' && draft.value.projectId===projectId
     && question.value.projectId===projectId && question.value.draftId===draftId && draft.value.questions.includes(questionId),
     'continuation_question_missing','Every role invocation requires its exact question and draft');
+  variantSubject = variantTransportSubject(purpose, actor, variantSubject, subject, assessmentSubject);
+  if (variantSubject) variantTransportGuards(projectId, draftId, variantSubject);
   const assessmentKey = assessmentSubjectKey(assessmentSubject);
-  const id=`continuation-state:${hashJson(assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? [projectId,subject,purpose,actor] : [projectId,questionId,purpose,actor])}`;
+  const id=`continuation-state:${hashJson(variantSubject ? ['variant/v1',projectId,reference(draft),reference(question),variantSubject,purpose,actor] : assessmentSubject ? [projectId,assessmentSubject,purpose,actor] : subject ? [projectId,subject,purpose,actor] : [projectId,questionId,purpose,actor])}`;
   const state=store.get<ContinuationState>(id);
   const calls=store.list<ModelCall>('model-call').filter(c=>c.value.projectId===projectId
     && ((c.value as unknown as {assessmentKey?:string}).assessmentKey ?? null) === assessmentKey
-    && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor)
+    && callAddressesSubject(c.value as unknown as Record<string,unknown>, reference(question), subject) && c.value.purpose===purpose && c.value.requested.actor===actor
+    && canonical(packetVariantSubject(c.value)) === canonical(variantSubject)
+    && (!variantSubject || !Object.hasOwn(c.value,'subject') && !Object.hasOwn(c.value,'assessmentSubject')
+      && c.value.draftId === draftId))
     .sort((a,b)=>a.value.startedAt-b.value.startedAt||a.id.localeCompare(b.id));
+  if (variantSubject) for (const call of calls) {
+    requireCondition(call.value.packet && isRef(call.value.packet.archive),'continuation_foreign','A variant call requires its exact transport archive');
+    requireVariantArchive(store,call.value.packet.archive,projectId,reference(draft),reference(question),purpose,actor,variantSubject);
+  }
   requireCondition(!calls.some(c=>c.value.status==='running'),'continuation_call_active',
     'This question/role has an unfinished invocation; recover its actual outcome before another dispatch');
   if(state) requireCondition((state.value.assessmentKey ?? null) === assessmentKey && state.kind==='continuation-state' && state.value.question===questionId
+    && canonical(packetVariantSubject(state.value)) === canonical(variantSubject)
+    && (!variantSubject || isRef(state.value.draft) && isRef(state.value.questionRef) && canonical(state.value.draft) === canonical(reference(draft)) && canonical(state.value.questionRef) === canonical(reference(question)))
     && sameSubject(packetPlanSubject(state.value),subject) && state.value.projectId===projectId && state.value.purpose===purpose && state.value.actor===actor,
     'continuation_foreign','Continuation state belongs to another role/question');
   if(state) requireCondition(typeof state.value.activeCall==='string'&&calls.some(c=>c.id===state.value.activeCall),
@@ -280,12 +346,15 @@ export function continuationState(store: Store, projectId: string, draftId: stri
       &&sameSubject(packetPlanSubject(original.value),subject),'continuation_foreign','Delivered foundation belongs to another question');
   }
   return {initial:delivered.length===0,state,id,priorCalls:delivered.length,attempts:calls.length,
-    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject};
+    basis:archives[0]??null,latest:archives.at(-1)??null,callGuards:calls.map(reference),projectId,question,draft,purpose,actor,subject,assessmentSubject,...(variantSubject?{variantSubject}:{})};
 }
-export function continuationDispatch(state: ContinuationPacketState, callId: string): { writes: Write[]; guards: ReadGuard[] } {
+export function continuationDispatch(state: LegacyContinuationPacketState, callId: string): {writes: Write[]; guards: ReadGuard[]};
+export function continuationDispatch(state: ContinuationPacketState, callId: string): {writes: Write[]; guards: TransactionGuard[]};
+export function continuationDispatch(state: ContinuationPacketState, callId: string): { writes: Write[]; guards: TransactionGuard[] } {
   return {writes:[{id:state.id,kind:'continuation-state',expected:state.state?.revision??0,
     value:{projectId:state.projectId,question:state.question.id,purpose:state.purpose,actor:state.actor,
-      activeCall:callId,attempts:state.attempts+1,...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards]};
+      activeCall:callId,attempts:state.attempts+1,...(state.variantSubject?{variantSubject:state.variantSubject,draft:reference(state.draft),questionRef:reference(state.question)}:{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),...(state.subject?{subject:state.subject}:{})}}],guards:[reference(state.question),reference(state.draft),...state.draft.value.inputs,...state.callGuards,
+      ...(state.variantSubject?variantTransportGuards(state.projectId,state.draft.id,state.variantSubject):[])]};
 }
 
 export const CONTINUATION_INSTRUCTION = 'This is an independent stateless continuation, not a remembered conversation. The question field MUST equal subject.question.id, never the prompt text. Use the supplied question contract, saved conclusions, current piece and exact original addresses. Never infer omitted context to be empty or irrelevant. The complete project foundation was transported earlier and is not repeated. If a specific condition is missing, request a small child pointer via read_context; never request the entire foundation again. Saved conclusions/checkpoints are unassessed proposals, not evidence. Preserve exceptions, conflicting findings and source citations. Follow the current phase protocol and advance only the supplied cursor. Do not reread already paid files or request a reader to extract them again.';
@@ -354,6 +423,8 @@ export function selectedQuestion(question: Revision<Question>, body: Record<stri
 
 export function continuationMetadata(state: ContinuationPacketState, archive: Ref, store: Store) {
   const foundation = state.basis ?? archive;
+  if (state.variantSubject) for (const ref of [foundation, archive])
+    requireVariantArchive(store,ref,state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject);
   const original = store.get<{ projectId: string; draft: Ref; question: Ref; subject?:V7PlanSubject }>(foundation.id, foundation.revision);
   // DRS1a2: the saved foundation record and its restored body are separate —
   // the record proves the address and metadata, the body comes by its contract.
@@ -365,7 +436,7 @@ export function continuationMetadata(state: ContinuationPacketState, archive: Re
     && isRef(original.value.question) && original.value.question.id === state.question.id
     && body !== null && sameAssessmentSubject(body,state.assessmentSubject?{assessmentSubject:state.assessmentSubject}:{}) && sameSubject(packetPlanSubject(original.value),state.subject),
   'continuation_foreign', `[${foundation.id}] The exact foundation archive is unavailable`);
-  return {...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
+  return {...(state.variantSubject?variantTransportFields(state.projectId,reference(state.draft),reference(state.question),state.purpose,state.actor,state.variantSubject):{}),...(state.assessmentSubject?{assessmentKey:assessmentSubjectKey(state.assessmentSubject)}:{}),kind:state.initial?'initial':'continuation',role:state.purpose,question:state.subject?.planQuestionId??state.question.id,...(state.subject?{subject:state.subject}:{}),
     foundation,current:archive,previousCalls:state.priorCalls,
     foundationPointers:contextSections(body!, [...FOUNDATION_FIELDS]).map(section => section.pointer)};
 }
