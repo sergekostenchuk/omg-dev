@@ -1896,7 +1896,7 @@ test('LG17 t1 a managed intent names its exact owner, its saved stages repeat wi
     const binding = ok(readCompletionBinding(f.store, f.project, admission.originalSeries, admission.attempt));
     assert.ok(binding, 'the original attempt of this intent is managed');
     const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(intent)))!;
-    assert.equal(disposition.binding.id, binding.id, 'the disposition names the exact binding of the original attempt');
+    assert.deepEqual(disposition.binding, reference(binding), 'the disposition names the exact binding of the original attempt');
     const assignment = f.store.get<{ kind: string; question: string | null }>(disposition.assignment.id,
       disposition.assignment.revision)!;
     assert.equal(assignment.value.kind, 'fact');
@@ -1925,8 +1925,10 @@ test('LG17 t1 a managed intent names its exact owner, its saved stages repeat wi
   await t.test('a new intent naming a fact outside the original response refuses before any write or dispatch', async () => {
     const f = fixture(t), request = await f.original();
     const intents = f.store.list(ASSESSMENT_INTENT_KIND).length, sent = f.sent().length;
+    const history = f.store.list().map(reference);
     denied(writeAssessmentIntent(f.store, { ...request, questionId: 'discovery:transport' }), 'assessment_source_invalid');
     assert.equal(f.store.list(ASSESSMENT_INTENT_KIND).length, intents);
+    assert.deepEqual(f.store.list().map(reference), history);
     assert.equal(f.sent().length, sent);
   });
 
