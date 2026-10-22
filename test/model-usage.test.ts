@@ -10,6 +10,7 @@ import { codexUsage } from "../src/adapters/codex-usage.js";
 import { modelUsage, tokenUsage, type ModelCall } from "../src/runtime/model-usage.js";
 import type { Environment } from "../src/runtime/environment.js";
 import { runProcess } from "../src/runtime/process.js";
+import { REAL_PROCESS_TIMEOUT_MS } from "./process-limits.js";
 
 const PROVIDER = `import {readFileSync} from 'node:fs';
 const req=JSON.parse(readFileSync(0,'utf8')),scenario=process.argv[2];
@@ -26,7 +27,7 @@ function fixture(t: test.TestContext) {
   const environment = (scenario: string): Environment => {
     const command = { executable: process.execPath, args: [join(root, "provider.mjs"), scenario] };
     return { projectId: "p", workspace: root, implementer: { actor: "reader", model: "fixture-reader", effort: "high", speed: "fast", command },
-      reviewer: { actor: "assessor", model: "fixture-assessor", effort: "high", command }, fullCheck: command, timeoutMs: scenario === "timeout" ? 150 : 3000 };
+      reviewer: { actor: "assessor", model: "fixture-assessor", effort: "high", command }, fullCheck: command, timeoutMs: scenario === "timeout" ? 150 : REAL_PROCESS_TIMEOUT_MS };
   };
   return { root, store, environment };
 }
@@ -161,7 +162,7 @@ console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:30,output_
     assert.equal(store.list<ModelCall>("model-call")[0]!.value.usage!.inputTokens, 30);
     for (const mode of ["implement", "review", "chat"]) {
       const result = await runProcess(env.implementer.command, root, JSON.stringify({ protocol: "omg-agent/v1", requestId: "probe",
-        mode, model: "fixture", effort: "high", prompt: "No dispatch permitted" }), 3000);
+        mode, model: "fixture", effort: "high", prompt: "No dispatch permitted" }), REAL_PROCESS_TIMEOUT_MS);
       assert.notEqual(result.exitCode, 0); assert.match(result.stderr, /adapter_mode_invalid/);
       assert.equal(readFileSync(join(root, "compact-input.txt"), "utf8"), sent, "Rejected mode never reaches the provider");
     }

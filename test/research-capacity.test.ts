@@ -69,12 +69,22 @@ function fixture(t: { after(fn: () => void): void }, oversize: string, owner = f
   return { store, engine, database, calls, normal, run, control: (value: Record<string, unknown>) => writeFileSync(settings, JSON.stringify({ oversize, fields, owner, ...value })) };
 }
 
+/** The saved model call that ended on the physical output limit. Any other outcome of the first run is a failure that names
+ * what was saved, so a slow or failing machine reports its own cause instead of an undefined call. */
+function outputLimitCall(f: ReturnType<typeof fixture>, stopped: unknown): Revision<ModelCall> {
+  const calls = f.store.list<ModelCall>('model-call');
+  const call = calls.find(row => row.value.error === 'process_output_limit');
+  assert.ok(call, `no saved model call ended on process_output_limit; run: ${JSON.stringify(stopped)}; saved calls: ${
+    JSON.stringify(calls.map(row => ({ id: row.id, status: row.value.status, error: row.value.error })))}`);
+  return call;
+}
+
 for (const role of ['research', 'assess-answer', 'assess-escalation']) {
   test(`RD2a physical output-limit: ${role} needs the exact one-use permit; restart pays at most one bounded attempt`, async t => {
     const f = fixture(t, role, role === 'assess-escalation');
     const stopped = await f.run();
-    const call = f.store.list<ModelCall>('model-call').find(row => row.value.error === 'process_output_limit')!;
-    assert.ok(call, JSON.stringify(stopped)); assert.equal(call.value.response, null);
+    const call = outputLimitCall(f, stopped);
+    assert.equal(call.value.response, null);
     const request = f.store.get<{text:string}>(call.value.request.record!.id, call.value.request.record!.revision)!;
     assert.equal(JSON.parse(request.value.text).subject.responseOutputLimit.combinedStdoutStderrBytes, 4_000_000);
     const initial = f.calls().length;
@@ -99,8 +109,8 @@ for (const role of ['research', 'assess-answer', 'assess-escalation']) {
 
 test('RD2a limited retry rejects usable responses, a foreign project and the cancellation door', async t => {
   const f = fixture(t, 'research');
-  await f.run();
-  const call = f.store.list<ModelCall>('model-call').find(row => row.value.error === 'process_output_limit')!;
+  const stopped = await f.run();
+  const call = outputLimitCall(f, stopped);
   f.engine.execute({ type: 'create-project', project: 'other', title: 'Other' });
   assert.throws(() => f.engine.execute({ type: 'permit-limited-call-retry', project: 'other', call: reference(call) }), { code: 'limited_call_retry_stale' });
   assert.throws(() => f.engine.execute({ type: 'permit-cancelled-call-retry', project: 'p', call: reference(call) }), { code: 'call_retry_permit_invalid' });
@@ -113,8 +123,8 @@ test('RD2a limited retry rejects usable responses, a foreign project and the can
 });
 
 test('RD2a limited retry window: two Stores issuing the same permission return the same unspent record', async t => {
-  const f = fixture(t, 'research'); await f.run();
-  const call = f.store.list<ModelCall>('model-call').find(row => row.value.error === 'process_output_limit')!;
+  const f = fixture(t, 'research'); const stopped = await f.run();
+  const call = outputLimitCall(f, stopped);
   const door = { type: 'permit-limited-call-retry', project: 'p', call: reference(call) } as const;
   const second = new Store(f.database); t.after(() => second.close());
   const write = f.store.writeMany.bind(f.store); let concurrent: unknown;
@@ -129,8 +139,8 @@ test('RD2a limited retry window: two Stores issuing the same permission return t
 });
 
 test('RD2a limited retry window: a legitimate Source change before write refuses the permission without a new call', async t => {
-  const f = fixture(t, 'research'); await f.run();
-  const call = f.store.list<ModelCall>('model-call').find(row => row.value.error === 'process_output_limit')!;
+  const f = fixture(t, 'research'); const stopped = await f.run();
+  const call = outputLimitCall(f, stopped);
   const second = new Store(f.database); t.after(() => second.close());
   const write = f.store.writeMany.bind(f.store); let changed = false;
   f.store.writeMany = ((writes, guards) => {
@@ -147,8 +157,8 @@ test('RD2a limited retry window: a legitimate Source change before write refuses
 
 
 test('RD2a a physical retry permit preserves stop and its exact question across a cold restart', async t => {
-  const f = fixture(t, 'research'); await f.run();
-  const call = f.store.list<ModelCall>('model-call').find(row => row.value.error === 'process_output_limit')!;
+  const f = fixture(t, 'research'); const first = await f.run();
+  const call = outputLimitCall(f, first);
   f.engine.execute({ type: 'permit-limited-call-retry', project: 'p', call: reference(call) });
   const stopped = stopPass(f.store, { project: 'p' }); assert.ok(stopped.ok);
   const token = stopped.value.control!.value.stop!.token;

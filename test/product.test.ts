@@ -19,6 +19,7 @@ import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { designOf } from "../src/graph/builder.js";
 import { createProductServer } from "../src/server.js";
 import type { Environment } from "../src/runtime/environment.js";
+import { REAL_PROCESS_TIMEOUT_MS } from "./process-limits.js";
 
 test("the real product command path carries two independent products from brief to traceable features and cold reopen", t => {
   const root = mkdtempSync(join(tmpdir(), "omg-product-")); const path = join(root, "state.sqlite"); const store = new Store(path);
@@ -163,8 +164,19 @@ function lg30Commands(t: test.TestContext) {
 const lg30Web = { enabled: true, gatewayUrl: "http://127.0.0.1:18890", timeoutMs: 1000,
   budgetContract: "web-budget/v2", limits: { materialChars: 2000000, responseBytes: 100000 } };
 
+/** An error with every cause it carries: undici reports a refused or reset request only as "fetch failed", the reason is in the cause. */
+function describeFailure(error: unknown): string {
+  const parts: string[] = [];
+  for (let current: unknown = error, depth = 0; current !== undefined && current !== null && depth < 5; depth += 1) {
+    const e = current as { name?: unknown; message?: unknown; code?: unknown; cause?: unknown };
+    parts.push(`${String(e.name ?? typeof current)}: ${String(e.message ?? current)}${e.code === undefined ? "" : ` [${String(e.code)}]`}`);
+    current = e.cause;
+  }
+  return parts.join(" <- ");
+}
+
 async function refusesRetiredCommands(f: ReturnType<typeof lg30Commands>, commands: { type: string }[]) {
-  const server = createProductServer(f.engine);
+  const server = createProductServer(f.engine), began = Date.now();
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
   const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/api/command`;
   const before = f.store.list().flatMap(record => f.store.history(record.id));
@@ -172,10 +184,14 @@ async function refusesRetiredCommands(f: ReturnType<typeof lg30Commands>, comman
     for (const input of commands) {
       assert.throws(() => f.engine.execute(input), { code: "command_invalid" }, input.type);
       const cli = spawnSync(process.execPath, [new URL("../src/cli.js", import.meta.url).pathname, "command", f.path],
-        { input: JSON.stringify(input), encoding: "utf8", timeout: 10000 });
-      assert.equal(cli.status, 1, cli.stderr); assert.equal(JSON.parse(cli.stderr.split("\n").find(line => line.startsWith("{"))!).error, "command_invalid");
+        { input: JSON.stringify(input), encoding: "utf8", timeout: REAL_PROCESS_TIMEOUT_MS });
+      assert.equal(cli.status, 1, `${input.type}: CLI ${JSON.stringify({ error: cli.error ? describeFailure(cli.error) : null,
+        signal: cli.signal, status: cli.status, stderr: cli.stderr })}`);
+      assert.equal(JSON.parse(cli.stderr.split("\n").find(line => line.startsWith("{"))!).error, "command_invalid");
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json",
-        "X-OMG-Token": server.accessToken }, body: JSON.stringify(input) });
+        "X-OMG-Token": server.accessToken }, body: JSON.stringify(input) }).catch((error: unknown) => {
+        throw new Error(`${input.type}: HTTP request failed ${Date.now() - began} ms after the start: ${describeFailure(error)}`, { cause: error });
+      });
       assert.equal(response.status, 400); assert.equal((await response.json() as { error: string }).error, "command_invalid");
       assert.deepEqual(f.store.list().flatMap(record => f.store.history(record.id)), before, input.type);
     }
