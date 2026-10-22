@@ -27,7 +27,7 @@ import { writeHorizon } from '../src/om/horizon.js';
 import { type GapRequest, writeGaps } from '../src/om/gaps.js';
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRequest, type QuestionPacketRecord, prepareQuestionPacket, type PartProposalBody, readQuestionPacket } from '../src/om/question-packet.js';
 import { writeRoutes } from '../src/om/routes.js';
-import { openSeries, beginAttempt, completeAttempt, type RepairSeries, readCompletionBinding, completionWorkId, seriesRequestOf } from '../src/om/series.js';
+import { openSeries, beginAttempt, completeAttempt, type RepairSeries, readCompletionBinding, completionWorkId, seriesRequestOf, type AnyBeginAttemptRequest, type AnyRepairSeries, type MechanismRepairSeries } from '../src/om/series.js';
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
 import { type FrameRequest, prepareFrame, fillObligations, type FrameScope } from '../src/om/frame-obligations.js';
@@ -37,7 +37,7 @@ import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, writeOmOblig
 import { taskBindingId } from '../src/graph/task-obligations.js';
 import type { CarriedObligation } from '../src/graph/obligation-policy.js';
 import { recordCall } from '../src/om/call-record.js';
-import { openAttempt as managedOpenAttempt, closeAttempt } from '../src/om/repeat-gate.js';
+import { openAttempt as managedOpenAttempt, closeAttempt, prepareManagedClaim, type OriginHold } from '../src/om/repeat-gate.js';
 import { Environments } from '../src/runtime/environment.js';
 import { unitRefusalNamespace, UNIT_REFUSAL_KIND, recordRefusal } from '../src/om/refusal-journal.js';
 import { Evidence, Source } from '../src/evidence/evidence.js';
@@ -46,6 +46,8 @@ import { setTimeout as fixtureDelay } from 'node:timers/promises';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { createRequire } from 'node:module';
+import { runFixture, regatedHold, defectedWork } from './om-run-fixture.js';
+import { startRun } from '../src/om/run.js';
 
 
 
@@ -246,6 +248,94 @@ out(take(${materialize ? 'writeQuestionPacket' : 'prepareQuestionPacket'}(store,
 }
 
 
+interface ManagedFixtureOptions {
+  capacity?: number;
+  timeoutMs?: number;
+  priorNoProgress?: number;
+  priorRefused?: boolean;
+  extraQuestion?: boolean;
+  material?: (store: Store, project: string, root: string) => void;
+}
+type ManagedE4Fixture = Omit<ReturnType<typeof e4Fixture>, 'series'> & { series: Revision<AnyRepairSeries> };
+type ManagedPacketFixture = Pick<ManagedE4Fixture, 'store' | 'project' | 'series' | 'packetRequest'>;
+type PreparedE4Fixture = ManagedE4Fixture & { prefix: Ref[]; preparationCalls: Ref[] };
+type BlockE4Fixture = Omit<PreparedE4Fixture, 'series'> & { series: Revision<RepairSeries> };
+type MechanismE4Fixture = Omit<PreparedE4Fixture, 'series'> & { series: Revision<MechanismRepairSeries> };
+
+/** Explicit G7: a paid E4/E5 result alone never closes a managed attempt. */
+export function e4ManagedClose(f: ManagedPacketFixture, reason: 'off-form' | 'refused' | 'result' = 'refused') {
+  const current = f.store.get<RepairSeries>(f.series.id)!;
+  const request = { ...seriesRequestOf(current.value), attempt: f.packetRequest.attempt!.ordinal,
+    outcome: { reason, accepting: [], cancelling: [], refusals: [] } };
+  const claim = valueOf(prepareManagedClaim(f.store, request)).outcome;
+  return valueOf(closeAttempt(f.store, { ...request, outcome: claim }));
+}
+
+/** Technical no-progress paid through E2/E4; any correction is real work, never a fabricated completion row. */
+async function payNoProgress(f: ManagedE4Fixture, script: Record<string, unknown>[]) {
+  const start = script.length;
+  script.push({ research: { invalid: 'first untyped reply' }, usage, confirmed },
+    { research: { invalid: 'second untyped reply' }, usage, confirmed });
+  f.steps(script);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
+  assert.equal(cycle.last.outcome, null);
+  // Keep only replies actually consumed, so a terminal without correction cannot lend a reply to the next ordinal.
+  script.splice(start + cycle.record.value.steps.length); f.steps(script);
+  e4ManagedClose(f, 'off-form');
+  return reference(cycle.record);
+}
+
+/**
+ * Opt-in current carrier. The synchronous e4Fixture (including its old prefix flags) retains its era/defaults.
+ * Each prior ordinal here owns the complete M6 batch, pays its real E4 work and closes at G7. Prefix calls remain
+ * in sent()/the ledger; callers take their baseline after this preparation and attribute their own calls by Ref.
+ */
+export function e4ManagedFixture(t: TestContext, kind: 'field', options?: ManagedFixtureOptions): Promise<MechanismE4Fixture>;
+export function e4ManagedFixture(t: TestContext, kind?: 'fact' | 'node' | 'design', options?: ManagedFixtureOptions): Promise<BlockE4Fixture>;
+export function e4ManagedFixture(t: TestContext, kind: Parameters<typeof e4Fixture>[1], options?: ManagedFixtureOptions): Promise<PreparedE4Fixture>;
+export async function e4ManagedFixture(t: TestContext, kind: Parameters<typeof e4Fixture>[1] = 'fact', options: ManagedFixtureOptions = {}) {
+  const count = options.priorNoProgress ?? 0;
+  assert.ok(Number.isSafeInteger(count) && count >= 0 && count + Number(options.priorRefused ?? false) < 3,
+    'A current attempt must precede the first-rung stop');
+  const f: ManagedE4Fixture = e4Fixture(t, kind, options.capacity ?? 100_000, 0, options.timeoutMs ?? 5000, true, true,
+    options.extraQuestion ?? false, undefined, options.material);
+  const script: Record<string, unknown>[] = [], prefix: Ref[] = [];
+  const next = () => {
+    const ordinal = f.packetRequest.attempt!.ordinal + 1;
+    const current = f.store.get<RepairSeries>(f.series.id)!;
+    const binding = valueOf(readCompletionBinding(f.store, f.project, reference(current), ordinal - 1))!;
+    const address = seriesRequestOf(current.value), work = { attempt: ordinal, goal: current.value.attempts[0]!.goal,
+      completion: { routes: reference(f.routes), batches: [f.batch.id] } };
+    let opening: AnyBeginAttemptRequest;
+    if ('owner' in address) {
+      assert.ok(binding.value.admission, 'The mechanism keeps its exact D1/M6 admission');
+      opening = { ...address, ...work, admission: binding.value.admission };
+    } else opening = { ...address, ...work };
+    f.series = valueOf(managedOpenAttempt(f.store, opening));
+    f.packetRequest = { ...f.packetRequest, attempt: { series: reference(f.series), ordinal } };
+    f.packet = valueOf(writeQuestionPacket(f.store, f.packetRequest)).record;
+    f.request = { ...f.request, packet: reference(f.packet) };
+  };
+  for (let index = 0; index < count; index++) { prefix.push(await payNoProgress(f, script)); next(); }
+  if (options.priorRefused) {
+    const questions = (f.packet.value.packet as { questions: { id: string }[] }).questions;
+    script.push({ research: { protocol: '$answerProtocol', requestId: '$requestId', action: 'cannot_answer',
+      questionIds: questions.map(row => row.id), reason: 'The complete assigned batch needs another design' }, usage, confirmed });
+    f.steps(script);
+    const cycle = valueOf(await runModelCycle(f.store, f.request));
+    assert.equal(cycle.last.outcome?.kind, 'no-result');
+    prefix.push(reference(cycle.record)); e4ManagedClose(f); next();
+  }
+  const preparationSteps = [...script], writeScenario = f.steps;
+  return Object.assign(f, { prefix, preparationCalls: f.store.list<ModelCall>('model-call').map(reference),
+    // Like the original helper, steps() names the caller's work; paid setup replies keep their consumed indices.
+    steps(steps: Record<string, unknown>[]) { writeScenario([...preparationSteps, ...steps]); } });
+}
+
+/** The current works carrier opens only its own M6 batch; callers explicitly execute and G7-close it. */
+export function e4ManagedWorksFixture(t: TestContext) { return e4WorksFixture(t, true); }
+
+
 export function e4Fact(f: ReturnType<typeof e4Fixture>) {
   return { protocol: '$answerProtocol', requestId: '$requestId', action: 'answer',
     results: [{ questionId: f.batch.items[0]!.gap, value: 'UTF-8',
@@ -373,7 +463,7 @@ export function e4WorksFixture(t: TestContext, managed = false) {
 }
 
 
-export function e4NeedSource(f: ReturnType<typeof e4Fixture>, reads: unknown[]) {
+export function e4NeedSource(f: Pick<ReturnType<typeof e4Fixture>, 'batch'>, reads: unknown[]) {
   return { protocol: '$answerProtocol', requestId: '$requestId', action: 'need_source',
     questionIds: f.batch.items.map(item => item.gap), missing: 'Need the addressed source data', reads };
 }
@@ -422,6 +512,53 @@ export function e4AnalysisFixture(t: TestContext, purpose: 'stop-analysis' | 'or
   writeFileSync(scenario, JSON.stringify({ steps: [{ research: { cause: 'fixture observation', hypothesis: true }, usage, confirmed }] }));
   return { root, database: path, scenario, trace, project, packet, request, series, address, environment,
     get store() { return store; }, restart() { store.close(); store = new Store(path); },
+    sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean) : []; } };
+}
+
+
+/** A6 transport with a genuine paid managed stop, or the block G5 hold produced by a regated works pass. */
+export async function e4ManagedAnalysisFixture(t: TestContext, purpose: 'stop-analysis' | 'origin-analysis', timeoutMs = 5000) {
+  let base: { root: string; database: string; project: string; store: Store; restart(): void };
+  let series: Revision<RepairSeries>;
+  let basis: { kind: 'series-stop'; series: Ref; attempt: number } | { kind: 'origin-hold'; hold: Ref };
+  if (purpose === 'stop-analysis') {
+    const f = await e4ManagedFixture(t, 'fact', { priorNoProgress: 2 });
+    await payNoProgress(f, []);
+    series = f.store.get<RepairSeries>(f.series.id)!;
+    assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
+    base = f; basis = { kind: 'series-stop', series: reference(series), attempt: 3 };
+  } else {
+    const f = runFixture(t, [], 'executed');
+    valueOf(startRun(f.store, { project: 'garden' }));
+    const held = await regatedHold(f, { cycle: (packet, batch) => batch.task === 'node-expansion' && batch.level === 3
+      ? defectedWork(f, reference(packet)) : null, pause: { step: 'analyze' } });
+    const step = held.second!.step!.request as { hold: Ref };
+    const hold = f.store.get<OriginHold>(step.hold.id, step.hold.revision)!;
+    assert.equal(hold.value.lift, null);
+    series = f.store.get<RepairSeries>(hold.value.series.id, hold.value.series.revision)!;
+    base = Object.assign(f, { project: 'garden' }); basis = { kind: 'origin-hold', hold: reference(hold) };
+  }
+  const { root, database, project } = base, address = seriesRequestOf(series.value);
+  const preparationCalls = base.store.list<ModelCall>('model-call').map(reference);
+  // The analysis has a separate wire trace/scenario; its assertions cannot count the paid preparation as A6 traffic.
+  const scenario = join(root, 'managed-analysis-scenario.json'), trace = join(root, 'managed-analysis-trace.jsonl');
+  const command = { executable: process.execPath, args: [fixturePath, '--scenario', scenario, '--trace', trace] };
+  const environment = new Environments(base.store).configure(project, { workspace: root,
+    implementer: { actor: 'analysis-executor', model: 'fixture', effort: 'high', command },
+    reviewer: { actor: 'analysis-reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs }, base.store.get(`environment:${project}`)!.revision);
+  const adapter = base.store.write({ id: `adapter:${project}:managed-analysis`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: project, protocol: 'codex-stdio' } });
+  const packet = { task: 'Diagnose the named ground', note: 'No fabricated A6 protocol', basis } as unknown as Json;
+  const goal = { key: purpose, questions: ['What caused this ground?'], result: 'A cause or explicit hypothesis with an addressed change' };
+  const attempt = purpose === 'stop-analysis' ? 3 : series.value.attempts.at(-1)!.ordinal;
+  const admitted = valueOf(recordCall(base.store, project, { call: `e4:managed:${purpose}`, purpose, basis, block: series.value.block,
+    gaps: [{ id: purpose, goal: purpose, field: 'cause-and-change', consumer: 'A6:stop-analysis' }], series: reference(series), attempt, goal,
+    dispatch: { adapter: reference(adapter), config: reference(environment) }, packet }));
+  const request: ModelTransportRequest = { project, call: reference(admitted.call), packet, role: 'reviewer' };
+  writeFileSync(scenario, JSON.stringify({ steps: [{ research: { cause: 'fixture observation', hypothesis: true }, usage, confirmed }] }));
+  return { root, database, scenario, trace, project, packet, request, series, address, environment, basis, preparationCalls,
+    get store() { return base.store; }, restart() { base.restart(); },
     sent() { return existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n').filter(Boolean) : []; } };
 }
 
@@ -733,14 +870,25 @@ export const MP3_LARGE = 'Large carried line.\n'.repeat(3000);
 
 
 export function mp3Cycle(t: TestContext, kind: 'fact' | 'node' = 'fact', capacity = 100_000, managed = false) {
-  const f = e4Fixture(t, kind, capacity, 0, 5000, managed, true, false, undefined, (store, project, root) => {
-    writeFileSync(join(root, 'mp3-notes.txt'), MP3_NOTES);
-    new Evidence(store).file(project, 'mp3-notes', root, 'mp3-notes.txt', 'text/plain', 0);
-    new Evidence(store).document(project, 'mp3-config', MP3_CONFIG, 'application/json', 0);
-    writeFileSync(join(root, 'mp3-large.txt'), MP3_LARGE);
-    new Evidence(store).file(project, 'mp3-large', root, 'mp3-large.txt', 'text/plain', 0);
-    new Evidence(store).document(project, 'mp3-empty', '', 'text/plain', 0);
-  });
+  const f = e4Fixture(t, kind, capacity, 0, 5000, managed, true, false, undefined, mp3Material);
+  return mp3Materials(f);
+}
+
+function mp3Material(store: Store, project: string, root: string) {
+  writeFileSync(join(root, 'mp3-notes.txt'), MP3_NOTES);
+  new Evidence(store).file(project, 'mp3-notes', root, 'mp3-notes.txt', 'text/plain', 0);
+  new Evidence(store).document(project, 'mp3-config', MP3_CONFIG, 'application/json', 0);
+  writeFileSync(join(root, 'mp3-large.txt'), MP3_LARGE);
+  new Evidence(store).file(project, 'mp3-large', root, 'mp3-large.txt', 'text/plain', 0);
+  new Evidence(store).document(project, 'mp3-empty', '', 'text/plain', 0);
+}
+
+/** MP3 materials on an explicitly managed carrier, including any paid previous ordinals. */
+export async function mp3ManagedCycle(t: TestContext, kind: 'fact' | 'node' = 'fact', options: Omit<ManagedFixtureOptions, 'material'> = {}) {
+  return mp3Materials(await e4ManagedFixture(t, kind, { ...options, material: mp3Material }));
+}
+
+function mp3Materials<F extends ManagedE4Fixture>(f: F) {
   const notes = f.store.get<Source>(`source:${f.project}:mp3-notes`)!, config = f.store.get<Source>(`source:${f.project}:mp3-config`)!;
   const large = f.store.get<Source>(`source:${f.project}:mp3-large`)!, empty = f.store.get<Source>(`source:${f.project}:mp3-empty`)!;
   const range = (start: number, end: number, source: Revision<Source> = notes) => ({ action: 'read_source', source: reference(source), selector: { kind: 'text-range', start, end } });
