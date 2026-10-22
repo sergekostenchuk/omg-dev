@@ -268,7 +268,8 @@ test('3 H1.0a managed opening fixes the complete root before E1 and MC1 reveals 
 test('C39 H1.0a technical diagnostics retain the stop and a real independent A6 decision can resume it',async t=>{
   const {runStopAnalysis}=await import('../src/om/stop-analysis.js');
   const {resumeSeries}=await import('../src/om/series.js');
-  const f=e4Fixture(t,'fact',100_000,2,1000,true);f.steps([{research:{wrong:true},usage}]);
+  // LG07 C39 (№11653): attempts 1 and 2 are the carrier's own paid no-progress ordinals, each closed at G7; the third is this test's.
+  const f=await e4ManagedFixture(t,'fact',{priorNoProgress:2}),paid=f.sent().length;f.steps([{research:{wrong:true},usage}]);
   valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
   valueOf(closeAttempt(f.store,{...address,attempt:3,outcome:{reason:'off-form',accepting:[],cancelling:[],refusals:work.refusals}}));
   const stopped=f.store.get<RepairSeries>(f.series.id)!,closedWork=f.store.get(work.work.id);assert.equal(stopped.value.stop?.attempt,3);
@@ -285,7 +286,7 @@ test('C39 H1.0a technical diagnostics retain the stop and a real independent A6 
   assert.equal(opened.value.attempts.at(-1)!.outcome,null);
   const saved=f.store.list();f.restart();
   assert.deepEqual(valueOf(await runStopAnalysis(f.store,request)),analysis);assert.deepEqual(f.store.list(),saved);
-  assert.equal(f.sent().length,2);
+  assert.equal(f.sent().length-paid,2,'the two sends of this test, after the paid ordinals before it');
 });
 
 
