@@ -18,6 +18,7 @@ import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
 import {
   frameObligations, fillObligations, carryFrameFills, flowKey, representativeId, FRAME_REFUSAL_CODES, WORKS_FRAME_CONTRACT, workAnchorId,
+  recordedWorkFillCode,
   readFrame, readFrameBasis, prepareFrame, type FrameRequest,
   type AcceptedFrame, type ConnectionFrame, type FrameLevel, type FrameScope,
 } from "../src/om/frame-obligations.js";
@@ -244,6 +245,62 @@ test("works-frame awake lower delivery preserves its anchored upper flow without
   const mapping = { ...storedFrame(graph, 3, fills), worksContract: WORKS_FRAME_CONTRACT };
   assert.deepEqual(delivered(fillObligations(view, horizon, accepted(graph, mapping), upperRef, 3)).open, []);
   refusedAs(fillObligations(view, horizon, accepted(graph, storedFrame(graph, 3, fills)), upperRef, 3), "frame_record_invalid");
+});
+
+test("works-frame recorded correspondence resolves different code on the same consumer port by exact flow", () => {
+  const graph = gardenGraph("cross"), consumer = graph.nodes.find(node => node.id === "garden-consume-work")!;
+  markedWorks(graph);
+  consumer.code.push({ path: "src/second-consumer.ts", symbol: "consumeSecond", access: "read", status: "planned" });
+  const connector = graph.connectors.find(item => item.id === "garden-flow")!;
+  connector.bindings.find(item => item.level === 3 && item.producer.port === "out-alt")!.consumers[0]!.codeRef = clone(consumer.code[1]!);
+  const view = upper(graph, 3), horizon = allScope(view, 3);
+  const obligations = delivered(frameObligations(view, horizon, 3));
+  const fills: ConnectionFrame["fills"] = explicitFills(graph, view, obligations, 3)
+    .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) }));
+  const frame = storedFrame(graph, 3, fills); frame.worksContract = WORKS_FRAME_CONTRACT;
+  const basis = accepted(graph, frame);
+  const historical = delivered(fillObligations(view, horizon, basis, upperRef, 3)), fingerprint = hashJson(historical);
+  for (const producerPort of ["out", "out-alt"]) {
+    const producer = historical.obligations.find(item => item.connector === connector.id && item.role === "producer"
+      && item.upper.port === producerPort)!;
+    const obligation = historical.obligations.find(item => item.connector === connector.id && item.flow === producer.flow
+      && item.role === "consumer" && item.upper.node === "garden-consume-operation" && item.upper.port === "in")!;
+    const fill = historical.fills.find(row => row.obligation === obligation.id)!;
+    const code = delivered(recordedWorkFillCode(view, basis, obligation, fill));
+    assert.deepEqual(code, consumer.code[producerPort === "out" ? 0 : 1]);
+    assert.ok(Object.isFrozen(code));
+  }
+  for (const fill of historical.fills.filter(row => row.source === "accepted")) {
+    const recorded = frame.fills.find(row => row.obligation === fill.obligation && row.node === fill.node)!;
+    assert.deepEqual(fill.codeRef, recorded.codeRef);
+  }
+  assert.equal(hashJson(delivered(fillObligations(view, horizon, basis, upperRef, 3))), fingerprint);
+});
+
+test("works-frame recorded correspondence checks every producer delivery before deduplicating code references", () => {
+  for (const defect of ["missing", "foreign", "distinct"] as const) {
+    const graph = gardenGraph("cross"), producer = graph.nodes.find(node => node.id === "garden-produce-work")!;
+    markedWorks(graph);
+    producer.code.push({ path: "src/second-producer.ts", access: "write", status: "planned" });
+    const connector = graph.connectors.find(item => item.id === "garden-flow")!;
+    const binding = connector.bindings.find(item => item.level === 3 && item.producer.port === "out" && item.anchor === null)!;
+    const split = clone(binding); split.consumers = [binding.consumers.pop()!];
+    if (defect === "missing") delete split.producer.codeRef;
+    if (defect === "foreign") split.producer.codeRef!.path = "foreign.ts";
+    if (defect === "distinct") split.producer.codeRef = clone(producer.code[1]!);
+    connector.bindings.push(split);
+    const view = upper(graph, 3), horizon = allScope(view, 3);
+    const obligations = delivered(frameObligations(view, horizon, 3));
+    const fills: ConnectionFrame["fills"] = explicitFills(graph, view, obligations, 3)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) }));
+    const frame = storedFrame(graph, 3, fills); frame.worksContract = WORKS_FRAME_CONTRACT;
+    const basis = accepted(graph, frame);
+    refusedAs(fillObligations(view, horizon, basis, upperRef, 3), "frame_record_invalid");
+    const obligation = obligations.find(item => item.connector === connector.id && item.role === "producer"
+      && item.upper.port === "out")!;
+    const fill = fills.find(row => row.obligation === obligation.id)!;
+    refusedAs(recordedWorkFillCode(view, basis, obligation, fill), "works_code_missing");
+  }
 });
 
 test("C2 carry preserves renamed cross-flow correspondence and retires incompatible whole flows independently of open outcomes", () => {
@@ -644,23 +701,39 @@ test("a disclosed producer in one flow cannot stand in for an undisclosed produc
   for (const level of levels) {
     const graph = gardenGraph(), kind = level === 2 ? "block" : "operation";
     const later = `garden-later-${kind}`, consumer = `garden-consume-${kind}`;
+    const lower = level === 2 ? "garden-later-operation" : "w-garden-later-operation";
+    const lowerConsumer = level === 2 ? "garden-consume-operation" : "garden-consume-work";
     graph.nodes.find(item => item.id === later)!.ports.push({ id: "out-second", direction: "out", contract: "garden-contract" });
+    graph.nodes.find(item => item.id === lower)!.ports.push({ id: "out-second", direction: "out", contract: "garden-contract" });
     graph.connectors.find(item => item.id === "garden-flow")!.bindings.push({
       level: level === 2 ? 1 : 2, producer: { node: later, port: "out-second" },
       consumers: [{ node: consumer, port: "in" }], anchor: null,
+    }, {
+      level, producer: { node: lower, port: "out-second" },
+      consumers: [{ node: lowerConsumer, port: "in" }], anchor: null,
     });
-    const view = upper(graph, level);
-    const missingNode = level === 2 ? "garden-later-operation" : "w-garden-later-operation";
-    graph.nodes = graph.nodes.filter(item => item.id !== missingNode && item.parent !== missingNode);
-    for (const connector of graph.connectors) {
-      connector.bindings = connector.bindings.filter(item => item.producer.node !== missingNode);
-      for (const binding of connector.bindings) binding.consumers = binding.consumers.filter(item => item.node !== missingNode);
-      connector.bindings = connector.bindings.filter(item => item.consumers.length > 0);
+    if (level === 3) {
+      markedWorks(graph);
+      for (const binding of graph.connectors.flatMap(item => item.bindings).filter(item => item.level === 3)) {
+        if (binding.producer.node === lower) delete binding.producer.codeRef;
+        for (const endpoint of binding.consumers.filter(item => item.node === lower)) delete endpoint.codeRef;
+      }
     }
-    const refusal = refusedAs(fillObligations(view, scope([consumer]), null, upperRef, level), "horizon_producer_unrefined");
-    // Without an accepted lower graph every outside producer is unrefined; the refusal names the first sorted obligation.
-    const required = delivered(frameObligations(view, scope([consumer]), level)).find(item =>
-      item.connector === "garden-flow" && item.role === "producer" && item.zone === "outside")!;
+    const view = upper(graph, level), horizon = scope([consumer]);
+    const obligations = delivered(frameObligations(view, horizon, level));
+    const fills: ConnectionFrame["fills"] = explicitFills(graph, view, obligations, level)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) }));
+    const required = obligations.find(item => item.connector === "garden-flow" && item.role === "producer"
+      && item.upper.node === later)!;
+    assert.ok(fills.some(fill => fill.obligation === required.id && fill.node === lower));
+    // The recorded frame discloses the lower node only as an identity representative of `later`:
+    // its presence in one flow never produces the undisclosed producer of the other.
+    for (const fill of fills.filter(row => row.node === lower)) {
+      fill.source = "identity"; delete fill.codeRef;
+    }
+    const frame = storedFrame(graph, level, fills);
+    if (level === 3) frame.worksContract = WORKS_FRAME_CONTRACT;
+    const refusal = refusedAs(fillObligations(view, horizon, accepted(graph, frame), upperRef, level), "horizon_producer_unrefined");
     assert.equal(refusal.at.target, required.id);
     assert.equal(refusal.route, "readiness");
   }
@@ -699,6 +772,28 @@ test("frame boundaries reject absent sets, foreign correspondence, reserved iden
   assert.deepEqual([...FRAME_REFUSAL_CODES].sort(), ["frame_request_invalid", "upper_binding_ambiguous", "accepted_binding_ambiguous",
     "frame_upper_drift", "frame_layer_drift", "frame_record_invalid", "horizon_producer_unrefined", "representative_id_conflict",
     "frame_basis_unproven", "input_stale", "works_code_missing", "works_code_foreign"].sort());
+});
+
+test("a node named like a reserved identity representative is refused when a rebased open obligation resolves it", () => {
+  const original = gardenGraph(), before = upper(original, 3), horizon = scope(["garden-consume-operation"]);
+  markedWorks(original);
+  const obligations = delivered(frameObligations(before, horizon, 3));
+  const fills: ConnectionFrame["fills"] = explicitFills(original, before, obligations, 3)
+    .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(original) }));
+  // The renamed consumer port retires `garden-later-operation`'s recorded fill; the leftover representative node
+  // still present in the accepted graph must not silently absorb the reopened obligation's reserved identity.
+  const changed = clone(original), reserved = representativeId("garden-later-operation", 3);
+  changed.nodes.find(node => node.id === "garden-later-operation")!.ports.find(port => port.id === "in")!.id = "in-renamed";
+  changed.connectors.find(item => item.id === "garden-flow")!.bindings.find(item => item.level === 2)!
+    .consumers.find(item => item.node === "garden-later-operation")!.port = "in-renamed";
+  const leftover = clone(original.nodes.find(node => node.id === "w-garden-later-operation")!);
+  leftover.id = reserved; leftover.parent = "garden-later-operation";
+  changed.nodes.push(leftover);
+  const previous = { obligations: [...obligations], fills, worksContract: WORKS_FRAME_CONTRACT };
+  const refusal = refusedAs(carryFrameFills(upper(changed, 3), horizon, { graph: changed, reference: actualGraphRef(changed) },
+    previous, upperRef, 3), "representative_id_conflict");
+  assert.equal(refusal.at.target, reserved);
+  assert.equal(refusal.at.field, "id");
 });
 
 function acceptedInput(store: Store) {

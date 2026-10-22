@@ -373,7 +373,7 @@ function gateAgainst(result: GapCollection, fresh: Sealed<GapCollection>, source
 
 function requireStore(store: Store): void { if (!(store instanceof Store)) invalid('store'); }
 function unavailableWorks(value: WorksSourceRequest): value is UnavailableWorksSource { return 'state' in value; }
-function requireRequest(value: unknown): asserts value is GapRequest {
+function requireRequest(value: unknown, historical = false): asserts value is GapRequest {
   if (!object(value) || !text(value.project) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(value.project)) invalid('request');
   for (const field of ['input', 'graph', 'horizon']) if (!isRef(value[field])) invalid(field);
   for (const field of ['operations', 'works']) {
@@ -388,7 +388,7 @@ function requireRequest(value: unknown): asserts value is GapRequest {
     if (!text(frame.project) || ![2, 3].includes(frame.level) || !isRef(frame.graph) || !isRef(frame.horizon)
       || (frame.frame !== null && !isRef(frame.frame)) || (frame.layer !== null && !isRef(frame.layer))
       || (frame.level === 2 ? frame.upper !== null : !object(frame.upper) || !isRef(frame.upper.horizon)
-        || !isRef(frame.upper.frame))) invalid(field);
+        || (historical ? frame.upper.frame !== null && !isRef(frame.upper.frame) : !isRef(frame.upper.frame)))) invalid(field);
   }
 }
 function normalizedRequest(request: GapRequest): GapRequest {
@@ -483,7 +483,7 @@ export function writeGaps(store: Store, request: GapRequest): OmResult<Sealed<Ga
 export function readGaps(store: Store, request: GapReadRequest): OmResult<Sealed<GapRecords>> {
   requireStore(store);
   if (!object(request) || !Array.isArray(request.records) || !request.records.every(isRef)) invalid('records');
-  requireRequest(request.sources); request = copy(request);
+  requireRequest(request.sources, true); request = copy(request);
   return outcome(() => historicalProof(store, { reader: 'D1.readGaps', project: request.sources.project, ref: request.sources.input,
     parameters: { sources: normalizedRequest(request.sources), records: sorted(request.records) } as unknown as Json },
   store => deriveGapRecords(store, request),

@@ -796,4 +796,15 @@ test('D7 transfer entry points reject missing malformed and foreign arguments be
   }
   for (const from of [null, [], {}, { producer: ref, ledger: ref }, { ...input.from, assignment: null }, { ...input.from, producer: { ...ref, revision: 0 } }])
     assert.throws(() => prepareObligationTransfer(view, { ...input, from } as unknown as ObligationTransferRequest), malformed);
+  const operationsFrame = { project: 'garden', level: 2, graph: ref, horizon: ref, layer: ref, frame: ref, upper: null };
+  const worksFrame = { project: 'garden', level: 3, graph: ref, horizon: ref, layer: ref, frame: ref, upper: { horizon: ref, frame: ref } };
+  const sources = { project: 'garden', input: ref, graph: ref, horizon: ref, operations: { proposals: [], frame: operationsFrame },
+    works: { proposals: [], frame: worksFrame } };
+  for (const upper of [{ horizon: ref, frame: null }, { horizon: ref }]) {
+    const request = { ...input, context: { gaps: { sources: { ...sources, works: { proposals: [], frame: { ...worksFrame, upper } } },
+      records: [] }, lines: ref } };
+    const refusal = thrownWith(() => prepareObligationTransfer(view, request as unknown as ObligationTransferRequest),
+      'obligation_request_invalid');
+    assert.deepEqual(refusal.details, { unit: 'D7', target: 'om-obligations', field: 'transfer.sources.frame' });
+  }
 });

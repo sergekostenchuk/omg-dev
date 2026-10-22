@@ -160,6 +160,39 @@ test("S1 D1 shares the full historical set only inside one operation and keeps c
   assert.ok(recordsRead > outside, "a new external operation reads exact gap history again");
 });
 
+test("D1 cold-reads a set saved before the explicit upper frame while new work requires it", async t => {
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
+  const saved = delivered(writeGaps(f.store, currentRequest(f)));
+  // A set written by the previous era: its works frame named the accepted upper horizon without an accepted frame.
+  const sources = clone(saved.sources) as GapRequest;
+  (sources.works as ProposalRequest).frame.upper!.frame = null;
+  const records = saved.records.map(row => f.store.write({ id: `${row.id}:previous-era`, kind: row.kind,
+    expected: 0, value: { ...clone(row.value), sources } }));
+  const request: GapReadRequest = { sources, records: records.map(reference) };
+  const before = revisions(f.store);
+  const historical = delivered(readGaps(f.store, request));
+  assert.deepEqual(historical.records.map(row => row.id), records.map(row => row.id));
+  assert.deepEqual(historical.collection.gaps, saved.collection.gaps);
+  assert.deepEqual(revisions(f.store), before);
+});
+
+test("D1 rejects new work whose works frame names no accepted upper frame", async t => {
+  const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
+  const saved = delivered(writeGaps(f.store, currentRequest(f)));
+  const sources = clone(saved.sources) as GapRequest;
+  (sources.works as ProposalRequest).frame.upper!.frame = null;
+  const records = saved.records.map(row => f.store.write({ id: `${row.id}:strict-era`, kind: row.kind,
+    expected: 0, value: { ...clone(row.value), sources } }));
+  const before = revisions(f.store), invalid = (error: unknown): boolean => {
+    assert.ok(error instanceof EngineError); assert.equal(error.code, "gap_request_invalid");
+    assert.deepEqual(error.details, { unit: "G4", target: "gaps", field: "works" }); return true;
+  };
+  assert.throws(() => prepareGaps(f.store, sources), invalid);
+  assert.throws(() => writeGaps(f.store, sources), invalid);
+  assert.throws(() => prepareCurrentGaps(f.store, { sources, records: records.map(reference) }), invalid);
+  assert.deepEqual(revisions(f.store), before);
+});
+
 test("S1 D1 separates semantic Store views and never caches a failed historical read", { todo: "NR1 №3591: записанное не перепроверяется при чтении — проверка была у производителя при записи" }, async t => {
   const f = await createOmFixture(t), saved = delivered(writeGaps(f.store, nativeRequest(f)));
   const request: GapReadRequest = { sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) };
