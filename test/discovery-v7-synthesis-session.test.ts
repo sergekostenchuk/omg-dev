@@ -7,7 +7,8 @@ import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/
 import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
 import { findUnfinishedSynthesisSession, findUnfinishedSynthesisSessionV3, readSynthesisSessionV3,
   synthesisSession } from "../src/discovery/synthesis-session.js";
-import { exactContextLookup, projectSynthesisSessionV3Initial, projectSynthesisTransition, turnAction } from "../src/discovery/research-consumer-transition.js";
+import { exactContextLookup, managedTurnId, projectPaidTurnAdmission, projectResearchTurnRevision,
+  projectSynthesisSessionV3Initial, projectSynthesisTransition, turnAction } from "../src/discovery/research-consumer-transition.js";
 import { addContextLookup, contextWorkspace, packContextWorkspace } from "../src/discovery/context-workspace.js";
 import { readReaderResultAt } from "../src/discovery/reader.js";
 import { pilotEnvironment, readerPilot } from "../src/discovery/reader-pilot.js";
@@ -20,8 +21,12 @@ import { recoverContextSession } from "../src/discovery/context-recovery.js";
 import { questionDispatchId } from "../src/discovery/v7-managed-attempt.js";
 import type { Write } from "../src/storage/store.js";
 import { Researcher } from "../src/discovery/research-runner.js";
-import { prepareResearchConsumerIntent, readResearchConsumerExecution, recoverResearchResponse,
-  subjectContextRecordHolds } from "../src/discovery/response-recovery.js";
+import { prepareResearchConsumerIntent, prepareResearchConsumerApplication, readResearchConsumerExecution,
+  recoverResearchResponse, subjectContextRecordHolds, contextRecordValue,
+  prepareResearchConsumerReservation } from "../src/discovery/response-recovery.js";
+import { REQUEST_MANIFEST_CONTRACT } from "../src/discovery/request-parts.js";
+import { processStart } from "../src/runtime/process-identity.js";
+import type { ResearchRun } from "../src/discovery/research-model.js";
 import { addressedWorkspace, workingSelections } from "../src/discovery/research-continuation.js";
 import { PLANNING_INSTRUCTION } from "../src/discovery/reading-plan.js";
 import { digest, hashJson } from "../src/canonical.js";
@@ -695,6 +700,165 @@ test("S5-03 writer ≡ reader on the inherited runner prefix: A's session inheri
   assert.deepEqual(f.store.get<any>(session.id, 1)!.value.delivery, delivery);
   const head = f.store.get<any>(session.id)!;
   assert.deepEqual(readSynthesisSessionV3(f.open(), reference(head)), head, "the chain reader proves the same prefix and reservation");
+});
+
+test("S5-03 runner-prefix packet contract: a delivered packet without its research-delivery/v1 contract — missing or foreign — is refused before any record or call; a packet-free paid turn inherits", async t => {
+  // Paid analyst read_context turns on a hand-made run. A lawful turn carries
+  // no delivered packet (packet === null keeps the door); the corrupted turn's
+  // whole physical chain is fabricated by hand — a packet without or with a
+  // foreign deliveryContract in its own self-consistent previous-era form.
+  const produce = async (f: Paid, run: Revision<ResearchRun>, corrupt: "delete" | "foreign" | null) => {
+    const subject = subjectOf(f.p.planAnswer, "q-supply");
+    const draft = f.store.get<DiscoveryDraft>(f.p.draft.id)!, plan = f.store.get<Question>(f.p.plan.id)!;
+    const head = f.store.get<any>(run.id)!, number = head.value.turns + 1;
+    const context: Record<string, any> = { role: "research", stage: "discovery", subject, history: [], readings: [] };
+    const intent = prepareResearchConsumerIntent(f.store, { projectId: f.p.project, kind: "analyst",
+      key: hashJson([run.id, number, "analyst"]), owner: reference(head), draft: reference(draft),
+      question: reference(plan), role: f.p.environment.value.implementer, dispatch: f.p.environment.value, profile: null,
+      cursor: { run: run.id, turn: number, instruction: "Research the exact plan question", context, subject },
+      basis: draft.value.inputs,
+      guards: uniqueTransactionGuards([reference(head), reference(draft), reference(plan), reference(f.p.environment)]) });
+    let response: Record<string, any>;
+    if (corrupt !== null) {
+      // The packet is digest-bound through its request wire, so a packet with a
+      // missing or foreign contract can only exist as a record written in its
+      // own consistent form — the whole physical chain is fabricated by hand
+      // with exactly that one field absent or foreign.
+      const requestId = `fabricated-${corrupt}-${hashJson([run.id, number]).slice(0, 12)}`;
+      const archive = f.store.write<any>({ id: `research-context:${requestId}`, kind: "research-context", expected: 0,
+        value: { projectId: f.p.project, draft: reference(draft), question: reference(plan),
+          body: { resultCapacity: intent.value.cursor.resultCapacity } } });
+      const wireSubject = { role: "research", stage: "discovery", subject, history: [], readings: [],
+        resultCapacity: intent.value.cursor.resultCapacity,
+        contextWorkspace: [exactContextLookup(f.store, draft, plan,
+          reference(draft), "/fields/plan", undefined, () => {})],
+        working: { archive: reference(archive), instruction: "A previous-era delivery packet",
+          ...(corrupt === "foreign" ? { deliveryContract: "research-delivery/v0" } : {}) } };
+      const role = f.p.environment.value.implementer;
+      const requestText = JSON.stringify({ protocol: "omg-agent/v1", requestId, mode: "research",
+        model: role.model, effort: role.effort, ...(role.speed !== undefined ? { speed: role.speed } : {}),
+        subject: wireSubject, prompt: intent.value.cursor.resultCapacityPrompt });
+      const request = f.store.write<any>({ id: `model-request:${requestId}`, kind: "model-request", expected: 0,
+        value: { projectId: f.p.project, draftId: draft.id, text: requestText } });
+      const pid = process.pid, started = processStart(pid)!;
+      const claimWrite = { id: `model-call:consumer:v1:${requestId}`, kind: "model-call" as const, expected: 0,
+        value: { projectId: f.p.project, draftId: draft.id, questionId: "q-supply",
+          planAnswer: subject.planAnswer, purpose: "analyst", requestId, requested: intent.value.role,
+          profile: intent.value.profile, status: "running", startedAt: 1, finishedAt: null, error: null,
+          confirmed: { model: null, effort: null, speed: null }, usage: null, usageSource: "unavailable",
+          request: { record: reference(request), hash: digest(requestText), chars: requestText.length,
+            bytes: Buffer.byteLength(requestText) },
+          response: null, packet: { archive: reference(archive) }, consumerIntent: reference(intent),
+          execution: { version: "model-execution/v1", phase: "claimed", owner: { pid, started }, provider: null },
+          ownerProcess: { pid, started } } };
+      const reservation = prepareResearchConsumerReservation(f.store, reference(intent), claimWrite,
+        reference(request), reference(archive));
+      f.store.writeMany([claimWrite, ...reservation.writes], reservation.guards);
+      const claimed = f.store.get<any>(claimWrite.id)!;
+      const dispatched = f.store.write<any>({ id: claimed.id, kind: "model-call", expected: claimed.revision,
+        value: { ...claimed.value,
+          execution: { version: "model-execution/v1", phase: "authorized", owner: { pid, started },
+            provider: { pid, started, group: null } },
+          providerProcess: { pid, started } } });
+      const research = { action: "read_context", record: reference(draft), pointer: "/fields/plan" };
+      const usage = { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0 };
+      const responseText = JSON.stringify({ protocol: "omg-agent/v1", requestId, research, usage });
+      const reply = f.store.write<any>({ id: `model-response:${requestId}`, kind: "model-response", expected: 0,
+        value: { projectId: f.p.project, draftId: draft.id, text: responseText,
+          consumerExecution: { contract: "research-consumer-execution/v1", call: reference(claimed),
+            dispatch: reference(dispatched), process: { exitCode: 0, signal: null, stderr: "" } } } });
+      f.store.write<any>({ id: claimed.id, kind: "model-call", expected: dispatched.revision,
+        value: { ...dispatched.value, status: "succeeded", finishedAt: 2, error: null,
+          confirmed: { model: null, effort: null, speed: null }, usage, usageSource: "adapter",
+          response: { record: reference(reply), chars: responseText.length,
+            bytes: Buffer.byteLength(responseText) } } });
+      response = research;
+    } else {
+      f.configure([...Array(f.calls()).fill(null),
+        { action: "read_context", record: reference(draft), pointer: "/fields/plan" }]);
+      response = await researchCall(f.p.environment.value.implementer, f.p.environment.value,
+        "Research the exact plan question", context, undefined,
+        { store: f.store, draftId: draft.id, questionId: plan.id, purpose: "analyst", consumerIntent: reference(intent),
+          requestContract: REQUEST_MANIFEST_CONTRACT }) as Record<string, any>;
+    }
+    const savedIntent = f.store.get<any>(intent.id)!;
+    const execution = readResearchConsumerExecution(f.store, f.p.project, reference(savedIntent));
+    assert.equal(execution.kind, "response");
+    const projected = projectPaidTurnAdmission(head.value, { runId: run.id, intent: reference(intent), response,
+      question: reference(plan), owner: head.value.owner, limit: 100, context, subject });
+    const turnId = managedTurnId(run.id, number);
+    const application = prepareResearchConsumerApplication(f.store, reference(savedIntent), reference(execution.call),
+      [{ id: run.id, kind: run.kind, expected: head.revision, value: projected.run },
+        { id: turnId, kind: "research-turn", expected: 0, value: projected.turn }],
+      [reference(head), reference(f.p.environment), { id: turnId, absent: true }]);
+    f.store.writeMany(application.writes, application.guards);
+    // A mid-attempt paid step completes by its own read-context proof —
+    // no attempt record is written for it.
+    const pending = f.store.get<any>(turnId)!, step = turnAction(pending.value) as any;
+    assert.equal(step.action, "read_context", "the produced turn is an addressed context read");
+    const exact = f.store.get<any>(step.record.id, step.record.revision)!;
+    const completed = projectResearchTurnRevision(pending.value,
+      { kind: "read-context", recordValue: contextRecordValue(f.store, exact), record: step.record,
+        maxChars: f.p.pilot.value.maxRequestChars ?? 300000 });
+    f.store.write({ id: turnId, kind: "research-turn", expected: pending.revision, value: completed });
+    return f.store.get<any>(turnId)!;
+  };
+  const startRun = (f: Paid) => f.store.write<ResearchRun>({ id: `research-run:${hashJson([f.p.project, f.p.draft.id, "packet-contract"])}`,
+    kind: "research-run", expected: 0,
+    value: { projectId: f.p.project, draftId: f.p.draft.id, environment: reference(f.p.environment), turns: 0, limit: 100,
+      requestChars: 0, owner: { pid: process.pid, started: processStart(process.pid)! }, ownerQuestion: null,
+      error: null, pauseCode: null, status: "running", inputs: f.p.draft.value.inputs } });
+  const prefix = (f: Paid, run: Revision<ResearchRun>) => {
+    const turns = f.store.list<any>("research-turn").filter(row => row.value.run === run.id)
+      .sort((a, b) => a.value.number - b.value.number);
+    const packetFor = (row: Revision<any>) => {
+      const paid = readResearchConsumerExecution(f.store, f.p.project, row.value.consumerIntent);
+      return paid.kind === "response" && Array.isArray((paid.subject as any)?.contextWorkspace)
+        ? paid.subject : null;
+    };
+    return addressedWorkspace(f.store, turns, f.p.plan, packetFor, subjectOf(f.p.planAnswer, "q-supply"));
+  };
+  const enter = (f: Paid, run: Revision<ResearchRun>, own: ReturnType<typeof prefix>) => {
+    const head = f.store.get<any>(run.id)!;
+    const delivery = { run: run.id, turn: head.value.turns + 1 };
+    const reserve = () => { const current = f.store.get<any>(run.id)!;
+      return { write: { id: current.id, kind: current.kind, expected: current.revision,
+        value: { ...current.value, turns: current.value.turns + 1 } }, guards: [reference(current)] }; };
+    return synthesisSession(f.store, f.p.draft, f.p.plan, f.p.environment, f.p.dispatch, f.p.pilot,
+      { ...contextOf(subjectOf(f.p.planAnswer, "q-supply")), workingSelections: [] },
+      "Synthesize the exact plan-question", undefined, { delivery, reserve: reserve(), initialWorkspace: own });
+  };
+  // Positive: a packet-free paid prefix inherits; the session's first record
+  // carries exactly the folded runner workspace.
+  {
+    const f = await paidPlanned(t, "s5r2-packet-free");
+    const run = startRun(f);
+    await produce(f, run, null);
+    const own = prefix(f, run);
+    assert.equal(own.entries.length, 1, "the read_context turn folds its entry");
+    assert.equal(await code(() => enter(f, run, own)), "no-error", "the packet-free prefix inherits");
+    const session = sessionOf(f.store, "q-supply");
+    assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
+    const head = f.store.get<any>(session.id)!;
+    assert.deepEqual(readSynthesisSessionV3(f.open(), reference(head)), head, "the chain reader proves the same prefix");
+  }
+  // Negative packet only: the saved packet names no or a foreign contract;
+  // the refusal fires at the packet check itself — every wire digest is exact.
+  for (const corrupt of ["delete", "foreign"] as const) {
+    const f = await paidPlanned(t, `s5r2-packet-${corrupt === "delete" ? "missing" : "foreign"}`);
+    const run = startRun(f);
+    await produce(f, run, null);
+    const turn = await produce(f, run, corrupt);
+    const paid = readResearchConsumerExecution(f.store, f.p.project, turn.value.consumerIntent);
+    assert.equal(paid.kind, "response");
+    assert.ok(paid.kind === "response" && Array.isArray(paid.subject.contextWorkspace),
+      "the produced packet carries its delivered set");
+    const before = history(f.store), calls = f.calls();
+    assert.equal(await code(() => enter(f, run, prefix(f, run))), "synthesis_session_invalid",
+      corrupt === "delete" ? "a packet without its contract is no delivery" : "a foreign contract is no delivery");
+    assert.deepEqual(history(f.store), before, "the refusal wrote nothing");
+    assert.equal(f.calls(), calls, "and paid nothing");
+  }
 });
 
 test("S5-04 an order of unfinished v3 sessions is proven by reserved positions of one run: a second session on the same proven position is ambiguous, an unreserved position is refused before any record and an unknown run is no session", async t => {

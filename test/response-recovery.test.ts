@@ -146,12 +146,18 @@ test('the same operator mechanism reprocesses an assessor response through norma
   assert.equal(f.store.get<Question>(f.question.id)!.value.status, 'open');
 });
 
-test('changed notes, workspace or archived materials cannot be applied to an unchanged cursor', async t => {
+test('changed notes, session workspace or archived materials cannot be applied to an unchanged cursor', async t => {
   for (const field of ['notes', 'focus'] as const) {
-    const f = fixture(t); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
-    const changed = f.store.write({ id: session.id, kind: session.kind, expected: session.revision, value: { ...session.value,
+    const f = fixture(t); const call = await interruptCheckpoint(f), head = f.store.list<any>('synthesis-session')[0]!;
+    const intent = f.store.list<any>('research-consumer-intent')[0]!;
+    const ownerSession = f.store.get<any>(intent.value.owner.id, intent.value.owner.revision)!;
+    f.store.write({ id: head.id, kind: head.kind, expected: head.revision, value: { ...head.value,
       [field]: field === 'notes' ? [{ proposal: 'different findings' }] : f.context.workingSelections[0]!.value } });
-    await assert.rejects(f.recover(call, changed), { code: 'response_recovery_session_stale' });
+    const mutated = f.store.list();
+    // The exact paid owner is named, so the mutated head must fail the cursor
+    // content check itself — not the foreign-session guard.
+    await assert.rejects(f.recover(call, ownerSession), { code: 'response_recovery_cursor_stale' });
+    assert.deepEqual(f.store.list(), mutated, 'the typed refusal leaves the mutated snapshot untouched');
     assert.equal(f.store.list('model-call').length, 1); assert.equal(f.store.list('research-response-recovery').length, 0);
   }
   const f = fixture(t); const call = await interruptCheckpoint(f), archive = f.store.get<any>(call.value.packet!.archive.id)!;
@@ -169,15 +175,21 @@ test('changed notes, workspace or archived materials cannot be applied to an unc
 
 test('a concurrent dispatch in the receipt write window cannot advance the recovered session', async t => {
   const f = fixture(t); const call = await interruptCheckpoint(f), session = f.store.list<any>('synthesis-session')[0]!;
+  const counter = f.store.list<any>('question-dispatch')[0]!, before = f.store.list();
   const original = f.store.writeMany.bind(f.store); let injected = false;
   f.store.writeMany = ((writes: any[], guards: any[] = []) => {
     if (!injected && writes.some(write => write.kind === 'research-response-recovery')) {
-      injected = true; const counter = f.store.list<any>('question-dispatch')[0]!;
+      injected = true;
       original([{ id: counter.id, kind: counter.kind, expected: counter.revision, value: { ...counter.value, serial: counter.value.serial + 1 } }]);
     }
     return original(writes, guards);
   }) as typeof f.store.writeMany;
   await assert.rejects(f.recover(call, session), { code: 'response_recovery_boundary' }); f.store.writeMany = original;
+  assert.ok(injected, 'the concurrent write actually fired inside the receipt window');
+  const after = f.store.list();
+  assert.deepEqual(after.filter(row => row.id !== counter.id), before.filter(row => row.id !== counter.id),
+    'the refused recovery leaves the full snapshot unchanged except the concurrent write');
+  assert.equal((after.find(row => row.id === counter.id)!.value as any).serial, counter.value.serial + 1);
   assert.deepEqual(f.store.get(session.id), session); assert.equal(f.store.list('research-response-recovery').length, 0);
   const recovered = await f.recover(call, session);
   assert.equal(recovered.value.state, 'applied'); assert.equal(f.store.list('model-call').length, 1);
