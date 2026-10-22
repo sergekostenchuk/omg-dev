@@ -1113,14 +1113,18 @@ class RacingStore extends Store {
 
 test("a dispatch or ledger head changed in the check/write window refuses the whole transaction (T7)", async t => {
   // The managed admission reads the dispatch several times before it writes, so this race commits just before the guarded write.
+  // Every segment compares the whole store with the snapshot right after the winner: a managed E1 also writes the E4 ownership.
+  let won: Ref[] = [];
   let f = ordinary(t, "race-admit", MechanismCommitRaceStore);
   (f.store as MechanismCommitRaceStore).race = other => {
     other.write({ id: f.config.id, kind: f.config.kind, expected: f.config.revision, value: { changed: "between" } });
+    won = fullSnapshot(other);
   };
   const staleDispatch = addressed(recordCall(f.store, PROJECT, lawful(f)), "input_stale");
   assert.deepEqual(staleDispatch.at.ref, reference(f.config));
   assert.equal(lawfulCall(f), null);
   assert.equal(heldLedger(f), null);
+  assert.deepEqual(fullSnapshot(f.store), won, "the losing admission wrote nothing beside the winner's records");
 
   f = ordinary(t, "race-settle", RacingStore);
   let store = f.store as RacingStore;
@@ -1130,9 +1134,11 @@ test("a dispatch or ledger head changed in the check/write window refuses the wh
   store.remaining = 1;
   store.run = other => {
     other.write({ id: ledger.id, kind: ledger.kind, expected: ledger.revision, value: ledger.value });
+    won = fullSnapshot(other);
   };
   const staleLedger = addressed(settleCall(store, reference(admitted.call), usage, "succeeded"), "input_stale");
   assert.deepEqual(staleLedger.at.ref, reference(ledger));
+  assert.deepEqual(fullSnapshot(store), won, "the losing settlement wrote nothing beside the winner's records");
   assert.equal(lawfulCall(f)!.value.status, "open");
   assert.equal(lawfulCall(f)!.revision, 1);
   assert.equal(heldLedger(f)!.revision, 2);
@@ -1148,9 +1154,11 @@ test("a dispatch or ledger head changed in the check/write window refuses the wh
       project: PROJECT, block: s.block, line: 1, stop: 3,
       ground: "review-record", text: "the independent review named an addressed change", review: { ref: review },
     }));
+    won = fullSnapshot(other);
   };
   const staleStop = addressed(recordCall(store, PROJECT, stopRequest(s, { call: "race-stop-analysis" })), "input_stale");
   assert.deepEqual(staleStop.at.ref, reference(s.series));
+  assert.deepEqual(fullSnapshot(store), won, "the losing analysis wrote nothing beside the winner's records");
   assert.equal(heldCall(s, "race-stop-analysis"), null);
   assert.deepEqual(reference(heldLedger(s)!), reference(s.paid.ledger));
 
@@ -1844,18 +1852,22 @@ test("block successor and call admission serialize both orders without partial a
       basis: { ground: "inputs-changed" as const, text: "Added a question to the block horizon" } };
     let saved: ReturnType<typeof recordCall> | null = null;
     if (successorFirst) {
-      store.race = other => { deliveredOf(openSeries(other, successorRequest)); };
+      let won: Ref[] = [];
+      store.race = other => { deliveredOf(openSeries(other, successorRequest)); won = fullSnapshot(other); };
       const before = accountingSnapshot(store);
       assert.equal(refusalOf(recordCall(store, PROJECT, input)).code, "input_stale");
       assert.deepEqual(accountingSnapshot(store), before, "Successor winning immediately before call write leaves neither call nor ledger");
+      assert.deepEqual(fullSnapshot(store), won, "The losing admission wrote nothing beside the successor's records");
     } else {
       saved = recordCall(store, PROJECT, input);
       const admitted = deliveredOf(saved), launch = deliveredOf(prepareCallDispatch(store, PROJECT, reference(admitted.call)));
       deliveredOf(openSeries(store, successorRequest));
+      const afterSuccessor = fullSnapshot(store);
       assert.equal(refusalOf(writeGuarded(store, { unit: "E4-test", target: "launch:old-line",
         writes: [{ id: "launch:old-line", kind: "launch", expected: 0, value: {} }], guards: launch.guards })).code, "input_stale");
       assert.equal(store.get("launch:old-line"), null);
       addressed(prepareCallDispatch(store, PROJECT, reference(admitted.call)), "call_series_unresolved");
+      assert.deepEqual(fullSnapshot(store), afterSuccessor, "The refused launch and dispatch wrote nothing after the successor");
     }
     const claimed = store.get<RepairSeries>(stopped.id)!, successor = store.get<RepairSeries>(seriesId(PROJECT, s.block, 2))!;
     assert.equal(claimed.revision, stopped.revision + 1);
@@ -2305,9 +2317,18 @@ test('MP1 E1 measures the sent Cyrillic/non-BMP text while binding the complete 
   const saved = deliveredOf(recordCall(f.store, f.project, input)).call;
   assert.deepEqual(saved.value.packet, { hash: hashJson(packet), chars: text.length, bytes: Buffer.byteLength(text, 'utf8') });
   assert.deepEqual(deliveredOf(recordCall(f.store, f.project, input)).call, saved);
+  const before = f.store.list().map(reference);
+  // A semantic part of the packet other than the sent text changes: the brief, its text, and so its chars and bytes, stand; only
+  // the full packet hash moves. Measuring the text alone would admit it; the identity of the call name binds the whole packet.
+  const semantic = { ...packet, task: `${String(packet.task)} (foreign)` } as Record<string, any>;
+  assert.equal(semantic.brief.text, text);
+  assert.deepEqual([semantic.brief.text.length, Buffer.byteLength(semantic.brief.text, 'utf8')], [saved.value.packet.chars, saved.value.packet.bytes]);
+  assert.notEqual(hashJson(semantic as Json), saved.value.packet.hash);
+  addressed(recordCall(f.store, f.project, { ...input, packet: semantic as Json }), 'call_identity_conflict');
+  assert.deepEqual(f.store.list().map(reference), before);
+  // And the sent text itself changing moves hash, chars and bytes together.
   const other = { ...packet, brief: { ...packet.brief, text: `${text} (foreign)` } } as Json;
   assert.notEqual(hashJson(packet), hashJson(other));
-  const before = f.store.list().map(reference);
   addressed(recordCall(f.store, f.project, { ...input, packet: other }), 'call_identity_conflict');
   assert.deepEqual(f.store.list().map(reference), before);
   for (const field of ['text', 'labels', 'manifest', 'references', 'contract', 'requestId']) {
