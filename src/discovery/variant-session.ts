@@ -75,24 +75,23 @@ export function prepareVariantSession(store:Store,input:VariantSessionInput):{
   const mode=store.get<Record<string,unknown>>(subject.mode.id,subject.mode.revision);
   if(!mode || !same(reference(mode),subject.mode) || mode.value.projectId!==input.projectId) invalid('The variant mode basis is missing or foreign');
   const id=variantExecutionSessionId(initial),existing=store.get<VariantExecutionSession>(id);
-  let session:Revision<VariantExecutionSession>;
-  if(existing) session=readVariantExecutionSession(store,input.projectId,reference(existing));
-  else {
-    const environment=exact<Environment>(store,reference(input.environment),'environment');
-    if(environment.value.projectId!==input.projectId || !same(environment.value,input.environment.value)
-      || ![environment.value.implementer,environment.value.reviewer].some(role=>same(role,input.role)))
-      invalid('The variant actor/role needs its exact project environment');
-    session=store.writeMany<VariantExecutionSession>([{id,kind:'discovery-variant-session',expected:0,value:initial}],
-      uniqueTransactionGuards([initial.draft,question,reference(environment),...variantTransportGuards(input.projectId,initial.draft.id,subject),{id,absent:true}]))[0]!;
-  }
-  const previous=findResearchConsumerIntent(store,input.projectId,initial.purpose,id,initial.draft.id);
-  if(previous) return {session,intent:readResearchConsumerIntent(store,reference(previous))};
+  let session=existing?readVariantExecutionSession(store,input.projectId,reference(existing)):null;
+  const previous=session?findResearchConsumerIntent(store,input.projectId,initial.purpose,id,initial.draft.id):null;
+  if(previous) return {session:session!,intent:readResearchConsumerIntent(store,reference(previous))};
+  // Every NEW intent needs a proven admission, including a session-only recovery.
+  // A saved intent above retains its own dispatch and role for paid recovery.
+  const environment=exact<Environment>(store,reference(input.environment),'environment');
+  if(environment.value.projectId!==input.projectId || !same(environment.value,input.environment.value)
+    || ![environment.value.implementer,environment.value.reviewer].some(role=>same(role,input.role)))
+    invalid('The variant actor/role needs its exact project environment');
+  if(!session) session=store.writeMany<VariantExecutionSession>([{id,kind:'discovery-variant-session',expected:0,value:initial}],
+    uniqueTransactionGuards([initial.draft,question,reference(environment),...variantTransportGuards(input.projectId,initial.draft.id,subject),{id,absent:true}]))[0]!;
   if(session.value.cursor!==0) invalid('A completed variant session lost its original intent');
   const context={...variantTransportFields(input.projectId,initial.draft,question,initial.purpose,initial.actor,subject),
     snapshot:snapshot.value,history:[]};
   const basis=[subject.snapshot,subject.mode,...(subject.expectedSelection?[subject.expectedSelection]:[])];
   const intent=prepareResearchConsumerIntent(store,{projectId:input.projectId,kind:initial.purpose,key:id,
-    owner:reference(session),draft:initial.draft,question,role:input.role,dispatch:input.environment.value,profile:null,
+    owner:reference(session),draft:initial.draft,question,role:input.role,dispatch:environment.value,profile:null,
     cursor:{sessionId:id,offset:0,variantSubject:subject,prompt:input.prompt,context},basis,
     guards:uniqueTransactionGuards([reference(session),initial.draft,question,reference(input.environment),
       ...variantTransportGuards(input.projectId,initial.draft.id,subject)])});

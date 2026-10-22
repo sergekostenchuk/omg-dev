@@ -15,6 +15,9 @@ import type { ResearchRun } from '../src/discovery/research-model.js';
 import { prepareResearchConsumerIntent, readResearchConsumerExecution, readResearchConsumerIntent,
   type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
+import { workingContext } from '../src/discovery/working-context.js';
+import { invocationProgress } from '../src/discovery/invocation-progress.js';
+import { readRequestWire, readArchiveBody } from '../src/discovery/request-parts.js';
 import { REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
 import { assessAttempts } from '../src/discovery/research-assessment.js';
 import { projectAttemptPacket } from '../src/discovery/v7-attempt-assessment.js';
@@ -22,7 +25,7 @@ import { applyDiscoveryAssessment, v7ProgressBaseline } from '../src/discovery/v
 import { produceVariantSnapshot } from '../src/discovery/variant-snapshot.js';
 import { prepareVariantSession, runVariantSession, applyVariantSession, readVariantExecutionSession, variantExecutionSessionId } from '../src/discovery/variant-session.js';
 import { VARIANT_SUBJECT_CONTRACT, VARIANT_CRITERIA, type VariantSubject, type VariantExecutionSession } from '../src/discovery/discovery-variants.js';
-import { variantTransportFields, variantTransportGuards } from '../src/discovery/continuation-packet.js';
+import { continuationState, continuationMetadata, variantTransportFields, variantTransportGuards } from '../src/discovery/continuation-packet.js';
 import { researchSetup, produce, rand } from './discovery-v7-fixture.js';
 
 const snapshot=(store:Store)=>store.list().flatMap(row=>store.history(row.id));
@@ -104,6 +107,106 @@ test('4T.4: a session-only cut resumes through the common preparer and buys only
   f.store.writeMany=write;
   const result=await runVariantSession(f.open(),f.input);assert.equal(result.value.cursor,1);assert.equal(f.wires().length,calls+1);
 });
+
+for(const changed of ['timeoutMs','workspace','role'] as const)
+  test(`4T4-01: session-only recovery refuses an unproven ${changed} before a new intent`,async t=>{
+    const f=await setup(t),calls=f.wires().length,write=f.store.writeMany.bind(f.store);let cut=false;
+    f.store.writeMany=((writes:Write[],guards:any[])=>{const saved=write(writes,guards);
+      if(!cut&&writes.some(w=>w.kind==='discovery-variant-session'&&w.expected===0)){
+        cut=true;throw new EngineError('fixture_cut','after real session, before intent');}return saved;}) as typeof f.store.writeMany;
+    await assert.rejects(runVariantSession(f.store,f.input),code('fixture_cut'));f.store.writeMany=write;
+    const input=changed==='role'?{...f.input,role:{...f.input.role,model:'outside-the-saved-environment'}}:
+      {...f.input,environment:{...f.environment,value:{...f.environment.value,
+        ...(changed==='timeoutMs'?{timeoutMs:f.environment.value.timeoutMs+1}:{workspace:f.root+'/unproven'})}}};
+    assert.equal(input.role.actor,f.input.role.actor);
+    assert.deepEqual(reference(input.environment),reference(f.environment));
+    const before=snapshot(f.store);
+    await assert.rejects(runVariantSession(f.open(),input),code('discovery_variant_session_invalid'));
+    assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+    const result=await runVariantSession(f.open(),f.input);
+    assert.equal(result.value.cursor,1);assert.equal(f.wires().length,calls+1);
+    const paid=readResearchConsumerExecution(f.store,'p',result.value.result!.intent);
+    assert.deepEqual(paid.intent.value.dispatch,f.environment.value);assert.deepEqual(paid.intent.value.role,f.input.role);
+    const completed=snapshot(f.store);
+    assert.deepEqual(await runVariantSession(f.open(),f.input),result);
+    assert.deepEqual(snapshot(f.store),completed);assert.equal(f.wires().length,calls+1);
+  });
+
+test('4T4-01: a saved paid intent keeps its admission despite different environment arguments',async t=>{
+  const f=await setup(t),intent=await pay(f),calls=f.wires().length;
+  const input={...f.input,environment:{...f.environment,value:{...f.environment.value,workspace:f.root+'/unused'}},
+    role:{...f.input.role,model:'unused-new-role'}};
+  const result=await runVariantSession(f.open(),input);
+  assert.deepEqual(result.value.result!.intent,reference(intent));assert.equal(f.wires().length,calls);
+  const paid=readResearchConsumerExecution(f.store,'p',result.value.result!.intent);
+  assert.deepEqual(paid.intent.value.dispatch,f.environment.value);assert.deepEqual(paid.intent.value.role,f.input.role);
+  const before=snapshot(f.store);assert.deepEqual(await runVariantSession(f.open(),input),result);
+  assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+});
+
+for(const changed of ['mode','actor'] as const)
+  test(`4T4-02: real managed packet/progress survive paid recovery and isolate another legal ${changed}`,async t=>{
+    const f=await setup(t);
+    if(changed==='actor') {
+      // Service transport calibration only; the managed positive below uses the real snapshot.
+      const cal=f.store.write({id:'transport-fixture:reviewer-calibration',kind:'transport-fixture',expected:0,value:{projectId:'p'}});
+      await researchCall(f.environment.value.reviewer,f.environment.value,'Calibrate reviewer variants',
+        {variantSubject:{...f.input.variantSubject,snapshot:reference(cal)},history:[]},undefined,
+        {store:f.store,draftId:f.calibration.draft.id,questionId:f.calibration.question.id,purpose:'variant-proposal'});
+    }
+    const prepared=prepareVariantSession(f.store,f.input),v=prepared.intent.value,calls=f.wires().length;
+    const initial=invocationProgress(f.store,v.question.id,v.kind,v.cursor.context,null,v.role.actor,null,v.cursor.variantSubject);
+    assert.equal(initial.guards.some(g=>g.id.startsWith('model-call:consumer:')),false);
+    const running=await pay(f),execution=readResearchConsumerExecution(f.store,'p',reference(running));
+    assert.equal(execution.kind,'response');if(execution.kind!=='response')return;
+    assert.ok(execution.call.id.startsWith('model-call:consumer:'));
+    const fields=variantTransportFields('p',v.draft,v.question,v.kind,v.role.actor,v.cursor.variantSubject);
+    const inspect=(store:Store)=>{
+      const state=continuationState(store,'p',v.draft.id,v.question.id,v.kind,v.role.actor,null,null,v.cursor.variantSubject);
+      const progress=invocationProgress(store,v.question.id,v.kind,v.cursor.context,null,v.role.actor,null,v.cursor.variantSubject);
+      assert.equal(state.initial,false);assert.equal(state.priorCalls,1);assert.equal(state.attempts,1);
+      assert.deepEqual(state.callGuards,[reference(execution.call)]);assert.deepEqual(state.basis,execution.archive);
+      assert.deepEqual(reference(state.draft),v.draft);assert.deepEqual(reference(state.question),v.question);
+      assert.equal(progress.key,initial.key);assert.deepEqual(progress.guards.filter(g=>g.id.startsWith('model-call:')),[reference(execution.call)]);
+      assert.equal(execution.call.value.progressKey,progress.key);
+      const wire=JSON.parse(readRequestWire(store,execution.request).text),archive=store.get<any>(execution.archive.id,execution.archive.revision)!;
+      const body=readArchiveBody(store,archive).body;
+      for(const [key,value] of Object.entries(fields)) {
+        assert.deepEqual(wire.subject[key],value);assert.deepEqual(body[key],value);
+        assert.deepEqual(wire.subject.continuation[key],value);
+      }
+      assert.deepEqual(archive.value.variantSubject,v.cursor.variantSubject);assert.deepEqual(archive.value.draft,v.draft);
+      assert.deepEqual(archive.value.question,v.question);assert.equal(archive.value.actor,v.role.actor);
+      assert.deepEqual(wire.subject.working.archive,execution.archive);
+      const packet=workingContext(store,'p',v.draft.id,v.question.id,{...v.cursor.context,resultCapacity:v.cursor.resultCapacity},
+        execution.call.value.packet!.maxChars,{common:true,continuation:true,previous:state.latest!,purpose:v.kind,actor:v.role.actor,variantSubject:v.cursor.variantSubject});
+      const metadata=continuationMetadata(state,packet.working.archive,store);
+      assert.deepEqual(metadata.foundation,execution.archive);assert.equal(metadata.previousCalls,1);
+      for(const [key,value] of Object.entries(fields))assert.deepEqual(packet[key],value);
+      return {state,progress,packet,metadata,wire,body};
+    };
+    const history=inspect(f.store),paidSnapshot=snapshot(f.store);
+    assert.deepEqual(inspect(f.open()),history);assert.deepEqual(snapshot(f.store),paidSnapshot);
+    assert.equal(f.wires().length,calls+1);
+    const result=await runVariantSession(f.open(),f.input);
+    assert.deepEqual(inspect(f.open()),history);assert.equal(f.wires().length,calls+1);
+    const otherInput=changed==='actor'?{...f.input,role:f.environment.value.reviewer}:
+      {...f.input,variantSubject:{...f.input.variantSubject,mode:reference(f.store.write({id:f.mode.id,kind:f.mode.kind,
+        expected:f.mode.revision,value:{projectId:'p',mode:'another-legal-transport-mode'}}))}};
+    const other=prepareVariantSession(f.store,otherInput),o=other.intent.value;
+    const otherState=continuationState(f.store,'p',o.draft.id,o.question.id,o.kind,o.role.actor,null,null,o.cursor.variantSubject);
+    const otherProgress=invocationProgress(f.store,o.question.id,o.kind,o.cursor.context,null,o.role.actor,null,o.cursor.variantSubject);
+    assert.equal(otherState.initial,true);assert.equal(otherState.priorCalls,0);assert.deepEqual(otherState.callGuards,[]);
+    assert.notEqual(otherState.id,history.state.id);assert.notEqual(otherProgress.key,history.progress.key);
+    assert.deepEqual(otherProgress.guards.filter(g=>g.id.startsWith('model-call:')),[]);
+    const otherResult=await runVariantSession(f.open(),otherInput);
+    const otherPaid=readResearchConsumerExecution(f.store,'p',otherResult.value.result!.intent);
+    assert.equal(otherPaid.kind,'response');assert.notEqual(otherPaid.call.id,execution.call.id);
+    assert.deepEqual(inspect(f.open()),history);assert.equal(f.wires().length,calls+2);
+    const completed=snapshot(f.store);
+    assert.deepEqual(await runVariantSession(f.open(),f.input),result);assert.deepEqual(inspect(f.open()),history);
+    assert.deepEqual(snapshot(f.store),completed);assert.equal(f.wires().length,calls+2);
+  });
 
 test('4T.4: a paid cut recovers after mode/state changed, preserving the original choice and paid basis',async t=>{
   const f=await setup(t),calls=f.wires().length,intent=await pay(f);assert.equal(f.wires().length,calls+1);
