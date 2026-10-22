@@ -1,10 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
-import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
+import { createPartialV7Draft, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
 import { Researcher } from "../src/discovery/research-runner.js";
 import { researchCall } from "../src/discovery/research-protocol.js";
 import { prepareResearchConsumerIntent, readResearchConsumerTurn } from "../src/discovery/response-recovery.js";
@@ -18,9 +15,9 @@ import { EngineError } from "../src/errors.js";
 import { hashJson, type Json } from "../src/canonical.js";
 import { reference, uniqueRefs, type Ref } from "../src/pipeline/contracts.js";
 import { uniqueTransactionGuards } from "../src/runtime/environment.js";
-import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
+import { discoveryFixture, allAxes } from "./discovery-v7-fixture.js";
 
 // DR3a3-S3 (codex-omg №7690 §3 S3; граница проверок — №8173, вариант (b)):
 // the reading queue of the v7 planner. The plan, the run and the planner
@@ -29,14 +26,8 @@ import { answerDiscoveryFixture } from "./product-fixture.js";
 // checked on in-memory values only — a projector output is never saved as a
 // paid turn. The positive queue on a lawfully paid parent is S6's (№8173).
 
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3s3-queue-"));
-  const store = new Store(join(root, "state.sqlite")), engine = new ProductEngine(store), discovery = new Discovery(store);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, store, engine, discovery };
-}
+const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-dr3a3s3-queue-");
 type Fixture = ReturnType<typeof fixture>;
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 const validFrame = (): Json => ({ productType: "internal", scale: "30 users across 10 sites",
   industries: ["construction"], domains: ["materials supply"], axes: allAxes("deep"),
   budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } });

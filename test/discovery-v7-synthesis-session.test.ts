@@ -1,10 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
-import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
+import { createPartialV7Draft, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
 import { findUnfinishedSynthesisSession, findUnfinishedSynthesisSessionV3, readSynthesisSessionV3,
   synthesisSession } from "../src/discovery/synthesis-session.js";
 import { exactContextLookup, managedTurnId, projectPaidTurnAdmission, projectResearchTurnRevision,
@@ -37,9 +36,9 @@ import type { ModelCall } from "../src/runtime/model-usage.js";
 import { EngineError } from "../src/errors.js";
 import type { Json } from "../src/canonical.js";
 import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
-import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
+import { discoveryFixture, allAxes } from "./discovery-v7-fixture.js";
 
 // DR3a3-S5, независимая часть (№8525; переносы S1→S5 №7869 и S4→S5 №8455):
 // the v3 synthesis producer of one v7 plan-question. The plan, environment
@@ -49,16 +48,8 @@ import { answerDiscoveryFixture } from "./product-fixture.js";
 // record and a prepared step intent, and the payment refuses before any
 // adapter or ledger.
 
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3s5-session-"));
-  const path = join(root, "state.sqlite"), stores: Store[] = [];
-  const open = () => { const db = new Store(path); stores.push(db); return db; };
-  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
-  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, store, engine, discovery, open };
-}
+const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-dr3a3s5-session-");
 type Fixture = ReturnType<typeof fixture>;
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 const validFrame = (): Json => ({ productType: "internal", scale: "30 users across 10 sites",
   industries: ["construction"], domains: ["materials supply"], axes: allAxes("deep"),
   budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } });

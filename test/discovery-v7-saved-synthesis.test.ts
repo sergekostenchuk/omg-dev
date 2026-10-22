@@ -1,10 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
-import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
+import { type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
+import { createPartialV7Draft, V7_STAGE_TOKEN_CEILING } from "../src/discovery/v7-contracts.js";
 import { configureV7SavedSynthesis, notesInProvenOrder, provenSubjectSessions, savedV7SynthesisMaterials, selectSavedCheckpointsV2,
   savedSynthesisMaterials } from "../src/discovery/saved-synthesis.js";
 import { recoverContextSession, recoveryRecordSubjectHolds } from "../src/discovery/context-recovery.js";
@@ -17,9 +14,9 @@ import type { ResearchTurn } from "../src/discovery/research-model.js";
 import { EngineError } from "../src/errors.js";
 import { hashJson, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
-import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision } from "../src/storage/store.js";
 import { answerDiscoveryFixture } from "./product-fixture.js";
+import { discoveryFixture, allAxes } from "./discovery-v7-fixture.js";
 
 // DR3a3-S4 (codex-omg №7690 §3 S4; решения 3, 5, 6): saved-only of one v7
 // subject, its subject-aware history and the v3 operator recovery rule. The
@@ -28,14 +25,8 @@ import { answerDiscoveryFixture } from "./product-fixture.js";
 // is checked on in-memory proven-session values, and the saved-only choice on
 // lawful notes moves to S5 (the boundary of №7869 S1→S5 and №8173 S3→S6).
 
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3s4-saved-"));
-  const store = new Store(join(root, "state.sqlite")), engine = new ProductEngine(store), discovery = new Discovery(store);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, store, engine, discovery };
-}
+const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-dr3a3s4-saved-");
 type Fixture = ReturnType<typeof fixture>;
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 const validFrame = (): Json => ({ productType: "internal", scale: "30 users across 10 sites",
   industries: ["construction"], domains: ["materials supply"], axes: allAxes("deep"),
   budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } });
