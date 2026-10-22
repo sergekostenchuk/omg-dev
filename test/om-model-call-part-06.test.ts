@@ -24,11 +24,11 @@ import { completeAttempt, seriesRequestOf, type RepairSeries, readCompletionBind
 import { answerProducerOf, prepareAnswersGateTrace } from '../src/om/answers-gate.js';
 import { readCall, recordCall } from '../src/om/call-record.js';
 import { checkAnswerForm } from '../src/om/answer-form.js';
-import { closeAttempt, openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
+import { closeAttempt, openAttempt as managedOpenAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { readModelCallRecovery, prepareLateModelReceipt } from '../src/discovery/model-call-recovery.js';
-import { CycleCommitPhase, H10A_COMMIT, H15_BASE_COMMIT, MP1_COMMIT, MP2_BASE_COMMIT, MP3_NOTES, MP3_PRIOR_COMMIT, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4AnalysisFixture, e4CannotAnswer, e4Fact, e4Fixture, e4NeedSource, e4Node, e4WorksFixture, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15AtCommit, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2IssuedBy, mp2Managed, mp2Refused, mp2Step, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3PriorAttempt, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
+import { CycleCommitPhase, H10A_COMMIT, H15_BASE_COMMIT, MP1_COMMIT, MP2_BASE_COMMIT, MP3_NOTES, MP3_PRIOR_COMMIT, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4AnalysisFixture, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4ManagedWorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15AtCommit, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2IssuedBy, mp2Managed, mp2Refused, mp2Step, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3PriorAttempt, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -172,29 +172,36 @@ test("E4 exported boundaries reject missing or invalid arguments with EngineErro
 
 test('E4 control and malformed outcomes complete their attempt once, preserve unanswered questions, and replay after restart', async t => {
   for (const action of ['need_owner', 'cannot_answer', 'pause', 'malformed', 'process_failure'] as const) {
-    const f = e4Fixture(t, 'fact', 100_000, action === 'need_owner' ? 1 : 0), common = { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap] };
+    // LG07 (№10753 п.8): managed carriers — an attempt the managed E4 opens stays open until an explicit G7.
+    // The need_owner line keeps one genuine no-progress ordinal through the paid managed prefix.
+    const f = action === 'need_owner' ? await e4ManagedFixture(t, 'fact', { priorNoProgress: 1 })
+      : e4Fixture(t, 'fact', 100_000, 0, 1000, true), common = { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap] };
     f.steps([action === 'malformed' ? { research: { invalid: true }, usage }
       : action === 'process_failure' ? { rawStdout: '{broken', exitCode: 7 }
       : { research: { ...common, action, reason: 'Need a concrete source', ...(action === 'need_owner' ? { decision: 'Choose the source' } : {}) }, usage }]);
+    const sendsBefore = f.sent().length;
     const actual = valueOf(await runModelCall(f.store, f.request));
     assert.ok(actual.diagnostic, action); assert.equal(f.store.list('accepted-answer').length, 0);
+    const opened = f.store.get<{attempts: {outcome: unknown}[]}>(f.series.id)!;
+    assert.equal(opened.value.attempts.at(-1)!.outcome, null, action);
+    e4ManagedClose(f);
     const current = f.store.get<{attempts: {outcome: unknown; verdict: string}[]; withoutProgress: number}>(f.series.id)!;
     assert.ok(current.value.attempts.at(-1)!.outcome, action); assert.notEqual(current.value.attempts.at(-1)!.verdict, 'progress');
     assert.equal((current.value.attempts.at(-1)!.outcome as {reason:string}).reason, action === 'need_owner' ? 'awaiting-owner' : action === 'malformed' ? 'off-form' : action === 'process_failure' ? 'interrupted' : 'refused');
     if (action === 'need_owner') { assert.equal(actual.outcome?.kind, 'awaiting-owner');
-      assert.equal(f.series.value.withoutProgress, 1); assert.equal(current.value.withoutProgress, 1);
+      assert.equal(current.value.withoutProgress, 1); // only the paid prior ordinal counts — awaiting-owner is not no-progress
       if (actual.outcome?.kind === 'awaiting-owner') { assert.equal(actual.outcome.recipient, 'owner'); assert.ok(actual.outcome.questions[0]!.consumers.length); } }
     const snapshot = f.store.list().map(reference); f.restart();
     const replay = valueOf(await runModelCall(f.store, f.request));
     assert.equal(replay.repeated, true); assert.deepEqual(replay.diagnostic, actual.diagnostic);
-    assert.deepEqual(f.store.list().map(reference), snapshot); assert.equal(f.sent().length, 1);
+    assert.deepEqual(f.store.list().map(reference), snapshot); assert.equal(f.sent().length, sendsBefore + 1);
   }
 });
 
 
 
 test('E4 cycle delivers all addressed read forms then answers once in the same attempt with immutable history', async t => {
-  const f = e4Fixture(t), native = f.store.list('question').map(reference), originalInput = reference(f.input), originalGraph = reference(f.graph);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), native = f.store.list('question').map(reference), originalInput = reference(f.input), originalGraph = reference(f.graph); // LG07: managed E4 carrier
   const reads = [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' },
     { action: 'read_source', source: reference(f.source), selector: { kind: 'text-range', start: 0, end: f.source.value.content.length } },
     { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' },
@@ -230,7 +237,7 @@ test('E4 cycle delivers all addressed read forms then answers once in the same a
 
 test('E4 direct continuation refuses repeated knowledge atomically before a third dispatch and replays after restart', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const kind of ['fact', 'field'] as const) {
-    const f = e4Fixture(t, kind);
+    const f = e4Fixture(t, kind, 100_000, 0, 5000, true); // LG07: managed E4 carrier
     const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
     f.steps([{ research: need, usage }, { research: need, usage }, { research: need, usage }]);
     const first = valueOf(await runModelCall(f.store, f.request));
@@ -284,7 +291,7 @@ test('E4 direct continuation refuses repeated knowledge atomically before a thir
 
 
 test('E4 no-progress preparation guards concurrent completion without a partial blocked packet or diagnostic', async t => {
-  const f = e4Fixture(t), need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true), need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
   f.steps([{ research: need }, { research: need }]);
   let packet = f.packet;
   let terminalRequest: QuestionPacketRequest | undefined;
@@ -299,8 +306,11 @@ test('E4 no-progress preparation guards concurrent completion without a partial 
   const prepared = valueOf(prepareQuestionPacket(f.store, terminalRequest!));
   const other = new Store(f.database);
   try {
-    valueOf(completeAttempt(other, { project: f.project, block: 'garden-consume-block', line: 1, attempt: 1,
-      outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } }));
+    // LG07: a managed attempt cannot be closed concurrently — the only lawful race is an incompatible
+    // required-record replacement; the guards of the prepared bundle go stale exactly like a lost CAS.
+    const head = other.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+    const { projectId: _project, ...config } = structuredClone(head.value);
+    new ProductEngine(other).environments.configure(f.project, { ...config, timeoutMs: config.timeoutMs + 1 }, head.revision);
   } finally { other.close(); }
   const snapshot = f.store.list().map(reference);
   const conflict = writeGuarded(f.store, { unit: 'E2', target: prepared.record.id,
@@ -315,13 +325,17 @@ test('E4 no-progress preparation guards concurrent completion without a partial 
 
 
 test('E4 cycle repeated unchanged reads refuse once while exact late replay adds no calls, deliveries or completions', async t => {
-  const f = e4Fixture(t), read = { action: 'read', path: 'e4-source.txt', media: 'text/plain' };
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true), read = { action: 'read', path: 'e4-source.txt', media: 'text/plain' };
   const need = e4NeedSource(f, [read, read]); f.steps([{ research: need }, { research: need }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
   assert.equal(cycle.record.value.terminal, 'research-no-progress'); assert.ok(cycle.diagnostic);
   assert.equal(f.sent().length, 2); assert.equal(f.store.list('om-read-delivery').length, 2);
+  // LG07: under a managed attempt the refusal journal is written but the attempt stays open until explicit G7.
+  const opened = f.store.get<{attempts: {outcome: unknown}[]}>(f.series.id)!;
+  assert.equal(opened.value.attempts.length, 1); assert.equal(opened.value.attempts[0]!.outcome, null);
+  e4ManagedClose(f);
   const series = f.store.get<{attempts: {outcome: {reason: string}}[]; withoutProgress: number}>(f.series.id)!;
-  assert.equal(series.value.attempts.length, 1); assert.equal(series.value.attempts[0]!.outcome.reason, 'refused');
+  assert.equal(series.value.attempts[0]!.outcome!.reason, 'refused');
   assert.equal(series.value.withoutProgress, 1);
   const snapshot = f.store.list().map(reference); f.restart();
   valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) }));
@@ -332,7 +346,7 @@ test('E4 cycle repeated unchanged reads refuse once while exact late replay adds
 
 
 test('E4 cycle saves delivery overflow without a second dispatch or context truncation', async t => {
-  const f = e4Fixture(t), config = f.environment(currentPacketWire(f.packet.value.packet) + 100);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) + 100); // LG07: managed E4 carrier
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
   writeFileSync(join(f.root, 'e4-source.txt'), 'UTF-8 '.repeat(20_000));
@@ -352,7 +366,7 @@ test('E4 cycle saves delivery overflow without a second dispatch or context trun
 
 test('E4 carries checked works handoffs through local dispatch, split assembly, restart and exact late repeats without accepting L3', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const split of [false, true]) await t.test(split ? 'split with prior work and test' : 'whole node', async t => {
-    const f = e4WorksFixture(t), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured;
+    const f = e4ManagedWorksFixture(t), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured; // LG07: managed works carrier
     const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
     assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, split ? 'parts' : 'whole');
     const count = packet.value.plan!.assignments.length;
@@ -451,19 +465,20 @@ test('E4 carries checked works handoffs through local dispatch, split assembly, 
 
 
 test('E4 analysis transport rejects another actual body and stale fresh-dispatch grounds without spawning', async t => {
-  const f = e4AnalysisFixture(t, 'stop-analysis');
+  const f = await e4ManagedAnalysisFixture(t, 'stop-analysis');
   const wrongBody = await runModelTransport(f.store, { ...f.request, packet: { text: 'Copied call ref with a different payload' } });
   assert.equal(wrongBody.ok, false); if (!wrongBody.ok) assert.equal(wrongBody.refusal.code, 'packet_invalid');
   f.store.write({ id: f.environment.id, kind: f.environment.kind, expected: f.environment.revision, value: f.environment.value });
   const stale = await runModelTransport(f.store, f.request);
-  assert.equal(stale.ok, false); assert.equal(f.sent().length, 0); assert.equal(f.store.list('model-call').length, 0);
+  assert.equal(stale.ok, false); assert.equal(f.sent().length, 0);
+  assert.equal(f.store.list('model-call').length, f.preparationCalls.length);
 });
 
 
 
 test('E4 cycle refuses missing coverage and conflicting definitions without accepting a partial node', async t => {
   for (const issue of ['coverage', 'conflict'] as const) {
-    const f = e4Fixture(t, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
+    const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1); // LG07: managed E4 carrier
     const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
     assert.equal(packet.value.plan!.mode, 'parts'); assert.ok(packet.value.plan!.assignments.length > 1);
     const answers = packet.value.plan!.assignments.map((_, position) => e4Node(f, { ...packet,
@@ -476,6 +491,8 @@ test('E4 cycle refuses missing coverage and conflicting definitions without acce
     const diagnostic = f.store.get<{refusals: {code: string}[]}>(cycle.diagnostic.id)!;
     assert.equal(diagnostic.value.refusals[0]!.code, issue === 'coverage' ? 'model_parts_invalid' : 'model_parts_conflict');
     assert.equal(f.store.list('om-part-assembly').length, 0);
+    assert.equal(f.store.get<{attempts: {outcome: unknown}[]}>(f.series.id)!.value.attempts[0]!.outcome, null, issue);
+    e4ManagedClose(f); // LG07: the parts-invalid refusal is owned by the explicit G7 close
     assert.equal(f.store.get<{withoutProgress:number}>(f.series.id)!.value.withoutProgress, 1);
     f.restart(); valueOf(readModelCycle(f.store, { project: f.project, record: reference(cycle.record) }));
   }
@@ -485,8 +502,8 @@ test('E4 cycle refuses missing coverage and conflicting definitions without acce
 
 test('E4 exact malformed environment and adapter sources return addressed refusals instead of raw property exceptions', async t => {
   for (const malformed of ['environment', 'adapter'] as const) {
-    const f = e4AnalysisFixture(t, 'stop-analysis'), get = f.store.get.bind(f.store);
-    const source = malformed === 'environment' ? f.environment.id : 'adapter:analysis';
+    const f = await e4ManagedAnalysisFixture(t, 'stop-analysis'), get = f.store.get.bind(f.store);
+    const source = malformed === 'environment' ? f.environment.id : `adapter:${f.project}:managed-analysis`;
     f.store.get = ((id, revision) => {
       const row = get(id, revision); return row && id === source ? { ...row, value: null } : row;
     }) as Store['get'];
@@ -517,26 +534,37 @@ test('E4 public persistence paths reject absent or malformed requests before rea
 
 
 test('E4 control completion cannot replace an outcome saved after the control response was received', async t => {
-  const f = e4Fixture(t);
+  // LG07: managed carrier — the competing completion is a lawful explicit G7 from a second Store over the same
+  // database (the received refusal already proves the registry complete), not the retired standalone close.
+  const f = e4Fixture(t, 'fact', 100_000, 0, 1000, true);
   f.steps([{ research: { protocol: '$answerProtocol', requestId: '$requestId', questionIds: [f.batch.items[0]!.gap],
     action: 'cannot_answer', reason: 'The requested information is unavailable' }, usage }]);
-  const get = f.store.get.bind(f.store); let completed: Revision<unknown> | null = null;
-  f.store.get = ((id, revision) => {
-    if (!completed && f.sent().length && id.startsWith(`om-unit-refusal:${f.project}:e4:`)) {
+  const writeMany = f.store.writeMany.bind(f.store); let completed: Revision<unknown> | null = null;
+  f.store.writeMany = ((writes, guards) => {
+    const committed = writeMany(writes, guards);
+    // The refusal journal is durable now — a second Store sees the complete registry and may lawfully G7-close.
+    if (!completed && writes.some(write => write.kind === 'om-refusal-journal')) {
       const other = new Store(f.database);
-      try { completed = valueOf(completeAttempt(other, { ...seriesRequestOf(f.series.value), attempt: 1,
-        outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } })); }
+      try {
+        const request = { ...seriesRequestOf(f.series.value), attempt: 1,
+          outcome: { reason: 'refused' as const, accepting: [], cancelling: [], refusals: [] } };
+        valueOf(closeAttempt(other, { ...request, outcome: valueOf(prepareManagedClaim(other, request)).outcome }));
+        completed = other.get(f.series.id);
+      }
       finally { other.close(); }
     }
-    return get(id, revision);
-  }) as Store['get'];
-  const actual = valueOf(await runModelCall(f.store, f.request)); f.store.get = get;
-  assert.ok(completed); assert.equal(actual.record.value.status, 'failed'); assert.equal(actual.diagnostic, null);
-  assert.equal(actual.record.value.om.application, 'application-refused'); assert.equal(f.store.list('om-model-exchange').length, 1);
-  assert.deepEqual(f.store.get(f.series.id), completed); assert.equal(f.store.list('part-response').length, 0);
+    return committed;
+  }) as Store['writeMany'];
+  const actual = valueOf(await runModelCall(f.store, f.request)); f.store.writeMany = writeMany;
+  assert.ok(completed); assert.equal(actual.record.value.om.application, 'applied');
+  assert.equal(actual.record.value.status, 'succeeded');
+  // The saved outcome stands: the apply owns only its own accounting, never the closed attempt's A3 row.
+  assert.deepEqual(f.store.get(f.series.id), completed);
+  assert.equal(f.store.list('om-model-exchange').length, 1);
+  assert.equal(f.store.list('part-response').length, 1); // the genuine managed application product
   assert.deepEqual(actual.record.value.usage, usage);
-  const snapshot = f.store.list(), historical = valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
-  f.restart(); assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), historical);
+  const snapshot = f.store.list(); f.restart();
+  assert.equal(valueOf(await runModelCall(f.store, f.request)).repeated, true);
   assert.deepEqual(f.store.list(), snapshot); assert.equal(f.sent().length, 1);
 });
 
@@ -1049,6 +1077,8 @@ test('15 H1.0a exact no-progress, blocked successor and invalid assembly dischar
 
 
 
+// LG07 (№10753 п.8): standalone-only property — beginAttempt/completeAttempt history is the retired standalone
+// route itself, not a managed positive. This test leaves with the route; it is intentionally not migrated.
 test('1 H1.0a standalone physical history retains its original completion and never acquires an owner', async t => {
   const f=e4Fixture(t); f.steps([{research:{wrong:true},usage}]);
   const original=valueOf(await runModelCall(f.store,f.request));
@@ -1063,6 +1093,8 @@ test('1 H1.0a standalone physical history retains its original completion and ne
 
 
 
+// LG07 (№10753 п.8): standalone-only property — a beginAttempt opening that must never be adopted. Leaves
+// with the retired standalone route; intentionally not migrated to a managed carrier.
 test('4 H1.0a an existing standalone opening cannot be adopted even before any physical call',t=>{
   const f=e4Fixture(t), before=f.store.list();
   const request={...seriesRequestOf(f.series.value),attempt:1,goal:f.series.value.attempts[0]!.goal,
@@ -1074,6 +1106,9 @@ test('4 H1.0a an existing standalone opening cannot be adopted even before any p
 
 
 
+// LG07 (№10753 п.8): old-ordinal route coverage — e4Fixture(priorNoProgress:2) fabricates raw
+// beginAttempt/completeAttempt ordinals and the test proves beginAttempt refusal; this leaves with the
+// retired ordinal route. Not a managed positive.
 test('C03 H1.0a completion threshold preserves old ordinals and an exact managed opening ignores later M6 heads',async t=>{
   const f=e4Fixture(t,'fact',100_000,2,1000,true);
   assert.equal(valueOf(readCompletionBinding(f.store,f.project,reference(f.series),1)),null);
@@ -1104,6 +1139,8 @@ test('C09 H1.0a a current-only assembly admission failure cannot manufacture a h
 
 
 
+// LG07 (№10753 п.8): old-ordinal route coverage — the successor attempt 2 is opened/completed through raw
+// beginAttempt/completeAttempt to prove the ordinal threshold; this leaves with the retired ordinal route.
 test('C06 H1.0a successor inherits original completion proofs but starts its own independent ordinal threshold',async t=>{
   const f=e4Fixture(t,'fact',100_000,0,1000,true);f.steps([{research:{wrong:true},usage}]);
   valueOf(await runModelCall(f.store,f.request));const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
