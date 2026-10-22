@@ -38,11 +38,13 @@ function fixture(t: { after(fn: () => void): void }, prefix: string, realRoot = 
 }
 export type DiscoveryFixture = ReturnType<typeof fixture>;
 type Fixture = DiscoveryFixture;
+/** The plain producer fixture: a root, one database file, Store + ProductEngine + Discovery, and open() for further openings. */
+export const discoveryFixture = fixture;
 
 export const rand = () => Math.random().toString(16).slice(2);
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
+export const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 
-function validFrame(): Json {
+export function validFrame(): Json {
   return { productType: "internal", scale: "30 users across 10 sites",
     industries: ["construction"], domains: ["materials supply", "equipment accounting"],
     axes: allAxes("deep"),

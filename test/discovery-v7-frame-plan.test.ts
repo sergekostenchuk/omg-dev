@@ -1,8 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Discovery, type DiscoveryDraft, type Question } from "../src/discovery/discovery.js";
 import { createPartialV7Draft, V7_AXES, V7_REQUIREMENTS, V7_STAGE_TOKEN_CEILING,
   DISCOVERY_ACCEPTANCE_ACT_KIND, DISCOVERY_ACCEPTANCE_ACT_CONTRACT,
@@ -18,24 +15,12 @@ import { answerDiscoveryFixture } from "./product-fixture.js";
 import { storeView } from "../src/storage/store-view.js";
 import { managedAnswerId, acceptanceBindingId, managedTurnId } from "../src/discovery/research-consumer-transition.js";
 import { savedAcceptanceAct } from "../src/discovery/projection-reader.js";
+import { discoveryFixture, questionOf } from "./discovery-v7-fixture.js";
 
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-dr2-v7-"));
-  const store = new Store(join(root, "state.sqlite")), engine = new ProductEngine(store);
-  const discovery = new Discovery(store);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, store, engine, discovery };
-}
+const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-dr2-v7-");
 
 function source(discovery: Discovery, project: string) {
   return discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
-}
-
-function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
-  const question = draft.value.questions.map(id => store.get<Question>(id)!)
-    .find(q => q.value.spec.field === field);
-  assert.ok(question, `question for ${field}`);
-  return question;
 }
 
 const thrown = (fn: () => unknown, code: string, includes?: string) => {
