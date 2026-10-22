@@ -3142,8 +3142,12 @@ test('mechanism completion and exact late repeats survive D3 addressing and rest
   await m.pay(1, 1, 'off-form');
   f.address(['A']); const second = f.publish();
   assert.notEqual(deliveredOf(projectMechanismSlice(f.store, 'garden', second.gaps)).slice, opened.value.slice);
-  assert.equal(deliveredOf(openAttempt(f.store, begin as never)).revision, f.store.get(running.id)!.revision);
-  assert.equal(deliveredOf(openSeries(f.store, opening)).revision, f.store.get(running.id)!.revision);
+  // After the lawful payment and D3, before any repeat: the exact head of the series and every record as they stand.
+  const paid = reference(f.store.get(running.id)!), settled = f.store.list().map(reference);
+  assert.deepEqual(reference(deliveredOf(openAttempt(f.store, begin as never))), paid);
+  assert.deepEqual(f.store.list().map(reference), settled);
+  assert.deepEqual(reference(deliveredOf(openSeries(f.store, opening))), paid);
+  assert.deepEqual(f.store.list().map(reference), settled);
   const claim = m.claim(1, 1);
   assert.equal(claim.reason, 'off-form');
   const done = m.close(1, 1, claim);
