@@ -2556,7 +2556,13 @@ function e51AssessorStep(verdict: E51Verdict) {
 }
 
 /** The directory-independent prefix of e51Fixture — stages, B1, M5 addresses, G2, D1, routes and the open attempt — per fact count. */
-function e51Prefix(store: Store, factCount: number, managed = false) {
+/**
+ * LG07 variants of the E5.1 seed (№10083 п.5–6): `notes` — the answers cite a separate owner document instead of the
+ * stage brief, so its revision makes them inapplicable; `producer` — one more question, addressed to the producing block,
+ * gives that block an MC1 batch and a plan of its own. Each variant is part of the seed key.
+ */
+interface E51Variant { readonly notes?: boolean; readonly producer?: boolean }
+function e51Prefix(store: Store, factCount: number, managed = false, variant: E51Variant = {}) {
   const facts = ["encoding", "transport", "retention"].slice(0, factCount);
   const project = "garden", engine = new ProductEngine(store), desired = gardenGraph("cross");
   desired.nodes.find(node => node.id === "garden-produce-block")!.ports.push({ id: "out-side", direction: "out", contract: "garden-contract" });
@@ -2567,18 +2573,23 @@ function e51Prefix(store: Store, factCount: number, managed = false) {
   const { level: _level, ...l1 } = projectGraph(desired, 1);
   preparedFeatures(engine, project, l1 as Graph, field => {
     const value = preparedField(project, field);
-    if (field === "preparation") (value as Record<string, Json>).unknowns = facts.map(id => ({ id,
+    if (field === "preparation") (value as Record<string, Json>).unknowns = [...facts.map(id => ({ id,
       question: `What ${id} is supported?`, consumer: "garden-consume-block", moment: "om-pass",
-      blocksCurrentStage: false, resolution: "Resolve the addressed question during OM" }));
+      blocksCurrentStage: false, resolution: "Resolve the addressed question during OM" })),
+      ...(variant.producer ? [{ id: "pressure", question: "What pressure is supported?", consumer: "garden-produce-block",
+        moment: "om-pass", blocksCurrentStage: false, resolution: "Resolve the addressed question during OM" }] : [])];
     return value;
   });
+  if (variant.notes) engine.discovery.evidence.document(project, "e51-notes", "UTF-8 is the supported encoding.", "text/plain", 0);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   const base = deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
   const graph = store.get<Graph>(`graph:${project}`)!;
+  const addressed = [...facts.map(id => ({ target: `discovery:${id}`, consumer: "garden-consume-block" })),
+    ...(variant.producer ? [{ target: "discovery:pressure", consumer: "garden-produce-block" }] : [])];
   const input = deliveredOf(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
-    decisions: facts.map(id => `discovery:${id}`).map(target => ({ pending:
+    decisions: addressed.map(({ target, consumer }) => ({ pending:
       structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
-        decision: { target, field: "address", value: { consumer: "garden-consume-block", kind: "repository-fact" } } })) as Write })) }));
+        decision: { target, field: "address", value: { consumer, kind: "repository-fact" } } })) as Write })) }));
   const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null,
     available: {}, choice: { choiceVersion: "e51-fact", features: [{ outcome: "garden-result" }], excluded: [] } }));
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
@@ -2596,22 +2607,27 @@ function e51Prefix(store: Store, factCount: number, managed = false) {
     catalog: { paths: ["e51-source.txt"], records: [] }, previous: null }));
   const batch = routes.value.batches.find(item => item.model === "MC1" && item.items.some(question => question.target === "discovery:encoding"))!;
   assert.ok(batch);
-  const block = "garden-consume-block", source = store.get<{ content: string }>(`source:${project}:brief`)!;
+  const producerBatch = variant.producer ? routes.value.batches.find(item => item.model === "MC1"
+    && item.items.some(question => question.target === "discovery:pressure")) ?? null : null;
+  if (variant.producer) assert.ok(producerBatch && producerBatch.id !== batch.id, "the producing block has an MC1 batch of its own");
+  const block = "garden-consume-block",
+    source = store.get<{ content: string }>(variant.notes ? `source:${project}:e51-notes` : `source:${project}:brief`)!;
   const attemptGoal: AttemptGoal = { key: "e51:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   deliveredOf(openSeries(store, { project, block, line: 1, slice: "e51-fact", predecessor: null, basis: null }));
   // LG07: a managed attempt opens through G7 with the complete plan of its MC1 batch.
   const series = deliveredOf(managed ? openAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal,
     completion: { routes: reference(routes), batches: [batch.id] } }) : beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
-  return { frame: sources.operations.frame, routes, batch, source, attemptGoal, series };
+  return { frame: sources.operations.frame, routes, batch, source, attemptGoal, series, producerBatch };
 }
 
 /** An issued one-to-three-question MC1 response, with the real E1 transport and D1 attempt behind E5. */
-function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, managed = false) {
+function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, managed = false, variant: E51Variant = {}) {
   const factCount = typeof twoFacts === "boolean" ? twoFacts ? 2 : 1 : twoFacts;
   assert.ok(Number.isInteger(factCount) && factCount >= 1 && factCount <= 3);
-  const seeded = seedCopy(`e51:${factCount}:${managed ? "managed" : "standalone"}`, store => e51Prefix(store, factCount, managed), "omg-e51-g7-");
-  const { root, database: path } = seeded, { frame, routes, batch, source, attemptGoal, series } = seeded.data;
+  const seeded = seedCopy(`e51:${factCount}:${managed ? "managed" : "standalone"}:${variant.notes ? "notes" : "brief"}:${variant.producer ? "producer" : "one"}`,
+    store => e51Prefix(store, factCount, managed, variant), "omg-e51-g7-");
+  const { root, database: path } = seeded, { frame, routes, batch, source, attemptGoal, series, producerBatch } = seeded.data;
   const project = "garden", block = "garden-consume-block";
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -2634,7 +2650,7 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, mana
   const dispatch = { adapter: reference(adapter), config: reference(config) };
   writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep] }));
   return { root, path, project, block, series, attemptGoal, frame,
-    engine, config, scenario, originalStep, routes, batch, dispatch,
+    engine, config, scenario, originalStep, routes, batch, dispatch, source, producerBatch,
     questionIds: batch.items.map(item => item.gap),
     get store() { return store; },
     async original(): Promise<AssessmentIntentRequest> {
@@ -2686,6 +2702,42 @@ async function e51NextAttempt(f: ReturnType<typeof e51Fixture>, attempt: number,
   const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
   assert.equal(model.outcome?.kind, "fact-candidates");
   return { project: f.project, modelCall: reference(model.record), questionId: f.batch.items[0]!.gap, dispatch: f.dispatch };
+}
+
+/** LG07 (№10083 п.5): the owner revises the notes of the notes variant; the answers that cite the earlier revision lapse. */
+function e51Revise(f: ReturnType<typeof e51Fixture>): void {
+  const notes = f.store.get<{ content: string }>(f.source.id)!;
+  f.engine.discovery.evidence.document(f.project, "e51-notes", `${notes.value.content} Revised.`, "text/plain", notes.revision);
+}
+
+/**
+ * LG07 (№10083 п.4–5): the next managed attempt on the successor of `previous`, prepared explicitly: its batch holds the
+ * question again once the earlier answer lapsed. The original answers each fact with `value`, citing the notes as they
+ * stand now, and the assessor gives these verdicts.
+ */
+async function e51ReroutedAttempt(f: ReturnType<typeof e51Fixture>, attempt: number,
+  previous: Revision<RoutesRecord> | ReturnType<typeof e51Fixture>["routes"], value: string, ...verdicts: E51Verdict[]) {
+  const prior = (previous as Revision<RoutesRecord>).value.request;
+  const routes = deliveredOf(writeRoutes(f.store, { project: f.project, gaps: structuredClone(prior.gaps) as GapReadRequest,
+    tasks: prior.tasks.map(record => ({ record })), catalog: { paths: [...prior.catalog.paths], records: [...prior.catalog.records] },
+    previous: reference(previous) })) as Revision<RoutesRecord>;
+  const batch = routes.value.batches.find(item => item.model === "MC1" && item.items.some(row => row.gap === f.batch.items[0]!.gap));
+  assert.ok(batch, "the lapsed question is routed again");
+  const goal: AttemptGoal = { ...f.attemptGoal, questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort() };
+  const series = deliveredOf(openAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt, goal,
+    completion: { routes: reference(routes), batches: [batch.id] } }));
+  const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes), batch: batch.id,
+    environment: reference(f.config), attempt: { series: reference(series), ordinal: attempt }, previous: [] })).record;
+  const source = f.store.get<{ content: string }>(f.source.id)!;
+  const answer = { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
+    results: batch.items.map(item => ({ questionId: item.gap, value, citations: [{ source: reference(source),
+      selector: { kind: "text-range", start: 0, end: source.value.content.length } }] })) }, usage: e51Usage };
+  const steps = (JSON.parse(readFileSync(f.scenario, "utf8")) as { steps: unknown[] }).steps;
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [...steps, answer, ...verdicts.map(e51AssessorStep)] }));
+  const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
+  assert.equal(model.outcome?.kind, "fact-candidates");
+  return { routes, batch, goal, request: { project: f.project, modelCall: reference(model.record), questionId: batch.items[0]!.gap,
+    dispatch: f.dispatch } as AssessmentIntentRequest };
 }
 
 /** LG07: G7 closes a managed E5 attempt with the claim it derives itself; E5 never closes A3 on its own (E7). */
@@ -2891,14 +2943,16 @@ test("E5.1 rejects a partial two-refusal claim and closes the full negative set 
   assert.equal(duplicated.withoutProgress, 1);
   assert.equal(duplicated.routed.length, 2);
   assert.deepEqual(e51Outcome(f)?.refusals.map(item => item.row).sort(), refusals.map(item => item.row).sort());
-  const closed = f.store.get<RepairSeries>(f.series.id)!;
-  // The full set itself is that close again: an exact repeat writes nothing.
+  const closed = f.store.get<RepairSeries>(f.series.id)!, settled = f.store.list().map(reference);
+  // The full set itself is that close again: an exact repeat writes nothing — no series, close, work or journal record.
   deliveredOf(closeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, outcome: refusedBy(...refusals) }));
+  assert.deepEqual(f.store.list().map(reference), settled);
   const repeated = deliveredOf(finishAssessmentAttempt(f.store, f.project, results[0]!.value.intent));
   assert.equal(repeated.complete, true);
   assert.equal(repeated.closed, true);
   assert.deepEqual(repeated.results.map(item => item.id).sort(), results.map(item => item.id).sort());
   assert.deepEqual(f.store.get<RepairSeries>(f.series.id), closed);
+  assert.deepEqual(f.store.list().map(reference), settled);
   assert.equal(f.sent().length, calls);
 });
 
@@ -2953,21 +3007,50 @@ async function e51SingleBeforeGate(f: ReturnType<typeof e51Fixture>) {
 }
 
 test("E5.1 binds a refusal to its exact consumer and attempt ordinal", async t => {
-  // LG07: the refusal of attempt 1 cannot be claimed by the next managed attempt of the same block. (A managed attempt of
-  // another consumer needs a plan of that consumer's own; that variant is reported, not forged here.)
-  const f = e51Fixture(t, false, true), request = await f.original();
-  f.assessor("insufficient");
-  const result = deliveredOf(await assessFact(f.store, request));
-  const source = f.store.get(assessmentRefusalId(f.project, reference(result)))!;
-  const refusal = e51Claim(f.store, f.project, reference(source));
-  e51Close(f);
-  deliveredOf(await assessFact(f.store, await e51NextAttempt(f, 2, "insufficient")));
-  const line = f.store.get<RepairSeries>(f.series.id)!;
-  const own = deliveredOf(prepareManagedClaim(f.store, { project: f.project, block: f.block, line: 1, attempt: 2, outcome: outcome() })).outcome;
-  const rejection = refusalOf(closeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 2,
-    outcome: { ...own, refusals: [...own.refusals, refusal] } }));
-  assert.equal(rejection.code, "completion_invalid");
-  assert.deepEqual(f.store.get<RepairSeries>(line.id), line);
+  await t.test("ordinal", async child => {
+    // The refusal of attempt 1 cannot be added to the complete claim of the next managed attempt of the same block.
+    const f = e51Fixture(child, false, true), request = await f.original();
+    f.assessor("insufficient");
+    const result = deliveredOf(await assessFact(f.store, request));
+    const source = f.store.get(assessmentRefusalId(f.project, reference(result)))!;
+    const refusal = e51Claim(f.store, f.project, reference(source));
+    e51Close(f);
+    deliveredOf(await assessFact(f.store, await e51NextAttempt(f, 2, "insufficient")));
+    const line = f.store.get<RepairSeries>(f.series.id)!;
+    const own = deliveredOf(prepareManagedClaim(f.store, { project: f.project, block: f.block, line: 1, attempt: 2, outcome: outcome() })).outcome;
+    const rejection = refusalOf(closeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 2,
+      outcome: { ...own, refusals: [...own.refusals, refusal] } }));
+    assert.deepEqual([rejection.code, rejection.at.field], ["completion_invalid", "refusals"]);
+    assert.deepEqual(f.store.get<RepairSeries>(line.id), line);
+  });
+  await t.test("consumer", async child => {
+    // №10083 п.6: the producing block has a question and a plan of its own (so its goal differs as well). Its attempt
+    // completes its own work; the consuming block's E5 refusal added to its complete lawful claim is the one mutation.
+    const f = e51Fixture(child, false, true, { producer: true }), request = await f.original();
+    f.assessor("insufficient");
+    const result = deliveredOf(await assessFact(f.store, request));
+    const refusal = e51Claim(f.store, f.project, reference(f.store.get(assessmentRefusalId(f.project, reference(result)))!));
+    const block = "garden-produce-block", batch = f.producerBatch!;
+    deliveredOf(openSeries(f.store, { project: f.project, block, line: 1, slice: "e51-producer", predecessor: null, basis: null }));
+    const goal: AttemptGoal = { key: "e51:producer", questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
+      result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
+    const series = deliveredOf(openAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal,
+      completion: { routes: reference(f.routes), batches: [batch.id] } }));
+    const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.routes), batch: batch.id,
+      environment: reference(f.config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+    const steps = (JSON.parse(readFileSync(f.scenario, "utf8")) as { steps: unknown[] }).steps;
+    writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [...steps, { ...f.originalStep, research: { ...f.originalStep.research,
+      results: batch.items.map(item => ({ ...f.originalStep.research.results[0]!, questionId: item.gap })) } }, e51AssessorStep("insufficient")] }));
+    const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
+    deliveredOf(await assessFact(f.store, { project: f.project, modelCall: reference(model.record), questionId: batch.items[0]!.gap, dispatch: f.dispatch }));
+    const at = { project: f.project, block, line: 1, attempt: 1 };
+    const own = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).outcome;
+    assert.equal(own.reason, "refused");
+    const line = f.store.get<RepairSeries>(seriesId(f.project, block, 1))!;
+    const rejection = refusalOf(closeAttempt(f.store, { ...at, outcome: { ...own, refusals: [...own.refusals, refusal] } }));
+    assert.deepEqual([rejection.code, rejection.at.field], ["completion_invalid", "refusals"]);
+    assert.deepEqual(f.store.get<RepairSeries>(line.id), line);
+  });
 });
 
 test("E5.1 a stop before the negative terminal and its A2 source are written is completed by the next run without another call", async t => {
@@ -3171,6 +3254,31 @@ test("E5.1 lets G7 win first and then refuses a late assessor E1 without another
   assert.equal(repeated.withoutProgress, 1);
   assert.deepEqual(f.store.get<RepairSeries>(f.series.id), closed);
   assert.equal(f.sent().length, calls);
+});
+
+test("E5.1 a managed close is not prepared while a fact of its issued original set awaits its first E1 or its terminal", async t => {
+  // LG07 (№10083 п.3): the issued original creates an assignment for every fact; until each has its terminal the registry
+  // is incomplete, so no claim is derived and no close is prepared — and nothing is written.
+  const f = e51Fixture(t, true, true), first = await f.original();
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
+  const refused = () => {
+    const before = f.store.list().map(reference), sends = f.sent().length;
+    assert.equal(refusalOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).code, "completion_incomplete");
+    assert.equal(refusalOf(prepareCloseAttempt(f.store, { ...at, outcome: outcome() })).code, "completion_incomplete");
+    assert.deepEqual(f.store.list().map(reference), before);
+    assert.equal(f.sent().length, sends);
+  };
+  f.assessor("insufficient", "insufficient");
+  deliveredOf(await assessFact(f.store, first));
+  // The second fact has had no E1 of its assessor yet.
+  refused();
+  // Its assessor E1 is admitted, and it has no terminal yet.
+  deliveredOf(e51AdmitAssessorE1(f.store, { ...first, questionId: f.questionIds[1]! }).call);
+  refused();
+  assert.equal(e51Outcome(f), null);
+  // The terminal completes the set, and G7 closes it.
+  deliveredOf(await assessFact(f.store, { ...first, questionId: f.questionIds[1]! }));
+  assert.equal(e51Close(f).claim.refusals.length, 2);
 });
 
 test("E5.1 keeps an earlier G3 attempt with no assessor E1 closeable and exactly repeatable", async t => {
@@ -3533,28 +3641,29 @@ test("E5.1 checks both supported MC1 sources but records one achievement for the
   assert.equal(f.sent().length, sends);
 });
 
-test("E5.1 does not let duplicate supported keys hide an incomplete original MC1 set", async t => {
-  const f = e51Fixture(t, 2), first = await f.original(), second = await f.secondOriginal();
+test("E5.1 does not let a duplicated supported accepting hide an incomplete original MC1 set", async t => {
+  // LG07 (№10083 п.4): two facts of one real set; the first is supported, the second has an admitted assessor E1 and no
+  // terminal. The supported answer named twice does not stand in for the missing work.
+  const f = e51Fixture(t, 2, true), first = await f.original();
   deliveredOf(e51AdmitAssessorE1(f.store, first).call);
-  deliveredOf(e51AdmitAssessorE1(f.store, second).call);
-  f.assessorsForTwoOriginals("supported", "supported");
+  deliveredOf(e51AdmitAssessorE1(f.store, { ...first, questionId: f.questionIds[1]! }).call);
+  f.assessor("supported");
   const firstResult = deliveredOf(await assessFact(f.store, first));
-  const secondResult = deliveredOf(await assessFact(f.store, second));
-  const accepting = [firstResult.value.accepted!, secondResult.value.accepted!];
-  assert.equal(deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: accepting[0]! })).key,
-    deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: accepting[1]! })).key);
+  const accepting = [firstResult.value.accepted!, firstResult.value.accepted!];
   const current = f.store.get<RepairSeries>(f.series.id)!;
   const closure = deliveredOf(readCurrentAssessmentAttemptClosure(f.store, { project: f.project,
     block: f.block, series: reference(current), attempt: 1, goal: f.attemptGoal }));
   assert.equal(closure.status, "incomplete");
-  assert.equal(closure.results.length, 2);
+  assert.equal(closure.results.length, 1);
   const request = { project: f.project, block: f.block, line: 1, attempt: 1,
     outcome: outcome({ accepting }) };
   const before = f.store.list().map(reference), sends = f.sent().length;
-  assert.equal(closeAttempt(f.store, request).ok, false);
+  assert.equal(refusalOf(closeAttempt(f.store, request)).code, "completion_incomplete");
+  assert.equal(refusalOf(prepareManagedClaim(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, outcome: outcome() })).code,
+    "completion_incomplete");
   assert.equal(e51Outcome(f), null);
   f.restart();
-  assert.equal(closeAttempt(f.store, request).ok, false);
+  assert.equal(refusalOf(closeAttempt(f.store, request)).code, "completion_incomplete");
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, sends);
 });
@@ -3673,29 +3782,108 @@ test("E5.1 gives two negative MC1 terminals of one question separate A2 rows", a
   assert.equal(f.sent().length, sends);
 });
 
-test("E5.1 does not transfer an identical fact key to another attempt", async t => {
-  const f = e51Fixture(t, false), first = await f.original();
+// LG07 (№10083 п.4): properties of two answers to ONE question, carried by two lawful managed attempts. They are not the
+// earlier tests' checks of two bases in one close, a shared canonical representative, achieved beside a refusal in one
+// close, or two refusals joined by one close; those leave with the standalone scenarios of those tests in the src part.
+const e51KeyOf = (f: ReturnType<typeof e51Fixture>, ref: Ref): string =>
+  deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: ref })).key;
+
+test("E5.1 two attempts of one question accept two real answers of one semantic key, and the second repeats the result", async t => {
+  const f = e51Fixture(t, false, true, { notes: true }), first = await f.original();
   f.assessor("supported");
-  const terminal = deliveredOf(await assessFact(f.store, first));
-  const accepted = terminal.value.accepted!;
-  assert.equal(e51Outcome(f)?.reason, "result");
-  deliveredOf(openAttempt(f.store, { project: f.project, block: f.block, line: 1,
-    attempt: 2, goal: f.attemptGoal }));
-  const key = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: accepted })).key;
-  assert.equal(acceptedAnswerRepresents(f.store, { project: f.project, block: f.block,
-    goal: f.attemptGoal, attempt: { series: reference(f.store.get<RepairSeries>(f.series.id)!), ordinal: 2 },
-    accepting: [accepted] }, accepted, key), false,
-  "the E5 provider does not confirm its first-attempt result for another attempt");
-  const before = f.store.get<RepairSeries>(f.series.id)!;
-  const foreign = closeAttempt(f.store, { project: f.project, block: f.block, line: 1,
-    attempt: 2, outcome: outcome({ accepting: [accepted] }) });
-  assert.equal(foreign.ok, false);
-  if (!foreign.ok) assert.equal(foreign.refusal.code, "achievement_unconfirmed");
-  assert.deepEqual(f.store.get<RepairSeries>(f.series.id), before);
+  const a = deliveredOf(await assessFact(f.store, first)).value.accepted!;
+  assert.equal(e51Close(f).closed.verdict, "progress");
+  e51Revise(f);
+  const next = await e51ReroutedAttempt(f, 2, f.routes, "UTF-8", "supported");
+  const b = deliveredOf(await assessFact(f.store, next.request)).value.accepted!;
+  assert.notEqual(a.id, b.id);
+  assert.equal(e51KeyOf(f, a), e51KeyOf(f, b));
+  assert.equal(e51Close(f, 2).closed.verdict, "none", "the key is the goal's already: the second answer repeats the result");
+  const attempts = f.store.get<RepairSeries>(f.series.id)!.value.attempts;
+  assert.deepEqual(attempts.map(item => item.outcome!.achieved.map(row => row.basis.id)), [[a.id], [b.id]]);
+});
+
+test("E5.1 a supported and a negative terminal of one question stand each in its own attempt's outcome", async t => {
+  const f = e51Fixture(t, false, true, { notes: true }), first = await f.original();
+  f.assessor("supported");
+  const a = deliveredOf(await assessFact(f.store, first)).value.accepted!;
+  e51Close(f);
+  const before = structuredClone(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome);
+  e51Revise(f);
+  const next = await e51ReroutedAttempt(f, 2, f.routes, "UTF-8", "insufficient");
+  const negative = deliveredOf(await assessFact(f.store, next.request));
+  const row = e51Claim(f.store, f.project, reference(f.store.get(assessmentRefusalId(f.project, reference(negative)))!));
+  assert.equal(e51Close(f, 2).closed.verdict, "none");
+  const attempts = f.store.get<RepairSeries>(f.series.id)!.value.attempts;
+  assert.deepEqual(attempts[0]!.outcome, before);
+  assert.deepEqual([attempts[0]!.outcome!.reason, attempts[0]!.outcome!.achieved.map(item => item.basis.id), attempts[0]!.outcome!.refusals],
+    ["result", [a.id], []]);
+  assert.deepEqual([attempts[1]!.outcome!.reason, attempts[1]!.outcome!.achieved, attempts[1]!.outcome!.refusals],
+    ["refused", [], [{ row: row.row }]]);
+});
+
+test("E5.1 distinct supported values of one question in two attempts are distinct semantic achievements", async t => {
+  const f = e51Fixture(t, false, true, { notes: true }), first = await f.original();
+  f.assessor("supported");
+  const a = deliveredOf(await assessFact(f.store, first)).value.accepted!;
+  e51Close(f);
+  e51Revise(f);
+  const next = await e51ReroutedAttempt(f, 2, f.routes, "UTF-16", "supported");
+  const b = deliveredOf(await assessFact(f.store, next.request)).value.accepted!;
+  assert.notEqual(e51KeyOf(f, a), e51KeyOf(f, b));
+  assert.equal(e51Close(f, 2).closed.verdict, "progress", "another value is another result of the goal");
+  assert.deepEqual(f.store.get<RepairSeries>(f.series.id)!.value.attempts[1]!.outcome!.achieved.map(item => item.key), [e51KeyOf(f, b)]);
+});
+
+test("E5.1 two negative terminals of one question in two attempts give two A2 rows, each of its own attempt", async t => {
+  const f = e51Fixture(t, false, true), first = await f.original();
+  f.assessor("insufficient");
+  const one = deliveredOf(await assessFact(f.store, first));
+  e51Close(f);
+  const two = deliveredOf(await assessFact(f.store, await e51NextAttempt(f, 2, "insufficient")));
+  e51Close(f, 2);
+  const rows = [one, two].map(result => e51Claim(f.store, f.project, reference(f.store.get(assessmentRefusalId(f.project, reference(result)))!)));
+  assert.notEqual(rows[0]!.row, rows[1]!.row);
+  assert.deepEqual([rows[0]!.name, rows[0]!.goal], [rows[1]!.name, rows[1]!.goal]);
+  const attempts = f.store.get<RepairSeries>(f.series.id)!.value.attempts;
+  assert.deepEqual(attempts.map(item => item.outcome!.refusals), [[{ row: rows[0]!.row }], [{ row: rows[1]!.row }]]);
+  const journal = f.store.get<RefusalJournal>(journalId(f.project))!.value;
+  assert.deepEqual(rows.map(item => journal.rows.find(row => row.id === item.row)!.origin.sources.map(source => source.ref.id)),
+    [[one.id], [two.id]]);
+});
+
+test("E5.1 does not transfer an identical fact key to another attempt", async t => {
+  // LG07 (№10083 п.5): two managed attempts of the same question with an equal full goal — the second after the notes
+  // its first answer cited were revised — and one key; the second has its own complete set and lawful claim.
+  const f = e51Fixture(t, false, true, { notes: true }), first = await f.original();
+  f.assessor("supported");
+  const accepted = deliveredOf(await assessFact(f.store, first)).value.accepted!;
+  assert.equal(e51Close(f).closed.verdict, "progress");
+  e51Revise(f);
+  const next = await e51ReroutedAttempt(f, 2, f.routes, "UTF-8", "supported");
+  assert.deepEqual({ ...next.goal, questions: [...next.goal.questions].sort() }, { ...f.attemptGoal, questions: [...f.attemptGoal.questions].sort() });
+  const own = deliveredOf(await assessFact(f.store, next.request)).value.accepted!;
+  const keyOf = (ref: Ref): string => deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: ref })).key;
+  const key = keyOf(accepted);
+  assert.equal(keyOf(own), key);
+  const context = (ref: Ref) => ({ project: f.project, block: f.block, goal: next.goal,
+    attempt: { series: reference(f.store.get<RepairSeries>(f.series.id)!), ordinal: 2 }, accepting: [ref] });
+  assert.equal(acceptedAnswerRepresents(f.store, context(own), own, key), true, "the second attempt's own answer is its result");
+  assert.equal(acceptedAnswerRepresents(f.store, context(accepted), accepted, key), false,
+    "the E5 provider does not confirm its first-attempt result for another attempt");
+  const at = { project: f.project, block: f.block, line: 1, attempt: 2 };
+  const claim = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).outcome;
+  assert.deepEqual(claim.accepting, [own]);
+  const request = { ...at, outcome: { ...claim, accepting: [...claim.accepting, accepted] } };
+  const before = f.store.list().map(reference), sends = f.sent().length;
+  // G7 refuses the foreign Ref: the close holds exactly this attempt's own supported E5 bases.
+  const foreign = refusalOf(closeAttempt(f.store, request));
+  assert.deepEqual([foreign.code, foreign.at.field], ["completion_invalid", "accepting"]);
+  assert.deepEqual(f.store.list().map(reference), before);
   f.restart();
-  assert.equal(closeAttempt(f.store, { project: f.project, block: f.block, line: 1,
-    attempt: 2, outcome: outcome({ accepting: [accepted] }) }).ok, false);
-  assert.equal(f.sent().length, 2);
+  assert.equal(refusalOf(closeAttempt(f.store, request)).code, foreign.code);
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(f.sent().length, sends);
 });
 
 test("E5.1 confirms both E5 and native D5 of one fact but advances the goal once", async t => {
@@ -3788,7 +3976,7 @@ test("E5.1 confirms both E5 and native D5 of one fact but advances the goal once
 });
 
 async function crossProviderAttempt(t: test.TestContext, managed: boolean) {
-  const f = e51Fixture(t, false), first = await f.original();
+  const f = e51Fixture(t, false, managed), first = await f.original();
   const intent = deliveredOf(writeAssessmentIntent(f.store, first));
   const admission = deliveredOf(readAssessmentIntentAt(f.store, f.project, reference(intent)));
   const mc1 = f.store.get<Mc1QuestionRecord>(admission.question.record.id, admission.question.record.revision)!;
@@ -3814,7 +4002,16 @@ async function crossProviderAttempt(t: test.TestContext, managed: boolean) {
     answer: answered.value.answer, answeredQuestion: reference(answered), draft: reference(researchedDraft),
     attempt: { series: reference(f.series), attempt: 1 } }));
   const nativeRef = reference(native), at = { project: f.project, block: f.block, line: 1 };
-  deliveredOf(closeAttempt(f.store, { ...at, attempt: 1, outcome: outcome({ accepting: [nativeRef] }) }));
+  if (managed) {
+    // LG07: the issued fact owes its E5 terminal before G7 can close attempt 1; a technical one accepts nothing, and the
+    // native D5 answer is the attempt's independent result.
+    writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, e51AssessorStep("supported"),
+      e51AssessorStep("off-form")] }));
+    assert.equal(deliveredOf(await assessFact(f.store, first)).value.verdict, "off-form");
+    const claim = deliveredOf(prepareManagedClaim(f.store, { ...at, attempt: 1, outcome: outcome({ accepting: [nativeRef] }) })).outcome;
+    assert.deepEqual(claim.accepting, [nativeRef]);
+    deliveredOf(closeAttempt(f.store, { ...at, attempt: 1, outcome: claim }));
+  } else deliveredOf(closeAttempt(f.store, { ...at, attempt: 1, outcome: outcome({ accepting: [nativeRef] }) }));
   let secondSeries = managed ? null : deliveredOf(openAttempt(f.store, { ...at, attempt: 2, goal: f.attemptGoal }));
 
   writeFileSync(join(f.root, "native-proof.txt"), "This evidence no longer supports the old encoding.");
@@ -3832,7 +4029,7 @@ async function crossProviderAttempt(t: test.TestContext, managed: boolean) {
     batch: batch.id, environment: reference(f.config),
     attempt: { series: reference(secondSeries!), ordinal: 2 }, previous: [] })).record;
   writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, e51AssessorStep("supported"),
-    f.originalStep, e51AssessorStep("supported")] }));
+    ...(managed ? [e51AssessorStep("off-form")] : []), f.originalStep, e51AssessorStep("supported")] }));
   const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet),
     dispatch: first.dispatch, role: "implementer" }));
   const second = { ...first, modelCall: reference(model.record) };
@@ -3847,7 +4044,7 @@ async function crossProviderAttempt(t: test.TestContext, managed: boolean) {
     else await assert.rejects(() => assessFact(f.store, second), /stop before cross-attempt G7 write/);
   }
   finally { f.store.writeMany = originalWrite; }
-  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
+  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND).find(row => row.value.verdict === "supported")!;
   const e5 = terminal.value.accepted!;
   const e5Fact = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: e5 }));
   const nativeFact = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: nativeRef }));
@@ -4416,7 +4613,7 @@ async function m5CallWithoutE4(f: ReturnType<typeof m5Fixture>, request: ModelCa
   try { await assert.rejects(() => runModelCall(f.store, request), /stop before E4 claim/); }
   finally { f.store.writeMany = original; }
 }
-test("C15 H1.0d a close prepared before the first E1 guards the absent ledger: the later applied M5 result fails it", async t => {
+test("C15 H1.0d an incomplete registry admits no close before the first E1, and the close after the applied E4 names its result", async t => {
   // LG07: a managed attempt cannot be closed before its registry is complete, so no close without the later result can
   // be prepared at all; once the M5 answer is applied, the close names it.
   const f = m5Fixture(t, true);
@@ -4435,7 +4632,7 @@ test("C15 H1.0d a close prepared before the first E1 guards the absent ledger: t
   assert.equal(deliveredOf(closeAttempt(second, { ...f.address, attempt: 1, outcome: claim })).verdict, "progress");
   assert.equal(second.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!.reason, "result");
 });
-test("C15 H1.0d an E1 without E4 guards the absence of its E4, which unknown usage never settles in the ledger", async t => {
+test("C15 H1.0d an E1 without its E4 admits no close, unknown usage leaves the ledger as it was, and the close after the E4 names its result", async t => {
   // LG07: an admitted call whose E4 is still absent leaves the registry incomplete, so no close stands beside it.
   const f = m5Fixture(t, true);
   f.steps([f.answer()]);
