@@ -444,18 +444,18 @@ test("a refusal of the proposal from a negative E5 reaches the gate with its cla
   assert.deepEqual(journal.value.rows, journalBefore.value.rows);
   assert.equal(series().value.attempts[0]!.outcome!.reason, "refused");
   assert.ok(series().revision > seriesBefore.revision);
-  // Delivering the same close again is a repeat: no revision of either record, and the same report.
-  const settled = { series: series().revision, journal: journal.revision };
+  // Delivering the same close again is a repeat: no record of the store moves, and the same report.
+  const settled = store.list().map(reference);
   assert.deepEqual(deliveredOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: claim })), result);
-  assert.deepEqual({ series: series().revision, journal: heldJournal(store)!.revision }, settled);
-  // And still a repeat after a later cycle moved both records on: what it says of the series is the series as it stands.
+  assert.deepEqual(store.list().map(reference), settled);
+  // And still a repeat after a later cycle moved the records on: what it says of the series is the series as it stands.
   await m.cycle("gap:cart:price", "insufficient");
-  const later = { series: series().revision, journal: heldJournal(store)!.revision };
+  const later = store.list().map(reference);
   const late = deliveredOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: claim }));
   assert.deepEqual(late.routed, result.routed);
   assert.deepEqual(late.question, result.question);
   assert.equal(late.withoutProgress, 2);
-  assert.deepEqual({ series: series().revision, journal: heldJournal(store)!.revision }, later);
+  assert.deepEqual(store.list().map(reference), later);
 });
 
 test("the distinct refusals of a cycle are an unordered set: another order is the same decisions, written in one canonical order (T6)", async t => {
@@ -3282,6 +3282,27 @@ async function e51SingleBeforeGate(f: ReturnType<typeof e51Fixture>) {
   return { request, result, source, refusal: e51Claim(f.store, f.project, reference(source)) };
 }
 
+/**
+ * LG07 (№10083 п.6, №10158 (в)): the producing block of the producer variant — a second series of the project with a
+ * question and a plan of its own, so its goal differs as well. Its managed attempt 1 is answered and assessed.
+ */
+async function e51ProducerAttempt(f: ReturnType<typeof e51Fixture>, verdict: E51Verdict) {
+  const block = "garden-produce-block", batch = f.producerBatch!;
+  deliveredOf(openSeries(f.store, { project: f.project, block, line: 1, slice: "e51-producer", predecessor: null, basis: null }));
+  const goal: AttemptGoal = { key: "e51:producer", questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
+    result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
+  const series = deliveredOf(openAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal,
+    completion: { routes: reference(f.routes), batches: [batch.id] } }));
+  const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.routes), batch: batch.id,
+    environment: reference(f.config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+  const steps = (JSON.parse(readFileSync(f.scenario, "utf8")) as { steps: unknown[] }).steps;
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [...steps, { ...f.originalStep, research: { ...f.originalStep.research,
+    results: batch.items.map(item => ({ ...f.originalStep.research.results[0]!, questionId: item.gap })) } }, e51AssessorStep(verdict)] }));
+  const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
+  deliveredOf(await assessFact(f.store, { project: f.project, modelCall: reference(model.record), questionId: batch.items[0]!.gap, dispatch: f.dispatch }));
+  return { at: { project: f.project, block, line: 1, attempt: 1 } };
+}
+
 test("E5.1 binds a refusal to its exact consumer and attempt ordinal", async t => {
   await t.test("ordinal", async child => {
     // The refusal of attempt 1 cannot be added to the complete claim of the next managed attempt of the same block.
@@ -3306,27 +3327,58 @@ test("E5.1 binds a refusal to its exact consumer and attempt ordinal", async t =
     f.assessor("insufficient");
     const result = deliveredOf(await assessFact(f.store, request));
     const refusal = e51Claim(f.store, f.project, reference(f.store.get(assessmentRefusalId(f.project, reference(result)))!));
-    const block = "garden-produce-block", batch = f.producerBatch!;
-    deliveredOf(openSeries(f.store, { project: f.project, block, line: 1, slice: "e51-producer", predecessor: null, basis: null }));
-    const goal: AttemptGoal = { key: "e51:producer", questions: batch.items.map(item => gapLineKey(f.project, item.target, item.field)).sort(),
-      result: gapLineExpectedResult(f.project, batch.items[0]!.target, batch.items[0]!.field) };
-    const series = deliveredOf(openAttempt(f.store, { project: f.project, block, line: 1, attempt: 1, goal,
-      completion: { routes: reference(f.routes), batches: [batch.id] } }));
-    const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.routes), batch: batch.id,
-      environment: reference(f.config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
-    const steps = (JSON.parse(readFileSync(f.scenario, "utf8")) as { steps: unknown[] }).steps;
-    writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [...steps, { ...f.originalStep, research: { ...f.originalStep.research,
-      results: batch.items.map(item => ({ ...f.originalStep.research.results[0]!, questionId: item.gap })) } }, e51AssessorStep("insufficient")] }));
-    const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: f.dispatch, role: "implementer" }));
-    deliveredOf(await assessFact(f.store, { project: f.project, modelCall: reference(model.record), questionId: batch.items[0]!.gap, dispatch: f.dispatch }));
-    const at = { project: f.project, block, line: 1, attempt: 1 };
+    const { at } = await e51ProducerAttempt(f, "insufficient");
     const own = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).outcome;
     assert.equal(own.reason, "refused");
-    const line = f.store.get<RepairSeries>(seriesId(f.project, block, 1))!;
+    const line = f.store.get<RepairSeries>(seriesId(f.project, at.block, 1))!;
     const rejection = refusalOf(closeAttempt(f.store, { ...at, outcome: { ...own, refusals: [...own.refusals, refusal] } }));
     assert.deepEqual([rejection.code, rejection.at.field], ["completion_invalid", "refusals"]);
     assert.deepEqual(f.store.get<RepairSeries>(line.id), line);
   });
+});
+
+test("E5.1 a close of another series of the project that commits first in the write window leaves this close neither an outcome nor a classification (T7, the journal alone)", async t => {
+  // LG07 (№10158 (в)): the consuming and the producing block are two series of one project, each with its own plan and
+  // paid work, and they share the project's refusal journal. Both E5 are complete before the window; another Store
+  // closes the producing series with its own complete claim just before this close writes.
+  const f = e51Fixture(t, false, true, { producer: true }), request = await f.original();
+  f.assessor("insufficient");
+  deliveredOf(await assessFact(f.store, request));
+  const producer = await e51ProducerAttempt(f, "insufficient");
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
+  const claim = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).outcome;
+  const rivalClaim = deliveredOf(prepareManagedClaim(f.store, { ...producer.at, outcome: outcome() })).outcome;
+  const journal = reference(f.store.get(journalId(f.project))!), line = f.store.get<RepairSeries>(f.series.id)!;
+  let afterWinner: Ref[] = [], armed = true;
+  const originalWrite = f.store.writeMany.bind(f.store);
+  f.store.writeMany = ((writes, guards) => {
+    if (armed && writes.some(write => write.id === f.series.id)) {
+      armed = false;
+      const rival = new Store(f.path);
+      try { deliveredOf(closeAttempt(rival, { ...producer.at, outcome: rivalClaim })); } finally { rival.close(); }
+      afterWinner = f.store.list().map(reference);
+    }
+    return originalWrite(writes, guards);
+  }) as Store["writeMany"];
+  const lost = (() => {
+    try { return refusalOf(closeAttempt(f.store, { ...at, outcome: claim })); } finally { f.store.writeMany = originalWrite; }
+  })();
+  assert.equal(armed, false, "the rival ran in the write window");
+  // The one record both closes write is the journal, and this close is refused on the exact revision it read.
+  assert.deepEqual([lost.code, lost.at.target, lost.at.ref], ["input_stale", journalId(f.project), journal]);
+  // The loser wrote nothing: the store is exactly as the winner left it, and this series stands as it was.
+  assert.deepEqual(f.store.list().map(reference), afterWinner);
+  assert.deepEqual(f.store.get<RepairSeries>(f.series.id), line);
+  // The winner's close stands: its series closed on its own refusal, and the journal holds its classes only, one revision on.
+  assert.equal(f.store.get<RepairSeries>(seriesId(f.project, producer.at.block, 1))!.value.attempts[0]!.outcome!.reason, "refused");
+  const shared = f.store.get<RefusalJournal>(journalId(f.project))!;
+  assert.equal(shared.revision, journal.revision + 1);
+  assert.deepEqual(shared.value.classifications.map(item => item.row), rivalClaim.refusals.map(item => item.row).sort());
+  // Nothing was lost: read again, this close carries its own refusal through beside the winner's.
+  const done = deliveredOf(closeAttempt(f.store, { ...at, outcome: claim }));
+  assert.equal(routeOf(done, claim.refusals[0]!.row).class, "proposal");
+  assert.deepEqual(f.store.get<RefusalJournal>(journalId(f.project))!.value.classifications.map(item => item.row).sort(),
+    [...rivalClaim.refusals, ...claim.refusals].map(item => item.row).sort());
 });
 
 test("E5.1 a stop before the negative terminal and its A2 source are written is completed by the next run without another call", async t => {
