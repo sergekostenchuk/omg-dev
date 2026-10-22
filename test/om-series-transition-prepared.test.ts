@@ -6,7 +6,7 @@ import { readLayerAcceptance } from "../src/om/layer-basis.js";
 import { createOmFixture, refusedWith } from "./om-fixture.js";
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +23,7 @@ import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { writeOmInput } from "../src/om/input.js";
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from "../src/om/addressing.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
-import { writeGapLines } from "../src/om/gap-lines.js";
+import { gapLineExpectedResult, gapLineKey, writeGapLines } from "../src/om/gap-lines.js";
 import { writeOmObligations } from "../src/om/obligations.js";
 import { writeWorksFrame } from "../src/om/works-frame.js";
 import { writeNeighbors } from "../src/om/neighbors.js";
@@ -33,10 +33,14 @@ import { resolveSnapshot } from "../src/om/impact.js";
 import { writeHandoff } from "../src/om/handoff.js";
 import { writeHorizon, prepareHorizonIssuance, writeHorizonIssuance, readHorizonIssuance,
   type HorizonRequest } from "../src/om/horizon.js";
-import { beginAttempt, completeAttempt, openSeries, readSeriesAt, type RepairSeries } from "../src/om/series.js";
+import { beginAttempt, completeAttempt, completionWorkId, openSeries, readCompletionBinding, readSeriesAt, type RepairSeries } from "../src/om/series.js";
 import { prepareSeriesTransition, writeSeriesTransition, readPreparedSeriesTransition, comparePreparedSeriesSlices,
   type PreparedSeriesTransitionRecord } from "../src/om/series-transition.js";
 import { writeGuarded } from "../src/om/refs.js";
+import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
+import { readCompletionWorkAt, runModelCall } from "../src/om/model-call.js";
+import { prepareQuestionTasks, writeQuestionPacket } from "../src/om/question-packet.js";
+import { writeRoutes } from "../src/om/routes.js";
 import type { OmResult, Sealed } from "../src/om/refusal.js";
 import { gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -71,7 +75,7 @@ class ExactOnlyStore extends Store {
   }
   override list<T = Json>(_kind?: string): Revision<T>[] { assert.fail("Historical preparation may not enumerate today's records"); }
 }
-function fixture(t: TestContext, change: (graph: Graph) => void = () => {}, includeLater = false, addressing = false) {
+function fixture(t: TestContext, change: (graph: Graph) => void = () => {}, includeLater = false, addressing = false, repositoryFact = false) {
   const root = mkdtempSync(join(tmpdir(), "omg-series-transition-")), path = join(root, "state.sqlite");
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -87,6 +91,9 @@ function fixture(t: TestContext, change: (graph: Graph) => void = () => {}, incl
     if (addressing && field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "unaddressed",
       question: "Which consumer owns this question?", consumer: "unresolved-consumer", moment: "om-pass", blocksCurrentStage: false,
       resolution: "Address the question during OM" }];
+    if (repositoryFact && field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "encoding",
+      question: "What encoding is supported?", consumer: block, moment: "om-pass", blocksCurrentStage: false,
+      resolution: "Read repository facts during OM" }];
     if (includeLater && field === "preparation") {
       const rows = (value as Record<string, Json>).outcomes as Record<string, Json>[];
       rows.push({ ...clone(rows[0]!), id: "garden-later", result: "The later result" });
@@ -113,7 +120,10 @@ function fixture(t: TestContext, change: (graph: Graph) => void = () => {}, incl
   });
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage,
     reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-  const input = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  const base = ok(writeOmInput(store, { project, expected: 0, stages })), graph = store.get<Graph>(`graph:${project}`)!;
+  const input = repositoryFact ? ok(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
+    decisions: [{ pending: clone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      decision: { target: "discovery:encoding", field: "address", value: { consumer: block, kind: "repository-fact" } } })) as Write }] })) : base;
   const horizon = (version: string, extra: Partial<HorizonRequest['choice']> = {}) => ok(writeHorizon(store, {
     project, input: reference(input), graph: reference(graph), refinement: null, available: {},
     choice: { choiceVersion: version, features: [{ outcome: "garden-result" }], excluded: [], ...extra },
@@ -141,6 +151,66 @@ function stop(store: Store, owner = block) {
   }
   assert.ok(saved?.value.stop);
   return saved;
+}
+
+const usage = { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 };
+const adapterFixture = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
+
+/** LG07 st-a: the consuming block's own repository-fact carrier — the question declared in the input materials and
+ *  addressed by writeAddressing goes through D1 gaps, question tasks and the M6 route into one whole MC1 batch. */
+function managedRoutes(f: ReturnType<typeof fixture>, horizon: Ref) {
+  const input = reference(f.input), graph = reference(f.graph);
+  const sources: GapRequest = { project, input, graph, horizon,
+    operations: { proposals: [], frame: { project, level: 2, graph, horizon, layer: null, frame: null, upper: null } },
+    works: { state: "upper-not-accepted", layer: reference(f.store.get(`graph-layer:${project}:2`)!) } };
+  const gaps = ok(writeGaps(f.store, sources)), gapRequest = { sources: clone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const tasks = ok(prepareQuestionTasks(f.store, { project, gaps: gapRequest,
+    questions: gaps.records.filter(row => row.value.gap.kind === "repository-fact" && row.value.gap.code !== "inventory_missing" && !row.value.gap.deferral)
+      .map(gap => ({ gap: reference(gap), requirements: [{ pointer: "/contracts/0" }], resultForm: { type: "string" as const } })) }));
+  const routes = ok(writeRoutes(f.store, { project, gaps: gapRequest, tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })),
+    catalog: { paths: ["e4-source.txt"], records: [] }, previous: null }));
+  writeFileSync(join(f.root, "e4-source.txt"), "UTF-8 is supported.");
+  const batch = routes.value.batches.find(row => row.model === "MC1" && row.items.some(item => item.target === "discovery:encoding"));
+  assert.ok(batch, "The addressed repository-fact question is routed into the consuming block's MC1 batch");
+  const goal = { key: "current:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  return { routes, batch, goal, completion: { routes: reference(routes), batches: [batch.id] } };
+}
+
+/** LG07 st-a: three managed attempts stop the line — each opened with its own completion plan, paid by one real
+ *  off-form model call through its own E2 packet and closed through G7 with the claim the registry derives. */
+async function managedStop(f: ReturnType<typeof fixture>, carrier: ReturnType<typeof managedRoutes>, count = 3) {
+  const engine = new ProductEngine(f.store), scenario = join(f.root, "scenario.json"), trace = join(f.root, "trace.jsonl");
+  const command = { executable: process.execPath, args: [adapterFixture, "--scenario", scenario, "--trace", trace] };
+  const environment = engine.environments.configure(project, { workspace: f.root,
+    implementer: { actor: "current-worker", model: "fixture", effort: "high", speed: "fast", command },
+    reviewer: { actor: "current-reviewer", model: "fixture-reviewer", effort: "medium", command },
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000, requestCapacityChars: 100000 }, 0);
+  const adapter = f.store.write({ id: `adapter:${project}:current`, kind: "dispatch-adapter", expected: 0,
+    value: { projectId: project, protocol: "codex-stdio" } });
+  writeFileSync(scenario, JSON.stringify({ database: f.store.path,
+    steps: Array.from({ length: count }, () => ({ research: { malformed: true }, usage })) }));
+  for (let attempt = 1; attempt <= count; attempt++) {
+    const series = ok(openAttempt(f.store, { project, block, line: 1, attempt, goal: carrier.goal, completion: carrier.completion }));
+    const binding = ok(readCompletionBinding(f.store, project, reference(series), attempt));
+    assert.ok(binding); assert.deepEqual(binding.value.plan, carrier.completion);
+    const packet = ok(writeQuestionPacket(f.store, { project, routes: reference(carrier.routes), batch: carrier.batch.id,
+      environment: reference(environment), attempt: { series: reference(series), ordinal: attempt }, previous: [] })).record;
+    const physical = ok(await runModelCall(f.store, { project, packet: reference(packet),
+      dispatch: { adapter: reference(adapter), config: reference(environment) }, role: "implementer" }));
+    assert.ok(physical.diagnostic);
+    const work = ok(readCompletionWorkAt(f.store, project, reference(f.store.get(completionWorkId(project, binding.id))!)));
+    assert.equal(work.complete, true);
+    const claim = ok(prepareManagedClaim(f.store, { project, block, line: 1, attempt,
+      outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } }));
+    ok(closeAttempt(f.store, { project, block, line: 1, attempt, outcome: claim.outcome }));
+  }
+  assert.equal((existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []).length, count,
+    "Each stopped attempt has its own physical producer");
+  const stopped = f.store.get<RepairSeries>(`repair-series:${project}:1:${block}`)!;
+  assert.ok(stopped.value.stop); assert.deepEqual(stopped.value.stop!.attempts, [1, 2, 3]);
+  assert.deepEqual(stopped.value.attempts.map(item => item.outcome?.reason), ["off-form", "off-form", "off-form"]);
+  return stopped;
 }
 
 /** The same current OM route the garden fixture drives natively: L2 admission, addressing, L3 and the M8 handoff. */
@@ -231,9 +301,9 @@ function nativeExecuted(engine: ProductEngine, desired: Graph, sources: Ref[] = 
   ok(writeHandoff(store, { project, feasibility: reference(feasibility), expected: 0 }));
 }
 
-test("prepared transition establishes an active legacy basis without changing its stopped series", t => {
-  const f = fixture(t), horizon = f.horizon("choice-1");
-  f.series(); const series = stop(f.store), before = snapshot(f.store);
+test("prepared transition establishes an active legacy basis without changing its stopped series", async t => {
+  const f = fixture(t, () => {}, false, false, true), horizon = f.horizon("choice-1");
+  f.series(); const series = await managedStop(f, managedRoutes(f, reference(horizon.gate))), before = snapshot(f.store);
   const prepared = ok(prepareSeriesTransition(f.store, request(reference(horizon.gate), [reference(series)])));
   assert.deepEqual(snapshot(f.store), before, "Preparing P is read-only");
   const row = decision(prepared.record);
@@ -422,22 +492,25 @@ test("P carries graph, stage, input and evidence guards to the same final transa
 });
 
 test("prepared source CAS rejects a series changed by a second Store and writes no neighboring record", t => {
-  const f = fixture(t), horizon = f.horizon("choice-1"), series = f.series();
+  const f = fixture(t, () => {}, false, false, true), horizon = f.horizon("choice-1"), series = f.series();
+  const carrier = managedRoutes(f, reference(horizon.gate));
   const prepared = ok(prepareSeriesTransition(f.store, request(reference(horizon.gate), [reference(series)])));
   const other = new Store(f.path);
-  try { ok(beginAttempt(other, { project, block, line: 1, attempt: 1,
-    goal: { key: "new-attempt", questions: ["Name the result"], result: "accepted proposal" } })); }
+  try { ok(openAttempt(other, { project, block, line: 1, attempt: 1, goal: carrier.goal, completion: carrier.completion })); }
   finally { other.close(); }
+  const winner = snapshot(f.store);
   refusedWith(writeGuarded(f.store, { unit: "B3.0a", target: prepared.record.id,
     writes: [...prepared.writes, { id: "transition-neighbor", kind: "test", expected: 0, value: {} }], guards: prepared.guards }), "input_stale");
+  assert.deepEqual(snapshot(f.store), winner, "The refused common write leaves no record of its own");
   assert.equal(f.store.get(prepared.record.id), null); assert.equal(f.store.get("transition-neighbor"), null);
 });
 
 test("prepared history remains exact after source heads advance and the Store is reopened", t => {
-  const f = fixture(t), horizon = f.horizon("choice-1"), series = f.series();
+  const f = fixture(t, () => {}, false, false, true), horizon = f.horizon("choice-1"), series = f.series();
+  const carrier = managedRoutes(f, reference(horizon.gate));
   const prepared = ok(writeSeriesTransition(f.store, request(reference(horizon.gate), [reference(series)])));
-  ok(beginAttempt(f.store, { project, block, line: 1, attempt: 1,
-    goal: { key: "later-attempt", questions: ["Later question"], result: "accepted result" } }));
+  const opened = ok(openAttempt(f.store, { project, block, line: 1, attempt: 1, goal: carrier.goal, completion: carrier.completion }));
+  assert.ok(opened.revision > series.revision, "A real managed opening advances the series head");
   const source = f.store.get(`source:${project}:brief`)!;
   f.store.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
   f.restart();
@@ -813,8 +886,9 @@ test("a separate provider flow to independent C changes neither B's frame obliga
     "A different producer-end flow of an otherwise selected connector is still unrelated to B");
 });
 
-test("a genuinely refused horizon has an exact prepared transition and negative issuance without asserting block participation", t => {
-  const f = fixture(t); f.series(); const series = stop(f.store), savedSeries = f.store.history(series.id);
+test("a genuinely refused horizon has an exact prepared transition and negative issuance without asserting block participation", async t => {
+  const f = fixture(t, () => {}, false, false, true); f.series();
+  const series = await managedStop(f, managedRoutes(f, reference(f.horizon("setup").gate))), savedSeries = f.store.history(series.id);
   const horizon = f.horizon("refused-choice", { excluded: [{ block: producer,
     reason: "The owner excluded a required provider", returnCondition: "Select the provider again" }] });
   assert.equal(horizon.gate.value.state, "refused");
