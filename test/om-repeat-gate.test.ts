@@ -2502,7 +2502,7 @@ function e51AssessorStep(verdict: E51Verdict) {
 }
 
 /** The directory-independent prefix of e51Fixture — stages, B1, M5 addresses, G2, D1, routes and the open attempt — per fact count. */
-function e51Prefix(store: Store, factCount: number) {
+function e51Prefix(store: Store, factCount: number, managed = false) {
   const facts = ["encoding", "transport", "retention"].slice(0, factCount);
   const project = "garden", engine = new ProductEngine(store), desired = gardenGraph("cross");
   desired.nodes.find(node => node.id === "garden-produce-block")!.ports.push({ id: "out-side", direction: "out", contract: "garden-contract" });
@@ -2546,15 +2546,17 @@ function e51Prefix(store: Store, factCount: number) {
   const attemptGoal: AttemptGoal = { key: "e51:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   deliveredOf(openSeries(store, { project, block, line: 1, slice: "e51-fact", predecessor: null, basis: null }));
-  const series = deliveredOf(beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
+  // LG07: a managed attempt opens through G7 with the complete plan of its MC1 batch.
+  const series = deliveredOf(managed ? openAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal,
+    completion: { routes: reference(routes), batches: [batch.id] } }) : beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
   return { frame: sources.operations.frame, routes, batch, source, attemptGoal, series };
 }
 
 /** An issued one-to-three-question MC1 response, with the real E1 transport and D1 attempt behind E5. */
-function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true) {
+function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, managed = false) {
   const factCount = typeof twoFacts === "boolean" ? twoFacts ? 2 : 1 : twoFacts;
   assert.ok(Number.isInteger(factCount) && factCount >= 1 && factCount <= 3);
-  const seeded = seedCopy(`e51:${factCount}`, store => e51Prefix(store, factCount), "omg-e51-g7-");
+  const seeded = seedCopy(`e51:${factCount}:${managed ? "managed" : "standalone"}`, store => e51Prefix(store, factCount, managed), "omg-e51-g7-");
   const { root, database: path } = seeded, { frame, routes, batch, source, attemptGoal, series } = seeded.data;
   const project = "garden", block = "garden-consume-block";
   let store = new Store(path);
@@ -3915,7 +3917,7 @@ const m5Context = (f: ReturnType<typeof m5Fixture>, series: Ref = reference(f.se
   target: f.series.id, goal: f.goal, attempt: { series, ordinal: 1 }, cancelling: [] as Ref[] });
 
 test("O1 O2 O4 O11 C1 C3 C6 C11 E1 E2 E5 X8 H1.0d an applied M5 E4 confirms every addressing of its batch under the typed owner, and G7 closes with them", async t => {
-  const f = m5Fixture(t);
+  const f = m5Fixture(t, true);
   f.steps([f.answer()]);
   const sent = deliveredOf(await runModelCall(f.store, f.call()));
   assert.equal(sent.outcome?.kind, "input-decisions");
@@ -3944,7 +3946,7 @@ test("O1 O2 O4 O11 C1 C3 C6 C11 E1 E2 E5 X8 H1.0d an applied M5 E4 confirms ever
 });
 
 test("O3 C28 H1.0d a partial applied answer accepts only its addressed question; the unanswered one is neither accepted nor refused", async t => {
-  const f = m5Fixture(t);
+  const f = m5Fixture(t, true);
   f.steps([f.answer(["discovery:encoding"])]);
   const sent = deliveredOf(await runModelCall(f.store, f.call()));
   assert.equal(sent.outcome?.kind, "input-decisions");
@@ -3972,7 +3974,7 @@ test("C15 X3 H1.0d a new standalone close cannot omit an accepted M5 result, nor
 });
 
 test("C01 O6 C8 C13 O13 H1.0d owners select their providers: no block provider reads a mechanism, no M5 result serves a block or another attempt", async t => {
-  const f = m5Fixture(t);
+  const f = m5Fixture(t, true);
   f.steps([f.answer()]);
   const e4 = reference(deliveredOf(await runModelCall(f.store, f.call())).record);
   const input = reference(f.store.list("om-input").at(-1)!);
@@ -4328,31 +4330,41 @@ async function m5CallWithoutE4(f: ReturnType<typeof m5Fixture>, request: ModelCa
   finally { f.store.writeMany = original; }
 }
 test("C15 H1.0d a close prepared before the first E1 guards the absent ledger: the later applied M5 result fails it", async t => {
-  const f = m5Fixture(t);
+  // LG07: a managed attempt cannot be closed before its registry is complete, so no close without the later result can
+  // be prepared at all; once the M5 answer is applied, the close names it.
+  const f = m5Fixture(t, true);
   f.steps([f.answer()]);
   const request = f.call();
-  const prepared = deliveredOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() }));
-  assert.ok(prepared.guards.some(guard => "absent" in guard && guard.id === callLedgerId(f.project)));
-  assert.equal(deliveredOf(await runModelCall(f.store, request)).outcome?.kind, "input-decisions");
+  const before = mechanismSnapshot(f.store);
+  assert.equal(refusalOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() })).code, "completion_incomplete");
+  assert.equal(refusalOf(prepareManagedClaim(f.store, { ...f.address, attempt: 1, outcome: outcome() })).code, "completion_incomplete");
+  assert.deepEqual(mechanismSnapshot(f.store), before);
+  const applied = deliveredOf(await runModelCall(f.store, request));
+  assert.equal(applied.outcome?.kind, "input-decisions");
+  const e4 = reference(f.store.get(applied.record.id)!);
   const second = new Store(f.database); t.after(() => second.close());
-  const written = writeGuarded(second, { unit: "G7", target: f.series.id, writes: [...prepared.writes], guards: [...prepared.guards] });
-  assert.equal(written.ok, false, "the prepared no-result close must not erase a subsequently applied M5 result");
-  assert.equal(second.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null);
+  const claim = deliveredOf(prepareManagedClaim(second, { ...f.address, attempt: 1, outcome: outcome() })).outcome;
+  assert.deepEqual(claim.accepting, [e4]);
+  assert.equal(deliveredOf(closeAttempt(second, { ...f.address, attempt: 1, outcome: claim })).verdict, "progress");
+  assert.equal(second.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome!.reason, "result");
 });
 test("C15 H1.0d an E1 without E4 guards the absence of its E4, which unknown usage never settles in the ledger", async t => {
-  const f = m5Fixture(t);
+  // LG07: an admitted call whose E4 is still absent leaves the registry incomplete, so no close stands beside it.
+  const f = m5Fixture(t, true);
   f.steps([f.answer()]);
   const request = f.call();
   await m5CallWithoutE4(f, request);
   assert.equal(f.store.list("model-call").length, 0); assert.equal(f.store.list("call-record").length, 1);
-  const prepared = deliveredOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() }));
-  assert.ok(prepared.guards.some(guard => "absent" in guard && guard.id.startsWith(`model-call:${f.project}:om:`)));
+  const before = mechanismSnapshot(f.store);
+  assert.equal(refusalOf(prepareCloseAttempt(f.store, { ...f.address, attempt: 1, outcome: outcome() })).code, "completion_incomplete");
+  assert.deepEqual(mechanismSnapshot(f.store), before);
   const ledgerBefore = reference(f.store.list(CALL_LEDGER_KIND)[0]!);
   assert.equal(deliveredOf(await runModelCall(f.store, request)).outcome?.kind, "input-decisions");
   assert.deepEqual(reference(f.store.list(CALL_LEDGER_KIND)[0]!), ledgerBefore, "unknown usage leaves the E1 ledger unchanged");
   const second = new Store(f.database); t.after(() => second.close());
-  const written = writeGuarded(second, { unit: "G7", target: f.series.id, writes: [...prepared.writes], guards: [...prepared.guards] });
-  assert.equal(written.ok, false, "the exact absence of the E4 guards the close");
+  const claim = deliveredOf(prepareManagedClaim(second, { ...f.address, attempt: 1, outcome: outcome() })).outcome;
+  assert.equal(claim.accepting.length, 1);
+  assert.equal(deliveredOf(closeAttempt(second, { ...f.address, attempt: 1, outcome: claim })).verdict, "progress");
 });
 test("C15 C43 H1.0d the public finish entry carries the absence of another admitted E4: it finishes without that call, fails in the window, keeps its later K", async t => {
   const finishOf = (f: ReturnType<typeof m5Fixture>, request: ModelCallRequest) => {
