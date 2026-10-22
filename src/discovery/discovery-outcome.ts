@@ -1,5 +1,13 @@
-import { provePlanQuestions } from "./v7-plan-questions.js";
-import type { ResearchAssessment } from './research-model.js';
+import { proveAttempt, provePlanQuestions } from "./v7-plan-questions.js";
+import type { ResearchAssessment, ResearchRun, PaidDiscoveryAttemptsAssessment, V7ProgressApplication, V7ProgressState,
+  V7ProgressSubject, V7ProgressSummary } from './research-model.js';
+import { readV7ProgressStateAt } from './v7-progress.js';
+import { readDiscoveryAssessment } from './research-assessment.js';
+import { DISCOVERY_ASSESSMENT_KIND, v7ProgressStateId } from './v7-attempt-assessment.js';
+import { V7_ATTEMPT_KIND } from './v7-contracts.js';
+import { stageBudgetPlan } from './stage-token-budget.js';
+import { budgetUsage } from '../runtime/research-budget.js';
+import { researchRunId } from './projection-reader.js';
 import { Ajv } from 'ajv';
 import { canonical, hashJson, type Json } from '../canonical.js';
 import { EngineError, requireCondition } from '../errors.js';
@@ -434,6 +442,147 @@ export function discoveryInspection(store: Store, draft: Revision<DiscoveryDraft
       reason: null, guards: gate.guards, findings: [] }, gate };
   }
   return { outcome: outcomeFromGate(store, draft, gate), gate };
+}
+
+export const V7_TRAVERSAL_CONTRACT = 'v7-traversal-outcome/v1' as const;
+/** The proved end of the plan traversal. None of them is Discovery acceptance: discoveryOutcome stays researching. */
+export type V7TraversalEnd = 'open' | 'assessment_unpaid' | 'assessment_unapplied' | 'stalled' | 'limit' | 'completed';
+export interface V7TraversalSubject {
+  subject: V7ProgressSubject;
+  class: string;
+  /** unstarted — no attempt; otherwise the applied summary outcome, or open while no attempt is applied yet. */
+  outcome: 'unstarted' | V7ProgressSummary['outcome'];
+  state: Ref | null;
+  /** The whole proved application chain of this exact subject, from its first application to its last, without
+   * repeats; state is the state of the last. Empty while nothing is applied. */
+  applications: Ref[];
+  /** Proven attempts K of this subject that no application of its progress chain accounted for. */
+  pending: Ref[];
+  /** Proven paid assessments whose packet holds a pending attempt: paid, not applied. */
+  assessments: Ref[];
+}
+/** The stage budget as its saved segment, ledger and calls prove it; null while the segment is lawfully not created. */
+export interface V7TraversalBudget {
+  segment: Ref; ledger: Ref; calls: Ref[];
+  measured: number; reserved: number; remaining: number;
+  /** measured > limit. */
+  overrun: boolean;
+  /** overrun, or no research tokens remain: the budget admits no new paid research send. */
+  exhausted: boolean;
+}
+export const V7_TRAVERSAL_BUDGET_PAUSES = Object.freeze(['discovery_budget_reserve', 'discovery_budget_overrun', 'budget_estimate_missing']);
+export interface V7TraversalBudgetPause { run: Ref; code: string; error: string | null }
+export interface V7Traversal {
+  contract: typeof V7_TRAVERSAL_CONTRACT;
+  plan: Ref;
+  end: V7TraversalEnd;
+  /** The exact subject the end belongs to; null for a stage-wide end (completed, limit, open). */
+  subject: V7ProgressSubject | null;
+  reason: string | null;
+  subjects: V7TraversalSubject[];
+  budget: V7TraversalBudget | null;
+  /** Diagnostic only: the saved budget pause of the run, as it was written. It is never a ground of an end, of a
+   * limit or of a permission to pay. */
+  pause: V7TraversalBudgetPause | null;
+  guards: Ref[];
+}
+
+/**
+ * R.3: the proved end of the v7 plan traversal of the answered plan edition, read from its producers alone — the
+ * attempts K through the common attempt reader, their accounting through the proven progress-state chain (P), and a
+ * paid but unapplied assessment through its own reader (MR), and the stage budget through its segment and ledger. The
+ * run record is read only for the diagnostic pause, never as a ground: a bare completed run proves nothing, and no end
+ * accepts Discovery. Null outside v7 Discovery or before the plan is answered.
+ */
+export function discoveryTraversal(store: Store, draft: Revision<DiscoveryDraft>): V7Traversal | null {
+  if (draft.value.contractVersion !== 7 || draft.value.stage !== 'discovery') return null;
+  const project = draft.value.projectId;
+  const plan = draft.value.questions.map(id => store.get<Question>(id))
+    .find(question => question?.kind === 'question' && question.value.spec.field === 'plan');
+  if (!plan || plan.value.status !== 'answered') return null;
+  requireCondition(isRef(plan.value.answer), 'plan_questions_invalid', 'The answered plan lost its exact answer');
+  const planAnswer = plan.value.answer, guards: Ref[] = [reference(draft), reference(plan), planAnswer];
+  const attempts = store.list<{ project: string; planAnswer: Ref; planQuestionId: string }>(V7_ATTEMPT_KIND)
+    .filter(row => object(row.value) && row.value.project === project && same(row.value.planAnswer, planAnswer));
+  const assessments = store.list<PaidDiscoveryAttemptsAssessment>(DISCOVERY_ASSESSMENT_KIND)
+    .filter(row => object(row.value) && row.value.projectId === project && same(row.value.subject?.packet?.planAnswer, planAnswer));
+  const subjects = provePlanQuestions(store, draft, planAnswer).map((entry): V7TraversalSubject => {
+    const subject: V7ProgressSubject = { project, planAnswer, planQuestionId: entry.planQuestionId };
+    const element = entry.question as Record<string, Json>;
+    // Applied attempts are exactly those of the applications along the proven state chain.
+    const head = store.get<V7ProgressState>(v7ProgressStateId(subject));
+    const state = head ? readV7ProgressStateAt(store, reference(head)) : null;
+    const accounted = new Set<string>(), chain: Ref[] = [];
+    for (let row = state; row;) {
+      guards.push(reference(row));
+      const application = store.get<V7ProgressApplication>(row.value.application.id, row.value.application.revision)!;
+      chain.unshift(reference(application));
+      for (const attempt of application.value.attempts) accounted.add(canonical(attempt));
+      row = application.value.previous ? store.get<V7ProgressState>(application.value.previous.id, application.value.previous.revision) : null;
+    }
+    const own = attempts.filter(row => row.value.planQuestionId === entry.planQuestionId)
+      .map(row => reference(proveAttempt(store, reference(row)).attempt));
+    const pending = own.filter(ref => !accounted.has(canonical(ref)));
+    // An unapplied assessment is one of this exact subject and packet: every entry is an own attempt, one is pending.
+    const paid = pending.length ? assessments.filter(row => {
+      const packet = row.value.subject.packet;
+      return packet.project === project && packet.planQuestionId === entry.planQuestionId && packet.question?.id === plan.id
+        && packet.entries.every(item => own.some(ref => same(item.attempt, ref)))
+        && packet.entries.some(item => pending.some(ref => same(item.attempt, ref)));
+    }).map(row => reference(readDiscoveryAssessment(store, project, reference(row)))) : [];
+    guards.push(...chain, ...own, ...paid);
+    return { subject, class: typeof element.class === 'string' ? element.class : 'supporting',
+      outcome: state ? state.value.summary.outcome : own.length ? 'open' : 'unstarted',
+      state: state ? reference(state) : null, applications: chain, pending, assessments: paid };
+  });
+  const budget = traversalBudget(store, draft);
+  if (budget) guards.push(budget.segment, budget.ledger, ...budget.calls);
+  const named = (row: V7TraversalSubject) => `plan question ${row.subject.planQuestionId} of plan answer ${planAnswer.id}@${planAnswer.revision}`;
+  const result = (end: V7TraversalEnd, row: V7TraversalSubject | null, reason: string | null): V7Traversal =>
+    ({ contract: V7_TRAVERSAL_CONTRACT, plan: planAnswer, end, subject: row ? row.subject : null, reason, subjects,
+      budget, pause: budgetPause(store, draft), guards: uniqueRefs(guards) });
+  // A pending assessment keeps its meaning beside an exhausted budget; a proved completed or stalled front is not
+  // masked by it. The limit ends only a front with an open question.
+  const waiting = subjects.find(row => row.pending.length > 0);
+  if (waiting) return waiting.assessments.length
+    ? result('assessment_unapplied', waiting, `The paid assessment of ${named(waiting)} is not applied to its progress yet`)
+    : result('assessment_unpaid', waiting, `The completed attempts of ${named(waiting)} wait for their paid assessment`);
+  if (subjects.every(row => row.outcome === 'closed' || row.outcome === 'unknown'))
+    return result('completed', null, 'Every plan question has a proved applied closed or unknown outcome; Discovery is not accepted by it');
+  const unfinished = subjects.filter(row => row.outcome !== 'closed' && row.outcome !== 'unknown');
+  if (unfinished.every(row => row.outcome === 'stalled')) {
+    const stalled = unfinished[0]!;
+    const summary = store.get<V7ProgressState>(stalled.state!.id, stalled.state!.revision)!.value.summary;
+    return result('stalled', stalled, `${named(stalled)} is stalled: ${summary.reason ?? 'no new accepted basis'}`);
+  }
+  if (budget?.exhausted) return result('limit', null, budget.overrun
+    ? `The measured usage of stage budget ${budget.segment.id} exceeds its limit: no new paid research send is admitted`
+    : `No research tokens of stage budget ${budget.segment.id} remain: no new paid research send is admitted`);
+  return result('open', null, null);
+}
+
+/** R.3: the stage budget proved by its segment policy, its ledger and every assigned call — never zero usage for a
+ * lost basis. A segment not created yet is not created for reading: there is no spent budget to prove. */
+function traversalBudget(store: Store, draft: Revision<DiscoveryDraft>): V7TraversalBudget | null {
+  const plan = stageBudgetPlan(store, draft);
+  if (plan.isNew) return null;
+  const segment = plan.segment as Revision<import('../runtime/research-budget.js').BudgetSegment> & { value: { completionReserve?: number } };
+  const usage = budgetUsage(store, segment);
+  const ledger = usage.ledger;
+  requireCondition(ledger && ledger.kind === 'research-budget-ledger' && ledger.hash === hashJson(ledger.value),
+    'discovery_budget_policy_invalid', `[${segment.id}] The saved stage segment lost its exact ledger`);
+  const remaining = segment.value.limit - (segment.value.completionReserve ?? 0) - usage.measured - usage.reserved;
+  return { segment: reference(segment), ledger: reference(ledger), calls: usage.guards.slice(1) as Ref[],
+    measured: usage.measured, reserved: usage.reserved, remaining, overrun: usage.measured > segment.value.limit,
+    exhausted: usage.measured > segment.value.limit || remaining <= 0 };
+}
+
+/** Diagnostic only: the run's saved budget pause, exactly as written; its fields prove nothing. */
+function budgetPause(store: Store, draft: Revision<DiscoveryDraft>): V7TraversalBudgetPause | null {
+  const run = store.get<ResearchRun>(researchRunId(draft.value.projectId, draft.id));
+  if (!run || run.kind !== 'research-run' || !object(run.value) || run.value.status !== 'paused'
+    || !V7_TRAVERSAL_BUDGET_PAUSES.includes(run.value.pauseCode ?? '')) return null;
+  return { run: reference(run), code: run.value.pauseCode!, error: run.value.error };
 }
 
 function outcomeFromGate(store: Store, draft: Revision<DiscoveryDraft>, gate: OutcomeGate): DiscoveryOutcome {

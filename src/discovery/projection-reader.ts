@@ -45,7 +45,8 @@ import type { Decision, DiscoveryDraft, Fact, FieldSpec, Question } from "./disc
 import { managedAnswerTurn, type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
 import { readResearchAcceptanceBinding } from "./response-recovery.js";
 import type { ResearchAnswer, ResearchAssessment, ResearchRun } from "./research-model.js";
-import { discoveryOutcome, type DiscoveryConditionDecision, type DiscoveryOutcome } from "./discovery-outcome.js";
+import { discoveryOutcome, discoveryTraversal, type DiscoveryConditionDecision, type DiscoveryOutcome,
+  type V7Traversal } from "./discovery-outcome.js";
 
 // Потребителям вне модуля внутренние читатели доступны только через эту границу.
 export {
@@ -53,8 +54,9 @@ export {
 } from "./discovery.js";
 export type { ResearchAnswer } from "./research-model.js";
 export {
-  discoveryContext, discoveryOutcome, discoveryInspection, readDiscoveryConditionDecision,
-  type DiscoveryChoice, type DiscoveryConditionDecision, type DiscoveryOutcome,
+  discoveryContext, discoveryOutcome, discoveryInspection, discoveryTraversal, readDiscoveryConditionDecision, V7_TRAVERSAL_CONTRACT,
+  type DiscoveryChoice, type DiscoveryConditionDecision, type DiscoveryOutcome, type V7Traversal, type V7TraversalEnd,
+  type V7TraversalSubject,
 } from "./discovery-outcome.js";
 export type { ResearchRun } from "./research-model.js";
 export { REQUIREMENTS, selectResearchRequirements, UPSTREAM_STAGES, type ProducerPolicy, type UpstreamStage } from "./requirements.js";
@@ -865,6 +867,9 @@ export interface OutcomeSummary {
    * Ленивый: читается при первом обращении — сводка не сдвигает порядок
    * чтений потребителя, которому нужен только исход. */
   readonly run: Revision<ResearchRun> | null;
+  /** R.3: доказанный исход обхода плана v7 (discoveryTraversal), null вне v7 и до ответа плана. Ленивый, как run:
+   * сводка не добавляет чтений потребителю, которому нужен только исход; ни один исход не принимает Discovery. */
+  readonly traversal: V7Traversal | null;
   /** Интерпретированная сохранённая форма вопросов (принимается от вызывающего,
    * чтобы не дублировать уже выполненные чтения). */
   readonly form: IssuedForm;
@@ -876,7 +881,8 @@ export interface OutcomeSummary {
 export function outcomeSummary(store: Store, draft: Revision<DiscoveryDraft>, form: IssuedForm): OutcomeSummary {
   const era = contractEraOf(draft.value), projectId = draft.value.projectId;
   return { era, prepared: era >= PREPARATION_CONTRACT_ERA, outcome: discoveryOutcome(store, draft),
-    get run() { return readResearchRun(store, projectId, draft.id); }, form };
+    get run() { return readResearchRun(store, projectId, draft.id); },
+    get traversal() { return discoveryTraversal(store, draft); }, form };
 }
 
 // ---------------------------------------------------------------------------
