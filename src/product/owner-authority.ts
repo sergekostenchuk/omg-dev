@@ -1,3 +1,7 @@
+import { VARIANT_OWNER_ACTION, VARIANT_OWNER_GRANT_CONTRACT, VARIANT_OWNER_SESSION_CONTRACT,
+  decodeVariantChoiceScope, type VariantChoiceScope } from '../discovery/variant-decision.js';
+import { readProjectMode } from './project-mode.js';
+import { readVariantGeneration } from '../discovery/variant-session.js';
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { digest, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -754,3 +758,231 @@ export class ProjectModeSessions {
     });
   }
 }
+
+/** 4O.1: a separate, exact capability for one prospective variant choice. */
+export const VARIANT_CHOICE_GRANT_PREFIX = 'owner-variant-grant:';
+export const VARIANT_CHOICE_SESSION_PREFIX = 'owner-variant-session:';
+export interface VariantChoiceSessionGrant {
+  contract: typeof VARIANT_OWNER_GRANT_CONTRACT; id: string; database: string;
+  action: typeof VARIANT_OWNER_ACTION; method: typeof OWNER_PAIRING_METHOD; scope: VariantChoiceScope;
+  issuedAt: number; expiresAt: number; proof: string;
+}
+export interface VariantChoiceSession {
+  contract: typeof VARIANT_OWNER_SESSION_CONTRACT; grant: Ref; database: string;
+  action: typeof VARIANT_OWNER_ACTION; method: typeof OWNER_PAIRING_METHOD; scope: VariantChoiceScope;
+  session: string; openedAt: number; expiresAt: number; state: 'open' | 'closed'; closedAt?: number;
+}
+export function variantChoiceSessionId(grant: Ref): string {
+  requireCondition(isRef(grant), 'owner_session_state_invalid', 'A variant session address needs an exact grant Ref');
+  return `${VARIANT_CHOICE_SESSION_PREFIX}${hashJson(exactRef(grant))}`;
+}
+function denyVariant(code: OwnerAuthorityRefusalCode, target: string, field: string, message: string): never {
+  return deny(code, target, field, message, '4O.1');
+}
+function variantChoiceScope(value: unknown, code: OwnerAuthorityRefusalCode): VariantChoiceScope {
+  try { return decodeVariantChoiceScope(value); }
+  catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    return denyVariant(code, 'variant-choice', 'scope', error.message);
+  }
+}
+/** This door proves saved grounds; the later decision producer proves operation/current-state admissibility. */
+function variantChoiceGrounds(store: Store, scope: VariantChoiceScope): void {
+  let field = 'mode', ref = scope.mode;
+  try {
+    readProjectMode(store, scope.projectId, scope.mode);
+    field = 'set'; ref = scope.set;
+    const generation = readVariantGeneration(store, scope.projectId, scope.set), publication = generation.publication;
+    requireCondition(publication.result.kind === 'discovery-variant-set'
+      && sameScope(publication.result.value.draft, scope.draft), 'discovery_variant_basis_invalid',
+      'Variant authority needs the exact draft and a proven paid set');
+    if (scope.outcome.kind === 'choose') {
+      const member = scope.outcome.member;
+      requireCondition(publication.members.some(row => sameScope(row.ref, member)), 'discovery_variant_basis_invalid',
+        'Variant authority chooses an exact member of its proven set');
+    }
+  } catch (error) {
+    if (!(error instanceof EngineError)) throw error;
+    take(refused(error.code, error.message, { unit: '4O.1', target: scope.projectId, field, ref }, 'owner'));
+  }
+}
+function provenVariantGrant(store: Store, record: Revision<VariantChoiceSessionGrant>): Revision<VariantChoiceSessionGrant> {
+  const value = record.value;
+  if (record.revision !== 1 || record.kind !== OWNER_GRANT_KIND || !shape(value)
+    || value.contract !== VARIANT_OWNER_GRANT_CONTRACT || !/^[a-f0-9]{32}$/.test(value.id)
+    || record.id !== `${VARIANT_CHOICE_GRANT_PREFIX}${value.id}` || value.database !== store.databaseId
+    || value.action !== VARIANT_OWNER_ACTION || value.method !== OWNER_PAIRING_METHOD
+    || !Number.isSafeInteger(value.issuedAt) || value.issuedAt <= 0 || !Number.isSafeInteger(value.expiresAt)
+    || value.expiresAt - value.issuedAt !== OWNER_GRANT_LIFETIME_MS
+    || typeof value.proof !== 'string' || !/^[a-f0-9]{64}$/.test(value.proof)
+    || Object.keys(value).some(key => !['contract', 'id', 'database', 'action', 'method', 'scope',
+      'issuedAt', 'expiresAt', 'proof'].includes(key)))
+    denyVariant('owner_invitation_invalid', record.id, 'contract', 'A variant grant retains its exact v4 origin and database');
+  const scope = variantChoiceScope(value.scope, 'owner_invitation_invalid');
+  variantChoiceGrounds(store, scope);
+  return record;
+}
+export function readVariantChoiceSessionGrant(store: Store, ref: unknown): OmResult<Sealed<Revision<VariantChoiceSessionGrant>>> {
+  return run(() => {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'A variant grant reader needs a Store');
+    return provenVariantGrant(store, take(readRecord<VariantChoiceSessionGrant>(store, ref,
+      { unit: '4O.1', target: 'variant-grant', idPrefix: VARIANT_CHOICE_GRANT_PREFIX, kind: OWNER_GRANT_KIND })));
+  });
+}
+export function readVariantChoiceSession(store: Store, ref: unknown): OmResult<Sealed<Revision<VariantChoiceSession>>> {
+  return run(() => {
+    requireCondition(store instanceof Store, 'owner_session_state_invalid', 'A variant session reader needs a Store');
+    const row = take(readRecord<VariantChoiceSession>(store, ref,
+      { unit: '4O.1', target: 'variant-session', idPrefix: VARIANT_CHOICE_SESSION_PREFIX, kind: OWNER_SESSION_KIND }));
+    const value = row.value;
+    if (!shape(value) || value.contract !== VARIANT_OWNER_SESSION_CONTRACT || !isRef(value.grant)
+      || !sameScope(value.grant, exactRef(value.grant))
+      || row.id !== variantChoiceSessionId(value.grant) || value.database !== store.databaseId
+      || value.action !== VARIANT_OWNER_ACTION || value.method !== OWNER_PAIRING_METHOD
+      || typeof value.session !== 'string' || !/^[a-f0-9]{32}$/.test(value.session)
+      || !Number.isSafeInteger(value.openedAt) || !Number.isSafeInteger(value.expiresAt)
+      || value.expiresAt - value.openedAt !== OWNER_SESSION_LIFETIME_MS
+      || (value.state !== 'open' && value.state !== 'closed')
+      || (value.state === 'open' && (row.revision !== 1 || Object.hasOwn(value, 'closedAt')))
+      || (value.state === 'closed' && (row.revision !== 2 || !Number.isSafeInteger(value.closedAt)
+        || value.closedAt! < value.openedAt))
+      || Object.keys(value).some(key => !['contract', 'grant', 'database', 'action', 'method', 'scope',
+        'session', 'openedAt', 'expiresAt', 'state', 'closedAt'].includes(key)))
+      denyVariant('owner_session_state_invalid', row.id, 'contract', 'A variant session retains its exact open or revoked v4 origin');
+    variantChoiceScope(value.scope, 'owner_session_state_invalid');
+    const grant = take(readVariantChoiceSessionGrant(store, value.grant));
+    if (!sameScope(value.scope, grant.value.scope) || value.openedAt < grant.value.issuedAt
+      || value.openedAt >= grant.value.expiresAt)
+      denyVariant('owner_session_state_invalid', row.id, 'grant', 'A session descends from its exact scoped grant inside its saved window');
+    if (value.state === 'closed') {
+      const first = store.get<VariantChoiceSession>(row.id, 1);
+      if (!first) denyVariant('owner_session_state_invalid', row.id, 'session', 'The initial open session is absent');
+      const opened = take(readVariantChoiceSession(store, reference(first)));
+      const { closedAt: _closed, ...rest } = value;
+      if (!sameScope({ ...rest, state: 'open' }, opened.value))
+        denyVariant('owner_session_state_invalid', row.id, 'session', 'Revocation changes only state and closedAt');
+    }
+    return row;
+  });
+}
+export function issueVariantChoiceInvitation(store: Store, request: unknown):
+  OmResult<Sealed<{ invitation: string; grant: Ref; expiresAt: number }>> {
+  return run(() => {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'A variant invitation needs a Store');
+    const scope = variantChoiceScope(request, 'owner_invitation_invalid');
+    const project = store.get(`project:${scope.projectId}`);
+    if (!project) denyVariant('owner_project_missing', scope.projectId, 'projectId', 'A variant invitation needs its project');
+    variantChoiceGrounds(store, scope);
+    const secret = randomBytes(32).toString('hex'), id = randomBytes(16).toString('hex'), issuedAt = Date.now();
+    const value: VariantChoiceSessionGrant = { contract: VARIANT_OWNER_GRANT_CONTRACT, id, database: store.databaseId,
+      action: VARIANT_OWNER_ACTION, method: OWNER_PAIRING_METHOD, scope, issuedAt,
+      expiresAt: issuedAt + OWNER_GRANT_LIFETIME_MS, proof: digest(secret) };
+    const rows = take(writeGuarded<VariantChoiceSessionGrant>(store, { unit: '4O.1', target: `${VARIANT_CHOICE_GRANT_PREFIX}${id}`,
+      writes: [{ id: `${VARIANT_CHOICE_GRANT_PREFIX}${id}`, kind: OWNER_GRANT_KIND, expected: 0, value }],
+      guards: [reference(project)] }));
+    return { invitation: `${id}.${secret}`, grant: exactRef(reference(rows[0]!)), expiresAt: value.expiresAt };
+  });
+}
+const VARIANT_CHOICE_MINT = Symbol('variant-choice-authority-mint');
+const VARIANT_CHOICE_AUTHORITIES = new WeakSet<VariantChoiceAuthority>();
+export class VariantChoiceAuthority {
+  readonly #sessions: VariantChoiceSessions; readonly #store: Store; readonly #digest: string;
+  readonly #session: Ref; readonly #scope: VariantChoiceScope;
+  constructor(token: symbol, sessions: VariantChoiceSessions, store: Store, key: string, session: Ref, scope: VariantChoiceScope) {
+    requireCondition(token === VARIANT_CHOICE_MINT, 'owner_authority_invalid', 'Only variant invitation exchange mints this authority');
+    this.#sessions = sessions; this.#store = store; this.#digest = key;
+    this.#session = exactRef(session); this.#scope = structuredClone(scope); VARIANT_CHOICE_AUTHORITIES.add(this);
+  }
+  exercise(request: { store: Store; action: string; scope: VariantChoiceScope }): OmResult<Sealed<{ session: Ref; at: number }>> {
+    return run(() => {
+      if (!VARIANT_CHOICE_AUTHORITIES.has(this)) denyVariant('owner_authority_invalid', 'authority', 'authority', 'Unknown variant authority');
+      if (!shape(request) || request.store !== this.#store || request.action !== VARIANT_OWNER_ACTION
+        || Object.keys(request).some(key => !['store', 'action', 'scope'].includes(key)))
+        denyVariant('owner_authority_foreign', this.#session.id, 'action', 'Variant authority belongs to its Store and action');
+      const scope = variantChoiceScope(request.scope, 'owner_authority_foreign');
+      if (!sameScope(scope, this.#scope)) denyVariant('owner_authority_foreign', this.#session.id, 'scope', 'Variant authority covers one full exact scope');
+      const head = this.#store.get<VariantChoiceSession>(this.#session.id);
+      if (!head) denyVariant('owner_session_missing', this.#session.id, 'session', 'The variant session is absent');
+      const session = take(readVariantChoiceSession(this.#store, reference(head)));
+      if (session.value.state !== 'open') denyVariant('owner_session_revoked', head.id, 'session', 'The variant session is revoked');
+      if (!sameScope(reference(session), this.#session) || !sameScope(session.value.scope, this.#scope))
+        denyVariant('owner_authority_foreign', head.id, 'session', 'The original variant session cannot be substituted');
+      if (VARIANT_CHOICE_SESSION_OF.call(this.#sessions, this.#digest) !== this.#session.id)
+        denyVariant('owner_session_missing', head.id, 'session', 'The bearer is not live in this process');
+      const at = Date.now();
+      if (at < session.value.openedAt || at >= session.value.expiresAt)
+        denyVariant('owner_session_expired', head.id, 'session', 'The variant session is outside its live window');
+      return { session: exactRef(reference(session)), at };
+    });
+  }
+}
+const VARIANT_CHOICE_EXERCISE = VariantChoiceAuthority.prototype.exercise;
+export function requireVariantChoiceAuthority(candidate: unknown,
+  request: { store: Store; action: string; scope: VariantChoiceScope }): OmResult<Sealed<{ session: Ref; at: number }>> {
+  if (candidate instanceof OwnerAuthority || candidate instanceof DiscoveryChoiceAuthority || candidate instanceof ProjectModeAuthority)
+    return refused('owner_authority_foreign', 'Another owner action cannot authorize a variant choice',
+      { unit: '4O.1', target: 'authority', field: 'action' }, 'owner');
+  if (!(candidate instanceof VariantChoiceAuthority) || !VARIANT_CHOICE_AUTHORITIES.has(candidate))
+    return refused('owner_authority_invalid', 'Use the local variant invitation and its live bearer',
+      { unit: '4O.1', target: 'authority', field: 'authority' }, 'owner');
+  return VARIANT_CHOICE_EXERCISE.call(candidate, request);
+}
+export class VariantChoiceSessions {
+  readonly #store: Store;
+  readonly #live = new Map<string, { session: string; authority: VariantChoiceAuthority }>();
+  constructor(store: Store) {
+    requireCondition(store instanceof Store, 'owner_invitation_invalid', 'Variant sessions need a Store'); this.#store = store;
+  }
+  sessionOf(key: string): string | null { return this.#live.get(key)?.session ?? null; }
+  exchange(request: unknown): OmResult<Sealed<{ bearer: string; session: Ref; expiresAt: number }>> {
+    return run(() => {
+      if (!shape(request) || !isText(request.projectId) || !isText(request.invitation)
+        || Object.keys(request).some(key => !['projectId', 'invitation'].includes(key)))
+        denyVariant('owner_invitation_invalid', 'variant-session', 'request', 'Exchange names projectId and local invitation only');
+      const projectId = request.projectId as string, parts = (request.invitation as string).split('.');
+      if (parts.length !== 2 || !/^[a-f0-9]{32}$/.test(parts[0]!) || !/^[a-f0-9]{64}$/.test(parts[1]!))
+        denyVariant('owner_invitation_invalid', projectId, 'invitation', 'An invitation is <grant-id>.<secret>');
+      const head = this.#store.get<VariantChoiceSessionGrant>(`${VARIANT_CHOICE_GRANT_PREFIX}${parts[0]}`);
+      if (!head) denyVariant('owner_invitation_invalid', projectId, 'invitation', 'Unknown variant invitation');
+      const grant = take(readVariantChoiceSessionGrant(this.#store, reference(head)));
+      if (!timingSafeEqual(Buffer.from(digest(parts[1]!), 'hex'), Buffer.from(grant.value.proof, 'hex')))
+        denyVariant('owner_invitation_invalid', projectId, 'invitation', 'The invitation secret does not verify');
+      if (grant.value.scope.projectId !== projectId) denyVariant('owner_invitation_foreign', projectId, 'projectId', 'Invitation belongs to another project');
+      const now = Date.now();
+      if (now < grant.value.issuedAt) denyVariant('owner_invitation_invalid', projectId, 'invitation', 'Invitation is not yet issued');
+      if (now >= grant.value.expiresAt) denyVariant('owner_invitation_expired', projectId, 'invitation', 'Invitation has expired');
+      const grantRef = exactRef(reference(grant)), id = variantChoiceSessionId(grantRef);
+      if (this.#store.get(id)) denyVariant('owner_invitation_spent', projectId, 'invitation', 'Invitation is already exchanged');
+      const value: VariantChoiceSession = { contract: VARIANT_OWNER_SESSION_CONTRACT, grant: grantRef,
+        database: this.#store.databaseId, action: VARIANT_OWNER_ACTION, method: OWNER_PAIRING_METHOD,
+        scope: grant.value.scope, session: randomBytes(16).toString('hex'), openedAt: now,
+        expiresAt: now + OWNER_SESSION_LIFETIME_MS, state: 'open' };
+      const rows = take(writeGuarded<VariantChoiceSession>(this.#store, { unit: '4O.1', target: id,
+        writes: [{ id, kind: OWNER_SESSION_KIND, expected: 0, value }], guards: [grantRef] }));
+      const session = exactRef(reference(rows[0]!)), bearer = randomBytes(32).toString('hex'), key = digest(bearer);
+      this.#live.set(key, { session: id, authority: new VariantChoiceAuthority(VARIANT_CHOICE_MINT, this,
+        this.#store, key, session, grant.value.scope) });
+      return { bearer, session, expiresAt: value.expiresAt };
+    });
+  }
+  authority(bearer: unknown): VariantChoiceAuthority | null {
+    return typeof bearer === 'string' && /^[a-f0-9]{64}$/.test(bearer) ? this.#live.get(digest(bearer))?.authority ?? null : null;
+  }
+  revoke(bearer: unknown, store: Store = this.#store): OmResult<Sealed<{ session: Ref }>> {
+    return run(() => {
+      const key = typeof bearer === 'string' ? digest(bearer) : '', live = this.#live.get(key);
+      if (!live) denyVariant('owner_session_missing', 'variant-session', 'bearer', 'No variant session carries this bearer');
+      if (!(store instanceof Store) || store.databaseId !== this.#store.databaseId)
+        denyVariant('owner_authority_foreign', live.session, 'database', 'Revocation needs the same database');
+      const head = store.get<VariantChoiceSession>(live.session);
+      if (!head) denyVariant('owner_session_missing', live.session, 'session', 'The variant session is absent');
+      const opened = take(readVariantChoiceSession(store, reference(head)));
+      if (opened.value.state === 'closed') { this.#live.delete(key); return { session: exactRef(reference(opened)) }; }
+      const closed: VariantChoiceSession = { ...opened.value, state: 'closed', closedAt: Math.max(Date.now(), opened.value.openedAt) };
+      const rows = take(writeGuarded<VariantChoiceSession>(store, { unit: '4O.1', target: head.id,
+        writes: [{ id: head.id, kind: OWNER_SESSION_KIND, expected: head.revision, value: closed }], guards: [reference(opened)] }));
+      this.#live.delete(key); return { session: exactRef(reference(rows[0]!)) };
+    });
+  }
+}
+const VARIANT_CHOICE_SESSION_OF = VariantChoiceSessions.prototype.sessionOf;
