@@ -22,7 +22,7 @@ import { researchAction, researchCall, prepareResearchEnvelope } from "./researc
 import { turnAction, projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectResearchTurnRevision, projectSourceReadingTurn, projectPaidLocalRefusal, projectRepeatedContextRead,
   projectAddressedWorkspace, ACTION_RESPONSE_REFUSAL_CODES, webResearchCapability, admittedResearchAction,
-  projectSynthesisHandoffTurn, acceptanceEraOf, acceptanceBindingId, EARLY_ACTIONS, EARLY_UNKNOWN, earlyUnknownEra,
+  projectSynthesisHandoffTurn, projectSynthesisHandoffIntent, acceptanceEraOf, acceptanceBindingId, EARLY_ACTIONS, EARLY_UNKNOWN, earlyUnknownEra,
   type ManagedResearchTurn, type TurnTransitionProof, type SynthesisSessionState,
   type ResearchAcceptanceBinding } from "./research-consumer-transition.js";
 import { completeResearchAttemptTurn, earlyResearchConsumerFailure, consumerCapacityFailure, captureResearchConsumerRetryPermits, findResearchConsumerIntent, listResearchConsumerIntents, retryableResearchConsumerRefusal,
@@ -2039,11 +2039,11 @@ export class Researcher {
   private handoffSynthesis(intent: Revision<ResearchConsumerIntent>, run: Revision<ResearchRun>,
     action: ResearchAction, owner: ResearchRun["owner"], guards: Ref[] = []) {
     const current = this.store.get<ResearchConsumerIntent>(intent.id);
-    // G5a (№6218): the once-only delivery extension is proved here at the write —
-    // only the exact third revision (prepared → running → applied) may grow a
-    // turn output; the reader trusts the saved row without replaying history.
+    // The predecessor proves the first applied transition even after lawful
+    // re-preparation; an already delivered application cannot grow again.
     requireCondition(current && (current.value.kind === "synthesis" || current.value.kind === "consolidation")
-      && current.value.state === "applied" && current.revision === 3 && Array.isArray(current.value.outputs)
+      && current.value.state === "applied" && Array.isArray(current.value.outputs)
+      && (planSubjectOf(current.value.cursor) !== null || current.revision === 3)
       && current.value.cursor.delivery && typeof current.value.cursor.delivery === "object"
       && current.value.cursor.delivery.run === run.id && current.value.cursor.delivery.turn === run.value.turns,
       "research_consumer_intent_invalid", "Only the exact completed synthesis may hand off its turn");
@@ -2063,12 +2063,18 @@ export class Researcher {
       number: run.value.turns, action, question: current.value.question,
       ...(planSubjectOf(current.value.cursor) ? { subject: planSubjectOf(current.value.cursor)! } : {}) });
     const turnRef: Ref = { id: turnId, revision: 1, hash: hashJson(turnValue) };
+    const prior = this.store.get<ResearchConsumerIntent>(current.id, current.revision - 1);
+    requireCondition(prior, "research_consumer_intent_invalid", "The synthesis application lost its running predecessor");
+    const deliveredIntent = projectSynthesisHandoffIntent(current, prior, turnRef);
+    if (planSubjectOf(current.value.cursor)) requireCondition(session.value.delivered == null
+      && session.value.delivery?.run === run.id && session.value.delivery.turn === run.value.turns,
+      "research_consumer_intent_invalid", "The v3 handoff lost its unconsumed exact reservation");
     const writes: Write[] = [
       { id: run.id, kind: run.kind, expected: run.revision,
         value: { ...run.value, status: "running", owner, error: null, pauseCode: null } },
       { id: turnId, kind: "research-turn", expected: 0, value: turnValue },
       { id: current.id, kind: current.kind, expected: current.revision,
-        value: { ...current.value, outputs: [...current.value.outputs, turnRef] } }
+        value: deliveredIntent }
     ];
     // The one-time delivered mark rides the same transaction (№1499-38): the
     // reserved turn, the producer outputs and the consumed reservation commit

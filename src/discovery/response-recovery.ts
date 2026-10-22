@@ -1325,10 +1325,22 @@ export function readResearchConsumerTurn(store: Store, ref: Ref): Revision<Recor
     catch { consumerInvalid(saved.id, 'The new turn carries a damaged attempt subject'); }
   }
   const originIntent = readResearchConsumerIntent(store, saved.value.consumerIntent);
-  // The original turn is written either in the runner application at @3 or in
-  // the synthesis handoff at @4. A later intent HEAD is not evidence for this
-  // historical output.
-  const candidates = (['synthesis', 'consolidation'].includes(originIntent.value.kind) ? [3, 4] : [3])
+  // The old producer keeps its @3/@4 positions. A subject synthesis may
+  // lawfully re-prepare before its claim: locate that exact prepared prefix,
+  // then its application and one delivery extension, never today's HEAD.
+  const synthesisOrigin = ['synthesis', 'consolidation'].includes(originIntent.value.kind);
+  let appliedRevision = 3;
+  if (synthesisOrigin && turnSubject) {
+    for (let revision = 2; ; revision++) {
+      const step = store.get<ResearchConsumerIntent>(originIntent.id, revision);
+      if (!step) consumerInvalid(saved.id, 'The handoff lost its prepared prefix or physical claim');
+      if (step.value.state === 'prepared') continue;
+      if (step.value.state !== 'running') consumerInvalid(saved.id, 'The handoff has no exact running claim');
+      appliedRevision = revision + 1;
+      break;
+    }
+  }
+  const candidates = (synthesisOrigin ? [appliedRevision, appliedRevision + 1] : [3])
     .map(revision => store.get<ResearchConsumerIntent>(originIntent.id, revision))
     .filter((candidate): candidate is Revision<ResearchConsumerIntent> => !!candidate
       && candidate.value.state === 'applied' && !!candidate.value.outputs?.some(output =>

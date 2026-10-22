@@ -1688,6 +1688,27 @@ export function projectSynthesisHandoffTurn(input: { intent: Ref; runId: string;
     ...(input.subject ? { attemptContract: ATTEMPT_BINDING_CONTRACT, subject: input.subject } : {}) };
 }
 
+/** The once-only delivery extension of a proved paid synthesis application.
+ * Re-preparation may add prepared revisions before the one physical claim;
+ * delivery follows its first applied revision, never an already extended one. */
+export function projectSynthesisHandoffIntent(applied: Revision<ResearchConsumerIntent>,
+  prior: Revision<ResearchConsumerIntent>, turn: Ref): ResearchConsumerIntent {
+  const value = applied?.value, before = prior?.value, delivery = value?.cursor?.delivery;
+  requireCondition(applied?.kind === 'research-consumer-intent' && prior?.kind === applied.kind
+    && applied.id === prior.id && applied.revision === prior.revision + 1
+    && ['synthesis', 'consolidation'].includes(value?.kind)
+    && value.state === 'applied' && before?.state === 'running' && before.outputs === null
+    && Array.isArray(value.outputs) && value.outputs.length > 0
+    && isRef(value.call) && value.call.revision === 1
+    && canonical({ ...value, state: before.state, outputs: before.outputs }) === canonical(before)
+    && typeof delivery === 'object' && delivery !== null && typeof delivery.run === 'string'
+    && Number.isSafeInteger(delivery.turn) && delivery.turn > 0
+    && isRef(turn) && turn.revision === 1 && turn.id === managedTurnId(delivery.run, delivery.turn)
+    && value.outputs.every(output => output.id !== turn.id),
+    'research_consumer_intent_invalid', 'Only the first paid synthesis application may append its exact reserved turn');
+  return { ...value, outputs: [...value.outputs!, turn] };
+}
+
 /** DR3a3-K: the exact records one recorded attempt turn derives from. */
 export interface AttemptTurnInputs {
   projectId: string;
