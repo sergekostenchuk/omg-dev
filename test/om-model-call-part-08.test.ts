@@ -50,9 +50,9 @@ test('E4 mechanism field dispatch applies E3 decisions through D3 and does not m
 
 
 
-test('E4 physical receipt survives a second race that prevents applying the rejection and completing A3', async t => {
+test('E4 physical receipt survives an application CAS loss; a competing close is refused over the unfinished work', async t => {
   const f = e4Fixture(t, 'node', 100_000, 0, 5000, true); f.steps([{ research: e4Node(f), usage }]);
-  const writeMany = f.store.writeMany.bind(f.store); let changed = false; const closed: { ok: boolean }[] = [];
+  const writeMany = f.store.writeMany.bind(f.store); let changed = false; const closed: ReturnType<typeof closeAttempt>[] = [];
   const seriesBefore = f.store.get(f.series.id)!;
   f.store.writeMany = ((writes, guards) => {
     if (!changed && writes.some(write => write.kind === 'part-result')) {
@@ -60,11 +60,15 @@ test('E4 physical receipt survives a second race that prevents applying the reje
       const env = f.store.get(f.configured.id)!;
       writeMany([{ id: env.id, kind: env.kind, expected: env.revision, value: env.value }]);
       // The managed A3 is closeAttempt; it must refuse over unresolved work — the retired standalone
-      // completeAttempt no longer exists for a managed attempt.
+      // completeAttempt no longer exists for a managed attempt. A thrown error must surface, not pass
+      // as the expected refusal; a refused close must leave the whole store untouched.
       const other = new Store(f.database);
-      try { closed.push(closeAttempt(other, { ...seriesRequestOf(f.series.value), attempt: 1,
-        outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }) as { ok: boolean }); }
-      catch { closed.push({ ok: false }); }
+      const untouched = other.list().map(reference);
+      try {
+        closed.push(closeAttempt(other, { ...seriesRequestOf(f.series.value), attempt: 1,
+          outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } }));
+        assert.deepEqual(other.list().map(reference), untouched, 'The refused close wrote nothing');
+      }
       finally { other.close(); }
     }
     return writeMany(writes, guards);
@@ -72,6 +76,7 @@ test('E4 physical receipt survives a second race that prevents applying the reje
   const applied = await runModelCall(f.store, f.request); f.store.writeMany = writeMany;
   assert.ok(changed); assert.equal(closed.length, 1, 'The competing close ran once');
   assert.equal(closed[0]!.ok, false, 'The racing G7 close is refused over the unresolved assignment');
+  if (!closed[0]!.ok) assert.equal(closed[0]!.refusal.code, 'completion_incomplete');
   assert.deepEqual(f.store.get(f.series.id), seriesBefore, 'The refused close never touched the series');
   // A managed application that loses CAS returns the typed refusal; no rejection record is manufactured
   // and the paid receipt stays in its received state, exchange linked and reusable.
@@ -89,6 +94,12 @@ test('E4 physical receipt survives a second race that prevents applying the reje
   assert.deepEqual(runtime.value.usage, usage);
   assert.equal(f.store.list('om-model-application-rejection').length, 0);
   for (const recordKind of ['part-response', 'part-result', 'layer-proposal']) assert.equal(f.store.list(recordKind).length, 0);
+  // E1 was settled already at the lost CAS — settlePhysicalCall runs on the first refusal path:
+  // the call's own record is succeeded with the exact usage and exactly two revisions
+  // (the unpaid opening write and the one settlement) — not deferred to a later apply.
+  const settled = f.store.get<{ status: string; usage: typeof usage }>(runtime.value.om.call.id)!;
+  assert.equal(settled.value.status, 'succeeded'); assert.deepEqual(settled.value.usage, usage);
+  assert.equal(f.store.history(settled.id).length, 2, 'The expense is opened unpaid and settled once');
   f.restart();
   // The repeat resumes the same received exchange: the compatible environment admits it now and the
   // saved response is applied once — without a resend or a second physical expense.
@@ -101,6 +112,8 @@ test('E4 physical receipt survives a second race that prevents applying the reje
   assert.deepEqual(replay, valueOf(readModelCall(f.store, { project: f.project, record: reference(resumed.record) })));
   assert.deepEqual(f.store.list().map(reference), history); assert.equal(f.sent().length, 1);
   assert.deepEqual(history.filter(ref => ref.id === f.series.id), [reference(seriesBefore)], 'A3 was never completed by the race');
+  // Neither the apply nor the deterministic replay wrote a second settlement.
+  assert.deepEqual(f.store.get(settled.id), settled); assert.equal(f.store.history(settled.id).length, 2);
 });
 
 
