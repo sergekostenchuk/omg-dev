@@ -10,11 +10,13 @@ import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import { isRef, reference, type Ref } from "../src/pipeline/contracts.js";
 import { Store, type Revision, type Write, type ReadGuard } from "../src/storage/store.js";
-import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
+import { REFUSAL_ROUTES, type OmResult, type Refusal, type Sealed } from "../src/om/refusal.js";
 import {
   beginAttempt, completeAttempt, openSeries, resumeSeries, escalateSeries, readSeriesAt, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
-  prepareSeriesAdmission, readMechanismAdmission, readCompletionBinding, completionWorkId,
+  prepareSeriesAdmission, readMechanismAdmission, readCompletionBinding, completionWorkId, completionOwnerId,
+  COMPLETION_ASSIGNMENT_KIND,
   type AttemptGoal, type RepairSeries, type AnyRepairSeries, type MechanismAdmission,
+  type CompletionAssignment, type CompletionOwner, type CompletionWork,
 } from "../src/om/series.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import {
@@ -1162,12 +1164,17 @@ test("E1 admits an explicit mechanism owner on a fresh equivalent D1 and preserv
 });
 
 test("E1 mechanism admission rejects missing owner basis, foreign goal, purpose, consumers and incomplete batch without records", t => {
-  const f = mechanismFixture(t, "mechanism-rejections"), valid = f.call();
+  // LG07 m3d (№10464): the lawful request is the one a product E1 derives from the attempt's own issued E2.
+  const f = managedMechanismFixture(t, "mechanism-rejections"), { packet } = f.issued(1), valid = f.managedCall(packet);
+  const foreign = deliveredOf(openSeries(f.store, { project: PROJECT, block: BLOCK, line: 1, slice: SLICE,
+    predecessor: null, basis: null }));
+  const binding = f.store.get<CompletionOwner>(completionOwnerId(PROJECT, f.mechanismSeries.id, 1))!;
+  const registered = f.store.get<CompletionWork>(completionWorkId(PROJECT, binding.id))!;
   const cases: [string, unknown, string][] = [
     ["owner", { ...valid, owner: { kind: "mechanism", mechanism: "M5:other" } }, "call_request_invalid"],
     ["missing-basis", Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "admission")), "call_request_invalid"],
     ["block-masquerade", { ...valid, block: "M5:addressing" }, "call_request_invalid"],
-    ["foreign-series", { ...valid, series: reference(f.series) }, "call_series_unresolved"],
+    ["foreign-series", { ...valid, series: reference(foreign) }, "call_series_unresolved"],
     ["foreign-goal", { ...valid, goal: { ...valid.goal, result: "Unrelated result" } }, "call_goal_conflict"],
     ["foreign-purpose", { ...valid, purpose: "model-research" }, "call_purpose_invalid"],
     ["foreign-consumer", { ...valid, gaps: valid.gaps.map(gap => ({ ...gap, consumer: "M5:addressing" })) }, "call_question_invalid"],
@@ -1176,12 +1183,22 @@ test("E1 mechanism admission rejects missing owner basis, foreign goal, purpose,
     ["foreign-batch", { ...valid, admission: { ...valid.admission, batch: "other-task" } }, "call_series_unresolved"],
     ["incomplete-d1", { ...valid, admission: { ...valid.admission, gaps: { ...valid.admission.gaps, records: valid.admission.gaps.records.slice(1) } } }, "call_series_unresolved"],
   ];
+  const prepared = fullSnapshot(f.store);
   for (const [name, value, expected] of cases) {
-    addressed(recordCall(f.store, PROJECT, { ...(value as MechanismRecordCallRequest), call: name }), expected);
-    assert.equal(f.store.get(callRecordId(PROJECT, name)), null);
+    addressed(recordCall(f.store, PROJECT, value as MechanismRecordCallRequest), expected);
+    assert.equal(f.store.get(callRecordId(PROJECT, valid.call)), null, name);
   }
   assert.equal(f.store.get(callLedgerId(PROJECT)), null);
+  assert.deepEqual(fullSnapshot(f.store), prepared, "no refused admission writes anything");
   const saved = deliveredOf(recordCall(f.store, PROJECT, valid));
+  const work = f.store.get<CompletionWork>(completionWorkId(PROJECT, binding.id))!;
+  // The lawful managed E1 registers its completion — a new work revision with the packet — with its call and ledger.
+  assert.equal(work.revision, registered.revision + 1);
+  assert.ok(work.value.products.some(ref => ref.id === packet.id && ref.revision === packet.revision));
+  assert.ok(f.store.list<CompletionAssignment>(COMPLETION_ASSIGNMENT_KIND)
+    .some(row => row.value.kind === "part" && row.value.source.id === packet.id));
+  assert.deepEqual(f.store.get<CallLedger>(callLedgerId(PROJECT))!.value.calls.map(row => row.call.id),
+    [saved.call.id]);
   const forged = { ...structuredClone(saved.call.value), goal: { ...saved.call.value.goal, result: "Forged historical result" } } as AnyCallRecord;
   // A new self-consistent opening record still cannot replace the goal proved by the exact series.
   const bad = f.store.write({ id: callRecordId(PROJECT, "forged-history"), kind: CALL_RECORD_KIND, expected: 0,
@@ -1205,8 +1222,8 @@ class MechanismCommitRaceStore extends Store {
 }
 
 test("E1 guards the full mechanism admission through the transaction and propagates storage failures", t => {
-  const f = mechanismFixture(t, "mechanism-race", MechanismCommitRaceStore), store = f.store as MechanismCommitRaceStore;
-  const input = f.call();
+  const f = managedMechanismFixture(t, "mechanism-race", MechanismCommitRaceStore), store = f.store as MechanismCommitRaceStore;
+  const { packet } = f.issued(1), input = f.managedCall(packet);
   const failure = new EngineError("record_corrupt", "broken saved source");
   const broken = new Proxy(store, { get(target, property) {
     if (property === "get") return (id: string, revision?: number) => {
@@ -1216,13 +1233,16 @@ test("E1 guards the full mechanism admission through the transaction and propaga
     const value = Reflect.get(target, property); return typeof value === "function" ? value.bind(target) : value;
   } });
   assert.throws(() => recordCall(broken, PROJECT, input), error => error === failure);
+  let raced: Ref[] | null = null;
   store.race = other => {
     const source = other.get(f.initial.admission.gaps.sources.input.id)!;
     other.write({ id: source.id, kind: source.kind, expected: source.revision, value: source.value });
+    raced = fullSnapshot(other);
   };
   addressed(recordCall(store, PROJECT, input), "input_stale");
   assert.equal(store.get(callRecordId(PROJECT, input.call)), null); assert.equal(store.get(callLedgerId(PROJECT)), null);
-  assert.equal(store.get(callRecordId(PROJECT, input.call)), null);
+  // The losing E1 adds neither its call, the ledger nor a completion registration over the rival's write.
+  assert.deepEqual(fullSnapshot(store), raced);
 });
 
 /**
@@ -1279,13 +1299,32 @@ function managedMechanismFixture(t: test.TestContext, label: string, StoreType: 
   const proof = deliveredOf(prepareSeriesAdmission(store, ownerAddress, initial.admission));
   const attemptGoal = { key: "address-missing-fields", ...proof.goal };
   let mechanismSeries: Revision<AnyRepairSeries> | null = null;
-  /** One managed M5 attempt: opened, paid off its form, claimed as G7 derives it and closed at the gate. */
-  async function cycle(attempt: number): Promise<Revision<AnyRepairSeries>> {
+  /** LG07 m3d (№10464): the managed M5 opening — its own admission and completion — and its own issued E2 packet. */
+  function issued(attempt: number): { opened: Revision<AnyRepairSeries>; packet: Sealed<Revision<QuestionPacketRecord>> } {
     const opened = deliveredOf(openAttempt(store, { ...ownerAddress, attempt, goal: attemptGoal, admission: initial.admission,
       completion: { routes: initial.admission.routes, batches: [initial.admission.batch] } } as never)) as Revision<AnyRepairSeries>;
     mechanismSeries ??= opened;
     const packet = deliveredOf(writeQuestionPacket(store, { project: PROJECT, routes: initial.admission.routes, batch: initial.admission.batch,
       environment, attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record;
+    return { opened, packet };
+  }
+  /** The lawful recordCall a product E1 sends for an issued packet — its requestId, designation and admission. */
+  function managedCall(packet: Sealed<Revision<QuestionPacketRecord>>): MechanismRecordCallRequest {
+    const request = packet.value.request;
+    const payload = packet.value.packet as { requestId: string; purpose: "model-design"; questions: { id: string }[] } | null;
+    assert.ok(payload && request.attempt && request.batch);
+    const batch = initial.routes.value.batches.find(row => row.id === request.batch)!;
+    const assigned = new Set(payload.questions.map(question => question.id));
+    return { call: payload.requestId, purpose: payload.purpose, basis: null, owner: mechanismOwner,
+      admission: { routes: request.routes, batch: request.batch, gaps: initial.routes.value.request.gaps },
+      gaps: batch.items.filter(item => assigned.has(item.gap))
+        .map(item => ({ id: item.gap, goal: item.target, field: item.field, consumer: mechanismOwner })),
+      series: request.attempt.series, attempt: request.attempt.ordinal, goal: attemptGoal,
+      dispatch: { adapter: paidAdapter, config: environment }, packet: payload };
+  }
+  /** One managed M5 attempt: opened, paid off its form, claimed as G7 derives it and closed at the gate. */
+  async function cycle(attempt: number): Promise<Revision<AnyRepairSeries>> {
+    const { opened, packet } = issued(attempt);
     steps.push({ research: {}, usage });
     writeFileSync(scenario, JSON.stringify({ database: path, steps }));
     deliveredOf(await runModelCall(store, { project: PROJECT, packet: reference(packet), dispatch: { adapter: paidAdapter, config: environment }, role: "implementer" }));
@@ -1347,8 +1386,8 @@ function managedMechanismFixture(t: test.TestContext, label: string, StoreType: 
     questionCount = ids.length;
     return task();
   }
-  return { root, path, store, adapter, config, initial, ownerAddress, attemptGoal, cycle, stop, call, refreshInventory, addressOne,
-    replaceProducerQuestions, get mechanismSeries() { return mechanismSeries!; } };
+  return { root, path, store, adapter, config, initial, ownerAddress, attemptGoal, issued, managedCall, cycle, stop, call,
+    refreshInventory, addressOne, replaceProducerQuestions, get mechanismSeries() { return mechanismSeries!; } };
 }
 
 /** LG07 m3c (№10309): every record's exact head — a refusal or a repeat after real paid work hides no partial write. */
