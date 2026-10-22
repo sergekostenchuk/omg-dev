@@ -4,9 +4,9 @@ import { discoveryConstraintBindings, discoveryDecisionId } from "../discovery/d
 import {
   acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planStopSubject,
   isAdmissionEra, isSupportedEra, issuedEntry, issuedForm,
-  listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft,
+  listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft, readDiscoveryIndexAt,
   readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions,
-  type DiscoveryChoice, type DiscoveryDraft, type FormEntry, type IssuedAnswerProof,
+  type DiscoveryChoice, type DiscoveryDraft, type DiscoveryIndexCursor, type DiscoveryIndexRead, type FormEntry, type IssuedAnswerProof,
   type IssuedProjection, type Question, type RecordView, type ResearchRun, type UpstreamStage,
 } from "../discovery/projection-reader.js";
 import { EngineError, requireCondition } from "../errors.js";
@@ -84,6 +84,15 @@ export interface SummaryCandidate {
 export interface DiscoveryStageSummary {
   contract: "stage-summary/discovery/v1"; project: string; stage: "discovery"; currentStage: Ref | null;
   accepted: SummaryAccepted | null; candidate: SummaryCandidate | null; candidates: Ref[];
+}
+
+/** An explicit historical section request; no current draft, cursor or grounds are inferred. */
+export interface DiscoveryIndexSummaryRequest {
+  section: "v7-index"; plan: Ref; cursor: DiscoveryIndexCursor; basis: Ref[];
+}
+export interface DiscoveryIndexStageSummary {
+  contract: "stage-summary/discovery-index/v1"; project: string; stage: "discovery";
+  index: DiscoveryIndexRead;
 }
 
 export type SummaryStructuredStage = Exclude<UpstreamStage, "discovery">;
@@ -873,10 +882,20 @@ function selectStructuredCandidate(store: Store, project: string, stage: Summary
     : { selected: null, candidates: drafts.map(reference) };
 }
 
+export function stageSummary(store: Store, project: string, stage: "discovery", request: DiscoveryIndexSummaryRequest): DiscoveryIndexStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", draftId?: string): DiscoveryStageSummary;
 export function stageSummary(store: Store, project: string, stage: SummaryStructuredStage, draftId?: string): StructuredStageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage, draftId?: string): StageSummary;
-export function stageSummary(store: Store, project: string, stage: Stage, draftId?: string): StageSummary {
+export function stageSummary(store: Store, project: string, stage: Stage,
+  draftId?: string | DiscoveryIndexSummaryRequest): StageSummary | DiscoveryIndexStageSummary {
+  if (draftId !== undefined && typeof draftId !== "string") {
+    requireCondition(stage === "discovery" && object(draftId) && draftId.section === "v7-index",
+      "stage_summary_index_request_invalid", "Expected an explicit Discovery v7 index section request");
+    // This section has its own historical boundary. It does not read the current outcome,
+    // choose a draft or scan stage/assessment history to replace a missing index.
+    return { contract: "stage-summary/discovery-index/v1", project, stage: "discovery",
+      index: readDiscoveryIndexAt(store, project, draftId.plan, draftId.cursor, {basis: draftId.basis}) };
+  }
   requireCondition(UPSTREAM_STAGES.includes(stage as UpstreamStage), "stage_summary_unavailable",
     `Readable summary for ${stage} is not connected yet`);
   const stamp = store.changeStamp();
@@ -1003,7 +1022,36 @@ function logicalQuestionText(run: SummaryRun): string {
     + ` (${basis})${run.subjectText ? `: ${run.subjectText}` : ""}`;
 }
 
-export function renderStageSummary(summary: StageSummary): string {
+function renderDiscoveryIndexSummary(summary: DiscoveryIndexStageSummary): string {
+  const index = summary.index, refText = (ref: Ref): string => `${ref.id}@${ref.revision}#${ref.hash}`;
+  const lines = ["# Discovery", "", "## Индексная проекция v7", "",
+    `Проект: ${summary.project}`, `База: ${index.scope.databaseId}`,
+    `План: ${refText(index.scope.plan)}`, `Граница событий: ${index.cursor.sequence}`,
+    `Последнее событие: ${index.cursor.tail ? refText(index.cursor.tail) : "нет"}`,
+    `Проиндексировано по событие: ${index.indexedThrough}`, "",
+    "### Запрошенные основания", "", ...index.basis.map(ref => `- ${refText(ref)}`)];
+  if (!index.basis.length) lines.push("Явный пустой набор; основания принятия плана проверяются отдельно.");
+  lines.push("", "Индекс не устанавливает достаточность, отсутствие блокировок или принятие Discovery.");
+  if (index.status === "incomplete") {
+    lines.push(`Неполнота: ${index.reason}`, ...index.missingBasis.map(ref => `- отсутствует основание: ${refText(ref)}`));
+  } else if (index.projection) {
+    const projection = index.projection;
+    lines.push("Запрошенный диапазон и основания проиндексированы.", "", "### Вопросы плана", "",
+      ...projection.questions.map(question => `- ${question.planQuestionId}: ${canonical(question.question)}`), "", "### Claims (структурные данные)", "",
+      ...projection.claims.map(claim => `- ${refText(claim.address.container)}${claim.address.pointer}: ${canonical(claim.value)}`),
+      "", "### Применённый прогресс P", "",
+      ...projection.progress.map(progress => `- ${refText(progress.state)}: ${canonical(progress.data)}`),
+      "", `Неполнота глубокого покрытия: ${projection.coverage.reason}`,
+      ...projection.coverage.cells.map(cell => `- структурная ячейка ${refText(cell.source)}: ${canonical(cell.cell)}`),
+      "", "### Источники и происхождение", "",
+      ...projection.sources.map(source => `- ${source.record.kind}: ${refText(reference(source.record))}; событие ${source.sequence}`),
+      ...projection.provenance.map(link => `- ${refText(link.from)}${link.path} → ${refText(link.to)}; ${link.availability}`));
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary): string {
+  if (summary.contract === "stage-summary/discovery-index/v1") return renderDiscoveryIndexSummary(summary);
   if (summary.stage !== "discovery") return renderStructuredStageSummary(summary);
   const lines = ["# Discovery", ""];
   if (!summary.accepted) lines.push("Принятый результат: ещё не принято.", "");
