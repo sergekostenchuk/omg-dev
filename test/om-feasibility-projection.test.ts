@@ -367,8 +367,6 @@ test('G1.2 a genuine mixed project preserves native R3 while the OM continuation
   const staleFindings = stale.findings.filter(finding => finding.code === 'feasibility_stale');
   assert.ok(staleFindings.some(finding => finding.target === f.phaseL2.id),
     'The native gate names the exact L2 milestone the reseal superseded');
-  assert.ok(!stale.findings.some(finding => finding.code === 'feasibility_contract_superseded'),
-    'An explicit native reference retains its own producer contract in a mixed project');
   assert.equal(canonical(f.store.get(f.legacy.id)), legacyBytes);
   f.restart();
   assert.equal(canonical(f.store.get(f.legacy.id, f.legacy.revision)), legacyBytes);

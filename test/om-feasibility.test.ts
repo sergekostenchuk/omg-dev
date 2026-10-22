@@ -1007,4 +1007,71 @@ test('AT1 row 14 M8 issues a plan only on the tree its works were checked agains
   const h = acceptedWorksFixture(t, 'planned', null);
   assert.deepEqual([h.gate.value.contract, h.gate.value.impact], [ATOMIC_GATE_IMPACT_CONTRACT, { snapshot: null, works: [] }]);
   denied(prepareFeasibility(h.store, h.feasibility), 'feasibility_not_ready');
+  // LG09 (codex-omg2 №9048 п.4): the legal explicit null with no repository keeps its own semantics — the real
+  // producer's positive no-repo form; other findings decide readiness, nothing pretends ready=true.
+  const hAway = join(h.root, 'retained-git');
+  renameSync(join(h.workspace, '.git'), hAway);
+  try {
+    const hHeads = heads(h.store), noRepo = ok(prepareFeasibility(h.store, h.feasibility));
+    assert.equal(noRepo.record.value.repository, null);
+    assert.equal(noRepo.record.value.ready, false);
+    assert.ok(noRepo.record.value.findings.some(finding => finding.code === 'repository_unavailable'),
+      canonical(noRepo.record.value.findings));
+    assert.deepEqual(heads(h.store), hHeads);
+    h.restart();
+    assert.ok(prepareFeasibility(h.store, h.feasibility).ok, 'a cold repeat keeps the same no-repository form');
+  } finally { renameSync(hAway, join(h.workspace, '.git')); }
+  // LG09 (codex-omg2 №9048 п.4): addressed negative mutations of the genuine saved records — a missing or wrong basis,
+  // a missing/v1/foreign contract at a kept impact, a missing impact or its snapshot field. Each is
+  // feasibility_not_ready, identical with and without a repository so the tree=null branch cannot hide the bypass.
+  const mutations: { name: string; field: string; target: 'frame' | 'gate';
+    change(values: { gate: Record<string, unknown>; frame: Record<string, unknown> }): void }[] = [
+    { name: 'a missing gate basis of the accepted frame', field: 'acceptance.gate.basis', target: 'frame',
+      change: ({ frame }) => { delete ((frame['acceptance'] as Record<string, unknown>)['gate'] as Record<string, unknown>)['basis']; } },
+    { name: 'a missing gate contract', field: 'snapshot', target: 'gate',
+      change: ({ gate }) => { delete gate['contract']; } },
+    { name: 'a v1 gate contract', field: 'snapshot', target: 'gate',
+      change: ({ gate }) => { gate['contract'] = 'om-atomic-gate/v1'; } },
+    { name: 'a foreign gate contract', field: 'snapshot', target: 'gate',
+      change: ({ gate }) => { gate['contract'] = 'om-atomic-gate/v9'; } },
+    { name: 'a missing gate impact', field: 'snapshot', target: 'gate',
+      change: ({ gate }) => { delete gate['impact']; } },
+    { name: 'a missing snapshot field of a kept impact', field: 'snapshot', target: 'gate',
+      change: ({ gate }) => { delete (gate['impact'] as Record<string, unknown>)['snapshot']; } },
+  ];
+  for (const mutation of mutations) {
+    const m = acceptedWorksFixture(t, 'planned', 'head');
+    const gateRecord = m.store.get(m.gate.id)!, frameRecord = m.store.get(m.acceptance.frame.id)!,
+      layerRecord = m.store.get(m.acceptance.layer.id)!;
+    const values = { gate: structuredClone(gateRecord.value) as Record<string, unknown>,
+      frame: structuredClone(frameRecord.value) as Record<string, unknown> };
+    mutation.change(values);
+    const movedGate = m.store.write({ id: gateRecord.id, kind: gateRecord.kind, expected: gateRecord.revision, value: values.gate });
+    const frameGate = (values.frame['acceptance'] as { gate: Record<string, unknown> }).gate;
+    if (Object.hasOwn(frameGate, 'basis')) frameGate['basis'] = reference(movedGate);
+    const movedFrame = m.store.write({ id: frameRecord.id, kind: frameRecord.kind, expected: frameRecord.revision, value: values.frame });
+    const layerValue = structuredClone(layerRecord.value) as Record<string, unknown>;
+    (layerValue['acceptance'] as Record<string, unknown>)['frame'] = reference(movedFrame);
+    const movedLayer = m.store.write({ id: layerRecord.id, kind: layerRecord.kind, expected: layerRecord.revision, value: layerValue });
+    const request = { ...m.feasibility, layer: reference(movedLayer), frame: reference(movedFrame) };
+    const target = mutation.target === 'gate' ? m.gate.id : m.acceptance.frame.id;
+    const expectRefusal = (label: string) => {
+      const before = heads(m.store), result = prepareFeasibility(m.store, request);
+      assert.equal(result.ok, false, `${mutation.name} (${label})`);
+      if (result.ok) throw new Error('A gate that never named its snapshot cannot prepare a plan');
+      assert.equal(result.refusal.code, 'feasibility_not_ready', `${mutation.name} (${label})`);
+      assert.equal(result.refusal.at.unit, 'M8');
+      assert.equal(result.refusal.at.target, target, `${mutation.name} (${label})`);
+      assert.equal(result.refusal.at.field, mutation.field, `${mutation.name} (${label})`);
+      assert.deepEqual(heads(m.store), before, `${mutation.name} (${label}): the typed refusal writes nothing`);
+    };
+    expectRefusal('repository');
+    const away = join(m.root, 'retained-git');
+    renameSync(join(m.workspace, '.git'), away);
+    try {
+      expectRefusal('no repository');
+      m.restart();
+      expectRefusal('cold repeat without a repository');
+    } finally { renameSync(away, join(m.workspace, '.git')); }
+  }
 });

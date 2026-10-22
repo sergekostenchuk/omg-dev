@@ -533,7 +533,7 @@ test("Q2b catalogues: each module's full local set from its places of issue, the
     "atomic_gate_record_forged", "atomic_gate_transaction_conflict", "input_stale", "obligation_assignment_invalid", "packet_foreign",
     "work_blocking_gap_open"]));
   assert.deepEqual([...ATOMIC_GATE_ERROR_CODES], ["atomic_gate_request_invalid", "atomic_gate_internal"]);
-  assert.deepEqual(sorted(FEASIBILITY_LOCAL_CODES), sorted(["feasibility_record_invalid", "feasibility_contract_superseded",
+  assert.deepEqual(sorted(FEASIBILITY_LOCAL_CODES), sorted(["feasibility_record_invalid",
     "feasibility_stale", "feasibility_not_ready", "input_stale"]));
   assert.deepEqual([...FEASIBILITY_ERROR_CODES], ["feasibility_request_invalid", "feasibility_internal"]);
   // M9 states the saved-record codes of its own sources itself (№2460-1): they are its local codes, not a transfer of refs.

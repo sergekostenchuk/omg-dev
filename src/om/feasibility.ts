@@ -49,7 +49,7 @@ export interface OmFeasibility extends Feasibility {
   };
 }
 /** Q2b (№2518): every refusal code M8 creates itself, from the actual places of issue; its exceptions apart. */
-export const FEASIBILITY_LOCAL_CODES = Object.freeze(['feasibility_record_invalid', 'feasibility_contract_superseded',
+export const FEASIBILITY_LOCAL_CODES = Object.freeze(['feasibility_record_invalid',
   'feasibility_stale', 'feasibility_not_ready', 'input_stale'] as const);
 export type FeasibilityLocalCode = typeof FEASIBILITY_LOCAL_CODES[number];
 export const FEASIBILITY_ERROR_CODES = Object.freeze(['feasibility_request_invalid', 'feasibility_internal'] as const);
@@ -107,16 +107,20 @@ function requireRequest(store: Store, request: unknown): asserts request is Feas
 
 /** The same exact C5/F2/D7 readers establish the inputs for preview and provenance. */
 /**
- * AT1 (№4091 п.5): a plan is issued on exactly the tree its works were checked against. A gate of the impact era names that
+ * AT1 (№4091 п.5): a plan is issued on exactly the tree its works were checked against. The gate of the impact era names that
  * snapshot (read as saved, never derived again); without one the impact was never checked, and no plan is issued. A gate
- * of the earlier era is read by its own rule.
+ * of any other contract can never have named it — there is no earlier-era rule left to read.
  */
-function sameSnapshot(store: Store, project: string, frame: { value: { acceptance: unknown } } | null, tree: string | null): void {
-  const gate = (frame?.value.acceptance as { gate?: { basis?: unknown } } | undefined)?.gate?.basis;
-  if (!isRef(gate)) return;
+function sameSnapshot(store: Store, project: string, frame: { id: string; value: { acceptance: unknown } }, tree: string | null): void {
+  const gate = (frame.value.acceptance as { gate?: { basis?: unknown } } | undefined)?.gate?.basis;
+  // A genuine accepted L3 always receives its exact G5 basis at issue; a missing one is an unproved input, not a skip.
+  if (!isRef(gate))
+    fail('feasibility_not_ready', frame.id, 'acceptance.gate.basis', 'The accepted frame must name the exact atomic-gate basis of its works');
   const record = take(readRecord<AtomicGateRecord>(store, gate, { unit: 'M8', target: gate.id, idPrefix: `om-atomic-gate:${project}:`, kind: 'om-atomic-gate' }));
-  if (record.value.contract !== ATOMIC_GATE_IMPACT_CONTRACT) return;
-  const snapshot = record.value.impact?.snapshot ?? null;
+  const impact = record.value.contract === ATOMIC_GATE_IMPACT_CONTRACT ? record.value.impact : undefined;
+  if (!impact || !Object.hasOwn(impact, 'snapshot'))
+    fail('feasibility_not_ready', gate.id, 'snapshot', 'The works were accepted without the repository snapshot their impact is checked against');
+  const snapshot = impact.snapshot;
   // A workspace without a repository has no snapshot to check an impact against — its packets carry none; a repository does.
   if (!snapshot) {
     if (tree !== null) fail('feasibility_not_ready', gate.id, 'snapshot', 'The works were accepted without the repository snapshot their impact is checked against');
@@ -183,8 +187,6 @@ function requireRecord(value: unknown, project: string): asserts value is OmFeas
     || !Object.hasOwn(value, 'repository') || !refs(value['inputs']) || !findingsShape(value['findings'])) bad('record');
   const producer = value['producer'];
   if (!object(producer)) return bad('producer');
-  if (producer['contract'] === 'om-m8/v1')
-    fail('feasibility_contract_superseded', id(project), 'producer.contract', 'The M8/v1 producer contract has been replaced by M8/v2');
   if (producer['contract'] !== FEASIBILITY_PRODUCER_CONTRACT || producer['project'] !== project
     || !['layer', 'frame', 'candidate', 'horizon'].every(key => isRef(producer[key]))) bad('producer');
   const obligations = producer['obligations'], readiness = producer['readiness'], inspection = producer['inspection'];
@@ -349,7 +351,7 @@ export function prepareFeasibility(store: Store, request: FeasibilityRequest): F
     const inspection: FeasibilityInspection = { graph: request.graph, layer: request.layer, environment: request.environment,
       root: effective.root, executionRoot, workspace: executionRoot && workspace ? reference(workspace) : null,
       result: inspectRepository({ ...effective.environment.value, workspace: effective.root }, basis.graph as Graph) };
-    sameSnapshot(traced, request.project, basis.accepted.frame, inspection.result.state?.tree ?? null);
+    sameSnapshot(traced, request.project, basis.accepted.frame!, inspection.result.state?.tree ?? null);
     const d7 = { producer: reference(basis.obligations.producer), ledger: reference(basis.obligations.record) };
     const readiness = readinessObligations(traced, request.project, [d7.producer, d7.ledger]);
     const deliveries = deliveryInputs(traced, request.project, basis, inspection);

@@ -1,10 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
 import test, { type TestContext } from 'node:test';
 import { canonical, hashJson, type Json } from '../src/canonical.js';
 import { deriveTasks } from '../src/compiler/derive.js';
@@ -17,11 +13,10 @@ import { ensureWorktree } from '../src/execution/worktree.js';
 import { currentBasis } from '../src/execution/basis.js';
 import type { TaskRun } from '../src/execution/model.js';
 import type { Graph } from '../src/graph/model.js';
-import type { Feasibility } from '../src/graph/refinement.js';
 import { requireTaskObligations, taskObligationHandoff } from '../src/graph/task-obligations.js';
 import { Owners } from '../src/ownership/owners.js';
 import { readWriterIndex, type WriterIndex } from '../src/ownership/writer-index.js';
-import { reference, uniqueRefs, type GateResult, type Ref, type StageArtifact, type StageProjection } from '../src/pipeline/contracts.js';
+import { reference, uniqueRefs, type GateResult, type Ref, type StageArtifact } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { Environments, uniqueTransactionGuards, type ExecutionRoot } from '../src/runtime/environment.js';
 import { Store, type Revision } from '../src/storage/store.js';
@@ -186,6 +181,8 @@ const omissions: Alteration[] = [
   { name: 'producer contract', change(value) { delete (value['producer'] as Record<string, unknown>)['contract']; } },
   { name: 'null producer contract', change(value) { (value['producer'] as Record<string, unknown>)['contract'] = null; } },
   { name: 'unknown producer contract', change(value) { (value['producer'] as Record<string, unknown>)['contract'] = 'om-m8/unknown'; } },
+  // LG09 (codex-omg2 №9048 п.5): the superseded M8/v1 contract is refused as any other foreign producer contract — no era branch.
+  { name: 'v1 producer contract', field: 'producer', change(value) { (value['producer'] as Record<string, unknown>)['contract'] = 'om-m8/v1'; } },
 ];
 
 test('G1.1 current Refinement gate accepts the genuine M8 producer with its complete G6 admission after restart', async t => {
@@ -311,7 +308,7 @@ function planWithIncompleteProvenance(store: Store, feasibility: Revision<OmFeas
 
 test('G1.1 Compiler read and current gate reject incomplete M8 provenance by the shared historical reader', async t => {
   const f = await fixture(t), saved = ok(writeFeasibility(f.store, f.feasibility));
-  for (const alteration of omissions.filter(item => ['both D7 references and saved obligations', 'producer', 'producer contract'].includes(item.name)))
+  for (const alteration of omissions.filter(item => ['both D7 references and saved obligations', 'producer', 'producer contract', 'v1 producer contract'].includes(item.name)))
     await t.test(alteration.name, () => {
       const value = structuredClone(saved.value) as unknown as Record<string, unknown>;
       alteration.change(value);
@@ -633,110 +630,4 @@ test('G1.1 two native tasks extend one writer index across restart and reject a 
       'The whole source chain has valid commit roots and complete writer gates');
     assert.throws(() => currentBasis(view, plan, root.value), errorCode('plan_stale'));
   });
-});
-
-const HISTORY_LOADER = String.raw`import {execFileSync} from 'node:child_process';
-import {fileURLToPath} from 'node:url';
-let root,ts;
-export async function initialize(data){root=data.root;ts=(await import(data.typescript)).default;}
-export async function load(url,context,next){
- const prefix=new URL('dist/',root).href;
- if(url.startsWith(prefix)&&/\.js$/.test(url)){
-  const relative=url.slice(prefix.length).replace(/\.js$/,'.ts');
-  if(relative.startsWith('src/')||relative.startsWith('test/')){
-   let source=execFileSync('git',['show','3e495b1c0cf7:'+relative],
-    {cwd:fileURLToPath(root),encoding:'utf8',maxBuffer:10000000});
-   if(relative==='test/om-feasibility.test.ts'){
-    const boundary=source.indexOf('const heads =');if(boundary<0)throw new Error('Missing old native M8 fixture');
-    source=source.slice(0,boundary)+'\nexport {acceptedWorksFixture};';
-   }
-   return {format:'module',shortCircuit:true,source:ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2023}}).outputText};
-  }
- }
- return next(url,context);
-}`;
-
-test('G1.1 complete 3e495b1 producer preserves legacy feasibility and plans while M8 v1 is explicitly superseded without rewriting history', t => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'omg-g11-era-producer-')));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const repository = fileURLToPath(new URL('../../', import.meta.url));
-  const loader = join(directory, 'old-loader.mjs'), script = join(directory, 'old-producer.mjs');
-  writeFileSync(loader, HISTORY_LOADER);
-  writeFileSync(script, `import assert from 'node:assert/strict';
-import {join} from 'node:path';import {pathToFileURL} from 'node:url';
-const repository=process.argv[2],src=path=>pathToFileURL(join(repository,'dist/src',path)).href,
- helpers=path=>pathToFileURL(join(repository,'dist/test',path)).href;
-const {executionFixture}=await import(helpers('execution-fixture.js'));
-const {acceptedWorksFixture}=await import(helpers('om-feasibility.test.js'));
-const {writeFeasibility}=await import(src('om/feasibility.js'));
-const {reference,uniqueRefs}=await import(src('pipeline/contracts.js'));
-const {canonical,hashJson}=await import(src('canonical.js'));
-const {Owners}=await import(src('ownership/owners.js'));
-const {taskObligationHandoff,requireTaskObligations}=await import(src('graph/task-obligations.js'));
-const {deriveTasks}=await import(src('compiler/derive.js'));
-const {resolveArtifact}=await import(src('compiler/inputs.js'));
-${planWithIncompleteProvenance.toString()}
-const cleanup=[];
-try {
- const l=executionFixture({after:fn=>cleanup.push(fn)}),ready=l.store.get('feasibility:p');
- const checks={feasibility:l.engine.refinement.feasibilityGate('p',reference(ready)),
-  om:l.engine.pipeline.inspect('p','om-g2'),compilation:l.engine.pipeline.inspect('p','compilation'),
-  plan:l.engine.compiler.gate('p',reference(l.plan))};
- assert.equal(checks.feasibility.findings.length,0);assert.equal(checks.plan.findings.length,0);
- assert.equal(checks.om.state,'accepted');assert.equal(checks.compilation.state,'accepted');
- const legacy={directory:l.directory,database:l.store.path,project:'p',ready,plan:l.plan,checks,
-  history:canonical(l.store.list().flatMap(row=>l.store.history(row.id)))};
- l.store.close();
- const f=acceptedWorksFixture({after:fn=>cleanup.push(fn)}),m8=writeFeasibility(f.store,f.feasibility);
- assert.equal(m8.ok,true);assert.equal(m8.value.value.producer.contract,'om-m8/v1');
- const plan=planWithIncompleteProvenance(f.store,m8.value);
- const om={directory:f.root,database:f.store.path,project:f.project,ready:m8.value,plan,request:f.feasibility,
-  history:canonical(f.store.list().flatMap(row=>f.store.history(row.id)))};
- f.store.close();process.stdout.write(JSON.stringify({legacy,om}));
-} catch(error){for(const fn of cleanup)try{fn();}catch{}throw error;}
-`);
-  const typescript = pathToFileURL(createRequire(import.meta.url).resolve('typescript')).href;
-  const bootstrap = `import{register}from'node:module';register(${JSON.stringify(pathToFileURL(loader).href)},
-{data:{root:${JSON.stringify(pathToFileURL(repository).href)},typescript:${JSON.stringify(typescript)}}});`;
-  const environment = { ...process.env }; delete environment.NODE_TEST_CONTEXT;
-  const raw = execFileSync(process.execPath, ['--import', `data:text/javascript,${encodeURIComponent(bootstrap)}`, script, repository],
-    { cwd: repository, env: environment, encoding: 'utf8', timeout: 120_000, maxBuffer: 40_000_000 });
-  const old = JSON.parse(raw) as {
-    legacy: { directory: string; database: string; project: string; ready: Revision<Feasibility>; plan: Revision<MachinePlan>; history: string;
-      checks: { feasibility: GateResult; om: StageProjection; compilation: StageProjection; plan: GateResult } };
-    om: { directory: string; database: string; project: string; ready: Revision<OmFeasibility>; plan: Revision<MachinePlan>;
-      request: FeasibilityRequest; history: string };
-  };
-  t.after(() => { rmSync(old.legacy.directory, { recursive: true, force: true }); rmSync(old.om.directory, { recursive: true, force: true }); });
-  for (const restart of [0, 1]) {
-    const legacy = new Store(old.legacy.database), engine = new ProductEngine(legacy);
-    try {
-      assert.equal(canonical(legacy.list().flatMap(row => legacy.history(row.id))), old.legacy.history);
-      assert.deepEqual(engine.compiler.read(old.legacy.plan.id), old.legacy.plan);
-      assert.deepEqual(engine.compiler.compile(old.legacy.project), old.legacy.plan);
-      assert.deepEqual({ feasibility: engine.refinement.feasibilityGate(old.legacy.project, reference(old.legacy.ready)),
-        om: engine.pipeline.inspect(old.legacy.project, 'om-g2'), compilation: engine.pipeline.inspect(old.legacy.project, 'compilation'),
-        plan: engine.compiler.gate(old.legacy.project, reference(old.legacy.plan)) }, old.legacy.checks);
-      assert.equal(canonical(legacy.list().flatMap(row => legacy.history(row.id))), old.legacy.history);
-    } finally { legacy.close(); }
-    const store = new Store(old.om.database), current = new ProductEngine(store), request = { project: old.om.project, record: reference(old.om.ready) };
-    try {
-      for (const result of [readFeasibility(store, request), gateFeasibility(store, request), writeFeasibility(store, old.om.request)]) {
-        assert.equal(result.ok, false, `The unreleased v1 producer remains explicitly superseded after restart ${restart}`);
-        if (result.ok) throw new Error('M8 v1 cannot silently adopt the v2 formula');
-        assert.equal(result.refusal.code, 'feasibility_contract_superseded');
-        assert.equal(result.refusal.at.target, old.om.ready.id); assert.equal(result.refusal.at.field, 'producer.contract');
-      }
-      for (const historical of [false, true]) {
-        refused(current.refinement.feasibilityGate(old.om.project, reference(old.om.ready), historical), 'feasibility_contract_superseded', old.om.ready.id);
-        assert.throws(() => current.compiler.gate(old.om.project, reference(old.om.plan), historical), errorCode('feasibility_contract_superseded'));
-      }
-      assert.throws(() => requireBasis(store, old.om.plan.value), errorCode('feasibility_contract_superseded'));
-      assert.throws(() => requirePlanTaskObligations(store, old.om.plan.value), errorCode('feasibility_contract_superseded'));
-      assert.throws(() => current.compiler.read(old.om.plan.id), errorCode('feasibility_contract_superseded'));
-      assert.deepEqual(store.get(old.om.ready.id, old.om.ready.revision), old.om.ready);
-      assert.equal(canonical(store.list().flatMap(row => store.history(row.id))), old.om.history,
-        'Typed refusal never rewrites v1 records, their hashes, or either saved inputs set');
-    } finally { store.close(); }
-  }
 });
