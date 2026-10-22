@@ -27,6 +27,7 @@ import type { ClaimAddress } from '../src/discovery/claim-address.js';
 import { discoveryOutcome, discoveryTraversal, type V7Traversal } from '../src/discovery/discovery-outcome.js';
 import { issuedForm, outcomeSummary, researchRunId } from '../src/discovery/projection-reader.js';
 import { EngineError } from '../src/errors.js';
+import { Researcher } from '../src/discovery/research-runner.js';
 
 // R.3 (codex-omg №10880 п.2, №10906): the proved end of the v7 plan traversal on real K → assessment → application.
 // The chains are built through the accepted MR/P producers (as P.4 does); the ordinary runner case follows R.2.
@@ -413,4 +414,96 @@ test('R.3: a forged attempt of the plan is a typed refusal of the common attempt
   // Negative mutation: a renamed copy of a real attempt under an id that is not the deterministic id of its key.
   f.store.write({ id: `${saved.id}-copy`, kind: saved.kind, expected: 0, value: saved.value });
   assert.throws(() => traversal(f), (error: unknown) => error instanceof EngineError && error.code === 'attempt_invalid');
+});
+
+// ---- R.3 end to end on the ordinary runner (R.2 merged, om/module 1b4be1fb): the setup of the accepted R.1 test ----
+async function runnerSetup(t: test.TestContext, questions = [planQuestion('support', 'market'), planQuestion('block', 'industry', 'blocking')]) {
+  const f = fixture(t); f.engine.execute({ type: 'create-project', project: 'p', title: 'P' });
+  const wire = join(f.root, 'wire.ndjson'), settings = join(f.root, 'reply.json'), adapter = join(f.root, 'adapter.mjs');
+  const configure = (replies: unknown[] = [], tokens: number | null = 10) => writeFileSync(settings, JSON.stringify({ replies, tokens }));
+  configure();
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
+let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
+appendFileSync(${JSON.stringify(wire)},raw+'\\n');
+const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
+let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ research={verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected:[],newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
+}
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
+  const command = { executable: process.execPath, args: [adapter] };
+  const environment = f.engine.environments.configure('p', { workspace: f.root,
+    implementer: { actor: 'author', model: 'fixture', effort: 'high', command }, reviewer: { actor: 'reviewer', model: 'fixture', effort: 'high', command },
+    fullCheck: command, timeoutMs: 5000 }, 0);
+  const calibration = f.discovery.create('p', 'discovery', 'R0', 'concept', [
+    { field: 'probe', kind: 'fact', prompt: 'Calibrate', risk: 'unknown', schema: { type: 'object' } }], [], 6);
+  const ended = { action: 'answer', question: '$selected', value: { type: 'impossible', code: 'source_unavailable', evidence: [], text: 'No accessible source' }, citations: [] };
+  const audit = (purpose: string) => ({ store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose });
+  await researchCall(environment.value.implementer, environment.value, 'Calibrate', {}, undefined, audit('analyst') as any);
+  configure([ended, { necessary: true, reason: 'Calibration review' }]);
+  await researchCall(environment.value.reviewer, environment.value, 'Calibrate reviewer', {}, undefined, audit('escalation-assessor') as any);
+  await researchCall(environment.value.reviewer, environment.value, 'Calibrate assessor', {}, undefined, audit('assessor') as any);
+  await researchCall(environment.value.implementer, environment.value, 'Calibrate planner', { dispatchMode: 'planning' }, undefined, audit('reading-planner') as any);
+  configure(); writeFileSync(wire, '');
+  const v = acceptPlan(f, 'p', questions);
+  // The real paid unknown of every subject: an unavailable source with its saved evidence (R.1 finishFrontier).
+  const finishFrontier = () => writeFileSync(settings, JSON.stringify({ ...JSON.parse(readFileSync(settings, 'utf8')),
+    terminalConstraint: reference(f.discovery.evidence.document('p', 'terminal-source', 'The requested source is unavailable', 'text/plain', 0)) }));
+  const run = (limit = 8, store = f.store, policy = true) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
+    .run('p', v.draft.id, limit, undefined, policy ? { producerPolicy: { discovery: 7 } } : {});
+  const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean);
+  return { ...f, v, questions, run, wires, finishFrontier };
+}
+/** The R.1 cut: the paid assessment is published, and the run stops before its application. */
+function beforeApply(f: Awaited<ReturnType<typeof runnerSetup>>) {
+  const write = f.store.writeMany.bind(f.store); let hit = false;
+  f.store.writeMany = ((writes, guards = []) => {
+    if (!hit && writes.some(w => w.kind === 'v7-progress-application')) { hit = true; throw new Error('R3 cut before-apply'); }
+    return write(writes, guards);
+  }) as typeof f.store.writeMany;
+  return () => { f.store.writeMany = write; assert.ok(hit, 'the real producer reached its application'); };
+}
+const runnerTraversal = (f: { store: Store; v: { draft: Revision<DiscoveryDraft> } }, store = f.store) =>
+  discoveryTraversal(store, store.get<DiscoveryDraft>(f.v.draft.id)!)!;
+
+test('R.3 end to end: the ordinary runner completes its run on a front of proved unknowns, which does not accept Discovery', async t => {
+  const f = await runnerSetup(t); f.finishFrontier();
+  const run = await f.run();
+  assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
+  const read = runnerTraversal(f);
+  assert.equal(read.end, 'completed');
+  assert.deepEqual(read.subjects.map(row => [row.subject.planQuestionId, row.outcome, row.applications.length, row.pending.length]),
+    [['support', 'unknown', 1, 0], ['block', 'unknown', 1, 0]]);
+  const before = f.store.list().map(row => [row.id, row.revision, row.hash]), sent = f.wires().length, cold = f.open();
+  assert.deepEqual(runnerTraversal(f, cold), read);
+  assert.equal(discoveryOutcome(cold, cold.get<DiscoveryDraft>(f.v.draft.id)!).state, 'researching');
+  assert.equal(cold.get('stage:p:discovery'), null);
+  assert.deepEqual(f.store.list().map(row => [row.id, row.revision, row.hash]), before);
+  assert.equal(f.wires().length, sent);
+});
+
+test('R.3 end to end: a run marked completed with its paid assessment unapplied is the unapplied end of its exact subject', async t => {
+  const f = await runnerSetup(t, [planQuestion('block', 'industry', 'blocking')]); f.finishFrontier();
+  const restore = beforeApply(f), stopped = await f.run(); restore();
+  assert.equal(stopped.value.status, 'paused');
+  // Negative mutation, as the accepted R.1 recovery does: the run claims completion before the application.
+  const saved = f.store.get<ResearchRun>(stopped.id)!;
+  f.store.write({ id: saved.id, kind: saved.kind, expected: saved.revision, value: { ...saved.value, status: 'completed' } });
+  const pending = runnerTraversal(f);
+  assert.equal(pending.end, 'assessment_unapplied');
+  assert.deepEqual(pending.subject, { project: 'p', planAnswer: f.v.planAnswer, planQuestionId: 'block' });
+  assert.equal(pending.subjects[0]!.assessments.length, 1);
+  assert.deepEqual(pending.subjects[0]!.applications, []);
+  // The free recovery of the runner applies the paid assessment without another send; the front is then completed.
+  const sent = f.wires().length, done = await f.run(1, f.open(), false);
+  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(f.wires().length, sent);
+  const read = runnerTraversal(f, f.open());
+  assert.equal(read.end, 'completed');
+  assert.deepEqual(read.subjects[0]!.applications.length, 1);
 });
