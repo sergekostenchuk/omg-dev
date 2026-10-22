@@ -153,6 +153,19 @@ export function replayAssessmentApplication(store: Store, session: Revision<Reco
   return paid.kind==='response'?paid:null;
 }
 
+/** 4T3-J01 (codex-omg №11354): whether a variant call is managed is fixed by its immutable first revision — the head keeps
+ * exactly the consumerIntent Ref that revision saved, or exactly its absence. A removed, added, replaced or malformed binding
+ * is a typed refusal, never read as an absence. Every call is classified, not only up to the first managed one. */
+export function variantCallManaged(store: Store, call: Revision<ModelCall>): boolean {
+  const first = store.get<ModelCall>(call.id, 1);
+  requireCondition(first?.kind === 'model-call', 'discovery_variant_origin_invalid', 'A variant call needs its first saved revision');
+  const had = Object.hasOwn(first.value, 'consumerIntent'), has = Object.hasOwn(call.value, 'consumerIntent');
+  const origin = (first.value as { consumerIntent?: unknown }).consumerIntent, now = (call.value as { consumerIntent?: unknown }).consumerIntent;
+  requireCondition(had === has && (!had || isRef(origin) && canonical(origin) === canonical(now)), 'discovery_variant_origin_invalid',
+    'A variant call keeps exactly the managed or direct origin its first revision saved');
+  return had;
+}
+
 /** Every call of exactly this saved variant transport identity, direct or managed (its first packet fixes the identity). */
 export function variantIdentityCalls(store: Store, projectId: string, draftId: string, questionId: string, purpose: string,
   actor: string, variant: VariantSubject): Revision<ModelCall>[] {
@@ -173,7 +186,7 @@ export function replayVariantResponse(store: Store, projectId: string, draftId: 
   if (draft?.kind !== 'discovery-draft' || question?.kind !== 'question') return null;
   const own = variantIdentityCalls(store, projectId, draftId, questionId, purpose, actor, variant);
   // 4T.4: a managed call of this identity is read through its own intent, never returned or paid beside it here.
-  requireCondition(!own.some(call => isRef((call.value as { consumerIntent?: unknown }).consumerIntent)), 'discovery_variant_managed',
+  requireCondition(!own.map(call => variantCallManaged(store, call)).includes(true), 'discovery_variant_managed',
     'This variant identity is carried by its managed intent; its result is read through that intent');
   requireCondition(!own.some(call => call.value.status === 'running'), 'continuation_call_active',
     'This variant identity has an unfinished invocation; recover its actual outcome before another dispatch');

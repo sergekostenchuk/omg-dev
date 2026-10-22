@@ -54,7 +54,7 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { workingContext } from "./working-context.js";
-import { replayAssessmentApplication, replayVariantResponse, variantIdentityCalls } from "./response-replay.js";
+import { replayAssessmentApplication, replayVariantResponse, variantIdentityCalls, variantCallManaged } from "./response-replay.js";
 import { decodeVariantGeneration, decodeVariantExecutionSession, VARIANT_SESSION_KIND, type VariantSubject } from "./discovery-variants.js";
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
   readResearchConsumerIntent, resumeResearchConsumerExecution,
@@ -473,7 +473,7 @@ async function dispatchResearchCall(role: RoleBinding, environment: Environment,
     // The managed and the direct path of one identity never mix: a managed send never stands beside a direct call of this
     // identity, and the direct replay never returns or pays beside a managed one (replayVariantResponse).
     if (consumerIntent) requireCondition(!variantIdentityCalls(audit.store, environment.projectId, audit.draftId, audit.questionId,
-      audit.purpose, role.actor, variantSubject).some(call => !isRef((call.value as { consumerIntent?: unknown }).consumerIntent)),
+      audit.purpose, role.actor, variantSubject).map(call => variantCallManaged(audit.store, call)).includes(false),
     'discovery_variant_managed', 'This variant identity already has a direct call; a managed send would pay it twice');
     else {
       const paid = replayVariantResponse(audit.store, environment.projectId, audit.draftId, audit.questionId, audit.purpose,

@@ -446,13 +446,41 @@ test('4T.3×4T.4: only an intent of its own kind, owned by the exact session of 
 test('4T.3×4T.4: the direct replay never returns or pays beside a managed call of the same identity', async t => {
   const f = await setup(t), v = f.subject('proposal', f.transport('snapshot'), f.transport('mode'));
   await f.call(v, f.v.draft.id, f.v.plan);
-  const [call] = variantCalls(f);
-  // Negative mutation: a managed call of the very same identity stands beside the direct one.
-  f.store.write({ id: `model-call:consumer:v1:${call!.value.requestId}-managed`, kind: 'model-call', expected: 0,
-    value: { ...call!.value, consumerIntent: f.transport('intent') } as unknown as Json });
-  const before = f.snapshot(f.store), sent = f.wires().length;
-  for (const store of [f.store, f.open()])
-    await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, store), errorCode('discovery_variant_managed'));
-  assert.deepEqual(f.snapshot(f.store), before);
-  assert.equal(f.wires().length, sent);
+  const [direct] = variantCalls(f);
+  const intent = f.transport('intent');
+  // Negative inputs: managed calls of the very same identity (consumerIntent saved in their first revision) beside the
+  // direct one. Their producer is 4T.4; here they only stand for an origin the direct path must respect.
+  const managedId = `model-call:consumer:v1:${direct!.value.requestId}-managed`;
+  let managed = f.store.write({ id: managedId, kind: 'model-call', expected: 0, value: { ...direct!.value, consumerIntent: intent } as unknown as Json });
+  const head = (id: string, value: Record<string, unknown>) => f.store.write({ id, kind: 'model-call', expected: f.store.get(id)!.revision, value: value as Json });
+  const { consumerIntent: _dropped, ...withoutIntent } = managed.value as unknown as Record<string, unknown>;
+  const refusedEverywhere = async (code: string, note: string) => {
+    const before = f.snapshot(f.store), sent = f.wires().length;
+    for (const store of [f.store, f.open()])
+      await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, store), errorCode(code), note);
+    assert.deepEqual(f.snapshot(f.store), before, note);
+    assert.equal(f.wires().length, sent, note);
+  };
+  const firstRevisions = () => [direct!.id, managedId].map(id => f.store.get(id, 1));
+  const origins = firstRevisions();
+  await refusedEverywhere('discovery_variant_managed', 'an intact managed call beside the direct one');
+  managed = head(managedId, withoutIntent);
+  await refusedEverywhere('discovery_variant_origin_invalid', 'the managed binding removed from the head only (№11354)');
+  managed = head(managedId, { ...withoutIntent, consumerIntent: f.transport('other-intent') });
+  await refusedEverywhere('discovery_variant_origin_invalid', 'the managed binding replaced in the head');
+  managed = head(managedId, { ...withoutIntent, consumerIntent: intent });
+  await refusedEverywhere('discovery_variant_managed', 'the exact original binding restored');
+  head(direct!.id, { ...(f.store.get(direct!.id)!.value as Record<string, unknown>), consumerIntent: intent });
+  await refusedEverywhere('discovery_variant_origin_invalid', 'a managed binding added to the head of a direct call');
+  assert.deepEqual(firstRevisions(), origins, 'no first revision is touched');
+  // A malformed binding saved from the start is no absence either.
+  const g = await setup(t), w = g.subject('proposal', g.transport('snapshot'), g.transport('mode'));
+  await g.call(w, g.v.draft.id, g.v.plan);
+  const [own] = variantCalls(g);
+  g.store.write({ id: `${own!.id}-malformed`, kind: 'model-call', expected: 0, value: { ...own!.value, consumerIntent: { id: 'research-consumer-intent:x' } } as unknown as Json });
+  const before = g.snapshot(g.store), sent = g.wires().length;
+  for (const store of [g.store, g.open()])
+    await assert.rejects(() => g.call(w, g.v.draft.id, g.v.plan, g.environment.value.implementer, store), errorCode('discovery_variant_origin_invalid'));
+  assert.deepEqual(g.snapshot(g.store), before);
+  assert.equal(g.wires().length, sent);
 });
