@@ -41,10 +41,11 @@ import { writeHorizon } from "../src/om/horizon.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
 import { writeRoutes } from "../src/om/routes.js";
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
-import { readModelCallState, readModelTransport, recoverOmModelCall, runModelCall, runModelTransport, readCompletionWorkAt, writeCompletionCessation } from "../src/om/model-call.js";
+import { readModelCallState, readModelTransport, recoverOmModelCall, runModelCall, runModelTransport, readCompletionWorkAt, writeCompletionCessation, prepareCompletionCall } from "../src/om/model-call.js";
 import { readAssessmentIntentAt, writeAssessmentIntent, assessFact } from "../src/om/assessment.js";
 import { gapLineKey, gapLineExpectedResult } from "../src/om/gap-lines.js";
 import { gardenGraph } from "./om-fixture.js";
+import { managedBlock } from "./om-managed-block.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
@@ -169,12 +170,12 @@ function stoppedSeries(f: Fixture): Revision<RepairSeries> {
   return stopped;
 }
 
-function stopReview(store: Store, series: Revision<RepairSeries>): Ref {
+function stopReview(store: Store, series: Revision<RepairSeries>, block = BLOCK): Ref {
   const stop = series.value.stop!;
   return reference(store.write({
     id: `${stopReviewNamespace(PROJECT)}${next()}`, kind: STOP_REVIEW_KIND, expected: 0,
     value: {
-      projectId: PROJECT, block: BLOCK, stop: stop.attempt, goals: [...stop.goals],
+      projectId: PROJECT, block, stop: stop.attempt, goals: [...stop.goals],
       reviewer: { name: "independent reviewer", independent: true },
       cause: "the same unresolved question survived every attempt in the window",
       change: { text: "change the producer addressed by the repeated question", addresses: ["M5"] },
@@ -331,14 +332,77 @@ test("readCall preserves storage exceptions from either the requested revision o
   assert.equal(store.history(settled.ledger.id).length, 2);
 });
 
-test("recordCall writes the call and the one project-ledger row before dispatch, as sealed copies", t => {
-  const f = fixture(t, "record");
+/** LG07 (№10173 п.1, №9133): the goal of a stop analysis, asked as two questions so that their order is data. */
+const stopGoal = (): AttemptGoal => ({
+  key: "analysis:the saved stop",
+  questions: ["what caused the stop?", "what exact change addresses it?"],
+  result: "a review record with a cause or explicit hypothesis and an addressed change",
+});
+
+interface ManagedStop {
+  readonly root: string;
+  readonly path: string;
+  readonly store: Store;
+  readonly block: string;
+  readonly series: Revision<RepairSeries>;
+  readonly adapter: Revision<Json>;
+  readonly config: Revision<Json>;
+  /** What the paid attempts left: every count of the tests below is relative to it. */
+  readonly paid: { readonly calls: readonly Ref[]; readonly ledger: Revision<CallLedger>; readonly history: number };
+}
+
+/**
+ * LG07 (№10173 п.1, №9133): a real first-rung stop — three managed attempts whose E5 found the fact insufficient, each
+ * closed by G7 — and the dispatch records a direct stop analysis is sent through. On the managed path an ordinary
+ * research E1 is exactly its E2 (the product E1 test below); a stop analysis is the call whose packet and gaps are the
+ * caller's transport data.
+ */
+async function managedStop(t: test.TestContext, label: string): Promise<ManagedStop> {
+  const root = mkdtempSync(join(tmpdir(), `omg-om-call-${label}-`)), path = join(root, "state.sqlite");
+  const store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const m = managedBlock(store, { root, path }, PROJECT);
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  for (let attempt = 1; attempt <= 3; attempt += 1) await m.cycle("gap:cart:price", "insufficient");
+  const series = store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!;
+  assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
+  assert.ok(series.value.ladder.grounds.includes("review-record"));
+  const adapter = store.write({ id: `adapter:${PROJECT}`, kind: "dispatch-adapter", expected: 0,
+    value: { projectId: PROJECT, protocol: "codex-stdio", status: "configured-not-accepted" } });
+  const config = store.write({ id: `config:${PROJECT}`, kind: "dispatch-config", expected: 0,
+    value: { projectId: PROJECT, model: "fixture", transport: "stdio", status: "configured-not-accepted" } });
+  const ledger = store.get<CallLedger>(callLedgerId(PROJECT))!;
+  assert.ok(ledger.value.calls.length > 0, "the stop was paid for");
+  return { root, path, store, block: m.block, series, adapter, config,
+    paid: { calls: store.list(CALL_RECORD_KIND).map(reference), ledger, history: store.history(ledger.id).length } };
+}
+
+function stopRequest(s: ManagedStop, over: Partial<RecordCallRequest> = {}): RecordCallRequest {
+  const wanted = stopGoal();
+  return {
+    call: "review-stop-3",
+    purpose: "stop-analysis",
+    basis: { kind: "series-stop", series: reference(s.series), attempt: 3 },
+    block: s.block,
+    gaps: [
+      { id: `${s.series.id}:stop:3`, goal: wanted.key, field: "cause", consumer: "A6:stop-analysis" },
+      { id: `${s.series.id}:stop:3`, goal: wanted.key, field: "change", consumer: "A6:stop-analysis" },
+    ],
+    series: reference(s.series), attempt: 3, goal: wanted,
+    dispatch: { adapter: reference(s.adapter), config: reference(s.config) },
+    packet: { question: "what stopped the price?", neighbours: ["cart", "catalogue"] },
+    ...over,
+  };
+}
+
+test("recordCall writes the call and the one project-ledger row before dispatch, as sealed copies", async t => {
+  const s = await managedStop(t, "record");
   assert.deepEqual([...CALL_PURPOSES], ["model-research", "model-design", "stop-analysis", "origin-analysis", "fact-assessment", "wake-choice"]);
   const packet = Object.create(null) as Record<string, Json>;
   Object.defineProperty(packet, "__proto__", { value: { literal: true }, enumerable: true });
-  packet['question'] = "who produces the price?";
-  const input = request(f, { packet, gaps: [...request(f).gaps].reverse() });
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, input));
+  packet['question'] = "what stopped the price?";
+  const input = stopRequest(s, { packet, gaps: [...stopRequest(s).gaps].reverse() });
+  const recorded = deliveredOf(recordCall(s.store, PROJECT, input));
 
   assert.equal(recorded.repeated, false);
   assert.equal(recorded.call.id, callRecordId(PROJECT, input.call));
@@ -353,56 +417,124 @@ test("recordCall writes the call and the one project-ledger row before dispatch,
   assert.equal(hashJson(recorded.call.value), recorded.call.hash);
   assert.equal(recorded.ledger.id, callLedgerId(PROJECT));
   assert.equal(recorded.ledger.kind, CALL_LEDGER_KIND);
-  assert.equal(recorded.ledger.value.calls.length, 1);
-  assert.deepEqual(recorded.ledger.value.calls[0]!.call, reference(recorded.call));
-  assert.equal(recorded.call.value.purpose, "model-research");
-  assert.equal(recorded.call.value.basis, null);
-  assert.equal(recorded.ledger.value.calls[0]!.purpose, "model-research");
-  assert.equal(recorded.ledger.value.calls[0]!.basis, null);
+  assert.equal(recorded.call.value.purpose, "stop-analysis");
+  assert.deepEqual(recorded.call.value.basis, input.basis);
+  // One row more in the project's one ledger, one revision on; the rows of the paid attempts stand as they were.
+  assert.equal(recorded.ledger.revision, s.paid.ledger.revision + 1);
+  const own = recorded.ledger.value.calls.filter(row => row.call.id === recorded.call.id);
+  assert.equal(own.length, 1);
+  assert.deepEqual(own[0]!.call, reference(recorded.call));
+  assert.equal(own[0]!.purpose, "stop-analysis");
+  assert.deepEqual(own[0]!.basis, input.basis);
+  assert.deepEqual(recorded.ledger.value.calls.filter(row => row.call.id !== recorded.call.id), s.paid.ledger.value.calls);
   assert.equal(hashJson(recorded.ledger.value), recorded.ledger.hash);
   assert.ok(deeplyFrozen(recorded));
+  // The analysis opens no attempt four, and the stop it analyses stands.
+  assert.deepEqual(s.store.get<RepairSeries>(s.series.id), s.series);
 
   // Caller-owned objects can move after admission; neither stored bytes nor the delivered copy moves with them (T11).
   (input.gaps[0] as { consumer: string }).consumer = "changed-later";
   (input.goal.questions as string[])[0] = "changed-later";
   packet['question'] = "changed-later";
-  assert.equal(heldCall(f)!.value.gaps.some(gap => gap.consumer === "changed-later"), false);
-  assert.equal(heldCall(f)!.value.goal.questions.includes("changed-later"), false);
-  assert.equal(heldCall(f)!.value.packet.hash, recorded.call.value.packet.hash);
-  assert.deepEqual(f.store.list(CALL_RECORD_KIND).map(item => item.id), [recorded.call.id]);
-  assert.deepEqual(f.store.list(CALL_LEDGER_KIND).map(item => item.id), [recorded.ledger.id]);
+  const held = s.store.get<CallRecord>(callRecordId(PROJECT, input.call))!;
+  assert.equal(held.value.gaps.some(gap => gap.consumer === "changed-later"), false);
+  assert.equal(held.value.goal.questions.includes("changed-later"), false);
+  assert.equal(held.value.packet.hash, recorded.call.value.packet.hash);
+  assert.equal(recorded.call.value.gaps.some(gap => gap.consumer === "changed-later"), false);
+  assert.deepEqual(s.store.list(CALL_RECORD_KIND).map(item => item.id).sort(), [...s.paid.calls.map(ref => ref.id), recorded.call.id].sort());
+  assert.deepEqual(s.store.list(CALL_LEDGER_KIND).map(item => item.id), [recorded.ledger.id]);
 });
 
-test("a normalized late repeat after settlement and restart adds no revision or row", t => {
-  const f = fixture(t, "repeat");
-  const base = request(f);
+test("a normalized late repeat after settlement and restart adds no revision or row", async t => {
+  const s = await managedStop(t, "repeat");
+  const base = stopRequest(s);
   const gaps = [...base.gaps, { ...base.gaps[0]! }];
-  const firstRequest = request(f, {
+  const firstRequest = stopRequest(s, {
     gaps: [...gaps].reverse(),
-    goal: { ...f.goal, questions: [...f.goal.questions].reverse() },
+    goal: { ...base.goal, questions: [...base.goal.questions].reverse() },
   });
-  const first = deliveredOf(recordCall(f.store, PROJECT, firstRequest));
-  const settled = deliveredOf(settleCall(f.store, reference(first.call), usage, "succeeded"));
-  deliveredOf(completeAttempt(f.store, {
-    project: PROJECT, block: BLOCK, line: 1, attempt: 1,
-    outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] },
-  }));
-  f.store.write({ id: f.config.id, kind: f.config.kind, expected: f.config.revision, value: { changed: true } });
-  f.store.close();
+  const first = deliveredOf(recordCall(s.store, PROJECT, firstRequest));
+  const settled = deliveredOf(settleCall(s.store, reference(first.call), usage, "succeeded"));
+  // Later events move the series and the current dispatch on: an independent review resumes the stop, and the
+  // configuration changes. The admitted call stands on neither.
+  deliveredOf(resumeSeries(s.store, { project: PROJECT, block: s.block, line: 1, stop: 3, ground: "review-record",
+    text: "the independent review named an addressed change", review: { ref: stopReview(s.store, s.series, s.block) } }));
+  s.store.write({ id: s.config.id, kind: s.config.kind, expected: s.config.revision, value: { changed: true } });
+  const before = s.store.list().map(reference);
+  s.store.close();
 
-  const reopened = new Store(f.path);
+  const reopened = new Store(s.path);
   try {
-    const repeat = deliveredOf(recordCall(reopened, PROJECT, request(f, { gaps })));
+    const repeat = deliveredOf(recordCall(reopened, PROJECT, stopRequest(s, { gaps })));
     assert.equal(repeat.repeated, true);
     assert.deepEqual(reference(repeat.call), reference(settled.call));
     assert.deepEqual(reference(repeat.ledger), reference(settled.ledger));
+    assert.deepEqual(repeat.call.value.usage, usage);
     assert.equal(reopened.history(first.call.id).length, 2);
-    assert.equal(reopened.history(first.ledger.id).length, 2);
-    assert.equal(repeat.ledger.value.calls.length, 1);
+    assert.equal(reopened.history(first.ledger.id).length, s.paid.history + 2);
+    assert.equal(repeat.ledger.value.calls.length, s.paid.ledger.value.calls.length + 1);
     assert.equal(repeat.call.value.gaps.length, 3); // T6 keeps multiplicity while normalizing order.
+    assert.deepEqual(reopened.list().map(reference), before);
   } finally {
     reopened.close();
   }
+});
+
+/** LG07 (№10173 п.2, №9133): the research E1 its own E2 assignment derives — its call, packet, gaps, goal and dispatch. */
+function productE1(f: ReturnType<typeof factAssessmentFixture>): RecordCallRequest {
+  const payload = (f.packet as Revision<QuestionPacketRecord>).value.packet as unknown as Record<string, Json>
+    & { requestId: string; purpose: "model-research" | "model-design" };
+  return {
+    call: payload.requestId, purpose: payload.purpose, basis: null, block: f.block,
+    series: reference(f.series), attempt: 1, goal: f.attemptGoal, dispatch: f.dispatch, packet: payload,
+    gaps: f.batch.items.flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
+  };
+}
+
+test("a product E1 is exactly the call its E2 assignment derives: an arbitrary packet or a duplicated gap is refused before any record", async t => {
+  const f = factAssessmentFixture(t), lawful = productE1(f);
+  const binding = deliveredOf(readCompletionBinding(f.store, f.project, reference(f.series), 1))!;
+  const opaque = Object.create(null) as Record<string, Json>;
+  Object.defineProperty(opaque, "__proto__", { value: { literal: true }, enumerable: true });
+  opaque['question'] = "who produces the price?";
+  // Each negative is the complete lawful request with one corruption.
+  const corrupted: [string, RecordCallRequest, readonly [string, string, string]][] = [
+    ["an arbitrary packet", { ...lawful, packet: opaque }, ["E4", lawful.call, "packet"]],
+    ["a duplicated gap", { ...lawful, gaps: [...lawful.gaps, structuredClone(lawful.gaps[0]!)] }, ["E4", binding.id, "call"]],
+  ];
+  const prepared = f.store.list().map(reference);
+  const refusedAll = () => {
+    for (const [name, input, [unit, target, field]] of corrupted) {
+      const found = refusalOf(recordCall(f.store, f.project, input));
+      assert.deepEqual([found.code, found.at.unit, found.at.target, found.at.field], ["completion_foreign", unit, target, field], name);
+      assert.deepEqual(f.store.list().map(reference), prepared, name);
+    }
+  };
+  refusedAll();
+  f.restart();
+  refusedAll();
+
+  // The lawful one writes the call, its ledger row and exactly the E4 ownership its registration derives.
+  const registration = deliveredOf(prepareCompletionCall(f.store, f.project, lawful));
+  assert.ok(registration.owner);
+  const recorded = deliveredOf(recordCall(f.store, f.project, lawful));
+  assert.equal(recorded.repeated, false);
+  assert.equal(recorded.call.value.purpose, lawful.purpose);
+  assert.equal(recorded.call.value.packet.hash, hashJson(lawful.packet));
+  assert.equal(recorded.call.value.gaps.length, lawful.gaps.length);
+  assert.equal(recorded.ledger.value.calls.filter(row => row.call.id === recorded.call.id).length, 1);
+  const admitted = f.store.list().map(reference);
+  const added = admitted.filter(ref => !prepared.some(item => item.id === ref.id)).map(ref => ref.id).sort();
+  assert.deepEqual(added, [...new Set([recorded.call.id, recorded.ledger.id, ...registration.writes.map(write => write.id)])]
+    .filter(id => !prepared.some(item => item.id === id)).sort());
+  assert.deepEqual(admitted.filter(ref => prepared.some(item => item.id === ref.id && item.revision !== ref.revision)).map(ref => ref.id).sort(),
+    registration.writes.map(write => write.id).filter(id => prepared.some(item => item.id === id)).sort());
+  // A cold late repeat is the same call and writes nothing.
+  f.restart();
+  const again = deliveredOf(recordCall(f.store, f.project, lawful));
+  assert.equal(again.repeated, true);
+  assert.deepEqual(reference(again.call), reference(recorded.call));
+  assert.deepEqual(f.store.list().map(reference), admitted);
 });
 
 test("unknown usage leaves a call open; known usage closes call and ledger once, survives restart, and has no amount ceiling", t => {
@@ -1510,7 +1642,8 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
     });
     return { model, research, basis, intent, assessment };
   }
-  return { project, block, path, root, sourcePath, source, series, packet, native, questionId, get store() { return store; }, original,
+  return { project, block, path, root, sourcePath, source, series, packet, native, questionId, batch, attemptGoal,
+    dispatch: modelRequest.dispatch, get store() { return store; }, original,
     assessorScenario() { writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep,
       { research: { verdict: "supported", reasons: [] }, usage }] })); },
     sent() { return readFileSync(trace, "utf8").trim().split("\n").filter(Boolean); },
