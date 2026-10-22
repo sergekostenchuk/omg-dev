@@ -17,15 +17,15 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { type OmResult, type Refusal } from "../src/om/refusal.js";
-import { beginAttempt, completeAttempt, openSeries, prepareSeriesAdmission, resumeSeries, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
+import { beginAttempt, completeAttempt, openSeries, prepareSeriesAdmission, readCompletionBinding, resumeSeries, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
   type AttemptGoal, type RepairSeries, type MechanismAdmission } from "../src/om/series.js";
-import { closeAttempt, openAttempt } from "../src/om/repeat-gate.js";
+import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { writeOmInput } from "../src/om/input.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { writeGaps, type GapRequest } from "../src/om/gaps.js";
-import { writeRoutes } from "../src/om/routes.js";
+import { writeGaps, type GapReadRequest, type GapRequest } from "../src/om/gaps.js";
+import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRequest } from "../src/om/question-packet.js";
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from "../src/om/gap-lines.js";
 import { writeOmObligations, normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND } from "../src/om/obligations.js";
@@ -674,25 +674,36 @@ test("E6 report: corrupted ledger and exact snapshot references cannot become un
   spendRefused(spendReport(f.store, { project: PROJECT }), "ledger_invalid");
 });
 
-test("E6 report: explicit D1 sources count distinct obligations, consumers and blocks rather than repeated mentions", t => {
-  const f = mechanismOriginFixture(t);
-  const selected = f.gaps.records.filter(record => record.value.gap.code === "obligation_open" && record.value.gap.consumers.length > 0);
-  assert.ok(selected.length >= 2, "The real frame fixture carries several addressed obligations");
+/** LG07 sr-c (№10394 п.6): the exact D1 set the paid plan of the attempt stood on, as its routes record it. */
+function planD1(f: SpendStop): GapReadRequest {
+  const binding = deliveredOf(readCompletionBinding(f.store, PROJECT, reference(f.series), 1));
+  assert.ok(binding, "the paid attempt has its completion plan");
+  const routes = f.store.get<RoutesRecord>(binding.value.plan.routes.id, binding.value.plan.routes.revision)!;
+  return structuredClone(routes.value.request.gaps) as GapReadRequest;
+}
+type D1Gap = { gap: { code: string; target: string; field: string; consumers: string[] } };
+
+test("E6 report: explicit D1 sources count distinct obligations, consumers and blocks rather than repeated mentions", async t => {
+  // LG07 sr-c (№10394 п.6): the D1 set is the exact one the paid plan stood on, and the declaring package is a stop
+  // analysis of the paid stop: no origin history enters the ledger, so the report names none.
+  const f = await spendStop(t), gapScope = planD1(f);
+  const records = gapScope.records.map(ref => f.store.get<D1Gap>(ref.id, ref.revision)!);
+  const selected = records.filter(record => record.value.gap.code === "obligation_open" && record.value.gap.consumers.length > 0);
+  assert.ok(selected.length >= 2, "The real plan carries several addressed obligations");
   const chosen = selected.slice(0, 2), rows = chosen.flatMap(record => record.value.gap.consumers.map(consumer => ({
     id: record.value.gap.target, goal: record.value.gap.target, field: record.value.gap.field, consumer,
   })));
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, { ...request(f, "declared-significance"), gaps: [...rows, rows[0]!] }));
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, { ...analysisRequest(f, "declared-significance"), gaps: [...rows, rows[0]!] }));
   const settled = deliveredOf(settleCall(f.store, reference(recorded.call), actualUsage, "succeeded"));
-  const source = { call: reference(settled.call), gaps: f.gapScope, obligations: null };
-  const report = deliveredOf(spendReport(f.store, { project: PROJECT,
-    histories: [{ call: reference(f.settled.call), journal: f.journal }], significance: [source] }));
+  const source = { call: reference(settled.call), gaps: gapScope, obligations: null };
+  const report = deliveredOf(spendReport(f.store, { project: PROJECT, significance: [source] }));
   const row = report.rows.find(item => item.call?.id === settled.call.id)!;
   assert.ok(row);
   assert.equal(row.questions.length, rows.length + 1, "Accounting keeps every declared question in the package");
   assert.equal(row.significance.obligations, new Set(chosen.map(item => item.value.gap.target)).size);
   const consumers = new Set(rows.map(item => item.consumer));
   assert.equal(row.significance.consumers, consumers.size);
-  const graph = f.store.get<Graph>(f.gapScope.sources.graph.id, f.gapScope.sources.graph.revision)!.value;
+  const graph = f.store.get<Graph>(gapScope.sources.graph.id, gapScope.sources.graph.revision)!.value;
   const blocks = new Set([...consumers].map(consumer => {
     let node = graph.nodes.find(item => item.id === consumer)!;
     assert.ok(node, "Each D1 consumer has an exact graph address");
@@ -709,12 +720,11 @@ test("E6 report: explicit D1 sources count distinct obligations, consumers and b
   finally { reopened.close(); }
 });
 
-test("E6 report: a valid D1 set unrelated to the call is refused instead of producing guessed counts", t => {
-  const f = mechanismOriginFixture(t);
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "unrelated-to-d1")));
+test("E6 report: a valid D1 set unrelated to the call is refused instead of producing guessed counts", async t => {
+  const f = await spendStop(t), gapScope = planD1(f);
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "unrelated-to-d1")));
   const report = spendReport(f.store, { project: PROJECT,
-    histories: [{ call: reference(f.settled.call), journal: f.journal }],
-    significance: [{ call: reference(recorded.call), gaps: f.gapScope, obligations: null }] });
+    significance: [{ call: reference(recorded.call), gaps: gapScope, obligations: null }] });
   const refusal = spendRefused(report, "spend_basis_invalid");
   assert.equal(refusal.at.target, recorded.call.id);
   assert.equal(refusal.at.field, "gaps");
@@ -1176,7 +1186,7 @@ test("E6 report: physical recovery retains a complete terminal time in both curr
   finally { reopened.close(); }
 });
 
-test("E6 report: a real D7 package counts one obligation shared by two accepted consumers once", t => {
+test("E6 report: a real D7 package counts one obligation shared by two accepted consumers once", async t => {
   const root = mkdtempSync(join(tmpdir(), "omg-spend-d7-")), database = join(root, "state.sqlite");
   const store = new Store(database), engine = new ProductEngine(store), project = "garden";
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -1228,29 +1238,65 @@ test("E6 report: a real D7 package counts one obligation shared by two accepted 
   }] }));
   assert.equal(obligations.handoff.obligations.length, 2);
   assert.equal(new Set(obligations.handoff.obligations.map(item => item.obligation)).size, 1);
-  const block = "garden-produce-block", address = { project, block, line: 1 };
-  const goal = { key: "shared-result-proof", questions: [gap.value.gap.target], result: "An assigned proof for both consumers" };
-  deliveredOf(openSeries(store, { ...address, slice: "spend-d7", predecessor: null, basis: null }));
-  const series = deliveredOf(beginAttempt(store, { ...address, attempt: 1, goal }));
+  // LG07 sr-c (№10394 п.6): the packages are direct stop analyses of a real block stop — three managed attempts on the
+  // input-field MC2 batch these same D1 routes address to the consuming block, each paid by the implementer's answer off
+  // its form and closed by G7. (A node-expansion batch of the producing block cannot end without a result here: its
+  // work stays incomplete until the common acceptance of its level, which this fixture does not run.) The block
+  // semantics of the packages stay: gap.target and the two block consumers they declare.
+  const block = "garden-consume-block", address = { project, block, line: 1 };
+  const routes = deliveredOf(writeRoutes(store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(item => item.model === "MC2" && item.task === "input-field"
+    && item.items.every(member => canonical(member.consumers) === canonical([block])))!;
+  assert.ok(batch, "The same D1 routes hold an input-field MC2 batch of the consuming block");
+  const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl"), steps: unknown[] = [];
+  const paidCommand = { executable: process.execPath, args: [providerPath, "--scenario", scenario, "--trace", trace] };
+  const paidEnvironment = engine.environments.configure(project, { workspace: root,
+    implementer: { actor: "assignment-researcher", model: "fixture", effort: "high", command: paidCommand },
+    reviewer: { actor: "assignment-reviewer", model: "fixture", effort: "high", command: paidCommand },
+    fullCheck: command, timeoutMs: 10_000, requestCapacityChars: 100_000 }, environment.revision);
   const adapter = store.write({ id: `adapter:${project}:spend`, kind: "dispatch-adapter", expected: 0, value: { protocol: "codex-stdio" } });
+  const attemptGoal: AttemptGoal = { key: "shared-result-proof", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+    result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
+  deliveredOf(openSeries(store, { ...address, slice: "spend-d7", predecessor: null, basis: null }));
+  for (const attempt of [1, 2, 3]) {
+    const opened = deliveredOf(openAttempt(store, { ...address, attempt, goal: attemptGoal,
+      completion: { routes: reference(routes), batches: [batch.id] } }));
+    const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: batch.id,
+      environment: reference(paidEnvironment), attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record;
+    steps.push({ research: {}, usage: actualUsage });
+    writeFileSync(scenario, JSON.stringify({ database, steps }));
+    deliveredOf(await runModelCall(store, { project, packet: reference(packet),
+      dispatch: { adapter: reference(adapter), config: reference(paidEnvironment) }, role: "implementer" }));
+    const claim = deliveredOf(prepareManagedClaim(store, { ...address, attempt,
+      outcome: { reason: "result", accepting: [], cancelling: [], refusals: [] } })).outcome;
+    deliveredOf(closeAttempt(store, { ...address, attempt, outcome: claim }));
+  }
+  const stopped = store.get<RepairSeries>(seriesId(project, block, 1))!;
+  assert.deepEqual(stopped.value.stop?.attempts, [1, 2, 3]);
+  // What the stop cost by its scenario: three paid calls at actualUsage.
+  const paidCalls = 3, paidUsage = tokensOf(actualUsage, actualUsage, actualUsage);
+  assert.equal(deliveredOf(readCallLedger(store, project))!.value.calls.length, paidCalls);
+  const analysis = (call: string, gaps: RecordCallRequest["gaps"], packet: Json): RecordCallRequest => ({ call, purpose: "stop-analysis",
+    basis: { kind: "series-stop", series: reference(stopped), attempt: 3 }, block, gaps, series: reference(stopped), attempt: 3,
+    goal: { key: "analysis:shared-result-proof", questions: [gap.value.gap.target], result: "An assigned proof for both consumers" },
+    dispatch: { adapter: reference(adapter), config: reference(paidEnvironment) }, packet });
   const questions = gap.value.gap.consumers.map(block => ({ id: gap.value.gap.target, goal: gap.value.gap.target,
     field: gap.value.gap.field, consumer: block }));
-  const admitted = deliveredOf(recordCall(store, project, { call: "shared-proof-package", purpose: "model-design", basis: null,
-    block, gaps: questions, series: reference(series), attempt: 1, goal,
-    dispatch: { adapter: reference(adapter), config: reference(environment) },
-    packet: { question: gap.value.gap.target, consumers: gap.value.gap.consumers, obligations: { ...reference(obligations.record) } } }));
+  const admitted = deliveredOf(recordCall(store, project, analysis("shared-proof-package", questions,
+    { question: gap.value.gap.target, consumers: gap.value.gap.consumers, obligations: { ...reference(obligations.record) } })));
   const paid = deliveredOf(settleCall(store, reference(admitted.call), actualUsage, "succeeded"));
   const report = deliveredOf(spendReport(store, { project,
     significance: [{ call: reference(paid.call), gaps: gapRead, obligations: reference(obligations.record) }] }));
-  assert.equal(report.rows.length, 1);
-  assert.deepEqual(report.rows[0]!.questions, paid.call.value.gaps);
-  assert.equal(report.rows[0]!.questions.length, 2);
-  assert.equal(report.rows[0]!.significance.obligations, 1);
-  assert.equal(report.rows[0]!.significance.consumers, 2);
-  assert.equal(report.rows[0]!.significance.blocks, 2);
-  assert.ok(report.rows[0]!.significance.sources.some(ref => canonical(ref) === canonical(reference(obligations.record))));
-  assert.ok(report.rows[0]!.significance.sources.some(ref => canonical(ref) === canonical(reference(obligations.producer))));
-  assert.deepEqual(report.totals, { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: actualUsage });
+  assert.equal(report.rows.length, paidCalls + 1);
+  const own = report.rows.find(row => row.call?.id === paid.call.id)!;
+  assert.deepEqual(own.questions, paid.call.value.gaps);
+  assert.equal(own.questions.length, 2);
+  assert.equal(own.significance.obligations, 1);
+  assert.equal(own.significance.consumers, 2);
+  assert.equal(own.significance.blocks, 2);
+  assert.ok(own.significance.sources.some(ref => canonical(ref) === canonical(reference(obligations.record))));
+  assert.ok(own.significance.sources.some(ref => canonical(ref) === canonical(reference(obligations.producer))));
+  assert.deepEqual(report.totals, { calls: paidCalls + 1, measuredCalls: paidCalls + 1, unmeasuredCalls: 0, reportedTokens: tokensOf(paidUsage, actualUsage) });
   const reversed = deliveredOf(spendReport(store, { project, significance: [{ call: reference(paid.call),
     gaps: { ...gapRead, records: [...gapRead.records].reverse() }, obligations: reference(obligations.record) }] }));
   assert.deepEqual(reversed.rows, report.rows, "Source-set ordering cannot change proven D7 significance");
@@ -1262,16 +1308,15 @@ test("E6 report: a real D7 package counts one obligation shared by two accepted 
     { call: "frame-with-unrelated-d7", gaps: frameQuestions, count: 1 },
     { call: "frame-union-d7", gaps: [...frameQuestions, ...questions], count: 2 },
   ].map(item => {
-    const recorded = deliveredOf(recordCall(store, project, { call: item.call, purpose: "model-design", basis: null,
-      block, gaps: item.gaps, series: reference(series), attempt: 1, goal,
-      dispatch: { adapter: reference(adapter), config: reference(environment) }, packet: { questions: item.gaps } }));
+    const recorded = deliveredOf(recordCall(store, project, analysis(item.call, item.gaps, { questions: item.gaps })));
     return { ...item, call: reference(deliveredOf(settleCall(store, reference(recorded.call), zeroUsage, "succeeded")).call) };
   });
   const combined = deliveredOf(spendReport(store, { project,
     significance: [reference(paid.call), ...extraCalls.map(item => item.call)].map(call => ({ call, gaps: gapRead, obligations: reference(obligations.record) })) }));
   for (const extra of extraCalls) assert.equal(combined.rows.find(row => row.call?.id === extra.call.id)!.significance.obligations, extra.count,
     "An empty selected D7 subset cannot erase a frame obligation, and two consumer bindings add only one D7 obligation");
-  assert.deepEqual(combined.totals.reportedTokens, actualUsage, "Three packages retain three expenses, including two explicit zeros");
+  assert.deepEqual(combined.totals.reportedTokens, tokensOf(paidUsage, actualUsage, zeroUsage, zeroUsage),
+    "Three packages retain three expenses, including two explicit zeros, beside the paid stop");
   store.close();
   const reopened = new ExactOnlyStore(database);
   try {
@@ -1282,33 +1327,27 @@ test("E6 report: a real D7 package counts one obligation shared by two accepted 
 });
 
 test("E6 report: a native accepted answer contributes only its provider-confirmed result after completion and restart", async t => {
-  const f = mechanismOriginFixture(t), engine = new ProductEngine(f.store), project = PROJECT;
-  const root = dirname(f.path), block = `${project}-consume-block`, target = "discovery:encoding";
-  const graph = f.gapScope.sources.graph;
-  const input = deliveredOf(writeAddressing(f.store, { project, input: f.gapScope.sources.input, graph, decisions: [{
-    pending: inputDecisionWrite({ project, input: f.gapScope.sources.input, graph, layers: [],
-      decision: { target, field: "address", value: { consumer: block, kind: "repository-fact" } } }) as Write,
-  }] }));
-  const horizon = deliveredOf(writeHorizon(f.store, { project, input: reference(input), graph, refinement: null, available: {},
-    choice: { choiceVersion: "spend-accepted-answer", features: [{ outcome: `${project}-result` }], excluded: [] } }));
-  const sources: GapRequest = { project, input: reference(input), graph, horizon: reference(horizon.gate),
-    operations: { proposals: [], frame: { project, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null } },
-    works: { state: "upper-not-accepted", layer: reference(f.store.get(`graph-layer:${project}:2`)!) } };
-  const gaps = deliveredOf(writeGaps(f.store, sources)), gap = gaps.records.find(record => record.value.gap.target === target)!;
+  // LG07 sr-c (№10394 п.6): a managed attempt on its own MC1 E2. Its paid work ends off its form — a technical E4 — and
+  // its result is the native accepted answer, which G7 confirms through the answer's own provider beside that work, as
+  // for the native D5 of om-repeat-gate (:3858). The native assessment stays outside OM/E1.
+  const f = ordinarySpendFixture(t, true), engine = new ProductEngine(f.store), project = f.project, block = f.address.block;
+  const root = dirname(f.database), target = "discovery:encoding";
+  const gap = f.gaps.records.find(record => record.value.gap.target === target)!;
   assert.equal(gap.value.gap.kind, "repository-fact");
-  const gapRead = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const gapRead = { sources: structuredClone(f.gaps.sources) as GapRequest, records: f.gaps.records.map(reference) };
+  type AddressedInput = Extract<ReturnType<typeof writeAddressing>, { ok: true }>["value"];
+  const input = f.store.get(gapRead.sources.input.id, gapRead.sources.input.revision) as unknown as AddressedInput;
+  f.steps([{ research: {}, usage: actualUsage }]);
+  const paid = deliveredOf(await runModelCall(f.store, f.request));
+  assert.notEqual(paid.outcome?.kind, "fact-candidates", "the paid answer is off its form");
   const command = { executable: process.execPath, args: ["-e",
     "const req=JSON.parse(require('node:fs').readFileSync(0,'utf8'));console.log(JSON.stringify({protocol:req.protocol,requestId:req.requestId,research:{verdict:'supported',reasons:[]}}));"] };
   const environment = engine.environments.configure(project, { workspace: root,
     implementer: { actor: "fact-researcher", model: "fixture", effort: "high", command },
     reviewer: { actor: "fact-assessor", model: "fixture", effort: "high", command },
-    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000 }, 0);
+    fullCheck: { executable: process.execPath, args: ["--version"] }, timeoutMs: 5000 }, f.store.get(`environment:${project}`)!.revision);
   writeFileSync(join(root, "answer.json"), JSON.stringify({ answer: "UTF-8" }));
   const source = engine.discovery.evidence.file(project, "encoding-answer", root, "answer.json", "application/json", 0);
-  const address = { project, block, line: 1 }, goal = { key: "encoding-fact", questions: [gapLineKey(project, target, "answer")],
-    result: gapLineExpectedResult(project, target, "answer") };
-  deliveredOf(openSeries(f.store, { ...address, slice: "spend-accepted-answer", predecessor: null, basis: null }));
-  const attempt = deliveredOf(beginAttempt(f.store, { ...address, attempt: 1, goal }));
   const contract: AnswerQuestionContract = { establishes: input.value.input.questions[0]!.question,
     consumer: { blocks: [...gap.value.gap.consumers] }, requirements: [structuredClone(input.value.input.contracts[0]!) as unknown as Json], resultForm: { type: "string" } };
   const draft = engine.discovery.create(project, "om-g2", "R1", block,
@@ -1316,30 +1355,28 @@ test("E6 report: a native accepted answer contributes only its provider-confirme
   const issued = f.store.get<Question>(draft.value.questions[0]!)!;
   const question = deliveredOf(writeMc1Question(f.store, { project, input: reference(input), gaps: gapRead,
     gap: reference(gap), contract, requirements: [{ pointer: "/contracts/0" }], engineQuestion: reference(issued), draft: reference(draft) }));
-  const admitted = deliveredOf(recordCall(f.store, project, { call: "accepted-encoding", purpose: "model-research", basis: null,
-    block, gaps: [{ id: target, goal: target, field: "answer", consumer: block }], series: reference(attempt), attempt: 1, goal,
-    dispatch: { adapter: f.adapter, config: reference(environment) }, packet: { question: { ...reference(question) } } }));
   const assessed = await assessAnswer(f.store, issued, { action: "answer", question: issued.id, value: "UTF-8",
     citations: [{ source: reference(source), selector: { kind: "json-pointer", pointer: "/answer" } }] }, environment, root);
   const answeredDraft = engine.discovery.researched(issued.id, issued.revision, reference(assessed)), answered = f.store.get<Question>(issued.id)!;
   const accepted = deliveredOf(writeAcceptedAnswer(f.store, { project, question: reference(question), answer: answered.value.answer!,
-    answeredQuestion: reference(answered), draft: reference(answeredDraft), attempt: { series: reference(attempt), attempt: 1 } }));
-  const confirmed = deliveredOf(confirmResults(f.store, { project, block, target: attempt.id, goal,
+    answeredQuestion: reference(answered), draft: reference(answeredDraft), attempt: { series: reference(f.series), attempt: 1 } }));
+  const confirmed = deliveredOf(confirmResults(f.store, { project, block, target: f.series.id, goal: f.goal,
     accepting: [reference(accepted)], cancelling: [] }));
   assert.equal(confirmed.achieved.length, 1);
-  deliveredOf(closeAttempt(f.store, { ...address, attempt: 1,
-    outcome: { reason: "result", accepting: [reference(accepted)], cancelling: [], refusals: [] } }));
-  deliveredOf(settleCall(f.store, reference(admitted.call), actualUsage, "succeeded"));
-  const completed = f.store.get(attempt.id)!;
-  const report = deliveredOf(spendReport(f.store, { project,
-    histories: [{ call: reference(f.settled.call), journal: f.journal }] }));
-  const row = report.rows.find(item => item.call?.id === admitted.call.id)!;
+  // G7 derives the claim of the attempt's own work and adds the one independent result of this step.
+  const at = { ...f.address, attempt: 1 };
+  const claim = deliveredOf(prepareManagedClaim(f.store, { ...at,
+    outcome: { reason: "result", accepting: [reference(accepted)], cancelling: [], refusals: [] } })).outcome;
+  deliveredOf(closeAttempt(f.store, { ...at, outcome: claim }));
+  const completed = f.store.get(f.series.id)!;
+  const report = deliveredOf(spendReport(f.store, { project }));
+  const row = report.rows.find(item => item.call?.id === paid.call.id)!;
   assert.deepEqual(row.result, { series: reference(completed), attempt: 1, verdict: "progress", achieved: confirmed.achieved });
-  assert.equal(report.rows.length, 2, "Native assessment transport is outside OM/E1 expense scope");
-  assert.equal(report.snapshot.calls.length, 0, "Native assessment is not an OM physical model-call");
+  assert.equal(report.rows.length, 1, "Native assessment transport is outside OM/E1 expense scope");
+  assert.deepEqual(report.snapshot.calls, omPhysical(f.store, project), "Only the attempt's own E4 is an OM physical model-call");
   assert.ok(f.store.list<ModelCall>("model-call").some(record => !record.id.startsWith(`model-call:${project}:om:`)), "The result was assessed through the real native call producer");
   f.store.close();
-  const reopened = new ExactOnlyStore(f.path);
+  const reopened = new ExactOnlyStore(f.database);
   try { assert.deepEqual(deliveredOf(readSpendReport(reopened, report.snapshot)), report); }
   finally { reopened.close(); }
 });
