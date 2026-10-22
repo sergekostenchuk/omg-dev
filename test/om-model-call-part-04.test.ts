@@ -19,7 +19,7 @@ import { writeQuestionPacket, type QuestionPacketRecord, readPartResult, readQue
 import { readCompletionBinding, completionWorkId, type RepairSeries, seriesRequestOf, completeAttempt } from '../src/om/series.js';
 import { readCall, recordCall } from '../src/om/call-record.js';
 import { closeAttempt, openAttempt as managedOpenAttempt } from '../src/om/repeat-gate.js';
-import { MP3_NOTES, completionE1, completionSnapshot, confirmed, currentPacketWire, e4AnalysisFixture, e4CannotAnswer, e4Fact, e4Fixture, e4NeedSource, e4Node, envelope, fixturePath, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, mp2Managed, mp2Refused, mp3Carried, mp3Close, mp3Cycle, mp3Decisions, mp3Delivered, mp3Open, mp3Origins, mp3Parts, mp3Readings, readsOf, request, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
+import { MP3_NOTES, completionE1, completionSnapshot, confirmed, currentPacketWire, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedFixture, e4NeedSource, e4Node, envelope, fixturePath, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, mp2Managed, mp2Refused, mp3Carried, mp3Close, mp3Cycle, mp3Decisions, mp3Delivered, mp3ManagedCycle, mp3Open, mp3Origins, mp3Parts, mp3Readings, readsOf, request, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -76,7 +76,8 @@ test("E4 exercises the local stdio fixture, ordered trace, exact request binding
 
 
 test('E4 admits before spawning, saves MC1 candidates and actual usage, and replays exact history without native reissuance', async t => {
-  const f = e4Fixture(t), native = f.store.list('question').map(reference);
+  // LG07 mc-04 (№11277): the attempt is the managed one — opened by G7 with its exact completion, its E2 packet issued.
+  const f = await e4ManagedFixture(t), native = f.store.list('question').map(reference);
   f.steps([{ research: e4Fact(f), usage, confirmed }]);
   const writeMany = f.store.writeMany.bind(f.store);
   let admissionWritten = false, runningWritten = false;
@@ -106,7 +107,7 @@ test('E4 admits before spawning, saves MC1 candidates and actual usage, and repl
 
 
 test('E4 saves node response, proposal, result and completed runtime atomically while leaving acceptance to C5', async t => {
-  const f = e4Fixture(t, 'node'); f.steps([{ research: e4Node(f) }]);
+  const f = await e4ManagedFixture(t, 'node'); f.steps([{ research: e4Node(f) }]);
   const writeMany = f.store.writeMany.bind(f.store), batches: string[][] = [];
   f.store.writeMany = ((writes, guards) => { batches.push(writes.map(write => write.kind)); return writeMany(writes, guards); }) as Store['writeMany'];
   const actual = valueOf(await runModelCall(f.store, f.request)); f.store.writeMany = writeMany;
@@ -120,14 +121,24 @@ test('E4 saves node response, proposal, result and completed runtime atomically 
 
 
 
-test('S1.1 a saved assembly is proved once per operation on its original source: a repeat reuses the proof, the historical path opens no pending view, the current assembly keeps its pending proposal, a re-entry is a cycle', async t => {
-  const f = e4Fixture(t, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
-  const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
+/**
+ * LG07 mc-04 (№11277): a node attempt of the managed carrier whose root packet is a multi-part plan from the start — the
+ * carrier is opened with a capacity just under the single packet of an identical one — and the real scripted answer of every part.
+ */
+async function multiPartNode(t: test.TestContext) {
+  const measured = await e4ManagedFixture(t, 'node');
+  const f = await e4ManagedFixture(t, 'node', { capacity: currentPacketWire(measured.packet.value.packet) - 1 });
+  const packet = f.packet as Revision<QuestionPacketRecord>;
+  assert.equal(packet.value.plan?.mode, 'parts');
   const total = packet.value.plan!.assignments.length;
   f.steps(Array.from({ length: total }, (_, position) => ({ research: e4Node(f, { ...packet,
     value: { ...packet.value, plan: { ...packet.value.plan!, position } } } as Revision<QuestionPacketRecord>) })));
-  const request = { ...f.request, packet: reference(packet), dispatch: { ...f.request.dispatch, config: reference(config) } };
-  const cycle = valueOf(await runModelCycle(f.store, request));
+  return { f, packet, total };
+}
+
+test('S1.1 a saved assembly is proved once per operation on its original source: a repeat reuses the proof, the historical path opens no pending view, the current assembly keeps its pending proposal, a re-entry is a cycle', async t => {
+  const { f } = await multiPartNode(t);
+  const cycle = valueOf(await runModelCycle(f.store, f.request));
   assert.equal(cycle.record.value.terminal, 'assembled'); assert.ok(cycle.assembly);
   const read = (store: Store) => valueOf(readPartAssembly(store, { project: f.project, record: cycle.assembly! }));
   const assembly = read(f.store);
@@ -165,13 +176,9 @@ test('S1.1 a saved assembly is proved once per operation on its original source:
   const snapshot = f.store.list().map(reference);
   assert.deepEqual(valueOf(assembleModelParts(f.store, { project: f.project, results: [...cycle.record.value.results] })).record, assembly.record);
   assert.deepEqual(f.store.list().map(reference), snapshot);
-  const fresh = e4Fixture(t, 'node'), freshConfig = fresh.environment(currentPacketWire(fresh.packet.value.packet) - 1);
-  const freshPacket = valueOf(writeQuestionPacket(fresh.store, { ...fresh.packetRequest, environment: reference(freshConfig) })).record;
-  const freshTotal = freshPacket.value.plan!.assignments.length;
-  fresh.steps(Array.from({ length: freshTotal }, (_, position) => ({ research: e4Node(fresh, { ...freshPacket,
-    value: { ...freshPacket.value, plan: { ...freshPacket.value.plan!, position } } } as Revision<QuestionPacketRecord>) })));
+  const { f: fresh } = await multiPartNode(t);
   const before = views.length;
-  const freshCycle = valueOf(await runModelCycle(fresh.store, { ...fresh.request, packet: reference(freshPacket), dispatch: { ...fresh.request.dispatch, config: reference(freshConfig) } }));
+  const freshCycle = valueOf(await runModelCycle(fresh.store, fresh.request));
   assert.equal(freshCycle.record.value.terminal, 'assembled');
   assert.ok(views.length > before, 'A new current assembly still stands on its pending proposal before it is written');
   // A re-entry into the same active exact key is a cyclic derivation, addressed at the assembly; the outer read completes.
@@ -197,13 +204,17 @@ test('S1.1 a saved assembly is proved once per operation on its original source:
 
 
 test('E4 analysis transport sends both real E1 purposes, preserves opaque A6 data and settles without another attempt', async t => {
+  // LG07 mc-04 (№11277): the stop is the managed one — paid E2→E4 attempts closed by G7 — and the origin hold is the block's own;
+  // the analysis is told from that paid preparation by its own wire trace and by the packets the preparation left.
   for (const purpose of ['stop-analysis', 'origin-analysis'] as const) {
-    const f = e4AnalysisFixture(t, purpose), before = reference(f.store.get(f.series.id)!);
+    const f = await e4ManagedAnalysisFixture(t, purpose), before = reference(f.store.get(f.series.id)!);
+    const packets = f.store.list('question-packet').map(reference), calls = f.store.list('model-call').map(reference);
     const sent = valueOf(await runModelTransport(f.store, f.request));
     assert.equal(sent.result.kind, 'answered'); assert.equal(sent.record.value.purpose, purpose);
     if (sent.result.kind === 'answered') assert.deepEqual(JSON.parse(sent.result.raw), { cause: 'fixture observation', hypothesis: true });
     assert.deepEqual(sent.record.value.usage, usage); assert.equal(f.sent().length, 1);
-    assert.deepEqual(reference(f.store.get(f.series.id)!), before); assert.equal(f.store.list('question-packet').length, 0);
+    assert.deepEqual(reference(f.store.get(f.series.id)!), before); assert.deepEqual(f.store.list('question-packet').map(reference), packets);
+    assert.deepEqual(f.store.list('model-call').map(reference).filter(ref => !calls.some(own => own.id === ref.id)), [reference(sent.record)]);
     assert.equal(f.store.get<{status:string}>(sent.call.id)!.value.status, 'succeeded');
     const expected = valueOf(readModelTransport(f.store, { project: f.project, record: reference(sent.record) }));
     f.store.write({ id: f.environment.id, kind: f.environment.kind, expected: f.environment.revision, value: f.environment.value });
@@ -433,9 +444,9 @@ test('MP2 (№2968 rows 14, 18) stopped after the first applied refusal the root
 
 // OBL1 (№3768): a whole record read by a pointer can exceed what a continuation may carry.
 test('OBL1 №3768 №3773 a large context result is shown as an exact bounded fragment, the delivery stays whole, and a small read is shown whole', async t => {
-  const measured = mp3Cycle(t), graphChars = canonical(measured.f.graph.value as unknown as Json).length;
+  const measured = await mp3ManagedCycle(t), graphChars = canonical(measured.f.graph.value as unknown as Json).length;
   const capacity = currentPacketWire(measured.f.packet.value.packet) + Math.floor(graphChars / 2);
-  const m = mp3Cycle(t, 'fact', capacity), { f } = m;
+  const m = await mp3ManagedCycle(t, 'fact', { capacity }), { f } = m;
   const whole = { action: 'read_context', record: reference(f.graph), pointer: '' }, small = { action: 'read_context', record: reference(f.input), pointer: '/input/questions/0/question' };
   const graph = f.store.get(f.graph.id, f.graph.revision)!.value as Record<string, unknown>;
   assert.ok(canonical(graph as Json).length + currentPacketWire(f.packet.value.packet) > capacity, 'Whole, the graph would not fit beside the packet');
@@ -462,9 +473,9 @@ test('OBL1 №3768 №3773 a large context result is shown as an exact bounded f
 
 
 test('OBL1 №3780 what is new is judged by what the reader is shown: the same bounded fragment asked again is research-no-progress without another send; a narrower read is progress', async t => {
-  const measured = mp3Cycle(t), graphChars = canonical(measured.f.graph.value as unknown as Json).length;
+  const measured = await mp3ManagedCycle(t), graphChars = canonical(measured.f.graph.value as unknown as Json).length;
   const capacity = currentPacketWire(measured.f.packet.value.packet) + Math.floor(graphChars / 2);
-  const m = mp3Cycle(t, 'fact', capacity), { f } = m;
+  const m = await mp3ManagedCycle(t, 'fact', { capacity }), { f } = m;
   const whole = { action: 'read_context', record: reference(f.graph), pointer: '' };
   f.steps([{ research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: m.need([whole]), usage }, { research: e4Fact(f), usage }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
@@ -480,7 +491,7 @@ test('OBL1 №3780 what is new is judged by what the reader is shown: the same b
     assert.equal(g.sent().length, 2);
   });
   await t.test('a narrower read after the fragment is progress', async child => {
-    const n = mp3Cycle(child, 'fact', capacity), g = n.f;
+    const n = await mp3ManagedCycle(child, 'fact', { capacity }), g = n.f;
     const narrow = { action: 'read_context', record: reference(g.graph), pointer: '/id' };
     g.steps([{ research: n.need([{ action: 'read_context', record: reference(g.graph), pointer: '' }]), usage }, { research: n.need([narrow]), usage },
       { research: e4Fact(g), usage }]);
@@ -504,7 +515,7 @@ test('OBL1 №3780 what is new is judged by what the reader is shown: the same b
 
 
 test('MP3 row 8: after reopen with the working file changed or removed, a delivery is the same data and Ref from saved sources; current applicability is checked separately', async t => {
-  const m = mp3Cycle(t), { f } = m;
+  const m = await mp3ManagedCycle(t), { f } = m;
   f.steps([{ research: m.need([m.range(0, 9), { action: 'read', path: 'mp3-notes.txt', media: 'text/plain' }]), usage }, { research: e4Fact(f), usage }]);
   const cycle = valueOf(await runModelCycle(f.store, f.request));
   const link = valueOf(readQuestionPacket(f.store, { project: f.project, record: cycle.record.value.steps[1]!.packet })).value.request.continuation!;
