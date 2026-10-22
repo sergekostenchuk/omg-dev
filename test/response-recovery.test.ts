@@ -118,11 +118,11 @@ test('recovery is explicit and changed profiles, foreign hashes or sessions cann
 });
 
 test('a normal resume consumes the paid pending intent itself — never an implicit recovery', async t => {
-  const f = fixture(t); await interruptCheckpoint(f);
+  const f = fixture(t); const call = await interruptCheckpoint(f);
   await assert.rejects(f.invoke(), { code: 'synthesis_no_progress' });
   const session = f.store.list<any>('synthesis-session')[0]!;
   assert.equal(session.value.offset, 1); assert.equal(session.value.notes.length, 1);
-  assert.equal(f.store.list<any>('research-consumer-intent')[0]!.value.state, 'applied');
+  assert.equal(f.store.list<any>('research-consumer-intent').find(record => record.value.call?.id === call.id)!.value.state, 'applied');
   assert.equal(f.store.list('research-response-recovery').length, 0, 'the paid step applied through the consumer, not an operator replay');
 });
 
