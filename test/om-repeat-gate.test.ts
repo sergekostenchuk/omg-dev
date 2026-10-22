@@ -2989,6 +2989,22 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, mana
       assert.equal(model.outcome?.kind, "fact-candidates");
       return { project, modelCall: reference(model.record), questionId: nextBatch.items[0]!.gap, dispatch };
     },
+    /**
+     * LG07 (№10753 п.1): the original E1 of the first set, or of the second set of twoSets, ends without facts — off its
+     * form, or the model's typed cannot_answer; the managed E4 finish writes its model diagnostic, and no fact of that set
+     * reaches an assessor.
+     */
+    async endedOriginal(end: "off-form" | "cannot_answer", set: "first" | "second" = "first") {
+      const own = set === "first" ? packet : deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes),
+        batch: secondBatch!.id, environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+      const items = set === "first" ? batch.items : secondBatch!.items;
+      const step = end === "off-form" ? { research: { answer: "untyped implementer reply" }, usage: e51Usage }
+        : { research: { protocol: "$answerProtocol", requestId: "$requestId", action: "cannot_answer",
+          questionIds: items.map(item => item.gap), reason: "The repository does not settle this question" }, usage: e51Usage };
+      if (set === "second") secondOriginalStep = step as unknown as typeof originalStep;
+      writeFileSync(scenario, JSON.stringify({ database: store.path, steps: set === "first" ? [step] : [originalStep, step] }));
+      return deliveredOf(await runModelCall(store, { project, packet: reference(own), dispatch, role: "implementer" }));
+    },
     assessor(...verdicts: E51Verdict[]) {
       writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, ...verdicts.map(e51AssessorStep)] }));
     },
@@ -3497,6 +3513,48 @@ test("E5.1 requires its full negative or mixed set even when direct G7 is given 
   });
 });
 
+test("E5.1 requires its full negative or mixed set even when direct G7 is given only the valid E4 refusal of the plan's other set", async t => {
+  // LG07 (№10753 п.1, №10078 п.6): managed coverage beside the standalone test above — the refusal beside the E5 set is the
+  // typed cannot_answer of the plan's second MC1 set, an E4 of the attempt's own registry. It does not carry that test's
+  // independent source of another type, which stays with it for the src part.
+  for (const shape of ["negative", "mixed"] as const) await t.test(shape, async child => {
+    const f = e51Fixture(child, shape === "mixed" ? 3 : 2, true, { twoSets: true }), first = await f.original();
+    const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
+    const ended = await f.endedOriginal("cannot_answer", "second");
+    const verdicts = shape === "mixed" ? ["supported", "insufficient"] as const : ["insufficient"] as const;
+    f.assessorsForTwoOriginals(...verdicts);
+    const terminals = [];
+    for (const questionId of f.questionIds) terminals.push(deliveredOf(await assessFact(f.store, { ...first, questionId })));
+    assert.deepEqual(terminals.map(row => row.value.verdict), [...verdicts]);
+    const negative = verdicts.indexOf("insufficient");
+    const e5 = e51Claim(f.store, f.project, reference(f.store.get(assessmentRefusalId(f.project, reference(terminals[negative]!)))!));
+    const e4 = e51Claim(f.store, f.project, ended.diagnostic!);
+    const supported = shape === "mixed" ? terminals[0]!.value.accepted! : null;
+    const before = f.store.list().map(reference), sends = f.sent().length;
+    const direct = refusalOf(closeAttempt(f.store, { ...at, outcome: refusedBy(e4) }));
+    assert.deepEqual([direct.code, direct.at.field], ["completion_invalid", supported ? "accepting" : "refusals"], shape);
+    assert.deepEqual(f.store.list().map(reference), before);
+    assert.equal(f.sent().length, sends);
+    const claim = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).outcome;
+    assert.equal(claim.reason, supported ? "result" : "refused");
+    assert.deepEqual(claim.accepting, supported ? [supported] : []);
+    assert.deepEqual(claim.refusals.map(item => item.row).sort(), [e5.row, e4.row].sort());
+    const full = deliveredOf(closeAttempt(f.store, { ...at, outcome: claim }));
+    // The classes and addressees are the rule's: an E5 row is the proposal of its fact, a semantic E4 that of its goal.
+    const targetOf = (index: number) => f.batch.items.find(item => item.gap === f.questionIds[index])!.target;
+    assert.deepEqual(full.routed.map(item => [item.row, item.class, item.addressee, item.toModel]).sort(),
+      [[e5.row, "proposal", `node:${targetOf(negative)}`, true], [e4.row, "proposal", `node:${f.secondBatch!.items[0]!.target}`, true]].sort());
+    assert.equal(e51Outcome(f)?.reason, supported ? "result" : "refused");
+    assert.equal(e51Outcome(f)?.achieved.length, supported ? 1 : 0);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, supported ? 0 : 1);
+    const closed = f.store.list().map(reference), calls = f.sent().length;
+    f.restart();
+    assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), full);
+    assert.deepEqual(f.store.list().map(reference), closed);
+    assert.equal(f.sent().length, calls);
+  });
+});
+
 test("E5.1 refuses an incomplete E1 set and guards the final terminal after successful G7 preparation", async t => {
   // LG07: the claim is G7's own; the independent G3 row this test once added beside it changed none of its two properties.
   const f = e51Fixture(t, true, true), request = await f.original();
@@ -3668,6 +3726,38 @@ test("E5.1 keeps an earlier G3 attempt with no assessor E1 closeable and exactly
   assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), first);
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, calls);
+});
+
+test("E5.1 closes a managed attempt whose original E1 ended without facts on its own E4, and repeats it exactly", async t => {
+  // LG07 (№10753 п.1, №10078 п.6): managed coverage beside the standalone tests above — an attempt closed on the E4 of its
+  // own original, with no assessor E1, classified by the E4 rule; before the paid original its registry is incomplete. The
+  // exact repeat does not revisit the E1 ledger. The standalone G3 close and its absent ledger stay for the src part.
+  for (const [end, reason, kind, toModel] of [["cannot_answer", "refused", "proposal", true],
+    ["off-form", "off-form", "conditions", false]] as const) await t.test(end, async child => {
+    const f = e51Fixture(child, false, true);
+    const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
+    const unpaid = f.store.list().map(reference);
+    assert.equal(deliveredOf(readCallLedger(f.store, f.project)), null);
+    assert.equal(refusalOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).code, "completion_incomplete");
+    assert.deepEqual(f.store.list().map(reference), unpaid);
+    const ended = await f.endedOriginal(end);
+    const row = e51Claim(f.store, f.project, ended.diagnostic!);
+    const { claim, closed } = e51Close(f);
+    assert.deepEqual(claim, outcome({ reason, refusals: [row] }));
+    assert.equal(closed.withoutProgress, 1);
+    assert.deepEqual(closed.routed.map(item => [item.row, item.class, item.addressee, item.toModel]),
+      [[row.row, kind, kind === "proposal" ? `node:${f.batch.items[0]!.target}` : `owner:${f.series.id}`, toModel]]);
+    assert.equal(f.sent().length, 1, "only the original is paid");
+    const ledger = f.store.get(callLedgerId(f.project))!;
+    f.store.write({ id: callLedgerId(f.project), kind: CALL_LEDGER_KIND, expected: ledger.revision,
+      value: { projectId: f.project, calls: [] } });
+    assert.equal(refusalOf(readCallLedger(f.store, f.project)).code, "ledger_invalid");
+    const before = f.store.list().map(reference);
+    f.restart();
+    assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), closed);
+    assert.deepEqual(f.store.list().map(reference), before);
+    assert.equal(f.sent().length, 1);
+  });
 });
 
 test("E5.1 checks the full E1 ledger even when its head is missing, foreign, or malformed", async t => {
@@ -3896,6 +3986,32 @@ test("E5.1 lets an independent G3 refusal close a technical E5 set as refused", 
   const before = f.store.list().map(reference), calls = f.sent().length;
   f.restart();
   assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), closed);
+  assert.deepEqual(deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent)),
+    { complete: true, closed: true, results: [reference(terminal)] });
+  assert.deepEqual(deliveredOf(await assessFact(f.store, original)), terminal);
+  assert.deepEqual(f.store.list().map(reference), before);
+  assert.equal(f.sent().length, calls);
+});
+
+test("E5.1 lets the semantic E4 refusal of the plan's other set close a technical E5 set as refused", async t => {
+  // LG07 (№10753 п.1, №10078 п.6): managed coverage beside the standalone test above — the semantic E4 of the plan's second
+  // MC1 set refuses beside a technical E5 set. The independent source of another type stays with that test for the src part.
+  const f = e51Fixture(t, 2, true, { twoSets: true }), original = await f.original();
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
+  const ended = await f.endedOriginal("cannot_answer", "second");
+  f.assessorsForTwoOriginals("interrupted");
+  const terminal = deliveredOf(await assessFact(f.store, original));
+  assert.equal(terminal.value.verdict, "interrupted");
+  const e4 = e51Claim(f.store, f.project, ended.diagnostic!);
+  const { claim, closed } = e51Close(f);
+  assert.deepEqual(claim, refusedBy(e4));
+  assert.equal(e51Outcome(f)?.reason, "refused");
+  assert.equal(e51Outcome(f)?.refusals.length, 1);
+  assert.equal(f.store.list(UNIT_REFUSAL_KIND).length, 1, "the technical E5 terminal writes no refusal of its own");
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 1);
+  const before = f.store.list().map(reference), calls = f.sent().length;
+  f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), closed);
   assert.deepEqual(deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent)),
     { complete: true, closed: true, results: [reference(terminal)] });
   assert.deepEqual(deliveredOf(await assessFact(f.store, original)), terminal);
