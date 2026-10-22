@@ -1887,3 +1887,115 @@ test('3 H1.0b staged assessor role agrees at cessation, transport and historical
         if (call) assert.deepEqual(f.store.get(call.id, 1), call);
       });
 });
+
+test('LG17 t1 a managed intent names its exact owner, its saved stages repeat without writes and a damaged registry stays completion_invalid', async t => {
+  await t.test('the intent selects its exact owner and every saved stage repeats without writes after the managed close', async () => {
+    const f = fixture(t), request = await f.original();
+    const intent = ok(writeAssessmentIntent(f.store, request));
+    const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
+    const binding = ok(readCompletionBinding(f.store, f.project, admission.originalSeries, admission.attempt));
+    assert.ok(binding, 'the original attempt of this intent is managed');
+    const disposition = ok(prepareAssessmentDisposition(f.store, f.project, reference(intent)))!;
+    assert.equal(disposition.binding.id, binding.id, 'the disposition names the exact binding of the original attempt');
+    const assignment = f.store.get<{ kind: string; question: string | null }>(disposition.assignment.id,
+      disposition.assignment.revision)!;
+    assert.equal(assignment.value.kind, 'fact');
+    assert.equal(assignment.value.question, admission.fact.questionId);
+    f.assessor('supported');
+    const terminal = ok(await assessFact(f.store, request)), sent = f.sent().length;
+    closeFactWork(f);
+    const history = f.store.list().map(reference);
+    assert.deepEqual(ok(writeAssessmentIntent(f.store, request)), intent);
+    assert.deepEqual(ok(applyAssessmentResult(f.store, { project: f.project,
+      intent: terminal.value.intent, assessor: terminal.value.assessor })), terminal);
+    assert.deepEqual(ok(finishAssessmentAttempt(f.store, f.project, reference(intent))),
+      { complete: true, closed: true, results: [reference(terminal)] });
+    assert.deepEqual(f.store.list().map(reference), history);
+    assert.equal(f.sent().length, sent);
+    f.restart();
+    assert.deepEqual(ok(writeAssessmentIntent(f.store, request)), intent);
+    assert.deepEqual(ok(applyAssessmentResult(f.store, { project: f.project,
+      intent: terminal.value.intent, assessor: terminal.value.assessor })), terminal);
+    assert.deepEqual(ok(finishAssessmentAttempt(f.store, f.project, reference(intent))),
+      { complete: true, closed: true, results: [reference(terminal)] });
+    assert.deepEqual(f.store.list().map(reference), history);
+    assert.equal(f.sent().length, sent);
+  });
+
+  await t.test('a new intent naming a fact outside the original response refuses before any write or dispatch', async () => {
+    const f = fixture(t), request = await f.original();
+    const intents = f.store.list(ASSESSMENT_INTENT_KIND).length, sent = f.sent().length;
+    denied(writeAssessmentIntent(f.store, { ...request, questionId: 'discovery:transport' }), 'assessment_source_invalid');
+    assert.equal(f.store.list(ASSESSMENT_INTENT_KIND).length, intents);
+    assert.equal(f.sent().length, sent);
+  });
+
+  await t.test('a never-intended fact of the completed attempt mints no intent while the saved one repeats exactly', async () => {
+    const f = fixture(t, true), request = await f.original();
+    const intent = ok(writeAssessmentIntent(f.store, request));
+    f.assessor('supported');
+    const terminal = ok(await assessFact(f.store, request));
+    assert.ok(terminal.value.accepted);
+    const binding = ok(readCompletionBinding(f.store, f.project, reference(f.store.get(f.series.id)!), 1))!;
+    const work = ok(readCompletionWorkAt(f.store, f.project,
+      reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    const pending = work.assignments.filter(row => row.value.kind === 'fact' && row.value.question === f.questionIds[1]);
+    assert.equal(pending.length, 1, 'the second fact stays one mandatory pending assignment');
+    const brief = f.store.get<{ content: string }>(f.source.id)!;
+    f.store.write({ id: brief.id, kind: brief.kind, expected: brief.revision,
+      value: { ...brief.value, content: 'a superseded brief' } });
+    const ceased = ok(writeCompletionCessation(f.store, { project: f.project,
+      binding: reference(binding), assignment: reference(pending[0]!) }));
+    assert.equal(ceased.value.disposition, 'not-dispatched');
+    closeFactWork(f);
+    const history = f.store.list().map(reference), sent = f.sent().length;
+    assert.deepEqual(ok(writeAssessmentIntent(f.store, request)), intent);
+    denied(writeAssessmentIntent(f.store, { ...request, questionId: f.questionIds[1]! }), 'assessment_source_invalid');
+    assert.equal(f.store.list(ASSESSMENT_INTENT_KIND).length, 1);
+    assert.deepEqual(f.store.list().map(reference), history);
+    assert.equal(f.sent().length, sent);
+  });
+
+  await t.test('a saved intent before its terminal refuses a damaged managed registry as completion_invalid', async () => {
+    const f = fixture(t), request = await f.original();
+    const intent = ok(writeAssessmentIntent(f.store, request));
+    const admission = ok(readAssessmentIntentAt(f.store, f.project, reference(intent)));
+    const call = ok(recordCall(f.store, f.project, { call: admission.call, purpose: 'fact-assessment', basis: admission.basis,
+      block: admission.block, gaps: admission.gaps, series: admission.series, attempt: admission.attempt,
+      goal: admission.goal, dispatch: admission.dispatch, packet: admission.packet as Json }));
+    f.assessor('supported');
+    const physical = ok(await runModelTransport(f.store, { project: f.project, call: reference(call.call),
+      packet: admission.packet as Json, role: 'reviewer' }));
+    const binding = ok(readCompletionBinding(f.store, f.project, admission.originalSeries, admission.attempt))!;
+    const workId = completionWorkId(f.project, binding.id), head = f.store.get<{ binding: Ref }>(workId)!;
+    f.store.write({ id: workId, kind: head.kind, expected: head.revision,
+      value: { ...head.value, binding: reference(head) } });
+    const damaged = f.store.list().map(reference), sent = f.sent().length;
+    refusedWith(applyAssessmentResult(f.store, { project: f.project,
+      intent: reference(intent), assessor: reference(physical.record) }), 'completion_invalid');
+    assert.equal(f.store.list(ASSESSMENT_RESULT_KIND).length, 0);
+    assert.deepEqual(f.store.list().map(reference), damaged);
+    assert.equal(f.sent().length, sent);
+  });
+
+  await t.test('a saved terminal repeat refuses the same damaged registry as completion_invalid, never masked', async () => {
+    const f = fixture(t), request = await f.original();
+    ok(writeAssessmentIntent(f.store, request));
+    f.assessor('supported');
+    const terminal = ok(await assessFact(f.store, request));
+    const sent = f.sent().length, clean = f.store.list().map(reference);
+    assert.deepEqual(ok(applyAssessmentResult(f.store, { project: f.project,
+      intent: terminal.value.intent, assessor: terminal.value.assessor })), terminal);
+    assert.deepEqual(f.store.list().map(reference), clean);
+    const binding = ok(readCompletionBinding(f.store, f.project, reference(f.store.get(f.series.id)!), 1))!;
+    const workId = completionWorkId(f.project, binding.id), head = f.store.get<{ binding: Ref }>(workId)!;
+    f.store.write({ id: workId, kind: head.kind, expected: head.revision,
+      value: { ...head.value, binding: reference(head) } });
+    const damaged = f.store.list().map(reference);
+    refusedWith(applyAssessmentResult(f.store, { project: f.project,
+      intent: terminal.value.intent, assessor: terminal.value.assessor }), 'completion_invalid');
+    assert.equal(f.store.list(ASSESSMENT_RESULT_KIND).length, 1);
+    assert.deepEqual(f.store.list().map(reference), damaged);
+    assert.equal(f.sent().length, sent);
+  });
+});
