@@ -19,7 +19,8 @@ import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { type OmResult, type Refusal } from "../src/om/refusal.js";
 import { beginAttempt, completeAttempt, openSeries, prepareSeriesAdmission, readCompletionBinding, resumeSeries, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
   type AttemptGoal, type RepairSeries, type MechanismAdmission } from "../src/om/series.js";
-import { closeAttempt, openAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
+import { closeAttempt, openAttempt, prepareManagedClaim, type OriginHold } from "../src/om/repeat-gate.js";
+import { startRun } from "../src/om/run.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { writeOmInput } from "../src/om/input.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
@@ -46,6 +47,7 @@ import {
 } from "../src/om/call-record.js";
 import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import { managedBlock, managedUsage } from "./om-managed-block.js";
+import { defectedWork, regatedHold, runFixture } from "./om-run-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
@@ -751,7 +753,8 @@ test("E6 report: a named missing or incorrect D1 source is a refusal rather than
 });
 
 const providerPath = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
-function physicalFixture(t: test.TestContext, purpose: "stop-analysis" | "origin-analysis" = "stop-analysis") {
+function physicalFixture(t: test.TestContext) {
+  const purpose = "stop-analysis" as const;
   const root = mkdtempSync(join(tmpdir(), "omg-spend-physical-")), database = join(root, "state.sqlite");
   let store = new Store(database);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -760,25 +763,12 @@ function physicalFixture(t: test.TestContext, purpose: "stop-analysis" | "origin
   const goal = { key: "physical-ground", questions: ["Which contract needs evidence?"], result: "An evidenced contract" };
   deliveredOf(openSeries(store, { ...address, slice: "analysis-slice", predecessor: null, basis: null }));
   let series = deliveredOf(beginAttempt(store, { ...address, attempt: 1, goal })) as Revision<RepairSeries>;
-  let basis: { kind: "series-stop"; series: Ref; attempt: number } | { kind: "origin-hold"; hold: Ref };
-  if (purpose === "stop-analysis") {
-    for (const attempt of [1, 2, 3]) {
-      if (attempt > 1) deliveredOf(beginAttempt(store, { ...address, attempt, goal }));
-      series = deliveredOf(completeAttempt(store, { ...address, attempt,
-        outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } })) as Revision<RepairSeries>;
-    }
-    basis = { kind: "series-stop", series: reference(series), attempt: 3 };
-  } else {
-    const source = store.write({ id: `${unitRefusalNamespace(project)}spend-origin`, kind: UNIT_REFUSAL_KIND, expected: 0,
-      value: { gate: "G3", refusals: [{ code: "unrecognized_spend_refusal", goal: goal.key, remedy: "Identify the exact origin",
-        origin: { name: "artifact_missing", stage: "layer-check", subject: "artifact:fixture", sources: [] } }] } });
-    const journal = deliveredOf(recordRefusal(store, { project, source: reference(source) })), row = journal.value.rows[0]!;
-    const closed = deliveredOf(closeAttempt(store, { ...address, attempt: 1,
-      outcome: { reason: "refused", accepting: [], cancelling: [], refusals: [{ row: row.id, name: row.code, goal: row.goal }] } }));
-    assert.equal(closed.holds.length, 1);
-    series = store.get<RepairSeries>(series.id)!;
-    basis = { kind: "origin-hold", hold: closed.holds[0]! };
+  for (const attempt of [1, 2, 3]) {
+    if (attempt > 1) deliveredOf(beginAttempt(store, { ...address, attempt, goal }));
+    series = deliveredOf(completeAttempt(store, { ...address, attempt,
+      outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } })) as Revision<RepairSeries>;
   }
+  const basis = { kind: "series-stop" as const, series: reference(series), attempt: 3 };
   const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
   const command = { executable: process.execPath, args: [providerPath, "--scenario", scenario, "--trace", trace] };
   const environment = new Environments(store).configure(project, { workspace: root,
@@ -789,7 +779,7 @@ function physicalFixture(t: test.TestContext, purpose: "stop-analysis" | "origin
   const reviewGoal = { key: purpose, questions: ["What caused this ground?"], result: "An evidenced cause or an explicit hypothesis" };
   const admitted = deliveredOf(recordCall(store, project, { call: `spend:${purpose}`, purpose, basis, block,
     gaps: [{ id: purpose, goal: purpose, field: "cause", consumer: "A6:stop-analysis" }],
-    series: reference(series), attempt: purpose === "stop-analysis" ? 3 : 1, goal: reviewGoal,
+    series: reference(series), attempt: 3, goal: reviewGoal,
     dispatch: { adapter: reference(adapter), config: reference(environment) }, packet }));
   const request: ModelTransportRequest = { project, call: reference(admitted.call), packet, role: "reviewer" };
   function scenarioUsage(usage: unknown) {
@@ -840,6 +830,56 @@ async function managedPhysicalFixture(t: test.TestContext) {
       assert.equal(own.length, 1, "the analysis made exactly one physical call");
       return own[0]!;
     } };
+}
+/** The per-purpose block of the report for `count` settled calls, each at `usage`. */
+const spentPurpose = (count: number, usage: Tokens) => ({ calls: count, measuredCalls: count, unmeasuredCalls: 0,
+  reportedTokens: tokensOf(...Array.from({ length: count }, () => usage)) });
+/**
+ * What the regated pass pays before its hold, by its scenario: its native layers are prepared, so the one call sent is
+ * the design of the level-3 batch, whose works answer is defected. The expected counts below come from this, not from
+ * the rows read.
+ */
+const REGATED_PAID: Readonly<Record<string, number>> = { "model-design": 1 };
+/**
+ * LG07 sr-origin (№10753 п.2): the origin analysis of a real standing block hold — the carrier of the accepted LG07 oh-a:
+ * the regated run's works answer is defected, so its G5 rejects the attempt and the run waits at the analysis of the
+ * hold. What the run paid up to that hold is the preparation: it is checked against the provider's trace and the
+ * producer's ledger before the analysis is recorded, and every count of the test is relative to it. The analysis is an
+ * E1 of its own and its provider step follows the run's scripted replies, so what it sends is counted apart from the
+ * preparation.
+ */
+async function regatedOriginFixture(t: test.TestContext) {
+  const project = "garden", f = runFixture(t, [], "executed");
+  deliveredOf(startRun(f.store, { project }));
+  const held = await regatedHold(f, {
+    cycle: (packet, batch) => batch.task === "node-expansion" && batch.level === 3 ? defectedWork(f, reference(packet)) : null,
+    pause: { step: "analyze" },
+  });
+  const waiting = held.second?.step?.request as { hold: Ref } | undefined;
+  assert.ok(waiting, "the regated pass waits at the analysis of its hold");
+  const hold = f.store.get<OriginHold>(waiting.hold.id, waiting.hold.revision)!;
+  // The preparation as its producers left it: every scripted reply was sent once and is one settled call at its usage.
+  const scenario = join(f.root, "scenario.json"), sentBefore = f.sent().length;
+  assert.equal((JSON.parse(readFileSync(scenario, "utf8")) as { steps: unknown[] }).steps.length, sentBefore,
+    "no scripted reply is left over: the next one is the analysis's own");
+  const calls = f.store.get<CallLedger>(callLedgerId(project))!.value.calls;
+  assert.equal(calls.length, sentBefore, "every send of the preparation is one recorded call");
+  assert.ok(calls.every(row => row.status === "succeeded" && canonical(row.usage) === canonical(actualUsage)));
+  const paid: Record<string, number> = {};
+  for (const row of calls) paid[row.purpose] = (paid[row.purpose] ?? 0) + 1;
+  assert.deepEqual(paid, REGATED_PAID, "the regated pass paid exactly what its scenario sends");
+  const basis = { kind: "origin-hold" as const, hold: reference(hold) };
+  const packet = { task: "Analyse this exact origin hold", basis } as unknown as Json;
+  const reviewGoal = { key: "origin-analysis", questions: ["What caused this ground?"], result: "An evidenced cause or an explicit hypothesis" };
+  const admitted = deliveredOf(recordCall(f.store, project, { call: "spend:origin-analysis", purpose: "origin-analysis", basis, block: hold.value.block,
+    gaps: [{ id: "origin-analysis", goal: "origin-analysis", field: "cause", consumer: "A6:stop-analysis" }],
+    series: hold.value.series, attempt: hold.value.attempt, goal: reviewGoal,
+    dispatch: { adapter: reference(f.store.get(`adapter:${project}:run`)!), config: reference(f.store.get(`environment:${project}`)!) }, packet }));
+  const request: ModelTransportRequest = { project, call: reference(admitted.call), packet, role: "reviewer" };
+  f.push({ research: { cause: "fixture observation", hypothesis: true }, usage: actualUsage });
+  return { database: f.database, project, hold, admitted, request, paid: REGATED_PAID, prepared: calls.map(row => row.call),
+    get store() { return f.store; }, restart() { f.restart(); },
+    sent() { return f.sent().slice(sentBefore); } };
 }
 /** The physical OM calls of a project as their producer names them — not as the report under test lists them. */
 const omPhysical = (store: Store, project: string): Ref[] =>
@@ -990,13 +1030,16 @@ for (const mode of ["analysis", "ordinary"] as const) {
 
 for (const purpose of ["stop-analysis", "origin-analysis"] as const) {
   test(`E6 report: real ${purpose} transport records measured expense without asserting acceptance`, async t => {
-    // LG07 sr-b (№10394 п.5): the stop analysis runs on a real managed stop; the origin analysis keeps its dependent
-    // preparation until the origin-hold migration.
-    const f = purpose === "stop-analysis" ? await managedPhysicalFixture(t) : physicalFixture(t, purpose);
-    const paid = "paidPhysical" in f ? PAID_CALLS : 0;
+    // LG07 sr-b (№10394 п.5) and sr-origin (№10753 п.2): both analyses run on a real standing block — the stop analysis
+    // on the paid managed stop, the origin analysis on the hold of a regated run. What the carrier paid before the
+    // analysis comes from its scenario; the row under test is the analysis's own call.
+    const f = purpose === "stop-analysis" ? await managedPhysicalFixture(t) : await regatedOriginFixture(t);
+    const paid: Readonly<Record<string, number>> = "paidPhysical" in f ? PAID : f.paid;
+    const paidCalls = Object.values(paid).reduce((total, count) => total + count, 0);
+    assert.equal(paid[purpose], undefined, "the analysis is the first call of its purpose");
     const sent = deliveredOf(await runModelTransport(f.store, f.request));
     const before = canonical(f.store.list()), report = deliveredOf(spendReport(f.store, { project: f.project }));
-    assert.equal(report.rows.length, paid + 1);
+    assert.equal(report.rows.length, paidCalls + 1);
     const row = report.rows.find(item => item.call?.id === f.admitted.call.id)!;
     assert.equal(row.purpose, purpose);
     assert.deepEqual(row.physical, reference(sent.record));
@@ -1004,7 +1047,13 @@ for (const purpose of ["stop-analysis", "origin-analysis"] as const) {
     assert.equal(row.settlement, "succeeded");
     assert.equal(row.result, null, "Analysis response is not the completed product attempt's accepted result");
     assert.deepEqual(report.byPurpose[purpose], { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: actualUsage });
-    if (paid) for (const other of Object.keys(PAID)) assert.deepEqual(report.byPurpose[other as keyof typeof report.byPurpose], paidPurpose(other), other);
+    for (const other of Object.keys(paid)) assert.deepEqual(report.byPurpose[other as keyof typeof report.byPurpose],
+      "paidPhysical" in f ? paidPurpose(other) : spentPurpose(paid[other]!, actualUsage), other);
+    if ("prepared" in f) {
+      assert.deepEqual(row.call, reference(f.store.get(f.admitted.call.id)!), "the report names the analysis's settled call record by its exact Ref");
+      assert.deepEqual(report.rows.filter(item => item !== row).map(item => canonical(item.call)).sort(), f.prepared.map(canonical).sort(),
+        "besides the analysis the report lists exactly the calls the preparation paid");
+    }
     assert.deepEqual(report.findings, []);
     assert.equal(canonical(f.store.list()), before);
     assert.equal(f.sent().length, 1);
