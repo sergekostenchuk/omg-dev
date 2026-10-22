@@ -690,40 +690,73 @@ test("D2 unrelated attempts and a shifted series cannot close a line or partiall
   const block = ok(prepareFrame(f.store, f.frame)).result.obligations.find(item => item.id === line.target)!.upper.node;
   // LG07 gl-a: the real M6 of the original D1 — whole node-expansion MC2 batches — before the acceptance can retire it.
   const routes = ok(writeRoutes(f.store, { project: "garden", gaps: f.initial, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
-  const carrier = (batch: (typeof routes.value.batches)[number]) => ({ batch,
-    goal: { key: `goal:${gapLineKey("garden", batch.items[0]!.target, batch.items[0]!.field)}`,
-      questions: batch.items.map(item => gapLineKey("garden", item.target, item.field)).sort(),
-      result: gapLineExpectedResult("garden", batch.items[0]!.target, batch.items[0]!.field) },
-    completion: { routes: reference(routes), batches: [batch.id] } });
+  const carrier = (projectName: string, routesRecord: typeof routes, batch: (typeof routes.value.batches)[number]) => ({ batch,
+    goal: { key: `goal:${gapLineKey(projectName, batch.items[0]!.target, batch.items[0]!.field)}`,
+      questions: batch.items.map(item => gapLineKey(projectName, item.target, item.field)).sort(),
+      result: gapLineExpectedResult(projectName, batch.items[0]!.target, batch.items[0]!.field) },
+    completion: { routes: reference(routesRecord), batches: [batch.id] } });
   const ownBatch = routes.value.batches.find(item => item.model === "MC2" && item.task === "node-expansion" && item.node === block);
   assert.ok(ownBatch, "The chosen fill's owner must have a node-expansion batch");
   assert.ok(ownBatch.items.some(item => item.target === line.target));
   const otherBatch = routes.value.batches.find(item => item.model === "MC2" && item.task === "node-expansion" && item.node !== block);
   assert.ok(otherBatch, "The graph needs another real block with its own node-expansion batch");
-  const own = carrier(ownBatch), other = carrier(otherBatch);
+  const own = carrier("garden", routes, ownBatch), other = carrier("garden", routes, otherBatch);
+  // A real "other" project in the same Store: its own producers, D1, M6 and a whole node-expansion MC2 batch.
+  const otherGraph = gardenGraph("cross", "other"), { level: _otherLevel, ...otherUpper } = projectGraph(otherGraph, 1);
+  preparedFeatures(new ProductEngine(f.store), "other", otherUpper as Graph);
+  const otherInput = ok(writeOmInput(f.store, { project: "other", expected: 0,
+    stages: Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(f.store.get(`stage:other:${stage}`)!)])) as Record<UpstreamStage, Ref> }));
+  const otherHorizon = ok(writeHorizon(f.store, { project: "other", input: reference(otherInput), graph: reference(f.store.get("graph:other")!),
+    refinement: null, choice: { choiceVersion: "gap-lines-initial", features: [{ outcome: "other-result" }], excluded: [] }, available: {} }));
+  const otherFrame: FrameRequest = { project: "other", level: 2, graph: reference(f.store.get("graph:other")!),
+    horizon: reference(otherHorizon.gate), layer: null, frame: null, upper: null };
+  const otherGaps = ok(writeGaps(f.store, { project: "other", input: reference(otherInput), graph: otherFrame.graph, horizon: otherFrame.horizon,
+    operations: { frame: otherFrame, proposals: [] }, works: { state: "upper-not-accepted", layer: reference(f.store.get("graph-layer:other:2")!) } }));
+  const otherInitial: GapReadRequest = { sources: structuredClone(otherGaps.sources) as GapRequest, records: otherGaps.records.map(reference) };
+  const otherRoutes = ok(writeRoutes(f.store, { project: "other", gaps: otherInitial, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const foreignBatch = otherRoutes.value.batches.find(item => item.model === "MC2" && item.task === "node-expansion" && item.node === "other-produce-block");
+  assert.ok(foreignBatch, "The other project's produce-block must have a node-expansion batch");
+  const foreign = carrier("other", otherRoutes, foreignBatch);
+  const lineKey = gapLineKey("garden", line.target, line.field), lineResult = gapLineExpectedResult("garden", line.target, line.field);
   const address = { project: "garden", block, line: 1 };
   ok(openSeries(f.store, { ...address, slice: "operations", predecessor: null, basis: null }));
   const attempt = ok(managedOpenAttempt(f.store, { ...address, attempt: 1, goal: own.goal, completion: own.completion }));
   // The snapshot precedes the acceptance: each case replays acceptOperations AFTER its own attempt, as the engine does.
   const saved = await f.store.snapshot(join(f.root, "before-attempt"));
-  const cases: Array<{ project?: string; block?: string; mutateGoal?: "questions" | "result"; ordinal?: number; corruptHash?: boolean; code: string }> = [
-    { project: "other", code: "record_foreign" }, { block: otherBatch.node!, code: "closure_unconfirmed" },
-    { mutateGoal: "questions", code: "closure_unconfirmed" }, { mutateGoal: "result", code: "closure_unconfirmed" },
-    { ordinal: 2, code: "closure_unconfirmed" }, { corruptHash: true, code: "record_forged" },
+  const cases: Array<{ foreignProject?: boolean; block?: string; takeOverGoal?: boolean;
+    mutateGoal?: "questions" | "result"; ordinal?: number; corruptHash?: boolean; code: string; field: string }> = [
+    { foreignProject: true, code: "record_foreign", field: "id" },
+    { block: otherBatch.node!, code: "closure_unconfirmed", field: "attempt.goal" },
+    { block: otherBatch.node!, takeOverGoal: true, code: "closure_unconfirmed", field: "attempt.block" },
+    { mutateGoal: "questions", code: "closure_unconfirmed", field: "attempt.goal" },
+    { mutateGoal: "result", code: "closure_unconfirmed", field: "attempt.goal" },
+    { ordinal: 2, code: "closure_unconfirmed", field: "attempt.goal" },
+    { corruptHash: true, code: "record_forged", field: "hash" },
   ];
   for (const [index, variant] of cases.entries()) {
     const path = join(f.root, `bad-attempt-${index}.sqlite`); copyFileSync(saved.path, path);
     const store = new Store(path);
     try {
       let series: Ref;
-      if (variant.project !== undefined) {
-        // Boundary: a managed opening refuses a foreign-project plan (record_foreign on om-routes) — no lawful managed
-        // series of project "other" exists, so this case keeps the previous standalone opening.
-        series = reference(openAttempt(store, { project: variant.project, block, line: 1 }, goalFor(line)));
+      if (variant.foreignProject) {
+        const foreignAddress = { project: "other", block: foreignBatch.node!, line: 1 };
+        ok(openSeries(store, { ...foreignAddress, slice: "operations", predecessor: null, basis: null }));
+        series = reference(ok(managedOpenAttempt(store, { ...foreignAddress, attempt: 1, goal: foreign.goal, completion: foreign.completion })));
       } else if (variant.block !== undefined) {
-        const foreign = { project: "garden", block: variant.block, line: 1 };
-        ok(openSeries(store, { ...foreign, slice: "operations", predecessor: null, basis: null }));
-        series = reference(ok(managedOpenAttempt(store, { ...foreign, attempt: 1, goal: other.goal, completion: other.completion })));
+        const foreignAddress = { project: "garden", block: variant.block, line: 1 };
+        ok(openSeries(store, { ...foreignAddress, slice: "operations", predecessor: null, basis: null }));
+        const opened = ok(managedOpenAttempt(store, { ...foreignAddress, attempt: 1, goal: other.goal, completion: other.completion }));
+        if (variant.takeOverGoal) {
+          // An explicitly negative mutation of the lawfully opened attempt: its saved goal is bent to the closing
+          // line's own questions and result, so D2 passes seriesGoal and must still refuse the foreign block.
+          const head = store.get<RepairSeries>(opened.id)!, value = clone(head.value) as Record<string, any>;
+          const running = (value.attempts as { ordinal: number; goal: { questions: string[]; result: string } }[])
+            .find(item => item.ordinal === 1)!;
+          running.goal.questions = [lineKey]; running.goal.result = lineResult;
+          series = reference(rewrite(store, head, value as RepairSeries));
+        } else {
+          series = reference(opened);
+        }
       } else if (variant.mutateGoal !== undefined) {
         const head = store.get<RepairSeries>(attempt.id)!, value = clone(head.value) as Record<string, any>;
         const running = (value.attempts as { ordinal: number; goal: { questions: string[]; result: string } }[])
@@ -739,7 +772,12 @@ test("D2 unrelated attempts and a shifted series cannot close a line or partiall
       const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
         closures: [{ ...next.closure, attempt: { series: link, attempt: variant.ordinal ?? 1 } }] };
       const before = historySnapshot(store);
-      for (const operation of [prepareGapLines, writeGapLines]) denied(operation(store, request), variant.code);
+      for (const operation of [prepareGapLines, writeGapLines]) {
+        const refusal = denied(operation(store, request), variant.code);
+        assert.equal(refusal.at.target, line.id);
+        assert.equal(refusal.at.field, variant.field);
+        if (refusal.at.ref !== undefined) assert.deepEqual(refusal.at.ref, link);
+      }
       assert.deepEqual(historySnapshot(store), before);
     } finally { store.close(); }
   }
