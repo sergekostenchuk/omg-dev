@@ -1,5 +1,5 @@
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
-import { currentPlan, planAttemptSelection, planOwnerSubject, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
+import { currentPlan, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
 import { recordV7Attempt } from "./v7-attempts.js";
 import { planSubjectOf, sameSubject, attemptEndOfAction, addressedQuestionId, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { isResearchPreview } from './research-preview.js';
@@ -1541,12 +1541,12 @@ export class Researcher {
           if (outstanding.value.state === "prepared") {
             requireCondition(!options.restoreOnly && producerContractEra("discovery", options.producerPolicy) === 7,
               "research_contract_upgrade_required", "New v7 work requires its explicit producer policy");
-            const current = currentPlan(this.store, project), selected = planSubjectOf(outstanding.value.cursor);
+            const current = currentPlan(this.store, project), selected = planSubjectOf(outstanding.value.kind === "escalation-assessor"
+              ? consumerIntentContext(this.store, outstanding.value, outstanding.id) : outstanding.value.cursor);
             const effective = this.environments.effective(project);
             requireCondition(canonical(outstanding.value.dispatch) === canonical({ ...effective.environment.value, workspace: effective.root }),
               "research_consumer_context_stale", "The unpaid research environment changed");
-            if (outstanding.value.kind !== "escalation-assessor") requireCondition(selected
-              && canonical(current.planAnswer) === canonical(selected.planAnswer),
+            requireCondition(selected && canonical(current.planAnswer) === canonical(selected.planAnswer),
               "research_consumer_context_stale", "The unpaid intent belongs to another plan edition");
             if (outstanding.value.kind === "reading-planner") {
               const planning = planningForPlanSubject(this.store, project, reference(current.draft), selected!, options.producerPolicy);
@@ -1757,7 +1757,9 @@ export class Researcher {
           ...(webResearchCapability("discovery", "analyst", dispatch)
             ? { webResearch: webResearchGuide(webBudgetView(this.store, project, "discovery", dispatch.webResearch!)) } : {}) };
         if (mode === "synthesis") {
-          Object.assign(context, savedMaterials
+          const rejected = rejectedPlanOwnerRequest(this.store, selectedTurns as Revision<ManagedResearchTurn>[], subject);
+          Object.assign(context, rejected ? { previousProposal: turnAction(rejected.value),
+            previousProposalRef: reference(rejected) } : {}, savedMaterials
             ? { savedMaterials, savedOnly: true, history: [] }
             : { workingSelections: workingSelections(this.store, selectedTurns, selection.question, subject) });
           run = await this.applyV7Synthesis(project, run, selection.draft, selection.question, environment,
@@ -2029,9 +2031,20 @@ export class Researcher {
       { id: pending.id, kind: pending.kind, expected: pending.revision,
         value: projected.turn }
     ];
+    // The paid subject and its accepted plan remain historical provenance.
+    // Application CAS uses today's heads of those same ids; an unpaid intent
+    // still passed current-plan admission before its reservation above.
+    const subjectHeads = planSubjectOf(pending.value) ? [intent.value.draft, intent.value.question].map((ref, index) => {
+      const head = this.store.get<Record<string, any>>(ref.id);
+      requireCondition(head && head.kind === (index === 0 ? "discovery-draft" : "question")
+        && head.value.projectId === intent.value.projectId
+        && (index === 0 || head.value.draftId === intent.value.draft.id),
+      "research_consumer_intent_invalid", "The paid owner review lost its subject basis head");
+      return reference(head);
+    }) : [];
     const environmentHead = this.store.get<Environment>(`environment:${intent.value.projectId}`);
     const prepared = prepareResearchConsumerApplication(this.store, reference(intent), reference(paid.call), writes,
-      uniqueTransactionGuards([reference(run), reference(pending),
+      uniqueTransactionGuards([reference(run), reference(pending), ...subjectHeads,
         ...(environmentHead ? [reference(environmentHead)] : []),
         ...(pilot ? [reference(pilot)] : [])]));
     return this.store.writeMany<ResearchRun | ResearchTurn>(prepared.writes, prepared.guards)[0]! as Revision<ResearchRun>;

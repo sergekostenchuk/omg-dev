@@ -1,0 +1,270 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
+import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
+import { Store, type Revision } from '../src/storage/store.js';
+import { ProductEngine } from '../src/product/engine.js';
+import { reference, type Ref } from '../src/pipeline/contracts.js';
+import { type Json } from '../src/canonical.js';
+import { answerDiscoveryFixture } from './product-fixture.js';
+import { researchCall } from '../src/discovery/research-protocol.js';
+import { Researcher } from '../src/discovery/research-runner.js';
+import { readResearchConsumerTurn, listResearchConsumerIntents } from '../src/discovery/response-recovery.js';
+import { readSynthesisSessionV3 } from '../src/discovery/synthesis-session.js';
+import { planOwnerSubject } from '../src/discovery/v7-plan-questions.js';
+import { readArchiveBody } from '../src/discovery/request-parts.js';
+
+function fixture(t: { after(fn: () => void): void }) {
+  const root = mkdtempSync(join(tmpdir(), "omg-v7-s6-8-"));
+  const path = join(root, "state.sqlite"), stores: Store[] = [];
+  const open = () => { const db = new Store(path); stores.push(db); return db; };
+  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  return { root, path, store, engine, discovery, open };
+}
+type Fixture = ReturnType<typeof fixture>;
+
+const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
+
+function validFrame(): Json {
+  return { productType: "internal", scale: "30 users across 10 sites",
+    industries: ["construction"], domains: ["materials supply", "equipment accounting"],
+    axes: allAxes("deep"),
+    budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
+}
+type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
+  criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
+function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
+  return { id, axis, domain: "construction", text: `What covers ${id}?`,
+    class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
+    roles: ["domain expert"], searchPlaces: ["domain documents"] };
+}
+function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
+  return { edition, frame: frameRef, previous, questions } as unknown as Json;
+}
+function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
+  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
+  assert.ok(question, `question for ${field}`);
+  return question;
+}
+/** The real plan acceptance chain (frame and plan through #answer). */
+function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
+  const base = createPartialV7Draft(f.discovery, project, "concept");
+  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
+  const frame = questionOf(f.store, base, "frame");
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
+  const planQ = questionOf(f.store, base, "plan");
+  answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
+  const plan = f.store.get<Question>(planQ.id)!;
+  return { draft: f.store.get<DiscoveryDraft>(base.id)!, plan, planAnswer: plan.value.answer!, frameRef };
+}
+
+async function setup(t: test.TestContext, questions = [planQuestion('support','market'), planQuestion('block','industry','blocking')], calibrated = true, planning = true) {
+  const f=fixture(t);f.engine.execute({type:'create-project',project:'p',title:'P'});
+  const wire=join(f.root,'wire.ndjson'), settings=join(f.root,'reply.json'), adapter=join(f.root,'adapter.mjs');
+  const configure=(replies: unknown[]=[], tokens: number | null=10)=>writeFileSync(settings,JSON.stringify({replies,tokens}));
+  configure();
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
+let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
+appendFileSync(${JSON.stringify(wire)},raw+'\\n');
+const position=previous.filter(line=>JSON.parse(line).subject?.dispatchMode!=='consolidation').length;
+let research=r.subject?.dispatchMode==='consolidation'
+ ?{action:'checkpoint',question:r.subject.question.id,value:{summaries:r.subject.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:r.subject.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
+ :s.replies[position]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+if(research.question==='$selected')research.question=r.subject.question.id;
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
+  const command={executable:process.execPath,args:[adapter]};
+  const environment=f.engine.environments.configure('p',{workspace:f.root,
+    implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},
+    fullCheck:command,timeoutMs:5000},0);
+  const calibration=f.discovery.create('p','discovery','R0','concept',[
+    {field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'object'}}],[],6);
+  const calibrate = async (tokens = 10) => {
+    configure([], tokens);
+    await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'analyst'});
+    configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    configure([ended(), {necessary:true,reason:'Calibration review'}, {action:'read_plan',question:'$selected',reads}], tokens);
+    await researchCall(environment.value.implementer,environment.value,'Calibrate planner',{dispatchMode:'planning'},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'reading-planner'});
+    configure([ended(), {necessary:true,reason:'Calibration review'}, {action:'read_plan',question:'$selected',reads},
+      {selections:[{sourceIndex:0,firstLine:1,lastLine:2}],unresolved:[]}], tokens);
+    await researchCall({actor:'reader',model:'fixture',effort:'high',speed:'inherited',command},environment.value,
+      'Calibrate reader',{role:'reader'},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'reader'});
+    configure();writeFileSync(wire,'');
+  };
+  if (calibrated) await calibrate();
+  configure();writeFileSync(wire,'');
+  const v=acceptPlan(f,'p',questions);
+  const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
+    .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
+  const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
+  const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]);
+  const commandForPilot = { executable: process.execPath, args: [adapter] };
+  const enablePlanning = (maxRequestChars = 100000) => f.engine.execute({ type: 'configure-reader-pilot', project: 'p', expected: 0, settings: { experimental: true, active: true,
+    stopAfter: 'L2', reader: { actor: 'reader', model: 'fixture', effort: 'high', speed: 'inherited', command: commandForPilot },
+    agentCommand: commandForPilot, maxRequestChars: 100000, maxReadChars: 20000, maxReplyChars: 200000,
+    maxCalls: 50, maxReportedTokens: 100000,
+    v7Planning: { contract: 'v7-plan-planning/v1', maxRequestChars, maxRounds: 3 } } });
+  if (planning) enablePlanning();
+  return {...f,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
+}
+
+const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
+
+const reads = [{action:'read_context',record:{id:'unused',revision:1,hash:'0'.repeat(64)},pointer:'/unused'}];
+
+
+type Ready=Awaited<ReturnType<typeof setup>>;
+const snapshot=(f:Ready)=>({calls:f.store.list('model-call'),ledger:f.store.list('research-budget-ledger'),wire:f.wires()});
+const history=(f:Ready)=>f.store.list().map(row=>f.store.history(row.id).map(reference));
+const verdict=(necessary:boolean)=>({necessary,reason:necessary?'Only the owner can choose this jurisdiction':'The cited source already answers this subject'});
+function scenario(f:Ready,necessary:boolean) {
+ const source=f.discovery.evidence.document('p','jurisdiction','Only the owner can select a jurisdiction for this subject.','text/plain',0);
+ const sourceRef=reference(source);
+ f.configure([{action:'read_plan',question:'$selected',reads:[{action:'read_source',source:sourceRef,start:0,end:source.value.content.length}]},
+  {action:'need_owner',question:'$selected',reason:'Choose the jurisdiction of this exact plan subject',searched:[sourceRef]},verdict(necessary),ended()]);
+ return sourceRef;
+}
+function proveOwner(f:Ready,necessary:boolean,source:Ref) {
+ const owner=f.store.list<any>('research-turn').find(turn=>turn.value.action?.action==='need_owner')!;
+ assert.ok(owner);assert.equal(owner.value.status,'completed');assert.deepEqual(owner.value.observation,verdict(necessary));
+ assert.deepEqual(owner.value.subject,{contract:'v7-plan-subject/v1',planAnswer:f.v.planAnswer,planQuestionId:'block'});
+ assert.equal(owner.value.action.question,'block');assert.equal(owner.value.question.id,f.v.plan.id);
+ const producer=f.store.get<any>(owner.value.consumerIntent.id,1)!;assert.equal(producer.value.kind,'synthesis');
+ const session=readSynthesisSessionV3(f.open(),reference(f.store.get(producer.value.owner.id)!));
+ assert.deepEqual(session.value.delivered,reference(f.store.get(owner.id,1)!));
+ const reviews=listResearchConsumerIntents(f.store,'p',f.v.draft.id).filter(intent=>intent.value.kind==='escalation-assessor');
+ assert.equal(reviews.length,1);assert.equal(reviews[0]!.value.state,'applied');
+ const request=f.wires().find(row=>row.subject?.role==='assess-escalation');assert.ok(request);
+ assert.deepEqual(request.subject.subject,owner.value.subject);
+ assert.deepEqual(request.subject.request.subject,owner.value.subject);
+ assert.equal(request.subject.request.question,'block');assert.equal(request.subject.request.planQuestion.id,'block');
+ assert.equal(request.subject.question.field,'plan');assert.deepEqual(owner.value.action.searched,[source]);
+ for(const turn of f.store.list<any>('research-turn'))assert.deepEqual(readResearchConsumerTurn(f.open(),reference(turn)),turn);
+ return owner;
+}
+function cutPaidReview(f:Ready) {
+ const write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{
+  const rows=write(writes,guards);
+  if(!cut&&writes.some(row=>row.kind==='model-call'&&(row.value as any).purpose==='escalation-assessor'&&(row.value as any).status==='succeeded')){
+   cut=true;throw new Error('S6.8 stop after paid reviewer receipt');
+  }
+  return rows;
+ }) as Store['writeMany'];
+ return ()=>{f.store.writeMany=write;assert.equal(cut,true);};
+}
+function edition(f:Ready) {
+ const plan=f.store.get<Question>(f.v.plan.id)!;f.discovery.reopen(plan.id,plan.revision);
+ const basis=f.discovery.evidence.document('p','next-plan','Another accepted plan edition.','text/plain',0);
+ answerDiscoveryFixture(f.engine,'p',f.store.get<DiscoveryDraft>(f.v.draft.id)!,f.store.get<Question>(plan.id)!,
+  validPlan(f.v.frameRef,[planQuestion('block','industry','blocking')],2,f.v.planAnswer),basis);
+ return f.store.get<Question>(plan.id)!.value.answer!;
+}
+for(const necessary of [true,false])
+ test(`S6.8: synthesis need_owner uses the logical subject and the real ${necessary?'necessary':'unnecessary'} review`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]),source=scenario(f,necessary);
+ const result=await f.run(3);assert.equal(result.value.status,necessary?'needs_owner':'completed',JSON.stringify(result.value));
+ const reviewed=proveOwner(f,necessary,source);assert.equal(f.wires().length,necessary?3:4);
+ if(!necessary){
+  const continuation=f.wires()[3].subject;
+  assert.deepEqual(continuation.previousProposalRef,reference(reviewed));
+  const archive=f.store.get(continuation.working.archive.id,continuation.working.archive.revision)!;
+  assert.deepEqual(reference(archive),continuation.working.archive);
+  const body=readArchiveBody(f.open(),archive).body;
+  assert.deepEqual(body.previousProposal,reviewed.value.action);
+  assert.ok(body.history.some((row:any)=>row.action?.action==='need_owner'&&row.observation?.necessary===false));
+  assert.ok(continuation.working.sections.some((section:any)=>section.pointer==='/body/history'));
+  assert.ok(f.store.list<any>('synthesis-session').some(row=>row.value.basis.previousProposalRef?.id===reviewed.id
+   && row.value.basis.previousProposalRef.revision===reviewed.revision));
+ }
+ assert.equal(f.store.list('research-attempt').length,necessary?0:1);
+ assert.deepEqual(result.value.ownerQuestion,necessary?{question:'block',reason:verdict(true).reason,searched:[source]}:null);
+ assert.deepEqual(reference(f.store.get(f.v.plan.id)!),reference(f.v.plan),'the already answered plan anchor is unchanged');
+ if(necessary)assert.deepEqual(planOwnerSubject(f.open(),result),{subject:{contract:'v7-plan-subject/v1',planAnswer:f.v.planAnswer,planQuestionId:'block'},question:f.store.list<any>('research-turn').find(row=>row.value.action?.action==='need_owner')!.value.question});
+ const before=snapshot(f),fixed=history(f);
+ for(let repeat=0;repeat<2;repeat++){
+  assert.deepEqual(await f.run(1,f.open(),false),result);assert.deepEqual(history(f),fixed);assert.deepEqual(snapshot(f),before);
+ }
+});
+for(const necessary of [true,false])
+ test(`S6.8: cold paid ${necessary?'necessary':'unnecessary'} review completes the synthesis turn before a new send`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]),source=scenario(f,necessary),restore=cutPaidReview(f);
+ try{await f.run(3);}finally{restore();}
+ assert.equal(f.wires().length,3);assert.equal(f.store.list('research-attempt').length,0);
+ const before=snapshot(f),result=await f.run(1,f.open(),false);
+ assert.equal(result.value.status,necessary?'needs_owner':'paused',JSON.stringify(result.value));
+ if(!necessary)assert.equal(result.value.pauseCode,'research_contract_upgrade_required');
+ proveOwner(f,necessary,source);assert.deepEqual(snapshot(f),before);assert.equal(f.store.list('research-attempt').length,0);
+ const fixed=history(f);
+ for(let repeat=0;repeat<2;repeat++){
+  assert.deepEqual(await f.run(1,f.open(),false),result);assert.deepEqual(history(f),fixed);assert.deepEqual(snapshot(f),before);
+ }
+});
+for(const necessary of [true,false])
+ test(`S6.8: an old edition's paid ${necessary?'necessary':'unnecessary'} review keeps its exact subject after a new plan`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]),source=scenario(f,necessary),restore=cutPaidReview(f);
+ try{await f.run(3);}finally{restore();}
+ const next=edition(f);assert.notDeepEqual(next,f.v.planAnswer);
+ const before=snapshot(f),result=await f.run(1,f.open(),false);
+ assert.equal(result.value.status,necessary?'needs_owner':'paused',JSON.stringify(result.value));
+ if(!necessary)assert.equal(result.value.pauseCode,'research_contract_upgrade_required');
+ proveOwner(f,necessary,source);assert.deepEqual(snapshot(f),before);assert.equal(f.store.list('research-attempt').length,0);
+ if(necessary)assert.deepEqual(planOwnerSubject(f.open(),result).subject,{contract:'v7-plan-subject/v1',planAnswer:f.v.planAnswer,planQuestionId:'block'});
+ const fixed=history(f);assert.deepEqual(await f.run(1,f.open(),false),result);assert.deepEqual(history(f),fixed);assert.deepEqual(snapshot(f),before);
+});
+test('S6.8: another subject read cannot authorize a synthesis owner review',async t=>{
+ const f=await setup(t,[planQuestion('a','industry','blocking'),planQuestion('block','market','blocking')]);
+ const source=f.discovery.evidence.document('p','other-subject','A source only A has consulted.','text/plain',0),ref=reference(source);
+ f.configure([{action:'read_plan',question:'$selected',reads:[{action:'read_source',source:ref,start:0,end:source.value.content.length}]},
+  ended(),{action:'synthesize',question:'$selected'},
+  {action:'need_owner',question:'$selected',reason:'Try using A history for B',searched:[ref]}]);
+ const result=await f.run(8);assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'owner_escalation_premature',JSON.stringify(result.value));
+ assert.equal(f.wires().length,4);assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).some(row=>row.value.kind==='escalation-assessor'),false);
+ const before=snapshot(f);await f.run(1,f.open(),false);assert.deepEqual(snapshot(f),before);
+});
+
+test('S6.8: a prepared owner review of an old plan cannot buy the new edition',async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);scenario(f,true);
+ const write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{const rows=write(writes,guards);
+  if(!cut&&writes.some(row=>row.kind==='research-consumer-intent'&&(row.value as any).kind==='escalation-assessor'&&(row.value as any).state==='prepared')){
+   cut=true;throw new Error('S6.8 cut before reviewer reservation');
+  }return rows;}) as Store['writeMany'];
+ try{await f.run(3);}finally{f.store.writeMany=write;}
+ assert.equal(cut,true);assert.equal(f.wires().length,2);edition(f);
+ const before=snapshot(f),result=await f.run(1,f.open());
+ assert.equal(result.value.pauseCode,'research_consumer_context_stale',JSON.stringify(result.value));
+ assert.deepEqual(snapshot(f),before);assert.equal(f.store.list('research-attempt').length,0);
+});
+
+test('S6.8: a second Store changing the plan before paid review application conflicts atomically and cold recovery applies once',async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]),source=scenario(f,true),restore=cutPaidReview(f);
+ try{await f.run(3);}finally{restore();}
+ const before=snapshot(f),write=f.store.writeMany.bind(f.store);let raced=false;
+ f.store.writeMany=((writes,guards=[])=>{
+  if(!raced&&writes.some(row=>row.kind==='research-consumer-intent'&&(row.value as any).kind==='escalation-assessor'&&(row.value as any).state==='applied')){
+   raced=true;const other=f.open();edition({...f,store:other,discovery:new Discovery(other),engine:new ProductEngine(other)});
+  }
+  return write(writes,guards);
+ }) as Store['writeMany'];
+ let paused;
+ try{paused=await f.run(1,f.store,false);}finally{f.store.writeMany=write;}
+ assert.equal(raced,true);assert.equal(paused.value.pauseCode,'input_stale',JSON.stringify(paused.value));
+ const review=listResearchConsumerIntents(f.store,'p',f.v.draft.id).find(row=>row.value.kind==='escalation-assessor')!;
+ assert.equal(review.value.state,'running');
+ assert.equal(f.store.list<any>('research-turn').find(row=>row.value.action?.action==='need_owner')!.value.status,'pending');
+ assert.equal(f.store.list('research-attempt').length,0);assert.deepEqual(snapshot(f),before);
+ const result=await f.run(1,f.open(),false);assert.equal(result.value.status,'needs_owner',JSON.stringify(result.value));
+ proveOwner(f,true,source);assert.deepEqual(snapshot(f),before);
+ const fixed=history(f);assert.deepEqual(await f.run(1,f.open(),false),result);assert.deepEqual(history(f),fixed);
+});

@@ -7,7 +7,7 @@ import type { DiscoveryDraft, Question } from "./discovery.js";
 import type { ResearchAnswer, ResearchRun } from "./research-model.js";
 import { consumerIntentContext, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn,
   type ResearchConsumerIntent } from "./response-recovery.js";
-import { planSubjectOf, type V7PlanSubject } from "./v7-managed-attempt.js";
+import { planSubjectOf, sameSubject, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { synthesisReservationConsumed, turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
 import { issuedAnswerSchemaHolds, orderedQuestions, proveIssuedAnswer, readExact,
   savedAcceptanceAct } from "./projection-reader.js";
@@ -249,6 +249,19 @@ export function selectV7AnalystRecovery(store: Store, projectId: string, draftId
     if (turn && value.kind !== "escalation-assessor") return { turns, intents, turn, outstanding: undefined };
   }
   return { turns, intents, turn, outstanding };
+}
+
+/** A rejected synthesis owner request becomes the exact previous proposal
+ * of its next synthesis. Its completed Ref carries the paid verdict, so a
+ * finished need_owner result cannot be delivered again under a new position. */
+export function rejectedPlanOwnerRequest(store: Store, turns: Revision<ManagedResearchTurn>[],
+  subject: V7PlanSubject): Revision<ManagedResearchTurn> | null {
+  const saved = turns.findLast(turn => sameSubject(planSubjectOf(turn.value), subject)
+    && turn.value.dispatchMode === "synthesis" && turnAction(turn.value).action === "need_owner");
+  if (!saved) return null;
+  const turn = readResearchConsumerTurn(store, reference(saved)) as Revision<ManagedResearchTurn>;
+  return turn.value.status === "completed" && obj(turn.value.observation)
+    && turn.value.observation.necessary === false ? turn : null;
 }
 
 /** A saved owner pause belongs to the paid turn, never to the plan field's answered flag. */
