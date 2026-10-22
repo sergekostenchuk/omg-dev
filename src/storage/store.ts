@@ -10,6 +10,8 @@ export interface Revision<T = Json> { id: string; kind: string; revision: number
 /** A saved revision's identity without its body. */
 export interface RevisionIdentity { id: string; kind: string; revision: number; hash: string }
 export interface Write { id: string; kind: string; expected: number; value: unknown }
+export interface AtomicWriteBatch<T> { value: T; writes: Write[]; guards: TransactionGuard[] }
+interface PreparedWrite extends Write { body: string; hash: string }
 export interface ReadGuard { id: string; revision: number; hash: string }
 export interface AbsentGuard { id: string; absent: true }
 export type TransactionGuard = ReadGuard | AbsentGuard;
@@ -354,9 +356,55 @@ export class Store {
     // Even a refused or rolled-back attempt: its guard reads are no pure proof (№2302-2).
     observer?.write(this);
     requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
-    const checkedGuards = checkTransactionGuards(guards);
+    requireCondition(!this.#writing, "store_atomic_prepare_invalid", "A write cannot be nested in atomic preparation");
+    const checkedGuards = checkTransactionGuards(guards), prepared = this.#prepareWrites(inputs);
+    this.#db.exec("BEGIN IMMEDIATE");
+    this.#writing = true;
+    try {
+      const results = this.#insert<T>(prepared, checkedGuards);
+      this.#db.exec("COMMIT");
+      this.#writing = false;
+      this.#commits++;
+      return results;
+    } catch (error) { this.#writing = false; this.#db.exec("ROLLBACK"); throw error; }
+  }
+  /** Prepare a product batch under the same write lock that commits it. Readers see this connection's committed
+   * snapshot; the callback is synchronous and gets no writing surface. An empty batch is a read-only repeat. */
+  atomicWrite<T>(prepare: (view: Store) => AtomicWriteBatch<T>): { value: T; records: Revision<unknown>[] } {
+    observer?.write(this);
+    requireCondition(!this.#busy && !this.#closed, "store_busy", "Store is closed or creating a snapshot");
+    requireCondition(!this.#writing && typeof prepare === 'function', "store_atomic_prepare_invalid", "Atomic preparation cannot be nested");
+    this.#db.exec("BEGIN IMMEDIATE");
+    this.#writing = true;
+    try {
+      const reads = new Set(['get', 'list', 'history', 'identities', 'headsMatch', 'changeStamp', 'lastEvent',
+        'events', 'integrityLedger', 'eventAt', 'proofCacheRead', 'proofCacheNode']);
+      const denied = () => { observer?.write(this); throw new EngineError('store_atomic_prepare_invalid', 'Atomic preparation permits reads only'); };
+      // Inherited methods let historical readers wrap this frozen surface in their tracing Proxy.
+      const methods = Object.create(Store.prototype) as Store, view = Object.create(methods) as Store;
+      Object.defineProperty(view, 'path', { value: this.path });
+      for (const name of Object.getOwnPropertyNames(Store.prototype)) {
+        if (name === 'constructor') continue;
+        const descriptor = Object.getOwnPropertyDescriptor(Store.prototype, name)!;
+        Object.defineProperty(methods, name, descriptor.get
+          ? { get: () => Reflect.get(this, name, this) }
+          : { value: name === 'proofCacheWrite' ? () => null : reads.has(name) ? (Reflect.get(this, name, this) as (...args: never[]) => unknown).bind(this) : denied });
+      }
+      Object.freeze(methods); Object.freeze(view);
+      const batch = prepare(view);
+      requireCondition(batch !== null && typeof batch === 'object' && typeof (batch as any).then !== 'function'
+        && Array.isArray(batch.writes), 'store_atomic_prepare_invalid', 'Atomic preparation returns a synchronous batch');
+      const prepared = this.#prepareWrites(batch.writes), guards = checkTransactionGuards(batch.guards);
+      const value = batch.value, records = this.#insert<unknown>(prepared, guards);
+      this.#db.exec("COMMIT");
+      this.#writing = false;
+      if (records.length) this.#commits++;
+      return { value, records };
+    } catch (error) { this.#writing = false; this.#db.exec("ROLLBACK"); throw error; }
+  }
+  #prepareWrites(inputs: Write[]): PreparedWrite[] {
     const ids = new Set<string>();
-    const prepared = inputs.map(input => {
+    return inputs.map(input => {
       requireCondition(typeof input.id === "string" && input.id.length > 0 && input.id.length <= 200
         && typeof input.kind === "string" && input.kind.length > 0 && Number.isSafeInteger(input.expected) && input.expected >= 0,
       "invalid_write", "A write needs an ID, kind and explicit expected revision");
@@ -365,36 +413,30 @@ export class Store {
       const body = canonical(input.value);
       return { ...input, body, hash: digest(body) };
     });
-    this.#db.exec("BEGIN IMMEDIATE");
-    // PF3 (№3424 §1 В4): inside the transaction every read keeps the uncached checked load and fills nothing.
-    this.#writing = true;
-    try {
-      for (const guard of checkedGuards) {
-        if ('absent' in guard) {
-          const head = this.#db.prepare("SELECT revision FROM heads WHERE entity_id=?").get(guard.id);
-          requireCondition(!head, "input_stale", `Input ${guard.id} appeared before the transaction could commit`);
-        } else {
-          const current = this.#get(guard.id);
-          requireCondition(current && current.revision === guard.revision && current.hash === guard.hash,
-            "input_stale", "An input changed before the transaction could commit");
-        }
+  }
+  #insert<T = Json>(prepared: PreparedWrite[], checkedGuards: TransactionGuard[]): Revision<T>[] {
+    for (const guard of checkedGuards) {
+      if ('absent' in guard) {
+        const head = this.#db.prepare("SELECT revision FROM heads WHERE entity_id=?").get(guard.id);
+        requireCondition(!head, "input_stale", `Input ${guard.id} appeared before the transaction could commit`);
+      } else {
+        const current = this.#get(guard.id);
+        requireCondition(current && current.revision === guard.revision && current.hash === guard.hash,
+          "input_stale", "An input changed before the transaction could commit");
       }
-      const results: Revision<T>[] = [];
-      for (const input of prepared) {
-        const current = this.get(input.id);
-        if ((current?.revision ?? 0) !== input.expected) throw new EngineError("revision_conflict", "Entity changed; reload before writing", { id: input.id });
-        requireCondition(!current || current.kind === input.kind, "kind_mismatch", "An entity cannot change its kind");
-        const revision = input.expected + 1;
-        this.#db.prepare("INSERT INTO revisions VALUES(?,?,?,?,?)").run(input.id, revision, input.kind, input.body, input.hash);
-        this.#db.prepare("INSERT INTO heads VALUES(?,?) ON CONFLICT(entity_id) DO UPDATE SET revision=excluded.revision").run(input.id, revision);
-        this.#db.prepare("INSERT INTO events(entity_id,revision) VALUES(?,?)").run(input.id, revision);
-        results.push({ id: input.id, kind: input.kind, revision, hash: input.hash, value: JSON.parse(input.body) as T });
-      }
-      this.#db.exec("COMMIT");
-      this.#writing = false;
-      this.#commits++;
-      return results;
-    } catch (error) { this.#writing = false; this.#db.exec("ROLLBACK"); throw error; }
+    }
+    const results: Revision<T>[] = [];
+    for (const input of prepared) {
+      const current = this.get(input.id);
+      if ((current?.revision ?? 0) !== input.expected) throw new EngineError("revision_conflict", "Entity changed; reload before writing", { id: input.id });
+      requireCondition(!current || current.kind === input.kind, "kind_mismatch", "An entity cannot change its kind");
+      const revision = input.expected + 1;
+      this.#db.prepare("INSERT INTO revisions VALUES(?,?,?,?,?)").run(input.id, revision, input.kind, input.body, input.hash);
+      this.#db.prepare("INSERT INTO heads VALUES(?,?) ON CONFLICT(entity_id) DO UPDATE SET revision=excluded.revision").run(input.id, revision);
+      this.#db.prepare("INSERT INTO events(entity_id,revision) VALUES(?,?)").run(input.id, revision);
+      results.push({ id: input.id, kind: input.kind, revision, hash: input.hash, value: JSON.parse(input.body) as T });
+    }
+    return results;
   }
   /**
    * PF4 (№3499 §3.1): the sequence of the last committed product event (0 for none). Writers are serialized and
@@ -556,7 +598,7 @@ export class Store {
    */
   proofCacheWrite(records: readonly ProofCacheRecord[], nodes: readonly ProofCacheNode[], limits: { roots: number; bytes: number }): ProofCacheWritten | null {
     requireCondition(!this.#closed, "store_busy", "Store is closed or creating a snapshot");
-    if (this.#busy) { eventCounters.cacheBusy++; return null; }
+    if (this.#busy || this.#writing) { eventCounters.cacheBusy++; return null; }
     this.#db.exec("PRAGMA busy_timeout=0; PRAGMA synchronous=NORMAL");
     try {
       try { this.#db.exec("BEGIN IMMEDIATE"); }
