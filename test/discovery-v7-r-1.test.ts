@@ -1,3 +1,5 @@
+import {synthesisSession} from '../src/discovery/synthesis-session.js';
+import {pilotEnvironment,readerPilot} from '../src/discovery/reader-pilot.js';
 import {prepareResearchConsumerIntent,prepareResearchConsumerApplication,readResearchConsumerExecution,completeResearchAttemptTurn} from '../src/discovery/response-recovery.js';
 import {projectPaidTurnAdmission,managedTurnId} from '../src/discovery/research-consumer-transition.js';
 import {recordV7Attempt} from '../src/discovery/v7-attempts.js';
@@ -17,11 +19,11 @@ import {createPartialV7Draft,V7_AXES,V7_STAGE_TOKEN_CEILING} from '../src/discov
 import {Store,type Revision} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {reference,type Ref} from '../src/pipeline/contracts.js';
-import {hashJson,type Json} from '../src/canonical.js';
+import {canonical,hashJson,type Json} from '../src/canonical.js';
 import {answerDiscoveryFixture} from './product-fixture.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {Researcher} from '../src/discovery/research-runner.js';
-import {applyDiscoveryAssessment,v7ProgressBaseline,readV7ProgressStateAt} from '../src/discovery/v7-progress.js';
+import {applyDiscoveryAssessment,v7ProgressBaseline,readV7ProgressStateAt,PROGRESS_EVENT_KIND} from '../src/discovery/v7-progress.js';
 import {assessAttemptsWithRequirements,readDiscoveryAssessment} from '../src/discovery/research-assessment.js';
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "omg-r1-"));
@@ -136,15 +138,15 @@ const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{t
 function assessmentWires(f: Awaited<ReturnType<typeof setup>>) { return f.wires().filter(w=>w.subject.assessmentSubject); }
 function counters(f: Awaited<ReturnType<typeof setup>>) {
   return {calls:f.wires().length,ledger:f.store.list('research-budget-ledger'),
-    accounts:f.store.list('v7-attempt-account'),events:f.store.list('v7-progress-event'),
+    accounts:f.store.list('v7-attempt-account'),events:f.store.list(PROGRESS_EVENT_KIND),
     states:f.store.list('v7-progress-state'),attempts:f.store.list('research-attempt')};
 }
-function cutAt(f: Awaited<ReturnType<typeof setup>>, boundary:'paid'|'published'|'before-apply'|'after-apply') {
+function cutAt(f: Awaited<ReturnType<typeof setup>>, boundary:'unpaid'|'paid'|'published'|'before-apply'|'after-apply') {
   const write=f.store.writeMany.bind(f.store);let hit=false;
   f.store.writeMany=((writes,guards=[])=>{
-    const selected=writes.some(w=>boundary==='paid'?w.kind==='model-call'&&(w.value as any).purpose==='assessor'&&(w.value as any).status==='succeeded':
+    const selected=writes.some(w=>boundary==='unpaid'?w.kind==='assessment-session':boundary==='paid'?w.kind==='model-call'&&(w.value as any).purpose==='assessor'&&(w.value as any).status==='succeeded':
       boundary==='published'?w.kind==='discovery-assessment':w.kind==='v7-progress-application');
-    if(!hit&&selected){hit=true;if(boundary!=='before-apply')write(writes,guards);throw new Error('R1 cut '+boundary);}
+    if(!hit&&selected){hit=true;if(boundary!=='before-apply'&&boundary!=='unpaid')write(writes,guards);throw new Error('R1 cut '+boundary);}
     return write(writes,guards);
   }) as typeof f.store.writeMany;
   return ()=>{f.store.writeMany=write;assert.ok(hit,'the real producer reached '+boundary);};
@@ -335,4 +337,160 @@ test('R.1: a forged account cannot suppress assessment or authorize run completi
  for(const policy of [false,true]){const result=await f.run(1,f.open(),policy);assert.equal(result.value.status,'paused');
   assert.equal(result.value.pauseCode,'discovery_progress_conflict',JSON.stringify(result.value));assert.deepEqual(counters(f),before);}
  assert.equal(f.store.list('v7-progress-state').length,0);assert.equal(f.store.list('discovery-assessment').length,0);
+});
+
+
+test('R.1-01: a stale assessor continuation pauses its own running revision and cold replay never becomes busy',async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ writeFileSync(f.settings,JSON.stringify({replies:[],tokens:10,assessmentReply:{action:'assessment_checkpoint',notes:['Continue exact packet']}}));
+ const restore=cutAt(f,'paid');await f.run();restore();
+ const waiting=await f.run(1,f.open(),false);assert.equal(waiting.value.pauseCode,'research_assessment_pending');
+ acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','market')]);
+ const before=counters(f);
+ const stale=await f.run(1,f.open());assert.equal(stale.value.status,'paused',JSON.stringify(stale.value));
+ assert.equal(stale.value.pauseCode,'input_stale',JSON.stringify(stale.value));assert.deepEqual(counters(f),before);
+ for(const policy of [false,true]){
+  const repeated=await f.run(1,f.open(),policy);
+  assert.equal(repeated.value.status,'paused');assert.notEqual(repeated.value.pauseCode,'research_busy');
+  assert.deepEqual(counters(f),before);
+ }
+});
+
+test('R.1-01: a genuine competing Store CAS wins over checkpoint activation without being overwritten',async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]),restore=cutAt(f,'unpaid');
+ const stopped=await f.run();restore();
+ const cold=f.open(),competitor=f.open(),write=cold.writeMany.bind(cold);let winner:Revision<ResearchRun>|undefined;
+ cold.writeMany=((writes,guards=[])=>{
+  if(!winner&&writes.some(w=>w.id===stopped.id&&(w.value as any).status==='running')){
+   const current=competitor.get<ResearchRun>(stopped.id)!;
+   winner=competitor.write<ResearchRun>({id:current.id,kind:current.kind,expected:current.revision,
+    value:{...current.value,status:'paused',pauseCode:'research_interrupted',error:'Competing researcher stopped this run'}});
+  }
+  return write(writes,guards);
+ }) as typeof cold.writeMany;
+ const before=counters(f),result=await f.run(1,cold);
+ assert.ok(winner);assert.deepEqual(result,winner);assert.deepEqual(f.store.get(stopped.id),winner);
+ assert.deepEqual(counters(f),before);
+});
+
+async function reserveNextSynthesis(f:Awaited<ReturnType<typeof setup>>,boundary:'session'|'prepared'|'paid',materials:unknown[]=[]){
+ f.engine.execute({type:'configure-reader-pilot',project:'p',expected:0,settings:{experimental:true,active:true,stopAfter:'L2',
+  reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command:f.command},agentCommand:f.command,
+  maxRequestChars:100000,maxReadChars:20000,maxReplyChars:200000,maxCalls:50,maxReportedTokens:100000}});
+ const pilot=readerPilot(f.store,'p')!,run=f.store.list<ResearchRun>('research-run')[0]!,number=run.value.turns+1;
+ const subject={contract:V7_PLAN_SUBJECT_CONTRACT,planAnswer:f.v.planAnswer,planQuestionId:'support'};
+ const write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{
+  const result=write(writes,guards);
+  if(!cut&&writes.some(w=>boundary==='session'?w.kind==='synthesis-session'&&w.expected===0:
+   boundary==='prepared'?w.kind==='research-consumer-intent'&&(w.value as any).kind==='synthesis'&&(w.value as any).state==='prepared':
+   w.kind==='model-call'&&(w.value as any).purpose==='analyst'&&(w.value as any).status==='succeeded')){
+   cut=true;throw new Error('R1 synthesis cut '+boundary);
+  }
+  return result;
+ }) as typeof f.store.writeMany;
+ try{
+  await assert.rejects(synthesisSession(f.store,f.v.draft,f.v.plan,f.environment,pilotEnvironment(f.environment.value,pilot.value),pilot,
+   {role:'research',stage:'discovery',subject,workingSelections:materials,inventory:{sources:[]},history:[]},'Synthesize the exact next subject',undefined,
+   {delivery:{run:run.id,turn:number},reserve:{write:{id:run.id,kind:run.kind,expected:run.revision,value:{...run.value,turns:number}},guards:[reference(run)]}}),
+   new RegExp('R1 synthesis cut '+boundary));
+ }finally{f.store.writeMany=write;}
+ assert.ok(cut);return f.store.list<any>('synthesis-session')[0]!;
+}
+
+for(const assessment of ['published','unpaid'] as const)for(const step of ['session','prepared'] as const)
+test(`R.1-02: ${step}-only v3 synthesis waits for the prior ${assessment} assessment before any new send`,async t=>{
+ const f=await setup(t),restore=cutAt(f,assessment);await f.run();restore();
+ await reserveNextSynthesis(f,step);
+ const before=counters(f),waiting=await f.run(1,f.open(),false);
+ assert.equal(waiting.value.status,'paused');assert.equal(waiting.value.pauseCode,
+  assessment==='published'?'research_restore_complete':'research_assessment_pending',JSON.stringify(waiting.value));
+ assert.equal(f.wires().length,before.calls);assert.deepEqual(f.store.list('research-budget-ledger'),before.ledger);
+ assert.equal(f.store.list('v7-attempt-account').length,assessment==='published'?1:0);
+ const cold=f.open(),write=cold.writeMany.bind(cold);let sent=false;
+ cold.writeMany=((writes,guards=[])=>{
+  if(writes.some(w=>w.kind==='model-call'&&w.expected===0&&(w.value as any).purpose==='analyst')){
+   sent=true;const state=cold.list<any>('v7-progress-state')[0]!;assert.ok(state);
+   assert.equal(readV7ProgressStateAt(cold,reference(state)).value.summary.count,1);
+   assert.equal(cold.list('v7-attempt-account').length,1,'The first complete paid application precedes synthesis');
+  }
+  return write(writes,guards);
+ }) as typeof cold.writeMany;
+ const done=await f.run(1,cold);assert.ok(sent,JSON.stringify(done.value));
+ assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ assert.equal(done.value.turns,2);assert.equal(f.store.list('research-attempt').length,2);
+ assert.equal(f.store.list('v7-attempt-account').length,2);
+ const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
+});
+
+test('R.1-02: a paid v3 synthesis result restores before its unpaid prior assessment without another call',async t=>{
+ const f=await setup(t),restore=cutAt(f,'unpaid');await f.run();restore();
+ const session=await reserveNextSynthesis(f,'paid');
+ const before=counters(f),waiting=await f.run(1,f.open(),false);
+ assert.equal(waiting.value.status,'paused');assert.equal(waiting.value.pauseCode,'research_assessment_pending',JSON.stringify(waiting.value));
+ assert.equal(f.wires().length,before.calls);assert.deepEqual(f.store.list('research-budget-ledger'),before.ledger);
+ assert.equal(f.store.list('v7-attempt-account').length,0);assert.equal(f.store.list('v7-progress-state').length,0);
+ assert.equal(f.store.list('research-attempt').length,2,'The already paid synthesis end and K were restored');
+ assert.ok(f.store.get<any>(session.id)!.value.delivered);
+ const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
+});
+
+
+test('R.1-02: a paid intermediate v3 checkpoint restores its note before gating the next synthesis send',async t=>{
+ const f=await setup(t),restore=cutAt(f,'unpaid');await f.run();restore();
+ const source=f.discovery.evidence.document('p','checkpoint-material','A delivered clause and its exception.','text/plain',0);
+ const material={kind:'context',value:f.discovery.evidence.observe('p',reference(source),
+  {kind:'text-range',start:0,end:source.value.content.length})};
+ f.configure([ended(),{action:'checkpoint',question:'$selected',value:{finding:'The delivered clause has an exception'},
+  citations:[{source:material.value.source,selector:material.value.selector}],unresolved:[]}]);
+ const session=await reserveNextSynthesis(f,'paid',[material]),before=counters(f);
+ const waiting=await f.run(1,f.open(),false);
+ assert.equal(waiting.value.status,'paused');assert.equal(waiting.value.pauseCode,'research_assessment_pending',JSON.stringify(waiting.value));
+ assert.equal(f.wires().length,before.calls);assert.deepEqual(f.store.list('research-budget-ledger'),before.ledger);
+ const restored=f.store.get<any>(session.id)!;assert.equal(restored.value.result,null);assert.ok(restored.value.notes.length);
+ assert.equal(f.store.list('research-checkpoint').length,1);assert.equal(f.store.list('research-attempt').length,1);
+ assert.equal(f.store.list('v7-attempt-account').length,0);
+ const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
+ f.configure();const cold=f.open(),write=cold.writeMany.bind(cold);let resumed=false;
+ cold.writeMany=((writes,guards=[])=>{
+  if(writes.some(w=>w.kind==='model-call'&&w.expected===0&&(w.value as any).purpose==='analyst')){
+   resumed=true;assert.equal(cold.list('v7-attempt-account').length,1);
+   assert.equal(readV7ProgressStateAt(cold,reference(cold.list<any>('v7-progress-state')[0]!)).value.summary.count,1);
+  }
+  return write(writes,guards);
+ }) as typeof cold.writeMany;
+ const done=await f.run(1,cold);assert.ok(resumed,JSON.stringify(done.value));
+ assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(done.value.turns,2);
+ assert.equal(f.store.list('v7-attempt-account').length,2);assert.equal(f.wires().length,before.calls+3);
+});
+
+for (const boundary of ['unpaid','prepared-assessor'] as const)
+test(`R.1: replacement edition leaves ${boundary} old assessment uncounted and completes its own exact subject`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ const write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{
+  if(!cut&&writes.some(w=>boundary==='unpaid'?w.kind==='assessment-session':
+    w.kind==='model-call'&&w.expected===0&&(w.value as any).purpose==='assessor')){
+   cut=true;throw new Error('before old assessor payment');
+  }
+  return write(writes,guards);
+ }) as Store['writeMany'];
+ await f.run();f.store.writeMany=write;assert.ok(cut);
+ const old=f.store.list('research-attempt')[0]!,oldRef=reference(old);
+ const next=acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','market')]);
+ const calls=f.wires().length,ledger=f.store.list('research-budget-ledger');
+ const pending=await f.run(1,f.open(),false);
+ assert.equal(pending.value.pauseCode,'research_assessment_pending',JSON.stringify(pending.value));
+ assert.equal(f.wires().length,calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+ const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ assert.deepEqual(f.wires().filter(w=>!w.subject.assessmentSubject).map(w=>w.subject.question.id),['block','new']);
+ assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planAnswer),[next.planAnswer]);
+ assert.deepEqual(f.store.get(old.id,old.revision),old);
+ assert.equal(f.store.list('v7-attempt-account').length,1);
+ const state=f.store.list<any>('v7-progress-state')[0]!;
+ assert.deepEqual(state.value.subject.planAnswer,next.planAnswer);assert.equal(state.value.summary.count,1);
+ const paid=readDiscoveryAssessment(f.store,'p',reference(f.store.list<any>('discovery-assessment')[0]!));
+ assert.ok(paid.value.subject.packet.entries.every(e=>canonical(e.attempt)!==canonical(oldRef)));
+ const before=counters(f),history=f.history();const cold=await f.run(1,f.open(),false);
+ assert.deepEqual(cold,done);assert.deepEqual(counters(f),before);assert.deepEqual(f.history(),history);
 });

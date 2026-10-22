@@ -195,6 +195,11 @@ const position=seen.filter(line=>JSON.parse(line).subject?.dispatchMode!=='conso
 let research=c.dispatchMode==='consolidation'
   ?{action:'checkpoint',question:c.question.id,value:{summaries:c.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:c.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
   :queue[position]??{action:'pause',reason:'calibration'};
+if(c.assessmentSubject){
+ const packet=c.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(c.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research={verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+}
 research=JSON.parse(JSON.stringify(research).replaceAll('$q',c.question?.id??'probe'));
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   f.engine.execute({ type: "create-project", project, title: project });
@@ -212,6 +217,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   for (const purpose of ["analyst", "reading-planner"])
     await researchCall(environment.value.implementer, environment.value, "Calibrate", {}, undefined,
       { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose });
+  await researchCall(environment.value.reviewer, environment.value, "Calibrate assessor", {}, undefined,
+    { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: "assessor" });
   writeFileSync(wire, ""); usage(10);
   const base = createPartialV7Draft(f.discovery, project, "concept");
   const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
@@ -658,7 +665,7 @@ test("S5-03 writer ≡ reader on the inherited runner prefix: A's session inheri
   // The real runner (no v7 planning settings: the analyst path R) — A first as the blocking plan-question.
   // A second subject's read_context in the same run is not reachable today (the R defect reported to S6),
   // so the prefix carries A's lookup and A's lawful end, and B only pauses.
-  f.configure([{ action: "read_context", record: reference(f.p.draft), pointer: "/fields/plan" }, endOf(ENDS.refused),
+  f.configure([{ action: "read_context", record: reference(f.p.draft), pointer: "/fields/plan" }, endOf(ENDS.refused), null,
     { action: "pause", reason: "hold B" }]);
   const run = await new Researcher(f.store, new Discovery(f.store), f.engine.environments)
     .run(f.p.project, f.p.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
@@ -796,7 +803,7 @@ test("S5 круг 3 ОТСУТСТВИЕ: a v3 basis material proves its kind's 
 test("S5-05 the previous proposal of a v3 basis is a paid turn proven by the common turn reader: a forged same-subject turn is refused before any record or payment; A's own paid turn from the real runner is accepted", async t => {
   const f = await paidPlanned(t, "s5r3-proposal");
   const A = subjectOf(f.p.planAnswer, "q-supply");
-  f.configure([endOf(ENDS.refused), { action: "pause", reason: "hold B" }]);
+  f.configure([endOf(ENDS.refused), null, { action: "pause", reason: "hold B" }]);
   const run = await new Researcher(f.store, new Discovery(f.store), f.engine.environments)
     .run(f.p.project, f.p.draft.id, 8, undefined, { producerPolicy: { discovery: 7 } });
   assert.equal(run.value.pauseCode, "research_model_paused", JSON.stringify(run.value));

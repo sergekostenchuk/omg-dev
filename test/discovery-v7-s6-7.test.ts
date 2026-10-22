@@ -1,3 +1,4 @@
+import { readV7ProgressStateAt } from '../src/discovery/v7-progress.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
@@ -73,11 +74,16 @@ async function setup(t: test.TestContext, questions = [planQuestion('support','m
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-const position=previous.filter(line=>JSON.parse(line).subject?.dispatchMode!=='consolidation').length;
+const position=previous.map(line=>JSON.parse(line)).filter(row=>row.subject?.dispatchMode!=='consolidation'&&!row.subject?.assessmentSubject).length;
 let research=r.subject?.dispatchMode==='consolidation'
  ?{action:'checkpoint',question:r.subject.question.id,value:{summaries:r.subject.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:r.subject.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
  :s.replies[position]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+} 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure('p',{workspace:f.root,
@@ -100,6 +106,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     await researchCall({actor:'reader',model:'fixture',effort:'high',speed:'inherited',command},environment.value,
       'Calibrate reader',{role:'reader'},undefined,
       {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'reader'});
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate assessor',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'assessor'});
     configure();writeFileSync(wire,'');
   };
   if (calibrated) await calibrate();
@@ -133,7 +141,7 @@ const synthesisIntent = (f:Ready) => listResearchConsumerIntents(f.store,'p',f.v
 function handoff(writes:Write[]) {
  return writes.some(row=>row.kind==='research-turn' && row.expected===0 && (row.value as any).dispatchMode==='synthesis');
 }
-function verifyDelivery(f:Ready) {
+function verifyDelivery(f:Ready, assessments=0) {
  const intent=synthesisIntent(f),session=readSynthesisSessionV3(f.open(),reference(sessions(f.store)[0]!));
  const turns=f.store.list<any>('research-turn').filter(row=>row.value.dispatchMode==='synthesis');
  assert.equal(turns.length,1);const turn=turns[0]!,original=f.store.get<any>(turn.id,1)!;
@@ -147,7 +155,16 @@ function verifyDelivery(f:Ready) {
  assert.deepEqual(binding.inputs.call,intent.value.call);
  assert.equal(f.store.list('research-attempt').length,1);
  assert.deepEqual(binding.attempt.value.call,intent.value.call);
- assert.equal(f.wires().length,2,'one planner and one synthesis call');
+ assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,2,'one planner and one synthesis call');
+ assert.equal(f.wires().filter(w=>w.subject.dispatchMode==='planning').length,1);
+ assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,assessments);
+ assert.equal(f.store.list('v7-progress-application').length,assessments);
+ assert.equal(f.wires().length,2+assessments);
+ for(const wire of f.wires().filter(w=>w.subject.assessmentSubject)) {
+  assert.deepEqual(wire.subject.assessmentSubject.packet.planAnswer,f.v.planAnswer);
+  assert.equal(wire.subject.assessmentSubject.packet.planQuestionId,'block');
+ }
+ for(const state of f.store.list('v7-progress-state'))readV7ProgressStateAt(f.open(),reference(state));
  return {intent,session,turn,original,binding};
 }
 
@@ -189,7 +206,8 @@ for(const boundary of boundaries)
   assert.equal(synthesisIntent(f).value.outputs!.some(ref=>ref.id===turnWrite.id),false);
  }
  const before=paid(f),result=await f.run(3,f.open(),false);
- assert.equal(result.value.status,'completed',JSON.stringify(result.value));assert.deepEqual(paid(f),before);
+ assert.equal(result.value.status,'paused',JSON.stringify(result.value));
+ assert.equal(result.value.pauseCode,'research_assessment_pending');assert.deepEqual(paid(f),before);
  verifyDelivery(f);
  const fixed=productHistory(f);
  for(let repeat=0;repeat<2;repeat++){
@@ -215,7 +233,7 @@ test('S6.7: a lawfully re-prepared synthesis claims once and hands off its actua
  new ProductEngine(other).execute({type:'configure-reader-pilot',project:'p',expected:pilot.revision,
   settings:{...settings,maxReplyChars:settings.maxReplyChars+1}});
  const result=await f.run(3,f.open());assert.equal(result.value.status,'completed',JSON.stringify(result.value));
- const saved=verifyDelivery(f),history=f.store.history<any>(first.id);
+ const saved=verifyDelivery(f,1),history=f.store.history<any>(first.id);
  assert.deepEqual(history.map(row=>row.value.state),['prepared','prepared','running','applied','applied']);
  assert.deepEqual(saved.intent.value.profile,reference(readerPilot(f.store,'p')!));
  const fixed=productHistory(f),before=paid(f);await f.run(3,f.open(),false);
@@ -225,7 +243,7 @@ test('S6.7: a lawfully re-prepared synthesis claims once and hands off its actua
 test('S6.7: delivery projection refuses an absent basis, a foreign position and a second append',async t=>{
  const f=await setup(t,[planQuestion('block','industry','blocking')]);f.configure([toSynthesis,ended()]);
  assert.equal((await f.run(3)).value.status,'completed');
- const {intent,original}=verifyDelivery(f);
+ const {intent,original}=verifyDelivery(f,1);
  const applied=f.store.get<any>(intent.id,intent.revision-1)!,running=f.store.get<any>(intent.id,intent.revision-2)!;
  assert.deepEqual(projectSynthesisHandoffIntent(applied,running,reference(original)),intent.value);
  for(const change of [

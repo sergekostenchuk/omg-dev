@@ -1,3 +1,4 @@
+import { readV7ProgressStateAt } from '../src/discovery/v7-progress.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
@@ -84,8 +85,14 @@ async function setup(t: test.TestContext, questions = [planQuestion('support', '
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
+let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+} 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command = { executable: process.execPath, args: [adapter] };
   const environment = f.engine.environments.configure('p', { workspace: f.root,
@@ -99,10 +106,12 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   configure([ended(), { necessary: true, reason: 'Calibration review' }], 10);
   await researchCall(environment.value.reviewer, environment.value, 'Calibrate reviewer', {}, undefined,
     { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'escalation-assessor' });
+  await researchCall(environment.value.reviewer, environment.value, 'Calibrate assessor', {}, undefined,
+    { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'assessor' });
   configure(); writeFileSync(wire, '');
   const v = acceptPlan(f, 'p', questions);
-  const run = (limit = 8, store = f.store) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
-    .run('p', v.draft.id, limit, undefined, { producerPolicy: { discovery: 7 } });
+  const run = (limit = 8, store = f.store, policy = true) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
+    .run('p', v.draft.id, limit, undefined, policy ? { producerPolicy: { discovery: 7 } } : {});
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).length;
   const history = () => f.store.list().map(row => [row.id, row.revision, row.hash]);
   /** A cold summary: a fresh Store, no adapter call, no model-call, ledger or any other write. */
@@ -177,10 +186,18 @@ for (const [name, limit, replies, tokens, code] of [
     assert.ok(!/Логический вопрос: (block|support)/.test(text));
   });
 
-test('S6.9: a completed run with recorded attempts but no applied assessment keeps the stage researching — nothing is accepted', async t => {
+test('S6.9: a completed run with applied return/noProgress assessments keeps the stage researching — nothing is accepted', async t => {
   const f = await setup(t); f.configure([ended('refused'), ended()]);
   const run = await f.run(); assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
   assert.equal(f.store.list('research-attempt').length, 2);
+  assert.equal(f.store.list('v7-progress-application').length, 2);
+  for(const state of f.store.list('v7-progress-state')) {
+    const proof=readV7ProgressStateAt(f.open(),reference(state));
+    assert.deepEqual(proof.value.subject.planAnswer,f.v.planAnswer);
+  }
+  for (const state of f.store.list<any>('v7-progress-state')) {
+    assert.equal(state.value.summary.count, 1); assert.equal(state.value.summary.streak, 1);
+  }
   const { summary, candidate, text } = f.cold();
   assert.equal(summary.accepted, null, 'no accepted Discovery appears');
   assert.equal(candidate.state, 'researching'); assert.equal(candidate.run!.status, 'completed');
@@ -218,3 +235,28 @@ for (const damage of ['pause reason', 'pause turn subject', 'run turn count', 'o
     assert.ok(text.includes(`Отказ чтения запуска кандидата ${expected}`), text);
     assert.ok(!text.includes('Логический вопрос'));
   });
+
+
+test('S6.9: an unpaid assessment pause keeps the finished K and an unbound logical question without accepting Discovery', async t => {
+  const f=await setup(t),write=f.store.writeMany.bind(f.store);let cut=false;
+  f.store.writeMany=((writes,guards=[])=>{
+    if(!cut&&writes.some(w=>w.kind==='assessment-session')){cut=true;throw new Error('Before unpaid assessor');}
+    return write(writes,guards);
+  }) as Store['writeMany'];
+  await f.run();f.store.writeMany=write;assert.ok(cut);
+  const calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger'),wire=f.wires();
+  const run=await f.run(8,f.open(),false);
+  assert.equal(run.value.status,'paused');assert.equal(run.value.pauseCode,'research_assessment_pending');
+  assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.store.list('research-attempt-binding').length,1);
+  assert.equal(f.store.list('v7-progress-application').length,0);
+  assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  const {summary,candidate,text}=f.cold();
+  assert.equal(summary.accepted,null);assert.equal(candidate.state,'researching');
+  assert.equal(candidate.run!.subjectBinding,'unbound');assert.equal(candidate.run!.pauseCode,'research_assessment_pending');
+  assert.ok(text.includes('Логический вопрос: не закреплён'),text);
+  assert.ok(!text.includes('Логический вопрос: block')&&!text.includes('Логический вопрос: support'),text);
+  const history=()=>f.store.list().flatMap(row=>f.store.history(row.id).map(reference));
+  const fixed=history();assert.deepEqual(await f.run(8,f.open(),false),run);
+  f.cold();assert.deepEqual(history(),fixed);assert.equal(f.wires(),wire);
+  assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+});

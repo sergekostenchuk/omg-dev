@@ -73,8 +73,14 @@ async function setup(t: test.TestContext, questions = [planQuestion('support','m
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
+let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+} 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure('p',{workspace:f.root,
@@ -89,6 +95,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
     await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
       {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate assessor',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'assessor'});
     configure();writeFileSync(wire,'');
   };
   if (calibrated) await calibrate();
@@ -151,7 +159,8 @@ test('S6.2: a cold paid turn finishes before the next prepared analyst admission
   assert.equal(selected.outstanding, undefined);
   const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
   const cold = f.open(), resumed = await f.run(1, cold, false);
-  assert.equal(resumed.value.pauseCode, 'research_contract_upgrade_required', JSON.stringify(resumed.value));
+  assert.equal(resumed.value.status, 'paused');
+  assert.equal(resumed.value.pauseCode, 'research_assessment_pending', JSON.stringify(resumed.value));
   assert.equal(cold.list('research-attempt').length, 1, 'the prior paid result finishes before admitting a new call');
   assert.equal(cold.list('research-attempt-binding').length, 1);
   assert.equal(cold.get<any>(next.id)!.value.state, 'prepared');
@@ -159,10 +168,12 @@ test('S6.2: a cold paid turn finishes before the next prepared analyst admission
   assert.equal(f.wires().length, 1);
   const done = await f.run(1, cold);
   assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
-  assert.deepEqual(f.wires().map(wire => wire.subject.question.id), ['block', 'support']);
+  assert.deepEqual(f.wires().filter(wire => !wire.subject.assessmentSubject).map(wire => wire.subject.question.id), ['block', 'support']);
+  assert.deepEqual(f.wires().filter(wire => wire.subject.assessmentSubject).map(wire => wire.subject.assessmentSubject.packet.planQuestionId), ['block', 'support']);
+  assert.equal(cold.list('v7-progress-application').length, 2);
   assert.equal(cold.list('research-attempt').length, 2);
   const before = f.history(); assert.deepEqual(await f.run(1, f.open(), false), done);
-  assert.deepEqual(f.history(), before); assert.equal(f.wires().length, 2);
+  assert.deepEqual(f.history(), before); assert.equal(f.wires().length, 4);
 });
 
 test('S6.2: two genuine prepared admissions claiming one position refuse without a send', async t => {
@@ -184,7 +195,8 @@ test('S6.2: an old paid attempt completes its own binding before selecting the r
   const oldAttempt = f.store.list('research-attempt')[0]!, nextPlan = nextEdition(f);
   const calls = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
   const cold = f.open(), result = await f.run(1, cold, false);
-  assert.equal(result.value.pauseCode, 'research_contract_upgrade_required', JSON.stringify(result.value));
+  assert.equal(result.value.status, 'paused');
+  assert.equal(result.value.pauseCode, 'research_assessment_pending', JSON.stringify(result.value));
   assert.deepEqual(cold.list('research-attempt'), [oldAttempt]);
   assert.equal(cold.list('research-attempt-binding').length, 1);
   assert.deepEqual(proveAttempt(cold, reference(oldAttempt)).attempt.value.planAnswer, f.v.planAnswer);
@@ -197,9 +209,14 @@ test('S6.2: an old paid attempt completes its own binding before selecting the r
   assert.deepEqual(new Set(attempts.map(attempt => canonical(attempt.planAnswer))),
     new Set([canonical(f.v.planAnswer), canonical(nextPlan)]));
   assert.equal(new Set(attempts.map(attempt => canonical(attempt.call))).size, 2, 'the replacement edition buys its own call');
-  assert.equal(f.wires().length, 2);
+  assert.equal(f.wires().length, 3);
+  assert.equal(f.wires().filter(wire => wire.subject.assessmentSubject).length, 1);
+  assert.deepEqual(f.wires().filter(wire => !wire.subject.assessmentSubject).map(wire => wire.subject.question.id), ['block', 'block']);
+  const app = cold.list<any>('v7-progress-application')[0]!;
+  assert.deepEqual(app.value.subject.planAnswer, nextPlan);
+  assert.equal(cold.list('v7-attempt-account').length, 1);
   const before = f.history(); assert.deepEqual(await f.run(1, f.open(), false), done);
-  assert.deepEqual(f.history(), before); assert.equal(f.wires().length, 2);
+  assert.deepEqual(f.history(), before); assert.equal(f.wires().length, 3);
 });
 
 test('S6.2: an unpaid old-edition admission is retained but cannot send under the replacement plan', async t => {

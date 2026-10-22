@@ -13,6 +13,7 @@ import { EngineError } from '../src/errors.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { Researcher } from '../src/discovery/research-runner.js';
+import { proveAttempt } from '../src/discovery/v7-plan-questions.js';
 import { readResearchConsumerIntent, consumerIntentContext, preparationBinding, CONSUMER_INTENT_V2,
   type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
 import { CONTEXT_PREPARATION_CONTRACT, CONTEXT_PREPARATION_KIND, ARCHIVE_PARTS_CONTRACT, readPreparationRecord, prepareContextPreparation,
@@ -88,9 +89,15 @@ async function setup(t: test.TestContext, questions = [planQuestion('block', 'in
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
+let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.action==='$readOwnArchive')research={action:'read_context',record:r.subject.working.archive,pointer:research.pointer??'/body/role'};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+} 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command = { executable: process.execPath, args: [adapter] };
   const environment = f.engine.environments.configure('p', { workspace: f.root,
@@ -105,6 +112,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     configure([ended(), { necessary: true, reason: 'Calibration review' }], tokens);
     await researchCall(environment.value.reviewer, environment.value, 'Calibrate reviewer', {}, undefined,
       { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'escalation-assessor' });
+    await researchCall(environment.value.reviewer, environment.value, 'Calibrate assessor', {}, undefined,
+      { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'assessor' });
     configure(); writeFileSync(wire, '');
   };
   if (calibrated) await calibrate();
@@ -150,7 +159,8 @@ test('DRS1a2 first compact v7 analyst send: no prior preparation, one batch publ
   const done = await f.run();
   assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
   f.store.writeMany = write;
-  assert.equal(f.wires().length, 1);
+  assert.equal(f.wires().length, 2);
+  assert.equal(f.wires().filter(w => w.subject.assessmentSubject).length, 1);
   // One publication batch carried the new parts, the preparation and the intent, all expected:0.
   assert.equal(publications.length, 1, JSON.stringify(publications));
   assert.ok(publications[0]!.includes('context-preparation@0') && publications[0]!.includes('research-consumer-intent@0')
@@ -191,7 +201,8 @@ test('DRS1a2 continuation from a compact foundation: the call reads its own comp
   const done = await f.run();
   assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
   const wires = f.wires();
-  assert.equal(wires.length, 2);
+  assert.equal(wires.length, 3);
+  assert.equal(wires.filter(w => w.subject.assessmentSubject).length, 1);
   const first = wires[0]!.subject, second = wires[1]!.subject;
   assert.equal(first.continuation.kind, 'initial');
   assert.equal(second.continuation.kind, 'continuation');
@@ -287,7 +298,7 @@ test('DRS1a2 batch atomicity: a revision_conflict injected inside the publicatio
   assert.equal(f.intents().length, 1);
   assert.equal(intent!.value.preparation!.revision, 1);
   assert.equal(f.store.history(injected!.id).length, 1);
-  assert.equal(f.wires().length, 1, 'paid once');
+  assert.equal(f.wires().length, 2, 'one analyst and one assessor');
 });
 
 test('DRS1a2 budget refusal before the send: the compact intent waits prepared with its preparation, no call; the later run sends that exact intent once', async t => {
@@ -304,7 +315,7 @@ test('DRS1a2 budget refusal before the send: the compact intent waits prepared w
   f.configure([ended()]);
   const done = await f.run();
   assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
-  assert.equal(f.wires().length, 1);
+  assert.equal(f.wires().length, 2);
   const [sent] = f.intents();
   assert.equal(sent!.id, prepared!.id, 'the same compact intent was sent');
   assert.deepEqual(sent!.value.preparation, prepared!.value.preparation);
@@ -322,15 +333,28 @@ test('DRS1a2 crash after the physical outcome, before the application: the cold 
   assert.equal(cut, true);
   assert.equal(paused.value.status, 'paused', JSON.stringify(paused.value));
   f.store.writeMany = write;
-  const calls = f.wires().length;
+  const calls = f.wires().length, ledger = f.store.list('research-budget-ledger');
   assert.equal(calls, 1);
   const done = await f.run(8, f.open(), false, false);
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status, 'paused', JSON.stringify(done.value));
+  assert.equal(done.value.pauseCode, 'research_assessment_pending');
   assert.equal(f.wires().length, calls, 'no new call');
   assert.equal(f.store.list('research-attempt').length, 1);
-  const saved = f.history();
-  await f.run(8, f.open(), false, false);
-  assert.equal(f.history(), saved);
+  const attempt=f.store.list('research-attempt')[0]!;
+  const exact=proveAttempt(f.open(),reference(attempt));
+  assert.deepEqual(exact.attempt.value.planAnswer,f.v.planAnswer);
+  assert.deepEqual(exact.attempt.value.call,f.intents()[0]!.value.call);
+  assert.equal(f.store.list('research-attempt-binding').length, 1);
+  assert.equal(f.store.list('v7-progress-application').length, 0);
+  assert.equal(f.store.list('assessment-session').length, 0);
+  const [intent] = f.intents();
+  readPreparedContext(f.open(), intent!.value.preparation!, preparationBinding(intent!.value));
+  readResearchConsumerIntent(f.open(), reference(intent!));
+  const fullHistory = () => canonical(f.store.list().flatMap(row => f.store.history(row.id).map(reference)));
+  const saved = fullHistory();
+  assert.deepEqual(await f.run(8, f.open(), false, false), done);
+  assert.equal(fullHistory(), saved);
+  assert.equal(f.wires().length, calls); assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
 });
 
 test('DRS1a2 damage and unknown contracts are typed refusals: part, revision, preparation contract, archive contract and intent contract; the whole-body archive reads literally', async t => {
@@ -387,7 +411,8 @@ test('DRS1a2 measurement: two identical real scenarios (12 project sources, init
     f.configure([...['/body/role', '/body/stage', '/body/subject', '/body/inventory'].map(pointer => ({ ...readOwnArchive, pointer })), ended()]);
     const done = await f.run(8, f.store, compact);
     assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
-    assert.equal(f.wires().length, 5);
+    assert.equal(f.wires().length, 6);
+    assert.equal(f.wires().filter(w => w.subject.assessmentSubject).length, 1);
     const bytes = revisionBytes(f.store, kinds);
     const file = (path: string) => existsSync(path) ? statSync(path).size : 0;
     return { bytes, sqlite: file(f.path), wal: file(`${f.path}-wal`) };

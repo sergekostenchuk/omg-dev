@@ -1,3 +1,4 @@
+import { readV7ProgressStateAt } from '../src/discovery/v7-progress.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
@@ -71,8 +72,14 @@ async function setup(t: test.TestContext, questions = [planQuestion('support','m
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
+let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+} 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure('p',{workspace:f.root,
@@ -87,6 +94,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
     await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
       {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate assessor',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'assessor'});
     configure();writeFileSync(wire,'');
   };
   if (calibrated) await calibrate();
@@ -109,8 +118,17 @@ test('S6.1: paid context reads keep the complete run prefix across plan subjects
   const run = await f.run();
   assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
   assert.equal(run.value.pauseCode, null);
-  assert.deepEqual(f.wires().map(wire => wire.subject.question.id), ['q-supply', 'q-supply', 'q-market', 'q-market']);
-  const wires = f.wires();
+  assert.deepEqual(f.wires().filter(wire => !wire.subject.assessmentSubject).map(wire => wire.subject.question.id), ['q-supply', 'q-supply', 'q-market', 'q-market']);
+  const wires = f.wires().filter(wire => !wire.subject.assessmentSubject);
+  const assessments = f.wires().filter(wire => wire.subject.assessmentSubject);
+  assert.deepEqual(assessments.map(w => w.subject.assessmentSubject.packet.planQuestionId), ['q-supply','q-market']);
+  for (const wire of assessments) assert.deepEqual(wire.subject.assessmentSubject.packet.planAnswer, f.v.planAnswer);
+  assert.equal(f.store.list('v7-progress-application').length, 2);
+  for(const state of f.store.list('v7-progress-state')) {
+    const proof=readV7ProgressStateAt(f.open(),reference(state));
+    assert.deepEqual(proof.value.subject.planAnswer,f.v.planAnswer);
+  }
+  assert.equal(f.wires().length, 6);
   assert.deepEqual(wires[1]!.subject.contextWorkspace.map((entry: { pointer: string }) => entry.pointer), ['/fields/frame']);
   assert.deepEqual(wires[2]!.subject.contextWorkspace, [], 'the new subject receives none of the prior subject workspace');
   assert.deepEqual(wires[3]!.subject.contextWorkspace.map((entry: { pointer: string }) => entry.pointer), ['/fields/plan']);
@@ -135,7 +153,7 @@ test('S6.1: paid context reads keep the complete run prefix across plan subjects
       message: `[${f.v.draft.id}] The addressed read lost its complete earlier run history` });
   assert.deepEqual(f.history(), before);
   const paid = f.store.list('model-call'), ledger = f.store.list('research-budget-ledger');
-  assert.equal(paid.filter(row => (row.value as { draftId?: string }).draftId === f.v.draft.id).length, 4);
+  assert.equal(paid.filter(row => (row.value as { draftId?: string }).draftId === f.v.draft.id).length, 6);
   const cold = f.open();
   assert.notEqual(cold, f.store);
   assert.deepEqual(readContextTurnHistoryAt(cold, 'p', f.v.draft, question, turns, 3), prefix);
@@ -143,5 +161,5 @@ test('S6.1: paid context reads keep the complete run prefix across plan subjects
   assert.deepEqual(f.history(), before);
   assert.deepEqual(cold.list('model-call'), paid);
   assert.deepEqual(cold.list('research-budget-ledger'), ledger);
-  assert.equal(f.wires().length, 4);
+  assert.equal(f.wires().length, 6);
 });

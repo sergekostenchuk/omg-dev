@@ -1483,12 +1483,28 @@ export class Researcher {
    * baseline, declaration and environment belong to the saved operation. */
   private async checkpointV7Attempts(project: string, draftId: string, run: Revision<ResearchRun>,
     turns: Revision<ManagedResearchTurn>[], owner: ResearchRun['owner'], signal: AbortSignal | undefined,
-    allowNew: boolean): Promise<Revision<ResearchRun>> {
+    allowNew: boolean, advanced: (next: Revision<ResearchRun>) => void): Promise<Revision<ResearchRun>> {
     const prefixes = v7CheckpointPrefixes(this.store, project, draftId, run, turns);
     if (!prefixes.length) return run;
+    const activate = () => {
+      if (run.value.status !== 'running') {
+        run = this.save(run,{status:'running',owner,error:null,pauseCode:null});
+        // Publish our own revision before an awaited admission can fail. A
+        // later, different revision still belongs to the competing CAS path.
+        advanced(run);
+      }
+    };
     const ownAttempts = new Set(prefixes.flatMap(p => p.entries.map(e => e.attempt.id)));
     const belongs = (packet: V7AttemptPacket) => packet?.entries?.some(e => ownAttempts.has(e.attempt?.id));
     const published = new Set<string>(), accounted = new Set<string>();
+    const supersededUnpaid = (packet: V7AttemptPacket) => {
+      const current = currentPlan(this.store,project).planAnswer;
+      // A new admission may leave an unsent old-edition assessment behind.
+      // Once an exact attempt of the replacement edition exists, cold replay
+      // preserves that choice too. Neither route assesses or counts the old K.
+      return canonical(current) !== canonical(packet.planAnswer)
+        && (allowNew || prefixes.some(prefix => canonical(prefix.subject.planAnswer) === canonical(current)));
+    };
     const apply = (paid: Revision<PaidDiscoveryAttemptsAssessment>) => {
       applyDiscoveryAssessment(this.store,project,reference(paid)); published.add(paid.value.session.id);
       for (const entry of paid.value.subject.packet.entries) accounted.add(canonical(entry.attempt));
@@ -1530,6 +1546,9 @@ export class Researcher {
           application!.value.session,`research-runner:${run.id}`);
         applySaved(); if (published.has(original.id)) continue;
       }
+      if (session.revision === 1 && application?.revision === 1
+        && application.value.call === null && application.value.previous === null
+        && supersededUnpaid(subject.packet)) continue;
       requireCondition(allowNew,'research_assessment_pending',
         'The saved assessment needs another admitted request; its paid prefix is preserved');
       const environmentRef = admitted.environment;
@@ -1544,7 +1563,7 @@ export class Researcher {
         || canonical(subject.assessment) === canonical(methodologyAssessmentTransport()),
         'discovery_assessment_invalid','The checkpoint needs its exact saved assessment declaration');
       const assess = subject.assessment?.contract === 'discovery-assessment/v3' ? assessAttemptsWithRequirements : assessAttempts;
-      if (run.value.status !== 'running') run = this.save(run,{status:'running',owner,error:null,pauseCode:null});
+      activate();
       const paid = await assess(this.store,subject.packet,subject.baseline,environment,
         admitted.dispatch.workspace,signal,pilot);
       apply(paid);
@@ -1560,7 +1579,7 @@ export class Researcher {
             {field:'account',ref:reference(account),attempt:entry.attempt});
         return !account;
       });
-      if (!fresh.length) continue;
+      if (!fresh.length || supersededUnpaid(packet)) continue;
       requireCondition(allowNew,'research_assessment_pending',
         'The finished prefix needs assessment before another attempt or run completion');
       const current = currentPlan(this.store,project);
@@ -1568,7 +1587,7 @@ export class Researcher {
         'research_consumer_context_stale','A new assessment must retain its current original plan');
       const effective = this.environments.effective(project);
       const pending = projectAttemptPacket(this.store,{project,...prefix.subject,entries:fresh});
-      if (run.value.status !== 'running') run = this.save(run,{status:'running',owner,error:null,pauseCode:null});
+      activate();
       const paid = await assessAttemptsWithRequirements(this.store,pending,baseline,effective.environment,effective.root,signal);
       apply(paid);
     }
@@ -1607,21 +1626,34 @@ export class Researcher {
             value: { projectId: project, draftId, environment: reference(environment), status: "paused", turns: 0,
               limit, inputs: draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null, owner, requestChars: 0 } });
           const restoreOnly = options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7 || used >= limit;
-          // Paid restoration is guarded by the session/application CAS. Do not
-          // erase a saved pause merely to rediscover the same no-new-work door.
-          if (!restoreOnly && run.value.status !== "running") run = this.save(run,
-            { status: "running", owner, error: null, pauseCode: null }, [reference(synthesis.session)]);
           const rejected = rejectedPlanOwnerRequest(this.store, turns, synthesis.subject!);
-          // A saved-only session may stop before its first intent. Restore the
-          // paid review named by this session's exact proposal basis as context.
+          // Retain S6.8's exact paid review for saved-only session recovery,
+          // including a cut before its first intent. Both restore and send use it.
           const reviewHistory = rejected && canonical(reference(rejected)) === canonical(synthesis.session.value.basis.previousProposalRef)
             ? [{ ...rejected.value, ref: reference(rejected) }] : [];
           const context = { role: "research", stage: "discovery", subject: synthesis.subject!,
             savedMaterials: synthesis.session.value.basis.materials,
             previousProposal: synthesis.session.value.basis.previousProposal,
             previousProposalRef: synthesis.session.value.basis.previousProposalRef, inventory: { sources: [] }, history: reviewHistory };
-          run = await this.applyV7Synthesis(project, run, draft, question, environment, context, owner, signal,
-            restoreOnly, synthesis);
+          try {
+            // Restore the paid step first. The common producer stops at its
+            // existing no-new-work boundary before preparing/sending a step.
+            run = await this.applyV7Synthesis(project, run, draft, question, environment, context, owner, signal,
+              true, synthesis);
+          } catch (error) {
+            if (!(error instanceof EngineError) || error.code !== 'research_restore_complete') throw error;
+            run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
+              !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7, next => { run = next; });
+            if (restoreOnly) throw error;
+            const nextSynthesis = this.v7SynthesisRecovery(project,draftId);
+            requireCondition(nextSynthesis,'research_synthesis_ambiguous','The restored synthesis lost its next step');
+            // Only a newly admitted send activates this run. Paid restore and
+            // a repeated no-new-work door must retain the saved pause unchanged.
+            if (run.value.status !== "running") run = this.save(run,
+              { status: "running", owner, error: null, pauseCode: null }, [reference(nextSynthesis.session)]);
+            run = await this.applyV7Synthesis(project, run, draft, question, environment, context, owner, signal,
+              false, nextSynthesis);
+          }
           if (run.value.status === "paused") return run;
           used++;
           continue;
@@ -1645,7 +1677,7 @@ export class Researcher {
           if (outstanding.value.state === "prepared") {
             if (outstanding.value.kind === "analyst" || outstanding.value.kind === "reading-planner")
               run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
-                !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7);
+                !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7, next => { run = next; });
             requireCondition(!options.restoreOnly && producerContractEra("discovery", options.producerPolicy) === 7,
               "research_contract_upgrade_required", "New v7 work requires its explicit producer policy");
             const current = currentPlan(this.store, project), selected = planSubjectOf(outstanding.value.kind === "escalation-assessor"
@@ -1822,7 +1854,7 @@ export class Researcher {
         if (refused) throw new EngineError(refused.value.refusal!.code,
           `[${refused.id}] Paid response retained for this plan subject; call ${refused.value.refusal!.call.id}`);
         if (run) run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
-          !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7);
+          !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7, next => { run = next; });
         const selection = planAttemptSelection(this.store, project);
         requireCondition(selection.draft.id === draftId, "plan_questions_invalid", "The selected plan belongs to another draft");
         if (!selection.next && run) {
