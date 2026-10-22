@@ -260,7 +260,8 @@ async function assessedFact(f: ReturnType<typeof fixture>, verdict: 'supported' 
   const terminal = ok(await assessFact(f.store, { project: f.project, modelCall: reference(original.record),
     questionId: batch.items[0]!.gap, dispatch }));
   assert.equal(terminal.value.verdict, verdict);
-  return { terminal, original, packet };
+  // LG07 ag-b (№10588): what a later attempt of the same line needs to pay its own work — returned, never used here.
+  return { terminal, original, packet, batch, goal, series, config, dispatch, scenario, trace, steps: [originalStep, assessorStep] };
 }
 
 async function ordinaryOffFormFact(f: ReturnType<typeof fixture>) {
@@ -3608,29 +3609,67 @@ test('X9 H1.0c a prepared check cessation fails whole when the line returns, the
 
 test('X7 H1.0c a journal-only G4b row of another binding stays readable in the A5 context and the stop report', async t => {
   // A stopped series whose attempt 1 counted its E5 N row, and a real journal-only G4b row of another binding's check.
+  // LG07 ag-b (№10588): every attempt of the series is a managed one with its own MC1 batch and E2 — attempt 1 pays a
+  // real E4 and E5, attempts 2 and 3 a real E4 off its form — and G7 closes each with the claim it derives itself.
   const f = fixture(t, 'repository-fact');
-  // LG07 ag-a (№10521): X7 keeps the previous standalone preparation — attempt 1 must already be closed.
-  await assessedFact(f, 'insufficient', 'standalone');
+  const first = await assessedFact(f, 'insufficient', 'managed');
+  const address = { project: f.project, block: f.block, line: 1 }, plan = { routes: reference(f.route), batches: [first.batch.id] };
+  const closeOwn = (attempt: number) => {
+    const binding = ok(readCompletionBinding(f.store, f.project, reference(f.store.get(seriesIdOf(f))!), attempt));
+    if (!binding) assert.fail(`attempt ${attempt} has its completion binding`);
+    const work = ok(readCompletionWorkAt(f.store, f.project, reference(f.store.get(completionWorkId(f.project, binding.id))!)));
+    assert.equal(work.complete, true, `attempt ${attempt} completed its own work`);
+    const claim = ok(prepareManagedClaim(f.store, { ...address, attempt,
+      outcome: { reason: 'result', accepting: [], cancelling: [], refusals: [] } })).outcome;
+    return ok(closeAttempt(f.store, { ...address, attempt, outcome: claim }));
+  };
+  // The managed E5 does not close attempt 1 (E7); G7 does.
+  assert.equal(f.store.get<RepairSeries>(seriesIdOf(f))!.value.attempts[0]!.outcome, null, 'The managed E5 leaves attempt 1 open');
+  closeOwn(1);
+  const counted = f.store.get<RepairSeries>(seriesIdOf(f))!.value.attempts[0]!.outcome!;
+  assert.deepEqual([counted.reason, counted.refusals.length], ['refused', 1], 'Attempt 1 counted its E5 N row');
+  // The other binding's check stays real and open; its journal-only G4b row is none of this series' claims.
   const other = managedOn(f, 'garden-consume-block', [nodeBatch(f, 'garden-consume-block').id], 1, 'x7-other');
   const waiting = ok(evaluate(f, other, []));
   assert.ok(waiting.groups.length > 0);
-  const address = { project: f.project, block: f.block, line: 1 };
-  const counted = f.store.get<RepairSeries>(seriesIdOf(f))!.value.attempts[0]!.outcome!;
-  assert.deepEqual([counted.reason, counted.refusals.length], ['refused', 1], 'Attempt 1 counted its E5 N row');
   const goal = f.store.get<RepairSeries>(seriesIdOf(f))!.value.attempts[0]!.goal;
   // Two more attempts without progress stop the series: its A5 context then weighs the journal of attempt 1's rows.
+  const steps: unknown[] = [...first.steps];
   for (const attempt of [2, 3]) {
-    ok(beginAttempt(f.store, { ...address, attempt, goal }));
-    ok(completeAttempt(f.store, { ...address, attempt, outcome: { reason: 'off-form', achieved: [], cancelled: [], refusals: [] } }));
+    const opened = ok(managedOpenAttempt(f.store, { ...address, attempt, goal, completion: plan }));
+    const packet = ok(writeQuestionPacket(f.store, { project: f.project, routes: reference(f.route), batch: first.batch.id,
+      environment: reference(first.config), attempt: { series: reference(opened), ordinal: attempt }, previous: [] })).record;
+    steps.push({ research: { invalid: true }, usage: { inputTokens: 120, outputTokens: 30, cachedInputTokens: 20, reasoningOutputTokens: 10 } });
+    writeFileSync(first.scenario, JSON.stringify({ database: f.path, steps }));
+    const physical = ok(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: first.dispatch, role: 'implementer' }));
+    assert.ok(physical.diagnostic, `attempt ${attempt} ended its own work off its form`);
+    closeOwn(attempt);
   }
+  const series = f.store.get<RepairSeries>(seriesIdOf(f))!;
+  assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
+  assert.deepEqual(series.value.attempts.map(item => item.outcome!.reason), ['refused', 'off-form', 'off-form']);
+  assert.equal(new Set(series.value.attempts.map(item => canonical(item.goal))).size, 1, 'One goal across the window');
+  assert.equal(readFileSync(first.trace, 'utf8').trim().split('\n').filter(Boolean).length, 4,
+    'Attempt 1 paid its original and its assessor; attempts 2 and 3 paid their own E4');
   const context = ok(readStopContext(f.store, address));
   const journal = f.store.get<{ rows: { id: string; source: Ref }[]; classifications: unknown[] }>(journalId(f.project))!;
   assert.ok(context.reads.some(ref => same(ref, reference(journal))), 'The A5 context reads the journal of this series');
   const group = waiting.groups[0]!, row = journal.value.rows.find(item => same(item.source, group.source))!;
-  assert.ok(row);
-  const series = f.store.get(seriesIdOf(f))!;
-  ok(stopReport(f.store, address));
-  ok(readStopContextAt(f.store, { project: f.project, sources: { series: reference(series), journal: reference(journal), holds: [] } }));
+  assert.ok(row, 'The exact Ref of the other group stands in the journal the context reads');
+  assert.ok(series.value.attempts.every(item => !item.outcome!.refusals.some(refusal => refusal.row === row.id)),
+    'The other binding\'s row became no outcome of this series');
+  const sources = { series: reference(series), journal: reference(journal), holds: [] };
+  const report = ok(stopReport(f.store, address)), at = ok(readStopContextAt(f.store, { project: f.project, sources }));
+  // A cold reading of the same sources is the same and writes nothing.
+  const before = snapshot(f.store);
+  const cold = new Store(f.path);
+  try {
+    assert.deepEqual(ok(readStopContext(cold, address)), context);
+    assert.deepEqual(ok(stopReport(cold, address)), report);
+    assert.deepEqual(ok(readStopContextAt(cold, { project: f.project, sources })), at);
+    assert.deepEqual(snapshot(cold), before);
+  } finally { cold.close(); }
+  assert.deepEqual(snapshot(f.store), before);
 });
 
 test('X9 H1.0c one transition cannot both cease the check and add its next evaluation', t => {
