@@ -30,7 +30,7 @@ import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASS
 import { writeGuarded } from '../src/om/refs.js';
 import type { OmResult, Refusal } from '../src/om/refusal.js';
 import { prepareWorksFrame, readWorksFrame, writeWorksFrame } from '../src/om/works-frame.js';
-import { createCrossOmFixture, gardenGraph, refusedWith } from './om-fixture.js';
+import { createCrossOmFixture, explicitMapping, gardenGraph, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -63,8 +63,7 @@ function proposalFor(frame: FrameRead, graph: Graph): LayerProposal {
     });
   }
   const level = frame.request.level, projected = projectGraph(graph, level);
-  const mapped = ok(fillObligations(frame.upper, frame.scope, { graph,
-    reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+  const mapped = explicitMapping(graph, frame.upper, frame.scope, level);
   const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? 'operation' : 'work')
     && (level === 2 || frame.scope.nodes.includes(node.parent!)));
   const selected = new Set(nodes.map(node => node.id));
@@ -448,10 +447,9 @@ test('F2 recorded carry resolves different code addresses of one consumer port b
   const ref = (id: string): Ref => ({ id, revision: 1, hash: hashJson(id) });
   const graphRef = { ...ref('graph:garden'), hash: hashJson(graph) }, upperRef = ref('graph-layer:garden:2');
   const scope = { nodes: ['garden-consume-operation', 'garden-prep-operation', 'garden-produce-operation'], excluded: [], hash: hashJson('legacy-cross-scope') };
-  const base = { graph, reference: graphRef, frame: null };
   // Derive the full fill set, then record it in the worksContract ConnectionFrame with the code reference
   // each real end already carries on its exact lower flow. No code is derived from history at assembly.
-  const skeleton = ok(fillObligations(upper, scope, base, upperRef, 3));
+  const skeleton = explicitMapping(graph, upper, scope, 3);
   const endpointCode = (fill: FrameFill) => {
     const obligation = skeleton.obligations.find(item => item.id === fill.obligation)!;
     if (fill.source !== 'accepted' || obligation.kind !== 'connection-end') return undefined;
@@ -463,8 +461,9 @@ test('F2 recorded carry resolves different code addresses of one consumer port b
     return clone(endpoints.find(item => item.node === fill.node && item.port === fill.port)!.codeRef!);
   };
   const fills = canonicalSorted(skeleton.fills.map(fill => {
-    const codeRef = endpointCode(fill);
-    return { ...fill, ...(codeRef ? { codeRef } : {}) } as FrameFill;
+    const withSource = { ...fill, source: 'accepted' as const, basis: graphRef } as FrameFill;
+    const codeRef = endpointCode(withSource);
+    return { ...withSource, ...(codeRef ? { codeRef } : {}) };
   }));
   const frameValue = { project: 'garden', level: 3 as const, candidateHash: '0'.repeat(64),
     layerHash: hashJson(projectGraph(graph, 3)), worksContract: WORKS_FRAME_CONTRACT, fills };
@@ -474,7 +473,7 @@ test('F2 recorded carry resolves different code addresses of one consumer port b
   const rows = result.fills.filter(fill => fill.node === consumer.id && fill.port === 'in');
   assert.equal(rows.length, 2); assert.ok(rows.every(fill => Object.hasOwn(fill, 'codeRef')));
   const frame: FrameRead = { request: { project: 'garden', level: 3, graph: graphRef, horizon: ref('om-horizon:garden:legacy-cross'),
-    layer: ref('graph-layer:garden:3'), frame: frameRef, upper: { horizon: ref('om-horizon:garden:legacy-cross'), frame: null } },
+    layer: ref('graph-layer:garden:3'), frame: frameRef, upper: { horizon: ref('om-horizon:garden:legacy-cross'), frame: ref('om-frame:garden:2') } },
     upper, upperRef, scope, accepted, result, references: [graphRef, upperRef] };
   const works = { contract: 'works-frame/v1' as const, producer: ref('om-obligation-basis:garden:cross'),
     ledger: ref('om-obligations:garden:cross'), bindings: [] };
@@ -486,15 +485,10 @@ test('F2 recorded carry resolves different code addresses of one consumer port b
     assert.deepEqual(flow.consumers.find(endpoint => endpoint.node === consumer.id && endpoint.port === 'in')!.codeRef, code);
   }
   assert.deepEqual(projectGraph(built.candidate.graph as Graph, 2), projectGraph(upper, 2));
-  // An inherited end of a frame recorded before the works contract has no code reference and cannot be revived:
-  // assembly refuses it at the candidate boundary (foreign code is refused on local connectors above).
+  // An inherited frame recorded before the works contract cannot be revived: the read itself refuses it.
   const legacy = { project: 'garden', level: 3 as const, candidateHash: '0'.repeat(64),
-    layerHash: frameValue.layerHash, fills: clone(skeleton.fills) as FrameFill[] };
+    layerHash: frameValue.layerHash, fills: clone(fills) };
   const legacyRef = { ...frameRef, hash: hashJson(legacy) };
   const legacyAccepted = { graph, reference: graphRef, frame: { reference: legacyRef, value: legacy } };
-  const legacyResult = clone(ok(fillObligations(upper, scope, legacyAccepted, upperRef, 3))) as FrameRead['result'];
-  assert.ok(legacyResult.fills.some(fill => fill.source === 'accepted' && !Object.hasOwn(fill, 'codeRef')));
-  const legacyFrame: FrameRead = { ...clone(frame), accepted: legacyAccepted,
-    request: { ...clone(frame.request), frame: legacyRef }, result: legacyResult };
-  denied(assembleCandidate(legacyFrame, [], works), 'works_code_missing');
+  denied(fillObligations(upper, scope, legacyAccepted, upperRef, 3), 'frame_record_invalid');
 });

@@ -29,7 +29,7 @@ import type { OmResult } from '../src/om/refusal.js';
 import { writeRoutes } from '../src/om/routes.js';
 import { openSeries, type AttemptGoal } from '../src/om/series.js';
 import { closeAttempt, openAttempt, prepareManagedClaim } from '../src/om/repeat-gate.js';
-import { gardenGraph } from './om-fixture.js';
+import { gardenGraph, storedAccepted } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -78,8 +78,8 @@ export async function produceAtomicSeed(seedResources: AtomicSeedResources, with
   const frame2: FrameRequest = { project, level: 2, graph: reference(store.get(`graph:${project}`)!), horizon: reference(initial.gate),
     layer: null, frame: null, upper: null };
   const prepared = ok(prepareFrame(store, frame2)), projected = projectGraph(desired, 2);
-  const mapped = ok(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope, { graph: desired,
-    reference: { ...prepared.request.graph, hash: hashJson(desired) }, frame: null }, prepared.upperRef, 2));
+  const mapped = ok(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
+    storedAccepted(desired, prepared.upper as Graph, prepared.scope as FrameScope, project, 2), prepared.upperRef, 2));
   const nodes = projected.nodes.filter(node => node.kind === 'operation'), nodeIds = new Set(nodes.map(node => node.id));
   const proposalValue: LayerProposal = { base: { graph: prepared.request.graph, frame: null }, level: 2, source: 'decision', status: 'proposed', nodes,
     fills: mapped.fills.filter(fill => nodeIds.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,

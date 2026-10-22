@@ -6,8 +6,9 @@ import type { TestContext } from "node:test";
 import { canonical, canonicalSorted, hashJson, type Json } from "../src/canonical.js";
 import { receiptId, type ArtifactReceipt, type MachinePlan } from "../src/compiler/model.js";
 import { EngineError } from "../src/errors.js";
-import type { Graph, Node } from "../src/graph/model.js";
+import { LEVEL, type Binding, type CodeRef, type Endpoint, type Graph, type Node } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
+import { RefinementRelations } from "../src/graph/relations.js";
 import { ProductEngine } from "../src/product/engine.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
 import { reference, type Ref, type StageArtifact } from "../src/pipeline/contracts.js";
@@ -18,7 +19,7 @@ import { Store, type Write } from "../src/storage/store.js";
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal, type ModelDecision } from "../src/om/addressing.js";
 import { writeOmInput, writeReadinessInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { fillObligations, prepareFrame, type FrameRead, type FrameRequest } from "../src/om/frame-obligations.js";
+import { flowKey, frameObligations, prepareFrame, workAnchorId, type AcceptedFrame, type ConnectionFrame, type FrameLevel, type FrameObligation, type FrameRead, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import { gateCandidate, writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
@@ -232,6 +233,137 @@ function take<T>(result: OmResult<T>): T {
   return result.value;
 }
 
+interface ExplicitFlow { connector: string; artifact: string; key: string; producer: Endpoint; consumers: Endpoint[]; anchor: string | null }
+
+/** Upper flows of one level, grouped the same way the frame reader groups them. */
+function explicitUpperFlows(upper: Graph, level: FrameLevel): ExplicitFlow[] {
+  const flows = new Map<string, ExplicitFlow>(), seen = new Map<string, Set<string>>();
+  for (const connector of upper.connectors) for (const binding of connector.bindings.filter(item => item.level === level - 1)) {
+    const key = flowKey(binding), address = canonical([connector.id, key]);
+    let flow = flows.get(address);
+    if (!flow) {
+      flow = { connector: connector.id, artifact: connector.artifact, key, producer: binding.producer, consumers: [], anchor: binding.anchor };
+      flows.set(address, flow); seen.set(address, new Set());
+    }
+    for (const endpoint of binding.consumers) {
+      const end = canonical([endpoint.node, endpoint.port]);
+      if (seen.get(address)!.has(end)) throw new EngineError(OM_FIXTURE_ERROR,
+        "The same consumer endpoint occurs twice in one upper flow", { target: connector.id });
+      seen.get(address)!.add(end); flow.consumers.push(endpoint);
+    }
+  }
+  return canonicalSorted([...flows.values()].map(flow => ({ ...flow, consumers: canonicalSorted(flow.consumers) })));
+}
+
+/** Anchor acceptance, ported from the production check: plain upper/lower anchor equality below L3,
+ *  the full works-frame/v1 sleeping-anchor mechanics at L3. */
+function acceptsExplicitAnchor(upper: Graph, graph: Graph, flow: ExplicitFlow,
+  binding: Pick<Binding, "anchor" | "consumers" | "producer">, level: FrameLevel): boolean {
+  if (level !== 3) return flow.anchor === binding.anchor;
+  if (binding.anchor === null) return !graph.horizon.includes(binding.producer.node)
+    || binding.consumers.every(endpoint => graph.horizon.includes(endpoint.node));
+  const anchor = graph.anchors.find(item => item.id === binding.anchor), connector = graph.connectors.find(item => item.id === flow.connector);
+  return graph.horizon.includes(binding.producer.node) && !binding.consumers.some(endpoint => graph.horizon.includes(endpoint.node))
+    && !!anchor && anchor.id === workAnchorId(flow.connector, flow.key, binding.producer)
+    && anchor.owner === binding.producer.node && anchor.outcome === flow.artifact
+    && graph.nodes.some(node => node.id === anchor.owner && node.outcome === anchor.outcome && node.tests.includes(anchor.test))
+    && graph.tests.some(test => test.id === anchor.test && test.node === binding.producer.node && test.covers.includes(flow.connector))
+    && connector?.wakeTest === (upper.connectors.find(item => item.id === flow.connector)?.wakeTest ?? anchor.test)
+    && graph.tests.some(test => test.id === connector?.wakeTest);
+}
+
+/** The real lower endpoints each obligation names — explicit projection, replacing the removed fills:null derivation. */
+export function explicitFills(graph: Graph, upper: Graph, obligations: readonly FrameObligation[], level: FrameLevel):
+  { obligation: string; node: string; port?: string; codeRef?: CodeRef }[] {
+  const relations = new RefinementRelations(graph), fills: { obligation: string; node: string; port?: string; codeRef?: CodeRef }[] = [];
+  for (const obligation of obligations) {
+    if (obligation.kind !== "connection-end") {
+      for (const node of graph.nodes.filter(node => LEVEL[node.kind] === level
+        && node.outcome === obligation.artifact && relations.refines(node.id, obligation.upper.node)))
+        fills.push({ obligation: obligation.id, node: node.id });
+      continue;
+    }
+    const flows = explicitUpperFlows(upper, level).filter(flow => flow.connector === obligation.connector);
+    const endpoints: Endpoint[] = [];
+    for (const binding of graph.connectors.find(item => item.id === obligation.connector)?.bindings.filter(item => item.level === level) ?? []) {
+      let candidates = flows.filter(flow => acceptsExplicitAnchor(upper, graph, flow, binding, level)
+        && relations.refines(binding.producer.node, flow.producer.node)
+        && binding.consumers.every(endpoint => flow.consumers.some(consumer => relations.refines(endpoint.node, consumer.node))));
+      if (candidates.length > 1) {
+        candidates = candidates.filter(flow => flow.producer.port === binding.producer.port
+          && binding.consumers.every(endpoint => flow.consumers.some(consumer => relations.refines(endpoint.node, consumer.node) && endpoint.port === consumer.port)));
+        if (candidates.length !== 1) throw new EngineError(OM_FIXTURE_ERROR,
+          "An ambiguous lower binding needs distinct port IDs", { target: obligation.connector });
+      }
+      const flow = candidates.find(item => item.key === obligation.flow);
+      if (!flow) continue;
+      if (obligation.role === "producer") endpoints.push(binding.producer);
+      else {
+        const ports = new Set(flow.consumers.filter(endpoint => endpoint.node === obligation.upper.node).map(endpoint => endpoint.port));
+        const matches = binding.consumers.filter(endpoint => relations.refines(endpoint.node, obligation.upper.node));
+        if (ports.size > 1 && matches.some(endpoint => !ports.has(endpoint.port)))
+          throw new EngineError(OM_FIXTURE_ERROR, "Several upper ports of one consumer need distinct port IDs", { target: obligation.connector });
+        endpoints.push(...matches.filter(endpoint => ports.size <= 1 || endpoint.port === obligation.upper.port));
+      }
+    }
+    for (const endpoint of [...new Map(endpoints.map(endpoint => [canonical([endpoint.node, endpoint.port]), endpoint])).values()])
+      fills.push({ obligation: obligation.id, node: endpoint.node, port: endpoint.port,
+        ...(endpoint.codeRef ? { codeRef: endpoint.codeRef } : {}) });
+  }
+  return fills;
+}
+
+/** Obligations plus their explicit lower fills — the pair the proposal builders used to get from a fills-less frame read. */
+export function explicitMapping(graph: Graph, upper: Graph, scope: FrameScope, level: FrameLevel):
+  { obligations: readonly FrameObligation[]; fills: { obligation: string; node: string; port?: string; codeRef?: CodeRef }[] } {
+  const obligations = take(frameObligations(upper, scope, level));
+  return { obligations, fills: explicitFills(graph, upper, obligations, level) };
+}
+
+/** An accepted graph read through its recorded connection frame — the surviving shape of the removed frame-less accepted input. */
+export function storedAccepted(graph: Graph, upper: Graph, scope: FrameScope, project: string, level: FrameLevel,
+  candidateHash = hashJson({ accepted: project })): AcceptedFrame {
+  if (level === 3) markedWorks(graph);
+  const graphReference: Ref = { id: `graph:${project}`, revision: 1, hash: hashJson(graph) };
+  const value: ConnectionFrame = { project, level, candidateHash, layerHash: hashJson(projectGraph(graph, level)),
+    ...(level === 3 ? { worksContract: "works-frame/v1" as const } : {}),
+    fills: canonicalSorted(explicitMapping(graph, upper, scope, level).fills
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: { ...graphReference } }))) };
+  return { graph, reference: graphReference,
+    frame: { reference: { id: `om-frame:${project}:${level}`, revision: 1, hash: hashJson(value) }, value } };
+}
+
+/** Give a graph the works-frame/v1 mechanics the L3 recorded contract requires: declared code on works, codeRef on L3 endpoints, mechanical sleeping anchors. */
+export function markedWorks(graph: Graph): void {
+  for (const node of graph.nodes.filter(node => node.kind === "work" && node.ports.length && !node.code.length))
+    node.code = [{ path: `${node.id}.ts`, access: "write", status: "planned" }];
+  for (const connector of graph.connectors) for (const binding of connector.bindings.filter(item => item.level === 3)) {
+    for (const endpoint of [binding.producer, ...binding.consumers])
+      endpoint.codeRef = structuredClone(graph.nodes.find(node => node.id === endpoint.node)!.code.at(-1)!);
+    if (binding.anchor !== null) {
+      const flow = connector.bindings.find(item => item.level === 2
+        && (item.anchor === binding.anchor || item.producer.port === binding.producer.port))!;
+      const anchor = graph.anchors.find(item => item.id === binding.anchor)!;
+      anchor.id = workAnchorId(connector.id, flowKey(flow), binding.producer); binding.anchor = anchor.id;
+    }
+  }
+}
+
+/** Re-derive mechanical sleeping anchors after a lower endpoint rename — the works contract keys them on the current endpoint. */
+export function reanchor(graph: Graph, upper: Graph, level: FrameLevel): void {
+  const relations = new RefinementRelations(graph);
+  for (const connector of graph.connectors) for (const binding of connector.bindings.filter(item => item.level === level && item.anchor !== null)) {
+    const anchor = graph.anchors.find(item => item.id === binding.anchor);
+    if (!anchor) continue;
+    const flow = (upper.connectors.find(item => item.id === connector.id)?.bindings ?? [])
+      .filter(item => item.level === level - 1 && relations.refines(binding.producer.node, item.producer.node))
+      .find(item => [binding.producer.port, binding.producer.port.replace(/^(lower|renamed)-/, "")]
+        .some(port => workAnchorId(connector.id, flowKey(item), { node: binding.producer.node, port }) === anchor.id));
+    if (!flow) continue;
+    anchor.id = workAnchorId(connector.id, flowKey(flow), binding.producer); binding.anchor = anchor.id;
+  }
+}
+
 /** Prepare only current upstream stages, even when called from an inherited era scope. */
 export function prepareOmFixtureStages(engine: ProductEngine, project: string, graph: Graph, valueFor?: Parameters<typeof preparedFeatures>[3]): void {
   const { level: _level, ...l1 } = projectGraph(graph, 1);
@@ -270,8 +402,8 @@ export function prepareNativeLayers(engine: ProductEngine, project: string, desi
         ...(desired.connectors.find(connector => connector.id === upper.id)?.bindings ?? []).filter(binding => binding.level === 3)] }));
     }
     const projected = projectGraph(graph, level);
-    const mapped = take(fillObligations(frame.upper, frame.scope,
-      { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    const obligations = take(frameObligations(frame.upper, frame.scope, level));
+    const mapped = { obligations, fills: explicitFills(graph, frame.upper, obligations, level) };
     const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? "operation" : "work")
       && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
     const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,

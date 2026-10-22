@@ -140,7 +140,7 @@ function requireRequest(value: unknown): asserts value is FrameRequest {
   for (const key of ['layer', 'frame']) if (value[key] !== null && !isRef(value[key])) invalid(`frame.${key}`);
   const upper = value['upper'];
   if (value['level'] === 2 ? upper !== null : !object(upper) || !isRef(upper['horizon'])
-    || (upper['frame'] !== null && !isRef(upper['frame']))) invalid('frame.upper');
+    || !isRef(upper['frame'])) invalid('frame.upper');
   // RL3: a reopening is carried only by a works request over an accepted frame, as its exact record and sorted works.
   if (Object.hasOwn(value, 'reopen')) {
     const reopen = value['reopen'];

@@ -25,7 +25,7 @@ import { checkAtomicWorks, prepareCandidateSources, writeAtomicGate } from '../s
 import { resolveSnapshot } from '../src/om/impact.js';
 import { inputDecisionWrite, writeAddressing, type InputDecisionProposal } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { fillObligations, prepareFrame, representativeId, type FrameRead, type FrameRequest } from '../src/om/frame-obligations.js';
+import { prepareFrame, representativeId, type FrameRead, type FrameRequest } from '../src/om/frame-obligations.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
@@ -44,7 +44,7 @@ import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
 import { preparedFeatures, refinedLayers } from './product-fixture.js';
 import { executionFixture, refreshExecutionPlan } from './execution-fixture.js';
-import { prepareNativeLayers, prepareOmFixtureStages } from './om-fixture.js';
+import { prepareNativeLayers, prepareOmFixtureStages, explicitMapping, markedWorks } from './om-fixture.js';
 
 export type ExternalInputMode = 'inside' | 'outside' | 'mixed' | 'control';
 export interface ExternalAgentCall {
@@ -175,8 +175,8 @@ function prepareExternalWorks(engine: ProductEngine, desired: Graph, reject = fa
   if (prerequisite) prerequisite.target = representativeId('p-produce-operation', 3);
   const projected = projectGraph(proposed, 3), nodes = projected.nodes.filter(node => node.kind === 'work' && basis.scope.nodes.includes(node.parent!)),
     selected = new Set(nodes.map(node => node.id));
-  const fills = externalOk(fillObligations(basis.upper, basis.scope,
-    { graph: proposed, reference: { ...graph, hash: hashJson(proposed) }, frame: null }, basis.upperRef, 3));
+  markedWorks(proposed);
+  const fills = explicitMapping(proposed, basis.upper, basis.scope, 3);
   const proposal: LayerProposal = { base: { graph, frame: null }, level: 3, worksContract: 'works-frame/v1', source: 'decision', status: 'proposed', nodes,
     fills: fills.fills.filter(fill => selected.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,
       ...(fill.port === undefined ? {} : { port: fill.port, codeRef: structuredClone(nodes.find(node => node.id === fill.node)!.code[0]!) }) })),

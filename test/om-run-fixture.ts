@@ -21,10 +21,10 @@ import type { OmInputRecord } from "../src/om/input.js";
 import { writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
 import { WORKS_BRIEF_PACKET_CONTRACT } from "../src/om/packet-brief.js";
 import { prepareFrameProposals, type ProposalRequest } from "../src/om/frame-proposals.js";
-import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
+import { explicitMapping, gardenGraph, prepareNativeLayers } from "./om-fixture.js";
 import { preparedFeatures, refinedLayers } from "./product-fixture.js";
 import { projectGraph } from "../src/graph/project.js";
-import { fillObligations, prepareFrame, type FrameScope } from "../src/om/frame-obligations.js";
+import { prepareFrame, type FrameScope } from "../src/om/frame-obligations.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
@@ -652,8 +652,7 @@ function worksFixture(t: test.TestContext, late = false, fact: boolean | number 
     choice: { choiceVersion: "h1-upper", features: [{ outcome: "garden-result" }], excluded: [] } }));
   const frame2: FrameRequest = { project, level: 2, graph: first, horizon: reference(upper.gate), layer: null, frame: null, upper: null };
   const prepared = ok(prepareFrame(store, frame2)), projected = projectGraph(desired, 2);
-  const mapped = ok(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope, { graph: desired,
-    reference: { ...prepared.request.graph, hash: hashJson(desired) }, frame: null }, prepared.upperRef, 2));
+  const mapped = explicitMapping(desired, prepared.upper as Graph, prepared.scope as FrameScope, 2);
   const nodes = projected.nodes.filter(node => node.kind === "operation"), nodeIds = new Set(nodes.map(node => node.id));
   const value: LayerProposal = { base: { graph: prepared.request.graph, frame: null }, level: 2, source: "decision", status: "proposed", nodes,
     fills: mapped.fills.filter(fill => nodeIds.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),

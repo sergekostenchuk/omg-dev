@@ -3,14 +3,14 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Revision, Store, Write } from "../src/storage/store.js";
-import { hashJson, type Json } from "../src/canonical.js";
+import { type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
 import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { fillObligations, prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import { prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
@@ -26,7 +26,7 @@ import { writeQuestionPacket } from "../src/om/question-packet.js";
 import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
 import { seriesId, type AttemptGoal, type BeginAttemptRequest, type ClaimedRefusal, type RepairSeries, type SeriesRequest } from "../src/om/series.js";
 import { closeAttempt, openAttempt, prepareManagedClaim, type GateOutcome, type RepeatOutcome } from "../src/om/repeat-gate.js";
-import { gardenGraph } from "./om-fixture.js";
+import { explicitMapping, gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
@@ -88,8 +88,7 @@ function definition(store: Store, project: string, block: string): Definition {
     refinement: null, choice: { choiceVersion: "managed-initial", features: [{ outcome: `${project}-result` }], excluded: [] }, available: {} }));
   const first: FrameRequest = { project, level: 2, graph: graphRef, horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
   const read = take(prepareFrame(store, first)), projected = projectGraph(graph, 2);
-  const mapped = take(fillObligations(read.upper as Graph, read.scope as FrameScope,
-    { graph, reference: { ...first.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const mapped = explicitMapping(graph, read.upper as Graph, read.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: first.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: projected.nodes.filter(node => node.kind === "operation"), fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
       ...(fill.port === undefined ? {} : { port: fill.port }) })),

@@ -24,12 +24,12 @@ import type { OmResult } from '../src/om/refusal.js';
 import { QUEUE_POLICY_VERSION, computeBlockWeights, prepareBlockQueue, writeBlockQueue, readBlockQueue,
   readQuestionQueue, prepareQuestionQueue, selectMachinePath,
   type QueuePolicy, type QueueRequest } from '../src/om/queue.js';
-import { fillObligations, prepareFrame, prepareHorizonBasis, readFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
+import { prepareFrame, prepareHorizonBasis, readFrame, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import type { LayerProposal } from '../src/om/frame-proposals.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { readLayerAcceptance } from '../src/om/layer-basis.js';
-import { gardenGraph, createOmFixture, refusedWith } from './om-fixture.js';
+import { gardenGraph, createOmFixture, explicitMapping, refusedWith } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 
 const project = 'garden', producer = 'garden-produce-block', consumer = 'garden-consume-block';
@@ -529,8 +529,7 @@ function acceptQueueL2(f: ReturnType<typeof fixture>) {
   const graph = gardenGraph(), frame: FrameRequest = { project, level: 2, graph: reference(f.graph),
     horizon: f.request.horizon, layer: null, frame: null, upper: null };
   const prepared = ok(prepareFrame(f.store, frame)), projected = projectGraph(graph, 2);
-  const mapped = ok(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, prepared.upperRef, 2));
+  const mapped = explicitMapping(graph, prepared.upper as Graph, prepared.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
     nodes: projected.nodes.filter(node => node.kind === 'operation'),
     fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
@@ -634,7 +633,8 @@ test('the extracted horizon admission retains the existing frame layer and upper
   const worksRead = ok(readFrame(f.store, works)), worksPrepared = ok(prepareFrame(f.store, works));
   assert.deepEqual(worksPrepared.result, worksRead.result);
   refusedWith(prepareFrame(f.store, { ...works, upper: { horizon: f.request.horizon, frame: reference(accepted.frame) } }), 'frame_basis_unproven');
-  refusedWith(prepareFrame(f.store, { ...works, upper: { ...works.upper!, frame: null } }), 'frame_basis_unproven');
+  assert.throws(() => prepareFrame(f.store, { ...works, upper: { ...works.upper!, frame: null } }),
+    (error: unknown) => error instanceof EngineError && error.code === 'frame_request_invalid');
   refusedWith(prepareFrame(f.store, { ...works, upper: { ...works.upper!, frame: { ...reference(accepted.frame), hash: '0'.repeat(64) } } }), 'frame_basis_unproven');
   const historicalWorks = ok(readFrame(f.store, { ...works, workZoneContract: 'accepted-l2-v1' }));
   f.restart();

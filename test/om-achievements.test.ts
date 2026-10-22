@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store, type Revision } from "../src/storage/store.js";
 import { EngineError } from "../src/errors.js";
-import { canonical, hashJson, type Json } from "../src/canonical.js";
+import { canonical, type Json } from "../src/canonical.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { REFUSAL_ROUTES, type OmResult, type Refusal } from "../src/om/refusal.js";
 import {
@@ -29,7 +29,7 @@ import { readResultIdentity } from "../src/om/result-identity.js";
 import { closeAttempt, prepareCloseAttempt } from "../src/om/repeat-gate.js";
 import { readSpendReport, spendReport } from "../src/om/spend-report.js";
 import { writeGuarded } from "../src/om/refs.js";
-import { gardenGraph } from "./om-fixture.js";
+import { gardenGraph, storedAccepted } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 
 const UNIT = "om-acceptance";
@@ -274,7 +274,7 @@ function n2Fixture(t: test.TestContext, identities = false) {
     layer: null, frame: null, upper: null };
   const read = deliveredOf(prepareFrame(store, frame)), projected = projectGraph(graph, 2);
   const mapped = deliveredOf(fillObligations(read.upper as Graph, read.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+    storedAccepted(graph, read.upper as Graph, read.scope as FrameScope, project, 2), read.upperRef, 2));
   const obligations = read.result.obligations.filter(item => item.upper.node === block).map(item => item.id).sort();
   const goal: AttemptGoal = { key: "declared-frame-result", questions: obligations.map(id => gapLineKey(project, id, "fill")).sort(), result: "accepted-gap-fill" };
   deliveredOf(openSeries(store, { ...address, slice: "achievement-input", predecessor: null, basis: null }));

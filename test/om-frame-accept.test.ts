@@ -20,7 +20,7 @@ import { prepareCandidate, writeCandidate } from '../src/om/frame-candidate.js';
 import { prepareSettleCandidate, settleCandidate, readAcceptedFrame, readRejectedCandidate, readWorkRejectionAt, prepareRejectProposals, rejectProposals, readRejectedProposals, type SettleCandidateRequest, type RejectedLayerProposal } from '../src/om/frame-accept.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { writeGuarded } from '../src/om/refs.js';
-import { gardenGraph, createOmFixture, refusedWith, sameButReferences, thrownWith } from './om-fixture.js';
+import { gardenGraph, createOmFixture, refusedWith, sameButReferences, storedAccepted, thrownWith } from './om-fixture.js';
 import { prepareRebaseFrame, rebaseFrame } from '../src/om/frame-accept.js';
 import { buildRebasedLayer, readLayerAcceptance, readAcceptedFrameLayer, type LayerBasis, type OmRebasedFrame } from '../src/om/layer-basis.js';
 import { prepareGaps, writeGaps, readGaps, type GapRequest } from '../src/om/gaps.js';
@@ -277,7 +277,8 @@ function fixture(t: TestContext, keepOutsideIdentities = false) {
   const frame: FrameRequest = { project: 'garden', level: 2, graph: reference(store.get('graph:garden')!),
     horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
   const read = ok(prepareFrame(store, frame)), projected = projectGraph(graph, 2);
-  const mapped = ok(fillObligations(read.upper as Graph, read.scope as FrameScope, { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const mapped = ok(fillObligations(read.upper as Graph, read.scope as FrameScope,
+    storedAccepted(graph, read.upper as Graph, read.scope as FrameScope, 'garden', 2), read.upperRef, 2));
   const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
     nodes: projected.nodes.filter(node => node.kind === 'operation'), fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
       ...(fill.port === undefined ? {} : { port: fill.port }) })),
@@ -561,7 +562,7 @@ test('C5 cannot reject successful assemblies, gaps, foreign sources, nonproposed
   for (const [ref, code] of [[{ ...f.proposalRef, id: f.proposalRef.id.replace(':garden:', ':foreign:') }, 'record_foreign'],
     [{ ...f.proposalRef, hash: '0'.repeat(64) }, 'record_forged']] as const)
     refusedWith(rejectProposals(f.store, { frame: f.frame, proposals: [ref] }), code);
-  refusedWith(rejectProposals(f.store, { frame: { ...f.frame, level: 3, workZoneContract: 'accepted-l2-v1', upper: { horizon: f.frame.horizon, frame: null } },
+  refusedWith(rejectProposals(f.store, { frame: { ...f.frame, level: 3, workZoneContract: 'accepted-l2-v1', upper: { horizon: f.frame.horizon, frame: f.frame.horizon } },
     proposals: [f.proposalRef] }), 'candidate_level_unsupported');
   refusedWith(rejectProposals(f.store, { frame: f.frame, proposals: [f.proposalRef, f.proposalRef] }), 'proposal_rejection_invalid');
   for (const value of [undefined, null, [], {}, { proposals: [] }, { frame: f.frame }])

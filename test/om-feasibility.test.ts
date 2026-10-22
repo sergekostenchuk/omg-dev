@@ -28,7 +28,8 @@ import { writeAtomicGate, writeWorksAcceptance, type AtomicGateRequest } from '.
 import { resolveSnapshot } from '../src/om/impact.js';
 import { settleCandidate, readAcceptedFrame } from '../src/om/frame-accept.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
-import { fillObligations, prepareFrame, type FrameRequest, type FrameRead } from '../src/om/frame-obligations.js';
+import { prepareFrame, type FrameRequest, type FrameRead } from '../src/om/frame-obligations.js';
+import { explicitMapping } from './om-fixture.js';
 import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.js';
 import { writeGaps, type GapRequest } from '../src/om/gaps.js';
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
@@ -106,8 +107,7 @@ function acceptedOperationsFixture(t: TestContext, codeStatus: 'planned' | 'exis
       graph.connectors = frame.upper.connectors.map(upper => ({ ...clone(upper), bindings: [...clone(upper.bindings),
         ...desired.connectors.find(connector => connector.id === upper.id)!.bindings.filter(binding => binding.level === 3)] }));
     }
-    const projected = projectGraph(graph, level), mapped = ok(fillObligations(frame.upper, frame.scope, {
-      graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    const projected = projectGraph(graph, level), mapped = explicitMapping(graph, frame.upper, frame.scope, level);
     const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? 'operation' : 'work')
       && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
     const fills = mapped.fills.filter(fill => selected.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,

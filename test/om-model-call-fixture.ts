@@ -17,7 +17,7 @@ import { ProductEngine } from '../src/product/engine.js';
 import { UPSTREAM_STAGES, type UpstreamStage } from '../src/discovery/requirements.js';
 import { projectGraph } from '../src/graph/project.js';
 import type { Graph, Node } from '../src/graph/model.js';
-import { gardenGraph } from './om-fixture.js';
+import { explicitMapping, gardenGraph } from './om-fixture.js';
 import { seedCopy } from './om-seed.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
@@ -30,7 +30,7 @@ import { writeRoutes } from '../src/om/routes.js';
 import { openSeries, beginAttempt, completeAttempt, type RepairSeries, readCompletionBinding, completionWorkId, seriesRequestOf, type AnyBeginAttemptRequest, type AnyRepairSeries, type MechanismRepairSeries } from '../src/om/series.js';
 import { gapLineKey, gapLineExpectedResult, writeGapLines } from '../src/om/gap-lines.js';
 import { prepareFrameProposals, type LayerProposal } from '../src/om/frame-proposals.js';
-import { type FrameRequest, prepareFrame, fillObligations, type FrameScope } from '../src/om/frame-obligations.js';
+import { type FrameRequest, prepareFrame, type FrameScope } from '../src/om/frame-obligations.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { normalizeOwnerGapAssignment, OM_OWNER_ASSIGNMENT_CONTRACT, writeOmObligations, OM_OWNER_ASSIGNMENT_KIND } from '../src/om/obligations.js';
@@ -381,8 +381,7 @@ export function e4WorksFixture(t: TestContext, managed = false) {
   const frame2: FrameRequest = { project, level: 2, graph: reference(store.get(`graph:${project}`)!), horizon: reference(initial.gate),
     layer: null, frame: null, upper: null };
   const frame = valueOf(prepareFrame(store, frame2)), projected = projectGraph(desired, 2);
-  const fills = valueOf(fillObligations(frame.upper as Graph, frame.scope as FrameScope, { graph: desired,
-    reference: { ...frame.request.graph, hash: hashJson(desired) }, frame: null }, frame.upperRef, 2));
+  const fills = explicitMapping(desired, frame.upper as Graph, frame.scope as FrameScope, 2);
   const nodes = projected.nodes.filter(node => node.kind === 'operation'), nodeIds = new Set(nodes.map(node => node.id));
   const proposalValue: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level: 2, source: 'decision', status: 'proposed', nodes,
     fills: fills.fills.filter(fill => nodeIds.has(fill.node)).map(fill => ({ obligation: fill.obligation, node: fill.node,

@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { EngineError } from "../src/errors.js";
 import { pendingOverlay, storeView } from "../src/storage/store-view.js";
-import { canonical, hashJson } from "../src/canonical.js";
+import { canonical } from "../src/canonical.js";
 import type { Graph } from "../src/graph/model.js";
 import { reference, STAGE_CLOSURE_CONTRACT, type Ref } from "../src/pipeline/contracts.js";
 import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requirements.js";
@@ -20,9 +20,9 @@ import {
   prepareHorizon, writeHorizon, type HorizonRequest,
 } from "../src/om/horizon.js";
 import {
-  prepareFrame, prepareHorizonBasis, prepareLayerAcceptance, fillObligations, type FrameRequest, type FrameLevel, type FrameScope,
+  prepareFrame, prepareHorizonBasis, prepareLayerAcceptance, type FrameRequest, type FrameLevel, type FrameScope,
 } from "../src/om/frame-obligations.js";
-import { createOmFixture, gardenGraph, type OmFixture } from "./om-fixture.js";
+import { createOmFixture, explicitMapping, gardenGraph, type OmFixture } from "./om-fixture.js";
 
 import { Refinement } from "../src/graph/refinement.js";
 import { ProductEngine } from "../src/product/engine.js";
@@ -120,8 +120,7 @@ function committedFrameFixture(t: TestContext, absence?: string) {
   const original: FrameRequest = { project: "garden", level: 2, horizon: reference(initial.gate),
     graph: reference(store.get("graph:garden")!), layer: null, frame: null, upper: null };
   const prepared = delivered(prepareFrame(store, original)), design = projectGraph(graph, 2);
-  const fills = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-    { graph, reference: { id: "graph:garden", revision: 1, hash: hashJson(graph) }, frame: null }, prepared.upperRef, 2)).fills;
+  const fills = explicitMapping(graph, prepared.upper as Graph, prepared.scope as FrameScope, 2).fills;
   const proposal: LayerProposal = { base: { graph: original.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: clone(design.nodes.filter(node => node.kind === "operation")),
     fills: fills.map(fill => ({ obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),

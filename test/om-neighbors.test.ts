@@ -28,12 +28,12 @@ import { prepareDeliveries, readDeliveries } from '../src/om/deliveries.js';
 import { EngineError } from '../src/errors.js';
 import { LEVEL, type Graph, type Node } from '../src/graph/model.js';
 import { RefinementRelations } from '../src/graph/relations.js';
-import { fillObligations, prepareFrame, readFrame, readFrameFlow, frameObligations, flowKey, workAnchorId, type FrameRead, type FrameRequest, type FrameLevel, type FrameObligation, type FrameFlowSource } from '../src/om/frame-obligations.js';
+import { prepareFrame, readFrame, readFrameFlow, frameObligations, flowKey, workAnchorId, type FrameRead, type FrameRequest, type FrameLevel, type FrameObligation, type FrameFlowSource } from '../src/om/frame-obligations.js';
 import { buildPackets, neighborsOf, prepareNeighbors, readNeighbors, writeNeighbors, type NeighborCollection, type NeighborReadRequest, type NeighborSources } from '../src/om/neighbors.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
 import { exampleGraph } from './graph-fixture.js';
-import { createOmFixture, gardenGraph } from './om-fixture.js';
+import { createOmFixture, explicitMapping, gardenGraph } from './om-fixture.js';
 
 const producer = 'garden-produce-work', consumer = 'garden-consume-work';
 const producerOp = 'garden-produce-operation', consumerOp = 'garden-consume-operation';
@@ -311,8 +311,7 @@ function persistedProposal(frame: FrameRead, desired: Graph): LayerProposal {
     graph.connectors = frame.upper.connectors.map(upper => ({ ...clone(upper), bindings: [...clone(upper.bindings),
       ...graph.connectors.find(connector => connector.id === upper.id)!.bindings.filter(binding => binding.level === 3)] }));
   }
-  const projected = projectGraph(graph, level), mapped = ok(fillObligations(frame.upper, frame.scope,
-    { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+  const projected = projectGraph(graph, level), mapped = explicitMapping(graph, frame.upper, frame.scope, level);
   const nodes = projected.nodes.filter(item => item.kind === (level === 2 ? 'operation' : 'work')
     && (level === 2 || frame.scope.nodes.includes(item.parent!))), selected = new Set(nodes.map(item => item.id));
   return { base: { graph: frame.request.graph, frame: frame.request.frame }, level,
@@ -842,7 +841,7 @@ for (const crossed of [false, true]) test(`saved flow correspondence ${crossed ?
 
 function checkedFlowSource(options: NeighborSources): FrameFlowSource {
   return { obligations: clone(options.frames.works.obligations),
-    fills: options.frames.works.fills?.map(fill => ({ ...clone(fill), source: fill.source === 'identity' ? 'identity' : 'accepted' })) ?? null,
+    fills: options.frames.works.fills.map(fill => ({ ...clone(fill), source: fill.source === 'identity' ? 'identity' : 'accepted' as const })),
     worksContract: 'works-frame/v1' };
 }
 
@@ -856,7 +855,7 @@ test('readFrameFlow validates public arguments and refuses foreign exact binding
     const values = [...args]; values[index] = value as never; invalid(values);
   }
   for (const changed of [{ ...source, obligations: undefined }, { ...source, obligations: [null] }, { ...source, fills: undefined },
-    { ...source, fills: [{}] }, { ...source, worksContract: undefined }, { ...source, worksContract: 'unknown' }])
+    { ...source, fills: null }, { ...source, fills: [{}] }, { ...source, worksContract: undefined }, { ...source, worksContract: 'unknown' }])
     invalid([graph, graph, changed, connectorId, lower]);
   for (const changed of [{ ...lower, level: 1 }, { ...lower, consumers: [] }, { ...lower, anchor: undefined },
     { ...lower, producer: { node: producer } }]) invalid([graph, graph, source, connectorId, changed]);

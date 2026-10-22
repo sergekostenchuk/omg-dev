@@ -94,7 +94,7 @@ function frameGaps(graph: Graph, level: FrameLevel): FrameGap[] {
   const scope: FrameScope = { nodes, excluded: [], hash: hashJson({ nodes: [...nodes].sort(), excluded: [] }) };
   const upperRef = ref(`graph-layer:garden:${level - 1}`);
   const frame: FrameRead = { request: { project: "garden", level, graph: ref("graph:garden"), horizon: ref("om-horizon:garden:choice"),
-    layer: null, frame: null, upper: level === 2 ? null : { horizon: ref("om-horizon:garden:choice"), frame: null } },
+    layer: null, frame: null, upper: level === 2 ? null : { horizon: ref("om-horizon:garden:choice"), frame: ref("om-frame:garden:2") } },
     upper, upperRef, scope, accepted: null, references: [upperRef],
     result: clone(ok(fillObligations(upper, scope, null, upperRef, level))) as FrameRead["result"] };
   return clone(ok(openObligationsToGaps(frame, ok(applyProposals(frame, [])) as Parameters<typeof openObligationsToGaps>[1]))) as FrameGap[];

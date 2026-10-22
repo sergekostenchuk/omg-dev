@@ -278,7 +278,7 @@ function requireTransfer(request: ObligationTransferRequest): void {
     if (!text(frame.project) || frame.level !== level || ![frame.graph, frame.horizon].every(isRef)
       || (frame.frame !== null && !isRef(frame.frame)) || (frame.layer !== null && !isRef(frame.layer))
       || (level === 2 ? frame.upper !== null : !object(frame.upper) || !isRef(frame.upper.horizon)
-        || (frame.upper.frame !== null && !isRef(frame.upper.frame)))) invalid('transfer.sources.frame');
+        || !isRef(frame.upper.frame))) invalid('transfer.sources.frame');
   }
 }
 function assignmentRecord(store: Store, project: string, ref: Ref): { record: AssignmentRecord; inputs: Ref[]; owner: Ref } {

@@ -3,18 +3,19 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { hashJson, type Json } from '../src/canonical.js';
+import { canonical, canonicalSorted, type Json } from '../src/canonical.js';
 import { Store, type Write } from '../src/storage/store.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { reference, STAGES, type Ref, type StageArtifact } from '../src/pipeline/contracts.js';
-import type { Graph } from '../src/graph/model.js';
+import { LEVEL, type Endpoint, type Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
+import { RefinementRelations } from '../src/graph/relations.js';
 import type { EarlyStageOutcome } from '../src/product/early-stage-driver.js';
 import { git } from '../src/runtime/environment.js';
 import { writeOmInput } from '../src/om/input.js';
 import { inputDecisionWrite, writeAddressing } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { fillObligations, prepareFrame, type FrameScope, type FrameRequest } from '../src/om/frame-obligations.js';
+import { flowKey, frameObligations, prepareFrame, type FrameObligation, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import type { LayerProposal } from '../src/om/frame-proposals.js';
 import { gateCandidate, writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
@@ -28,6 +29,59 @@ import { runIntegrityCheck } from '../src/om/integrity.js';
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const { publishSample } = await import(new URL('../../scripts/golden-sample.mjs', import.meta.url).href);
 const take = <T>(r: OmResult<T>): T => { if (!r.ok) throw new Error(JSON.stringify(r.refusal)); return r.value; };
+interface UpperFlow { connector: string; key: string; producer: Endpoint; consumers: Endpoint[]; anchor: string | null }
+/** Upper L1 flows grouped exactly as the frame reader groups them. */
+function upperFlows(upper: Graph): UpperFlow[] {
+  const flows = new Map<string, UpperFlow>(), seen = new Map<string, Set<string>>();
+  for (const connector of upper.connectors) for (const binding of connector.bindings.filter(item => item.level === 1)) {
+    const key = flowKey(binding), address = canonical([connector.id, key]);
+    let flow = flows.get(address);
+    if (!flow) {
+      flow = { connector: connector.id, key, producer: binding.producer, consumers: [], anchor: binding.anchor };
+      flows.set(address, flow); seen.set(address, new Set());
+    }
+    for (const endpoint of binding.consumers) {
+      const end = canonical([endpoint.node, endpoint.port]);
+      assert.ok(!seen.get(address)!.has(end), `Duplicate upper consumer ${endpoint.node}.${endpoint.port}`);
+      seen.get(address)!.add(end); flow.consumers.push(endpoint);
+    }
+  }
+  return canonicalSorted([...flows.values()].map(flow => ({ ...flow, consumers: canonicalSorted(flow.consumers) })));
+}
+/** The recipe's explicit L2 fills — each obligation names the recipe endpoints that correspond to it. */
+function recipeFills(upper: Graph, obligations: readonly FrameObligation[]): { obligation: string; node: string; port?: string }[] {
+  const relations = new RefinementRelations(desired), flows = upperFlows(upper), fills: { obligation: string; node: string; port?: string }[] = [];
+  for (const obligation of obligations) {
+    if (obligation.kind !== 'connection-end') {
+      for (const node of desired.nodes.filter(node => LEVEL[node.kind] === 2 && node.outcome === obligation.artifact
+        && relations.refines(node.id, obligation.upper.node))) fills.push({ obligation: obligation.id, node: node.id });
+      continue;
+    }
+    const endpoints: Endpoint[] = [];
+    for (const binding of desired.connectors.find(item => item.id === obligation.connector)?.bindings.filter(item => item.level === 2) ?? []) {
+      let candidates = flows.filter(flow => flow.connector === obligation.connector && flow.anchor === binding.anchor
+        && relations.refines(binding.producer.node, flow.producer.node)
+        && binding.consumers.every(endpoint => flow.consumers.some(consumer => relations.refines(endpoint.node, consumer.node))));
+      if (candidates.length > 1) {
+        candidates = candidates.filter(flow => flow.producer.port === binding.producer.port
+          && binding.consumers.every(endpoint => flow.consumers.some(consumer => relations.refines(endpoint.node, consumer.node) && endpoint.port === consumer.port)));
+        assert.equal(candidates.length, 1, `Ambiguous lower binding on ${obligation.connector}`);
+      }
+      const flow = candidates.find(item => item.key === obligation.flow);
+      if (!flow) continue;
+      if (obligation.role === 'producer') endpoints.push(binding.producer);
+      else {
+        const ports = new Set(flow.consumers.filter(endpoint => endpoint.node === obligation.upper.node).map(endpoint => endpoint.port));
+        const matches = binding.consumers.filter(endpoint => relations.refines(endpoint.node, obligation.upper.node));
+        assert.ok(ports.size <= 1 || matches.every(endpoint => ports.has(endpoint.port)), `Several upper ports need distinct port IDs on ${obligation.connector}`);
+        endpoints.push(...matches.filter(endpoint => ports.size <= 1 || endpoint.port === obligation.upper.port));
+      }
+    }
+    for (const endpoint of new Map(endpoints.map(endpoint => [canonical([endpoint.node, endpoint.port]), endpoint])).values())
+      fills.push({ obligation: obligation.id, node: endpoint.node, port: endpoint.port });
+  }
+  return fills;
+}
 const recipePath = join(root, 'test/golden-sample-recipe.json');
 const recipe = JSON.parse(readFileSync(recipePath, 'utf8')) as { project: string; desired: Graph; fields: Record<string, Json> };
 const project = recipe.project, desired = recipe.desired, workspace = join(root, 'workspace');
@@ -74,8 +128,8 @@ try {
     choice: { choiceVersion: 'golden-v1', features: [{ outcome: `${project}-result` }], excluded: [] } }));
   const frame: FrameRequest = { project, level: 2, graph, horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
   const prepared = take(prepareFrame(store, frame)), projected = projectGraph(desired, 2);
-  const mapped = take(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-    { graph: desired, reference: { ...prepared.request.graph, hash: hashJson(desired) }, frame: null }, prepared.upperRef, 2));
+  const obligations = take(frameObligations(prepared.upper as Graph, prepared.scope as FrameScope, 2));
+  const mapped = { fills: recipeFills(prepared.upper as Graph, obligations) };
   const nodes = projected.nodes.filter(n => n.kind === 'operation'), ids = new Set(nodes.map(n => n.id));
   const proposal: LayerProposal = { base: { graph, frame: null }, level: 2, source: 'decision', status: 'proposed', nodes,
     fills: mapped.fills.filter(f => ids.has(f.node)).map(f => ({ obligation: f.obligation, node: f.node, ...(f.port ? { port: f.port } : {}) })),

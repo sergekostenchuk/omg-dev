@@ -43,14 +43,14 @@ import { assessAnswer } from '../src/discovery/research-assessment.js';
 import type { Question } from '../src/discovery/discovery.js';
 import { prepareAcceptedAnswer, writeAcceptedAnswer, readAcceptedAnswer, readAnswerForInput, answerSourceGuards,
   applicableAnswerTask, confirmAnswerGapClosure, answerIndexId, type AnswerRequest, type Mc1QuestionRecord } from '../src/om/accepted-answer.js';
-import { prepareFrame, fillObligations, type FrameRead, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
+import { prepareFrame, type FrameRead, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate, type AcceptedFrameRequest } from '../src/om/frame-accept.js';
 import { writeGuarded } from '../src/om/refs.js';
 import type { OmResult } from '../src/om/refusal.js';
 import { receiptId, type ArtifactReceipt } from '../src/compiler/model.js';
-import { createOmFixture, gardenGraph, refusedWith, acceptNativeWorks, type OmPreparedFixture } from './om-fixture.js';
+import { createOmFixture, explicitMapping, gardenGraph, refusedWith, acceptNativeWorks, type OmPreparedFixture } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -780,8 +780,7 @@ function acceptMappedFrame(f: Pick<Fixture, 'store'>, frame: FrameRequest): Acce
     node.implements = [...new Set([...(node.implements ?? []), ...(graph.requirements ?? []).filter(item => item.outcome === node.outcome).map(item => item.id)])];
   assert.deepEqual(projectGraph(graph, 1), projectGraph(upper, 1), 'The proposal template preserves the exact upper of this fixture producer');
   const projected = projectGraph(graph, 2);
-  const mapped = ok(fillObligations(current.upper as Graph, current.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, current.upperRef, 2));
+  const mapped = explicitMapping(graph, current.upper as Graph, current.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
     nodes: projected.nodes.filter(node => node.kind === 'operation'),
     fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),
@@ -1778,8 +1777,7 @@ test('B3 two Stores race the same discarded address without another write or ser
 
 async function acceptBoundB3Frame(f: OmPreparedFixture, frame: FrameRequest, standing: Revision<RepairSeries>, goal: RepairSeries['attempts'][number]['goal']) {
   const store = f.store, read = ok(prepareFrame(store, frame)), graph = gardenGraph(), projected = projectGraph(graph, 2);
-  const mapped = ok(fillObligations(read.upper as Graph, read.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const mapped = explicitMapping(graph, read.upper as Graph, read.scope as FrameScope, 2);
   const obligations = read.result.obligations.filter(item => item.upper.node === block).map(item => item.id).sort();
   const all: LayerProposal = { base: { graph: frame.graph, frame: frame.frame }, level: 2, source: 'decision', status: 'proposed',
     nodes: projected.nodes.filter(node => node.kind === 'operation'),
@@ -1848,8 +1846,7 @@ async function executeForReceipts(f: OmPreparedFixture, upperFrame: Ref): Promis
         ...(desired.connectors.find(connector => connector.id === upper.id)?.bindings ?? []).filter(binding => binding.level === 3)] }));
     }
     const projected = projectGraph(graph, level);
-    const mapped = ok(fillObligations(frame.upper, frame.scope,
-      { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    const mapped = explicitMapping(graph, frame.upper, frame.scope, level);
     const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? "operation" : "work")
       && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
     const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,

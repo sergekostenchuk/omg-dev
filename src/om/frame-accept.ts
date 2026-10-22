@@ -412,7 +412,7 @@ function requireRejectionRequest(store: Store, value: unknown): asserts value is
     || frame['layer'] !== null && !isRef(frame['layer']) || frame['frame'] !== null && !isRef(frame['frame'])) invalid('rejection.frame');
   const upper = frame['upper'];
   if (frame['level'] === 2 ? upper !== null : !object(upper) || !isRef(upper['horizon'])
-    || upper['frame'] !== null && !isRef(upper['frame'])) invalid('rejection.upper');
+    || !isRef(upper['frame'])) invalid('rejection.upper');
 }
 function rejectionRequest(request: ProposalRequest): ProposalRequest {
   try { return sealed({ frame: request.frame, proposals: sorted(request.proposals) }) as ProposalRequest; }
@@ -539,7 +539,7 @@ function requireRebaseRequest(store: Store, request: unknown): asserts request i
       || !isRef(frame['graph']) || !isRef(frame['horizon'])
       || frame['frame'] !== null && !isRef(frame['frame']) || frame['layer'] !== null && !isRef(frame['layer'])
       || !object(frame['upper']) || !isRef(frame['upper']['horizon'])
-      || frame['upper']['frame'] !== null && !isRef(frame['upper']['frame'])) invalid(`rebase.${key}`);
+      || !isRef(frame['upper']['frame'])) invalid(`rebase.${key}`);
   }
 }
 function rebaseResult(frame: Revision<OmRebasedFrame>, layer: Revision<LayerBasis>, state: FrameRebase['state']): FrameRebase {

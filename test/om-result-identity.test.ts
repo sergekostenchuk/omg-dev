@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { canonical, hashJson, type Json } from "../src/canonical.js";
 import { EngineError } from "../src/errors.js";
 import type { Graph, Node } from "../src/graph/model.js";
-import { fillObligations, prepareFrame, type FrameFill, type FrameObligation, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import { prepareFrame, type FrameFill, type FrameObligation, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { OmResult } from "../src/om/refusal.js";
 import { extractResultSlice, factResultKey, normalizeResultContent, readResultIdentity, type FactResultIdentity, type ResultIdentityRequest, type ResultDependencySlice, RESULT_SLICE_REFUSAL_CODES } from "../src/om/result-identity.js";
 import { Store, type Revision } from "../src/storage/store.js";
@@ -22,7 +22,7 @@ import { writeHorizon } from "../src/om/horizon.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
-import { gardenGraph } from "./om-fixture.js";
+import { explicitMapping, gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { git } from "../src/runtime/environment.js";
 
@@ -460,8 +460,7 @@ function identityFixture(t: TestContext, research = false, options: { thirdPort?
       choice: { choiceVersion: "identity-native-l2", features: [{ outcome: "garden-result" }], excluded: [] }, available: {} }));
     const native: FrameRequest = { project: "garden", level: 2, graph: graphRef, horizon: reference(gate.gate), layer: null, frame: null, upper: null };
     const prepared = delivered(prepareFrame(store, native));
-    const mapped = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-      { graph, reference: { ...native.graph, hash: hashJson(graph) }, frame: null }, prepared.upperRef, 2));
+    const mapped = explicitMapping(graph, prepared.upper as Graph, prepared.scope as FrameScope, 2);
     const projected = projectGraph(graph, 2);
     const proposal: LayerProposal = { base: { graph: native.graph, frame: null }, level: 2, source: "decision", status: "proposed",
       nodes: projected.nodes.filter(node => node.kind === "operation"),
@@ -504,8 +503,7 @@ function identityFixture(t: TestContext, research = false, options: { thirdPort?
     return request;
   };
   const initial = delivered(prepareFrame(store, frame)), projected = projectGraph(graph, 2);
-  const mapped = delivered(fillObligations(initial.upper as Graph, initial.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, initial.upperRef, 2));
+  const mapped = explicitMapping(graph, initial.upper as Graph, initial.scope as FrameScope, 2);
   const first = empty();
   if (!research) {
     first.nodes = projected.nodes.filter(node => node.kind === "operation");

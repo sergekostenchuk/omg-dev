@@ -14,14 +14,14 @@ import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requiremen
 import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { fillObligations, prepareFrame, readFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import { prepareFrame, readFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
 import { observeProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate, readCandidate, gateCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { gardenGraph, createOmFixture, prepareNativeLayers } from "./om-fixture.js";
+import { explicitMapping, gardenGraph, createOmFixture, prepareNativeLayers } from "./om-fixture.js";
 import { seedCopy } from "./om-seed.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
@@ -138,8 +138,7 @@ function definitionFixture(store: Store, project: string): DefinitionFixture {
   const previous = cache.get(project); if (previous) return previous;
   const { graph, upper, input, first } = initialFrame(store, project);
   const read = deliveredOf(prepareFrame(store, first)), projected = projectGraph(graph, 2);
-  const mapped = deliveredOf(fillObligations(read.upper as Graph, read.scope as FrameScope,
-    { graph, reference: { ...first.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const mapped = explicitMapping(graph, read.upper as Graph, read.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: first.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: projected.nodes.filter(node => node.kind === "operation"), fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
       ...(fill.port === undefined ? {} : { port: fill.port }) })),

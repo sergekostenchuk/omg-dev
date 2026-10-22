@@ -9,7 +9,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonical, hashJson, type Json } from '../src/canonical.js';
+import { canonical, type Json } from '../src/canonical.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { Store, type Write } from '../src/storage/store.js';
 import { Evidence } from '../src/evidence/evidence.js';
@@ -41,11 +41,11 @@ import { prepareAssessmentIntent, writeAssessmentIntent, readAssessmentIntentAt,
   type AssessmentIntentRequest, type AssessmentResultRecord } from '../src/om/assessment.js';
 import { writeGuarded } from '../src/om/refs.js';
 import { type OmResult } from '../src/om/refusal.js';
-import { gardenGraph, refusedWith } from './om-fixture.js';
+import { gardenGraph, refusedWith, storedAccepted } from './om-fixture.js';
 import { seedCopy } from './om-seed.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
-import { prepareFrame, fillObligations } from '../src/om/frame-obligations.js';
+import { prepareFrame, fillObligations, type FrameScope } from '../src/om/frame-obligations.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 
@@ -1031,7 +1031,7 @@ function twoMc1Fixture(t: TestContext, deferredPackets = false) {
   const frame={project,level:2 as const,graph:graph0,horizon:reference(horizon0.gate),layer:null,frame:null,upper:null};
   const initial=ok(prepareFrame(store,frame)), projected=projectGraph(graph,2);
   const fills=ok(fillObligations(initial.upper as Graph,structuredClone(initial.scope) as Parameters<typeof fillObligations>[1],
-    {graph,reference:{...graph0,hash:hashJson(graph)},frame:null},initial.upperRef,2));
+    storedAccepted(graph,initial.upper as Graph,initial.scope as FrameScope,project,2),initial.upperRef,2));
   const offered=store.write({id:'om-proposal:garden:shared-operation',kind:'layer-proposal',expected:0,value:{
     base:{graph:graph0,frame:null},level:2,source:'decision',status:'proposed',nodes:projected.nodes.filter(n=>n.kind==='operation'),
     fills:fills.fills.map(f=>({obligation:f.obligation,node:f.node,...(f.port===undefined?{}:{port:f.port})})),

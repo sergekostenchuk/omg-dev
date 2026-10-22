@@ -26,7 +26,7 @@ import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { checkAtomicWorks, prepareWorksAcceptance, prepareWorksSources, writeWorksAcceptance, readAtomicGate, prepareAtomicGate, writeAtomicGate, readWorksAcceptance, transactionForTests, type AtomicGateRecord, type AtomicGateRequest, type PreparedWorksAcceptance } from '../src/om/atomic-gate.js';
 import { readAcceptedFrame, settleCandidate } from '../src/om/frame-accept.js';
 import { writeCandidate, readCandidate, type FrameCandidateRecord } from '../src/om/frame-candidate.js';
-import { fillObligations, prepareFrame, type FrameRequest, type FrameRead } from '../src/om/frame-obligations.js';
+import { prepareFrame, type FrameRequest, type FrameRead } from '../src/om/frame-obligations.js';
 import type { LayerProposal, ProposalRequest } from '../src/om/frame-proposals.js';
 import { writeGaps, readGaps, type Gap, type GapRequest, type GapReadRequest } from '../src/om/gaps.js';
 import { gapLineKey, prepareGapLines, writeGapLines, readGapLines, type GapLinesRecord, type GapLinesRequest } from '../src/om/gap-lines.js';
@@ -47,7 +47,7 @@ import { writeRoutes } from '../src/om/routes.js';
 import { checkStanding, stopReport } from '../src/om/stop-report.js';
 import { readAcceptedAnswer } from '../src/om/accepted-answer.js';
 import { managedBlock } from './om-managed-block.js';
-import { gardenGraph } from './om-fixture.js';
+import { gardenGraph, explicitMapping, markedWorks } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { enrichedGraph } from './enriched-graph-fixture.js';
@@ -649,8 +649,8 @@ function externalCandidate(t: TestContext) {
       graph.connectors = frame.upper.connectors.map(upper => ({ ...clone(upper), bindings: [...clone(upper.bindings),
         ...desired.connectors.find(connector => connector.id === upper.id)!.bindings.filter(binding => binding.level === 3)] }));
     }
-    const projected = projectGraph(graph, level), mapped = ok(fillObligations(frame.upper, frame.scope, {
-      graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    if (level === 3) markedWorks(graph);
+    const projected = projectGraph(graph, level), mapped = explicitMapping(graph, frame.upper, frame.scope, level);
     const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? 'operation' : 'work')
       && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
     const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,

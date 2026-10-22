@@ -7,7 +7,7 @@ import { RefinementRelations } from "../src/graph/relations.js";
 import type { Horizon } from "../src/om/horizon.js";
 import { sealed, type OmResult, type Refusal, type Sealed } from "../src/om/refusal.js";
 import { workZone, readWorkZone, prepareWorkZone, type WorkZoneRequest } from "../src/om/work-zone.js";
-import { gardenGraph, createOmFixture, refusedWith } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, explicitMapping, refusedWith } from "./om-fixture.js";
 
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,7 +19,7 @@ import { ProductEngine } from '../src/product/engine.js';
 import { Store } from '../src/storage/store.js';
 import { writeOmInput } from '../src/om/input.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { fillObligations, prepareFrame, readFrameBasis, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
+import { prepareFrame, readFrameBasis, type FrameRequest, type FrameScope } from '../src/om/frame-obligations.js';
 import type { LayerProposal } from '../src/om/frame-proposals.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
@@ -202,8 +202,7 @@ function nativeZone(t: TestContext) {
   const frame: FrameRequest = { project: 'garden', level: 2, graph: reference(store.get('graph:garden')!),
     horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
   const read = ok(prepareFrame(store, frame)), projected = projectGraph(graph, 2);
-  const mapped = ok(fillObligations(read.upper as Graph, read.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const mapped = explicitMapping(graph, read.upper as Graph, read.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
     nodes: projected.nodes.filter(node => node.kind === 'operation'), fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
       ...(fill.port === undefined ? {} : { port: fill.port }) })),

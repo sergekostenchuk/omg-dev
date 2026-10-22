@@ -16,7 +16,7 @@ import { configureReaderPilot, type ReaderPilotSettings } from '../src/discovery
 import type { Source } from '../src/evidence/evidence.js';
 import type { Graph } from '../src/graph/model.js';
 import { projectGraph } from '../src/graph/project.js';
-import { prepareFrame, fillObligations, type FrameRead } from '../src/om/frame-obligations.js';
+import { prepareFrame, type FrameRead } from '../src/om/frame-obligations.js';
 import type { LayerProposal } from '../src/om/frame-proposals.js';
 import { writeWorksAcceptance } from '../src/om/atomic-gate.js';
 import { readAcceptedFrame, type AcceptedFrameRequest } from '../src/om/frame-accept.js';
@@ -53,7 +53,7 @@ import type { ProcessResult } from '../src/runtime/process.js';
 import { OM_OWNER_ASSIGNMENT_CONTRACT, OM_OWNER_ASSIGNMENT_KIND, normalizeOwnerGapAssignment,
   writeOmObligations, readOmObligations, readOmObligationLedger, type OwnerGapAssignment, type ObligationRequest, type OmObligations, type OmObligationRecord } from '../src/om/obligations.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
-import { gardenGraph, prepareNativeLayers } from './om-fixture.js';
+import { explicitMapping, gardenGraph, prepareNativeLayers } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { taskObligationExecutionFixture } from './execution-fixture.js';
@@ -184,8 +184,7 @@ process.exitCode=readFileSync(condition,'utf8')==='ready'&&!existsSync(marker+'.
       wakeTest: desired.connectors.find(item => item.id === upper.id)?.wakeTest ?? upper.wakeTest,
       bindings: [...clone(upper.bindings), ...(desired.connectors.find(item => item.id === upper.id)?.bindings ?? []).filter(item => item.level === 3)] }));
     const projected = projectGraph(graph, 3);
-    const mapped = ok(fillObligations(frame.upper, frame.scope,
-      { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, 3));
+    const mapped = explicitMapping(graph, frame.upper, frame.scope, 3);
     const nodes = projected.nodes.filter(node => node.kind === 'work' && frame.scope.nodes.includes(node.parent!));
     const routes = ok(writeRoutes(store, { project, gaps: gapRead, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
     const adapter = store.write({ id: `adapter:${project}:runtime-task-fixture`, kind: 'dispatch-adapter', expected: 0,

@@ -23,13 +23,13 @@ import { readBlockQueue } from "../src/om/queue.js";
 import type { RoutesRecord } from "../src/om/routes.js";
 import { readRun, startRun } from "../src/om/run.js";
 import { FACT_RESULT_FORM, RUN_BASES_POLICY, prepareRunBases, writeRunBases, type BuiltRunBases } from "../src/om/run-bases.js";
-import { gardenGraph, createOmFixture } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, explicitMapping } from "./om-fixture.js";
 import { enrichedGraph } from "./enriched-graph-fixture.js";
 import { exampleGraph } from "./graph-fixture.js";
 import { prepareAtomicGate, prepareCandidateSources, type AtomicGateRequest } from "../src/om/atomic-gate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
-import { fillObligations, prepareFrame, type FrameRead, type FrameRequest } from "../src/om/frame-obligations.js";
+import { prepareFrame, type FrameRead, type FrameRequest } from "../src/om/frame-obligations.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
 import { writeGapLines } from "../src/om/gap-lines.js";
@@ -446,8 +446,7 @@ function externalCandidate(t: test.TestContext, selfInput = false) {
       graph.connectors = frame.upper.connectors.map(upper => ({ ...structuredClone(upper), bindings: [...structuredClone(upper.bindings),
         ...desired.connectors.find(connector => connector.id === upper.id)!.bindings.filter(binding => binding.level === 3)] }));
     }
-    const projected = projectGraph(graph, level), mapped = ok(fillObligations(frame.upper, frame.scope, {
-      graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    const projected = projectGraph(graph, level), mapped = explicitMapping(graph, frame.upper, frame.scope, level);
     const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? "operation" : "work")
       && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
     const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,

@@ -88,7 +88,7 @@ function frameOf(graph: Graph, level: FrameLevel): FrameRead {
   const scope: FrameScope = { nodes, excluded: [], hash: hashJson({ nodes: [...nodes].sort(), excluded: [] }) };
   const upperRef = fakeRef(`graph-layer:garden:${level - 1}`);
   const frame: FrameRead = { request: { project: "garden", level, graph: fakeRef("graph:garden"), horizon: fakeRef("om-horizon:garden:choice"),
-    layer: null, frame: null, upper: level === 2 ? null : { horizon: fakeRef("om-horizon:garden:choice"), frame: null } },
+    layer: null, frame: null, upper: level === 2 ? null : { horizon: fakeRef("om-horizon:garden:choice"), frame: fakeRef("om-frame:garden:2") } },
     upper, upperRef, scope, accepted: null, references: [upperRef],
     result: clone(delivered(fillObligations(upper, scope, null, upperRef, level))) as FrameRead["result"] };
   return frame;
@@ -789,7 +789,7 @@ test("native first-pass gaps accept an explicit unaccepted work upper, then expo
     operations: { proposals: [], frame: { project: "garden", level: 2, graph: reference(nextGraph), horizon: reference(workHorizon.gate),
       layer: reference(store.get("graph-layer:garden:2")!), frame: null, upper: null } },
     works: { proposals: [], frame: { project: "garden", level: 3, graph: reference(nextGraph), horizon: reference(workHorizon.gate),
-      layer: null, frame: null, upper: { horizon: reference(workHorizon.gate), frame: null }, workZoneContract: "accepted-l2-v1" } } };
+      layer: null, frame: null, upper: { horizon: reference(workHorizon.gate), frame: fakeRef("om-frame:garden:2") }, workZoneContract: "accepted-l2-v1" } } };
   const workSource = delivered(prepareFrameProposals(store, current.works));
   assert.ok(workSource.gaps.length > 0);
   const falseEmpty: GapRequest = { ...current, works: { state: "upper-not-accepted", layer: reference(store.get("graph-layer:garden:2")!) } };

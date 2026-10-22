@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { hashJson, canonical, type Json } from '../src/canonical.js';
+import { canonical, type Json } from '../src/canonical.js';
 import { runModelCycle, runModelCall, readModelCall, type OmModelCall, runModelTransport, readManagedModelDiagnostic, readModelCycle, type ReadDeliveryRecord, finishModelAttempt } from '../src/om/model-call.js';
 import { type Revision, Store } from '../src/storage/store.js';
 import { reference } from '../src/pipeline/contracts.js';
@@ -14,7 +14,8 @@ import type { Graph } from '../src/graph/model.js';
 import { readRecord } from '../src/om/refs.js';
 import { writeQuestionPacket, readQuestionPacket, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { completeAttempt, seriesRequestOf, type RepairSeries } from '../src/om/series.js';
-import { prepareFrame, fillObligations, type FrameScope } from '../src/om/frame-obligations.js';
+import { prepareFrame, type FrameScope } from '../src/om/frame-obligations.js';
+import { explicitMapping } from './om-fixture.js';
 import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { recordCall } from '../src/om/call-record.js';
@@ -291,8 +292,7 @@ test('32 H1.0b exact accepted frame ends a required absence and ceases only the 
   graph.nodes.find(row => row.id === 'garden-consume-operation')!.ports.push({ id: 'in-side', direction: 'in', contract: 'garden-contract' });
   graph.connectors.find(row => row.id === 'garden-side-flow')!.bindings.push({ level: 2, producer: { node: 'garden-produce-operation', port: 'out-side' }, consumers: [{ node: 'garden-consume-operation', port: 'in-side' }], anchor: null });
   const projected = projectGraph(graph, 2);
-  const fills = valueOf(fillObligations(frame.upper as Graph, frame.scope as FrameScope,
-    { graph, reference: { ...reference(f.graph), hash: hashJson(graph) }, frame: null }, frame.upperRef, 2));
+  const fills = explicitMapping(graph, frame.upper as Graph, frame.scope as FrameScope, 2);
   const proposal = f.store.write({ id: `om-proposal:${f.project}:h10b-frame`, kind: 'layer-proposal', expected: 0, value: {
     base: { graph: reference(f.graph), frame: null }, level: 2, source: 'decision', status: 'proposed',
     nodes: projected.nodes.filter(row => row.kind === 'operation'),

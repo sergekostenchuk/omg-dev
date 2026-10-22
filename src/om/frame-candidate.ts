@@ -103,7 +103,7 @@ function requireRequest(value: unknown): asserts value is CandidateRequest {
   for (const field of ['horizon', 'graph']) if (!isRef(frame[field])) invalid(`frame.${field}`);
   for (const field of ['layer', 'frame']) if (frame[field] !== null && !isRef(frame[field])) invalid(`frame.${field}`);
   if (frame['level'] === 2 ? frame['upper'] !== null : !object(frame['upper']) || !isRef(frame['upper']['horizon'])
-    || (frame['upper']['frame'] !== null && !isRef(frame['upper']['frame']))) invalid('frame.upper');
+    || !isRef(frame['upper']['frame'])) invalid('frame.upper');
   if (!Array.isArray(value['proposals']) || !value['proposals'].every(isRef)) invalid('proposals');
   if (Object.hasOwn(value, 'joinAssembly') && (frame['level'] !== 3 || value['joinAssembly'] !== JOIN_ASSEMBLY)) invalid('joinAssembly');
 }

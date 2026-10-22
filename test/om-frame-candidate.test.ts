@@ -20,7 +20,7 @@ import { writeHorizon } from "../src/om/horizon.js";
 import { historicalTrace, withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
-import { gardenGraph, createOmFixture, prepareNativeLayers, acceptNativeWorks, type OmFixture } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, explicitMapping, prepareNativeLayers, acceptNativeWorks, storedAccepted, type OmFixture } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 
 const clone = structuredClone;
@@ -54,10 +54,11 @@ function scope(nodes: string[]): FrameScope {
 function pureFrame(graph: Graph, accepted = false, selected?: string[]): FrameRead {
   const upper = projection(graph, 1), upperRef = fakeRef("graph-layer:garden:1");
   const horizon = scope(selected ?? upper.nodes.filter(node => node.kind === "block").map(node => node.id));
+  const acceptedLayer = accepted ? storedAccepted(graph, upper, horizon, "garden", 2) : null;
   const base = accepted ? graph : upper;
   const request: FrameRequest = { project: "garden", level: 2, horizon: fakeRef("om-horizon:garden:choice"),
-    graph: graphRef(base), layer: accepted ? fakeRef("graph-layer:garden:2") : null, frame: null, upper: null };
-  const acceptedLayer = accepted ? { graph, reference: request.graph, frame: null } : null;
+    graph: graphRef(base), layer: accepted ? fakeRef("graph-layer:garden:2") : null,
+    frame: accepted ? acceptedLayer!.frame!.reference : null, upper: null };
   return { request, upper, upperRef, scope: horizon, accepted: acceptedLayer,
     result: clone(delivered(fillObligations(upper, horizon, acceptedLayer, upperRef, 2))) as FrameRead["result"],
     references: [upperRef, request.graph, request.horizon] };
@@ -72,8 +73,7 @@ function emptyProposal(frame: FrameRead, id = "empty"): ProposalObservation {
 }
 function proposalFor(frame: FrameRead, graph: Graph, id = "one"): ProposalObservation {
   const projected = projectGraph(graph, 2);
-  const filled = delivered(fillObligations(frame.upper, frame.scope,
-    { graph, reference: graphRef(graph), frame: null }, frame.upperRef, 2));
+  const filled = explicitMapping(graph, frame.upper, frame.scope, 2);
   const value: LayerProposal = { base: { graph: frame.request.graph, frame: frame.request.frame }, level: 2,
     source: "decision", status: "proposed", nodes: clone(projected.nodes.filter(node => node.kind === "operation")),
     fills: filled.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
@@ -468,7 +468,7 @@ test("unbound operation input ports are refused and graph semantic findings keep
 test("N3 without its works contract is refused on assembly and storage paths, never a partial candidate", t => {
   const f = firstPass(t), level3 = clone(f.frame); level3.request.level = 3;
   refusedAs(assembleCandidate(level3, []), "works_contract_invalid");
-  const request = { ...f.request, frame: { ...f.request.frame, level: 3 as const, workZoneContract: 'accepted-l2-v1' as const, upper: { horizon: f.request.frame.horizon, frame: null } } }, before = revisions(f.store);
+  const request = { ...f.request, frame: { ...f.request.frame, level: 3 as const, workZoneContract: 'accepted-l2-v1' as const, upper: { horizon: f.request.frame.horizon, frame: fakeRef("om-frame:garden:2") } } }, before = revisions(f.store);
   refusedAs(prepareCandidate(f.store, request), "works_contract_invalid");
   refusedAs(writeCandidate(f.store, request), "works_contract_invalid");
   assert.deepEqual(revisions(f.store), before);
@@ -980,8 +980,7 @@ function fjProposalFor(frame: FrameRead, graph: Graph): LayerProposal {
     }).concat(local);
   }
   const level = frame.request.level, projected = projectGraph(graph, level);
-  const mapped = delivered(fillObligations(frame.upper, frame.scope, { graph,
-    reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+  const mapped = explicitMapping(graph, frame.upper, frame.scope, level);
   const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? 'operation' : 'work')
     && (level === 2 || frame.scope.nodes.includes(node.parent!)));
   const selected = new Set(nodes.map(node => node.id));

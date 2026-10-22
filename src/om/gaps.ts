@@ -388,7 +388,7 @@ function requireRequest(value: unknown): asserts value is GapRequest {
     if (!text(frame.project) || ![2, 3].includes(frame.level) || !isRef(frame.graph) || !isRef(frame.horizon)
       || (frame.frame !== null && !isRef(frame.frame)) || (frame.layer !== null && !isRef(frame.layer))
       || (frame.level === 2 ? frame.upper !== null : !object(frame.upper) || !isRef(frame.upper.horizon)
-        || (frame.upper.frame !== null && !isRef(frame.upper.frame)))) invalid(field);
+        || !isRef(frame.upper.frame))) invalid(field);
   }
 }
 function normalizedRequest(request: GapRequest): GapRequest {

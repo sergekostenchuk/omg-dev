@@ -3,7 +3,7 @@ import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.j
 import { gateCandidate, writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { readLayerAcceptance } from "../src/om/layer-basis.js";
-import { refusedWith } from "./om-fixture.js";
+import { explicitMapping, refusedWith } from "./om-fixture.js";
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -284,8 +284,7 @@ function nativeSetup(engine: ProductEngine, desired: Graph) {
         ...(desired.connectors.find(connector => connector.id === upper.id)?.bindings ?? []).filter(binding => binding.level === 3)] }));
     }
     const projected = projectGraph(graph, level);
-    const mapped = ok(fillObligations(frame.upper, frame.scope,
-      { graph, reference: { ...frame.request.graph, hash: hashJson(graph) }, frame: null }, frame.upperRef, level));
+    const mapped = explicitMapping(graph, frame.upper, frame.scope, level);
     const nodes = projected.nodes.filter(node => node.kind === (level === 2 ? "operation" : "work")
       && (level === 2 || frame.scope.nodes.includes(node.parent!))), selected = new Set(nodes.map(node => node.id));
     const value: LayerProposal = { base: { graph: frame.request.graph, frame: null }, level,
@@ -795,8 +794,7 @@ function sharedAcceptedL2(t: TestContext, change: (graph: Graph) => void = () =>
     layer: null, frame: null, upper: null };
   const base = ok(prepareFrame(f.store, frame)), projected = projectGraph(graph, 2);
   // This pure mapping is only proposal construction, as in om-frame-accept.test.ts.
-  const mapped = ok(fillObligations(base.upper as Graph, base.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, base.upperRef, 2));
+  const mapped = explicitMapping(graph, base.upper as Graph, base.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: projected.nodes.filter(node => node.kind === "operation"),
     fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,

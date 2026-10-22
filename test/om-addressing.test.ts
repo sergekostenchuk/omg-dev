@@ -23,7 +23,7 @@ import { applyAddressing, applyInputDecisions, inputDecisionWrite, prepareAddres
   prepareApplyAnswer, writeApplyAnswer, prepareReopenAnswers, writeReopenAnswers, ADDRESSING_CODES, ADDRESSING_KINDS, normalizeInputDecisionProposal,
   type AddressingRequest, type ApplyAnswerRequest, type InputFieldDecision } from '../src/om/addressing.js';
 import { writeHorizon } from '../src/om/horizon.js';
-import { fillObligations, prepareFrame } from '../src/om/frame-obligations.js';
+import { fillObligations, prepareFrame, type FrameScope } from '../src/om/frame-obligations.js';
 import { writeGaps, readGaps, type GapRequest } from '../src/om/gaps.js';
 import { mc1FieldSpec, writeMc1Question, prepareAcceptedAnswer, writeAcceptedAnswer, readAcceptedAnswer, answerSourceGuards,
   type AnswerQuestionContract, type AnswerRequest, type Mc1QuestionRequest } from '../src/om/accepted-answer.js';
@@ -36,7 +36,7 @@ import { writeCandidate } from '../src/om/frame-candidate.js';
 import { settleCandidate } from '../src/om/frame-accept.js';
 import { readLayerAcceptance } from '../src/om/layer-basis.js';
 import type { OmResult, Sealed } from '../src/om/refusal.js';
-import { gardenGraph, refusedWith } from './om-fixture.js';
+import { gardenGraph, refusedWith, storedAccepted } from './om-fixture.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 
@@ -459,8 +459,8 @@ test('D3 canonical nodes proposals retain one identity across permutations, late
 function acceptOperations(f: ReturnType<typeof fixture>) {
   const sources = gapRequest(f, f.input, 'lower-admission'), frame = sources.operations.frame;
   const initial = ok(prepareFrame(f.store, frame)), graph = gardenGraph(), projected = projectGraph(graph, 2);
-  const fills = ok(fillObligations(initial.upper as Graph, initial.scope as any, {
-    graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, initial.upperRef, 2));
+  const fills = ok(fillObligations(initial.upper as Graph, initial.scope as any,
+    storedAccepted(graph, initial.upper as Graph, initial.scope as FrameScope, 'garden', 2), initial.upperRef, 2));
   const proposal = {
     base: { graph: frame.graph, frame: null }, level: 2, source: 'decision', status: 'proposed',
     nodes: projected.nodes.filter(node => node.kind === 'operation'),

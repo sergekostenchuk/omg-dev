@@ -20,7 +20,7 @@ import { mergeLines, prepareGapLines, writeGapLines, readGapLines, gapLinesId, g
   type GapLine, type GapLineClosure, type GapLinesRequest, type GapLinesRecord, type GapClosureRequest } from "../src/om/gap-lines.js";
 import { withHistoricalReads, writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { fillObligations, prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import { prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { LayerProposal } from "../src/om/frame-proposals.js";
 import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
@@ -32,7 +32,7 @@ import { closeAttempt, openAttempt as managedOpenAttempt, prepareCloseAttempt, p
 import { writeCompletionCessation } from "../src/om/model-call.js";
 import { writeRoutes } from "../src/om/routes.js";
 import { readResultIdentity } from "../src/om/result-identity.js";
-import { gardenGraph, refusedWith, sameButReferences } from "./om-fixture.js";
+import { explicitMapping, gardenGraph, refusedWith, sameButReferences } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { produceAtomicSeed, type AtomicSeedResources } from "./om-atomic-seed.js";
 import { writeWorksAcceptance, type AtomicGateRecord } from "../src/om/atomic-gate.js";
@@ -374,8 +374,7 @@ test("S1 D2 does not share a proof with a different Store view or a forged exact
 function acceptOperations(f: ReturnType<typeof firstPassFixture>) {
   const { store, frame, graph } = f;
   const current = ok(prepareFrame(store, frame)), projected = projectGraph(graph, 2);
-  const mapped = ok(fillObligations(current.upper as Graph, current.scope as FrameScope,
-    { graph, reference: { ...frame.graph, hash: hashJson(graph) }, frame: null }, current.upperRef, 2));
+  const mapped = explicitMapping(graph, current.upper as Graph, current.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: frame.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: projected.nodes.filter(node => node.kind === "operation"),
     fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),

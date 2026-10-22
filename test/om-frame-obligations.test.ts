@@ -17,11 +17,12 @@ import { writeHorizon, prepareHorizon, readHorizon, type HorizonRequest } from "
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult } from "../src/om/refusal.js";
 import {
-  frameObligations, fillObligations, carryFrameFills, flowKey, representativeId, FRAME_REFUSAL_CODES, WORKS_FRAME_CONTRACT, workAnchorId, workFillCode,
+  frameObligations, fillObligations, carryFrameFills, flowKey, representativeId, FRAME_REFUSAL_CODES, WORKS_FRAME_CONTRACT, workAnchorId,
   readFrame, readFrameBasis, prepareFrame, type FrameRequest,
   type AcceptedFrame, type ConnectionFrame, type FrameLevel, type FrameScope,
 } from "../src/om/frame-obligations.js";
-import { gardenGraph, createOmFixture, type OmFixture, type FixtureLayer } from "./om-fixture.js";
+import { explicitFills, explicitMapping, gardenGraph, createOmFixture, markedWorks, reanchor, storedAccepted,
+  type OmFixture, type FixtureLayer } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 import { writeCandidate, gateCandidate } from "../src/om/frame-candidate.js";
@@ -79,30 +80,19 @@ function markedWorkFrame() {
   for (const node of graph.nodes.filter(node => node.kind === "work" && node.ports.length && !node.code.length))
     node.code = [{ path: `${node.id}.ts`, access: "write", status: "planned" }];
   graph.nodes.find(node => node.id === "garden-produce-work")!.code.push({ path: "src/producer.ts", symbol: "produce", access: "write", status: "planned" });
-  for (const connector of graph.connectors) for (const binding of connector.bindings.filter(item => item.level === 3)) {
-    for (const endpoint of [binding.producer, ...binding.consumers])
-      endpoint.codeRef = clone(graph.nodes.find(node => node.id === endpoint.node)!.code.at(-1)!);
-    if (binding.anchor !== null) {
-      const flow = connector.bindings.find(item => item.level === 2 && item.producer.port === binding.producer.port)!;
-      const anchor = graph.anchors.find(item => item.id === binding.anchor)!;
-      anchor.id = workAnchorId(connector.id, flowKey(flow), binding.producer); binding.anchor = anchor.id;
-    }
-  }
+  markedWorks(graph);
   const view = upper(graph, 3), horizon = allScope(view, 3);
-  const legacy = delivered(fillObligations(view, horizon, accepted(graph), upperRef, 3));
-  const fills = legacy.fills.map(fill => ({ ...fill, ...(fill.port === undefined ? {} : {
-    codeRef: clone(graph.nodes.find(node => node.id === fill.node)!.code.at(-1)!),
-  }) }));
+  const obligations = delivered(frameObligations(view, horizon, 3));
+  const fills: ConnectionFrame["fills"] = explicitFills(graph, view, obligations, 3)
+    .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) }));
   const frame = storedFrame(graph, 3, fills); frame.worksContract = WORKS_FRAME_CONTRACT;
-  return { graph, view, horizon, legacy, frame };
+  return { graph, view, horizon, obligations, fills, frame };
 }
 
-test("works-frame saved correspondence preserves exact code references while legacy L3 extraction remains unchanged", () => {
-  const { graph, view, horizon, legacy, frame } = markedWorkFrame();
-  assert.ok(legacy.fills.every(fill => !Object.hasOwn(fill, "codeRef")));
-  const oldFrame = storedFrame(graph, 3, legacy.fills);
-  const old = delivered(fillObligations(view, horizon, accepted(graph, oldFrame), upperRef, 3));
-  assert.ok(old.fills.every(fill => !Object.hasOwn(fill, "codeRef")));
+test("works-frame saved correspondence preserves exact code references and refuses a frame without its works contract", () => {
+  const { graph, view, horizon, fills, frame } = markedWorkFrame();
+  const oldFrame = storedFrame(graph, 3, fills);
+  assert.equal(refusedAs(fillObligations(view, horizon, accepted(graph, oldFrame), upperRef, 3), "frame_record_invalid").at.field, "worksContract");
   const current = delivered(fillObligations(view, horizon, accepted(graph, frame), upperRef, 3));
   assert.deepEqual(current.open, []);
   for (const fill of current.fills) {
@@ -111,7 +101,7 @@ test("works-frame saved correspondence preserves exact code references while leg
     else assert.ok(!Object.hasOwn(fill, "codeRef"));
   }
   assert.ok(current.fills.some(fill => fill.codeRef?.path === "src/producer.ts" && fill.codeRef.symbol === "produce"));
-  assert.deepEqual(delivered(fillObligations(view, horizon, accepted(graph, oldFrame), upperRef, 3)), old);
+  assert.deepEqual(delivered(fillObligations(view, horizon, accepted(graph, frame), upperRef, 3)), current);
 });
 
 test("works-frame correspondence refuses absent or foreign code and a different declared path on the exact endpoint", () => {
@@ -143,28 +133,24 @@ test("works-frame correspondence refuses absent or foreign code and a different 
       graph.connectors.flatMap(connector => connector.bindings).find(binding => binding.anchor === anchor.id)!.anchor = null;
     const changed = { ...storedFrame(graph, 3, frame.fills), worksContract: WORKS_FRAME_CONTRACT };
     refusedAs(fillObligations(upper(graph, 3), horizon, accepted(graph, changed), upperRef, 3), "frame_record_invalid");
-    if (mutation === "producer-inactive" || mutation === "wake-distinct" || mutation === "node-test-missing" || mutation === "test-coverage") {
-      const historical = storedFrame(graph, 3, frame.fills);
-      assert.deepEqual(delivered(fillObligations(upper(graph, 3), horizon, accepted(graph, historical), upperRef, 3)).open, []);
-    }
   }
 });
 
 test("works-frame carry preserves code and retires a complete flow when its exact endpoint code changes", () => {
-  const { graph, view, horizon, legacy, frame } = markedWorkFrame();
-  const source = { obligations: [...legacy.obligations], fills: frame.fills, worksContract: WORKS_FRAME_CONTRACT };
+  const { graph, view, horizon, obligations, frame } = markedWorkFrame();
+  const source = { obligations: [...obligations], fills: frame.fills, worksContract: WORKS_FRAME_CONTRACT };
   const carried = delivered(carryFrameFills(view, horizon, accepted(graph), source, upperRef, 3));
   assert.deepEqual(carried.fills, frame.fills); assert.deepEqual(carried.retired, []); assert.deepEqual(carried.open, []);
   const changed = clone(graph), connector = changed.connectors.find(item => item.id === "garden-flow")!;
   for (const binding of connector.bindings.filter(item => item.level === 3 && item.producer.port === "out"))
     binding.producer.codeRef = clone(changed.nodes.find(node => node.id === binding.producer.node)!.code[0]!);
   const retired = delivered(carryFrameFills(upper(changed, 3), horizon, accepted(changed), source, upperRef, 3));
-  const end = legacy.obligations.find(item => item.connector === connector.id && item.role === "producer" && item.upper.port === "out")!;
-  const affected = legacy.obligations.filter(item => item.connector === connector.id && item.flow === end.flow);
+  const end = obligations.find(item => item.connector === connector.id && item.role === "producer" && item.upper.port === "out")!;
+  const affected = obligations.filter(item => item.connector === connector.id && item.flow === end.flow);
   assert.ok(affected.every(item => retired.open.some(row => row.id === item.id)));
   assert.ok(frame.fills.filter(fill => affected.some(item => item.id === fill.obligation))
     .every(fill => retired.retired.some(row => canonical(row) === canonical(fill))));
-  assert.ok(retired.fills.some(fill => legacy.obligations.find(item => item.id === fill.obligation)?.connector === "garden-prep-flow"));
+  assert.ok(retired.fills.some(fill => obligations.find(item => item.id === fill.obligation)?.connector === "garden-prep-flow"));
 });
 
 test("saved work frame contract markers reject unknown, null, own-undefined and L2 forms", () => {
@@ -174,7 +160,8 @@ test("saved work frame contract markers reject unknown, null, own-undefined and 
     assert.equal(refusedAs(fillObligations(view, horizon, input, upperRef, 3), "frame_record_invalid").at.field, "worksContract");
   }
   const graph = gardenGraph(), view = upper(graph, 2), horizon = allScope(view, 2);
-  const fills = delivered(fillObligations(view, horizon, accepted(graph), upperRef, 2)).fills;
+  const fills = explicitFills(graph, view, delivered(frameObligations(view, horizon, 2)), 2)
+    .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) }));
   const frame = storedFrame(graph, 2, fills); frame.worksContract = WORKS_FRAME_CONTRACT;
   assert.equal(refusedAs(fillObligations(view, horizon, accepted(graph, frame), upperRef, 2), "frame_record_invalid").at.field, "worksContract");
 });
@@ -259,60 +246,14 @@ test("works-frame awake lower delivery preserves its anchored upper flow without
   refusedAs(fillObligations(view, horizon, accepted(graph, storedFrame(graph, 3, fills)), upperRef, 3), "frame_record_invalid");
 });
 
-test("works-frame enrichment resolves different code on the same consumer port by exact historical flow", () => {
-  for (const recorded of [false, true]) {
-    const graph = gardenGraph("cross"), consumer = graph.nodes.find(node => node.id === "garden-consume-work")!;
-    consumer.code.push({ path: "src/second-consumer.ts", symbol: "consumeSecond", access: "read", status: "planned" });
-    const connector = graph.connectors.find(item => item.id === "garden-flow")!;
-    connector.bindings.find(item => item.level === 3 && item.producer.port === "out-alt")!.consumers[0]!.codeRef = clone(consumer.code[1]!);
-    const view = upper(graph, 3), horizon = allScope(view, 3);
-    const original = delivered(fillObligations(view, horizon, accepted(graph), upperRef, 3));
-    const fills = clone(original.fills) as ConnectionFrame["fills"];
-    if (recorded) {
-      for (const node of graph.nodes.filter(node => node.kind === "work")) for (const port of node.ports) port.id = `saved-${port.id}`;
-      for (const connector of graph.connectors) for (const binding of connector.bindings.filter(item => item.level === 3))
-        for (const endpoint of [binding.producer, ...binding.consumers]) endpoint.port = `saved-${endpoint.port}`;
-      for (const fill of fills) if (fill.port !== undefined) fill.port = `saved-${fill.port}`;
-    }
-    const basis = accepted(graph, recorded ? storedFrame(graph, 3, fills) : null);
-    const historical = delivered(fillObligations(view, horizon, basis, upperRef, 3)), fingerprint = hashJson(historical);
-    for (const producerPort of ["out", "out-alt"]) {
-      const producer = historical.obligations.find(item => item.connector === connector.id && item.role === "producer" && item.upper.port === producerPort)!;
-      const obligation = historical.obligations.find(item => item.connector === connector.id && item.flow === producer.flow
-        && item.role === "consumer" && item.upper.node === "garden-consume-operation" && item.upper.port === "in")!;
-      const fill = historical.fills.find(row => row.obligation === obligation.id)!;
-      const code = delivered(workFillCode(view, basis, obligation, fill));
-      assert.deepEqual(code, consumer.code[producerPort === "out" ? 0 : 1]); assert.ok(Object.isFrozen(code));
-    }
-    assert.ok(historical.fills.every(fill => !Object.hasOwn(fill, "codeRef")));
-    assert.equal(hashJson(delivered(fillObligations(view, horizon, basis, upperRef, 3))), fingerprint);
-  }
-});
-
-test("works-frame enrichment checks every producer delivery before deduplicating code references", () => {
-  for (const recorded of [false, true]) for (const defect of ["missing", "foreign", "distinct"] as const) {
-    const graph = gardenGraph("cross"), producer = graph.nodes.find(node => node.id === "garden-produce-work")!;
-    producer.code.push({ path: "src/second-producer.ts", access: "write", status: "planned" });
-    const connector = graph.connectors.find(item => item.id === "garden-flow")!;
-    const binding = connector.bindings.find(item => item.level === 3 && item.producer.port === "out" && item.anchor === null)!;
-    const split = clone(binding); split.consumers = [binding.consumers.pop()!];
-    if (defect === "missing") delete split.producer.codeRef;
-    if (defect === "foreign") split.producer.codeRef!.path = "foreign.ts";
-    if (defect === "distinct") split.producer.codeRef = clone(producer.code[1]!);
-    connector.bindings.push(split);
-    const view = upper(graph, 3), horizon = allScope(view, 3);
-    const legacy = delivered(fillObligations(view, horizon, accepted(graph), upperRef, 3));
-    const obligation = legacy.obligations.find(item => item.connector === connector.id && item.role === "producer" && item.upper.port === "out")!;
-    const fill = legacy.fills.find(row => row.obligation === obligation.id)!;
-    const basis = accepted(graph, recorded ? storedFrame(graph, 3, legacy.fills) : null);
-    refusedAs(workFillCode(view, basis, obligation, fill), defect === "foreign" ? "works_code_foreign" : "works_code_missing");
-  }
-});
-
 test("C2 carry preserves renamed cross-flow correspondence and retires incompatible whole flows independently of open outcomes", () => {
   for (const level of levels) {
-    const original = gardenGraph("cross"), oldUpper = upper(original, level), horizon = allScope(oldUpper, level);
-    const previous = delivered(fillObligations(oldUpper, horizon, accepted(original), upperRef, level));
+    const original = gardenGraph("cross");
+    if (level === 3) markedWorks(original);
+    const oldUpper = upper(original, level), horizon = allScope(oldUpper, level);
+    const obligations = delivered(frameObligations(oldUpper, horizon, level));
+    const previous = { obligations, fills: explicitFills(original, oldUpper, obligations, level)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(original) })) };
     const renamed = clone(original);
     for (const node of renamed.nodes.filter(item => LEVEL[item.kind] === level))
       for (const port of node.ports) port.id = `lower-${port.id}`;
@@ -320,8 +261,10 @@ test("C2 carry preserves renamed cross-flow correspondence and retires incompati
       binding.producer.port = `lower-${binding.producer.port}`;
       for (const endpoint of binding.consumers) endpoint.port = `lower-${endpoint.port}`;
     }
+    if (level === 3) reanchor(renamed, oldUpper, level);
     const source = { obligations: [...previous.obligations], fills: previous.fills.map(fill => ({ ...fill,
-      ...(fill.port === undefined ? {} : { port: `lower-${fill.port}` }) })) };
+      ...(fill.port === undefined ? {} : { port: `lower-${fill.port}` }) })),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     const unchanged = delivered(carryFrameFills(oldUpper, horizon, accepted(renamed), source, upperRef, level));
     assert.deepEqual(unchanged.fills, storedFrame(renamed, level, source.fills).fills);
     assert.deepEqual(unchanged.retired, []);
@@ -362,16 +305,19 @@ test("C2 carry preserves renamed cross-flow correspondence and retires incompati
 });
 
 test("C2 carry requires explicit source obligations and rows instead of treating absence as an empty mapping", () => {
-  const graph = gardenGraph(), view = upper(graph, 3), horizon = allScope(view, 3);
-  const prior = delivered(fillObligations(view, horizon, accepted(graph), upperRef, 3));
+  const graph = gardenGraph(); markedWorks(graph);
+  const view = upper(graph, 3), horizon = allScope(view, 3);
+  const prior = explicitMapping(graph, view, horizon, 3);
+  const priorFills = prior.fills.map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) }));
   const invoke = carryFrameFills as (...args: unknown[]) => unknown;
-  const args: unknown[] = [view, horizon, accepted(graph), { obligations: prior.obligations, fills: prior.fills }, upperRef, 3];
+  const args: unknown[] = [view, horizon, accepted(graph),
+    { obligations: prior.obligations, fills: priorFills, worksContract: WORKS_FRAME_CONTRACT }, upperRef, 3];
   for (const index of [0, 1, 2, 3, 4, 5]) for (const missing of [undefined, null]) {
     const bad = [...args]; bad[index] = missing;
     assert.throws(() => invoke(...bad), malformed);
   }
-  for (const previous of [{ fills: prior.fills }, { obligations: prior.obligations },
-    { obligations: prior.obligations, fills: null }, { obligations: "wrong", fills: prior.fills }]) {
+  for (const previous of [{ fills: priorFills }, { obligations: prior.obligations },
+    { obligations: prior.obligations, fills: null }, { obligations: "wrong", fills: priorFills }]) {
     const bad = [...args]; bad[3] = previous;
     assert.throws(() => invoke(...bad), malformed);
   }
@@ -415,19 +361,23 @@ test("an indistinguishable repeated upper consumer is refused instead of collaps
   }
 });
 
-test("historical accepted cross flows keep every port, and saved correspondence survives arbitrary lower-port names", () => {
+test("accepted cross flows keep every port, and saved correspondence survives arbitrary lower-port names", () => {
   for (const level of levels) {
-    const graph = gardenGraph("cross"), view = upper(graph, level), horizon = allScope(view, level);
-    const first = delivered(fillObligations(view, horizon, accepted(graph), upperRef, level));
-    assert.deepEqual(first.open, []);
-    assert.deepEqual(first.representatives, []);
+    const graph = gardenGraph("cross");
+    if (level === 3) markedWorks(graph);
+    const view = upper(graph, level), horizon = allScope(view, level);
+    const obligations = delivered(frameObligations(view, horizon, level));
+    const first = { obligations, fills: explicitFills(graph, view, obligations, level)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) })) };
     assert.equal(first.fills.length, first.obligations.length);
     assert.ok(first.fills.every(fill => fill.source === "accepted" && canonical(fill.basis) === canonical(actualGraphRef(graph))));
     const producerObligations = first.obligations.filter(item => item.connector === "garden-flow" && item.role === "producer");
     const firstProducer = first.fills.find(fill => fill.obligation === producerObligations[0]!.id)!;
     const lostFlow = first.fills.map(fill => fill.obligation === producerObligations[1]!.id
       ? { ...fill, node: firstProducer.node, port: firstProducer.port! } : fill);
-    refusedAs(fillObligations(view, horizon, accepted(graph, storedFrame(graph, level, lostFlow)), upperRef, level), "frame_record_invalid");
+    const lostFrame = { ...storedFrame(graph, level, lostFlow),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
+    refusedAs(fillObligations(view, horizon, accepted(graph, lostFrame), upperRef, level), "frame_record_invalid");
     const renamed = clone(graph);
     for (const node of renamed.nodes.filter(item => LEVEL[item.kind] === level))
       for (const port of node.ports) port.id = `lower-${port.id}`;
@@ -435,14 +385,16 @@ test("historical accepted cross flows keep every port, and saved correspondence 
       binding.producer.port = `lower-${binding.producer.port}`;
       for (const endpoint of binding.consumers) endpoint.port = `lower-${endpoint.port}`;
     }
+    if (level === 3) reanchor(renamed, view, level);
     const fills = first.fills.map(fill => ({ ...fill, ...(fill.port === undefined ? {} : { port: `lower-${fill.port}` }) }));
-    const frame = storedFrame(renamed, level, fills);
+    const frame = { ...storedFrame(renamed, level, fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     const repeated = delivered(fillObligations(view, horizon, accepted(renamed, frame), upperRef, level));
     assert.deepEqual(repeated.open, []);
-    assert.deepEqual(repeated.fills.map(fill => ({ ...fill, basis: actualGraphRef(graph) })), fills);
+    assert.deepEqual(repeated.fills.map(fill => ({ ...fill, basis: actualGraphRef(graph) })), storedFrame(renamed, level, fills).fills);
     assert.ok(repeated.fills.every(fill => canonical(fill.basis) === canonical(actualFrameRef(frame))));
     assert.deepEqual(delivered(fillObligations(view, horizon, accepted(renamed, frame), upperRef, level)), repeated);
-    refusedAs(fillObligations(view, horizon, accepted(renamed), upperRef, level), "accepted_binding_ambiguous");
+    refusedAs(fillObligations(view, horizon, accepted(renamed), upperRef, level), "frame_record_invalid");
     const singleFlow = clone(graph);
     const connector = singleFlow.connectors.find(item => item.id === "garden-flow")!;
     connector.bindings = connector.bindings.filter(binding => binding.producer.port !== "out-alt");
@@ -450,8 +402,7 @@ test("historical accepted cross flows keep every port, and saved correspondence 
     for (const port of consumer.ports) port.id = `renamed-${port.id}`;
     for (const binding of connector.bindings.filter(binding => binding.level === level))
       for (const endpoint of binding.consumers.filter(endpoint => endpoint.node === consumer.id)) endpoint.port = `renamed-${endpoint.port}`;
-    const ambiguousPort = refusedAs(fillObligations(upper(singleFlow, level), horizon, accepted(singleFlow), upperRef, level), "accepted_binding_ambiguous");
-    assert.equal(ambiguousPort.at.field, "consumer.port");
+    refusedAs(fillObligations(upper(singleFlow, level), horizon, accepted(singleFlow), upperRef, level), "frame_record_invalid");
     renamed.nodes.find(item => LEVEL[item.kind] === level)!.title += " changed";
     refusedAs(fillObligations(view, horizon, accepted(renamed, frame), upperRef, level), "frame_layer_drift");
   }
@@ -459,9 +410,14 @@ test("historical accepted cross flows keep every port, and saved correspondence 
 
 test("a self-consistent saved frame cannot merge two upper flows into one surviving lower binding", () => {
   for (const level of levels) {
-    const graph = gardenGraph("cross"), view = upper(graph, level), horizon = allScope(view, level);
-    const complete = delivered(fillObligations(view, horizon, accepted(graph), upperRef, level));
-    const originalFrame = storedFrame(graph, level, complete.fills);
+    const graph = gardenGraph("cross");
+    if (level === 3) markedWorks(graph);
+    const view = upper(graph, level), horizon = allScope(view, level);
+    const obligations = delivered(frameObligations(view, horizon, level));
+    const complete = { obligations, fills: explicitFills(graph, view, obligations, level)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) })) };
+    const originalFrame = { ...storedFrame(graph, level, complete.fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     assert.deepEqual(delivered(fillObligations(view, horizon, accepted(graph, originalFrame), upperRef, level)).open, []);
     const omitted = clone(graph), connector = omitted.connectors.find(item => item.id === "garden-flow")!;
     const removed = connector.bindings.find(item => item.level === level && item.producer.port === "out-alt")!;
@@ -469,7 +425,8 @@ test("a self-consistent saved frame cannot merge two upper flows into one surviv
     connector.bindings = connector.bindings.filter(item => item !== removed);
     const producer = complete.obligations.find(item => item.connector === "garden-flow" && item.role === "producer" && item.upper.port === "out-alt")!;
     const fills = complete.fills.map(fill => fill.obligation === producer.id ? { ...fill, port: "out" } : fill);
-    const forged = storedFrame(omitted, level, fills);
+    const forged = { ...storedFrame(omitted, level, fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     assert.notEqual(actualGraphRef(omitted).hash, actualGraphRef(graph).hash);
     assert.notEqual(actualFrameRef(forged).hash, actualFrameRef(originalFrame).hash);
     assert.equal(forged.layerHash, hashJson(projectGraph(omitted, level)));
@@ -480,33 +437,47 @@ test("a self-consistent saved frame cannot merge two upper flows into one surviv
 
 test("anchor-distinct upper flows retain separate lower bindings even with arbitrary lower port names", () => {
   for (const level of levels) {
-    const graph = gardenGraph(), originalView = upper(graph, level), horizon = allScope(originalView, level);
-    const existing = delivered(fillObligations(originalView, horizon, accepted(graph), upperRef, level));
+    const graph = gardenGraph();
     const upperKind = level === 2 ? "block" : "operation", lowerKind = level === 2 ? "operation" : "work";
     const producer = `garden-produce-${lowerKind}`, consumer = `garden-consume-${lowerKind}`;
+    const sleeper = `${consumer}-sleeping`;
     graph.nodes.find(node => node.id === producer)!.ports.push({ id: "named-source", direction: "out", contract: "garden-contract" });
     graph.nodes.find(node => node.id === consumer)!.ports.push({ id: "named-target", direction: "in", contract: "garden-contract" });
+    if (level === 3) {
+      // Under the works contract anchored deliveries are sleeping: the consumer stays outside the work horizon,
+      // the anchor is the mechanical derivative of its upper flow and the producer's wake test covers the connector.
+      graph.nodes.push({ ...clone(graph.nodes.find(node => node.id === consumer)!), id: sleeper, outcome: "garden-later" });
+      graph.tests.find(test => test.id === "garden-produce-work-test")!.covers.push("garden-anchor-flows");
+    }
     graph.connectors.push({ id: "garden-anchor-flows", artifact: "garden-data", returnsTo: "garden-produce-block", wakeTest: "garden-produce-work-test",
       bindings: ["first", "second"].flatMap(name => [
         { level: (level - 1) as 1 | 2, producer: { node: `garden-produce-${upperKind}`, port: "out" },
           consumers: [{ node: `garden-consume-${upperKind}`, port: "in" }], anchor: `anchor-${name}` },
-        { level, producer: { node: producer, port: "named-source" }, consumers: [{ node: consumer, port: "named-target" }], anchor: `anchor-${name}` },
+        { level, producer: { node: producer, port: "named-source" },
+          consumers: [{ node: level === 3 ? sleeper : consumer, port: "named-target" }], anchor: `anchor-${name}` },
       ]) });
-    for (const name of ["first", "second"]) graph.anchors.push({ id: `anchor-${name}`, owner: "garden-produce-work", outcome: "garden-data", test: "garden-produce-work-test" });
-    const view = upper(graph, level), obligations = delivered(frameObligations(view, horizon, level));
+    for (const name of ["first", "second"]) graph.anchors.push({ id: `anchor-${name}`,
+      owner: level === 3 ? producer : `garden-produce-${upperKind}`, outcome: "garden-data", test: "garden-produce-work-test" });
+    if (level === 3) markedWorks(graph);
+    const view = upper(graph, level), horizon = allScope(view, level);
+    const obligations = delivered(frameObligations(view, horizon, level));
     const additional = obligations.filter(item => item.connector === "garden-anchor-flows");
     assert.equal(additional.length, 4);
     assert.equal(new Set(additional.map(item => item.flow)).size, 2);
-    const fills = [...existing.fills, ...additional.map(item => ({ obligation: item.id,
-      node: item.role === "producer" ? producer : consumer, port: item.role === "producer" ? "named-source" : "named-target",
-      source: "accepted" as const, basis: actualGraphRef(graph) }))];
-    const frame = storedFrame(graph, level, fills);
+    const fills = explicitFills(graph, view, obligations, level)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) }));
+    const frame = { ...storedFrame(graph, level, fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     const mapped = delivered(fillObligations(view, horizon, accepted(graph, frame), upperRef, level));
     assert.deepEqual(mapped.open, []);
     assert.equal(mapped.fills.filter(fill => additional.some(item => item.id === fill.obligation)).length, 4);
     const lost = clone(graph), connector = lost.connectors.find(item => item.id === "garden-anchor-flows")!;
-    connector.bindings = connector.bindings.filter(item => !(item.level === level && item.anchor === "anchor-second"));
-    const forged = storedFrame(lost, level, fills);
+    const secondAnchor = level === 3 ? workAnchorId(connector.id,
+      flowKey(connector.bindings.find(item => item.level === level - 1 && item.anchor === "anchor-second")!),
+      { node: producer, port: "named-source" }) : "anchor-second";
+    connector.bindings = connector.bindings.filter(item => !(item.level === level && item.anchor === secondAnchor));
+    const forged = { ...storedFrame(lost, level, fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     assert.notEqual(actualGraphRef(lost).hash, actualGraphRef(graph).hash);
     assert.notEqual(actualFrameRef(forged).hash, actualFrameRef(frame).hash);
     refusedAs(fillObligations(view, horizon, accepted(lost, forged), upperRef, level), "frame_record_invalid");
@@ -521,12 +492,16 @@ test("saved fills cannot omit any accepted lower consumer even when another row 
     graph.nodes.push(extra);
     const binding = graph.connectors.find(connector => connector.id === "garden-flow")!.bindings.find(item => item.level === level)!;
     binding.consumers.push({ node: extra.id, port: "in" });
+    if (level === 3) { graph.horizon.push(extra.id); markedWorks(graph); }
     const view = upper(graph, level), horizon = allScope(view, level);
-    const inferred = delivered(fillObligations(view, horizon, accepted(graph), upperRef, level));
+    const obligations = delivered(frameObligations(view, horizon, level));
+    const inferred = { obligations, fills: explicitFills(graph, view, obligations, level)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) })) };
     const obligation = inferred.obligations.find(item => item.connector === "garden-flow" && item.role === "consumer"
       && item.upper.node === (level === 2 ? "garden-consume-block" : "garden-consume-operation"))!;
     assert.equal(inferred.fills.filter(fill => fill.obligation === obligation.id).length, 2);
-    const frame = storedFrame(graph, level, inferred.fills);
+    const frame = { ...storedFrame(graph, level, inferred.fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     assert.deepEqual(delivered(fillObligations(view, horizon, accepted(graph, frame), upperRef, level)).open, []);
     for (const missing of ["partial", "all"] as const) {
       const incomplete = clone(frame);
@@ -547,14 +522,17 @@ test("accepted fills follow explicit realizes even when containment belongs to a
     const node = graph.nodes.find(item => item.id === nodeId)!;
     node.parent = level === 2 ? "garden-produce-block" : "garden-produce-operation";
     graph.edges!.push({ id: `realize-later-${kind}`, relation: "realizes", source: nodeId, target: upperId, condition: "Explicit role realization" });
+    if (level === 3) markedWorks(graph);
     const view = upper(graph, level), horizon = allScope(view, level);
-    const inferred = delivered(fillObligations(view, horizon, accepted(graph), upperRef, level));
+    const obligations = delivered(frameObligations(view, horizon, level));
+    const inferred = { obligations, fills: explicitFills(graph, view, obligations, level)
+      .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) })) };
     const outcome = inferred.obligations.find(item => item.kind !== "connection-end" && item.upper.node === upperId)!;
     assert.ok(inferred.fills.some(fill => fill.obligation === outcome.id && fill.node === nodeId));
-    assert.ok(!inferred.open.some(item => item.id === outcome.id));
-    const frame = storedFrame(graph, level, inferred.fills);
+    const frame = { ...storedFrame(graph, level, inferred.fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     const recorded = delivered(fillObligations(view, horizon, accepted(graph, frame), upperRef, level));
-    assert.deepEqual(recorded.fills.map(fill => ({ ...fill, basis: actualGraphRef(graph) })), inferred.fills);
+    assert.deepEqual(recorded.fills.map(fill => ({ ...fill, basis: actualGraphRef(graph) })), storedFrame(graph, level, inferred.fills).fills);
     assert.deepEqual(recorded.open, []);
   }
 });
@@ -588,15 +566,18 @@ test("FJ1 row 10: outside representatives carry only their own required ports an
       }));
       connector.bindings.push(...lowerBindings);
     }
-    const frame = storedFrame(identityGraph, level, identities.fills);
+    const frame = { ...storedFrame(identityGraph, level, identities.fills),
+      ...(level === 3 ? { worksContract: WORKS_FRAME_CONTRACT } : {}) };
     const repeated = delivered(fillObligations(view, scope(), accepted(identityGraph, frame), upperRef, level));
     assert.ok(repeated.fills.every(fill => fill.source === "identity"));
     const entered = delivered(fillObligations(view, allScope(view, level), accepted(identityGraph, frame), upperRef, level));
     assert.deepEqual(entered.fills, []);
     assert.deepEqual(entered.representatives, []);
     assert.equal(entered.open.length, entered.obligations.length);
-    const real = gardenGraph("cross"), realView = upper(real, level);
-    const transferred = delivered(fillObligations(realView, scope(), accepted(real), upperRef, level));
+    const real = gardenGraph("cross");
+    if (level === 3) markedWorks(real);
+    const realView = upper(real, level);
+    const transferred = delivered(fillObligations(realView, scope(), storedAccepted(real, realView, scope(), "garden", level), upperRef, level));
     assert.deepEqual(transferred.representatives, []);
     assert.ok(transferred.fills.every(fill => fill.source === "accepted"));
   }
@@ -604,7 +585,9 @@ test("FJ1 row 10: outside representatives carry only their own required ports an
 
 test("only an external source may remain an identity producer outside the horizon", () => {
   for (const level of levels) {
-    const graph = gardenGraph(), view = upper(graph, level);
+    const graph = gardenGraph();
+    if (level === 3) markedWorks(graph);
+    const view = upper(graph, level);
     const consumer = level === 2 ? "garden-consume-block" : "garden-consume-operation";
     const producer = level === 2 ? "garden-produce-block" : "garden-produce-operation";
     const horizon = scope([consumer]);
@@ -618,7 +601,7 @@ test("only an external source may remain an identity producer outside the horizo
     assert.ok(identity.fills.some(fill => fill.obligation === outgoing.id && fill.source === "identity"));
     assert.ok(identity.open.some(item => item.role === "consumer" && item.upper.node === consumer));
     const acceptedExternal = clone(graph); acceptedExternal.artifacts.find(item => item.id === "garden-data")!.external = true;
-    const existing = delivered(fillObligations(external, horizon, accepted(acceptedExternal), upperRef, level));
+    const existing = delivered(fillObligations(external, horizon, storedAccepted(acceptedExternal, external, horizon, "garden", level), upperRef, level));
     assert.ok(existing.fills.some(fill => fill.obligation === outgoing.id && fill.source === "accepted"));
     assert.ok(!existing.representatives.some(item => item.parent === producer));
   }
@@ -629,10 +612,18 @@ test("native layer assembly retains every external-flow consumer and its accepte
     const graph = gardenGraph("cross");
     graph.artifacts.find(item => item.id === "garden-data")!.external = true;
     graph.horizon = ["garden-consume-work"];
+    if (level === 3) {
+      // With an active producer the external artifact would become its own outcome claim; the delivery
+      // stays unanchored so the works contract accepts its producer outside the work horizon.
+      const delivery = graph.connectors.find(connector => connector.id === "garden-flow")!.bindings
+        .find(binding => binding.level === 3 && binding.anchor !== null)!;
+      graph.anchors = graph.anchors.filter(item => item.id !== delivery.anchor); delivery.anchor = null;
+      markedWorks(graph);
+    }
     const view = upper(graph, level), consumer = level === 2 ? "garden-consume-block" : "garden-consume-operation";
     const producer = level === 2 ? "garden-produce-block" : "garden-produce-operation";
     const horizon = scope([consumer]);
-    const filled = delivered(fillObligations(view, horizon, accepted(graph), upperRef, level));
+    const filled = delivered(fillObligations(view, horizon, storedAccepted(graph, view, horizon, "garden", level), upperRef, level));
     const outgoing = filled.obligations.filter(item => item.connector === "garden-flow" && item.role === "producer");
     assert.equal(outgoing.length, 2);
     assert.ok(outgoing.every(item => filled.fills.some(fill => fill.obligation === item.id && fill.source === "accepted")));
@@ -643,9 +634,9 @@ test("native layer assembly retains every external-flow consumer and its accepte
         canonical({ producer: binding.producer, consumer: endpoint, anchor: binding.anchor }))).sort();
     assert.equal(endpoints(candidate).length, 4);
     assert.deepEqual(endpoints(candidate), endpoints(graph));
-    const candidateFills = delivered(fillObligations(view, horizon, accepted(candidate), upperRef, level));
+    const candidateFills = delivered(fillObligations(view, horizon, storedAccepted(candidate, view, horizon, "garden", level), upperRef, level));
     assert.deepEqual(candidateFills.open, []);
-    assert.deepEqual(candidateFills.fills.map(fill => ({ ...fill, basis: actualGraphRef(graph) })), filled.fills);
+    assert.deepEqual(candidateFills.fills.map(fill => ({ ...fill, basis: actualGraphRef(graph) })), filled.fills.map(fill => ({ ...fill, basis: actualGraphRef(graph) })));
   }
 });
 
@@ -666,9 +657,10 @@ test("a disclosed producer in one flow cannot stand in for an undisclosed produc
       for (const binding of connector.bindings) binding.consumers = binding.consumers.filter(item => item.node !== missingNode);
       connector.bindings = connector.bindings.filter(item => item.consumers.length > 0);
     }
-    const refusal = refusedAs(fillObligations(view, scope([consumer]), accepted(graph), upperRef, level), "horizon_producer_unrefined");
+    const refusal = refusedAs(fillObligations(view, scope([consumer]), null, upperRef, level), "horizon_producer_unrefined");
+    // Without an accepted lower graph every outside producer is unrefined; the refusal names the first sorted obligation.
     const required = delivered(frameObligations(view, scope([consumer]), level)).find(item =>
-      item.connector === "garden-flow" && item.role === "producer" && item.upper.node === later)!;
+      item.connector === "garden-flow" && item.role === "producer" && item.zone === "outside")!;
     assert.equal(refusal.at.target, required.id);
     assert.equal(refusal.route, "readiness");
   }
@@ -690,7 +682,9 @@ test("frame boundaries reject absent sets, foreign correspondence, reserved iden
   }
   for (const bad of [undefined, null, 1, 4, "2"])
     assert.throws(() => frameObligations(view, horizon, bad as FrameLevel), malformed);
-  const initial = delivered(fillObligations(view, horizon, accepted(graph), upperRef, 2));
+  const obligations = delivered(frameObligations(view, horizon, 2));
+  const initial = { obligations, fills: explicitFills(graph, view, obligations, 2)
+    .map(fill => ({ ...fill, source: "accepted" as const, basis: actualGraphRef(graph) })) };
   const frame = storedFrame(graph, 2, initial.fills);
   const foreign = clone(frame); foreign.project = "other";
   refusedAs(fillObligations(view, horizon, accepted(graph, foreign), upperRef, 2), "frame_record_invalid");
@@ -700,7 +694,8 @@ test("frame boundaries reject absent sets, foreign correspondence, reserved iden
   refusedAs(fillObligations(drifted, horizon, accepted(graph), upperRef, 2), "frame_upper_drift");
   const collision = clone(graph), colliding = collision.nodes.find(item => item.id === "garden-produce-operation")!;
   colliding.id = representativeId("garden-produce-block", 2); colliding.parent = "garden-consume-block";
-  refusedAs(fillObligations(view, scope(), accepted(collision), upperRef, 2), "representative_id_conflict");
+  // An accepted graph without its recorded frame is refused at the boundary before identity resolution.
+  refusedAs(fillObligations(view, scope(), accepted(collision), upperRef, 2), "frame_record_invalid");
   assert.deepEqual([...FRAME_REFUSAL_CODES].sort(), ["frame_request_invalid", "upper_binding_ambiguous", "accepted_binding_ambiguous",
     "frame_upper_drift", "frame_layer_drift", "frame_record_invalid", "horizon_producer_unrefined", "representative_id_conflict",
     "frame_basis_unproven", "input_stale", "works_code_missing", "works_code_foreign"].sort());
@@ -801,7 +796,7 @@ test("the first frame assembly uses accepted L1 and open obligations without cre
   const proposal = layerDesignOf(gardenGraph(), 2);
   const candidate = composeLayer(prepared.upper as Graph, 2, proposal);
   const completed = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-    accepted(candidate), prepared.upperRef, 2));
+    storedAccepted(candidate, prepared.upper as Graph, prepared.scope as FrameScope, "garden", 2), prepared.upperRef, 2));
   assert.deepEqual(completed.obligations, prepared.result.obligations);
   assert.deepEqual(completed.open, []);
   for (const open of prepared.result.open)
@@ -905,7 +900,7 @@ test("accepted upper bases come from saved acceptance rather than the latest pro
   noRefinementRequest.refinement = null; noRefinementRequest.choice.choiceVersion = "frame-without-L2";
   const noRefinement = delivered(writeHorizon(f.store, noRefinementRequest));
   const noUpper = requestFor(f, reference(horizon.gate), 3);
-  noUpper.upper = { horizon: reference(noRefinement.gate), frame: null };
+  noUpper.upper = { horizon: reference(noRefinement.gate), frame: reference(f.store.get("om-frame:garden:2")!) };
   for (const action of [readFrame, prepareFrame]) {
     const refusal = refusedAs(action(f.store, noUpper), "frame_basis_unproven");
     assert.equal(refusal.at.field, "refinement");
@@ -961,8 +956,7 @@ test("OM acceptance from L1 is consumed by C2, B2 and D1 with historical sources
   const original: FrameRequest = { project: "garden", level: 2, horizon: reference(initial.gate),
     graph: reference(store.get("graph:garden")!), layer: null, frame: null, upper: null };
   const prepared = delivered(prepareFrame(store, original)), design = projectGraph(graph, 2);
-  const fills = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-    { graph, reference: actualGraphRef(graph), frame: null }, prepared.upperRef, 2)).fills;
+  const fills = explicitMapping(graph, prepared.upper as Graph, prepared.scope as FrameScope, 2).fills;
   const proposal: LayerProposal = { base: { graph: original.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: clone(design.nodes.filter(node => node.kind === "operation")),
     fills: fills.map(fill => ({ obligation: fill.obligation, node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),
@@ -1067,8 +1061,7 @@ function identityOperationFixture(t: TestContext) {
   const prepared = delivered(prepareFrame(store, original)), design = projectGraph(graph, 2);
   const realNodes = design.nodes.filter(node => node.kind === "operation" && node.parent !== later);
   const included = new Set(realNodes.map(node => node.id));
-  const fills = delivered(fillObligations(prepared.upper as Graph, prepared.scope as FrameScope,
-    { graph, reference: actualGraphRef(graph), frame: null }, prepared.upperRef, 2)).fills;
+  const fills = explicitMapping(graph, prepared.upper as Graph, prepared.scope as FrameScope, 2).fills;
   const proposal: LayerProposal = { base: { graph: original.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: clone(realNodes), fills: fills.filter(fill => included.has(fill.node)).map(fill => ({ obligation: fill.obligation,
       node: fill.node, ...(fill.port === undefined ? {} : { port: fill.port }) })),

@@ -14,13 +14,13 @@ import { UPSTREAM_STAGES, type UpstreamStage } from "../src/discovery/requiremen
 import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { fillObligations, prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
+import { prepareFrame, type FrameRequest, type FrameScope } from "../src/om/frame-obligations.js";
 import type { LayerProposal, ProposalRequest } from "../src/om/frame-proposals.js";
 import { writeCandidate, type FrameCandidateRecord } from "../src/om/frame-candidate.js";
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { gardenGraph } from "./om-fixture.js";
+import { explicitMapping, gardenGraph } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
@@ -141,8 +141,7 @@ function definitionFixture(store: Store, project: string, subject = SUBJECT): De
   const first: FrameRequest = { project, level: 2, graph: graphRef,
     horizon: reference(horizon.gate), layer: null, frame: null, upper: null };
   const read = deliveredOf(prepareFrame(store, first)), projected = projectGraph(graph, 2);
-  const mapped = deliveredOf(fillObligations(read.upper as Graph, read.scope as FrameScope,
-    { graph, reference: { ...first.graph, hash: hashJson(graph) }, frame: null }, read.upperRef, 2));
+  const mapped = explicitMapping(graph, read.upper as Graph, read.scope as FrameScope, 2);
   const proposal: LayerProposal = { base: { graph: first.graph, frame: null }, level: 2, source: "decision", status: "proposed",
     nodes: projected.nodes.filter(node => node.kind === "operation"), fills: mapped.fills.map(fill => ({ obligation: fill.obligation, node: fill.node,
       ...(fill.port === undefined ? {} : { port: fill.port }) })),

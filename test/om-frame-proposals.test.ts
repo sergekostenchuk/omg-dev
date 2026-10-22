@@ -21,7 +21,7 @@ import { fillObligations, representativeId, readFrame, prepareFrame, WORKS_FRAME
 import { applyProposals, definitionIds, observeProposal, openObligationsToGaps, readFrameProposals, prepareFrameProposals,
   PROPOSAL_REFUSAL_CODES, type LayerProposal, type ProposalObservation,
   type ProposalRequest, type ProposalResult } from "../src/om/frame-proposals.js";
-import { gardenGraph, createOmFixture, type OmFixture } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, explicitMapping, markedWorks, storedAccepted, type OmFixture } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
 
 const clone = structuredClone;
@@ -54,21 +54,22 @@ function scope(nodes: string[]): FrameScope {
   return { nodes, excluded: [], hash: hashJson({ nodes: [...nodes].sort(), excluded: [] }) };
 }
 function pureFrame(graph: Graph, level: FrameLevel, accepted = false, nodes?: string[]): FrameRead {
+  if (level === 3) markedWorks(graph);
   const view = upper(graph, level), upperRef = fakeRef(`graph-layer:garden:${level - 1}`);
   const horizon = scope(nodes ?? view.nodes.filter(node => LEVEL[node.kind] === level - 1).map(node => node.id));
+  const acceptedLayer = accepted ? storedAccepted(graph, view, horizon, "garden", level) : null;
   const base = accepted ? graph : view;
   const request: FrameRequest = { project: "garden", level, horizon: fakeRef("om-horizon:garden:choice"),
-    graph: graphRef(base), layer: accepted ? fakeRef(`graph-layer:garden:${level}`) : null, frame: null,
-    upper: level === 2 ? null : { horizon: fakeRef("om-horizon:garden:choice"), frame: null } };
-  const acceptedLayer = accepted ? { graph, reference: request.graph, frame: null } : null;
+    graph: graphRef(base), layer: accepted ? fakeRef(`graph-layer:garden:${level}`) : null,
+    frame: accepted ? acceptedLayer!.frame!.reference : null,
+    upper: level === 2 ? null : { horizon: fakeRef("om-horizon:garden:choice"), frame: fakeRef("om-frame:garden:2") } };
   return { request, upper: view, upperRef, scope: horizon, accepted: acceptedLayer,
     result: clone(delivered(fillObligations(view, horizon, acceptedLayer, upperRef, level))) as FrameRead["result"],
     references: [upperRef, request.graph, request.horizon] };
 }
 function proposalFor(frame: FrameRead, graph: Graph, id = "one"): ProposalObservation {
   const level = frame.request.level;
-  const completed = delivered(fillObligations(frame.upper, frame.scope,
-    { graph, reference: graphRef(graph), frame: null }, frame.upperRef, level));
+  const completed = explicitMapping(graph, frame.upper, frame.scope, level);
   const projected = projectGraph(graph, level);
   const value: LayerProposal = { base: { graph: frame.request.graph, frame: frame.request.frame }, level,
     source: "decision", status: "proposed", nodes: clone(projected.nodes.filter(node => LEVEL[node.kind] === level)),
@@ -452,6 +453,8 @@ test("replacing one accepted consumer retains every other consumer and every flo
     const old = graph.nodes.find(node => node.id === oldId)!;
     const peer = { ...clone(old), id: `${oldId}-peer`, outcome: "garden-data" };
     graph.nodes.push(peer);
+    // The works contract calls the anchor-free delivery active: its consumers live in the work horizon.
+    if (level === 3) graph.horizon.push(peer.id);
     for (const binding of graph.connectors.find(connector => connector.id === "garden-flow")!.bindings.filter(item => item.level === level)) {
       for (const endpoint of [...binding.consumers].filter(item => item.node === oldId))
         binding.consumers.push({ ...clone(endpoint), node: peer.id });
@@ -712,16 +715,23 @@ test("gap questions include introduced eligible nodes and exclude explicitly rem
     }
     const partial = clone(graph), internal = { ...clone(node), id: `${node.id}-unused`, outcome: "garden-data" };
     partial.nodes.push(internal);
-    const connector = partial.connectors.find(item => item.id === "garden-flow")!;
-    connector.bindings = connector.bindings.filter(binding => binding.level !== level);
     const accepted = pureFrame(partial, level, true);
     assert.ok(!accepted.result.fills.some(fill => fill.node === internal.id));
+    if (level === 2) {
+      // A recorded L2 frame covers every obligation; an unfilled accepted node is only removable, never a gap.
+      const removal = emptyProposal(accepted, "remove-internal"); removal.value.removes = [internal.id];
+      const removed = delivered(applyProposals(accepted, [observe(removal.value, "remove-internal")]));
+      assert.deepEqual(removed.fills, accepted.result.fills);
+      continue;
+    }
+    // RL3: a recorded works frame opens its horizon fills again only through the saved reopening it carries.
+    Object.assign(accepted.request, { reopen: { record: fakeRef("om-l3-reopen:garden"), works: [node.id] } });
     const before = delivered(openObligationsToGaps(accepted, delivered(applyProposals(accepted, [])) as ProposalResult));
     const consumerGap = before.find(gap => gap.consumer === upperConsumer && gap.question.role === "consumer")!;
     assert.ok(consumerGap.question.existing.includes(internal.id));
     const removal = emptyProposal(accepted, "remove-internal"); removal.value.removes = [internal.id];
     const removed = delivered(applyProposals(accepted, [observe(removal.value, "remove-internal")]));
-    assert.deepEqual(removed.fills, accepted.result.fills);
+    assert.deepEqual(removed.fills, accepted.result.fills.filter(fill => fill.node !== node.id));
     const after = delivered(openObligationsToGaps(accepted, removed as ProposalResult));
     assert.ok(after.some(gap => gap.target === consumerGap.target));
     assert.ok(after.every(gap => !gap.question.existing.includes(internal.id)));
