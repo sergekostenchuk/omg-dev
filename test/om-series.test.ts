@@ -2484,7 +2484,7 @@ test("a review written WITH the escalation: nothing of it stands before, both st
   assert.equal(held(store, "taken")!.value.ladder.rung, 1);
 });
 
-test("a review, a confirmation of a fix and a decision of the owner, each written with the continuation it grounds", async t => {
+test("a review and a decision of the owner are written with the continuation they ground, and a confirmation of a fix is weighed before anything is written", async t => {
   const { store, root, path } = fixture(t);
   // A stop of three managed attempts in a project of its own, and the refusal the last of them left.
   const window = async (project: string): Promise<{ readonly base: { input: Ref; refusal: ClaimedRefusal } }> => {
@@ -2716,7 +2716,9 @@ test("the history of the stops comes from the same walk: exact goals, window bou
   const owner = byOwner(store, PROJECT, 6, ["gap:cart:price"]);
   deliveredOf(resumeSeries(store, { ...address(PROJECT), stop: 6, ...owner } as ResumeSeriesRequest));
   await m.cycle("gap:cart:price", "supported");
-  const accepted = m.achieved(7);
+  // The keys the window ended with, read independently of the series: from the answers its close accepted.
+  const accepted = m.claimed(7).accepting.map(ref => deliveredOf(readAcceptedAnswer(store, { project: PROJECT, record: ref })).key).sort();
+  assert.ok(accepted.length > 0);
   assert.deepEqual(held(store)!.value.ladder.windows, []);
   await stopped3(m);
 
@@ -2950,8 +2952,12 @@ import { gapLineKey, gapLineExpectedResult } from '../src/om/gap-lines.js';
 import { preparedFeatures } from './product-fixture.js';
 import { preparedField } from './preparation-fixture.js';
 import { gardenGraph } from './om-fixture.js';
+import { managedUsage } from './om-managed-block.js';
+import { writeQuestionPacket } from '../src/om/question-packet.js';
+import { runModelCall } from '../src/om/model-call.js';
 import { seriesAddress, seriesOwner, seriesRequestOf, readAnySeries, readAnySeriesAt, projectMechanismSlice, prepareSeriesAdmission, readMechanismAdmission,
-  type MechanismSeriesRequest, type MechanismAdmission } from '../src/om/series.js';
+  type MechanismSeriesRequest, type MechanismAdmission, type MechanismRepairSeries } from '../src/om/series.js';
+import type { GateOutcome } from '../src/om/repeat-gate.js';
 
 function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = '', extraConsumer = false) {
   const root = mkdtempSync(join(tmpdir(), 'omg-mechanism-series-')), path = join(root, 'state.sqlite');
@@ -2970,6 +2976,58 @@ function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = 
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
   let input = deliveredOf(writeOmInput(store, { project, stages, expected: 0 }));
   const request: MechanismSeriesRequest = { project, owner: { kind: 'mechanism', mechanism: 'M5:addressing' }, line: 1 };
+  // LG07: the paid work of a mechanism attempt — its E2 packet and the E1+E4 call — through the scenario adapter.
+  const scenario = join(root, 'scenario.json'), trace = join(root, 'trace.jsonl'), steps: unknown[] = [];
+  const adapterFixture = fileURLToPath(new URL('../../test/om-adapter-fixture.mjs', import.meta.url));
+  const command = { executable: process.execPath, args: [adapterFixture, '--scenario', scenario, '--trace', trace] };
+  const config = reference(engine.environments.configure(project, { workspace: root,
+    implementer: { actor: 'mechanism-implementer', model: 'fixture', effort: 'high', speed: 'fast', command },
+    reviewer: { actor: 'mechanism-reviewer', model: 'fixture-reviewer', effort: 'medium', command },
+    fullCheck: { executable: process.execPath, args: ['--version'] }, timeoutMs: 5000, requestCapacityChars: 100_000 },
+  store.get(`environment:${project}`)?.revision ?? 0));
+  const adapter = reference(store.write({ id: `adapter:${project}:mechanism`, kind: 'dispatch-adapter', expected: 0,
+    value: { projectId: project, protocol: 'codex-stdio' } }));
+  type Snapshot = ReturnType<typeof publish>;
+  const opened = new Map<string, { snapshot: Snapshot; series: Ref }>(), claims = new Map<string, GateOutcome>();
+  const slot = (line: number, attempt: number): string => `${line}:${attempt}`;
+  /** The complete managed opening of a mechanism attempt: its admission and the exact completion of its MC2 batch. */
+  const opening = (snapshot: Snapshot, line: number, attempt: number) => ({ ...request, line, attempt, goal: snapshot.goal!,
+    admission: snapshot.admission!, completion: { routes: reference(snapshot.routes), batches: [snapshot.admission!.batch] } });
+  const managed = {
+    opening,
+    open(snapshot: Snapshot, line: number, attempt: number) {
+      const series = deliveredOf(openAttempt(store, opening(snapshot, line, attempt) as never)) as Revision<unknown>;
+      if (!opened.has(slot(line, attempt))) opened.set(slot(line, attempt), { snapshot, series: reference(series) });
+      return series;
+    },
+    /** The implementer's own end of the attempt: an answer off its form, or a request for the owner's decision. */
+    async pay(line: number, attempt: number, ending: 'off-form' | 'need-owner') {
+      const at = opened.get(slot(line, attempt))!, batch = at.snapshot.routes.value.batches.find(item => item.id === at.snapshot.admission!.batch)!;
+      const packet = deliveredOf(writeQuestionPacket(store, { project, routes: reference(at.snapshot.routes), batch: batch.id,
+        environment: config, attempt: { series: at.series, ordinal: attempt }, previous: [] })).record;
+      steps.push(ending === 'off-form' ? { research: {}, usage: managedUsage } : { research: { protocol: '$answerProtocol', requestId: '$requestId',
+        questionIds: batch.items.map(item => item.gap), action: 'need_owner', reason: 'Only the owner knows the consumer', decision: 'Name the consumer' },
+      usage: managedUsage });
+      writeFileSync(scenario, JSON.stringify({ database: path, steps }));
+      deliveredOf(await runModelCall(store, { project, packet: reference(packet), dispatch: { adapter, config }, role: 'implementer' }));
+    },
+    claim(line: number, attempt: number): GateOutcome {
+      return deliveredOf(prepareManagedClaim(store, { ...request, line, attempt,
+        outcome: { reason: 'result', accepting: [], cancelling: [], refusals: [] } } as never)).outcome;
+    },
+    close(line: number, attempt: number, outcome: GateOutcome) {
+      deliveredOf(closeAttempt(store, { ...request, line, attempt, outcome } as never));
+      if (!claims.has(slot(line, attempt))) claims.set(slot(line, attempt), outcome);
+      return store.get<MechanismRepairSeries>(seriesAddress({ ...request, line }).id)!;
+    },
+    claimed: (line: number, attempt: number): GateOutcome => claims.get(slot(line, attempt))!,
+    /** One completed mechanism cycle: opened, paid, claimed as G7 derives it and closed at the gate. */
+    async cycle(snapshot: Snapshot, line: number, attempt: number, ending: 'off-form' | 'need-owner' = 'off-form') {
+      managed.open(snapshot, line, attempt);
+      await managed.pay(line, attempt, ending);
+      return managed.close(line, attempt, managed.claim(line, attempt));
+    },
+  };
   function publish() {
     const graph = reference(store.get(`graph:${project}`)!);
     const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph, refinement: null, available: {},
@@ -2986,7 +3044,7 @@ function mechanismFixture(t: test.TestContext, questions = ['A', 'B'], suffix = 
       result: gapLineExpectedResult(project, batch.items[0]!.target, 'address') } : null;
     return { gaps, routes, admission, goal };
   }
-  return { request, stages, publish, get store() { return store; }, get input() { return input; },
+  return { request, stages, publish, managed, get store() { return store; }, get input() { return input; },
     replaceProducerQuestions(ids: string[]) {
       // A fresh accepted research contract for each stage preserves real producer provenance while its
       // unknown-question set changes. Neither the B1 record nor any D1 classification is patched by the fixture.
@@ -3067,32 +3125,36 @@ test('mechanism slice derives full D1 and accepted consumer conditions while ind
   f.restart(); assert.equal(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(opened))).value.slice, before.slice);
 });
 
-test('mechanism completion and exact late repeats survive D3 addressing and restart while new work needs successor', t => {
-  const f = mechanismFixture(t), first = f.publish();
+test('mechanism completion and exact late repeats survive D3 addressing and restart while new work needs successor', async t => {
+  const f = mechanismFixture(t), first = f.publish(), m = f.managed;
   const opening = { ...f.request, scope: first.gaps, predecessor: null, basis: null };
   const opened = deliveredOf(openSeries(f.store, opening));
-  const begin = { ...f.request, attempt: 1, goal: first.goal!, admission: first.admission! };
-  const running = deliveredOf(beginAttempt(f.store, begin));
+  const begin = m.opening(first, 1, 1);
+  const running = m.open(first, 1, 1);
   const permuted = { ...begin, admission: { ...begin.admission, gaps: { ...begin.admission.gaps, records: [...begin.admission.gaps.records].reverse() } } };
-  assert.equal(deliveredOf(beginAttempt(f.store, permuted)).revision, running.revision);
+  assert.equal(deliveredOf(openAttempt(f.store, permuted as never)).revision, running.revision);
   const beforeMalformed = f.store.list().map(reference), { admission: _admission, ...missingAdmission } = begin;
   for (const request of [missingAdmission, { ...begin, admission: null }, { ...begin, admission: {} },
     { ...begin, admission: { ...begin.admission, gaps: null } }])
     assert.throws(() => beginAttempt(f.store, request as never), code('series_request_invalid'));
   assert.deepEqual(f.store.list().map(reference), beforeMalformed);
+  // The attempt is paid before D3 addresses A: its own E4 ended off its form, and its registry keeps that work.
+  await m.pay(1, 1, 'off-form');
   f.address(['A']); const second = f.publish();
   assert.notEqual(deliveredOf(projectMechanismSlice(f.store, 'garden', second.gaps)).slice, opened.value.slice);
-  assert.equal(deliveredOf(beginAttempt(f.store, begin)).revision, running.revision);
-  assert.equal(deliveredOf(openSeries(f.store, opening)).revision, running.revision);
-  const doneRequest = { ...f.request, attempt: 1, outcome: { reason: 'off-form' as const, achieved: [], cancelled: [], refusals: [] } };
-  const done = deliveredOf(completeAttempt(f.store, doneRequest));
-  assert.equal(refusalOf(beginAttempt(f.store, { ...f.request, attempt: 2, goal: second.goal!, admission: second.admission! })).code, 'series_conflict');
+  assert.equal(deliveredOf(openAttempt(f.store, begin as never)).revision, f.store.get(running.id)!.revision);
+  assert.equal(deliveredOf(openSeries(f.store, opening)).revision, f.store.get(running.id)!.revision);
+  const claim = m.claim(1, 1);
+  assert.equal(claim.reason, 'off-form');
+  const done = m.close(1, 1, claim);
+  assert.equal(refusalOf(openAttempt(f.store, m.opening(second, 1, 2) as never)).code, 'series_conflict');
   const successor = deliveredOf(openSeries(f.store, { ...f.request, line: 2, scope: second.gaps, predecessor: reference(done), basis: { ground: 'inputs-changed', text: 'A was addressed by F5.3' } }));
   assert.equal(successor.value.inherited.length, 1); assert.equal(successor.value.withoutProgress, 1);
   f.restart();
   assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(successor))), successor);
   const claimedRevision = f.store.get(done.id)!.revision;
-  assert.equal(deliveredOf(completeAttempt(f.store, doneRequest)).revision, claimedRevision);
+  m.close(1, 1, m.claimed(1, 1));
+  assert.equal(f.store.get(done.id)!.revision, claimedRevision);
   assert.equal(deliveredOf(openSeries(f.store, opening)).revision, claimedRevision);
   assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(running))), running);
   f.address(['B']); const empty = f.publish();
@@ -3143,7 +3205,7 @@ test('mechanism semantic slice distinguishes changed task text, accepted consume
 test('mechanism prepared admissions guard all fresh sources and successor atomically claims the earlier line', t => {
   const f = mechanismFixture(t), first = f.publish();
   const opening = deliveredOf(openSeries(f.store, { ...f.request, scope: first.gaps, predecessor: null, basis: null }));
-  const pending = deliveredOf(prepareBeginAttempt(f.store, { ...f.request, attempt: 1, goal: first.goal!, admission: first.admission! }));
+  const pending = deliveredOf(prepareOpenAttempt(f.store, f.managed.opening(first, 1, 1) as never));
   assert.ok(pending.guards.some(ref => ref.id === 'om-input:garden'));
   assert.ok(pending.guards.some(ref => ref.id === first.routes.id));
   f.address(['A']); const next = f.publish();
@@ -3208,7 +3270,7 @@ export async function load(url, context, next) {
 }
 `;
 
-test(mechanismCostName, t => {
+test(mechanismCostName, async t => {
   const runtime = globalThis as unknown as {
     __mechanismCostInternals?: { sourceView(store: Store): Store; footprint(): boolean };
     __mechanismCost?: { hit(family: string, store: Store, key: unknown): void };
@@ -3264,9 +3326,9 @@ test(mechanismCostName, t => {
   const counts: ReturnType<typeof measured>[] = [];
   let latest: Ref | null = null;
   for (let attempt = 1; attempt <= 4; attempt++) {
-    deliveredOf(beginAttempt(f.store, { ...f.request, attempt, goal: native.goal!, admission: native.admission! }));
-    const closed = deliveredOf(completeAttempt(f.store, { ...f.request, attempt,
-      outcome: { reason: 'awaiting-owner', achieved: [], cancelled: [], refusals: [] } }));
+    // Each attempt waits for the owner: its implementer asked for the decision, and G7 closes it as awaiting-owner.
+    const closed = await f.managed.cycle(native, 1, attempt, 'need-owner');
+    assert.equal(closed.value.attempts[attempt - 1]!.outcome!.reason, 'awaiting-owner');
     latest = reference(closed);
     if ([1, 2, 4].includes(attempt)) {
       counts.push(measured(() => assert.deepEqual(deliveredOf(readAnySeriesAt(counted, 'garden', latest!)), closed)));
@@ -3296,22 +3358,19 @@ test(mechanismCostName, t => {
 });
 
 
-test('mechanism one real producer lineage A to A+B to B to empty to A inherits every attempt, stop and owner ladder', t => {
+test('mechanism one real producer lineage A to A+B to B to empty to A inherits every attempt, stop and owner ladder', async t => {
   const f = mechanismFixture(t, ['A']), a = f.publish();
   const first = deliveredOf(openSeries(f.store, { ...f.request, scope: a.gaps, predecessor: null, basis: null }));
-  const noResult = { reason: 'off-form' as const, achieved: [], cancelled: [], refusals: [] };
-  const cycle = (snapshot: ReturnType<typeof f.publish>, line: number, attempt: number) => {
-    deliveredOf(beginAttempt(f.store, { ...f.request, line, attempt, goal: snapshot.goal!, admission: snapshot.admission! }));
-    return deliveredOf(completeAttempt(f.store, { ...f.request, line, attempt, outcome: noResult }));
-  };
-  cycle(a, 1, 1); const twice = cycle(a, 1, 2);
+  // Every attempt of the lineage ends off its form: its own E4, paid on the batch of its own line, closed by G7.
+  const cycle = (snapshot: ReturnType<typeof f.publish>, line: number, attempt: number) => f.managed.cycle(snapshot, line, attempt);
+  await cycle(a, 1, 1); const twice = await cycle(a, 1, 2);
   assert.equal(twice.value.withoutProgress, 2); assert.equal(twice.value.stop, null);
 
   f.replaceProducerQuestions(['A', 'B']); const ab = f.publish();
   const second = deliveredOf(openSeries(f.store, { ...f.request, line: 2, scope: ab.gaps, predecessor: reference(twice),
     basis: { ground: 'inputs-changed', text: 'The accepted producer added B to A' } }));
   assert.equal(second.value.inherited.length, 2); assert.equal(second.value.withoutProgress, 2);
-  const firstStop = cycle(ab, 2, 3);
+  const firstStop = await cycle(ab, 2, 3);
   assert.equal(firstStop.value.stop!.attempt, 3); assert.equal(firstStop.value.ladder.rung, 1);
   const pendingReviewId = `${stopReviewNamespace('garden')}prepared-before-successor`;
   const pendingReviewValue = { ...review('garden', 3, firstStop.value.stop!.goals), owner: f.request.owner } as Record<string, unknown>;
@@ -3331,13 +3390,13 @@ test('mechanism one real producer lineage A to A+B to B to empty to A inherits e
     writes: lateResume.writes, guards: lateResume.guards })).code, 'input_stale');
   assert.equal(f.store.get(pendingReviewId), null);
   assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), claimed);
-  assert.equal(refusalOf(beginAttempt(f.store, { ...f.request, line: 3, attempt: 4, goal: b.goal!, admission: b.admission! })).code, 'series_stopped');
+  assert.equal(refusalOf(openAttempt(f.store, f.managed.opening(b, 3, 4) as never)).code, 'series_stopped');
   const reviewedValue = { ...review('garden', 3, third.value.stop!.goals), owner: f.request.owner } as Record<string, unknown>;
   delete reviewedValue.block;
   const reviewRef = reviewed(f.store, 'garden', reviewedValue);
   deliveredOf(resumeSeries(f.store, { ...f.request, line: 3, stop: 3, ground: 'review-record',
     text: 'The review supplies the first continuation', review: { ref: reviewRef } }));
-  cycle(b, 3, 4); cycle(b, 3, 5); const ownerStop = cycle(b, 3, 6);
+  await cycle(b, 3, 4); await cycle(b, 3, 5); const ownerStop = await cycle(b, 3, 6);
   assert.equal(ownerStop.value.stop!.attempt, 6); assert.equal(ownerStop.value.ladder.rung, 2);
   assert.deepEqual(ownerStop.value.ladder.grounds, ['owner-decision']);
 
@@ -3362,15 +3421,16 @@ test('mechanism one real producer lineage A to A+B to B to empty to A inherits e
     ab.goal!.questions, b.goal!.questions, b.goal!.questions, b.goal!.questions]);
   assert.equal(fourth.value.withoutProgress, ownerStop.value.withoutProgress);
   assert.deepEqual(fourth.value.stop, ownerStop.value.stop); assert.deepEqual(fourth.value.ladder, ownerStop.value.ladder);
-  assert.equal(refusalOf(beginAttempt(f.store, { ...f.request, line: 4, attempt: 7, goal: returned.goal!, admission: returned.admission! })).code, 'series_stopped');
-  const repeated = { ...f.request, line: 1, attempt: 1, outcome: noResult }, stable = f.store.list(REPAIR_SERIES_KIND).map(reference);
-  deliveredOf(completeAttempt(f.store, repeated)); assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), stable);
+  assert.equal(refusalOf(openAttempt(f.store, f.managed.opening(returned, 4, 7) as never)).code, 'series_stopped');
+  // The close of the first attempt delivered again, on its own line, is a repeat that writes nothing.
+  const stable = f.store.list(REPAIR_SERIES_KIND).map(reference);
+  f.managed.close(1, 1, f.managed.claimed(1, 1)); assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), stable);
   f.restart();
   assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(first))), first);
   assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(firstStop))), firstStop);
   assert.deepEqual(deliveredOf(readAnySeriesAt(f.store, 'garden', reference(ownerStop))), ownerStop);
   assert.deepEqual(deliveredOf(readAnySeries(f.store, { ...f.request, line: 4 })), fourth);
-  deliveredOf(completeAttempt(f.store, repeated)); assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), stable);
+  f.managed.close(1, 1, f.managed.claimed(1, 1)); assert.deepEqual(f.store.list(REPAIR_SERIES_KIND).map(reference), stable);
 });
 
 
@@ -3391,12 +3451,13 @@ test('A3.3 public A4 and D2 readers load independently in fresh Node processes w
 
 test("block successor CAS excludes competing work in both transaction orders and retains exact history after restart", t => {
   for (const successorFirst of [false, true]) {
-    const { store, path } = fixture(t);
+    const { store, path, m } = managedFixture(t);
     const first = opened(store);
     const admission = deliveredOf(prepareSeriesLineAdmission(store, PROJECT, reference(first)));
     assert.deepEqual(admission.series, first);
     assert.deepEqual(admission.guards, [reference(first)]);
-    const attempt = deliveredOf(prepareBeginAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
+    // The managed opening of attempt 1 — its series, owner and work — prepared, against a successor prepared beside it.
+    const attempt = deliveredOf(prepareOpenAttempt(store, m.opening(1)));
     const successorRequest: OpenSeriesRequest = { ...address(PROJECT, 2), slice: "slice:cart@2", predecessor: reference(first),
       basis: { ground: "inputs-changed", text: "The horizon added a question" } };
     const successor = deliveredOf(prepareOpenSeries(store, successorRequest));
@@ -3416,21 +3477,21 @@ test("block successor CAS excludes competing work in both transaction orders and
         assert.equal(claimed.revision, first.revision + 1);
         assert.deepEqual(claimed.value, first.value);
         assert.equal(refusalOf(prepareSeriesLineAdmission(restarted, PROJECT, reference(claimed))).code, "series_conflict");
-        assert.equal(refusalOf(beginAttempt(restarted, { ...address(PROJECT), attempt: 1, goal: goal() })).code, "series_conflict");
+        assert.equal(refusalOf(openAttempt(restarted, m.on(restarted).opening(1))).code, "series_conflict");
         assert.equal(deliveredOf(openSeries(restarted, successorRequest)).revision, 1);
-        assert.equal(deliveredOf(beginAttempt(restarted, { ...address(PROJECT, 2), attempt: 1, goal: goal() })).value.attempts.length, 1);
+        assert.equal(deliveredOf(openAttempt(restarted, m.on(restarted).opening(1, "gap:cart:price", 2))).value.attempts.length, 1);
       } else {
         assert.equal(restarted.get(seriesId(PROJECT, BLOCK, 2)), null);
-        assert.equal(deliveredOf(beginAttempt(restarted, { ...address(PROJECT), attempt: 1, goal: goal() })).revision, first.revision + 1);
+        assert.equal(deliveredOf(openAttempt(restarted, m.on(restarted).opening(1))).revision, first.revision + 1);
       }
     } finally { restarted.close(); }
   }
 });
 
-test("a block stop can be answered only on its current successor while old exact deliveries remain historical", t => {
-  const { store, path } = fixture(t);
+test("a block stop can be answered only on its current successor while old exact deliveries remain historical", async t => {
+  const { store, path, m } = managedFixture(t);
   opened(store);
-  for (let n = 0; n < 3; n++) cycle(store, PROJECT, goal(), fruitless());
+  await stopped3(m);
   const stopped = held(store)!;
   const ground = byReview(store, PROJECT, 3);
   const pending = deliveredOf(prepareResumeSeries(store, { ...address(PROJECT), stop: 3, ...ground }));
@@ -3440,8 +3501,9 @@ test("a block stop can be answered only on its current successor while old exact
   assert.equal(refusalOf(resumeSeries(store, { ...address(PROJECT), stop: 3, ...ground })).code, "series_conflict");
   assert.equal(refusalOf(escalateSeries(store, { ...address(PROJECT), stop: 3, review: { ref: undecided(store, PROJECT, 3) } })).code, "series_conflict");
   assert.deepEqual(deliveredOf(readSeriesAt(store, PROJECT, reference(stopped))), stopped);
+  // The exact close of attempt 3 delivered again stays historical: it writes nothing on the claimed line.
   const stable = store.list(REPAIR_SERIES_KIND).map(reference);
-  deliveredOf(completeAttempt(store, { ...address(PROJECT), attempt: 3, outcome: fruitless() }));
+  m.close(3, m.claimed(3));
   assert.deepEqual(store.list(REPAIR_SERIES_KIND).map(reference), stable);
   const continued = deliveredOf(resumeSeries(store, { ...address(PROJECT, 2), stop: 3, ...ground }));
   assert.equal(continued.value.stop, null);
