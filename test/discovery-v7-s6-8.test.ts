@@ -13,9 +13,12 @@ import { answerDiscoveryFixture } from './product-fixture.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
 import { Researcher } from '../src/discovery/research-runner.js';
 import { readResearchConsumerTurn, listResearchConsumerIntents } from '../src/discovery/response-recovery.js';
-import { readSynthesisSessionV3 } from '../src/discovery/synthesis-session.js';
+import { synthesisSession, readSynthesisSessionV3 } from '../src/discovery/synthesis-session.js';
 import { planOwnerSubject } from '../src/discovery/v7-plan-questions.js';
 import { readArchiveBody } from '../src/discovery/request-parts.js';
+import { readerPilot, pilotEnvironment } from '../src/discovery/reader-pilot.js';
+import { configureV7SavedSynthesis } from '../src/discovery/saved-synthesis.js';
+import { exactContextLookup } from '../src/discovery/research-consumer-transition.js';
 
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "omg-v7-s6-8-"));
@@ -267,4 +270,64 @@ test('S6.8: a second Store changing the plan before paid review application conf
  const result=await f.run(1,f.open(),false);assert.equal(result.value.status,'needs_owner',JSON.stringify(result.value));
  proveOwner(f,true,source);assert.deepEqual(snapshot(f),before);
  const fixed=history(f);assert.deepEqual(await f.run(1,f.open(),false),result);assert.deepEqual(history(f),fixed);
+});
+
+for (const cutSession of [false,true])
+ test(`S6.8-01: saved-only retains its paid negative review${cutSession?' after a session-only interruption':''}`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ const pieces=['a','b'].map(name=>{
+  const source=f.discovery.evidence.document('p','note-'+name,'A condition and its exception '+name,'text/plain',0);
+  return {kind:'context',value:f.discovery.evidence.observe('p',reference(source),{kind:'text-range',start:0,end:source.value.content.length})};
+ });
+ const subject={contract:'v7-plan-subject/v1' as const,planAnswer:f.v.planAnswer,planQuestionId:'block'};
+ const pilot=readerPilot(f.store,'p')!;
+ f.configure([{action:'checkpoint',question:'$selected',value:{finding:'A finding with its exception'},
+  citations:[{source:pieces[0]!.value.source,selector:pieces[0]!.value.selector}],unresolved:[]},ended()]);
+ assert.equal((await synthesisSession(f.store,f.v.draft,f.v.plan,f.environment,pilotEnvironment(f.environment.value,pilot.value),pilot,
+  {role:'research',stage:'discovery',subject,workingSelections:pieces,inventory:{sources:[]},history:[]},'Synthesize',undefined,{})).action,'answer');
+ const notes=f.store.list('research-checkpoint');assert.equal(notes.length,1);
+ const prior=f.wires().length,source=scenario(f,false);
+ const config=JSON.parse(readFileSync(join(f.root,'reply.json'),'utf8'));
+ f.configure([...Array.from({length:prior},()=>ended()),...config.replies]);
+ const restore=cutPaidReview(f);
+ try{await f.run(3);}finally{restore();}
+ const reviewCalls=f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference);
+ const choice=configureV7SavedSynthesis(f.store,'p',subject,0);
+ assert.deepEqual(choice.value.subject,subject);assert.deepEqual(choice.value.checkpoints,notes.map(reference));
+ const before=snapshot(f),write=f.store.writeMany.bind(f.store);let interrupted=false;
+ if(cutSession)f.store.writeMany=((writes,guards=[])=>{
+  const rows=write(writes,guards);
+  if(!interrupted&&writes.some(row=>row.kind==='synthesis-session'&&row.expected===0
+   &&(row.value as any).basis.previousProposalRef)){
+   interrupted=true;throw new Error('S6.8 stop after saved-only session before its first intent');
+  }
+  return rows;
+ }) as Store['writeMany'];
+ let result;
+ try{result=await f.run(4);}finally{f.store.writeMany=write;}
+ if(cutSession){
+  assert.equal(interrupted,true);assert.equal(result.value.pauseCode,'research_interrupted',JSON.stringify(result.value));
+  assert.deepEqual(snapshot(f),before);
+  result=await f.run(4,f.open());
+ }
+ assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+ const reviewed=proveOwner(f,false,source);
+ assert.deepEqual(reviewed.value.subject,subject);
+ const requests=f.wires().slice(before.wire.length);
+ assert.equal(requests.length,1);const request=requests[0]!.subject;
+ assert.equal(request.dispatchMode,'synthesis');assert.deepEqual(request.previousProposalRef,reference(reviewed));
+ const archive=request.working.archive;
+ const body=readArchiveBody(f.open(),f.store.get(archive.id,archive.revision)!).body;
+ if(!cutSession)assert.equal(body.savedOnly,true);
+ assert.deepEqual(body.savedMaterials.map((piece:any)=>piece.value.checkpoint),choice.value.checkpoints);
+ assert.deepEqual(body.subject,subject);
+ assert.deepEqual(body.history,[{...reviewed.value,ref:reference(reviewed)}]);
+ const lookup=exactContextLookup(f.open(),f.v.draft,f.v.plan,archive,'/body/history/0',undefined,()=>assert.fail('Review context is not a reader-result'));
+ assert.deepEqual(lookup.value,{...reviewed.value,ref:reference(reviewed)});
+ assert.deepEqual((lookup.value as any).observation,verdict(false));
+ assert.ok(request.working.sections.some((section:any)=>section.pointer==='/body/history'));
+ assert.deepEqual(f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference),reviewCalls);
+ assert.equal(f.store.list('model-call').length,before.calls.length+1);
+ const fixed=history(f),paid=snapshot(f);
+ assert.deepEqual(await f.run(1,f.open(),false),result);assert.deepEqual(history(f),fixed);assert.deepEqual(snapshot(f),paid);
 });

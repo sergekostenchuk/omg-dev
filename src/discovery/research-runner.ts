@@ -1512,10 +1512,15 @@ export class Researcher {
           // erase a saved pause merely to rediscover the same no-new-work door.
           if (!restoreOnly && run.value.status !== "running") run = this.save(run,
             { status: "running", owner, error: null, pauseCode: null }, [reference(synthesis.session)]);
+          const rejected = rejectedPlanOwnerRequest(this.store, turns, synthesis.subject!);
+          // A saved-only session may stop before its first intent. Restore the
+          // paid review named by this session's exact proposal basis as context.
+          const reviewHistory = rejected && canonical(reference(rejected)) === canonical(synthesis.session.value.basis.previousProposalRef)
+            ? [{ ...rejected.value, ref: reference(rejected) }] : [];
           const context = { role: "research", stage: "discovery", subject: synthesis.subject!,
             savedMaterials: synthesis.session.value.basis.materials,
             previousProposal: synthesis.session.value.basis.previousProposal,
-            previousProposalRef: synthesis.session.value.basis.previousProposalRef, inventory: { sources: [] }, history: [] };
+            previousProposalRef: synthesis.session.value.basis.previousProposalRef, inventory: { sources: [] }, history: reviewHistory };
           run = await this.applyV7Synthesis(project, run, draft, question, environment, context, owner, signal,
             restoreOnly, synthesis);
           if (run.value.status === "paused") return run;
@@ -1760,7 +1765,7 @@ export class Researcher {
           const rejected = rejectedPlanOwnerRequest(this.store, selectedTurns as Revision<ManagedResearchTurn>[], subject);
           Object.assign(context, rejected ? { previousProposal: turnAction(rejected.value),
             previousProposalRef: reference(rejected) } : {}, savedMaterials
-            ? { savedMaterials, savedOnly: true, history: [] }
+            ? { savedMaterials, savedOnly: true, history: rejected ? [{ ...rejected.value, ref: reference(rejected) }] : [] }
             : { workingSelections: workingSelections(this.store, selectedTurns, selection.question, subject) });
           run = await this.applyV7Synthesis(project, run, selection.draft, selection.question, environment,
             context, owner, signal, false, null, workspace, selectedTurns.map(reference));
