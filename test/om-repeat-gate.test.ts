@@ -58,6 +58,7 @@ import {
   type OriginTally, type RepeatOutcome, type RoutedRefusal,
 } from "../src/om/repeat-gate.js";
 import { readRun, regateRun, type RunStep } from "../src/om/run.js";
+import { managedBlock, MANAGED_FIRST_TARGET } from "./om-managed-block.js";
 import { gardenPass, project, usage } from "./om-run-fixture.js";
 
 const UNIT = "gate-repeat";
@@ -406,6 +407,87 @@ test("a refusal of the proposal reaches the gate with its class, its addressee a
   assert.equal(late.withoutProgress, 2);
   assert.equal(heldSeries(store)!.revision, later.series);
   assert.equal(heldJournal(store)!.revision, later.journal);
+});
+
+// LG07 (№10076 п.2): the parts of the tests above that real producers carry now — a refusal of the proposal is the
+// negative E5 of a managed attempt. The proofs on base/derived/proposal sources and the lost definition stay with them.
+test("a refusal of the proposal from a negative E5 reaches the gate with its class, its addressee and its route, in one transaction", async t => {
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT), store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  const series = () => store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!;
+  m.open(1);
+  await m.pay(1, "insufficient");
+  const claim = m.claim(1), journalBefore = heldJournal(store)!, seriesBefore = series();
+  const result = m.close(1, claim);
+  assert.equal(result.routed.length, 1);
+  const routed = result.routed[0]!;
+  assert.equal(routed.row, claim.refusals[0]!.row);
+  assert.equal(routed.class, "proposal");
+  // The class comes from the negative verdict on the fact: the node is corrected, and the question goes back to it.
+  assert.equal(routed.addressee, `${ADDRESSEE_KINDS.proposal}:${MANAGED_FIRST_TARGET}`);
+  assert.equal(routed.toModel, true);
+  assert.deepEqual(result.question, [MANAGED_FIRST_TARGET]);
+  assert.deepEqual(routed.basis.map(item => item.role), ["assessment"]);
+  // A refusal of the proposal is the gate's pass back to the model, not a refusal of the gate itself.
+  assert.deepEqual(result.refusals, []);
+  // The verdict, the count and the stop are the series' own findings, reported here and not counted again.
+  assert.equal(result.attempt, 1);
+  assert.equal(result.verdict, "none");
+  assert.equal(result.withoutProgress, 1);
+  assert.equal(result.stop, null);
+  assert.equal(result.ladder, null);
+  assert.equal(result.context, null);
+  // Both records moved by ONE transaction: one revision of the journal, and its row untouched.
+  const journal = heldJournal(store)!;
+  assert.equal(journal.revision, journalBefore.revision + 1);
+  assert.deepEqual(journal.value.classifications, [{ row: routed.row, class: "proposal", addressee: routed.addressee, basis: [...routed.basis] }]);
+  assert.deepEqual(journal.value.rows, journalBefore.value.rows);
+  assert.equal(series().value.attempts[0]!.outcome!.reason, "refused");
+  assert.ok(series().revision > seriesBefore.revision);
+  // Delivering the same close again is a repeat: no revision of either record, and the same report.
+  const settled = { series: series().revision, journal: journal.revision };
+  assert.deepEqual(deliveredOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: claim })), result);
+  assert.deepEqual({ series: series().revision, journal: heldJournal(store)!.revision }, settled);
+  // And still a repeat after a later cycle moved both records on: what it says of the series is the series as it stands.
+  await m.cycle("gap:cart:price", "insufficient");
+  const later = { series: series().revision, journal: heldJournal(store)!.revision };
+  const late = deliveredOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: claim }));
+  assert.deepEqual(late.routed, result.routed);
+  assert.deepEqual(late.question, result.question);
+  assert.equal(late.withoutProgress, 2);
+  assert.deepEqual({ series: series().revision, journal: heldJournal(store)!.revision }, later);
+});
+
+test("the distinct refusals of a cycle are an unordered set: another order is the same decisions, written in one canonical order (T6)", async t => {
+  // LG07 (№10076 п.2, №10047 В2): distinct rows of one attempt in any order; the same row named twice is that one row.
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT, { facts: 3 }), store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  m.open(1);
+  await m.pay(1, "insufficient");
+  const claim = m.claim(1), rows = claim.refusals.map(item => item.row);
+  assert.equal(rows.length, 3);
+  const result = m.close(1, { ...claim, refusals: [claim.refusals[2]!, claim.refusals[0]!, claim.refusals[1]!] });
+  const written = heldJournal(store)!, settled = store.list().map(reference);
+  assert.deepEqual(result.routed.map(item => item.row), [...rows].sort());
+  assert.deepEqual(written.value.classifications.map(item => item.row), [...rows].sort());
+  // The same set in another order, and with one row named twice, is the same close: no revision, the same report.
+  for (const refusals of [[claim.refusals[1]!, claim.refusals[2]!, claim.refusals[0]!], [claim.refusals[0]!, claim.refusals[0]!, ...claim.refusals.slice(1)]]) {
+    const again = deliveredOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: { ...claim, refusals } }));
+    assert.deepEqual(again.routed, result.routed);
+    assert.deepEqual(store.list().map(reference), settled);
+  }
+  assert.deepEqual(store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!.value.attempts[0]!.outcome!.refusals.map(item => item.row), [...rows].sort());
+  // Dropping one row is a different outcome.
+  assert.equal(refusalOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: { ...claim, refusals: claim.refusals.slice(1) } })).code, "outcome_conflict");
+  // A journal whose very first write came from another order holds the decisions in the same canonical order.
+  const g = fixture(t), other = managedBlock(g.store, g, PROJECT, { facts: 3 });
+  deliveredOf(openSeries(g.store, { ...other.address(), slice: SLICE, predecessor: null, basis: null }));
+  other.open(1);
+  await other.pay(1, "insufficient");
+  const mirrored = other.claim(1);
+  other.close(1, { ...mirrored, refusals: [...mirrored.refusals].reverse() });
+  assert.deepEqual(g.store.get<RefusalJournal>(journalId(PROJECT))!.value.classifications.map(item => item.row),
+    mirrored.refusals.map(item => item.row).sort());
 });
 
 test("the refusals of a cycle are an unordered set: another order is the same decisions, written the same way (T6)", t => {
@@ -796,6 +878,58 @@ test("a stop whose own cycle carried no refusal is still explained with the clas
   assert.deepEqual(stopped.context!.endings.map(item => item.reason), ["refused", "refused", "off-form"]);
 });
 
+test("after a stop of managed attempts the gate names the rung the SERIES derived, and the direct model route stays", async t => {
+  // LG07 (№10076 п.2): the ladder, the stop, the continuation and the direct route of a negative E5; the input class
+  // and handed_to_producer stay with the dependent test above.
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT), store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  const series = () => store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!;
+  await m.cycle("gap:cart:price", "insufficient");
+  await m.cycle("gap:cart:price", "insufficient");
+  assert.equal(series().value.stop, null);
+  const stopped = await m.cycle("gap:cart:price", "insufficient");
+  assert.equal(stopped.withoutProgress, 3);
+  assert.equal(stopped.stop!.attempt, 3);
+  assert.deepEqual(stopped.stop!.attempts, [1, 2, 3]);
+  assert.equal(stopped.ladder!.rung, 1);
+  assert.deepEqual(stopped.ladder!.grounds, ["inputs-fixed", "owner-decision", "review-record"]);
+  assert.deepEqual(stopped.ladder, series().value.ladder);
+  assert.ok(stopped.refusals.some(item => item.code === "stopped_without_progress" && item.route === "owner"));
+  // The ladder replaces no direct route: the refusal of this cycle still goes back to its node, and to the model.
+  const own = m.claimed(3).refusals[0]!.row;
+  assert.equal(routeOf(stopped, own).class, "proposal");
+  assert.equal(routeOf(stopped, own).toModel, true);
+  assert.deepEqual(stopped.question, [MANAGED_FIRST_TARGET]);
+  // The context is assembled from the records of the attempts: each attempt's own row, with its responsible.
+  const context = stopped.context!;
+  assert.equal(context.series, seriesId(PROJECT, m.block, 1));
+  assert.deepEqual(context.goals.map(item => item.key), ["gap:cart:price"]);
+  assert.deepEqual(context.accepted, []);
+  assert.deepEqual(context.endings, [1, 2, 3].map(attempt => ({ attempt, reason: "refused" })));
+  assert.deepEqual(context.repeated.map(item => item.row).sort(), [1, 2, 3].map(n => m.claimed(n).refusals[0]!.row).sort());
+  assert.ok(context.repeated.every(item => item.class === "proposal" && item.addressee === `${ADDRESSEE_KINDS.proposal}:${MANAGED_FIRST_TARGET}` && item.times === 1));
+  assert.deepEqual(context.grounds, []);
+  assert.deepEqual(deliveredOf(stopContext(store, m.address())), context);
+  // A continuation spends the rung; the next stop is the owner's, and a refusal of the node is still its question.
+  deliveredOf(resumeSeries(store, { ...m.address(), stop: 3, ground: "review-record", text: "the reviewer answered",
+    review: { ref: storedAs(store, STOP_REVIEW_KIND, stopReviewNamespace(PROJECT), { ...review(PROJECT, 3, stopped.stop!.goals), block: m.block }) } }));
+  await m.cycle("gap:cart:price", "insufficient");
+  await m.cycle("gap:cart:price", "insufficient");
+  const owners = await m.cycle("gap:cart:price", "insufficient");
+  assert.equal(owners.stop!.attempt, 6);
+  assert.equal(owners.ladder!.rung, 2);
+  assert.deepEqual(owners.ladder!.grounds, ["owner-decision"]);
+  assert.ok(owners.stop!.resume.includes("owner"));
+  assert.deepEqual(owners.context!.grounds.map(item => item.after), [3]);
+  assert.deepEqual(owners.question, [MANAGED_FIRST_TARGET]);
+  f.store.close();
+  const back = new Store(f.path);
+  t.after(() => back.close());
+  const read = deliveredOf(stopContext(back, m.address()));
+  assert.deepEqual(read.stop, owners.stop);
+  assert.equal(read.ladder.rung, 2);
+});
+
 test("every refusal code of this unit is produced, addressed and routed", t => {
   const { store } = fixture(t);
   const seen: string[] = [];
@@ -997,20 +1131,82 @@ test("a forged input is refused: a foreign namespace, a substituted hash and an 
   assert.equal(refusalOf(recordRefusal(store, { project: PROJECT, source: reference(declared) })).code, "refusal_entry_invalid");
 });
 
+test("over a complete managed close, the available refusal codes and forged inputs are refused and nothing is written (T3, T4)", async t => {
+  // LG07 (№10076 п.2): each corruption is one mutation beside the attempt's own complete lawful claim. The hold and
+  // lift codes, positive empty sources or definitions and plain/boastful proposals stay with the dependent tests above.
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT), store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  // A context of a stop asked for where no stop stands.
+  assert.equal(addressed(refusalOf(stopContext(store, m.address())), "stop_absent", seriesId(PROJECT, m.block, 1)).code, "stop_absent");
+  m.open(1);
+  await m.pay(1, "insufficient");
+  const claim = m.claim(1);
+  const before = store.list().map(reference);
+  const refused = (extra: ClaimedRefusal): Refusal => refusalOf(closeAttempt(store, { ...m.address(), attempt: 1,
+    outcome: { ...claim, refusals: [...claim.refusals, extra] } }));
+  // Negative mutations, written by hand only to be refused: rows that stand nowhere, in another project's journal, or
+  // on sources that do not stand at the exact reference they name.
+  const standing = reference(store.get(`graph:${PROJECT}`)!);
+  const twin = reference(store.write({ id: `om-workspace:beta:twin`, kind: "om-workspace", expected: 0, value: { rows: [SUBJECT] } }));
+  const candidate = reference(store.write({ id: `om-candidate:${PROJECT}:forged`, kind: "frame-candidate", expected: 0, value: { graph: null } }));
+  const verdictOnly = reference(store.write({ id: `om-proposal:${PROJECT}:loud`, kind: "om-proposal", expected: 0, value: { class: "input", accepted: true } }));
+  const cases: [ClaimedRefusal, string, string][] = [
+    [{ name: "graph_invalid", goal: "g", row: "om-refusal:invented" }, "completion_invalid", "refusals"],
+    [journalled(store, "beta", { sources: [source("base", twin)] }), "completion_invalid", "refusals"],
+    [journalled(store, PROJECT, { sources: [source("base", { ...standing, revision: 9 })] }), "origin_unreadable", "outcome.refusals.sources.0.ref"],
+    [journalled(store, PROJECT, { sources: [source("base", { ...standing, hash: hex("e") })] }), "origin_unreadable", "outcome.refusals.sources.0.ref"],
+    [journalled(store, PROJECT, { sources: [source("environment", { id: `om-workspace:${PROJECT}:absent`, revision: 1, hash: hex("e") })] }),
+      "origin_unreadable", "outcome.refusals.sources.0"],
+    [journalled(store, PROJECT, { sources: [source("base", twin), source("derived", candidate)] }), "origin_unreadable", "outcome.refusals.sources.0.kind"],
+    [journalled(store, PROJECT, { sources: [source("proposal", verdictOnly)] }), "origin_unreadable", "outcome.refusals.sources.0.kind"],
+  ];
+  const mutated = store.list().map(reference);
+  for (const [extra, expected, field] of cases) {
+    const found = refused(extra);
+    assert.deepEqual([found.code, found.at.field], [expected, field]);
+    assert.equal(found.at.target, seriesId(PROJECT, m.block, 1));
+    assert.deepEqual(store.list().map(reference), mutated);
+  }
+  // An absent set of refusals, of accepting records or of cancelling ones is the calling code's defect.
+  for (const over of [{ refusals: undefined }, { refusals: null }, { refusals: "none" }, { refusals: {} },
+    { accepting: undefined }, { accepting: null }, { cancelling: undefined }, { cancelling: {} }]) {
+    assert.throws(() => closeAttempt(store, { ...m.address(), attempt: 1, outcome: { ...claim, ...over } as unknown as GateOutcome }),
+      code("repeat_request_invalid"));
+  }
+  // The gate that refused may not hand the class down either: A2 refuses a record that declares one.
+  const declared = store.write({ id: `${unitRefusalNamespace(PROJECT)}declared`, kind: UNIT_REFUSAL_KIND, expected: 0,
+    value: { gate: "G3", refusals: [{ code: "graph_invalid", goal: "g", remedy: "r", class: "proposal",
+      origin: { name: "artifact_missing", stage: "layer-check", subject: SUBJECT, sources: [] } }] } as Json });
+  assert.equal(refusalOf(recordRefusal(store, { project: PROJECT, source: reference(declared) })).code, "refusal_entry_invalid");
+  // None of them wrote anything beyond the mutations themselves: the attempt stays open, then closes as it ended.
+  assert.deepEqual(store.list().map(reference).filter(ref => !before.some(item => item.id === ref.id)).length,
+    mutated.filter(ref => !before.some(item => item.id === ref.id)).length + 1);
+  assert.equal(store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!.value.attempts[0]!.outcome, null);
+  assert.deepEqual(store.list(ORIGIN_HOLD_KIND), []);
+  assert.equal(m.close(1, claim).verdict, "none");
+});
+
 // A second writer commits between this unit's read and its own write. The store is synchronous, so the only way to
 // stand in that window is to write from another connection while a read is being answered.
 class RacingStore extends Store {
   armed = false;
+  /** LG07: the rival runs after every read of a prepared change and just before its transaction writes the target. */
+  atWrite = false;
   target = "";
   run: ((store: Store) => void) | null = null;
+  private rival(): void {
+    this.armed = false;
+    const other = new Store(this.path);
+    try { this.run!(other); } finally { other.close(); }
+  }
   override get<T = Json>(id: string, revision?: number): Revision<T> | null {
     const found = super.get<T>(id, revision);
-    if (this.armed && id === this.target && this.run) {
-      this.armed = false;
-      const other = new Store(this.path);
-      try { this.run(other); } finally { other.close(); }
-    }
+    if (this.armed && !this.atWrite && id === this.target && this.run) this.rival();
     return found;
+  }
+  override writeMany<T = Json>(inputs: Write[], guards: Parameters<Store["writeMany"]>[1] = []): Revision<T>[] {
+    if (this.armed && this.atWrite && this.run && inputs.some(input => input.id === this.target)) this.rival();
+    return super.writeMany<T>(inputs, guards);
   }
 }
 
@@ -1058,56 +1254,97 @@ test("a guarded record that changes between the reading and the write leaves nei
   assert.deepEqual(heldJournal(store)!.value.classifications.map(item => item.row).sort(), [other.row, refusal.row].sort());
 });
 
-test("the outcome of a cycle and the classes of its refusals are one transaction: a refusal of either leaves neither", t => {
-  const { store } = fixture(t);
-  opened(store);
-  const refusal = artifactMissing(store, PROJECT, "proposal");
-  deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
+test("a managed close the rival makes first in the write window leaves this one neither an outcome nor a classification, and nothing is lost (T7)", async t => {
+  // LG07 (№10076 п.2): the rival closes through G7 as well, after this call has read everything and before it writes.
+  // The window of the journal alone needs a second series of the project; that variant stays with the test above.
+  const root = mkdtempSync(join(tmpdir(), "omg-om-gate-managed-race-"));
+  const path = join(root, "live.sqlite");
+  const store = new RacingStore(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const m = managedBlock(store, { root, path }, PROJECT);
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  const id = seriesId(PROJECT, m.block, 1), series = () => store.get<RepairSeries>(id)!;
+  m.open(1);
+  await m.pay(1, "insufficient");
+  const claim = m.claim(1), open = series(), journal = heldJournal(store)!;
+  store.target = id;
+  store.atWrite = true;
+  store.armed = true;
+  store.run = rival => { deliveredOf(closeAttempt(rival, { ...m.address(), attempt: 1, outcome: claim })); };
+  const lost = refusalOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: claim }));
+  assert.ok(["input_stale", "revision_conflict"].includes(lost.code), lost.code);
+  // The rival's close stands once: one revision of the series, one of the journal, and its classes only.
+  assert.equal(series().revision, open.revision + 1);
+  assert.equal(heldJournal(store)!.revision, journal.revision + 1);
+  assert.deepEqual(heldJournal(store)!.value.classifications.map(item => item.row), claim.refusals.map(item => item.row));
+  // Read again, the same close is a repeat of the one that stands.
+  store.armed = false;
+  const settled = store.list().map(reference);
+  m.close(1, claim);
+  assert.deepEqual(store.list().map(reference), settled);
+  // Nothing was lost: the next attempt carries its own refusal through.
+  const next = await m.cycle("gap:cart:price", "insufficient");
+  const own = m.claimed(2).refusals[0]!.row;
+  assert.notEqual(own, claim.refusals[0]!.row);
+  assert.equal(routeOf(next, own).class, "proposal");
+  assert.deepEqual(heldJournal(store)!.value.classifications.map(item => item.row).sort(), [claim.refusals[0]!.row, own].sort());
+});
 
-  // Prepared and not written: two records, the series first, and the store still holds neither change.
-  const transition = deliveredOf(prepareCloseAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(refusal) }));
-  assert.deepEqual(transition.writes.map(write => write.id), [at(PROJECT), journalId(PROJECT)]);
-  assert.equal(heldSeries(store)!.value.attempts[0]!.outcome, null);
+test("the outcome of a cycle and the classes of its refusals are one transaction: a refusal of either leaves neither", async t => {
+  // LG07: a managed block whose every plan asks two facts; the refusals are the rows its own paid E5 work left.
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT, { facts: 2 }), store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  m.open(1);
+  await m.pay(1, "insufficient");
+  const claim = m.claim(1);
+  assert.equal(claim.refusals.length, 2);
+  const series = () => store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!;
+  const journalBefore = heldJournal(store)!;
+  assert.deepEqual(journalBefore.value.classifications, []);
+
+  // Prepared and not written: the series, the close, the work and the journal, and the store still holds none of them.
+  const transition = deliveredOf(prepareCloseAttempt(store, { ...m.address(), attempt: 1, outcome: claim }));
+  assert.deepEqual(transition.writes.map(write => write.id.split(":")[0]).sort(),
+    ["om-completion-close", "om-completion-work", "om-refusal-journal", "repair-series"]);
+  assert.equal(series().value.attempts[0]!.outcome, null);
   assert.deepEqual(heldJournal(store)!.value.classifications, []);
-  assert.equal(transition.value.routed.length, 1);
+  assert.equal(transition.value.routed.length, 2);
 
-  // A caller that writes more than these two puts them into one guarded transaction of its own.
+  // A caller that writes more than these puts them into one guarded transaction of its own.
   const ledger = { id: "mc2-ledger:alpha", kind: "om-ledger", expected: 0, value: { closed: 1 } };
   const applied = deliveredOf(writeGuarded(store, {
     unit: "mc2", target: ledger.id, writes: [...transition.writes, ledger], guards: [...transition.guards],
   }));
-  assert.deepEqual(applied.map(record => record.id), [at(PROJECT), journalId(PROJECT), ledger.id]);
-  assert.equal(heldJournal(store)!.value.classifications.length, 1);
+  assert.deepEqual(applied.map(record => record.id).sort(), [...transition.writes.map(write => write.id), ledger.id].sort());
+  // Both refusals of the cycle are ONE revision of the journal, not one per refusal.
+  assert.equal(heldJournal(store)!.revision, journalBefore.revision + 1);
+  assert.equal(heldJournal(store)!.value.classifications.length, 2);
 
   // A refusal of the SERIES leaves no classification: a different outcome for a cycle already closed.
-  const late = artifactMissing(store, PROJECT, "input");
   const journal = heldJournal(store)!;
-  assert.equal(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: refusedBy(late) })).code, "outcome_conflict");
+  assert.equal(refusalOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: { ...claim, refusals: [claim.refusals[0]!] } })).code,
+    "outcome_conflict");
   assert.equal(heldJournal(store)!.revision, journal.revision);
-  assert.equal(heldJournal(store)!.value.classifications.length, 1);
+  assert.equal(heldJournal(store)!.value.classifications.length, 2);
 
-  // A refusal of the JOURNAL leaves no outcome: a row somebody classified otherwise by hand.
-  deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 2, goal: goal() }));
+  // A refusal of the JOURNAL leaves no outcome: a row of the next attempt classified otherwise by hand (a negative
+  // mutation, written only to be refused).
+  m.open(2);
+  await m.pay(2, "insufficient");
+  const next = m.claim(2), late = next.refusals[0]!;
   deliveredOf(classifyRefusal(store, { project: PROJECT, row: late.row, class: "derivation", addressee: "code:elsewhere", basis: [] }));
-  const series = heldSeries(store)!;
-  assert.equal(refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 2, outcome: refusedBy(late) })).code, "classification_conflict");
-  assert.equal(heldSeries(store)!.revision, series.revision);
-  assert.equal(heldSeries(store)!.value.attempts[1]!.outcome, null);
-
-  // Several refusals of one cycle are ONE revision of the journal, not one per refusal.
-  const many = [0, 1, 2].map(() => artifactMissing(store, PROJECT, "proposal"));
-  const before = heldJournal(store)!.revision;
-  const result = deliveredOf(closeAttempt(store, { ...address(PROJECT), attempt: 2, outcome: refusedBy(...many) }));
-  assert.equal(result.routed.length, 3);
-  assert.equal(heldJournal(store)!.revision, before + 1);
-  assert.equal(heldJournal(store)!.value.classifications.length, 5);
+  const open = series();
+  assert.equal(refusalOf(closeAttempt(store, { ...m.address(), attempt: 2, outcome: next })).code, "classification_conflict");
+  assert.equal(series().revision, open.revision);
+  assert.equal(series().value.attempts[1]!.outcome, null);
 });
 
 test("every exported function refuses a missing, null or mistyped argument as a typed defect, never a TypeError", t => {
-  const { store } = fixture(t);
-  opened(store);
-  deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
-  const good: CloseAttemptRequest = { ...address(PROJECT), attempt: 1, outcome: outcome() };
+  // LG07: the attempt the defects are aimed at is a managed one; the calls under test carry broken arguments only.
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT), store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  m.open(1);
+  const good: CloseAttemptRequest = { ...m.address(), attempt: 1, outcome: outcome() };
   const goodDefinitions = { project: PROJECT, source: { role: "environment", ref: { id: "workspace:alpha:x", revision: 1, hash: hex("a") } } };
   for (const request of [undefined, null, "request", 7, {}, { project: PROJECT },
     { ...goodDefinitions, project: null }, { ...goodDefinitions, source: null }, { ...goodDefinitions, source: { role: "base" } },
@@ -1188,11 +1425,11 @@ test("every exported function refuses a missing, null or mistyped argument as a 
     assert.throws(() => originHoldId(project, block, attempt, row), typedDefect);
   }
   // Not one of them wrote anything.
-  assert.equal(heldSeries(store)!.value.attempts[0]!.outcome, null);
+  assert.equal(store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!.value.attempts[0]!.outcome, null);
   assert.equal(heldJournal(store), null);
 });
 
-test("the vocabulary of classes and addressees is this gate's, closed and unchangeable while it works (T11)", t => {
+test("the vocabulary of classes and addressees is this gate's, closed and unchangeable while it works (T11)", async t => {
   const { store } = fixture(t);
   // Every class named has an addressee kind and a place in the gate's own report; nothing is named twice or left out.
   assert.deepEqual([...REFUSAL_CLASSES].sort(), Object.keys(ADDRESSEE_KINDS).sort());
@@ -1209,9 +1446,11 @@ test("the vocabulary of classes and addressees is this gate's, closed and unchan
     REFUSAL_CLASSES[0] = "invented";
   }, TypeError);
 
-  // What a consumer is handed is a deep frozen copy, sharing no object with the store or with a policy table.
-  opened(store);
-  const result = closed(store, PROJECT, goal(), refusedBy(artifactMissing(store, PROJECT, "proposal")));
+  // What a consumer is handed is a deep frozen copy, sharing no object with the store or with a policy table. The
+  // cycle is a managed one, and its refusal the row its own E5 assessment left.
+  const m = managedBlock(store, { root: store.path.slice(0, store.path.lastIndexOf("/")), path: store.path }, PROJECT);
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  const result = await m.cycle("gap:cart:price", "insufficient");
   assert.ok(deeplyFrozen(result));
   assert.throws(() => {
     // @ts-expect-error a delivered report is readonly at compile time, not only frozen at run time
@@ -1224,6 +1463,27 @@ test("the vocabulary of classes and addressees is this gate's, closed and unchan
     row: result.routed[0]!.row, class: result.routed[0]!.class,
     addressee: result.routed[0]!.addressee, basis: result.routed[0]!.basis,
   }));
+});
+
+test("a managed close writes the series, its proof, its work and the classes in the journal, and nothing else, for each class its producers give (T8)", async t => {
+  // LG07 (№10076 п.2): the classes real producers give now — proposal from a negative E5, conditions from a technical
+  // E4. The stage-specific addressees and all six classes stay with the dependent test below.
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT), store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  for (const [attempt, ending, expected] of [[1, "insufficient", "proposal"], [2, "need-owner", "conditions"]] as const) {
+    m.open(attempt);
+    await m.pay(attempt, ending);
+    const claim = m.claim(attempt);
+    const before = new Map(store.list().map(record => [record.id, { head: reference(record), history: store.history(record.id).map(reference) }]));
+    const result = m.close(attempt, claim);
+    assert.ok(result.routed.length > 0 && result.routed.every(row => row.class === expected), expected);
+    assert.deepEqual(result.holds, []);
+    const changed = store.list().filter(record => canonical(before.get(record.id)?.head ?? null) !== canonical(reference(record)));
+    assert.deepEqual(changed.map(record => record.id.split(":")[0]).sort(),
+      ["om-completion-close", "om-completion-work", "om-refusal-journal", "repair-series"], expected);
+    for (const [id, was] of before) if (!changed.some(record => record.id === id)) assert.deepEqual(store.history(id).map(reference), was.history, id);
+    assert.deepEqual(store.list(ORIGIN_HOLD_KIND), []);
+  }
 });
 
 test("the gate writes the series and the journal and nothing else, whatever the class of the refusal (T8)", t => {
@@ -1281,35 +1541,36 @@ test("the classes of the gate are re-derived at every reading, and a stored deci
   assert.equal(heldSeries(store)!.value.attempts[2]!.outcome, null);
 });
 
-test("a result is never taken on the caller's word: five invented keys on one real record move nothing (P1)", t => {
-  const { store, path } = fixture(t);
-  opened(store);
-  // The reviewer's scenario: one real record — a refusal of G3, which accepted nothing — offered as the ground of a
-  // result in five cycles, under five invented keys. In the old words of an outcome it is not even an outcome.
-  const refusal = store.write({
-    id: `${unitRefusalNamespace(PROJECT)}g3:real`, kind: UNIT_REFUSAL_KIND, expected: 0,
-    value: { gate: "G3", refusals: [{ code: "graph_invalid", goal: "g", remedy: "r", origin: { name: "n", stage: "layer-check", subject: SUBJECT, sources: [] } }] },
-  });
-  deliveredOf(openAttempt(store, { ...address(PROJECT), attempt: 1, goal: goal() }));
-  const before = heldSeries(store)!;
+test("a result is never taken on the caller's word: five invented keys on one real record move nothing (P1)", async t => {
+  const f = fixture(t), m = managedBlock(f.store, f, PROJECT), path = f.path;
+  let store = f.store;
+  deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+  const series = () => store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!;
+  // The reviewer's scenario: one real record — the A2 source of the attempt's own negative E5, which accepted nothing —
+  // offered as the ground of a result in five cycles, under five invented keys. In the old words it is not an outcome.
+  m.open(1);
+  await m.pay(1, "insufficient");
+  const claim = m.claim(1);
+  const refusal = reference(store.list(UNIT_REFUSAL_KIND).find(record => record.id.startsWith(unitRefusalNamespace(PROJECT)))!);
+  const before = series();
   for (let round = 1; round <= 5; round += 1) {
     assert.throws(() => closeAttempt(store, {
-      ...address(PROJECT), attempt: 1,
-      outcome: { reason: "result", achieved: [{ key: `invented-${round}`, basis: reference(refusal) }], cancelled: [], refusals: [] } as unknown as GateOutcome,
+      ...m.address(), attempt: 1,
+      outcome: { reason: "result", achieved: [{ key: `invented-${round}`, basis: refusal }], cancelled: [], refusals: [] } as unknown as GateOutcome,
     }), code("repeat_request_invalid"));
-    // Named as what it is — a record offered as accepting a result — it is refused: nothing accepted it.
-    const refused_ = refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: outcome({ accepting: [reference(refusal)] }) }));
+    // Named as what it is — a record offered as accepting a result, beside the attempt's own full claim — it is refused.
+    const refused_ = refusalOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: { ...claim, accepting: [refusal] } }));
     assert.equal(refused_.code, "achievement_unconfirmed");
     assert.equal(refused_.at.field, "outcome.accepting.0.kind");
-    assert.equal(refused_.at.target, at(PROJECT));
-    assert.deepEqual(refused_.at.ref, reference(refusal));
+    assert.equal(refused_.at.target, seriesId(PROJECT, m.block, 1));
+    assert.deepEqual(refused_.at.ref, refusal);
   }
   // The series did not move: no outcome, no progress, no count cleared.
-  assert.equal(heldSeries(store)!.revision, before.revision);
-  assert.equal(heldSeries(store)!.value.attempts[0]!.outcome, null);
+  assert.equal(series().revision, before.revision);
+  assert.equal(series().value.attempts[0]!.outcome, null);
 
-  // The whole class: a record of any kind no provider is connected for, a record that does not stand, a candidate the
-  // store holds, and a cancellation with no transition that confirms it.
+  // The whole class: a record of a kind no provider is connected for, records written by hand as the shapes a result
+  // might take (negative mutations), and a cancellation with no transition that confirms it.
   const candidate = reference(store.write({ id: `om-candidate:${PROJECT}:1`, kind: "om-candidate", expected: 0, value: { accepted: true, keys: ["line:cart:price"] } }));
   const line = reference(store.write({ id: `om-gap-line:${PROJECT}:1`, kind: "om-gap-line", expected: 0, value: { closed: "line:cart:price", accepted: true } }));
   const cases: [Partial<GateOutcome>, string, string][] = [
@@ -1318,29 +1579,31 @@ test("a result is never taken on the caller's word: five invented keys on one re
     [{ accepting: [{ ...line, hash: hex("d") }] }, "achievement_unconfirmed", "outcome.accepting.0"],
     [{ accepting: [{ ...line, revision: 2 }] }, "achievement_unconfirmed", "outcome.accepting.0"],
     [{ cancelling: [line] }, "cancellation_unconfirmed", "outcome.cancelling.0.kind"],
-    [{ cancelling: [reference(refusal)] }, "cancellation_unconfirmed", "outcome.cancelling.0.kind"],
+    [{ cancelling: [refusal] }, "cancellation_unconfirmed", "outcome.cancelling.0.kind"],
   ];
   for (const [over, expected, field] of cases) {
-    const found = refusalOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: outcome(over) }));
+    const found = refusalOf(closeAttempt(store, { ...m.address(), attempt: 1, outcome: { ...claim, ...over } }));
     assert.equal(found.code, expected, field);
     assert.equal(found.at.field, field);
   }
-  assert.equal(heldSeries(store)!.revision, before.revision);
+  assert.equal(series().revision, before.revision);
 
   // What the cycle really achieved — nothing — still closes it, and three such cycles stop the series.
-  assert.equal(deliveredOf(closeAttempt(store, { ...address(PROJECT), attempt: 1, outcome: outcome() })).verdict, "none");
-  closed(store, PROJECT, goal(), outcome());
-  const third = closed(store, PROJECT, goal(), outcome());
+  assert.equal(m.close(1, claim).verdict, "none");
+  await m.cycle("gap:cart:price", "insufficient");
+  const third = await m.cycle("gap:cart:price", "insufficient");
   assert.equal(third.withoutProgress, 3);
   assert.equal(third.stop!.attempt, 3);
   store.close();
 
   // A restart changes none of it: the stop stands, and a claimed result is refused as before.
-  const back = new Store(path);
-  t.after(() => back.close());
-  assert.equal(refusalOf(openAttempt(back, { ...address(PROJECT), attempt: 4, goal: goal() })).code, "series_stopped");
-  assert.equal(deliveredOf(stopContext(back, address(PROJECT))).stop!.attempt, 3);
-  assert.equal(refusalOf(closeAttempt(back, { ...address(PROJECT), attempt: 3, outcome: outcome({ accepting: [line] }) })).code, "achievement_unconfirmed");
+  store = new Store(path);
+  t.after(() => store.close());
+  assert.equal(refusalOf(openAttempt(store, m.on(store).opening(4))).code, "series_stopped");
+  assert.equal(deliveredOf(stopContext(store, m.address())).stop!.attempt, 3);
+  // The closed managed attempt keeps its whole claim: a result offered for it later is refused before any provider.
+  const late = refusalOf(closeAttempt(store, { ...m.address(), attempt: 3, outcome: { ...m.claimed(3), accepting: [line] } }));
+  assert.deepEqual([late.code, late.at.field], ["outcome_conflict", "outcome"]);
 });
 
 test("a hold is lifted on the analysis of ITS refusal, which routes it by the class it established — stored or written with it", t => {
@@ -1590,6 +1853,59 @@ test("a hold outlives a successor of the series: one change of the slice does no
   deliveredOf(openAttempt(store, { ...address(PROJECT, 2), attempt: 2, goal: goal() }));
 });
 
+/**
+ * The rule of the table in its own words: blamed on a holder — that holder named, exactly one; blamed on an absence —
+ * every place looked in. Written independently of the gate's table, so that a change of either shows up as a
+ * disagreement.
+ */
+const tableExpected = (p: number, hp: number, b: number, hb: number, d: number, hd: number): RefusalClass => {
+  if (p + b + d === 0) return "unknown";
+  const lostOnTheWay = d === 1 && hd === 0 && hp + hb === 1;
+  const unfitInTheBase = hb === 1 && hp === 0 && hd === d;
+  const unfitInTheProposal = p === 1 && hp === 1 && hb === 0 && hd === d;
+  const missingFromTheProposal = p === 1 && hp === 0 && b >= 1 && hb === 0 && hd === 0;
+  return lostOnTheWay ? "derivation" : unfitInTheBase ? "input" : unfitInTheProposal || missingFromTheProposal ? "proposal" : "unknown";
+};
+/** And a few by hand, among them the reviewer's two. */
+const TABLE_PINNED: Readonly<Record<string, RefusalClass>> = {
+  "0 0 0 0 1 1": "unknown", // only the assembly, holding it: nothing says the proposal lacked it
+  "0 0 2 2 0 0": "unknown", // two accepted records hold it: nobody is singled out
+  "1 0 1 0 1 0": "proposal", // looked for in the proposal and the base, found in neither
+  "1 0 0 0 0 0": "unknown", // not in the proposal, but the base was never looked in
+  "1 1 0 0 0 0": "proposal", // in the one proposal, unfit there
+  "2 1 1 0 0 0": "unknown", // in one of two proposals: which proposal is the question's is not said
+  "1 1 1 0 1 0": "derivation", // proposed, and not in what the one assembly produced
+  "1 1 1 0 2 1": "unknown", // one of two assemblies lost it: which one is not said
+  "0 0 1 1 1 1": "input", // in the one accepted record, and nothing lost it
+  "0 0 2 1 0 0": "input", // in one of two accepted records: that one is singled out
+  "1 1 1 1 1 1": "unknown", // proposed and accepted both: whose definition is unfit is not said
+};
+/** Every tally on the table itself (Т3): at most one row suffices, and the class is the independent rule's. */
+function tableClasses(): Map<string, RefusalClass> {
+  const classes = new Map<string, RefusalClass>();
+  for (let p = 0; p <= 2; p += 1) for (let hp = 0; hp <= p; hp += 1)
+  for (let b = 0; b <= 2; b += 1) for (let hb = 0; hb <= b; hb += 1)
+  for (let d = 0; d <= 2; d += 1) for (let hd = 0; hd <= d; hd += 1) {
+    const key = `${p} ${hp} ${b} ${hb} ${d} ${hd}`;
+    const tally: OriginTally = { named: { proposal: p, base: b, derived: d }, holding: { proposal: hp, base: hb, derived: hd } };
+    const rows = SUBJECT_DECISIONS.filter(row => row.sufficient(tally));
+    assert.ok(rows.length <= 1, `${key}: two rows of the table admit one tally`);
+    classes.set(key, rows[0]?.class ?? "unknown");
+    assert.equal(classes.get(key), tableExpected(p, hp, b, hb, d, hd), key);
+  }
+  assert.equal(classes.size, 216);
+  for (const [key, want] of Object.entries(TABLE_PINNED)) assert.equal(classes.get(key), want, key);
+  assert.deepEqual([...new Set(classes.values())].sort(), ["derivation", "input", "proposal", "unknown"]);
+  assert.deepEqual(SUBJECT_DECISIONS.map(row => row.class), ["derivation", "input", "proposal"]);
+  return classes;
+}
+
+// LG07 (№10076 п.3): the table as data, apart from any journal — the public SUBJECT_DECISIONS against the independent
+// rule, on all 216 tallies and the pinned examples. The end-to-end rows below wait for real origins of the objects.
+test("the table of decision as data: every tally of roles and holders gets the class its sources suffice for, and no other", () => {
+  tableClasses();
+});
+
 test("the table of decision: every tally of roles and holders gets the class its sources suffice for, and no other", async t => {
   // This exhaustive table uses native acceptance once; dedicated integration tests also cover OM acceptance.
   const native = await createOmFixture(t, "standard", "pool", { mode: "n2" }), template = native.store, root = native.root, path = native.database;
@@ -1606,47 +1922,7 @@ test("the table of decision: every tally of roles and holders gets the class its
   const baseAbsent = remember(read.upperRef, { kind: "frame", request: first });
   remember(accepted.graph, { kind: "frame", request: accepted });
   definitionFixtures.set(template, new Map([["pool", { first, accepted, upper, subject: matrixSubject, baseAbsent }]]));
-  // The rule in its own words: blamed on a holder — that holder named, exactly one; blamed on an absence — every place
-  // looked in. Written here independently of the gate's table, so that a change of either shows up as a disagreement.
-  const expected = (p: number, hp: number, b: number, hb: number, d: number, hd: number): RefusalClass => {
-    if (p + b + d === 0) return "unknown";
-    const lostOnTheWay = d === 1 && hd === 0 && hp + hb === 1;
-    const unfitInTheBase = hb === 1 && hp === 0 && hd === d;
-    const unfitInTheProposal = p === 1 && hp === 1 && hb === 0 && hd === d;
-    const missingFromTheProposal = p === 1 && hp === 0 && b >= 1 && hb === 0 && hd === 0;
-    return lostOnTheWay ? "derivation" : unfitInTheBase ? "input" : unfitInTheProposal || missingFromTheProposal ? "proposal" : "unknown";
-  };
-  // And a few by hand, among them the reviewer's two.
-  const pinned: Record<string, RefusalClass> = {
-    "0 0 0 0 1 1": "unknown", // only the assembly, holding it: nothing says the proposal lacked it
-    "0 0 2 2 0 0": "unknown", // two accepted records hold it: nobody is singled out
-    "1 0 1 0 1 0": "proposal", // looked for in the proposal and the base, found in neither
-    "1 0 0 0 0 0": "unknown", // not in the proposal, but the base was never looked in
-    "1 1 0 0 0 0": "proposal", // in the one proposal, unfit there
-    "2 1 1 0 0 0": "unknown", // in one of two proposals: which proposal is the question's is not said
-    "1 1 1 0 1 0": "derivation", // proposed, and not in what the one assembly produced
-    "1 1 1 0 2 1": "unknown", // one of two assemblies lost it: which one is not said
-    "0 0 1 1 1 1": "input", // in the one accepted record, and nothing lost it
-    "0 0 2 1 0 0": "input", // in one of two accepted records: that one is singled out
-    "1 1 1 1 1 1": "unknown", // proposed and accepted both: whose definition is unfit is not said
-  };
-
-  // Every tally on the table itself (Т3): at most one row suffices, and the class is the independent rule's.
-  const classes = new Map<string, RefusalClass>();
-  for (let p = 0; p <= 2; p += 1) for (let hp = 0; hp <= p; hp += 1)
-  for (let b = 0; b <= 2; b += 1) for (let hb = 0; hb <= b; hb += 1)
-  for (let d = 0; d <= 2; d += 1) for (let hd = 0; hd <= d; hd += 1) {
-    const key = `${p} ${hp} ${b} ${hb} ${d} ${hd}`;
-    const tally: OriginTally = { named: { proposal: p, base: b, derived: d }, holding: { proposal: hp, base: hb, derived: hd } };
-    const rows = SUBJECT_DECISIONS.filter(row => row.sufficient(tally));
-    assert.ok(rows.length <= 1, `${key}: two rows of the table admit one tally`);
-    classes.set(key, rows[0]?.class ?? "unknown");
-    assert.equal(classes.get(key), expected(p, hp, b, hb, d, hd), key);
-  }
-  assert.equal(classes.size, 216);
-  for (const [key, want] of Object.entries(pinned)) assert.equal(classes.get(key), want, key);
-  assert.deepEqual([...new Set(classes.values())].sort(), ["derivation", "input", "proposal", "unknown"]);
-  assert.deepEqual(SUBJECT_DECISIONS.map(row => row.class), ["derivation", "input", "proposal"]);
+  const pinned = TABLE_PINNED, classes = tableClasses();
 
   // The gate counts the real sources itself: the pinned rows, and a proposal and a derived role each held twice, end to end.
   // A closed, legitimately built snapshot preserves exact source histories for every row; each row gets its own journal.
@@ -4385,8 +4661,35 @@ test("C13 C14 C45 E3 E7 X3 E10 E11 E12 X15 H1.0d a managed M5 close retains ever
  * attempt — attempt 2 — so the D2 variant does not exercise the D2 branch of the product repeat path; that coverage
  * lives in the seeded net test right after these two.
  */
-async function representativeAttempt(t: test.TestContext, variant: "D2" | "D5"): Promise<void> {
-  const f = e51Fixture(t, false), first = await f.original();
+/**
+ * LG07: the managed prelude of the C22 scenarios — attempt 1 issues the fact, its assessor ends off its form and G7
+ * closes it without a result; attempt 2 is opened on the explicitly prepared successor routes, which hold the fact
+ * again, and its original is answered. The assessor of attempt 2 gives `verdict`.
+ */
+async function e51SuccessorAttempt(f: ReturnType<typeof e51Fixture>, first: AssessmentIntentRequest, verdict: E51Verdict) {
+  const at = { project: f.project, block: f.block, line: 1 };
+  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, e51AssessorStep("off-form"),
+    f.originalStep, e51AssessorStep(verdict)] }));
+  assert.equal(deliveredOf(await assessFact(f.store, first)).value.verdict, "off-form");
+  e51Close(f);
+  const oldRoutes = f.store.list<RoutesRecord>("route-result")[0]!;
+  const priorRoutes = oldRoutes.value.request;
+  const routes = deliveredOf(writeRoutes(f.store, { project: f.project, gaps: priorRoutes.gaps,
+    tasks: priorRoutes.tasks.map(record => ({ record })), catalog: priorRoutes.catalog, previous: reference(oldRoutes) }));
+  const batch = routes.value.batches.find(row => row.model === "MC1" && row.items.some(item => item.gap === first.questionId));
+  assert.ok(batch);
+  const secondSeries = deliveredOf(openAttempt(f.store, { ...at, attempt: 2, goal: f.attemptGoal,
+    completion: { routes: reference(routes), batches: [batch.id] } }));
+  const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes),
+    batch: batch.id, environment: reference(f.config), attempt: { series: reference(secondSeries), ordinal: 2 }, previous: [] })).record;
+  const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: first.dispatch, role: "implementer" }));
+  const second = { ...first, modelCall: reference(model.record) };
+  deliveredOf(await assessFact(f.store, second));
+  return { at, routes, batch, secondSeries, model, second };
+}
+
+/** The standalone prefix of the C22 scenarios, kept for the D2 variant (№10083: its later attempt has no managed plan). */
+async function e51StandaloneSecondAttempt(f: ReturnType<typeof e51Fixture>, first: AssessmentIntentRequest) {
   const at = { project: f.project, block: f.block, line: 1 };
   deliveredOf(closeAttempt(f.store, { ...at, attempt: 1, outcome: outcome() }));
   const secondSeries = deliveredOf(openAttempt(f.store, { ...at, attempt: 2, goal: f.attemptGoal }));
@@ -4409,7 +4712,17 @@ async function representativeAttempt(t: test.TestContext, variant: "D2" | "D5"):
   }) as Store["writeMany"];
   try { await assert.rejects(() => assessFact(f.store, second), /stop before G7/); }
   finally { f.store.writeMany = originalWrite; }
-  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
+  return { at, routes, batch, secondSeries, model, second };
+}
+
+async function representativeAttempt(t: test.TestContext, variant: "D2" | "D5"): Promise<void> {
+  // LG07: the D5 variant runs on managed attempts; the D2 variant needs a later attempt with an empty supported set on
+  // the same goal, which no managed plan carries once D3 has applied the answer — it keeps the standalone prefix.
+  const managed = variant === "D5";
+  const f = e51Fixture(t, false, managed), first = await f.original();
+  const { at, secondSeries, model, second } = managed ? await e51SuccessorAttempt(f, first, "supported")
+    : await e51StandaloneSecondAttempt(f, first);
+  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND).find(row => row.value.verdict === "supported")!;
   const e5 = terminal.value.accepted!;
   const e5Fact = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: e5 }));
   // O12: an applied E4 of another kind (this MC1 call) is no M5 addressing, whatever owner names it.
@@ -4492,30 +4805,10 @@ test("C22 C2 C10 C12 O12 E8 E9 H1.0d the E5 repeat and its consumption accept th
  * passes silently — when no D2 win occurs.
  */
 async function d2RepresentedAttempt(t: test.TestContext, choice: string): Promise<"D2" | "D5"> {
-  const f = e51Fixture(t, false), first = await f.original();
-  const at = { project: f.project, block: f.block, line: 1 };
-  deliveredOf(closeAttempt(f.store, { ...at, attempt: 1, outcome: outcome() }));
-  const secondSeries = deliveredOf(openAttempt(f.store, { ...at, attempt: 2, goal: f.attemptGoal }));
-  const oldRoutes = f.store.list<RoutesRecord>("route-result")[0]!;
-  const priorRoutes = oldRoutes.value.request;
-  const routes = deliveredOf(writeRoutes(f.store, { project: f.project, gaps: priorRoutes.gaps,
-    tasks: priorRoutes.tasks.map(record => ({ record })), catalog: priorRoutes.catalog, previous: reference(oldRoutes) }));
-  const batch = routes.value.batches.find(row => row.model === "MC1" && row.items.some(item => item.gap === first.questionId));
-  assert.ok(batch);
-  const packet = deliveredOf(writeQuestionPacket(f.store, { project: f.project, routes: reference(routes),
-    batch: batch.id, environment: reference(f.config), attempt: { series: reference(secondSeries), ordinal: 2 }, previous: [] })).record;
-  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, f.originalStep, e51AssessorStep("supported")] }));
-  const model = deliveredOf(await runModelCall(f.store, { project: f.project, packet: reference(packet), dispatch: first.dispatch, role: "implementer" }));
-  const second = { ...first, modelCall: reference(model.record) };
-  const originalWrite = f.store.writeMany.bind(f.store);
-  f.store.writeMany = ((writes, guards) => {
-    if (writes.some(write => write.kind === "repair-series" && write.id === f.series.id && write.expected > 0))
-      throw new Error("stop before G7");
-    return originalWrite(writes, guards);
-  }) as Store["writeMany"];
-  try { await assert.rejects(() => assessFact(f.store, second), /stop before G7/); }
-  finally { f.store.writeMany = originalWrite; }
-  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
+  // LG07: managed attempts; attempt 2 closes on the pair [e5, d2] of one key, which G7 confirms through both providers.
+  const f = e51Fixture(t, false, true), first = await f.original();
+  const { at, secondSeries, model, second } = await e51SuccessorAttempt(f, first, "supported");
+  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND).find(row => row.value.verdict === "supported")!;
   const e5 = terminal.value.accepted!;
   const e5Fact = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: e5 }));
   // O12: an applied E4 of another kind (this MC1 call) is no M5 addressing, whatever owner names it.
