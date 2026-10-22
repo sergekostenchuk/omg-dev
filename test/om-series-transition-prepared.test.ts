@@ -517,7 +517,9 @@ test("prepared history remains exact after source heads advance and the Store is
   const exact = new ExactOnlyStore(f.path);
   try { assert.deepEqual(ok(readPreparedSeriesTransition(exact, { project, record: reference(prepared) })).record, prepared); }
   finally { exact.close(); }
+  const beforeRepeat = snapshot(f.store);
   assert.deepEqual(ok(writeSeriesTransition(f.store, request(reference(horizon.gate), [reference(series)]))), prepared);
+  assert.deepEqual(snapshot(f.store), beforeRepeat, "An exact repeat of P writes nothing");
 });
 
 test("prepared records require exact source references and rederive decisions instead of trusting saved hashes", t => {
@@ -928,8 +930,10 @@ test("a genuinely refused horizon has an exact prepared transition and negative 
     assert.deepEqual(ok(readPreparedSeriesTransition(exact, { project, record: reference(transition) })).record, transition);
     assert.deepEqual(ok(readHorizonIssuance(exact, { project, record: reference(issued) })).record, issued);
   } finally { exact.close(); }
+  const beforeRepeats = snapshot(f.store);
   assert.deepEqual(ok(writeSeriesTransition(f.store, given)), transition);
   assert.deepEqual(ok(writeHorizonIssuance(f.store, issuanceRequest)), issued);
+  assert.deepEqual(snapshot(f.store), beforeRepeats, "Exact repeats of P and G2 write nothing");
   assert.deepEqual(f.store.history(series.id), savedSeries);
 });
 
