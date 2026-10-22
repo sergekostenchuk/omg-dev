@@ -1,7 +1,7 @@
 import { answerDiscoveryFixture, currentUpstreamFixtureValue } from './product-fixture.js';
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -41,7 +41,7 @@ import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
 import { writeGaps, type GapRequest } from "../src/om/gaps.js";
-import { writeRoutes } from "../src/om/routes.js";
+import { writeRoutes, type RoutesRecord } from "../src/om/routes.js";
 import { prepareQuestionTasks, writeQuestionPacket, type QuestionPacketRecord } from "../src/om/question-packet.js";
 import { readModelCallState, readModelTransport, recoverOmModelCall, runModelCall, runModelTransport, readCompletionWorkAt, writeCompletionCessation, prepareCompletionCall } from "../src/om/model-call.js";
 import { readAssessmentIntentAt, writeAssessmentIntent, assessFact } from "../src/om/assessment.js";
@@ -157,23 +157,6 @@ const analysisGaps = (basis: string, wanted: AttemptGoal, field: string) => [{
   id: basis, goal: wanted.key, field, consumer: "A6:stop-analysis",
 }];
 
-function stoppedSeries(f: Fixture): Revision<RepairSeries> {
-  deliveredOf(completeAttempt(f.store, {
-    project: PROJECT, block: BLOCK, line: 1, attempt: 1,
-    outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] },
-  }));
-  for (const attempt of [2, 3]) {
-    deliveredOf(beginAttempt(f.store, { project: PROJECT, block: BLOCK, line: 1, attempt, goal: f.goal }));
-    deliveredOf(completeAttempt(f.store, {
-      project: PROJECT, block: BLOCK, line: 1, attempt,
-      outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] },
-    }));
-  }
-  const stopped = f.store.get<RepairSeries>(seriesId(PROJECT, BLOCK, 1))!;
-  assert.equal(stopped.value.stop?.attempt, 3);
-  return stopped;
-}
-
 function stopReview(store: Store, series: Revision<RepairSeries>, block = BLOCK): Ref {
   const stop = series.value.stop!;
   return reference(store.write({
@@ -253,9 +236,9 @@ function originRequest(f: ReturnType<typeof runFixture>, hold: Revision<OriginHo
   };
 }
 
-const heldCall = (f: Fixture, name = "research-price-1"): Revision<CallRecord> | null =>
+const heldCall = (f: { readonly store: Store }, name = "research-price-1"): Revision<CallRecord> | null =>
   f.store.get<CallRecord>(callRecordId(PROJECT, name));
-const heldLedger = (f: Fixture): Revision<CallLedger> | null => f.store.get<CallLedger>(callLedgerId(PROJECT));
+const heldLedger = (f: { readonly store: Store }): Revision<CallLedger> | null => f.store.get<CallLedger>(callLedgerId(PROJECT));
 
 class CallReadStore extends Store {
   onRead: ((id: string, revision: number | undefined) => void) | null = null;
@@ -266,8 +249,8 @@ class CallReadStore extends Store {
 }
 
 test("readCall returns sealed exact history after settlement and source or call head movement", t => {
-  const f = fixture(t, "read-history", CallReadStore), store = f.store as CallReadStore;
-  const admitted = deliveredOf(recordCall(store, PROJECT, request(f)));
+  const f = ordinary(t, "read-history", CallReadStore), store = f.store as CallReadStore;
+  const admitted = deliveredOf(recordCall(store, PROJECT, lawful(f)));
   const settled = deliveredOf(settleCall(store, reference(admitted.call), usage, "succeeded"));
   for (const source of [f.adapter, f.config, f.series]) {
     store.write({ id: source.id, kind: source.kind, expected: source.revision, value: { later: true } });
@@ -293,8 +276,8 @@ test("readCall returns sealed exact history after settlement and source or call 
 });
 
 test("readCall rejects malformed arguments and foreign namespaces before storage", t => {
-  const f = fixture(t, "read-arguments", CallReadStore), store = f.store as CallReadStore;
-  const ref = reference(deliveredOf(recordCall(store, PROJECT, request(f))).call);
+  const f = ordinary(t, "read-arguments", CallReadStore), store = f.store as CallReadStore;
+  const ref = reference(deliveredOf(recordCall(store, PROJECT, lawful(f))).call);
   store.onRead = () => assert.fail("Invalid read arguments must not access storage");
   for (const invalid of [undefined, null, {}, [], "store"]) {
     assert.throws(() => readCall(invalid as never, PROJECT, ref), code("call_request_invalid"));
@@ -312,8 +295,8 @@ test("readCall rejects malformed arguments and foreign namespaces before storage
 });
 
 test("readCall refuses missing or forged references, kinds, identities and historical bodies", t => {
-  const f = fixture(t, "read-forged");
-  const admitted = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  const f = ordinary(t, "read-forged");
+  const admitted = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
   const ref = reference(admitted.call);
   for (const forged of [
     { ...ref, id: callRecordId(PROJECT, "missing") }, { ...ref, hash: "f".repeat(64) }, { ...ref, revision: 2 },
@@ -341,8 +324,8 @@ test("readCall refuses missing or forged references, kinds, identities and histo
 });
 
 test("readCall preserves storage exceptions from either the requested revision or its admission", t => {
-  const f = fixture(t, "read-storage", CallReadStore), store = f.store as CallReadStore;
-  const admitted = deliveredOf(recordCall(store, PROJECT, request(f)));
+  const f = ordinary(t, "read-storage", CallReadStore), store = f.store as CallReadStore;
+  const admitted = deliveredOf(recordCall(store, PROJECT, lawful(f)));
   const settled = deliveredOf(settleCall(store, reference(admitted.call), usage, "failed"));
   for (const revision of [1, 2]) {
     for (const failure of [new EngineError("record_corrupt", "checksum mismatch"), new Error("storage unavailable")]) {
@@ -380,7 +363,7 @@ interface ManagedStop {
  * research E1 is exactly its E2 (the product E1 test below); a stop analysis is the call whose packet and gaps are the
  * caller's transport data.
  */
-async function managedStop(t: test.TestContext, label: string): Promise<ManagedStop> {
+async function managedStop(t: { after(fn: () => void): void }, label: string): Promise<ManagedStop> {
   const root = mkdtempSync(join(tmpdir(), `omg-om-call-${label}-`)), path = join(root, "state.sqlite");
   const store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -507,8 +490,11 @@ test("a normalized late repeat after settlement and restart adds no revision or 
   }
 });
 
+/** What a lawful ordinary E1 is derived from: the attempt's issued E2 packet with its batch, goal and dispatch. */
+type Issued = Pick<ReturnType<typeof factAssessmentFixture>, "packet" | "block" | "series" | "attemptGoal" | "dispatch" | "batch">;
+
 /** LG07 (№10173 п.2, №9133): the research E1 its own E2 assignment derives — its call, packet, gaps, goal and dispatch. */
-function productE1(f: ReturnType<typeof factAssessmentFixture>): RecordCallRequest {
+function productE1(f: Issued): RecordCallRequest {
   const payload = (f.packet as Revision<QuestionPacketRecord>).value.packet as unknown as Record<string, Json>
     & { requestId: string; purpose: "model-research" | "model-design" };
   return {
@@ -516,6 +502,185 @@ function productE1(f: ReturnType<typeof factAssessmentFixture>): RecordCallReque
     series: reference(f.series), attempt: 1, goal: f.attemptGoal, dispatch: f.dispatch, packet: payload,
     gaps: f.batch.items.flatMap(item => item.consumers.map(consumer => ({ id: item.target, goal: item.target, field: item.field, consumer }))),
   };
+}
+
+/** The ordinary E1 an issued E2 derives, with the one corruption a test lays over it. */
+function lawful(f: Issued, over: Partial<RecordCallRequest> = {}): RecordCallRequest {
+  return { ...productE1(f), ...over };
+}
+
+interface Ordinary extends Issued {
+  readonly root: string;
+  readonly path: string;
+  readonly store: Store;
+  readonly adapter: Revision<Json>;
+  readonly config: Revision<Json>;
+}
+
+interface OrdinaryWorld {
+  readonly root: string;
+  readonly path: string;
+  readonly block: string;
+  readonly goal: AttemptGoal;
+  readonly routes: Ref;
+  readonly batch: string;
+  readonly packet: Ref;
+}
+let ordinaryWorld: OrdinaryWorld | null = null;
+
+/** One test's own root with a copy of a world's database: E1 reads no file of the workspace, so the copy is exact for it. */
+function copyWorld(world: { readonly path: string }, label: string): { readonly root: string; readonly path: string } {
+  const root = mkdtempSync(join(tmpdir(), `omg-om-call-${label}-`)), path = join(root, "state.sqlite");
+  copyFileSync(world.path, path);
+  return { root, path };
+}
+
+/**
+ * LG07 cr-rest (№11158): the carrier of an ordinary E1 — one managed block of PROJECT whose attempt 1 G7 opened with the
+ * exact completion of its M6 batch, and the E2 packet that attempt issued. Nothing is paid and nothing is closed: the
+ * lawful call is the one the packet derives (lawful). Built once per process by its producers; each test copies it.
+ */
+function ordinaryBase(): OrdinaryWorld {
+  if (ordinaryWorld) return ordinaryWorld;
+  const root = mkdtempSync(join(tmpdir(), "omg-om-call-world-")), path = join(root, "state.sqlite");
+  process.once("exit", () => rmSync(root, { recursive: true, force: true }));
+  const store = new Store(path);
+  try {
+    const m = managedBlock(store, { root, path }, PROJECT);
+    deliveredOf(openSeries(store, { ...m.address(), slice: SLICE, predecessor: null, basis: null }));
+    const series = m.open(1), opening = m.opening(1), completion = opening.completion!;
+    const packet = deliveredOf(writeQuestionPacket(store, { project: PROJECT, routes: completion.routes, batch: completion.batches[0]!,
+      environment: reference(store.get(`environment:${PROJECT}`)!), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+    ordinaryWorld = { root, path, block: m.block, goal: opening.goal, routes: completion.routes, batch: completion.batches[0]!, packet: reference(packet) };
+  } finally { store.close(); }
+  return ordinaryWorld;
+}
+
+function ordinaryOf(store: Store, own: { readonly root: string; readonly path: string }): Ordinary {
+  const world = ordinaryBase();
+  const adapter = store.get(`adapter:${PROJECT}:managed`)!, config = store.get(`environment:${PROJECT}`)!;
+  return { ...own, store, adapter, config, block: world.block, attemptGoal: world.goal,
+    series: store.get<RepairSeries>(seriesId(PROJECT, world.block, 1))!,
+    packet: store.get<QuestionPacketRecord>(world.packet.id, world.packet.revision)! as Issued["packet"],
+    batch: store.get<RoutesRecord>(world.routes.id, world.routes.revision)!.value.batches.find(row => row.id === world.batch)!,
+    dispatch: { adapter: reference(adapter), config: reference(config) } };
+}
+
+function ordinary(t: test.TestContext, label = "case", StoreType: typeof Store = Store): Ordinary {
+  const own = copyWorld(ordinaryBase(), label), store = new StoreType(own.path);
+  t.after(() => { store.close(); rmSync(own.root, { recursive: true, force: true }); });
+  return ordinaryOf(store, own);
+}
+
+/** The call of the ordinary carrier as it stands in the store. */
+const lawfulCall = (f: Ordinary): Revision<CallRecord> | null => heldCall(f, lawful(f).call);
+
+/** The owner's D1 moves: a repository inventory is written and the OM input is written again over it. */
+function moveD1(store: Store): void {
+  const input = store.get(`om-input:${PROJECT}`)!;
+  const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${PROJECT}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
+  const inventory = store.write({ id: `repo-inventory:${PROJECT}`, kind: "repo-inventory", expected: 0, value: { projectId: PROJECT, paths: [] } });
+  deliveredOf(writeOmInput(store, { project: PROJECT, expected: input.revision, stages, inventory: reference(inventory) }));
+}
+
+/**
+ * The outcome G7 closes with when the D1 moved under an admitted call that never launched: the move proves the cause that
+ * ceases the unlaunched assignment of the exact plan, and the outcome is the one the then complete work derives.
+ */
+function ceasedOutcome(store: Store, series: Ref): GateOutcome {
+  const binding = deliveredOf(readCompletionBinding(store, PROJECT, reference(store.get(series.id)!), 1))!;
+  const workRef = (): Ref => reference(store.get(completionWorkId(PROJECT, binding.id))!);
+  const part = deliveredOf(readCompletionWorkAt(store, PROJECT, workRef())).assignments.find(row => row.value.kind === "part")!;
+  const ceased = deliveredOf(writeCompletionCessation(store, { project: PROJECT, binding: reference(binding), assignment: reference(part) }));
+  assert.equal(ceased.value.disposition, "not-dispatched");
+  const work = deliveredOf(readCompletionWorkAt(store, PROJECT, workRef()));
+  assert.equal(work.complete, true);
+  return { reason: "interrupted", accepting: work.accepting, cancelling: [], refusals: work.refusals } as GateOutcome;
+}
+
+/** G7 ends the attempt of an ordinary call that never launched. */
+function endUnlaunched(f: Ordinary): void {
+  moveD1(f.store);
+  deliveredOf(closeAttempt(f.store, { project: PROJECT, block: f.block, line: 1, attempt: 1, outcome: ceasedOutcome(f.store, reference(f.series)) }));
+}
+
+let stopWorld: ManagedStop | null = null;
+
+/**
+ * LG07 cr-rest (№11158): the paid first-rung stop of managedStop as the original snapshot of a test — built once per
+ * process by its own producers, copied per test. The test's own calls are told from the paid ones by exact Ref (s.paid).
+ */
+async function stopCarrier(t: test.TestContext, label: string, StoreType: typeof Store = Store): Promise<ManagedStop> {
+  if (!stopWorld) {
+    stopWorld = await managedStop({ after: fn => { process.once("exit", fn); } }, "world");
+    stopWorld.store.close();
+  }
+  const world = stopWorld, own = copyWorld(world, label), store = new StoreType(own.path);
+  t.after(() => { store.close(); rmSync(own.root, { recursive: true, force: true }); });
+  const ledger = store.get<CallLedger>(callLedgerId(PROJECT))!;
+  return { ...own, store, block: world.block, series: store.get<RepairSeries>(world.series.id)!,
+    adapter: store.get(world.adapter.id)!, config: store.get(world.config.id)!,
+    paid: { calls: store.list(CALL_RECORD_KIND).map(reference), ledger, history: store.history(ledger.id).length } };
+}
+
+interface MixedWorld {
+  readonly root: string;
+  readonly path: string;
+  readonly admission: MechanismAdmission;
+  readonly goal: AttemptGoal;
+  readonly series: Ref;
+  readonly packet: Ref;
+}
+let mixedWorld: MixedWorld | null = null;
+
+/**
+ * LG07 cr-rest (№11158): the ordinary world with the M5 mechanism of the same project on its managed path. The routes of
+ * the managed block already hold the MC2 batch of the unaddressed questions; the mechanism's attempt is opened with its own
+ * admission and the exact completion of that batch and its E2 packet is issued, so one ledger can hold a block's call
+ * and the mechanism's, each the call its own E2 derives.
+ */
+function mixedBase(): MixedWorld {
+  if (mixedWorld) return mixedWorld;
+  const base = ordinaryBase(), own = copyWorld(base, "mixed-world");
+  process.once("exit", () => rmSync(own.root, { recursive: true, force: true }));
+  const store = new Store(own.path);
+  try {
+    const routes = store.get<RoutesRecord>(base.routes.id, base.routes.revision)!;
+    const batch = routes.value.batches.find(row => row.task === "input-field"
+      && row.items.every(item => item.target.startsWith("discovery:") && item.consumers.length === 0))!;
+    const admission: MechanismAdmission = { gaps: routes.value.request.gaps, routes: reference(routes), batch: batch.id };
+    const address = { project: PROJECT, owner: mechanismOwner, line: 1 };
+    deliveredOf(openSeries(store, { ...address, scope: admission.gaps, predecessor: null, basis: null }));
+    const goal: AttemptGoal = { key: "address-missing-fields", ...deliveredOf(prepareSeriesAdmission(store, address, admission)).goal };
+    const opened = deliveredOf(openAttempt(store, { ...address, attempt: 1, goal, admission,
+      completion: { routes: admission.routes, batches: [admission.batch] } } as never)) as Revision<AnyRepairSeries>;
+    const packet = deliveredOf(writeQuestionPacket(store, { project: PROJECT, routes: admission.routes, batch: admission.batch,
+      environment: reference(store.get(`environment:${PROJECT}`)!), attempt: { series: reference(opened), ordinal: 1 }, previous: [] })).record;
+    mixedWorld = { root: own.root, path: own.path, admission, goal, series: reference(opened), packet: reference(packet) };
+  } finally { store.close(); }
+  return mixedWorld;
+}
+
+interface Mixed extends Ordinary {
+  readonly ownerAddress: { readonly project: string; readonly owner: typeof mechanismOwner; readonly line: 1 };
+  readonly mechanism: Revision<AnyRepairSeries>;
+  readonly mechanismCall: MechanismRecordCallRequest;
+}
+
+function mixed(t: test.TestContext, label: string): Mixed {
+  const world = mixedBase(), own = copyWorld(world, label), store = new Store(own.path);
+  t.after(() => { store.close(); rmSync(own.root, { recursive: true, force: true }); });
+  const f = ordinaryOf(store, own);
+  const packet = store.get<QuestionPacketRecord>(world.packet.id, world.packet.revision)!, request = packet.value.request;
+  const payload = packet.value.packet as unknown as { requestId: string; purpose: "model-design"; questions: { id: string }[] };
+  const assigned = new Set(payload.questions.map(question => question.id));
+  const routes = store.get<RoutesRecord>(world.admission.routes.id, world.admission.routes.revision)!;
+  return { ...f, ownerAddress: { project: PROJECT, owner: mechanismOwner, line: 1 }, mechanism: store.get<AnyRepairSeries>(world.series.id)!,
+    mechanismCall: { call: payload.requestId, purpose: payload.purpose, basis: null, owner: mechanismOwner,
+      admission: { routes: request.routes, batch: request.batch!, gaps: routes.value.request.gaps },
+      gaps: routes.value.batches.find(row => row.id === request.batch)!.items.filter(item => assigned.has(item.gap))
+        .map(item => ({ id: item.gap, goal: item.target, field: item.field, consumer: mechanismOwner })),
+      series: request.attempt!.series, attempt: request.attempt!.ordinal, goal: world.goal, dispatch: f.dispatch, packet: payload as never } };
 }
 
 test("a product E1 is exactly the call its E2 assignment derives: an arbitrary packet or a duplicated gap is refused before any record", async t => {
@@ -565,24 +730,17 @@ test("a product E1 is exactly the call its E2 assignment derives: an arbitrary p
 });
 
 test("unknown usage leaves a call open; known usage closes call and ledger once, survives restart, and has no amount ceiling", t => {
-  const root = mkdtempSync(join(tmpdir(), "omg-om-call-restart-"));
-  const path = join(root, "state.sqlite");
-  const firstStore = new Store(path);
-  // Build the same fixture without handing cleanup of the first connection to node:test.
-  const adapter = firstStore.write({ id: "adapter:alpha", kind: "adapter", expected: 0, value: {} });
-  const config = firstStore.write({ id: "config:alpha", kind: "config", expected: 0, value: {} });
-  deliveredOf(openSeries(firstStore, { project: PROJECT, block: BLOCK, line: 1, slice: SLICE, predecessor: null, basis: null }));
-  const series = deliveredOf(beginAttempt(firstStore, { project: PROJECT, block: BLOCK, line: 1, attempt: 1, goal: goal() }));
-  const f = { root, path, store: firstStore, adapter, config, series, goal: goal() } satisfies Fixture;
-  const admitted = deliveredOf(recordCall(firstStore, PROJECT, request(f)));
-  const unknown = deliveredOf(settleCall(firstStore, reference(admitted.call), null, "failed"));
+  // LG07 cr-rest (№11158): the call is the ordinary E1 of a managed attempt; nothing is paid, so the ledger holds this one row.
+  const f = ordinary(t, "restart");
+  const admitted = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
+  const unknown = deliveredOf(settleCall(f.store, reference(admitted.call), null, "failed"));
   assert.equal(unknown.settled, false);
   assert.equal(unknown.call.value.status, "open");
-  assert.equal(firstStore.history(admitted.call.id).length, 1);
-  firstStore.close();
+  assert.equal(f.store.history(admitted.call.id).length, 1);
+  f.store.close();
 
-  const store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const store = new Store(f.path);
+  t.after(() => store.close());
   const enormous = {
     inputTokens: 9_000_000_000_000, outputTokens: 8_000_000_000_000,
     cachedInputTokens: 8_000_000_000_000, reasoningOutputTokens: 7_000_000_000_000,
@@ -605,8 +763,8 @@ test("unknown usage leaves a call open; known usage closes call and ledger once,
 });
 
 test("token counters use tokenUsage exactly and any different final usage or status conflicts", t => {
-  const f = fixture(t, "usage");
-  const admitted = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  const f = ordinary(t, "usage");
+  const admitted = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
   for (const invalid of [
     { inputTokens: -1, outputTokens: 0, cachedInputTokens: 0, reasoningOutputTokens: 0 },
     { inputTokens: 1.5, outputTokens: 0, cachedInputTokens: 0, reasoningOutputTokens: 0 },
@@ -614,64 +772,61 @@ test("token counters use tokenUsage exactly and any different final usage or sta
     { inputTokens: 1, outputTokens: 0, cachedInputTokens: 0 },
   ]) {
     addressed(settleCall(f.store, reference(admitted.call), invalid as never, "failed"), "usage_invalid");
-    assert.equal(heldCall(f)!.revision, 1);
+    assert.equal(lawfulCall(f)!.revision, 1);
   }
   const measured = { ...usage, cachedInputTokens: null, reasoningOutputTokens: null };
   const settled = deliveredOf(settleCall(f.store, reference(admitted.call), measured, "failed"));
   addressed(settleCall(f.store, reference(admitted.call), { ...measured, outputTokens: 31 }, "failed"), "settlement_conflict");
   addressed(settleCall(f.store, reference(admitted.call), measured, "succeeded"), "settlement_conflict");
   addressed(settleCall(f.store, reference(admitted.call), null, "failed"), "settlement_conflict");
-  assert.deepEqual(reference(heldCall(f)!), reference(settled.call));
+  assert.deepEqual(reference(lawfulCall(f)!), reference(settled.call));
   assert.equal(heldLedger(f)!.revision, 2);
 });
 
-test("a stop-analysis call binds to the standing first-rung stop without opening attempt four", t => {
-  const f = fixture(t, "stop-analysis");
-  const stopped = stoppedSeries(f);
-  const reviewGoal = analysisGoal("the saved stop");
-  const input = request(f, {
-    call: "review-stop-3", purpose: "stop-analysis",
-    basis: { kind: "series-stop", series: reference(stopped), attempt: 3 },
-    gaps: analysisGaps(`${stopped.id}:stop:3`, reviewGoal, "cause-and-change"),
-    series: reference(stopped), attempt: 3, goal: reviewGoal,
-  });
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, input));
+test("a stop-analysis call binds to the standing first-rung stop without opening attempt four", async t => {
+  // LG07 cr-rest (№11158): the stop is the managed one — three paid attempts closed by G7; the call is told from the paid ones by Ref.
+  const s = await stopCarrier(t, "stop-analysis");
+  const input = stopRequest(s);
+  const recorded = deliveredOf(recordCall(s.store, PROJECT, input));
   assert.equal(recorded.call.value.purpose, "stop-analysis");
   assert.deepEqual(recorded.call.value.basis, input.basis);
-  assert.deepEqual(recorded.ledger.value.calls[0]!.basis, input.basis);
-  assert.equal(f.store.get<RepairSeries>(stopped.id)!.revision, stopped.revision);
-  assert.equal(f.store.get<RepairSeries>(stopped.id)!.value.stop?.attempt, 3);
-  assert.equal(f.store.get<RepairSeries>(stopped.id)!.value.attempts.length, 3);
+  assert.deepEqual(recorded.ledger.value.calls.find(row => row.call.id === recorded.call.id)!.basis, input.basis);
+  assert.deepEqual(s.store.get<RepairSeries>(s.series.id), s.series);
+  assert.equal(s.store.get<RepairSeries>(s.series.id)!.value.stop?.attempt, 3);
+  assert.equal(s.store.get<RepairSeries>(s.series.id)!.value.attempts.length, 3);
 
-  addressed(recordCall(f.store, PROJECT, request(f, {
+  const admitted = s.store.list().map(reference);
+  addressed(recordCall(s.store, PROJECT, stopRequest(s, {
     call: "ordinary-after-stop", purpose: "model-design", basis: null,
-    series: reference(stopped), attempt: 3, goal: f.goal,
+    gaps: [{ id: "gap:contract", goal: "price contract", field: "contract", consumer: s.block }],
+    goal: s.series.value.attempts[2]!.goal,
   })), "call_series_unresolved");
-  addressed(recordCall(f.store, PROJECT, request(f, {
-    call: "foreign-stop", purpose: "stop-analysis",
-    basis: { kind: "series-stop", series: reference(f.series), attempt: 1 },
-    gaps: analysisGaps(`${stopped.id}:stop:3`, reviewGoal, "cause-and-change"),
-    series: reference(stopped), attempt: 3, goal: reviewGoal,
+  const earlier = s.store.get<RepairSeries>(s.series.id, s.series.revision - 1)!;
+  assert.equal(earlier.value.stop, null);
+  addressed(recordCall(s.store, PROJECT, stopRequest(s, {
+    call: "foreign-stop", basis: { kind: "series-stop", series: reference(earlier), attempt: 3 },
   })), "call_basis_unresolved");
+  assert.deepEqual(s.store.list().map(reference), admitted, "refused analyses write nothing");
 
-  const resumed = deliveredOf(resumeSeries(f.store, {
-    project: PROJECT, block: BLOCK, line: 1, stop: 3,
+  const resumed = deliveredOf(resumeSeries(s.store, {
+    project: PROJECT, block: s.block, line: 1, stop: 3,
     ground: "review-record", text: "the independent review named an addressed change",
-    review: { ref: stopReview(f.store, stopped) },
+    review: { ref: stopReview(s.store, s.series, s.block) },
   }));
   assert.equal(resumed.value.stop, null);
-  addressed(recordCall(f.store, PROJECT, request(f, {
-    call: "review-lifted-stop", purpose: "stop-analysis",
+  const lifted = s.store.list().map(reference);
+  addressed(recordCall(s.store, PROJECT, stopRequest(s, {
+    call: "review-lifted-stop", series: reference(resumed),
     basis: { kind: "series-stop", series: reference(resumed), attempt: 3 },
-    gaps: analysisGaps(`${resumed.id}:stop:3`, reviewGoal, "cause-and-change"),
-    series: reference(resumed), attempt: 3, goal: reviewGoal,
   })), "call_basis_unresolved");
+  assert.deepEqual(s.store.list().map(reference), lifted, "a lifted stop admits no analysis and writes nothing");
 
-  const late = deliveredOf(recordCall(f.store, PROJECT, input));
+  const late = deliveredOf(recordCall(s.store, PROJECT, input));
   assert.equal(late.repeated, true);
+  assert.deepEqual(s.store.list().map(reference), lifted, "a late repeat writes nothing");
   assert.deepEqual(reference(late.call), reference(recorded.call));
-  assert.equal(f.store.history(recorded.call.id).length, 1);
-  assert.equal(heldLedger(f)!.value.calls.length, 1);
+  assert.equal(s.store.history(recorded.call.id).length, 1);
+  assert.equal(heldLedger(s)!.value.calls.length, s.paid.ledger.value.calls.length + 1);
 });
 
 test("an origin-analysis call binds to its standing hold after close and rejects foreign or lifted holds", async t => {
@@ -723,116 +878,121 @@ test("an origin-analysis call binds to its standing hold after close and rejects
 });
 
 test("every refusal introduced by E1 is produced with an address and route", t => {
+  // LG07 cr-rest (№11158): every case lays one corruption over the ordinary E1 its managed attempt's E2 derives (lawful).
   const seen = new Set<string>();
-  const take = <T>(result: OmResult<T>, expected: string): Refusal => {
+  const snap = (store: Store) => ({ store, refs: store.list().map(reference) });
+  // The snapshot is taken before the call is evaluated: a refusal of E1 leaves every record as it stood.
+  const take = <T>(before: ReturnType<typeof snap>, result: OmResult<T>, expected: string): Refusal => {
     const refusal = addressed(result, expected);
     seen.add(refusal.code);
+    assert.deepEqual(before.store.list().map(reference), before.refs, `${expected}: a refused E1 writes nothing`);
     return refusal;
   };
 
-  let f = fixture(t, "codes-request");
-  take(recordCall(f.store, PROJECT, { ...request(f), extra: "status" } as never), "call_request_invalid");
+  let f = ordinary(t, "codes-request");
+  take(snap(f.store), recordCall(f.store, PROJECT, { ...lawful(f), extra: "status" } as never), "call_request_invalid");
 
-  f = fixture(t, "codes-question-missing");
-  take(recordCall(f.store, PROJECT, request(f, { gaps: [] })), "call_question_missing");
+  f = ordinary(t, "codes-question-missing");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { gaps: [] })), "call_question_missing");
 
-  f = fixture(t, "codes-question-invalid");
-  take(recordCall(f.store, PROJECT, request(f, { gaps: [{ id: "g", goal: "g", field: "f" } as never] })), "call_question_invalid");
+  f = ordinary(t, "codes-question-invalid");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { gaps: [{ id: "g", goal: "g", field: "f" } as never] })), "call_question_invalid");
 
-  f = fixture(t, "codes-goal-missing");
-  take(recordCall(f.store, PROJECT, request(f, { goal: null as never })), "call_goal_missing");
+  f = ordinary(t, "codes-goal-missing");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { goal: null as never })), "call_goal_missing");
 
-  f = fixture(t, "codes-goal-invalid");
-  take(recordCall(f.store, PROJECT, request(f, { goal: { key: "g", questions: [], result: "r" } })), "call_goal_invalid");
+  f = ordinary(t, "codes-goal-invalid");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { goal: { key: "g", questions: [], result: "r" } })), "call_goal_invalid");
 
-  f = fixture(t, "codes-goal-conflict");
-  take(recordCall(f.store, PROJECT, request(f, { goal: goal({ result: "a different result" }) })), "call_goal_conflict");
+  f = ordinary(t, "codes-goal-conflict");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { goal: { ...f.attemptGoal, result: "a different result" } })), "call_goal_conflict");
 
-  f = fixture(t, "codes-purpose");
-  take(recordCall(f.store, PROJECT, request(f, { purpose: "other" as never })), "call_purpose_invalid");
+  f = ordinary(t, "codes-purpose");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { purpose: "other" as never })), "call_purpose_invalid");
 
-  f = fixture(t, "codes-basis-invalid");
-  take(recordCall(f.store, PROJECT, request(f, {
+  f = ordinary(t, "codes-basis-invalid");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, {
     basis: { kind: "series-stop", series: reference(f.series), attempt: 1 },
   })), "call_basis_invalid");
 
-  f = fixture(t, "codes-basis-unresolved");
-  take(recordCall(f.store, PROJECT, request(f, {
+  f = ordinary(t, "codes-basis-unresolved");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, {
     purpose: "stop-analysis", basis: { kind: "series-stop", series: reference(f.series), attempt: 1 },
     goal: analysisGoal("a stop that does not stand"),
   })), "call_basis_unresolved");
 
-  f = fixture(t, "codes-series");
-  take(recordCall(f.store, PROJECT, request(f, { series: { ...reference(f.series), id: "repair-series:beta:1:block:cart" } })), "call_series_unresolved");
+  f = ordinary(t, "codes-series");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { series: { ...reference(f.series), id: "repair-series:beta:1:block:cart" } })), "call_series_unresolved");
 
-  f = fixture(t, "codes-dispatch-invalid");
-  take(recordCall(f.store, PROJECT, request(f, {
+  f = ordinary(t, "codes-dispatch-invalid");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, {
     dispatch: { adapter: { ...reference(f.adapter), status: "accepted" } as never, config: reference(f.config) },
   })), "dispatch_contract_invalid");
 
-  f = fixture(t, "codes-dispatch-unresolved");
-  take(recordCall(f.store, PROJECT, request(f, {
+  f = ordinary(t, "codes-dispatch-unresolved");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, {
     dispatch: { adapter: { ...reference(f.adapter), hash: "0".repeat(64) }, config: reference(f.config) },
   })), "dispatch_contract_unresolved");
 
-  f = fixture(t, "codes-packet");
+  f = ordinary(t, "codes-packet");
   const cyclic: Record<string, unknown> = {};
   cyclic['self'] = cyclic;
-  take(recordCall(f.store, PROJECT, request(f, { packet: cyclic as Json })), "packet_invalid");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { packet: cyclic as Json })), "packet_invalid");
 
-  f = fixture(t, "codes-identity");
-  deliveredOf(recordCall(f.store, PROJECT, request(f)));
-  take(recordCall(f.store, PROJECT, request(f, { packet: { different: true } })), "call_identity_conflict");
+  f = ordinary(t, "codes-identity");
+  deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f, { packet: { different: true } })), "call_identity_conflict");
 
-  f = fixture(t, "codes-record");
-  const badId = callRecordId(PROJECT, "research-price-1");
+  f = ordinary(t, "codes-record");
+  const badId = callRecordId(PROJECT, lawful(f).call);
   f.store.write({ id: badId, kind: CALL_RECORD_KIND, expected: 0, value: { status: "accepted", projectId: PROJECT } });
-  take(recordCall(f.store, PROJECT, request(f)), "call_record_invalid");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f)), "call_record_invalid");
 
-  f = fixture(t, "codes-ledger");
-  const ledgerCall = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  f = ordinary(t, "codes-ledger");
+  const ledgerCall = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
   f.store.write({ id: ledgerCall.ledger.id, kind: CALL_LEDGER_KIND, expected: 1,
     value: { projectId: PROJECT, calls: [null] } });
-  take(recordCall(f.store, PROJECT, request(f)), "ledger_invalid");
+  take(snap(f.store), recordCall(f.store, PROJECT, lawful(f)), "ledger_invalid");
 
-  f = fixture(t, "codes-call-unresolved");
-  take(settleCall(f.store, { id: "call-record:absent", revision: 1, hash: "a".repeat(64) }, usage, "failed"), "call_unresolved");
+  f = ordinary(t, "codes-call-unresolved");
+  take(snap(f.store), settleCall(f.store, { id: "call-record:absent", revision: 1, hash: "a".repeat(64) }, usage, "failed"), "call_unresolved");
 
-  f = fixture(t, "codes-status");
-  const statusCall = deliveredOf(recordCall(f.store, PROJECT, request(f)));
-  take(settleCall(f.store, reference(statusCall.call), usage, "accepted" as never), "settlement_status_invalid");
+  f = ordinary(t, "codes-status");
+  const statusCall = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
+  take(snap(f.store), settleCall(f.store, reference(statusCall.call), usage, "accepted" as never), "settlement_status_invalid");
 
-  f = fixture(t, "codes-conflict");
-  const conflictCall = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  f = ordinary(t, "codes-conflict");
+  const conflictCall = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
   deliveredOf(settleCall(f.store, reference(conflictCall.call), usage, "succeeded"));
-  take(settleCall(f.store, reference(conflictCall.call), { ...usage, inputTokens: 121 }, "succeeded"), "settlement_conflict");
+  take(snap(f.store), settleCall(f.store, reference(conflictCall.call), { ...usage, inputTokens: 121 }, "succeeded"), "settlement_conflict");
 
-  f = fixture(t, "codes-usage");
-  const usageCall = deliveredOf(recordCall(f.store, PROJECT, request(f)));
-  take(settleCall(f.store, reference(usageCall.call), { ...usage, inputTokens: -1 }, "failed"), "usage_invalid");
+  f = ordinary(t, "codes-usage");
+  const usageCall = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
+  take(snap(f.store), settleCall(f.store, reference(usageCall.call), { ...usage, inputTokens: -1 }, "failed"), "usage_invalid");
 
   assert.deepEqual([...seen].sort(), [...CALL_RECORD_CODES].sort());
 });
 
 test("absent arguments, sets and fields fail with typed codes before field access or storage", t => {
-  const f = fixture(t, "absence");
+  const f = ordinary(t, "absence"), prepared = f.store.list().map(reference);
   for (const value of [undefined, null, "request", 7, []]) {
     addressed(recordCall(f.store, PROJECT, value as never), "call_request_invalid");
   }
   for (const field of ["call", "purpose", "basis", "block", "gaps", "series", "attempt", "goal", "dispatch", "packet"] as const) {
-    const value = { ...request(f) } as Record<string, unknown>;
+    const value = { ...lawful(f) } as Record<string, unknown>;
     delete value[field];
     const refusal = refusalOf(recordCall(f.store, PROJECT, value as never));
     assert.ok(CALL_RECORD_CODES.includes(refusal.code as never), `${field} produced ${refusal.code}`);
     assert.equal(refusal.at.unit, UNIT);
   }
-  addressed(recordCall(f.store, null as never, request(f)), "call_request_invalid");
-  assert.throws(() => recordCall(null as never, PROJECT, request(f)), code("call_request_invalid"));
+  addressed(recordCall(f.store, null as never, lawful(f)), "call_request_invalid");
+  assert.throws(() => recordCall(null as never, PROJECT, lawful(f)), code("call_request_invalid"));
   assert.throws(() => callRecordId(undefined as never, "call"), code("call_request_invalid"));
   assert.throws(() => callRecordId(PROJECT, undefined as never), code("call_request_invalid"));
   assert.throws(() => callLedgerId(undefined as never), code("call_request_invalid"));
   addressed(settleCall(f.store, null as never, usage, "failed"), "call_unresolved");
-  const admitted = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  assert.deepEqual(f.store.list().map(reference), prepared, "refused arguments write nothing");
+  const admitted = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
   assert.throws(() => settleCall(null as never, reference(admitted.call), usage, "failed"), code("settlement_request_invalid"));
   addressed(settleCall(f.store, reference(admitted.call), usage, undefined as never), "settlement_status_invalid");
   addressed(settleCall(f.store, reference(admitted.call), undefined as never, "failed"), "usage_invalid");
@@ -890,41 +1050,43 @@ test("foreign series, forged hashes and status masquerades cannot stand for exac
   assert.equal(heldLedger(clean)!.revision, 1);
 });
 
-test("every record and settlement path rejects partial or total ledger loss derived from saved calls", t => {
+test("every record and settlement path rejects partial or total ledger loss derived from saved calls", async t => {
+  // LG07 cr-rest (№11158): the paid stop is the original snapshot of every case; the calls the loss is derived from are the
+  // test's own analyses on it, and the paid rows lose with them when the ledger is cut.
   const paths = ["create-other", "repeat-other", "settle-other", "unknown-other"] as const;
   for (const loss of ["partial", "total"] as const) {
     for (const path of paths) {
-      const f = fixture(t, `ledger-${loss}-${path}`);
-      const closed = deliveredOf(recordCall(f.store, PROJECT, request(f, { call: `closed-${loss}-${path}` })));
-      deliveredOf(settleCall(f.store, reference(closed.call), usage, "succeeded"));
-      const otherRequest = request(f, { call: `other-${loss}-${path}`, purpose: "model-design" });
-      const other = deliveredOf(recordCall(f.store, PROJECT, otherRequest));
-      const ledger = heldLedger(f)!;
+      const s = await stopCarrier(t, `ledger-${loss}-${path}`);
+      const closed = deliveredOf(recordCall(s.store, PROJECT, stopRequest(s, { call: `closed-${loss}-${path}` })));
+      deliveredOf(settleCall(s.store, reference(closed.call), usage, "succeeded"));
+      const otherRequest = stopRequest(s, { call: `other-${loss}-${path}` });
+      const other = deliveredOf(recordCall(s.store, PROJECT, otherRequest));
+      const ledger = heldLedger(s)!;
       const otherRow = ledger.value.calls.find(row => row.call.id === other.call.id)!;
-      f.store.write({
+      s.store.write({
         id: ledger.id, kind: CALL_LEDGER_KIND, expected: ledger.revision,
         value: { projectId: PROJECT, calls: loss === "partial" ? [otherRow] : [] },
       });
       const before = {
-        calls: f.store.list(CALL_RECORD_KIND).map(reference),
-        ledger: reference(heldLedger(f)!),
-        histories: f.store.list(CALL_RECORD_KIND).map(call => [call.id, f.store.history(call.id).length] as const),
+        calls: s.store.list(CALL_RECORD_KIND).map(reference),
+        ledger: reference(heldLedger(s)!),
+        histories: s.store.list(CALL_RECORD_KIND).map(call => [call.id, s.store.history(call.id).length] as const),
       };
       const result = path === "create-other"
-        ? recordCall(f.store, PROJECT, request(f, { call: `new-${loss}-${path}` }))
+        ? recordCall(s.store, PROJECT, stopRequest(s, { call: `new-${loss}-${path}` }))
         : path === "repeat-other"
-          ? recordCall(f.store, PROJECT, otherRequest)
-          : settleCall(f.store, reference(other.call), path === "unknown-other" ? null : usage, "failed");
+          ? recordCall(s.store, PROJECT, otherRequest)
+          : settleCall(s.store, reference(other.call), path === "unknown-other" ? null : usage, "failed");
       addressed(result, "ledger_invalid");
-      assert.deepEqual(f.store.list(CALL_RECORD_KIND).map(reference), before.calls, `${loss}/${path}: calls changed`);
-      assert.deepEqual(reference(heldLedger(f)!), before.ledger, `${loss}/${path}: ledger changed`);
+      assert.deepEqual(s.store.list(CALL_RECORD_KIND).map(reference), before.calls, `${loss}/${path}: calls changed`);
+      assert.deepEqual(reference(heldLedger(s)!), before.ledger, `${loss}/${path}: ledger changed`);
       assert.deepEqual(
-        f.store.list(CALL_RECORD_KIND).map(call => [call.id, f.store.history(call.id).length] as const),
+        s.store.list(CALL_RECORD_KIND).map(call => [call.id, s.store.history(call.id).length] as const),
         before.histories, `${loss}/${path}: history changed`,
       );
-      assert.equal(heldCall(f, `new-${loss}-${path}`), null);
-      assert.equal(heldCall(f, otherRequest.call)!.value.status, "open");
-      assert.equal(heldCall(f, closed.call.value.call)!.value.status, "succeeded");
+      assert.equal(heldCall(s, `new-${loss}-${path}`), null);
+      assert.equal(heldCall(s, otherRequest.call)!.value.status, "open");
+      assert.equal(heldCall(s, closed.call.value.call)!.value.status, "succeeded");
     }
   }
 });
@@ -950,21 +1112,19 @@ class RacingStore extends Store {
 }
 
 test("a dispatch or ledger head changed in the check/write window refuses the whole transaction (T7)", async t => {
-  let f = fixture(t, "race-admit", RacingStore);
-  let store = f.store as RacingStore;
-  store.target = f.config.id;
-  store.remaining = 2; // exact revision, then its head
-  store.run = other => {
+  // The managed admission reads the dispatch several times before it writes, so this race commits just before the guarded write.
+  let f = ordinary(t, "race-admit", MechanismCommitRaceStore);
+  (f.store as MechanismCommitRaceStore).race = other => {
     other.write({ id: f.config.id, kind: f.config.kind, expected: f.config.revision, value: { changed: "between" } });
   };
-  const staleDispatch = addressed(recordCall(store, PROJECT, request(f)), "input_stale");
+  const staleDispatch = addressed(recordCall(f.store, PROJECT, lawful(f)), "input_stale");
   assert.deepEqual(staleDispatch.at.ref, reference(f.config));
-  assert.equal(heldCall(f), null);
+  assert.equal(lawfulCall(f), null);
   assert.equal(heldLedger(f), null);
 
-  f = fixture(t, "race-settle", RacingStore);
-  store = f.store as RacingStore;
-  const admitted = deliveredOf(recordCall(store, PROJECT, request(f)));
+  f = ordinary(t, "race-settle", RacingStore);
+  let store = f.store as RacingStore;
+  const admitted = deliveredOf(recordCall(store, PROJECT, lawful(f)));
   const ledger = heldLedger(f)!;
   store.target = ledger.id;
   store.remaining = 1;
@@ -973,31 +1133,26 @@ test("a dispatch or ledger head changed in the check/write window refuses the wh
   };
   const staleLedger = addressed(settleCall(store, reference(admitted.call), usage, "succeeded"), "input_stale");
   assert.deepEqual(staleLedger.at.ref, reference(ledger));
-  assert.equal(heldCall(f)!.value.status, "open");
-  assert.equal(heldCall(f)!.revision, 1);
+  assert.equal(lawfulCall(f)!.value.status, "open");
+  assert.equal(lawfulCall(f)!.revision, 1);
   assert.equal(heldLedger(f)!.revision, 2);
 
-  f = fixture(t, "race-stop", RacingStore);
-  store = f.store as RacingStore;
-  const stopped = stoppedSeries(f);
-  const review = stopReview(store, stopped);
-  store.target = stopped.id;
+  // The stop is the managed one: what its paid attempts left stands as the snapshot the loser must leave untouched.
+  const s = await stopCarrier(t, "race-stop", RacingStore);
+  store = s.store as RacingStore;
+  const review = stopReview(store, s.series, s.block);
+  store.target = s.series.id;
   store.remaining = 2; // exact historical revision, then the current head read by readSeries
   store.run = other => {
     deliveredOf(resumeSeries(other, {
-      project: PROJECT, block: BLOCK, line: 1, stop: 3,
+      project: PROJECT, block: s.block, line: 1, stop: 3,
       ground: "review-record", text: "the independent review named an addressed change", review: { ref: review },
     }));
   };
-  const staleStop = addressed(recordCall(store, PROJECT, request(f, {
-    call: "race-stop-analysis", purpose: "stop-analysis",
-    basis: { kind: "series-stop", series: reference(stopped), attempt: 3 },
-    gaps: analysisGaps(`${stopped.id}:stop:3`, analysisGoal("the saved stop"), "cause-and-change"),
-    series: reference(stopped), attempt: 3, goal: analysisGoal("the saved stop"),
-  })), "input_stale");
-  assert.deepEqual(staleStop.at.ref, reference(stopped));
-  assert.equal(heldCall(f, "race-stop-analysis"), null);
-  assert.equal(heldLedger(f), null);
+  const staleStop = addressed(recordCall(store, PROJECT, stopRequest(s, { call: "race-stop-analysis" })), "input_stale");
+  assert.deepEqual(staleStop.at.ref, reference(s.series));
+  assert.equal(heldCall(s, "race-stop-analysis"), null);
+  assert.deepEqual(reference(heldLedger(s)!), reference(s.paid.ledger));
 
   const regated = await regatedFixture(t);
   regated.f.restart(path => new RacingStore(path));
@@ -1016,18 +1171,22 @@ test("a dispatch or ledger head changed in the check/write window refuses the wh
     row => row.call.id !== callRecordId(GARDEN, "race-origin-analysis")));
 });
 
-test("two admitted calls share one ledger, stay distinguishable, and settle independently", t => {
-  const f = fixture(t, "several");
-  const first = deliveredOf(recordCall(f.store, PROJECT, request(f, { call: "same-purpose-a" })));
-  const second = deliveredOf(recordCall(f.store, PROJECT, request(f, { call: "same-purpose-b", purpose: "model-design" })));
+test("two admitted calls share one ledger, stay distinguishable, and settle independently", async t => {
+  // LG07 cr-rest (№11158): the paid stop is the original snapshot; the two calls are the test's own analyses on it.
+  const s = await stopCarrier(t, "several");
+  const first = deliveredOf(recordCall(s.store, PROJECT, stopRequest(s, { call: "same-purpose-a" })));
+  const second = deliveredOf(recordCall(s.store, PROJECT, stopRequest(s, { call: "same-purpose-b" })));
   assert.notEqual(first.call.id, second.call.id);
-  assert.equal(second.ledger.value.calls.length, 2);
-  assert.deepEqual(second.ledger.value.calls.map(row => row.name).sort(), ["same-purpose-a", "same-purpose-b"]);
-  assert.equal(second.ledger.value.calls.find(row => row.name === "same-purpose-b")!.purpose, "model-design");
-  const closed = deliveredOf(settleCall(f.store, reference(first.call), usage, "succeeded"));
+  const isPaid = (row: { readonly call: Ref }): boolean => s.paid.calls.some(ref => ref.id === row.call.id);
+  assert.equal(second.ledger.value.calls.length, s.paid.ledger.value.calls.length + 2);
+  assert.deepEqual(second.ledger.value.calls.filter(isPaid), s.paid.ledger.value.calls);
+  assert.deepEqual(second.ledger.value.calls.filter(row => !isPaid(row)).map(row => row.name).sort(), ["same-purpose-a", "same-purpose-b"]);
+  assert.equal(second.ledger.value.calls.find(row => row.name === "same-purpose-b")!.purpose, "stop-analysis");
+  const closed = deliveredOf(settleCall(s.store, reference(first.call), usage, "succeeded"));
   assert.equal(closed.ledger.value.calls.find(row => row.name === "same-purpose-a")!.status, "succeeded");
   assert.equal(closed.ledger.value.calls.find(row => row.name === "same-purpose-b")!.status, "open");
-  assert.equal(f.store.history(second.call.id).length, 1);
+  assert.deepEqual(closed.ledger.value.calls.filter(isPaid), s.paid.ledger.value.calls);
+  assert.equal(s.store.history(second.call.id).length, 1);
 });
 
 
@@ -1142,36 +1301,84 @@ function mechanismFixture(t: test.TestContext, label: string, StoreType: typeof 
     replaceProducerQuestions, addressForSuccessor, graph, input: () => input };
 }
 
-test("E1 admits an explicit mechanism owner on a fresh equivalent D1 and preserves exact history after D3 and restart", t => {
-  const f = mechanismFixture(t, "mechanism-refresh"), before = reference(f.mechanismSeries);
-  const legacy = deliveredOf(recordCall(f.store, PROJECT, request(f, { call: "legacy-in-mixed-ledger" })));
-  const fresh = f.refreshInventory();
-  const stale = recordCall(f.store, PROJECT, f.call(f.initial.admission, "stale-source"));
-  addressed(stale, "call_series_unresolved");
-  assert.equal(f.store.get(callRecordId(PROJECT, "stale-source")), null);
-  const input = f.call(fresh.admission), saved = deliveredOf(recordCall(f.store, PROJECT, input));
+/** A copy of `value` with every occurrence of the exact reference `from` replaced by `to`. */
+function swapRef<T>(value: T, from: Ref, to: Ref): T {
+  const walk = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(walk);
+    if (item === null || typeof item !== "object") return item;
+    if (isRef(item) && item.id === from.id && item.revision === from.revision && item.hash === from.hash) return { ...to };
+    return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, walk(child)]));
+  };
+  return walk(value) as T;
+}
+
+/** The M6 a moved D1 writes — horizon, gaps and routes over the new input — with the MC2 batch of the unaddressed questions. */
+function freshAdmission(f: Mixed): MechanismAdmission {
+  const old = f.mechanismCall.admission.gaps.sources, input = reference(f.store.get(`om-input:${PROJECT}`)!);
+  const horizon = deliveredOf(writeHorizon(f.store, { project: PROJECT, input, graph: old.graph, refinement: old.operations.frame.layer,
+    available: {}, choice: { choiceVersion: "cr-fresh-d1", features: [{ outcome: `${PROJECT}-result` }], excluded: [] } }));
+  const sources = swapRef(swapRef(old, old.input, input), old.horizon, reference(horizon.gate)) as unknown as GapRequest;
+  const gaps = deliveredOf(writeGaps(f.store, sources));
+  const gapSet = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
+  const questions = gaps.records.filter(row => row.value.gap.kind === "repository-fact" && row.value.gap.code !== "inventory_missing" && !row.value.gap.deferral)
+    .map(gap => ({ gap: reference(gap), requirements: [{ pointer: "/contracts/0" }], resultForm: { type: "string" } as const }));
+  const tasks = deliveredOf(prepareQuestionTasks(f.store, { project: PROJECT, gaps: gapSet, questions })).tasks
+    .map(task => task.writes.length ? { pending: structuredClone(task.writes[0]!) as Write } : { record: reference(task.record) });
+  const routes = deliveredOf(writeRoutes(f.store, { project: PROJECT, gaps: gapSet, tasks, catalog: { paths: [], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(row => row.task === "input-field"
+    && row.items.every(item => item.target.startsWith("discovery:") && item.consumers.length === 0))!;
+  return { gaps: gapSet, routes: reference(routes), batch: batch.id };
+}
+
+/** The same mechanism call under another name, its packet naming it as an E2 packet does. */
+const renamed = (call: MechanismRecordCallRequest, name: string): MechanismRecordCallRequest =>
+  ({ ...call, call: name, packet: JSON.parse(JSON.stringify(call.packet).replaceAll(call.call, name)) as Json });
+
+test("a block row and an exact-plan mechanism row share one ledger; a moved D1 admits no other plan and history stays exact after D3 and restart", t => {
+  // LG07 cr-rest (№11158): both calls are the ones their own E2 derives. The standalone route admitted a fresh equivalent D1;
+  // a managed series proves only the plan its attempt was opened with, so another M6 is not a continuation of its completion.
+  const f = mixed(t, "mechanism-refresh"), before = reference(f.mechanism);
+  const block = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
+  const saved = deliveredOf(recordCall(f.store, PROJECT, f.mechanismCall));
   assert.equal("block" in saved.call.value, false);
   assert.deepEqual("owner" in saved.call.value && saved.call.value.owner, mechanismOwner);
-  assert.deepEqual("admission" in saved.call.value && saved.call.value.admission, fresh.admission);
-  assert.deepEqual(reference(f.store.get(f.mechanismSeries.id)!), before, "E1 does not rewrite A3's declaration");
+  assert.deepEqual("admission" in saved.call.value && saved.call.value.admission, f.mechanismCall.admission);
+  assert.deepEqual(reference(f.store.get(f.mechanism.id)!), before, "E1 does not rewrite A3's declaration");
   const rows = saved.ledger.value.calls;
-  assert.equal(rows.length, 2); assert.ok(rows.some(row => row.call.id === legacy.call.id && "block" in row));
+  assert.equal(rows.length, 2); assert.ok(rows.some(row => row.call.id === block.call.id && "block" in row));
   assert.ok(rows.some(row => row.call.id === saved.call.id && "owner" in row && !Object.hasOwn(row, "block")));
-  f.addressOne(); // The question is answered before accounting closes the admitted call.
-  const completed = deliveredOf(completeAttempt(f.store, { ...f.ownerAddress, attempt: 1,
-    outcome: { reason: "interrupted", achieved: [], cancelled: [], refusals: [] } }));
+
+  moveD1(f.store);
+  const fresh = freshAdmission(f), refused = f.store.list().map(reference);
+  addressed(recordCall(f.store, PROJECT, renamed(f.mechanismCall, "after-moved-d1")), "call_series_unresolved");
+  addressed(recordCall(f.store, PROJECT, { ...renamed(f.mechanismCall, "fresh-equivalent-d1"), admission: fresh }), "call_series_unresolved");
+  assert.deepEqual(f.store.list().map(reference), refused, "a refused E1 writes nothing");
+
+  // The question is answered (D3) before accounting closes the admitted call; G7 ends the unlaunched remainder.
+  const input = f.store.get(`om-input:${PROJECT}`)!, graph = f.store.get(`graph:${PROJECT}`)!;
+  deliveredOf(writeAddressing(f.store, { project: PROJECT, input: reference(input), graph: reference(graph),
+    decisions: [{ pending: inputDecisionWrite({ project: PROJECT, input: reference(input), graph: reference(graph), layers: [],
+      decision: { target: "discovery:price-1", field: "address", value: { consumer: f.block, kind: "repository-fact" } } }) as Write }] }));
+  deliveredOf(closeAttempt(f.store, { ...f.ownerAddress, attempt: 1, outcome: ceasedOutcome(f.store, reference(f.mechanism)) } as never));
+  const completed = f.store.get<AnyRepairSeries>(f.mechanism.id)!;
   assert.equal(completed.value.attempts[0]!.outcome!.reason, "interrupted");
-  addressed(recordCall(f.store, PROJECT, { ...input, call: "late-new-dispatch" }), "call_series_unresolved");
+  addressed(recordCall(f.store, PROJECT, renamed(f.mechanismCall, "late-new-dispatch")), "call_series_unresolved");
   assert.equal(f.store.get(callRecordId(PROJECT, "late-new-dispatch")), null);
   const settled = deliveredOf(settleCall(f.store, reference(saved.call), usage, "succeeded"));
-  assert.deepEqual("admission" in settled.call.value && settled.call.value.admission, fresh.admission);
-  assert.equal(deliveredOf(recordCall(f.store, PROJECT, input)).repeated, true);
+  assert.deepEqual("admission" in settled.call.value && settled.call.value.admission, f.mechanismCall.admission);
+  assert.equal(settled.ledger.value.calls.find(row => row.call.id === saved.call.id)!.status, "succeeded");
+  assert.equal(settled.ledger.value.calls.find(row => row.call.id === block.call.id)!.status, "open");
+  const accounted = f.store.list().map(reference);
+  assert.equal(deliveredOf(recordCall(f.store, PROJECT, f.mechanismCall)).repeated, true);
+  assert.deepEqual(f.store.list().map(reference), accounted, "a repeat writes nothing");
   const reopened = new Store(f.path);
   try {
     assert.deepEqual(deliveredOf(readCall(reopened, PROJECT, reference(saved.call))), saved.call);
     assert.deepEqual(deliveredOf(readCall(reopened, PROJECT, reference(settled.call))), settled.call);
-    assert.equal(deliveredOf(recordCall(reopened, PROJECT, input)).repeated, true);
-    assert.deepEqual(reference(reopened.get(f.mechanismSeries.id)!), reference(completed));
+    assert.equal(deliveredOf(recordCall(reopened, PROJECT, f.mechanismCall)).repeated, true);
+    assert.deepEqual(reopened.list().map(reference), accounted, "a cold repeat writes nothing");
+    assert.deepEqual(reference(reopened.get(f.mechanism.id)!), reference(completed));
+    assert.deepEqual(reference(reopened.get(block.call.id)!), reference(block.call));
   } finally { reopened.close(); }
 });
 
@@ -1628,14 +1835,12 @@ test("E1 analyses an inherited origin hold after D3 and a full D1 successor, wit
   } finally { reopened.close(); }
 });
 
-test("block successor and call admission serialize both orders without partial accounting or loss of historical settlement", t => {
+test("block successor and call admission serialize both orders without partial accounting or loss of historical settlement", async t => {
   for (const successorFirst of [false, true]) {
-    const f = fixture(t, `block-successor-${successorFirst}`, MechanismCommitRaceStore), store = f.store as MechanismCommitRaceStore;
-    const stopped = stoppedSeries(f), wanted = analysisGoal("block predecessor stop");
-    const input = request(f, { call: "block-line-analysis", purpose: "stop-analysis", attempt: 3, series: reference(stopped),
-      basis: { kind: "series-stop", series: reference(stopped), attempt: 3 }, goal: wanted,
-      gaps: analysisGaps(stopped.id, wanted, "stop") });
-    const successorRequest = { project: PROJECT, block: BLOCK, line: 2, slice: "slice:cart@2", predecessor: reference(stopped),
+    const s = await stopCarrier(t, `block-successor-${successorFirst}`, MechanismCommitRaceStore), store = s.store as MechanismCommitRaceStore;
+    const stopped = s.series, wanted = analysisGoal("block predecessor stop");
+    const input = stopRequest(s, { call: "block-line-analysis", goal: wanted, gaps: analysisGaps(stopped.id, wanted, "stop") });
+    const successorRequest = { project: PROJECT, block: s.block, line: 2, slice: "slice:cart@2", predecessor: reference(stopped),
       basis: { ground: "inputs-changed" as const, text: "Added a question to the block horizon" } };
     let saved: ReturnType<typeof recordCall> | null = null;
     if (successorFirst) {
@@ -1652,7 +1857,7 @@ test("block successor and call admission serialize both orders without partial a
       assert.equal(store.get("launch:old-line"), null);
       addressed(prepareCallDispatch(store, PROJECT, reference(admitted.call)), "call_series_unresolved");
     }
-    const claimed = store.get<RepairSeries>(stopped.id)!, successor = store.get<RepairSeries>(seriesId(PROJECT, BLOCK, 2))!;
+    const claimed = store.get<RepairSeries>(stopped.id)!, successor = store.get<RepairSeries>(seriesId(PROJECT, s.block, 2))!;
     assert.equal(claimed.revision, stopped.revision + 1);
     assert.deepEqual(claimed.value, stopped.value);
     for (const ref of [reference(stopped), reference(claimed)]) {
@@ -1663,7 +1868,7 @@ test("block successor and call admission serialize both orders without partial a
       basis: { kind: "series-stop" as const, series: reference(successor), attempt: 3 } };
     const inherited = deliveredOf(recordCall(store, PROJECT, inheritedInput));
     assert.deepEqual(deliveredOf(prepareCallDispatch(store, PROJECT, reference(inherited.call))).call, inherited.call);
-    const restarted = new Store(f.path);
+    const restarted = new Store(s.path);
     try {
       addressed(recordCall(restarted, PROJECT, { ...input, call: "old-after-restart" }), "call_series_unresolved");
       assert.deepEqual(deliveredOf(readSeriesAt(restarted, PROJECT, reference(stopped))), stopped);
@@ -1681,16 +1886,15 @@ test("block successor and call admission serialize both orders without partial a
   }
 });
 
-test("current admission rejects a legacy block predecessor even when succession left its exact head unchanged", t => {
-  const f = fixture(t, "legacy-successor"), stopped = stoppedSeries(f), wanted = analysisGoal("legacy stop");
-  const input = request(f, { call: "legacy-admitted", purpose: "stop-analysis", series: reference(stopped), attempt: 3,
-    basis: { kind: "series-stop", series: reference(stopped), attempt: 3 }, goal: wanted, gaps: analysisGaps(stopped.id, wanted, "stop") });
-  const admitted = deliveredOf(recordCall(f.store, PROJECT, input));
+test("current admission rejects a legacy block predecessor even when succession left its exact head unchanged", async t => {
+  const s = await stopCarrier(t, "legacy-successor"), stopped = s.series, wanted = analysisGoal("legacy stop");
+  const input = stopRequest(s, { call: "legacy-admitted", goal: wanted, gaps: analysisGaps(stopped.id, wanted, "stop") });
+  const admitted = deliveredOf(recordCall(s.store, PROJECT, input));
   // Reconstruct the historical era's valid record shape; its writer did not claim the predecessor.
   const legacyValue: RepairSeries = { ...stopped.value, line: 2, slice: "legacy:second-slice", predecessor: reference(stopped),
     basis: { ground: "inputs-changed", text: "The historical slice moved" }, inherited: stopped.value.attempts, attempts: [] };
-  const legacy = f.store.write({ id: seriesId(PROJECT, BLOCK, 2), kind: stopped.kind, expected: 0, value: legacyValue });
-  const restarted = new Store(f.path);
+  const legacy = s.store.write({ id: seriesId(PROJECT, s.block, 2), kind: stopped.kind, expected: 0, value: legacyValue });
+  const restarted = new Store(s.path);
   try {
     assert.deepEqual(reference(restarted.get(stopped.id)!), reference(stopped));
     assert.deepEqual(deliveredOf(readSeriesAt(restarted, PROJECT, reference(legacy))), legacy);
@@ -1703,7 +1907,7 @@ test("current admission rejects a legacy block predecessor even when succession 
 });
 
 test("prepareCallDispatch uses current purpose, call and configuration guards while readCall stays historical", t => {
-  const f = fixture(t, "prepare-dispatch"), admitted = deliveredOf(recordCall(f.store, PROJECT, request(f)));
+  const f = ordinary(t, "prepare-dispatch"), admitted = deliveredOf(recordCall(f.store, PROJECT, lawful(f)));
   const proof = deliveredOf(prepareCallDispatch(f.store, PROJECT, reference(admitted.call)));
   assert.deepEqual(proof.call, admitted.call);
   assert.ok(deeplyFrozen(proof));
@@ -1717,17 +1921,17 @@ test("prepareCallDispatch uses current purpose, call and configuration guards wh
   assert.equal(refusalOf(writeGuarded(f.store, { unit: "E4-test", target: "launch:changed-config",
     writes: [{ id: "launch:changed-config", kind: "launch", expected: 0, value: {} }], guards: proof.guards })).code, "input_stale");
   assert.equal(f.store.get("launch:changed-config"), null);
-  assert.equal(moved.revision, 2);
+  assert.equal(moved.revision, f.config.revision + 1);
   assert.deepEqual(deliveredOf(readCall(f.store, PROJECT, reference(admitted.call))), admitted.call);
   const settled = deliveredOf(settleCall(f.store, reference(admitted.call), usage, "succeeded"));
   addressed(prepareCallDispatch(f.store, PROJECT, reference(admitted.call)), "call_unresolved");
   addressed(prepareCallDispatch(f.store, PROJECT, reference(settled.call)), "call_unresolved");
 
-  const g = fixture(t, "dispatch-ended-attempt"), ordinary = deliveredOf(recordCall(g.store, PROJECT, request(g)));
-  deliveredOf(completeAttempt(g.store, { project: PROJECT, block: BLOCK, line: 1, attempt: 1,
-    outcome: { reason: "off-form", achieved: [], cancelled: [], refusals: [] } }));
-  addressed(prepareCallDispatch(g.store, PROJECT, reference(ordinary.call)), "call_series_unresolved");
-  assert.deepEqual(deliveredOf(readCall(g.store, PROJECT, reference(ordinary.call))), ordinary.call);
+  // The attempt of an admitted call that never launched ends as G7 allows (endUnlaunched), not by a raw completion.
+  const g = ordinary(t, "dispatch-ended-attempt"), unlaunched = deliveredOf(recordCall(g.store, PROJECT, lawful(g)));
+  endUnlaunched(g);
+  addressed(prepareCallDispatch(g.store, PROJECT, reference(unlaunched.call)), "call_series_unresolved");
+  assert.deepEqual(deliveredOf(readCall(g.store, PROJECT, reference(unlaunched.call))), unlaunched.call);
 });
 
 test("block origin analysis follows its inherited current hold and rejects a lifted hold on a fresh process launch", async t => {
@@ -1762,7 +1966,7 @@ test("block origin analysis follows its inherited current hold and rejects a lif
 
 const e4FixturePath = fileURLToPath(new URL("../../test/om-adapter-fixture.mjs", import.meta.url));
 
-function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store, fileEvidence = false) {
+function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = Store, fileEvidence = false, question = "What encoding is supported?") {
   const root = mkdtempSync(join(tmpdir(), "omg-e50-fact-")), path = join(root, "state.sqlite"), project = "garden";
   let store = new StoreType(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -1775,7 +1979,7 @@ function factAssessmentFixture(t: test.TestContext, StoreType: typeof Store = St
   const { level: _level, ...l1 } = projectGraph(desired, 1);
   preparedFeatures(engine, project, l1 as Graph, field => {
     const value = preparedField(project, field);
-    if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "encoding", question: "What encoding is supported?",
+    if (field === "preparation") (value as Record<string, Json>).unknowns = [{ id: "encoding", question,
       consumer: "garden-consume-block", moment: "om-pass", blocksCurrentStage: false,
       resolution: "Resolve the addressed question during OM" }];
     return value;
@@ -2093,24 +2297,22 @@ test("fact assessment recovers a lost claimed E4 owner without another physical 
 });
 
 test('MP1 E1 measures the sent Cyrillic/non-BMP text while binding the complete semantic packet', t => {
-  const f = fixture(t, 'brief-fingerprint');
-  const call = 'research-price-1', text = 'Задание 😀: установи цену';
-  const packet: Json = { version: 'om-question-packet/brief-v1', requestId: call,
-    responseForm: { protocol: 'omg-answer/v3', requestId: call, schema: { type: 'object' } },
-    brief: { contract: 'om-brief/v1', requestId: call, text, labels: [], manifest: [], references: [], examples: [] },
-    semanticBasis: { meaning: 'price for cart' } };
-  const saved = deliveredOf(recordCall(f.store, PROJECT, request(f, { packet }))).call;
-  assert.deepEqual(saved.value.packet, { hash: hashJson(packet), chars: text.length, bytes: Buffer.byteLength(text, 'utf8') });
+  // LG07 cr-rest (№11158): the brief is the one the managed attempt's E2 issued, from a question asked in Cyrillic and non-BMP text.
+  const f = factAssessmentFixture(t, Store, false, 'Какая кодировка 😀 поддерживается?'), input = productE1(f);
+  const packet = input.packet as Record<string, any>, text = packet.brief.text as string;
+  assert.ok(text.includes('Какая кодировка 😀 поддерживается?'));
   assert.notEqual(text.length, [...text].length); assert.ok(Buffer.byteLength(text) > text.length);
-  assert.deepEqual(deliveredOf(recordCall(f.store, PROJECT, request(f, { packet }))).call, saved);
-  const other = { ...packet as object, semanticBasis: { meaning: 'foreign cart' } } as Json;
+  const saved = deliveredOf(recordCall(f.store, f.project, input)).call;
+  assert.deepEqual(saved.value.packet, { hash: hashJson(packet), chars: text.length, bytes: Buffer.byteLength(text, 'utf8') });
+  assert.deepEqual(deliveredOf(recordCall(f.store, f.project, input)).call, saved);
+  const other = { ...packet, brief: { ...packet.brief, text: `${text} (foreign)` } } as Json;
   assert.notEqual(hashJson(packet), hashJson(other));
   const before = f.store.list().map(reference);
-  assert.equal(recordCall(f.store, PROJECT, request(f, { packet: other })).ok, false);
+  addressed(recordCall(f.store, f.project, { ...input, packet: other }), 'call_identity_conflict');
   assert.deepEqual(f.store.list().map(reference), before);
   for (const field of ['text', 'labels', 'manifest', 'references', 'contract', 'requestId']) {
     const broken = structuredClone(packet) as Record<string, any>; delete broken.brief[field];
-    addressed(recordCall(f.store, PROJECT, request(f, { packet: broken })), 'packet_invalid');
+    addressed(recordCall(f.store, f.project, { ...input, packet: broken }), 'packet_invalid');
     assert.deepEqual(f.store.list().map(reference), before);
   }
 });
