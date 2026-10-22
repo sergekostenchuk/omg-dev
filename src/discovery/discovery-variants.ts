@@ -41,6 +41,13 @@ export interface VariantNone {
   contract: typeof VARIANT_NONE_CONTRACT; projectId: string; draft: Ref; snapshot: Ref; origin: VariantOrigin;
   reasons: VariantReason[]; searchLimits: string[]; unknowns: string[];
 }
+/** 4T.3: the closed wire answer of a variant generation call (purpose variant-proposal). Local keys only: turning them
+ * into immutable member Refs and publishing the set belong to 4B.1, never to the transport. */
+export interface VariantGenerationMember { key: string; title: string; proposal: Json; criteria: VariantJudgements }
+export type VariantGenerationAnswer = {
+  action: 'variants'; variants: VariantGenerationMember[]; scale: VariantScale; comparison: string;
+  recommendation: { key: string; reason: string }; searchLimits: string[]; unknowns: string[];
+} | { action: 'no_variants'; reasons: VariantReason[]; searchLimits: string[]; unknowns: string[] };
 export interface VariantRecordView { get<T = Json>(id: string, revision?: number): Revision<T> | null }
 export interface StructuralVariantRecord<T> { verification: 'structural'; record: Revision<T> }
 
@@ -137,28 +144,66 @@ export function decodeVariantSnapshot(value: unknown): VariantSnapshot {
   });
   return structuredClone(value) as unknown as VariantSnapshot;
 }
+function judgements(value: unknown, at: string): asserts value is VariantJudgements {
+  variantShape(value, VARIANT_CRITERIA, at);
+  for (const criterion of VARIANT_CRITERIA) {
+    const field = `${at}.${criterion}`, judgement = value[criterion];
+    variantShape(judgement, ['conclusion', 'grounds', 'assumptions', 'unknowns', 'quantity'], field);
+    variantText(judgement.conclusion, `${field}.conclusion`); variantRefs(judgement.grounds, `${field}.grounds`);
+    variantTexts(judgement.assumptions, `${field}.assumptions`); variantTexts(judgement.unknowns, `${field}.unknowns`);
+    if (!judgement.grounds.length && !judgement.assumptions.length && !judgement.unknowns.length)
+      variantInvalid(field, 'A conclusion exposes grounds, assumptions or unknowns');
+    if (judgement.quantity !== null) {
+      const q = judgement.quantity;
+      variantShape(q, ['unit', 'minimum', 'maximum', 'limitations', 'grounds'], `${field}.quantity`);
+      variantText(q.unit, `${field}.quantity.unit`); variantText(q.limitations, `${field}.quantity.limitations`);
+      if (typeof q.minimum !== 'number' || !Number.isFinite(q.minimum) || typeof q.maximum !== 'number'
+        || !Number.isFinite(q.maximum) || q.minimum > q.maximum) variantInvalid(`${field}.quantity`, 'Expected a finite ordered range');
+      variantRefs(q.grounds, `${field}.quantity.grounds`, 1);
+    }
+  }
+}
 export function decodeDiscoveryVariant(value: unknown): DiscoveryVariant {
   variantShape(value, ['contract', 'projectId', 'draft', 'snapshot', 'origin', 'key', 'title', 'proposal', 'scale', 'criteria'], 'variant');
   variantBasis(value, VARIANT_CONTRACT); variantRef(value.snapshot, 'snapshot'); variantOrigin(value.origin, 'origin');
   variantText(value.key, 'key'); variantText(value.title, 'title'); json(value.proposal, 'proposal'); scale(value.scale, 'scale');
-  variantShape(value.criteria, VARIANT_CRITERIA, 'criteria');
-  for (const criterion of VARIANT_CRITERIA) {
-    const at = `criteria.${criterion}`, judgement = value.criteria[criterion];
-    variantShape(judgement, ['conclusion', 'grounds', 'assumptions', 'unknowns', 'quantity'], at);
-    variantText(judgement.conclusion, `${at}.conclusion`); variantRefs(judgement.grounds, `${at}.grounds`);
-    variantTexts(judgement.assumptions, `${at}.assumptions`); variantTexts(judgement.unknowns, `${at}.unknowns`);
-    if (!judgement.grounds.length && !judgement.assumptions.length && !judgement.unknowns.length)
-      variantInvalid(at, 'A conclusion exposes grounds, assumptions or unknowns');
-    if (judgement.quantity !== null) {
-      const q = judgement.quantity;
-      variantShape(q, ['unit', 'minimum', 'maximum', 'limitations', 'grounds'], `${at}.quantity`);
-      variantText(q.unit, `${at}.quantity.unit`); variantText(q.limitations, `${at}.quantity.limitations`);
-      if (typeof q.minimum !== 'number' || !Number.isFinite(q.minimum) || typeof q.maximum !== 'number'
-        || !Number.isFinite(q.maximum) || q.minimum > q.maximum) variantInvalid(`${at}.quantity`, 'Expected a finite ordered range');
-      variantRefs(q.grounds, `${at}.quantity.grounds`, 1);
-    }
-  }
+  judgements(value.criteria, 'criteria');
   return structuredClone(value) as unknown as DiscoveryVariant;
+}
+/** 4T.3: the closed generation answer — one to three variants with unique local keys on one shared scale and a
+ * recommendation naming an existing key; no_variants is a separate result with its reasons. */
+export function decodeVariantGeneration(value: unknown): VariantGenerationAnswer {
+  const code = 'discovery_variant_answer_invalid';
+  try {
+    if (!variantObject(value) || (value.action !== 'variants' && value.action !== 'no_variants'))
+      variantInvalid('action', 'Expected variants or no_variants', code);
+    if (value.action === 'no_variants') {
+      variantShape(value, ['action', 'reasons', 'searchLimits', 'unknowns'], 'answer', code);
+      if (!Array.isArray(value.reasons) || value.reasons.length === 0) variantInvalid('reasons', 'no_variants explains its result', code);
+      Array.from(value.reasons).forEach((reason, i) => variantReason(reason, `reasons.${i}`));
+    } else {
+      variantShape(value, ['action', 'variants', 'scale', 'comparison', 'recommendation', 'searchLimits', 'unknowns'], 'answer', code);
+      if (!Array.isArray(value.variants) || value.variants.length < 1 || value.variants.length > 3)
+        variantInvalid('variants', 'A generation proposes one to three variants', code);
+      const keys = new Set<string>();
+      Array.from(value.variants).forEach((member: unknown, i: number) => {
+        const at = `variants.${i}`;
+        variantShape(member, ['key', 'title', 'proposal', 'criteria'], at, code);
+        variantText(member.key, `${at}.key`); variantText(member.title, `${at}.title`);
+        if (keys.has(member.key)) variantInvalid(`${at}.key`, 'Local variant keys are unique', code);
+        keys.add(member.key); json(member.proposal, `${at}.proposal`); judgements(member.criteria, `${at}.criteria`);
+      });
+      scale(value.scale, 'scale'); variantText(value.comparison, 'comparison');
+      variantShape(value.recommendation, ['key', 'reason'], 'recommendation', code);
+      variantText(value.recommendation.key, 'recommendation.key'); variantText(value.recommendation.reason, 'recommendation.reason');
+      if (!keys.has(value.recommendation.key)) variantInvalid('recommendation.key', 'The recommendation names an existing local key', code);
+    }
+    variantTexts(value.searchLimits, 'searchLimits', 1); variantTexts(value.unknowns, 'unknowns');
+  } catch (error) {
+    if (!(error instanceof EngineError) || error.code === code) throw error;
+    throw new EngineError(code, error.message, error.details);
+  }
+  return structuredClone(value) as unknown as VariantGenerationAnswer;
 }
 export function decodeVariantSet(value: unknown): VariantSet {
   variantShape(value, ['contract', 'projectId', 'draft', 'snapshot', 'origin', 'members', 'scale', 'comparison', 'recommendation', 'searchLimits', 'unknowns'], 'set');

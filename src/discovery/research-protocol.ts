@@ -35,7 +35,7 @@ import { invocationProgress, consumeInvocationAllowance, requireInvocationAllowa
 import { requireContextDelivery } from './context-workspace.js';
 import { interceptResearchPreview, isResearchPreview } from './research-preview.js';
 import type { RuntimeObservation } from '../runtime/runtime-observation-model.js';
-import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject } from "./continuation-packet.js";
+import { assessmentTransportPrompt, packetAssessmentSubject, sameAssessmentSubject, proveAssessmentTransportSubject, assessmentSubjectKey, continuationState, continuationDispatch, continuationMetadata, continuationPrompt, packetPlanSubject, packetVariantSubject } from "./continuation-packet.js";
 import { estimateCliCall } from "../adapters/codex-estimate.js";
 import { assertPilotBoundary } from "./reader-pilot.js";
 import { phasePolicy } from "./phase-policy.js";
@@ -54,7 +54,7 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { workingContext } from "./working-context.js";
-import { replayAssessmentApplication } from "./response-replay.js";
+import { replayAssessmentApplication, replayVariantResponse } from "./response-replay.js";
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
   readResearchConsumerIntent, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, prepareResearchConsumerReservation, consumerIntentContext, CONSUMER_INTENT_V2,
@@ -233,8 +233,10 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   }
   requireCondition(!planSubject || audit?.questionId && draft, 'research_plan_subject_invalid',
     'A plan subject requires the common saved-question packet');
+  // 4T.3: the variant subject travels on its own transport branch of the common packer (4T.2-T).
+  const variantSubject = packetVariantSubject(context);
   const packetState = audit?.questionId && draft ? continuationState(audit.store, environment.projectId, audit.draftId,
-    audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject) : null;
+    audit.questionId, audit.purpose, role.actor, planSubject, assessmentSubject, variantSubject) : null;
   const consolidating = (context as any)?.dispatchMode === 'consolidation';
   const controls = (context as any)?.contextControls;
   const finalizing = !consolidating && controls?.mode === 'finalization';
@@ -249,7 +251,8 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
     controls && !consolidating ? JSON.stringify({...envelope,prompt:finalInstruction,subject:{}}).length : 0) + (packetState ? 4000 : 0);
   const subjectFor = (limit: number) => {
     const packed = packetState ? workingContext(audit!.store, environment.projectId, audit!.draftId, audit!.questionId!, packingContext,
-      limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}), continuation: !packetState.initial,
+      limit, { common: true, purpose: audit!.purpose, ...(planSubject?{subject:planSubject}:{}), ...(assessmentSubject?{assessmentSubject}:{}),
+        ...(variantSubject?{variantSubject,actor:role.actor}:{}), continuation: !packetState.initial,
         ...(packetState.latest ? { previous: packetState.latest } : {}),
         ...(audit!.pilot ? { contextChars: audit!.pilot.value.maxRequestChars } : {}),
         ...(audit!.pilot ? { extractedChars: audit!.pilot.value.maxRequestChars } : {}),
@@ -411,6 +414,16 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     assertPilotBoundary(audit.store, environment.projectId, phase);
   }
   requireCondition(!draft || Boolean(audit?.questionId), "continuation_question_missing", "A saved research draft cannot bypass the common packer by omitting its question");
+  // 4T.3: a variant call travels on its own branch — no consumer intent, assessment or plan subject; it creates no
+  // attempt, progress or assessor. Its paid answer of exactly this saved identity returns before packing or payment.
+  const variantSubject = packetVariantSubject(context);
+  if (variantSubject) {
+    requireCondition(audit && draft && audit.questionId && !consumerIntent && !assessment && !assessmentSubject && !planSubject,
+      'discovery_variant_subject_invalid', 'A variant call needs its saved draft and Question, without an intent, assessment or plan subject');
+    const paid = replayVariantResponse(audit.store, environment.projectId, audit.draftId, audit.questionId, audit.purpose,
+      role.actor, variantSubject);
+    if (paid) { audit.onContext?.(paid.subject); return paid.research; }
+  }
   const requestId = randomUUID();
   const callId = consumerIntent ? `model-call:consumer:v1:${requestId}` : `model-call:${requestId}`;
   const capacity = consumerIntent?.value.cursor.resultCapacity
@@ -479,8 +492,9 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     throw error;
   }
   const progressContext = (subject as any)?.contextControls ? {...context as Record<string,any>,contextControls:(subject as any).contextControls} : context;
-  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor,assessmentSubject):null;
-  const reservation = !stagePlan && audit?.pilot ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
+  const progress=packetState?invocationProgress(audit!.store,audit!.questionId!,audit!.purpose,progressContext as Record<string,any>,planSubject,role.actor,assessmentSubject,variantSubject):null;
+  const reservation: { writes: Write[]; guards: TransactionGuard[] } = !stagePlan && audit?.pilot
+    ? pilotDispatch(audit.store, audit.pilot, callId, input.length) : { writes: [], guards: [] };
   if (stagePlan && stageEstimate && audit && draft) {
     // The closing-kind whitelist is empty until DR6/DR7. No caller/model field
     // (role, purpose, finalization mode or attempt end) grants completion funds.
@@ -526,13 +540,14 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     reservation.guards.push(...manifestReservationResult.guards);
   }
   if (packetState) {
-    const questionCounterId=`question-dispatch:${hashJson(assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? [environment.projectId,planSubject] : audit!.questionId!)}`;
+    const questionCounterId=`question-dispatch:${hashJson(variantSubject ? ['variant/v1',environment.projectId,audit!.draftId,audit!.questionId!,variantSubject,audit!.purpose,role.actor] : assessmentSubject ? [environment.projectId,assessmentSubject] : planSubject ? [environment.projectId,planSubject] : audit!.questionId!)}`;
     const questionCounter=audit!.store.get<{projectId:string;question:string;serial:number;subject?:V7PlanSubject;assessmentKey?:string}>(questionCounterId);
     requireCondition(!questionCounter||(questionCounter.kind==='question-dispatch'&&questionCounter.value.projectId===environment.projectId
-      &&questionCounter.value.question===audit!.questionId&&(questionCounter.value.assessmentKey??null)===assessmentSubjectKey(assessmentSubject)&&sameSubject(packetPlanSubject(questionCounter.value),planSubject)&&Number.isSafeInteger(questionCounter.value.serial)&&questionCounter.value.serial>=0),
+      &&questionCounter.value.question===audit!.questionId&&(questionCounter.value.assessmentKey??null)===assessmentSubjectKey(assessmentSubject)&&sameSubject(packetPlanSubject(questionCounter.value),planSubject)
+      &&canonical(packetVariantSubject(questionCounter.value))===canonical(variantSubject)&&Number.isSafeInteger(questionCounter.value.serial)&&questionCounter.value.serial>=0),
     'research_dispatch_invalid','Invalid question dispatch counter');
     reservation.writes.push({id:questionCounterId,kind:'question-dispatch',expected:questionCounter?.revision??0,
-      value:{projectId:environment.projectId,question:audit!.questionId,...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),...(planSubject?{subject:planSubject}:{}),serial:(questionCounter?.value.serial??0)+1}});
+      value:{projectId:environment.projectId,question:audit!.questionId,...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),...(planSubject?{subject:planSubject}:{}),...(variantSubject?{variantSubject}:{}),serial:(questionCounter?.value.serial??0)+1}});
     if(questionCounter) reservation.guards.push(reference(questionCounter));
     if(audit!.session) reservation.guards.push(audit!.session);
     const dispatch = continuationDispatch(packetState, callId);
@@ -549,6 +564,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
         groups: [DISCOVERY_V7_STAGE_BUDGET_KEY], estimate: stageEstimate } } : {}),
       ...(progress?{progressKey:progress.key}:{}),
       ...(assessmentSubject?{assessmentKey:assessmentSubjectKey(assessmentSubject)}:{}),
+      ...(variantSubject?{variantSubject}:{}),
       ...(ownership ?? {}),
       ...(audit?.application ? { assessmentApplication: audit.application } : {}),
       ...(consumerIntent ? { consumerIntent: reference(consumerIntent) } : {}),

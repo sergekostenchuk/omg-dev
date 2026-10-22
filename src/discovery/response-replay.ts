@@ -1,7 +1,9 @@
 import { researchCapacityProjection } from './early-research-outcome.js';
 import { readResearchExecution } from './response-recovery.js';
 import type { RecoverableContextSession } from './context-recovery.js';
-import { packetAssessmentSubject, sameAssessmentSubject, assessmentSubjectKey } from './continuation-packet.js';
+import { packetAssessmentSubject, sameAssessmentSubject, assessmentSubjectKey, packetVariantSubject, variantCallMatches } from './continuation-packet.js';
+import type { VariantSubject } from './discovery-variants.js';
+import { readArchiveBody } from './request-parts.js';
 import type { Store, Revision } from "../storage/store.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import type { ModelCall } from "../runtime/model-usage.js";
@@ -150,4 +152,33 @@ export function replayAssessmentApplication(store: Store, session: Revision<Reco
     && canonical(paid.body[key])===canonical(app.context[key])),
     'The paid wire changed its prepared assessment context');
   return paid.kind==='response'?paid:null;
+}
+
+/** 4T.3: the paid answer of exactly this saved variant transport identity — project, the draft and Question edition of
+ * its first packet, purpose, actor and the complete variantSubject — returns again without another payment. Only the
+ * saved identity is compared: today's mode or state heads never select or replace it, and another identity never
+ * receives this answer. A running call recovers first; several paid matches are a typed refusal, never a pick. */
+export function replayVariantResponse(store: Store, projectId: string, draftId: string, questionId: string,
+  purpose: string, actor: string, variant: VariantSubject): { research: unknown; subject: Record<string, any>; call: Ref; response: Ref } | null {
+  const draft = store.get<DiscoveryDraft>(draftId), question = store.get<Question>(questionId);
+  if (draft?.kind !== 'discovery-draft' || question?.kind !== 'question') return null;
+  const own = store.list<ModelCall>('model-call').filter(call => call.value.projectId === projectId && call.value.purpose === purpose
+    && call.value.requested?.actor === actor && canonical(packetVariantSubject(call.value)) === canonical(variant)
+    && variantCallMatches(store, call, projectId, reference(draft), reference(question), purpose, actor, variant));
+  requireCondition(!own.some(call => call.value.status === 'running'), 'continuation_call_active',
+    'This variant identity has an unfinished invocation; recover its actual outcome before another dispatch');
+  const paid = own.filter(call => call.value.status === 'succeeded');
+  if (paid.length === 0) return null;
+  requireCondition(paid.length === 1, 'research_replay_invalid', 'Several paid calls answer this exact variant identity');
+  const call = paid[0]!, ref = call.value.response?.record;
+  requireCondition(isRef(ref), 'research_replay_invalid', 'The paid variant call lost its complete saved response');
+  const response = store.get<{ projectId: string; draftId: string; text: string }>(ref.id, ref.revision);
+  requireCondition(response?.kind === 'model-response' && response.hash === ref.hash && response.hash === hashJson(response.value)
+    && response.value.projectId === projectId && response.value.draftId === draftId,
+  'research_replay_invalid', 'The saved variant response does not match its audit record');
+  const payload = JSON.parse(response.value.text);
+  requireCondition(payload?.protocol === 'omg-agent/v1' && payload.requestId === call.value.requestId && Object.hasOwn(payload, 'research'),
+    'research_replay_invalid', 'The saved variant response has a foreign request envelope');
+  const archive = store.get<Record<string, any>>(call.value.packet!.archive.id, call.value.packet!.archive.revision)!;
+  return { research: payload.research, subject: readArchiveBody(store, archive).body, call: reference(call), response: reference(response) };
 }
