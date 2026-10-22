@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -13,7 +14,7 @@ import type { Graph } from "../src/graph/model.js";
 import { projectGraph } from "../src/graph/project.js";
 import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
-import { Store } from "../src/storage/store.js";
+import { Store, type Revision } from "../src/storage/store.js";
 import { gapId, readGaps, writeGaps, type Gap, type GapRequest, type GapReadRequest } from "../src/om/gaps.js";
 import { mergeLines, prepareGapLines, writeGapLines, readGapLines, gapLinesId, gapLineKey, gapLineExpectedResult, GAP_LINE_KIND,
   type GapLine, type GapLineClosure, type GapLinesRequest, type GapLinesRecord, type GapClosureRequest } from "../src/om/gap-lines.js";
@@ -25,9 +26,10 @@ import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { openSeries, beginAttempt, completeAttempt, readSeries, readSeriesAt, type AttemptGoal, type SeriesRequest } from "../src/om/series.js";
+import { openSeries, beginAttempt, completeAttempt, readSeries, readSeriesAt, type AttemptGoal, type RepairSeries, type SeriesRequest } from "../src/om/series.js";
 import { confirmResults } from "../src/om/achievements.js";
-import { closeAttempt, prepareCloseAttempt } from "../src/om/repeat-gate.js";
+import { closeAttempt, openAttempt as managedOpenAttempt, prepareCloseAttempt } from "../src/om/repeat-gate.js";
+import { writeRoutes } from "../src/om/routes.js";
 import { readResultIdentity } from "../src/om/result-identity.js";
 import { gardenGraph, refusedWith, sameButReferences } from "./om-fixture.js";
 import { preparedFeatures } from "./product-fixture.js";
@@ -268,6 +270,16 @@ function denied(value: OmResult<unknown>, code: string | readonly string[]): Ref
   addressed(refusal); return refusal;
 }
 const historySnapshot = (store: Store) => store.list().map(row => ({ head: reference(row), history: store.history(row.id).map(reference) }));
+/** An explicitly negative mutation of a lawfully created record: bytes are replaced in place, the Ref stays exact. */
+function rewrite<T>(store: Store, record: Revision<T>, value: T): Revision<T> {
+  const database = new DatabaseSync(store.path), hash = hashJson(value);
+  try {
+    database.exec("DROP TRIGGER IF EXISTS revisions_no_update");
+    database.prepare("UPDATE revisions SET body=?, sha256=? WHERE entity_id=? AND revision=?")
+      .run(canonical(value), hash, record.id, record.revision);
+  } finally { database.close(); }
+  return { ...record, hash, value };
+}
 function firstPassFixture(t: TestContext) {
   const root = mkdtempSync(join(tmpdir(), "omg-gap-lines-")), database = join(root, "state.sqlite");
   const store = new Store(database);
@@ -673,30 +685,82 @@ test("D2 verifies the exact earlier attempt goal and retains that historical lin
 });
 
 test("D2 unrelated attempts and a shifted series cannot close a line or partially write a neighbor", async t => {
-  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request)), next = acceptOperations(f);
-  const block = ok(prepareFrame(f.store, next.gaps.sources.operations.frame)).result.obligations.find(item => item.id === next.line.target)!.upper.node;
-  const goal = goalFor(next.line), saved = await f.store.snapshot(join(f.root, "before-attempt"));
-  const cases: Array<{ project?: string; block?: string; goal?: AttemptGoal; ordinal?: number; corruptHash?: boolean; code: string }> = [
-    { project: "other", code: "record_foreign" }, { block: "garden-other-block", code: "closure_unconfirmed" },
-    { goal: { ...goal, questions: ["another-question"] }, code: "closure_unconfirmed" },
-    { goal: { ...goal, result: "another-result" }, code: "closure_unconfirmed" },
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
+  const line = f.gaps.collection.gaps.find(item => item.field === "fill" && item.evidence.some(evidence => evidence.origin === "operations"))!;
+  const block = ok(prepareFrame(f.store, f.frame)).result.obligations.find(item => item.id === line.target)!.upper.node;
+  // LG07 gl-a: the real M6 of the original D1 — whole node-expansion MC2 batches — before the acceptance can retire it.
+  const routes = ok(writeRoutes(f.store, { project: "garden", gaps: f.initial, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const carrier = (batch: (typeof routes.value.batches)[number]) => ({ batch,
+    goal: { key: `goal:${gapLineKey("garden", batch.items[0]!.target, batch.items[0]!.field)}`,
+      questions: batch.items.map(item => gapLineKey("garden", item.target, item.field)).sort(),
+      result: gapLineExpectedResult("garden", batch.items[0]!.target, batch.items[0]!.field) },
+    completion: { routes: reference(routes), batches: [batch.id] } });
+  const ownBatch = routes.value.batches.find(item => item.model === "MC2" && item.task === "node-expansion" && item.node === block);
+  assert.ok(ownBatch, "The chosen fill's owner must have a node-expansion batch");
+  assert.ok(ownBatch.items.some(item => item.target === line.target));
+  const otherBatch = routes.value.batches.find(item => item.model === "MC2" && item.task === "node-expansion" && item.node !== block);
+  assert.ok(otherBatch, "The graph needs another real block with its own node-expansion batch");
+  const own = carrier(ownBatch), other = carrier(otherBatch);
+  const address = { project: "garden", block, line: 1 };
+  ok(openSeries(f.store, { ...address, slice: "operations", predecessor: null, basis: null }));
+  const attempt = ok(managedOpenAttempt(f.store, { ...address, attempt: 1, goal: own.goal, completion: own.completion }));
+  // The snapshot precedes the acceptance: each case replays acceptOperations AFTER its own attempt, as the engine does.
+  const saved = await f.store.snapshot(join(f.root, "before-attempt"));
+  const cases: Array<{ project?: string; block?: string; mutateGoal?: "questions" | "result"; ordinal?: number; corruptHash?: boolean; code: string }> = [
+    { project: "other", code: "record_foreign" }, { block: otherBatch.node!, code: "closure_unconfirmed" },
+    { mutateGoal: "questions", code: "closure_unconfirmed" }, { mutateGoal: "result", code: "closure_unconfirmed" },
     { ordinal: 2, code: "closure_unconfirmed" }, { corruptHash: true, code: "record_forged" },
   ];
   for (const [index, variant] of cases.entries()) {
     const path = join(f.root, `bad-attempt-${index}.sqlite`); copyFileSync(saved.path, path);
     const store = new Store(path);
     try {
-      const address = { project: variant.project ?? "garden", block: variant.block ?? block, line: 1 };
-      const attempt = openAttempt(store, address, variant.goal ?? goal);
-      const series = variant.corruptHash ? { ...reference(attempt), hash: "0".repeat(64) } : reference(attempt);
+      let series: Ref;
+      if (variant.project !== undefined) {
+        // Boundary: a managed opening refuses a foreign-project plan (record_foreign on om-routes) — no lawful managed
+        // series of project "other" exists, so this case keeps the previous standalone opening.
+        series = reference(openAttempt(store, { project: variant.project, block, line: 1 }, goalFor(line)));
+      } else if (variant.block !== undefined) {
+        const foreign = { project: "garden", block: variant.block, line: 1 };
+        ok(openSeries(store, { ...foreign, slice: "operations", predecessor: null, basis: null }));
+        series = reference(ok(managedOpenAttempt(store, { ...foreign, attempt: 1, goal: other.goal, completion: other.completion })));
+      } else if (variant.mutateGoal !== undefined) {
+        const head = store.get<RepairSeries>(attempt.id)!, value = clone(head.value) as Record<string, any>;
+        const running = (value.attempts as { ordinal: number; goal: { questions: string[]; result: string } }[])
+          .find(item => item.ordinal === 1)!;
+        if (variant.mutateGoal === "questions") running.goal.questions = ["another-question"];
+        else running.goal.result = "another-result";
+        series = reference(rewrite(store, head, value as RepairSeries));
+      } else {
+        series = reference(store.get(attempt.id)!);
+      }
+      const next = acceptOperations({ ...f, store });
+      const link = variant.corruptHash ? { ...series, hash: "0".repeat(64) } : series;
       const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
-        closures: [{ ...next.closure, attempt: { series, attempt: variant.ordinal ?? 1 } }] };
+        closures: [{ ...next.closure, attempt: { series: link, attempt: variant.ordinal ?? 1 } }] };
       const before = historySnapshot(store);
       for (const operation of [prepareGapLines, writeGapLines]) denied(operation(store, request), variant.code);
       assert.deepEqual(historySnapshot(store), before);
     } finally { store.close(); }
   }
-  const address = { project: "garden", block, line: 1 }, attempt = openAttempt(f.store, address, goal);
+  const next = acceptOperations(f);
+  assert.equal(next.line.id, line.id);
+  const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
+    closures: [{ ...next.closure, attempt: { series: reference(attempt), attempt: 1 } }] };
+  const prepared = ok(prepareGapLines(f.store, request));
+  assert.ok(prepared.guards.some(ref => ref.id === attempt.id));
+  const closed = ok(writeGapLines(f.store, request));
+  assert.deepEqual(closed.value, prepared.record);
+  const confirmed = ok(confirmResults(f.store, { project: "garden", block, target: attempt.id, goal: own.goal,
+    accepting: [reference(closed)], cancelling: [] }));
+  const identity = ok(readResultIdentity(f.store, { acceptance: next.acceptance, obligation: line.target }));
+  assert.deepEqual(confirmed, { achieved: [{ key: identity.key, basis: reference(closed) }], cancelled: [] });
+});
+
+test("D2 prepared closure CAS loses to a shifted attempt series and writes no neighbor", t => {
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request)), next = acceptOperations(f);
+  const block = ok(prepareFrame(f.store, next.gaps.sources.operations.frame)).result.obligations.find(item => item.id === next.line.target)!.upper.node;
+  const address = { project: "garden", block, line: 1 }, attempt = openAttempt(f.store, address, goalFor(next.line));
   const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
     closures: [{ ...next.closure, attempt: { series: reference(attempt), attempt: 1 } }] };
   const prepared = ok(prepareGapLines(f.store, request));
