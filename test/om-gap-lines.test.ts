@@ -26,9 +26,10 @@ import { writeCandidate } from "../src/om/frame-candidate.js";
 import { settleCandidate, type AcceptedFrameRequest } from "../src/om/frame-accept.js";
 import { writeGuarded } from "../src/om/refs.js";
 import type { OmResult, Refusal } from "../src/om/refusal.js";
-import { openSeries, beginAttempt, completeAttempt, readSeries, readSeriesAt, type AttemptGoal, type RepairSeries, type SeriesRequest } from "../src/om/series.js";
+import { openSeries, readSeries, readSeriesAt, readCompletionBinding, completionRootAssignments, type AttemptGoal, type RepairSeries, type SeriesRequest } from "../src/om/series.js";
 import { confirmResults } from "../src/om/achievements.js";
-import { closeAttempt, openAttempt as managedOpenAttempt, prepareCloseAttempt } from "../src/om/repeat-gate.js";
+import { closeAttempt, openAttempt as managedOpenAttempt, prepareCloseAttempt, prepareManagedClaim } from "../src/om/repeat-gate.js";
+import { writeCompletionCessation } from "../src/om/model-call.js";
 import { writeRoutes } from "../src/om/routes.js";
 import { readResultIdentity } from "../src/om/result-identity.js";
 import { gardenGraph, refusedWith, sameButReferences } from "./om-fixture.js";
@@ -636,9 +637,33 @@ function goalFor(line: Pick<GapLine, "target" | "field">): AttemptGoal {
   return { key: `goal:${gapLineKey("garden", line.target, line.field)}`,
     questions: [gapLineKey("garden", line.target, line.field)], result: gapLineExpectedResult("garden", line.target, line.field) };
 }
-function openAttempt(store: Store, address: SeriesRequest, goal: AttemptGoal) {
+/** LG07 gl-rest (№10753 п.5): a closure's D2 names a lawful managed attempt — the series is opened on the exact
+ * current head with the whole node-expansion M6 batch of the filled line's own block, while that D1 is current. */
+function managedCarrier(store: Store, frame: FrameRequest, initial: GapReadRequest, line: Pick<GapLine, "target" | "field">) {
+  const block = ok(prepareFrame(store, frame)).result.obligations.find(item => item.id === line.target)!.upper.node;
+  const routes = ok(writeRoutes(store, { project: "garden", gaps: initial, tasks: [], catalog: { paths: [], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(item => item.model === "MC2" && item.task === "node-expansion" && item.node === block);
+  assert.ok(batch, "The closing line's owner must have a node-expansion batch");
+  assert.ok(batch.items.some(item => item.target === line.target && item.field === line.field));
+  const first = batch.items[0]!, address: SeriesRequest = { project: "garden", block, line: 1 };
+  const goal: AttemptGoal = { key: `goal:${gapLineKey("garden", first.target, first.field)}`,
+    questions: batch.items.map(item => gapLineKey("garden", item.target, item.field)).sort(),
+    result: gapLineExpectedResult("garden", first.target, first.field) };
   ok(openSeries(store, { ...address, slice: "operations", predecessor: null, basis: null }));
-  return ok(beginAttempt(store, { ...address, attempt: 1, goal }));
+  const completion = { routes: reference(routes), batches: [batch.id] };
+  const attempt = ok(managedOpenAttempt(store, { ...address, attempt: 1, goal, completion }));
+  const binding = ok(readCompletionBinding(store, "garden", reference(attempt), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, completion); assert.deepEqual(binding.value.goal, goal);
+  return { address, attempt, goal, completion, batch, routes, binding };
+}
+/** The only lawful G7 end of a managed attempt in these fixtures: the acceptance moved the graph its M6 batch stood
+ * on, so the root assignment ceases by its proved cause and the derived claim closes the attempt. */
+function closeCarrier(store: Store, carrier: ReturnType<typeof managedCarrier>, accepting: readonly Ref[] = []) {
+  const root = completionRootAssignments(carrier.binding)[0]!;
+  ok(writeCompletionCessation(store, { project: "garden", binding: reference(carrier.binding), assignment: reference(root) }));
+  const claim = ok(prepareManagedClaim(store, { ...carrier.address, attempt: 1,
+    outcome: { reason: "result", accepting: [...accepting], cancelling: [], refusals: [] } }));
+  return ok(closeAttempt(store, { ...carrier.address, attempt: 1, outcome: claim.outcome }));
 }
 
 /**
@@ -844,13 +869,18 @@ test("D2 unrelated attempts and a shifted series cannot close a line or partiall
 });
 
 test("D2 prepared closure CAS loses to a shifted attempt series and writes no neighbor", t => {
-  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request)), next = acceptOperations(f);
-  const block = ok(prepareFrame(f.store, next.gaps.sources.operations.frame)).result.obligations.find(item => item.id === next.line.target)!.upper.node;
-  const address = { project: "garden", block, line: 1 }, attempt = openAttempt(f.store, address, goalFor(next.line));
+  const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
+  const line = f.gaps.collection.gaps.find(item => item.field === "fill"
+    && item.evidence.some(evidence => evidence.origin === "operations"))!;
+  // LG07 gl-rest (№10753 п.5): the closure's attempt is the real managed carrier, opened before the acceptance can
+  // retire the D1 its M6 stands on — and the series is moved only by a lawful G7 of that same attempt.
+  const carrier = managedCarrier(f.store, f.frame, f.initial, line);
+  const next = acceptOperations(f);
+  assert.equal(next.line.id, line.id);
   const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
-    closures: [{ ...next.closure, attempt: { series: reference(attempt), attempt: 1 } }] };
+    closures: [{ ...next.closure, attempt: { series: reference(carrier.attempt), attempt: 1 } }] };
   const prepared = ok(prepareGapLines(f.store, request));
-  ok(completeAttempt(f.store, { ...address, attempt: 1, outcome: { reason: "interrupted", achieved: [], cancelled: [], refusals: [] } }));
+  closeCarrier(f.store, carrier);
   const before = historySnapshot(f.store);
   denied(writeGuarded(f.store, { unit: "D2-neighbor", target: "bound-attempt", guards: prepared.guards,
     writes: [...prepared.writes, { id: "neighbor:bound-attempt", kind: "neighbor", expected: 0, value: {} }] }), "input_stale");
@@ -896,37 +926,34 @@ test("D2 real C5→D1→D2→G7 A→B→A keeps a closed line and counts only ne
     .find(item => item.kind === "block-outcome" && item.upper.node === "garden-produce-block")!;
   const line = first.value.lines.find(item => item.target === obligation.id && item.field === "fill")!;
   assert.ok(line);
-  const address = { project: "garden", block: obligation.upper.node, line: 1 }, goal = goalFor(line);
-  const firstAttempt = openAttempt(f.store, address, goal), a = acceptOperations(f);
+  // LG07 gl-rest (№10753 п.5): one lawful managed attempt carries every closure of this line — a D2 write can name
+  // only an attempt still open in the current head, so the A→B→A history runs inside it and its single G7 counts the
+  // new semantic results once; the third standalone cycle has no managed carrier and that boundary is pinned below.
+  const carrier = managedCarrier(f.store, f.frame, f.initial, line);
+  const { address, goal } = carrier, a = acceptOperations(f);
   const requestA: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: a.gaps,
     closures: [{ id: line.id, reason: "filled", basis: a.acceptance.frame, acceptance: a.acceptance,
-      attempt: { series: reference(firstAttempt), attempt: 1 } }] };
+      attempt: { series: reference(carrier.attempt), attempt: 1 } }] };
   const closedA = ok(writeGapLines(f.store, requestA));
   const keyA = ok(readResultIdentity(f.store, { acceptance: a.acceptance, obligation: line.target })).key;
-  const confirmedA = ok(confirmResults(f.store, { ...address, target: firstAttempt.id, goal, accepting: [reference(closedA)], cancelling: [] }));
+  const confirmedA = ok(confirmResults(f.store, { ...address, target: carrier.attempt.id, goal, accepting: [reference(closedA)], cancelling: [] }));
   assert.deepEqual(confirmedA.achieved.map(item => item.key), [keyA]);
-  assert.equal(ok(closeAttempt(f.store, { ...address, attempt: 1,
-    outcome: { reason: "result", accepting: [reference(closedA)], cancelling: [], refusals: [] } })).verdict, "progress");
 
-  const secondAttempt = ok(beginAttempt(f.store, { ...address, attempt: 2, goal }));
   const b = replaceOperationResult(f, a.gaps.sources.operations.frame, line.target,
     [{ path: "src/structural-result-b.ts", access: "read", status: "existing" }], "B");
   const requestB: GapLinesRequest = { ...requestA, previous: reference(closedA), pass: 4, gaps: b.gaps,
     closures: [{ id: line.id, reason: "filled", basis: b.acceptance.frame, acceptance: b.acceptance,
-      attempt: { series: reference(secondAttempt), attempt: 2 } }] };
+      attempt: { series: reference(carrier.attempt), attempt: 1 } }] };
   const preparedB = ok(prepareGapLines(f.store, requestB));
-  for (const ref of [reference(closedA), reference(secondAttempt), b.acceptance.graph, b.acceptance.layer, b.acceptance.frame])
+  for (const ref of [reference(closedA), reference(carrier.attempt), b.acceptance.graph, b.acceptance.layer, b.acceptance.frame])
     assert.ok(preparedB.guards.some(item => canonical(item) === canonical(ref)), ref.id);
   const closedB = ok(writeGapLines(f.store, requestB));
   const valueA = closedA.value.lines.find(item => item.id === line.id)!, valueB = closedB.value.lines.find(item => item.id === line.id)!;
   assert.deepEqual(valueB, { ...valueA, basis: b.acceptance.frame, closedPass: 4, statePass: 4 });
   const keyB = ok(readResultIdentity(f.store, { acceptance: b.acceptance, obligation: line.target })).key;
   assert.notEqual(keyB, keyA);
-  assert.deepEqual(ok(confirmResults(f.store, { ...address, target: secondAttempt.id, goal,
+  assert.deepEqual(ok(confirmResults(f.store, { ...address, target: carrier.attempt.id, goal,
     accepting: [reference(closedB)], cancelling: [] })).achieved.map(item => item.key), [keyB]);
-  const changed = ok(closeAttempt(f.store, { ...address, attempt: 2,
-    outcome: { reason: "result", accepting: [reference(closedB)], cancelling: [], refusals: [] } }));
-  assert.equal(changed.verdict, "progress"); assert.equal(changed.withoutProgress, 0);
   const beforeReplay = historySnapshot(f.store);
   assert.deepEqual(ok(writeGapLines(f.store, requestA)), closedA);
   assert.deepEqual(historySnapshot(f.store), beforeReplay);
@@ -937,20 +964,27 @@ test("D2 real C5→D1→D2→G7 A→B→A keeps a closed line and counts only ne
   assert.deepEqual(ok(writeGapLines(reopened, requestA)), closedA);
   assert.deepEqual(ok(writeGapLines(reopened, requestB)), closedB);
   assert.deepEqual(historySnapshot(reopened), afterRestart);
-  const thirdAttempt = ok(beginAttempt(reopened, { ...address, attempt: 3, goal }));
   const restored = replaceOperationResult({ ...f, store: reopened }, b.gaps.sources.operations.frame, line.target, [], "A-restored");
   const restoredRequest: GapLinesRequest = { ...requestB, previous: reference(closedB), pass: 6, gaps: restored.gaps,
     closures: [{ id: line.id, reason: "filled", basis: restored.acceptance.frame, acceptance: restored.acceptance,
-      attempt: { series: reference(thirdAttempt), attempt: 3 } }] };
+      attempt: { series: reference(carrier.attempt), attempt: 1 } }] };
   const restoredLine = ok(writeGapLines(reopened, restoredRequest));
   assert.deepEqual(restoredLine.value.lines.find(item => item.id === line.id), { ...valueA, basis: restored.acceptance.frame, closedPass: 6, statePass: 6 });
+  // The repeat of the same semantic result is exactly the key the first D2 counted — no second key is created.
   assert.equal(ok(readResultIdentity(reopened, { acceptance: restored.acceptance, obligation: line.target })).key, keyA);
-  assert.deepEqual(ok(confirmResults(reopened, { ...address, target: thirdAttempt.id, goal,
+  assert.deepEqual(ok(confirmResults(reopened, { ...address, target: carrier.attempt.id, goal,
     accepting: [reference(restoredLine)], cancelling: [] })).achieved.map(item => item.key), [keyA]);
-  const returned = ok(closeAttempt(reopened, { ...address, attempt: 3,
-    outcome: { reason: "result", accepting: [reference(restoredLine)], cancelling: [], refusals: [] } }));
-  assert.equal(returned.verdict, "none"); assert.equal(returned.withoutProgress, 1);
+  const returned = closeCarrier(reopened, carrier, [reference(closedA), reference(closedB), reference(restoredLine)]);
+  assert.equal(returned.verdict, "progress"); assert.equal(returned.withoutProgress, 0);
+  // The pinned boundary of M6/open: after the close the fresh M6 holds no batch that could carry this goal again —
+  // a repeated managed attempt has no carrier and its opening is refused before anything is written (№10753 п.5).
+  const fresh = ok(writeRoutes(reopened, { project: "garden", gaps: restored.gaps, tasks: [], catalog: { paths: [], records: [] },
+    previous: reference(carrier.routes) }));
+  assert.ok(!fresh.value.batches.some(batch => batch.items.every(item => item.consumers.includes(address.block))
+    && batch.items.some(item => goal.questions.includes(gapLineKey("garden", item.target, item.field)))));
   const beforeRefusal = historySnapshot(reopened);
+  denied(managedOpenAttempt(reopened, { ...address, attempt: 2, goal,
+    completion: { routes: reference(fresh), batches: [] } }), "completion_request_invalid");
   for (const operation of [prepareGapLines, writeGapLines]) {
     denied(operation(reopened, { ...requestB, closures: requestA.closures }), "pass_conflict");
     denied(operation(reopened, { ...restoredRequest, pass: 3 }), "pass_out_of_order");
@@ -965,21 +999,24 @@ test("D2 historical closure stays bound to its saved D1 context on replay, confi
   const obligation = ok(prepareFrame(f.store, f.frame)).result.obligations
     .find(item => item.kind === "block-outcome" && item.upper.node === "garden-produce-block")!;
   const line = first.value.lines.find(item => item.target === obligation.id && item.field === "fill")!;
-  const address = { project: "garden", block: obligation.upper.node, line: 1 }, goal = goalFor(line);
-  const firstAttempt = openAttempt(f.store, address, goal), a = acceptOperations(f);
+  // LG07 gl-rest (№10753 п.5): one lawful managed attempt stays open through both closures — a D2 write can name
+  // only an attempt still open in the current head, so the A and B closures share its carrier.
+  const carrier = managedCarrier(f.store, f.frame, f.initial, line);
+  const { address, goal } = carrier, a = acceptOperations(f);
   const requestA: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: a.gaps,
     closures: [{ id: line.id, reason: "filled", basis: a.acceptance.frame, acceptance: a.acceptance,
-      attempt: { series: reference(firstAttempt), attempt: 1 } }] };
+      attempt: { series: reference(carrier.attempt), attempt: 1 } }] };
   const closedA = ok(writeGapLines(f.store, requestA));
-  ok(closeAttempt(f.store, { ...address, attempt: 1,
-    outcome: { reason: "result", accepting: [reference(closedA)], cancelling: [], refusals: [] } }));
-  const secondAttempt = ok(beginAttempt(f.store, { ...address, attempt: 2, goal }));
   const b = replaceOperationResult(f, a.gaps.sources.operations.frame, line.target,
     [{ path: "src/B.ts", access: "read", status: "existing" }], "context-B");
   const requestB: GapLinesRequest = { ...requestA, previous: reference(closedA), pass: 4, gaps: b.gaps,
     closures: [{ id: line.id, reason: "filled", basis: b.acceptance.frame, acceptance: b.acceptance,
-      attempt: { series: reference(secondAttempt), attempt: 2 } }] };
+      attempt: { series: reference(carrier.attempt), attempt: 1 } }] };
   const closedB = ok(writeGapLines(f.store, requestB));
+  // A complete exact registry lets the managed close reach the substance of a forged accepting — without it the
+  // answer would be completion_incomplete and the forged record would never be judged.
+  const rootAssignment = completionRootAssignments(carrier.binding)[0]!;
+  ok(writeCompletionCessation(f.store, { project: "garden", binding: reference(carrier.binding), assignment: reference(rootAssignment) }));
   const bad: GapLinesRequest = { ...clone(closedB.value.request) as GapLinesRequest, previous: reference(closedB), pass: 6,
     closures: [{ ...requestB.closures[0]!, basis: a.acceptance.frame, acceptance: a.acceptance }] };
   assert.notDeepEqual(bad.gaps.sources.operations.frame.graph, bad.closures[0]!.acceptance!.graph);
@@ -997,14 +1034,14 @@ test("D2 historical closure stays bound to its saved D1 context on replay, confi
     const before = historySnapshot(store);
     assert.equal(denied(readGapLines(store, { project: "garden", record: reference(forged) }), "closure_unconfirmed").at.field, "acceptance");
     for (const operation of [prepareGapLines, writeGapLines]) denied(operation(store, bad), "closure_unconfirmed");
-    const confirmation = denied(confirmResults(store, { ...address, target: secondAttempt.id, goal,
+    const confirmation = denied(confirmResults(store, { ...address, target: carrier.attempt.id, goal,
       accepting: [reference(forged)], cancelling: [] }), "achievement_unconfirmed");
     assert.match(confirmation.message, /closure_unconfirmed.*saved D1 context/);
-    for (const operation of [prepareCloseAttempt, closeAttempt]) denied(operation(store, { ...address, attempt: 2,
+    for (const operation of [prepareCloseAttempt, closeAttempt]) denied(operation(store, { ...address, attempt: 1,
       outcome: { reason: "result", accepting: [reference(forged)], cancelling: [], refusals: [] } }), "achievement_unconfirmed");
     for (const saved of [closedA, closedB])
       assert.deepEqual(ok(readGapLines(store, { project: "garden", record: reference(saved) })), saved);
-    assert.equal(ok(confirmResults(store, { ...address, target: secondAttempt.id, goal,
+    assert.equal(ok(confirmResults(store, { ...address, target: carrier.attempt.id, goal,
       accepting: [reference(closedB)], cancelling: [] })).achieved.length, 1);
     assert.deepEqual(historySnapshot(store), before);
   };
@@ -1021,7 +1058,8 @@ async function producePreF5ResultHistory() {
   // Only the child loader exports these helpers, from the immutable old test source.
   const fixture = await import('./om-gap-lines.test.js') as unknown as {
     firstPassFixture: typeof firstPassFixture; acceptOperations: typeof acceptOperations;
-    goalFor: typeof goalFor; openAttempt: typeof openAttempt;
+    goalFor: (line: Pick<GapLine, "target" | "field">) => AttemptGoal;
+    openAttempt: (store: Store, address: SeriesRequest, goal: AttemptGoal) => Revision<RepairSeries>;
   };
   const { canonical } = await import('../src/canonical.js');
   const { reference } = await import('../src/pipeline/contracts.js');
@@ -1147,18 +1185,18 @@ export async function load(url, context, next) {
 test("S1.1 a saved closure's attempt is checked by the exact series reader: a repeat in one operation reads no series again, the historical read stands after a second Store moved the series, a new operation of the unchanged Store serves its kept proofs, a new Store proves again, the current preparation with the old reference still refuses", t => {
   const f = firstPassFixture(t), first = ok(writeGapLines(f.store, f.request));
   const oldGap = f.gaps.collection.gaps.find(item => item.field === "fill" && item.evidence.some(evidence => evidence.origin === "operations"))!;
-  const obligation = ok(prepareFrame(f.store, f.frame)).result.obligations.find(item => item.id === oldGap.target)!;
-  const address: SeriesRequest = { project: "garden", block: obligation.upper.node, line: 1 };
-  const goal = goalFor(oldGap), attempt = openAttempt(f.store, address, goal), next = acceptOperations(f);
+  // LG07 gl-rest (№10753 п.5): the closure's attempt is the real managed carrier, and the series moves only through
+  // its lawful G7 — no next ordinal is needed to make the saved link historical.
+  const carrier = managedCarrier(f.store, f.frame, f.initial, oldGap);
+  const address = carrier.address, attempt = carrier.attempt, next = acceptOperations(f);
   const request: GapLinesRequest = { ...f.request, previous: reference(first), pass: 2, gaps: next.gaps,
     closures: [{ ...next.closure, attempt: { series: reference(attempt), attempt: 1 } }] };
   const saved = ok(writeGapLines(f.store, request));
-  // The series moves on through a second Store of the same file (№2233-3): the attempt closes with the result and a
-  // second attempt begins, so the saved link is historical.
+  // The series moves on through a second Store of the same file (№2233-3): a real G7 of the managed attempt closes
+  // it with the result, so the saved link is historical.
   const second = new Store(f.database);
   try {
-    ok(closeAttempt(second, { ...address, attempt: 1, outcome: { reason: "result", accepting: [reference(saved)], cancelling: [], refusals: [] } }));
-    ok(beginAttempt(second, { ...address, attempt: 2, goal }));
+    closeCarrier(second, carrier, [reference(saved)]);
   } finally { second.close(); }
   const head = ok(readSeries(f.store, address));
   assert.ok(head.revision > attempt.revision);
