@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
@@ -17,7 +17,7 @@ import { projectPaidTurnAdmission, managedTurnId } from '../src/discovery/resear
 import { recordV7Attempt } from '../src/discovery/v7-attempts.js';
 import { attemptEndOfAction, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from '../src/discovery/v7-managed-attempt.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
-import type { Environment } from '../src/runtime/environment.js';
+import type { Environment, WebResearchSettings } from '../src/runtime/environment.js';
 
 /**
  * OMG-V7-HELPER, package 1 (P.2–P.5, MR.5): the producer preparation the Discovery v7 tests repeated byte for byte.
@@ -28,15 +28,16 @@ import type { Environment } from '../src/runtime/environment.js';
  * verdict, novelty and methodology) are local, so the expectations remain readable next to the tests that hold them.
  */
 
-function fixture(t: { after(fn: () => void): void }, prefix: string) {
-  const root = mkdtempSync(join(tmpdir(), prefix));
+function fixture(t: { after(fn: () => void): void }, prefix: string, realRoot = false) {
+  const root = realRoot ? realpathSync(mkdtempSync(join(tmpdir(), prefix))) : mkdtempSync(join(tmpdir(), prefix));
   const path = join(root, "state.sqlite"), stores: Store[] = [];
   const open = () => { const db = new Store(path); stores.push(db); return db; };
   const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
   t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
   return { root, path, store, engine, discovery, open };
 }
-type Fixture = ReturnType<typeof fixture>;
+export type DiscoveryFixture = ReturnType<typeof fixture>;
+type Fixture = DiscoveryFixture;
 
 export const rand = () => Math.random().toString(16).slice(2);
 const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
@@ -47,17 +48,17 @@ function validFrame(): Json {
     axes: allAxes("deep"),
     budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
 }
-type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
+export type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
   criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
-function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
+export function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
   return { id, axis, domain: "construction", text: `What covers ${id}?`,
     class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
     roles: ["domain expert"], searchPlaces: ["domain documents"] };
 }
-function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
+export function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
   return { edition, frame: frameRef, previous, questions } as unknown as Json;
 }
-function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
+export function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
   const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
   assert.ok(question, `question for ${field}`);
   return question;
@@ -67,9 +68,11 @@ function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string
  * Discovery.researched door on a prepared basis, not a live model assessment of the frame or the plan. A paid attempt
  * produced later does not make this initial assessment a real model one.
  */
-function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
+export function acceptPlan(f: Pick<Fixture, 'store' | 'engine' | 'discovery'>, project: string, questions: PlanQuestion[],
+  options: { readonly sourceKey?: 'shared' | 'per-draft' } = {}) {
   const base = createPartialV7Draft(f.discovery, project, "concept");
-  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
+  const src = f.discovery.evidence.document(project, options.sourceKey === 'per-draft' ? `basis:${base.id}` : "basis",
+    `Exact source for ${project}`, "text/plain", 0);
   const frame = questionOf(f.store, base, "frame");
   answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
   const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
@@ -80,10 +83,22 @@ function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
 }
 
 export interface ResearchSetupOptions {
-  /** `queue` (default): a source read, then the queued replies, then `reply`; `archive` puts a read of the saved archive first. */
-  readonly adapter?: 'queue' | 'archive';
+  /** `queue` (default): a source read, then the queued replies, then `reply`; `archive` puts a read of the saved archive first;
+   * `reply` answers `settings.reply` or the default answer; `fixed` always gives the default answer. */
+  readonly adapter?: 'queue' | 'archive' | 'reply' | 'fixed';
   /** Prefix of the temporary root. */
   readonly prefix?: string;
+  /** Resolve the symbolic links of the temporary root (macOS keeps /tmp behind one). */
+  readonly realRoot?: boolean;
+  /** `timeoutMs` of the environment; 10 000 by default. */
+  readonly timeoutMs?: number;
+  /** Web research settings of the environment; none by default. */
+  readonly webResearch?: WebResearchSettings;
+  /** The roles calibrated, in this order, before the plan is accepted; both by default. */
+  readonly calibrate?: readonly ('analyst' | 'assessor')[];
+  /** The key of the source `acceptPlan` builds on: `shared` (default) is `basis`, written once per project (a second plan of the
+   * project meets revision_conflict); `per-draft` names it by the base draft. */
+  readonly sourceKey?: 'shared' | 'per-draft';
 }
 /**
  * The scripted research environment of the v7 tests, in the order every copy used: root and Stores → scenario adapter
@@ -91,30 +106,33 @@ export interface ResearchSetupOptions {
  * analyst and the assessor → the fixture frame and plan. `prepare` and `runId` are the caller's.
  */
 export async function researchSetup(t: TestContext, options: ResearchSetupOptions = {}) {
-  const f = fixture(t, options.prefix ?? "omg-dr3ba-"), project = 'p', wire = join(f.root,'wire.ndjson'), adapter = join(f.root,'adapter.mjs');
-  const archive = options.adapter === 'archive'
+  const f = fixture(t, options.prefix ?? "omg-dr3ba-", options.realRoot), project = 'p', wire = join(f.root,'wire.ndjson'), adapter = join(f.root,'adapter.mjs');
+  const mode = options.adapter ?? 'queue', queueing = mode === 'queue' || mode === 'archive';
+  const archive = mode === 'archive'
     ? `settings.readArchive?{action:'read_context',record:settings.corruptReadArchive?{...r.subject.working.archive,hash:'0'.repeat(64)}:r.subject.working.archive,pointer:'/body/value'}:` : '';
   const settings = join(f.root,'reply.json');
   writeFileSync(settings,JSON.stringify({tokens:10}));
-  writeFileSync(adapter, `import {readFileSync,appendFileSync,writeFileSync} from 'node:fs';
+  const answer = `{action:'answer',question:r.subject.question?.id??'reader',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]}`;
+  const research = mode === 'fixed' ? answer : mode === 'reply' ? `settings.reply??${answer}`
+    : `${archive}settings.readSource&&!r.subject.contextWorkspace?.length?{action:'read_context',record:r.subject.working.archive,pointer:'/body/value/materials/0/value/content'}:queued??settings.reply??${answer}`;
+  writeFileSync(adapter, `import {readFileSync,appendFileSync${queueing ? ',writeFileSync' : ''}} from 'node:fs';
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),settings=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-const queued=settings.replies?.shift();if(queued)writeFileSync(${JSON.stringify(settings)},JSON.stringify(settings));
-const research=${archive}settings.readSource&&!r.subject.contextWorkspace?.length?{action:'read_context',record:r.subject.working.archive,pointer:'/body/value/materials/0/value/content'}:queued??settings.reply??{action:'answer',question:r.subject.question?.id??'reader',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+${queueing ? `const queued=settings.replies?.shift();if(queued)writeFileSync(${JSON.stringify(settings)},JSON.stringify(settings));\n` : ''}const research=${research};
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:settings.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
   const command = {executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure(project,{workspace:f.root,
     implementer:{actor:'author',model:'fixture',effort:'high',command},
-    reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:10000},0);
+    reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:options.timeoutMs??10000,
+    ...(options.webResearch?{webResearch:options.webResearch}:{})},0);
   const old=f.discovery.create(project,'discovery','R0','concept',[
     {field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'object'}}],[],6);
   const q=f.store.get<Question>(old.value.questions[0]!)!;
-  await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
-    {store:f.store,draftId:old.id,questionId:q.id,purpose:'analyst'});
-  await researchCall(environment.value.reviewer,environment.value,'Calibrate',{},undefined,
-    {store:f.store,draftId:old.id,questionId:q.id,purpose:'assessor'});
+  for (const purpose of options.calibrate ?? ['analyst','assessor'])
+    await researchCall(environment.value[purpose==='analyst'?'implementer':'reviewer'],environment.value,'Calibrate',{},undefined,
+      {store:f.store,draftId:old.id,questionId:q.id,purpose});
   const questions=[planQuestion('q-industry','industry','blocking'),planQuestion('q-market','market')];
-  const v=acceptPlan(f,project,questions);
+  const v=acceptPlan(f,project,questions,options.sourceKey?{sourceKey:options.sourceKey}:{});
   const subject=(id='q-industry',answer=v.planAnswer):V7PlanSubject=>({contract:V7_PLAN_SUBJECT_CONTRACT,planAnswer:answer,planQuestionId:id});
   const prompt='Research the selected plan question; return an answer with a V7AttemptEnd value and empty citations.';
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').map(line=>JSON.parse(line));

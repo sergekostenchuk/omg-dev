@@ -1,21 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { Discovery, type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
-import { createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
-import { Store, type Revision } from '../src/storage/store.js';
-import { ProductEngine } from '../src/product/engine.js';
+import { writeFileSync } from 'node:fs';
+import { type DiscoveryDraft, type Question } from '../src/discovery/discovery.js';
+import { V7_STAGE_TOKEN_CEILING } from '../src/discovery/v7-contracts.js';
+import { type Revision } from '../src/storage/store.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
-import { type Json } from '../src/canonical.js';
+import { researchSetup, rand, questionOf, validPlan, type PlanQuestion, type DiscoveryFixture as Fixture } from './discovery-v7-fixture.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { researchCall, prepareResearchEnvelope } from '../src/discovery/research-protocol.js';
 import { prepareResearchConsumerIntent, prepareResearchConsumerApplication, readResearchConsumerExecution,
   completeResearchAttemptTurn, type ResearchConsumerIntent } from '../src/discovery/response-recovery.js';
 import { projectPaidTurnAdmission, managedTurnId } from '../src/discovery/research-consumer-transition.js';
 import { recordV7Attempt } from '../src/discovery/v7-attempts.js';
-import { attemptEndOfAction, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from '../src/discovery/v7-managed-attempt.js';
+import { attemptEndOfAction } from '../src/discovery/v7-managed-attempt.js';
 import { invocationProgress } from '../src/discovery/invocation-progress.js';
 import { workingContext } from '../src/discovery/working-context.js';
 import { REQUEST_MANIFEST_CONTRACT, readRequestWire } from '../src/discovery/request-parts.js';
@@ -25,52 +22,7 @@ import { processStart } from '../src/runtime/process-identity.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
 import { budgetUsage, type BudgetSegment } from '../src/runtime/research-budget.js';
 import { stageBudgetSegmentId } from '../src/discovery/stage-token-budget.js';
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-dr3a3k-"));
-  const path = join(root, "state.sqlite"), stores: Store[] = [];
-  const open = () => { const db = new Store(path); stores.push(db); return db; };
-  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
-  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, path, store, engine, discovery, open };
-}
-type Fixture = ReturnType<typeof fixture>;
 
-const rand = () => Math.random().toString(16).slice(2);
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
-
-function validFrame(): Json {
-  return { productType: "internal", scale: "30 users across 10 sites",
-    industries: ["construction"], domains: ["materials supply", "equipment accounting"],
-    axes: allAxes("deep"),
-    budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
-}
-type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
-  criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
-function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
-  return { id, axis, domain: "construction", text: `What covers ${id}?`,
-    class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
-    roles: ["domain expert"], searchPlaces: ["domain documents"] };
-}
-function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
-  return { edition, frame: frameRef, previous, questions } as unknown as Json;
-}
-function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
-  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
-  assert.ok(question, `question for ${field}`);
-  return question;
-}
-/** The real plan acceptance chain (frame and plan through #answer). */
-function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
-  const base = createPartialV7Draft(f.discovery, project, "concept");
-  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
-  const frame = questionOf(f.store, base, "frame");
-  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
-  const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
-  const planQ = questionOf(f.store, base, "plan");
-  answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
-  const plan = f.store.get<Question>(planQ.id)!;
-  return { draft: f.store.get<DiscoveryDraft>(base.id)!, plan, planAnswer: plan.value.answer!, frameRef };
-}
 /** The next lawful plan edition: reopen and accept again. */
 function acceptNextPlanEdition(f: Fixture, project: string, draft: Revision<DiscoveryDraft>, frameRef: Ref,
   previous: Ref, questions: PlanQuestion[]) {
@@ -85,27 +37,7 @@ function acceptNextPlanEdition(f: Fixture, project: string, draft: Revision<Disc
 }
 
 async function setup(t: test.TestContext) {
-  const f = fixture(t), project = 'p', wire = join(f.root,'wire.ndjson'), adapter = join(f.root,'adapter.mjs');
-  const settings = join(f.root,'reply.json');
-  writeFileSync(settings,JSON.stringify({tokens:10}));
-  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
-const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),settings=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
-appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-const research={action:'answer',question:r.subject.question?.id??'reader',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
-console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,usage:{inputTokens:settings.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
-  const command = {executable:process.execPath,args:[adapter]};
-  const environment=f.engine.environments.configure(project,{workspace:f.root,
-    implementer:{actor:'author',model:'fixture',effort:'high',command},
-    reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},fullCheck:command,timeoutMs:5000},0);
-  const old=f.discovery.create(project,'discovery','R0','concept',[
-    {field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'object'}}],[],6);
-  const q=f.store.get<Question>(old.value.questions[0]!)!;
-  await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
-    {store:f.store,draftId:old.id,questionId:q.id,purpose:'analyst'});
-  const questions=[planQuestion('q-industry','industry','blocking'),planQuestion('q-market','market')];
-  const v=acceptPlan(f,project,questions);
-  const subject=(id='q-industry',answer=v.planAnswer):V7PlanSubject=>({contract:V7_PLAN_SUBJECT_CONTRACT,planAnswer:answer,planQuestionId:id});
-  const prompt='Research the selected plan question; return an answer with a V7AttemptEnd value and empty citations.';
+  const f = await researchSetup(t, { adapter: 'fixed', prefix: 'omg-dr3a3k-', timeoutMs: 5000, calibrate: ['analyst'] }), { v, project, environment, subject, prompt } = f;
   const prepare=(selected=subject(), context:Record<string,any>={history:[],readings:[]})=>{
     const draft=f.store.get<DiscoveryDraft>(v.draft.id)!,question=f.store.get<Question>(v.plan.id)!;
     const run=f.store.write<ResearchRun>({id:`research-run:${rand()}`,kind:'research-run',expected:0,
@@ -120,8 +52,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
       {store,draftId:draft.id,questionId:question.id,purpose:'analyst',consumerIntent:reference(intent),requestContract:REQUEST_MANIFEST_CONTRACT,...(onContext?{onContext}:{})});
     return {run,intent,input,invoke,question,draft,selected,context};
   };
-  const wires=()=>readFileSync(wire,'utf8').trim().split('\n').map(line=>JSON.parse(line));
-  return {...f,v,project,questions,subject,prepare,wires,environment,prompt,settings};
+  return {...f,prepare};
 }
 
 test('C: real managed call reserves atomically and completes an immutable attempt from the original call revision',async t=>{
