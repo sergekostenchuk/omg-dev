@@ -483,26 +483,40 @@ export function readV7ProgressStateAt(store: Store, ref: Ref): Revision<V7Progre
 export interface ProgressApplicationResult { state: Revision<V7ProgressState>;
   applications: Revision<V7ProgressApplication>[]; repeated: boolean }
 
+/** Shared read-only inputs of P.3: a covered packet still proves every original application and the
+ * unchanged accepted claims. Merely finding account addresses cannot make a paid result a replay. */
+function assessmentProgress(store: Store, paid: Revision<PaidDiscoveryAttemptsAssessment>) {
+  const a = paid.value, subject = a.subject.packet, stateId = v7ProgressStateId(subject);
+  const covered: Revision<V7AttemptAccount>[] = [], fresh: Ref[] = [];
+  for (const entry of subject.entries) {
+    const saved = store.get<V7AttemptAccount>(attemptAccountKey(subject, entry.attempt), 1);
+    if (saved) covered.push(readAccount(store, reference(saved))); else fresh.push(entry.attempt);
+  }
+  const head = store.get<V7ProgressState>(stateId);
+  const previous = head ? readV7ProgressStateAt(store, reference(head)) : null;
+  let replay: ProgressApplicationResult | null = null;
+  if (!fresh.length) {
+    for (const r of covered) need(same(r.value.accepted, acceptedAt(a, r.value.attempt)),
+      'account.accepted', 'A second judgment cannot rewrite the accepted claims');
+    need(previous, 'state', 'Accounted attempts need their derived state');
+    const apps = [...new Map(covered.map(r => [r.value.application.id, r.value.application])).values()];
+    replay = { state: previous, applications: apps.map(r => readApplication(store, r).application), repeated: true };
+  }
+  return { subject, stateId, covered, previous, replay };
+}
+/** The existing free replay branch of applyDiscoveryAssessment, without applying or writing anything.
+ * Null means there is an unaccounted remainder; broken provenance or changed acceptance is a typed refusal. */
+export function readV7AssessmentReplay(store: Store, projectId: string, ref: Ref): ProgressApplicationResult | null {
+  return withHistoricalReads(() => assessmentProgress(store, readDiscoveryAssessment(store, projectId, ref)).replay);
+}
+
 /** Current heads are used only for CAS admission. The selected paid result and
  * all proof readers retain their original exact packet/baseline. */
 export function applyDiscoveryAssessment(store: Store, projectId: string, ref: Ref): ProgressApplicationResult {
   return withHistoricalReads(() => {
     const paid = readDiscoveryAssessment(store, projectId, ref), a = paid.value;
-    const subject = a.subject.packet, stateId = v7ProgressStateId(subject);
-    const covered: Revision<V7AttemptAccount>[] = [], fresh: Ref[] = [];
-    for (const entry of subject.entries) {
-      const saved = store.get<V7AttemptAccount>(attemptAccountKey(subject, entry.attempt), 1);
-      if (saved) covered.push(readAccount(store, reference(saved))); else fresh.push(entry.attempt);
-    }
-    const head = store.get<V7ProgressState>(stateId);
-    const previous = head ? readV7ProgressStateAt(store, reference(head)) : null;
-    if (!fresh.length) {
-      for (const r of covered) need(same(r.value.accepted, acceptedAt(a, r.value.attempt)),
-        'account.accepted', 'A second judgment cannot rewrite the accepted claims');
-      need(previous, 'state', 'Accounted attempts need their derived state');
-      const apps = [...new Map(covered.map(r => [r.value.application.id, r.value.application])).values()];
-      return { state: previous, applications: apps.map(r => readApplication(store, r).application), repeated: true };
-    }
+    const { subject, stateId, covered, previous, replay } = assessmentProgress(store, paid);
+    if (replay) return replay;
     const expected = previous ? { kind: 'state', ref: reference(previous) } : { kind: 'absent', id: stateId };
     if (!same(a.baseline.state, expected)) fail('discovery_progress_stale', 'baseline.state',
       'The unaccounted paid result names a moved baseline; preserve it and select an addressed recovery');

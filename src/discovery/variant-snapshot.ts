@@ -9,7 +9,7 @@ import { currentPlan, provePlanQuestions } from './v7-plan-questions.js';
 import { discoveryTraversal, type V7TraversalBudget } from './discovery-outcome.js';
 import { discoveryAcceptanceActId, provenAcceptance, type DiscoveryAcceptanceAct } from './v7-contracts.js';
 import { proveIssuedAnswer, readExact, researchRunId, savedAcceptanceAct } from './projection-reader.js';
-import { readV7ProgressStateAt } from './v7-progress.js';
+import { readV7AssessmentReplay, readV7ProgressStateAt } from './v7-progress.js';
 import { readDiscoveryAssessment } from './research-assessment.js';
 import { DISCOVERY_ASSESSMENT_KIND, v7ProgressStateId } from './v7-attempt-assessment.js';
 import { planSubjectOf, questionDispatchId, type V7PlanSubject } from './v7-managed-attempt.js';
@@ -158,12 +158,14 @@ export function variantSnapshotReadiness(store: Store, project: string): Variant
       appliedAssessments.add(canonical(exact<V7ProgressApplication>(store, ref, 'v7-progress-application').value.assessment));
     questions.push(question);
   }
-  // A paid reassessment of an already-accounted K is still an unapplied paid result. The traversal's pending-K
-  // selection alone cannot see it, so compare exact paid assessments with the proven application chains too.
+  // A paid reassessment can contain an unaccounted remainder even when earlier K already have accounts.
+  // The traversal's pending-K selection alone cannot classify every paid result. P.3's read-only replay proof also permits a fully accounted packet whose
+  // unchanged acceptance was established by the original applications, without creating another application.
   for (const row of store.list<PaidDiscoveryAttemptsAssessment>(DISCOVERY_ASSESSMENT_KIND)) {
     if (row.value?.projectId !== project || !same(row.value.subject?.packet?.planAnswer, plan.planAnswer)) continue;
     if (appliedAssessments.has(canonical(reference(row)))) continue; // already proved through its P application
     const assessment = readDiscoveryAssessment(store, project, reference(row));
+    if (readV7AssessmentReplay(store, project, reference(assessment))) continue;
     if (!reasons.some(reason => reason.grounds.some(ref => same(ref, reference(assessment)))))
       reasons.push({ code: 'assessment_unapplied', message: `Plan question ${assessment.value.subject.packet.planQuestionId} has an unapplied paid assessment`,
         grounds: [reference(assessment)] });

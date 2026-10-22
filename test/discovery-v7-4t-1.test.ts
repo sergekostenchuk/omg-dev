@@ -22,7 +22,7 @@ import { REQUEST_MANIFEST_CONTRACT } from '../src/discovery/request-parts.js';
 import type { ResearchRun } from '../src/discovery/research-model.js';
 import { processStart } from '../src/runtime/process-identity.js';
 import { uniqueTransactionGuards } from '../src/runtime/environment.js';
-import { projectAttemptPacket } from '../src/discovery/v7-attempt-assessment.js';
+import { attemptAccountKey, projectAttemptPacket } from '../src/discovery/v7-attempt-assessment.js';
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "omg-4t1-"));
   const path = join(root, "state.sqlite"), stores: Store[] = [];
@@ -119,7 +119,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,u
   return {...f,v,subject,prepare,wires,environment,settings};
 }
 
-import { applyDiscoveryAssessment, readV7ProgressStateAt, v7ProgressBaseline } from '../src/discovery/v7-progress.js';
+import { applyDiscoveryAssessment, readV7AssessmentReplay, readV7ProgressStateAt, v7ProgressBaseline } from '../src/discovery/v7-progress.js';
 import { type ClaimAddress } from '../src/discovery/claim-address.js';
 import { EngineError } from '../src/errors.js';
 
@@ -221,13 +221,54 @@ test('4T.1: real broad sweep retains open blocking, refuses pending paid P, then
   assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
 });
 
-test('4T.1: a paid reassessment remains pending even when its K was previously accounted',async t=>{
+test('4T.1-01: a lawful fully covered paid packet replays cold without blocking the same snapshot',async t=>{
+  const f=await setup(t),entry=await produce(f),first=await assess(f,[entry]);
+  const original=applyDiscoveryAssessment(f.store,'p',reference(first.paid));await applied(f,'q-market');
+  const published=ready(f).record,second=await assess(f,[entry]);assert.notEqual(second.paid.id,first.paid.id);
+  const before=snapshot(f.store),calls=f.wires().length;
+  const replay=applyDiscoveryAssessment(f.open(),'p',reference(second.paid));assert.equal(replay.repeated,true);
+  assert.deepEqual(replay.state,original.state);assert.deepEqual(replay.applications,original.applications);
+  assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+  const cold=f.open(),read=readV7AssessmentReplay(cold,'p',reference(second.paid));assert.deepEqual(read,replay);
+  assert.equal(variantSnapshotReadiness(cold,'p').status,'ready');
+  const repeated=produceVariantSnapshot(cold,'p');assert.equal(repeated.repeated,true);assert.deepEqual(repeated.record,published);
+  assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+});
+
+test('4T.1-01: a paid packet with an uncovered remainder stays pending and the replay reader does not apply it',async t=>{
   const f=await setup(t),entry=await produce(f),first=await assess(f,[entry]);
   applyDiscoveryAssessment(f.store,'p',reference(first.paid));await applied(f,'q-market');
-  assert.equal(variantSnapshotReadiness(f.store,'p').status,'ready');
-  const second=await assess(f,[entry]);assert.notEqual(second.paid.id,first.paid.id);
-  const before=snapshot(f.store),calls=f.wires().length,result=refused(f);
-  assert.ok(result.reasons.some(r=>r.code==='assessment_unapplied'&&r.grounds.some(g=>g.id===second.paid.id)));
+  const remaining=await produce(f),second=await assess(f,[entry,remaining]);
+  const before=snapshot(f.store),calls=f.wires().length;
+  assert.equal(readV7AssessmentReplay(f.open(),'p',reference(second.paid)),null);
+  const result=refused(f);assert.ok(result.reasons.some(r=>r.code==='assessment_unapplied'));
+  assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+});
+
+for(const damage of ['account','application'] as const)test(`4T.1-01: an unproved ${damage} cannot masquerade as a covered packet`,async t=>{
+  const f=await setup(t),entry=await produce(f),first=await assess(f,[entry]);
+  applyDiscoveryAssessment(f.store,'p',reference(first.paid));await applied(f,'q-market');
+  const remaining=await produce(f),second=await assess(f,[entry,remaining]);
+  const saved=f.store.get<any>(attemptAccountKey(second.packet,entry.attempt),1)!;
+  // Negative corruption only: a manufactured account of the new K is not a P.3 application.
+  const fake={...saved.value,attempt:remaining.attempt,
+    ...(damage==='application'?{application:{id:'v7-progress-application:missing',revision:1,hash:saved.hash}}:{})};
+  f.store.write({id:attemptAccountKey(second.packet,remaining.attempt),kind:saved.kind,expected:0,value:fake});
+  const before=snapshot(f.store),calls=f.wires().length;
+  errorCode(()=>readV7AssessmentReplay(f.open(),'p',reference(second.paid)),'discovery_progress_conflict');
+  errorCode(()=>produceVariantSnapshot(f.open(),'p'),'discovery_progress_conflict');
+  assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
+});
+
+test('4T.1-01: a real paid reassessment cannot change the previously accepted claims through replay',async t=>{
+  const f=await setup(t),end={type:'submitted',contract:'discovery-claims/v7',value:{claims:[{id:'h',kind:'hypothesis',
+    text:'The product may use one shared inventory',axis:'industry',planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId:'q-industry'}],
+    scope:{variants:'common'},basis:{howToVerify:'Measure shared inventory use'}}]}},entry=await produce(f,end),first=await assess(f,[entry]);
+  applyDiscoveryAssessment(f.store,'p',reference(first.paid));await applied(f,'q-market');
+  const second=await assess(f,[entry],{accept:true}),before=snapshot(f.store),calls=f.wires().length;
+  for(const action of [()=>readV7AssessmentReplay(f.open(),'p',reference(second.paid)),
+    ()=>applyDiscoveryAssessment(f.open(),'p',reference(second.paid)),()=>produceVariantSnapshot(f.open(),'p')])
+    errorCode(action,'discovery_progress_conflict');
   assert.deepEqual(snapshot(f.store),before);assert.equal(f.wires().length,calls);
 });
 
