@@ -28,7 +28,7 @@ import { closeAttempt, openAttempt as managedOpenAttempt, prepareManagedClaim } 
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { readModelCallRecovery, prepareLateModelReceipt } from '../src/discovery/model-call-recovery.js';
-import { CycleCommitPhase, H10A_COMMIT, H15_BASE_COMMIT, MP1_COMMIT, MP2_BASE_COMMIT, MP3_NOTES, MP3_PRIOR_COMMIT, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4AnalysisFixture, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4ManagedWorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15AtCommit, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2IssuedBy, mp2Managed, mp2Refused, mp2Step, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3PriorAttempt, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
+import { CycleCommitPhase, H10A_COMMIT, H15_BASE_COMMIT, MP1_COMMIT, MP2_BASE_COMMIT, MP3_NOTES, MP3_PRIOR_COMMIT, completionE1, completionSnapshot, confirmed, currentPacketWire, cycleCommitPhase, cycleCommitPhases, decode, deeplyFrozen, e4AnalysisFixture, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4ManagedClose, e4ManagedFixture, e4WorksFixture, e4NeedSource, e4Node, ensureFixtureProject, envelope, fixtureCheckpoint, fixtureDriver, h15AtCommit, h15CannotAnswer, h15Heads, h15Refusal, h15Unserved, h15Written, killFixtureDriver, killFixtureProvider, lp4Root, mp2IssuedBy, mp2Managed, mp2Refused, mp2Step, mp2StopAfter, mp3Carried, mp3Close, mp3Cycle, mp3Delivered, mp3Open, mp3PriorAttempt, mp3Readings, mp3SearchDelivery, omit, processResult, publicRecovery, refusesLiveRecovery, request, requestId, signalFixtureProvider, unknownConfirmed, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -237,7 +237,7 @@ test('E4 cycle delivers all addressed read forms then answers once in the same a
 
 test('E4 direct continuation refuses repeated knowledge atomically before a third dispatch and replays after restart', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const kind of ['fact', 'field'] as const) {
-    const f = e4Fixture(t, kind, 100_000, 0, 5000, true); // LG07: managed E4 carrier
+    const f = e4Fixture(t, kind);
     const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
     f.steps([{ research: need, usage }, { research: need, usage }, { research: need, usage }]);
     const first = valueOf(await runModelCall(f.store, f.request));
@@ -366,7 +366,7 @@ test('E4 cycle saves delivery overflow without a second dispatch or context trun
 
 test('E4 carries checked works handoffs through local dispatch, split assembly, restart and exact late repeats without accepting L3', { todo: "NR1 №3646: согласованная перезапись цепочки до новейшей записи — om-fsck её не видит; решение позже" }, async t => {
   for (const split of [false, true]) await t.test(split ? 'split with prior work and test' : 'whole node', async t => {
-    const f = e4ManagedWorksFixture(t), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured; // LG07: managed works carrier
+    const f = e4WorksFixture(t), config = split ? f.environment(currentPacketWire(f.packet.value.packet, null) - 1) : f.configured;
     const packet = split ? valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record : f.packet;
     assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, split ? 'parts' : 'whole');
     const count = packet.value.plan!.assignments.length;
@@ -466,12 +466,15 @@ test('E4 carries checked works handoffs through local dispatch, split assembly, 
 
 test('E4 analysis transport rejects another actual body and stale fresh-dispatch grounds without spawning', async t => {
   const f = await e4ManagedAnalysisFixture(t, 'stop-analysis');
+  const before = f.store.list();
   const wrongBody = await runModelTransport(f.store, { ...f.request, packet: { text: 'Copied call ref with a different payload' } });
   assert.equal(wrongBody.ok, false); if (!wrongBody.ok) assert.equal(wrongBody.refusal.code, 'packet_invalid');
+  assert.deepEqual(f.store.list(), before);
   f.store.write({ id: f.environment.id, kind: f.environment.kind, expected: f.environment.revision, value: f.environment.value });
+  const afterEnv = f.store.list();
   const stale = await runModelTransport(f.store, f.request);
   assert.equal(stale.ok, false); assert.equal(f.sent().length, 0);
-  assert.equal(f.store.list('model-call').length, f.preparationCalls.length);
+  assert.deepEqual(f.store.list(), afterEnv);
 });
 
 
@@ -563,8 +566,8 @@ test('E4 control completion cannot replace an outcome saved after the control re
   assert.equal(f.store.list('om-model-exchange').length, 1);
   assert.equal(f.store.list('part-response').length, 1); // the genuine managed application product
   assert.deepEqual(actual.record.value.usage, usage);
-  const snapshot = f.store.list(); f.restart();
-  assert.equal(valueOf(await runModelCall(f.store, f.request)).repeated, true);
+  const snapshot = f.store.list(), historical = valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
+  f.restart(); assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), historical);
   assert.deepEqual(f.store.list(), snapshot); assert.equal(f.sent().length, 1);
 });
 
