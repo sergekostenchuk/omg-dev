@@ -704,92 +704,110 @@ test("S5-03 writer ≡ reader on the inherited runner prefix: A's session inheri
 });
 
 test("S5-03 runner-prefix packet contract: a delivered packet without its research-delivery/v1 contract — missing or foreign — is refused before any record or call; a packet-free paid turn and a lawful real packet inherit", async t => {
-  // Paid analyst read_context turns on a hand-made run. A "free" turn carries
-  // no delivered packet (packet === null keeps the door); the packet-bearing
-  // turns carry the real packet produced by workingContext itself and wired by
-  // prepareRequestPartsAndManifest — the corrupted variants differ from that
-  // same real packet only in the saved working.deliveryContract field.
-  const produce = async (f: Paid, run: Revision<ResearchRun>, packetMode: "free" | "packet" | "delete" | "foreign") => {
+  // The positive prefix is the real runner path itself — the same Researcher
+  // preparation as the first S5-03 test: the adapter answers every call, the
+  // paid machinery writes every intent/claim/dispatch/response/manifest/turn
+  // record, and the lawful delivered packet is read back from the store.
+  const realRun = (f: Paid, actions: Record<string, any>[], limit = 8) => {
+    f.configure(actions);
+    return new Researcher(f.store, new Discovery(f.store), f.engine.environments)
+      .run(f.p.project, f.p.draft.id, limit, undefined, { producerPolicy: { discovery: 7 } });
+  };
+  const wires = (f: Paid) => readFileSync(join(f.root, "wire.ndjson"), "utf8")
+    .trim().split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, any>);
+  // The packet gate mirrors runnerWorkspaceAt exactly: any saved delivered
+  // set — even an empty one — is the packet boundary it records.
+  const packetFor = (f: Paid, row: Revision<any>): Record<string, any> | null => {
+    const paid = readResearchConsumerExecution(f.store, f.p.project, row.value.consumerIntent);
+    return paid.kind === "response" && Array.isArray((paid.subject as any)?.contextWorkspace)
+      ? paid.subject as Record<string, any> : null;
+  };
+  const prefix = (f: Paid, run: Revision<ResearchRun>) => {
+    const turns = f.store.list<any>("research-turn").filter(row => row.value.run === run.id)
+      .sort((a, b) => a.value.number - b.value.number);
+    return addressedWorkspace(f.store, turns, f.p.plan, row => packetFor(f, row), subjectOf(f.p.planAnswer, "q-supply"));
+  };
+  const enter = (f: Paid, run: Revision<ResearchRun>, own: ReturnType<typeof prefix>) => {
+    const head = f.store.get<any>(run.id)!;
+    const delivery = { run: run.id, turn: head.value.turns + 1 };
+    const reserve = () => { const current = f.store.get<any>(run.id)!;
+      return { write: { id: current.id, kind: current.kind, expected: current.revision,
+        value: { ...current.value, turns: current.value.turns + 1 } }, guards: [reference(current)] }; };
+    return synthesisSession(f.store, f.p.draft, f.p.plan, f.p.environment, f.p.dispatch, f.p.pilot,
+      { ...contextOf(subjectOf(f.p.planAnswer, "q-supply")), workingSelections: [] },
+      "Synthesize the exact plan-question", undefined, { delivery, reserve: reserve(), initialWorkspace: own });
+  };
+  // Positive: a packet-free real prefix inherits — a one-turn real run; the
+  // session's first record carries exactly the folded runner workspace.
+  {
+    const f = await paidPlanned(t, "s5r2-packet-free");
+    const run = await realRun(f, [{ action: "read_context", record: reference(f.p.draft), pointer: "/fields/plan" }], 1);
+    const own = prefix(f, run);
+    assert.equal(own.entries.length, 1, "the read_context turn folds its entry");
+    assert.ok(!(own.deliveryCoverage ?? []).length, "no packet delivered any material");
+    assert.ok(!wires(f).some(w => Array.isArray(w.subject?.contextWorkspace) && w.subject.contextWorkspace.length),
+      "the adapter trace carries no delivered packet");
+    const freeResult = await code(async () => { try { await enter(f, run, own); } catch (e) {
+      console.log("DBG packet-free:", (e as EngineError).code, (e as EngineError).message); throw e; } });
+    assert.equal(freeResult, "no-error", "the packet-free prefix inherits");
+    const session = sessionOf(f.store, "q-supply");
+    assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
+    const head = f.store.get<any>(session.id)!;
+    assert.deepEqual(readSynthesisSessionV3(f.open(), reference(head)), head, "the chain reader proves the same prefix");
+  }
+  // Positive: a real delivered packet — A's second paid call of the real run
+  // carries the folded lookup under research-delivery/v1; the adapter trace
+  // proves the actual dispatch and the session inherits the packet's coverage.
+  {
+    const f = await paidPlanned(t, "s5r2-packet-lawful");
+    const run = await realRun(f, [
+      { action: "read_context", record: reference(f.p.draft), pointer: "/fields/plan" },
+      endOf(ENDS.refused), { action: "pause", reason: "hold B" }]);
+    const turns = f.store.list<any>("research-turn").filter(row => row.value.run === run.id)
+      .sort((a, b) => a.value.number - b.value.number);
+    const packetTurn = turns.find(row => { const packet = packetFor(f, row);
+      return packet !== null && (packet.contextWorkspace as unknown[]).length > 0; });
+    assert.ok(packetTurn, "the real run produced a packet-bearing paid turn");
+    const sent = wires(f).filter(w => Array.isArray(w.subject?.contextWorkspace) && w.subject.contextWorkspace.length
+      && w.subject?.working?.deliveryContract === "research-delivery/v1");
+    assert.ok(sent.length > 0, "the adapter trace carries the real research-delivery/v1 dispatch");
+    const own = prefix(f, run);
+    assert.equal(own.entries.length, 1, "the read_context turn folds its entry");
+    assert.ok((own.deliveryCoverage ?? []).length > 0, "the real packet records its delivery coverage");
+    assert.equal(await code(() => enter(f, run, own)), "no-error", "the lawful packet prefix inherits");
+    const session = sessionOf(f.store, "q-supply");
+    assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
+  }
+  // Negative packet only — CORRUPTION. A real paid call on the corruption
+  // fixture's run first saves a lawful packet (the same researchCall path as
+  // the positives); the corrupted turn rebuilds exactly that saved packet with
+  // working.deliveryContract absent or foreign, and only here are the
+  // dependent records — manifest, parts, claim, dispatch, response — rewritten
+  // by hand over the corrupted bytes (input hash/bytes stay consistent).
+  const startRun = (f: Paid) => f.store.write<ResearchRun>({ id: `research-run:${hashJson([f.p.project, f.p.draft.id, "packet-contract"])}`,
+    kind: "research-run", expected: 0,
+    value: { projectId: f.p.project, draftId: f.p.draft.id, environment: reference(f.p.environment), turns: 0, limit: 100,
+      requestChars: 0, owner: { pid: process.pid, started: processStart(process.pid)! }, ownerQuestion: null,
+      error: null, pauseCode: null, status: "running", inputs: f.p.draft.value.inputs } });
+  const produce = async (f: Paid, run: Revision<ResearchRun>, deliver: boolean) => {
     const subject = subjectOf(f.p.planAnswer, "q-supply");
     const draft = f.store.get<DiscoveryDraft>(f.p.draft.id)!, plan = f.store.get<Question>(f.p.plan.id)!;
     const head = f.store.get<any>(run.id)!, number = head.value.turns + 1;
-    const context: Record<string, any> = { role: "research", stage: "discovery", subject, history: [], readings: [] };
+    const context: Record<string, any> = { role: "research", stage: "discovery", subject, history: [], readings: [],
+      ...(deliver ? { contextWorkspace: [exactContextLookup(f.store, draft, plan,
+        reference(draft), "/fields/plan", undefined, () => {})] } : {}) };
     const intent = prepareResearchConsumerIntent(f.store, { projectId: f.p.project, kind: "analyst",
       key: hashJson([run.id, number, "analyst"]), owner: reference(head), draft: reference(draft),
       question: reference(plan), role: f.p.environment.value.implementer, dispatch: f.p.environment.value, profile: null,
       cursor: { run: run.id, turn: number, instruction: "Research the exact plan question", context, subject },
       basis: draft.value.inputs,
       guards: uniqueTransactionGuards([reference(head), reference(draft), reference(plan), reference(f.p.environment)]) });
-    let response: Record<string, any>;
-    if (packetMode !== "free") {
-      // The delivered packet and its request wire are written by the same real
-      // producers the paid path uses — workingContext packs the packet (with
-      // its own research-context archive and context index) and
-      // prepareRequestPartsAndManifest publishes the durable manifest. The two
-      // corrupted variants differ from the lawful packet in exactly the saved
-      // working.deliveryContract field; every dependent ref/digest is produced
-      // over the actual bytes.
-      const requestId = `fabricated-${packetMode}-${hashJson([run.id, number]).slice(0, 12)}`;
-      const lawful = workingContext(f.store, f.p.project, draft.id, plan.id,
-        { role: "research", stage: "discovery", subject, history: [], readings: [],
-          resultCapacity: intent.value.cursor.resultCapacity,
-          contextWorkspace: [exactContextLookup(f.store, draft, plan,
-            reference(draft), "/fields/plan", undefined, () => {})] },
-        f.p.pilot.value.maxRequestChars ?? 300000,
-        { common: true, purpose: "analyst", subject });
-      const { deliveryContract: _removed, ...noContract } = lawful.working as Record<string, any>;
-      const packet = { ...lawful, working: packetMode === "foreign"
-        ? { ...lawful.working, deliveryContract: "research-delivery/v0" }
-        : packetMode === "delete" ? noContract : lawful.working };
-      const role = f.p.environment.value.implementer;
-      const wire = prepareRequestPartsAndManifest({ store: f.store, projectId: f.p.project, draftId: draft.id,
-        requestId, intentRef: reference(intent),
-        envelope: { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
-          effort: role.effort, ...(role.speed !== undefined ? { speed: role.speed } : {}),
-          prompt: intent.value.cursor.resultCapacityPrompt },
-        subject: packet });
-      const pid = process.pid, started = processStart(pid)!;
-      const claimWrite = { id: `model-call:consumer:v1:${requestId}`, kind: "model-call" as const, expected: 0,
-        value: { projectId: f.p.project, draftId: draft.id, questionId: "q-supply",
-          planAnswer: subject.planAnswer, purpose: "analyst", requestId, requested: intent.value.role,
-          profile: intent.value.profile, status: "running", startedAt: 1, finishedAt: null, error: null,
-          confirmed: { model: null, effort: null, speed: null }, usage: null, usageSource: "unavailable",
-          request: { record: wire.manifestRef, hash: digest(wire.input), chars: wire.input.length,
-            bytes: Buffer.byteLength(wire.input) },
-          response: null, packet: { archive: packet.working.archive }, consumerIntent: reference(intent),
-          execution: { version: "model-execution/v1", phase: "claimed", owner: { pid, started }, provider: null },
-          ownerProcess: { pid, started } } };
-      const reservation = prepareResearchConsumerReservation(f.store, reference(intent), claimWrite,
-        wire.manifestRef, packet.working.archive);
-      f.store.writeMany([...wire.writes, claimWrite, ...reservation.writes],
-        uniqueTransactionGuards([...wire.guards, ...reservation.guards]));
-      const claimed = f.store.get<any>(claimWrite.id)!;
-      const dispatched = f.store.write<any>({ id: claimed.id, kind: "model-call", expected: claimed.revision,
-        value: { ...claimed.value,
-          execution: { version: "model-execution/v1", phase: "authorized", owner: { pid, started },
-            provider: { pid, started, group: null } },
-          providerProcess: { pid, started } } });
-      const research = { action: "read_context", record: reference(draft), pointer: "/fields/plan" };
-      const usage = { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0 };
-      const responseText = JSON.stringify({ protocol: "omg-agent/v1", requestId, research, usage });
-      const reply = f.store.write<any>({ id: `model-response:${requestId}`, kind: "model-response", expected: 0,
-        value: { projectId: f.p.project, draftId: draft.id, text: responseText,
-          consumerExecution: { contract: "research-consumer-execution/v1", call: reference(claimed),
-            dispatch: reference(dispatched), process: { exitCode: 0, signal: null, stderr: "" } } } });
-      f.store.write<any>({ id: claimed.id, kind: "model-call", expected: dispatched.revision,
-        value: { ...dispatched.value, status: "succeeded", finishedAt: 2, error: null,
-          confirmed: { model: null, effort: null, speed: null }, usage, usageSource: "adapter",
-          response: { record: reference(reply), chars: responseText.length,
-            bytes: Buffer.byteLength(responseText) } } });
-      response = research;
-    } else {
-      f.configure([...Array(f.calls()).fill(null),
-        { action: "read_context", record: reference(draft), pointer: "/fields/plan" }]);
-      response = await researchCall(f.p.environment.value.implementer, f.p.environment.value,
-        "Research the exact plan question", context, undefined,
-        { store: f.store, draftId: draft.id, questionId: plan.id, purpose: "analyst", consumerIntent: reference(intent),
-          requestContract: REQUEST_MANIFEST_CONTRACT }) as Record<string, any>;
-    }
+    f.configure([...Array(f.calls()).fill(null),
+      { action: "read_context", record: reference(draft), pointer: "/fields/plan" }]);
+    const response = await researchCall(f.p.environment.value.implementer, f.p.environment.value,
+      "Research the exact plan question", context, undefined,
+      { store: f.store, draftId: draft.id, questionId: plan.id, purpose: "analyst", consumerIntent: reference(intent),
+        requestContract: REQUEST_MANIFEST_CONTRACT }) as Record<string, any>;
     const savedIntent = f.store.get<any>(intent.id)!;
     const execution = readResearchConsumerExecution(f.store, f.p.project, reference(savedIntent));
     assert.equal(execution.kind, "response");
@@ -812,75 +830,105 @@ test("S5-03 runner-prefix packet contract: a delivered packet without its resear
     f.store.write({ id: turnId, kind: "research-turn", expected: pending.revision, value: completed });
     return f.store.get<any>(turnId)!;
   };
-  const startRun = (f: Paid) => f.store.write<ResearchRun>({ id: `research-run:${hashJson([f.p.project, f.p.draft.id, "packet-contract"])}`,
-    kind: "research-run", expected: 0,
-    value: { projectId: f.p.project, draftId: f.p.draft.id, environment: reference(f.p.environment), turns: 0, limit: 100,
-      requestChars: 0, owner: { pid: process.pid, started: processStart(process.pid)! }, ownerQuestion: null,
-      error: null, pauseCode: null, status: "running", inputs: f.p.draft.value.inputs } });
-  const prefix = (f: Paid, run: Revision<ResearchRun>) => {
-    const turns = f.store.list<any>("research-turn").filter(row => row.value.run === run.id)
-      .sort((a, b) => a.value.number - b.value.number);
-    const packetFor = (row: Revision<any>) => {
-      const paid = readResearchConsumerExecution(f.store, f.p.project, row.value.consumerIntent);
-      return paid.kind === "response" && Array.isArray((paid.subject as any)?.contextWorkspace)
-        ? paid.subject : null;
-    };
-    return addressedWorkspace(f.store, turns, f.p.plan, packetFor, subjectOf(f.p.planAnswer, "q-supply"));
+  const corrupt = async (f: Paid, run: Revision<ResearchRun>, lawfulTurn: Revision<any>, kind: "delete" | "foreign") => {
+    const subject = subjectOf(f.p.planAnswer, "q-supply");
+    const draft = f.store.get<DiscoveryDraft>(f.p.draft.id)!, plan = f.store.get<Question>(f.p.plan.id)!;
+    const head = f.store.get<any>(run.id)!, number = head.value.turns + 1;
+    const lawfulIntent = f.store.get<any>(lawfulTurn.value.consumerIntent.id)!;
+    // The corrupted intent reuses the lawful intent's saved cursor context so
+    // the delivered set is the same folded lookup the lawful turn carried.
+    const context = lawfulIntent.value.cursor.context as Record<string, any>;
+    const intent = prepareResearchConsumerIntent(f.store, { projectId: f.p.project, kind: "analyst",
+      key: hashJson([run.id, number, "analyst"]), owner: reference(head), draft: reference(draft),
+      question: reference(plan), role: f.p.environment.value.implementer, dispatch: f.p.environment.value, profile: null,
+      cursor: { run: run.id, turn: number, instruction: "Research the exact plan question", context, subject },
+      basis: draft.value.inputs,
+      guards: uniqueTransactionGuards([reference(head), reference(draft), reference(plan), reference(f.p.environment)]) });
+    // The packet is produced by the same real producer the paid path uses —
+    // workingContext packs this intent's declared result capacity into the
+    // packet and its archive — and only working.deliveryContract is mutated.
+    const lawfulPacket = workingContext(f.store, f.p.project, draft.id, plan.id,
+      { ...context, resultCapacity: intent.value.cursor.resultCapacity },
+      f.p.pilot.value.maxRequestChars ?? 300000, { common: true, purpose: "analyst", subject });
+    const { deliveryContract: _removed, ...noContract } = lawfulPacket.working as Record<string, any>;
+    const packet = { ...lawfulPacket, working: kind === "foreign"
+      ? { ...lawfulPacket.working, deliveryContract: "research-delivery/v0" } : noContract };
+    const requestId = `corrupted-${kind}-${hashJson([run.id, number]).slice(0, 12)}`;
+    const role = f.p.environment.value.implementer;
+    const wire = prepareRequestPartsAndManifest({ store: f.store, projectId: f.p.project, draftId: draft.id,
+      requestId, intentRef: reference(intent),
+      envelope: { protocol: "omg-agent/v1", requestId, mode: "research", model: role.model,
+        effort: role.effort, ...(role.speed !== undefined ? { speed: role.speed } : {}),
+        prompt: intent.value.cursor.resultCapacityPrompt },
+      subject: packet });
+    const pid = process.pid, started = processStart(pid)!;
+    const claimWrite = { id: `model-call:consumer:v1:${requestId}`, kind: "model-call" as const, expected: 0,
+      value: { projectId: f.p.project, draftId: draft.id, questionId: "q-supply",
+        planAnswer: subject.planAnswer, purpose: "analyst", requestId, requested: intent.value.role,
+        profile: intent.value.profile, status: "running", startedAt: 1, finishedAt: null, error: null,
+        confirmed: { model: null, effort: null, speed: null }, usage: null, usageSource: "unavailable",
+        request: { record: wire.manifestRef, hash: digest(wire.input), chars: wire.input.length,
+          bytes: Buffer.byteLength(wire.input) },
+        response: null, packet: { archive: packet.working.archive }, consumerIntent: reference(intent),
+        execution: { version: "model-execution/v1", phase: "claimed", owner: { pid, started }, provider: null },
+        ownerProcess: { pid, started } } };
+    const reservation = prepareResearchConsumerReservation(f.store, reference(intent), claimWrite,
+      wire.manifestRef, packet.working.archive);
+    f.store.writeMany([...wire.writes, claimWrite, ...reservation.writes],
+      uniqueTransactionGuards([...wire.guards, ...reservation.guards]));
+    const claimed = f.store.get<any>(claimWrite.id)!;
+    const dispatched = f.store.write<any>({ id: claimed.id, kind: "model-call", expected: claimed.revision,
+      value: { ...claimed.value,
+        execution: { version: "model-execution/v1", phase: "authorized", owner: { pid, started },
+          provider: { pid, started, group: null } },
+        providerProcess: { pid, started } } });
+    const research = { action: "read_context", record: reference(draft), pointer: "/fields/plan" };
+    const usage = { inputTokens: 1, outputTokens: 1, cachedInputTokens: 0, reasoningOutputTokens: 0 };
+    const responseText = JSON.stringify({ protocol: "omg-agent/v1", requestId, research, usage });
+    const reply = f.store.write<any>({ id: `model-response:${requestId}`, kind: "model-response", expected: 0,
+      value: { projectId: f.p.project, draftId: draft.id, text: responseText,
+        consumerExecution: { contract: "research-consumer-execution/v1", call: reference(claimed),
+          dispatch: reference(dispatched), process: { exitCode: 0, signal: null, stderr: "" } } } });
+    f.store.write<any>({ id: claimed.id, kind: "model-call", expected: dispatched.revision,
+      value: { ...dispatched.value, status: "succeeded", finishedAt: 2, error: null,
+        confirmed: { model: null, effort: null, speed: null }, usage, usageSource: "adapter",
+        response: { record: reference(reply), chars: responseText.length,
+          bytes: Buffer.byteLength(responseText) } } });
+    const savedIntent = f.store.get<any>(intent.id)!;
+    const execution = readResearchConsumerExecution(f.store, f.p.project, reference(savedIntent));
+    assert.equal(execution.kind, "response");
+    const projected = projectPaidTurnAdmission(head.value, { runId: run.id, intent: reference(intent), response: research,
+      question: reference(plan), owner: head.value.owner, limit: 100, context, subject });
+    const turnId = managedTurnId(run.id, number);
+    const application = prepareResearchConsumerApplication(f.store, reference(savedIntent), reference(execution.call),
+      [{ id: run.id, kind: run.kind, expected: head.revision, value: projected.run },
+        { id: turnId, kind: "research-turn", expected: 0, value: projected.turn }],
+      [reference(head), reference(f.p.environment), { id: turnId, absent: true }]);
+    f.store.writeMany(application.writes, application.guards);
+    const pending = f.store.get<any>(turnId)!, step = turnAction(pending.value) as any;
+    const exact = f.store.get<any>(step.record.id, step.record.revision)!;
+    const completed = projectResearchTurnRevision(pending.value,
+      { kind: "read-context", recordValue: contextRecordValue(f.store, exact), record: step.record,
+        maxChars: f.p.pilot.value.maxRequestChars ?? 300000 });
+    f.store.write({ id: turnId, kind: "research-turn", expected: pending.revision, value: completed });
+    return f.store.get<any>(turnId)!;
   };
-  const enter = (f: Paid, run: Revision<ResearchRun>, own: ReturnType<typeof prefix>) => {
-    const head = f.store.get<any>(run.id)!;
-    const delivery = { run: run.id, turn: head.value.turns + 1 };
-    const reserve = () => { const current = f.store.get<any>(run.id)!;
-      return { write: { id: current.id, kind: current.kind, expected: current.revision,
-        value: { ...current.value, turns: current.value.turns + 1 } }, guards: [reference(current)] }; };
-    return synthesisSession(f.store, f.p.draft, f.p.plan, f.p.environment, f.p.dispatch, f.p.pilot,
-      { ...contextOf(subjectOf(f.p.planAnswer, "q-supply")), workingSelections: [] },
-      "Synthesize the exact plan-question", undefined, { delivery, reserve: reserve(), initialWorkspace: own });
-  };
-  // Positive: a packet-free paid prefix inherits; the session's first record
-  // carries exactly the folded runner workspace.
-  {
-    const f = await paidPlanned(t, "s5r2-packet-free");
+  for (const kind of ["delete", "foreign"] as const) {
+    const f = await paidPlanned(t, `s5r2-packet-${kind === "delete" ? "missing" : "foreign"}`);
     const run = startRun(f);
-    await produce(f, run, "free");
-    const own = prefix(f, run);
-    assert.equal(own.entries.length, 1, "the read_context turn folds its entry");
-    assert.equal(await code(() => enter(f, run, own)), "no-error", "the packet-free prefix inherits");
-    const session = sessionOf(f.store, "q-supply");
-    assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
-    const head = f.store.get<any>(session.id)!;
-    assert.deepEqual(readSynthesisSessionV3(f.open(), reference(head)), head, "the chain reader proves the same prefix");
-  }
-  // Positive: a real delivered packet — produced by workingContext itself with
-  // its research-delivery/v1 contract — folds into the runner workspace and the
-  // session inherits it whole.
-  {
-    const f = await paidPlanned(t, "s5r2-packet-lawful");
-    const run = startRun(f);
-    await produce(f, run, "free");
-    await produce(f, run, "packet");
-    const own = prefix(f, run);
-    assert.equal(own.entries.length, 1, "the read_context turn folds its entry");
-    assert.ok((own.deliveryCoverage ?? []).length > 0, "the real packet records its delivery coverage");
-    assert.equal(await code(() => enter(f, run, own)), "no-error", "the lawful packet prefix inherits");
-    const session = sessionOf(f.store, "q-supply");
-    assert.deepEqual(f.store.get<any>(session.id, 1)!.value.workspace, own);
-  }
-  // Negative packet only: the packet is the same real producer output with
-  // exactly working.deliveryContract absent or foreign; the refusal fires at
-  // the packet check itself — every wire digest is exact.
-  for (const corrupt of ["delete", "foreign"] as const) {
-    const f = await paidPlanned(t, `s5r2-packet-${corrupt === "delete" ? "missing" : "foreign"}`);
-    const run = startRun(f);
-    await produce(f, run, "free");
-    const turn = await produce(f, run, corrupt);
+    await produce(f, run, false);
+    const lawfulTurn = await produce(f, run, true);
+    const lawful = packetFor(f, lawfulTurn);
+    assert.ok(lawful && lawful.working?.deliveryContract === "research-delivery/v1",
+      "the real paid turn saved the lawful packet the corruption mutates");
+    const turn = await corrupt(f, run, lawfulTurn, kind);
     const paid = readResearchConsumerExecution(f.store, f.p.project, turn.value.consumerIntent);
     assert.equal(paid.kind, "response");
     assert.ok(paid.kind === "response" && Array.isArray(paid.subject.contextWorkspace),
-      "the produced packet carries its delivered set");
+      "the corrupted packet retains its delivered set");
     const before = history(f.store), calls = f.calls();
     assert.equal(await code(() => enter(f, run, prefix(f, run))), "synthesis_session_invalid",
-      corrupt === "delete" ? "a packet without its contract is no delivery" : "a foreign contract is no delivery");
+      kind === "delete" ? "a packet without its contract is no delivery" : "a foreign contract is no delivery");
     assert.deepEqual(history(f.store), before, "the refusal wrote nothing");
     assert.equal(f.calls(), calls, "and paid nothing");
   }
