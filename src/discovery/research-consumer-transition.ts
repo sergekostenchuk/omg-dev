@@ -1,4 +1,4 @@
-import { decodeVariantExecutionSession, decodeVariantGeneration, type VariantExecutionSession } from './discovery-variants.js';
+import { decodeVariantDecisionAnswer, decodeVariantExecutionSession, decodeVariantGeneration, type VariantExecutionSession } from './discovery-variants.js';
 import type { AssessmentTransportSubject } from './continuation-packet.js';
 import { DISCOVERY_ASSESSMENT_CONTRACT_V2, DISCOVERY_ASSESSMENT_CONTRACT_V3, type DiscoveryAttemptsAssessmentV2, type DiscoveryAttemptsAssessmentV3, type PaidDiscoveryAttemptsAssessment } from './research-model.js';
 import { earlyResearchFailure, deliveredConceptSections, EARLY_RESEARCH_OUTCOME, researchResultFailure, requireAttemptsAssessmentReply,
@@ -2364,5 +2364,6 @@ export function projectPaidVariantSession(session: Revision<VariantExecutionSess
   const capacityFailure=researchResultFailure(v.cursor.resultCapacity,paid.payload);
   if(capacityFailure) throw capacityFailure;
   if(before.variantSubject.kind==='proposal') decodeVariantGeneration(paid.payload);
+  else decodeVariantDecisionAnswer(paid.payload);
   return {...before,cursor:1,result:{intent:reference(intent),call:paid.call,response:paid.response}};
 }

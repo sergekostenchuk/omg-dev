@@ -397,6 +397,8 @@ test('4T.4: the general managed decision door cannot reserve against a merely st
   const subject:VariantSubject={contract:VARIANT_SUBJECT_CONTRACT,kind:'decision',set:reference(f.saved),mode:reference(f.mode),expectedSelection:null};
   // Negative transport fixtures only: this is deliberately NOT a set producer or a positive paid decision.
   const cal=f.store.write({id:'transport-fixture:decision-calibration',kind:'transport-fixture',expected:0,value:{projectId:'p'}});
+  // 4B.2: a decision answer has its own closed form; the calibration reply is one.
+  writeFileSync(f.settings,JSON.stringify({tokens:10,reply:{action:'choose',key:'one',reason:'Transport calibration only'}}));
   await researchCall(f.environment.value.implementer,f.environment.value,'Calibrate decision transport',
     {variantSubject:{...subject,set:reference(cal)},history:[]},undefined,
     {store:f.store,draftId:f.calibration.draft.id,questionId:f.calibration.question.id,purpose:'variant-decision'});

@@ -236,6 +236,24 @@ export function decodeVariantGeneration(value: unknown): VariantGenerationAnswer
   }
   return structuredClone(value) as unknown as VariantGenerationAnswer;
 }
+/** 4B.2: the closed wire answer of a variant decision call (purpose variant-decision): one choice of an existing member of
+ * the exact set by its local key, or the rejection of the whole set, each with its reason. The key becomes the exact Ref
+ * of that member in the decision projection; a recommendation of the generation never becomes a decision by itself. */
+export type VariantDecisionAnswer = { action: 'choose'; key: string; reason: string } | { action: 'reject_all'; reason: string };
+export function decodeVariantDecisionAnswer(value: unknown): VariantDecisionAnswer {
+  const code = 'discovery_variant_answer_invalid';
+  try {
+    if (!variantObject(value) || (value.action !== 'choose' && value.action !== 'reject_all'))
+      variantInvalid('action', 'Expected choose or reject_all', code);
+    variantShape(value, value.action === 'choose' ? ['action', 'key', 'reason'] : ['action', 'reason'], 'decision', code);
+    if (value.action === 'choose') variantText(value.key, 'key');
+    variantText(value.reason, 'reason');
+  } catch (error) {
+    if (!(error instanceof EngineError) || error.code === code) throw error;
+    throw new EngineError(code, error.message, error.details);
+  }
+  return structuredClone(value) as unknown as VariantDecisionAnswer;
+}
 export function decodeVariantSet(value: unknown): VariantSet {
   variantShape(value, ['contract', 'projectId', 'draft', 'snapshot', 'origin', 'members', 'scale', 'comparison', 'recommendation', 'searchLimits', 'unknowns'], 'set');
   variantBasis(value, VARIANT_SET_CONTRACT); variantRef(value.snapshot, 'snapshot'); variantOrigin(value.origin, 'origin');

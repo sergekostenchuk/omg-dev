@@ -1,5 +1,8 @@
-import { decodeVariantExecutionSession, decodeVariantSubject, type VariantExecutionSession } from './discovery-variants.js';
-import { variantPublicationWrites } from './variant-decision.js';
+import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural,
+  type VariantExecutionSession, type VariantPublication, type VariantPublicationRecord, type VariantSubject } from './discovery-variants.js';
+import { variantPublicationWrites, variantDecisionPublicationWrites, readVariantDecisionStructural, readVariantStateStructural,
+  variantStateId, type VariantModelDecision } from './variant-decision.js';
+import { readProjectMode } from '../product/project-mode.js';
 import { readVariantSnapshot } from './variant-snapshot.js';
 import { variantExecutionSessionId, projectPaidVariantSession } from './research-consumer-transition.js';
 import { requireVariantArchive, variantTransportFields, variantTransportGuards } from './continuation-packet.js';
@@ -1528,8 +1531,8 @@ export function consumerResultCapacity(store: Store, intent: ResearchConsumerInt
     cursor: Object.fromEntries(['sessionId', 'offset', 'materialOffset', 'run', 'turn', 'pendingTurn', 'delivery',
       'previousProposalRef', 'contextContract'].filter(key => Object.hasOwn(cursor, key)).map(key => [key, cursor[key]])) });
   // The common result bound measures the complete generation reply, not legacy analyst actions.
-  return intent.kind==='variant-proposal'
-    ? {...capacity,forms:[{kind:'variants'},{kind:'no_variants'}]} : capacity;
+  return intent.kind==='variant-proposal' ? {...capacity,forms:[{kind:'variants'},{kind:'no_variants'}]}
+    : intent.kind==='variant-decision' ? {...capacity,forms:[{kind:'choose'},{kind:'reject_all'}]} : capacity;
 }
 export function consumerCapacityFailure(_store: Store, intent: Revision<ResearchConsumerIntent>, payload: unknown) {
   const cursor = intent.value.cursor;
@@ -1745,8 +1748,11 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
   request: Ref, archive: Ref): { writes: Write[]; guards: TransactionGuard[] } {
   const intent = readResearchConsumerIntent(store, intentRef);
   // This is a NEW physical claim only. Paid returns and historical decision readers stay available.
-  if(intent.value.kind==='variant-decision') throw new EngineError('discovery_variant_set_not_ready',
-    'A new managed decision reservation requires the proven set producer of 4B.1');
+  // 4B.2: a NEW managed decision is admitted here again — proven set, real bypass mode, an undecided current selection of
+  // that set, one purchase per set — and its exact/absent dependencies always enter the reservation.
+  const decisionGuards = intent.value.kind==='variant-decision'
+    ? requireVariantDecisionAdmission(store,intent.value.projectId,decodeVariantSubject(intent.value.cursor.variantSubject),intent.value.owner.id,
+      decodeVariantExecutionSession(store.get(intent.value.owner.id,intent.value.owner.revision)?.value)) : [];
   if (intent.value.state !== 'prepared' || !object(call.value) || call.kind !== 'model-call' || call.expected !== 0
     || !isRef(request) || !isRef(archive) || !object(call.value.request) || !object(call.value.packet)
     || !isRef(call.value.request.record) || canonical(call.value.request.record) !== canonical(request)
@@ -1773,7 +1779,7 @@ export function prepareResearchConsumerReservation(store: Store, intentRef: Ref,
   const write: Write = { id: intent.id, kind: 'research-consumer-intent', expected: intent.revision,
     value: { ...intent.value, state: 'running', call: pendingRef(call), request, archive } satisfies ResearchConsumerIntent };
   return { writes: [write], guards: uniqueTransactionGuards([reference(intent), reference(owner),
-    ...intent.value.guards.filter(guard => !runner || guard.id !== intent.value.owner.id)]) };
+    ...intent.value.guards.filter(guard => !runner || guard.id !== intent.value.owner.id), ...decisionGuards]) };
 }
 
 /** The saved session producer selects the contract; a missing response field
@@ -3206,7 +3212,7 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
     const value=projectPaidVariantSession(owner,running,{call:reference(paid.call),response:paid.response,payload:paid.payload});
     // 4B.1: the receipt and the whole product publication its paid generation projects, in one fixed order.
     const shape=(write:{id:string;kind:string;expected:number;value:unknown})=>({id:write.id,kind:write.kind,expected:write.expected,value:write.value});
-    const product=variantPublicationWrites(store,value,paid.payload);
+    const product=value.variantSubject.kind==='proposal'?variantPublicationWrites(store,value,paid.payload):variantDecisionPublicationWrites(store,value,paid.payload);
     const expected=[{id:owner.id,kind:owner.kind,expected:owner.revision,value},...product.writes];
     if(canonical(writes.map(shape))!==canonical(expected.map(shape)))
       consumerInvalid(intent.id,'Only the exact paid variant receipt and the publication its generation projects can be applied');
@@ -4073,4 +4079,150 @@ export function readContextIdentityAt(store: Store, projectId: string,
   draft: Revision<DiscoveryDraft>, question: Ref,
   action: Extract<ResearchAction, { action: 'read_context' }>, observation: unknown) {
   return checkedContextIdentity(store, projectId, draft, question, action, observation);
+}
+
+
+// ---- 4B.1/4B.2: the historical proof of a variant execution and of its product publication. It lives beside the managed
+// lifecycle so that the common door can prove a set without an import ring; variant-session.ts re-exports these readers.
+const variantSame=(a:unknown,b:unknown)=>canonical(a)===canonical(b);
+function variantSessionInvalid(reason:string):never {throw new EngineError('discovery_variant_session_invalid',reason);}
+function variantExact<T>(store:Store,ref:Ref,kind:string):Revision<T> {
+  if(!isRef(ref)) variantSessionInvalid(`Missing exact ${kind}`);
+  const row=store.get<T>(ref.id,ref.revision);
+  if(!row || row.kind!==kind || !variantSame(reference(row),ref) || row.hash!==hashJson(row.value)) variantSessionInvalid(`Missing exact ${kind}`);
+  return row;
+}
+function variantProduct(store:Store,v:VariantExecutionSession,payload:unknown,admit:boolean) {
+  return v.variantSubject.kind==='proposal' ? variantPublicationWrites(store,v,payload,admit).writes
+    : variantDecisionPublicationWrites(store,v,payload,admit).writes;
+}
+/** Historical proof of execution. A 4T.4 execution-only receipt neither accepts Discovery nor publishes a set; a 4B
+ * receipt carries the whole publication its paid answer projects, each named output read and compared in full. */
+export function readVariantExecutionSession(store:Store,project:string,ref:Ref):Revision<VariantExecutionSession> {
+  const row=variantExact<VariantExecutionSession>(store,ref,'discovery-variant-session');
+  const v=decodeVariantExecutionSession(row.value);
+  if(v.projectId!==project || row.id!==variantExecutionSessionId(v) || row.revision!==v.cursor+1)
+    variantSessionInvalid('The execution session differs from its full identity or cursor');
+  const draft=variantExact<DiscoveryDraft>(store,v.draft,'discovery-draft'),question=variantExact<Question>(store,v.question,'question');
+  if(draft.value.projectId!==project || question.value.projectId!==project || question.value.draftId!==draft.id
+    || !draft.value.questions.includes(question.id)) variantSessionInvalid('The execution session has foreign draft/Question');
+  if(v.variantSubject.kind==='proposal') {
+    const basis=readVariantSnapshot(store,project,v.variantSubject.snapshot);
+    if(!variantSame(basis.value.draft,v.draft) || !basis.value.questions.some(q=>variantSame(q.question,v.question)))
+      variantSessionInvalid('The session Question is not the exact Question of its snapshot');
+  } else if(v.cursor===1) {
+    // A prepared decision session claims nothing yet (its purchase is admitted at the door); an applied one is over a proven set.
+    const set=readVariantGeneration(store,project,v.variantSubject.set);
+    if(set.publication.result.kind!=='discovery-variant-set' || !variantSame(set.session.value.draft,v.draft)
+      || !variantSame(set.session.value.question,v.question)) variantSessionInvalid('The decision session does not name its proven set');
+  }
+  if(v.cursor===1) {
+    const running=readResearchConsumerIntent(store,v.result!.intent);
+    const paid=readResearchConsumerExecution(store,project,reference(running));
+    const outputs=paid.intent.value.outputs;
+    if(paid.kind!=='response' || paid.intent.value.state!=='applied' || !outputs?.length || !variantSame(outputs[0],ref))
+      variantSessionInvalid('The execution receipt has no atomic managed application');
+    const initial=variantExact<VariantExecutionSession>(store,running.value.owner,'discovery-variant-session');
+    const projected=projectPaidVariantSession(initial,running,{call:reference(paid.call),response:paid.response,payload:paid.payload});
+    if(!variantSame(projected,v) || paid.intent.revision!==running.revision+1
+      || !variantSame(paid.intent.value,{...running.value,state:'applied',outputs:paid.intent.value.outputs}))
+      variantSessionInvalid('The execution receipt differs from its exact paid application');
+    if(outputs!.length>1) {
+      // 4B1-02 (№11560): every named output revision is read and compared — kind, exact Ref and whole value — with the
+      // projection of the paid answer; a listed Ref alone proves nothing. The form (with or without state) is the one named.
+      const refOf=(write:{id:string;expected:number;value:unknown})=>({id:write.id,revision:write.expected+1,hash:hashJson(write.value as never)});
+      const writes=[true,false].map(admit=>variantProduct(store,v,paid.payload,admit)).find(form=>variantSame(outputs!.slice(1),form.map(refOf)));
+      if(!writes) variantSessionInvalid('The execution receipt names another publication than its paid answer projects');
+      for(const write of writes!) {
+        const saved=store.get(write.id,write.expected+1);
+        if(!saved || saved.kind!==write.kind || !variantSame(reference(saved),refOf(write)) || saved.hash!==hashJson(saved.value)
+          || !variantSame(saved.value,write.value)) variantSessionInvalid('A named output of the publication is missing or differs from its projection');
+      }
+    } else if(v.variantSubject.kind==='decision') variantSessionInvalid('A model decision is never an execution-only receipt');
+  }
+  return row;
+}
+/** The application of a published product record: its running intent, the applied revision right after it naming the record
+ * among its outputs, and the receipt that leads them. */
+function variantApplicationOf(store:Store,project:string,ref:Ref,origin:{intent:Ref}) {
+  const running=readResearchConsumerIntent(store,origin.intent);
+  const applied=store.get<ResearchConsumerIntent>(running.id,running.revision+1);
+  if(running.value.state!=='running' || applied?.value.state!=='applied' || !applied.value.outputs?.length
+    || !applied.value.outputs.some(output=>variantSame(output,ref))) variantSessionInvalid('The result is not an output of its exact managed application');
+  const session=readVariantExecutionSession(store,project,applied.value.outputs[0]!);
+  if(!variantSame(session.value.result,origin)) variantSessionInvalid('The result names another execution receipt');
+  const paid=readResearchConsumerExecution(store,project,reference(running));
+  if(paid.kind!=='response') variantSessionInvalid('The result lost its paid response');
+  const stateOf=(state:{id:string;expected:number;value:unknown})=>{
+    const stateRef={id:state.id,revision:state.expected+1,hash:hashJson(state.value as never)};
+    return applied.value.outputs!.some(output=>variantSame(output,stateRef))?stateRef:null;
+  };
+  return {session,payload:paid.payload,stateOf};
+}
+export interface ProvenVariantGeneration {
+  verification:'proven'; session:Revision<VariantExecutionSession>; publication:VariantPublication; state:Ref|null;
+}
+/** 4B.1: the proven reader of a published generation result — a set or no_variants. A structural record alone, or a 4T.4
+ * execution-only receipt, proves no product set. */
+export function readVariantGeneration(store:Store,project:string,ref:Ref):ProvenVariantGeneration {
+  const row=isRef(ref)?store.get(ref.id,ref.revision):null;
+  const structural=row?.kind==='discovery-variant-set'?readVariantSetStructural(store,project,ref).record
+    :row?.kind==='discovery-variant-none'?readVariantNoneStructural(store,project,ref).record:variantSessionInvalid('Expected an exact published set or no_variants');
+  const {session,payload,stateOf}=variantApplicationOf(store,project,ref,structural.value.origin);
+  if(session.value.variantSubject.kind!=='proposal') variantSessionInvalid('A generation result is published by a generation');
+  const {publication,state}=variantPublicationWrites(store,session.value,payload,true);
+  if(!variantSame(publication.result.ref,ref)) variantSessionInvalid('The generation result is not the one its paid answer projects');
+  return {verification:'proven',session,publication,state:stateOf(state)};
+}
+export interface ProvenVariantModelDecision {
+  verification:'proven'; session:Revision<VariantExecutionSession>; decision:VariantPublicationRecord<VariantModelDecision>; state:Ref|null;
+}
+/** 4B.2: the proven reader of a paid model decision. The structural record leads to its application and receipt; the
+ * decision is recomputed from the paid answer over the exact proven set. A structural decision alone proves nothing. */
+export function readVariantModelDecision(store:Store,project:string,ref:Ref):ProvenVariantModelDecision {
+  const row=isRef(ref)?store.get(ref.id,ref.revision):null;
+  if(row?.kind!=='discovery-variant-model-decision') variantSessionInvalid('Expected an exact model decision');
+  const structural=readVariantDecisionStructural(store,project,ref).record.value as VariantModelDecision;
+  const {session,payload,stateOf}=variantApplicationOf(store,project,ref,structural.origin);
+  if(session.value.variantSubject.kind!=='decision') variantSessionInvalid('A model decision is published by a decision execution');
+  const {decision,state}=variantDecisionPublicationWrites(store,session.value,payload,true);
+  if(!variantSame(decision.ref,ref)) variantSessionInvalid('The model decision is not the one its paid answer projects');
+  return {verification:'proven',session,decision,state:stateOf(state)};
+}
+/** 4B.2: the admission of a NEW managed model decision, judged at preparation and again at the common reservation door.
+ * Only bypass buys a model choice; questions stops at the owner door. The set is proven, the expected selection is the
+ * undecided current state of exactly that set, and one set is bought once: another mode, actor or expected selection of
+ * the same set buys nothing new. Returns the exact dependencies the reservation must guard. */
+export function requireVariantDecisionAdmission(store:Store,project:string,subject:VariantSubject,sessionId:string,
+  session:{draft:Ref;question:Ref}):Ref[] {
+  if(subject.kind!=='decision') return [];
+  const proven=readProvenVariantSet(store,project,subject.set);
+  if(!variantSame(proven.session.value.draft,session.draft) || !variantSame(proven.session.value.question,session.question))
+    throw new EngineError('discovery_variant_decision_invalid','The decision session names the draft and Question of its proven set');
+  const mode=readProjectMode(store,project,subject.mode);
+  if(mode.mode!=='bypass') throw new EngineError('discovery_variant_owner_door','In questions mode the choice belongs to the owner door; no model decision is bought');
+  if(!subject.expectedSelection) throw new EngineError('discovery_variant_decision_invalid','A model decision names the exact current selection of its set');
+  const state=readVariantStateStructural(store,project,proven.session.value.draft.id,subject.expectedSelection).record.value;
+  const decided=store.list<{set?:Ref}>('discovery-variant-model-decision').concat(store.list<{set?:Ref}>('discovery-variant-owner-decision'))
+    .some(row=>variantSame(row.value.set,subject.set));
+  const bought=store.list<ResearchConsumerIntent>('research-consumer-intent').some(row=>row.value.kind==='variant-decision'
+    && row.value.state!=='refused' && row.value.owner?.id!==sessionId && variantSame(row.value.cursor?.variantSubject?.set,subject.set));
+  if(!variantSame(state.set,subject.set) || state.decision!==null || decided || bought)
+    throw new EngineError('discovery_variant_decision_exists','This set is already decided or being decided; another mode, actor or selection buys no new choice');
+  if(variantStateId(project,proven.session.value.draft.id)!==subject.expectedSelection.id)
+    throw new EngineError('discovery_variant_decision_invalid','The expected selection is the state of the set\'s own draft');
+  return [subject.set,subject.mode,subject.expectedSelection];
+}
+
+/** The proven set a model decision is over; an unprovable or no_variants result is a typed "set not ready". */
+export function readProvenVariantSet(store:Store,project:string,ref:Ref):ProvenVariantGeneration {
+  let proven:ProvenVariantGeneration;
+  try { proven=readVariantGeneration(store,project,ref); }
+  catch(error) {
+    if(!(error instanceof EngineError)) throw error;
+    throw new EngineError('discovery_variant_set_not_ready',`A model decision needs a proven set: ${error.message}`,{cause:error.code});
+  }
+  if(proven.publication.result.kind!=='discovery-variant-set')
+    throw new EngineError('discovery_variant_set_not_ready','A model decision needs a proven set, not no_variants');
+  return proven;
 }

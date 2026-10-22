@@ -1,9 +1,9 @@
-import { hashJson } from '../canonical.js';
+import { hashJson, type Json } from '../canonical.js';
 import { reference, type Ref } from '../pipeline/contracts.js';
 import { VARIANT_SCOPE_CONTRACT, readVariantNoneStructural, readVariantSetStructural, readVariantSnapshotStructural,
   readVariantStructure, variantBasis, variantInvalid, variantNullableRef, variantOrigin, variantReason,
   variantRecordId, variantRef, variantSame, variantShape, variantText,
-  projectVariantPublication, type StructuralVariantRecord, type VariantExecutionSession, type VariantOrigin, type VariantPublication,
+  projectVariantPublication, decodeVariantDecisionAnswer, decodeVariantExecutionSession, type VariantPublicationRecord, type StructuralVariantRecord, type VariantExecutionSession, type VariantOrigin, type VariantPublication,
   type VariantReason, type VariantRecordView } from './discovery-variants.js';
 
 export const VARIANT_OWNER_DECISION_CONTRACT = 'discovery-variant-owner-decision/v1' as const;
@@ -227,4 +227,42 @@ export function variantPublicationWrites(view: VariantRecordView, session: Varia
     ...(admitted ? [stateWrite] : [])];
   const basis = subject.kind === 'proposal' ? [subject.snapshot] : [];
   return { publication, writes, guards: admitted ? [subject.mode, ...basis] : basis, state: stateWrite, admitted };
+}
+
+/** 4B.2: the product batch of one paid model decision over an exact proven set — the model-decision record and, when
+ * admissible, the next current state naming it — as the producer writes it and the historical reader recomputes it.
+ * The chosen key becomes the exact Ref of that member; reject_all keeps no member. The previous state is the exact
+ * expected selection the decision was dispatched with; it is admissible only while the current selection and mode are
+ * still exactly the subject's. Otherwise the paid decision stays published under its original subject and the newer
+ * current state is never overwritten. `admit` fixes the form when a saved application is reread. */
+export function variantDecisionPublicationWrites(view: VariantRecordView, session: VariantExecutionSession, payload: unknown, admit?: boolean):
+  { decision: VariantPublicationRecord<VariantModelDecision>; writes: VariantPublicationWrite[]; guards: Ref[]; state: VariantPublicationWrite; admitted: boolean } {
+  const receipt = decodeVariantExecutionSession(session), subject = receipt.variantSubject;
+  if (receipt.cursor !== 1 || receipt.result === null || subject.kind !== 'decision' || subject.expectedSelection === null)
+    decisionError('session', 'A model decision needs the applied receipt of a decision over a current selection');
+  const subjectSet = (subject as { set: Ref }).set;
+  const answer = decodeVariantDecisionAnswer(payload);
+  const set = readVariantSetStructural(view, receipt.projectId, subjectSet).record.value;
+  let outcome: VariantOutcome = { kind: 'reject_all', reason: answer.reason };
+  if (answer.action === 'choose') {
+    const member = set.members.find(ref => (view.get<{ key: string }>(ref.id, ref.revision)?.value as { key?: string } | undefined)?.key === answer.key);
+    if (!member) variantInvalid('key', 'The choice names an existing member of the exact set', 'discovery_variant_answer_invalid');
+    outcome = { kind: 'choose', member: member!, reason: answer.reason };
+  }
+  const value = decodeVariantModelDecision({ contract: VARIANT_MODEL_DECISION_CONTRACT, projectId: receipt.projectId, draft: set.draft,
+    set: subjectSet, mode: subject.mode, expectedSelection: subject.expectedSelection, previous: null, outcome, origin: receipt.result });
+  const id = variantRecordId('discovery-variant-model-decision', value);
+  const decision = { id, kind: 'discovery-variant-model-decision', value, ref: { id, revision: 1, hash: hashJson(value as unknown as Json) } };
+  const expected = subject.expectedSelection!, stateId = variantStateId(receipt.projectId, set.draft.id);
+  readVariantStateStructural(view, receipt.projectId, set.draft.id, expected);
+  const state = decodeVariantState({ contract: VARIANT_STATE_CONTRACT, projectId: receipt.projectId, draft: set.draft, mode: subject.mode,
+    result: subjectSet, set: subjectSet, decision: decision.ref, previous: expected });
+  const stateWrite: VariantPublicationWrite = { id: stateId, kind: 'discovery-variant-state', expected: expected.revision, value: state };
+  let admitted = admit;
+  if (admitted === undefined) {
+    const head = view.get(stateId), mode = view.get(subject.mode.id);
+    admitted = !!head && variantSame(reference(head), expected) && !!mode && variantSame(reference(mode), subject.mode);
+  }
+  const writes: VariantPublicationWrite[] = [{ id, kind: decision.kind, expected: 0, value }, ...(admitted ? [stateWrite] : [])];
+  return { decision, writes, guards: admitted ? [subject.mode, subjectSet] : [subjectSet], state: stateWrite, admitted };
 }
