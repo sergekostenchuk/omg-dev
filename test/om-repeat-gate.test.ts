@@ -4214,91 +4214,70 @@ test("E5.1 does not transfer an identical fact key to another attempt", async t 
   assert.equal(f.sent().length, sends);
 });
 
-test("E5.1 confirms both E5 and native D5 of one fact but advances the goal once", async t => {
+test("E5.1 confirms both E5 and its own D2 closure of one fact but advances the goal once", async t => {
+  // LG19 t1 (codex-omg2 №10709 п.1): the second basis of the key is the D2 closure of this attempt's own E5 answer — the
+  // managed pair of representativeAttempt "D5" and d2RepresentedAttempt — instead of a native D5 acceptance, whose route
+  // LG19 removes.
   const f = e51Fixture(t, false, true), original = await f.original();
-  const intent = deliveredOf(writeAssessmentIntent(f.store, original));
-  const admission = deliveredOf(readAssessmentIntentAt(f.store, f.project, reference(intent)));
-  const mc1Ref = admission.question.record;
-  const mc1 = f.store.get<Mc1QuestionRecord>(mc1Ref.id, mc1Ref.revision)!;
-  const source = f.store.get<{ content: string }>(`source:${f.project}:brief`)!;
-  const nativeDraft = f.engine.discovery.create(f.project, "om-g2", "R1", f.block,
-    [mc1FieldSpec({ input: mc1.value.request.input, gap: mc1.value.request.gap,
-      contract: mc1.value.request.contract })],
-    [mc1.value.request.input, mc1.value.request.gap,
-      ...(mc1.value.request.task ? [mc1.value.request.task] : []), reference(source)]);
-  const issued = f.store.get<Question>(nativeDraft.value.questions[0]!)!;
-  const nativeQuestion = deliveredOf(writeMc1Question(f.store, { ...mc1.value.request,
-    engineQuestion: reference(issued), draft: reference(nativeDraft) }));
   writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep, e51AssessorStep("supported")] }));
-  const assessment = await assessAnswer(f.store, issued, { action: "answer", question: issued.id, value: "UTF-8",
-    citations: [{ source: reference(source), selector: { kind: "text-range", start: 0,
-      end: source.value.content.length } }] }, f.config, f.root);
-  const researchedDraft = f.engine.discovery.researched(issued.id, issued.revision, reference(assessment));
-  const answered = f.store.get<Question>(issued.id)!;
-  assert.ok(answered.value.answer);
-  const native = deliveredOf(writeAcceptedAnswer(f.store, { project: f.project, question: reference(nativeQuestion),
-    answer: answered.value.answer!, answeredQuestion: reference(answered), draft: reference(researchedDraft),
-    attempt: { series: reference(f.series), attempt: 1 } }));
-  // Native assessment consumed the second fixture response; E5's independent assessor gets the third.
-  writeFileSync(f.scenario, JSON.stringify({ database: f.store.path, steps: [f.originalStep,
-    e51AssessorStep("supported"), e51AssessorStep("supported")] }));
   // The E5 terminal is saved and the attempt waits for G7: E5 never closes a managed attempt itself.
   deliveredOf(await assessFact(f.store, original));
   assert.equal(e51Outcome(f), null);
-  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND)[0]!;
-  assert.equal(terminal.value.verdict, "supported");
+  const terminal = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND).find(row => row.value.verdict === "supported")!;
   const e5 = terminal.value.accepted!;
-  const nativeRef = reference(native);
-  assert.notEqual(e5.id, nativeRef.id);
-  const e5Key = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: e5 })).key;
-  const nativeKey = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: nativeRef })).key;
-  assert.equal(e5Key, nativeKey);
-  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
-  // G7 requires the E5 basis and adds the caller's native D5 beside it; either order is the same close.
-  const derived = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome({ accepting: [nativeRef] }) })).outcome;
-  assert.deepEqual([...derived.accepting].map(ref => ref.id).sort(), [e5.id, nativeRef.id].sort());
-  const one = deliveredOf(prepareCloseAttempt(f.store, { ...at,
-    outcome: outcome({ accepting: [e5, nativeRef] }) }));
-  const opposite = deliveredOf(prepareCloseAttempt(f.store, { ...at,
-    outcome: outcome({ accepting: [nativeRef, e5] }) }));
-  assert.deepEqual(one.writes, opposite.writes);
-  const closing = { ...at, outcome: outcome({ accepting: [e5, nativeRef] }) };
-  const closed = deliveredOf(closeAttempt(f.store, closing));
-  const saved = e51Outcome(f);
-  assert.ok(saved);
-  assert.equal(saved.reason, "result");
-  assert.equal(saved.achieved.length, 1);
-  assert.equal(saved.achieved[0]!.key, e5Key);
-  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 0);
-  const nativeFact = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: nativeRef }));
+  const e5Fact = deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: e5 }));
+  // D3 applies the E5 answer and D2 closes its line for this very attempt while the attempt is still open.
+  const mc1 = f.store.get<Mc1QuestionRecord>(deliveredOf(readAssessmentIntentAt(f.store, f.project, terminal.value.intent)).question.record.id)!;
   const prior = mc1.value.request.gaps;
-  const initial = deliveredOf(writeGapLines(f.store, { project: f.project, previous: null,
-    pass: 1, gaps: prior, closures: [] }));
-  const applied = deliveredOf(writeApplyAnswer(f.store, { project: f.project,
-    input: mc1.value.request.input, answer: nativeRef, question: reference(mc1) }));
+  const initial = deliveredOf(writeGapLines(f.store, { project: f.project, previous: null, pass: 1, gaps: prior, closures: [] }));
+  const applied = deliveredOf(writeApplyAnswer(f.store, { project: f.project, input: mc1.value.request.input, answer: e5, question: reference(mc1) }));
   const nextHorizon = deliveredOf(writeHorizon(f.store, { project: f.project, input: reference(applied),
     graph: prior.sources.graph, refinement: null, available: {},
-    choice: { choiceVersion: "e51-native-d2", features: [{ outcome: "garden-result" }], excluded: [] } }));
+    choice: { choiceVersion: "e51-own-d2", features: [{ outcome: "garden-result" }], excluded: [] } }));
   const nextSources: GapRequest = { ...structuredClone(prior.sources), input: reference(applied),
     horizon: reference(nextHorizon.gate), operations: { ...structuredClone(prior.sources.operations),
       frame: { ...structuredClone(prior.sources.operations.frame), horizon: reference(nextHorizon.gate) } } };
   const nextGaps = deliveredOf(writeGaps(f.store, nextSources));
   const current: GapReadRequest = { sources: structuredClone(nextGaps.sources) as GapRequest,
     records: nextGaps.records.map(reference) };
-  const nativeAttempt = { series: nativeFact.attempt!.series, attempt: nativeFact.attempt!.ordinal };
-  const confirmation = { project: f.project, basis: { record: nativeRef }, target: nativeFact.gap.target,
-    field: nativeFact.gap.field, prior, current, attempt: nativeAttempt, currentOnly: true };
-  assert.equal(deliveredOf(confirmAnswerGapClosure(f.store, confirmation)).key, nativeFact.key);
-  const closure = { id: nativeFact.gap.id, reason: "filled" as const, basis: nativeRef, acceptance: null,
-    attempt: nativeAttempt, answer: { record: nativeRef } };
-  deliveredOf(writeGapLines(f.store, { project: f.project, previous: reference(initial),
-    pass: 2, gaps: current, closures: [closure] }));
+  const answerAttempt = { series: e5Fact.attempt!.series, attempt: e5Fact.attempt!.ordinal };
+  assert.deepEqual(answerAttempt, { series: reference(f.series), attempt: 1 }, "The answer belongs to this attempt");
+  const confirmation = { project: f.project, basis: { record: e5 }, target: e5Fact.gap.target,
+    field: e5Fact.gap.field, prior, current, attempt: answerAttempt, currentOnly: true };
+  assert.equal(deliveredOf(confirmAnswerGapClosure(f.store, confirmation)).key, e5Fact.key);
+  const closure = { id: e5Fact.gap.id, reason: "filled" as const, basis: e5, acceptance: null,
+    attempt: answerAttempt, answer: { record: e5 } };
+  const d2 = reference(deliveredOf(writeGapLines(f.store, { project: f.project, previous: reference(initial),
+    pass: 2, gaps: current, closures: [closure] })));
+  // Two different bases of one key, each proved by its own provider.
+  assert.notEqual(d2.id, e5.id);
+  const context = () => ({ project: f.project, block: f.block, goal: f.attemptGoal,
+    attempt: { series: reference(f.store.get<RepairSeries>(f.series.id)!), ordinal: 1 }, accepting: [e5, d2] });
+  assert.equal(acceptanceRepresents(f.store, context(), e5, e5Fact.key), true);
+  assert.equal(acceptanceRepresents(f.store, context(), d2, e5Fact.key), true);
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
+  // G7 requires the E5 basis and adds the caller's D2 beside it; either order is the same close.
+  const derived = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome({ accepting: [d2] }) })).outcome;
+  assert.deepEqual([...derived.accepting].map(ref => ref.id).sort(), [e5.id, d2.id].sort());
+  const one = deliveredOf(prepareCloseAttempt(f.store, { ...at, outcome: outcome({ accepting: [e5, d2] }) }));
+  const opposite = deliveredOf(prepareCloseAttempt(f.store, { ...at, outcome: outcome({ accepting: [d2, e5] }) }));
+  assert.deepEqual(one.writes, opposite.writes);
+  const closing = { ...at, outcome: outcome({ accepting: [e5, d2] }) };
+  const closed = deliveredOf(closeAttempt(f.store, closing));
+  const saved = e51Outcome(f);
+  assert.ok(saved);
+  assert.equal(saved.reason, "result");
+  assert.deepEqual(saved.achieved.map(item => item.key), [e5Fact.key], "One achieved key for the two bases");
+  assert.equal(canonical(saved.achieved[0]!.basis), [canonical(e5), canonical(d2)].sort()[0]);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 0);
   const before = f.store.list().map(reference), sends = f.sent().length;
   f.restart();
   assert.deepEqual(deliveredOf(closeAttempt(f.store, closing)), closed);
   assert.deepEqual(deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent)),
     { complete: true, closed: true, results: [reference(terminal)] });
-  assert.equal(deliveredOf(confirmAnswerGapClosure(f.store, confirmation)).key, nativeFact.key);
+  assert.equal(deliveredOf(confirmAnswerGapClosure(f.store, confirmation)).key, e5Fact.key);
+  assert.equal(acceptanceRepresents(f.store, context(), e5, e5Fact.key), true);
+  assert.equal(acceptanceRepresents(f.store, context(), d2, e5Fact.key), true);
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, sends);
 });
