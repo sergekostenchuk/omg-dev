@@ -12,54 +12,24 @@ import type {ResearchRun} from '../src/discovery/research-model.js';
 import {v7CheckpointPrefixes} from '../src/discovery/v7-plan-questions.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtempSync,rmSync,writeFileSync,readFileSync} from 'node:fs';
-import {tmpdir} from 'node:os';
+import { writeFileSync, readFileSync } from 'node:fs';
 import {join} from 'node:path';
 import {Discovery,type DiscoveryDraft,type Question} from '../src/discovery/discovery.js';
-import {createPartialV7Draft,V7_AXES,V7_STAGE_TOKEN_CEILING} from '../src/discovery/v7-contracts.js';
+import { createPartialV7Draft } from '../src/discovery/v7-contracts.js';
 import {Store,type Revision} from '../src/storage/store.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {reference,type Ref} from '../src/pipeline/contracts.js';
-import {canonical,hashJson,type Json} from '../src/canonical.js';
+import { canonical, hashJson } from '../src/canonical.js';
 import {answerDiscoveryFixture} from './product-fixture.js';
 import {researchCall} from '../src/discovery/research-protocol.js';
 import {Researcher} from '../src/discovery/research-runner.js';
 import {applyDiscoveryAssessment,v7ProgressBaseline,readV7ProgressStateAt,PROGRESS_EVENT_KIND} from '../src/discovery/v7-progress.js';
 import {assessAttemptsWithRequirements,readDiscoveryAssessment} from '../src/discovery/research-assessment.js';
-function fixture(t: { after(fn: () => void): void }) {
-  const root = mkdtempSync(join(tmpdir(), "omg-r1-"));
-  const path = join(root, "state.sqlite"), stores: Store[] = [];
-  const open = () => { const db = new Store(path); stores.push(db); return db; };
-  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
-  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
-  return { root, path, store, engine, discovery, open };
-}
+import { discoveryFixture, rand, validFrame, planQuestion, validPlan, questionOf, type PlanQuestion } from "./discovery-v7-fixture.js";
+const fixture = (t: { after(fn: () => void): void }) => discoveryFixture(t, "omg-r1-");
 type Fixture = ReturnType<typeof fixture>;
 
-const rand = () => Math.random().toString(16).slice(2);
-const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
 
-function validFrame(): Json {
-  return { productType: "internal", scale: "30 users across 10 sites",
-    industries: ["construction"], domains: ["materials supply", "equipment accounting"],
-    axes: allAxes("deep"),
-    budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
-}
-type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
-  criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
-function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
-  return { id, axis, domain: "construction", text: `What covers ${id}?`,
-    class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
-    roles: ["domain expert"], searchPlaces: ["domain documents"] };
-}
-function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
-  return { edition, frame: frameRef, previous, questions } as unknown as Json;
-}
-function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
-  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
-  assert.ok(question, `question for ${field}`);
-  return question;
-}
 /** The real plan acceptance chain (frame and plan through #answer). */
 function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
   const base = createPartialV7Draft(f.discovery, project, "concept");
