@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +17,8 @@ import { reference, type Ref } from "../src/pipeline/contracts.js";
 import { ProductEngine } from "../src/product/engine.js";
 import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { type OmResult, type Refusal } from "../src/om/refusal.js";
-import { beginAttempt, completeAttempt, openSeries, prepareSeriesAdmission, type AttemptGoal, type RepairSeries, type MechanismAdmission } from "../src/om/series.js";
+import { beginAttempt, completeAttempt, openSeries, prepareSeriesAdmission, resumeSeries, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
+  type AttemptGoal, type RepairSeries, type MechanismAdmission } from "../src/om/series.js";
 import { closeAttempt } from "../src/om/repeat-gate.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { writeOmInput } from "../src/om/input.js";
@@ -44,6 +45,7 @@ import {
   type CallLedger, type RecordCallRequest, type MechanismRecordCallRequest,
 } from "../src/om/call-record.js";
 import { gardenGraph, prepareNativeLayers } from "./om-fixture.js";
+import { managedBlock, managedUsage } from "./om-managed-block.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
 
@@ -112,7 +114,7 @@ function request(f: Fixture, call: string): RecordCallRequest {
   };
 }
 
-function rewriteLedger(f: Fixture, value: unknown): Ref {
+function rewriteLedger(f: { readonly store: Store }, value: unknown): Ref {
   const current = f.store.get(callLedgerId(PROJECT));
   return reference(f.store.write({
     id: callLedgerId(PROJECT), kind: CALL_LEDGER_KIND, expected: current?.revision ?? 0, value,
@@ -130,12 +132,117 @@ class ExactOnlyStore extends Store {
   }
 }
 
-test("E6 ledger: absence is explicit; reading current and exact snapshots writes nothing and seals the result", t => {
-  const f = fixture(t);
-  const beforeEmpty = canonical(f.store.list());
-  assert.equal(deliveredOf(readCallLedger(f.store, PROJECT)), null);
-  assert.equal(canonical(f.store.list()), beforeEmpty);
-  const first = deliveredOf(recordCall(f.store, PROJECT, request(f, "price-1")));
+
+/** LG07 sr-a (№10394 п.2): a store that holds nothing yet — no series and no E1 — where absence is read first. */
+function bareStore(t: test.TestContext): { readonly path: string; readonly store: Store } {
+  const root = mkdtempSync(join(tmpdir(), "omg-om-spend-bare-")), path = join(root, "state.sqlite");
+  const store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  return { path, store };
+}
+
+type LedgerRow = CallLedger["calls"][number];
+type Tokens = { inputTokens: number | null; outputTokens: number | null; cachedInputTokens: number | null; reasoningOutputTokens: number | null };
+/** Token totals the way the report adds them: a component unknown in any measured call is unknown in the sum. */
+function tokensOf(...usages: readonly Tokens[]): Tokens {
+  const sum = (key: keyof Tokens) => usages.some(usage => usage[key] === null) ? null : usages.reduce((total, usage) => total + usage[key]!, 0);
+  return { inputTokens: sum("inputTokens"), outputTokens: sum("outputTokens"), cachedInputTokens: sum("cachedInputTokens"), reasoningOutputTokens: sum("reasoningOutputTokens") };
+}
+/**
+ * What the paid preparation costs by its scenario: each of three managed attempts pays one research call and the
+ * assessment of its one fact, each at managedUsage. The expected sums below come from these, not from the rows read.
+ */
+const PAID: Readonly<Record<string, number>> = { "model-research": 3, "fact-assessment": 3 };
+const PAID_CALLS = Object.values(PAID).reduce((total, count) => total + count, 0);
+const paidTokens = (count: number): Tokens => tokensOf(...Array.from({ length: count }, () => managedUsage));
+const paidPurpose = (purpose: string) => ({ calls: PAID[purpose]!, measuredCalls: PAID[purpose]!, unmeasuredCalls: 0, reportedTokens: paidTokens(PAID[purpose]!) });
+
+interface SpendStop {
+  readonly root: string;
+  readonly path: string;
+  readonly store: Store;
+  readonly block: string;
+  readonly series: Revision<RepairSeries>;
+  readonly adapter: Ref;
+  readonly config: Ref;
+  /** The ledger the paid attempts left: every count of the tests on this carrier is relative to it. */
+  readonly paid: Revision<CallLedger>;
+}
+interface PaidSeed { readonly database: string; readonly block: string; readonly series: Ref; readonly adapter: Ref; readonly config: Ref }
+let paidSeed: Promise<PaidSeed> | null = null;
+
+/**
+ * LG07 sr-a (№10394): the carrier N1 of the ledger and spend readers. A real first-rung stop is paid once per test
+ * process — three managed attempts whose E5 found the fact insufficient, each closed by G7 — and every test receives
+ * its own copy of that database file. (seedCopy takes only synchronous builds whose records name no directory; this
+ * preparation names its workspace, which none of the readers below opens.) The calls under test are direct stop
+ * analyses of that stop: their gaps and packet are transport data, and they are settled through settleCall.
+ */
+async function buildPaidSeed(): Promise<PaidSeed> {
+  const root = mkdtempSync(join(tmpdir(), "omg-om-spend-paid-")), database = join(root, "state.sqlite");
+  process.once("exit", () => rmSync(root, { recursive: true, force: true }));
+  const store = new Store(database);
+  try {
+    const m = managedBlock(store, { root, path: database }, PROJECT);
+    deliveredOf(openSeries(store, { ...m.address(), slice: "slice:cart@1", predecessor: null, basis: null }));
+    for (let attempt = 1; attempt <= 3; attempt += 1) await m.cycle("gap:cart:price", "insufficient");
+    const series = store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!;
+    assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
+    assert.ok(series.value.ladder.grounds.includes("review-record"));
+    // The preparation paid exactly what its scenario says, and every paid call is settled.
+    const paid = store.get<CallLedger>(callLedgerId(PROJECT))!.value.calls;
+    assert.deepEqual(Object.fromEntries(Object.keys(PAID).map(purpose => [purpose, paid.filter(row => row.purpose === purpose).length])), PAID);
+    assert.equal(paid.length, PAID_CALLS);
+    assert.ok(paid.every(row => row.status === "succeeded" && canonical(row.usage) === canonical(managedUsage)));
+    const adapter = reference(store.write({ id: `adapter:${PROJECT}`, kind: "dispatch-adapter", expected: 0,
+      value: { projectId: PROJECT, protocol: "codex-stdio", status: "configured-not-accepted" } }));
+    const config = reference(store.write({ id: `config:${PROJECT}`, kind: "dispatch-config", expected: 0,
+      value: { projectId: PROJECT, model: "fixture", transport: "stdio", status: "configured-not-accepted" } }));
+    return { database, block: m.block, series: reference(series), adapter, config };
+  } finally {
+    store.close();
+    assert.equal(existsSync(`${database}-wal`), false, "the paid seed is one checkpointed file");
+  }
+}
+
+async function spendStop(t: test.TestContext): Promise<SpendStop> {
+  paidSeed ??= buildPaidSeed();
+  const seed = await paidSeed;
+  const root = mkdtempSync(join(tmpdir(), "omg-om-spend-")), path = join(root, "state.sqlite");
+  copyFileSync(seed.database, path);
+  const store = new Store(path);
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const series = store.get<RepairSeries>(seed.series.id)!;
+  assert.deepEqual(reference(series), seed.series);
+  return { root, path, store, block: seed.block, series, adapter: seed.adapter, config: seed.config,
+    paid: store.get<CallLedger>(callLedgerId(PROJECT))! };
+}
+
+/** A direct stop analysis of the paid stop: its own name, and the questions its package addresses. */
+function analysisRequest(f: SpendStop, call: string): RecordCallRequest {
+  return {
+    call, purpose: "stop-analysis", basis: { kind: "series-stop", series: reference(f.series), attempt: 3 }, block: f.block,
+    gaps: [{ id: "gap:price", goal: "price contract", field: "contract", consumer: f.block }],
+    series: reference(f.series), attempt: 3,
+    goal: { key: "analysis:the saved stop", questions: ["what caused the stop of the price?"], result: "a review record with an addressed change" },
+    dispatch: { adapter: f.adapter, config: f.config }, packet: { question: "who produces the price?" },
+  };
+}
+
+const ownRow = (ledger: Revision<CallLedger>, call: Ref | string): LedgerRow =>
+  ledger.value.calls.find(row => row.call.id === (typeof call === "string" ? call : call.id))!;
+/** The full ledger with exactly the row of `call` changed: every other row, the paid ones included, stays as it was. */
+const changedRows = (ledger: Revision<CallLedger>, call: Ref | string, change: (row: LedgerRow) => unknown): unknown[] =>
+  ledger.value.calls.map(row => row.call.id === (typeof call === "string" ? call : call.id) ? change(row) : row);
+
+test("E6 ledger: absence is explicit; reading current and exact snapshots writes nothing and seals the result", async t => {
+  // LG07 sr-a (№10394 п.2): absence is read before any paid preparation; the positive half runs on the carrier N1.
+  const bare = bareStore(t).store;
+  const beforeEmpty = canonical(bare.list());
+  assert.equal(deliveredOf(readCallLedger(bare, PROJECT)), null);
+  assert.equal(canonical(bare.list()), beforeEmpty);
+  const f = await spendStop(t);
+  const first = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "price-1")));
   const before = canonical(f.store.list());
   const current = deliveredOf(readCallLedger(f.store, PROJECT));
   const historical = deliveredOf(readCallLedgerAt(f.store, PROJECT, reference(first.ledger)));
@@ -146,46 +253,46 @@ test("E6 ledger: absence is explicit; reading current and exact snapshots writes
   assert.equal(canonical(f.store.list()), before);
 });
 
-test("E6 ledger: unknown usage stays open and differs from an explicitly settled zero", t => {
-  const f = fixture(t);
-  const unknown = deliveredOf(recordCall(f.store, PROJECT, request(f, "unknown")));
+test("E6 ledger: unknown usage stays open and differs from an explicitly settled zero", async t => {
+  const f = await spendStop(t);
+  const unknown = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "unknown")));
   const unsettled = deliveredOf(settleCall(f.store, reference(unknown.call), null, "failed"));
   assert.equal(unsettled.settled, false);
   assert.deepEqual(unsettled.ledger, unknown.ledger);
-  const zero = deliveredOf(recordCall(f.store, PROJECT, request(f, "zero")));
+  const zero = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "zero")));
   const settled = deliveredOf(settleCall(f.store, reference(zero.call), zeroUsage, "succeeded"));
   const ledger = deliveredOf(readCallLedger(f.store, PROJECT))!;
   assert.deepEqual(ledger, settled.ledger);
-  const unknownRow = ledger.value.calls.find(row => row.name === "unknown")!;
-  const zeroRow = ledger.value.calls.find(row => row.name === "zero")!;
+  const unknownRow = ownRow(ledger, unknown.call), zeroRow = ownRow(ledger, zero.call);
   assert.equal(unknownRow.usage, null);
   assert.equal(unknownRow.status, "open");
   assert.equal(unknownRow.settledAt, null);
   assert.deepEqual(zeroRow.usage, zeroUsage);
   assert.equal(zeroRow.status, "succeeded");
   assert.equal(typeof zeroRow.settledAt, "number");
-  assert.equal(ledger.value.calls.length, 2);
+  assert.equal(ledger.value.calls.length, PAID_CALLS + 2);
 });
 
-test("E6 ledger: exact admission and settlement snapshots survive later calls, head changes and restart", t => {
-  const f = fixture(t);
-  const first = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 ledger: exact admission and settlement snapshots survive later calls, head changes and restart", async t => {
+  const f = await spendStop(t);
+  const first = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
   const settled = deliveredOf(settleCall(f.store, reference(first.call), actualUsage, "succeeded"));
-  const second = deliveredOf(recordCall(f.store, PROJECT, request(f, "second")));
+  const second = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "second")));
   deliveredOf(settleCall(f.store, reference(second.call), zeroUsage, "failed"));
-  assert.equal(deliveredOf(readCallLedger(f.store, PROJECT))!.value.calls.length, 2);
+  assert.equal(deliveredOf(readCallLedger(f.store, PROJECT))!.value.calls.length, PAID_CALLS + 2);
   f.store.close();
   const reopened = new ExactOnlyStore(f.path);
   try {
+    assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, PROJECT, reference(f.paid))), f.paid);
     assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, PROJECT, reference(first.ledger))), first.ledger);
     assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, PROJECT, reference(settled.ledger))), settled.ledger);
     assert.deepEqual(deliveredOf(readCallLedgerAt(reopened, PROJECT, reference(second.ledger))), second.ledger);
   } finally { reopened.close(); }
 });
 
-test("E6 ledger: a missing ledger cannot turn existing calls into an empty current report", t => {
-  const f = fixture(t);
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 ledger: a missing ledger cannot turn existing calls into an empty current report", async t => {
+  const f = await spendStop(t);
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
   class MissingLedgerStore extends Store {
     override get<T = Json>(id: string, revision?: number): Revision<T> | null {
       return id === callLedgerId(PROJECT) ? null : super.get<T>(id, revision);
@@ -198,9 +305,9 @@ test("E6 ledger: a missing ledger cannot turn existing calls into an empty curre
   } finally { missing.close(); }
 });
 
-test("E6 ledger: an exact historical slice requires its own project, revision and hash", t => {
-  const f = fixture(t);
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 ledger: an exact historical slice requires its own project, revision and hash", async t => {
+  const f = await spendStop(t);
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
   const ref = reference(recorded.ledger);
   for (const invalid of [
     { ...ref, id: callLedgerId("other") },
@@ -213,15 +320,15 @@ test("E6 ledger: an exact historical slice requires its own project, revision an
   }
 });
 
-test("E6 ledger: malformed and incomplete ledger values are refusals, not empty slices", t => {
+test("E6 ledger: malformed and incomplete ledger values are refusals, not empty slices", async t => {
   const cases: ((valid: CallLedger) => unknown)[] = [
     () => null, () => ({}), valid => ({ calls: valid.calls }), () => ({ projectId: PROJECT }),
     valid => ({ ...valid, projectId: "other" }), valid => ({ ...valid, calls: null }),
     valid => ({ ...valid, calls: {} }), valid => ({ ...valid, extra: true }),
   ];
   for (const change of cases) {
-    const f = fixture(t);
-    const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+    const f = await spendStop(t);
+    const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
     const ref = rewriteLedger(f, change(recorded.ledger.value));
     refusedWith(readCallLedger(f.store, PROJECT), "ledger_invalid");
     refusedWith(readCallLedgerAt(f.store, PROJECT, ref), "ledger_invalid");
@@ -229,84 +336,89 @@ test("E6 ledger: malformed and incomplete ledger values are refusals, not empty 
 });
 
 for (const field of ["call", "name", "purpose", "basis", "block", "gaps", "series", "attempt", "goal", "status", "usage", "openedAt", "settledAt"]) {
-  test(`E6 ledger: missing row.${field} is refused by both readers`, t => {
-    const f = fixture(t);
-    const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
-    const row = { ...recorded.ledger.value.calls[0] } as Record<string, unknown>;
-    delete row[field];
-    const ref = rewriteLedger(f, { projectId: PROJECT, calls: [row] });
+  test(`E6 ledger: missing row.${field} is refused by both readers`, async t => {
+    const f = await spendStop(t);
+    const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
+    const ref = rewriteLedger(f, { projectId: PROJECT, calls: changedRows(recorded.ledger, recorded.call, own => {
+      const row = { ...own } as Record<string, unknown>;
+      delete row[field];
+      return row;
+    }) });
     refusedWith(readCallLedger(f.store, PROJECT), "ledger_invalid");
     refusedWith(readCallLedgerAt(f.store, PROJECT, ref), "ledger_invalid");
   });
 }
 
-test("E6 ledger: the current full set rejects a removed row and historical transitions cannot lose an admitted call", t => {
-  const f = fixture(t);
-  deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
-  const second = deliveredOf(recordCall(f.store, PROJECT, request(f, "second")));
-  const ref = rewriteLedger(f, { projectId: PROJECT, calls: second.ledger.value.calls.slice(0, 1) });
+test("E6 ledger: the current full set rejects a removed row and historical transitions cannot lose an admitted call", async t => {
+  const f = await spendStop(t);
+  deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
+  const second = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "second")));
+  // Removal: the newest admitted row is dropped; every other row stays.
+  const ref = rewriteLedger(f, { projectId: PROJECT, calls: second.ledger.value.calls.filter(row => row.call.id !== second.call.id) });
   refusedWith(readCallLedger(f.store, PROJECT), "ledger_invalid");
   refusedWith(readCallLedgerAt(f.store, PROJECT, ref), "ledger_invalid");
   assert.deepEqual(deliveredOf(readCallLedgerAt(f.store, PROJECT, reference(second.ledger))), second.ledger);
 });
 
-test("E6 ledger: historical transitions cannot replace a call, repeat a snapshot, or duplicate an identity", t => {
+test("E6 ledger: historical transitions cannot replace a call, repeat a snapshot, or duplicate an identity", async t => {
   for (const kind of ["replace", "repeat", "duplicate"]) {
-    const f = fixture(t);
-    const first = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
-    const second = deliveredOf(recordCall(f.store, PROJECT, request(f, "second")));
-    const firstRow = first.ledger.value.calls[0]!;
-    const secondRow = second.ledger.value.calls.find(row => row.call.id !== firstRow.call.id)!;
-    const calls = kind === "replace" ? [secondRow] : kind === "repeat" ? second.ledger.value.calls : [firstRow, firstRow];
+    const f = await spendStop(t);
+    const first = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
+    const second = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "second")));
+    const all = second.ledger.value.calls, firstRow = ownRow(second.ledger, first.call);
+    // Replacement: the earlier admitted row is gone and the later one stands in its place; repetition: the same set
+    // again as a new revision; duplication: the earlier row named twice. The paid rows stay as they were in each.
+    const calls = kind === "replace" ? all.filter(row => row.call.id !== first.call.id)
+      : kind === "repeat" ? all
+      : all.filter(row => row.call.id !== second.call.id).flatMap(row => row.call.id === first.call.id ? [firstRow, firstRow] : [row]);
     const ref = rewriteLedger(f, { projectId: PROJECT, calls });
     refusedWith(readCallLedgerAt(f.store, PROJECT, ref), "ledger_invalid");
   }
 });
 
-test("E6 ledger: copied rows must equal the exact call, including expense and addressed questions", t => {
+test("E6 ledger: copied rows must equal the exact call, including expense and addressed questions", async t => {
   for (const kind of ["usage", "gaps", "name", "purpose", "status"]) {
-    const f = fixture(t);
-    const opened = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+    const f = await spendStop(t);
+    const opened = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
     const settled = deliveredOf(settleCall(f.store, reference(opened.call), actualUsage, "succeeded"));
-    const row = settled.ledger.value.calls[0]!;
-    const changed = kind === "usage" ? { ...row, usage: { ...actualUsage, inputTokens: 0 } }
+    const ref = rewriteLedger(f, { projectId: PROJECT, calls: changedRows(settled.ledger, settled.call, row =>
+      kind === "usage" ? { ...row, usage: { ...actualUsage, inputTokens: 0 } }
       : kind === "gaps" ? { ...row, gaps: [{ ...row.gaps[0], id: "gap:other" }] }
       : kind === "name" ? { ...row, name: "other" }
       : kind === "purpose" ? { ...row, purpose: "model-design" }
-      : { ...row, status: "open", usage: null, settledAt: null };
-    const ref = rewriteLedger(f, { projectId: PROJECT, calls: [changed] });
+      : { ...row, status: "open", usage: null, settledAt: null }) });
     refusedWith(readCallLedger(f.store, PROJECT), "ledger_invalid");
     refusedWith(readCallLedgerAt(f.store, PROJECT, ref), "ledger_invalid");
   }
 });
 
-test("E6 ledger: absent, foreign and wrong-hash exact call references refuse a historical slice", t => {
+test("E6 ledger: absent, foreign and wrong-hash exact call references refuse a historical slice", async t => {
   for (const kind of ["missing", "foreign", "hash", "revision"]) {
-    const f = fixture(t);
-    const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
-    const row = recorded.ledger.value.calls[0]!;
-    const call = kind === "missing" ? { ...row.call, id: callRecordId(PROJECT, "missing") }
-      : kind === "foreign" ? { ...row.call, id: callRecordId("other", "first") }
-      : kind === "hash" ? { ...row.call, hash: "0".repeat(64) } : { ...row.call, revision: 42 };
-    const ref = rewriteLedger(f, { projectId: PROJECT, calls: [{ ...row, call }] });
+    const f = await spendStop(t);
+    const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
+    const ref = rewriteLedger(f, { projectId: PROJECT, calls: changedRows(recorded.ledger, recorded.call, row => {
+      const call = kind === "missing" ? { ...row.call, id: callRecordId(PROJECT, "missing") }
+        : kind === "foreign" ? { ...row.call, id: callRecordId("other", "first") }
+        : kind === "hash" ? { ...row.call, hash: "0".repeat(64) } : { ...row.call, revision: 42 };
+      return { ...row, call };
+    }) });
     refusedWith(readCallLedgerAt(f.store, PROJECT, ref), ["call_unresolved", "ledger_invalid"]);
   }
 });
 
-test("E6 ledger: a named call's saved shape is validated rather than trusted from its ledger row", t => {
-  const f = fixture(t);
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 ledger: a named call's saved shape is validated rather than trusted from its ledger row", async t => {
+  const f = await spendStop(t);
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
   const changed = { ...recorded.call.value, gaps: [] };
   const call = f.store.write({ id: recorded.call.id, kind: CALL_RECORD_KIND, expected: 1, value: changed });
-  const row = { ...recorded.ledger.value.calls[0], call: reference(call), gaps: [] };
-  const ref = rewriteLedger(f, { projectId: PROJECT, calls: [row] });
+  const ref = rewriteLedger(f, { projectId: PROJECT, calls: changedRows(recorded.ledger, recorded.call, row => ({ ...row, call: reference(call), gaps: [] })) });
   refusedWith(readCallLedger(f.store, PROJECT), "call_record_invalid");
   refusedWith(readCallLedgerAt(f.store, PROJECT, ref), ["call_record_invalid", "ledger_invalid"]);
 });
 
-test("E6 ledger: invalid reader arguments and undeclared historical contexts are typed refusals", t => {
-  const f = fixture(t);
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 ledger: invalid reader arguments and undeclared historical contexts are typed refusals", async t => {
+  const f = await spendStop(t);
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
   const ref = reference(recorded.ledger);
   const invalid = (error: unknown) => error instanceof EngineError && error.code === "call_request_invalid";
   assert.throws(() => readCallLedger({} as Store, PROJECT), invalid);
@@ -415,7 +527,8 @@ function spendRefused(result: OmResult<unknown>, codes: string | readonly string
 }
 
 test("E6 report: empty OM scope is explicit and excludes native research calls", t => {
-  const f = fixture(t);
+  // LG07 sr-a (№10394 п.2): an empty scope is a project with no series and no E1 at all.
+  const f = bareStore(t);
   // The native research producer owns another namespace and does not write E1.
   f.store.write({ id: "model-call:3e621321-003a-4abf-8da4-dd8b827697ce", kind: "model-call", expected: 0,
     value: { projectId: PROJECT, purpose: "research-assessment", status: "succeeded", usage: actualUsage } });
@@ -432,8 +545,10 @@ test("E6 report: empty OM scope is explicit and excludes native research calls",
   assert.ok(deeplyFrozen(report));
 });
 
-test("E6 report: one packet with several questions and consumers incurs one expense, with no hidden significance threshold", t => {
-  const f = fixture(t), input = request(f, "package");
+test("E6 report: one packet with several questions and consumers incurs one expense, with no hidden significance threshold", async t => {
+  // LG07 sr-a (№10394 п.1): the package is a direct stop analysis, so its purpose is stop-analysis; the paid
+  // preparation's research and assessment calls stand beside it with what their scenario cost.
+  const f = await spendStop(t), input = analysisRequest(f, "package");
   const admitted = deliveredOf(recordCall(f.store, PROJECT, { ...input, gaps: [
     { id: "encoding", goal: "Encoding at first consumer", field: "encoding", consumer: "block:first" },
     { id: "encoding", goal: "Encoding at second consumer", field: "encoding", consumer: "block:second" },
@@ -442,8 +557,8 @@ test("E6 report: one packet with several questions and consumers incurs one expe
   const measured = { inputTokens: 9_000_000, outputTokens: 3_000_000, cachedInputTokens: 2_000_000, reasoningOutputTokens: 1_000_000 };
   const settled = deliveredOf(settleCall(f.store, reference(admitted.call), measured, "succeeded"));
   const report = deliveredOf(spendReport(f.store, { project: PROJECT }));
-  assert.equal(report.rows.length, 1);
-  const row = report.rows[0]!;
+  assert.equal(report.rows.length, PAID_CALLS + 1);
+  const row = report.rows.find(item => item.call?.id === settled.call.id)!;
   assert.deepEqual(row.call, reference(settled.call));
   assert.deepEqual(row.questions, settled.call.value.gaps);
   assert.equal(row.questions.length, 3);
@@ -451,41 +566,59 @@ test("E6 report: one packet with several questions and consumers incurs one expe
   assert.equal(row.settlement, "succeeded");
   assert.deepEqual(row.significance, { obligations: null, consumers: null, blocks: null, sources: [] });
   assert.equal(row.result, null, "Settlement is not acceptance of an attempt result");
-  assert.deepEqual(report.totals, { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: measured });
-  assert.deepEqual(report.byPurpose["model-research"], report.totals);
+  assert.deepEqual(report.byPurpose["stop-analysis"], { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: measured });
+  for (const purpose of Object.keys(PAID)) assert.deepEqual(report.byPurpose[purpose as keyof typeof report.byPurpose], paidPurpose(purpose), purpose);
+  assert.deepEqual(report.totals, { calls: PAID_CALLS + 1, measuredCalls: PAID_CALLS + 1, unmeasuredCalls: 0,
+    reportedTokens: tokensOf(paidTokens(PAID_CALLS), measured) });
   assert.deepEqual(report.findings, [], "Disproportionate expense is the owner's decision, not an automatic finding");
 });
 
-test("E6 report: partial token measurements stay unknown, explicit zeros stay measured and purposes stay separate", t => {
-  const f = fixture(t);
-  const unknown = deliveredOf(recordCall(f.store, PROJECT, request(f, "unknown")));
-  const zero = deliveredOf(recordCall(f.store, PROJECT, { ...request(f, "zero"), purpose: "model-design" }));
+test("E6 report: partial token measurements stay unknown, explicit zeros stay measured and purposes stay separate", async t => {
+  // LG07 sr-a (№10394 п.1): the calls under test are stop analyses (the former model-design call has no lawful
+  // carrier here); the separation of purposes is shown on the paid research and assessment calls beside them.
+  const f = await spendStop(t);
+  const unknown = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "unknown")));
+  const zero = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "zero")));
   deliveredOf(settleCall(f.store, reference(zero.call), zeroUsage, "failed"));
-  const partial = deliveredOf(recordCall(f.store, PROJECT, request(f, "partial")));
+  const partial = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "partial")));
   const measured = { inputTokens: 120, outputTokens: 30, cachedInputTokens: null, reasoningOutputTokens: null };
   deliveredOf(settleCall(f.store, reference(partial.call), measured, "succeeded"));
   const report = deliveredOf(spendReport(f.store, { project: PROJECT }));
-  assert.equal(report.totals.calls, 3);
-  assert.equal(report.totals.measuredCalls, 2);
+  // Unknown usage: one call stays unmeasured and open.
+  assert.equal(report.totals.calls, PAID_CALLS + 3);
   assert.equal(report.totals.unmeasuredCalls, 1);
-  assert.deepEqual(report.totals.reportedTokens, measured);
-  assert.deepEqual(report.byPurpose["model-design"], { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: zeroUsage });
-  assert.equal(report.byPurpose["model-research"].calls, 2);
+  assert.equal(report.rows.find(row => row.call?.id === unknown.call.id)!.usage, null);
   assert.deepEqual(report.findings.map(item => item.code), ["call_not_settled"]);
   assert.equal(report.findings[0]!.at.target, unknown.call.id);
-  assert.equal(report.rows.find(row => row.call?.id === unknown.call.id)!.usage, null);
+  // An explicit zero is a measurement.
+  assert.equal(report.totals.measuredCalls, PAID_CALLS + 2);
+  assert.deepEqual(report.rows.find(row => row.call?.id === zero.call.id)!.usage, zeroUsage);
+  // A component unknown in one measured call is unknown in every sum it enters.
+  assert.deepEqual(report.byPurpose["stop-analysis"], { calls: 3, measuredCalls: 2, unmeasuredCalls: 1, reportedTokens: tokensOf(zeroUsage, measured) });
+  assert.equal(report.byPurpose["stop-analysis"].reportedTokens!.cachedInputTokens, null);
+  assert.deepEqual(report.totals.reportedTokens, tokensOf(paidTokens(PAID_CALLS), zeroUsage, measured));
+  // Each purpose keeps exactly its own calls and their cost.
+  for (const purpose of Object.keys(PAID)) assert.deepEqual(report.byPurpose[purpose as keyof typeof report.byPurpose], paidPurpose(purpose), purpose);
 });
 
-test("E6 report: historical snapshots keep exact expense and unfinished outcomes after later settlement, attempts and restart", t => {
-  const f = fixture(t);
-  const first = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 report: historical snapshots keep exact expense and unfinished outcomes after later settlement, attempts and restart", async t => {
+  const f = await spendStop(t);
+  const first = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
   const saved = deliveredOf(spendReport(f.store, { project: PROJECT }));
+  assert.equal(saved.rows.find(row => row.call?.id === first.call.id)!.usage, null);
   deliveredOf(settleCall(f.store, reference(first.call), actualUsage, "succeeded"));
-  deliveredOf(completeAttempt(f.store, { project: PROJECT, block: BLOCK, line: 1, attempt: 1,
-    outcome: { reason: "result", achieved: [], cancelled: [], refusals: [] } }));
-  deliveredOf(beginAttempt(f.store, { project: PROJECT, block: BLOCK, line: 1, attempt: 2, goal: f.goal }));
+  // LG07 sr-a (№10394 п.2): the later change of the series is its lawful continuation after an independent review.
+  const stop = f.series.value.stop!;
+  const review = reference(f.store.write({ id: `${stopReviewNamespace(PROJECT)}spend-later`, kind: STOP_REVIEW_KIND, expected: 0,
+    value: { projectId: PROJECT, block: f.block, stop: stop.attempt, goals: [...stop.goals],
+      reviewer: { name: "independent reviewer", independent: true },
+      cause: "the same unresolved question survived every attempt in the window",
+      change: { text: "change the producer addressed by the repeated question", addresses: ["M5"] } } }));
+  const resumed = deliveredOf(resumeSeries(f.store, { project: PROJECT, block: f.block, line: 1, stop: stop.attempt,
+    ground: "review-record", text: "the independent review named an addressed change", review: { ref: review } }));
+  assert.equal(resumed.value.stop, null);
   const current = deliveredOf(spendReport(f.store, { project: PROJECT }));
-  assert.deepEqual(current.rows[0]!.usage, actualUsage);
+  assert.deepEqual(current.rows.find(row => row.call?.id === first.call.id)!.usage, actualUsage);
   assert.notDeepEqual(current.snapshot, saved.snapshot);
   f.store.close();
   const historical = new ExactOnlyStore(f.path);
@@ -494,8 +627,10 @@ test("E6 report: historical snapshots keep exact expense and unfinished outcomes
 });
 
 test("E6 report: every historical snapshot field is mandatory, including explicit empty sets and null ledger", t => {
-  const f = fixture(t);
+  // LG07 sr-a (№10394 п.2): the empty sets and the null ledger are those of a project with no series and no E1.
+  const f = bareStore(t);
   const report = deliveredOf(spendReport(f.store, { project: PROJECT }));
+  assert.equal(report.snapshot.ledger, null);
   const invalid = (error: unknown) => error instanceof EngineError && error.code === "spend_request_invalid";
   for (const field of ["purposeSet", "project", "ledger", "calls", "series", "histories", "significance", "late"]) {
     const bad = { ...report.snapshot } as Record<string, unknown>;
@@ -507,23 +642,26 @@ test("E6 report: every historical snapshot field is mandatory, including explici
   }
 });
 
-test("E6 report: invalid E1 questions with a consistent hash remain a refusal of record integrity", t => {
-  const question = { id: "gap:price", goal: "price contract", field: "contract", consumer: BLOCK };
-  const malformed = [[], ...Object.keys(question).map(field => [Object.fromEntries(Object.entries(question).filter(([key]) => key !== field))])];
-  for (const gaps of malformed) {
-    const f = fixture(t);
-    const original = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 report: invalid E1 questions with a consistent hash remain a refusal of record integrity", async t => {
+  const malformed = (owner: string) => {
+    const question = { id: "gap:price", goal: "price contract", field: "contract", consumer: owner };
+    return [[], ...Object.keys(question).map(field => [Object.fromEntries(Object.entries(question).filter(([key]) => key !== field))])];
+  };
+  for (const index of malformed(BLOCK).keys()) {
+    const f = await spendStop(t), gaps = malformed(f.block)[index]!;
+    const original = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
+    // A negative mutation, written by hand only to be refused: a self-consistent record whose questions are invalid.
     const bad = f.store.write({ id: callRecordId(PROJECT, "bad-questions"), kind: CALL_RECORD_KIND, expected: 0,
       value: { ...original.call.value, call: "bad-questions", gaps } });
-    const badRow = { ...original.ledger.value.calls[0], call: reference(bad), name: "bad-questions", gaps };
-    rewriteLedger(f, { projectId: PROJECT, calls: [original.ledger.value.calls[0]!, badRow].sort((a, b) => a.call.id.localeCompare(b.call.id)) });
+    const badRow = { ...ownRow(original.ledger, original.call), call: reference(bad), name: "bad-questions", gaps };
+    rewriteLedger(f, { projectId: PROJECT, calls: [...original.ledger.value.calls, badRow].sort((a, b) => a.call.id.localeCompare(b.call.id)) });
     spendRefused(spendReport(f.store, { project: PROJECT }), "call_record_invalid");
   }
 });
 
-test("E6 report: corrupted ledger and exact snapshot references cannot become unknown significance or empty expense", t => {
-  const f = fixture(t);
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, request(f, "first")));
+test("E6 report: corrupted ledger and exact snapshot references cannot become unknown significance or empty expense", async t => {
+  const f = await spendStop(t);
+  const recorded = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "first")));
   const report = deliveredOf(spendReport(f.store, { project: PROJECT }));
   spendRefused(readSpendReport(f.store, { ...report.snapshot, ledger: { ...reference(recorded.ledger), hash: "0".repeat(64) } }), "ledger_invalid");
   rewriteLedger(f, { projectId: PROJECT, calls: [] });
@@ -1468,15 +1606,17 @@ test("E6 ordinary E4: packet significance and exact physical expense survive lat
   });
 });
 
-test("E6 report: recomputed E1 and ledger hashes do not let another block claim a series", t => {
-  const f = fixture(t);
-  const admitted = deliveredOf(recordCall(f.store, PROJECT, request(f, "wrong-owner")));
+test("E6 report: recomputed E1 and ledger hashes do not let another block claim a series", async t => {
+  const f = await spendStop(t);
+  const admitted = deliveredOf(recordCall(f.store, PROJECT, analysisRequest(f, "wrong-owner")));
   const saved = deliveredOf(spendReport(f.store, { project: PROJECT }));
   const changedCall = { ...admitted.call, value: { ...admitted.call.value, block: "other-block" } };
   changedCall.hash = hashJson(changedCall.value);
   const changedLedger: Revision<CallLedger> = { ...admitted.ledger, value: {
     ...admitted.ledger.value,
+    // LG07 sr-a (№10394 п.1): only the selected E1 and its row change; the paid rows stay exactly as they were.
     calls: admitted.ledger.value.calls.map(row => {
+      if (row.call.id !== admitted.call.id) return row;
       if ("owner" in row) assert.fail("The block fixture must retain a block-owned E1 row");
       return { ...row, block: "other-block", call: reference(changedCall) };
     }),
