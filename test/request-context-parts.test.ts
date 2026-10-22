@@ -93,10 +93,12 @@ const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.asse
 let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.action==='$readOwnArchive')research={action:'read_context',record:r.subject.working.archive,pointer:research.pointer??'/body/role'};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
  research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint&&research.novelty){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 } 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command = { executable: process.execPath, args: [adapter] };
@@ -119,6 +121,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   if (calibrated) await calibrate();
   configure(); writeFileSync(wire, '');
   const v = acceptPlan(f, 'p', questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run = (limit = 8, store = f.store, compact = true, policy = true) =>
     new Researcher(store, new Discovery(store), new ProductEngine(store).environments).run('p', v.draft.id, limit, undefined,
       { ...(policy ? { producerPolicy: { discovery: 7 as const } } : {}), ...(compact ? { contextContract: CONTEXT_PREPARATION_CONTRACT } : {}) });
@@ -126,7 +130,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   const history = () => canonical(f.store.list().map(reference));
   const intents = (store = f.store) => store.list<ResearchConsumerIntent>('research-consumer-intent')
     .filter(row => row.value.kind === 'analyst' && row.value.draft.id === v.draft.id);
-  return { ...f, v, questions, run, wires, history, configure, environment, calibrate, intents };
+  return { ...f,finishFrontier, v, questions, run, wires, history, configure, environment, calibrate, intents };
 }
 const failure = (fn: () => unknown): string => {
   try { fn(); } catch (error) {
@@ -156,6 +160,7 @@ test('DRS1a2 first compact v7 analyst send: no prior preparation, one batch publ
   }) as typeof f.store.writeMany;
   assert.equal(f.store.list(CONTEXT_PREPARATION_KIND).length, 0, 'the first send starts without a preparation');
   f.configure([ended('refused')]);
+ f.finishFrontier();
   const done = await f.run();
   assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
   f.store.writeMany = write;
@@ -198,6 +203,7 @@ test('DRS1a2 first compact v7 analyst send: no prior preparation, one batch publ
 test('DRS1a2 continuation from a compact foundation: the call reads its own compact archive, the next call continues from it, and both direct archive readers find the body (era bounded, repeat key found)', async t => {
   const f = await setup(t);
   f.configure([readOwnArchive, ended()]);
+ f.finishFrontier();
   const done = await f.run();
   assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
   const wires = f.wires();
@@ -244,7 +250,7 @@ function viewWith(store: Store, id: string, change: (value: any) => any): Store 
 test('DRS1a2 subject binding: two plan-questions of one Question and the same id in two plan editions never share a preparation, at write and at read', async t => {
   const f = await setup(t, [planQuestion('block', 'industry', 'blocking'), planQuestion('support', 'market')]);
   f.configure([ended('refused'), ended()]);
-  assert.equal((await f.run()).value.status, 'completed');
+  f.finishFrontier();assert.equal((await f.run()).value.status, 'completed');
   const [a, b] = f.intents().sort((x, y) => x.value.cursor.turn - y.value.cursor.turn);
   assert.notEqual(a!.value.cursor.subject.planQuestionId, b!.value.cursor.subject.planQuestionId);
   assert.deepEqual(a!.value.question, b!.value.question, 'one physical plan Question');
@@ -255,7 +261,7 @@ test('DRS1a2 subject binding: two plan-questions of one Question and the same id
   // The next plan edition with the same plan-question id is another subject and another preparation.
   const next = acceptNextPlanEdition(f, 'p', f.v.draft, f.v.frameRef, f.v.planAnswer, [planQuestion('block', 'industry', 'blocking')]);
   f.configure([ended()]); writeFileSync(join(f.root, 'wire.ndjson'), '');
-  assert.equal((await f.run()).value.status, 'completed');
+  f.finishFrontier();assert.equal((await f.run()).value.status, 'completed');
   const edition2 = f.intents().find(row => canonical(row.value.cursor.subject.planAnswer) === canonical(next.planAnswer))!;
   assert.equal(edition2.value.cursor.subject.planQuestionId, 'block');
   assert.notEqual(edition2.value.preparation!.id, a!.value.preparation!.id);
@@ -280,6 +286,7 @@ test('DRS1a2 batch atomicity: a revision_conflict injected inside the publicatio
     return write(writes, guards);
   }) as typeof f.store.writeMany;
   f.configure([ended()]);
+ f.finishFrontier();
   const paused = await f.run();
   const injected = seen.injected as Write | null;
   assert.ok(injected, 'the publication batch carried the new preparation');
@@ -304,6 +311,7 @@ test('DRS1a2 batch atomicity: a revision_conflict injected inside the publicatio
 test('DRS1a2 budget refusal before the send: the compact intent waits prepared with its preparation, no call; the later run sends that exact intent once', async t => {
   const f = await setup(t, undefined, false);
   f.configure([ended()]);
+ f.finishFrontier();
   const paused = await f.run();
   assert.equal(paused.value.status, 'paused', JSON.stringify(paused.value));
   assert.equal(f.wires().length, 0);
@@ -312,7 +320,7 @@ test('DRS1a2 budget refusal before the send: the compact intent waits prepared w
   assert.equal(prepared!.value.contract, CONSUMER_INTENT_V2);
   assert.equal(prepared!.value.state, 'prepared');
   await f.calibrate();
-  f.configure([ended()]);
+  f.configure([ended()]);f.finishFrontier();
   const done = await f.run();
   assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
   assert.equal(f.wires().length, 2);
@@ -409,7 +417,7 @@ test('DRS1a2 measurement: two identical real scenarios (12 project sources, init
     for (let i = 0; i < 12; i += 1)
       f.discovery.evidence.document('p', `market-${i}`, `Supply market note ${i}. `.repeat(80), 'text/plain', 0);
     f.configure([...['/body/role', '/body/stage', '/body/subject', '/body/inventory'].map(pointer => ({ ...readOwnArchive, pointer })), ended()]);
-    const done = await f.run(8, f.store, compact);
+    f.finishFrontier();const done = await f.run(8, f.store, compact);
     assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
     assert.equal(f.wires().length, 6);
     assert.equal(f.wires().filter(w => w.subject.assessmentSubject).length, 1);

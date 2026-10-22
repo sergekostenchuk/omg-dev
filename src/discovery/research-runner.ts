@@ -13,7 +13,7 @@ import { discoveryContext, discoveryInspection, type DiscoveryOutcome } from './
 import { savedSynthesisMaterials, savedV7SynthesisMaterials } from "./saved-synthesis.js";
 import { readResearchContext, researchContextReadEra } from "./research-limits.js";
 import { planningForQuestion, planningForPlanSubject } from "./research-routing.js";
-import { Store, type Revision, type Write } from "../storage/store.js";
+import { Store, type Revision, type Write, type TransactionGuard } from "../storage/store.js";
 import { Environments, uniqueTransactionGuards, type Environment } from "../runtime/environment.js";
 import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js";
 import { canonical, hashJson } from "../canonical.js";
@@ -1310,6 +1310,19 @@ export class Researcher {
         pauseCode: error instanceof EngineError ? error.code : "research_interrupted" });
     }
   }
+  /** Preserve the exact paid negative review when a later completed answer
+   * becomes the next synthesis basis. Both turns are proved within this run. */
+  private v7ReviewHistory(turns: Revision<ManagedResearchTurn>[], subject: V7PlanSubject, previous: Ref | null) {
+    const rejected = rejectedPlanOwnerRequest(this.store, turns, subject);
+    if (!rejected || !previous) return [];
+    if (canonical(reference(rejected)) !== canonical(previous)) {
+      const basis = readResearchConsumerTurn(this.store, previous) as Revision<ManagedResearchTurn>;
+      if (basis.value.run !== rejected.value.run || basis.value.number <= rejected.value.number
+        || basis.value.status !== "completed" || turnAction(basis.value).action !== "answer"
+        || !sameSubject(planSubjectOf(basis.value), subject)) return [];
+    }
+    return [{ ...rejected.value, ref: reference(rejected) }];
+  }
   /** Discover all subjects/editions before current-plan selection; positions,
    * rather than record order or the answered plan anchor, order their work. */
   private v7SynthesisRecovery(project: string, draftId: string): UnfinishedSynthesisOperation | null {
@@ -1344,7 +1357,7 @@ export class Researcher {
     question: Revision<Question>, environment: Revision<Environment>, context: Record<string, any>,
     owner: ResearchRun["owner"], signal: AbortSignal | undefined, restoreOnly: boolean,
     operation: UnfinishedSynthesisOperation | null,
-    workspace?: ReturnType<typeof addressedWorkspace>, workspaceGuards: Ref[] = []): Promise<Revision<ResearchRun>> {
+    workspace?: ReturnType<typeof addressedWorkspace>, workspaceGuards: Ref[] = [], frontierGuards: TransactionGuard[] = []): Promise<Revision<ResearchRun>> {
     const attached = operation ? listResearchConsumerIntents(this.store, project, draft.id)
       .filter(intent => intent.value.owner.id === operation.session.id) : [];
     const paid = attached.find(intent => intent.value.state === "running")
@@ -1361,7 +1374,7 @@ export class Researcher {
     const reserve = operation?.deliveryTurn != null || unboundPaid ? undefined
       : { write: { id: run.id, kind: run.kind, expected: run.revision,
         value: { ...run.value, turns: number, requestChars: run.value.requestChars + canonical(context).length } },
-        guards: [reference(run)] };
+        guards: [reference(run), ...frontierGuards] };
     const action = await synthesisSession(this.store, draft, question, environment, dispatch, pilot, context,
       "Research the exact selected plan-question; preserve the exact subject and return its lawful attempt end.", signal,
       { restoreOnly, ...(unboundPaid ? {} : { delivery: { run: run.id, turn: number } }),
@@ -1594,7 +1607,7 @@ export class Researcher {
     return run;
   }
 
-  /** The initial v7 plan traversal uses the ordinary managed transport and K.
+  /** The v7 open frontier uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
     options: { restoreOnly?: boolean; producerPolicy?: ProducerPolicy; contextContract?: typeof CONTEXT_PREPARATION_CONTRACT }): Promise<Revision<ResearchRun>> {
@@ -1626,11 +1639,8 @@ export class Researcher {
             value: { projectId: project, draftId, environment: reference(environment), status: "paused", turns: 0,
               limit, inputs: draft.value.inputs, ownerQuestion: null, error: null, pauseCode: null, owner, requestChars: 0 } });
           const restoreOnly = options.restoreOnly || producerContractEra("discovery", options.producerPolicy) !== 7 || used >= limit;
-          const rejected = rejectedPlanOwnerRequest(this.store, turns, synthesis.subject!);
-          // Retain S6.8's exact paid review for saved-only session recovery,
-          // including a cut before its first intent. Both restore and send use it.
-          const reviewHistory = rejected && canonical(reference(rejected)) === canonical(synthesis.session.value.basis.previousProposalRef)
-            ? [{ ...rejected.value, ref: reference(rejected) }] : [];
+          const reviewHistory = this.v7ReviewHistory(turns, synthesis.subject!,
+            synthesis.session.value.basis.previousProposalRef);
           const context = { role: "research", stage: "discovery", subject: synthesis.subject!,
             savedMaterials: synthesis.session.value.basis.materials,
             previousProposal: synthesis.session.value.basis.previousProposal,
@@ -1668,7 +1678,9 @@ export class Researcher {
           run = await this.applyV7QueuedChild(project, run, turn, signal);
           continue;
         }
-        if (run && (turn || outstanding) && run.value.status !== "running")
+        const unsentAnalyst = outstanding?.value.state === "prepared"
+          && (outstanding.value.kind === "analyst" || outstanding.value.kind === "reading-planner");
+        if (run && (turn || outstanding) && !unsentAnalyst && run.value.status !== "running")
           run = this.save(run, { status: "running", owner, error: null, pauseCode: null },
             [...(turn ? [reference(turn)] : []), ...(outstanding ? [reference(outstanding)] : [])]);
         if (outstanding) {
@@ -1687,6 +1699,16 @@ export class Researcher {
               "research_consumer_context_stale", "The unpaid research environment changed");
             requireCondition(selected && canonical(current.planAnswer) === canonical(selected.planAnswer),
               "research_consumer_context_stale", "The unpaid intent belongs to another plan edition");
+            if (outstanding.value.kind === "analyst" || outstanding.value.kind === "reading-planner") {
+              const frontier = planAttemptSelection(this.store, project);
+              requireCondition(frontier.next?.planQuestionId === selected!.planQuestionId,
+                "research_consumer_context_stale", "The unpaid intent no longer names the open frontier");
+              for (const guard of frontier.guards) {
+                const original = outstanding.value.guards.find(saved => saved.id === guard.id);
+                requireCondition(!original || canonical(original) === canonical(guard),
+                  "research_consumer_context_stale", "The unpaid intent fixes an older applied frontier");
+              }
+            }
             if (outstanding.value.kind === "reading-planner") {
               const planning = planningForPlanSubject(this.store, project, reference(current.draft), selected!, options.producerPolicy);
               requireCondition(planning, "reading_plan_disabled", "A new planner send requires its current explicit v7 settings");
@@ -1708,6 +1730,8 @@ export class Researcher {
             if (outstanding.value.state === "prepared") {
               if (used >= limit) return this.save(run, { status: "paused", pauseCode: "research_turns_exhausted",
                 error: "Research turn allowance reached; paid attempts are preserved" }, [reference(outstanding)]);
+              if (run.value.status !== "running") run = this.save(run,
+                { status: "running", owner, error: null, pauseCode: null }, [reference(outstanding)]);
               // Count new dispatches here, including restored prepared intents; paid replay is free.
               used++;
             }
@@ -1860,7 +1884,7 @@ export class Researcher {
         if (!selection.next && run) {
           if (run.value.status === "completed") return run;
           return this.save(run, { status: "completed", ownerQuestion: null, error: null, pauseCode: null },
-            [reference(selection.draft), reference(selection.question), ...selection.attempts.map(reference)]);
+            [reference(selection.draft), reference(selection.question), ...selection.attempts.map(reference), ...selection.guards]);
         }
         requireCondition(!options.restoreOnly && producerContractEra("discovery", options.producerPolicy) === 7,
           "research_contract_upgrade_required", "New v7 work requires its explicit producer policy");
@@ -1869,7 +1893,7 @@ export class Researcher {
           value: { projectId: project, draftId, environment: reference(environment), status: "running", turns: 0,
             limit, inputs: uniqueRefs([...selection.draft.value.inputs, ...effective.guards]), ownerQuestion: null,
             error: null, pauseCode: null, owner, requestChars: 0 } }],
-          [reference(selection.draft), reference(selection.question), reference(environment)])[0]!;
+          [reference(selection.draft), reference(selection.question), reference(environment), ...selection.guards])[0]!;
         if (!selection.next) return this.save(run, { status: "completed", error: null, pauseCode: null });
         if (used >= limit) return this.save(run, { status: "paused", pauseCode: "research_turns_exhausted",
           error: "Research turn allowance reached; paid attempts are preserved" });
@@ -1900,12 +1924,16 @@ export class Researcher {
             ? { webResearch: webResearchGuide(webBudgetView(this.store, project, "discovery", dispatch.webResearch!)) } : {}) };
         if (mode === "synthesis") {
           const rejected = rejectedPlanOwnerRequest(this.store, selectedTurns as Revision<ManagedResearchTurn>[], subject);
-          Object.assign(context, rejected ? { previousProposal: turnAction(rejected.value),
-            previousProposalRef: reference(rejected) } : {}, savedMaterials
-            ? { savedMaterials, savedOnly: true, history: rejected ? [{ ...rejected.value, ref: reference(rejected) }] : [] }
+          const previous = selectedTurns.findLast(row => row.value.status === "completed"
+            && (turnAction(row.value).action === "answer" || row.id === rejected?.id));
+          const proved = previous ? readResearchConsumerTurn(this.store, reference(previous)) : null;
+          Object.assign(context, proved ? { previousProposal: turnAction(proved.value),
+            previousProposalRef: reference(proved) } : {}, savedMaterials
+            ? { savedMaterials, savedOnly: true, history: this.v7ReviewHistory(selectedTurns, subject,
+              proved ? reference(proved) : null) }
             : { workingSelections: workingSelections(this.store, selectedTurns, selection.question, subject) });
           run = await this.applyV7Synthesis(project, run, selection.draft, selection.question, environment,
-            context, owner, signal, false, null, workspace, selectedTurns.map(reference));
+            context, owner, signal, false, null, workspace, selectedTurns.map(reference), selection.guards);
           used++;
           continue;
         }
@@ -1918,7 +1946,7 @@ export class Researcher {
           basis: uniqueRefs([...selection.draft.value.inputs, selection.planAnswer, ...(planningPilot ? [reference(planningPilot)] : []),
             ...selectedTurns.map(reference), ...sources.list().map(reference)]),
           guards: uniqueTransactionGuards([reference(run), reference(selection.draft), reference(selection.question),
-            reference(environment), ...effective.guards, ...selection.draft.value.inputs, selection.planAnswer,
+            reference(environment), ...effective.guards, ...selection.draft.value.inputs, selection.planAnswer, ...selection.guards,
             ...(planningPilot ? [reference(planningPilot)] : []), ...selectedTurns.map(reference), ...sources.list().map(reference),
             { id: paidTurnId(id, run.value.turns + 1), absent: true }]) }, [],
           options.contextContract && mode !== "planning" ? { contextContract: options.contextContract } : {});
@@ -2245,7 +2273,7 @@ export class Researcher {
         { id: turnId, absent: true }, ...(mark ? mark.guards : []), ...guards]));
     return { run: saved[0]! as Revision<ResearchRun>, turn: saved[1]! as Revision<ResearchTurn> };
   }
-  private save(run: Revision<ResearchRun>, patch: Partial<ResearchRun>, guards: Ref[] = []): Revision<ResearchRun> {
+  private save(run: Revision<ResearchRun>, patch: Partial<ResearchRun>, guards: TransactionGuard[] = []): Revision<ResearchRun> {
     return this.store.writeMany<ResearchRun>([{ id: run.id, kind: run.kind, expected: run.revision, value: { ...run.value, ...patch } }], guards)[0]!;
   }
 }

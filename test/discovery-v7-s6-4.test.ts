@@ -77,10 +77,12 @@ appendFileSync(${JSON.stringify(wire)},raw+'\\n');
 const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
 let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
  research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint&&research.novelty){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 } 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
@@ -111,6 +113,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   if (calibrated) await calibrate();
   configure();writeFileSync(wire,'');
   const v=acceptPlan(f,'p',questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
     .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -122,7 +126,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     maxCalls: 20, maxReportedTokens: 100000,
     v7Planning: { contract: 'v7-plan-planning/v1', maxRequestChars, maxRounds: 3 } } });
   if (planning) enablePlanning();
-  return {...f,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
+  return {...f,finishFrontier,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
 }
 
 const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
@@ -307,6 +311,7 @@ test('S6.4: subject B does not inherit subject A failed child when the real anal
   const f=await setup(t);writeFileSync(join(f.root,'scope.txt'),'Available to the second subject.');
   f.configure([{...planner,reads:[{action:'read',path:'missing.txt',media:'text/plain'}]},ended(),
     {...planner,reads:[{action:'read',path:'scope.txt',media:'text/plain'}]}]);
+ f.finishFrontier();
   assert.equal((await f.run(2)).value.pauseCode,'reading_plan_blocked');
   const failed=ownTurns(f.store)[1]!;
   changePilot(f,{active:false});

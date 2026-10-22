@@ -79,10 +79,12 @@ let research=r.subject?.dispatchMode==='consolidation'
  ?{action:'checkpoint',question:r.subject.question.id,value:{summaries:r.subject.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:r.subject.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
  :s.replies[position]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
  research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint&&research.novelty){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 } 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
@@ -113,6 +115,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   if (calibrated) await calibrate();
   configure();writeFileSync(wire,'');
   const v=acceptPlan(f,'p',questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
     .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -124,7 +128,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     maxCalls: 50, maxReportedTokens: 100000,
     v7Planning: { contract: 'v7-plan-planning/v1', maxRequestChars, maxRounds: 3 } } });
   if (planning) enablePlanning();
-  return {...f,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
+  return {...f,finishFrontier,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
 }
 
 const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
@@ -226,6 +230,7 @@ test('S6.7: a lawfully re-prepared synthesis claims once and hands off its actua
   }
   return rows;
  }) as Store['writeMany'];
+ f.finishFrontier();
  try{await f.run(3);}finally{f.store.writeMany=write;}
  assert.equal(cut,true);assert.equal(f.wires().length,1);
  const first=synthesisIntent(f);assert.equal(first.revision,1);
@@ -242,7 +247,7 @@ test('S6.7: a lawfully re-prepared synthesis claims once and hands off its actua
 
 test('S6.7: delivery projection refuses an absent basis, a foreign position and a second append',async t=>{
  const f=await setup(t,[planQuestion('block','industry','blocking')]);f.configure([toSynthesis,ended()]);
- assert.equal((await f.run(3)).value.status,'completed');
+ f.finishFrontier();assert.equal((await f.run(3)).value.status,'completed');
  const {intent,original}=verifyDelivery(f,1);
  const applied=f.store.get<any>(intent.id,intent.revision-1)!,running=f.store.get<any>(intent.id,intent.revision-2)!;
  assert.deepEqual(projectSynthesisHandoffIntent(applied,running,reference(original)),intent.value);

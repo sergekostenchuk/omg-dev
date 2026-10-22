@@ -81,9 +81,11 @@ let research=r.subject?.dispatchMode==='consolidation'
  ?{action:'checkpoint',question:r.subject.question.id,value:{summaries:r.subject.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:r.subject.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
  :s.replies[position]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  research={verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected:[],newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint&&research.novelty){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 }
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
@@ -114,6 +116,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   if (calibrated) await calibrate();
   configure();writeFileSync(wire,'');
   const v=acceptPlan(f,'p',questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
     .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -125,7 +129,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     maxCalls: 50, maxReportedTokens: 100000,
     v7Planning: { contract: 'v7-plan-planning/v1', maxRequestChars, maxRounds: 3 } } });
   if (planning) enablePlanning();
-  return {...f,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
+  return {...f,finishFrontier,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
 }
 
 const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
@@ -197,7 +201,7 @@ function edition(f:Ready) {
 for(const necessary of [true,false])
  test(`S6.8: synthesis need_owner uses the logical subject and the real ${necessary?'necessary':'unnecessary'} review`,async t=>{
  const f=await setup(t,[planQuestion('block','industry','blocking')]),source=scenario(f,necessary);
- const result=await f.run(3);assert.equal(result.value.status,necessary?'needs_owner':'completed',JSON.stringify(result.value));
+ if(!necessary)f.finishFrontier();const result=await f.run(3);assert.equal(result.value.status,necessary?'needs_owner':'completed',JSON.stringify(result.value));
  const reviewed=proveOwner(f,necessary,source);assert.equal(f.wires().length,necessary?3:5);
  proveAssessments(f,necessary?[]:['block']);
  assert.equal(f.wires().filter(row=>!row.subject.assessmentSubject).length,necessary?3:4);
@@ -254,7 +258,7 @@ test('S6.8: another subject read cannot authorize a synthesis owner review',asyn
  f.configure([{action:'read_plan',question:'$selected',reads:[{action:'read_source',source:ref,start:0,end:source.value.content.length}]},
   ended(),{action:'synthesize',question:'$selected'},
   {action:'need_owner',question:'$selected',reason:'Try using A history for B',searched:[ref]}]);
- const result=await f.run(8);assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'owner_escalation_premature',JSON.stringify(result.value));
+ f.finishFrontier();const result=await f.run(8);assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'owner_escalation_premature',JSON.stringify(result.value));
  assert.equal(f.wires().length,5);assert.equal(f.wires().filter(row=>!row.subject.assessmentSubject).length,4);proveAssessments(f,['a']);assert.equal(listResearchConsumerIntents(f.store,'p',f.v.draft.id).some(row=>row.value.kind==='escalation-assessor'),false);
  const before=snapshot(f);await f.run(1,f.open(),false);assert.deepEqual(snapshot(f),before);
 });
@@ -315,7 +319,7 @@ for (const cutSession of [false,true])
  const restore=cutPaidReview(f);
  try{await f.run(3);}finally{restore();}
  const reviewCalls=f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference);
- const choice=configureV7SavedSynthesis(f.store,'p',subject,0);
+ const choice=configureV7SavedSynthesis(f.store,'p',subject,0);f.finishFrontier();
  assert.deepEqual(choice.value.subject,subject);assert.deepEqual(choice.value.checkpoints,notes.map(reference));
  const before=snapshot(f),write=f.store.writeMany.bind(f.store);let interrupted=false;
  if(cutSession)f.store.writeMany=((writes,guards=[])=>{

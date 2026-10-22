@@ -98,10 +98,12 @@ appendFileSync(${JSON.stringify(wire)},raw+'\\n');
 const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
 let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
  research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint&&research.novelty){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 } 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
@@ -126,11 +128,13 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   if (calibrated) await calibrate();
   configure();writeFileSync(wire,'');
   const v=acceptPlan(f,'p',questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
     .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
   const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]);
-  return {...f,v,questions,run,wires,history,configure,environment,calibrate,command,settings};
+  return {...f,v,questions,run,wires,history,configure,environment,calibrate,command,settings,finishFrontier};
 }
 
 const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
@@ -154,7 +158,7 @@ function cutAt(f: Awaited<ReturnType<typeof setup>>, boundary:'unpaid'|'paid'|'p
 }
 
 test('R.1: each exact subject is assessed and applied before the next analyst call; assessment adds no attempt',async t=>{
-  const f=await setup(t),write=f.store.writeMany.bind(f.store);let second=false;
+  const f=await setup(t),write=f.store.writeMany.bind(f.store);let second=false;f.finishFrontier();
   f.store.writeMany=((writes,guards=[])=>{
     if(writes.some(w=>w.kind==='model-call'&&w.expected===0&&(w.value as any).purpose==='analyst')&&f.store.list('research-attempt').length){
       second=true;assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-state').length,1);
@@ -183,7 +187,7 @@ for(const boundary of ['paid','published','before-apply','after-apply'] as const
   assert.equal(f.store.list('v7-progress-state').length,boundary==='after-apply'?1:0);
   if(completed){const run=f.store.get<any>(stopped.id)!;f.store.write({id:run.id,kind:run.kind,expected:run.revision,value:{...run.value,status:'completed'}});}
   const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
-  const done=await f.run(1,f.open(),false);assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+  const done=await f.run(1,f.open(),false);assert.equal(done.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(done.value));
   assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
   assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-application').length,1);
   assert.equal(f.store.list<any>('v7-progress-state')[0]!.value.summary.count,1);assert.equal(done.value.turns,1);
@@ -202,7 +206,7 @@ for(const boundary of ['paid','published','after-apply'] as const)test(`R.1: ${b
 });
 
 test('R.1: an earlier paid pending answer is not skipped or counted while its assessment is still unpaid',async t=>{
- const f=await setup(t),write=f.store.writeMany.bind(f.store);let cut=false;
+ const f=await setup(t),write=f.store.writeMany.bind(f.store);let cut=false;f.finishFrontier();
  f.store.writeMany=((writes,guards=[])=>{if(!cut&&writes.some(w=>w.kind==='research-attempt')){cut=true;throw new Error('before attempt');}return write(writes,guards);}) as typeof f.store.writeMany;
  await f.run();assert.ok(cut);f.store.writeMany=write;const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
  const paused=await f.run(1,f.open(),false);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_assessment_pending',JSON.stringify(paused.value));
@@ -258,7 +262,7 @@ for(const covered of [false,true])test(`R.1: stale paid packet covered=${covered
  const packet=packetOf(f);await competingFirst(f,packet);
  const before=counters(f),apps=f.store.list('v7-progress-application');
  const result=await f.run(1,f.open(),false);
- if(covered){assert.equal(result.value.status,'completed',JSON.stringify(result.value));}
+ if(covered){assert.equal(result.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(result.value));}
  else {assert.equal(result.value.pauseCode,'discovery_progress_stale',JSON.stringify(result.value));assert.equal(result.value.status,'paused');}
  assert.deepEqual(counters(f),before);assert.deepEqual(f.store.list('v7-progress-application'),apps);
  const again=await f.run(1,f.open(),false);assert.equal(again.value.status,result.value.status);assert.equal(again.value.pauseCode,result.value.pauseCode);
@@ -284,7 +288,7 @@ test('R.1: a real pending queued child blocks the checkpoint; completed reads ad
  const pilot=f.store.get<any>('reader-pilot:p')!;
  f.store.write({id:pilot.id,kind:pilot.kind,expected:pilot.revision,value:{...pilot.value,active:false}});
  f.configure([{action:'read_plan',question:'$selected',reads:[]},ended()]);
- const done=await f.run(1,f.open());assert.equal(packetOf(f).entries.length,1);assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ const done=await f.run(1,f.open());assert.equal(packetOf(f).entries.length,1);assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
  assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.store.list('v7-attempt-account').length,1);
  const state=f.store.list<any>('v7-progress-state')[0]!;assert.equal(state.value.summary.count,1);assert.equal(done.value.turns,3);
  assert.equal(assessmentWires(f).length,1);
@@ -292,7 +296,7 @@ test('R.1: a real pending queued child blocks the checkpoint; completed reads ad
 
 test('R.1: an already paid assessor checkpoint replays free and waits without N before its next admitted request',async t=>{
  const f=await setup(t,[planQuestion('block','industry','blocking')]);
- writeFileSync(f.settings,JSON.stringify({replies:[],tokens:10,assessmentReply:{action:'assessment_checkpoint',notes:['Continue the exact packet']}}));
+ writeFileSync(f.settings,JSON.stringify({replies:[],tokens:10,assessmentReply:{action:'assessment_checkpoint',notes:['Continue the exact packet']}}));f.finishFrontier();
  const restore=cutAt(f,'paid');await f.run();restore();
  const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
  const waiting=await f.run(1,f.open(),false);assert.equal(waiting.value.pauseCode,'research_assessment_pending',JSON.stringify(waiting.value));
@@ -300,14 +304,14 @@ test('R.1: an already paid assessor checkpoint replays free and waits without N 
  assert.equal(f.store.list('v7-progress-state').length,0);assert.equal(f.store.list('discovery-assessment').length,0);
  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
  const before=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),before);
- f.configure();const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ f.configure();f.finishFrontier();const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
  assert.equal(done.value.turns,1);assert.equal(f.store.list('v7-attempt-account').length,1);
  assert.equal(f.store.list<any>('v7-progress-state')[0]!.value.summary.count,1);assert.equal(f.wires().length,sent+1);
  const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
 });
 
 test('R.1: a restored unpaid next intent cannot dispatch ahead of the previous paid application',async t=>{
- const f=await setup(t),restore=cutAt(f,'published');const stopped=await f.run();restore();
+ const f=await setup(t),restore=cutAt(f,'published');f.finishFrontier();const stopped=await f.run();restore();
  const run=f.store.get<ResearchRun>(stopped.id)!,draft=f.store.get<DiscoveryDraft>(f.v.draft.id)!,question=f.store.get<Question>(f.v.plan.id)!;
  const subject={contract:V7_PLAN_SUBJECT_CONTRACT,planAnswer:f.v.planAnswer,planQuestionId:'support'};
  const instruction='Research the next exact subject.',context={role:'research',history:[],readings:[],contextWorkspace:[]};
@@ -418,7 +422,7 @@ test(`R.1-02: ${step}-only v3 synthesis waits for the prior ${assessment} assess
   return write(writes,guards);
  }) as typeof cold.writeMany;
  const done=await f.run(1,cold);assert.ok(sent,JSON.stringify(done.value));
- assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
  assert.equal(done.value.turns,2);assert.equal(f.store.list('research-attempt').length,2);
  assert.equal(f.store.list('v7-attempt-account').length,2);
  const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
@@ -461,7 +465,7 @@ test('R.1-02: a paid intermediate v3 checkpoint restores its note before gating 
   return write(writes,guards);
  }) as typeof cold.writeMany;
  const done=await f.run(1,cold);assert.ok(resumed,JSON.stringify(done.value));
- assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(done.value.turns,2);
+ assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));assert.equal(done.value.turns,2);
  assert.equal(f.store.list('v7-attempt-account').length,2);assert.equal(f.wires().length,before.calls+3);
 });
 
@@ -483,7 +487,7 @@ test(`R.1: replacement edition leaves ${boundary} old assessment uncounted and c
  const pending=await f.run(1,f.open(),false);
  assert.equal(pending.value.pauseCode,'research_assessment_pending',JSON.stringify(pending.value));
  assert.equal(f.wires().length,calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
- const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ f.finishFrontier();const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
  assert.deepEqual(f.wires().filter(w=>!w.subject.assessmentSubject).map(w=>w.subject.question.id),['block','new']);
  assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planAnswer),[next.planAnswer]);
  assert.deepEqual(f.store.get(old.id,old.revision),old);
@@ -532,15 +536,15 @@ test(`R.1/S6.8: saved-only recovery retains the exact negative owner review${cut
    sessionCut=true;throw new Error('R1/S6.8 cut before the first saved-only intent');
   }return rows;}) as Store['writeMany'];
  let result;
- try{result=await f.run(4);}finally{f.store.writeMany=write;}
+ try{result=await f.run(1);}finally{f.store.writeMany=write;}
  if(cutSession){
   assert.ok(sessionCut);assert.equal(result.value.pauseCode,'research_interrupted');assert.equal(f.wires().length,before);
   const cold=await f.run(1,f.open(),false);assert.equal(cold.value.pauseCode,'research_restore_complete');
   const fixed=f.history(),snapshot=counters(f);assert.deepEqual(await f.run(1,f.open(),false),cold);
   assert.deepEqual(f.history(),fixed);assert.deepEqual(counters(f),snapshot);
-  result=await f.run(4,f.open());
+  result=await f.run(1,f.open());
  }
- assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+ assert.equal(result.value.pauseCode,'research_turns_exhausted',JSON.stringify(result.value));
  const reviewed=f.store.list<any>('research-turn').find(row=>row.value.action?.action==='need_owner')!;
  assert.equal(reviewed.value.status,'completed');assert.equal(reviewed.value.observation.necessary,false);
  const fresh=f.wires().slice(before),sends=fresh.filter(row=>!row.subject.assessmentSubject);
@@ -552,6 +556,7 @@ test(`R.1/S6.8: saved-only recovery retains the exact negative owner review${cut
  assert.deepEqual(f.store.list<any>('model-call').filter(row=>row.value.purpose==='escalation-assessor').map(reference),reviews);
  assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.store.list('v7-attempt-account').length,1);
  assert.equal(readV7ProgressStateAt(f.open(),reference(f.store.list<any>('v7-progress-state')[0]!)).value.summary.count,1);
- const fixed=f.history(),snapshot=counters(f);assert.deepEqual(await f.run(1,f.open(),false),result);
+ const restored=await f.run(1,f.open(),false);assert.equal(restored.value.pauseCode,'research_contract_upgrade_required');
+ const fixed=f.history(),snapshot=counters(f);assert.deepEqual(await f.run(1,f.open(),false),restored);
  assert.deepEqual(f.history(),fixed);assert.deepEqual(counters(f),snapshot);
 });

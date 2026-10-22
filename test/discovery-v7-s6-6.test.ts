@@ -77,10 +77,12 @@ let research=r.subject?.dispatchMode==='consolidation'
  ?{action:'checkpoint',question:r.subject.question.id,value:{summaries:r.subject.consolidation.notes.map((n,i)=>({notes:[i],text:'Finding '+i+' retains its exception and unresolved condition'})),citationIds:r.subject.consolidation.citations.map((_,i)=>i)},citations:[],unresolved:['New conflict remains open']}
  :s.replies[position]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
  research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint&&research.novelty){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 } 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
@@ -111,6 +113,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   if (calibrated) await calibrate();
   configure();writeFileSync(wire,'');
   const v=acceptPlan(f,'p',questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
     .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
@@ -122,7 +126,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     maxCalls: 50, maxReportedTokens: 100000,
     v7Planning: { contract: 'v7-plan-planning/v1', maxRequestChars, maxRounds: 3 } } });
   if (planning) enablePlanning();
-  return {...f,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
+  return {...f,finishFrontier,v,questions,run,wires,history,configure,environment,calibrate,enablePlanning};
 }
 
 const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
@@ -144,7 +148,7 @@ for(const boundary of ['session','prepared','paid','applied'] as const)
    if(!cut && found){cut=true;write(writes,guards);throw new Error(`S6.6 cut after ${boundary}`);}
    return write(writes,guards);
   }) as Store['writeMany'];
-  try{await f.run(3);}finally{f.store.writeMany=write;}
+  f.finishFrontier();try{await f.run(3);}finally{f.store.writeMany=write;}
   assert.equal(cut,true);assert.equal(sessions(f.store).length,1);
   const original=sessions(f.store)[0]!;
   const callsBefore=f.wires().length;
@@ -223,7 +227,7 @@ test('S6.6: paid lookup applies in restore-only; the next synthesis send require
   assert.deepEqual(await f.run(3,f.open(),false),restored);
   assert.deepEqual(snapshot(f),fixed,'second and third restore-only entries preserve complete history and payment');
  }
- const resumed=await f.run(3,f.open());assert.equal(resumed.value.status,'completed',JSON.stringify(resumed.value));
+ f.finishFrontier();const resumed=await f.run(3,f.open());assert.equal(resumed.value.status,'completed',JSON.stringify(resumed.value));
  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,count+1);
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
 });
@@ -261,7 +265,7 @@ test('S6.6: saved-only uses the exact subject notes without asking a new planner
  const unadmitted=snapshot(f);
  await assert.rejects(f.run(3,f.open(),false),{code:'research_contract_upgrade_required'});
  assert.deepEqual(snapshot(f),unadmitted);
- const result=await f.run(3,f.open());
+ f.finishFrontier();const result=await f.run(3,f.open());
  assert.equal(result.value.status,'completed',JSON.stringify(result.value));assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,count+1);
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);
  assert.equal(f.wires().some(row=>row.subject.dispatchMode==='planning'),false);
@@ -281,7 +285,7 @@ for(const boundary of ['reservation','paid'] as const)
  await f.run(3,f.store);restore();
  const reserved=sessions(f.store)[0]!;assert.deepEqual(reserved.value.delivered,session.value.delivered);
  assert.equal(reserved.value.delivery.turn,first.value.turns+1);const calls=f.wires().length;
- const result=await f.run(3,f.open(),boundary!=='paid');
+ f.finishFrontier();const result=await f.run(3,f.open(),boundary!=='paid');
  assert.equal(result.value.status,boundary==='paid'?'paused':'completed',JSON.stringify(result.value));
  assert.equal(result.value.pauseCode,boundary==='paid'?'research_assessment_pending':null);
  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,calls+(boundary==='paid'?0:1));
@@ -313,7 +317,7 @@ test('S6.6: a real paid consolidation resumes in restore-only before another syn
  assert.equal(restored.value.pauseCode,'research_restore_complete',JSON.stringify(restored.value));
  assert.deepEqual(heads(f),paid);assert.equal(f.wires().length,calls);
  const session=readSynthesisSessionV3(f.open(),reference(sessions(f.store)[0]!));assert.ok(session.value.notes.some(note=>note.consolidated));
- const completed=await f.run(3,f.open());assert.equal(completed.value.status,'completed',JSON.stringify(completed.value));
+ f.finishFrontier();const completed=await f.run(3,f.open());assert.equal(completed.value.status,'completed',JSON.stringify(completed.value));
  assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,calls+1);
  assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);assert.equal(f.wires().filter(row=>row.subject.dispatchMode==='planning').length,1);
  for(const turn of f.store.list<any>('research-turn'))readResearchConsumerTurn(f.open(),reference(turn));
@@ -371,7 +375,7 @@ for (const foreign of [true, false])
  assert.throws(()=>readSynthesisSessionV3(f.open(),reference(broken)),{code:'synthesis_session_invalid'});
  if (foreign) {
   f.configure([ended()]);
-  const result=await f.run(3,f.open());assert.equal(result.value.status,'completed',JSON.stringify(result.value));
+  f.finishFrontier();const result=await f.run(3,f.open());assert.equal(result.value.status,'completed',JSON.stringify(result.value));
   assert.equal(f.wires().filter(w=>!w.subject.assessmentSubject).length,1);
   assert.equal(f.wires().filter(w=>w.subject.assessmentSubject).length,1);assert.deepEqual(f.store.get(broken.id),broken);
   const own=readSynthesisSessionV3(f.open(),reference(f.store.get<any>(original.id)!));

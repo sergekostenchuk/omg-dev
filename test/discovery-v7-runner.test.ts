@@ -14,12 +14,11 @@ import { stageBudgetPlan, stageBudgetSegmentId } from '../src/discovery/stage-to
 import { budgetUsage, type BudgetSegment, type CallEstimate } from '../src/runtime/research-budget.js';
 import { answerDiscoveryFixture } from './product-fixture.js';
 import { researchCall } from '../src/discovery/research-protocol.js';
-import { uniqueTransactionGuards } from "../src/runtime/environment.js";
 import { recordV7Attempt } from '../src/discovery/v7-attempts.js';
 import { proveClaimAddress } from '../src/discovery/claim-address.js';
 import { Researcher } from '../src/discovery/research-runner.js';
 import { planAttemptSelection, nextPlanQuestion, proveAttempt, type V7AttemptEnd } from '../src/discovery/v7-plan-questions.js';
-import { readResearchConsumerTurn, prepareResearchConsumerIntent, completeResearchAttemptTurn } from '../src/discovery/response-recovery.js';
+import { readResearchConsumerTurn,  completeResearchAttemptTurn } from '../src/discovery/response-recovery.js';
 import { discoveryInspection } from '../src/discovery/discovery-outcome.js';
 import { executionAdmission, acceptedIssuance } from '../src/discovery/projection-reader.js';
 import {v7ProgressStateId} from '../src/discovery/v7-attempt-assessment.js';
@@ -96,10 +95,12 @@ appendFileSync(${JSON.stringify(wire)},raw+'\\n');
 const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
 let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
  research={verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 } 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
@@ -122,11 +123,13 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
   if (calibrated) await calibrate();
   configure();writeFileSync(wire,'');
   const v=acceptPlan(f,'p',questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
     .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
   const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
   const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]);
-  return {...f,v,questions,run,wires,history,configure,environment,calibrate};
+  return {...f,v,questions,run,wires,history,configure,environment,calibrate,finishFrontier};
 }
 
 const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
@@ -135,7 +138,7 @@ test('R: real initial traversal orders blocking first, uses reservation @1 and l
   const f=await setup(t), beforeDraft=f.store.get(f.v.draft.id), beforeQuestion=f.store.get(f.v.plan.id);
   const batches:{purpose:string;kinds:string[]}[]=[],write=f.store.writeMany.bind(f.store);
   f.store.writeMany=((writes,guards=[])=>{const call=writes.find(w=>w.kind==='model-call'&&w.expected===0);if(call)batches.push({purpose:(call.value as any).purpose,kinds:writes.map(w=>w.kind)});return write(writes,guards);}) as typeof f.store.writeMany;
-  f.configure([ended('refused'),ended()]);
+  f.configure([ended('refused'),ended()]);f.finishFrontier();
   const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));
   assert.deepEqual(f.wires().map(w=>w.subject.assessmentSubject?'assessor:'+w.subject.question.id:w.subject.question.id),['block','assessor:block','support','assessor:support']);
   assert.deepEqual(f.store.get(f.v.draft.id),beforeDraft);assert.deepEqual(f.store.get(f.v.plan.id),beforeQuestion);
@@ -175,7 +178,7 @@ for(const boundary of ['paid','attempt','binding'] as const)test(`R: cold recove
 test('R: default v7 stays off, allowance pauses before a new question and completed turns recover first',async t=>{
   const f=await setup(t);
   await assert.rejects(f.run(1,f.store,false),{code:'research_contract_upgrade_required'});assert.equal(f.wires().length,0);
-  const paused=await f.run(1);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_turns_exhausted');
+  f.finishFrontier();const paused=await f.run(1);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_turns_exhausted');
   assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.wires().length,2);
   const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(f.wires().length,4);
 });
@@ -251,38 +254,21 @@ test('R: acceptance gates require a proved plan and keep the new stage-result ro
 });
 
 test('R: submitted and duplicate ends use ordinary paid calls without accepting their claims',async t=>{
-  const f=await setup(t,[planQuestion('block','industry','blocking')]),write=f.store.writeMany.bind(f.store);let cut=false;
-  f.store.writeMany=((writes,guards=[])=>{
-    if(!cut&&writes.some(w=>w.kind==='research-consumer-intent'&&w.expected===0)){cut=true;throw new Error('before prepare');}
-    return write(writes,guards);
-  }) as typeof f.store.writeMany;
-  const paused=await f.run();assert.equal(cut,true);f.store.writeMany=write;
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
   const source=f.discovery.evidence.document('p','claim-basis','Evidence for claim','text/plain',0);
   const end={type:'submitted' as const,contract:DISCOVERY_CLAIMS_CONTRACT,value:{claims:[{id:'fact',kind:'fact',text:'Claim',axis:'industry',
     planQuestions:[{planAnswer:f.v.planAnswer,planQuestionId:'block'}],scope:{variants:'common'},
     basis:{source:{ref:reference(source),range:{start:0,end:3},valueHash:hashJson('Evi')},limit:'snapshot',asOf:'2026-10'}}]}} as unknown as V7AttemptEnd;
   f.configure([{...ended(),value:end}]);
-  const owner=f.store.write({id:'research-run:independent',kind:'research-run',expected:0,value:{...paused.value,status:'running' as const}});
-  const subject={contract:'v7-plan-subject/v1' as const,planAnswer:f.v.planAnswer,planQuestionId:'block'};
-  const context={role:'research',history:[],readings:[],contextWorkspace:[]},instruction='Return a submitted attempt for this exact plan question.';
-  const intent=prepareResearchConsumerIntent(f.store,{projectId:'p',kind:'analyst',key:owner.id,owner:reference(owner),
-    draft:reference(f.v.draft),question:reference(f.v.plan),role:f.environment.value.implementer,dispatch:f.environment.value,profile:null,
-    cursor:{run:owner.id,turn:1,mode:null,instruction,context,subject},basis:[],
-    guards:uniqueTransactionGuards([reference(owner),reference(f.v.draft),reference(f.v.plan),reference(f.environment)])});
-  await researchCall(f.environment.value.implementer,f.environment.value,instruction,context,undefined,
-    {store:f.store,draftId:f.v.draft.id,questionId:f.v.plan.id,purpose:'analyst',consumerIntent:reference(intent)});
-  const original=recordV7Attempt(f.store,{project:'p',planAnswer:f.v.planAnswer,planQuestionId:'block',
-    call:f.store.get<any>(intent.id)!.value.call,end});
-  f.configure([{...ended(),value:end},{...ended(),value:{type:'duplicate',of:reference(original.attempt)}}]);
-  const current=f.store.get<any>(paused.id)!;
-  prepareResearchConsumerIntent(f.store,{projectId:'p',kind:'analyst',key:hashJson([paused.id,1,'analyst']),owner:reference(current),
-    draft:reference(f.v.draft),question:reference(f.v.plan),role:f.environment.value.implementer,dispatch:f.environment.value,profile:null,
-    cursor:{run:paused.id,turn:1,mode:null,instruction,context,subject},basis:[],
-    guards:uniqueTransactionGuards([reference(current),reference(f.v.draft),reference(f.v.plan),reference(f.environment)])});
-  const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+  const first=await f.run(1);assert.equal(first.value.pauseCode,'research_turns_exhausted',JSON.stringify(first.value));
+  const original=f.store.list('research-attempt')[0]!;
+  f.configure([ended(),{...ended(),value:{type:'duplicate',of:reference(original)}}]);
+  const done=await f.run(1,f.open());assert.equal(done.value.pauseCode,'research_turns_exhausted',JSON.stringify(done.value));
   assert.deepEqual(f.store.list<any>('research-attempt').map(a=>a.value.end.type).sort(),['duplicate','submitted']);
-  assert.equal(f.wires().length,3);
-  assert.throws(()=>proveClaimAddress(f.store,{project:'p',container:reference(original.attempt),containerKind:'research-attempt',pointer:'/claims/0',claimId:'fact'}),{code:'claim_attempt_not_accepted'});
+  assert.equal(f.store.list('v7-attempt-account').length,2);assert.equal(f.wires().length,4);
+  assert.throws(()=>proveClaimAddress(f.store,{project:'p',container:reference(original),containerKind:'research-attempt',pointer:'/claims/0',claimId:'fact'}),{code:'claim_attempt_not_accepted'});
+  const restored=await f.run(1,f.open(),false);assert.equal(restored.value.pauseCode,'research_contract_upgrade_required');
+  const before=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),before);assert.equal(f.wires().length,4);
 });
 
 test('R: a competing completion wins the K batch without partial binding or overwriting its run',async t=>{
@@ -329,15 +315,16 @@ test('R: source search and context reads precede a submitted end without accepti
     basis:{source:{ref:reference(source),range:{start:0,end:1},valueHash:hashJson('A')},limit:'snapshot',asOf:'2026-10'}}]}};
   f.configure([{action:'search',query:'precise'},{action:'read_context',record:reference(f.v.draft),pointer:'/fields/plan'},
     {...ended(),value:end}]);
-  const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));
+  const run=await f.run(3);assert.equal(run.value.pauseCode,'research_turns_exhausted',JSON.stringify(run.value));
   assert.equal(f.wires().length,4);assert.equal(f.store.list<any>('research-turn').filter(t=>t.value.status==='completed').length,3);
   const attempt=f.store.list('research-attempt')[0]!;
   assert.throws(()=>proveClaimAddress(f.store,{project:'p',container:reference(attempt),containerKind:'research-attempt',pointer:'/claims/0',claimId:'fact'}),{code:'claim_attempt_not_accepted'});
+  assert.equal((await f.run(1,f.open(),false)).value.pauseCode,'research_contract_upgrade_required');
   const saved=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),saved);
 });
 
 test('R: corrupt attempt heads are refused rather than treated as unanswered questions',async t=>{
-  const f=await setup(t,[planQuestion('block','industry','blocking')]);await f.run();
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);f.finishFrontier();await f.run();
   const record=f.store.list<any>('research-attempt')[0]!;
   f.store.write({id:record.id,kind:record.kind,expected:record.revision,value:{...record.value,project:'foreign'}});
   assert.throws(()=>planAttemptSelection(f.store,'p'),{code:'attempt_invalid'});assert.equal(f.wires().length,2);
@@ -402,8 +389,8 @@ test('R: paid replay stays free before one new turn in current allowance', async
   const paidCalls = assignedCalls();
   const after = await f.run(1, f.open());
   assert.equal(f.wires().length, 4);
-  assert.deepEqual(f.wires().filter(row=>!row.subject.assessmentSubject).map(row => row.subject.question.id), ['block', 'support']);
-  assert.equal(after.value.status, 'completed');
+  assert.deepEqual(f.wires().filter(row=>!row.subject.assessmentSubject).map(row => row.subject.question.id), ['block', 'block']);
+  assert.equal(after.value.status, 'paused');assert.equal(after.value.pauseCode,'research_turns_exhausted');
   assert.equal(assignedCalls().length, paidCalls.length + 3, 'one new analyst and two required assessors; the paid analyst stays assigned once');
   for (const call of paidCalls) assert.equal(assignedCalls().filter(id => id === call).length, 1);
 });

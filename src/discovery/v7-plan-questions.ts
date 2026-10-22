@@ -2,9 +2,11 @@ import { readSynthesisSessionV3 } from "./synthesis-session.js";
 import { canonical, hashJson, type Json } from "../canonical.js";
 import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
-import type { Store, Revision } from "../storage/store.js";
+import type { Store, Revision, TransactionGuard } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import type { ResearchAnswer, ResearchRun, V7AttemptPacketEntry } from "./research-model.js";
+import type { ResearchAnswer, ResearchRun, V7AttemptPacketEntry, V7ProgressState, V7ProgressApplication } from "./research-model.js";
+import { readV7ProgressStateAt } from "./v7-progress.js";
+import { v7ProgressStateId } from "./v7-attempt-assessment.js";
 import { consumerIntentContext, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn, readResearchAttemptBinding,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { planSubjectOf, sameSubject, type V7PlanSubject } from "./v7-managed-attempt.js";
@@ -148,26 +150,56 @@ export function currentPlan(store: Store, projectId: string): CurrentPlan {
 
 /** The deterministic next plan-question: blocking questions first in plan
  * order, then supporting in plan order — derived from the proven current
- * plan only. In DR3a1 every plan question is open; skipping closed/stalled
- * belongs to the DR3b state machine. */
+ * plan only. This stateless projection retains its historical contract;
+ * execution selects the proven P frontier through planAttemptSelection. */
 export function nextPlanQuestion(store: Store, projectId: string): V7PlanQuestion | null {
   const { questions } = currentPlan(store, projectId);
   return questions.find(item => (item.question as Record<string, Json>)["class"] === "blocking")
     ?? questions[0] ?? null;
 }
 
-/** One initial traversal, not DR3b question acceptance: every proven end counts. */
+/** R.2: only the exact applied P history may remove a question from the
+ * frontier. A finished but unassessed K cannot authorize another dispatch. */
 export function planAttemptSelection(store: Store, projectId: string): CurrentPlan & {
-  attempts: Revision<V7Attempt>[]; next: V7PlanQuestion | null;
+  attempts: Revision<V7Attempt>[]; next: V7PlanQuestion | null; guards: TransactionGuard[];
 } {
   const plan = currentPlan(store, projectId);
   const attempts = store.list<V7Attempt>(V7_ATTEMPT_KIND)
     .filter(record => canonical(record.value?.planAnswer ?? null) === canonical(plan.planAnswer)
       || record.value?.project === projectId && !isRef(record.value.planAnswer))
     .map(record => proveAttemptWithPlan(store, reference(record), plan).attempt);
-  const ended = new Set(attempts.map(record => record.value.planQuestionId));
-  const open = plan.questions.filter(question => !ended.has(question.planQuestionId));
-  return { ...plan, attempts,
+  const guards: TransactionGuard[] = [];
+  const open = plan.questions.filter(question => {
+    const subject = { project: projectId, planAnswer: plan.planAnswer, planQuestionId: question.planQuestionId };
+    const stateId = v7ProgressStateId(subject);
+    const head = store.get<V7ProgressState>(stateId);
+    const own = attempts.filter(attempt => attempt.value.planQuestionId === question.planQuestionId);
+    if (!head) {
+      guards.push({ id: stateId, absent: true });
+      if (own.length) refuse('research_assessment_pending', question.planQuestionId,
+        'The finished attempts need their applied assessment before another dispatch');
+      return true;
+    }
+    const state = readV7ProgressStateAt(store, reference(head));
+    if (canonical(state.value.subject) !== canonical(subject))
+      refuse('discovery_progress_conflict', question.planQuestionId, 'The progress belongs to another exact subject');
+    guards.push(reference(state));
+    // The common reader has proved the complete application chain. Match K to
+    // those immutable applications, rather than trust a count or an account head.
+    const covered = new Set<string>();
+    let cursor: Revision<V7ProgressState> | null = state;
+    while (cursor) {
+      const application: Revision<V7ProgressApplication> = store.get<V7ProgressApplication>(cursor.value.application.id, cursor.value.application.revision)!;
+      for (const attempt of application.value.attempts) covered.add(canonical(attempt));
+      cursor = application.value.previous
+        ? store.get<V7ProgressState>(application.value.previous.id, application.value.previous.revision) : null;
+    }
+    if (own.some(attempt => !covered.has(canonical(reference(attempt)))))
+      refuse('research_assessment_pending', question.planQuestionId,
+        'An unaccounted attempt cannot be bypassed by the next frontier selection');
+    return state.value.summary.outcome === 'open';
+  });
+  return { ...plan, attempts, guards,
     next: open.find(question => (question.question as Record<string, Json>)["class"] === "blocking") ?? open[0] ?? null };
 }
 

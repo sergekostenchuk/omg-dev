@@ -88,10 +88,12 @@ appendFileSync(${JSON.stringify(wire)},raw+'\\n');
 const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
 let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(s.terminalConstraint&&research.action==='answer')research.value.evidence=[s.terminalConstraint];
 if(r.subject.assessmentSubject){
  const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
  const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
  research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+ if(s.terminalConstraint&&research.novelty){research.verdict='supported';research.return=null;research.novelty.noProgress=[];research.novelty.transition={outcome:'unknown',bases:[{constraint:packet.entries[0].attempt}],reason:'Source unavailable',consequence:'The named basis remains unknown',nextAction:'Obtain another source'};}
 } 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command = { executable: process.execPath, args: [adapter] };
@@ -110,6 +112,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     { store: f.store, draftId: calibration.id, questionId: calibration.value.questions[0]!, purpose: 'assessor' });
   configure(); writeFileSync(wire, '');
   const v = acceptPlan(f, 'p', questions);
+  let terminalConstraint: Ref | undefined;
+  const finishFrontier=()=>{terminalConstraint??=reference(f.discovery.evidence.document('p','terminal-source','The requested source is unavailable','text/plain',0));writeFileSync(settings,JSON.stringify({...JSON.parse(readFileSync(settings,'utf8')),terminalConstraint}));};
   const run = (limit = 8, store = f.store, policy = true) => new Researcher(store, new Discovery(store), new ProductEngine(store).environments)
     .run('p', v.draft.id, limit, undefined, policy ? { producerPolicy: { discovery: 7 } } : {});
   const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).length;
@@ -121,7 +125,7 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     assert.deepEqual(history(), before, 'a cold summary writes nothing'); assert.equal(wires(), calls, 'a cold summary calls no adapter');
     return { summary, candidate: summary.candidate!, text };
   };
-  return { ...f, v, run, configure, cold, wires };
+  return { ...f,finishFrontier, v, run, configure, cold, wires };
 }
 
 const ended = (type = 'impossible') => ({ action: 'answer', question: '$selected', value: { type, code: 'source_unavailable', evidence: [], text: 'No accessible source' }, citations: [] });
@@ -130,6 +134,7 @@ const turns = (store: Store) => store.list<any>('research-turn').sort((a, b) => 
 
 test('S6.9: a paid model pause names its logical question — two logical questions of one physical Question stay distinct, and the code, reason and door stay verbatim', async t => {
   const f = await setup(t); f.configure([ended(), pause('Need the regional retention act')]);
+ f.finishFrontier();
   const run = await f.run();
   assert.equal(run.value.status, 'paused', JSON.stringify(run.value)); assert.equal(run.value.pauseCode, 'research_model_paused');
   const [first, last] = turns(f.store);
@@ -189,14 +194,15 @@ for (const [name, limit, replies, tokens, code] of [
 test('S6.9: a completed run with applied return/noProgress assessments keeps the stage researching — nothing is accepted', async t => {
   const f = await setup(t); f.configure([ended('refused'), ended()]);
   const run = await f.run(); assert.equal(run.value.status, 'completed', JSON.stringify(run.value));
-  assert.equal(f.store.list('research-attempt').length, 2);
-  assert.equal(f.store.list('v7-progress-application').length, 2);
+  assert.equal(f.store.list('research-attempt').length, 6);
+  assert.equal(f.store.list('v7-progress-application').length, 6);
   for(const state of f.store.list('v7-progress-state')) {
     const proof=readV7ProgressStateAt(f.open(),reference(state));
     assert.deepEqual(proof.value.subject.planAnswer,f.v.planAnswer);
   }
   for (const state of f.store.list<any>('v7-progress-state')) {
-    assert.equal(state.value.summary.count, 1); assert.equal(state.value.summary.streak, 1);
+    assert.equal(state.value.summary.count, 3); assert.equal(state.value.summary.streak, 3);
+    assert.equal(state.value.summary.outcome, 'stalled');
   }
   const { summary, candidate, text } = f.cold();
   assert.equal(summary.accepted, null, 'no accepted Discovery appears');
