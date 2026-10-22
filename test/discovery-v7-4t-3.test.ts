@@ -251,3 +251,17 @@ test('4T.3: the closed generation answer — one to three unique keys on one sca
   for (const [label, value] of bad)
     assert.throws(() => decodeVariantGeneration(JSON.parse(JSON.stringify(value))), errorCode('discovery_variant_answer_invalid'), label);
 });
+
+test('4T.3: an off-form paid generation answer is kept as paid and refused on every reading, without a second payment', async t => {
+  const f = await setup(t), v = f.subject('proposal', f.transport('snapshot'), f.transport('mode'));
+  f.configure({ action: 'variants', variants: [], note: 'untyped' });
+  await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan), errorCode('discovery_variant_answer_invalid'));
+  const [call] = variantCalls(f);
+  assert.equal(call!.value.status, 'succeeded', 'the paid off-form answer is retained');
+  const saved = f.snapshot(f.store), sent = f.wires().length;
+  f.configure(generation('never-sent'));
+  await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan), errorCode('discovery_variant_answer_invalid'));
+  await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, f.open()), errorCode('discovery_variant_answer_invalid'));
+  assert.deepEqual(f.snapshot(f.store), saved);
+  assert.equal(f.wires().length, sent);
+});

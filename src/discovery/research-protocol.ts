@@ -55,6 +55,7 @@ import { pilotDispatch } from "./pilot-budget.js";
 import type { ReaderPilot } from "./reader-pilot.js";
 import { workingContext } from "./working-context.js";
 import { replayAssessmentApplication, replayVariantResponse } from "./response-replay.js";
+import { decodeVariantGeneration } from "./discovery-variants.js";
 import { recoveryDispatchBoundary, operatorReplayedResponse, assessmentSessionEra, isResponseRecovery,
   readResearchConsumerIntent, resumeResearchConsumerExecution,
   refuseResearchConsumerIntent, prepareResearchConsumerReservation, consumerIntentContext, CONSUMER_INTENT_V2,
@@ -295,7 +296,16 @@ export function prepareResearchEnvelope(role: RoleBinding, environment: Environm
   return { packetState, subject, envelope, input, requestLimit };
 }
 
+/** 4T.3: a variant generation answer — new or replayed — leaves the transport only in its closed form. The paid call is
+ * saved before the check, so an off-form answer is a typed refusal on every reading and never a second payment. */
 export async function researchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
+  audit?: ResearchCallAudit): Promise<unknown> {
+  const answer = await dispatchResearchCall(role, environment, prompt, context, signal, audit);
+  if (audit?.purpose === 'variant-proposal' && packetVariantSubject(context)?.kind === 'proposal') decodeVariantGeneration(answer);
+  return answer;
+}
+
+async function dispatchResearchCall(role: RoleBinding, environment: Environment, prompt: string, context: unknown, signal?: AbortSignal,
   audit?: ResearchCallAudit): Promise<unknown> {
   recoveryDispatchBoundary();
   requireCondition(!packetAssessmentSubject(context) || !audit?.consumerIntent,
