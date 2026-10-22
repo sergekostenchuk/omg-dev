@@ -371,8 +371,10 @@ test('F5 declared work goal closes accepted L3 gaps and confirms progress throug
   const fresh = ok(writeRoutes(f.store, { project: f.project, gaps,
     tasks: [], catalog: { paths: [], records: [] }, previous: reference(f.routes) }));
   const boundary = heads(f.store);
-  assert.ok(!fresh.value.batches.some(batch => batch.level === 3 && batch.task === 'node-expansion'
-    && f.desired.nodes.some(node => node.id === batch.node && node.parent === declared.block)));
+  // LG08 (codex-omg2 №10415 P3): batch availability is measured the way completionPlanSources selects — every item
+  // carries this block among item.consumers and the batch serves the declared goal's questions; node.parent is no key.
+  assert.ok(!fresh.value.batches.some(batch => batch.items.every(item => item.consumers.includes(declared.block))
+    && batch.items.some(item => declared.goal.questions.includes(gapLineKey(f.project, item.target, item.field)))));
   denied(openAttempt(f.store, { ...address, attempt: declared.ordinal + 1, goal: declared.goal,
     completion: { routes: reference(fresh), batches: [] } }), 'completion_request_invalid');
   assert.deepEqual(heads(f.store), boundary); assert.equal(f.sent().length, beforeSend);
