@@ -24,7 +24,7 @@ import { MP3_NOTES, MP3_SCOPES, completionSnapshot, currentPacketWire, e4CannotA
 
 test('E4 current admission blocks stale packets, mismatched configs and masqueraded adapters without spawning', async t => {
   for (const change of ['stale', 'config', 'adapter'] as const) {
-    const f = e4Fixture(t); f.steps([{ research: e4Fact(f) }]);
+    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4Fact(f) }]);
     const request = structuredClone(f.request);
     if (change === 'stale') f.environment();
     else if (change === 'config') request.dispatch = { ...request.dispatch, config: reference(f.environment()) };
@@ -37,7 +37,7 @@ test('E4 current admission blocks stale packets, mismatched configs and masquera
 
 
 test('E4 narrowing the questions of an unchanged source read does not manufacture progress', async t => {
-  const f = e4Fixture(t, 'node');
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true);
   const need = e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]);
   assert.ok(need.questionIds.length > 1);
   f.steps([{ research: need }, { research: { ...need, questionIds: need.questionIds.slice(0, 1) } }]);
@@ -49,7 +49,7 @@ test('E4 narrowing the questions of an unchanged source read does not manufactur
 
 
 test('E4 cycle assembles all node parts after a source continuation with exact coverage and no hidden final call', async t => {
-  const f = e4Fixture(t, 'node'), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true), config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   assert.equal(packet.value.state, 'ready'); assert.equal(packet.value.plan!.mode, 'parts');
   const total = packet.value.plan!.assignments.length;
@@ -77,7 +77,7 @@ test('E4 cycle replay accounts a late receipt once before or after the cycle is 
   for (const kind of ['fact', 'node'] as const) for (const timing of ['before-cycle', 'after-cycle'] as const) {
     const replayPaths = kind === 'fact' && timing === 'after-cycle' ? ['cycle', 'public-recovery'] as const : ['cycle'] as const;
     for (const replayPath of replayPaths) await t.test(`${kind}: ${timing} via ${replayPath}`, async nested => {
-      const f = e4Fixture(nested, kind, 100_000, 0, 30_000), checkpoint = join(f.root, 'late-cycle.json');
+      const f = e4Fixture(nested, kind, 100_000, 0, 30_000, true), checkpoint = join(f.root, 'late-cycle.json');
       f.steps([{ research: kind === 'fact' ? e4Fact(f) : e4Node(f), usage }]);
       const driver = fixtureDriver(nested, f.database, f.root, 'call', f.request,
         { path: checkpoint, kind: 'om-model-exchange', matches: [], when: 'before' });
@@ -257,7 +257,10 @@ test('C10 H1.0a E1 ledger races protect G7 and a closed owner invalidates its ea
 
 test('C03 H1.0a original managed opening protects all M6 sources in the same transaction',async t=>{
   const {prepareManagedBeginAttempt}=await import('../src/om/series.js');
-  const f=e4Fixture(t);f.steps([{research:{wrong:true},usage}]);valueOf(await runModelCall(f.store,f.request));
+  const f=e4Fixture(t,'fact',100_000,0,5000,true);f.steps([{research:{wrong:true},usage}]);valueOf(await runModelCall(f.store,f.request));
+  const work=completionSnapshot(f);
+  valueOf(closeAttempt(f.store,{...seriesRequestOf(f.series.value),attempt:1,
+    outcome:{reason:'off-form' as const,accepting:[],cancelling:[],refusals:work.refusals}}));
   const closed=f.store.get<RepairSeries>(f.series.id)!,goal=closed.value.attempts[0]!.goal;
   valueOf(openSeries(f.store,{project:f.project,block:closed.value.block,line:2,slice:'next-line',predecessor:reference(closed),
     basis:{ground:'inputs-changed',text:'The declared task was revised'}}));
@@ -270,9 +273,10 @@ test('C03 H1.0a original managed opening protects all M6 sources in the same tra
     const graph=second.get<Graph>(`graph:${f.project}`)!;
     new ProductEngine(second).graphs.save(f.project,graph.value,graph.revision,'concurrent shared source');
   }finally{second.close();}
+  const owners=f.store.list('om-completion-owner').length,eras=f.store.list('om-completion-era').length;
   const result=writeGuarded(f.store,{unit:'G7',target:f.project,writes:prepared.writes,guards:prepared.guards});
   assert.equal(result.ok,false);if(!result.ok)assert.equal(result.refusal.code,'input_stale');
-  assert.equal(f.store.list('om-completion-owner').length,0);assert.equal(f.store.list('om-completion-era').length,0);
+  assert.equal(f.store.list('om-completion-owner').length,owners);assert.equal(f.store.list('om-completion-era').length,eras);
 });
 
 
@@ -415,7 +419,7 @@ test('MP2 (№2968 row 13) join inputs are no answer check: a part whose join na
 
 
 test('MP3 main scenario, rows 1, 2, 3, 5: one need_source of several reads delivers complete, clipped, outside and missing results with search rows; the next prompt names requested and served; the answer follows', async t => {
-  const m = mp3Cycle(t), { f, length } = m;
+  const m = mp3Cycle(t, 'fact', 100_000, true), { f, length } = m;
   const root = f.packet.value.packet as Record<string, any>;
   assert.deepEqual(mp3Readings(root), { contract: 'om-brief-readings/v1', snapshots: [], entries: [] });
   const catalogued = (root.brief.manifest as { source: Ref; length: number; completeness: string }[]).find(row => canonical(row.source) === canonical(reference(m.notes)))!;
