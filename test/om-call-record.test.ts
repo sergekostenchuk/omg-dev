@@ -50,6 +50,8 @@ import { gardenGraph } from "./om-fixture.js";
 import { managedBlock } from "./om-managed-block.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
+import { defectedWork, ok, regatedHold, runFixture } from "./om-run-fixture.js";
+import { startRun } from "../src/om/run.js";
 
 const UNIT = "gate-admit";
 const PROJECT = "alpha";
@@ -202,22 +204,6 @@ function unknownRefusal(store: Store, project: string): { readonly name: string;
   return { name, goal: wanted, row: journal.value.rows[journal.value.rows.length - 1]!.id };
 }
 
-function raisedHold(store: Store, project: string, attemptGoal: AttemptGoal, begin = false, block = BLOCK): {
-  readonly hold: Ref; readonly series: Revision<RepairSeries>;
-} {
-  if (begin) {
-    deliveredOf(openSeries(store, { project, block, line: 1, slice: `slice:${project}:${block}@1`, predecessor: null, basis: null }));
-    deliveredOf(openAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
-  }
-  const refusal = unknownRefusal(store, project);
-  const result = deliveredOf(closeAttempt(store, {
-    project, block, line: 1, attempt: 1,
-    outcome: { reason: "refused", accepting: [], cancelling: [], refusals: [refusal] },
-  }));
-  assert.equal(result.holds.length, 1);
-  return { hold: result.holds[0]!, series: store.get<RepairSeries>(seriesId(project, block, 1))! };
-}
-
 function liftByOwner(store: Store, project: string, hold: Ref): Ref {
   const value = store.get<OriginHold>(hold.id)!.value;
   const decision = reference(store.write({
@@ -230,6 +216,41 @@ function liftByOwner(store: Store, project: string, hold: Ref): Ref {
   return reference(deliveredOf(liftOriginHold(store, {
     project, hold, ground: "owner-decision", record: { ref: decision },
   })));
+}
+
+const GARDEN = "garden";
+
+/** LG07 oh-a (№10670): a real standing origin hold — the regated works answer defected so its G5 rejects the attempt. */
+async function regatedFixture(t: test.TestContext, files?: Record<string, string>) {
+  const f = runFixture(t, [], "executed");
+  ok(startRun(f.store, { project: GARDEN }));
+  const held = await regatedHold(f, {
+    ...(files ? { files } : {}),
+    cycle: (packet, batch) => batch.task === "node-expansion" && batch.level === 3
+      ? defectedWork(f, reference(packet)) : null,
+    pause: { step: "analyze" },
+  });
+  const step = held.second!.step!.request as { hold: Ref; series: Ref };
+  const hold = f.store.get<OriginHold>(step.hold.id, step.hold.revision)!;
+  const series = f.store.get<RepairSeries>(hold.value.series.id, hold.value.series.revision)!;
+  return { f, hold, series };
+}
+
+/** The call-record input standing on the real hold: the run's own dispatch contract and the hold's series/attempt/block. */
+function originRequest(f: ReturnType<typeof runFixture>, hold: Revision<OriginHold>, over: Partial<RecordCallRequest> = {}): RecordCallRequest {
+  const reviewGoal = analysisGoal("the unknown refusal origin");
+  return {
+    call: "review-origin-1", purpose: "origin-analysis",
+    basis: { kind: "origin-hold", hold: reference(hold) }, block: hold.value.block,
+    gaps: analysisGaps(hold.id, reviewGoal, "origin"),
+    series: hold.value.series, attempt: hold.value.attempt, goal: reviewGoal,
+    dispatch: {
+      adapter: reference(f.store.get(`adapter:${GARDEN}:run`)!),
+      config: reference(f.store.get(`environment:${GARDEN}`)!),
+    },
+    packet: { question: "what opened this hold?", neighbours: ["consume"] },
+    ...over,
+  };
 }
 
 const heldCall = (f: Fixture, name = "research-price-1"): Revision<CallRecord> | null =>
@@ -653,61 +674,46 @@ test("a stop-analysis call binds to the standing first-rung stop without opening
   assert.equal(heldLedger(f)!.value.calls.length, 1);
 });
 
-test("an origin-analysis call binds to its standing hold after close and rejects foreign or lifted holds", t => {
-  const f = fixture(t, "origin-analysis");
-  const own = raisedHold(f.store, PROJECT, f.goal);
+test("an origin-analysis call binds to its standing hold after close and rejects foreign or lifted holds", async t => {
+  const { f, hold, series } = await regatedFixture(t);
   const reviewGoal = analysisGoal("the unknown refusal origin");
-  const input = request(f, {
-    call: "review-origin-1", purpose: "origin-analysis",
-    basis: { kind: "origin-hold", hold: own.hold },
-    gaps: analysisGaps(own.hold.id, reviewGoal, "origin"),
-    series: reference(own.series), attempt: 1, goal: reviewGoal,
-  });
-  const seriesRevision = own.series.revision;
-  const recorded = deliveredOf(recordCall(f.store, PROJECT, input));
+  const input = originRequest(f, hold);
+  const seriesRevision = series.revision;
+  const paid = f.store.get<CallLedger>(callLedgerId(GARDEN))!.value.calls.length;
+  const recorded = deliveredOf(recordCall(f.store, GARDEN, input));
   assert.equal(recorded.call.value.purpose, "origin-analysis");
   assert.deepEqual(recorded.call.value.basis, input.basis);
-  assert.equal(f.store.get<RepairSeries>(own.series.id)!.revision, seriesRevision);
-  assert.equal(f.store.get<RepairSeries>(own.series.id)!.value.attempts.length, 1);
-  assert.equal(f.store.get<OriginHold>(own.hold.id)!.value.lift, null);
+  assert.equal(f.store.get<RepairSeries>(series.id)!.revision, seriesRevision);
+  assert.equal(f.store.get<RepairSeries>(series.id)!.value.attempts.length, 1);
+  assert.equal(f.store.get<OriginHold>(hold.id)!.value.lift, null);
 
-  addressed(recordCall(f.store, PROJECT, request(f, {
-    call: "ordinary-after-hold", purpose: "model-research", basis: null,
-    series: reference(own.series), attempt: 1, goal: f.goal,
-  })), "call_series_unresolved");
-  const foreign = raisedHold(f.store, PROJECT, f.goal, true, "block:foreign-cart");
-  addressed(recordCall(f.store, PROJECT, request(f, {
-    call: "foreign-origin-hold", purpose: "origin-analysis",
-    basis: { kind: "origin-hold", hold: foreign.hold },
+  addressed(recordCall(f.store, GARDEN, {
+    ...input, call: "ordinary-after-hold", purpose: "model-research", basis: null,
+  }), "call_series_unresolved");
+  const foreign = await regatedFixture(t, { "consume.txt": "foreign payload\n", "regate.test.mjs": "import \"./consume.txt\";\n" });
+  addressed(recordCall(f.store, GARDEN, {
+    ...input, call: "foreign-origin-hold",
+    basis: { kind: "origin-hold", hold: reference(foreign.hold) },
     gaps: analysisGaps(foreign.hold.id, reviewGoal, "origin"),
-    series: reference(own.series), attempt: 1, goal: reviewGoal,
-  })), "call_basis_unresolved");
-  addressed(recordCall(f.store, PROJECT, request(f, {
-    call: "forged-origin-hold", purpose: "origin-analysis",
-    basis: { kind: "origin-hold", hold: { ...own.hold, hash: "f".repeat(64) } },
-    gaps: analysisGaps(own.hold.id, reviewGoal, "origin"),
-    series: reference(own.series), attempt: 1, goal: reviewGoal,
-  })), "call_basis_unresolved");
+  }), "call_basis_unresolved");
+  addressed(recordCall(f.store, GARDEN, {
+    ...input, call: "forged-origin-hold",
+    basis: { kind: "origin-hold", hold: { ...reference(hold), hash: "f".repeat(64) } },
+  }), "call_basis_unresolved");
 
-  const lifted = liftByOwner(f.store, PROJECT, own.hold);
-  addressed(recordCall(f.store, PROJECT, request(f, {
-    call: "old-origin-hold", purpose: "origin-analysis",
-    basis: { kind: "origin-hold", hold: own.hold },
-    gaps: analysisGaps(own.hold.id, reviewGoal, "origin"),
-    series: reference(own.series), attempt: 1, goal: reviewGoal,
-  })), "call_basis_unresolved");
-  addressed(recordCall(f.store, PROJECT, request(f, {
-    call: "lifted-origin-hold", purpose: "origin-analysis",
+  const lifted = liftByOwner(f.store, GARDEN, reference(hold));
+  addressed(recordCall(f.store, GARDEN, { ...input, call: "old-origin-hold" }), "call_basis_unresolved");
+  addressed(recordCall(f.store, GARDEN, {
+    ...input, call: "lifted-origin-hold",
     basis: { kind: "origin-hold", hold: lifted },
     gaps: analysisGaps(lifted.id, reviewGoal, "origin"),
-    series: reference(own.series), attempt: 1, goal: reviewGoal,
-  })), "call_basis_unresolved");
+  }), "call_basis_unresolved");
 
-  const late = deliveredOf(recordCall(f.store, PROJECT, input));
+  const late = deliveredOf(recordCall(f.store, GARDEN, input));
   assert.equal(late.repeated, true);
   assert.deepEqual(reference(late.call), reference(recorded.call));
   assert.equal(f.store.history(recorded.call.id).length, 1);
-  assert.equal(heldLedger(f)!.value.calls.length, 1);
+  assert.equal(f.store.get<CallLedger>(callLedgerId(GARDEN))!.value.calls.length, paid + 1);
 });
 
 test("every refusal introduced by E1 is produced with an address and route", t => {
@@ -937,7 +943,7 @@ class RacingStore extends Store {
   }
 }
 
-test("a dispatch or ledger head changed in the check/write window refuses the whole transaction (T7)", t => {
+test("a dispatch or ledger head changed in the check/write window refuses the whole transaction (T7)", async t => {
   let f = fixture(t, "race-admit", RacingStore);
   let store = f.store as RacingStore;
   store.target = f.config.id;
@@ -987,21 +993,19 @@ test("a dispatch or ledger head changed in the check/write window refuses the wh
   assert.equal(heldCall(f, "race-stop-analysis"), null);
   assert.equal(heldLedger(f), null);
 
-  f = fixture(t, "race-origin", RacingStore);
-  store = f.store as RacingStore;
-  const held = raisedHold(store, PROJECT, f.goal);
-  store.target = held.hold.id;
-  store.remaining = 1;
-  store.run = other => { liftByOwner(other, PROJECT, held.hold); };
-  const staleHold = addressed(recordCall(store, PROJECT, request(f, {
-    call: "race-origin-analysis", purpose: "origin-analysis",
-    basis: { kind: "origin-hold", hold: held.hold },
-    gaps: analysisGaps(held.hold.id, analysisGoal("the unknown refusal origin"), "origin"),
-    series: reference(held.series), attempt: 1, goal: analysisGoal("the unknown refusal origin"),
+  const regated = await regatedFixture(t);
+  regated.f.restart(path => new RacingStore(path));
+  const racing = regated.f.store as RacingStore;
+  racing.target = regated.hold.id;
+  racing.remaining = 1;
+  racing.run = other => { liftByOwner(other, GARDEN, reference(regated.hold)); };
+  const staleHold = addressed(recordCall(racing, GARDEN, originRequest(regated.f, regated.hold, {
+    call: "race-origin-analysis",
   })), "input_stale");
-  assert.deepEqual(staleHold.at.ref, held.hold);
-  assert.equal(heldCall(f, "race-origin-analysis"), null);
-  assert.equal(heldLedger(f), null);
+  assert.deepEqual(staleHold.at.ref, reference(regated.hold));
+  assert.equal(racing.get(callRecordId(GARDEN, "race-origin-analysis")), null);
+  assert.ok(racing.get<CallLedger>(callLedgerId(GARDEN))!.value.calls.every(
+    row => row.call.id !== callRecordId(GARDEN, "race-origin-analysis")));
 });
 
 test("two admitted calls share one ledger, stay distinguishable, and settle independently", t => {
@@ -1718,25 +1722,27 @@ test("prepareCallDispatch uses current purpose, call and configuration guards wh
   assert.deepEqual(deliveredOf(readCall(g.store, PROJECT, reference(ordinary.call))), ordinary.call);
 });
 
-test("block origin analysis follows its inherited current hold and rejects a lifted hold on a fresh process launch", t => {
-  const f = fixture(t, "inherited-block-origin"), held = raisedHold(f.store, PROJECT, f.goal), wanted = analysisGoal("inherited block hold");
-  const input = request(f, { call: "block-origin-old", purpose: "origin-analysis", series: reference(held.series), attempt: 1,
-    basis: { kind: "origin-hold", hold: held.hold }, goal: wanted, gaps: analysisGaps(held.hold.id, wanted, "origin") });
-  const old = deliveredOf(recordCall(f.store, PROJECT, input));
-  const successor = deliveredOf(openSeries(f.store, { project: PROJECT, block: BLOCK, line: 2, slice: "slice:cart@2", predecessor: reference(held.series),
+test("block origin analysis follows its inherited current hold and rejects a lifted hold on a fresh process launch", async t => {
+  const { f, hold, series } = await regatedFixture(t);
+  const wanted = analysisGoal("inherited block hold");
+  const input = originRequest(f, hold, { call: "block-origin-old", goal: wanted,
+    gaps: analysisGaps(hold.id, wanted, "origin") });
+  const old = deliveredOf(recordCall(f.store, GARDEN, input));
+  const successor = deliveredOf(openSeries(f.store, { project: GARDEN, block: hold.value.block, line: 2,
+    slice: "slice:garden-consume-block@2", predecessor: reference(series),
     basis: { ground: "inputs-changed", text: "The inherited origin remains unresolved" } }));
-  addressed(prepareCallDispatch(f.store, PROJECT, reference(old.call)), "call_series_unresolved");
-  const inherited = deliveredOf(recordCall(f.store, PROJECT, { ...input, call: "block-origin-inherited", series: reference(successor) }));
-  const proof = deliveredOf(prepareCallDispatch(f.store, PROJECT, reference(inherited.call)));
-  assert.ok(proof.guards.some(ref => ref.id === held.hold.id));
-  liftByOwner(f.store, PROJECT, held.hold);
-  addressed(prepareCallDispatch(f.store, PROJECT, reference(inherited.call)), "call_basis_unresolved");
-  const restarted = new Store(f.path);
+  addressed(prepareCallDispatch(f.store, GARDEN, reference(old.call)), "call_series_unresolved");
+  const inherited = deliveredOf(recordCall(f.store, GARDEN, { ...input, call: "block-origin-inherited", series: reference(successor) }));
+  const proof = deliveredOf(prepareCallDispatch(f.store, GARDEN, reference(inherited.call)));
+  assert.ok(proof.guards.some(ref => ref.id === hold.id));
+  liftByOwner(f.store, GARDEN, reference(hold));
+  addressed(prepareCallDispatch(f.store, GARDEN, reference(inherited.call)), "call_basis_unresolved");
+  const restarted = new Store(f.database);
   try {
-    assert.deepEqual(deliveredOf(readCall(restarted, PROJECT, reference(old.call))), old.call);
-    assert.deepEqual(deliveredOf(readCall(restarted, PROJECT, reference(inherited.call))), inherited.call);
+    assert.deepEqual(deliveredOf(readCall(restarted, GARDEN, reference(old.call))), old.call);
+    assert.deepEqual(deliveredOf(readCall(restarted, GARDEN, reference(inherited.call))), inherited.call);
     assert.equal(deliveredOf(settleCall(restarted, reference(inherited.call), usage, "succeeded")).settled, true);
-    assert.equal(deliveredOf(recordCall(restarted, PROJECT, input)).repeated, true);
+    assert.equal(deliveredOf(recordCall(restarted, GARDEN, input)).repeated, true);
   } finally { restarted.close(); }
 });
 
