@@ -6,6 +6,7 @@ import {join} from 'node:path';
 import {Discovery,type DiscoveryDraft,type Question} from '../src/discovery/discovery.js';
 import {createPartialV7Draft,V7_AXES,V7_STAGE_TOKEN_CEILING} from '../src/discovery/v7-contracts.js';
 import {Store,type Revision} from '../src/storage/store.js';
+import {prepareResearchConsumerIntent,readResearchConsumerIntent,readResearchConsumerTurn,type ResearchConsumerIntent,type ResearchConsumerIntentInput} from '../src/discovery/response-recovery.js';
 import {ProductEngine} from '../src/product/engine.js';
 import {reference,type Ref} from '../src/pipeline/contracts.js';
 import {type Json} from '../src/canonical.js';
@@ -370,4 +371,142 @@ test('R.2: the next saved-only basis preserves its exact negative owner review a
  assert.equal((await f.run(1,f.open(),false)).value.pauseCode,'research_contract_upgrade_required');
  const before=fullHistory(f),sentCount=f.wires().length;await f.run(1,f.open(),false);
  assert.deepEqual(fullHistory(f),before);assert.equal(f.wires().length,sentCount);
+});
+
+/** The common producer with the exact pre-R.2 admission: the accepted base
+ * did not include P guards. No saved intent or paid result is edited. */
+function prepareBeforeFrontierGuards(f: Setup, kind: 'analyst' | 'reading-planner') {
+  const write=f.store.writeMany.bind(f.store);let prepared: Revision<ResearchConsumerIntent> | undefined;
+  f.store.writeMany=((writes,guards=[])=>{
+    const admission=writes.find(w=>w.kind==='research-consumer-intent'&&w.expected===0
+      &&(w.value as ResearchConsumerIntent).kind===kind);
+    if(!prepared&&admission){
+      const value=admission.value as ResearchConsumerIntent;
+      const frontierIds=new Set(planAttemptSelection(f.store,'p').guards.map(guard=>guard.id));
+      const input: ResearchConsumerIntentInput={projectId:value.projectId,kind:value.kind,key:value.key,
+        owner:value.owner,draft:value.draft,question:value.question,role:value.role,dispatch:value.dispatch,
+        profile:value.profile,cursor:value.cursor,basis:value.basis,
+        guards:value.guards.filter(guard=>!frontierIds.has(guard.id))};
+      // Re-enter only the real common producer, with the older admission input.
+      f.store.writeMany=write;
+      prepared=prepareResearchConsumerIntent(f.store,input);
+      throw new Error('R2 cut after pre-frontier admission');
+    }
+    return write(writes,guards);
+  }) as typeof f.store.writeMany;
+  return ()=>{f.store.writeMany=write;assert.ok(prepared,'real old admission published');
+    assert.deepEqual(readResearchConsumerIntent(f.open(),reference(prepared)),prepared);
+    return prepared;};
+}
+
+for(const kind of ['analyst','reading-planner'] as const)
+for(const existing of [false,true])
+for(const race of [false,true])
+test(`R.2-01: old prepared ${kind} retains ${existing?'exact':'absent'} frontier at reservation${race?' against a second Store':''}`,async t=>{
+  const plannerPrior=kind==='reading-planner'&&existing;
+  const f=await setup(t,[...(plannerPrior?[planQuestion('prior','market','blocking')]:[]),planQuestion('block','industry','blocking')]);
+  if(plannerPrior)f.outcomes({prior:'unknown'});
+  if(existing){await f.run(1);assert.equal(progress(f,plannerPrior?'prior':'block').value.summary.outcome,plannerPrior?'unknown':'open');}
+  if(kind==='reading-planner'){
+    f.engine.execute({type:'configure-reader-pilot',project:'p',expected:0,settings:{experimental:true,active:true,stopAfter:'L2',
+      reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command:f.command},agentCommand:f.command,
+      maxRequestChars:100000,maxReadChars:20000,maxReplyChars:200000,maxCalls:50,maxReportedTokens:100000,
+      v7Planning:{contract:'v7-plan-planning/v1',maxRequestChars:100000,maxRounds:3}}});
+    f.configure([...(existing?[ended()]:[]),{action:'pause',reason:'Prepared planner stops here'}]);
+  }
+  const oldProducer=prepareBeforeFrontierGuards(f,kind);
+  const cut=await f.run(1);const original=oldProducer();
+  assert.equal(cut.value.pauseCode,'research_interrupted');
+  const stateId=v7ProgressStateId({project:'p',planAnswer:f.v.planAnswer,planQuestionId:plannerPrior?'prior':'block'});
+  assert.ok(!original.value.guards.some(guard=>guard.id===stateId));
+  const prior=f.store.get(stateId),expected=prior?reference(prior):{id:stateId,absent:true};
+  assert.equal(!!prior,existing);
+  const beforeCalls=f.store.list('model-call'),beforeLedger=f.store.list('research-budget-ledger'),beforeBudget=f.store.list('research-budget');
+  const sent=f.wires().length,other=f.open(),resume=f.open(),write=resume.writeMany.bind(resume);let reserved=0;
+  resume.writeMany=((writes,guards=[])=>{
+    if(writes.some(w=>w.kind==='model-call'&&w.expected===0&&(w.value as any).purpose===kind)){
+      reserved++;assert.deepEqual(guards.find(guard=>guard.id===stateId),expected);
+      const refreshed=readResearchConsumerIntent(other,reference(other.get<ResearchConsumerIntent>(original.id)!));
+      assert.deepEqual(refreshed,original,'transient guards do not rewrite the original admission');
+      if(race){
+        // A competing head is a CAS adversary, not a fixture claiming a proven
+        // P transition. Even an invalid appearance must prevent this payment.
+        other.write({id:stateId,kind:'v7-progress-state',expected:prior?.revision??0,
+          value:prior?.value??{competing:true}});
+        try{return write(writes,guards);}catch(error){
+          assert.equal((error as {code:string}).code,'input_stale');
+          assert.deepEqual(other.list('model-call'),beforeCalls);
+          assert.deepEqual(other.list('research-budget-ledger'),beforeLedger);
+          assert.deepEqual(other.list('research-budget'),beforeBudget);
+          throw error;
+        }
+      }
+    }
+    return write(writes,guards);
+  }) as typeof resume.writeMany;
+  const result=await f.run(1,resume);assert.equal(reserved,1);
+  assert.deepEqual(f.store.get(original.id,original.revision),original,'saved original remains exact');
+  if(race){
+    assert.equal(result.value.pauseCode,'input_stale',JSON.stringify(result.value));
+    assert.deepEqual(f.store.list('research-budget'),beforeBudget);
+    assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('model-call'),beforeCalls);
+    assert.deepEqual(f.store.list('research-budget-ledger'),beforeLedger);
+    assert.equal(f.store.get<ResearchConsumerIntent>(original.id)!.value.state,'prepared');
+    const retried=await f.run(1,f.open());assert.equal(retried.value.status,'paused');
+    assert.notEqual(retried.value.pauseCode,'research_busy');assert.equal(f.wires().length,sent);
+    assert.deepEqual(f.store.list('model-call'),beforeCalls);assert.deepEqual(f.store.list('research-budget-ledger'),beforeLedger);
+  }else{
+    assert.equal(result.value.turns,cut.value.turns+1,JSON.stringify(result.value));
+    assert.equal(f.wires().length,sent+(kind==='analyst'?2:1),JSON.stringify(result.value));
+    const completed=f.store.get<ResearchConsumerIntent>(original.id)!;assert.equal(completed.value.state,'applied');
+    assert.equal(completed.revision,3);assert.equal(f.store.get<ResearchConsumerIntent>(original.id,2)!.value.state,'running');
+    assert.deepEqual(completed.value.guards,original.value.guards,'paid basis retains its original guards');
+    const turn=f.store.list<any>('research-turn').find(row=>row.value.consumerIntent?.id===original.id)!;
+    assert.deepEqual(readResearchConsumerTurn(f.open(),reference(turn)),turn);
+    assert.ok(!Object.hasOwn(f.wires()[sent].subject,'consumerDispatchGuards'));
+    assert.ok(!Object.hasOwn(completed.value.dispatch,'consumerDispatchGuards'));
+    const calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger');
+    await f.run(1,f.open(),false);
+    assert.deepEqual(f.store.list('model-call'),calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  }
+});
+
+for(const kind of ['analyst','reading-planner'] as const)
+test(`R.2-01: paid old ${kind} applies before a late corrupt P without another payment`,async t=>{
+  const f=await setup(t,[planQuestion('block','industry','blocking')]);
+  if(kind==='reading-planner'){
+    f.engine.execute({type:'configure-reader-pilot',project:'p',expected:0,settings:{experimental:true,active:true,stopAfter:'L2',
+      reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command:f.command},agentCommand:f.command,
+      maxRequestChars:100000,maxReadChars:20000,maxReplyChars:200000,maxCalls:50,maxReportedTokens:100000,
+      v7Planning:{contract:'v7-plan-planning/v1',maxRequestChars:100000,maxRounds:3}}});
+    f.configure([{action:'pause',reason:'Saved planner pause'}]);
+  }
+  const oldProducer=prepareBeforeFrontierGuards(f,kind);await f.run(1);const original=oldProducer();
+  const restore=interrupt(f,'research-turn');const paid=await f.run(1);restore();
+  assert.equal(paid.value.pauseCode,'research_interrupted');
+  assert.equal(f.store.get<ResearchConsumerIntent>(original.id)!.value.state,'running');
+  const calls=f.store.list('model-call'),ledger=f.store.list('research-budget-ledger'),sent=f.wires().length;
+  const other=f.open(),stateId=v7ProgressStateId({project:'p',planAnswer:f.v.planAnswer,planQuestionId:'block'});
+  const changed=other.write({id:stateId,kind:'v7-progress-state',expected:0,value:{corrupt:true}});
+  // Exercise the transport's own paid-return door as well as the runner.
+  // This now-false absent guard must never be evaluated for a saved response.
+  await researchCall(original.value.role,original.value.dispatch,original.value.cursor.instruction,
+    original.value.cursor.context,undefined,{store:other,draftId:original.value.draft.id,
+      questionId:original.value.question.id,purpose:kind,consumerIntent:reference(original),
+      consumerDispatchGuards:[{id:stateId,absent:true}]});
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('model-call'),calls);
+  assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  const result=await f.run(1,other,false);
+  assert.notEqual(result.value.pauseCode,'research_busy');
+  const applied=f.store.get<ResearchConsumerIntent>(original.id)!;
+  assert.equal(applied.value.state,'applied',JSON.stringify(result.value));assert.equal(applied.revision,3);
+  assert.deepEqual(applied.value.guards,original.value.guards);
+  const turn=f.store.list<any>('research-turn').find(row=>row.value.consumerIntent?.id===original.id)!;
+  assert.deepEqual(readResearchConsumerTurn(f.open(),reference(turn)),turn);
+  assert.deepEqual(f.store.get(stateId),changed,'late corrupt head is not accepted or repaired by paid replay');
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('model-call'),calls);
+  assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  const again=await f.run(1,f.open(),false);assert.notEqual(again.value.pauseCode,'research_busy');
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('model-call'),calls);
+  assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
 });

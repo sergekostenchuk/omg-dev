@@ -76,6 +76,9 @@ export interface ResearchCallAudit {
   session?: Ref; onContext?: (context: Record<string, any>) => void;
   application?: Ref; prepareCall?: (call: Write) => { writes: Write[]; guards: TransactionGuard[] };
   consumerIntent?: Ref;
+  /** Trusted caller dependencies for a new physical send only. They augment
+   * the reservation, never the saved intent, wire or a paid replay. */
+  consumerDispatchGuards?: TransactionGuard[];
   /** Virtual producer only inside the no-dispatch preview scope. */
   previewIntent?: Revision<ResearchConsumerIntent>;
   requestContract?: string;
@@ -571,7 +574,7 @@ export async function researchCall(role: RoleBinding, environment: Environment, 
     const writer = audit ? control?.view() ?? audit.store : null;
     call = writer ? writer.writeMany<ModelCall>([callWrite, ...reservation.writes,
       ...(application?.writes ?? []), ...(consumerReservation?.writes ?? [])],
-      [...reservation.guards, ...(application?.guards ?? []), ...(consumerReservation?.guards ?? [])])[0]! : null;
+      [...reservation.guards, ...(application?.guards ?? []), ...(consumerReservation?.guards ?? []), ...(audit?.consumerDispatchGuards ?? [])])[0]! : null;
   } catch (error) {
     if (error instanceof RunControlLost) throw new EngineError(error.refusal.code, error.refusal.message, error.refusal.at);
     throw error;

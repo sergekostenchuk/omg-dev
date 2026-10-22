@@ -1684,6 +1684,7 @@ export class Researcher {
           run = this.save(run, { status: "running", owner, error: null, pauseCode: null },
             [...(turn ? [reference(turn)] : []), ...(outstanding ? [reference(outstanding)] : [])]);
         if (outstanding) {
+          let dispatchGuards: TransactionGuard[] = [];
           requireCondition(run, "research_consumer_intent_invalid", "The unfinished call lost its run");
           // A prepared intent has not paid: it must still address today's plan.
           if (outstanding.value.state === "prepared") {
@@ -1708,6 +1709,7 @@ export class Researcher {
                 requireCondition(!original || canonical(original) === canonical(guard),
                   "research_consumer_context_stale", "The unpaid intent fixes an older applied frontier");
               }
+              dispatchGuards = frontier.guards;
             }
             if (outstanding.value.kind === "reading-planner") {
               const planning = planningForPlanSubject(this.store, project, reference(current.draft), selected!, options.producerPolicy);
@@ -1735,7 +1737,7 @@ export class Researcher {
               // Count new dispatches here, including restored prepared intents; paid replay is free.
               used++;
             }
-            const applied = await this.applyActionIntent(outstanding, run, outstanding.value.dispatch, null, owner, limit, signal);
+            const applied = await this.applyActionIntent(outstanding, run, outstanding.value.dispatch, null, owner, limit, signal, dispatchGuards);
             run = applied.run;
           }
           continue;
@@ -1992,7 +1994,7 @@ export class Researcher {
     return results[0] ?? null;
   }
   private async receivedIntent(intent: Revision<ResearchConsumerIntent>, dispatch: Environment,
-    pilot: Revision<ReaderPilot> | null, signal?: AbortSignal) {
+    pilot: Revision<ReaderPilot> | null, signal?: AbortSignal, dispatchGuards: TransactionGuard[] = []) {
     const cursor = intent.value.cursor;
     // DRS1a2: the call context by the intent's own contract (v2: its preparation).
     const context = consumerIntentContext(this.store, intent.value, intent.id);
@@ -2007,7 +2009,7 @@ export class Researcher {
         "research_consumer_context_stale", "The original research dispatch or reader profile changed");
       await researchCall(intent.value.role, intent.value.dispatch, cursor.instruction, context, signal,
         { store: this.store, draftId: intent.value.draft.id, questionId: intent.value.question.id,
-          purpose: intent.value.kind, ...(planSubjectOf(intent.value.cursor) ? { requestContract: REQUEST_MANIFEST_CONTRACT } : {}), ...(pilot ? { pilot } : {}), consumerIntent: reference(intent), ...(isResearchPreview() ? { previewIntent: intent } : {}) });
+          purpose: intent.value.kind, ...(planSubjectOf(intent.value.cursor) ? { requestContract: REQUEST_MANIFEST_CONTRACT } : {}), ...(pilot ? { pilot } : {}), consumerIntent: reference(intent), consumerDispatchGuards: dispatchGuards, ...(isResearchPreview() ? { previewIntent: intent } : {}) });
     }
     const paid = resumeResearchConsumerExecution(this.store, intent.value.projectId, reference(intent));
     requireCondition(paid.kind === "response", "research_consumer_execution_failed",
@@ -2092,7 +2094,7 @@ export class Researcher {
   }
   private async applyActionIntent(intent: Revision<ResearchConsumerIntent>, run: Revision<ResearchRun>,
     dispatch: Environment, pilot: Revision<ReaderPilot> | null, owner: ResearchRun["owner"], limit: number,
-    signal?: AbortSignal) {
+    signal?: AbortSignal, dispatchGuards: TransactionGuard[] = []) {
     requireCondition(intent.value.kind === "analyst" || intent.value.kind === "reading-planner",
       "research_consumer_intent_invalid", "The saved operation is not an analyst or planner turn");
     const cursor = intent.value.cursor;
@@ -2105,7 +2107,7 @@ export class Researcher {
         "research_consumer_context_stale", "A prepared action cannot replace a settled run");
       run = this.save(run, { status: "running", owner, error: null, pauseCode: null }, [reference(intent)]);
     }
-    const paid = await this.receivedIntent(intent, dispatch, pilot, signal);
+    const paid = await this.receivedIntent(intent, dispatch, pilot, signal, dispatchGuards);
     const action = this.consumerAction(intent, paid.payload);
     const originalIntent = this.store.get<ResearchConsumerIntent>(intent.id, 1);
     requireCondition(originalIntent?.kind === "research-consumer-intent", "research_consumer_intent_invalid",
