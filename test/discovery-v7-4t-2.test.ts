@@ -11,6 +11,17 @@ import {continuationState, continuationDispatch, continuationMetadata} from '../
 import {invocationProgress} from '../src/discovery/invocation-progress.js';
 import {VARIANT_SUBJECT_CONTRACT, type VariantSubject} from '../src/discovery/discovery-variants.js';
 import {variantStateId} from '../src/discovery/variant-decision.js';
+import {mkdirSync, writeFileSync, readFileSync} from 'node:fs';
+import {canonical, type Json} from '../src/canonical.js';
+import {type Revision} from '../src/storage/store.js';
+import {ProductEngine} from '../src/product/engine.js';
+import {Discovery, type DiscoveryDraft, type Question} from '../src/discovery/discovery.js';
+import {createPartialV7Draft, V7_AXES, V7_STAGE_TOKEN_CEILING} from '../src/discovery/v7-contracts.js';
+import {answerDiscoveryFixture} from './product-fixture.js';
+import {researchCall} from '../src/discovery/research-protocol.js';
+import {VARIANT_CRITERIA} from '../src/discovery/discovery-variants.js';
+import type {ModelCall} from '../src/runtime/model-usage.js';
+import {EngineError} from '../src/errors.js';
 
 // TRANSPORT FIXTURES ONLY: these rows are not produced snapshots/sets, paid
 // model calls, admission, mode authority, or evidence of product readiness.
@@ -243,3 +254,216 @@ for(const kind of ['proposal','decision'] as const) {
       assert.deepEqual(f.store.identities('list'),corrupt);
     });
 }
+
+// ---- 4T.2 rest: the same identities on the REAL common researchCall of 4T.3 (prerequisite commit ac338102). The
+// model-call, continuation-state, progress key and archive below are written by the real reservation and packer through
+// a scripted adapter; only the snapshot, set and mode rows are transport fixtures (their producers are 4T.1, 4B and 4O),
+// and nothing here stands for the managed variant lifecycle of 4T.4.
+const judgement = {conclusion:'Bounded by the snapshot',grounds:[],assumptions:['The saved snapshot is complete'],unknowns:[],quantity:null};
+function generation(label:string):Json {
+  const criteria = Object.fromEntries(VARIANT_CRITERIA.map(criterion => [criterion, judgement]));
+  return {action:'variants',variants:[
+    {key:`${label}-a`,title:`Variant ${label} A`,proposal:{scope:'narrow'},criteria},
+    {key:`${label}-b`,title:`Variant ${label} B`,proposal:{scope:'wide'},criteria}],
+  scale:Object.fromEntries(VARIANT_CRITERIA.map(criterion => [criterion, `${criterion} from low to high`])),
+  comparison:`A against B for ${label}`,recommendation:{key:`${label}-a`,reason:'Fits the mandate'},
+  searchLimits:['Only the saved snapshot was read'],unknowns:[]} as Json;
+}
+const choice = (label:string):Json => ({choice:'decline-all',reason:`Transport only: ${label}`});
+const errorCode = (code:string) => (error:unknown) => error instanceof EngineError && error.code === code;
+const allAxes = (depth:string) => Object.fromEntries(V7_AXES.map(axis => [axis, {depth}]));
+const questionOf = (store:Store, draft:Revision<DiscoveryDraft>, field:string) =>
+  draft.value.questions.map(id => store.get<Question>(id)!).find(question => question.value.spec.field === field)!;
+async function realPath(t:test.TestContext) {
+  const root = mkdtempSync(join(tmpdir(), 'omg-4t2r-')), path = join(root, 'state.sqlite'), stores:Store[] = [];
+  const open = () => { const db = new Store(path); stores.push(db); return db; };
+  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, {recursive:true, force:true}); });
+  const wire = join(root, 'wire.ndjson'), settings = join(root, 'reply.json'), adapter = join(root, 'adapter.mjs');
+  const configure = (reply:unknown) => writeFileSync(settings, JSON.stringify({reply, tokens:10}));
+  configure(generation('calibration'));
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
+appendFileSync(${JSON.stringify(wire)},raw+'\\n');
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research:s.reply,usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}}));`);
+  writeFileSync(wire, '');
+  const command = {executable:process.execPath, args:[adapter]};
+  let serial = 0;
+  const transport = (label:string) => reference(store.write({id:`transport-fixture:${label}:${serial++}`, kind:'transport-fixture', expected:0, value:{label}}));
+  const subject = (kind:'proposal'|'decision', basis:Ref, mode:Ref):VariantSubject => kind === 'proposal'
+    ? {contract:VARIANT_SUBJECT_CONTRACT, kind, snapshot:basis, mode, expectedSelection:null}
+    : {contract:VARIANT_SUBJECT_CONTRACT, kind, set:basis, mode, expectedSelection:null};
+  const purposeOf = (v:VariantSubject) => `variant-${v.kind}`;
+  const body = (v:VariantSubject, question:Revision<Question>) => ({variantSubject:v, question:{id:question.id, ...question.value.spec},
+    core:{objective:'Generate the variants of the saved snapshot'}, map:{nodes:[]}, history:[], readings:[]});
+  type Project = {id:string; environment:Revision<any>; draftId:string; planId:string};
+  const head = (p:Project, db = store) => ({draft:db.get<DiscoveryDraft>(p.draftId)!, plan:db.get<Question>(p.planId)!});
+  const call = (p:Project, v:VariantSubject, actor:'author'|'reviewer' = 'author', db = store, onContext?:(context:Record<string, any>) => void) =>
+    researchCall(actor === 'author' ? p.environment.value.implementer : p.environment.value.reviewer, p.environment.value,
+      'Propose the variants of the saved snapshot', body(v, head(p, db).plan), undefined,
+      {store:db, draftId:p.draftId, questionId:p.planId, purpose:purposeOf(v), ...(onContext ? {onContext} : {})});
+  async function project(id:string):Promise<Project> {
+    engine.execute({type:'create-project', project:id, title:id});
+    const workspace = join(root, id); mkdirSync(workspace);
+    const environment = engine.environments.configure(id, {workspace,
+      implementer:{actor:'author', model:'fixture', effort:'high', command}, reviewer:{actor:'reviewer', model:'fixture', effort:'high', command},
+      fullCheck:command, timeoutMs:10000}, 0);
+    // The ordinary estimate needs comparable measured calls of each variant purpose: calibrate once on a legacy draft.
+    const old = discovery.create(id, 'discovery', 'R0', 'concept', [
+      {field:'probe', kind:'fact', prompt:'Calibrate', risk:'unknown', schema:{type:'object'}}], [], 6);
+    const probe = store.get<Question>(old.value.questions[0]!)!, calibration = transport(`calibration-${id}`);
+    for (const kind of ['proposal', 'decision'] as const) for (const role of [environment.value.implementer, environment.value.reviewer])
+      await researchCall(role, environment.value, 'Calibrate', body(subject(kind, calibration, transport(`calibration-mode-${id}-${kind}-${role.actor}`)), probe),
+        undefined, {store, draftId:old.id, questionId:probe.id, purpose:`variant-${kind}`});
+    const base = createPartialV7Draft(discovery, id, 'concept');
+    const src = discovery.evidence.document(id, 'basis', `Exact source for ${id}`, 'text/plain', 0);
+    const frame = questionOf(store, base, 'frame');
+    answerDiscoveryFixture(engine, id, base, frame, {productType:'internal', scale:'30 users', industries:['construction'],
+      domains:['materials supply'], axes:allAxes('deep'),
+      budget:{ceiling:V7_STAGE_TOKEN_CEILING, axisHints:{industry:4_000_000}, completionReserve:2_000_000}} as Json, src);
+    const frameRef = store.get<Question>(frame.id)!.value.answer!, planQ = questionOf(store, base, 'plan');
+    answerDiscoveryFixture(engine, id, base, planQ, {edition:1, frame:frameRef, previous:null, questions:[{id:'q-industry',
+      axis:'industry', domain:'construction', text:'What covers the industry?', class:'blocking', criterion:'Named basis',
+      requiredDepth:'deep', roles:['domain expert'], searchPlaces:['domain documents']}]} as unknown as Json, src);
+    return {id, environment, draftId:base.id, planId:planQ.id};
+  }
+  const wires = () => readFileSync(wire, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const calls = (p:Project, db = store) => db.list<ModelCall>('model-call').filter(row => row.value.draftId === p.draftId);
+  const stateOf = (p:Project, v:VariantSubject, actor = 'author', db = store) =>
+    continuationState(db, p.id, p.draftId, p.planId, purposeOf(v), actor, null, null, v);
+  const progressOf = (p:Project, v:VariantSubject, actor = 'author', db = store) =>
+    invocationProgress(db, p.planId, purposeOf(v), body(v, head(p, db).plan), null, actor, null, v);
+  const ownCalls = (guards:{id:string}[]) => guards.filter(guard => guard.id.startsWith('model-call:')).map(guard => guard.id);
+  return {store, engine, discovery, open, configure, transport, subject, project, call, wires, calls, stateOf, progressOf, ownCalls, head};
+}
+
+test('4T.2 on the real researchCall every field of the identity and the actor is its own packet and progress: a new paid initial send, never another history', async t => {
+  const r = await realPath(t), p = await r.project('p');
+  const base = r.subject('proposal', r.transport('snapshot'), r.transport('mode'));
+  r.configure(generation('base'));
+  await r.call(p, base);
+  const [baseCall] = r.calls(p), baseState = r.stateOf(p, base), baseKey = r.progressOf(p, base).key;
+  assert.equal(baseCall!.value.packet!.kind, 'initial');
+  assert.equal(baseCall!.value.progressKey, baseKey);
+  // The expected selection comes last: once a selection state exists, an identity expecting none is refused (4T.2-T).
+  const others:[string, () => VariantSubject, 'author'|'reviewer', Json][] = [
+    ['a decision on the same basis', () => r.subject('decision', (base as any).snapshot, base.mode), 'author', choice('decision')],
+    ['another snapshot', () => ({...base, snapshot:r.transport('snapshot-2')} as VariantSubject), 'author', generation('snapshot')],
+    ['another mode', () => ({...base, mode:r.transport('mode-2')}), 'author', generation('mode')],
+    ['another actor', () => base, 'reviewer', generation('actor')],
+    ['an expected selection', () => ({...base, expectedSelection:reference(r.store.write({id:variantStateId('p', p.draftId),
+      kind:'transport-fixture', expected:0, value:{fixture:'selection'}}))}), 'author', generation('selection')],
+  ];
+  const seen = new Set([baseState.id]), keys = new Set([baseKey]);
+  for (const [note, make, actor, reply] of others) {
+    const other = make();
+    const before = r.stateOf(p, other, actor), progress = r.progressOf(p, other, actor);
+    assert.deepEqual([before.initial, before.priorCalls, before.attempts, before.basis, before.state], [true, 0, 0, null, null], note);
+    assert.deepEqual(r.ownCalls(progress.guards), [], note);
+    assert.ok(!seen.has(before.id) && !keys.has(progress.key), `${note}: its own state and progress`);
+    seen.add(before.id); keys.add(progress.key);
+    r.configure(reply);
+    const sent = r.wires().length;
+    assert.deepEqual(await r.call(p, other, actor), reply, note);
+    assert.equal(r.wires().length, sent + 1, `${note}: a new paid send`);
+    const own = r.calls(p).find(row => !before.callGuards.some(guard => guard.id === row.id) && canonical(row.value.variantSubject) === canonical(other)
+      && row.value.requested.actor === actor)!;
+    assert.equal(own.value.packet!.kind, 'initial', note);
+    assert.deepEqual(r.wires().at(-1).subject.variantSubject, other, note);
+    const after = r.stateOf(p, other, actor);
+    assert.equal(after.id, before.id, note);
+    assert.deepEqual([after.priorCalls, after.state!.value.activeCall, after.callGuards.map(guard => guard.id)], [1, own.id, [own.id]], note);
+    assert.deepEqual(r.ownCalls(r.progressOf(p, other, actor).guards), [own.id], note);
+    assert.equal(own.value.progressKey, progress.key, note);
+  }
+  // The first identity still has exactly its own call in its history and answers from it free.
+  assert.deepEqual(r.stateOf(p, base).callGuards.map(guard => guard.id), [baseCall!.id]);
+  assert.deepEqual(r.ownCalls(r.progressOf(p, base).guards), [baseCall!.id]);
+  const sent = r.wires().length;
+  r.configure(generation('never-sent'));
+  assert.deepEqual(await r.call(p, base), generation('base'));
+  assert.equal(r.wires().length, sent);
+});
+
+test('4T.2 the same closed subject in another project is another packet and progress, a new paid send, and answers nothing there', async t => {
+  const r = await realPath(t), p = await r.project('p'), q = await r.project('q');
+  const v = r.subject('proposal', r.transport('snapshot'), r.transport('mode'));
+  r.configure(generation('p'));
+  await r.call(p, v);
+  const inP = r.stateOf(p, v), keyP = r.progressOf(p, v).key, inQ = r.stateOf(q, v), progressQ = r.progressOf(q, v);
+  assert.notEqual(inQ.id, inP.id);
+  assert.notEqual(progressQ.key, keyP);
+  assert.deepEqual([inQ.initial, inQ.priorCalls, r.ownCalls(progressQ.guards)], [true, 0, []]);
+  const sent = r.wires().length;
+  r.configure(generation('q'));
+  assert.deepEqual(await r.call(q, v), generation('q'));
+  assert.equal(r.wires().length, sent + 1);
+  const [own] = r.calls(q);
+  assert.deepEqual([own!.value.projectId, own!.value.packet!.kind], ['q', 'initial']);
+  assert.deepEqual(r.stateOf(q, v).callGuards.map(guard => guard.id), [own!.id]);
+  assert.deepEqual(r.stateOf(p, v).callGuards.map(guard => guard.id), r.calls(p).map(row => row.id));
+  r.configure(generation('never-sent'));
+  assert.deepEqual(await r.call(p, v), generation('p'));
+  assert.equal(r.wires().length, sent + 1);
+});
+
+test('4T.2 a cold paid replay keeps its original subject in packet and progress after today\'s mode moves, and writes nothing', async t => {
+  const r = await realPath(t), p = await r.project('p'), mode = r.transport('mode');
+  const v = r.subject('proposal', r.transport('snapshot'), mode);
+  const seen:Record<string, any>[] = [], see = (context:Record<string, any>) => { seen.push(JSON.parse(JSON.stringify(context))); };
+  r.configure(generation('first'));
+  await r.call(p, v, 'author', r.store, see);
+  const state = r.stateOf(p, v), progress = r.progressOf(p, v);
+  const moved = r.store.write({id:mode.id, kind:'transport-fixture', expected:mode.revision, value:{label:'mode', revised:true}});
+  const before = r.store.identities('list'), sent = r.wires().length;
+  r.configure(generation('never-sent'));
+  const cold = r.open();
+  assert.deepEqual(await r.call(p, v, 'author', cold, see), generation('first'));
+  assert.deepEqual(seen[1], seen[0], 'the replay hands over the subject that was sent');
+  assert.deepEqual(seen[1]!.variantSubject, v, 'with its original mode, not today\'s');
+  assert.deepEqual(r.stateOf(p, v, 'author', cold), state);
+  assert.deepEqual(r.progressOf(p, v, 'author', cold), progress);
+  assert.deepEqual(cold.identities('list'), before);
+  assert.equal(r.wires().length, sent);
+  // Today's mode is another identity with an empty history of its own.
+  const today = {...v, mode:reference(moved)};
+  assert.deepEqual([r.stateOf(p, today).initial, r.stateOf(p, today).priorCalls, r.ownCalls(r.progressOf(p, today).guards)], [true, 0, []]);
+});
+
+test('4T.2 a new draft edition by a real door has its own history: the earlier edition\'s paid call is neither replayed nor counted', async t => {
+  const r = await realPath(t), p = await r.project('p');
+  const v = r.subject('proposal', r.transport('snapshot'), r.transport('mode'));
+  r.configure(generation('edition-1'));
+  await r.call(p, v);
+  const [old] = r.calls(p), oldState = r.stateOf(p, v), oldKey = r.progressOf(p, v).key;
+  // The operator answers the objective through the ordinary decision door: the draft moves to its next edition.
+  const objective = questionOf(r.store, r.head(p).draft, 'objective');
+  r.discovery.decision(objective.id, objective.revision, 'operator', 'Understand the variants of the saved snapshot');
+  assert.notEqual(r.head(p).draft.revision, r.store.get<any>(old!.value.packet!.archive.id)!.value.draft.revision);
+  const next = r.stateOf(p, v), progress = r.progressOf(p, v);
+  assert.notEqual(next.id, oldState.id);
+  assert.notEqual(progress.key, oldKey);
+  assert.deepEqual([next.initial, next.priorCalls, next.attempts, next.basis, r.ownCalls(progress.guards)], [true, 0, 0, null, []]);
+  const sent = r.wires().length;
+  r.configure(generation('edition-2'));
+  assert.deepEqual(await r.call(p, v), generation('edition-2'), 'not the earlier edition\'s answer');
+  assert.equal(r.wires().length, sent + 1);
+  const own = r.calls(p).find(row => row.id !== old!.id)!;
+  assert.equal(own.value.packet!.kind, 'initial');
+  assert.deepEqual(r.stateOf(p, v).callGuards.map(guard => guard.id), [own.id]);
+  assert.equal(r.store.get<ModelCall>(old!.id)!.hash, old!.hash, 'the earlier edition\'s call stays as it was');
+});
+
+test('4T.2 no caller ready on the real path: a ready flag selects no variant branch, a variant purpose without its subject refuses before payment', async t => {
+  const r = await realPath(t), p = await r.project('p');
+  const v = r.subject('proposal', r.transport('snapshot'), r.transport('mode'));
+  const plan = r.head(p).plan, before = r.store.identities('list'), sent = r.wires().length;
+  const {variantSubject:_omitted, ...bare} = {variantSubject:v, question:{id:plan.id, ...plan.value.spec}, core:{objective:'x'}, map:{nodes:[]}, history:[], readings:[]};
+  for (const context of [{...bare, ready:true}, {...bare, variantReady:true, selection:'ready'}])
+    await assert.rejects(() => researchCall(p.environment.value.implementer, p.environment.value, 'x', context, undefined,
+      {store:r.store, draftId:p.draftId, questionId:p.planId, purpose:'variant-proposal'}), errorCode('discovery_variant_subject_invalid'));
+  await assert.rejects(() => researchCall(p.environment.value.implementer, p.environment.value, 'x', {...bare, variantSubject:{...v, ready:true}},
+    undefined, {store:r.store, draftId:p.draftId, questionId:p.planId, purpose:'variant-proposal'}), errorCode('discovery_variant_subject_invalid'));
+  assert.deepEqual(r.store.identities('list'), before);
+  assert.equal(r.wires().length, sent);
+});
