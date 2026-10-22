@@ -5,9 +5,9 @@ import {
   acceptedIssuance, contractEraOf, discoveryContext, discoveryOutcome, hasPlanQuestions, planStopSubject,
   isAdmissionEra, isSupportedEra, issuedEntry, issuedForm,
   listDrafts, outcomeSummary, proveIssuedAnswer, readConditionDecision, readDiscoveryConditionDecision, readDraft, readDiscoveryIndexAt,
-  readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions,
+  readExact, readResearchRun, savedQuestionsMoved, UPSTREAM_STAGES, verdictConditions, variantGenerationSummary,
   type DiscoveryChoice, type DiscoveryDraft, type DiscoveryIndexCursor, type DiscoveryIndexRead, type FormEntry, type IssuedAnswerProof,
-  type IssuedProjection, type Question, type RecordView, type ResearchRun, type UpstreamStage,
+  type IssuedProjection, type Question, type RecordView, type ResearchRun, type UpstreamStage, type VariantGenerationSummary,
 } from "../discovery/projection-reader.js";
 import { EngineError, requireCondition } from "../errors.js";
 import type { Observation, Selector, Source } from "../evidence/evidence.js";
@@ -93,6 +93,13 @@ export interface DiscoveryIndexSummaryRequest {
 export interface DiscoveryIndexStageSummary {
   contract: "stage-summary/discovery-index/v1"; project: string; stage: "discovery";
   index: DiscoveryIndexRead;
+}
+
+/** An exact published generation, independent of today's draft/mode/choice. */
+export interface VariantGenerationSummaryRequest { section: "variant-generation"; result: Ref }
+export interface VariantGenerationStageSummary {
+  contract: "stage-summary/variant-generation/v1"; project: string; stage: "discovery";
+  generation: VariantGenerationSummary;
 }
 
 export type SummaryStructuredStage = Exclude<UpstreamStage, "discovery">;
@@ -882,13 +889,21 @@ function selectStructuredCandidate(store: Store, project: string, stage: Summary
     : { selected: null, candidates: drafts.map(reference) };
 }
 
+export function stageSummary(store: Store, project: string, stage: "discovery", request: VariantGenerationSummaryRequest): VariantGenerationStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", request: DiscoveryIndexSummaryRequest): DiscoveryIndexStageSummary;
 export function stageSummary(store: Store, project: string, stage: "discovery", draftId?: string): DiscoveryStageSummary;
 export function stageSummary(store: Store, project: string, stage: SummaryStructuredStage, draftId?: string): StructuredStageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage, draftId?: string): StageSummary;
 export function stageSummary(store: Store, project: string, stage: Stage,
-  draftId?: string | DiscoveryIndexSummaryRequest): StageSummary | DiscoveryIndexStageSummary {
+  draftId?: string | DiscoveryIndexSummaryRequest | VariantGenerationSummaryRequest): StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary {
   if (draftId !== undefined && typeof draftId !== "string") {
+    if (object(draftId) && draftId.section === "variant-generation") {
+      requireCondition(stage === "discovery" && Object.keys(draftId).length === 2
+        && Object.hasOwn(draftId, "section") && Object.hasOwn(draftId, "result") && isRef(draftId.result),
+        "stage_summary_variant_request_invalid", "Expected only an exact generation result; decision summaries are not supported");
+      return { contract: "stage-summary/variant-generation/v1", project, stage: "discovery",
+        generation: variantGenerationSummary(store, project, draftId.result) };
+    }
     requireCondition(stage === "discovery" && object(draftId) && draftId.section === "v7-index",
       "stage_summary_index_request_invalid", "Expected an explicit Discovery v7 index section request");
     // This section has its own historical boundary. It does not read the current outcome,
@@ -1050,7 +1065,42 @@ function renderDiscoveryIndexSummary(summary: DiscoveryIndexStageSummary): strin
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary): string {
+function renderVariantGenerationSummary(summary: VariantGenerationStageSummary): string {
+  const generation = summary.generation, refText = (ref: Ref): string => `${ref.id}@${ref.revision}#${ref.hash}`;
+  const lines = ["# Discovery", "", "## Генерация вариантов", "", `Проект: ${summary.project}`,
+    `Результат: ${refText(generation.result)}`, `Черновик: ${refText(generation.draft)}`,
+    `Основание — снимок исследования: ${refText(generation.snapshot)}`, "",
+    `Автор генерации (модель): ${generation.author.actor}`, `Сессия: ${refText(generation.author.session)}`,
+    `Intent: ${refText(generation.author.intent)}`, `Оплаченный вызов: ${refText(generation.author.call)}`,
+    `Сохранённый ответ: ${refText(generation.author.response)}`,
+    `Историческое состояние публикации: ${generation.publicationState ? refText(generation.publicationState) : "не записывалось"}`,
+    "Неполнота выбора: variant_decisions_unsupported; текущий выбор и цепочка решений этой секцией не доказаны.", ""];
+  if (generation.kind === "no_variants") {
+    lines.push("Опубликован результат no_variants: варианты не предложены.", "", "### Причины", "",
+      ...generation.reasons.map(reason => `- ${reason.code}: ${reason.message}; основания: ${reason.grounds.map(refText).join(", ") || "не указаны"}`));
+  } else {
+    lines.push("### Общая шкала", "", ...Object.entries(generation.scale).map(([key, value]) => `- ${key}: ${value}`),
+      "", "### Доказанные варианты", "");
+    for (const member of generation.members) {
+      lines.push(`#### ${member.value.title}`, "", `Вариант: ${refText(member.ref)}`, `Предложение: ${valueText(member.value.proposal)}`);
+      for (const [key, judgement] of Object.entries(member.value.criteria)) {
+        lines.push(`- ${key}: ${judgement.conclusion}`, `  Основания: ${judgement.grounds.map(refText).join(", ") || "не указаны"}`,
+          `  Допущения: ${canonical(judgement.assumptions)}`, `  Неизвестные: ${canonical(judgement.unknowns)}`);
+        if (judgement.quantity) lines.push(`  Количественная оценка: ${canonical(judgement.quantity)}`);
+      }
+      lines.push("");
+    }
+    lines.push(`Сравнение: ${generation.comparison}`,
+      `Рекомендация модели: ${refText(generation.recommendation.member)} — ${generation.recommendation.reason}`,
+      "Рекомендация не устанавливает выбор варианта.");
+  }
+  lines.push("", "### Пределы поиска", "", ...generation.searchLimits.map(limit => `- ${limit}`),
+    "", "### Неизвестные генерации", "", ...generation.unknowns.map(unknown => `- ${unknown}`));
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderStageSummary(summary: StageSummary | DiscoveryIndexStageSummary | VariantGenerationStageSummary): string {
+  if (summary.contract === "stage-summary/variant-generation/v1") return renderVariantGenerationSummary(summary);
   if (summary.contract === "stage-summary/discovery-index/v1") return renderDiscoveryIndexSummary(summary);
   if (summary.stage !== "discovery") return renderStructuredStageSummary(summary);
   const lines = ["# Discovery", ""];

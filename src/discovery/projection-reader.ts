@@ -1,4 +1,6 @@
 import { EngineError } from "../errors.js";
+import { readVariantGeneration } from "./variant-session.js";
+import type { DiscoveryVariant, VariantNone, VariantOrigin, VariantReason, VariantScale, VariantSet } from "./discovery-variants.js";
 import { currentPlan, planOwnerSubject, provePlanQuestions } from "./v7-plan-questions.js";
 import { readResearchConsumerTurn } from "./response-recovery.js";
 import { turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
@@ -52,6 +54,39 @@ import { discoveryOutcome, discoveryTraversal, type DiscoveryConditionDecision, 
 // R.3 traversal semantics and outcomeSummary remain with their accepted producers.
 export { readDiscoveryIndexAt, type DiscoveryIndexRead, type DiscoveryIndexCursor,
   type DiscoveryIndexScope, type DiscoveryIndex } from "./discovery-index.js";
+
+/** 4R.3 generation only: presentation of the common paid proof, never a decision reader. */
+export interface VariantGenerationAuthor extends VariantOrigin {
+  kind: "model"; actor: string; session: Ref;
+}
+interface VariantGenerationSummaryBasis {
+  verification: "proven"; result: Ref; draft: Ref; snapshot: Ref; author: VariantGenerationAuthor;
+  /** This historical application may have published without touching current state. */
+  publicationState: Ref | null;
+  choice: { status: "incomplete"; reason: "variant_decisions_unsupported" };
+  searchLimits: string[]; unknowns: string[];
+}
+export type VariantGenerationSummary = VariantGenerationSummaryBasis & (
+  { kind: "variants"; members: { ref: Ref; value: DiscoveryVariant }[]; scale: VariantScale;
+    comparison: string; recommendation: { member: Ref; reason: string } }
+  | { kind: "no_variants"; reasons: VariantReason[] }
+);
+export function variantGenerationSummary(store: Store, project: string, result: Ref): VariantGenerationSummary {
+  // All membership, origin and paid application proof stays in the producer's common reader.
+  const proven = readVariantGeneration(store, project, result), publication = proven.publication;
+  const value = publication.result.value;
+  const common: VariantGenerationSummaryBasis = {
+    verification: proven.verification, result: publication.result.ref, draft: value.draft, snapshot: value.snapshot,
+    author: { kind: "model", actor: proven.session.value.actor, session: reference(proven.session), ...value.origin },
+    publicationState: proven.state, choice: { status: "incomplete", reason: "variant_decisions_unsupported" },
+    searchLimits: value.searchLimits, unknowns: value.unknowns,
+  };
+  if (publication.result.kind === "discovery-variant-none")
+    return { ...common, kind: "no_variants", reasons: (value as VariantNone).reasons };
+  const set = value as VariantSet;
+  return { ...common, kind: "variants", members: publication.members.map(member => ({ ref: member.ref, value: member.value })),
+    scale: set.scale, comparison: set.comparison, recommendation: set.recommendation };
+}
 
 // Потребителям вне модуля внутренние читатели доступны только через эту границу.
 export {
