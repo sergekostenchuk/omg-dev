@@ -321,17 +321,25 @@ test('B3.0b participant membership changes invalidate an already prepared manage
 });
 
 test('B3.0b current admission preserves immutable pointer refs while attempt heads advance and rejects pointer loss', t => {
-  const f = fixture(t); f.series(); const applied = activate(f);
+  // LG07 sc-a (№10500): product prepares the activation, the real D1, routes, MC1 batch and goal and opens nothing; the
+  // series, the pointer and the admission are taken after that, and the attempt is opened managed, with the exact
+  // completion of that batch.
+  const f = product(fixture(t), true, false), plan = { routes: reference(f.routes), batches: [f.batch.id] };
+  const pointer = f.store.get(seriesCurrentId(project))!;
   const active = head(f), admitted = ok(prepareSeriesLineAdmission(f.store, project, reference(active)));
-  assert.deepEqual(admitted.pointer, reference(applied.pointer));
-  assert.ok(admitted.guards.some(guard => canonical(guard) === canonical(reference(applied.pointer))));
-  const running = ok(beginAttempt(f.store, { project, block, line: 1, attempt: 1, goal: workGoal }));
-  assert.deepEqual(f.store.get(seriesCurrentId(project)), applied.pointer);
-  assert.deepEqual(ok(prepareSeriesLineAdmission(f.store, project, reference(running))).pointer, reference(applied.pointer));
+  assert.deepEqual(admitted.pointer, reference(pointer));
+  assert.ok(admitted.guards.some(guard => canonical(guard) === canonical(reference(pointer))));
+  const running = ok(managedOpenAttempt(f.store, { project, block, line: 1, attempt: 1, goal: f.goal, completion: plan }));
+  assert.ok(running.revision > active.revision);
+  assert.deepEqual(f.store.get(seriesCurrentId(project)), pointer);
+  assert.deepEqual(ok(prepareSeriesLineAdmission(f.store, project, reference(running))).pointer, reference(pointer));
+  // A negative mutation, written only to be refused: the pointer is lost.
   erase(f.store, seriesCurrentId(project));
+  const before = snapshot(f.store);
   refusedWith(prepareSeriesLineAdmission(f.store, project, reference(running)), 'series_invalid');
   refusedWith(prepareSeriesParticipantAdmission(f.store, project, reference(running)), 'series_invalid');
-  refusedWith(beginAttempt(f.store, { project, block, line: 1, attempt: 2, goal: workGoal }), 'series_invalid');
+  refusedWith(managedOpenAttempt(f.store, { project, block, line: 1, attempt: 2, goal: f.goal, completion: plan }), 'series_invalid');
+  assert.deepEqual(snapshot(f.store), before);
   assert.deepEqual(ok(readSeriesAt(f.store, project, reference(active))), active);
 });
 
@@ -999,18 +1007,25 @@ test('B3.0b new-work waits for explicit terminal close then preserves stop histo
 });
 
 test('B3.0b common historical work admission restores its original pointer guards after heads advance', t => {
-  const f = fixture(t); f.series(); const first = activate(f), source = head(f);
+  // LG07 sc-a (№10500): the same preparation; the series head advances by a real managed opening, then the block is
+  // excluded.
+  const f = product(fixture(t), true, false), pointer = reference(f.store.get(seriesCurrentId(project))!), source = head(f);
   const admitted = ok(prepareSeriesLineAdmission(f.store, project, reference(source)));
-  ok(beginAttempt(f.store, { project, block, line: 1, attempt: 1, goal: workGoal })); exclude(f);
+  const running = ok(managedOpenAttempt(f.store, { project, block, line: 1, attempt: 1, goal: f.goal,
+    completion: { routes: reference(f.routes), batches: [f.batch.id] } }));
+  assert.ok(running.revision > source.revision);
+  exclude(f);
   const witness = era(f, reference(source));
   assert.equal(f.store.history(witness.id).length, 1);
   const view = forbidCurrentPointer(f.store);
-  const restored = ok(readSeriesWorkAdmission(view, { project, series: reference(source), pointer: reference(first.pointer) }));
+  const restored = ok(readSeriesWorkAdmission(view, { project, series: reference(source), pointer }));
   assert.deepEqual(restored.guards, admitted.guards);
   assert.ok(restored.guards.some(guard => canonical(guard) === canonical(reference(source))));
-  assert.ok(restored.guards.some(guard => canonical(guard) === canonical(reference(first.pointer))));
+  assert.ok(restored.guards.some(guard => canonical(guard) === canonical(pointer)));
+  const before = snapshot(f.store);
   refusedWith(commit(f.store, { writes: [{ id: 'old-work-proof', kind: 'test', expected: 0, value: null }], guards: restored.guards }), 'input_stale');
   assert.equal(f.store.get('old-work-proof'), null);
+  assert.deepEqual(snapshot(f.store), before);
 });
 
 function missingB1AtFsck(store: Store) {
