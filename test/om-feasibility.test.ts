@@ -1019,7 +1019,9 @@ test('AT1 row 14 M8 issues a plan only on the tree its works were checked agains
       canonical(noRepo.record.value.findings));
     assert.deepEqual(heads(h.store), hHeads);
     h.restart();
-    assert.ok(prepareFeasibility(h.store, h.feasibility).ok, 'a cold repeat keeps the same no-repository form');
+    const coldHeads = heads(h.store), cold = ok(prepareFeasibility(h.store, h.feasibility));
+    assert.deepEqual(cold.record, noRepo.record, 'a cold repeat returns the same no-repository record');
+    assert.deepEqual(heads(h.store), coldHeads, 'the cold repeat writes nothing');
   } finally { renameSync(hAway, join(h.workspace, '.git')); }
   // LG09 (codex-omg2 №9048 п.4): addressed negative mutations of the genuine saved records — a missing or wrong basis,
   // a missing/v1/foreign contract at a kept impact, a missing impact or its snapshot field. Each is
