@@ -178,15 +178,20 @@ export function replayVariantResponse(store: Store, projectId: string, draftId: 
   const payload = JSON.parse(response.value.text);
   requireCondition(payload?.protocol === 'omg-agent/v1' && payload.requestId === call.value.requestId && Object.hasOwn(payload, 'research'),
     'research_replay_invalid', 'The saved variant response has a foreign request envelope');
-  // 4T3-01 (№11174): what this call actually sent is read back from its own saved request bytes — the exact Ref, the
-  // digest, chars and bytes of its audit record, the same envelope and archive, and the very transport identity the
-  // call was matched by. The archive stays the ground of the call; it is never handed out as its wire.
-  const requestRef = call.value.request?.record;
-  const request = isRef(requestRef) ? store.get<{ projectId: string; draftId: string; text: string }>(requestRef.id, requestRef.revision) : null;
+  // 4T3-01 (№11174, №11197): what this call actually sent is read back from its own saved request bytes. The request is
+  // bound to the immutable first revision of the call, written before the send: the head keeps exactly that request, and
+  // the bytes are read by that revision's Ref and audit — digest, chars and bytes — then the same envelope, archive and
+  // transport identity the call was matched by. The archive stays the ground of the call; it is never its wire.
+  const first = store.get<ModelCall>(call.id, 1);
+  requireCondition(first?.kind === 'model-call' && isRef(first.value.request?.record)
+    && canonical(call.value.request) === canonical(first.value.request),
+  'research_replay_invalid', 'The paid variant call must keep the request its first revision saved before the send');
+  const sentAudit = first.value.request, requestRef = sentAudit.record!;
+  const request = store.get<{ projectId: string; draftId: string; text: string }>(requestRef.id, requestRef.revision);
   requireCondition(request?.kind === 'model-request' && canonical(reference(request)) === canonical(requestRef)
     && request.hash === hashJson(request.value) && request.value.projectId === projectId && request.value.draftId === draftId
-    && typeof request.value.text === 'string' && digest(request.value.text) === call.value.request.hash
-    && request.value.text.length === call.value.request.chars && Buffer.byteLength(request.value.text) === call.value.request.bytes,
+    && typeof request.value.text === 'string' && digest(request.value.text) === sentAudit.hash
+    && request.value.text.length === sentAudit.chars && Buffer.byteLength(request.value.text) === sentAudit.bytes,
   'research_replay_invalid', 'The paid variant call lost the exact saved bytes of its request');
   let wire: Record<string, any> | null;
   try { wire = JSON.parse(request.value.text); } catch { wire = null; }

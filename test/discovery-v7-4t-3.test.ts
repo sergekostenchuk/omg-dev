@@ -308,21 +308,28 @@ test('4T3-01: a lost or forged request record of a paid variant call is a typed 
   const otherIdentity = JSON.stringify({ ...envelope, subject: { ...envelope.subject, actor: 'reviewer' } });
   const otherArchive = JSON.stringify({ ...envelope, subject: { ...envelope.subject, working: { ...envelope.subject.working,
     archive: f.transport('archive') } } });
+  // №11197: the same requestId, actor, variantSubject and archive, another body, and a new audit consistent with it.
+  assert.equal(typeof envelope.subject.core?.objective, 'string', 'the sent body carries the objective this forgery changes');
+  const otherBody = JSON.stringify({ ...envelope, subject: { ...envelope.subject, core: { ...envelope.subject.core, objective: 'Another objective' } } });
   const cases: [string, Record<string, unknown>][] = [
     ['no saved request record', bare],
     ['other bytes under the audit of the original', { ...call!.value.request, record: forged('bytes', `${original.value.text} `) }],
     ['bytes of another envelope with their own matching audit', audited('envelope', otherEnvelope)],
     ['consistent bytes of another transport identity', audited('identity', otherIdentity)],
     ['consistent bytes naming another archive', audited('archive', otherArchive)],
+    ['consistent bytes of the same identity with another body', audited('body', otherBody)],
   ];
+  const firstRevision = f.store.get(call!.id, 1);
   let head: Revision<unknown> = call!;
   for (const [note, request] of cases) {
     head = f.store.write({ id: call!.id, kind: 'model-call', expected: head.revision, value: { ...call!.value, request } as unknown as Json });
     const before = f.snapshot(f.store), sent = f.wires().length;
     await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan), errorCode('research_replay_invalid'), note);
+    await assert.rejects(() => f.call(v, f.v.draft.id, f.v.plan, f.environment.value.implementer, f.open()), errorCode('research_replay_invalid'), `${note} (cold)`);
     assert.deepEqual(f.snapshot(f.store), before, note);
     assert.equal(f.wires().length, sent, note);
   }
+  assert.deepEqual(f.store.get(call!.id, 1), firstRevision, 'the first revision of the call is never touched');
 });
 
 test('4T3-02: no early paid return crosses branches — a paid analyst intent never answers a variant, a paid variant never a mixed context', async t => {
