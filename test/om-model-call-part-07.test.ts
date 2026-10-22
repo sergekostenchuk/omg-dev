@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { canonical, type Json } from '../src/canonical.js';
-import { runModelCall, deliverModelSources, readContinuationEvidence, readModelCall, readManagedModelDiagnostic, prepareModelAttemptFinish, finishModelAttempt, type OmModelCall, runModelCycle, runModelCycle as mp2Cycle, CYCLE_POLICY, readModelCycle as mp2ReadCycle } from '../src/om/model-call.js';
+import { runModelCall, deliverModelSources, readContinuationEvidence, readManagedModelDiagnostic, prepareModelAttemptFinish, finishModelAttempt, type OmModelCall, runModelCycle, runModelCycle as mp2Cycle, CYCLE_POLICY, readModelCycle as mp2ReadCycle } from '../src/om/model-call.js';
 import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { type Ref, reference } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -23,7 +23,7 @@ import { MP3_NOTES, MP3_SCOPES, completionE1, completionSnapshot, currentPacketW
 
 
 test('E4 delivery writes guard source heads, and a repeat after restart returns the same deliveries without writes', async t => {
-  const f = e4Fixture(t); f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true); f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'e4-source.txt', media: 'text/plain' }]) }]);
   const call = valueOf(await runModelCall(f.store, f.request)); assert.ok(call.response);
   const basis = { project: f.project, packet: f.request.packet, call: call.call, response: call.response };
   const writeMany = f.store.writeMany.bind(f.store); let raced = false;
@@ -49,7 +49,7 @@ test('E4 delivery writes guard source heads, and a repeat after restart returns 
 
 test('E4 retains terminal evidence when environment or captured file changes during the physical call before E3 preparation', async t => {
   for (const change of ['environment', 'file'] as const) {
-    const f = e4Fixture(t, 'fact', 100_000, 0, 1000, false, true, false, undefined, (store, project, root) => {
+    const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true, true, false, undefined, (store, project, root) => {
       new Evidence(store).file(project, 'transport-file', root, 'e4-source.txt', 'text/plain', 0);
     }), reply = e4Fact(f);
     const file = f.store.get<import('../src/evidence/evidence.js').Source>(`source:${f.project}:transport-file`)!;
@@ -60,21 +60,37 @@ test('E4 retains terminal evidence when environment or captured file changes dur
       if (!injected && f.sent().length && id === (change === 'environment' ? f.configured.id : file.id)) {
         injected = true;
         if (change === 'environment') {
-          const env = get(f.configured.id)!;
-          f.store.write({ id: env.id, kind: env.kind, expected: env.revision, value: env.value });
+          // A same-value rewrite is compatible under the managed admission; only a genuinely incompatible
+          // replacement of the measured environment ceases the assignment at application.
+          const env = get(f.configured.id)! as Revision<import('../src/runtime/environment.js').Environment>;
+          const { projectId: _project, ...config } = structuredClone(env.value);
+          config.implementer.model = 'changed-mid-call';
+          new ProductEngine(f.store).environments.configure(f.project, config, env.revision);
         } else writeFileSync(join(f.root, 'e4-source.txt'), 'A different physical source after the request.');
       }
       return get(id, revision);
     }) as Store['get'];
-    const actual = valueOf(await runModelCall(f.store, f.request)); f.store.get = get;
-    assert.ok(injected); assert.equal(actual.record.value.status, 'failed'); assert.ok(actual.record.value.om.rejection);
-    assert.equal(actual.response, null); assert.equal(f.store.list('part-response').length, 0);
-    assert.deepEqual(actual.record.value.usage, usage); assert.equal(f.sent().length, 1);
-    const saved = valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
-    writeFileSync(join(f.root, 'e4-source.txt'), 'Still later file content must not reinterpret the failed window.');
-    f.restart();
-    assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), saved); assert.equal(f.sent().length, 1);
-    assert.equal(f.store.history(actual.record.id).length, 4);
+    const actual = await runModelCall(f.store, f.request); f.store.get = get;
+    assert.ok(injected); assert.equal(f.sent().length, 1); assert.equal(f.store.list('om-model-exchange').length, 1);
+    assert.equal(f.store.list('part-response').length, 0);
+    // Under the managed carrier either mid-call change ends in a typed refusal: an incompatible environment
+    // ceases the assignment (its proved cessation is written); a changed captured file makes the answer
+    // inapplicable at its exact source. The received exchange and the paid usage stay as they were.
+    assert.equal(actual.ok, false);
+    const expected = change === 'environment' ? 'completion_ceased' : 'answer_inapplicable';
+    if (!actual.ok) {
+      assert.equal(actual.refusal.code, expected);
+      if (change === 'file') assert.deepEqual([actual.refusal.at.unit, actual.refusal.at.target, actual.refusal.at.field], ['D5', file.id, 'source']);
+    }
+    if (change === 'environment') assert.equal(f.store.list('om-completion-cessation').length, 1);
+    const record = f.store.list<OmModelCall>('model-call')[0]!;
+    assert.deepEqual(record.value.usage, usage);
+    writeFileSync(join(f.root, 'e4-source.txt'), 'Still later file content must not reinterpret the refused window.');
+    const before = f.store.list().map(reference); f.restart();
+    const repeat = await runModelCall(f.store, f.request);
+    assert.equal(repeat.ok, false); if (!repeat.ok) assert.equal(repeat.refusal.code, expected);
+    assert.deepEqual(f.store.list().map(reference), before); assert.equal(f.sent().length, 1);
+    assert.deepEqual(f.store.get(record.id), record, 'The refused receipt keeps its exact received state');
   }
 });
 
