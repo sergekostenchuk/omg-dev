@@ -5,13 +5,12 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hashJson, canonical, type Json } from '../src/canonical.js';
-import { runModelCycle, runModelCall, readModelCall, type OmModelCall, runModelTransport, readModelApplicationRejection, readManagedModelDiagnostic, readModelCycle, type ReadDeliveryRecord, finishModelAttempt } from '../src/om/model-call.js';
+import { runModelCycle, runModelCall, readModelCall, type OmModelCall, runModelTransport, readManagedModelDiagnostic, readModelCycle, type ReadDeliveryRecord, finishModelAttempt } from '../src/om/model-call.js';
 import { type Revision, Store } from '../src/storage/store.js';
 import { reference } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
 import { projectGraph } from '../src/graph/project.js';
 import type { Graph } from '../src/graph/model.js';
-import { withHistoricalReads } from '../src/om/input.js';
 import { readRecord } from '../src/om/refs.js';
 import { writeQuestionPacket, readQuestionPacket, type QuestionPacketRecord } from '../src/om/question-packet.js';
 import { completeAttempt, seriesRequestOf, type RepairSeries } from '../src/om/series.js';
@@ -21,7 +20,7 @@ import { settleCandidate } from '../src/om/frame-accept.js';
 import { recordCall } from '../src/om/call-record.js';
 import { closeAttempt } from '../src/om/repeat-gate.js';
 import { execFileSync } from 'node:child_process';
-import { CycleCommitPhase, MP3_EMPTY_SEARCH, MP3_NOTES, completionE1, completionSnapshot, currentPacketWire, cycleCommitPhase, e4Fact, e4Fixture, e4NeedSource, e4Node, mp3Carried, mp3Cycle, mp3Decisions, mp3Origins, mp3Parts, mp3Readings, mp3SearchDelivery, usage, valueOf } from './om-model-call-fixture.js';
+import { CycleCommitPhase, MP3_EMPTY_SEARCH, MP3_NOTES, completionE1, completionSnapshot, currentPacketWire, cycleCommitPhase, e4Fact, e4Fixture, e4ManagedFixture, e4NeedSource, e4Node, mp3Carried, mp3Cycle, mp3Decisions, mp3Origins, mp3Parts, mp3Readings, mp3SearchDelivery, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
@@ -70,7 +69,7 @@ h.update=(d,e)=>{globalThis.__hash1Digested.push({b:String(d),s:new Error().stac
 
 
 test('E4 missing addressed file can be supplied and resumed without redispatching the saved source request', async t => {
-  const f = e4Fixture(t);
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
   f.steps([{ research: e4NeedSource(f, [{ action: 'read', path: 'later.txt', media: 'text/plain' }]) }, { research: e4Fact(f) }]);
   const missing = await runModelCycle(f.store, f.request);
   assert.equal(missing.ok, false); if (!missing.ok) assert.equal(missing.refusal.code, 'model_read_unavailable');
@@ -82,43 +81,69 @@ test('E4 missing addressed file can be supplied and resumed without redispatchin
 
 
 
-test('E4 preserves received exchange when another Store completes the attempt during dispatch or application', async t => {
+test('E4 preserves received exchange when another Store replaces a required record during dispatch or application', async t => {
   for (const phase of ['before-form', 'application'] as const) for (const kind of ['fact', 'node'] as const) {
-    const f = e4Fixture(t, kind);
+    const f = e4Fixture(t, kind, 100_000, 0, 5000, true);
     f.steps([{ research: kind === 'node' ? e4Node(f) : e4Fact(f), usage }]);
     const get = f.store.get.bind(f.store), writeMany = f.store.writeMany.bind(f.store);
-    let completed: Revision<unknown> | null = null;
-    const complete = () => {
+    // The retired standalone route let the competitor completeAttempt over unpaid work — '26 H1.0a' proves that
+    // completion_required refuses it now. The lawful managed move is a required-record replacement: the
+    // application itself derives the proved cessation (completion_ceased) or loses CAS (input_stale).
+    let ended = false, replaced: Revision<unknown> | null = null;
+    const replace = () => {
+      ended = true;
       const other = new Store(f.database);
-      try { completed = valueOf(completeAttempt(other, { ...seriesRequestOf(f.series.value), attempt: 1,
-        outcome: { reason: 'interrupted', achieved: [], cancelled: [], refusals: [] } })); }
-      finally { other.close(); }
+      try {
+        const head = other.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+        const { projectId: _project, ...config } = structuredClone(head.value);
+        replaced = new ProductEngine(other).environments.configure(f.project, { ...config, timeoutMs: config.timeoutMs + 1 }, head.revision);
+      } finally { other.close(); }
     };
     f.store.get = ((id, revision) => {
-      if (phase === 'before-form' && !completed && f.sent().length && id === f.series.id) complete();
+      if (phase === 'before-form' && !ended && f.sent().length && id === f.series.id) replace();
       return get(id, revision);
     }) as Store['get'];
     f.store.writeMany = ((writes, guards) => {
-      if (phase === 'application' && !completed && writes.some(write => write.kind === 'part-response')) complete();
+      if (phase === 'application' && !ended && writes.some(write => write.kind === 'part-response')) replace();
       return writeMany(writes, guards);
     }) as Store['writeMany'];
-    const actual = valueOf(await runModelCall(f.store, f.request));
+    const actual = await runModelCall(f.store, f.request);
     f.store.get = get; f.store.writeMany = writeMany;
-    assert.ok(completed); assert.equal(actual.record.value.status, 'failed'); assert.equal(actual.outcome, null);
-    assert.equal(actual.diagnostic, null); assert.equal(actual.record.value.om.part, null);
+    assert.ok(replaced);
+    // Managed application failure is a typed refusal, not an invented failed product: the immutable received
+    // receipt stays resumable, the exchange and its usage are preserved, and no part records were written.
+    assert.equal(actual.ok, false);
+    if (!actual.ok) assert.equal(actual.refusal.code, phase === 'before-form' ? 'completion_ceased' : 'input_stale');
     assert.equal(f.store.list('om-model-exchange').length, 1); assert.equal(f.sent().length, 1);
     const exchange = f.store.list<{process: {stdout: string}}>('om-model-exchange')[0]!;
     assert.deepEqual(JSON.parse(exchange.value.process.stdout).usage, usage);
-    assert.deepEqual(f.store.get(f.series.id), completed);
+    assert.deepEqual(f.store.get(f.configured.id), replaced);
+    assert.equal(f.store.list('om-completion-cessation').length, phase === 'before-form' ? 1 : 0);
+    assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null, 'No unpaid work is closed');
     for (const recordKind of ['part-response', 'part-result', 'layer-proposal']) assert.equal(f.store.list(recordKind).length, 0);
+    const record = f.store.list<OmModelCall>('model-call')[0]!;
+    assert.equal(record.value.om.application, 'received'); assert.equal(record.value.om.part, null);
     const call = f.store.list<{usage: typeof usage;status: string}>('call-record')[0]!;
-    assert.deepEqual(call.value.usage, usage); assert.equal(call.value.status, 'failed');
-    const expected = valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
+    assert.deepEqual(call.value.usage, usage); assert.equal(call.value.status, 'succeeded');
+    const expected = f.store.get(record.id)!;
+    const pending = readModelCall(f.store, { project: f.project, record: reference(record) });
+    assert.equal(pending.ok, false);
+    if (!pending.ok) assert.equal(pending.refusal.code, 'model_call_application_pending');
+    const ids = new Set(f.store.list().map(row => row.id));
     const saved = f.store.list();
     f.restart();
-    assert.deepEqual(valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) })), expected);
-    assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), expected);
-    assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 1);
+    assert.deepEqual(f.store.get(record.id), expected);
+    const stillPending = readModelCall(f.store, { project: f.project, record: reference(record) });
+    assert.equal(stillPending.ok, false);
+    if (!stillPending.ok) assert.equal(stillPending.refusal.code, 'model_call_application_pending');
+    const replayed = await runModelCall(f.store, f.request);
+    assert.equal(replayed.ok, false);
+    if (!replayed.ok) assert.equal(replayed.refusal.code, 'completion_ceased', 'The retained cause refuses every later application');
+    assert.equal(f.store.list('om-completion-cessation').length, 1);
+    assert.deepEqual(f.store.list().filter(row => !ids.has(row.id)).map(row => row.kind),
+      phase === 'before-form' ? [] : ['om-completion-cessation']);
+    if (phase === 'before-form') assert.deepEqual(f.store.list(), saved);
+    assert.equal(f.sent().length, 1);
   }
 });
 
@@ -179,7 +204,8 @@ test('9 H1.0a durable running, received and unapplied work retain the barrier an
 
 
 test('34 H1.0a analysis of a stopped managed ordinal remains a separate transport and preserves its closed registry',async t=>{
-  const f=e4Fixture(t,'fact',100_000,2,1000,true);
+  const f=await e4ManagedFixture(t,'fact',{priorNoProgress:2,timeoutMs:1000});
+  const paid=f.sent().length;
   f.steps([{research:{wrong:true},usage},{research:{cause:'fixture observation',hypothesis:true},usage}]);
   valueOf(await runModelCall(f.store,f.request));
   const work=completionSnapshot(f),address=seriesRequestOf(f.series.value);
@@ -197,7 +223,7 @@ test('34 H1.0a analysis of a stopped managed ordinal remains a separate transpor
   assert.equal(called.record.value.transport.completionOwner,undefined);
   f.restart();assert.equal(valueOf(await runModelTransport(f.store,request)).repeated,true);
   assert.deepEqual(f.store.get(work.work.id),closedWork);assert.deepEqual(f.store.get(series.id),series);
-  assert.equal(f.sent().length,2);
+  assert.equal(f.sent().length,paid+2,'Two physical sends of this ordinal stand apart from the paid preparation prefix');
 });
 
 
@@ -320,8 +346,10 @@ test('34 H1.0b equivalent preclaim admission guards the current Environment agai
 
 
 
-test('S1.1 the collected application basis alone proves a rejection: a dispatch adapter that moved during the application is a stale relevant source only through the transparent collector; the rejection reads the same cold, hot, warmed and after restart', async t => {
-  const f = e4Fixture(t);
+test('S1.1 the collected application basis alone proves the stale class: a dispatch adapter that moved during the application is a stale relevant source; the refusal derives the same cold, hot, warmed and after restart', async t => {
+  // The saved om-model-application-rejection record was the standalone variant of this property. A managed call
+  // instead refuses with the derived class and keeps the immutable received receipt and settled accounting.
+  const f = e4Fixture(t, 'fact', 100_000, 0, 5000, true);
   f.steps([{ research: e4Fact(f), usage }]);
   const adapter = f.request.dispatch.adapter, writeMany = f.store.writeMany.bind(f.store);
   let moved: Revision<unknown> | null = null;
@@ -336,25 +364,37 @@ test('S1.1 the collected application basis alone proves a rejection: a dispatch 
     }
     return writeMany(writes, guards);
   }) as Store['writeMany'];
-  const actual = valueOf(await runModelCall(f.store, f.request));
+  const actual = await runModelCall(f.store, f.request);
   f.store.writeMany = writeMany;
-  assert.ok(moved); assert.equal(actual.record.value.status, 'failed'); assert.ok(actual.record.value.om.rejection);
-  const rejection = actual.record.value.om.rejection!;
-  const read = () => valueOf(readModelApplicationRejection(f.store, { project: f.project, record: rejection }));
-  const cold = read();
-  assert.equal(cold.failure.code, 'input_stale');
-  assert.equal(cold.record.value.completion, null, 'No completion: the adapter guard alone proves the rejected class');
-  assert.ok(cold.record.value.guards.some(ref => canonical(ref) === canonical(adapter)), 'The admitted adapter is a guard of the rejected application');
-  assert.deepEqual(cold.record.value.heads.find(row => row.id === adapter.id)!.head, reference(moved!), 'The observed head is the re-registered adapter');
-  const hot = withHistoricalReads(() => { read(); return read(); });
-  const warmed = withHistoricalReads(() => {
-    valueOf(readQuestionPacket(f.store, { project: f.project, record: f.request.packet }));
-    valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
-    return read();
-  });
-  assert.deepEqual(hot, cold); assert.deepEqual(warmed, cold);
+  assert.ok(moved); assert.equal(actual.ok, false);
+  if (!actual.ok) assert.deepEqual([actual.refusal.code, actual.refusal.at.target], ['input_stale', adapter.id],
+    'The adapter guard alone proves the refused class');
+  assert.equal(f.store.list('om-model-application-rejection').length, 0, 'A managed call writes no rejection record');
+  assert.equal(f.store.list('om-model-exchange').length, 1); assert.equal(f.sent().length, 1);
+  const record = f.store.list<OmModelCall>('model-call')[0]!;
+  assert.equal(record.value.om.application, 'received'); assert.equal(record.value.om.part, null);
+  const call = f.store.list<{usage: typeof usage;status: string}>('call-record')[0]!;
+  assert.deepEqual(call.value.usage, usage); assert.equal(call.value.status, 'succeeded');
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null,
+    'No completion: the refused application does not close the managed attempt');
+  const pending = readModelCall(f.store, { project: f.project, record: reference(record) });
+  assert.equal(pending.ok, false);
+  if (!pending.ok) assert.equal(pending.refusal.code, 'model_call_application_pending');
+  const expected = f.store.get(record.id)!;
+  // The moved adapter is a required record: the next application derives the proved cessation, and every later
+  // attempt — cold, warmed or after restart — repeats the same completion_ceased without writing again.
+  const replay = async () => {
+    const again = await runModelCall(f.store, f.request);
+    assert.equal(again.ok, false); if (!again.ok) assert.equal(again.refusal.code, 'completion_ceased');
+  };
+  await replay();
+  assert.equal(f.store.list('om-completion-cessation').length, 1, 'The first resume records the proved cessation once');
+  const saved = f.store.list();
+  await replay();
   f.restart();
-  assert.deepEqual(read(), cold);
+  assert.deepEqual(f.store.get(record.id), expected);
+  await replay();
+  assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 1);
 });
 
 
@@ -440,7 +480,7 @@ test('LP3 current E3 refusal cannot be assigned reads-invalid, and a lawful need
 
 
 test('MP3 rows 9, 18: a new part carries the proven deliveries of the preceding part chain as a fixed set; every packet keeps the root era and no carried read becomes another edge', async t => {
-  const m = mp3Cycle(t, 'node'), { f } = m, config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
+  const m = mp3Cycle(t, 'node', 100_000, true), { f } = m, config = f.environment(currentPacketWire(f.packet.value.packet) - 1);
   const packet = valueOf(writeQuestionPacket(f.store, { ...f.packetRequest, environment: reference(config) })).record;
   assert.equal(packet.value.plan!.mode, 'parts'); const total = packet.value.plan!.assignments.length; assert.ok(total >= 2);
   const answers = Array.from({ length: total }, (_, position) => e4Node(f, { ...packet,
@@ -487,7 +527,7 @@ test('MP3 row 17: a stop after each saving transition of an addressed read cycle
     { research: e4Fact(m.f), usage }];
   const phases: CycleCommitPhase[] = [];
   {
-    const m = mp3Cycle(t), { f } = m; f.steps(script(m));
+    const m = mp3Cycle(t, 'fact', 100_000, true), { f } = m; f.steps(script(m));
     const write = f.store.writeMany.bind(f.store);
     f.store.writeMany = ((writes, guards) => { const committed = write(writes, guards); if (writes.length) phases.push(cycleCommitPhase(writes)); return committed; }) as Store['writeMany'];
     try { valueOf(await runModelCycle(f.store, f.request)); } finally { f.store.writeMany = write; }
@@ -496,7 +536,7 @@ test('MP3 row 17: a stop after each saving transition of an addressed read cycle
   for (const [index, phase] of phases.entries()) {
     if (phase === 'running' || phase === 'authorized') continue;
     await t.test(`stop after transaction ${index + 1}: ${phase}`, async nested => {
-      const m = mp3Cycle(nested), { f } = m; f.steps(script(m));
+      const m = mp3Cycle(nested, 'fact', 100_000, true), { f } = m; f.steps(script(m));
       const write = f.store.writeMany.bind(f.store);
       let count = 0;
       f.store.writeMany = ((writes, guards) => {
