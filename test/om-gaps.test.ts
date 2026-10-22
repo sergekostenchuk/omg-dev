@@ -160,36 +160,36 @@ test("S1 D1 shares the full historical set only inside one operation and keeps c
   assert.ok(recordsRead > outside, "a new external operation reads exact gap history again");
 });
 
-test("D1 cold-reads a set saved before the explicit upper frame while new work requires it", async t => {
+test("D1 cold-reads a set written under the current contract through a new Store", async t => {
   const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
   const saved = delivered(writeGaps(f.store, currentRequest(f)));
-  // A set written by the previous era: its works frame named the accepted upper horizon without an accepted frame.
-  const sources = clone(saved.sources) as GapRequest;
-  (sources.works as ProposalRequest).frame.upper!.frame = null;
-  const records = saved.records.map(row => f.store.write({ id: `${row.id}:previous-era`, kind: row.kind,
-    expected: 0, value: { ...clone(row.value), sources } }));
-  const request: GapReadRequest = { sources, records: records.map(reference) };
-  const before = revisions(f.store);
-  const historical = delivered(readGaps(f.store, request));
-  assert.deepEqual(historical.records.map(row => row.id), records.map(row => row.id));
-  assert.deepEqual(historical.collection.gaps, saved.collection.gaps);
-  assert.deepEqual(revisions(f.store), before);
+  const request: GapReadRequest = { sources: clone(saved.sources) as GapRequest, records: saved.records.map(reference) };
+  const fresh = new Store(f.database);
+  t.after(() => fresh.close());
+  const before = revisions(fresh);
+  const historical = delivered(readGaps(fresh, request));
+  assert.deepEqual(historical, { sources: saved.sources, records: saved.records, collection: saved.collection, gate: saved.gate });
+  assert.deepEqual(revisions(fresh), before, "a cold historical read only reads");
 });
 
-test("D1 rejects new work whose works frame names no accepted upper frame", async t => {
+test("D1 rejects a current request corrupted to the previous-era shape, on read and on new work", async t => {
   const f = await createOmFixture(t, "standard", "garden", { mode: "executed" });
   const saved = delivered(writeGaps(f.store, currentRequest(f)));
-  const sources = clone(saved.sources) as GapRequest;
-  (sources.works as ProposalRequest).frame.upper!.frame = null;
-  const records = saved.records.map(row => f.store.write({ id: `${row.id}:strict-era`, kind: row.kind,
-    expected: 0, value: { ...clone(row.value), sources } }));
   const before = revisions(f.store), invalid = (error: unknown): boolean => {
     assert.ok(error instanceof EngineError); assert.equal(error.code, "gap_request_invalid");
     assert.deepEqual(error.details, { unit: "G4", target: "gaps", field: "works" }); return true;
   };
-  assert.throws(() => prepareGaps(f.store, sources), invalid);
-  assert.throws(() => writeGaps(f.store, sources), invalid);
-  assert.throws(() => prepareCurrentGaps(f.store, { sources, records: records.map(reference) }), invalid);
+  // Explicit corruption: the previous-era shape is not a legal input at any boundary, including reads.
+  for (const upper of [{ horizon: (saved.sources.works as ProposalRequest).frame.upper!.horizon, frame: null },
+      { horizon: (saved.sources.works as ProposalRequest).frame.upper!.horizon }]) {
+    const sources = clone(saved.sources) as GapRequest;
+    (sources.works as ProposalRequest).frame.upper = upper as ProposalRequest["frame"]["upper"];
+    const request: GapReadRequest = { sources, records: saved.records.map(reference) };
+    assert.throws(() => readGaps(f.store, request), invalid);
+    assert.throws(() => prepareGaps(f.store, sources), invalid);
+    assert.throws(() => writeGaps(f.store, sources), invalid);
+    assert.throws(() => prepareCurrentGaps(f.store, request), invalid);
+  }
   assert.deepEqual(revisions(f.store), before);
 });
 
