@@ -5848,3 +5848,30 @@ test("G7CTX first managed close retains prior classifications from its exact jou
   repeat();
 });
 
+
+test("PROBE c4 forged grounds", async t => {
+  const { f, hold, row } = await realHold(t);
+  const sources = row.origin.sources as unknown as Record<string, any>[];
+  const base = sources.find(s => s.role === "base")!, derived = sources.find(s => s.role === "derived")!, proposal = sources.find(s => s.role === "proposal")!;
+  const subject = row.origin.subject;
+  const try1 = (label: string, claim: string, basis: unknown[]) => {
+    const r = prepareLiftOriginHold(f.store, liftBy(project, reference(hold), "origin-analysis", { pending: { id: `${originAnalysisNamespace(project)}probe-${label}`, kind: ORIGIN_ANALYSIS_KIND, value: analysisOf(hold.value, { class: claim, basis }) as Json } }));
+    console.log("PROBE", label, JSON.stringify(r.ok ? "OK" : [r.refusal.code, r.refusal.at.field, r.refusal.message.slice(0, 160)]));
+  };
+  try1("base-base", "input", [base, base]);
+  const prop = f.store.get<any>(proposal.ref.id, proposal.ref.revision)!;
+  console.log("PROBE proposal keys", JSON.stringify(Object.keys(prop.value)), JSON.stringify((prop.value.nodes ?? []).map((n: any) => n.id)), JSON.stringify(Object.keys(proposal.context ?? {})), JSON.stringify(Object.keys(proposal.context?.request ?? {})));
+  const lacking = f.store.write({ id: `${prop.id}-lacking`, kind: prop.kind, expected: 0, value: { ...prop.value, nodes: (prop.value.nodes ?? []).filter((n: any) => n.id !== subject), fills: [] } });
+  const lackRef = reference(lacking);
+  try1("proposal-lacking-ownctx", "proposal", [{ role: "proposal", ref: lackRef, context: { kind: "proposal", request: { ...proposal.context.request, proposals: [lackRef] } } }]);
+  try1("proposal-lacking-rowctx", "proposal", [{ role: "proposal", ref: lackRef, context: proposal.context }]);
+  const cand = f.store.get<any>(derived.ref.id, derived.ref.revision)!;
+  console.log("PROBE cand keys", JSON.stringify(Object.keys(cand.value)), JSON.stringify((cand.value.graph?.nodes ?? []).some((n: any) => n.id === subject)));
+  const lostGraph = { ...cand.value.graph, nodes: (cand.value.graph?.nodes ?? []).filter((n: any) => n.id !== subject) };
+  const lostValue = { ...cand.value, graph: lostGraph, graphHash: hashJson(lostGraph), layerHash: hashJson(projectGraph(lostGraph as Graph, cand.value.level)) };
+  const lost = f.store.write({ id: `om-candidate:${project}:${hashJson([lostValue.level, lostValue.joinAssembly, lostValue.graphHash, lostValue.base, lostValue.proposals, lostValue.works])}`, kind: cand.kind, expected: 0, value: lostValue });
+  try1("two-assemblies", "derivation", [derived, { role: "derived", ref: reference(lost) }]);
+  try1("two-assemblies-ctx", "derivation", [derived, { ...derived, ref: reference(lost) }]);
+  try1("derived-proposal", "proposal", [derived, proposal]);
+  try1("base-proposal", "proposal", [base, proposal]);
+});
