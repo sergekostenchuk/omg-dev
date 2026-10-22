@@ -21,7 +21,7 @@ import { writeCandidate, readCandidate, gateCandidate, type FrameCandidateRecord
 import { settleCandidate } from "../src/om/frame-accept.js";
 import { writeOmInput } from "../src/om/input.js";
 import { writeHorizon } from "../src/om/horizon.js";
-import { gardenGraph, createOmFixture } from "./om-fixture.js";
+import { gardenGraph, createOmFixture, prepareNativeLayers } from "./om-fixture.js";
 import { seedCopy } from "./om-seed.js";
 import { preparedFeatures } from "./product-fixture.js";
 import { preparedField } from "./preparation-fixture.js";
@@ -2835,22 +2835,35 @@ function e51AssessorStep(verdict: E51Verdict) {
 /**
  * LG07 variants of the E5.1 seed (№10083 п.5–6): `notes` — the answers cite a separate owner document instead of the
  * stage brief, so its revision makes them inapplicable; `producer` — one more question, addressed to the producing block,
- * gives that block an MC1 batch and a plan of its own. Each variant is part of the seed key.
+ * gives that block an MC1 batch and a plan of its own; `twoSets` (№10753 п.1) — on an accepted L2 the transport fact is
+ * addressed to the producing operation that also realizes the consuming block (as atomic-second-consumer of the atomic
+ * seed), so its consumer set is both blocks: the consuming block's own plan has two original MC1 batches, and its attempt
+ * opens on both. Each variant is part of the seed key.
  */
-interface E51Variant { readonly notes?: boolean; readonly producer?: boolean }
+interface E51Variant { readonly notes?: boolean; readonly producer?: boolean; readonly twoSets?: boolean }
 function e51Prefix(store: Store, factCount: number, managed = false, variant: E51Variant = {}) {
   const facts = ["encoding", "transport", "retention"].slice(0, factCount);
   const project = "garden", engine = new ProductEngine(store), desired = gardenGraph("cross");
+  const shared = variant.twoSets ? "transport" : null, operation = "garden-produce-operation";
+  if (shared) desired.edges!.push({ id: "e51-second-consumer", relation: "realizes", source: operation,
+    target: "garden-consume-block", condition: "The producing operation also implements the consuming block" });
   desired.nodes.find(node => node.id === "garden-produce-block")!.ports.push({ id: "out-side", direction: "out", contract: "garden-contract" });
   desired.nodes.find(node => node.id === "garden-consume-block")!.ports.push({ id: "in-side", direction: "in", contract: "garden-contract" });
   desired.connectors.push({ id: "garden-side-flow", artifact: "garden-data", returnsTo: "garden-produce-block", wakeTest: null,
     bindings: [{ level: 1, producer: { node: "garden-produce-block", port: "out-side" },
       consumers: [{ node: "garden-consume-block", port: "in-side" }], anchor: null }] });
+  // twoSets: the accepted L2 fills the side connection with its operations, as the native layer producer requires.
+  if (shared) {
+    desired.nodes.find(node => node.id === operation)!.ports.push({ id: "out-side", direction: "out", contract: "garden-contract" });
+    desired.nodes.find(node => node.id === "garden-consume-operation")!.ports.push({ id: "in-side", direction: "in", contract: "garden-contract" });
+    desired.connectors.find(connector => connector.id === "garden-side-flow")!.bindings.push({ level: 2,
+      producer: { node: operation, port: "out-side" }, consumers: [{ node: "garden-consume-operation", port: "in-side" }], anchor: null });
+  }
   const { level: _level, ...l1 } = projectGraph(desired, 1);
   preparedFeatures(engine, project, l1 as Graph, field => {
     const value = preparedField(project, field);
     if (field === "preparation") (value as Record<string, Json>).unknowns = [...facts.map(id => ({ id,
-      question: `What ${id} is supported?`, consumer: "garden-consume-block", moment: "om-pass",
+      question: `What ${id} is supported?`, consumer: id === shared ? operation : "garden-consume-block", moment: "om-pass",
       blocksCurrentStage: false, resolution: "Resolve the addressed question during OM" })),
       ...(variant.producer ? [{ id: "pressure", question: "What pressure is supported?", consumer: "garden-produce-block",
         moment: "om-pass", blocksCurrentStage: false, resolution: "Resolve the addressed question during OM" }] : [])];
@@ -2858,20 +2871,25 @@ function e51Prefix(store: Store, factCount: number, managed = false, variant: E5
   });
   if (variant.notes) engine.discovery.evidence.document(project, "e51-notes", "UTF-8 is the supported encoding.", "text/plain", 0);
   const stages = Object.fromEntries(UPSTREAM_STAGES.map(stage => [stage, reference(store.get(`stage:${project}:${stage}`)!)])) as Record<UpstreamStage, Ref>;
-  const base = deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
-  const graph = store.get<Graph>(`graph:${project}`)!;
-  const addressed = [...facts.map(id => ({ target: `discovery:${id}`, consumer: "garden-consume-block" })),
+  // twoSets: the L2 is accepted through the native candidate and its real G3 gate; that producer writes the G1 input.
+  if (shared) prepareNativeLayers(engine, project, desired, "n2");
+  const base = shared ? store.get(`om-input:${project}`)! : deliveredOf(writeOmInput(store, { project, expected: 0, stages }));
+  const graph = store.get<Graph>(`graph:${project}`)!, layer = shared ? reference(store.get(`graph-layer:${project}:2`)!) : null;
+  const addressed = [...facts.map(id => ({ target: `discovery:${id}`, consumer: id === shared ? operation : "garden-consume-block" })),
     ...(variant.producer ? [{ target: "discovery:pressure", consumer: "garden-produce-block" }] : [])];
   const input = deliveredOf(writeAddressing(store, { project, input: reference(base), graph: reference(graph),
     decisions: addressed.map(({ target, consumer }) => ({ pending:
-      structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: [],
+      structuredClone(inputDecisionWrite({ project, input: reference(base), graph: reference(graph), layers: layer && consumer === operation ? [layer] : [],
         decision: { target, field: "address", value: { consumer, kind: "repository-fact" } } })) as Write })) }));
-  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: null,
+  const horizon = deliveredOf(writeHorizon(store, { project, input: reference(input), graph: reference(graph), refinement: layer,
     available: {}, choice: { choiceVersion: "e51-fact", features: [{ outcome: "garden-result" }], excluded: [] } }));
+  const upperFrame = layer ? reference(store.get(`om-frame:${project}:2`)!) : null;
   const sources: GapRequest = { project, input: reference(input), graph: reference(graph), horizon: reference(horizon.gate),
     operations: { proposals: [], frame: { project, level: 2, graph: reference(graph), horizon: reference(horizon.gate),
-      layer: null, frame: null, upper: null } },
-    works: { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
+      layer, frame: upperFrame, upper: null } },
+    works: layer ? { proposals: [], frame: { project, level: 3, graph: reference(graph), horizon: reference(horizon.gate), layer: null,
+      frame: null, upper: { horizon: reference(horizon.gate), frame: upperFrame }, workZoneContract: "accepted-l2-v1" } }
+      : { state: "upper-not-accepted", layer: reference(store.get(`graph-layer:${project}:2`)!) } };
   const gaps = deliveredOf(writeGaps(store, sources));
   const gapRequest = { sources: structuredClone(gaps.sources) as GapRequest, records: gaps.records.map(reference) };
   const tasks = deliveredOf(prepareQuestionTasks(store, { project, gaps: gapRequest,
@@ -2886,24 +2904,32 @@ function e51Prefix(store: Store, factCount: number, managed = false, variant: E5
   const producerBatch = variant.producer ? routes.value.batches.find(item => item.model === "MC1"
     && item.items.some(question => question.target === "discovery:pressure")) ?? null : null;
   if (variant.producer) assert.ok(producerBatch && producerBatch.id !== batch.id, "the producing block has an MC1 batch of its own");
+  // twoSets: the second original MC1 batch of the same plan — its consumer set is both blocks, the consuming block among them.
+  const secondBatch = shared ? routes.value.batches.find(item => item.model === "MC1"
+    && item.items.some(question => question.target === `discovery:${shared}`)) ?? null : null;
+  if (shared) assert.ok(secondBatch && secondBatch.id !== batch.id
+    && secondBatch.items.every(item => canonical(item.consumers) === canonical(["garden-consume-block", "garden-produce-block"])),
+    "the shared fact is its own MC1 batch of both blocks");
+  const batches = [batch, ...(secondBatch ? [secondBatch] : [])];
   const block = "garden-consume-block",
     source = store.get<{ content: string }>(variant.notes ? `source:${project}:e51-notes` : `source:${project}:brief`)!;
-  const attemptGoal: AttemptGoal = { key: "e51:fact", questions: batch.items.map(item => gapLineKey(project, item.target, item.field)),
+  const questions = batches.flatMap(row => row.items).map(item => gapLineKey(project, item.target, item.field));
+  const attemptGoal: AttemptGoal = { key: "e51:fact", questions: secondBatch ? questions.sort() : questions,
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   deliveredOf(openSeries(store, { project, block, line: 1, slice: "e51-fact", predecessor: null, basis: null }));
   // LG07: a managed attempt opens through G7 with the complete plan of its MC1 batch.
   const series = deliveredOf(managed ? openAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal,
-    completion: { routes: reference(routes), batches: [batch.id] } }) : beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
-  return { frame: sources.operations.frame, routes, batch, source, attemptGoal, series, producerBatch };
+    completion: { routes: reference(routes), batches: batches.map(row => row.id) } }) : beginAttempt(store, { project, block, line: 1, attempt: 1, goal: attemptGoal }));
+  return { frame: sources.operations.frame, routes, batch, source, attemptGoal, series, producerBatch, secondBatch };
 }
 
 /** An issued one-to-three-question MC1 response, with the real E1 transport and D1 attempt behind E5. */
 function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, managed = false, variant: E51Variant = {}) {
   const factCount = typeof twoFacts === "boolean" ? twoFacts ? 2 : 1 : twoFacts;
   assert.ok(Number.isInteger(factCount) && factCount >= 1 && factCount <= 3);
-  const seeded = seedCopy(`e51:${factCount}:${managed ? "managed" : "standalone"}:${variant.notes ? "notes" : "brief"}:${variant.producer ? "producer" : "one"}`,
+  const seeded = seedCopy(`e51:${factCount}:${managed ? "managed" : "standalone"}:${variant.notes ? "notes" : "brief"}:${variant.producer ? "producer" : "one"}${variant.twoSets ? ":two-sets" : ""}`,
     store => e51Prefix(store, factCount, managed, variant), "omg-e51-g7-");
-  const { root, database: path } = seeded, { frame, routes, batch, source, attemptGoal, series, producerBatch } = seeded.data;
+  const { root, database: path } = seeded, { frame, routes, batch, source, attemptGoal, series, producerBatch, secondBatch } = seeded.data;
   const project = "garden", block = "garden-consume-block";
   let store = new Store(path);
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -2926,7 +2952,7 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, mana
   const dispatch = { adapter: reference(adapter), config: reference(config) };
   writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep] }));
   return { root, path, project, block, series, attemptGoal, frame,
-    engine, config, scenario, originalStep, routes, batch, dispatch, source, producerBatch,
+    engine, config, scenario, originalStep, routes, batch, dispatch, source, producerBatch, secondBatch,
     questionIds: batch.items.map(item => item.gap),
     get store() { return store; },
     async original(): Promise<AssessmentIntentRequest> {
@@ -2935,6 +2961,17 @@ function e51Fixture(t: test.TestContext, twoFacts: boolean | number = true, mana
       return { project, modelCall: reference(model.record), questionId: batch.items[0]!.gap, dispatch };
     },
     async secondOriginal(value = "UTF-8"): Promise<AssessmentIntentRequest> {
+      if (secondBatch) {
+        // twoSets: the second product of the attempt's own original plan — the E2 packet of its second MC1 batch.
+        const secondPacket = deliveredOf(writeQuestionPacket(store, { project, routes: reference(routes), batch: secondBatch.id,
+          environment: reference(config), attempt: { series: reference(series), ordinal: 1 }, previous: [] })).record;
+        secondOriginalStep = { ...originalStep, research: { ...originalStep.research,
+          results: secondBatch.items.map(item => ({ ...originalStep.research.results[0]!, questionId: item.gap, value })) } };
+        writeFileSync(scenario, JSON.stringify({ database: store.path, steps: [originalStep, secondOriginalStep] }));
+        const model = deliveredOf(await runModelCall(store, { project, packet: reference(secondPacket), dispatch, role: "implementer" }));
+        assert.equal(model.outcome?.kind, "fact-candidates");
+        return { project, modelCall: reference(model.record), questionId: secondBatch.items[0]!.gap, dispatch };
+      }
       const prior = routes.value.request;
       const successor = deliveredOf(writeRoutes(store, { project, gaps: structuredClone(prior.gaps) as GapReadRequest,
         tasks: prior.tasks.map(record => ({ record })),
@@ -3497,7 +3534,9 @@ test("E5.1 refuses an incomplete E1 set and guards the final terminal after succ
 });
 
 test("E5.1 joins two distinct original MC1 sets on one attempt before closing it", async t => {
-  const f = e51Fixture(t, false), first = await f.original(), second = await f.secondOriginal();
+  // LG07 (№10753 п.1): the two sets are the two original MC1 batches of the attempt's own plan; G7 joins their refusals.
+  const f = e51Fixture(t, 2, true, { twoSets: true }), first = await f.original(), second = await f.secondOriginal();
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
   assert.notEqual(first.modelCall.id, second.modelCall.id);
   const admittedFirst = e51AdmitAssessorE1(f.store, first);
   const admittedSecond = e51AdmitAssessorE1(f.store, second);
@@ -3507,11 +3546,17 @@ test("E5.1 joins two distinct original MC1 sets on one attempt before closing it
   f.assessorsForTwoOriginals("insufficient", "conflicting");
   const firstResult = deliveredOf(await assessFact(f.store, first));
   assert.equal(firstResult.value.verdict, "insufficient");
-  assert.equal(e51Outcome(f), null, "the second issued MC1 set still has no terminal result");
+  const pending = f.store.list().map(reference), pendingSends = f.sent().length;
+  assert.equal(refusalOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).code, "completion_incomplete",
+    "the second original MC1 set still has no terminal result");
+  assert.deepEqual(f.store.list().map(reference), pending);
+  assert.equal(f.sent().length, pendingSends);
   const secondResult = deliveredOf(await assessFact(f.store, second));
   assert.equal(secondResult.value.verdict, "conflicting");
+  assert.equal(e51Outcome(f), null, "E5 leaves the close to G7");
   const refusalIds = [firstResult, secondResult].map(result => assessmentRefusalId(f.project, reference(result)));
   assert.equal(new Set(refusalIds).size, 2);
+  const { claim, closed } = e51Close(f);
   const attempt = e51Outcome(f);
   assert.ok(attempt);
   assert.equal(attempt.reason, "refused");
@@ -3523,6 +3568,7 @@ test("E5.1 joins two distinct original MC1 sets on one attempt before closing it
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 1);
   const before = f.store.list().map(reference), calls = f.sent().length;
   f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), closed);
   assert.deepEqual(deliveredOf(await assessFact(f.store, first)), firstResult);
   assert.deepEqual(deliveredOf(await assessFact(f.store, second)), secondResult);
   assert.deepEqual(f.store.list().map(reference), before);
@@ -3771,7 +3817,9 @@ test("E5.1 gives the same mixed result across fact order and two original MC1 se
     assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 0);
   });
   for (const reverse of [true]) await t.test(`MC1 discovery ${reverse ? "reverse" : "forward"}`, async child => {
-    const f = e51Fixture(child, false), first = await f.original(), second = await f.secondOriginal();
+    // LG07 (№10753 п.1): the two original MC1 batches of the attempt's own plan, assessed in reverse order; G7 closes them.
+    const f = e51Fixture(child, 2, true, { twoSets: true }), first = await f.original(), second = await f.secondOriginal();
+    const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
     deliveredOf(e51AdmitAssessorE1(f.store, first).call);
     deliveredOf(e51AdmitAssessorE1(f.store, second).call);
     f.assessorsForTwoOriginals(...(reverse ? ["off-form", "supported"] as const
@@ -3781,17 +3829,17 @@ test("E5.1 gives the same mixed result across fact order and two original MC1 se
     for (const request of requests) results.push(deliveredOf(await assessFact(f.store, request)));
     assert.deepEqual(results.map(row => row.value.verdict), reverse
       ? ["off-form", "supported"] : ["supported", "off-form"]);
-    const finished = deliveredOf(finishAssessmentAttempt(f.store, f.project, results[0]!.value.intent));
-    assert.equal(finished.closed, true);
+    assert.equal(deliveredOf(finishAssessmentAttempt(f.store, f.project, results[0]!.value.intent)).closed, false);
+    const accepted = results.find(row => row.value.verdict === "supported")!.value.accepted!;
+    const { claim, closed } = e51Close(f);
+    assert.deepEqual(claim.accepting, [accepted]);
+    assert.equal(deliveredOf(finishAssessmentAttempt(f.store, f.project, results[0]!.value.intent)).closed, true);
     const saved = e51Outcome(f);
     assert.ok(saved);
     assert.equal(saved.reason, "result");
     assert.equal(saved.achieved.length, 1);
     assert.deepEqual(saved.refusals, []);
-    const accepted = results.find(row => row.value.verdict === "supported")!.value.accepted!;
-    const request = { project: f.project, block: f.block, line: 1, attempt: 1,
-      outcome: outcome({ accepting: [accepted] }) };
-    const closed = deliveredOf(closeAttempt(f.store, request));
+    const request = { ...at, outcome: claim };
     const before = f.store.list().map(reference), calls = f.sent().length;
     f.restart();
     assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), closed);
@@ -3907,28 +3955,28 @@ test("E5.1 lets a proved native D5 achievement close a technical E5 set as resul
   assert.equal(f.sent().length, calls);
 });
 
-test("E5.1 checks both supported MC1 sources but records one achievement for their shared key", async t => {
-  const f = e51Fixture(t, false), first = await f.original(), second = await f.secondOriginal();
+test("E5.1 checks both supported original MC1 sets and closes their two achievements independent of caller order", async t => {
+  // LG07 (№10753 п.1): the two original MC1 batches of the attempt's own plan, both supported. A question has one batch of
+  // its plan, so one shared key of ONE question in one close is the E5+D2 pair of «confirms both E5 and its own D2
+  // closure», and across attempts «two attempts of one question accept two real answers of one semantic key».
+  const f = e51Fixture(t, 2, true, { twoSets: true }), first = await f.original(), second = await f.secondOriginal();
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
   deliveredOf(e51AdmitAssessorE1(f.store, first).call);
   deliveredOf(e51AdmitAssessorE1(f.store, second).call);
   f.assessorsForTwoOriginals("supported", "supported");
   const firstResult = deliveredOf(await assessFact(f.store, first));
-  assert.equal(e51Outcome(f), null, "the second admitted MC1 remains unfinished");
-  const originalWrite = f.store.writeMany.bind(f.store);
-  f.store.writeMany = ((writes, guards) => {
-    if (writes.some(write => write.kind === "repair-series" && write.id === f.series.id && write.expected > 0))
-      throw new Error("stop before duplicate-key G7 write");
-    return originalWrite(writes, guards);
-  }) as Store["writeMany"];
-  try { await assert.rejects(() => assessFact(f.store, second), /stop before duplicate-key G7 write/); }
-  finally { f.store.writeMany = originalWrite; }
-  const terminals = f.store.list<AssessmentResultRecord>(ASSESSMENT_RESULT_KIND);
-  assert.equal(terminals.length, 2);
+  const pending = f.store.list().map(reference);
+  assert.equal(refusalOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).code, "completion_incomplete",
+    "the second admitted MC1 set remains unfinished");
+  assert.deepEqual(f.store.list().map(reference), pending);
+  const secondResult = deliveredOf(await assessFact(f.store, second));
+  assert.equal(e51Outcome(f), null, "E5 leaves the close to G7");
+  const terminals = [firstResult, secondResult];
   assert.equal(terminals.every(row => row.value.verdict === "supported"), true);
   const accepted = terminals.map(row => row.value.accepted!);
   assert.equal(new Set(accepted.map(ref => ref.id)).size, 2);
-  const keys = accepted.map(ref => deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: ref })).key);
-  assert.equal(keys[0], keys[1], "the semantic fact is identical across two paid MC1 calls");
+  const keys = accepted.map(ref => e51KeyOf(f, ref));
+  assert.notEqual(keys[0], keys[1], "two questions of two sets are two semantic facts");
   const current = f.store.get<RepairSeries>(f.series.id)!;
   const closure = deliveredOf(readCurrentAssessmentAttemptClosure(f.store, { project: f.project,
     block: f.block, series: reference(current), attempt: 1, goal: f.attemptGoal }));
@@ -3937,27 +3985,25 @@ test("E5.1 checks both supported MC1 sources but records one achievement for the
   assert.equal(closure.results.length, 2);
   assert.deepEqual(closure.accepting, [...accepted].sort((left, right) =>
     canonical(left) < canonical(right) ? -1 : canonical(left) > canonical(right) ? 1 : 0));
-  const request = { project: f.project, block: f.block, line: 1, attempt: 1,
-    outcome: outcome({ accepting: closure.accepting }) };
-  const forward = deliveredOf(prepareCloseAttempt(f.store, request));
-  const reversed = deliveredOf(prepareCloseAttempt(f.store, { ...request,
-    outcome: outcome({ accepting: [...closure.accepting].reverse() }) }));
-  assert.deepEqual(reversed.writes, forward.writes,
-    "the aggregate and canonical representative cannot depend on caller order");
-  const closed = deliveredOf(closeAttempt(f.store, request));
+  const claim = deliveredOf(prepareManagedClaim(f.store, { ...at, outcome: outcome() })).outcome;
+  assert.deepEqual(claim.accepting, closure.accepting);
+  const forward = deliveredOf(prepareCloseAttempt(f.store, { ...at, outcome: claim }));
+  const reversed = deliveredOf(prepareCloseAttempt(f.store, { ...at,
+    outcome: { ...claim, accepting: [...claim.accepting].reverse() } }));
+  assert.deepEqual(reversed.writes, forward.writes, "the aggregate cannot depend on caller order");
+  const closed = deliveredOf(closeAttempt(f.store, { ...at, outcome: claim }));
   const saved = e51Outcome(f);
   assert.ok(saved);
   assert.equal(saved.reason, "result");
-  assert.equal(saved.achieved.length, 1);
-  assert.equal(saved.achieved[0]!.key, keys[0]);
-  assert.deepEqual(saved.achieved[0]!.basis, closure.accepting[0], "the representative is canonical");
+  assert.deepEqual(saved.achieved.map(item => item.key).sort(), [...keys].sort());
+  for (const [index, key] of keys.entries())
+    assert.deepEqual(saved.achieved.find(item => item.key === key)!.basis, accepted[index], "each achievement keeps its own basis");
   assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.withoutProgress, 0);
   const before = f.store.list().map(reference), sends = f.sent().length;
   assert.equal(sends, 4);
   f.restart();
-  assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), closed);
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), closed);
   assert.deepEqual(deliveredOf(await assessFact(f.store, first)), firstResult);
-  const secondResult = terminals.find(row => row.id !== firstResult.id)!;
   assert.deepEqual(deliveredOf(await assessFact(f.store, second)), secondResult);
   for (const terminal of terminals) {
     const replay = deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent));
@@ -3997,7 +4043,9 @@ test("E5.1 does not let a duplicated supported accepting hide an incomplete orig
 });
 
 test("E5.1 replays each local technical MC1 set against the shared interrupted outcome", async t => {
-  const f = e51Fixture(t, false), first = await f.original(), second = await f.secondOriginal();
+  // LG07 (№10753 п.1): the two original MC1 batches of the attempt's own plan; G7 derives their one interrupted outcome.
+  const f = e51Fixture(t, 2, true, { twoSets: true }), first = await f.original(), second = await f.secondOriginal();
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
   deliveredOf(e51AdmitAssessorE1(f.store, first).call);
   deliveredOf(e51AdmitAssessorE1(f.store, second).call);
   f.assessorsForTwoOriginals("off-form", "interrupted");
@@ -4006,9 +4054,8 @@ test("E5.1 replays each local technical MC1 set against the shared interrupted o
   assert.equal(offForm.value.verdict, "off-form");
   assert.equal(interrupted.value.verdict, "interrupted");
   assert.equal(e51Outcome(f), null);
-  const request = { project: f.project, block: f.block, line: 1, attempt: 1,
-    outcome: outcome({ reason: "interrupted" }) };
-  const closed = deliveredOf(closeAttempt(f.store, request));
+  const { claim, closed } = e51Close(f);
+  assert.equal(claim.reason, "interrupted");
   assert.equal(e51Outcome(f)?.reason, "interrupted");
   assert.deepEqual(e51Outcome(f)?.achieved, []);
   assert.deepEqual(e51Outcome(f)?.refusals, []);
@@ -4016,7 +4063,7 @@ test("E5.1 replays each local technical MC1 set against the shared interrupted o
   const before = f.store.list().map(reference), sends = f.sent().length;
   assert.equal(sends, 4);
   f.restart();
-  assert.deepEqual(deliveredOf(closeAttempt(f.store, request)), closed);
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), closed);
   for (const [original, terminal] of [[first, offForm], [second, interrupted]] as const) {
     const replay = deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent));
     assert.equal(replay.complete, true);
@@ -4028,25 +4075,30 @@ test("E5.1 replays each local technical MC1 set against the shared interrupted o
   assert.equal(f.sent().length, sends);
 });
 
-test("E5.1 keeps a supported fact and a separate negative result for the same question across MC1 calls", async t => {
-  const f = e51Fixture(t, false), first = await f.original(), second = await f.secondOriginal();
+test("E5.1 keeps a supported fact and a separate negative result of two original MC1 sets in one close", async t => {
+  // LG07 (№10753 п.1): achieved beside a refusal in one G7 close of the attempt's own two MC1 batches; for ONE question
+  // each stands in its own attempt («a supported and a negative terminal of one question»).
+  const f = e51Fixture(t, 2, true, { twoSets: true }), first = await f.original(), second = await f.secondOriginal();
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
   deliveredOf(e51AdmitAssessorE1(f.store, first).call);
   deliveredOf(e51AdmitAssessorE1(f.store, second).call);
   f.assessorsForTwoOriginals("supported", "insufficient");
   const supported = deliveredOf(await assessFact(f.store, first));
-  assert.equal(e51Outcome(f), null);
   const insufficient = deliveredOf(await assessFact(f.store, second));
+  assert.equal(e51Outcome(f), null);
   const source = f.store.get(assessmentRefusalId(f.project, reference(insufficient)))!;
-  const claim = e51Claim(f.store, f.project, reference(source));
+  const refusal = e51Claim(f.store, f.project, reference(source));
+  const { claim, closed } = e51Close(f);
   const saved = e51Outcome(f);
   assert.ok(saved);
   assert.equal(saved.reason, "result");
   assert.equal(saved.achieved.length, 1);
   assert.deepEqual(saved.achieved[0]!.basis, supported.value.accepted);
-  assert.deepEqual(saved.refusals, [{ row: claim.row }]);
+  assert.deepEqual(saved.refusals, [{ row: refusal.row }]);
   assert.deepEqual(saved.cancelled, []);
   const before = f.store.list().map(reference), sends = f.sent().length;
   f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), closed);
   for (const [original, terminal] of [[first, supported], [second, insufficient]] as const) {
     assert.deepEqual(deliveredOf(await assessFact(f.store, original)), terminal);
     const replay = deliveredOf(finishAssessmentAttempt(f.store, f.project, terminal.value.intent));
@@ -4084,19 +4136,23 @@ test("E5.1 keeps distinct supported values of one question as distinct semantic 
   assert.equal(f.sent().length, sends);
 });
 
-test("E5.1 gives two negative MC1 terminals of one question separate A2 rows", async t => {
-  const f = e51Fixture(t, false), first = await f.original(), second = await f.secondOriginal();
+test("E5.1 gives two negative terminals of the two original MC1 sets separate A2 rows joined by one close", async t => {
+  // LG07 (№10753 п.1): the same refusal code twice in one G7 close of the attempt's own two MC1 batches; for ONE question
+  // each row is of its own attempt («two negative terminals of one question in two attempts»).
+  const f = e51Fixture(t, 2, true, { twoSets: true }), first = await f.original(), second = await f.secondOriginal();
+  const at = { project: f.project, block: f.block, line: 1, attempt: 1 };
   deliveredOf(e51AdmitAssessorE1(f.store, first).call);
   deliveredOf(e51AdmitAssessorE1(f.store, second).call);
   f.assessorsForTwoOriginals("insufficient", "insufficient");
   const firstResult = deliveredOf(await assessFact(f.store, first));
-  assert.equal(e51Outcome(f), null);
   const secondResult = deliveredOf(await assessFact(f.store, second));
+  assert.equal(e51Outcome(f), null);
   const rows = [firstResult, secondResult].map(result => {
     const source = f.store.get(assessmentRefusalId(f.project, reference(result)))!;
     return e51Claim(f.store, f.project, reference(source)).row;
   });
   assert.equal(new Set(rows).size, 2);
+  const { claim, closed } = e51Close(f);
   const saved = e51Outcome(f);
   assert.ok(saved);
   assert.equal(saved.reason, "refused");
@@ -4104,15 +4160,15 @@ test("E5.1 gives two negative MC1 terminals of one question separate A2 rows", a
   assert.deepEqual(saved.refusals.map(item => item.row).sort(), rows.sort());
   const before = f.store.list().map(reference), sends = f.sent().length;
   f.restart();
+  assert.deepEqual(deliveredOf(closeAttempt(f.store, { ...at, outcome: claim })), closed);
   assert.deepEqual(deliveredOf(await assessFact(f.store, first)), firstResult);
   assert.deepEqual(deliveredOf(await assessFact(f.store, second)), secondResult);
   assert.deepEqual(f.store.list().map(reference), before);
   assert.equal(f.sent().length, sends);
 });
 
-// LG07 (№10083 п.4): properties of two answers to ONE question, carried by two lawful managed attempts. They are not the
-// earlier tests' checks of two bases in one close, a shared canonical representative, achieved beside a refusal in one
-// close, or two refusals joined by one close; those leave with the standalone scenarios of those tests in the src part.
+// LG07 (№10083 п.4): properties of two answers to ONE question, carried by two lawful managed attempts. Two original MC1
+// sets in one close — achieved beside a refusal, two refusals joined, two bases — are the twoSets tests above (№10753 п.1).
 const e51KeyOf = (f: ReturnType<typeof e51Fixture>, ref: Ref): string =>
   deliveredOf(readAcceptedAnswer(f.store, { project: f.project, record: ref })).key;
 
