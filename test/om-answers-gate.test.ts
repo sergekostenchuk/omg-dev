@@ -2600,7 +2600,17 @@ function plantedView(store: Store, ...planted: Revision<unknown>[]): Store {
 const reHashed = <T>(record: Revision<T>, value: T): Revision<T> => ({ ...record, value, hash: hashJson(value as unknown as Json) });
 
 test('15 H1.0c another attempt\'s N explains the gap but is journal-only for this attempt', async t => {
-  const f = fixture(t, 'repository-fact'), foreign = await assessedFact(f, 'insufficient', 'standalone'), m = managedAfter(f, 'row15', false);
+  // LG07 ag-rest (№10753 п.3): the earlier attempt is a real managed one — it pays its own MC1→E4→E5 N and ends
+  // by the claim its G7 derives; the next lawful managed attempt of the same line keeps the open question.
+  const f = fixture(t, 'repository-fact'), foreign = await assessedFact(f, 'insufficient', 'managed');
+  const priorBinding = ok(readCompletionBinding(f.store, f.project, reference(foreign.series), 1))!;
+  const priorWork = ok(readCompletionWorkAt(f.store, f.project,
+    reference(f.store.get(completionWorkId(f.project, priorBinding.id))!)));
+  assert.equal(priorWork.complete, true, 'The paid N completed the first managed work');
+  const claim = ok(prepareManagedClaim(f.store, { project: f.project, block: f.block, line: 1, attempt: 1,
+    outcome: { reason: 'result', accepting: [], cancelling: [], refusals: [] } })).outcome;
+  ok(closeAttempt(f.store, { project: f.project, block: f.block, line: 1, attempt: 1, outcome: claim }));
+  const m = managedAfter(f, 'row15', false);
   const saved = ok(evaluate(f, m, [{ gap: reference(factGap(f)), result: reference(foreign.terminal), candidate: null }]));
   assert.deepEqual(contributions(f, reference(saved.evaluation)), [['assessment-insufficient', 'answer_missing_for_blocking_gap',
     { kind: 'journal-only', wait: 'submission', barrier: true }]], 'No N or T of another attempt is carried over');
@@ -2900,6 +2910,9 @@ const laterRoute = (f: ReturnType<typeof fixture>) => ok(writeRoutes(f.store, { 
   tasks: f.route.value.routes.filter(row => row.task).map(row => ({ record: row.task! })), catalog: { paths: [], records: [] },
   previous: reference(f.route) }));
 
+// LG07 ag-rest (№10753 п.3): this test proves the cancelled non-managed close itself — it is removed together
+// with the LG07-src route rather than migrated; the live managed G4b guards are covered by the neighbouring
+// C22/37 tests below.
 test('C22 H1.0c a non-managed close claiming a real G4b row is origin_unreadable, without unknown, class or hold', t => {
   const f = fixture(t, 'repository-fact'), m = registered(f, 'c22');
   const saved = ok(evaluate(f, m, [])), source = saved.groups[0]!.source, g4b = claimOf(f, source);
