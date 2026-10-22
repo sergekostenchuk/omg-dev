@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonical, type Json, hashJson } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
-import { adapterRequest, readAdapterResponse, type AdapterRequestInput, type AdapterResponseInput, runModelCall, runModelCycle, readModelCycle, deliverModelSources, readContinuationEvidence, readPartAssembly, readModelCall, assembleModelParts, runModelTransport, readModelTransport, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type OmModelCall, readModelCallState, type ModelCallRequest, type ModelTransportRequest, pendingCallStore, readModelCycle as mp2ReadCycle, runModelCycle as mp2Cycle, CYCLE_POLICY } from '../src/om/model-call.js';
+import { adapterRequest, readAdapterResponse, type AdapterRequestInput, type AdapterResponseInput, runModelCall, runModelCycle, readModelCycle, deliverModelSources, readContinuationEvidence, readPartAssembly, readModelCall, readManagedModelDiagnostic, assembleModelParts, runModelTransport, readModelTransport, finishModelAttempt, prepareModelAttemptFinish, readModelApplicationRejection, type OmModelCall, readModelCallState, type ModelCallRequest, type ModelTransportRequest, pendingCallStore, readModelCycle as mp2ReadCycle, runModelCycle as mp2Cycle, CYCLE_POLICY } from '../src/om/model-call.js';
 import { type ProcessResult } from '../src/runtime/process.js';
 import { Store, type Write, type Revision } from '../src/storage/store.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
@@ -835,7 +835,11 @@ test('E4 public recovery closes a truly lost pre-spawn owner for products and an
       } else {
         // LG07: the still-owed node parts keep the registry honestly incomplete; the durable physical outcome is
         // the written unit refusal and no managed close can be fabricated over the lost call.
-        assert.ok((recovered.value as OmModelCall).om.diagnostic, 'The interrupted outcome is a written managed unit refusal');
+        const diagnostic = valueOf(readManagedModelDiagnostic(f.store,
+          completionSnapshot(f as ReturnType<typeof e4Fixture>).binding, (recovered.value as OmModelCall).om.diagnostic!));
+        assert.equal(diagnostic.reason, 'interrupted');
+        assert.deepEqual([diagnostic.request.packet, diagnostic.request.call],
+          [(recovered.value as OmModelCall).om.request.packet, (recovered.value as OmModelCall).om.call]);
         const unclosed = prepareManagedClaim(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
           outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } });
         assert.equal(unclosed.ok, false); if (!unclosed.ok) assert.equal(unclosed.refusal.code, 'completion_incomplete');
@@ -844,6 +848,9 @@ test('E4 public recovery closes a truly lost pre-spawn owner for products and an
       const snapshot = f.store.list(); f.restart();
       assert.deepEqual(valueOf(await runModelCall(f.store, f.request as ModelCallRequest)), expected);
       assert.deepEqual(f.store.list(), snapshot);
+      if (purpose !== 'fact') assert.equal(valueOf(readManagedModelDiagnostic(f.store,
+        completionSnapshot(f as ReturnType<typeof e4Fixture>).binding, (recovered.value as OmModelCall).om.diagnostic!)).reason,
+        'interrupted', 'The interrupted proof survives the restart');
     } else {
       assert.deepEqual(reference(f.store.get(f.series.id)!), originalSeries);
       const expected = valueOf(readModelTransport(f.store, { project: f.project, record: reference(recovered) }));
@@ -901,7 +908,11 @@ test('E4 actual owner and provider loss recover both product calls and analysis 
       } else {
         // LG07: the still-owed node parts keep the registry honestly incomplete; the durable physical outcome is
         // the written unit refusal and no managed close can be fabricated over the lost call.
-        assert.ok((recovered.value as OmModelCall).om.diagnostic, 'The interrupted outcome is a written managed unit refusal');
+        const diagnostic = valueOf(readManagedModelDiagnostic(f.store,
+          completionSnapshot(f as ReturnType<typeof e4Fixture>).binding, (recovered.value as OmModelCall).om.diagnostic!));
+        assert.equal(diagnostic.reason, 'interrupted');
+        assert.deepEqual([diagnostic.request.packet, diagnostic.request.call],
+          [(recovered.value as OmModelCall).om.request.packet, (recovered.value as OmModelCall).om.call]);
         const unclosed = prepareManagedClaim(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
           outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } });
         assert.equal(unclosed.ok, false); if (!unclosed.ok) assert.equal(unclosed.refusal.code, 'completion_incomplete');
@@ -910,6 +921,9 @@ test('E4 actual owner and provider loss recover both product calls and analysis 
       const snapshot = f.store.list(); f.restart();
       assert.deepEqual(valueOf(await runModelCall(f.store, f.request as ModelCallRequest)), expected);
       assert.deepEqual(f.store.list(), snapshot);
+      if (purpose !== 'fact') assert.equal(valueOf(readManagedModelDiagnostic(f.store,
+        completionSnapshot(f as ReturnType<typeof e4Fixture>).binding, (recovered.value as OmModelCall).om.diagnostic!)).reason,
+        'interrupted', 'The interrupted proof survives the restart');
     } else {
       assert.deepEqual(reference(f.store.get(f.series.id)!), originalSeries, 'Recovery must not resolve an analysis ground or invent A6 results');
       const expected = valueOf(readModelTransport(f.store, { project: f.project, record: reference(recovered) }));
@@ -931,11 +945,11 @@ test('E4 competing public recoveries commit one terminal product transition and 
     { path: checkpoint, kind: 'model-call', matches: [{ path: ['execution', 'phase'], value: 'claimed' }] });
   await fixtureCheckpoint(checkpoint, driver.child); await killFixtureDriver(driver);
   const running = f.store.list<ModelCall>('model-call')[0]!, writeMany = f.store.writeMany.bind(f.store);
-  let winner: Revision<ModelCall> | null = null;
+  let winner: Revision<ModelCall> | null = null, raced: ReturnType<Store['list']> | null = null;
   f.store.writeMany = ((writes, guards) => {
     if (!winner && writes.some(write => write.kind === 'model-call-recovery')) {
       const other = new Store(f.database);
-      try { winner = publicRecovery(other, f.project, reference(running)); }
+      try { winner = publicRecovery(other, f.project, reference(running)); raced = f.store.list(); }
       finally { other.close(); }
     }
     return writeMany(writes, guards);
@@ -944,7 +958,9 @@ test('E4 competing public recoveries commit one terminal product transition and 
     assert.throws(() => publicRecovery(f.store, f.project, reference(running)),
       (error: unknown) => error instanceof EngineError && ['input_stale', 'revision_conflict', 'model_call_foreign'].includes(error.code));
   } finally { f.store.writeMany = writeMany; }
-  assert.ok(winner); assert.deepEqual(f.store.get(running.id), winner);
+  // LG07: the losing refusal wrote nothing — the store still holds exactly the winner's commit.
+  assert.ok(winner); assert.deepEqual(f.store.list(), raced);
+  assert.deepEqual(f.store.get(running.id), winner);
   assert.equal(f.store.list('model-call-recovery').length, 1); assert.equal(f.sent().length, 0);
   // LG07: the winning recovery is the terminal physical transition; the managed attempt closes at explicit G7.
   const series = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
@@ -978,7 +994,9 @@ test('E4 records real local supplier death while its owner survives as one inter
   // the registry honestly incomplete — the attempt stays open and no managed close can be fabricated over it.
   const series = f.store.get<{attempts:{outcome:{reason:string}|null}[]}>(f.series.id)!;
   assert.equal(series.value.attempts[0]!.outcome, null);
-  assert.ok(recovered.value.om.diagnostic, 'The interrupted outcome is a written managed unit refusal');
+  const diagnostic = valueOf(readManagedModelDiagnostic(f.store, completionSnapshot(f).binding, recovered.value.om.diagnostic!));
+  assert.equal(diagnostic.reason, 'interrupted');
+  assert.deepEqual([diagnostic.request.packet, diagnostic.request.call], [recovered.value.om.request.packet, recovered.value.om.call]);
   const unclosed = prepareManagedClaim(f.store, { ...seriesRequestOf(f.series.value), attempt: 1,
     outcome: { reason: 'interrupted', accepting: [], cancelling: [], refusals: [] } });
   assert.equal(unclosed.ok, false); if (!unclosed.ok) assert.equal(unclosed.refusal.code, 'completion_incomplete');
@@ -988,6 +1006,8 @@ test('E4 records real local supplier death while its owner survives as one inter
   const saved = f.store.list(); f.restart();
   assert.deepEqual(valueOf(await runModelCall(f.store, f.request)), expected);
   assert.deepEqual(f.store.list(), saved); assert.equal(f.sent().length, 1);
+  assert.equal(valueOf(readManagedModelDiagnostic(f.store, completionSnapshot(f).binding, recovered.value.om.diagnostic!)).reason,
+    'interrupted', 'The interrupted proof survives the restart');
 });
 
 
