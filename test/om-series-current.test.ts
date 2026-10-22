@@ -809,8 +809,24 @@ function frameClosure(f: Fixture) {
   const line = gaps.collection.gaps.find(item => item.field === 'fill' && item.consumers.includes(block) && item.evidence.some(evidence => evidence.origin === 'operations'))!;
   assert.ok(line);
   f.series();
-  const goal = { key: 'frame:accepted-operation', questions: [gapLineKey(project, line.target, line.field)], result: gapLineExpectedResult(project, line.target, line.field) };
-  ok(beginAttempt(f.store, { project, block, line: 1, attempt: 1, goal }));
+  // LG07 sc-rest (№10753 п.4): the closure's attempt is a real managed open — real E2 tasks and M6 routing of the
+  // pass-1 gaps while their D1 batch is still current, the whole node-expansion batch of this block as the goal,
+  // and the exact route/batch plan as the completion. The open precedes the frame-accepted D2 because the
+  // activation of a not yet activated series is 'establish-basis', which a running attempt does not hold back,
+  // while the accepted frame's new graph head would make the recorded M6 re-derivation stale.
+  const tasks = ok(prepareQuestionTasks(f.store, { project, gaps: initial,
+    questions: gaps.records.filter(row => row.value.gap.kind === 'repository-fact' && row.value.gap.code !== 'inventory_missing' && !row.value.gap.deferral)
+      .map(row => ({ gap: reference(row), requirements: [{ pointer: '/contracts/0' }], resultForm: { type: 'string' } })) }));
+  const routes = ok(writeRoutes(f.store, { project, gaps: initial, tasks: tasks.tasks.map(task => ({ pending: clone(task.writes[0]!) as Write })),
+    catalog: { paths: [], records: [] }, previous: null }));
+  const batch = routes.value.batches.find(item => item.task === 'node-expansion' && item.node === block)!;
+  assert.ok(batch, 'The fill gaps of this block must own a whole node-expansion batch');
+  const goal = { key: 'frame:accepted-operation', questions: batch.items.map(item => gapLineKey(project, item.target, item.field)).sort(),
+    result: gapLineExpectedResult(project, line.target, line.field) };
+  const plan = { routes: reference(routes), batches: [batch.id] };
+  const begun = ok(managedOpenAttempt(f.store, { project, block, line: head(f).value.line, attempt: 1, goal, completion: plan }));
+  const binding = ok(readCompletionBinding(f.store, project, reference(begun), 1));
+  assert.ok(binding); assert.deepEqual(binding.value.plan, plan); assert.deepEqual(binding.value.goal, goal);
   const acceptance = acceptMappedFrame(f, frame);
   const nextHorizon = (choiceVersion: string) => ok(writeHorizon(f.store, { project, input: reference(f.input), graph: acceptance.graph,
     refinement: acceptance.layer, available: {}, choice: { choiceVersion, features: [{ outcome: 'garden-result' }], excluded: [] } }));
