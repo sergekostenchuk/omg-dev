@@ -953,7 +953,9 @@ test('G4b reads an ordinary applied MC1 off-form result by its E4 product contra
     && item.code === 'answer_missing_for_blocking_gap'));
   f.restart();
   assert.deepEqual(ok(readAnswersGate(f.store, { project: f.project, record: reference(saved) })), saved);
+  const stored = snapshot(f.store);
   assert.deepEqual(ok(writeAnswersGate(f.store, request)), saved);
+  assert.deepEqual(snapshot(f.store), stored, 'An exact repeat of the standing gate writes nothing');
 });
 
 test('G4b keeps a direct E5 assessor transport distinct from an ordinary MC1 after restart', async t => {
