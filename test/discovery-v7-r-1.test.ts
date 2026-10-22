@@ -1,0 +1,338 @@
+import {prepareResearchConsumerIntent,prepareResearchConsumerApplication,readResearchConsumerExecution,completeResearchAttemptTurn} from '../src/discovery/response-recovery.js';
+import {projectPaidTurnAdmission,managedTurnId} from '../src/discovery/research-consumer-transition.js';
+import {recordV7Attempt} from '../src/discovery/v7-attempts.js';
+import {attemptEndOfAction,V7_PLAN_SUBJECT_CONTRACT} from '../src/discovery/v7-managed-attempt.js';
+import {projectAttemptPacket,attemptAccountKey} from '../src/discovery/v7-attempt-assessment.js';
+import {REQUEST_MANIFEST_CONTRACT} from '../src/discovery/request-parts.js';
+import {uniqueTransactionGuards} from '../src/runtime/environment.js';
+import type {ResearchRun} from '../src/discovery/research-model.js';
+import {v7CheckpointPrefixes} from '../src/discovery/v7-plan-questions.js';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtempSync,rmSync,writeFileSync,readFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {Discovery,type DiscoveryDraft,type Question} from '../src/discovery/discovery.js';
+import {createPartialV7Draft,V7_AXES,V7_STAGE_TOKEN_CEILING} from '../src/discovery/v7-contracts.js';
+import {Store,type Revision} from '../src/storage/store.js';
+import {ProductEngine} from '../src/product/engine.js';
+import {reference,type Ref} from '../src/pipeline/contracts.js';
+import {hashJson,type Json} from '../src/canonical.js';
+import {answerDiscoveryFixture} from './product-fixture.js';
+import {researchCall} from '../src/discovery/research-protocol.js';
+import {Researcher} from '../src/discovery/research-runner.js';
+import {applyDiscoveryAssessment,v7ProgressBaseline,readV7ProgressStateAt} from '../src/discovery/v7-progress.js';
+import {assessAttemptsWithRequirements,readDiscoveryAssessment} from '../src/discovery/research-assessment.js';
+function fixture(t: { after(fn: () => void): void }) {
+  const root = mkdtempSync(join(tmpdir(), "omg-r1-"));
+  const path = join(root, "state.sqlite"), stores: Store[] = [];
+  const open = () => { const db = new Store(path); stores.push(db); return db; };
+  const store = open(), engine = new ProductEngine(store), discovery = new Discovery(store);
+  t.after(() => { for (const db of stores) db.close(); rmSync(root, { recursive: true, force: true }); });
+  return { root, path, store, engine, discovery, open };
+}
+type Fixture = ReturnType<typeof fixture>;
+
+const rand = () => Math.random().toString(16).slice(2);
+const allAxes = (depth: string) => Object.fromEntries(V7_AXES.map(axis => [axis, { depth }]));
+
+function validFrame(): Json {
+  return { productType: "internal", scale: "30 users across 10 sites",
+    industries: ["construction"], domains: ["materials supply", "equipment accounting"],
+    axes: allAxes("deep"),
+    budget: { ceiling: V7_STAGE_TOKEN_CEILING, axisHints: { industry: 4_000_000 }, completionReserve: 2_000_000 } };
+}
+type PlanQuestion = { id: string; axis: string; domain: string; text: string; class: string;
+  criterion: string; requiredDepth: string; roles: string[]; searchPlaces: string[] };
+function planQuestion(id: string, axis: string, cls = "supporting"): PlanQuestion {
+  return { id, axis, domain: "construction", text: `What covers ${id}?`,
+    class: cls, criterion: `Named basis answering ${id}`, requiredDepth: "deep",
+    roles: ["domain expert"], searchPlaces: ["domain documents"] };
+}
+function validPlan(frameRef: Ref, questions: PlanQuestion[], edition = 1, previous: Ref | null = null): Json {
+  return { edition, frame: frameRef, previous, questions } as unknown as Json;
+}
+function questionOf(store: Store, draft: Revision<DiscoveryDraft>, field: string): Revision<Question> {
+  const question = draft.value.questions.map(id => store.get<Question>(id)!).find(q => q.value.spec.field === field);
+  assert.ok(question, `question for ${field}`);
+  return question;
+}
+/** The real plan acceptance chain (frame and plan through #answer). */
+function acceptPlan(f: Fixture, project: string, questions: PlanQuestion[]) {
+  const base = createPartialV7Draft(f.discovery, project, "concept");
+  const src = f.discovery.evidence.document(project, "basis", `Exact source for ${project}`, "text/plain", 0);
+  const frame = questionOf(f.store, base, "frame");
+  answerDiscoveryFixture(f.engine, project, base, frame, validFrame(), src);
+  const frameRef = f.store.get<Question>(frame.id)!.value.answer!;
+  const planQ = questionOf(f.store, base, "plan");
+  answerDiscoveryFixture(f.engine, project, base, planQ, validPlan(frameRef, questions), src);
+  const plan = f.store.get<Question>(planQ.id)!;
+  return { draft: f.store.get<DiscoveryDraft>(base.id)!, plan, planAnswer: plan.value.answer!, frameRef };
+}
+/** The next lawful plan edition: reopen and accept again. */
+function acceptNextPlanEdition(f: Fixture, project: string, draft: Revision<DiscoveryDraft>, frameRef: Ref,
+  previous: Ref, questions: PlanQuestion[]) {
+  const planQ = questionOf(f.store, f.store.get<DiscoveryDraft>(draft.id)!, "plan");
+  f.discovery.reopen(planQ.id, planQ.revision);
+  const reopened = f.store.get<Question>(planQ.id)!;
+  const src = f.discovery.evidence.document(project, `basis-${rand()}`, `Source ${rand()}`, "text/plain", 0);
+  answerDiscoveryFixture(f.engine, project, f.store.get<DiscoveryDraft>(draft.id)!, reopened,
+    validPlan(frameRef, questions, 2, previous), src);
+  const plan = f.store.get<Question>(planQ.id)!;
+  return { draft: f.store.get<DiscoveryDraft>(draft.id)!, plan, planAnswer: plan.value.answer! };
+}
+
+
+async function setup(t: test.TestContext, questions = [planQuestion('support','market'), planQuestion('block','industry','blocking')], calibrated = true) {
+  const f=fixture(t);f.engine.execute({type:'create-project',project:'p',title:'P'});
+  const wire=join(f.root,'wire.ndjson'), settings=join(f.root,'reply.json'), adapter=join(f.root,'adapter.mjs');
+  const configure=(replies: unknown[]=[], tokens: number | null=10)=>writeFileSync(settings,JSON.stringify({replies,tokens}));
+  configure();
+  writeFileSync(adapter, `import {readFileSync,appendFileSync} from 'node:fs';
+const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
+let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
+appendFileSync(${JSON.stringify(wire)},raw+'\\n');
+const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
+let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research=s.assessmentReply??{verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+} 
+console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
+  const command={executable:process.execPath,args:[adapter]};
+  const environment=f.engine.environments.configure('p',{workspace:f.root,
+    implementer:{actor:'author',model:'fixture',effort:'high',command},reviewer:{actor:'reviewer',model:'fixture',effort:'high',command},
+    fullCheck:command,timeoutMs:5000},0);
+  const calibration=f.discovery.create('p','discovery','R0','concept',[
+    {field:'probe',kind:'fact',prompt:'Calibrate',risk:'unknown',schema:{type:'object'}}],[],6);
+  const calibrate = async (tokens = 10) => {
+    configure([], tokens);
+    await researchCall(environment.value.implementer,environment.value,'Calibrate',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'analyst'});
+    configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate assessor',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'assessor'});
+    await researchCall(environment.value.implementer,environment.value,'Calibrate planner',{dispatchMode:'planning'},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'reading-planner'});
+    configure();writeFileSync(wire,'');
+  };
+  if (calibrated) await calibrate();
+  configure();writeFileSync(wire,'');
+  const v=acceptPlan(f,'p',questions);
+  const run=(limit=8,store=f.store, policy=true)=>new Researcher(store,new Discovery(store),new ProductEngine(store).environments)
+    .run('p',v.draft.id,limit,undefined,policy?{producerPolicy:{discovery:7}}:{});
+  const wires=()=>readFileSync(wire,'utf8').trim().split('\n').filter(Boolean).map(line=>JSON.parse(line));
+  const history=()=>f.store.list().map(row=>[row.id,row.revision,row.hash]);
+  return {...f,v,questions,run,wires,history,configure,environment,calibrate,command,settings};
+}
+
+const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{type,code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]});
+
+
+function assessmentWires(f: Awaited<ReturnType<typeof setup>>) { return f.wires().filter(w=>w.subject.assessmentSubject); }
+function counters(f: Awaited<ReturnType<typeof setup>>) {
+  return {calls:f.wires().length,ledger:f.store.list('research-budget-ledger'),
+    accounts:f.store.list('v7-attempt-account'),events:f.store.list('v7-progress-event'),
+    states:f.store.list('v7-progress-state'),attempts:f.store.list('research-attempt')};
+}
+function cutAt(f: Awaited<ReturnType<typeof setup>>, boundary:'paid'|'published'|'before-apply'|'after-apply') {
+  const write=f.store.writeMany.bind(f.store);let hit=false;
+  f.store.writeMany=((writes,guards=[])=>{
+    const selected=writes.some(w=>boundary==='paid'?w.kind==='model-call'&&(w.value as any).purpose==='assessor'&&(w.value as any).status==='succeeded':
+      boundary==='published'?w.kind==='discovery-assessment':w.kind==='v7-progress-application');
+    if(!hit&&selected){hit=true;if(boundary!=='before-apply')write(writes,guards);throw new Error('R1 cut '+boundary);}
+    return write(writes,guards);
+  }) as typeof f.store.writeMany;
+  return ()=>{f.store.writeMany=write;assert.ok(hit,'the real producer reached '+boundary);};
+}
+
+test('R.1: each exact subject is assessed and applied before the next analyst call; assessment adds no attempt',async t=>{
+  const f=await setup(t),write=f.store.writeMany.bind(f.store);let second=false;
+  f.store.writeMany=((writes,guards=[])=>{
+    if(writes.some(w=>w.kind==='model-call'&&w.expected===0&&(w.value as any).purpose==='analyst')&&f.store.list('research-attempt').length){
+      second=true;assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-state').length,1);
+    }return write(writes,guards);
+  }) as typeof f.store.writeMany;
+  const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));assert.ok(second);
+  assert.equal(run.value.turns,2);assert.equal(f.store.list('research-attempt').length,2);
+  assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planQuestionId),['block','support']);
+  assert.deepEqual(f.wires().map(w=>w.subject.assessmentSubject?'assessor':w.subject.question.id),['block','assessor','support','assessor']);
+  assert.equal(f.store.list('v7-attempt-account').length,2);
+  for(const state of f.store.list<any>('v7-progress-state')){
+    const proof=readV7ProgressStateAt(f.open(),reference(state));assert.equal(proof.value.summary.count,1);
+    const application=f.store.get<any>(state.value.application.id,state.value.application.revision)!;
+    const paid=readDiscoveryAssessment(f.open(),'p',application.value.assessment);
+    assert.deepEqual(paid.value.subject.packet.planAnswer,f.v.planAnswer);assert.equal(paid.value.subject.packet.entries.length,1);
+  }
+  const before=counters(f),history=f.history();await f.run(1,f.open(),false);
+  assert.deepEqual(counters(f),before);assert.deepEqual(f.history(),history);
+});
+
+for(const boundary of ['paid','published','before-apply','after-apply'] as const)for(const completed of [false,true])
+ test(`R.1: cold ${boundary} recovery with completed=${completed} applies the paid prefix once without dispatch`,async t=>{
+  const f=await setup(t,[planQuestion('block','industry','blocking')]),restore=cutAt(f,boundary);
+  const stopped=await f.run();restore();assert.equal(stopped.value.status,'paused');
+  assert.equal(f.store.list('v7-attempt-account').length,boundary==='after-apply'?1:0);
+  assert.equal(f.store.list('v7-progress-state').length,boundary==='after-apply'?1:0);
+  if(completed){const run=f.store.get<any>(stopped.id)!;f.store.write({id:run.id,kind:run.kind,expected:run.revision,value:{...run.value,status:'completed'}});}
+  const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
+  const done=await f.run(1,f.open(),false);assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-application').length,1);
+  assert.equal(f.store.list<any>('v7-progress-state')[0]!.value.summary.count,1);assert.equal(done.value.turns,1);
+  const before=counters(f),history=f.history();await f.run(1,f.open(),false);assert.deepEqual(counters(f),before);assert.deepEqual(f.history(),history);
+ });
+
+for(const boundary of ['paid','published','after-apply'] as const)test(`R.1: ${boundary} recovery retains the original plan after a lawful new edition`,async t=>{
+  const f=await setup(t,[planQuestion('block','industry','blocking')]),restore=cutAt(f,boundary);
+  await f.run();restore();const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
+  acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('new','market')]);
+  const result=await f.run(1,f.open(),false);assert.equal(result.value.status,'paused');assert.equal(result.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(result.value));
+  assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+  const state=f.store.list<any>('v7-progress-state')[0]!;assert.deepEqual(state.value.subject.planAnswer,f.v.planAnswer);assert.equal(state.value.subject.planQuestionId,'block');
+  assert.equal(state.value.summary.count,1);assert.equal(f.store.list('v7-attempt-account').length,1);
+  const before=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),before);
+});
+
+test('R.1: an earlier paid pending answer is not skipped or counted while its assessment is still unpaid',async t=>{
+ const f=await setup(t),write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{if(!cut&&writes.some(w=>w.kind==='research-attempt')){cut=true;throw new Error('before attempt');}return write(writes,guards);}) as typeof f.store.writeMany;
+ await f.run();assert.ok(cut);f.store.writeMany=write;const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
+ const paused=await f.run(1,f.open(),false);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_assessment_pending',JSON.stringify(paused.value));
+ assert.equal(paused.value.turns,1);assert.equal(f.store.list('v7-attempt-account').length,0);assert.equal(f.store.list('discovery-assessment').length,0);
+ assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+ const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(done.value.turns,2);
+ assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planQuestionId),['block','support']);
+});
+
+async function appendAttempt(f:Awaited<ReturnType<typeof setup>>) {
+ const previous=f.store.list<ResearchRun>('research-run')[0]!;
+ const run=f.store.write<ResearchRun>({id:previous.id,kind:previous.kind,expected:previous.revision,value:{...previous.value,status:'running'}}),number=run.value.turns+1;
+ const draft=f.store.get<DiscoveryDraft>(f.v.draft.id)!,question=f.store.get<Question>(f.v.plan.id)!;
+ const subject={contract:V7_PLAN_SUBJECT_CONTRACT,planAnswer:f.v.planAnswer,planQuestionId:'block'};
+ const instruction='Return an ended attempt for the exact selected question.',context={history:[],readings:[]};
+ const intent=prepareResearchConsumerIntent(f.store,{projectId:'p',kind:'analyst',key:hashJson([run.id,number,'analyst']),
+  owner:reference(run),draft:reference(draft),question:reference(question),role:f.environment.value.implementer,dispatch:f.environment.value,profile:null,
+  cursor:{run:run.id,turn:number,instruction,context,subject},basis:draft.value.inputs,
+  guards:uniqueTransactionGuards([reference(run),reference(draft),reference(question),reference(f.environment)])});
+ const response=await researchCall(f.environment.value.implementer,f.environment.value,instruction,context,undefined,
+  {store:f.store,draftId:draft.id,questionId:question.id,purpose:'analyst',consumerIntent:reference(intent),requestContract:REQUEST_MANIFEST_CONTRACT});
+ const execution=readResearchConsumerExecution(f.store,'p',reference(intent));assert.equal(execution.kind,'response');
+ const projected=projectPaidTurnAdmission(run.value,{runId:run.id,intent:reference(intent),response,question:reference(question),owner:run.value.owner,limit:8,context,subject});
+ const turnId=managedTurnId(run.id,number);
+ const app=prepareResearchConsumerApplication(f.store,reference(intent),reference(execution.call),[
+  {id:run.id,kind:run.kind,expected:run.revision,value:projected.run},
+  {id:turnId,kind:'research-turn',expected:0,value:projected.turn}],
+  [reference(run),reference(f.environment),{id:turnId,absent:true}]);
+ f.store.writeMany(app.writes,app.guards);
+ const call=f.store.get<any>(intent.id)!.value.call;
+ const recorded=recordV7Attempt(f.store,{project:'p',planAnswer:subject.planAnswer,planQuestionId:'block',call,end:attemptEndOfAction(response,subject)});
+ completeResearchAttemptTurn(f.store,'p',reference(f.store.get(turnId)!),reference(recorded.attempt));
+ const stopped=f.store.get<ResearchRun>(run.id)!;f.store.write({id:stopped.id,kind:stopped.kind,expected:stopped.revision,value:{...stopped.value,status:'paused'}});
+}
+function packetOf(f:Awaited<ReturnType<typeof setup>>) {
+ const turns=f.store.list<any>('research-turn').sort((a,b)=>a.value.number-b.value.number);
+ const run=f.store.list<ResearchRun>('research-run')[0]!;
+ const prefix=v7CheckpointPrefixes(f.store,'p',f.v.draft.id,run,turns)[0]!;
+ return projectAttemptPacket(f.store,{project:'p',...prefix.subject,entries:prefix.entries});
+}
+async function competingFirst(f:Awaited<ReturnType<typeof setup>>,packet:ReturnType<typeof packetOf>) {
+ const first={...packet,entries:packet.entries.slice(0,1)};
+ const paid=await assessAttemptsWithRequirements(f.store,first,v7ProgressBaseline(f.store,first),f.environment,f.root);
+ return applyDiscoveryAssessment(f.store,'p',reference(paid));
+}
+for(const covered of [false,true])test(`R.1: stale paid packet covered=${covered} preserves accounts atomically and never repurchases`,async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ const write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{if(!cut&&writes.some(w=>w.kind==='assessment-session')){cut=true;throw new Error('before assessment session');}return write(writes,guards);}) as typeof f.store.writeMany;
+ await f.run();f.store.writeMany=write;assert.ok(cut);
+ if(!covered)await appendAttempt(f);
+ const restore=cutAt(f,'published');await f.run();restore();
+ const packet=packetOf(f);await competingFirst(f,packet);
+ const before=counters(f),apps=f.store.list('v7-progress-application');
+ const result=await f.run(1,f.open(),false);
+ if(covered){assert.equal(result.value.status,'completed',JSON.stringify(result.value));}
+ else {assert.equal(result.value.pauseCode,'discovery_progress_stale',JSON.stringify(result.value));assert.equal(result.value.status,'paused');}
+ assert.deepEqual(counters(f),before);assert.deepEqual(f.store.list('v7-progress-application'),apps);
+ const again=await f.run(1,f.open(),false);assert.equal(again.value.status,result.value.status);assert.equal(again.value.pauseCode,result.value.pauseCode);
+ assert.deepEqual(counters(f),before);assert.deepEqual(f.store.list('v7-progress-application'),apps);
+});
+
+test('R.1: a real pending queued child blocks the checkpoint; completed reads add no N',async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ f.engine.execute({type:'configure-reader-pilot',project:'p',expected:0,settings:{experimental:true,active:true,stopAfter:'L2',
+  reader:{actor:'reader',model:'fixture',effort:'high',speed:'inherited',command:f.command},agentCommand:f.command,
+  maxRequestChars:100000,maxReadChars:20000,maxReplyChars:10000,maxCalls:20,maxReportedTokens:100000,
+  v7Planning:{contract:'v7-plan-planning/v1',maxRequestChars:100000,maxRounds:3}}});
+ f.configure([{action:'read_plan',question:'$selected',reads:[{action:'read_context',record:reference(f.v.draft),pointer:'/fields/frame/domains'}]}]);
+ const write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{const result=write(writes,guards);if(!cut&&writes.some(w=>w.kind==='research-turn'&&w.expected===0&&!w.id.startsWith('research-turn:v1:'))){cut=true;throw new Error('after real queue publication');}return result;}) as typeof f.store.writeMany;
+ const blocked=await f.run(1);f.store.writeMany=write;assert.ok(cut);assert.equal(blocked.value.pauseCode,'research_interrupted',JSON.stringify(blocked.value));
+ assert.equal(f.store.list('discovery-assessment').length,0);assert.equal(f.store.list('v7-attempt-account').length,0);
+ const turns=f.store.list<any>('research-turn').sort((a,b)=>a.value.number-b.value.number);
+ assert.equal(turns.length,2);assert.equal(turns[1]!.value.status,'pending');
+ assert.deepEqual(v7CheckpointPrefixes(f.store,'p',f.v.draft.id,blocked,turns),[]);
+ const before=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),before);
+ // End planning after its admitted queue; the next analyst is separately admitted.
+ const pilot=f.store.get<any>('reader-pilot:p')!;
+ f.store.write({id:pilot.id,kind:pilot.kind,expected:pilot.revision,value:{...pilot.value,active:false}});
+ f.configure([{action:'read_plan',question:'$selected',reads:[]},ended()]);
+ const done=await f.run(1,f.open());assert.equal(packetOf(f).entries.length,1);assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.store.list('v7-attempt-account').length,1);
+ const state=f.store.list<any>('v7-progress-state')[0]!;assert.equal(state.value.summary.count,1);assert.equal(done.value.turns,3);
+ assert.equal(assessmentWires(f).length,1);
+});
+
+test('R.1: an already paid assessor checkpoint replays free and waits without N before its next admitted request',async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]);
+ writeFileSync(f.settings,JSON.stringify({replies:[],tokens:10,assessmentReply:{action:'assessment_checkpoint',notes:['Continue the exact packet']}}));
+ const restore=cutAt(f,'paid');await f.run();restore();
+ const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
+ const waiting=await f.run(1,f.open(),false);assert.equal(waiting.value.pauseCode,'research_assessment_pending',JSON.stringify(waiting.value));
+ assert.equal(waiting.value.turns,1);assert.equal(f.store.list('v7-attempt-account').length,0);
+ assert.equal(f.store.list('v7-progress-state').length,0);assert.equal(f.store.list('discovery-assessment').length,0);
+ assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+ const before=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),before);
+ f.configure();const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ assert.equal(done.value.turns,1);assert.equal(f.store.list('v7-attempt-account').length,1);
+ assert.equal(f.store.list<any>('v7-progress-state')[0]!.value.summary.count,1);assert.equal(f.wires().length,sent+1);
+ const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
+});
+
+test('R.1: a restored unpaid next intent cannot dispatch ahead of the previous paid application',async t=>{
+ const f=await setup(t),restore=cutAt(f,'published');const stopped=await f.run();restore();
+ const run=f.store.get<ResearchRun>(stopped.id)!,draft=f.store.get<DiscoveryDraft>(f.v.draft.id)!,question=f.store.get<Question>(f.v.plan.id)!;
+ const subject={contract:V7_PLAN_SUBJECT_CONTRACT,planAnswer:f.v.planAnswer,planQuestionId:'support'};
+ const instruction='Research the next exact subject.',context={role:'research',history:[],readings:[],contextWorkspace:[]};
+ const intent=prepareResearchConsumerIntent(f.store,{projectId:'p',kind:'analyst',key:hashJson([run.id,2,'analyst']),
+  owner:reference(run),draft:reference(draft),question:reference(question),role:f.environment.value.implementer,dispatch:f.environment.value,profile:null,
+  cursor:{run:run.id,turn:2,mode:null,instruction,context,subject},basis:draft.value.inputs,
+  guards:uniqueTransactionGuards([reference(run),reference(draft),reference(question),reference(f.environment)])});
+ const sent=f.wires().length,ledger=f.store.list('research-budget-ledger');
+ const waiting=await f.run(1,f.open(),false);assert.equal(waiting.value.pauseCode,'research_contract_upgrade_required',JSON.stringify(waiting.value));
+ assert.equal(f.store.list('v7-attempt-account').length,1);assert.equal(f.store.list('v7-progress-application').length,1);
+ assert.equal(f.store.get<any>(intent.id)!.value.state,'prepared');assert.equal(f.wires().length,sent);assert.deepEqual(f.store.list('research-budget-ledger'),ledger);
+ const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+ assert.equal(f.store.list('v7-attempt-account').length,2);assert.equal(done.value.turns,2);
+ assert.equal(f.store.get<any>(intent.id)!.value.state,'applied');
+ assert.deepEqual(assessmentWires(f).map(w=>w.subject.assessmentSubject.packet.planQuestionId),['block','support']);
+ const stable=counters(f);await f.run(1,f.open(),false);assert.deepEqual(counters(f),stable);
+});
+
+test('R.1: a forged account cannot suppress assessment or authorize run completion',async t=>{
+ const f=await setup(t,[planQuestion('block','industry','blocking')]),write=f.store.writeMany.bind(f.store);let cut=false;
+ f.store.writeMany=((writes,guards=[])=>{if(!cut&&writes.some(w=>w.kind==='assessment-session')){cut=true;throw new Error('before assessment admission');}return write(writes,guards);}) as typeof f.store.writeMany;
+ await f.run();f.store.writeMany=write;assert.ok(cut);const packet=packetOf(f),attempt=packet.entries[0]!.attempt;
+ // Explicitly corrupt fixture: no P.3 application or paid assessment backs this account.
+ f.store.write({id:attemptAccountKey(packet,attempt),kind:'v7-attempt-account',expected:0,value:{contract:'v7-attempt-account/v1',
+  subject:{project:'p',planAnswer:f.v.planAnswer,planQuestionId:'block'},application:{id:'missing-application',revision:1,hash:'a'.repeat(64)},
+  attempt,number:1,accepted:[],eventIds:[],streak:1}});
+ const before=counters(f);
+ for(const policy of [false,true]){const result=await f.run(1,f.open(),policy);assert.equal(result.value.status,'paused');
+  assert.equal(result.value.pauseCode,'discovery_progress_conflict',JSON.stringify(result.value));assert.deepEqual(counters(f),before);}
+ assert.equal(f.store.list('v7-progress-state').length,0);assert.equal(f.store.list('discovery-assessment').length,0);
+});

@@ -22,6 +22,7 @@ import { planAttemptSelection, nextPlanQuestion, proveAttempt, type V7AttemptEnd
 import { readResearchConsumerTurn, prepareResearchConsumerIntent, completeResearchAttemptTurn } from '../src/discovery/response-recovery.js';
 import { discoveryInspection } from '../src/discovery/discovery-outcome.js';
 import { executionAdmission, acceptedIssuance } from '../src/discovery/projection-reader.js';
+import {v7ProgressStateId} from '../src/discovery/v7-attempt-assessment.js';
 import { stageSummary } from '../src/product/stage-summary.js';
 function fixture(t: { after(fn: () => void): void }) {
   const root = mkdtempSync(join(tmpdir(), "omg-dr3a3k-"));
@@ -92,8 +93,14 @@ async function setup(t: test.TestContext, questions = [planQuestion('support','m
 const raw=readFileSync(0,'utf8'),r=JSON.parse(raw),s=JSON.parse(readFileSync(${JSON.stringify(settings)},'utf8'));
 let previous=[];try{previous=readFileSync(${JSON.stringify(wire)},'utf8').trim().split('\\n').filter(Boolean)}catch{}
 appendFileSync(${JSON.stringify(wire)},raw+'\\n');
-let research=s.replies[previous.length]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
+const ordinal=previous.map(line=>JSON.parse(line)).filter(row=>!row.subject.assessmentSubject).length;
+let research=s.replies[ordinal]??{action:'answer',question:r.subject.question?.id??'probe',value:{type:'impossible',code:'source_unavailable',evidence:[],text:'No accessible source'},citations:[]};
 if(research.question==='$selected')research.question=r.subject.question.id;
+if(r.subject.assessmentSubject){
+ const packet=r.subject.assessmentSubject.packet,attempts=packet.entries.map(entry=>({attempt:entry.attempt,reason:'Reviewed exact attempt'}));
+ const rejected=(r.subject.value?.attempts??[]).flatMap(entry=>entry.end.type==='submitted'?entry.end.value.claims.map((claim,index)=>({claim:{project:packet.project,container:entry.attempt,containerKind:'research-attempt',pointer:'/claims/'+index,claimId:claim.id},reason:'Insufficient corroboration'})):[]);
+ research={verdict:'return',reasons:['More material needed'],return:{target:{attempt:packet.entries[0].attempt},reason:'Continue research'},novelty:{attempts,accepted:[],rejected,newContent:[],duplicates:[],noProgress:attempts,transition:null},methodology:{contract:'assessment-methodology/v1',policy:'assessment-methodology-policy/v2',facts:[]}};
+} 
 console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,...(s.tokens===null?{}:{usage:{inputTokens:s.tokens,outputTokens:1,cachedInputTokens:0,reasoningOutputTokens:0}})}));`);
   const command={executable:process.execPath,args:[adapter]};
   const environment=f.engine.environments.configure('p',{workspace:f.root,
@@ -108,6 +115,8 @@ console.log(JSON.stringify({protocol:r.protocol,requestId:r.requestId,research,.
     configure([ended(),{necessary:true,reason:'Calibration review'}], tokens);
     await researchCall(environment.value.reviewer,environment.value,'Calibrate reviewer',{},undefined,
       {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'escalation-assessor'});
+    await researchCall(environment.value.reviewer,environment.value,'Calibrate assessor',{},undefined,
+      {store:f.store,draftId:calibration.id,questionId:calibration.value.questions[0]!,purpose:'assessor'});
     configure();writeFileSync(wire,'');
   };
   if (calibrated) await calibrate();
@@ -124,11 +133,11 @@ const ended=(type='impossible')=>({action:'answer',question:'$selected',value:{t
 
 test('R: real initial traversal orders blocking first, uses reservation @1 and leaves Discovery researching',async t=>{
   const f=await setup(t), beforeDraft=f.store.get(f.v.draft.id), beforeQuestion=f.store.get(f.v.plan.id);
-  const batches:string[][]=[],write=f.store.writeMany.bind(f.store);
-  f.store.writeMany=((writes,guards=[])=>{if(writes.some(w=>w.kind==='model-call'&&w.expected===0))batches.push(writes.map(w=>w.kind));return write(writes,guards);}) as typeof f.store.writeMany;
+  const batches:{purpose:string;kinds:string[]}[]=[],write=f.store.writeMany.bind(f.store);
+  f.store.writeMany=((writes,guards=[])=>{const call=writes.find(w=>w.kind==='model-call'&&w.expected===0);if(call)batches.push({purpose:(call.value as any).purpose,kinds:writes.map(w=>w.kind)});return write(writes,guards);}) as typeof f.store.writeMany;
   f.configure([ended('refused'),ended()]);
   const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));
-  assert.deepEqual(f.wires().map(w=>w.subject.question.id),['block','support']);
+  assert.deepEqual(f.wires().map(w=>w.subject.assessmentSubject?'assessor:'+w.subject.question.id:w.subject.question.id),['block','assessor:block','support','assessor:support']);
   assert.deepEqual(f.store.get(f.v.draft.id),beforeDraft);assert.deepEqual(f.store.get(f.v.plan.id),beforeQuestion);
   const attempts=f.store.list<any>('research-attempt');assert.equal(attempts.length,2);
   for(const attempt of attempts){
@@ -137,12 +146,12 @@ test('R: real initial traversal orders blocking first, uses reservation @1 and l
     assert.equal(f.store.get<any>(attempt.value.call.id)!.value.status,'succeeded');
   }
   for(const turn of f.store.list<any>('research-turn')){const proved=readResearchConsumerTurn(f.store,reference(turn));assert.equal(proved.value.status,'completed');assert.ok(proved.value.attemptBinding);}
-  assert.ok(batches[0]!.includes('research-budget'));
-  for(const kinds of batches)for(const kind of ['research-budget-ledger','model-call','research-consumer-intent','request-manifest'])assert.ok(kinds.includes(kind),`${kind}: ${kinds.join(',')}`);
+  assert.ok(batches[0]!.kinds.includes('research-budget'));
+  for(const {purpose,kinds} of batches)for(const kind of ['research-budget-ledger','model-call','request-manifest',purpose==='assessor'?'assessment-application':'research-consumer-intent'])assert.ok(kinds.includes(kind),`${purpose}/${kind}: ${kinds.join(',')}`);
   assert.equal(planAttemptSelection(f.store,'p').next,null);assert.equal(nextPlanQuestion(f.store,'p')!.planQuestionId,'block');
   assert.equal(discoveryInspection(f.store,f.store.get<DiscoveryDraft>(f.v.draft.id)!).outcome.state,'researching');
   assert.equal(acceptedIssuance(f.store,f.v.draft).issued,false);
-  const saved=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),saved);assert.equal(f.wires().length,2);
+  const saved=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),saved);assert.equal(f.wires().length,4);
 });
 
 for(const boundary of ['paid','attempt','binding'] as const)test(`R: cold recovery after ${boundary} never repays or adds ledger`,async t=>{
@@ -157,7 +166,7 @@ for(const boundary of ['paid','attempt','binding'] as const)test(`R: cold recove
   const paused=await f.run();assert.equal(interrupted,true);assert.equal(paused.value.status,'paused',JSON.stringify(paused.value));
   f.store.writeMany=write;
   const calls=f.wires().length,ledgers=f.store.list('research-budget-ledger');
-  const done=await f.run(1,f.open(),false);assert.equal(done.value.status,'completed',JSON.stringify(done.value));
+  const done=await f.run(1,f.open(),false);assert.equal(done.value.status,'paused',JSON.stringify(done.value));assert.equal(done.value.pauseCode,'research_assessment_pending');
   assert.equal(f.wires().length,calls);assert.deepEqual(f.store.list('research-budget-ledger'),ledgers);
   assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.store.list('research-attempt-binding').length,1);
   const saved=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),saved);
@@ -167,8 +176,8 @@ test('R: default v7 stays off, allowance pauses before a new question and comple
   const f=await setup(t);
   await assert.rejects(f.run(1,f.store,false),{code:'research_contract_upgrade_required'});assert.equal(f.wires().length,0);
   const paused=await f.run(1);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_turns_exhausted');
-  assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.wires().length,1);
-  const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(f.wires().length,2);
+  assert.equal(f.store.list('research-attempt').length,1);assert.equal(f.wires().length,2);
+  const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));assert.equal(f.wires().length,4);
 });
 
 for(const recorded of [false,true])test(`R: plan replacement ${recorded?'finishes the recorded attempt':'keeps a paid answer pending at its exact door'}`,async t=>{
@@ -182,7 +191,7 @@ for(const recorded of [false,true])test(`R: plan replacement ${recorded?'finishe
   acceptNextPlanEdition(f,'p',f.v.draft,f.v.frameRef,f.v.planAnswer,[planQuestion('next','market')]);
   const result=await f.run(1,f.open(),false);
   assert.equal(result.value.status,'paused');
-  assert.equal(result.value.pauseCode,recorded?'research_contract_upgrade_required':'attempt_invalid',JSON.stringify(result.value));
+  assert.equal(result.value.pauseCode,recorded?'research_assessment_pending':'attempt_invalid',JSON.stringify(result.value));
   const turn=f.store.list<any>('research-turn')[0]!;
   assert.equal(turn.value.status,recorded?'completed':'pending');
   assert.deepEqual(turn.value.subject,{contract:'v7-plan-subject/v1',planAnswer:f.v.planAnswer,planQuestionId:'block'});
@@ -272,7 +281,7 @@ test('R: submitted and duplicate ends use ordinary paid calls without accepting 
     guards:uniqueTransactionGuards([reference(current),reference(f.v.draft),reference(f.v.plan),reference(f.environment)])});
   const done=await f.run(1,f.open());assert.equal(done.value.status,'completed',JSON.stringify(done.value));
   assert.deepEqual(f.store.list<any>('research-attempt').map(a=>a.value.end.type).sort(),['duplicate','submitted']);
-  assert.equal(f.wires().length,2);
+  assert.equal(f.wires().length,3);
   assert.throws(()=>proveClaimAddress(f.store,{project:'p',container:reference(original.attempt),containerKind:'research-attempt',pointer:'/claims/0',claimId:'fact'}),{code:'claim_attempt_not_accepted'});
 });
 
@@ -289,7 +298,10 @@ test('R: a competing completion wins the K batch without partial binding or over
   }) as typeof f.store.writeMany;
   const done=await f.run();assert.equal(done.value.status,'completed');assert.deepEqual(f.history(),winner);
   f.store.writeMany=write;assert.equal(f.store.list('research-attempt-binding').length,1);
-  const before=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),before);assert.equal(f.wires().length,1);
+  const before=f.history().filter(row=>row[0]!==done.id);
+  const paused=await f.run(1,f.open(),false);assert.equal(paused.value.status,'paused');assert.equal(paused.value.pauseCode,'research_assessment_pending');
+  assert.deepEqual(f.history().filter(row=>row[0]!==done.id),before);assert.equal(f.wires().length,1);
+  const stable=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),stable);
 });
 
 for(const corrupt of ['subject','foreign-question','early-answer'] as const)test(`R: ${corrupt} is an addressed refusal without a second purchase`,async t=>{
@@ -318,7 +330,7 @@ test('R: source search and context reads precede a submitted end without accepti
   f.configure([{action:'search',query:'precise'},{action:'read_context',record:reference(f.v.draft),pointer:'/fields/plan'},
     {...ended(),value:end}]);
   const run=await f.run();assert.equal(run.value.status,'completed',JSON.stringify(run.value));
-  assert.equal(f.wires().length,3);assert.equal(f.store.list<any>('research-turn').filter(t=>t.value.status==='completed').length,3);
+  assert.equal(f.wires().length,4);assert.equal(f.store.list<any>('research-turn').filter(t=>t.value.status==='completed').length,3);
   const attempt=f.store.list('research-attempt')[0]!;
   assert.throws(()=>proveClaimAddress(f.store,{project:'p',container:reference(attempt),containerKind:'research-attempt',pointer:'/claims/0',claimId:'fact'}),{code:'claim_attempt_not_accepted'});
   const saved=f.history();await f.run(1,f.open(),false);assert.deepEqual(f.history(),saved);
@@ -328,7 +340,7 @@ test('R: corrupt attempt heads are refused rather than treated as unanswered que
   const f=await setup(t,[planQuestion('block','industry','blocking')]);await f.run();
   const record=f.store.list<any>('research-attempt')[0]!;
   f.store.write({id:record.id,kind:record.kind,expected:record.revision,value:{...record.value,project:'foreign'}});
-  assert.throws(()=>planAttemptSelection(f.store,'p'),{code:'attempt_invalid'});assert.equal(f.wires().length,1);
+  assert.throws(()=>planAttemptSelection(f.store,'p'),{code:'attempt_invalid'});assert.equal(f.wires().length,2);
 });
 
 test('R: a conflicting end at the paid call key preserves the pending turn and never purchases a replacement',async t=>{
@@ -364,8 +376,8 @@ test('R: an unpaid prepared intent consumes current allowance exactly once', asy
     .filter(row => row.value.cursor?.run === before.id && row.value.state === 'prepared').length, 1);
   f.store.writeMany = write;
   const after = await f.run(1, f.open());
-  assert.equal(f.wires().length, 1, 'run(1) may purchase only one new analyst turn');
-  assert.deepEqual(f.wires().map(row => row.subject.question.id), ['block']);
+  assert.equal(f.wires().length, 2, 'one analyst and its required assessor');
+  assert.deepEqual(f.wires().filter(row=>!row.subject.assessmentSubject).map(row => row.subject.question.id), ['block']);
   assert.equal(after.value.status, 'paused');
   assert.equal(after.value.pauseCode, 'research_turns_exhausted');
   assert.equal(f.store.list('research-attempt').length, 1);
@@ -389,10 +401,10 @@ test('R: paid replay stays free before one new turn in current allowance', async
     .flatMap(row => row.value.assignments.map(assignment => assignment.call));
   const paidCalls = assignedCalls();
   const after = await f.run(1, f.open());
-  assert.equal(f.wires().length, 2);
-  assert.deepEqual(f.wires().map(row => row.subject.question.id), ['block', 'support']);
+  assert.equal(f.wires().length, 4);
+  assert.deepEqual(f.wires().filter(row=>!row.subject.assessmentSubject).map(row => row.subject.question.id), ['block', 'support']);
   assert.equal(after.value.status, 'completed');
-  assert.equal(assignedCalls().length, paidCalls.length + 1);
+  assert.equal(assignedCalls().length, paidCalls.length + 3, 'one new analyst and two required assessors; the paid analyst stays assigned once');
   for (const call of paidCalls) assert.equal(assignedCalls().filter(id => id === call).length, 1);
 });
 
@@ -400,15 +412,17 @@ test('R: paid replay stays free before one new turn in current allowance', async
 // Observe the real transport refusal without changing its reads, writes or result.
 function observeBudgetFailures(t: test.TestContext): EngineError[] {
   const observed: EngineError[] = [];
-  const prototype = Researcher.prototype as unknown as { receivedIntent(...args: unknown[]): Promise<unknown> };
-  const original = prototype.receivedIntent;
-  t.mock.method(prototype, 'receivedIntent', async function (this: Researcher, ...args: unknown[]) {
+  const prototype = Researcher.prototype as unknown as Record<string,(...args: unknown[])=>Promise<unknown>>;
+  for(const method of ['receivedIntent','checkpointV7Attempts']) {
+  const original = prototype[method]!;
+  t.mock.method(prototype, method, async function (this: Researcher, ...args: unknown[]) {
     try { return await Reflect.apply(original, this, args); }
     catch (error) {
       if (error instanceof EngineError) observed.push(error);
       throw error;
     }
   });
+  }
   return observed;
 }
 function assertBudgetPause(run: Revision<{ status: string; pauseCode?: string | null; error: string | null }>,
@@ -449,7 +463,7 @@ test('a4: missing estimate persists the uncreated segment address and resumes th
   await f.calibrate();
   const continued = await f.run(1, f.open());
   assert.equal(continued.value.pauseCode, 'research_turns_exhausted');
-  assert.deepEqual(f.wires().map(row => row.subject.question.id), ['block']);
+  assert.deepEqual(f.wires().map(row => row.subject.assessmentSubject?'assessor:'+row.subject.question.id:row.subject.question.id), ['block','assessor:block']);
   assert.deepEqual(f.store.get(prepared.id, 1), prepared);
   assert.equal(f.store.get<any>(prepared.id)!.value.state, 'applied');
   assert.equal(f.store.list('research-attempt').length, 1);
@@ -474,7 +488,7 @@ test('a4: first reservation refusal saves the real estimate without creating seg
 
 for (const [tokens, code] of [[18_000_000, 'discovery_budget_reserve'],
   [V7_STAGE_TOKEN_CEILING, 'discovery_budget_overrun']] as const)
-test(`a4: paid replay precedes ${code}, preserving negative remaining and the unpaid next intent`, async t => {
+test(`a4: paid replay precedes ${code}, preserving negative remaining and the unpaid assessment application`, async t => {
   const f = await setup(t), failures = observeBudgetFailures(t), write = f.store.writeMany.bind(f.store);
   f.configure([], tokens);
   let interrupted = false;
@@ -500,10 +514,15 @@ test(`a4: paid replay precedes ${code}, preserving negative remaining and the un
   assert.equal(f.store.list('research-attempt').length, 1);
   assert.equal(f.store.list('research-attempt-binding').length, 1);
   assert.equal(f.store.list<any>('research-turn')[0]!.value.status, 'completed');
-  const prepared = f.store.list<any>('research-consumer-intent')
-    .filter(row => row.value.cursor.run === paused.id && row.value.state === 'prepared');
-  assert.equal(prepared.length, 1);
-  assert.equal(prepared[0]!.value.cursor.subject.planQuestionId, 'support');
+  const prepared = f.store.list<any>('assessment-application').filter(row=>row.value.projectId==='p'&&row.value.state==='prepared');
+  assert.equal(prepared.length,1);
+  const subject=prepared[0]!.value.context.assessmentSubject;
+  assert.equal(subject.kind,'attempts');assert.equal(subject.packet.planQuestionId,'block');assert.deepEqual(subject.packet.planAnswer,f.v.planAnswer);
+  assert.equal(subject.packet.entries.length,1);assert.deepEqual(subject.packet.entries[0]!.attempt,reference(f.store.list('research-attempt')[0]!));
+  assert.deepEqual(subject.packet.entries[0]!.binding,reference(f.store.list('research-attempt-binding')[0]!));
+  assert.deepEqual(subject.baseline,{contract:'v7-progress-baseline/v1',state:{kind:'absent',id:v7ProgressStateId(subject.packet)},materials:[]});
+  assert.equal(subject.assessment.contract,'discovery-assessment/v3');
+  assert.equal(f.store.list<any>('research-consumer-intent').filter(row=>row.value.cursor.run===paused.id&&row.value.state==='prepared').length,0);
   const repeated = await f.run(1, f.open());
   assert.equal(repeated.value.error, paused.value.error);
   assertBudgetPause(repeated, failures.at(-1)!, f.open());
@@ -529,7 +548,7 @@ test('a4: unknown usage keeps its reservation through a cold paid replay', async
   const before = budgetUsage(f.store, segment), ledger = f.store.list('research-budget-ledger');
   assert.equal(before.measured, 0); assert.ok(before.reserved > 0);
   const done = await f.run(1, f.open(), false);
-  assert.equal(done.value.status, 'completed', JSON.stringify(done.value));
+  assert.equal(done.value.status, 'paused', JSON.stringify(done.value));assert.equal(done.value.pauseCode,'research_assessment_pending');
   assert.equal(f.wires().length, 1);
   assert.deepEqual(f.store.list('research-budget-ledger'), ledger);
   const after = budgetUsage(f.open(), segment);

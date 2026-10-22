@@ -4,8 +4,8 @@ import { isRef, reference, type Ref } from "../pipeline/contracts.js";
 import { EngineError } from "../errors.js";
 import type { Store, Revision } from "../storage/store.js";
 import type { DiscoveryDraft, Question } from "./discovery.js";
-import type { ResearchAnswer, ResearchRun } from "./research-model.js";
-import { consumerIntentContext, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn,
+import type { ResearchAnswer, ResearchRun, V7AttemptPacketEntry } from "./research-model.js";
+import { consumerIntentContext, listResearchConsumerIntents, readResearchConsumerExecution, readResearchConsumerTurn, readResearchAttemptBinding,
   type ResearchConsumerIntent } from "./response-recovery.js";
 import { planSubjectOf, sameSubject, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { synthesisReservationConsumed, turnAction, type ManagedResearchTurn } from "./research-consumer-transition.js";
@@ -169,6 +169,36 @@ export function planAttemptSelection(store: Store, projectId: string): CurrentPl
   const open = plan.questions.filter(question => !ended.has(question.planQuestionId));
   return { ...plan, attempts,
     next: open.find(question => (question.question as Record<string, Json>)["class"] === "blocking") ?? open[0] ?? null };
+}
+
+/** R.1: the finished run prefix, grouped by its original exact subject.
+ * A pending position stops the prefix, including queued/split reading children.
+ * Only a completed attempt through the common K reader enters assessment. */
+export function v7CheckpointPrefixes(store: Store, project: string, draftId: string,
+  run: Revision<ResearchRun>, turns: Revision<ManagedResearchTurn>[]): {
+    subject: V7PlanSubject; entries: V7AttemptPacketEntry[];
+  }[] {
+  const groups = new Map<string, {subject: V7PlanSubject; entries: V7AttemptPacketEntry[]}>();
+  for (const [index, row] of turns.entries()) {
+    const turn = readResearchConsumerTurn(store, reference(row)) as Revision<ManagedResearchTurn>;
+    if (turn.value.run !== run.id || turn.value.number !== index + 1
+      || run.value.projectId !== project || run.value.draftId !== draftId)
+      refuse('discovery_progress_order_invalid', 'prefix', 'The checkpoint needs the exact ordered run prefix');
+    if (turn.value.status !== 'completed') break;
+    if (!turn.value.attemptBinding) {
+      if (turn.value.attemptContract && turnAction(turn.value).action === 'answer')
+        refuse('discovery_progress_order_invalid', 'prefix', 'A finished answer needs its attempt binding before assessment');
+      continue;
+    }
+    const bound = readResearchAttemptBinding(store, project, turn.id), subject = planSubjectOf(turn.value);
+    if (!bound || !subject || canonical(reference(bound.binding)) !== canonical(turn.value.attemptBinding)
+      || bound.intent.value.draft.id !== draftId)
+      refuse('discovery_progress_order_invalid', 'prefix', 'The checkpoint attempt lost its own subject or binding');
+    const key = canonical(subject), group = groups.get(key) ?? {subject, entries:[]};
+    group.entries.push({attempt:bound.binding.value.attempt, binding:reference(bound.binding)});
+    groups.set(key,group);
+  }
+  return [...groups.values()];
 }
 
 /** S6.2: recovery of the connected analyst/planner/owner-review turn branches only. The

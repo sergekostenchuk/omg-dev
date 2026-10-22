@@ -1,5 +1,7 @@
 import { REQUEST_MANIFEST_CONTRACT, CONTEXT_PREPARATION_CONTRACT } from "./request-parts.js";
-import { currentPlan, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
+import { currentPlan, v7CheckpointPrefixes, planAttemptSelection, planOwnerSubject, rejectedPlanOwnerRequest, provePlanQuestions, selectV7AnalystRecovery } from "./v7-plan-questions.js";
+import { applyDiscoveryAssessment, v7ProgressBaseline } from "./v7-progress.js";
+import { projectAttemptPacket, proveAttemptPacket, attemptAccountKey } from "./v7-attempt-assessment.js";
 import { recordV7Attempt } from "./v7-attempts.js";
 import { planSubjectOf, sameSubject, attemptEndOfAction, addressedQuestionId, V7_PLAN_SUBJECT_CONTRACT, type V7PlanSubject } from "./v7-managed-attempt.js";
 import { isResearchPreview } from './research-preview.js';
@@ -17,7 +19,7 @@ import { isRef, reference, uniqueRefs, type Ref } from "../pipeline/contracts.js
 import { canonical, hashJson } from "../canonical.js";
 import { EngineError, requireCondition } from "../errors.js";
 import { Discovery, type Decision, type DiscoveryDraft, type Question } from "./discovery.js";
-import type { EarlyUnknown, ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
+import type { PaidDiscoveryAttemptsAssessment, V7AttemptPacket, EarlyUnknown, ResearchAction, ResearchAssessment, ResearchRun, ResearchTurn } from "./research-model.js";
 import { researchAction, researchCall, prepareResearchEnvelope } from "./research-protocol.js";
 import { turnAction, projectPaidTurnAdmission, projectPaidOwnerReview, projectPaidPause,
   projectResearchTurnRevision, projectSourceReadingTurn, projectPaidLocalRefusal, projectRepeatedContextRead,
@@ -34,12 +36,13 @@ import { completeResearchAttemptTurn, earlyResearchConsumerFailure, consumerCapa
   refuseResearchConsumerIntent, pinnedLayerDeltaStore, readResearchAcceptanceBinding, intentWebCapability, intentResponseAction,
   earlyUnknownAdmission, earlyUnknownProof,
   type ManagedProposalRefusal,
-  type ResearchConsumerIntent } from "./response-recovery.js";
+  recoverResearchResponse, type ResearchConsumerIntent } from "./response-recovery.js";
+import { packetAssessmentSubject, methodologyAssessmentTransport, requirementsAssessmentTransport } from "./continuation-packet.js";
 import { ResearchSources } from "./research-sources.js";
 import { executeWebTurn, webBudgetView, webResearchGuide, type WebResearchOutcome } from "./web-research.js";
 import { Evidence, sourceReadContract, SOURCE_READ_MAX_CHARS, type Source } from "../evidence/evidence.js";
-import { assessAnswer, readResearchAssessmentAt } from "./research-assessment.js";
-import { readAssessmentPaidOrigin, paidAssessmentTerminal } from "./assessment-session.js";
+import { assessAnswer, assessAttempts, assessAttemptsWithRequirements, readDiscoveryAssessment, readResearchAssessmentAt } from "./research-assessment.js";
+import { readAssessmentDispatchAdmission, readAssessmentPaidOrigin, paidAssessmentTerminal } from "./assessment-session.js";
 import { OBLIGATION_EVIDENCE_PAUSES, requireDocumentarySources } from '../graph/obligation-evidence.js';
 import { processStart } from "../runtime/process-identity.js";
 import { reuseResearch } from "./research-reuse.js";
@@ -1476,6 +1479,102 @@ export class Researcher {
     this.store.writeMany([{ id: child.id, kind: child.kind, expected: child.revision, value: completion }], guards);
     return run;
   }
+  /** R.1: paid assessment recovery precedes current-plan admission. Packet,
+   * baseline, declaration and environment belong to the saved operation. */
+  private async checkpointV7Attempts(project: string, draftId: string, run: Revision<ResearchRun>,
+    turns: Revision<ManagedResearchTurn>[], owner: ResearchRun['owner'], signal: AbortSignal | undefined,
+    allowNew: boolean): Promise<Revision<ResearchRun>> {
+    const prefixes = v7CheckpointPrefixes(this.store, project, draftId, run, turns);
+    if (!prefixes.length) return run;
+    const ownAttempts = new Set(prefixes.flatMap(p => p.entries.map(e => e.attempt.id)));
+    const belongs = (packet: V7AttemptPacket) => packet?.entries?.some(e => ownAttempts.has(e.attempt?.id));
+    const published = new Set<string>(), accounted = new Set<string>();
+    const apply = (paid: Revision<PaidDiscoveryAttemptsAssessment>) => {
+      applyDiscoveryAssessment(this.store,project,reference(paid)); published.add(paid.value.session.id);
+      for (const entry of paid.value.subject.packet.entries) accounted.add(canonical(entry.attempt));
+    };
+    const applySaved = () => {
+      for (const identity of this.store.identities('list','discovery-assessment')) {
+        const row = this.store.get<PaidDiscoveryAttemptsAssessment>(identity.id,1);
+        if (!row || row.value?.projectId !== project || !belongs(row.value.subject?.packet)) continue;
+        const paid = readDiscoveryAssessment(this.store,project,reference(row));
+        requireCondition(proveAttemptPacket(this.store,paid.value.subject.packet).run === run.id,
+          'discovery_assessment_subject_invalid','The saved checkpoint belongs to another run');
+        apply(paid);
+      }
+    };
+    applySaved();
+    for (const identity of this.store.identities('list','assessment-session')) {
+      const original = this.store.get<Record<string,any>>(identity.id,1);
+      if (original?.value?.projectId !== project || original.value.binding?.draft?.id !== draftId
+        || published.has(original.id) || original.value.contract !== 'assessment-application/v1') continue;
+      const initial = this.store.get<Record<string,any>>(original.value.application,1);
+      const subject = initial ? packetAssessmentSubject(initial.value.context) : null;
+      if (subject?.kind !== 'attempts' || !belongs(subject.packet)) continue;
+      const admitted = readAssessmentDispatchAdmission(this.store,reference(initial!));
+      requireCondition(canonical(reference(admitted.session)) === canonical(reference(original)),
+        'discovery_assessment_invalid','The checkpoint application lost its original session');
+      requireCondition(proveAttemptPacket(this.store,subject.packet).run === run.id,
+        'discovery_assessment_subject_invalid','The checkpoint session belongs to another run');
+      const session = this.store.get<Record<string,any>>(original.id)!;
+      let application = this.store.get<Record<string,any>>(session.value.application);
+      // An intermediate paid step may have committed before its next unpaid
+      // application. Its previous session names that step without guessing IDs.
+      if (!application && session.revision > 1) {
+        const before = this.store.get<Record<string,any>>(session.id,session.revision-1);
+        if (before) application = this.store.get<Record<string,any>>(before.value.application);
+      }
+      const call = isRef(application?.value.call) ? this.store.get<any>(application.value.call.id) : null;
+      if (call?.value.status === 'succeeded') {
+        await recoverResearchResponse(this.store,this.environments,project,reference(call),
+          application!.value.session,`research-runner:${run.id}`);
+        applySaved(); if (published.has(original.id)) continue;
+      }
+      requireCondition(allowNew,'research_assessment_pending',
+        'The saved assessment needs another admitted request; its paid prefix is preserved');
+      const environmentRef = admitted.environment;
+      const environment = this.store.get<Environment>(environmentRef.id,environmentRef.revision);
+      requireCondition(environment && canonical(reference(environment)) === canonical(environmentRef),
+        'discovery_assessment_invalid','The checkpoint lost its exact environment');
+      const pilotRef = admitted.profile;
+      const pilot = isRef(pilotRef) ? this.store.get<ReaderPilot>(pilotRef.id,pilotRef.revision) ?? undefined : undefined;
+      requireCondition(!isRef(pilotRef) || pilot && canonical(reference(pilot)) === canonical(pilotRef),
+        'discovery_assessment_invalid','The checkpoint lost its exact profile');
+      requireCondition(canonical(subject.assessment) === canonical(requirementsAssessmentTransport())
+        || canonical(subject.assessment) === canonical(methodologyAssessmentTransport()),
+        'discovery_assessment_invalid','The checkpoint needs its exact saved assessment declaration');
+      const assess = subject.assessment?.contract === 'discovery-assessment/v3' ? assessAttemptsWithRequirements : assessAttempts;
+      if (run.value.status !== 'running') run = this.save(run,{status:'running',owner,error:null,pauseCode:null});
+      const paid = await assess(this.store,subject.packet,subject.baseline,environment,
+        admitted.dispatch.workspace,signal,pilot);
+      apply(paid);
+    }
+    for (const prefix of prefixes) {
+      const packet = projectAttemptPacket(this.store,{project,...prefix.subject,entries:prefix.entries});
+      const baseline = v7ProgressBaseline(this.store,packet);
+      const fresh = packet.entries.filter(entry => {
+        const account = this.store.get(attemptAccountKey(packet,entry.attempt),1);
+        if (account && !accounted.has(canonical(entry.attempt)))
+          throw new EngineError('discovery_progress_conflict',
+            `[${account.id}] The checkpoint account needs its original proven paid application`,
+            {field:'account',ref:reference(account),attempt:entry.attempt});
+        return !account;
+      });
+      if (!fresh.length) continue;
+      requireCondition(allowNew,'research_assessment_pending',
+        'The finished prefix needs assessment before another attempt or run completion');
+      const current = currentPlan(this.store,project);
+      requireCondition(canonical(current.planAnswer) === canonical(packet.planAnswer),
+        'research_consumer_context_stale','A new assessment must retain its current original plan');
+      const effective = this.environments.effective(project);
+      const pending = projectAttemptPacket(this.store,{project,...prefix.subject,entries:fresh});
+      if (run.value.status !== 'running') run = this.save(run,{status:'running',owner,error:null,pauseCode:null});
+      const paid = await assessAttemptsWithRequirements(this.store,pending,baseline,effective.environment,effective.root,signal);
+      apply(paid);
+    }
+    return run;
+  }
+
   /** The initial v7 plan traversal uses the ordinary managed transport and K.
    * Paid work is resolved before today's plan, environment or allowance admits a new send. */
   private async runPlanAttempts(project: string, draftId: string, limit: number, signal: AbortSignal | undefined,
@@ -1544,6 +1643,9 @@ export class Researcher {
           requireCondition(run, "research_consumer_intent_invalid", "The unfinished call lost its run");
           // A prepared intent has not paid: it must still address today's plan.
           if (outstanding.value.state === "prepared") {
+            if (outstanding.value.kind === "analyst" || outstanding.value.kind === "reading-planner")
+              run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
+                !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7);
             requireCondition(!options.restoreOnly && producerContractEra("discovery", options.producerPolicy) === 7,
               "research_contract_upgrade_required", "New v7 work requires its explicit producer policy");
             const current = currentPlan(this.store, project), selected = planSubjectOf(outstanding.value.kind === "escalation-assessor"
@@ -1629,6 +1731,7 @@ export class Researcher {
                 ? readSynthesisSessionV3(this.store, producer.value.owner) : null;
               const workspace = session ? contextWorkspace(session.value.workspace, session.value.focus)
                 : addressedWorkspace(this.store, sameTurns, question, row => {
+                  if (isRef(row.value.plannedBy)) return null;
                   const execution = readResearchConsumerExecution(this.store, project, (row.value as ManagedResearchTurn).consumerIntent);
                   return execution.kind === "response" ? execution.subject : null;
                 });
@@ -1718,6 +1821,8 @@ export class Researcher {
         const refused = intents.find(row => row.value.state === "refused" && row.value.cursor.turn === (run?.value.turns ?? 0) + 1);
         if (refused) throw new EngineError(refused.value.refusal!.code,
           `[${refused.id}] Paid response retained for this plan subject; call ${refused.value.refusal!.call.id}`);
+        if (run) run = await this.checkpointV7Attempts(project,draftId,run,turns,owner,signal,
+          !options.restoreOnly && producerContractEra('discovery',options.producerPolicy) === 7);
         const selection = planAttemptSelection(this.store, project);
         requireCondition(selection.draft.id === draftId, "plan_questions_invalid", "The selected plan belongs to another draft");
         if (!selection.next && run) {
