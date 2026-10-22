@@ -1080,7 +1080,7 @@ function renderVariantGenerationSummary(summary: VariantGenerationStageSummary):
       ...generation.reasons.map(reason => `- ${reason.code}: ${reason.message}; основания: ${reason.grounds.map(refText).join(", ") || "не указаны"}`));
   } else {
     lines.push("### Общая шкала", "", ...Object.entries(generation.scale).map(([key, value]) => `- ${key}: ${value}`),
-      "", "### Доказанные варианты", "");
+      "", "### Опубликованные варианты", "");
     for (const member of generation.members) {
       lines.push(`#### ${member.value.title}`, "", `Вариант: ${refText(member.ref)}`, `Предложение: ${valueText(member.value.proposal)}`);
       for (const [key, judgement] of Object.entries(member.value.criteria)) {

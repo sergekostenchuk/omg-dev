@@ -115,10 +115,10 @@ for (const count of [1, 2, 3]) {
     assert.deepEqual(g.choice, { status: 'incomplete', reason: 'variant_decisions_unsupported' });
     assert.deepEqual([g.searchLimits, g.unknowns], [set.value.searchLimits, set.value.unknowns]);
     const text = renderStageSummary(summary);
-    for (const value of ['Общая шкала', 'Рекомендация модели:', 'Рекомендация не устанавливает выбор', 'Допущения:', 'Количественная оценка:',
+    for (const value of ['Опубликованные варианты', 'Общая шкала', 'Рекомендация модели:', 'Рекомендация не устанавливает выбор', 'Допущения:', 'Количественная оценка:',
       'Only the saved sweep', 'Demand stays unknown', 'Bounded assumption', f.input.role.actor, ref.hash, g.snapshot.hash]) assert.ok(text.includes(value), value);
     for (const member of g.members) assert.ok(text.includes(member.ref.hash));
-    assert.ok(!text.includes('Вопрос:')); assert.ok(!Object.hasOwn(g, 'previous'));
+    assert.ok(!text.includes('Доказанные варианты')); assert.ok(!text.includes('Вопрос:')); assert.ok(!Object.hasOwn(g, 'previous'));
     assert.deepEqual(variantGenerationSummary(f.store, f.project, ref), g);
     const cold = f.open();
     assert.deepEqual(stageSummary(cold, f.project, 'discovery', request(ref)), summary);
