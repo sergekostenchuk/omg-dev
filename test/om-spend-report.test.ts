@@ -19,7 +19,7 @@ import { Store, type Revision, type Write } from "../src/storage/store.js";
 import { type OmResult, type Refusal } from "../src/om/refusal.js";
 import { beginAttempt, completeAttempt, openSeries, prepareSeriesAdmission, resumeSeries, seriesId, stopReviewNamespace, STOP_REVIEW_KIND,
   type AttemptGoal, type RepairSeries, type MechanismAdmission } from "../src/om/series.js";
-import { closeAttempt } from "../src/om/repeat-gate.js";
+import { closeAttempt, openAttempt } from "../src/om/repeat-gate.js";
 import { recordRefusal, unitRefusalNamespace, UNIT_REFUSAL_KIND } from "../src/om/refusal-journal.js";
 import { writeOmInput } from "../src/om/input.js";
 import { inputDecisionWrite, writeAddressing } from "../src/om/addressing.js";
@@ -168,8 +168,8 @@ interface SpendStop {
   /** The ledger the paid attempts left: every count of the tests on this carrier is relative to it. */
   readonly paid: Revision<CallLedger>;
 }
-interface PaidSeed { readonly database: string; readonly block: string; readonly series: Ref; readonly adapter: Ref; readonly config: Ref }
-let paidSeed: Promise<PaidSeed> | null = null;
+interface PaidSeed { readonly database: string; readonly block: string; readonly series: Ref }
+const paidSeeds = new Map<string, Promise<PaidSeed>>();
 
 /**
  * LG07 sr-a (№10394): the carrier N1 of the ledger and spend readers. A real first-rung stop is paid once per test
@@ -178,44 +178,50 @@ let paidSeed: Promise<PaidSeed> | null = null;
  * preparation names its workspace, which none of the readers below opens.) The calls under test are direct stop
  * analyses of that stop: their gaps and packet are transport data, and they are settled through settleCall.
  */
-async function buildPaidSeed(): Promise<PaidSeed> {
+async function buildPaidSeed(project: string): Promise<PaidSeed> {
   const root = mkdtempSync(join(tmpdir(), "omg-om-spend-paid-")), database = join(root, "state.sqlite");
   process.once("exit", () => rmSync(root, { recursive: true, force: true }));
   const store = new Store(database);
   try {
-    const m = managedBlock(store, { root, path: database }, PROJECT);
+    const m = managedBlock(store, { root, path: database }, project);
     deliveredOf(openSeries(store, { ...m.address(), slice: "slice:cart@1", predecessor: null, basis: null }));
     for (let attempt = 1; attempt <= 3; attempt += 1) await m.cycle("gap:cart:price", "insufficient");
-    const series = store.get<RepairSeries>(seriesId(PROJECT, m.block, 1))!;
+    const series = store.get<RepairSeries>(seriesId(project, m.block, 1))!;
     assert.deepEqual(series.value.stop?.attempts, [1, 2, 3]);
     assert.ok(series.value.ladder.grounds.includes("review-record"));
     // The preparation paid exactly what its scenario says, and every paid call is settled.
-    const paid = store.get<CallLedger>(callLedgerId(PROJECT))!.value.calls;
+    const paid = store.get<CallLedger>(callLedgerId(project))!.value.calls;
     assert.deepEqual(Object.fromEntries(Object.keys(PAID).map(purpose => [purpose, paid.filter(row => row.purpose === purpose).length])), PAID);
     assert.equal(paid.length, PAID_CALLS);
     assert.ok(paid.every(row => row.status === "succeeded" && canonical(row.usage) === canonical(managedUsage)));
-    const adapter = reference(store.write({ id: `adapter:${PROJECT}`, kind: "dispatch-adapter", expected: 0,
-      value: { projectId: PROJECT, protocol: "codex-stdio", status: "configured-not-accepted" } }));
-    const config = reference(store.write({ id: `config:${PROJECT}`, kind: "dispatch-config", expected: 0,
-      value: { projectId: PROJECT, model: "fixture", transport: "stdio", status: "configured-not-accepted" } }));
-    return { database, block: m.block, series: reference(series), adapter, config };
+    return { database, block: m.block, series: reference(series) };
   } finally {
     store.close();
     assert.equal(existsSync(`${database}-wal`), false, "the paid seed is one checkpointed file");
   }
 }
 
-async function spendStop(t: test.TestContext): Promise<SpendStop> {
-  paidSeed ??= buildPaidSeed();
-  const seed = await paidSeed;
-  const root = mkdtempSync(join(tmpdir(), "omg-om-spend-")), path = join(root, "state.sqlite");
+/** This test's own copy of the paid stop of `project`, in a root of its own. */
+async function paidCopy(project: string, prefix: string) {
+  if (!paidSeeds.has(project)) paidSeeds.set(project, buildPaidSeed(project));
+  const seed = await paidSeeds.get(project)!;
+  const root = mkdtempSync(join(tmpdir(), prefix)), path = join(root, "state.sqlite");
   copyFileSync(seed.database, path);
   const store = new Store(path);
-  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
   const series = store.get<RepairSeries>(seed.series.id)!;
   assert.deepEqual(reference(series), seed.series);
-  return { root, path, store, block: seed.block, series, adapter: seed.adapter, config: seed.config,
-    paid: store.get<CallLedger>(callLedgerId(PROJECT))! };
+  return { root, path, store, block: seed.block, series, paid: store.get<CallLedger>(callLedgerId(project))! };
+}
+
+async function spendStop(t: test.TestContext): Promise<SpendStop> {
+  const copy = await paidCopy(PROJECT, "omg-om-spend-"), store = copy.store;
+  t.after(() => { store.close(); rmSync(copy.root, { recursive: true, force: true }); });
+  // The dispatch records a direct analysis is sent through, as the shared fixture writes them.
+  const adapter = reference(store.write({ id: `adapter:${PROJECT}`, kind: "dispatch-adapter", expected: 0,
+    value: { projectId: PROJECT, protocol: "codex-stdio", status: "configured-not-accepted" } }));
+  const config = reference(store.write({ id: `config:${PROJECT}`, kind: "dispatch-config", expected: 0,
+    value: { projectId: PROJECT, model: "fixture", transport: "stdio", status: "configured-not-accepted" } }));
+  return { ...copy, adapter, config };
 }
 
 /** A direct stop analysis of the paid stop: its own name, and the questions its package addresses. */
@@ -785,6 +791,50 @@ function physicalFixture(t: test.TestContext, purpose: "stop-analysis" | "origin
     sent() { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; } };
 }
 
+/**
+ * LG07 sr-b (№10394 п.4): the physical stop analysis on a real managed stop — the paid stop of project "analysis" from
+ * the same seed as N1. The analysis has its own scenario and trace, so what it sends is counted apart from the paid
+ * preparation; the reviewer's environment is configured on top of the one the preparation configured.
+ */
+async function managedPhysicalFixture(t: test.TestContext) {
+  const project = "analysis", copy = await paidCopy(project, "omg-spend-physical-");
+  const root = copy.root, database = copy.path, series = copy.series;
+  let store = copy.store;
+  t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
+  const paidPhysical = new Set(store.list("model-call").map(record => record.id));
+  const basis = { kind: "series-stop" as const, series: reference(series), attempt: 3 };
+  const scenario = join(root, "scenario.json"), trace = join(root, "trace.jsonl");
+  const command = { executable: process.execPath, args: [providerPath, "--scenario", scenario, "--trace", trace] };
+  const environment = new Environments(store).configure(project, { workspace: root,
+    implementer: { actor: "physical-author", model: "fixture", effort: "high", command },
+    reviewer: { actor: "physical-reviewer", model: "fixture", effort: "high", command }, fullCheck: command, timeoutMs: 30_000 },
+  store.get(`environment:${project}`)?.revision ?? 0);
+  const adapter = store.write({ id: `adapter:${project}`, kind: "dispatch-adapter", expected: 0, value: { protocol: "codex-stdio" } });
+  const packet = { task: "Analyse this exact stop", basis } as unknown as Json;
+  const reviewGoal = { key: "stop-analysis", questions: ["What caused this ground?"], result: "An evidenced cause or an explicit hypothesis" };
+  const admitted = deliveredOf(recordCall(store, project, { call: "spend:stop-analysis", purpose: "stop-analysis", basis, block: copy.block,
+    gaps: [{ id: "stop-analysis", goal: "stop-analysis", field: "cause", consumer: "A6:stop-analysis" }],
+    series: reference(series), attempt: 3, goal: reviewGoal,
+    dispatch: { adapter: reference(adapter), config: reference(environment) }, packet }));
+  const request: ModelTransportRequest = { project, call: reference(admitted.call), packet, role: "reviewer" };
+  function scenarioUsage(usage: unknown) {
+    writeFileSync(scenario, JSON.stringify({ steps: [{ research: { cause: "fixture observation", hypothesis: true }, usage }] }));
+  }
+  scenarioUsage(actualUsage);
+  return { root, database, project, series, admitted, request, scenario, trace, scenarioUsage, paidPhysical,
+    get store() { return store; }, restart() { store.close(); store = new Store(database); },
+    sent() { return existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").filter(Boolean) : []; },
+    /** The one physical call this analysis made: the model-call record the paid preparation did not leave. */
+    dispatch(): Revision<ModelCall> {
+      const own = store.list<ModelCall>("model-call").filter(record => !paidPhysical.has(record.id));
+      assert.equal(own.length, 1, "the analysis made exactly one physical call");
+      return own[0]!;
+    } };
+}
+/** The physical OM calls of a project as their producer names them — not as the report under test lists them. */
+const omPhysical = (store: Store, project: string): Ref[] =>
+  store.list("model-call").filter(record => record.id.startsWith(`model-call:${project}:om:`)).map(reference);
+
 /** Commit the actual E4 claim and stop before the provider can be launched. */
 async function retainedPhysicalClaim(store: Store, invoke: () => Promise<unknown>): Promise<Revision<ModelCall>> {
   const checkpoint = new Error("Physical claim retained before provider launch"), writeMany = store.writeMany.bind(store);
@@ -930,17 +980,21 @@ for (const mode of ["analysis", "ordinary"] as const) {
 
 for (const purpose of ["stop-analysis", "origin-analysis"] as const) {
   test(`E6 report: real ${purpose} transport records measured expense without asserting acceptance`, async t => {
-    const f = physicalFixture(t, purpose);
+    // LG07 sr-b (№10394 п.5): the stop analysis runs on a real managed stop; the origin analysis keeps its dependent
+    // preparation until the origin-hold migration.
+    const f = purpose === "stop-analysis" ? await managedPhysicalFixture(t) : physicalFixture(t, purpose);
+    const paid = "paidPhysical" in f ? PAID_CALLS : 0;
     const sent = deliveredOf(await runModelTransport(f.store, f.request));
     const before = canonical(f.store.list()), report = deliveredOf(spendReport(f.store, { project: f.project }));
-    assert.equal(report.rows.length, 1);
-    const row = report.rows[0]!;
+    assert.equal(report.rows.length, paid + 1);
+    const row = report.rows.find(item => item.call?.id === f.admitted.call.id)!;
     assert.equal(row.purpose, purpose);
     assert.deepEqual(row.physical, reference(sent.record));
     assert.deepEqual(row.usage, actualUsage);
     assert.equal(row.settlement, "succeeded");
     assert.equal(row.result, null, "Analysis response is not the completed product attempt's accepted result");
     assert.deepEqual(report.byPurpose[purpose], { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: actualUsage });
+    if (paid) for (const other of Object.keys(PAID)) assert.deepEqual(report.byPurpose[other as keyof typeof report.byPurpose], paidPurpose(other), other);
     assert.deepEqual(report.findings, []);
     assert.equal(canonical(f.store.list()), before);
     assert.equal(f.sent().length, 1);
@@ -953,22 +1007,25 @@ for (const purpose of ["stop-analysis", "origin-analysis"] as const) {
 }
 
 test("E6 report: a completed physical response with unknown usage remains open and the reader does not settle it", async t => {
-  const f = physicalFixture(t);
+  const f = await managedPhysicalFixture(t);
   f.scenarioUsage(null);
   deliveredOf(await runModelTransport(f.store, f.request));
   const before = canonical(f.store.list()), report = deliveredOf(spendReport(f.store, { project: f.project }));
-  assert.equal(report.rows[0]!.settlement, "open");
-  assert.equal(report.rows[0]!.usage, null);
-  assert.deepEqual(report.findings.map(item => item.code), ["call_not_settled"]);
+  const own = report.rows.find(row => row.call?.id === f.admitted.call.id)!;
+  assert.equal(own.settlement, "open");
+  assert.equal(own.usage, null);
+  assert.deepEqual(report.findings.map(item => [item.code, item.at.target]), [["call_not_settled", f.admitted.call.id]]);
   assert.equal(report.totals.unmeasuredCalls, 1);
-  assert.equal(report.totals.measuredCalls, 0);
+  assert.equal(report.totals.measuredCalls, PAID_CALLS);
   assert.equal(canonical(f.store.list()), before);
   assert.equal(f.sent().length, 1);
 });
 
 test("E6 report: an OM physical call with its E1 record absent is visible as call_without_record", async t => {
-  const f = physicalFixture(t);
+  const f = await managedPhysicalFixture(t);
   const sent = deliveredOf(await runModelTransport(f.store, f.request));
+  const physical = omPhysical(f.store, f.project);
+  assert.equal(physical.length, f.paidPhysical.size + 1);
   class LostE1Store extends Store {
     override get<T = Json>(id: string, revision?: number): Revision<T> | null {
       return id.startsWith(`call-record:${f.project}:`) || id === callLedgerId(f.project) ? null : super.get<T>(id, revision);
@@ -980,17 +1037,19 @@ test("E6 report: an OM physical call with its E1 record absent is visible as cal
   const lost = new LostE1Store(f.database);
   try {
     const report = deliveredOf(spendReport(lost, { project: f.project }));
-    assert.equal(report.rows.length, 1);
-    assert.deepEqual(report.rows[0]!.physical, reference(sent.record));
-    assert.equal(report.rows[0]!.call, null);
-    assert.equal(report.rows[0]!.settlement, "missing");
-    assert.deepEqual(report.findings.map(item => item.code), ["call_without_record"]);
-    assert.ok(report.findings[0]!.at.target);
+    // LG07 sr-b (№10394 п.3): with every E1 of the project hidden, every real OM physical call of it — the paid ones and
+    // this analysis — is one row without its record, with its own addressed finding: none missing and none extra.
+    const sort = (refs: Ref[]) => [...refs].sort((a, b) => a.id.localeCompare(b.id));
+    assert.deepEqual(sort(report.rows.map(row => row.physical!)), sort(physical));
+    assert.ok(report.rows.every(row => row.call === null && row.settlement === "missing"));
+    assert.ok(report.rows.some(row => canonical(row.physical) === canonical(reference(sent.record))));
+    assert.deepEqual(report.findings.map(item => item.code), physical.map(() => "call_without_record"));
+    assert.deepEqual(report.findings.map(item => item.at.target).sort(), physical.map(ref => ref.id).sort());
   } finally { lost.close(); }
 });
 
 interface PhysicalCheckpoint { pid: number; writes: Write[] }
-function driver(t: test.TestContext, f: ReturnType<typeof physicalFixture>, checkpoint: string) {
+function driver(t: test.TestContext, f: { readonly root: string; readonly database: string; readonly request: ModelTransportRequest }, checkpoint: string) {
   const spec = join(f.root, "driver.json"), output = join(f.root, "driver-output.json");
   writeFileSync(spec, JSON.stringify({ database: f.database, output, operation: "transport", request: f.request,
     checkpoint: { path: checkpoint, kind: "om-model-exchange", matches: [], when: "before" } }));
@@ -1015,14 +1074,14 @@ async function physicalCheckpoint(path: string, child: ChildProcess): Promise<Ph
 }
 
 test("E6 report: a late receipt keeps measured expense when the recovered model-call retains usage null", async t => {
-  const f = physicalFixture(t), checkpoint = join(f.root, "received-before-save.json"), owner = driver(t, f, checkpoint);
+  const f = await managedPhysicalFixture(t), checkpoint = join(f.root, "received-before-save.json"), owner = driver(t, f, checkpoint);
   const pending = await physicalCheckpoint(checkpoint, owner.child);
   assert.equal(pending.pid, owner.child.pid);
   assert.equal(f.sent().length, 1);
   const exchange = pending.writes.find(write => write.kind === "om-model-exchange")!.value as { process: ProcessResult; launchError: null };
   const evidence = { process: exchange.process, launchError: exchange.launchError };
   assert.deepEqual(JSON.parse(evidence.process.stdout).usage, actualUsage);
-  const dispatch = f.store.list<ModelCall>("model-call")[0]!;
+  const dispatch = f.dispatch();
   assert.equal(owner.child.kill("SIGKILL"), true);
   await owner.exit;
   const recovered = new ProductEngine(f.store).execute({ type: "recover-model-call", project: f.project, call: reference(dispatch) }) as Revision<ModelCall>;
@@ -1031,10 +1090,11 @@ test("E6 report: a late receipt keeps measured expense when the recovered model-
   deliveredOf(writeGuarded(f.store, { unit: "E4", target: dispatch.id, writes: late.writes, guards: late.guards }));
   deliveredOf(await runModelTransport(f.store, f.request));
   const before = canonical(f.store.list()), report = deliveredOf(spendReport(f.store, { project: f.project }));
-  assert.deepEqual(report.rows[0]!.usage, actualUsage);
-  assert.equal(report.rows[0]!.settlement, "failed");
-  assert.deepEqual(report.totals.reportedTokens, actualUsage);
-  assert.equal(report.totals.calls, 1);
+  const own = report.rows.find(row => row.call?.id === f.admitted.call.id)!;
+  assert.deepEqual(own.usage, actualUsage);
+  assert.equal(own.settlement, "failed");
+  assert.deepEqual(report.totals.reportedTokens, tokensOf(paidTokens(PAID_CALLS), actualUsage));
+  assert.equal(report.totals.calls, PAID_CALLS + 1);
   assert.equal(report.totals.unmeasuredCalls, 0);
   assert.deepEqual(report.findings, []);
   assert.ok(report.snapshot.late.some(item => item.receipt?.id === late.record.id));
@@ -1050,17 +1110,17 @@ test("E6 report: a late receipt keeps measured expense when the recovered model-
 });
 
 test("E6 report: physical recovery retains a complete terminal time in both current and exact history", async t => {
-  const f = physicalFixture(t), checkpoint = join(f.root, "recovery-time.json"), owner = driver(t, f, checkpoint);
+  const f = await managedPhysicalFixture(t), checkpoint = join(f.root, "recovery-time.json"), owner = driver(t, f, checkpoint);
   await physicalCheckpoint(checkpoint, owner.child);
-  const dispatch = f.store.list<ModelCall>("model-call")[0]!;
+  const dispatch = f.dispatch();
   assert.equal(owner.child.kill("SIGKILL"), true);
   await owner.exit;
   const recovered = new ProductEngine(f.store).execute({
     type: "recover-model-call", project: f.project, call: reference(dispatch),
   }) as Revision<ModelCall>;
   const baseline = deliveredOf(spendReport(f.store, { project: f.project }));
-  assert.equal(baseline.rows[0]!.usage, null);
-  assert.deepEqual(baseline.findings.map(row => row.code), ["call_not_settled"]);
+  assert.equal(baseline.rows.find(row => row.call?.id === f.admitted.call.id)!.usage, null);
+  assert.deepEqual(baseline.findings.map(row => [row.code, row.at.target]), [["call_not_settled", f.admitted.call.id]]);
   assert.deepEqual(baseline.snapshot.late, [{ call: reference(recovered), receipt: null }]);
   assert.equal(f.sent().length, 1);
 
@@ -1089,7 +1149,10 @@ test("E6 report: physical recovery retains a complete terminal time in both curr
       const value = structuredClone(recovered.value) as unknown as PhysicalBody;
       invalid.change(value);
       const physical = replaceTerminal(value);
-      const snapshot = { ...baseline.snapshot, calls: [physical], late: [{ call: physical, receipt: null }] } as SpendSnapshot;
+      // LG07 sr-b (№10394 п.4): only the reference of the changed call is replaced; every other physical call, series and
+      // late entry of the complete snapshot stays, so the refusal cannot come from an incomplete cut.
+      const snapshot = { ...baseline.snapshot, calls: baseline.snapshot.calls.map(ref => ref.id === recovered.id ? physical : ref),
+        late: baseline.snapshot.late.map(item => item.call.id === recovered.id ? { call: physical, receipt: null } : item) } as SpendSnapshot;
       const current = new Store(f.database), history = new ExactOnlyStore(f.database);
       try {
         const readers = [() => readModelTransport(history, { project: f.project, record: physical }),
@@ -1427,7 +1490,7 @@ writeFileSync(output, JSON.stringify(expected));
 });
 
 /** Real ordinary E4/E2 fact assignment, using the same source construction as om-model-call.test.ts. */
-function ordinarySpendFixture(t: test.TestContext) {
+function ordinarySpendFixture(t: test.TestContext, managed = false) {
   const root = mkdtempSync(join(tmpdir(), "omg-spend-ordinary-")), database = join(root, "state.sqlite");
   const store = new Store(database), engine = new ProductEngine(store), project = "garden";
   t.after(() => { store.close(); rmSync(root, { recursive: true, force: true }); });
@@ -1481,7 +1544,11 @@ function ordinarySpendFixture(t: test.TestContext) {
     result: gapLineExpectedResult(project, batch.items[0]!.target, batch.items[0]!.field) };
   const address = { project, block: "garden-consume-block", line: 1 };
   deliveredOf(openSeries(store, { ...address, slice: "e6-e4-fixture", predecessor: null, basis: null }));
-  const series = deliveredOf(beginAttempt(store, { ...address, attempt: 1, goal }));
+  // LG07 sr-b (№10394 п.5): a migrated test opens the attempt with the complete plan of its own MC1 batch; the NR1
+  // tests keep the earlier opening until their own migration.
+  const series = deliveredOf(managed
+    ? openAttempt(store, { ...address, attempt: 1, goal, completion: { routes: reference(routes), batches: [batch.id] } })
+    : beginAttempt(store, { ...address, attempt: 1, goal }));
   const packetRequest: QuestionPacketRequest = { project, routes: reference(routes), batch: batch.id, environment: reference(configured),
     attempt: { series: reference(series), ordinal: 1 }, previous: [] };
   const packet = deliveredOf(writeQuestionPacket(store, packetRequest)).record;
@@ -1491,7 +1558,7 @@ function ordinarySpendFixture(t: test.TestContext) {
 }
 
 test("E6 report: one assessed fact has its own physical expense beside the original MC1 call", async t => {
-  const f = ordinarySpendFixture(t);
+  const f = ordinarySpendFixture(t, true);
   const assessmentUsage = { inputTokens: 11, outputTokens: 3, cachedInputTokens: 2, reasoningOutputTokens: 1 };
   f.steps([{ research: { protocol: "$answerProtocol", requestId: "$requestId", action: "answer",
     results: [{ questionId: f.batch.items[0]!.gap, value: "UTF-8",
@@ -1658,7 +1725,7 @@ test("E6 report: recomputed E1 and ledger hashes do not let another block claim 
 });
 
 test("E6 report: a real late receipt arriving after the absence read invalidates the current cut", async t => {
-  const f = physicalFixture(t), checkpoint = join(f.root, "receipt-race.json"), owner = driver(t, f, checkpoint);
+  const f = await managedPhysicalFixture(t), checkpoint = join(f.root, "receipt-race.json"), owner = driver(t, f, checkpoint);
   const pending = await physicalCheckpoint(checkpoint, owner.child);
   assert.equal(pending.pid, owner.child.pid);
   const exchange = pending.writes.find(write => write.kind === "om-model-exchange")!.value as {
@@ -1666,7 +1733,7 @@ test("E6 report: a real late receipt arriving after the absence read invalidates
   };
   const evidence = { process: exchange.process, launchError: exchange.launchError };
   assert.deepEqual(JSON.parse(evidence.process.stdout).usage, actualUsage);
-  const dispatch = f.store.list<ModelCall>("model-call")[0]!;
+  const dispatch = f.dispatch();
   assert.equal(owner.child.kill("SIGKILL"), true);
   await owner.exit;
   const recovered = new ProductEngine(f.store).execute({
@@ -1677,7 +1744,7 @@ test("E6 report: a real late receipt arriving after the absence read invalidates
   assert.equal(f.store.get(late.record.id), null);
   const beforeReceipt = deliveredOf(spendReport(f.store, { project: f.project }));
   assert.deepEqual(beforeReceipt.snapshot.late, [{ call: reference(recovered), receipt: null }]);
-  assert.equal(beforeReceipt.rows[0]!.usage, null);
+  assert.equal(beforeReceipt.rows.find(row => row.call?.id === f.admitted.call.id)!.usage, null);
   const ledgerBefore = f.store.get(callLedgerId(f.project));
   const writer = new Store(f.database);
   class ReceiptArrivesStore extends Store {
@@ -1709,12 +1776,14 @@ test("E6 report: a real late receipt arriving after the absence read invalidates
     finally { historical.close(); }
     const beforeRetry = canonical(f.store.list().flatMap(row => f.store.history(row.id)));
     const retried = deliveredOf(spendReport(racing, { project: f.project }));
-    assert.equal(retried.rows.length, 1);
-    assert.deepEqual(retried.rows[0]!.usage, actualUsage);
-    assert.equal(retried.rows[0]!.settlement, "open");
-    assert.deepEqual(retried.findings.map(row => row.code), ["call_not_settled"]);
+    assert.equal(retried.rows.length, PAID_CALLS + 1);
+    const own = retried.rows.find(row => row.call?.id === f.admitted.call.id)!;
+    assert.deepEqual(own.usage, actualUsage);
+    assert.equal(own.settlement, "open");
+    assert.deepEqual(retried.findings.map(row => [row.code, row.at.target]), [["call_not_settled", f.admitted.call.id]]);
     assert.deepEqual(retried.snapshot.late, [{ call: reference(recovered), receipt: reference(late.record) }]);
-    assert.deepEqual(retried.totals, { calls: 1, measuredCalls: 1, unmeasuredCalls: 0, reportedTokens: actualUsage });
+    assert.deepEqual(retried.totals, { calls: PAID_CALLS + 1, measuredCalls: PAID_CALLS + 1, unmeasuredCalls: 0,
+      reportedTokens: tokensOf(paidTokens(PAID_CALLS), actualUsage) });
     assert.equal(canonical(f.store.list().flatMap(row => f.store.history(row.id))), beforeRetry);
     assert.equal(f.sent().length, 1, "The reader neither retries the model nor settles the E1 call");
   } finally { racing.close(); writer.close(); }
@@ -1722,7 +1791,7 @@ test("E6 report: a real late receipt arriving after the absence read invalidates
 
 async function assertE6R2RecoveredEvidence(
   t: test.TestContext,
-  f: ReturnType<typeof physicalFixture>,
+  f: Awaited<ReturnType<typeof managedPhysicalFixture>>,
   dispatch: Revision<ModelCall>,
   recovered: Revision<ModelCall>,
   late: ReturnType<typeof prepareLateModelReceipt>,
@@ -1784,6 +1853,20 @@ async function assertE6R2RecoveredEvidence(
     assert.deepEqual(value.totals, { calls: 1, measuredCalls: 0, unmeasuredCalls: 1, reportedTokens: null });
   };
   const invalidLate = (error: unknown): boolean => error instanceof EngineError && error.code === "model_call_late_receipt_invalid";
+  // LG07 sr-b (№10394 п.3): with every E1 of the project hidden, the CURRENT report lists every real OM physical call of
+  // it as an orphan — the paid ones and the recovered analysis — exactly; the exact historical cut of the one recovered
+  // call stays a separate lawful slice with exactly one row (assertOrphan).
+  const physical = omPhysical(f.store, f.project), sort = (refs: readonly Ref[]) => [...refs].sort((a, b) => a.id.localeCompare(b.id));
+  assert.equal(physical.length, f.paidPhysical.size + 1);
+  assert.ok(physical.some(ref => canonical(ref) === canonical(recoveredRef)));
+  const assertCurrentOrphans = (report: ReturnType<typeof spendReport>): void => {
+    const value = deliveredOf(report);
+    assert.deepEqual(sort(value.rows.map(row => row.physical!)), sort(physical));
+    assert.ok(value.rows.every(row => row.call === null && row.settlement === "missing" && row.usage === null && row.result === null));
+    assert.deepEqual(value.findings.map(row => row.code), physical.map(() => "call_without_record"));
+    assert.deepEqual(value.findings.map(row => row.at.target).sort(), physical.map(ref => ref.id).sort());
+    assert.deepEqual(value.totals, { calls: physical.length, measuredCalls: 0, unmeasuredCalls: physical.length, reportedTokens: null });
+  };
 
   await t.test("orphan recovery accepts explicit absent and actual late sources without inventing expense", () => {
     for (const missingReceipt of [false, true]) {
@@ -1791,7 +1874,7 @@ async function assertE6R2RecoveredEvidence(
       current.hideReceipt = missingReceipt;
       try {
         const report = spendReport(current, { project: f.project });
-        assertOrphan(report);
+        assertCurrentOrphans(report);
         assert.deepEqual(deliveredOf(report).snapshot.late,
           [{ call: recoveredRef, receipt: missingReceipt ? null : receiptRef }]);
       } finally { current.close(); }
@@ -1859,9 +1942,10 @@ async function assertE6R2RecoveredEvidence(
         const refusal = spendRefused(spendReport(current, { project: f.project }), "model_call_record_invalid");
         assert.equal(refusal.at.target, dispatch.id);
         assert.equal(refusal.at.field, "usage");
+        // LG07 sr-b (№10394 п.4): only the forged call is replaced in the complete snapshot.
         const historical = spendRefused(readSpendReport(exact, {
-          ...baseline.snapshot, calls: [reference(forgedTerminal)],
-          late: [{ call: reference(forgedTerminal), receipt: null }],
+          ...baseline.snapshot, calls: baseline.snapshot.calls.map(ref => ref.id === recovered.id ? reference(forgedTerminal) : ref),
+          late: baseline.snapshot.late.map(item => item.call.id === recovered.id ? { call: reference(forgedTerminal), receipt: null } : item),
         }), "model_call_record_invalid");
         assert.equal(historical.at.target, dispatch.id);
         assert.equal(historical.at.field, "usage");
