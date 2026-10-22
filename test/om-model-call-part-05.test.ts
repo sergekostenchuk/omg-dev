@@ -4,7 +4,7 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { type Json, canonical } from '../src/canonical.js';
 import { EngineError } from '../src/errors.js';
-import { runModelCall, readModelCall, type ModelCallRequest, runModelTransport, type ModelTransportRequest, readCompletionWorkAt, runModelCycle, readModelCycle, assembleModelParts, checkCompletionLedger, deliverModelSources, correctionGround as mp2Ground, runModelCycle as mp2Cycle, readContinuationEvidence } from '../src/om/model-call.js';
+import { runModelCall, readModelCall, type ModelCallRequest, type OmModelCall, runModelTransport, type ModelTransportRequest, readCompletionWorkAt, runModelCycle, readModelCycle, assembleModelParts, checkCompletionLedger, deliverModelSources, correctionGround as mp2Ground, runModelCycle as mp2Cycle, readContinuationEvidence } from '../src/om/model-call.js';
 import { Store, type Revision, type Write } from '../src/storage/store.js';
 import { reference, type Ref } from '../src/pipeline/contracts.js';
 import { ProductEngine } from '../src/product/engine.js';
@@ -23,34 +23,51 @@ import { unitRefusalNamespace, UNIT_REFUSAL_KIND, recordRefusal } from '../src/o
 import { processStart } from '../src/runtime/process-identity.js';
 import type { ModelCall } from '../src/runtime/model-usage.js';
 import { readModelCallRecovery } from '../src/discovery/model-call-recovery.js';
-import { completionE1, completionSnapshot, currentPacketWire, e4AnalysisFixture, e4CannotAnswer, e4Fact, e4Fixture, e4NeedSource, e4Node, ensureFixtureProject, fixtureCheckpoint, fixtureDriver, h15CannotAnswer, h15Heads, h15Refusal, killFixtureDriver, killFixtureProvider, mp2Managed, mp2Refused, mp3Carried, mp3Cycle, mp3Decisions, mp3Parts, mp3Readings, publicRecovery, readsOf, refusesLiveRecovery, signalFixtureProvider, usage, valueOf } from './om-model-call-fixture.js';
+import { completionE1, completionSnapshot, currentPacketWire, e4CannotAnswer, e4Fact, e4Fixture, e4ManagedAnalysisFixture, e4NeedSource, e4Node, ensureFixtureProject, fixtureCheckpoint, fixtureDriver, h15CannotAnswer, h15Heads, h15Refusal, killFixtureDriver, killFixtureProvider, mp2Managed, mp2Refused, mp3Carried, mp3Cycle, mp3Decisions, mp3Parts, mp3Readings, publicRecovery, readsOf, refusesLiveRecovery, signalFixtureProvider, usage, valueOf } from './om-model-call-fixture.js';
 
 
 
 test('E4 node result conflict leaves no partial response/proposal/result, accounts observed usage and never dispatches twice', async t => {
-  const f = e4Fixture(t, 'node'); f.steps([{ research: e4Node(f), usage }]);
+  const f = e4Fixture(t, 'node', 100_000, 0, 5000, true); f.steps([{ research: e4Node(f), usage }]);
   const writeMany = f.store.writeMany.bind(f.store); let injected = false;
+  const replace = () => {
+    injected = true;
+    const other = new Store(f.database);
+    try {
+      const head = other.get<import('../src/runtime/environment.js').Environment>(f.configured.id)!;
+      const { projectId: _project, ...config } = structuredClone(head.value);
+      new ProductEngine(other).environments.configure(f.project, { ...config, timeoutMs: config.timeoutMs + 1 }, head.revision);
+    } finally { other.close(); }
+  };
   f.store.writeMany = ((writes, guards) => {
-    if (!injected && writes.some(write => write.kind === 'part-result')) {
-      injected = true;
-      const env = f.store.get(f.configured.id)!;
-      writeMany([{ id: env.id, kind: env.kind, expected: env.revision, value: env.value }]);
-    }
+    if (!injected && writes.some(write => write.kind === 'part-response')) replace();
     return writeMany(writes, guards);
   }) as Store['writeMany'];
-  const actual = valueOf(await runModelCall(f.store, f.request)); f.store.writeMany = writeMany;
-  assert.equal(actual.record.value.status, 'failed'); assert.equal(actual.record.value.error, 'input_stale');
-  assert.ok(actual.record.value.om.rejection && actual.record.value.om.exchange && actual.diagnostic);
-  assert.equal(actual.outcome, null);
+  // A managed application failure is a typed refusal, not an invented failed product — the standalone
+  // om.rejection record is removed (S1.1 in om-model-call-part-02); the received receipt stays resumable.
+  const actual = await runModelCall(f.store, f.request); f.store.writeMany = writeMany;
+  assert.equal(actual.ok, false);
+  if (!actual.ok) assert.equal(actual.refusal.code, 'input_stale');
   assert.ok(injected); assert.equal(f.sent().length, 1);
+  assert.equal(f.store.list('om-model-exchange').length, 1);
   for (const kind of ['part-response', 'part-result']) assert.equal(f.store.list(kind).length, 0);
   assert.equal(f.store.list('layer-proposal').length, 0);
+  assert.equal(f.store.list('om-completion-cessation').length, 0);
+  assert.equal(f.store.get<RepairSeries>(f.series.id)!.value.attempts[0]!.outcome, null, 'No unpaid work is closed');
+  const record = f.store.list<OmModelCall>('model-call')[0]!;
+  assert.equal(record.value.om.application, 'received'); assert.equal(record.value.om.part, null);
   const call = f.store.list<{usage: typeof usage;status:string}>('call-record')[0]!;
-  assert.deepEqual(call.value.usage, usage); assert.equal(call.value.status, 'failed');
-  const expected = valueOf(readModelCall(f.store, { project: f.project, record: reference(actual.record) }));
+  assert.deepEqual(call.value.usage, usage); assert.equal(call.value.status, 'succeeded');
+  const pending = readModelCall(f.store, { project: f.project, record: reference(record) });
+  assert.equal(pending.ok, false);
+  if (!pending.ok) assert.equal(pending.refusal.code, 'model_call_application_pending');
+  const expected = f.store.get(record.id)!;
   f.restart();
-  const repeated = valueOf(await runModelCall(f.store, f.request));
-  assert.deepEqual(repeated, expected);
+  assert.deepEqual(f.store.get(record.id), expected);
+  const repeated = await runModelCall(f.store, f.request);
+  assert.equal(repeated.ok, false);
+  if (!repeated.ok) assert.equal(repeated.refusal.code, 'completion_ceased');
+  assert.equal(f.store.list('om-completion-cessation').length, 1);
   assert.equal(f.sent().length, 1);
 });
 
@@ -59,7 +76,7 @@ test('E4 node result conflict leaves no partial response/proposal/result, accoun
 test('E4 owner loss after authorization but before stdin preserves unknown delivery for product and analysis', async t => {
   for (const purpose of ['fact', 'stop-analysis'] as const) await t.test(purpose, async nested => {
     const product = purpose === 'fact';
-    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 30_000) : e4AnalysisFixture(nested, 'stop-analysis', 30_000);
+    const f = product ? e4Fixture(nested, 'fact', 100_000, 0, 30_000, true) : await e4ManagedAnalysisFixture(nested, 'stop-analysis', 30_000);
     ensureFixtureProject(f.store, f.project);
     const checkpoint = join(f.root, 'authorized.json');
     const research = product ? e4Fact(f as ReturnType<typeof e4Fixture>) : { cause: 'No request yet transferred', hypothesis: true };
@@ -67,7 +84,9 @@ test('E4 owner loss after authorization but before stdin preserves unknown deliv
     const driver = fixtureDriver(nested, f.database, f.root, product ? 'call' : 'transport', f.request,
       { path: checkpoint, kind: 'model-call', matches: [{ path: ['execution', 'phase'], value: 'authorized' }] });
     const paused = await fixtureCheckpoint(checkpoint, driver.child); assert.equal(paused.pid, driver.child.pid);
-    const dispatch = f.store.list<ModelCall>('model-call')[0]!, provider = dispatch.value.execution!.provider!;
+    // Under the managed carrier the paid preparation holds its own model-call rows: the live dispatch is the
+    // only running one, the first list entry is otherwise an arbitrary paid predecessor.
+    const dispatch = f.store.list<ModelCall>('model-call').find(row => row.value.status === 'running')!, provider = dispatch.value.execution!.provider!;
     nested.after(() => { signalFixtureProvider(provider.pid, provider.started); });
     assert.equal(f.sent().length, 0, 'Authorization alone is not evidence that stdin was transferred');
     refusesLiveRecovery(f.store, f.project, reference(dispatch));
