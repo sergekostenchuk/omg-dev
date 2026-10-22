@@ -776,7 +776,7 @@ test("D2 unrelated attempts and a shifted series cannot close a line or partiall
         const refusal = denied(operation(store, request), variant.code);
         assert.equal(refusal.at.target, line.id);
         assert.equal(refusal.at.field, variant.field);
-        if (refusal.at.ref !== undefined) assert.deepEqual(refusal.at.ref, link);
+        if (variant.code === "record_foreign" || variant.code === "record_forged") assert.deepEqual(refusal.at.ref, link);
       }
       assert.deepEqual(historySnapshot(store), before);
     } finally { store.close(); }
