@@ -274,9 +274,11 @@ test('C03 H1.0a original managed opening protects all M6 sources in the same tra
     new ProductEngine(second).graphs.save(f.project,graph.value,graph.revision,'concurrent shared source');
   }finally{second.close();}
   const owners=f.store.list('om-completion-owner').length,eras=f.store.list('om-completion-era').length;
+  const snapshot=f.store.list();
   const result=writeGuarded(f.store,{unit:'G7',target:f.project,writes:prepared.writes,guards:prepared.guards});
   assert.equal(result.ok,false);if(!result.ok)assert.equal(result.refusal.code,'input_stale');
   assert.equal(f.store.list('om-completion-owner').length,owners);assert.equal(f.store.list('om-completion-era').length,eras);
+  assert.deepEqual(f.store.list(),snapshot);
 });
 
 
