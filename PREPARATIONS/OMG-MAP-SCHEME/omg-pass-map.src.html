@@ -1,4 +1,5 @@
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Проход продукта OMG</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -235,11 +236,36 @@ ul.plain b{color:var(--ink);font-weight:500}
 .decide div::before{counter-increment:q;content:counter(q);width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font:600 11px var(--mono);color:var(--accent);background:var(--accent-soft)}
 .decide b{color:var(--ink);font-weight:500}
 
+/* Карта на весь экран: .mapfs — общая обёртка меню карты, фильтра базы, обозначений, холста и карточки. Fullscreen API на ней; если API нет или отказал — тот же вид классом (position:fixed). */
+.mapfs{display:flex;flex-direction:column;gap:14px;min-width:0}
+.mapfs .fsleg{display:none}
+.mapfs:not(.is-fs) .fsonly{display:none}
+.mapfs.is-fs .nofs{display:none}
+.mapfs::backdrop{background:var(--bg)}
+.mapfs.is-fs{position:fixed;inset:0;z-index:2147483000;padding:10px 12px;gap:8px;background:var(--bg);color:var(--ink);overflow:hidden}
+@supports (height:100dvh){.mapfs.is-fs{height:100dvh}}
+.mapfs.is-fs .bar,.mapfs.is-fs .dbbar,.mapfs.is-fs .fsleg{flex:0 0 auto;overflow:auto;overscroll-behavior:contain}
+.mapfs.is-fs .bar{max-height:42%}
+.mapfs.is-fs .dbbar{max-height:30%}
+.mapfs.is-fs .fsleg{display:flex;padding:0 2px}
+.mapfs.is-fs .stagewrap{flex:1 1 0;min-height:0;display:flex;flex-direction:column}
+.mapfs.is-fs .canvas{flex:1 1 auto;height:auto;min-height:0;border-radius:10px}
+.mapfs.is-fs .detail{width:min(420px,calc(100% - 24px));overscroll-behavior:contain}
+.chip.fsx{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft);font-weight:600}
+.chip.fsx:hover{color:var(--accent-hi)}
+html.fslock,html.fslock body{overflow:hidden}
+
 @media (max-width:820px){
   .detail{position:static;width:auto;max-height:none;margin-top:12px}
   .canvas{height:64vh}
   .hint{margin-left:0;width:100%}
   h1{font-size:21px}
+  .mapfs.is-fs{padding:8px}
+  .mapfs.is-fs .hint{display:none}
+  .mapfs.is-fs .chip{height:30px}
+  .mapfs.is-fs .detail{position:absolute;left:8px;right:8px;top:auto;bottom:8px;width:auto;max-height:62%;margin:0}
+  .mapfs.is-fs .zoom{top:8px;bottom:auto}
+  .dbbar select.chip{max-width:100%}
 }
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
@@ -257,7 +283,9 @@ ul.plain b{color:var(--ink);font-weight:500}
     </div>
   </header>
 
+  <div class="mapfs" id="mapfs">
   <div class="bar" role="toolbar" aria-label="Управление картой">
+    <button class="chip fsx fsonly" id="fsOff" type="button" title="Вернуться в обычный вид (Esc)">✕ Обычный вид</button>
     <button class="chip" data-mode="" aria-pressed="true">Весь поток</button>
     <button class="chip" data-mode="chain" aria-pressed="false">Цепочка фактов</button>
     <button class="chip" data-mode="gaps" aria-pressed="false">Пробелы</button>
@@ -274,7 +302,8 @@ ul.plain b{color:var(--ink);font-weight:500}
     <button class="chip" id="expAll">Развернуть всё</button>
     <button class="chip" id="colAll">Свернуть всё</button>
     <button class="chip" id="resetPos">Сбросить расположение</button>
-    <span class="hint">клик по стадии — развернуть · тяните блоки и рамки · колесо — масштаб · пустое поле — сдвиг</span>
+    <button class="chip nofs" id="fsOn" type="button" title="Карта на весь экран (Esc — вернуться)">⛶ На весь экран</button>
+    <span class="hint">клик по стадии — развернуть · тяните блоки и рамки · колесо — масштаб · пустое поле — сдвиг<span class="fsonly"> · Esc — обычный вид</span></span>
   </div>
   <div class="dbbar" id="dbbar" role="toolbar" aria-label="Фильтр базы" hidden>
     <span class="eyebrow">база · фильтр</span>
@@ -302,6 +331,7 @@ ul.plain b{color:var(--ink);font-weight:500}
       </div>
     </div>
     <aside class="detail" id="detail" hidden aria-live="polite"></aside>
+  </div>
   </div>
 
   <nav class="nav" aria-label="Разделы">
@@ -3712,6 +3742,38 @@ research-stage(project, draftId, maxTurns)
     else if(cd){ev.preventDefault();var k=cd.dataset.key;expandable(k)?toggle(k):openDetail(k);}
   });
   document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&sel)closeDetail();});
+
+  /* ---------- карта на весь экран: меню, фильтр базы, обозначения, холст и карточка — в одной обёртке #mapfs ---------- */
+  var fsEl=document.getElementById("mapfs"),fsOnB=document.getElementById("fsOn"),fsOffB=document.getElementById("fsOff"),fsIs=false,fsY=0,fsOutAt=0;
+  (function(){var lg=document.querySelector(".head .legend"),sw=fsEl.querySelector(".stagewrap");
+    if(lg&&sw){var c=lg.cloneNode(true);c.classList.add("fsleg","fsonly");fsEl.insertBefore(c,sw);}})();
+  function fsNative(){return document.fullscreenElement||document.webkitFullscreenElement||null;}
+  function fsSettle(){
+    var go=function(){try{window.dispatchEvent(new Event("resize"));}catch(_){}draw();};
+    if(window.requestAnimationFrame)requestAnimationFrame(function(){requestAnimationFrame(go);});else go();
+  }
+  function fsApply(on){
+    if(fsIs===on)return;fsIs=on;
+    if(on)fsY=window.pageYOffset||0;
+    fsEl.classList.toggle("is-fs",on);document.documentElement.classList.toggle("fslock",on);
+    Array.prototype.slice.call(document.querySelectorAll(".page > :not(#mapfs)")).forEach(function(e){if(on)e.setAttribute("inert","");else e.removeAttribute("inert");});
+    if(!on){fsOutAt=Date.now();try{window.scrollTo(0,fsY);}catch(_){}}
+    fsSettle();
+    try{(on?fsOffB:fsOnB).focus({preventScroll:true});}catch(_){}
+  }
+  function fsAsk(fn,ctx){if(!fn)return;try{var p=fn.call(ctx);if(p&&p.catch)p.catch(function(){});}catch(_){}}
+  function fsEnter(){if(fsIs)return;fsApply(true);fsAsk(fsEl.requestFullscreen||fsEl.webkitRequestFullscreen,fsEl);}
+  function fsLeave(){if(!fsIs)return;fsApply(false);if(fsNative())fsAsk(document.exitFullscreen||document.webkitExitFullscreen,document);}
+  function fsChanged(){var n=fsNative();
+    if(fsIs&&!n)fsApply(false);
+    else if(fsIs)fsSettle();
+    else if(n===fsEl)fsAsk(document.exitFullscreen||document.webkitExitFullscreen,document);}
+  document.addEventListener("fullscreenchange",fsChanged);document.addEventListener("webkitfullscreenchange",fsChanged);
+  fsOnB.addEventListener("click",fsEnter);fsOffB.addEventListener("click",fsLeave);
+  window.addEventListener("keydown",function(ev){
+    if(ev.key!=="Escape")return;
+    if(fsIs||Date.now()-fsOutAt<400){ev.stopPropagation();if(fsIs){ev.preventDefault();fsLeave();}}
+  },true);
 
 /*@DBLAYERJS@*/
   renderDoneTable();
