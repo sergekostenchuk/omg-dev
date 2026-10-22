@@ -3,7 +3,8 @@ import type { Ref } from '../pipeline/contracts.js';
 import { VARIANT_SCOPE_CONTRACT, readVariantNoneStructural, readVariantSetStructural, readVariantSnapshotStructural,
   readVariantStructure, variantBasis, variantInvalid, variantNullableRef, variantOrigin, variantReason,
   variantRecordId, variantRef, variantSame, variantShape, variantText,
-  type StructuralVariantRecord, type VariantOrigin, type VariantReason, type VariantRecordView } from './discovery-variants.js';
+  projectVariantPublication, type StructuralVariantRecord, type VariantExecutionSession, type VariantOrigin, type VariantPublication,
+  type VariantReason, type VariantRecordView } from './discovery-variants.js';
 
 export const VARIANT_OWNER_DECISION_CONTRACT = 'discovery-variant-owner-decision/v1' as const;
 export const VARIANT_MODEL_DECISION_CONTRACT = 'discovery-variant-model-decision/v1' as const;
@@ -194,3 +195,26 @@ export function readVariantHandoffStructural(view: VariantRecordView, project: s
 }
 // Keep one address formula for immutable values; the state alone has a stable project/draft address.
 export { variantRecordId };
+
+export interface VariantPublicationWrite { id: string; kind: string; expected: number; value: unknown }
+/** 4B.1: the whole product batch of one paid generation — members, the set or no_variants, and the next current state —
+ * as the producer writes it and the historical reader recomputes it. The previous state is the exact expected selection
+ * the execution was dispatched with (absent when none); the state names the subject's exact mode and no decision yet. */
+export function variantPublicationWrites(view: VariantRecordView, session: VariantExecutionSession, payload: unknown):
+  { publication: VariantPublication; writes: VariantPublicationWrite[]; guards: Ref[] } {
+  const publication = projectVariantPublication(session, payload), subject = session.variantSubject;
+  const stateId = variantStateId(session.projectId, session.draft.id), expected = subject.expectedSelection;
+  let previous: Ref | null = null, revision = 0;
+  if (expected) {
+    readVariantStateStructural(view, session.projectId, session.draft.id, expected);
+    previous = expected; revision = expected.revision;
+  }
+  const isSet = publication.result.kind === 'discovery-variant-set';
+  const state = decodeVariantState({ contract: VARIANT_STATE_CONTRACT, projectId: session.projectId, draft: session.draft,
+    mode: subject.mode, result: publication.result.ref, set: isSet ? publication.result.ref : null, decision: null, previous });
+  const writes: VariantPublicationWrite[] = [
+    ...publication.members.map(member => ({ id: member.id, kind: member.kind, expected: 0, value: member.value })),
+    { id: publication.result.id, kind: publication.result.kind, expected: 0, value: publication.result.value },
+    { id: stateId, kind: 'discovery-variant-state', expected: revision, value: state }];
+  return { publication, writes, guards: [subject.mode, ...(subject.kind === 'proposal' ? [subject.snapshot] : [])] };
+}

@@ -4,8 +4,9 @@ import { reference, isRef, type Ref } from '../pipeline/contracts.js';
 import { uniqueTransactionGuards, type Environment, type RoleBinding } from '../runtime/environment.js';
 import type { Store, Revision } from '../storage/store.js';
 import type { DiscoveryDraft, Question } from './discovery.js';
-import { decodeVariantExecutionSession, decodeVariantSubject, VARIANT_SESSION_CONTRACT,
-  type VariantExecutionSession, type VariantSubject } from './discovery-variants.js';
+import { decodeVariantExecutionSession, decodeVariantSubject, readVariantNoneStructural, readVariantSetStructural, VARIANT_SESSION_CONTRACT,
+  type VariantExecutionSession, type VariantPublication, type VariantSubject } from './discovery-variants.js';
+import { variantPublicationWrites } from './variant-decision.js';
 import { variantTransportFields, variantTransportGuards } from './continuation-packet.js';
 import { readVariantSnapshot } from './variant-snapshot.js';
 import { researchCall } from './research-protocol.js';
@@ -40,15 +41,47 @@ export function readVariantExecutionSession(store:Store,project:string,ref:Ref):
   if(v.cursor===1) {
     const running=readResearchConsumerIntent(store,v.result!.intent);
     const paid=readResearchConsumerExecution(store,project,reference(running));
-    if(paid.kind!=='response' || paid.intent.value.state!=='applied'
-      || paid.intent.value.outputs?.length!==1 || !same(paid.intent.value.outputs[0],ref)) invalid('The execution receipt has no atomic managed application');
+    const outputs=paid.intent.value.outputs;
+    if(paid.kind!=='response' || paid.intent.value.state!=='applied' || !outputs?.length || !same(outputs[0],ref))
+      invalid('The execution receipt has no atomic managed application');
     const initial=exact<VariantExecutionSession>(store,running.value.owner,'discovery-variant-session');
     const projected=projectPaidVariantSession(initial,running,{call:reference(paid.call),response:paid.response,payload:paid.payload});
     if(!same(projected,v) || paid.intent.revision!==running.revision+1
       || !same(paid.intent.value,{...running.value,state:'applied',outputs:paid.intent.value.outputs}))
       invalid('The execution receipt differs from its exact paid application');
+    // A 4T.4 execution-only receipt keeps its own contract and is no product set; a 4B.1 receipt carries the whole
+    // publication its paid generation projects, in the exact order and revisions it was written with.
+    if(outputs!.length>1) {
+      const expected=variantPublicationWrites(store,v,paid.payload).writes.map(write=>({id:write.id,revision:write.expected+1,hash:hashJson(write.value as never)}));
+      if(!same(outputs!.slice(1),expected)) invalid('The execution receipt names another publication than its paid generation projects');
+    }
   }
   return row;
+}
+
+export interface ProvenVariantGeneration {
+  verification:'proven'; session:Revision<VariantExecutionSession>; publication:VariantPublication; state:Ref;
+}
+/** 4B.1: the proven reader of a published generation result — a set or no_variants. The structural record leads to the
+ * running intent it names, the applied revision right after it, and that application's receipt; the whole publication is
+ * recomputed from the paid answer. A structural record alone, or a 4T.4 execution-only receipt, proves no product set. */
+export function readVariantGeneration(store:Store,project:string,ref:Ref):ProvenVariantGeneration {
+  const row=isRef(ref)?store.get(ref.id,ref.revision):null;
+  const structural=row?.kind==='discovery-variant-set'?readVariantSetStructural(store,project,ref).record
+    :row?.kind==='discovery-variant-none'?readVariantNoneStructural(store,project,ref).record:invalid('Expected an exact published set or no_variants');
+  const origin=structural.value.origin;
+  const running=readResearchConsumerIntent(store,origin.intent);
+  const applied=store.get<ResearchConsumerIntent>(running.id,running.revision+1);
+  if(running.value.state!=='running' || applied?.value.state!=='applied' || !applied.value.outputs?.length
+    || !applied.value.outputs.some(output=>same(output,ref))) invalid('The generation result is not an output of its exact managed application');
+  const session=readVariantExecutionSession(store,project,applied.value.outputs[0]!);
+  if(!same(session.value.result,origin)) invalid('The generation result names another execution receipt');
+  const paid=readResearchConsumerExecution(store,project,reference(running));
+  if(paid.kind!=='response') invalid('The generation result lost its paid response');
+  const {publication,writes}=variantPublicationWrites(store,session.value,paid.payload);
+  if(!same(publication.result.ref,ref)) invalid('The generation result is not the one its paid answer projects');
+  const state=writes.at(-1)!;
+  return {verification:'proven',session,publication,state:{id:state.id,revision:state.expected+1,hash:hashJson(state.value as never)}};
 }
 
 export interface VariantSessionInput {
@@ -113,8 +146,11 @@ export function applyVariantSession(store:Store,project:string,intentRef:Ref):Re
   if(paid.kind!=='response') throw new EngineError('research_consumer_execution_refused','The original variant execution has no response');
   const owner=readVariantExecutionSession(store,project,paid.intent.value.owner);
   const value=projectPaidVariantSession(owner,paid.intent,{call:reference(paid.call),response:paid.response,payload:paid.payload});
+  // 4B.1: the receipt, the members, the set or no_variants and the next current state — one atomic batch of the common
+  // lifecycle. A moved mode or selection refuses the batch; the paid answer stays saved under its original subject.
+  const product=variantPublicationWrites(store,value,paid.payload);
   const batch=prepareResearchConsumerApplication(store,reference(paid.intent),reference(paid.call),[
-    {id:owner.id,kind:owner.kind,expected:owner.revision,value}],[reference(owner)]);
+    {id:owner.id,kind:owner.kind,expected:owner.revision,value},...product.writes],[reference(owner),...product.guards]);
   return store.writeMany<VariantExecutionSession>(batch.writes,batch.guards)[0]!;
 }
 export async function runVariantSession(store:Store,input:VariantSessionInput):Promise<Revision<VariantExecutionSession>> {

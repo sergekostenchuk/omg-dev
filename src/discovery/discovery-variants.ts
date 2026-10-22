@@ -305,3 +305,34 @@ export function readVariantNoneStructural(view: VariantRecordView, project: stri
   if (!variantSame(snapshot.record.value.draft, result.record.value.draft)) variantInvalid('draft', 'Negative result and snapshot belong to different drafts', 'discovery_variant_basis_invalid');
   return result;
 }
+
+/** One immutable record of a generation publication: its canonical address and the exact Ref of its first revision. */
+export interface VariantPublicationRecord<T> { id: string; kind: string; value: T; ref: Ref }
+export interface VariantPublication {
+  members: VariantPublicationRecord<DiscoveryVariant>[];
+  result: VariantPublicationRecord<VariantSet> | VariantPublicationRecord<VariantNone>;
+}
+function publicationRecord<T extends { projectId: string }>(kind: string, value: T): VariantPublicationRecord<T> {
+  const id = variantRecordId(kind, value);
+  return { id, kind, value, ref: { id, revision: 1, hash: hashJson(value as unknown as Json) } };
+}
+/** 4B.1: the product projection of one paid generation, shared by its producer and its historical reader. The answer's
+ * local keys become the exact Refs of immutable members and the recommendation the Ref of its member; no_variants is its
+ * own record. Every record names the receipt's origin — the running intent, never the terminal written beside it. */
+export function projectVariantPublication(session: VariantExecutionSession, payload: unknown): VariantPublication {
+  const receipt = decodeVariantExecutionSession(session);
+  if (receipt.cursor !== 1 || receipt.result === null || receipt.variantSubject.kind !== 'proposal')
+    variantInvalid('session', 'A publication needs the applied receipt of a generation', 'discovery_variant_session_invalid');
+  const answer = decodeVariantGeneration(payload);
+  const basis = { projectId: receipt.projectId, draft: receipt.draft, snapshot: receipt.variantSubject.snapshot, origin: receipt.result };
+  if (answer.action === 'no_variants')
+    return { members: [], result: publicationRecord('discovery-variant-none', decodeVariantNone({ contract: VARIANT_NONE_CONTRACT, ...basis,
+      reasons: answer.reasons, searchLimits: answer.searchLimits, unknowns: answer.unknowns })) };
+  const members = answer.variants.map(variant => publicationRecord('discovery-variant', decodeDiscoveryVariant({ contract: VARIANT_CONTRACT,
+    ...basis, key: variant.key, title: variant.title, proposal: variant.proposal, scale: answer.scale, criteria: variant.criteria })));
+  const recommended = members.find(member => member.value.key === answer.recommendation.key)!;
+  return { members, result: publicationRecord('discovery-variant-set', decodeVariantSet({ contract: VARIANT_SET_CONTRACT, ...basis,
+    members: members.map(member => member.ref), scale: answer.scale, comparison: answer.comparison,
+    recommendation: { member: recommended.ref, reason: answer.recommendation.reason },
+    searchLimits: answer.searchLimits, unknowns: answer.unknowns })) };
+}

@@ -1,4 +1,5 @@
 import { decodeVariantExecutionSession, decodeVariantSubject, type VariantExecutionSession } from './discovery-variants.js';
+import { variantPublicationWrites } from './variant-decision.js';
 import { readVariantSnapshot } from './variant-snapshot.js';
 import { variantExecutionSessionId, projectPaidVariantSession } from './research-consumer-transition.js';
 import { requireVariantArchive, variantTransportFields, variantTransportGuards } from './continuation-packet.js';
@@ -3203,9 +3204,11 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
     const running=intent.value.state==='running'?intent:store.get<ResearchConsumerIntent>(intent.id,intent.revision-1);
     if(!owner || !running) consumerInvalid(intent.id,'The variant application lost its original execution cursor');
     const value=projectPaidVariantSession(owner,running,{call:reference(paid.call),response:paid.response,payload:paid.payload});
-    if(writes.length!==1 || writes[0]!.id!==owner.id || writes[0]!.kind!==owner.kind
-      || writes[0]!.expected!==owner.revision || canonical(writes[0]!.value)!==canonical(value))
-      consumerInvalid(intent.id,'Only the exact paid variant execution receipt can be applied');
+    // 4B.1: the receipt and the whole product publication its paid generation projects, in one fixed order.
+    const shape=(write:{id:string;kind:string;expected:number;value:unknown})=>({id:write.id,kind:write.kind,expected:write.expected,value:write.value});
+    const expected=[{id:owner.id,kind:owner.kind,expected:owner.revision,value},...variantPublicationWrites(store,value,paid.payload).writes];
+    if(canonical(writes.map(shape))!==canonical(expected.map(shape)))
+      consumerInvalid(intent.id,'Only the exact paid variant receipt and the publication its generation projects can be applied');
     return;
   }
   if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
