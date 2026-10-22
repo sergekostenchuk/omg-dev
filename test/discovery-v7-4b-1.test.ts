@@ -238,3 +238,60 @@ test('4B.1: a real project-mode record is proved by its own reader; a forged one
     (error: unknown) => error instanceof EngineError && error.code.startsWith('project_mode_'));
   assert.deepEqual(history(f.store), before);
 });
+
+test('4B1-01: the common door derives the guards of an admitted state itself — a caller without the mode guard still meets it', async t => {
+  const f = await setup(t);
+  f.reply(generation(2));
+  const running = await f.pay(), sent = f.wires().length;
+  const paid = readResearchConsumerExecution(f.store, f.project, reference(running));
+  assert.equal(paid.kind, 'response');
+  if (paid.kind !== 'response') return;
+  const owner = f.store.get<VariantExecutionSession>(running.value.owner.id, running.value.owner.revision)!;
+  const receiptValue = projectPaidVariantSession(owner, running, { call: reference(paid.call), response: paid.response, payload: paid.payload });
+  const product = variantPublicationWrites(f.store, receiptValue, paid.payload);
+  assert.equal(product.admitted, true);
+  // The caller names only the owner guard; the prepared batch still carries the exact mode the state is admitted on.
+  const batch = prepareResearchConsumerApplication(f.store, reference(running), reference(paid.call),
+    [{ id: owner.id, kind: owner.kind, expected: owner.revision, value: receiptValue }, ...product.writes] as any, [reference(owner)]);
+  assert.ok(batch.guards.some(guard => canonical(guard) === canonical(f.input.variantSubject.mode)), 'the mode guard is derived, not trusted');
+  // A second Store moves the mode between preparation and the write.
+  const other = f.open(), mode = other.get(f.mode.id)!;
+  const moved = other.write({ id: mode.id, kind: mode.kind, expected: mode.revision, value: { projectId: f.project, mode: 'bypass' } });
+  const before = history(f.store);
+  assert.throws(() => f.store.writeMany(batch.writes, batch.guards), code('input_stale'));
+  assert.deepEqual(history(f.store), before, 'no part of the publication is written');
+  // The lawful recovery keeps the paid result under its original subject, without the state and without a new payment.
+  const receipt = applyVariantSession(f.store, f.project, reference(running));
+  assert.deepEqual(reference(f.store.get(f.mode.id)!), reference(moved), 'the newer mode stays');
+  assert.equal(f.store.get(variantStateId(f.project, receipt.value.draft.id)), null);
+  assert.equal(f.wires().length, sent);
+});
+
+for (const damage of ['a missing state', 'a substituted state'] as const)
+  test(`4B1-02: ${damage} named by the terminal intent proves neither the result nor the receipt, hot and cold`, async t => {
+    const f = await setup(t);
+    f.reply(generation(2));
+    const running = await f.pay(), sent = f.wires().length;
+    const paid = readResearchConsumerExecution(f.store, f.project, reference(running));
+    assert.equal(paid.kind, 'response');
+    if (paid.kind !== 'response') return;
+    const owner = f.store.get<VariantExecutionSession>(running.value.owner.id, running.value.owner.revision)!;
+    const receiptValue = projectPaidVariantSession(owner, running, { call: reference(paid.call), response: paid.response, payload: paid.payload });
+    const product = variantPublicationWrites(f.store, receiptValue, paid.payload, true);
+    const refOf = (write: { id: string; expected: number; value: unknown }) => ({ id: write.id, revision: write.expected + 1, hash: hashJson(write.value as Json) });
+    const receiptWrite = { id: owner.id, kind: owner.kind, expected: owner.revision, value: receiptValue };
+    // Negative corruption after a real payment, bypassing the door: the terminal names the expected state.
+    const kept = damage === 'a missing state' ? product.writes.slice(0, -1)
+      : [...product.writes.slice(0, -1), { ...product.state, value: { ...(product.state.value as any), mode: f.saved ? reference(f.saved) : null } }];
+    const outputs = [refOf(receiptWrite), ...product.writes.map(refOf)];
+    f.store.writeMany([receiptWrite, ...kept, { id: running.id, kind: running.kind, expected: running.revision,
+      value: { ...running.value, state: 'applied', outputs } }] as any, []);
+    const set = product.publication.result.ref, receipt = refOf(receiptWrite);
+    const before = history(f.store);
+    for (const store of [f.store, f.open()]) {
+      assert.throws(() => readVariantGeneration(store, f.project, set), code('discovery_variant_session_invalid'));
+      assert.throws(() => readVariantExecutionSession(store, f.project, receipt), code('discovery_variant_session_invalid'));
+    }
+    assert.deepEqual(history(f.store), before);
+    assert.equal(f.wires().length, sent);
+  });

@@ -3196,7 +3196,7 @@ export function subjectRecordFormHolds(record: Revision<Record<string, any>>, su
  * is checked by the form its own producer saved — a turn written before the
  * marker existed is the earlier era, never rewritten. */
 function validateConsumerApplicationWrites(store: Store, intent: Revision<ResearchConsumerIntent>, writes: Write[],
-  physical?: ResearchConsumerExecution, mode: 'application' | 'historical' = 'historical'): void {
+  physical?: ResearchConsumerExecution, mode: 'application' | 'historical' = 'historical'): Ref[] {
   if(isVariantConsumer(intent.value)) {
     const paid=physical??readResearchConsumerExecutionFromIntent(store,intent.value.projectId,intent);
     if(paid.kind!=='response') consumerInvalid(intent.id,'A variant application needs its paid response');
@@ -3206,10 +3206,13 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
     const value=projectPaidVariantSession(owner,running,{call:reference(paid.call),response:paid.response,payload:paid.payload});
     // 4B.1: the receipt and the whole product publication its paid generation projects, in one fixed order.
     const shape=(write:{id:string;kind:string;expected:number;value:unknown})=>({id:write.id,kind:write.kind,expected:write.expected,value:write.value});
-    const expected=[{id:owner.id,kind:owner.kind,expected:owner.revision,value},...variantPublicationWrites(store,value,paid.payload).writes];
+    const product=variantPublicationWrites(store,value,paid.payload);
+    const expected=[{id:owner.id,kind:owner.kind,expected:owner.revision,value},...product.writes];
     if(canonical(writes.map(shape))!==canonical(expected.map(shape)))
       consumerInvalid(intent.id,'Only the exact paid variant receipt and the publication its generation projects can be applied');
-    return;
+    // 4B1-01 (№11560): the guards the projection admitted its current state on are derived here and always enter the
+    // batch — never trusted to the caller of the common door.
+    return product.guards;
   }
   if (intent.value.kind === 'synthesis' || intent.value.kind === 'consolidation') {
     const paid = physical ?? readResearchConsumerExecutionFromIntent(store, intent.value.projectId, intent);
@@ -3254,7 +3257,7 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
       }
       if (rest.length !== (checkpointWrite ? 1 : 0)) consumerInvalid(intent.id, 'The application carried foreign writes');
     } else if (rest.length) consumerInvalid(intent.id, 'The application carried foreign writes');
-    return;
+    return [];
   }
   if (writes.some(write => write.id === intent.id || !Number.isSafeInteger(write.expected) || write.expected < 0)
     || new Set(writes.map(write => write.id)).size !== writes.length)
@@ -3287,7 +3290,7 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
       if (error instanceof EngineError && error.code === 'research_consumer_intent_invalid') throw error;
       consumerInvalid(intent.id, 'The runner application cannot be derived from its exact paid response');
     }
-    return;
+    return [];
   }
   if (intent.value.kind !== 'reader' || writes.length !== 1 || writes[0]?.kind !== 'reader-result'
     || writes[0].expected !== 0 || !object(writes[0].value))
@@ -3302,6 +3305,7 @@ function validateConsumerApplicationWrites(store: Store, intent: Revision<Resear
   const derived = derivePaidReaderResult(store, running, paid);
   if (output.id !== `reader-result:v2:${hashJson(value)}` || canonical(value) !== canonical(derived))
     consumerInvalid(intent.id, 'The reader result does not derive from its original selection');
+  return [];
 }
 
 function validateRunnerApplicationWrites(store: Store, intent: Revision<ResearchConsumerIntent>,
@@ -3383,7 +3387,7 @@ export function prepareResearchConsumerApplication(store: Store, intentRef: Ref,
   const intent = paid.intent;
   if (intent.value.state !== 'running' || paid.kind !== 'response' || canonical(reference(paid.call)) !== canonical(callRef))
     consumerInvalid(intent.id, 'Only one proved received response may be applied to this unfinished intent');
-  validateConsumerApplicationWrites(store, intent, writes, paid, 'application');
+  const derivedGuards = validateConsumerApplicationWrites(store, intent, writes, paid, 'application');
   const currentOwner = store.get(intent.value.owner.id);
   if (!currentOwner || !guards.some(guard => canonical(guard) === canonical(reference(currentOwner)))
     || !writes.some(write => write.id === currentOwner.id && write.expected === currentOwner.revision)
@@ -3398,7 +3402,7 @@ export function prepareResearchConsumerApplication(store: Store, intentRef: Ref,
   // not free application of an already paid answer; product publication supplies its own CAS in 4B.
   const original = isVariantConsumer(intent.value) ? []
     : intent.value.guards.filter(guard => guard.id !== intent.value.owner.id && !refreshed.has(guard.id));
-  const required = uniqueTransactionGuards([...original, ...currentReaderGuards, ...guards, reference(intent), reference(paid.call),
+  const required = uniqueTransactionGuards([...original, ...currentReaderGuards, ...guards, ...derivedGuards, reference(intent), reference(paid.call),
     paid.request, paid.response, paid.archive]);
   const outputs = writes.map(pendingRef);
   const terminal: Write = { id: intent.id, kind: 'research-consumer-intent', expected: intent.revision,

@@ -53,9 +53,17 @@ export function readVariantExecutionSession(store:Store,project:string,ref:Ref):
     // A 4T.4 execution-only receipt keeps its own contract and is no product set; a 4B.1 receipt carries the whole
     // publication its paid generation projects, in the exact order and revisions it was written with.
     if(outputs!.length>1) {
-      const refs=(admit:boolean)=>variantPublicationWrites(store,v,paid.payload,admit).writes.map(write=>({id:write.id,revision:write.expected+1,hash:hashJson(write.value as never)}));
-      if(!same(outputs!.slice(1),refs(true)) && !same(outputs!.slice(1),refs(false)))
-        invalid('The execution receipt names another publication than its paid generation projects');
+      // 4B1-02 (№11560): every named output revision is read and compared — kind, exact Ref and whole value — with the
+      // projection of the paid answer; a listed Ref alone proves nothing. The form (with or without state) is the one named.
+      const refOf=(write:{id:string;expected:number;value:unknown})=>({id:write.id,revision:write.expected+1,hash:hashJson(write.value as never)});
+      const writes=[true,false].map(admit=>variantPublicationWrites(store,v,paid.payload,admit).writes)
+        .find(form=>same(outputs!.slice(1),form.map(refOf)));
+      if(!writes) invalid('The execution receipt names another publication than its paid generation projects');
+      for(const write of writes!) {
+        const saved=store.get(write.id,write.expected+1);
+        if(!saved || saved.kind!==write.kind || !same(reference(saved),refOf(write)) || saved.hash!==hashJson(saved.value)
+          || !same(saved.value,write.value)) invalid('A named output of the publication is missing or differs from its projection');
+      }
     }
   }
   return row;
